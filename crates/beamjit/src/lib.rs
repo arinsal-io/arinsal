@@ -1631,6 +1631,10 @@ impl OpView<'_> {
     fn operands(&self) -> &[SpecificOperand] {
         self.operands
     }
+
+    fn is(&self, generic: i32) -> bool {
+        i32::from(self.id) == generic
+    }
 }
 
 /// The function being emitted.
@@ -2403,7 +2407,7 @@ fn emit_op(
     };
     let n = |index| number(args.get(index)).map_err(EmitError::Operand);
     let helper = env.arithmetic_helper();
-    if op.name() == "i_get_map_elements" {
+    if op.is(erts_tables::GENOP_I_GET_MAP_ELEMENTS_3) {
         count_at_least(args, 3, op.name())?;
         let size = usize::try_from(n(2)?)
             .map_err(|_| EmitError::Operand("map element size overflows usize".to_owned()))?;
@@ -2452,12 +2456,12 @@ fn emit_op(
         )));
     };
     let result = match emitter {
-        EmitterKind::Metadata => match op.name() {
-            "i_flush_stubs" => {
+        EmitterKind::Metadata => match i32::from(op.id) {
+            erts_tables::GENOP_I_FLUSH_STUBS_0 => {
                 count(0)?;
                 assembler.flush_yield_stubs()
             }
-            "i_nif_padding" => {
+            erts_tables::GENOP_I_NIF_PADDING_0 => {
                 count(0)?;
                 // erts pads the end of a function that a later `load_nif` can replace
                 // (beam_asm_module.cpp:163, emit_i_nif_padding). This assembler reserves the
@@ -2465,24 +2469,24 @@ fn emit_op(
                 // `emit_nif_patch_site` in the function loop), so there is nothing to pad.
                 Ok(())
             }
-            "i_func_label" => {
+            erts_tables::GENOP_I_FUNC_LABEL_1 => {
                 count(1)?;
                 assembler.emit_i_func_label(n(0)?)
             }
-            "label" => {
+            erts_tables::GENOP_LABEL_1 => {
                 count(1)?;
                 assembler.emit_label(n(0)?)
             }
-            "func_prologue" => {
+            erts_tables::GENOP_FUNC_PROLOGUE_2 => {
                 count(2)?;
                 // Port of erts/emulator/beam/jit/arm/ops.tab:905-906, OTP-29.1.1.
                 assembler.emit_i_entry_label(n(0)?)
             }
-            "aligned_label" => {
+            erts_tables::GENOP_ALIGNED_LABEL_2 => {
                 count(2)?;
                 assembler.emit_i_entry_label(n(0)?)
             }
-            "i_func_info" => {
+            erts_tables::GENOP_I_FUNC_INFO_4 => {
                 count(4)?;
                 let atom = |index: usize| match args.get(index) {
                     Some(SpecificOperand::Atom(value)) => {
@@ -2494,16 +2498,22 @@ fn emit_op(
                 };
                 assembler.emit_i_func_info(n(0)?, atom(1)?, atom(2)?, n(3)?.min(255) as u8)
             }
-            "line" | "func_line" | "executable_line" => {
+            erts_tables::GENOP_LINE_1
+            | erts_tables::GENOP_FUNC_LINE_1
+            | erts_tables::GENOP_EXECUTABLE_LINE_2 => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_line,
                 // emit_func_line, emit_executable_line) for the code and of
                 // erts/emulator/beam/jit/asm_load.c (add_line_entry) for the line table,
                 // OTP-29.1.1: `line` flushes a pending exception return address first;
                 // `func_line` keeps a duplicate entry, the others skip a repeat of the
                 // previous location.
-                let is_line = op.name() == "line";
-                let is_func_line = op.name() == "func_line";
-                count(if op.name() == "executable_line" { 2 } else { 1 })?;
+                let is_line = op.is(erts_tables::GENOP_LINE_1);
+                let is_func_line = op.is(erts_tables::GENOP_FUNC_LINE_1);
+                count(if op.is(erts_tables::GENOP_EXECUTABLE_LINE_2) {
+                    2
+                } else {
+                    1
+                })?;
                 if is_line {
                     assembler.flush_last_error()?;
                 }
@@ -2526,7 +2536,7 @@ fn emit_op(
                     };
                     assembler.record_line(u64::from(location), file, line, is_func_line);
                 }
-                if op.name() == "executable_line" {
+                if op.is(erts_tables::GENOP_EXECUTABLE_LINE_2) {
                     let cover_id = n(1)?;
                     if let Some(probe) = env.line_coverage_probe(location, cover_id) {
                         assembler.emit_coverage(probe.address, probe.flags)?;
@@ -2534,11 +2544,11 @@ fn emit_op(
                 }
                 Ok(())
             }
-            "i_breakpoint_trampoline" => {
+            erts_tables::GENOP_I_BREAKPOINT_TRAMPOLINE_0 => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
                 assembler.emit_i_breakpoint_trampoline(env.breakpoint_fragment())
             }
-            "i_debug_line" => {
+            erts_tables::GENOP_I_DEBUG_LINE_3 => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3203-3222, OTP-29.1.1.
                 count(3)?;
                 let line = beam
@@ -2577,12 +2587,12 @@ fn emit_op(
                 }
                 Ok(())
             }
-            "i_line_breakpoint_trampoline" => {
+            erts_tables::GENOP_I_LINE_BREAKPOINT_TRAMPOLINE_0 => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:337-348, OTP-29.1.1.
                 count(0)?;
                 assembler.emit_i_line_breakpoint_trampoline(env.line_breakpoint_fragment())
             }
-            "i_test_yield" => {
+            erts_tables::GENOP_I_TEST_YIELD_0 => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.
                 count(0)?;
                 assembler.test_yield()?;
@@ -2592,7 +2602,7 @@ fn emit_op(
                 }
                 Ok(())
             }
-            "nif_start" => {
+            erts_tables::GENOP_NIF_START_0 => {
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:627, OTP-29.1.1.
                 count(0)?;
                 Ok(())
@@ -2706,7 +2716,7 @@ fn emit_op(
             assembler.call_only(n(0)?)
         }
         EmitterKind::ProcessDictionaryGet => {
-            let destination = if matches!(op.name(), "get" | "i_get") {
+            let destination = if op.is(erts_tables::GENOP_I_GET_2) {
                 count(2)?;
                 value(1)?
             } else {
@@ -2763,7 +2773,7 @@ fn emit_op(
                 helper,
             )
         }
-        EmitterKind::IntDiv if op.name() == "i_m_div" => {
+        EmitterKind::IntDiv if op.is(erts_tables::GENOP_I_M_DIV_5) => {
             count(5)?;
             assembler.emit_i_m_div(value(2)?, value(3)?, value(4)?, helper)
         }
@@ -2775,7 +2785,7 @@ fn emit_op(
             );
             assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
-        EmitterKind::Rem if op.name() == "i_div_rem" => {
+        EmitterKind::Rem if op.is(erts_tables::GENOP_I_DIV_REM_6) => {
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
             count(6)?;
             assembler.set_arith_types(
@@ -2791,7 +2801,7 @@ fn emit_op(
                 helper,
             )
         }
-        EmitterKind::Rem if op.name() == "i_rem_div" => {
+        EmitterKind::Rem if op.is(erts_tables::GENOP_I_REM_DIV_6) => {
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
             count(6)?;
             assembler.set_arith_types(
@@ -2866,7 +2876,7 @@ fn emit_op(
         EmitterKind::Guard => {
             let fail = n(0)?;
             'body: {
-                if op.name() == "is_in_range" {
+                if op.is(erts_tables::GENOP_IS_IN_RANGE_5) {
                     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2537-2634, OTP-29.1.1.
                     count(5)?;
                     let helper = env.guard_helper();
@@ -2875,11 +2885,15 @@ fn emit_op(
                     assembler.emit_is_ge(value(4)?, source, n(1)?, helper)?;
                     break 'body;
                 }
-                let source_index = usize::from(op.name().ends_with("_ff")) + 1;
+                let source_index = usize::from(matches!(
+                    i32::from(op.id),
+                    erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4
+                        | erts_tables::GENOP_I_IS_TAGGED_TUPLE_FF_5
+                )) + 1;
                 let source = value(source_index)?;
                 let typed_source =
                     TypedArg::new(source, operand_type(args.get(source_index), beam));
-                if op.name() == "is_int_in_range" {
+                if op.is(erts_tables::GENOP_IS_INT_IN_RANGE_4) {
                     count(4)?;
                     if fail == 0 {
                         return Err(EmitError::Operand(
@@ -2895,12 +2909,12 @@ fn emit_op(
                     )?;
                     break 'body;
                 }
-                if op.name() == "i_is_tuple_of_arity_ff" {
+                if op.is(erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4) {
                     count(4)?;
                     assembler.emit_is_tuple_of_arity(typed_source, value(3)?, fail, n(1)?)?;
                     break 'body;
                 }
-                if op.name() == "i_is_tagged_tuple_ff" {
+                if op.is(erts_tables::GENOP_I_IS_TAGGED_TUPLE_FF_5) {
                     count(5)?;
                     assembler.emit_is_tagged_tuple_ff(
                         typed_source,
@@ -2911,31 +2925,48 @@ fn emit_op(
                     )?;
                     break 'body;
                 }
-                match op.name() {
-                    "is_integer" => assembler.emit_is_integer(typed_source, fail)?,
-                    "is_atom" => assembler.emit_is_atom(typed_source, fail)?,
-                    "is_float" => assembler.emit_is_float(typed_source, fail)?,
-                    "is_boolean" => assembler.emit_is_boolean(typed_source, fail)?,
-                    "is_binary" => assembler.emit_is_binary(typed_source, fail)?,
-                    "is_bitstring" => assembler.emit_is_bitstring(typed_source, fail)?,
-                    "is_number" => assembler.emit_is_number(typed_source, fail)?,
-                    "is_pid" => assembler.emit_is_pid(typed_source, fail)?,
-                    "is_port" => assembler.emit_is_port(typed_source, fail)?,
-                    "is_reference" => assembler.emit_is_reference(typed_source, fail)?,
-                    "is_function" => assembler.emit_is_function(typed_source, fail)?,
-                    "is_function2" => assembler.emit_is_function2_guard_with_helper(
-                        typed_source,
-                        value(2)?,
-                        fail,
-                        env.guard_helper(),
-                    )?,
-                    "is_any_native_record" => assembler.emit_is_any_native_record(fail, source)?,
-                    "is_native_record" => {
+                match i32::from(op.id) {
+                    erts_tables::GENOP_IS_INTEGER_2 => {
+                        assembler.emit_is_integer(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_ATOM_2 => assembler.emit_is_atom(typed_source, fail)?,
+                    erts_tables::GENOP_IS_FLOAT_2 => assembler.emit_is_float(typed_source, fail)?,
+                    erts_tables::GENOP_IS_BOOLEAN_2 => {
+                        assembler.emit_is_boolean(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_BINARY_2 => {
+                        assembler.emit_is_binary(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_BITSTRING_2 => {
+                        assembler.emit_is_bitstring(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_NUMBER_2 => {
+                        assembler.emit_is_number(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_PID_2 => assembler.emit_is_pid(typed_source, fail)?,
+                    erts_tables::GENOP_IS_PORT_2 => assembler.emit_is_port(typed_source, fail)?,
+                    erts_tables::GENOP_IS_REFERENCE_2 => {
+                        assembler.emit_is_reference(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_FUNCTION_2 => {
+                        assembler.emit_is_function(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_FUNCTION2_3 => assembler
+                        .emit_is_function2_guard_with_helper(
+                            typed_source,
+                            value(2)?,
+                            fail,
+                            env.guard_helper(),
+                        )?,
+                    erts_tables::GENOP_IS_ANY_NATIVE_RECORD_2 => {
+                        assembler.emit_is_any_native_record(fail, source)?
+                    }
+                    erts_tables::GENOP_IS_NATIVE_RECORD_4 => {
                         // Port of erts/emulator/beam/jit/arm/instr_records.cpp:29-71, OTP-29.1.1.
                         count(4)?;
                         assembler.emit_is_native_record(fail, source, value(2)?, value(3)?)?;
                     }
-                    "is_record_accessible" => {
+                    erts_tables::GENOP_IS_RECORD_ACCESSIBLE_3 => {
                         // Port of erts/emulator/beam/jit/arm/instr_records.cpp:73-115, OTP-29.1.1.
                         count(3)?;
                         let external = matches!(
@@ -2953,58 +2984,68 @@ fn emit_op(
                             ArgVal::Immediate(module),
                         )?;
                     }
-                    "is_list" => assembler.emit_is_list(typed_source, fail)?,
-                    "is_nonempty_list" => assembler.emit_is_nonempty_list(typed_source, fail)?,
-                    "is_nil" => assembler.emit_is_nil(typed_source, fail)?,
-                    "is_map" => assembler.emit_is_map(typed_source, fail)?,
-                    "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(typed_source, fail)?,
-                    "i_is_tuple_of_arity" => {
+                    erts_tables::GENOP_IS_LIST_2 => assembler.emit_is_list(typed_source, fail)?,
+                    erts_tables::GENOP_IS_NONEMPTY_LIST_2 => {
+                        assembler.emit_is_nonempty_list(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_IS_NIL_2 => assembler.emit_is_nil(typed_source, fail)?,
+                    erts_tables::GENOP_IS_MAP_2 => assembler.emit_is_map(typed_source, fail)?,
+                    erts_tables::GENOP_IS_TUPLE_2 | erts_tables::GENOP_I_IS_TUPLE_2 => {
+                        assembler.emit_is_tuple(typed_source, fail)?
+                    }
+                    erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_3 => {
                         assembler.emit_is_tuple_of_arity(typed_source, value(2)?, fail, fail)?;
                     }
-                    "test_arity" | "i_test_arity" => {
+                    erts_tables::GENOP_TEST_ARITY_3 | erts_tables::GENOP_I_TEST_ARITY_3 => {
                         assembler.emit_test_arity(typed_source, value(2)?, fail)?;
                     }
-                    "is_tagged_tuple" | "i_is_tagged_tuple" => {
+                    erts_tables::GENOP_IS_TAGGED_TUPLE_4
+                    | erts_tables::GENOP_I_IS_TAGGED_TUPLE_4 => {
                         assembler.emit_is_tagged_tuple(typed_source, value(2)?, value(3)?, fail)?;
                     }
-                    "is_eq_exact" | "is_ne_exact" | "is_eq" | "is_ne" | "is_lt" | "is_ge"
-                    | "is_int_ge" => {
+                    erts_tables::GENOP_IS_EQ_EXACT_3
+                    | erts_tables::GENOP_IS_NE_EXACT_3
+                    | erts_tables::GENOP_IS_EQ_3
+                    | erts_tables::GENOP_IS_NE_3
+                    | erts_tables::GENOP_IS_LT_3
+                    | erts_tables::GENOP_IS_GE_3
+                    | erts_tables::GENOP_IS_INT_GE_3 => {
                         let lhs = value(1)?;
                         let rhs = value(2)?;
-                        match op.name() {
-                            "is_eq_exact" => assembler.emit_is_eq_exact(
+                        match i32::from(op.id) {
+                            erts_tables::GENOP_IS_EQ_EXACT_3 => assembler.emit_is_eq_exact(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
                                 &eq_literal_operand(args.get(2), beam, env)?,
                                 env.compare_shared().eq,
                             )?,
-                            "is_ne_exact" => assembler.emit_is_ne_exact(
+                            erts_tables::GENOP_IS_NE_EXACT_3 => assembler.emit_is_ne_exact(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
                                 &eq_literal_operand(args.get(2), beam, env)?,
                                 env.compare_shared().eq,
                             )?,
-                            "is_eq" => assembler.emit_is_eq(
+                            erts_tables::GENOP_IS_EQ_3 => assembler.emit_is_eq(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
                                 env.guard_helper(),
                             )?,
-                            "is_ne" => assembler.emit_is_ne(
+                            erts_tables::GENOP_IS_NE_3 => assembler.emit_is_ne(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
                                 env.guard_helper(),
                             )?,
-                            "is_lt" => assembler.emit_is_lt(
+                            erts_tables::GENOP_IS_LT_3 => assembler.emit_is_lt(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
                                 env.guard_helper(),
                             )?,
-                            "is_ge" => assembler.emit_is_ge(
+                            erts_tables::GENOP_IS_GE_3 => assembler.emit_is_ge(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
@@ -3012,7 +3053,7 @@ fn emit_op(
                             )?,
                             // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_ge),
                             // OTP-29.1.1: fails unless the source is an integer AND >= Min.
-                            "is_int_ge" => assembler.emit_is_int_ge(
+                            erts_tables::GENOP_IS_INT_GE_3 => assembler.emit_is_int_ge(
                                 TypedArg::new(lhs, operand_type(args.get(1), beam)),
                                 rhs,
                                 fail,
@@ -3041,7 +3082,7 @@ fn emit_op(
             // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2696-2755, OTP-29.1.1.
             let source = TypedArg::new(value(2)?, operand_type(args.get(2), beam));
             assembler.emit_is_ge(source, value(3)?, n(0)?, env.guard_helper())?;
-            if op.name() == "is_ge_lt" {
+            if op.is(erts_tables::GENOP_IS_GE_LT_5) {
                 // `is_ge_lt` is `is_ge Src A` followed by `is_lt B Src` (instr_common.cpp:2713-2716).
                 assembler.emit_is_lt(value(4)?, source, n(1)?, env.guard_helper())?;
             } else {
@@ -3053,7 +3094,7 @@ fn emit_op(
             // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390 and 511-542,
             // OTP-29.1.1: immediate keys are looked up inline, others in the runtime.
             let runtime = env.map_runtime();
-            if op.name() == "i_get_map_element_hash" {
+            if op.is(erts_tables::GENOP_I_GET_MAP_ELEMENT_HASH_5) {
                 count(5)?;
                 // The hash is the loader's `hashmap_make_hash` of the key (gen.get_map_element).
                 assembler.emit_i_get_map_element_hash(
@@ -3079,7 +3120,7 @@ fn emit_op(
         EmitterKind::MapElements => unreachable!("map elements were emitted before dispatch"),
         EmitterKind::MapUpdate => {
             let runtime = env.map_runtime();
-            if op.name() == "update_map_assoc" {
+            if op.is(erts_tables::GENOP_UPDATE_MAP_ASSOC_4) {
                 count_at_least(args, 4, op.name())?;
                 let size = usize::try_from(n(3)?)
                     .map_err(|_| EmitError::Operand("map update size overflow".to_owned()))?;
@@ -3112,7 +3153,7 @@ fn emit_op(
                 )
             }
         }
-        EmitterKind::MapCreate if op.name() == "new_map" => {
+        EmitterKind::MapCreate if op.is(erts_tables::GENOP_NEW_MAP_3) => {
             // Port of erts/emulator/beam/jit/arm/instr_map.cpp:228-265, OTP-29.1.1.
             count_at_least(args, 3, op.name())?;
             let size = usize::try_from(n(2)?)
@@ -3145,7 +3186,7 @@ fn emit_op(
             assembler.emit_test_heap(words, n(1)?, env.gc_hook())?;
             assembler.emit_i_new_small_map_lit(value(0)?, value(2)?, &values)
         }
-        EmitterKind::BsConstruct if op.name() == "bs_init_writable" => {
+        EmitterKind::BsConstruct if op.is(erts_tables::GENOP_BS_INIT_WRITABLE_0) => {
             count(0)?;
             // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000, OTP-29.1.1.
             assembler.emit_bs_init_writable(ArgVal::X(0), env.bs_init_writable_helper())
@@ -3233,11 +3274,11 @@ fn emit_op(
         }
         EmitterKind::Bif => {
             // Port of erts/emulator/beam/jit/arm/ops.tab:812-836 and instr_bif.cpp:110-200.
-            let (arity, has_fail) = match op.name() {
-                "i_bif1" => (1, true),
-                "i_bif2" => (2, true),
-                "i_bif3" => (3, true),
-                "nofail_bif1" => (1, false),
+            let (arity, has_fail) = match i32::from(op.id) {
+                erts_tables::GENOP_I_BIF1_4 => (1, true),
+                erts_tables::GENOP_I_BIF2_5 => (2, true),
+                erts_tables::GENOP_I_BIF3_6 => (3, true),
+                erts_tables::GENOP_NOFAIL_BIF1_3 => (1, false),
                 _ => (2, false),
             };
             count(arity + 2 + usize::from(has_fail))?;
@@ -3304,8 +3345,8 @@ fn emit_op(
                     .map(|index| (pairs[index].1, pairs[index].2))
                     .collect())
             };
-            match op.name() {
-                "get_record_field" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_GET_RECORD_FIELD_5 => {
                     count(5)?;
                     assembler.emit_get_record_field(
                         n(0)?,
@@ -3316,20 +3357,21 @@ fn emit_op(
                         runtime,
                     )
                 }
-                "i_get_record_elements" => {
+                erts_tables::GENOP_I_GET_RECORD_ELEMENTS_3 => {
                     count_at_least(args, 3, op.name())?;
                     let pairs = sorted_pairs(3)?;
                     let keys: Vec<ArgVal> = pairs.iter().map(|(key, _)| *key).collect();
                     let dsts: Vec<ArgVal> = pairs.iter().map(|(_, dst)| *dst).collect();
                     assembler.emit_i_get_record_elements(n(0)?, value(1)?, &keys, &dsts, runtime)
                 }
-                "i_create_local_native_record" | "i_create_native_record" => {
+                erts_tables::GENOP_I_CREATE_LOCAL_NATIVE_RECORD_4
+                | erts_tables::GENOP_I_CREATE_NATIVE_RECORD_4 => {
                     count_at_least(args, 4, op.name())?;
                     let staged: Vec<ArgVal> = sorted_pairs(4)?
                         .into_iter()
                         .flat_map(|(key, val)| [key, val])
                         .collect();
-                    if op.name() == "i_create_local_native_record" {
+                    if op.is(erts_tables::GENOP_I_CREATE_LOCAL_NATIVE_RECORD_4) {
                         assembler.emit_i_create_local_native_record(
                             value(0)?,
                             value(1)?,
@@ -3347,7 +3389,7 @@ fn emit_op(
                         )
                     }
                 }
-                "i_update_native_record" => {
+                erts_tables::GENOP_I_UPDATE_NATIVE_RECORD_4 => {
                     count_at_least(args, 4, op.name())?;
                     let staged: Vec<ArgVal> = sorted_pairs(4)?
                         .into_iter()
@@ -3367,52 +3409,52 @@ fn emit_op(
         EmitterKind::Receive => {
             // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:25-295, OTP-29.1.1.
             let hooks = env.receive_hooks();
-            match op.name() {
-                "recv_marker_reserve" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_RECV_MARKER_RESERVE_1 => {
                     count(1)?;
                     assembler.emit_recv_marker_reserve(value(0)?, hooks)
                 }
-                "recv_marker_bind" => {
+                erts_tables::GENOP_RECV_MARKER_BIND_2 => {
                     count(2)?;
                     assembler.emit_recv_marker_bind(value(0)?, value(1)?, hooks)
                 }
-                "recv_marker_clear" => {
+                erts_tables::GENOP_RECV_MARKER_CLEAR_1 => {
                     count(1)?;
                     assembler.emit_recv_marker_clear(value(0)?, hooks)
                 }
-                "recv_marker_use" => {
+                erts_tables::GENOP_RECV_MARKER_USE_1 => {
                     count(1)?;
                     assembler.emit_recv_marker_use(value(0)?, hooks)
                 }
-                "i_loop_rec" => {
+                erts_tables::GENOP_I_LOOP_REC_1 => {
                     count(1)?;
                     assembler.emit_i_loop_rec(n(0)?, hooks)
                 }
-                "remove_message" => {
+                erts_tables::GENOP_REMOVE_MESSAGE_0 => {
                     count(0)?;
                     assembler.emit_remove_message(hooks)
                 }
-                "loop_rec_end" => {
+                erts_tables::GENOP_LOOP_REC_END_1 => {
                     count(1)?;
                     assembler.emit_loop_rec_end(n(0)?, hooks)
                 }
-                "wait_unlocked" => {
+                erts_tables::GENOP_WAIT_UNLOCKED_1 => {
                     count(1)?;
                     assembler.emit_wait_unlocked(n(0)?, hooks)
                 }
-                "wait_locked" => {
+                erts_tables::GENOP_WAIT_LOCKED_1 => {
                     count(1)?;
                     assembler.emit_wait_locked(n(0)?, hooks)
                 }
-                "wait_timeout_unlocked" => {
+                erts_tables::GENOP_WAIT_TIMEOUT_UNLOCKED_2 => {
                     count(2)?;
                     assembler.emit_wait_timeout_unlocked(value(0)?, n(1)?, hooks)
                 }
-                "wait_timeout_locked" => {
+                erts_tables::GENOP_WAIT_TIMEOUT_LOCKED_2 => {
                     count(2)?;
                     assembler.emit_wait_timeout_locked(value(0)?, n(1)?, hooks)
                 }
-                "timeout" => {
+                erts_tables::GENOP_TIMEOUT_0 => {
                     count(0)?;
                     assembler.emit_timeout(hooks)
                 }
@@ -3431,29 +3473,29 @@ fn emit_op(
                     _ => Err(EmitError::Operand("expected a float register".to_owned())),
                 }
             };
-            match op.name() {
-                "fload" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_FLOAD_2 => {
                     count(2)?;
                     assembler.emit_fload_native(value(0)?, fr(1)?)
                 }
-                "fstore" => {
+                erts_tables::GENOP_FSTORE_2 => {
                     count(2)?;
                     assembler.emit_fstore_native(fr(0)?, value(1)?)
                 }
-                "fconv" => {
+                erts_tables::GENOP_FCONV_2 => {
                     count(2)?;
                     assembler.emit_fconv_native(value(0)?, fr(1)?, env.big_to_float_helper())
                 }
-                "i_fnegate" => {
+                erts_tables::GENOP_I_FNEGATE_2 => {
                     count(2)?;
                     assembler.emit_i_fnegate(fr(0)?, fr(1)?)
                 }
                 name => {
                     count(3)?;
                     let float_op = match name {
-                        "i_fadd" => arinsal_beamasm::float::FloatOp::Add,
-                        "i_fsub" => arinsal_beamasm::float::FloatOp::Sub,
-                        "i_fmul" => arinsal_beamasm::float::FloatOp::Mul,
+                        erts_tables::GENOP_I_FADD_3 => arinsal_beamasm::float::FloatOp::Add,
+                        erts_tables::GENOP_I_FSUB_3 => arinsal_beamasm::float::FloatOp::Sub,
+                        erts_tables::GENOP_I_FMUL_3 => arinsal_beamasm::float::FloatOp::Mul,
                         _ => arinsal_beamasm::float::FloatOp::Div,
                     };
                     assembler.emit_float_instr(float_op, fr(0)?, fr(1)?, fr(2)?)
@@ -3466,19 +3508,21 @@ fn emit_op(
             use arinsal_beamasm::misc::{ApplyKind, emit_apply_call, emit_apply_tail};
             let runtime = env.apply_runtime();
             // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-320, OTP-29.1.1.
-            let (kind, tail, dealloc) = match op.name() {
-                "apply" => (ApplyKind::Fixed(n(0)?), false, None),
-                "apply_last" => (ApplyKind::Fixed(n(0)?), true, Some(1)),
-                "i_apply" => (ApplyKind::Apply3, false, None),
-                "i_apply_last" => (ApplyKind::Apply3, true, Some(0)),
-                "i_apply_only" => (ApplyKind::Apply3, true, None),
-                "i_apply_fun" => (ApplyKind::Apply2, false, None),
-                "i_apply_fun_last" => (ApplyKind::Apply2, true, Some(0)),
+            let (kind, tail, dealloc) = match i32::from(op.id) {
+                erts_tables::GENOP_APPLY_1 => (ApplyKind::Fixed(n(0)?), false, None),
+                erts_tables::GENOP_APPLY_LAST_2 => (ApplyKind::Fixed(n(0)?), true, Some(1)),
+                erts_tables::GENOP_I_APPLY_0 => (ApplyKind::Apply3, false, None),
+                erts_tables::GENOP_I_APPLY_LAST_1 => (ApplyKind::Apply3, true, Some(0)),
+                erts_tables::GENOP_I_APPLY_ONLY_0 => (ApplyKind::Apply3, true, None),
+                erts_tables::GENOP_I_APPLY_FUN_0 => (ApplyKind::Apply2, false, None),
+                erts_tables::GENOP_I_APPLY_FUN_LAST_1 => (ApplyKind::Apply2, true, Some(0)),
                 _ => (ApplyKind::Apply2, true, None),
             };
-            count(match op.name() {
-                "apply_last" => 2,
-                "apply" | "i_apply_last" | "i_apply_fun_last" => 1,
+            count(match i32::from(op.id) {
+                erts_tables::GENOP_APPLY_LAST_2 => 2,
+                erts_tables::GENOP_APPLY_1
+                | erts_tables::GENOP_I_APPLY_LAST_1
+                | erts_tables::GENOP_I_APPLY_FUN_LAST_1 => 1,
                 _ => 0,
             })?;
             if tail {
@@ -3496,64 +3540,64 @@ fn emit_op(
         EmitterKind::Catch => {
             use arinsal_beamasm::catch::ExceptionResolver;
             let resolver: ExceptionResolver = env.exception_resolver();
-            match op.name() {
-                "catch" | "try" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_CATCH_2 | erts_tables::GENOP_TRY_2 => {
                     count(2)?;
                     assembler.emit_catch(value(0)?, n(1)?)
                 }
-                "catch_end" => {
+                erts_tables::GENOP_CATCH_END_1 => {
                     count(1)?;
                     assembler.emit_catch_end(value(0)?, env.gc_hook(), env.add_stacktrace_helper())
                 }
-                "try_case" => {
+                erts_tables::GENOP_TRY_CASE_1 => {
                     count(1)?;
                     assembler.emit_try_case(value(0)?)
                 }
-                "try_end" => {
+                erts_tables::GENOP_TRY_END_1 => {
                     count(1)?;
                     assembler.emit_try_end(value(0)?)
                 }
-                "try_end_deallocate" => {
+                erts_tables::GENOP_TRY_END_DEALLOCATE_1 => {
                     count(1)?;
                     assembler.emit_try_end_deallocate(n(0)?)
                 }
-                "try_end_move_deallocate" => {
+                erts_tables::GENOP_TRY_END_MOVE_DEALLOCATE_3 => {
                     count(3)?;
                     assembler.emit_try_end_move_deallocate(value(0)?, value(1)?, n(2)?)
                 }
-                "try_case_end" => {
+                erts_tables::GENOP_TRY_CASE_END_1 => {
                     count(1)?;
                     assembler.emit_try_case_end(value(0)?, resolver)
                 }
-                "badmatch" => {
+                erts_tables::GENOP_BADMATCH_1 => {
                     count(1)?;
                     assembler.emit_badmatch(value(0)?, resolver)
                 }
-                "case_end" => {
+                erts_tables::GENOP_CASE_END_1 => {
                     count(1)?;
                     assembler.emit_case_end(value(0)?, resolver)
                 }
-                "if_end" => {
+                erts_tables::GENOP_IF_END_0 => {
                     count(0)?;
                     assembler.emit_if_end(resolver)
                 }
-                "badrecord" => {
+                erts_tables::GENOP_BADRECORD_1 => {
                     count(1)?;
                     assembler.emit_badrecord(value(0)?, resolver)
                 }
-                "raise" => {
+                erts_tables::GENOP_RAISE_2 => {
                     count(2)?;
                     assembler.emit_i_raise(value(0)?, value(1)?, env.raise_class_helper(), resolver)
                 }
-                "raw_raise" => {
+                erts_tables::GENOP_RAW_RAISE_0 => {
                     count(0)?;
                     assembler.emit_raw_raise(resolver)
                 }
-                "node" => {
+                erts_tables::GENOP_NODE_1 => {
                     count(1)?;
                     assembler.emit_node(value(0)?, env.this_node_sysname())
                 }
-                "build_stacktrace" => {
+                erts_tables::GENOP_BUILD_STACKTRACE_0 => {
                     count(0)?;
                     assembler.emit_build_stacktrace(
                         env.build_stacktrace_helper().ok_or_else(|| {
@@ -3566,8 +3610,8 @@ fn emit_op(
                 )),
             }
         }
-        EmitterKind::Fun => match op.name() {
-            "i_lambda_trampoline" => {
+        EmitterKind::Fun => match i32::from(op.id) {
+            erts_tables::GENOP_I_LAMBDA_TRAMPOLINE_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:167-205, OTP-29.1.1.
                 assembler.emit_i_lambda_trampoline(
@@ -3577,7 +3621,7 @@ fn emit_op(
                     n(3)?.min(u8::MAX as u32) as u8,
                 )
             }
-            "i_make_fun3" => {
+            erts_tables::GENOP_I_MAKE_FUN3_4 => {
                 count_at_least(args, 4, op.name())?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:211-251, OTP-29.1.1.
                 let environment_values = args[4..]
@@ -3599,19 +3643,19 @@ fn emit_op(
                 }
                 assembler.emit_i_make_fun3_entry(value(1)?, entry, entry_arity, &environment_values)
             }
-            "i_call_fun" => {
+            erts_tables::GENOP_I_CALL_FUN_1 => {
                 count(1)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:457-462, OTP-29.1.1.
                 let arity = n(0)?.min(u8::MAX as u32) as u8;
                 assembler.emit_i_call_fun(arity, env.fun_resolver())
             }
-            "i_call_fun_last" => {
+            erts_tables::GENOP_I_CALL_FUN_LAST_2 => {
                 count(2)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:464-470, OTP-29.1.1.
                 let arity = n(0)?.min(u8::MAX as u32) as u8;
                 assembler.emit_i_call_fun_last(arity, n(1)?, env.fun_resolver())
             }
-            "i_call_fun2" => {
+            erts_tables::GENOP_I_CALL_FUN2_3 => {
                 count(3)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:402-423, OTP-29.1.1.
                 let tag = fun_call_tag(args.first())?;
@@ -3619,7 +3663,7 @@ fn emit_op(
                 let func = arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_call_fun2(tag, arity, func, env.fun_resolver())
             }
-            "i_call_fun2_last" => {
+            erts_tables::GENOP_I_CALL_FUN2_LAST_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:425-455, OTP-29.1.1.
                 let tag = fun_call_tag(args.first())?;
@@ -3627,7 +3671,7 @@ fn emit_op(
                 let func = arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_call_fun2_last(tag, arity, func, n(3)?, env.fun_resolver())
             }
-            "send" => {
+            erts_tables::GENOP_SEND_0 => {
                 count(0)?;
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
                 assembler.emit_send(
@@ -3685,17 +3729,17 @@ fn emit_op(
             })?;
             assembler.return_()
         }
-        EmitterKind::Construct => match op.name() {
-            "put_list" => {
+        EmitterKind::Construct => match i32::from(op.id) {
+            erts_tables::GENOP_PUT_LIST_3 => {
                 count(3)?;
                 assembler.emit_put_list(value(0)?, value(1)?, value(2)?)
             }
-            "put_list2" => {
+            erts_tables::GENOP_PUT_LIST2_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:775-792, OTP-29.1.1.
                 assembler.emit_put_list2(value(0)?, value(1)?, value(2)?, value(3)?)
             }
-            "put_tuple2" => {
+            erts_tables::GENOP_PUT_TUPLE2_2 => {
                 // `put_tuple2 S A *`: the destination, the element count, the elements.
                 count_at_least(args, 2, op.name())?;
                 if args.len() != 2 + n(1)? as usize {
@@ -3709,34 +3753,34 @@ fn emit_op(
                     .collect::<Result<Vec<_>, _>>()?;
                 assembler.emit_put_tuple2(value(0)?, &elements)
             }
-            "get_list" => {
+            erts_tables::GENOP_GET_LIST_3 => {
                 count(3)?;
                 assembler.emit_get_list(value(0)?, value(1)?, value(2)?)
             }
-            "get_hd" => {
+            erts_tables::GENOP_GET_HD_2 => {
                 count(2)?;
                 assembler.emit_get_hd(value(0)?, value(1)?)
             }
-            "get_tl" => {
+            erts_tables::GENOP_GET_TL_2 => {
                 count(2)?;
                 assembler.emit_get_tl(value(0)?, value(1)?)
             }
-            "load_tuple_ptr" => {
+            erts_tables::GENOP_LOAD_TUPLE_PTR_1 => {
                 count(1)?;
                 assembler.emit_load_tuple_ptr(value(0)?, value(0)?)
             }
-            "get_tuple_element" | "i_get_tuple_element" => {
+            erts_tables::GENOP_GET_TUPLE_ELEMENT_3 | erts_tables::GENOP_I_GET_TUPLE_ELEMENT_3 => {
                 count(3)?;
                 let offset = tuple_byte_offset(args.get(1))?;
                 assembler.emit_get_tuple_element(value(0)?, offset, value(2)?)
             }
-            "get_two_tuple_elements" => {
+            erts_tables::GENOP_GET_TWO_TUPLE_ELEMENTS_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:408-421, OTP-29.1.1.
                 let offset = tuple_byte_offset(args.get(1))?;
                 assembler.emit_get_two_tuple_elements(value(0)?, offset, value(2)?, value(3)?)
             }
-            "set_tuple_element" => {
+            erts_tables::GENOP_SET_TUPLE_ELEMENT_3 => {
                 count(3)?;
                 assembler.emit_set_tuple_element(
                     value(0)?,
@@ -3744,7 +3788,7 @@ fn emit_op(
                     tuple_byte_offset(args.get(2))?,
                 )
             }
-            "update_record" => {
+            erts_tables::GENOP_UPDATE_RECORD_5 => {
                 count_at_least(args, 5, op.name())?;
                 let arity = n(1)?;
                 let pairs = &args[5..];
@@ -3763,7 +3807,7 @@ fn emit_op(
                 );
                 assembler.emit_update_record(reuse, value(2)?, value(3)?, arity, &updates)
             }
-            "update_record_in_place" => {
+            erts_tables::GENOP_UPDATE_RECORD_IN_PLACE_4 => {
                 if args.len() < 4 || !(args.len() - 4).is_multiple_of(2) {
                     return Err(EmitError::Operand(
                         "update_record_in_place expects index/value pairs".to_owned(),
@@ -3781,13 +3825,13 @@ fn emit_op(
         },
         EmitterKind::Heap => {
             let hook = env.gc_hook();
-            match op.name() {
-                "test_heap" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_TEST_HEAP_2 => {
                     count(2)?;
                     let (words, live) = (number(args.first())?, number(args.get(1))?);
                     assembler.emit_test_heap(words, live, hook)
                 }
-                "allocate_heap" => {
+                erts_tables::GENOP_ALLOCATE_HEAP_3 => {
                     count(3)?;
                     assembler.emit_allocate_heap(
                         number(args.first())?,
@@ -3796,7 +3840,7 @@ fn emit_op(
                         hook,
                     )
                 }
-                "allocate_heap_zero" => {
+                erts_tables::GENOP_ALLOCATE_HEAP_ZERO_3 => {
                     count(3)?;
                     assembler.emit_allocate_heap_zero(
                         number(args.first())?,
@@ -3808,31 +3852,31 @@ fn emit_op(
                 _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
             }
         }
-        EmitterKind::Fused => match op.name() {
-            "store_two_values" => {
+        EmitterKind::Fused => match i32::from(op.id) {
+            erts_tables::GENOP_STORE_TWO_VALUES_4 => {
                 count(4)?;
                 assembler.emit_store_two_values(value(0)?, value(1)?, value(2)?, value(3)?)
             }
-            "load_two_xregs" => {
+            erts_tables::GENOP_LOAD_TWO_XREGS_4 => {
                 count(4)?;
                 assembler.emit_load_two_xregs(value(0)?, value(1)?, value(2)?, value(3)?)
             }
-            "move_trim" => {
+            erts_tables::GENOP_MOVE_TRIM_3 => {
                 count(3)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:559-600, OTP-29.1.1.
                 assembler.move_trim(value(0)?, value(1)?, n(2)?)
             }
-            "move_call_last" => {
+            erts_tables::GENOP_MOVE_CALL_LAST_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:83-115, OTP-29.1.1.
                 assembler.move_call_last(value(0)?, value(1)?, n(2)?, n(3)?)
             }
-            "put_list_deallocate" => {
+            erts_tables::GENOP_PUT_LIST_DEALLOCATE_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:723-773, OTP-29.1.1.
                 assembler.emit_put_list_deallocate(value(0)?, value(1)?, value(2)?, n(3)?)
             }
-            "move_two_trim" => {
+            erts_tables::GENOP_MOVE_TWO_TRIM_5 => {
                 count(5)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:521-557, OTP-29.1.1: both
                 // Y sources are read before either destination is written, then the frame is
@@ -3844,7 +3888,7 @@ fn emit_op(
                 };
                 assembler.move_two_trim(src1, value(1)?, src2, value(3)?, n(4)?)
             }
-            "move_call_ext_last" => {
+            erts_tables::GENOP_MOVE_CALL_EXT_LAST_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/ops.tab:852 and instr_call.cpp:175-200, OTP-29.1.1.
                 assembler.move_(value(0)?, value(1)?)?;
@@ -3855,36 +3899,38 @@ fn emit_op(
             }
             _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
         },
-        EmitterKind::CallExternal => match op.name() {
-            "i_call_ext" => {
+        EmitterKind::CallExternal => match i32::from(op.id) {
+            erts_tables::GENOP_I_CALL_EXT_1 => {
                 count(1)?;
                 let import = n(0)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
                 assembler.dispatch_export(entry, false)
             }
-            "i_call_ext_only" => {
+            erts_tables::GENOP_I_CALL_EXT_ONLY_1 => {
                 count(1)?;
                 let import = n(0)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
                 assembler.dispatch_export(entry, true)
             }
-            "i_yield" => {
+            erts_tables::GENOP_I_YIELD_0 => {
                 count(0)?;
                 assembler.emit_i_yield()
             }
-            "i_perf_counter" => {
+            erts_tables::GENOP_I_PERF_COUNTER_0 => {
                 count(0)?;
                 assembler.emit_i_perf_counter(env.sys_perf_counter(), env.gc_hook())
             }
-            "i_hibernate" | "i_load_nif" | "i_call_on_load_function" => {
+            erts_tables::GENOP_I_HIBERNATE_0
+            | erts_tables::GENOP_I_LOAD_NIF_0
+            | erts_tables::GENOP_I_CALL_ON_LOAD_FUNCTION_0 => {
                 // Port of erts/emulator/beam/jit/arm/ops.tab:660-680, 612-641, OTP-29.1.1: the
                 // loader turns these BIF calls into instructions. They keep their
                 // scheduler-visible behaviour by calling the BIF's export, whose import the
                 // module still carries.
                 count(0)?;
-                let (module, function, arity) = match op.name() {
-                    "i_hibernate" => ("erlang", "hibernate", 0),
-                    "i_load_nif" => ("erlang", "load_nif", 2),
+                let (module, function, arity) = match i32::from(op.id) {
+                    erts_tables::GENOP_I_HIBERNATE_0 => ("erlang", "hibernate", 0),
+                    erts_tables::GENOP_I_LOAD_NIF_0 => ("erlang", "load_nif", 2),
                     _ => ("erlang", "call_on_load_function", 1),
                 };
                 // The export of these BIFs names their own stub body in `erlang` once
@@ -3912,7 +3958,7 @@ fn emit_op(
                 };
                 assembler.dispatch_export(entry, false)
             }
-            "call_light_bif" => {
+            erts_tables::GENOP_CALL_LIGHT_BIF_1 | erts_tables::GENOP_CALL_LIGHT_BIF_2 => {
                 count(2)?;
                 let import = n(1)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
@@ -3927,7 +3973,7 @@ fn emit_op(
                 };
                 assembler.dispatch_light_bif(fragment, entry, bif)
             }
-            "i_call_ext_last" => {
+            erts_tables::GENOP_I_CALL_EXT_LAST_2 => {
                 count(2)?;
                 let import = n(0)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
@@ -3938,28 +3984,28 @@ fn emit_op(
         },
         EmitterKind::GuardBif => {
             let runtime = env.guard_helper();
-            match op.name() {
-                "bif_and" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_BIF_AND_4 => {
                     count(4)?;
                     assembler.emit_bif_and(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
                 }
-                "bif_or" => {
+                erts_tables::GENOP_BIF_OR_4 => {
                     count(4)?;
                     assembler.emit_bif_or(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
                 }
-                "bif_not" => {
+                erts_tables::GENOP_BIF_NOT_3 => {
                     count(3)?;
                     assembler.emit_bif_not(n(0)?, value(1)?, value(2)?, runtime)
                 }
-                "bif_hd" | "bif_tl" => {
+                erts_tables::GENOP_BIF_HD_2 | erts_tables::GENOP_BIF_TL_2 => {
                     count(2)?;
-                    if op.name() == "bif_hd" {
+                    if op.is(erts_tables::GENOP_BIF_HD_2) {
                         assembler.emit_bif_hd(value(0)?, value(1)?, runtime)
                     } else {
                         assembler.emit_bif_tl(value(0)?, value(1)?, runtime)
                     }
                 }
-                "bif_element" => {
+                erts_tables::GENOP_BIF_ELEMENT_4 => {
                     count(4)?;
                     assembler.emit_bif_element(
                         n(0)?,
@@ -3969,43 +4015,45 @@ fn emit_op(
                         runtime,
                     )
                 }
-                "bif_node" | "bif_bit_size" | "bif_byte_size" | "bif_tuple_size"
-                | "bif_map_size" | "bif_length" | "bif_abs" => {
+                erts_tables::GENOP_BIF_NODE_3
+                | erts_tables::GENOP_BIF_BIT_SIZE_3
+                | erts_tables::GENOP_BIF_BYTE_SIZE_3
+                | erts_tables::GENOP_BIF_TUPLE_SIZE_3
+                | erts_tables::GENOP_BIF_MAP_SIZE_3 => {
                     count(3)?;
                     let source = value(1)?;
                     let destination = value(2)?;
-                    match op.name() {
-                        "bif_node" => assembler.emit_bif_node(n(0)?, source, destination, runtime),
-                        "bif_bit_size" => {
+                    match i32::from(op.id) {
+                        erts_tables::GENOP_BIF_NODE_3 => {
+                            assembler.emit_bif_node(n(0)?, source, destination, runtime)
+                        }
+                        erts_tables::GENOP_BIF_BIT_SIZE_3 => {
                             assembler.emit_bif_bit_size(n(0)?, source, destination, runtime)
                         }
-                        "bif_byte_size" => {
+                        erts_tables::GENOP_BIF_BYTE_SIZE_3 => {
                             assembler.emit_bif_byte_size(n(0)?, source, destination, runtime)
                         }
-                        "bif_tuple_size" => {
+                        erts_tables::GENOP_BIF_TUPLE_SIZE_3 => {
                             assembler.emit_bif_tuple_size(n(0)?, source, destination, runtime)
                         }
-                        "bif_map_size" => assembler.emit_bif_map_size_typed(
+                        erts_tables::GENOP_BIF_MAP_SIZE_3 => assembler.emit_bif_map_size_typed(
                             n(0)?,
                             typed_arg(args.get(1), beam, env)?,
                             destination,
                             runtime,
                         ),
-                        "bif_length" => {
-                            assembler.emit_bif_length_helper(n(0)?, source, destination, runtime)
-                        }
-                        _ => assembler.emit_bif_abs(n(0)?, source, destination, runtime),
+                        _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
                     }
                 }
-                "bif_map_get" | "bif_is_map_key" => {
-                    let (key_at, map_at, dest_at) = if op.name() == "bif_map_get" {
+                erts_tables::GENOP_BIF_MAP_GET_4 | erts_tables::GENOP_BIF_IS_MAP_KEY_5 => {
+                    let (key_at, map_at, dest_at) = if op.is(erts_tables::GENOP_BIF_MAP_GET_4) {
                         count(4)?;
                         (1, 2, 3)
                     } else {
                         count(5)?;
                         (2, 3, 4)
                     };
-                    if op.name() == "bif_map_get" {
+                    if op.is(erts_tables::GENOP_BIF_MAP_GET_4) {
                         assembler.emit_bif_map_get(
                             n(0)?,
                             value(key_at)?,
@@ -4031,22 +4079,25 @@ fn emit_op(
                         )
                     }
                 }
-                "bif_max" | "bif_min" => {
+                erts_tables::GENOP_BIF_MAX_3 | erts_tables::GENOP_BIF_MIN_3 => {
                     count(3)?;
-                    if op.name() == "bif_max" {
+                    if op.is(erts_tables::GENOP_BIF_MAX_3) {
                         assembler.emit_bif_max(value(0)?, value(1)?, value(2)?, runtime)
                     } else {
                         assembler.emit_bif_min(value(0)?, value(1)?, value(2)?, runtime)
                     }
                 }
-                "bif_is_eq_exact" | "bif_is_ne_exact" | "bif_is_ge" | "bif_is_lt" => {
+                erts_tables::GENOP_BIF_IS_EQ_EXACT_3
+                | erts_tables::GENOP_BIF_IS_NE_EXACT_3
+                | erts_tables::GENOP_BIF_IS_GE_3
+                | erts_tables::GENOP_BIF_IS_LT_3 => {
                     count(3)?;
                     // Port of erts/emulator/beam/jit/arm/ops.tab:819-840 and
                     // instr_guard_bifs.cpp:157-262, OTP-29.1.1.
-                    let operation = match op.name() {
-                        "bif_is_eq_exact" => 19,
-                        "bif_is_ne_exact" => 20,
-                        "bif_is_lt" => 23,
+                    let operation = match i32::from(op.id) {
+                        erts_tables::GENOP_BIF_IS_EQ_EXACT_3 => 19,
+                        erts_tables::GENOP_BIF_IS_NE_EXACT_3 => 20,
+                        erts_tables::GENOP_BIF_IS_LT_3 => 23,
                         _ => 24,
                     };
                     assembler.emit_bif_compare(
@@ -4057,7 +4108,7 @@ fn emit_op(
                         env.compare_shared(),
                     )
                 }
-                "bif_self" | "self" => {
+                erts_tables::GENOP_SELF_1 => {
                     count(1)?;
                     assembler.emit_bif_self(value(0)?, runtime)
                 }
@@ -4099,7 +4150,7 @@ fn emit_op(
             if matches!(ported_op(op), Some(EmitterKind::SelectVal)) {
                 let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190, OTP-29.1.1.
-                if op.name() == "i_select_val_lins" {
+                if op.is(erts_tables::GENOP_I_SELECT_VAL_LINS_3) {
                     assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
                 } else {
                     assembler.emit_i_select_val_bins(source, value(1)?, size, &pairs)
@@ -4148,7 +4199,7 @@ fn emit_op(
             }
         }
         EmitterKind::JumpOnVal | EmitterKind::JumpOnValZero => {
-            let (base, size_at, target_at) = if op.name() == "i_jump_on_val" {
+            let (base, size_at, target_at) = if op.is(erts_tables::GENOP_I_JUMP_ON_VAL_4) {
                 count_at_least(args, 5, op.name())?;
                 // The base is a full machine word, so a negative base arrives as its
                 // two's-complement bit pattern.
@@ -4188,7 +4239,7 @@ fn emit_op(
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
             let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
-            if op.name() == "i_jump_on_val" {
+            if op.is(erts_tables::GENOP_I_JUMP_ON_VAL_4) {
                 assembler.emit_i_jump_on_val(source, value(1)?, base, size_at, &targets)
             } else {
                 assembler.emit_i_jump_on_val_zero(source, value(1)?, size_at, &targets)
@@ -4201,8 +4252,8 @@ fn emit_op(
         }
         EmitterKind::BsMatch => {
             let helper = env.bs_match_helper();
-            match op.name() {
-                "i_bs_start_match3" => {
+            match i32::from(op.id) {
+                erts_tables::GENOP_I_BS_START_MATCH3_4 => {
                     count(4)?;
                     assembler.emit_i_bs_start_match3(
                         value(0)?,
@@ -4213,7 +4264,7 @@ fn emit_op(
                         env.gc_hook(),
                     )
                 }
-                "bs_get_integer2" => {
+                erts_tables::GENOP_BS_GET_INTEGER2_7 => {
                     // Fail Ms Live Sz Unit Flags Dst
                     count(7)?;
                     let flags = bs_flags(args.get(5), beam)?;
@@ -4228,7 +4279,7 @@ fn emit_op(
                         env.bs_match_cmd_helper(),
                     )
                 }
-                "i_bs_match" | "i_bs_match_test_heap" => {
+                erts_tables::GENOP_I_BS_MATCH_2 | erts_tables::GENOP_I_BS_MATCH_TEST_HEAP_4 => {
                     use arinsal_beamasm::bs_segments::BsmCommand;
                     count_at_least(args, 2, op.name())?;
                     let ctx = value(1)?;
@@ -4237,7 +4288,7 @@ fn emit_op(
                     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live):
                     // the heap test of `i_bs_match_test_heap` is merged into the segment list.
                     let (mut need, mut live) = (0u64, 0u32);
-                    if op.name() == "i_bs_match_test_heap" {
+                    if op.is(erts_tables::GENOP_I_BS_MATCH_TEST_HEAP_4) {
                         count_at_least(args, 4, op.name())?;
                         need = u64::from(number(args.get(2)).map_err(EmitError::Operand)?);
                         live = n(3)?;
@@ -4363,19 +4414,19 @@ fn emit_op(
                         env.gc_hook(),
                     )
                 }
-                "i_bs_get_position" => {
+                erts_tables::GENOP_I_BS_GET_POSITION_2 => {
                     count(2)?;
                     assembler.emit_i_bs_get_position(value(0)?, value(1)?, helper)
                 }
-                "bs_set_position" => {
+                erts_tables::GENOP_BS_SET_POSITION_2 => {
                     count(2)?;
                     assembler.emit_i_bs_set_position(value(0)?, value(1)?, helper)
                 }
-                "bs_get_tail" => {
+                erts_tables::GENOP_BS_GET_TAIL_3 => {
                     count(3)?;
                     assembler.emit_bs_get_tail(value(0)?, value(1)?, n(2)?, helper, env.gc_hook())
                 }
-                "i_bs_get_binary2" => {
+                erts_tables::GENOP_I_BS_GET_BINARY2_6 => {
                     count(6)?;
                     assembler.emit_i_bs_get_binary2(
                         value(0)?,
@@ -4388,7 +4439,7 @@ fn emit_op(
                         env.gc_hook(),
                     )
                 }
-                "i_bs_get_bin_and_tail" => {
+                erts_tables::GENOP_I_BS_GET_BIN_AND_TAIL_7 => {
                     count(7)?;
                     // Port of erts/emulator/beam/jit/arm/ops.tab:992-997 and
                     // instr_bs.cpp:506-577,407-455, OTP-29.1.1.
@@ -4404,27 +4455,27 @@ fn emit_op(
                     )?;
                     assembler.emit_bs_get_tail(value(0)?, value(6)?, n(2)?, helper, env.gc_hook())
                 }
-                "i_bs_get_utf8" => {
+                erts_tables::GENOP_I_BS_GET_UTF8_3 => {
                     count(3)?;
                     assembler.emit_i_bs_get_utf8(value(0)?, n(1)?, value(2)?, helper)
                 }
-                "i_bs_skip_utf8" => {
+                erts_tables::GENOP_I_BS_SKIP_UTF8_2 => {
                     count(2)?;
                     assembler.emit_i_bs_skip_utf8(value(0)?, n(1)?, helper)
                 }
-                "i_bs_skip_utf16" => {
+                erts_tables::GENOP_I_BS_SKIP_UTF16_3 => {
                     count(3)?;
                     assembler.emit_i_bs_skip_utf16(value(0)?, n(1)?, value(2)?, helper)
                 }
-                "i_bs_validate_unicode_retract" => {
+                erts_tables::GENOP_I_BS_VALIDATE_UNICODE_RETRACT_3 => {
                     count(3)?;
                     assembler.emit_i_bs_validate_unicode_retract(n(0)?, value(1)?, value(2)?)
                 }
-                "i_bs_get_utf16" => {
+                erts_tables::GENOP_I_BS_GET_UTF16_4 => {
                     count(4)?;
                     assembler.emit_i_bs_get_utf16(value(0)?, n(1)?, value(2)?, value(3)?, helper)
                 }
-                "i_bs_get_float2" => {
+                erts_tables::GENOP_I_BS_GET_FLOAT2_6 => {
                     count(6)?;
                     assembler.emit_i_bs_get_float2(
                         value(0)?,
@@ -4437,30 +4488,7 @@ fn emit_op(
                         env.gc_hook(),
                     )
                 }
-                "get_float2" => {
-                    count(7)?;
-                    // Port of erts/emulator/beam/jit/arm/generators.tab:57-71 (gen.get_float2)
-                    // with $NativeEndian resolved for a little-endian host, OTP-29.1.1.
-                    let flags = bs_flags(args.get(5), beam)? >> 4;
-                    let flags = if flags & 16 != 0 {
-                        (flags & !16) | 2
-                    } else {
-                        flags
-                    };
-                    let unit_and_flags = u32::try_from((u64::from(n(4)?) << 3) | flags)
-                        .map_err(|_| EmitError::Operand("float unit overflow".to_owned()))?;
-                    assembler.emit_i_bs_get_float2(
-                        value(1)?,
-                        n(0)?,
-                        n(2)?,
-                        value(3)?,
-                        unit_and_flags,
-                        value(6)?,
-                        helper,
-                        env.gc_hook(),
-                    )
-                }
-                "i_bs_match_string" => {
+                erts_tables::GENOP_I_BS_MATCH_STRING_4 => {
                     count(4)?;
                     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:191-234, OTP-29.1.1: the
                     // constant lives in the module's string table; the hook gets it as a
@@ -4481,7 +4509,7 @@ fn emit_op(
                         helper,
                     )
                 }
-                "i_bs_skip_bits2" => {
+                erts_tables::GENOP_I_BS_SKIP_BITS2_4 => {
                     count(4)?;
                     assembler.emit_i_bs_skip_bits2(value(0)?, value(1)?, n(3)?, n(2)?)
                 }
