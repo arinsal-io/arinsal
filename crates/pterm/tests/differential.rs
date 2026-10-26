@@ -12,7 +12,8 @@ fn local(name: &str, args: &[OwnedTerm]) -> CallResult {
         .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect();
     let bif = lookup("persistent_term", name, args.len() as u8).unwrap();
-    match bif(&mut Ctx::new(&mut heap), &args) {
+    let mut state = arinsal_bifs::BifState::default();
+    match bif(&mut Ctx::new(&mut heap, &mut state), &args) {
         Ok(term) => CallResult::Ok(to_owned(term).unwrap()),
         Err(BifError::Badarg { .. }) => CallResult::Exception {
             class: "error".into(),

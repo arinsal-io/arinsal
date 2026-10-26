@@ -1353,7 +1353,6 @@ fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 /// finishes a finite list. A full chunk charges `div_ceil(scanned, 16)`, which is
 /// `BUMP_ALL_REDS` when the chunk is exactly one reduction budget and
 /// `BIF_RET2`'s `reds_left - max_iter/16` otherwise.
-#[inline(always)]
 pub fn lists_member(
     ctx: &mut Ctx<'_>,
     term: Term,
@@ -1643,7 +1642,8 @@ mod tests {
         let list = TermBuilder::new(&mut alloc)
             .list_from_slice(&[Term::small(1).unwrap(), Term::small(2).unwrap()])
             .unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let out = crate::lookup("erlang", "++", 2).unwrap()(&mut ctx, &[list, Term::NIL]).unwrap();
         assert_eq!(out, list);
     }
@@ -1655,7 +1655,8 @@ mod tests {
         assert!(heap.alloc_halloc(left - 3).is_some());
         let used = heap.used_words();
         let mut alloc = ProcessHeapHandle(&mut heap);
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let bif = crate::lookup("erlang", "integer_to_list", 1).unwrap();
         bif(&mut ctx, &[Term::small(5555).unwrap()]).unwrap();
         assert_eq!(heap.used_words(), used);
@@ -1680,7 +1681,8 @@ mod subtract_tests {
             .map(|value| from_owned(value, &mut allocator).unwrap())
             .collect::<Vec<_>>();
         let result = {
-            let mut ctx = Ctx::new(&mut allocator);
+            let mut bif_state = crate::BifState::default();
+            let mut ctx = Ctx::new(&mut allocator, &mut bif_state);
             bif(&mut ctx, &terms)
         };
         match result {
@@ -1713,7 +1715,8 @@ mod subtract_tests {
         let mut walk = SubtractWalk::new(terms[0], terms[1]).unwrap();
         let result = loop {
             let step = {
-                let mut ctx = Ctx::new(&mut allocator);
+                let mut bif_state = crate::BifState::default();
+                let mut ctx = Ctx::new(&mut allocator, &mut bif_state);
                 walk.step(&mut ctx, budget)
             };
             match step {
@@ -1863,7 +1866,8 @@ mod reverse_chunk_tests {
         let mut alloc = ProcessHeapHandle(&mut heap);
         let source = list_of(&mut alloc, 20);
         let tail = Term::small(99).unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let ReverseStep::Done(one_shot) =
             lists_reverse(&mut ctx, source, tail, usize::MAX).unwrap()
         else {
@@ -1888,7 +1892,8 @@ mod reverse_chunk_tests {
             HeapAlloc::alloc(&mut alloc, left - 8).unwrap();
         }
         assert!(HeapAlloc::words_left(&alloc).unwrap_or(0) <= 8);
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let ReverseStep::Done(one_shot) =
             lists_reverse(&mut ctx, source, tail, usize::MAX).unwrap()
         else {
@@ -1906,7 +1911,8 @@ mod reverse_chunk_tests {
     fn empty_list_keeps_the_tail() {
         let mut heap = ProcessHeap::with_words(64);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let tail = Term::small(7).unwrap();
         let ReverseStep::Done(value) = lists_reverse(&mut ctx, Term::NIL, tail, 1).unwrap() else {
             panic!("empty reverse trapped");
@@ -1921,7 +1927,8 @@ mod reverse_chunk_tests {
         let bad = TermBuilder::new(&mut alloc)
             .cons(Term::small(1).unwrap(), Term::small(2).unwrap())
             .unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         assert!(matches!(
             lists_reverse(&mut ctx, bad, Term::NIL, 10),
             Err(crate::BifError::Badarg { .. })
@@ -1949,7 +1956,8 @@ mod trap_budget_tests {
         let mut alloc = ProcessHeapHandle(&mut heap);
         let list = list_of(&mut alloc, 20);
         let miss = Term::small(99).unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let MemberStep::Done(found) = lists_member(&mut ctx, miss, list, usize::MAX).unwrap()
         else {
             panic!("unbounded member trapped");
@@ -1957,7 +1965,8 @@ mod trap_budget_tests {
         assert!(!found);
         assert_eq!(ctx.reductions(), 0);
 
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let mut rest = list;
         let mut steps = 0u32;
         loop {
@@ -1977,7 +1986,8 @@ mod trap_budget_tests {
         // 16 cells then 4: ceil(16/16) + ceil(4/16) = 2, the same as one 20-cell call.
         assert_eq!(ctx.reductions(), 2);
 
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let MemberStep::Done(true) =
             lists_member(&mut ctx, Term::small(7).unwrap(), list, 16).unwrap()
         else {
@@ -2003,7 +2013,8 @@ mod trap_budget_tests {
             .unwrap();
         let key = Term::small(8).unwrap();
         let pos = Term::small(1).unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let mut rest = list;
         let mut steps = 0u32;
         let found = loop {
@@ -2022,7 +2033,8 @@ mod trap_budget_tests {
         let five = TermBuilder::new(&mut alloc)
             .list_from_slice(&tuples[..5])
             .unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut bif_state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let KeyOutcome::Done(hit) = lists_key(
             &mut ctx,
             KeyOp::Find,
@@ -2044,31 +2056,37 @@ mod trap_budget_tests {
         let mut alloc = ProcessHeapHandle(&mut heap);
         let lhs = list_of(&mut alloc, 20);
         let rhs = Term::small(7).unwrap();
-        let mut ctx = Ctx::new(&mut alloc);
-        let AppendStep::Done(one_shot) = lists_append(
-            &mut ctx,
-            AppendCont::start(lhs, rhs),
-            usize::MAX,
-            usize::MAX,
-        )
-        .unwrap() else {
-            panic!("unbounded append trapped");
-        };
-        let mut state = AppendCont::start(lhs, rhs);
-        let chunked = loop {
-            match lists_append(&mut ctx, state, 5, 5).unwrap() {
-                AppendStep::Done(value) => break value,
-                AppendStep::More(next) => state = next,
-            }
+        let mut bif_state = crate::BifState::default();
+        let (one_shot, chunked) = {
+            let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
+            let AppendStep::Done(one_shot) = lists_append(
+                &mut ctx,
+                AppendCont::start(lhs, rhs),
+                usize::MAX,
+                usize::MAX,
+            )
+            .unwrap() else {
+                panic!("unbounded append trapped");
+            };
+            let mut state = AppendCont::start(lhs, rhs);
+            let chunked = loop {
+                match lists_append(&mut ctx, state, 5, 5).unwrap() {
+                    AppendStep::Done(value) => break value,
+                    AppendStep::More(next) => state = next,
+                }
+            };
+            (one_shot, chunked)
         };
         assert!(exact_eq(one_shot, chunked));
 
-        let mut ctx = Ctx::new(&mut alloc);
-        let mut state = AppendCont::start(lhs, Term::NIL);
-        let same = loop {
-            match lists_append(&mut ctx, state, 4, 0).unwrap() {
-                AppendStep::Done(value) => break value,
-                AppendStep::More(next) => state = next,
+        let same = {
+            let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
+            let mut state = AppendCont::start(lhs, Term::NIL);
+            loop {
+                match lists_append(&mut ctx, state, 4, 0).unwrap() {
+                    AppendStep::Done(value) => break value,
+                    AppendStep::More(next) => state = next,
+                }
             }
         };
         assert_eq!(same, lhs);

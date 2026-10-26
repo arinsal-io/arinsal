@@ -98,7 +98,8 @@ fn c_api_groups_match_otp() {
         ("send_probe", vec![]),
         ("exception_probe", vec![]),
     ] {
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut heap));
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut heap), &mut state);
         let callback = nif.lookup(name, args.len()).unwrap();
         let result = if name == "send_probe" {
             callback.call_with_pid(&mut ctx, &args, Term::pid(1, 0))
@@ -125,7 +126,8 @@ fn c_api_groups_match_otp() {
     );
     drop(heap);
     let mut check_heap = ProcessHeap::with_words(1024);
-    let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut check_heap));
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut check_heap), &mut state);
     let destroyed = nif
         .lookup("dtor_count", 0)
         .unwrap()

@@ -66,8 +66,11 @@ pub fn call_bif(
     args: &[arinsal_term::Term],
 ) -> Result<arinsal_term::Term, arinsal_bifs::BifError> {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, fcalls);
-    target(&mut ctx, args)
+    let mut state = arinsal_bifs::BifState::from_fcalls(*fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
+    let result = target(&mut ctx, args);
+    *fcalls = state.fcalls;
+    result
 }
 
 /// Invoke a BIF and return its reported work for scheduler accounting.
@@ -78,9 +81,12 @@ pub(crate) fn call_bif_metered(
     args: &[arinsal_term::Term],
 ) -> (Result<arinsal_term::Term, arinsal_bifs::BifError>, u32) {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, fcalls);
+    let mut state = arinsal_bifs::BifState::from_fcalls(*fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
     let result = target(&mut ctx, args);
-    (result, ctx.reductions())
+    let reductions = ctx.reductions();
+    *fcalls = state.fcalls;
+    (result, reductions)
 }
 
 /// Invoke a BIF and preserve a continuation it deferred after exhausting its slice.
@@ -96,10 +102,12 @@ pub(crate) fn call_bif_metered_deferred(
     Option<Box<arinsal_bifs::DeferredTrap>>,
 ) {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, fcalls);
+    let mut state = arinsal_bifs::BifState::from_fcalls(*fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
     let result = target(&mut ctx, args);
     let reductions = ctx.reductions();
     let deferred = ctx.take_deferred();
+    *fcalls = state.fcalls;
     (result, reductions, deferred)
 }
 

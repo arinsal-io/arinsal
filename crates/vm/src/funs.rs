@@ -722,7 +722,8 @@ impl Vm {
     ) -> Result<ImportOutcome, VmError> {
         let (result, bif_reductions) = {
             let mut heap = ProcessHeapHandle(&mut p.heap);
-            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
+            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.reductions);
+            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 bif(&mut bif_ctx, &p.x[..arity])
             }))

@@ -533,7 +533,8 @@ mod tests {
 
         let mut heap = ProcessHeap::with_words(1 << 16);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
         let call = |ctx: &mut Ctx<'_>, name: &str, args: &[Term]| {
             lookup(name, args.len() as u8).expect("zstd NIF")(ctx, args)
         };

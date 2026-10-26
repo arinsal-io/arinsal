@@ -3547,7 +3547,8 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{op} arg {arg:?}: {error:?}"))
             })
             .collect::<Vec<_>>();
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
         let entry = if module == "prim_file" {
             arinsal_nif_file::lookup(module, op, args.len() as u8)
         } else {

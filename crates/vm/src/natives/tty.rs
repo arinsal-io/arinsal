@@ -465,7 +465,8 @@ fn call_values(
     note_caller(process, ctx);
     let result = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
         native(&mut bif_ctx, args)
     };
     Some(result.map_err(|error| exceptions::bif_error(process, module, function, args, error)))

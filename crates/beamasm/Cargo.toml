@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 arinsal-a64 = { path = "../a64" }
+arinsal-bifs = { path = "../bifs" }
 arinsal-term = { path = "../term" }
 
 [dev-dependencies]

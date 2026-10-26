@@ -14,7 +14,8 @@ fn call(name: &str, args: &[O]) -> Result<O, BifError> {
         .iter()
         .map(|a| from_owned(a, &mut alloc).unwrap())
         .collect::<Vec<_>>();
-    let mut ctx = Ctx::new(&mut alloc);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut alloc, &mut state);
     arinsal_re::invoke(&mut ctx, name, &terms).map(|value| to_owned(value).unwrap())
 }
 fn reference() -> Option<&'static RefErl> {

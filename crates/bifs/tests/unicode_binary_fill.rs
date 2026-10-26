@@ -33,7 +33,8 @@ fn utf8_size_and_fill_match_otp_with_and_without_traps() {
                 let mut allocator = ProcessHeapHandle(&mut heap);
                 let input = from_owned(&input, &mut allocator).unwrap();
                 let encoding = from_owned(&O::atom(encoding), &mut allocator).unwrap();
-                let mut ctx = Ctx::new(&mut allocator);
+                let mut state = arinsal_bifs::BifState::default();
+                let mut ctx = Ctx::new(&mut allocator, &mut state);
                 ctx.set_reduction_budget(budget);
                 let value = lookup("unicode", "characters_to_binary", 2).unwrap()(
                     &mut ctx,

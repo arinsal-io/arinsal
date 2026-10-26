@@ -1,6 +1,7 @@
 use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, Term, copy_term, to_owned};
+use similar_asserts::assert_eq;
 use std::thread;
 
 const THREADS: usize = 8;
@@ -23,7 +24,8 @@ fn run_parallel_add(counters: bool) -> O {
     };
     let reference = {
         let mut owner_allocator = ProcessHeapHandle(&mut owner_heap);
-        let mut ctx = Ctx::new(&mut owner_allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut owner_allocator, &mut state);
         lookup(module, name, args.len() as u8).unwrap()(&mut ctx, &args).unwrap()
     };
 
@@ -39,7 +41,8 @@ fn run_parallel_add(counters: bool) -> O {
             } else {
                 lookup("atomics", "add", 3).unwrap()
             };
-            let mut ctx = Ctx::new(&mut allocator);
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::new(&mut allocator, &mut state);
             for _ in 0..ADDS_PER_THREAD {
                 bif(&mut ctx, &args).unwrap();
             }
@@ -56,7 +59,8 @@ fn run_parallel_add(counters: bool) -> O {
     } else {
         ("atomics", "get")
     };
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let result = lookup(module, name, 2).unwrap()(&mut ctx, &args).unwrap();
     to_owned(result).unwrap()
 }

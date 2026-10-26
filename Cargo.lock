@@ -70,6 +70,7 @@ name = "arinsal-beamasm"
 version = "0.0.1"
 dependencies = [
  "arinsal-a64",
+ "arinsal-bifs",
  "arinsal-term",
  "similar-asserts",
 ]

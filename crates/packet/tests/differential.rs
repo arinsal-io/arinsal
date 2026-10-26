@@ -20,7 +20,8 @@ fn local(args: &[O]) -> CallResult {
         .iter()
         .map(|arg| from_owned(arg, &mut alloc).unwrap())
         .collect::<Vec<_>>();
-    let mut ctx = Ctx::new(&mut alloc);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut alloc, &mut state);
     let bif = arinsal_packet::lookup("erlang", "decode_packet", 3).unwrap();
     match bif(&mut ctx, &terms) {
         Ok(value) => CallResult::Ok(to_owned(value).unwrap()),

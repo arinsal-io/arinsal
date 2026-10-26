@@ -73,7 +73,8 @@ fn otp_crypto_callbacks_match_erl() {
         ("strong_rand_bytes_nif", vec![Term::small(32).unwrap()]),
         ("ng_crypto_one_time_nif", vec![aes, key, iv, abc, yes]),
     ] {
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
         let t = nif
             .lookup(name, args.len())
             .unwrap()

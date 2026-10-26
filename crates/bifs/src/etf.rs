@@ -1943,7 +1943,6 @@ fn result_binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
         .map_err(|_| BifError::SystemLimit)
 }
 
-#[inline(always)]
 fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match term_to_binary_result(ctx, args) {
         Ok(value) => value,
@@ -2006,7 +2005,6 @@ fn term_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
     Ok(binary)
 }
 
-#[inline(always)]
 fn external_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match external_size_result(ctx, args) {
         Ok(value) => value,
@@ -2023,7 +2021,6 @@ fn external_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErr
     integer(ctx, size)
 }
 
-#[inline(always)]
 fn term_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match term_to_iovec_result(ctx, args) {
         Ok(value) => value,
@@ -3191,7 +3188,8 @@ impl<'a> DecodeWalk<'a> {
             None => HeapReservation::new(&mut ctx.heap, _heap_words)
                 .map_err(|error| (map_term_build_error(error), consumed))?,
         };
-        let mut decode_ctx = Ctx::with_allocator(reservation);
+        let mut state = crate::BifState::default();
+        let mut decode_ctx = Ctx::with_allocator(reservation, &mut state);
         let budget = byte_budget.max(1).saturating_sub(consumed);
         let mut decoded = 0;
         let parsed = loop {
@@ -3361,7 +3359,6 @@ fn compressed_uncompressed_size(input: &[u8]) -> Result<usize, BifError> {
     }
 }
 
-#[inline(always)]
 fn binary_to_term(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match binary_to_term_result(ctx, args) {
         Ok(value) => value,

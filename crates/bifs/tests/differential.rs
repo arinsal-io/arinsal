@@ -5,6 +5,7 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, TermBuilder, from_owned, to_owned};
 use num_traits::ToPrimitive;
+use similar_asserts::assert_eq;
 use std::collections::HashSet;
 use support::{call, equivalent};
 
@@ -359,11 +360,13 @@ fn compiled_patterns_match_plain_patterns() {
         let haystack_term = from_owned(&haystack, &mut allocator).expect("haystack term");
         let compile = lookup("binary", "compile_pattern", 1).expect("compile_pattern/1");
         let compiled = {
-            let mut ctx = Ctx::new(&mut allocator);
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::new(&mut allocator, &mut state);
             compile(&mut ctx, &[needle_term]).expect("compile_pattern succeeds")
         };
         let matching = lookup("binary", "match", 2).expect("match/2");
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
         let actual_term = matching(&mut ctx, &[haystack_term, compiled])
             .expect("compiled pattern must match in its owner heap");
         let actual =
@@ -507,7 +510,8 @@ fn referenced_byte_size_keeps_subbinary_owner() {
         .sub_binary(original, 100 * 8, 100 * 8)
         .expect("subbinary");
     let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let bif = lookup("binary", "referenced_byte_size", 1).expect("BIF");
     let actual = arinsal_difftest::CallResult::Ok(
         to_owned(bif(&mut ctx, &[subbinary]).expect("size")).expect("term"),
@@ -766,7 +770,8 @@ fn clock_and_dst_behavior() {
     }
     let mut heap = ProcessHeap::with_words(128);
     let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let bif = lookup("erlang", "monotonic_time", 0).expect("monotonic_time BIF");
     let started = std::time::Instant::now();
     for _ in 0..1_000_000 {
@@ -794,7 +799,8 @@ fn binary_search_megabyte_benchmark() {
     let patterns = builder.cons(needle, tail).expect("patterns");
     let single = lookup("binary", "match", 2).expect("match BIF");
     let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let started = std::time::Instant::now();
     for _ in 0..200 {
         std::hint::black_box(single(&mut ctx, &[haystack, needle]).expect("match"));
@@ -828,7 +834,8 @@ fn map_bifs_handle_hamt() {
     let map = arinsal_maps::from_pairs(&pairs, &mut heap).expect("HAMT");
     assert!(map.is_hashmap());
     let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let bif = lookup("maps", "get", 2).expect("maps:get/2");
     for n in 0..40 {
         let key = arinsal_term::Term::small(n).unwrap();
@@ -985,7 +992,8 @@ fn map_projections_walk_collision_nodes() {
     assert!(map.is_hashmap());
 
     let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     for name in ["keys", "values"] {
         let actual = to_owned(lookup("maps", name, 1).unwrap()(&mut ctx, &[map]).unwrap()).unwrap();
         let expected = reference.call("maps", name, std::slice::from_ref(&expected_map));
@@ -1023,7 +1031,8 @@ fn system_info_snifs_matches_otp() {
     let mut heap = ProcessHeap::with_words(16_384);
     let mut allocator = ProcessHeapHandle(&mut heap);
     let selector = arinsal_term::from_owned(&atom("snifs"), &mut allocator).unwrap();
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let actual = lookup("erlang", "system_info", 1).unwrap()(&mut ctx, &[selector]).unwrap();
     let actual = CallResult::Ok(to_owned(actual).unwrap());
     assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
@@ -1251,7 +1260,8 @@ fn one_byte_pattern_search_matches_otp_29() {
     let dash_term = from_owned(&dash, &mut allocator).unwrap();
     let dashed_term = from_owned(&dashed, &mut allocator).unwrap();
     let scope_term = from_owned(&scope_hit, &mut allocator).unwrap();
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let compile = lookup("binary", "compile_pattern", 1).unwrap();
     let aye_pattern = compile(&mut ctx, &[aye_term]).unwrap();
     let dash_pattern = compile(&mut ctx, &[dash_term]).unwrap();
@@ -1277,7 +1287,8 @@ fn one_byte_pattern_search_matches_otp_29() {
     ];
     for (name, arity, args, expr) in compiled_cases {
         let bif = lookup("binary", name, *arity).unwrap();
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
         let actual = CallResult::Ok(to_owned(bif(&mut ctx, args).unwrap()).unwrap());
         let expected = CallResult::Ok(reference.eval(expr).unwrap());
         assert!(
@@ -1298,7 +1309,8 @@ fn binary_match_accepts_unaligned_subbinary() {
     let subject = builder.sub_binary(backing, 1, 8).expect("subbinary");
     let needle = builder.binary(&[0b1000_0001]).expect("needle");
     let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let bif = lookup("binary", "match", 2).expect("BIF");
     let actual = arinsal_difftest::CallResult::Ok(
         to_owned(bif(&mut ctx, &[subject, needle]).expect("match")).expect("term"),
@@ -1342,7 +1354,8 @@ fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
         ("binary", "split", vec![subject, needle]),
     ] {
         let bif = lookup(module, name, args.len() as u8).expect("BIF");
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
         let actual = CallResult::Ok(to_owned(bif(&mut ctx, &args).expect("BIF succeeds")).unwrap());
         let remote_args = if name == "at" {
             vec![reference_subject.clone(), O::Int(1)]

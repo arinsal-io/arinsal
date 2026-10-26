@@ -1,6 +1,7 @@
 use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_difftest::RefErl;
 use arinsal_term::{ProcessHeap, TermBuilder, to_owned};
+use similar_asserts::assert_eq;
 
 #[test]
 fn iolist_size_counts_shared_binary_graph_without_flattening() {
@@ -26,7 +27,8 @@ fn iolist_size_counts_shared_binary_graph_without_flattening() {
     }
 
     let bif = lookup("erlang", "iolist_size", 1).expect("iolist_size/1 registered");
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     let actual = bif(&mut ctx, &[value]).expect("valid iolist");
     assert_eq!(to_owned(actual).expect("owned result"), expected);
     assert_eq!(expected, arinsal_etf::OwnedTerm::Int(1_i64 << 37));

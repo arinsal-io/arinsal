@@ -33,7 +33,8 @@ fn main() {
     if module == "nb" {
         let args = [Term::small(2).unwrap(), Term::small(3).unwrap()];
         for (name, args) in [("noop", &args[..1]), ("add", &args[..])] {
-            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
             let result = library
                 .lookup(name, args.len())
                 .unwrap()
@@ -41,7 +42,8 @@ fn main() {
                 .unwrap();
             println!("{name}: {}", result.as_small().unwrap());
         }
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
         for (name, args) in [("noop", &args[..1]), ("add", &args[..])] {
             let callback = library.lookup(name, args.len()).unwrap();
             let count = 5_000_000;
@@ -72,7 +74,8 @@ fn main() {
             ("ng_crypto_one_time_nif", vec![aes, key, iv, abc, yes]),
         ];
         for (name, args) in calls {
-            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
             let result = library
                 .lookup(name, args.len())
                 .unwrap()

@@ -392,7 +392,8 @@ fn serialization_bif_reports_work_for_scheduler_accounting() {
     let mut allocator = ProcessHeapHandle(&mut heap);
     let input = TermBuilder::new(&mut allocator).binary(&[7; 4096]).unwrap();
     let bif = lookup("erlang", "term_to_binary", 1).unwrap();
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     bif(&mut ctx, &[input]).unwrap();
     assert!(ctx.reductions() > 0);
 }
@@ -434,7 +435,8 @@ fn invalid_binary_to_term_options_report_badopt_cause() {
     let decode = lookup("erlang", "binary_to_term", 2).unwrap();
     for option in options {
         let option = from_owned(&option, &mut allocator).unwrap();
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
         let error = decode(&mut ctx, &[input, option]).unwrap_err();
         let BifError::Badarg { cause: Some(cause) } = error else {
             panic!("invalid option returned {error:?}");
@@ -719,18 +721,16 @@ fn million_deep_list_and_tuple_use_iterative_codec() {
             }
         }
         let mut input_alloc = ProcessHeapHandle(&mut input_heap);
-        let binary = lookup("erlang", "term_to_binary", 1).unwrap()(
-            &mut Ctx::new(&mut input_alloc),
-            &[input],
-        )
-        .unwrap();
+        let mut input_state = arinsal_bifs::BifState::default();
+        let mut input_ctx = Ctx::new(&mut input_alloc, &mut input_state);
+        let binary =
+            lookup("erlang", "term_to_binary", 1).unwrap()(&mut input_ctx, &[input]).unwrap();
         let mut output_heap = ProcessHeap::with_words(2_100_000);
         let mut output_alloc = ProcessHeapHandle(&mut output_heap);
-        let decoded = lookup("erlang", "binary_to_term", 1).unwrap()(
-            &mut Ctx::new(&mut output_alloc),
-            &[binary],
-        )
-        .unwrap();
+        let mut output_state = arinsal_bifs::BifState::default();
+        let mut output_ctx = Ctx::new(&mut output_alloc, &mut output_state);
+        let decoded =
+            lookup("erlang", "binary_to_term", 1).unwrap()(&mut output_ctx, &[binary]).unwrap();
         assert!(exact_eq(input, decoded), "tuple={tuple}");
     }
 }
@@ -780,25 +780,22 @@ fn native_record_bytes_match_otp() {
                 &[(z, Term::small(1).unwrap()), (a, list)],
             )
             .unwrap();
-        let encoded = lookup("erlang", "term_to_binary", 2).unwrap()(
-            &mut Ctx::new(&mut allocator),
-            &[native, option_term],
-        )
-        .unwrap();
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
+        let encoded =
+            lookup("erlang", "term_to_binary", 2).unwrap()(&mut ctx, &[native, option_term])
+                .unwrap();
         let ours = CallResult::Ok(to_owned(encoded).unwrap());
         assert_eq!(ours, otp);
         if let CallResult::Ok(binary) = otp {
             let binary_term = from_owned(&binary, &mut allocator).unwrap();
-            let decoded = lookup("erlang", "binary_to_term", 1).unwrap()(
-                &mut Ctx::new(&mut allocator),
-                &[binary_term],
-            )
-            .unwrap();
-            let reencoded = lookup("erlang", "term_to_binary", 2).unwrap()(
-                &mut Ctx::new(&mut allocator),
-                &[decoded, option_term],
-            )
-            .unwrap();
+            let mut ctx = Ctx::new(&mut allocator, &mut state);
+            let decoded =
+                lookup("erlang", "binary_to_term", 1).unwrap()(&mut ctx, &[binary_term]).unwrap();
+            let mut ctx = Ctx::new(&mut allocator, &mut state);
+            let reencoded =
+                lookup("erlang", "term_to_binary", 2).unwrap()(&mut ctx, &[decoded, option_term])
+                    .unwrap();
             assert_eq!(to_owned(reencoded).unwrap(), binary);
         }
     }

@@ -1615,7 +1615,8 @@ impl Vm {
         {
             let result = {
                 let mut heap = ProcessHeapHandle(&mut process.heap);
-                let mut ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
+                let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+                let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bif(&mut ctx, args)))
                     .map_err(|_| VmError::Unsupported(format!("BIF {frame} panicked")))?
             };
@@ -3479,7 +3480,8 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
+                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.reductions);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, right]);
                             (result, ctx.reductions())
@@ -3546,7 +3548,8 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
+                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.reductions);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, right]);
                             (result, ctx.reductions())
@@ -3608,7 +3611,8 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
+                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.reductions);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, value]);
                             (result, ctx.reductions())
@@ -3670,7 +3674,8 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
+                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.reductions);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, value]);
                             (result, ctx.reductions())

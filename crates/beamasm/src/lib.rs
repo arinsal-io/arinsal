@@ -36,45 +36,19 @@ use arinsal_a64::{
     buf::{BufferError, CodeBuffer},
     enc::Gpr,
 };
-use core::ffi::c_void;
 
+pub use arinsal_bifs::BifState;
 pub use dump::{DumpError, write_global_note};
 
-/// C-layout prefix consumed directly by BeamAsm generated code.
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct ProcessHeader {
-    /// Current young heap allocation pointer.
-    pub htop: *mut u64,
-    /// Erlang stack pointer, growing toward lower addresses.
-    pub stop: *mut u64,
-    /// Young heap start.
-    pub heap: *mut u64,
-    /// Young heap end.
-    pub hend: *mut u64,
-    /// Reductions remaining in the current slice.
-    pub fcalls: i32,
-    pub _fcalls_pad: u32,
-    /// `c_p->freason`, `fvalue` and `ftrace`, adjacent as in erts.
-    pub exc: ExcFields,
-    /// Number of active catch tags in the process stack.
-    pub catches: usize,
-    /// Next instruction or native code pointer.
-    pub i: *const c_void,
-    /// Current function arity.
-    pub arity: u8,
-    pub _arity_pad: [u8; 7],
-    /// Current function metadata pointer.
-    pub current: *const c_void,
-    /// Process flags.
-    pub flags: u64,
-    /// Current process identifier consumed by the inline `self/0` emitter.
-    pub self_pid: u64,
-    /// First heap address safe for destructive tuple updates, published at offset 0x70.
-    /// Fields before this extension retain their established BeamAsm ABI offsets.
-    pub high_water: *mut u64,
-}
+/// C-layout process header consumed directly by BeamAsm generated code.
+///
+/// `BifState` owns the whole header prefix and its trailing BIF-only state, so the native ABI
+/// words remain flat at their erts offsets while BIF contexts borrow one state pointer.
+pub type ProcessHeader = BifState;
 
+const _: () = assert!(std::mem::offset_of!(ProcessHeader, fcalls) == 0x20);
+const _: () = assert!(std::mem::offset_of!(ProcessHeader, exc) == 0x28);
+const _: () = assert!(std::mem::offset_of!(ProcessHeader, catches) == 0x40);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, high_water) == 0x70);
 const _: () = assert!(std::mem::offset_of!(SchedulerRegisters, x_reg_array) == 0);
 

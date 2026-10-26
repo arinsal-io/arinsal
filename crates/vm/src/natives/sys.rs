@@ -499,7 +499,8 @@ fn call_values(
         let before = PersistentTermUpdate::snapshot(store);
         let result = {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
+            let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
             bif(store, &mut bif_ctx, args)
         };
         let published = result.is_ok() && before.published();
