@@ -150,10 +150,10 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "term_to_binary", 1 | 2) => v.entry::<bodies::term_to_binary>(),
-        ("erlang", "term_to_iovec", 1 | 2) => v.entry::<bodies::term_to_iovec>(),
-        ("erlang", "external_size", 1 | 2) => v.entry::<bodies::external_size>(),
-        ("erlang", "binary_to_term", 1 | 2) => v.entry::<bodies::binary_to_term>(),
+        ("erlang", "term_to_binary", 1 | 2) => v.entry::<word_bodies::term_to_binary>(),
+        ("erlang", "term_to_iovec", 1 | 2) => v.entry::<word_bodies::term_to_iovec>(),
+        ("erlang", "external_size", 1 | 2) => v.entry::<word_bodies::external_size>(),
+        ("erlang", "binary_to_term", 1 | 2) => v.entry::<word_bodies::binary_to_term>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -1934,7 +1934,15 @@ fn result_binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
         .map_err(|_| BifError::SystemLimit)
 }
 
-fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match term_to_binary_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn term_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let opts = options(args.get(1).copied())?;
     let mut encoder = EncodeWalk::start(args[0], opts);
     encoder.step_size(usize::MAX)?;
@@ -1989,7 +1997,15 @@ fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(binary)
 }
 
-fn external_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn external_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match external_size_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn external_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut encoder = EncodeWalk::new_external_size(args)?;
     encoder.step_size(usize::MAX)?;
     let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
@@ -1998,7 +2014,15 @@ fn external_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, size)
 }
 
-fn term_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn term_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match term_to_iovec_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn term_to_iovec_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let opts = options(args.get(1).copied())?;
     if opts.compressed.is_some_and(|level| level > 0) {
         let bytes = encode(args[0], opts)?;
@@ -3328,7 +3352,15 @@ fn compressed_uncompressed_size(input: &[u8]) -> Result<usize, BifError> {
     }
 }
 
-fn binary_to_term(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn binary_to_term(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match binary_to_term_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn binary_to_term_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut decoder = DecodeWalk::new(args)?;
     ctx.charge_reductions(decoder.input_size());
     let (term, _) = decoder
@@ -3372,4 +3404,4 @@ mod map_sort_tests {
     }
 }
 
-crate::bif_bodies!(term_to_binary, term_to_iovec, external_size, binary_to_term,);
+crate::word_bif_bodies_in!(word_bodies; term_to_binary, term_to_iovec, external_size, binary_to_term);

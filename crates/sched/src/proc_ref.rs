@@ -43,10 +43,11 @@ impl<T: Task> ProcRef<T> {
     ///
     /// Port of erts/emulator/beam/erl_process.c (alloc_process: `erts_alloc(ERTS_ALC_T_PROC)`
     /// and `refc` 1), OTP-29.1.1.
-    pub(crate) fn new_with<R>(
-        build: impl FnOnce() -> Process<T>,
-        init: impl FnOnce(&mut Process<T>) -> R,
-    ) -> (Self, R) {
+    pub(crate) fn new_with<C, R>(
+        prepare: impl FnOnce() -> Option<C>,
+        build: impl FnOnce(&C) -> Process<T>,
+        init: impl FnOnce(&mut Process<T>, &C) -> R,
+    ) -> Option<(Self, R, C)> {
         assert!(
             std::mem::align_of::<ProcessBlock<T>>() <= std::mem::align_of::<u64>(),
             "allocator blocks are word aligned"
@@ -59,18 +60,26 @@ impl<T: Task> ProcRef<T> {
         )
         .expect("process struct allocation");
         let block = NonNull::new(payload.cast::<ProcessBlock<T>>()).expect("allocated block");
+        let context = match prepare() {
+            Some(context) => context,
+            None => {
+                let _ = fix_free_at(ix, ErtsAlcType::PROC, handle);
+                return None;
+            }
+        };
         // SAFETY: `fix_alloc_at` returned a live, word-aligned block of
         // `size_of::<ProcessBlock<T>>()` bytes that nothing else refers to, and the alignment of
-        // `ProcessBlock<T>` is at most a word (asserted above). The process is initialized in
-        // this unpublished block and `init` has exclusive access before any reference escapes.
+        // `ProcessBlock<T>` is at most a word (asserted above). `prepare` acquires the table lock
+        // and reserves the id only after this allocation, matching alloc_process; the process is
+        // initialized in the unpublished block and `init` has exclusive access before it escapes.
         let result = unsafe {
             let raw = block.as_ptr();
             (&raw mut (*raw).refc).write(AtomicUsize::new(1));
             (&raw mut (*raw).handle).write(handle);
-            (&raw mut (*raw).process).write(build());
-            init(&mut (*raw).process)
+            (&raw mut (*raw).process).write(build(&context));
+            init(&mut (*raw).process, &context)
         };
-        (Self { block }, result)
+        Some((Self { block }, result, context))
     }
 
     fn block(&self) -> &ProcessBlock<T> {
