@@ -296,8 +296,16 @@ impl<'a> BeamCodeReader<'a> {
     fn read_operand(&mut self, operand: &Operand) -> Result<BeamOpArg, ReadError> {
         Ok(match operand {
             Operand::U(value) => BeamOpArg::new(TAG_U, *value),
-            // `marshal_integer`: a small integer stays `TAG_i`.
-            Operand::Int(value) => BeamOpArg::new(TAG_I, *value as u64),
+            // `marshal_integer`: a small integer stays `TAG_i`; one the beam file stores in the
+            // sized form but that does not fit a small integer is a bignum literal.
+            Operand::Int(value) if (-(1_i64 << 59)..(1_i64 << 59)).contains(value) => {
+                BeamOpArg::new(TAG_I, *value as u64)
+            }
+            Operand::Int(value) => {
+                let index = self.literal_base + self.bignum_literals.len();
+                self.bignum_literals.push(value.to_string());
+                BeamOpArg::new(TAG_Q, index as u64)
+            }
             // `marshal_integer`: a bignum becomes a literal.
             Operand::BigInt(value) => {
                 let index = self.literal_base + self.bignum_literals.len();
