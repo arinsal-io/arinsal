@@ -66,7 +66,12 @@ impl ModuleEnv for TestEnv {
         beam.lambdas
             .iter()
             .find(|lambda| lambda.index == index)
-            .map(|lambda| (0x2000 + 64 * index as usize, lambda.arity as u8))
+            .map(|lambda| {
+                (
+                    0x2000 + 64 * index as usize,
+                    (lambda.arity - lambda.num_free) as u8,
+                )
+            })
             .ok_or_else(|| format!("lambda {index} is missing"))
     }
 
@@ -532,16 +537,8 @@ fn otp_logger_reply_return_returns_the_reply_map() {
     if !cfg!(target_arch = "aarch64") {
         return;
     }
-    let path = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:which(logger_olp)]),halt().",
-        ])
-        .output()
-        .expect("erl must be installed for the OTP BeamAsm regression test");
-    assert!(path.status.success());
-    let bytes = fs::read(String::from_utf8(path.stdout).unwrap()).unwrap();
+    // The function of logger_olp, compiled alone: a whole OTP module needs every runtime helper.
+    let bytes = erlc_fixture("jit_reply_return.erl");
     // The atoms of the transformed code are global atom indexes.
     let atom = |name: &str| {
         let index = arinsal_beamops::global_atom_index(name).unwrap();
