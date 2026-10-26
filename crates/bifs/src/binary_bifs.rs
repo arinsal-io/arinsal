@@ -672,51 +672,6 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     walk.finish(&mut ctx.heap)
 }
 
-/// Flatten an iolist into its byte-aligned contents.
-// Port of erts/emulator/beam/erl_iolist.c:419-620, 842-849 (list_to_binary_copy), OTP-29.1.1.
-pub(super) fn iolist_bytes(root: Term) -> Result<Vec<u8>, BifError> {
-    let size = iolist_size_value(root)?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(size)
-        .map_err(|_| BifError::SystemLimit)?;
-    output.resize(size, 0);
-    let mut offset = 0_usize;
-    walk_iolist(root, |term, byte_allowed| {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::Bitstring => {
-                with_binary_input(term, |bytes| {
-                    let end = offset
-                        .checked_add(bytes.len())
-                        .ok_or(BifError::SystemLimit)?;
-                    output
-                        .get_mut(offset..end)
-                        .ok_or(BifError::SystemLimit)?
-                        .copy_from_slice(bytes);
-                    offset = end;
-                    Ok(())
-                })?;
-            }
-            TermKind::Number if byte_allowed => {
-                let byte = term
-                    .as_small()
-                    .and_then(|n| u8::try_from(n).ok())
-                    .ok_or(BADARG)?;
-                let slot = output.get_mut(offset).ok_or(BifError::SystemLimit)?;
-                *slot = byte;
-                offset += 1;
-            }
-            _ => return Err(BADARG),
-        }
-        Ok(())
-    })?;
-    if offset != size {
-        return Err(BifError::SystemLimit);
-    }
-    Ok(output)
-}
-
 // Port of erts/emulator/beam/erl_iolist.c:938-1093 (iolist_size_1), OTP-29.1.1.
 fn iolist_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let size = iolist_size_value(args[0])?;

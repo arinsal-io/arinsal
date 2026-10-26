@@ -23,11 +23,13 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "system_info", 1) => v.entry::<bodies::system_info>(),
-        ("erts_internal", "no_aux_work_threads", 0) => v.entry::<bodies::no_aux_work_threads>(),
-        ("os", "getenv", 1) => v.entry::<bodies::getenv>(),
-        ("os", "getpid", 0) => v.entry::<bodies::getpid>(),
-        ("os", "perf_counter", 0) => v.entry::<bodies::perf_counter>(),
+        ("erlang", "system_info", 1) => v.entry::<word_bodies::system_info>(),
+        ("erts_internal", "no_aux_work_threads", 0) => {
+            v.entry::<word_bodies::no_aux_work_threads>()
+        }
+        ("os", "getenv", 1) => v.entry::<word_bodies::getenv>(),
+        ("os", "getpid", 0) => v.entry::<word_bodies::getpid>(),
+        ("os", "perf_counter", 0) => v.entry::<word_bodies::perf_counter>(),
         _ => return None,
     };
     if module == "os" || arinsal_spec::bif_lookup(module, name, arity).is_some() {
@@ -62,7 +64,7 @@ fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
-fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let key = atom_name(args[0]).ok_or(BifError::BADARG)?;
     let info = arinsal_alloc::cpuinfo::cpu_info();
     let (cpus, online) = arinsal_alloc::cpuinfo::default_schedulers();
@@ -222,7 +224,7 @@ fn atom_list(ctx: &mut Ctx<'_>, names: &[&str]) -> Result<Term, BifError> {
     Ok(list)
 }
 
-fn no_aux_work_threads(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn no_aux_work_threads_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_process.c:9234 and :6219-6223, OTP-29.1.1.
     // The runtime uses one standard auxiliary worker and no dirty allocator instances.
     let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0 as u64;
@@ -239,7 +241,7 @@ fn tagged_integer(ctx: &mut Ctx<'_>, key: &str, value: i64) -> Result<Term, BifE
 fn os_string(ctx: &mut Ctx<'_>, value: OsString) -> Result<Term, BifError> {
     string(ctx, &value.to_string_lossy())
 }
-fn getenv(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn getenv_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let chars = crate::pure::list(args[0])?;
     let mut name = String::new();
     for ch in chars {
@@ -254,7 +256,7 @@ fn getenv(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         None => Ok(atom("false")),
     }
 }
-fn getpid(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn getpid_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // SAFETY: getpid has no preconditions and does not retain pointers.
     string(ctx, &unsafe { libc::getpid() }.to_string())
 }
@@ -305,17 +307,22 @@ pub extern "C" fn sys_perf_counter() -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
-fn perf_counter(ctx: &mut Ctx<'_>, _args: &[Term]) -> Result<Term, BifError> {
+fn perf_counter_result(ctx: &mut Ctx<'_>, _args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, sys_perf_counter())
 }
 
-crate::bif_bodies!(
-    system_info,
-    no_aux_work_threads,
-    getenv,
-    getpid,
-    perf_counter,
-);
+macro_rules! word_adapters {
+    ($($word:ident => $body:ident),+ $(,)?) => {
+        $(#[inline(always)]
+        fn $word(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+            match $body(ctx, args) { Ok(value) => value, Err(error) => ctx.fail(error) }
+        })+
+    };
+}
+word_adapters!(system_info => system_info_result, no_aux_work_threads => no_aux_work_threads_result,
+    getenv => getenv_result, getpid => getpid_result, perf_counter => perf_counter_result);
+crate::word_bif_bodies_in!(word_bodies; system_info, no_aux_work_threads, getenv, getpid,
+    perf_counter);
 
 /// `(os_flavor, os_version)` from `uname(2)`.
 // Port of erts/emulator/sys/unix/sys.c (os_flavor, os_version), OTP-29.1.1.

@@ -30,35 +30,35 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 ) -> Option<V::Output> {
     // `convert_time_unit/3` is an erlang.erl wrapper, absent from bif.tab.
     if (module, name, arity) == ("erlang", "convert_time_unit", 3) {
-        return Some(v.entry::<bodies::convert_time_unit>());
+        return Some(v.entry::<word_bodies::convert_time_unit>());
     }
     let f = match (module, name, arity) {
-        ("erlang", "monotonic_time", 0 | 1) => v.entry::<bodies::monotonic_time>(),
-        ("erlang", "time_offset", 0 | 1) => v.entry::<bodies::time_offset>(),
-        ("erlang", "timestamp", 0) | ("os", "timestamp", 0) => v.entry::<bodies::timestamp>(),
-        ("erlang", "now", 0) => v.entry::<bodies::now>(),
-        ("erlang", "time", 0) => v.entry::<bodies::time>(),
-        ("erlang", "date", 0) => v.entry::<bodies::date>(),
-        ("erlang", "localtime", 0) => v.entry::<bodies::localtime>(),
-        ("erlang", "universaltime", 0) => v.entry::<bodies::universaltime>(),
+        ("erlang", "monotonic_time", 0 | 1) => v.entry::<word_bodies::monotonic_time>(),
+        ("erlang", "time_offset", 0 | 1) => v.entry::<word_bodies::time_offset>(),
+        ("erlang", "timestamp", 0) | ("os", "timestamp", 0) => v.entry::<word_bodies::timestamp>(),
+        ("erlang", "now", 0) => v.entry::<word_bodies::now>(),
+        ("erlang", "time", 0) => v.entry::<word_bodies::time>(),
+        ("erlang", "date", 0) => v.entry::<word_bodies::date>(),
+        ("erlang", "localtime", 0) => v.entry::<word_bodies::localtime>(),
+        ("erlang", "universaltime", 0) => v.entry::<word_bodies::universaltime>(),
         ("erlang", "universaltime_to_localtime", 1) => {
-            v.entry::<bodies::universaltime_to_localtime>()
+            v.entry::<word_bodies::universaltime_to_localtime>()
         }
         ("erlang", "localtime_to_universaltime", 2) => {
-            v.entry::<bodies::localtime_to_universaltime>()
+            v.entry::<word_bodies::localtime_to_universaltime>()
         }
         ("erlang", "universaltime_to_posixtime", 1) => {
-            v.entry::<bodies::universaltime_to_posixtime>()
+            v.entry::<word_bodies::universaltime_to_posixtime>()
         }
         ("erlang", "posixtime_to_universaltime", 1) => {
-            v.entry::<bodies::posixtime_to_universaltime>()
+            v.entry::<word_bodies::posixtime_to_universaltime>()
         }
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
 }
 
-fn convert_time_unit(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn convert_time_unit_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let value = bigint(args[0])?;
     let from = unit(args[1])?;
     let to = unit(args[2])?;
@@ -152,10 +152,10 @@ fn sys_nanos() -> Result<i128, BifError> {
         .as_nanos() as i128)
 }
 
-fn monotonic_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn monotonic_time_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     scaled(ctx, mono_nanos(), args)
 }
-fn time_offset(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn time_offset_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     scaled(ctx, time_offset_nanos()?, args)
 }
 fn time_offset_nanos() -> Result<i128, BifError> {
@@ -206,7 +206,7 @@ fn datetime_tuple(ctx: &mut Ctx<'_>, value: Calendar) -> Term {
     let time = clock_tuple(ctx, value.hour, value.minute, value.second);
     tuple_build(ctx, &[date, time])
 }
-fn timestamp(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn timestamp_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_time_sup.c:1880-1907 (get_now), OTP-29.1.1.
     // `timestamp/0` must use the same monotonic sample and offset as
     // `system_time/0`; sampling the wall clock independently can disagree with
@@ -223,7 +223,7 @@ fn timestamp_tuple(ctx: &mut Ctx<'_>, micros: i128) -> Term {
         &[small(mega as i64), small(secs as i64), small(micro as i64)],
     )
 }
-fn now(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn now_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Ok(timestamp_tuple(ctx, next_now_micros()? as i128))
 }
 /// The strictly increasing microsecond clock of `erlang:now/0` (also `enif_now_time`).
@@ -246,18 +246,18 @@ pub fn next_now_micros() -> Result<i64, BifError> {
 pub fn time_offset_nanos_value() -> Option<i128> {
     time_offset_nanos().ok()
 }
-fn time(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn time_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     let now = local_calendar(now_seconds()?)?;
     Ok(clock_tuple(ctx, now.hour, now.minute, now.second))
 }
-fn date(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn date_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     let now = local_calendar(now_seconds()?)?;
     Ok(date_tuple(ctx, now.year, now.month, now.day))
 }
-fn localtime(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn localtime_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Ok(datetime_tuple(ctx, local_calendar(now_seconds()?)?))
 }
-fn universaltime(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn universaltime_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Ok(datetime_tuple(ctx, calendar_from_unix(now_seconds()?)))
 }
 
@@ -311,11 +311,11 @@ fn parse_localtime_datetime(term: Term) -> Result<Calendar, BifError> {
     }
     Ok(value)
 }
-fn universaltime_to_localtime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn universaltime_to_localtime_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let seconds = unix_from_calendar(parse_localtime_datetime(args[0])?).ok_or(BifError::BADARG)?;
     Ok(datetime_tuple(ctx, local_calendar(seconds)?))
 }
-fn localtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn localtime_to_universaltime_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let value = parse_localtime_datetime(args[0])?;
     let is_dst = match atom_name(args[1]) {
         Some("true") => Some(true),
@@ -335,13 +335,13 @@ fn localtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, 
     let utc = calendar_from_unix(seconds as i64);
     Ok(datetime_tuple(ctx, utc))
 }
-fn universaltime_to_posixtime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn universaltime_to_posixtime_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let secs = unix_from_calendar(parse_datetime(args[0])?).ok_or(BifError::BADARG)?;
     TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_i64(secs)
         .map_err(|_| BifError::SystemLimit)
 }
-fn posixtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn posixtime_to_universaltime_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let secs = bigint(args[0])?.to_i64().ok_or(BifError::BADARG)?;
     Ok(datetime_tuple(ctx, calendar_from_unix(secs)))
 }
@@ -447,21 +447,25 @@ fn calendar_from_tm(value: tm) -> Calendar {
     }
 }
 
-crate::bif_bodies!(
-    monotonic_time,
-    time_offset,
-    timestamp,
-    now,
-    time,
-    date,
-    localtime,
-    universaltime,
-    universaltime_to_localtime,
-    localtime_to_universaltime,
-    universaltime_to_posixtime,
-    posixtime_to_universaltime,
-    convert_time_unit,
-);
+macro_rules! word_adapters {
+    ($($word:ident => $body:ident),+ $(,)?) => {
+        $(#[inline(always)]
+        fn $word(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+            match $body(ctx, args) { Ok(value) => value, Err(error) => ctx.fail(error) }
+        })+
+    };
+}
+word_adapters!(monotonic_time => monotonic_time_result, time_offset => time_offset_result,
+    timestamp => timestamp_result, now => now_result, time => time_result, date => date_result,
+    localtime => localtime_result, universaltime => universaltime_result,
+    universaltime_to_localtime => universaltime_to_localtime_result,
+    localtime_to_universaltime => localtime_to_universaltime_result,
+    universaltime_to_posixtime => universaltime_to_posixtime_result,
+    posixtime_to_universaltime => posixtime_to_universaltime_result,
+    convert_time_unit => convert_time_unit_result);
+crate::word_bif_bodies_in!(word_bodies; monotonic_time, time_offset, timestamp, now, time, date,
+    localtime, universaltime, universaltime_to_localtime, localtime_to_universaltime,
+    universaltime_to_posixtime, posixtime_to_universaltime, convert_time_unit);
 
 /// Whether the local time zone has daylight saving time.
 // Port of erts/emulator/sys/unix/sys_time.c (sys_init_time, sys_daylight), OTP-29.1.1: the

@@ -480,6 +480,7 @@ fn chksum_trap(
     args: &[Term],
     state: Option<&Arc<MagicRef>>,
     kind: arinsal_bifs::ChksumKind,
+    md5_update: bool,
 ) -> Result<HandlerResult, BifError> {
     let resumed = match state {
         Some(state) => Some(
@@ -496,6 +497,9 @@ fn chksum_trap(
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
     let step = match &resumed {
         Some(cont) => arinsal_bifs::chksum_resume(&mut ctx, cont),
+        None if md5_update => {
+            arinsal_bifs::chksum_start(&mut ctx, arinsal_bifs::ChksumKind::Md5Update, args)
+        }
         None => arinsal_bifs::chksum_start(&mut ctx, kind, args),
     };
     drop(ctx);
@@ -523,7 +527,7 @@ fn erlang_crc32(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
-    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Crc32)
+    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Crc32, false)
 }
 
 fn erlang_adler32(
@@ -533,7 +537,13 @@ fn erlang_adler32(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
-    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Adler32)
+    chksum_trap(
+        process,
+        args,
+        state,
+        arinsal_bifs::ChksumKind::Adler32,
+        false,
+    )
 }
 
 fn erlang_md5_trap(
@@ -543,7 +553,18 @@ fn erlang_md5_trap(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
-    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5)
+    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5, false)
+}
+
+// Port of erts/emulator/beam/erl_bif_chksum.c:551-585 (md5_update_2), OTP-29.1.1.
+fn erlang_md5_update_trap(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5, true)
 }
 
 fn phash2_trap(
@@ -895,6 +916,13 @@ const ENTRIES: &[Entry] = &[
         arity: 2,
         continuation: "erlang:md5_trap/2",
         handler: erlang_md5_trap,
+    },
+    Entry {
+        module: "erlang",
+        function: "md5_update",
+        arity: 2,
+        continuation: "erlang:md5_update/2",
+        handler: erlang_md5_update_trap,
     },
     Entry {
         module: "lists",
