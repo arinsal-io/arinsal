@@ -1,6 +1,14 @@
 //! ERTS segment cache and per-instance accounting.
 
-use crate::raw::{MapError, RawRegion, page_size};
+use crate::raw::{ERTS_MMAP_SUPERALIGNED_SIZE, MapError, RawRegion, page_size};
+
+/// Superaligned segment unit (`MSEG_ALIGNED_SIZE = 1 << ERTS_MMAP_SUPERALIGNED_BITS`), bounded
+/// below by the host page size.
+/// Port of erts/emulator/sys/common/erl_mseg.h:46-51, OTP-29.1.1.
+#[inline]
+fn superaligned_size() -> usize {
+    ERTS_MMAP_SUPERALIGNED_SIZE.max(page_size())
+}
 
 /// Cache and realloc policy from `erts_mseg_default_opt`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +127,7 @@ impl Segment {
     ) -> Result<(), MapError> {
         let wanted = rounded_size(new_size, flags);
         let alignment = if flags == SegmentFlags::PowerOfTwo {
-            1 << 24
+            superaligned_size()
         } else {
             page_size()
         };
@@ -293,7 +301,7 @@ impl MsegAllocator {
         }
         self.calls.create.inc();
         let region = if flags == SegmentFlags::PowerOfTwo {
-            RawRegion::map_aligned(size, 1 << 24)?
+            RawRegion::map_aligned(size, superaligned_size())?
         } else {
             RawRegion::map(size)?
         };
@@ -369,7 +377,7 @@ impl MsegAllocator {
         } else {
             self.calls.recreate.inc();
             let alignment = if flags == SegmentFlags::PowerOfTwo {
-                1 << 24
+                superaligned_size()
             } else {
                 page_size()
             };
@@ -509,7 +517,7 @@ pub fn instances(schedulers: usize, config: CacheConfig) -> Vec<MsegAllocator> {
 fn rounded_size(size: usize, flags: SegmentFlags) -> usize {
     let page = page_size();
     let alignment = if flags == SegmentFlags::PowerOfTwo {
-        1 << 24
+        superaligned_size()
     } else {
         page
     };
@@ -652,7 +660,7 @@ mod tests {
     fn powered_cache_reuses_aligned_segment() {
         let mut a = MsegAllocator::new(0, CacheConfig::default());
         let s = a.alloc(1, SegmentFlags::PowerOfTwo).unwrap();
-        assert_eq!((s.as_ptr() as usize) % (1 << 24), 0);
+        assert_eq!((s.as_ptr() as usize) % superaligned_size(), 0);
         a.dealloc(s, MsegOptions::default());
         let s = a.alloc(1, SegmentFlags::PowerOfTwo).unwrap();
         assert_eq!(a.info().status.cache_hits, 1);

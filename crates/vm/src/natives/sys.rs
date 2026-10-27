@@ -11,7 +11,6 @@ use arinsal_term::{
     FragmentIndex, SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms,
 };
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -2318,84 +2317,167 @@ fn ethread_info(process: &mut Process) -> Result<Term, VmError> {
 }
 
 fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_info.c:2773 (allocated_areas selector), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_alloc.c:2580 (erts_allocated_areas), OTP-29.1.1.
     alloc_atoms::note_allocated_areas();
-    // `erlang:memory/0` already sampled process and atom bytes into the allocator
-    // reply (`std_alloc`). A second sample sees the heap grow while those replies
-    // are built, and `system = total - processes` then drops below atom+code.
-    let sampled = take_memory_sample();
-    let values = memory_values(vm, process);
-    let value = |name: &str| {
-        values
-            .iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| *value)
-            .unwrap_or(0)
-    };
-    let (_, persistent) = process.persistent_terms.info();
-    let external_bytes = persistent as u64;
-    let external_size = non_neg(process, external_bytes)?;
-    let external = tuple(process, &[atom("external_alloc"), external_size])?;
-    let (atom_bytes, atom_used_bytes, process_bytes) =
-        sampled.unwrap_or((value("atom"), value("atom_used"), value("processes")));
-    let allocated_atoms = non_neg(process, atom_bytes)?;
-    let used_atoms = non_neg(process, atom_used_bytes)?;
-    let atoms = tuple(process, &[atom("atom_space"), allocated_atoms, used_atoms])?;
-    let processes = non_neg(process, process_bytes)?;
-    let processes = tuple(process, &[atom("process_table"), processes])?;
-    let ets_size = non_neg(process, value("ets"))?;
-    let ets = tuple(process, &[atom("ets_misc"), ets_size])?;
-    let code_size = non_neg(process, value("code"))?;
-    let code = tuple(process, &[atom("loaded_code"), code_size])?;
-    let areas = [external, atoms, processes, ets, code];
-    cons_list(process, &areas)
+    let sources = MemorySources::gather(vm, process);
+    let atom = sources.atom;
+    let code = sources.code;
+    // `external_alloc` is the data no alloc_util allocator holds, which `erlang:memory/0` adds
+    // to `total` (the JIT keeps its code outside the allocators).
+    let areas: [(&str, &[u64]); 19] = [
+        ("sys_misc", &[0]),
+        ("static", &[0]),
+        ("atom_space", &[atom.text, atom.text]),
+        ("atom_table", &[atom.table]),
+        ("module_table", &[code.module_table]),
+        ("export_table", &[code.export_table]),
+        ("export_list", &[code.export_list]),
+        ("register_table", &[0]),
+        ("fun_table", &[code.fun_table]),
+        ("fun_list", &[code.fun_list]),
+        ("module_refs", &[code.module_refs]),
+        ("loaded_code", &[code.loaded_code]),
+        ("dist_table", &[0]),
+        ("node_table", &[0]),
+        ("bif_timer", &[0]),
+        ("process_table", &[sources.process_table]),
+        ("port_table", &[sources.port_table]),
+        ("ets_misc", &[0]),
+        ("external_alloc", &[code.loaded_code]),
+    ];
+    let mut entries = Vec::with_capacity(areas.len());
+    for (name, values) in areas {
+        let mut fields = vec![atom_term(name)];
+        for value in values {
+            fields.push(non_neg(process, *value)?);
+        }
+        entries.push(tuple(process, &fields)?);
+    }
+    cons_list(process, &entries)
 }
 
+fn atom_term(name: &str) -> Term {
+    atom(name)
+}
+
+/// Memory Arinsal keeps in its own structures that erts holds in `erts_alloc` blocks: each field
+/// is attributed to the allocator erts would allocate it from ([`MemorySources::blocks_in`]).
+#[derive(Clone, Copy)]
+pub(crate) struct MemorySources {
+    pub(crate) atom: arinsal_term::AtomMemory,
+    pub(crate) code: crate::load::CodeTableBytes,
+    /// ETS table and segment structures kept outside the `ets_alloc` blocks (`ets_alloc`).
+    pub(crate) ets: u64,
+    /// Persistent terms (`literal_alloc`).
+    pub(crate) persistent: u64,
+    pub(crate) process_table: u64,
+    pub(crate) port_table: u64,
+}
+
+impl MemorySources {
+    pub(crate) fn gather(vm: &Vm, process: &Process) -> Self {
+        let (_, persistent) = process.persistent_terms.info();
+        let runtime = process.runtime.as_ref();
+        Self {
+            atom: global_atoms().memory(),
+            code: vm.code.table_bytes(),
+            ets: ets_structure_bytes(process),
+            persistent: persistent as u64,
+            process_table: runtime
+                .and_then(|runtime| runtime.scheduler().ok())
+                .map_or(0, |scheduler| scheduler.process_table_bytes()),
+            port_table: runtime.map_or(0, |runtime| runtime.ports.memory_bytes(&runtime.port_ids)),
+        }
+    }
+
+    /// Bytes Arinsal holds in its own structures that erts allocates from `allocator`.
+    // Port of the ERTS_ALC_T_* to allocator mapping of erts/emulator/beam/erl_alloc.types
+    // (ETS data in ets_alloc, persistent terms in literal_alloc, atoms, code tables and the
+    // process and port tables in ll_alloc), OTP-29.1.1.
+    pub(crate) fn blocks_in(&self, allocator: &str) -> u64 {
+        match allocator {
+            "ets_alloc" => self.ets,
+            "literal_alloc" => self.persistent,
+            "ll_alloc" => self
+                .atom
+                .table
+                .saturating_add(self.atom.entries)
+                .saturating_add(self.atom.text)
+                .saturating_add(self.code.module_table)
+                .saturating_add(self.code.export_table)
+                .saturating_add(self.code.export_list)
+                .saturating_add(self.code.fun_table)
+                .saturating_add(self.code.fun_list)
+                .saturating_add(self.code.module_refs)
+                .saturating_add(self.process_table)
+                .saturating_add(self.port_table),
+            _ => 0,
+        }
+    }
+}
+
+/// `erlang:memory/0` for the process: the formulas of erts_memory.
+// Port of erts/emulator/beam/erl_alloc.c:2190 (erts_memory) and erlang.erl (`memory/0`),
+// OTP-29.1.1: totals are sums of allocator block sizes, not of carriers.
 pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
-    let store = process.persistent_terms;
-    // Port of erts/emulator/beam/erl_alloc.c (erts_memory: `processes` sums the allocator
-    // blocks of the PROCESSES class types, the process heaps and structs), OTP-29.1.1.
-    let processes = arinsal_alloc::typed::process_allocation_bytes();
-    let processes_used = processes;
-    // Port of erts/emulator/beam/erl_bif_info.c:4459 (erts_memory) and erl_alloc.c:2495,
-    // OTP-29.1.1: binary memory is global allocator usage, independent of process ownership.
-    let binary = arinsal_term::binary_memory_bytes();
-    let (atom, atom_used) = atom_bytes();
-    let code = code_bytes(vm);
-    let ets = ets_bytes(process);
-    let (_, persistent) = store.info();
-    let system = atom
-        .saturating_add(binary)
-        .saturating_add(code)
-        .saturating_add(ets)
-        .saturating_add(persistent as u64);
-    let total = processes.saturating_add(system);
+    let sources = MemorySources::gather(vm, process);
+    let blocks = |allocator: &str| {
+        arinsal_alloc::typed::allocator_blocks_bytes(allocator)
+            .unwrap_or(0)
+            .saturating_add(sources.blocks_in(allocator))
+    };
+    // The temporary allocator is skipped (erts_memory: "Often not thread safe").
+    let mut total = arinsal_alloc::typed::allocator_names()
+        .iter()
+        .filter(|name| **name != "temp_alloc")
+        .fold(0_u64, |sum, name| sum.saturating_add(blocks(name)));
+    // `external_alloc`: JIT code is not held by an alloc_util allocator.
+    total = total.saturating_add(sources.code.loaded_code);
+    let (fix_allocated, fix_used) = fix_process_bytes();
+    let base = blocks("eheap_alloc").saturating_add(sources.process_table);
+    let processes = base.saturating_add(fix_allocated);
+    let processes_used = base.saturating_add(fix_used);
+    let atom = sources.atom.table.saturating_add(sources.atom.text);
+    let atom_used = atom;
+    let code = sources
+        .code
+        .module_table
+        .saturating_add(sources.code.export_table)
+        .saturating_add(sources.code.export_list)
+        .saturating_add(sources.code.fun_table)
+        .saturating_add(sources.code.fun_list)
+        .saturating_add(sources.code.module_refs)
+        .saturating_add(sources.code.loaded_code);
     [
         ("total", total),
         ("processes", processes),
         ("processes_used", processes_used),
-        ("system", system),
+        ("system", total.saturating_sub(processes)),
         ("atom", atom),
         ("atom_used", atom_used),
-        ("binary", binary),
+        ("binary", blocks("binary_alloc")),
         ("code", code),
-        ("ets", ets),
+        ("ets", blocks("ets_alloc")),
     ]
 }
 
-thread_local! {
-    /// `(atom, atom_used, processes)` from the `memory_internal` half of `erlang:memory/0`.
-    static MEMORY_SAMPLE: Cell<Option<(u64, u64, u64)>> = const { Cell::new(None) };
-}
-
-/// Keep the `memory_internal` sizes for the following `allocated_areas` call.
-pub(super) fn freeze_memory_sample(atom: u64, atom_used: u64, processes: u64) {
-    MEMORY_SAMPLE.set(Some((atom, atom_used, processes)));
-}
-
-/// Take the sample captured by [`freeze_memory_sample`], if this thread has one.
-pub(super) fn take_memory_sample() -> Option<(u64, u64, u64)> {
-    MEMORY_SAMPLE.replace(None)
+/// Bytes of fixed-size process and message-reference allocations, as in `erts_memory`.
+// Port of erts/emulator/beam/erl_alloc.c:2452-2469 (`add_fix_values` for PROC through MSG_REF),
+// OTP-29.1.1.
+pub(crate) fn fix_process_bytes() -> (u64, u64) {
+    let instances = arinsal_alloc::typed::instance_count("fix_alloc").unwrap_or(0);
+    [
+        arinsal_alloc::typed::ErtsAlcType::PROC,
+        arinsal_alloc::typed::ErtsAlcType::MSG_REF,
+    ]
+    .into_iter()
+    .flat_map(|allocation_type| {
+        (0..instances)
+            .filter_map(move |instance| arinsal_alloc::typed::fix_bytes(allocation_type, instance))
+    })
+    .fold((0, 0), |(allocated, used), (a, u)| {
+        (allocated + a as u64, used + u as u64)
+    })
 }
 
 /// The persistent-term update permission owner of process `pid` (erts `updater_process`).
@@ -2403,42 +2485,16 @@ pub(crate) fn persistent_owner(pid: arinsal_sched::Pid) -> u64 {
     pid.data() + 1
 }
 
-fn code_bytes(vm: &Vm) -> u64 {
-    vm.code
-        .modules
-        .iter()
-        .map(|module| {
-            let code = std::mem::size_of_val(module.code.as_ref());
-            let generic = std::mem::size_of_val(module.generic.as_slice());
-            let names: usize = module.functions.iter().map(|(_, name, _)| name.len()).sum();
-            (code + generic + module.strings.len() + names + module.name.len()) as u64
-        })
-        .sum()
-}
-
-// Port of erts/emulator/beam/erl_bif_info.c (erts_memory: ERTS_ALC_A_ETS) and
-// erl_alloc.c:2509 (alcu_size), OTP-29.1.1: sums live `ets_alloc` object blocks
-// (`DbTerm`s including allocator block headers) plus table/segment structures.
-fn ets_bytes(process: &Process) -> u64 {
+// Port of erts/emulator/beam/erl_bif_info.c (erts_memory: ERTS_ALC_A_ETS), OTP-29.1.1: the table
+// and segment structures Arinsal keeps outside the `ets_alloc` allocator; the object blocks
+// (`DbTerm`s) are real `ets_alloc` blocks and counted by the allocator itself.
+fn ets_structure_bytes(process: &Process) -> u64 {
     let Some(runtime) = &process.runtime else {
         return 0;
     };
     let schedulers = runtime.scheduler().map_or(1, |s| s.scheduler_count());
     let registry = runtime.ets.read().expect("ets registry");
-    let structure_words = registry.total_structure_memory_words(schedulers);
-    arinsal_alloc::typed::ets_allocation_bytes()
-        .saturating_add(structure_words as u64 * std::mem::size_of::<usize>() as u64)
-}
-
-fn atom_bytes() -> (u64, u64) {
-    let count = global_atoms().len();
-    let predefined = arinsal_term::atoms::PREDEFINED;
-    let text: usize = predefined.iter().map(|name| name.len()).sum();
-    let extra = count.saturating_sub(predefined.len()).saturating_mul(8);
-    let entries = count.saturating_mul(std::mem::size_of::<usize>() * 6);
-    let used = (text + extra + entries) as u64;
-    let allocated = used.saturating_add((count as u64).saturating_mul(16));
-    (allocated, used.min(allocated))
+    registry.total_structure_memory_words(schedulers) as u64 * std::mem::size_of::<usize>() as u64
 }
 
 fn statistics(

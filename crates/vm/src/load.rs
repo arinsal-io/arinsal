@@ -537,7 +537,64 @@ fn release_slot(
     free_ids.push(id);
 }
 
+/// Memory of the code tables as the `allocated_areas` entries report it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CodeTableBytes {
+    pub(crate) module_table: u64,
+    pub(crate) export_table: u64,
+    pub(crate) export_list: u64,
+    pub(crate) fun_table: u64,
+    pub(crate) fun_list: u64,
+    pub(crate) module_refs: u64,
+    /// The code of the loaded modules (`erts_total_code_size`).
+    pub(crate) loaded_code: u64,
+}
+
 impl CodeTables {
+    /// Sizes of the tables of this code index: hash and index slots (`*_table`), entries
+    /// (`*_list`), code ranges and the loaded code itself.
+    // Port of erts/emulator/beam/module.c (module_table_sz), export.c (export_table_sz,
+    // export_entries_sz), beam_ranges.c (erts_ranges_sz), fun.c (erts_fun_table_sz,
+    // erts_fun_entries_sz) and beam_load.c (erts_total_code_size), OTP-29.1.1, for these
+    // tables' own layout.
+    pub(crate) fn table_bytes(&self) -> CodeTableBytes {
+        use std::mem::size_of;
+        // One `Arc` header: strong and weak counts.
+        const ARC: usize = 2 * size_of::<usize>();
+        let export_key = size_of::<(Atom, Atom, u8)>();
+        let exports = &self.exports;
+        let module_table = self.modules.capacity() * size_of::<Arc<Module>>()
+            + self.modules.len() * (ARC + size_of::<Module>());
+        let export_table = exports.order.capacity() * export_key
+            + exports.seen.capacity() * (export_key + 1)
+            + exports.entries.capacity() * (export_key + size_of::<ExportIndexEntry>() + 1);
+        let export_list = exports.order.len() * size_of::<arinsal_beamasm::bif::ExportEntry>();
+        let fun_table =
+            self.funs.capacity() * (size_of::<FunKey>() + size_of::<Arc<FunEntry>>() + 1);
+        let fun_list = self.funs.len() * (ARC + size_of::<FunEntry>());
+        let module_refs = self.code_meta.capacity() * size_of::<Option<Arc<CodeMeta>>>()
+            + self.registers.capacity() * size_of::<(usize, usize)>();
+        let loaded_code: usize = self
+            .modules
+            .iter()
+            .map(|module| {
+                let code = std::mem::size_of_val(module.code.as_ref());
+                let generic = std::mem::size_of_val(module.generic.as_slice());
+                let names: usize = module.functions.iter().map(|(_, name, _)| name.len()).sum();
+                code + generic + module.strings.len() + names + module.name.len()
+            })
+            .sum();
+        CodeTableBytes {
+            module_table: module_table as u64,
+            export_table: export_table as u64,
+            export_list: export_list as u64,
+            fun_table: fun_table as u64,
+            fun_list: fun_list as u64,
+            module_refs: module_refs as u64,
+            loaded_code: loaded_code as u64,
+        }
+    }
+
     pub(crate) fn new(code_scope: u64) -> Self {
         Self {
             code_scope,

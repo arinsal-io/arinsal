@@ -74,7 +74,7 @@ pub enum RegisterError {
 /// gets [`RegisterError::InstanceTaken`] and keeps using instance 0; the number is free again when
 /// the owner exits.
 pub fn register_thread(kind: ThreadKind) -> Result<usize, RegisterError> {
-    if CLAIM.with(|claim| claim.borrow().is_some()) || ALC_IX.with(Cell::get) != 0 {
+    if CLAIM.with(|claim| claim.borrow().is_some()) || thread_alloc_ix() != 0 {
         return Err(RegisterError::AlreadyRegistered);
     }
     let (schedulers, dirty) = crate::typed::configured().unwrap_or((0, 0));
@@ -101,7 +101,12 @@ pub fn register_thread(kind: ThreadKind) -> Result<usize, RegisterError> {
         }
         CLAIM.with(|claim| *claim.borrow_mut() = Some(InstanceClaim(no)));
     }
-    ALC_IX.with(|current| current.set(ix));
+    let scheduler = if matches!(kind, ThreadKind::Scheduler(_)) {
+        NORMAL_SCHEDULER_BIT
+    } else {
+        0
+    };
+    ALC_IX.with(|current| current.set(ix | scheduler));
     Ok(ix)
 }
 
@@ -112,8 +117,27 @@ pub fn register_thread(kind: ThreadKind) -> Result<usize, RegisterError> {
 /// looking the scheduler up on every allocation.
 #[inline]
 pub fn thread_alloc_ix() -> usize {
-    ALC_IX.with(Cell::get)
+    ALC_IX.with(Cell::get) & !NORMAL_SCHEDULER_BIT
 }
+
+/// Whether the calling thread is a normal scheduler eligible for scheduler-preferred pools.
+pub fn thread_is_scheduler() -> bool {
+    ALC_IX.with(Cell::get) & NORMAL_SCHEDULER_BIT != 0
+}
+
+/// [`thread_alloc_ix`] and [`thread_is_scheduler`] from one read of the thread's word, for the
+/// message-reference paths that need both on every call.
+#[inline]
+pub fn thread_alloc_ix_and_scheduler() -> (usize, bool) {
+    let word = ALC_IX.with(Cell::get);
+    (
+        word & !NORMAL_SCHEDULER_BIT,
+        word & NORMAL_SCHEDULER_BIT != 0,
+    )
+}
+
+/// Set in a normal scheduler's thread word, above any allocator index.
+const NORMAL_SCHEDULER_BIT: usize = 1 << 32;
 
 /// Installs the callback that wakes the owner of a scheduler instance (once).
 ///
@@ -137,7 +161,7 @@ struct Instance {
 }
 
 /// Number of fixed-size allocation types (`ERTS_ALC_NO_FIXED_SIZES`) the port knows.
-pub const FIX_TYPES: usize = 1;
+pub const FIX_TYPES: usize = 2;
 
 /// Longest free list of one fixed-size type.
 ///
@@ -472,6 +496,11 @@ impl ThreadSpecificAllocators {
         }
     }
 
+    /// Instances `1..=n` owned by scheduler threads.
+    pub fn scheduler_instance_count(&self) -> usize {
+        self.scheduler_instances
+    }
+
     /// Number of instances, including the shared instance 0.
     pub fn instance_count(&self) -> usize {
         self.instances.len()
@@ -715,8 +744,7 @@ impl ThreadSpecificAllocators {
     /// queues the drain on the owner and waits for it.
     pub fn drain_deallocations(&self, instance: usize) -> Result<usize, AllocError> {
         self.on_owner(instance, move |this, state| {
-            let drained = this.drain_locked(instance, state)?;
-            let count = drained.len();
+            let (count, drained) = this.drain_locked(instance, state)?;
             this.clear_routes(drained);
             this.publish_transfers(instance, state)?;
             Ok(count)
@@ -731,7 +759,7 @@ impl ThreadSpecificAllocators {
     /// from its aux work and is notified again while queued frees remain. A thread that does not
     /// own a scheduler instance does nothing.
     pub fn handle_owner_work(&self, instance: usize) -> Result<bool, AllocError> {
-        if self.lock_free(instance) && ALC_IX.with(Cell::get) != instance {
+        if self.lock_free(instance) && thread_alloc_ix() != instance {
             return Ok(false);
         }
         self.shared[instance]
@@ -739,7 +767,7 @@ impl ThreadSpecificAllocators {
             .store(false, Ordering::Release);
         let mut state = self.lock_instance(instance);
         self.run_requests_on(instance, &mut state);
-        let drained = self.drain_limited(instance, &mut state, OWNER_WORK_DD_LIMIT)?;
+        let (_, drained) = self.drain_limited(instance, &mut state, OWNER_WORK_DD_LIMIT)?;
         self.clear_routes(drained);
         self.publish_transfers(instance, &mut state)?;
         drop(state);
@@ -755,7 +783,7 @@ impl ThreadSpecificAllocators {
     /// Does nothing for a scheduler instance the calling thread does not own.
     pub fn run_owner_requests(&self, instance: usize) {
         if self.shared[instance].requests.is_empty()
-            || (self.lock_free(instance) && ALC_IX.with(Cell::get) != instance)
+            || (self.lock_free(instance) && thread_alloc_ix() != instance)
         {
             return;
         }
@@ -787,7 +815,7 @@ impl ThreadSpecificAllocators {
         F: FnOnce(&Self, &mut Instance) -> R + Send + 'static,
         R: Send + 'static,
     {
-        if !self.lock_free(instance) || ALC_IX.with(Cell::get) == instance {
+        if !self.lock_free(instance) || thread_alloc_ix() == instance {
             let mut state = self.lock_instance(instance);
             return work(self, &mut state);
         }
@@ -810,7 +838,7 @@ impl ThreadSpecificAllocators {
                 }));
         }
         self.schedule_owner_work(instance);
-        let own = ALC_IX.with(Cell::get);
+        let own = thread_alloc_ix();
         let mut waited = 0u32;
         loop {
             match answer.recv_timeout(OWNER_WAIT_SLICE) {
@@ -950,6 +978,17 @@ impl ThreadSpecificAllocators {
         })
     }
 
+    /// Bytes of fixed-size type `fix_ix` allocated and in use on `instance`: the block counts of
+    /// [`ThreadSpecificAllocators::fix_info`] times the type size, as `sz_info_fix` reports them.
+    // Port of erts/emulator/beam/erl_alloc_util.c:4897 (sz_info_fix), OTP-29.1.1.
+    pub fn fix_bytes(&self, instance: usize, fix_ix: usize) -> (usize, usize) {
+        self.on_owner(instance, move |_, state| {
+            state.fix.get(fix_ix).map_or((0, 0), |fix| {
+                (fix.type_size * fix.allocated, fix.type_size * fix.used)
+            })
+        })
+    }
+
     /// Returns the number of frees waiting for the instance.
     pub fn pending_deallocations(&self, instance: usize) -> usize {
         self.delayed[instance].len()
@@ -980,7 +1019,7 @@ impl ThreadSpecificAllocators {
         if !self.thread_specific {
             return 0;
         }
-        self.instance_for(ALC_IX.with(Cell::get))
+        self.instance_for(thread_alloc_ix())
     }
 
     /// The instance a thread with allocator index `ix` allocates on.
@@ -1043,7 +1082,7 @@ impl ThreadSpecificAllocators {
     #[inline(always)]
     fn drain_and_publish(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
         if !self.delayed[instance].is_empty() {
-            let drained = self.drain_locked(instance, state)?;
+            let (_, drained) = self.drain_locked(instance, state)?;
             self.clear_routes(drained);
         }
         self.publish_transfers(instance, state)
@@ -1417,7 +1456,7 @@ impl ThreadSpecificAllocators {
         &self,
         instance: usize,
         state: &mut Instance,
-    ) -> Result<Vec<InstanceAllocation>, AllocError> {
+    ) -> Result<(usize, Vec<InstanceAllocation>), AllocError> {
         self.drain_limited(instance, state, usize::MAX)
     }
 
@@ -1431,8 +1470,11 @@ impl ThreadSpecificAllocators {
         instance: usize,
         state: &mut Instance,
         limit: usize,
-    ) -> Result<Vec<InstanceAllocation>, AllocError> {
+    ) -> Result<(usize, Vec<InstanceAllocation>), AllocError> {
+        // The handles of freed blocks are kept only while some block has a route to clear: the
+        // common case allocates nothing per drain.
         let mut drained = Vec::new();
+        let mut freed = 0;
         let queue = &self.delayed[instance];
         let mut handled = 0;
         while handled < limit
@@ -1456,7 +1498,10 @@ impl ThreadSpecificAllocators {
                         queue.push(Delayed::Block(handle, allocation));
                         return Err(error);
                     }
-                    drained.push(handle);
+                    freed += 1;
+                    if self.routed.load(Ordering::Acquire) != 0 {
+                        drained.push(handle);
+                    }
                 }
                 Delayed::Fix(fix_ix, handle, allocation) => {
                     let allocation = match self.resolve_owned(instance, state, handle, allocation) {
@@ -1474,7 +1519,10 @@ impl ThreadSpecificAllocators {
                         queue.push(Delayed::Fix(fix_ix, handle, allocation));
                         return Err(error);
                     }
-                    drained.push(handle);
+                    freed += 1;
+                    if self.routed.load(Ordering::Acquire) != 0 {
+                        drained.push(handle);
+                    }
                 }
                 Delayed::Homecoming(id) => {
                     if let Err(error) = self.import_homecoming(instance, state, id) {
@@ -1484,7 +1532,7 @@ impl ThreadSpecificAllocators {
                 }
             }
         }
-        Ok(drained)
+        Ok((freed, drained))
     }
 }
 

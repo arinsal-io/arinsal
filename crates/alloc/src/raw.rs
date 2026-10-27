@@ -7,6 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const WORD_BYTES: usize = std::mem::size_of::<usize>();
 const BIN_FLAG_WRITABLE: u64 = 1 << 2;
 
+/// Superaligned mapping bit shift (`ERTS_MMAP_SUPERALIGNED_BITS = 14` on 64-bit).
+/// Port of erts/emulator/sys/common/erl_mmap.h:30, OTP-29.1.1.
+pub const ERTS_MMAP_SUPERALIGNED_BITS: u32 = 14;
+
+/// Superaligned mapping unit in bytes (`1 << ERTS_MMAP_SUPERALIGNED_BITS`, 16 KiB on 64-bit).
+/// Port of erts/emulator/sys/common/erl_mseg.h:51 (`MSEG_ALIGNED_SIZE`), OTP-29.1.1.
+pub const ERTS_MMAP_SUPERALIGNED_SIZE: usize = 1usize << ERTS_MMAP_SUPERALIGNED_BITS;
+
 #[cfg(test)]
 thread_local! {
     /// Count of `NodeRef::set_word` calls on this thread, for the tree upkeep tests.
@@ -671,6 +679,13 @@ impl RawRegion {
         }
         let len = round_pages(len)
             .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
+        // Port of erts/emulator/sys/common/erl_mmap.c:1376-1388 (os_mmap_aligned), OTP-29.1.1:
+        // try a plain mapping first before over-reserving and trimming.
+        let candidate = Self::map(len)?;
+        if (candidate.as_ptr() as usize) & (alignment - 1) == 0 {
+            return Ok(candidate);
+        }
+        drop(candidate);
         let reserve = len
             .checked_add(alignment)
             .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;

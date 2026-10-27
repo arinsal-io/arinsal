@@ -3816,12 +3816,12 @@ pub(crate) fn timeout_event(
 #[inline(always)]
 pub(crate) fn send_hooks_idle(process: &Process) -> bool {
     process.seq_trace_token.is_none()
-        && process.cold.as_deref().is_some_and(|cold| {
-            cold.saved_calls.is_none()
-                && cold.signal_probe.as_ref().is_some_and(|probe| {
-                    probe.proc_flags().load(Ordering::Relaxed) & arinsal_sched::proc_flags::TRACE
-                        == 0
-                })
+        && process
+            .cold
+            .as_deref()
+            .is_none_or(|cold| cold.saved_calls.is_none())
+        && process.signal_probe.as_ref().is_some_and(|probe| {
+            probe.proc_flags().load(Ordering::Relaxed) & arinsal_sched::proc_flags::TRACE == 0
         })
 }
 

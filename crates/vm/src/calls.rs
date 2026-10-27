@@ -758,7 +758,7 @@ impl Vm {
                 None => {
                     if p.native_pc.is_some() {
                         // Returning into a native continuation is not a scheduling point.
-                        p.cold_mut().native_transfer = true;
+                        p.native_transfer = true;
                         ImportOutcome::Yield
                     } else {
                         ImportOutcome::Advanced

@@ -228,6 +228,13 @@ pub struct PtabIdRing {
 }
 
 impl PtabIdRing {
+    /// Bytes `erts_ptab_mem_size` counts for the free identifier ring: one `erts_atomic32_t` per
+    /// table index, although erts stores the ring in word sized `erts_atomic_t` entries.
+    // Port of erts/emulator/beam/erl_ptab.c:349 (erts_ptab_mem_size), OTP-29.1.1.
+    pub fn free_id_bytes(&self) -> usize {
+        self.layout.max() as usize * std::mem::size_of::<u32>()
+    }
+
     /// Allocator for a table asked to hold `capacity` elements. At most
     /// `capacity` elements are live at once even when the table rounds up.
     ///

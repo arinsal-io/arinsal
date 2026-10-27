@@ -698,6 +698,7 @@ fn process_info_aux(
         arinsal_term::atoms::MEMORY => Term::small(
             (std::mem::size_of::<Process>()
                 + process.heap.total_heap_size_words() * 8
+                + src.read(process).inbox.memory_bytes()
                 + process
                     .dictionary
                     .as_ref()
@@ -710,7 +711,13 @@ fn process_info_aux(
             // adds `REDS_IN - fcalls`; a yielded process already folded that into `reds`.
             let rp = src.read(process);
             let inflight = if rp.heap.native_active() && rp.self_pid == Some(pid) {
-                u64::try_from(rp.native_reds_in.saturating_sub(rp.header.fcalls)).unwrap_or(0)
+                // `- virtual_reds`: what ERTS_VBUMP_REDS took is not the process's own work.
+                u64::try_from(
+                    rp.native_reds_in
+                        .saturating_sub(rp.header.fcalls)
+                        .saturating_sub(i32::try_from(rp.virtual_reds).unwrap_or(i32::MAX)),
+                )
+                .unwrap_or(0)
             } else {
                 0
             };
@@ -1736,7 +1743,7 @@ fn dictionary_lookup(selector: Term) -> Option<(Term, Term)> {
 pub(crate) fn native_call_site(
     process: &Process,
 ) -> Option<(crate::native_bridge::NativeFunction, usize)> {
-    let pc = process.cold.as_ref()?.native_call_pc;
+    let pc = process.native_call_pc;
     if pc == 0 {
         return None;
     }
@@ -1792,9 +1799,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok((module.to_owned(), function.to_owned(), arity));
     }
     // A send suspended on a busy port yields to the send/2 export (bif.c:2581 SEND_YIELD).
-    if process.cold.as_ref().and_then(|cold| cold.native_retry)
-        == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY)
-    {
+    if process.native_retry == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
         return Ok(("erlang".to_owned(), "send".to_owned(), 2));
     }
     if crate::signals::is_waiting_for_process_info(process) {
@@ -1896,7 +1901,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         .native_pc
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
         .or_else(|| {
-            let pc = process.cold.as_ref()?.native_call_pc;
+            let pc = process.native_call_pc;
             let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
             let pc = if pc & tag != 0 { (pc & !tag) - 1 } else { pc };
             (pc != 0 && crate::native_bridge::is_native_function_at(pc)).then_some(pc)
@@ -2077,11 +2082,7 @@ pub(crate) fn process_info_light(
     // The process's own signal probe answers without the table lookup: erts reads the
     // `ERTS_PSFLG_SIG_IN_Q` and `ERTS_PSFLG_SUSPENDED` bits of the caller's state word. The
     // table is the fallback.
-    let busy = match process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
-    {
+    let busy = match process.signal_probe.as_ref() {
         Some(probe) => {
             probe.has_pending()
                 || probe
@@ -2496,7 +2497,7 @@ pub(crate) fn fulfill_request(
             });
             if kill && references {
                 let reason = Message::copy_from(atom("kill"))?;
-                ctx.signal(ctx.pid(), Signal::Exit(reason))
+                ctx.signal(ctx.pid(), Signal::Exit(Box::new(reason)))
                     .map_err(|error| VmError::Unsupported(format!("CPC kill signal: {error}")))?;
             }
             let result = atom(if references { "true" } else { "false" });
@@ -2745,7 +2746,7 @@ fn undefined_atom() -> Term {
 pub(crate) fn dict_put(process: &mut Process, key: Term, value: Term) -> Term {
     process
         .dictionary
-        .get_or_insert_with(crate::proc_create::ProcDict::default)
+        .get_or_insert_with(Box::<crate::proc_create::ProcDict>::default)
         .put(key, value)
         .unwrap_or_else(undefined_atom)
 }

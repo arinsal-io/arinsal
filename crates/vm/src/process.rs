@@ -70,10 +70,7 @@ fn legacy_exception_trap(
 /// erts does without a scheduling point. Native FCALLS stay within this slice's
 /// quantum so that its reductions are charged to the scheduler.
 fn native_transfer_continues(process: &mut Process, ctx: &RunCtx<'_, Message>) -> bool {
-    let transfer = process
-        .cold
-        .as_mut()
-        .is_some_and(|cold| std::mem::take(&mut cold.native_transfer));
+    let transfer = std::mem::take(&mut process.native_transfer);
     let remaining = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
     if !transfer || remaining == 0 {
         return false;
@@ -98,11 +95,6 @@ pub struct Message {
     /// When set, the receiver inserts this into the priority section of its
     /// private message queue (OTP 28+ priority messages).
     priority: bool,
-    /// The VM timer id carried until delivery so expiry and cancellation release its message;
-    /// meaningful only when `has_timer_id` is set. Kept as a word and a flag beside the other
-    /// flags rather than an `Option<u64>`, which would widen every queued event by a word.
-    timer_id: u64,
-    has_timer_id: bool,
     /// The port connected handshake traces receipt before unblocking the recipient.
     receive_traced: bool,
     /// Sent by a process without a seq_trace token (`ERL_MESSAGE_TOKEN == NIL`).
@@ -125,6 +117,9 @@ struct SendMeta {
 struct MessageFragment {
     heap: Option<arinsal_term::message::MessageHeap>,
     seq_token: Option<Box<crate::seq_trace::Token>>,
+    /// The VM timer id a timer-sent message carries until delivery, so expiry and cancellation
+    /// release its message; kept here, not in `Message`, so the common message stays small.
+    timer_id: Option<u64>,
 }
 
 type RemovedMessage = (Term, crate::seq_trace::SeqState);
@@ -213,6 +208,17 @@ impl MessageQueue {
     /// Byte offset of the save term address, for generated code.
     pub(crate) const SAVE_TERM_OFFSET: usize = std::mem::offset_of!(MessageQueue, save_term);
 
+    /// Bytes the queued messages occupy: each node and its on-heap data.
+    // Port of erts/emulator/beam/erl_process_dump.c:117 (erts_process_memory, the message
+    // queue loop: `sizeof(ErtsMessage)` plus `erts_msg_attached_data_size`), OTP-29.1.1.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        let node = std::mem::size_of::<arinsal_term::message::SignalNode<Event<Message>>>();
+        self.entries
+            .iter_with_fragments()
+            .map(|(_, words)| node + words.map_or(0, std::mem::size_of_val))
+            .sum()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -262,6 +268,7 @@ impl MessageQueue {
             Some(Box::new(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
+                timer_id: None,
             })),
             false,
         ));
@@ -701,11 +708,15 @@ impl MessageQueue {
                 entry.fragment = Some(Box::new(MessageFragment {
                     heap: None,
                     seq_token: None,
+                    timer_id: None,
                 }));
             }
             if let Some(fragment) = entry.fragment.as_mut() {
                 fragment.heap = heap;
-                if fragment.heap.is_none() && fragment.seq_token.is_none() {
+                if fragment.heap.is_none()
+                    && fragment.seq_token.is_none()
+                    && fragment.timer_id.is_none()
+                {
                     entry.fragment = None;
                 }
             }
@@ -818,10 +829,9 @@ impl Message {
             fragment: Some(Box::new(MessageFragment {
                 heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
                 seq_token: None,
+                timer_id: None,
             })),
             priority: false,
-            timer_id: 0,
-            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -897,8 +907,6 @@ impl Message {
             term,
             fragment: None,
             priority: false,
-            timer_id: 0,
-            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -935,10 +943,9 @@ impl Message {
             fragment: Some(Box::new(MessageFragment {
                 heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
                 seq_token: None,
+                timer_id: None,
             })),
             priority: false,
-            timer_id: 0,
-            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -977,12 +984,21 @@ impl Message {
 
     /// The VM timer id this message carries, if it was sent by a timer.
     fn timer_id(&self) -> Option<u64> {
-        self.has_timer_id.then_some(self.timer_id)
+        self.fragment
+            .as_ref()
+            .and_then(|fragment| fragment.timer_id)
     }
 
     pub(crate) fn with_timer_id(mut self, id: u64) -> Self {
-        self.timer_id = id;
-        self.has_timer_id = true;
+        self.fragment
+            .get_or_insert_with(|| {
+                Box::new(MessageFragment {
+                    heap: None,
+                    seq_token: None,
+                    timer_id: None,
+                })
+            })
+            .timer_id = Some(id);
         self
     }
 
@@ -1019,6 +1035,7 @@ impl Message {
             self.fragment = Some(Box::new(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
+                timer_id: None,
             }));
         }
     }
@@ -1141,8 +1158,6 @@ fn message_on_receiver_heap(
         term,
         fragment: None,
         priority: false,
-        timer_id: 0,
-        has_timer_id: false,
         receive_traced: false,
         seq_nil: false,
         alias: 0,
@@ -1190,9 +1205,8 @@ impl Process {
         if self.message_queue_data() == MessageQueueData::OffHeap {
             return false;
         }
-        self.cold
+        self.signal_probe
             .as_ref()
-            .and_then(|cold| cold.signal_probe.as_ref())
             .is_some_and(arinsal_sched::SignalProbe::has_pending)
     }
 }
@@ -1962,9 +1976,7 @@ impl Executor {
                             break Ok(wait);
                         }
                     }
-                    if let Some(cold) = process.cold.as_mut() {
-                        cold.native_transfer = false;
-                    }
+                    process.native_transfer = false;
                     crate::dist::continue_fragmented_send(process, ctx)?;
                     // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1:
                     // the dirty scheduler runs the NIF, then the process returns to a normal
@@ -2073,10 +2085,7 @@ impl Executor {
                         // A native call to a BIF that parked the process (cross-process signal
                         // reply) is redone once the process wakes, like the interpreter re-executes
                         // the call instruction.
-                        let retry = process
-                            .cold
-                            .as_mut()
-                            .and_then(|cold| cold.native_retry.take());
+                        let retry = process.native_retry.take();
                         let outcome = if let Some(target_pc) = retry {
                             if let Some(call_arity) =
                                 retry_call_arity(target_pc, process.x.saved_arity())
@@ -2095,11 +2104,8 @@ impl Executor {
                             }
                             // The redone call keeps its return address and call site, so a BIF
                             // that fails after trapping raises at the original call.
-                            let (resume_pc, call_site_pc) = process
-                                .cold
-                                .as_mut()
-                                .and_then(|cold| cold.native_retry_site.take())
-                                .unwrap_or((0, 0));
+                            let (resume_pc, call_site_pc) =
+                                process.native_retry_site.take().unwrap_or((0, 0));
                             if call_site_pc != 0 {
                                 process.native_error_pc = call_site_pc;
                             }
@@ -2200,12 +2206,8 @@ impl Executor {
                                         // erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
                                         // OTP-29.1.1: fetch (no handling), then rerun the
                                         // instruction in place: erts does not schedule out there.
-                                        if process
-                                            .cold
-                                            .as_ref()
-                                            .is_some_and(|cold| cold.signal_probe.is_none())
-                                        {
-                                            process.cold_mut().signal_probe = ctx.signal_probe();
+                                        if process.signal_probe.is_none() {
+                                            process.signal_probe = ctx.signal_probe();
                                         }
                                         process.fetch_signals(ctx)?;
                                         reenter = true;
@@ -2218,12 +2220,8 @@ impl Executor {
                                         // (i_loop_rec_shared calls erts_proc_sig_receive_helper),
                                         // OTP-29.1.1: the helper runs here, then the `loop_rec`
                                         // reruns; a yield schedules out there.
-                                        if process
-                                            .cold
-                                            .as_ref()
-                                            .is_some_and(|cold| cold.signal_probe.is_none())
-                                        {
-                                            process.cold_mut().signal_probe = ctx.signal_probe();
+                                        if process.signal_probe.is_none() {
+                                            process.signal_probe = ctx.signal_probe();
                                         }
                                         let fcalls =
                                             i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
@@ -2235,10 +2233,7 @@ impl Executor {
                                         continue;
                                     }
                                     if exit_kind == crate::proc_create::NativeExit::Wait
-                                        && let Some(timeout_ms) = process
-                                            .cold
-                                            .as_mut()
-                                            .and_then(|cold| cold.native_wait.take())
+                                        && let Some(timeout_ms) = process.native_wait.take()
                                     {
                                         // A native receive found no matching message. Like the
                                         // interpreter's `wait`, sleep only if nothing arrived since the
@@ -2248,9 +2243,8 @@ impl Executor {
                                         process.set_native_resume_arity(0);
                                         // A receive without clauses blocks even with messages queued,
                                         // like the interpreter's self-targeting `wait`.
-                                        let self_wait = std::mem::take(
-                                            &mut process.cold_mut().native_wait_self,
-                                        );
+                                        let self_wait =
+                                            std::mem::take(&mut process.native_wait_self);
                                         if self_wait {
                                             // Queued messages never match; fetch them so the outer
                                             // queue does not keep waking the process.
@@ -2279,8 +2273,7 @@ impl Executor {
                                 // The native call site names the caller only if the called BIF
                                 // raises; any other continuation must not inherit it.
                                 let call_site_pc = std::mem::take(&mut process.native_error_pc);
-                                process.cold_mut().native_retry_site =
-                                    Some((resume_pc, call_site_pc));
+                                process.native_retry_site = Some((resume_pc, call_site_pc));
                                 if target_pc
                                     == arinsal_beamasm::dispatch::RETURN_TO_DISPATCH_IDENTITY
                                 {
@@ -2439,10 +2432,10 @@ impl Executor {
                                     process.x[4] = Term::atom(handler_module);
                                     process.x[5] = Term::atom(handler_function);
                                     process.gc_live = 4;
-                                    process.cold_mut().native_apply = true;
+                                    process.native_apply = true;
                                     let result =
                                         self.vm.apply_fixed(process, 4, true, 0, Some(ctx));
-                                    process.cold_mut().native_apply = false;
+                                    process.native_apply = false;
                                     match result? {
                                         crate::ImportOutcome::Jump(_) => {
                                             self.vm.enter_native_at_jump(process)
@@ -2531,7 +2524,7 @@ impl Executor {
                                         Err(VmError::Trap(_))
                                             if crate::port::take_busy_suspend() =>
                                         {
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             break Ok(RunState::Wait { timeout_ms: None });
                                         }
@@ -2577,7 +2570,7 @@ impl Executor {
                                             )
                                         }
                                         _ => {
-                                            process.cold_mut().native_apply = true;
+                                            process.native_apply = true;
                                             let result = match target_pc {
                                                 arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED => {
                                                     let arity = usize::from(process.header.arity);
@@ -2600,7 +2593,7 @@ impl Executor {
                                                     Some(ctx),
                                                 ),
                                             };
-                                            process.cold_mut().native_apply = false;
+                                            process.native_apply = false;
                                             result
                                         }
                                     };
@@ -2676,8 +2669,7 @@ impl Executor {
                                                         } else {
                                                             target_pc
                                                         };
-                                                        process.cold_mut().native_retry =
-                                                            Some(retry_pc);
+                                                        process.native_retry = Some(retry_pc);
                                                         process.native_pc = Some(code_ptr);
                                                     }
                                                     break Ok(RunState::Yield);
@@ -2709,7 +2701,7 @@ impl Executor {
                                             {
                                                 *register = *value;
                                             }
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             break Ok(RunState::Wait { timeout_ms: None });
                                         }
@@ -2721,7 +2713,7 @@ impl Executor {
                                             {
                                                 *register = *value;
                                             }
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             break Ok(RunState::Wait { timeout_ms: None });
                                         }
@@ -2736,7 +2728,7 @@ impl Executor {
                                                     *register = *value;
                                                 }
                                             }
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             break Ok(RunState::Yield);
                                         }
@@ -2746,7 +2738,7 @@ impl Executor {
                                             {
                                                 *register = *value;
                                             }
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             break Err(VmError::Dirty(kind));
                                         }
@@ -2762,7 +2754,7 @@ impl Executor {
                                         {
                                             if hibernate_resumes_in_place(process) {
                                                 hibernate_fetch_collect(process, ctx)?;
-                                                process.cold_mut().native_retry = Some(target_pc);
+                                                process.native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
                                                 break Ok(RunState::Wait { timeout_ms: None });
                                             }
@@ -2855,7 +2847,7 @@ impl Executor {
                                             (pending.caller_module, pending.caller_ip) = trap_site;
                                         }
                                         crate::bif_traps::arm_export_trap(process);
-                                        process.cold_mut().native_retry = Some(target_pc);
+                                        process.native_retry = Some(target_pc);
                                         process.native_pc = Some(code_ptr);
                                         break Ok(RunState::Yield);
                                     }
@@ -2926,7 +2918,7 @@ impl Executor {
                                                 pending.schedule_out = false;
                                             }
                                             crate::bif_traps::arm_export_trap(process);
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             break Ok(RunState::Yield);
                                         }
@@ -2935,14 +2927,14 @@ impl Executor {
                                         // native continuation. Port of erts/emulator/beam/beam_common.c
                                         // (BIF_TRAP), OTP-29.1.1.
                                         Some(Ok(crate::bif_traps::ResumeResult::Export(trap))) => {
-                                            process.cold_mut().native_apply = true;
+                                            process.native_apply = true;
                                             let outcome = self.vm.trap_to_export(
                                                 process,
                                                 trap,
                                                 true,
                                                 Some(ctx),
                                             );
-                                            process.cold_mut().native_apply = false;
+                                            process.native_apply = false;
                                             match outcome? {
                                                 crate::ImportOutcome::Jump(_) => {
                                                     self.vm.enter_native_at_jump(process)
@@ -3116,7 +3108,7 @@ impl Executor {
                                         {
                                             pending.schedule_out = false;
                                             (pending.caller_module, pending.caller_ip) = trap_site;
-                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             crate::native_helpers::debug_assert_native_heap(
                                                 process,
@@ -3181,7 +3173,7 @@ impl Executor {
                                                         pending.schedule_out = false;
                                                     }
                                                     crate::bif_traps::arm_export_trap(process);
-                                                    process.cold_mut().native_retry = Some(
+                                                    process.native_retry = Some(
                                                         crate::bif_traps::bif_export_trap_pc(),
                                                     );
                                                     process.native_pc = Some(code_ptr);
@@ -3247,7 +3239,7 @@ impl Executor {
                                             // The BIF runs at the native call site (erts c_p->i).
                                             let (module_before, position_before) =
                                                 (process.module, process.position_marker());
-                                            process.cold_mut().native_call_pc = call_site_pc;
+                                            process.native_call_pc = call_site_pc;
                                             let traced = self.vm.trace_native_call_named(
                                                 process,
                                                 ctx,
@@ -3263,11 +3255,8 @@ impl Executor {
                                             // address is pushed only when it traps. A heavy BIF
                                             // is entered through its export entry, whose frame
                                             // holds the return address.
-                                            let light = process
-                                                .cold
-                                                .as_ref()
-                                                .is_some_and(|cold| cold.native_light_bif_call)
-                                                && export.light_kind;
+                                            let light =
+                                                process.native_light_bif_call && export.light_kind;
                                             let hidden = usize::from(
                                                 light
                                                     && process.heap.stack_get(0).is_some_and(
@@ -3286,7 +3275,7 @@ impl Executor {
                                                 (export.class, export.native_bits),
                                             );
                                             process.heap.set_bif_hidden_words(0);
-                                            process.cold_mut().native_call_pc = 0;
+                                            process.native_call_pc = 0;
                                             // A BIF that traps to an Erlang export (erts BIF_TRAP*)
                                             // context-switches to beam_bif_export_trap, which runs
                                             // the export on schedule-in. Port of erts/emulator/beam/
@@ -3299,7 +3288,7 @@ impl Executor {
                                                         process, target_pc, callee, &trap,
                                                     );
                                                     crate::bif_traps::arm_export_trap(process);
-                                                    process.cold_mut().native_retry = Some(
+                                                    process.native_retry = Some(
                                                         crate::bif_traps::bif_export_trap_pc(),
                                                     );
                                                     process.native_pc = Some(code_ptr);
@@ -3387,8 +3376,7 @@ impl Executor {
                                                 {
                                                     *register = *value;
                                                 }
-                                                let cold = process.cold_mut();
-                                                cold.native_retry = Some(target_pc);
+                                                process.native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
                                                 break Ok(RunState::Wait { timeout_ms: None });
                                             }
@@ -3447,8 +3435,7 @@ impl Executor {
                                                 // on entry); the copies taken before it are stale.
                                                 // They stay live until the call is redone.
                                                 process.gc_live = saved_arguments.len();
-                                                let cold = process.cold_mut();
-                                                cold.native_retry = Some(target_pc);
+                                                process.native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
                                                 break Ok(RunState::Wait { timeout_ms: None });
                                             }
@@ -3468,8 +3455,7 @@ impl Executor {
                                                         *register = *value;
                                                     }
                                                 }
-                                                let cold = process.cold_mut();
-                                                cold.native_retry = Some(target_pc);
+                                                process.native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
                                                 break Ok(RunState::Yield);
                                             }
@@ -3481,8 +3467,7 @@ impl Executor {
                                                 {
                                                     *register = *value;
                                                 }
-                                                let cold = process.cold_mut();
-                                                cold.native_retry = Some(target_pc);
+                                                process.native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
                                                 break Err(VmError::Dirty(kind));
                                             }
@@ -3497,8 +3482,7 @@ impl Executor {
                                                 // native call is retried and returns `ok` in place.
                                                 if hibernate_resumes_in_place(process) {
                                                     hibernate_fetch_collect(process, ctx)?;
-                                                    let cold = process.cold_mut();
-                                                    cold.native_retry = Some(target_pc);
+                                                    process.native_retry = Some(target_pc);
                                                     process.native_pc = Some(code_ptr);
                                                     break Ok(RunState::Wait { timeout_ms: None });
                                                 }
@@ -3904,9 +3888,7 @@ impl Executor {
             if !arity_set
                 && process.native_pc.is_some()
                 && let Some(operands) = process
-                    .cold
-                    .as_ref()
-                    .and_then(|cold| cold.native_retry)
+                    .native_retry
                     .and_then(|target| retry_operand_count(target, call_arity))
             {
                 live_x = operands;
@@ -5090,7 +5072,7 @@ impl Process {
                     // (erts_proc_exit_handle_signal), OTP-29.1.1: a link reaching an
                     // exiting process is rejected with `noproc`.
                     if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
-                        let _ = ctx.signal(from, Signal::ExitLinked(reason));
+                        let _ = ctx.signal(from, Signal::ExitLinked(Box::new(reason)));
                     }
                 }
                 Payload::Signal(Signal::Unlink(id)) => {
@@ -5480,7 +5462,7 @@ impl Process {
                 {
                     message.attach_seq_token(token);
                 }
-                let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(message));
+                let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(Box::new(message)));
             }
         }
         // Port of erts/emulator/beam/erl_process.c:13829 (erts_proc_exit_handle_monitor,
@@ -5544,7 +5526,10 @@ impl Process {
                 {
                     let _ = ctx.signal(
                         pid,
-                        arinsal_sched::Signal::MonitorDownMsg { reference, message },
+                        arinsal_sched::Signal::MonitorDownMsg {
+                            reference,
+                            message: Box::new(message),
+                        },
                     );
                 }
             } else if let Ok(message) = Message::copy_from(reason) {
@@ -5552,7 +5537,7 @@ impl Process {
                     pid,
                     arinsal_sched::Signal::MonitorDown {
                         reference,
-                        reason: message,
+                        reason: Box::new(message),
                     },
                 );
             }
@@ -6086,10 +6071,7 @@ impl Process {
             // (erl_proc_sig_queue.h:2080) schedules nothing, so no run queue is needed.
             None => {
                 if pid == sender
-                    && let Some(probe) = self
-                        .cold
-                        .as_ref()
-                        .and_then(|cold| cold.signal_probe.as_ref())
+                    && let Some(probe) = self.signal_probe.as_ref()
                 {
                     probe.send_self_node(pid, node)
                 } else {
@@ -6245,9 +6227,8 @@ impl Process {
     /// non-message signal in erts.
     fn is_ordinary_message(payload: &Payload<Message>) -> bool {
         match payload {
-            Payload::Message(message) | Payload::TimerMessage { message, .. } => {
-                !message.is_altact_msg()
-            }
+            Payload::Message(message) => !message.is_altact_msg(),
+            Payload::TimerMessage { message, .. } => !message.is_altact_msg(),
             Payload::Timer { .. } => true,
             Payload::Signal(_) => false,
         }
@@ -6511,7 +6492,7 @@ impl Process {
                 std::mem::replace(&mut node.payload, placeholder)
             {
                 let priority = message.is_priority();
-                node.payload = Payload::Message(message);
+                node.payload = Payload::Message(*message);
                 let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                 let before = self.message_words_before();
                 let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
@@ -6674,7 +6655,7 @@ impl Process {
                 2
             }
             arinsal_sched::Signal::Monitor { reference, shared } => {
-                self.insert_target_monitor(reference, shared);
+                self.insert_target_monitor(reference, *shared);
                 2
             }
             arinsal_sched::Signal::Demonitor(reference) => {
@@ -6788,7 +6769,7 @@ impl Process {
                 // The sender built the DOWN message (erl_proc_sig_queue.c:2836-2900). The origin
                 // still drops it when its monitor is gone (erl_proc_sig_queue.c:6355).
                 let queued = self.inbox.len();
-                self.deliver_monitor_down_message(reference, message)?;
+                self.deliver_monitor_down_message(reference, *message)?;
                 self.trace_new_message(ctx, queued, from);
                 8
             }
@@ -7094,18 +7075,19 @@ impl Process {
         if !self.sig_cont_empty() || crate::trace::active() {
             return Ok(0);
         }
-        let Some(cold) = self.cold.as_mut() else {
-            return Ok(0);
-        };
-        if !cold.delayed_gc.is_empty() {
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.delayed_gc.is_empty())
+        {
             return Ok(0);
         }
-        let Some(probe) = cold.signal_probe.take() else {
+        let Some(probe) = self.signal_probe.take() else {
             return Ok(0);
         };
         let fetched =
             probe.fetch_messages_if(|message| !message.is_altact_msg(), &mut self.sig_cont);
-        self.cold_mut().signal_probe = Some(probe);
+        self.signal_probe = Some(probe);
         while let Some(node) = self.sig_cont.pop_front_signal() {
             self.sig_cont_taken += 1;
             debug_assert!(
@@ -7138,18 +7120,19 @@ impl Process {
         if self.fetch_messages_in_place()? != 0 {
             return Ok(());
         }
-        let Some(probe) = self.cold.as_mut().and_then(|cold| cold.signal_probe.take()) else {
+        let Some(probe) = self.signal_probe.take() else {
             return Ok(());
         };
         probe.fetch_all(&mut self.sig_cont);
         probe.set_sig_q(!self.sig_cont_empty());
-        self.cold_mut().signal_probe = Some(probe);
+        self.signal_probe = Some(probe);
         Ok(())
     }
 
     fn sig_cont_message_mut(payload: &mut Payload<Message>) -> Option<&mut Message> {
         match payload {
-            Payload::Message(message) | Payload::TimerMessage { message, .. } => Some(message),
+            Payload::Message(message) => Some(message),
+            Payload::TimerMessage { message, .. } => Some(&mut **message),
             _ => None,
         }
     }
@@ -7562,17 +7545,17 @@ impl Process {
         // Port of erts/emulator/beam/beam_bif_load.c:1171 and erl_nfunc_sched.h:120
         // (erts_check_nfunc_in_area), OTP-29.1.1: a native call that is redone when the process wakes (a parked BIF, a
         // NIF waiting for a dirty scheduler) keeps its return address outside the stack.
-        if let Some(cold) = self.cold.as_deref() {
-            let retry = cold
-                .native_retry
-                .and(cold.native_retry_site)
-                .is_some_and(|(resume, site)| in_native(resume) || in_native(site));
-            let dirty = cold
-                .native_dirty_nif
-                .is_some_and(|(_, resume, _)| in_native(resume));
-            if retry || dirty {
-                return true;
-            }
+        let retry = self
+            .native_retry
+            .and(self.native_retry_site)
+            .is_some_and(|(resume, site)| in_native(resume) || in_native(site));
+        let dirty = self
+            .cold
+            .as_deref()
+            .and_then(|cold| cold.native_dirty_nif)
+            .is_some_and(|(_, resume, _)| in_native(resume));
+        if retry || dirty {
+            return true;
         }
         for index in 0..self.heap.stack_words() {
             let Some(term) = self.heap.stack_get(index) else {
@@ -7947,7 +7930,9 @@ impl arinsal_sched::SignalMessage for Message {
             })
         };
         let (target, shared, reference) = match signal {
-            arinsal_sched::Signal::Monitor { reference, shared } => (true, shared, Some(reference)),
+            arinsal_sched::Signal::Monitor { reference, shared } => {
+                (true, *shared, Some(reference))
+            }
             arinsal_sched::Signal::DemonitorOrigin(shared) => (false, shared, None),
             signal => return allocated(signal),
         };
@@ -7959,7 +7944,10 @@ impl arinsal_sched::SignalMessage for Message {
             Err(other) => {
                 let shared = arinsal_sched::SharedPayload(other);
                 return allocated(match reference {
-                    Some(reference) => arinsal_sched::Signal::Monitor { reference, shared },
+                    Some(reference) => arinsal_sched::Signal::Monitor {
+                        reference,
+                        shared: Box::new(shared),
+                    },
                     None => arinsal_sched::Signal::DemonitorOrigin(shared),
                 });
             }
@@ -7969,7 +7957,10 @@ impl arinsal_sched::SignalMessage for Message {
             Event {
                 from,
                 payload: Payload::Signal(match reference {
-                    Some(reference) => arinsal_sched::Signal::Monitor { reference, shared },
+                    Some(reference) => arinsal_sched::Signal::Monitor {
+                        reference,
+                        shared: Box::new(shared),
+                    },
                     None => arinsal_sched::Signal::DemonitorOrigin(shared),
                 }),
             }
@@ -8044,13 +8035,10 @@ impl Task for Process {
         ctx.set_parallel_signal_buffers(self.message_queue_data() == MessageQueueData::OffHeap);
         // The light BIF path has no scheduler context. A probe is the process-side
         // `sig_inq` flag (`ERTS_PSFLG_MSG_SIG_IN_Q`) it checks before collecting.
-        if self
-            .cold
-            .as_ref()
-            .is_none_or(|cold| cold.signal_probe.is_none())
+        if self.signal_probe.is_none()
             && let Some(probe) = ctx.signal_probe()
         {
-            self.cold_mut().signal_probe = Some(probe);
+            self.signal_probe = Some(probe);
         }
         // Records built or decoded on this thread use its node's canonical definitions, and
         // export funs built here its export entries. A scheduler thread serves one runtime, so
@@ -8099,9 +8087,7 @@ impl Task for Process {
 
     fn scheduler_shutdown(&mut self) {
         // The probe holds a reference to this process's own struct.
-        if let Some(cold) = self.cold.as_mut() {
-            cold.signal_probe = None;
-        }
+        self.signal_probe = None;
         if let Some(pid) = self.self_pid {
             self.persistent_terms
                 .release_update_permission(crate::natives::sys::persistent_owner(pid));
@@ -8144,6 +8130,8 @@ impl Task for Process {
     fn delete_process(&mut self) {
         self.heap = arinsal_term::ProcessHeap::with_words(0);
         self.cold = None;
+        // The probe keeps a reference to this process; holding it past exit leaks the struct.
+        self.signal_probe = None;
         self.dictionary = None;
         self.inbox = MessageQueue::default();
         self.sig_cont = Default::default();
@@ -8228,7 +8216,7 @@ impl Task for Process {
         for linker in links {
             if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
                 // A link exit (erts_proc_exit_handle_link), so the linker drops its half.
-                let _ = scheduler.signal(pid, linker, Signal::ExitLinked(reason));
+                let _ = scheduler.signal(pid, linker, Signal::ExitLinked(Box::new(reason)));
             }
         }
         for (reference, watcher) in monitors {
@@ -8238,7 +8226,14 @@ impl Task for Process {
             let Ok(reason) = Message::copy_from(reason) else {
                 continue;
             };
-            let _ = scheduler.signal(pid, watcher, Signal::MonitorDown { reference, reason });
+            let _ = scheduler.signal(
+                pid,
+                watcher,
+                Signal::MonitorDown {
+                    reference,
+                    reason: Box::new(reason),
+                },
+            );
         }
     }
 }
@@ -9077,6 +9072,7 @@ fn mfa_atoms(
 #[cfg(test)]
 mod layout_tests {
     use super::{Message, Process, ProcessHeap, Term, TermBuilder};
+    use similar_asserts::assert_eq;
 
     fn envelope() -> Message {
         let mut source = ProcessHeap::with_words(8);
@@ -9259,19 +9255,23 @@ mod layout_tests {
     #[test]
     fn queued_event_stays_compact() {
         // Every message and signal crosses the in-queue and the middle queue as an `Event`, so
-        // its size is copied on each send and fetch. The rare wide signals (port exit, sync
-        // suspend, literal-area copy) are boxed and a fired timer carries only its id, which
-        // keeps an event within one 64-byte cache line.
-        assert_eq!(std::mem::size_of::<Message>(), 40);
-        assert_eq!(std::mem::size_of::<arinsal_sched::Signal<Message>>(), 56);
-        assert_eq!(std::mem::size_of::<arinsal_sched::Payload<Message>>(), 56);
-        assert_eq!(std::mem::size_of::<arinsal_sched::Event<Message>>(), 64);
+        // its size is copied on each send and fetch. Wide signal payloads and timer messages are
+        // boxed, keeping the event below one 64-byte cache line.
+        // Timer ids live with the fragment, so the common message envelope is 32 bytes.
+        assert_eq!(std::mem::size_of::<Message>(), 32);
+        assert_eq!(std::mem::size_of::<arinsal_sched::Signal<Message>>(), 24);
+        assert_eq!(std::mem::size_of::<arinsal_sched::Payload<Message>>(), 32);
+        assert_eq!(std::mem::size_of::<arinsal_sched::Event<Message>>(), 40);
+        assert_eq!(
+            std::mem::size_of::<arinsal_term::message::SignalNode<arinsal_sched::Event<Message>>>(),
+            56
+        );
         // Both halves of a monitor in one allocation with the nodes they are sent in (erts
         // `ErtsMonitorDataHeap`, whose signal header shares the halves' container links); the
         // rare tag and name are boxed separately.
         assert_eq!(
             std::mem::size_of::<crate::proc_create::ProcessMonitorData>(),
-            320
+            272
         );
     }
 }

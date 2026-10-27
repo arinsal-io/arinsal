@@ -478,7 +478,7 @@ fn route_incoming(
                 process,
                 from,
                 target,
-                Signal::Exit(Message::copy_from(reason)?),
+                Signal::Exit(Box::new(Message::copy_from(reason)?)),
             )?;
         }
         35 if parts.len() == 4 => {
@@ -537,7 +537,7 @@ fn route_incoming(
                 watcher,
                 Signal::MonitorDown {
                     reference,
-                    reason: Message::copy_from(reason)?,
+                    reason: Box::new(Message::copy_from(reason)?),
                 },
             )?;
         }
@@ -1199,7 +1199,7 @@ fn notify_connection_monitors(
                 monitor.watcher,
                 Signal::MonitorDown {
                     reference: monitor.reference,
-                    reason,
+                    reason: Box::new(reason),
                 },
             )
             .is_err()
@@ -1318,7 +1318,7 @@ fn route_incoming_port(
             };
             let reason = owned_to_message(reason)?;
             sched
-                .signal(from, target, Signal::Exit(reason))
+                .signal(from, target, Signal::Exit(Box::new(reason)))
                 .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
         }
         // Port of dist.c:2341 (DOP_MONITOR_P); ToProc may be a pid or registered name.
@@ -1360,7 +1360,7 @@ fn route_incoming_port(
                     watcher,
                     Signal::MonitorDown {
                         reference,
-                        reason: reason_msg,
+                        reason: Box::new(reason_msg),
                     },
                 )
                 .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;

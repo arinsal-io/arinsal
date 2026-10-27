@@ -55,6 +55,17 @@ pub struct HashInfo {
     pub depth: i32,
 }
 
+/// Memory of the atom table, in bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomMemory {
+    /// Hash buckets and index slots (`atom_table_sz`).
+    pub table: u64,
+    /// Atom entry records.
+    pub entries: u64,
+    /// Atom text (`atom_space`).
+    pub text: u64,
+}
+
 /// `index_info` counters for the atom index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IndexInfo {
@@ -397,6 +408,26 @@ impl AtomTable {
             size: inner.size,
             limit: inner.limit,
             entries: inner.entries,
+        }
+    }
+
+    /// Memory the table holds, split as erts accounts it: the hash and index tables
+    /// (`atom_table_sz`), the atom entries, and the atom text (`atom_space`).
+    // Port of erts/emulator/beam/atom.c (atom_table_sz, erts_atom_get_text_space_sizes) and
+    // index.c (index_table_sz), OTP-29.1.1, for this table's own layout.
+    pub fn memory(&self) -> AtomMemory {
+        let inner = self.inner.read();
+        let pages = self.seg.iter().filter(|page| page.load().is_some()).count();
+        let table = inner.buckets.capacity() * std::mem::size_of::<u32>()
+            + inner.atoms.capacity() * std::mem::size_of::<&'static AtomRec>()
+            + self.seg.len() * std::mem::size_of::<AtomicCell<Option<&'static Page>>>()
+            + pages * std::mem::size_of::<Page>();
+        // Records are allocated once and never freed, as erts `atom_alloc`.
+        let entries = inner.atoms.len() * std::mem::size_of::<AtomRec>();
+        AtomMemory {
+            table: table as u64,
+            entries: entries as u64,
+            text: inner.atom_space,
         }
     }
 

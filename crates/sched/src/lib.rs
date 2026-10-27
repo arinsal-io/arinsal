@@ -467,7 +467,7 @@ pub enum Signal<M> {
     /// Monitor request carrying a VM reference and the monitor's shared data.
     Monitor {
         reference: u64,
-        shared: SharedPayload,
+        shared: Box<SharedPayload>,
     },
     /// Suspend monitor activation: the suspender's `SuspendMonitor` (erl_proc_sig_queue.c
     /// handle_suspend, erl_process.c:9140). The target applies it and marks the monitor active.
@@ -496,10 +496,10 @@ pub enum Signal<M> {
     /// its own half through the data both halves share.
     DemonitorOrigin(SharedPayload),
     /// Exit signal (`exit/2`) carrying an opaque reason envelope.
-    Exit(M),
+    Exit(Box<M>),
     /// Exit signal of a link: removes the receiver's link to the sender.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:4640 (ERTS_SIG_Q_OP_EXIT_LINKED), OTP-29.1.1.
-    ExitLinked(M),
+    ExitLinked(Box<M>),
     /// Port exit signal preserving the port term used as the signal origin.
     /// Boxed: the signal is rare and would otherwise widen every queued event.
     PortExit(Box<PortExitSignal<M>>),
@@ -513,9 +513,9 @@ pub enum Signal<M> {
     // OTP-29.1.1.
     PortUnlink(u64),
     /// Monitor DOWN signal carrying an opaque reason envelope.
-    MonitorDown { reference: u64, reason: M },
+    MonitorDown { reference: u64, reason: Box<M> },
     /// Monitor DOWN message the sender already built (a non-immediate reason, erl_proc_sig_queue.c:2836-2900).
-    MonitorDownMsg { reference: u64, message: M },
+    MonitorDownMsg { reference: u64, message: Box<M> },
     /// Alias activation.
     Alias(u64),
     /// Alias deactivation.
@@ -573,12 +573,12 @@ pub enum Payload<M> {
     /// An expired `start_timer`; the VM can form `{timeout, Ref, Msg}`.
     Timer {
         reference: TimerId,
-        message: M,
+        message: Box<M>,
     },
     /// An expired `send_after`; the VM retires the timer reference and delivers the message as-is.
     TimerMessage {
         reference: TimerId,
-        message: M,
+        message: Box<M>,
     },
 }
 
@@ -635,9 +635,8 @@ impl SignalMessage for usize {}
 impl<M: SignalMessage> InSignal for Event<M> {
     fn is_message(&self) -> bool {
         match &self.payload {
-            Payload::Message(message) | Payload::TimerMessage { message, .. } => {
-                !message.is_altact_msg()
-            }
+            Payload::Message(message) => !message.is_altact_msg(),
+            Payload::TimerMessage { message, .. } => !message.is_altact_msg(),
             Payload::Timer { .. } => true,
             Payload::Signal(_) => false,
         }
@@ -1123,7 +1122,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// [`Self::send_self`] of a message node the sender allocated.
     pub fn send_self_node(&self, pid: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
         self.input()
-            .push_routed_node(|| signal_buffer_slot(pid), signal)
+            .push_routed_node(self.progress(), || signal_buffer_slot(pid), signal)
             .map_err(|_| Error::NoProcess)?;
         self.input().backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1151,7 +1150,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     }
 }
 
-impl<M> std::fmt::Debug for SignalProbe<M> {
+impl<M: SignalMessage> std::fmt::Debug for SignalProbe<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignalProbe").finish_non_exhaustive()
     }
@@ -2162,6 +2161,8 @@ struct Inner<T: Task> {
     fanin_peak_backlog: AtomicUsize,
     /// erts thread progress (erl_thr_progress.c) of the normal scheduler threads.
     progress: Arc<thr_progress::ThrProgress>,
+    /// `progress` as the domain handle the signal buffer pointer is read and freed through.
+    progress_domain: Progress,
     /// Dirty CPU and dirty I/O pools, indexed by [`DirtyKind::index`].
     dirty: [DirtyPool<T>; 2],
     /// Scheduler type allowed to execute while multi-scheduling is blocked.
@@ -2445,7 +2446,7 @@ impl<T: Task> Inner<T> {
                 from,
                 Payload::Signal(Signal::Monitor {
                     reference: id,
-                    shared,
+                    shared: Box::new(shared),
                 }),
                 local.as_deref_mut(),
                 false,
@@ -3793,9 +3794,17 @@ impl<T: Task> Inner<T> {
         signal: OwnedSignal<Event<T::Message>>,
         local: Option<&mut Local<T>>,
     ) -> Result<(), Error> {
-        self.table
-            .with_live(to, |process| self.deliver_live_node(process, signal, local))
-            .ok_or(Error::NoProcess)?
+        // A scheduler worker already participates in thread progress, so its send mirrors
+        // erts_proc_lookup_raw without adding an unmanaged delay point per message.
+        let delivered = if let Some(local) = local {
+            self.table.with_live_managed(to, |process| {
+                self.deliver_live_node(process, signal, Some(local))
+            })
+        } else {
+            self.table
+                .with_live(to, |process| self.deliver_live_node(process, signal, None))
+        };
+        delivered.ok_or(Error::NoProcess)?
     }
 
     fn deliver_live(
@@ -3861,10 +3870,11 @@ impl<T: Task> Inner<T> {
         // No state load first: the closed in-queue rejects the signal, and the read-modify-write
         // that sets the in-queue bits returns the state word the wake decision works from.
         let from = signal.from;
-        let Ok(state) = process
-            .input
-            .push_routed_node(|| signal_buffer_slot(from), signal)
-        else {
+        let Ok(state) = process.input.push_routed_node(
+            &self.progress_domain,
+            || signal_buffer_slot(from),
+            signal,
+        ) else {
             return Err(Error::NoProcess);
         };
         if wake {
@@ -3889,7 +3899,9 @@ impl<T: Task> Inner<T> {
         self.fanin_delivery(process, count);
         if process
             .input
-            .push_block_routed(events, |event| signal_buffer_slot(event.from))
+            .push_block_routed(&self.progress_domain, events, |event| {
+                signal_buffer_slot(event.from)
+            })
             .is_err()
         {
             process
@@ -4229,12 +4241,12 @@ impl<T: Task> Inner<T> {
                 let payload = if wrapped {
                     Payload::Timer {
                         reference: TimerId(id),
-                        message,
+                        message: Box::new(message),
                     }
                 } else {
                     Payload::TimerMessage {
                         reference: TimerId(id),
-                        message,
+                        message: Box::new(message),
                     }
                 };
                 let _ = self.deliver(pid, pid, payload, local);
@@ -4254,12 +4266,12 @@ impl<T: Task> Inner<T> {
                     let payload = if wrapped {
                         Payload::Timer {
                             reference: TimerId(id),
-                            message,
+                            message: Box::new(message),
                         }
                     } else {
                         Payload::TimerMessage {
                             reference: TimerId(id),
-                            message,
+                            message: Box::new(message),
                         }
                     };
                     let _ = self.deliver(pid, pid, payload, local);
@@ -4916,6 +4928,7 @@ trait ContextOps<M: SignalMessage> {
     fn deliver_node(&mut self, to: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error>;
     fn flush(&mut self);
     fn thread_progress_later(&self, op: LaterOp);
+    fn progress_domain(&self) -> &Progress;
     fn block_thread_progress(&self, duration: Duration);
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<M>>;
     fn total_reductions(&self) -> u64;
@@ -5080,7 +5093,8 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Force installation of parallel sender buffers for runtime regression tests.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10700-10718, OTP-29.1.1.
     pub fn force_parallel_signal_buffers(&mut self) -> bool {
-        self.input.force_buffers_enabled();
+        self.input
+            .force_buffers_enabled(self.inner.progress_domain());
         true
     }
     /// Whether this context acts for a process executing on a dirty scheduler, on
@@ -5316,7 +5330,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn send_self_node(&mut self, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
         let pid = self.pid;
         self.input
-            .push_routed_node(|| signal_buffer_slot(pid), signal)
+            .push_routed_node(
+                self.inner.progress_domain(),
+                || signal_buffer_slot(pid),
+                signal,
+            )
             .map_err(|_| Error::NoProcess)?;
         self.backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -5557,7 +5575,7 @@ impl<T: Task> Runner<'_, T> {
             from,
             payload: Payload::Signal(Signal::Monitor {
                 reference: id,
-                shared,
+                shared: Box::new(shared),
             }),
         };
         let Event { from, payload } = event;
@@ -5626,6 +5644,9 @@ impl<T: Task> Runner<'_, T> {
 }
 
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
+    fn progress_domain(&self) -> &Progress {
+        &self.inner.progress_domain
+    }
     fn thread_progress_later(&self, op: LaterOp) {
         thr_progress::schedule_later_op(&self.inner.progress, op);
     }
@@ -5844,7 +5865,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 from,
                 to,
                 id: *reference,
-                shared: shared.clone(),
+                shared: (**shared).clone(),
             };
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
@@ -5859,7 +5880,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 held.from,
                 Signal::Monitor {
                     reference: held.id,
-                    shared: held.shared,
+                    shared: Box::new(held.shared),
                 },
             )
         });
@@ -5885,7 +5906,11 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                     if let Some(first) = deferred {
                         // The held monitor and this signal enter the queue together.
                         let second = signal;
-                        let (first, second) = match process.input.push_pair(first, second) {
+                        let (first, second) = match process.input.push_pair(
+                            &self.inner.progress_domain,
+                            first,
+                            second,
+                        ) {
                             Ok(()) => {
                                 self.inner.fanin_delivery(process, 2);
                                 process.input.backlog.fetch_add(2, Ordering::Relaxed);
@@ -5962,7 +5987,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<T::Message>> {
         let process = self.lookup(pid)?;
-        Some(SignalProbe::of(&process))
+        Some(SignalProbe::of(
+            &process,
+            self.inner.progress_domain.clone(),
+        ))
     }
     fn total_reductions(&self) -> u64 {
         if self.inner.sim.is_some() {
@@ -6191,6 +6219,7 @@ impl<T: Task> Scheduler<T> {
         } else {
             thr_progress::ThrProgress::new(Arc::clone(&parked), Arc::clone(&sleepers))
         });
+        thr_progress::install_sspa_progress(Arc::clone(&progress));
         let balance = Arc::new(balance::Balance::new(workers, workers, config.compact_load));
         let now = clock.now_ms();
         let timer_commands: Vec<_> = (0..workers).map(|_| Arc::new(SegQueue::new())).collect();
@@ -6296,6 +6325,7 @@ impl<T: Task> Scheduler<T> {
             fanin_stats: std::env::var_os("ARINSAL_FANIN_STATS").is_some(),
             fanin_delivered: AtomicU64::new(0),
             fanin_peak_backlog: AtomicUsize::new(0),
+            progress_domain: Progress(Arc::clone(&progress)),
             progress,
             dirty: [
                 DirtyPool::new(dirty_cpu, 0),
@@ -7158,6 +7188,14 @@ impl<T: Task> Scheduler<T> {
             invocation_interval,
             active: true,
         }
+    }
+
+    /// Bytes of the process table: the slot array and the free identifier ring.
+    // Port of erts/emulator/beam/erl_ptab.c:349 (erts_ptab_mem_size), OTP-29.1.1.
+    pub fn process_table_bytes(&self) -> u64 {
+        let table = &self.inner.table;
+        (table.ids.process_slot_count() as usize * std::mem::size_of::<AtomicPtr<()>>()
+            + table.ids.free_id_bytes()) as u64
     }
 
     /// Process-table size (`erlang:system_info(process_limit)`).

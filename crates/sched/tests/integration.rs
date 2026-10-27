@@ -518,14 +518,8 @@ fn timer_envelope_and_wait_timeout_cancellation() {
             while let Some(event) = ctx.receive() {
                 let kind = match event.payload {
                     Payload::Message(()) => "plain",
-                    Payload::Timer {
-                        reference,
-                        message: (),
-                    } if reference.id() > 0 => "timer",
-                    Payload::TimerMessage {
-                        reference,
-                        message: (),
-                    } if reference.id() > 0 => "plain",
+                    Payload::Timer { reference, .. } if reference.id() > 0 => "timer",
+                    Payload::TimerMessage { reference, .. } if reference.id() > 0 => "plain",
                     _ => panic!("unexpected event"),
                 };
                 self.received.lock().unwrap().push(kind);

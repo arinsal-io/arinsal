@@ -7119,23 +7119,23 @@ mod stored_size_tests {
     #[test]
     fn dbterm_layout_matches_erts_word_sizes() {
         use std::mem::size_of;
-        assert_eq!(size_of::<StoredTerm>(), 16);
-        assert_eq!(size_of::<HashPrefix>(), 16);
-        assert_eq!(size_of::<TreePrefix>(), 24);
-        assert_eq!(size_of::<dbterm::Node<HashPrefix>>(), 32);
-        assert_eq!(size_of::<dbterm::Node<TreePrefix>>(), 40);
-        assert_eq!(size_of::<Option<HashDbTerm>>(), 8);
-        assert_eq!(size_of::<Option<TreeDbTerm>>(), 8);
+        similar_asserts::assert_eq!(size_of::<StoredTerm>(), 16);
+        similar_asserts::assert_eq!(size_of::<HashPrefix>(), 16);
+        similar_asserts::assert_eq!(size_of::<TreePrefix>(), 24);
+        similar_asserts::assert_eq!(size_of::<dbterm::Node<HashPrefix>>(), 32);
+        similar_asserts::assert_eq!(size_of::<dbterm::Node<TreePrefix>>(), 40);
+        similar_asserts::assert_eq!(size_of::<Option<HashDbTerm>>(), 8);
+        similar_asserts::assert_eq!(size_of::<Option<TreeDbTerm>>(), 8);
 
         let mut prefix = <HashPrefix as dbterm::Prefix>::empty();
-        assert_eq!(prefix.hvalue(), 0);
+        similar_asserts::assert_eq!(prefix.hvalue(), 0);
         assert!(!prefix.pseudo_deleted());
         prefix.set_hvalue((1u64 << 63) - 1);
         prefix.set_pseudo_deleted(true);
-        assert_eq!(prefix.hvalue(), (1u64 << 63) - 1);
+        similar_asserts::assert_eq!(prefix.hvalue(), (1u64 << 63) - 1);
         assert!(prefix.pseudo_deleted());
         prefix.set_pseudo_deleted(false);
-        assert_eq!(prefix.hvalue(), (1u64 << 63) - 1);
+        similar_asserts::assert_eq!(prefix.hvalue(), (1u64 << 63) - 1);
         assert!(!prefix.pseudo_deleted());
 
         let mut heap = VecHeap::new();
@@ -7145,11 +7145,11 @@ mod stored_size_tests {
         let before = arinsal_alloc::typed::ets_allocation_bytes();
         let hash_row = StoredTerm::copy_for_table::<HashPrefix>(pair, false, 1, 2).unwrap();
         let after_hash = arinsal_alloc::typed::ets_allocation_bytes();
-        assert_eq!(after_hash - before, 72);
+        similar_asserts::assert_eq!(after_hash - before, 64);
         let tree_row = StoredTerm::copy_for_table::<TreePrefix>(pair, false, 1, 3).unwrap();
         let after_tree = arinsal_alloc::typed::ets_allocation_bytes();
-        assert_eq!(after_tree - after_hash, 80);
+        similar_asserts::assert_eq!(after_tree - after_hash, 72);
         drop((hash_row, tree_row));
-        assert_eq!(arinsal_alloc::typed::ets_allocation_bytes(), before);
+        similar_asserts::assert_eq!(arinsal_alloc::typed::ets_allocation_bytes(), before);
     }
 }
