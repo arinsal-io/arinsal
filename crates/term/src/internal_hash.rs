@@ -1,5 +1,6 @@
 //! OTP's unsalted 64-bit HAMT hash. External node and export pointers are VM-local.
 use crate::{FLOAT, NEG_BIG, POS_BIG, Term, TermKind};
+use smallvec::SmallVec;
 
 const C1: u64 = 0x87c3_7b91_1142_53d5;
 const C2: u64 = 0x4cf5_ad43_2745_937f;
@@ -43,13 +44,15 @@ impl State {
             .wrapping_add(0x3849_5ab5);
         self.ticks += 1;
     }
-    fn push(&mut self, term: Term, jobs: &mut Jobs) {
+    // Port of IHASH_PUSH_TERM in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    #[inline(always)]
+    fn push_term(&mut self, term: Term, stack: &mut SmallVec<[u64; 16]>) {
         if term.bits() & 3 == 3 {
             self.alpha(1);
             self.beta(term.bits());
         } else {
             self.alpha(2);
-            jobs.push(Job::Visit(term));
+            stack.push(term.bits());
         }
     }
     fn finish(mut self) -> u64 {
@@ -64,45 +67,10 @@ impl State {
         self.alpha ^ self.beta
     }
 }
-#[derive(Clone, Copy)]
-enum Job {
-    Visit(Term),
-    CdrMarker,
-}
-
-/// Work stack that starts in a local array and spills to the heap only when it grows.
-// Port of erts/emulator/beam/global.h (DECLARE_ESTACK, DEF_ESTACK_SIZE), OTP-29.1.1.
-struct Jobs {
-    local: [Job; 16],
-    len: usize,
-    overflow: Vec<Job>,
-}
-impl Jobs {
-    fn new(first: Job) -> Self {
-        Self {
-            local: [first; 16],
-            len: 1,
-            overflow: Vec::new(),
-        }
-    }
-    #[inline]
-    fn push(&mut self, job: Job) {
-        if self.overflow.is_empty() && self.len < self.local.len() {
-            self.local[self.len] = job;
-            self.len += 1;
-        } else {
-            self.overflow.push(job);
-        }
-    }
-    #[inline]
-    fn pop(&mut self) -> Option<Job> {
-        if let Some(job) = self.overflow.pop() {
-            return Some(job);
-        }
-        self.len = self.len.checked_sub(1)?;
-        Some(self.local[self.len])
-    }
-}
+// Port of IHASH_CAR_MARKER / IHASH_CDR_MARKER in
+// erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1. These tagged header words are not terms.
+const IHASH_CAR_MARKER: u64 = (1 << 6) | 0x10;
+const IHASH_CDR_MARKER: u64 = (2 << 6) | 0x10;
 /// OTP `erts_internal_hash` for terms on this VM's heap.
 /// Port of `erts/emulator/beam/erl_term_hashing.c:1770` (`make_internal_hash`), OTP-29.1.1.
 #[inline(always)]
@@ -121,6 +89,8 @@ pub fn immediate_internal_hash(word: u64) -> u64 {
     mix64(word)
 }
 /// OTP internal hash with an explicit salt. OTP's ordinary internal hash uses zero.
+// Port of make_internal_hash and erts_internal_salted_hash in
+// erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
 pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
     if term.bits() & 3 == 3 {
         return mix64(term.bits().wrapping_add(salt));
@@ -130,27 +100,31 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
         beta: salt,
         ticks: 0,
     };
-    let mut jobs = Jobs::new(Job::Visit(term));
-    while let Some(job) = jobs.pop() {
-        match job {
-            Job::CdrMarker => state.beta(4),
-            Job::Visit(mut term) => match term.classify() {
-                TermKind::Nil | TermKind::Atom | TermKind::Catch => {
-                    state.alpha(1);
-                    state.beta(term.bits());
-                }
-                TermKind::Number if term.as_small().is_some() => {
-                    state.alpha(1);
-                    state.beta(term.bits());
-                }
-                TermKind::Pid if term.as_pid().is_some() => {
-                    state.alpha(1);
-                    state.beta(term.bits());
-                }
-                TermKind::Port if term.as_port().is_some() => {
-                    state.alpha(1);
-                    state.beta(term.bits());
-                }
+    let mut stack: SmallVec<[u64; 16]> = SmallVec::new();
+    let mut term = term;
+
+    // Port of make_internal_hash's DECLARE_ESTACK loop and pop_next label in
+    // erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1. Each stack entry is one Eterm word.
+    loop {
+        match term.bits() {
+            IHASH_CAR_MARKER => {
+                state.beta(3);
+                term = Term(stack.pop().expect("CAR marker has a pending term"));
+                continue;
+            }
+            IHASH_CDR_MARKER => {
+                state.beta(4);
+                term = Term(stack.pop().expect("CDR marker has a pending term"));
+                continue;
+            }
+            _ => {}
+        }
+
+        if term.bits() & 3 == 3 {
+            state.alpha(1);
+            state.beta(term.bits());
+        } else {
+            match term.classify() {
                 TermKind::List => {
                     let mut value = 0_u64;
                     let mut bytes = 0_u64;
@@ -180,18 +154,17 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                             if tail.classify() != TermKind::List {
                                 state.alpha(4);
                             }
-                            jobs.push(Job::Visit(tail));
+                            term = tail;
                         } else {
-                            jobs.push(Job::Visit(tail));
+                            stack.push(tail.bits());
                             if tail.classify() != TermKind::List {
-                                jobs.push(Job::CdrMarker);
+                                stack.push(IHASH_CDR_MARKER);
                             }
                             state.alpha(3);
-                            jobs.push(Job::Visit(head));
+                            term = head;
                         }
-                    } else if term.classify() != TermKind::List {
-                        jobs.push(Job::Visit(term));
                     }
+                    continue;
                 }
                 TermKind::Tuple => {
                     // SAFETY: tuple remains live throughout hashing.
@@ -200,18 +173,10 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                     state.beta(tuple.len() as u64);
                     if !tuple.is_empty() {
                         for i in 0..tuple.len() - 1 {
-                            state.push(tuple.get(i).unwrap(), &mut jobs);
+                            state.push_term(tuple.get(i).unwrap(), &mut stack);
                         }
-                        // erts walks the last element next (make_internal_hash, `term =
-                        // elements[arity]; continue`). An immediate is mixed here, which is the
-                        // step the stack pop would take next, so the stack is only for boxed terms.
-                        let last = tuple.get(tuple.len() - 1).unwrap();
-                        if last.bits() & 3 == 3 {
-                            state.alpha(1);
-                            state.beta(last.bits());
-                        } else {
-                            jobs.push(Job::Visit(last));
-                        }
+                        term = tuple.get(tuple.len() - 1).unwrap();
+                        continue;
                     }
                 }
                 TermKind::Record => {
@@ -219,15 +184,16 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                     let record = unsafe { term.record_ref().unwrap() };
                     state.alpha(7);
                     state.beta((record.len() + 1) as u64);
-                    state.push(
+                    state.push_term(
                         Term::small(record.definition_hash() as i64).unwrap(),
-                        &mut jobs,
+                        &mut stack,
                     );
                     if !record.is_empty() {
                         for i in 0..record.len() - 1 {
-                            state.push(record.value(i).unwrap(), &mut jobs);
+                            state.push_term(record.value(i).unwrap(), &mut stack);
                         }
-                        jobs.push(Job::Visit(record.value(record.len() - 1).unwrap()));
+                        term = record.value(record.len() - 1).unwrap();
+                        continue;
                     }
                 }
                 TermKind::Map if !term.is_hashmap() => {
@@ -236,19 +202,21 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                     state.alpha(8);
                     state.beta(map.len() as u64);
                     if !map.is_empty() {
-                        for i in 0..map.len() - 1 {
-                            let (key, val) = map.iter().nth(i).unwrap();
-                            state.push(val, &mut jobs);
-                            state.push(key, &mut jobs);
+                        let mut entries = map.iter();
+                        for _ in 0..map.len() - 1 {
+                            let (key, value) = entries.next().unwrap();
+                            state.push_term(value, &mut stack);
+                            state.push_term(key, &mut stack);
                         }
-                        let (key, val) = map.iter().last().unwrap();
-                        state.push(val, &mut jobs);
-                        jobs.push(Job::Visit(key));
+                        let (key, value) = entries.next().unwrap();
+                        state.push_term(value, &mut stack);
+                        term = key;
+                        continue;
                     }
                 }
                 TermKind::Map => {
-                    // Port of erts/emulator/beam/erl_term_hashing.c:1899-1979
-                    // (make_internal_hash map branch), OTP-29.1.1.
+                    // Port of the map branch in make_internal_hash,
+                    // erts/emulator/beam/erl_term_hashing.c:1899-1979, OTP-29.1.1.
                     let header = term.header().unwrap();
                     let kind = (header >> 6) & 3;
                     if kind == 2 || kind == 3 {
@@ -267,10 +235,10 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                         if child.classify() == TermKind::List {
                             // SAFETY: a HAMT leaf is a two-word cons cell.
                             let (key, value) = unsafe { child.cons_ref().unwrap() };
-                            state.push(value, &mut jobs);
-                            state.push(key, &mut jobs);
+                            state.push_term(value, &mut stack);
+                            state.push_term(key, &mut stack);
                         } else {
-                            jobs.push(Job::Visit(child));
+                            stack.push(child.bits());
                         }
                     }
                 }
@@ -284,9 +252,10 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                             state.beta(Term::atom(entry.module).bits());
                             if !free_vars.is_empty() {
                                 for value in &free_vars[..free_vars.len() - 1] {
-                                    state.push(Term(*value), &mut jobs);
+                                    state.push_term(Term(*value), &mut stack);
                                 }
-                                jobs.push(Job::Visit(Term(free_vars[free_vars.len() - 1])));
+                                term = Term(free_vars[free_vars.len() - 1]);
+                                continue;
                             }
                         }
                         crate::FunRef::Export { .. } => {
@@ -415,9 +384,16 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                         state.alpha(id);
                     }
                 }
+                TermKind::Nil | TermKind::Atom | TermKind::Catch => {
+                    unreachable!("immediate terms are handled before classification")
+                }
                 other => panic!("unsupported term kind in internal_hash: {other:?}"),
-            },
+            }
+        }
+
+        match stack.pop() {
+            Some(word) => term = Term(word),
+            None => return state.finish(),
         }
     }
-    state.finish()
 }

@@ -9,6 +9,41 @@ use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::ops::{Index, IndexMut};
 
+const SIZE_WSTACK_INLINE: usize = 16;
+
+// Port of DECLARE_WSTACK / WSTACK_PUSH / WSTACK_POP in erts global.h, OTP-29.1.1.
+struct SizeWStack {
+    inline: arrayvec::ArrayVec<u64, SIZE_WSTACK_INLINE>,
+    spill: Vec<u64>,
+}
+
+impl SizeWStack {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: arrayvec::ArrayVec::new(),
+            spill: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, word: u64) {
+        if self.inline.len() < SIZE_WSTACK_INLINE && self.spill.is_empty() {
+            self.inline.push(word);
+        } else {
+            if self.spill.capacity() == 0 {
+                self.spill.reserve(256);
+            }
+            self.spill.push(word);
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<u64> {
+        self.spill.pop().or_else(|| self.inline.pop())
+    }
+}
+
 // erts' WSTACK and PSTACK use an uninitialised inline array and allocate only
 // after it fills. ArrayVec provides the same initialized-prefix representation safely.
 struct WorkStack<T, const N: usize> {
@@ -504,7 +539,7 @@ pub fn size_object_litopt(root: Term, literals: &crate::LiteralAreas) -> usize {
 /// Port of erts/emulator/beam/copy.c:88 (`size_object_x`), OTP-29.1.1.
 pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>) -> usize {
     // `DECLARE_ESTACK` starts at DEF_ESTACK_SIZE (global.h:322).
-    let mut stack: SmallVec<[Term; 16]> = SmallVec::new();
+    let mut stack = SizeWStack::new();
     let mut sum = 0usize;
     // SAFETY: `obj` and every child pushed below are live terms owned by the caller.
     // Each raw read is the word `size_object_x` reads for that primary tag or header.
@@ -523,7 +558,7 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
                     sum += 2;
                     let head = Term(*ptr);
                     if !head.is_immed() {
-                        stack.push(head);
+                        stack.push(head.0);
                     }
                     obj = Term(*ptr.add(1));
                 }
@@ -552,7 +587,7 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
                             for i in 1..arity {
                                 let child = Term(*ptr.add(i));
                                 if !child.is_immed() {
-                                    stack.push(child);
+                                    stack.push(child.0);
                                 }
                             }
                             obj = Term(*ptr.add(arity));
@@ -571,7 +606,7 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
                             for i in 1..nfree {
                                 let env = Term(*ptr.add(2 + i));
                                 if !env.is_immed() {
-                                    stack.push(env);
+                                    stack.push(env.0);
                                 }
                             }
                             obj = Term(*ptr.add(2));
@@ -585,7 +620,7 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
                                     let term = Term(*child);
                                     child = child.add(1);
                                     if !term.is_immed() {
-                                        stack.push(term);
+                                        stack.push(term.0);
                                     }
                                 }
                                 pop_size(&mut stack, &mut obj);
@@ -614,7 +649,7 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
                                     left -= 1;
                                     let term = Term(*head.add(left));
                                     if !term.is_immed() {
-                                        stack.push(term);
+                                        stack.push(term.0);
                                     }
                                 }
                                 obj = Term(*head);
@@ -673,9 +708,9 @@ fn lit_kept(litopt: Option<&crate::LiteralAreas>, ptr: *const u64) -> bool {
 }
 
 #[inline]
-fn pop_size(stack: &mut SmallVec<[Term; 16]>, obj: &mut Term) {
+fn pop_size(stack: &mut SizeWStack, obj: &mut Term) {
     match stack.pop() {
-        Some(next) => *obj = next,
+        Some(next) => *obj = Term(next),
         None => *obj = Term(u64::MAX),
     }
 }

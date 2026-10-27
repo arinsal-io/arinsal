@@ -326,7 +326,14 @@ impl CATree {
             }
             let put = root.put_term(term, key, self.keypos, compressed, new_only);
             self.version.fetch_add(1, AtomicOrdering::Release);
-            let (result, new_words) = put?;
+            let (result, new_words) = match put {
+                Ok(result) => result,
+                Err(error) => {
+                    let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
+                    self.adapt_locked(base, root, stat);
+                    return Err(error);
+                }
+            };
             let inserted = match result {
                 crate::tree::InsertResult::Inserted => {
                     self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
@@ -344,8 +351,7 @@ impl CATree {
                 crate::tree::InsertResult::Exists => false,
             };
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
-            drop(root);
-            self.adapt(base, stat);
+            self.adapt_locked(base, root, stat);
             return Ok(inserted);
         }
     }
@@ -1009,6 +1015,155 @@ impl CATree {
         } else if stat < LOW_CONTENTION_LIMIT {
             self.join(base, JoinCause::LowStatistic);
         }
+    }
+
+    /// Port of erts/emulator/beam/erl_db_catree.c (wunlock_adapt_base_node), OTP-29.1.1.
+    /// The caller transfers its base-node write guard so split/join keep it through publication.
+    fn adapt_locked(&self, base: &Arc<BaseNode>, root: RwMtxWriteGuard<'_, TreeRoot>, _stat: i64) {
+        if self.force_split.load(AtomicOrdering::Relaxed) {
+            base.lock_statistics
+                .store(i64::MAX, AtomicOrdering::Relaxed);
+        }
+        let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
+        if (LOW_CONTENTION_LIMIT..=HIGH_CONTENTION_LIMIT).contains(&stat) {
+            drop(root);
+            return;
+        }
+        let _adaptation = self.adaptation.lock().expect("CA-tree adaptation poisoned");
+        let routes = self.routes.load_full();
+        let Some(index) = routes
+            .iter()
+            .position(|route| Arc::ptr_eq(&route.base, base))
+        else {
+            drop(root);
+            return;
+        };
+        if stat < LOW_CONTENTION_LIMIT && routes.len() == 1 && index == 0 {
+            base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+            drop(root);
+            return;
+        }
+        if stat > HIGH_CONTENTION_LIMIT {
+            self.split_locked(base, index, routes, root);
+        } else {
+            self.join_locked(base, index, routes, root, JoinCause::LowStatistic);
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_db_catree.c (split_catree), OTP-29.1.1.
+    fn split_locked(
+        &self,
+        base: &Arc<BaseNode>,
+        index: usize,
+        routes: Arc<RouteSnapshot>,
+        mut root: RwMtxWriteGuard<'_, TreeRoot>,
+    ) {
+        if !base.is_valid.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        if routes.len().next_power_of_two().trailing_zeros() as usize >= MAX_ROUTE_NODE_LAYER_HEIGHT
+        {
+            return;
+        }
+        if root.count() < 2 {
+            base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+            return;
+        }
+        base.is_valid.store(false, AtomicOrdering::Release);
+        let (left_root, right_root, first_right_key) =
+            std::mem::take(&mut *root).split_for_catree(self.keypos);
+        let first_key = Some(Arc::new(
+            key_object(first_right_key).expect("copying a route key succeeds"),
+        ));
+        base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+        let left_base = BaseNode::new(left_root, self.frequent_read);
+        let right_base = BaseNode::new(right_root, self.frequent_read);
+        let mut updated = routes.entries.clone();
+        updated[index] = RouteEntry {
+            first_key: routes[index].first_key.clone(),
+            base: left_base,
+        };
+        updated.insert(
+            index + 1,
+            RouteEntry {
+                first_key,
+                base: right_base,
+            },
+        );
+        self.routes.store(Arc::new(RouteSnapshot::new(updated)));
+        self.split_count.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Port of erts/emulator/beam/erl_db_catree.c (join_catree), OTP-29.1.1.
+    fn join_locked(
+        &self,
+        base: &Arc<BaseNode>,
+        index: usize,
+        routes: Arc<RouteSnapshot>,
+        mut root: RwMtxWriteGuard<'_, TreeRoot>,
+        cause: JoinCause,
+    ) {
+        if routes.len() < 2 {
+            base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+            return;
+        }
+        let right_index = if index == 0 { 1 } else { index };
+        let left_index = right_index - 1;
+        let left = Arc::clone(&routes[left_index].base);
+        let right = Arc::clone(&routes[right_index].base);
+        let neighbor_root;
+        let (left_tree, right_tree) = if Arc::ptr_eq(base, &left) {
+            let Some(mut neighbor) = right.root.try_write() else {
+                base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+                return;
+            };
+            if !left.is_valid.load(AtomicOrdering::Acquire)
+                || !right.is_valid.load(AtomicOrdering::Acquire)
+            {
+                base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+                return;
+            }
+            left.is_valid.store(false, AtomicOrdering::Release);
+            right.is_valid.store(false, AtomicOrdering::Release);
+            let trees = (std::mem::take(&mut *root), std::mem::take(&mut *neighbor));
+            neighbor_root = Some(neighbor);
+            trees
+        } else {
+            let Some(mut neighbor) = left.root.try_write() else {
+                base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+                return;
+            };
+            if !left.is_valid.load(AtomicOrdering::Acquire)
+                || !right.is_valid.load(AtomicOrdering::Acquire)
+            {
+                base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+                return;
+            }
+            left.is_valid.store(false, AtomicOrdering::Release);
+            right.is_valid.store(false, AtomicOrdering::Release);
+            let trees = (std::mem::take(&mut *neighbor), std::mem::take(&mut *root));
+            neighbor_root = Some(neighbor);
+            trees
+        };
+        let merged_root = TreeRoot::join_ordered(left_tree, right_tree);
+        let joined = BaseNode::new(merged_root, self.frequent_read);
+        let mut updated = routes.entries.clone();
+        updated[left_index].base = Arc::clone(&joined);
+        updated.remove(right_index);
+        self.routes.store(Arc::new(RouteSnapshot::new(updated)));
+        self.join_count.fetch_add(1, AtomicOrdering::Relaxed);
+        match cause {
+            JoinCause::LowStatistic => {
+                self.low_stat_join_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            JoinCause::RandomGravity => {
+                self.gravity_join_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        drop(root);
+        drop(neighbor_root);
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (split_catree), OTP-29.1.1.

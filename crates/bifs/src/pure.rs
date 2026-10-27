@@ -723,14 +723,53 @@ pub enum Phash2Run {
 /// yields; the common call hashes on the stack and returns a small.
 // Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`, OTP-29.1.1.
 pub fn phash2_run(args: &[Term], fcalls: i32) -> Result<Phash2Run, BifError> {
-    let range = match args.get(1) {
-        Some(range) => Some(phash2_range_arg(*range)?),
-        None => None,
-    };
+    match args.get(1) {
+        Some(range) => phash2_run_2(args[0], *range, fcalls),
+        None => phash2_run_1(args[0], fcalls),
+    }
+}
+
+/// Run the `phash2/1` BIF after its direct entry checked the immediate cases.
+// Port of erts/emulator/beam/bif.c:5350-5360 (`phash2_1`), OTP-29.1.1.
+#[inline(always)]
+pub fn phash2_run_1_after_immediate_check(term: Term, fcalls: i32) -> Result<Phash2Run, BifError> {
+    let run = arinsal_term::Hash2Run::new_after_immediate_check(term);
+    phash2_run_initialized(run, None, fcalls, true)
+}
+
+/// Run the `phash2/1` BIF, including its immediate cases.
+// Port of erts/emulator/beam/bif.c:5350-5360 (`phash2_1`), OTP-29.1.1.
+pub fn phash2_run_1(term: Term, fcalls: i32) -> Result<Phash2Run, BifError> {
+    phash2_run_initialized(arinsal_term::Hash2Run::new(term), None, fcalls, false)
+}
+
+/// Run the `phash2/2` BIF after validating its range argument.
+// Port of erts/emulator/beam/bif.c:5362-5389 (`phash2_2`), OTP-29.1.1.
+pub fn phash2_run_2(term: Term, range_term: Term, fcalls: i32) -> Result<Phash2Run, BifError> {
+    let range = phash2_range_arg(range_term)?;
+    phash2_run_initialized(
+        arinsal_term::Hash2Run::new(term),
+        Some(range),
+        fcalls,
+        false,
+    )
+}
+
+#[inline(always)]
+fn phash2_run_initialized(
+    mut run: arinsal_term::Hash2Run,
+    range: Option<u64>,
+    fcalls: i32,
+    immediate_checked: bool,
+) -> Result<Phash2Run, BifError> {
     let iterations =
         i64::from(fcalls.max(0)).saturating_mul(arinsal_term::HASH2_ITERATIONS_PER_RED);
-    let mut run = arinsal_term::Hash2Run::new(args[0]);
-    Ok(match run.run(Some(iterations)) {
+    let progress = if immediate_checked {
+        run.run_after_immediate_check(Some(iterations))
+    } else {
+        run.run(Some(iterations))
+    };
+    Ok(match progress {
         arinsal_term::Hash2Progress::Done { hash, used } => {
             let value = match range {
                 None => u64::from(hash & ((1 << 27) - 1)),
@@ -759,6 +798,40 @@ pub fn phash2_range_arg(term: Term) -> Result<u64, BifError> {
     Ok(range)
 }
 
+/// Return `phash2/1` immediately for the atom and small-integer cases.
+// Port of erts/emulator/beam/erl_term_hashing.c:974-980 (`make_hash2_helper`) and
+// erts/emulator/beam/bif.c:5350-5360 (`phash2_1`), OTP-29.1.1.
+#[inline(always)]
+pub fn phash2_immediate_1(term: Term) -> Option<Term> {
+    let hash = arinsal_term::hash2_immediate(term)?;
+    Some(Term::small(i64::from(hash & ((1 << 27) - 1))).expect("27-bit phash2 is a small"))
+}
+
+/// Return `phash2` immediately for the atom and small-integer cases.
+// Port of erts/emulator/beam/erl_term_hashing.c:974-980 (`make_hash2_helper`) and
+// erts/emulator/beam/bif.c:5350-5389 (`phash2_1`, `phash2_2`), OTP-29.1.1.
+#[inline(always)]
+pub fn phash2_immediate_result(args: &[Term]) -> Result<Option<Term>, BifError> {
+    let range = match args.get(1) {
+        Some(range) => Some(phash2_range_arg(*range)?),
+        None => None,
+    };
+    let Some(hash) = args
+        .first()
+        .and_then(|term| arinsal_term::hash2_immediate(*term))
+    else {
+        return Ok(None);
+    };
+    let value = match range {
+        None => u64::from(hash & ((1 << 27) - 1)),
+        Some(range) if range == 1_u64 << 32 => u64::from(hash),
+        Some(range) => u64::from(hash % range as u32),
+    };
+    Ok(Some(
+        Term::small(value as i64).ok_or(BifError::SystemLimit)?,
+    ))
+}
+
 /// Start `phash2/1` or `phash2/2`.
 pub fn phash2_start(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Phash2Step, BifError> {
     let range = if args.len() == 2 {
@@ -779,17 +852,8 @@ pub fn phash2_start(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Phash2Step, BifE
 fn phash2_bif_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`: a term
     // that hashes without a work stack never builds the resumable state.
-    let range = match args.get(1) {
-        Some(range) => Some(phash2_range_arg(*range)?),
-        None => None,
-    };
-    if let Some(hash) = arinsal_term::hash2_immediate(args[0]) {
-        let value = match range {
-            None => u64::from(hash & ((1 << 27) - 1)),
-            Some(range) if range == 1_u64 << 32 => u64::from(hash),
-            Some(range) => u64::from(hash % range as u32),
-        };
-        return integer(ctx, value as usize);
+    if let Some(value) = phash2_immediate_result(args)? {
+        return Ok(value);
     }
     match phash2_start(ctx, args)? {
         Phash2Step::Done(value) => Ok(value),
