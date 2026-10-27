@@ -70,15 +70,19 @@ enum Job {
     ListRun {
         tail: Term,
         packed: u32,
-        count: u32,
+        count: u8,
     },
-    /// A binary hashed in several slices: the bytes done and the block hash state.
-    Binary {
-        term: Term,
-        processed: usize,
-        state: (u32, u32, u32),
-        buffer: Option<Vec<u8>>,
-    },
+    /// A binary hashed in several slices: the bytes done and the block hash state. Boxed so a
+    /// work-stack entry stays two words (erts pushes only words on its `ESTACK`).
+    Binary(Box<BinaryJob>),
+}
+
+/// The saved state of a binary hashed in several slices.
+struct BinaryJob {
+    term: Term,
+    processed: usize,
+    state: (u32, u32, u32),
+    buffer: Option<Vec<u8>>,
 }
 
 /// Bytes of a binary hashed per iteration.
@@ -143,6 +147,7 @@ pub fn hash2_immediate(term: Term) -> Option<u32> {
     simple_hash(term)
 }
 
+#[inline]
 fn simple_hash(term: Term) -> Option<u32> {
     if let Some(n) = term.as_small() {
         return Some(small_hash(n));
@@ -241,6 +246,7 @@ fn block_hash_final_bytes(state: (u32, u32, u32), remaining: &[u8], full_length:
 
 impl Hash2Run {
     /// Start hashing `term`.
+    #[inline]
     pub fn new(term: Term) -> Self {
         let simple = simple_hash(term);
         let mut stack: smallvec::SmallVec<[Job; 16]> = smallvec::SmallVec::new();
@@ -264,7 +270,10 @@ impl Hash2Run {
         let can_trap = iterations.is_some();
         let max_iterations = iterations.unwrap_or(0);
         let mut left = max_iterations;
-        let hash = &mut self.hash;
+        // The running hash lives in a register: helpers take and return it by value, so its
+        // address never escapes this loop.
+        let mut running = self.hash;
+        let hash = &mut running;
         let stack = &mut self.stack;
         let xors = &mut self.xors;
         while let Some(job) = stack.pop() {
@@ -291,17 +300,21 @@ impl Hash2Run {
                     packed,
                     count,
                 } => {
-                    if Self::list(hash, stack, tail, packed, count, &mut left, can_trap) {
-                        return Hash2Progress::Yield;
+                    if Self::list_by_value(hash, stack, tail, packed, count, &mut left, can_trap) {
+                        {
+                            self.hash = *hash;
+                            return Hash2Progress::Yield;
+                        }
                     }
                 }
-                Job::Binary {
-                    term,
-                    processed,
-                    state,
-                    buffer,
-                } => {
-                    if Self::binary(
+                Job::Binary(job) => {
+                    let BinaryJob {
+                        term,
+                        processed,
+                        state,
+                        buffer,
+                    } = *job;
+                    if Self::binary_by_value(
                         hash,
                         stack,
                         term,
@@ -309,7 +322,10 @@ impl Hash2Run {
                         &mut left,
                         can_trap,
                     ) {
-                        return Hash2Progress::Yield;
+                        {
+                            self.hash = *hash;
+                            return Hash2Progress::Yield;
+                        }
                     }
                 }
                 Job::Visit(term) => match term.classify() {
@@ -420,19 +436,25 @@ impl Hash2Run {
                         // SAFETY: source heap remains live throughout hashing.
                         let tuple = unsafe { term.tuple_ref().unwrap() };
                         combine(hash, tuple.len() as u32, 0, H.wrapping_mul(9));
-                        for i in (0..tuple.len()).rev() {
-                            stack.push(Job::Visit(tuple.get(i).unwrap()));
+                        for &word in tuple.words().iter().rev() {
+                            stack.push(Job::Visit(Term(word)));
                         }
                         ticks += tuple.len().saturating_sub(1) as i64;
                     }
                     TermKind::List => {
-                        if Self::list(hash, stack, term, 0, 0, &mut left, can_trap) {
-                            return Hash2Progress::Yield;
+                        if Self::list_by_value(hash, stack, term, 0, 0, &mut left, can_trap) {
+                            {
+                                self.hash = *hash;
+                                return Hash2Progress::Yield;
+                            }
                         }
                     }
                     TermKind::Bitstring => {
-                        if Self::binary(hash, stack, term, None, &mut left, can_trap) {
-                            return Hash2Progress::Yield;
+                        if Self::binary_by_value(hash, stack, term, None, &mut left, can_trap) {
+                            {
+                                self.hash = *hash;
+                                return Hash2Progress::Yield;
+                            }
                         }
                     }
                     TermKind::Map => {
@@ -476,14 +498,49 @@ impl Hash2Run {
                 }
                 left -= ticks;
                 if left <= 0 && !stack.is_empty() {
-                    return Hash2Progress::Yield;
+                    {
+                        self.hash = *hash;
+                        return Hash2Progress::Yield;
+                    }
                 }
             }
         }
+        self.hash = *hash;
         Hash2Progress::Done {
             hash: *hash,
             used: max_iterations - left,
         }
+    }
+
+    #[inline(always)]
+    fn list_by_value(
+        hash: &mut u32,
+        stack: &mut smallvec::SmallVec<[Job; 16]>,
+        term: Term,
+        packed: u32,
+        count: u8,
+        left: &mut i64,
+        can_trap: bool,
+    ) -> bool {
+        let mut value = *hash;
+        let trapped = Self::list(&mut value, stack, term, packed, count, left, can_trap);
+        *hash = value;
+        trapped
+    }
+
+    #[inline(always)]
+    fn binary_by_value(
+        hash: &mut u32,
+        stack: &mut smallvec::SmallVec<[Job; 16]>,
+        term: Term,
+        resumed: Option<BinaryResume>,
+        left: &mut i64,
+        can_trap: bool,
+    ) -> bool {
+        let mut value = *hash;
+        let trapped = Self::binary(&mut value, stack, term, resumed, left, can_trap);
+        *hash = value;
+        trapped
     }
 
     /// The byte-run loop of the list case. Returns whether it trapped part way.
@@ -494,7 +551,7 @@ impl Hash2Run {
         stack: &mut smallvec::SmallVec<[Job; 16]>,
         term: Term,
         mut packed: u32,
-        mut count: u32,
+        mut count: u8,
         left: &mut i64,
         can_trap: bool,
     ) -> bool {
@@ -595,12 +652,12 @@ impl Hash2Run {
                 processed += to_process;
                 *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
                 if *left <= 0 {
-                    stack.push(Job::Binary {
+                    stack.push(Job::Binary(Box::new(BinaryJob {
                         term,
                         processed,
                         state,
                         buffer: None,
-                    });
+                    })));
                     return true;
                 }
                 if size - processed < BLOCK_HASH_BYTES_PER_ITER {
@@ -660,12 +717,12 @@ impl Hash2Run {
             processed += to_process;
             *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
             if *left <= 0 {
-                stack.push(Job::Binary {
+                stack.push(Job::Binary(Box::new(BinaryJob {
                     term,
                     processed,
                     state,
                     buffer: Some(buffer),
-                });
+                })));
                 return true;
             }
             if size - processed < BLOCK_HASH_BYTES_PER_ITER {
