@@ -3987,14 +3987,7 @@ fn external_size(
 ) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/external.c (erts_encode_ext_size), OTP-29.1.1.
     let mut encoder = arinsal_bifs::EncodeWalk::new_external_size(args)?;
-    let (node_name, creation) = {
-        let tables = crate::node_tables::lock();
-        (tables.local_name.clone(), tables.local_creation)
-    };
-    let node = global_atoms()
-        .intern(&node_name)
-        .map_err(|_| BifError::SystemLimit)?;
-    encoder.set_local_node(node, creation);
+    encoder.set_local_node_source(local_node_source);
     encoder.step_size(usize::MAX)?;
     let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
     let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
@@ -4016,12 +4009,17 @@ fn term_to_iovec(
     term_encode(process, args, state, restore_gc, true)
 }
 
+/// Node name and creation for locally tagged pids, ports and references; read only when the
+/// term being encoded holds one (erts reads `erts_this_node` in `enc_internal_pid`).
+fn local_node_source() -> (arinsal_term::Atom, u32) {
+    // `erts_this_node` is read without any lock.
+    arinsal_term::this_node()
+}
+
 #[inline(always)]
 fn new_term_encoder(args: &[Term]) -> Result<arinsal_bifs::EncodeWalk, BifError> {
     let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
-    // `erts_this_node` is read without any lock.
-    let (node, creation) = arinsal_term::this_node();
-    encoder.set_local_node(node, creation);
+    encoder.set_local_node_source(local_node_source);
     Ok(encoder)
 }
 
@@ -4031,6 +4029,8 @@ struct TermEncodeState {
     encoder: arinsal_bifs::EncodeWalk,
     pending_work: usize,
     output: Option<Term>,
+    /// The refc Binary being filled when the pass yielded without compression.
+    raw: Option<arinsal_term::RefcBinary>,
     source: Option<Term>,
     compressing: bool,
     iovec: bool,
@@ -4042,11 +4042,240 @@ impl TermEncodeState {
             encoder: arinsal_bifs::EncodeWalk::completed(),
             pending_work: 0,
             output: None,
+            raw: None,
             source: None,
             compressing: false,
             iovec: false,
         }
     }
+}
+
+const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
+
+/// The reductions `term_to_binary` charges for `work` units: one for an encoding that fits an
+/// on-heap binary, `work / TERM_TO_BINARY_LOOP_FACTOR` otherwise.
+fn term_encode_charge(encoder: &arinsal_bifs::EncodeWalk, work: usize) -> u32 {
+    if encoder.finishes_simple() {
+        1
+    } else {
+        (work / TERM_TO_BINARY_LOOP_FACTOR) as u32
+    }
+}
+
+/// Save the context of a first call that ran out of reductions, with the refc Binary being
+/// filled if the encode pass had started.
+// Port of erts/emulator/beam/external.c:2488-2518 and :2552-2567, OTP-29.1.1: the TTB context
+// stays on the stack until a pass actually yields.
+#[cold]
+#[inline(never)]
+fn term_encode_yield(
+    encoder: arinsal_bifs::EncodeWalk,
+    raw: Option<arinsal_term::RefcBinary>,
+    work: usize,
+) -> HandlerResult {
+    let state = magic_binary_state(
+        Mutex::new(TermEncodeState {
+            encoder,
+            pending_work: 0,
+            output: None,
+            raw,
+            source: None,
+            compressing: false,
+            iovec: false,
+        }),
+        ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
+    );
+    HandlerResult::Yield {
+        continuation: TERM_TO_BINARY_CONTINUATION,
+        state,
+        reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+    }
+}
+
+/// First call of `term_to_binary/1,2`, before any context was saved.
+// Port of erts/emulator/beam/external.c:2450-2567 (erts_term_to_binary_int), OTP-29.1.1.
+fn term_encode_first(
+    process: &mut Process,
+    args: &[Term],
+    restore_gc: bool,
+    chunk_work: usize,
+) -> Result<HandlerResult, BifError> {
+    let charge = term_encode_charge;
+    let mut encoder = new_term_encoder(args)?;
+    let (sized, size_work) = encoder.step_size(chunk_work)?;
+    if !sized {
+        return Ok(term_encode_yield(encoder, None, size_work));
+    }
+    if encoder.finishes_simple() {
+        let value = encoder
+            .encode_simple_binary(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))?;
+        process.set_gc_enabled(restore_gc);
+        return Ok(HandlerResult::Done {
+            value,
+            reductions: 1,
+        });
+    }
+
+    // Port of erts/emulator/beam/external.c:2519-2582, OTP-29.1.1:
+    // encode with the local context and export it only if this pass yields.
+    let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
+    let encode_budget = chunk_work.saturating_sub(size_work);
+    // erts_bin_nrml_alloc(size) filled in place; the context keeps the Binary if the pass
+    // yields (`ctx->result_bin`).
+    if !encoder.uses_compression() {
+        let encoded = encoder.encode_into_refc(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            encode_budget,
+        );
+        let (encoded, encode_work) = match encoded {
+            Ok(progress) => progress,
+            Err(error) => {
+                process.set_gc_enabled(restore_gc);
+                return Err(error);
+            }
+        };
+        match encoded {
+            arinsal_bifs::RefcEncoded::Done(value) => {
+                let reductions = charge(&encoder, size_work + encode_work);
+                process.set_gc_enabled(restore_gc);
+                return Ok(HandlerResult::Done { value, reductions });
+            }
+            arinsal_bifs::RefcEncoded::Partial(binary) => {
+                return Ok(term_encode_yield(
+                    encoder,
+                    Some(binary),
+                    size_work + encode_work,
+                ));
+            }
+        }
+    }
+    term_encode_writable_first(
+        process,
+        encoder,
+        restore_gc,
+        chunk_work,
+        size_work,
+        size,
+        encode_budget,
+    )
+}
+
+/// The first call of a compressed `term_to_binary`, which fills a writable binary and then
+/// compresses it.
+#[inline(never)]
+fn term_encode_writable_first(
+    process: &mut Process,
+    mut encoder: arinsal_bifs::EncodeWalk,
+    restore_gc: bool,
+    chunk_work: usize,
+    size_work: usize,
+    size: usize,
+    encode_budget: usize,
+) -> Result<HandlerResult, BifError> {
+    let charge = term_encode_charge;
+    let output = arinsal_bifs::allocate_iolist_binary(
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        size,
+    )?;
+    let encoded = arinsal_bifs::with_iolist_binary_output(output, |bytes| {
+        encoder.step_into(bytes, encode_budget)
+    });
+    let (done, encode_work) = match encoded {
+        Ok(progress) => progress,
+        Err(error) => {
+            arinsal_bifs::finish_iolist_binary_output(output);
+            process.set_gc_enabled(restore_gc);
+            return Err(error);
+        }
+    };
+    let mut work = size_work + encode_work;
+    if !done {
+        let state = magic_binary_state(
+            Mutex::new(TermEncodeState {
+                encoder,
+                pending_work: 0,
+                output: Some(output),
+                raw: None,
+                source: None,
+                compressing: false,
+                iovec: false,
+            }),
+            ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
+        );
+        return Ok(HandlerResult::Yield {
+            continuation: TERM_TO_BINARY_CONTINUATION,
+            state,
+            reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+        });
+    }
+    arinsal_bifs::finish_iolist_binary_output(output);
+    if !encoder.uses_compression() {
+        let reductions = charge(&encoder, work);
+        process.set_gc_enabled(restore_gc);
+        return Ok(HandlerResult::Done {
+            value: output,
+            reductions,
+        });
+    }
+
+    let compressed = arinsal_bifs::allocate_iolist_binary(
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        size,
+    )?;
+    arinsal_bifs::with_iolist_binary_output(compressed, |bytes| {
+        bytes[..6].copy_from_slice(&[131, 80, 0, 0, 0, 0]);
+        bytes[2..6].copy_from_slice(&((size - 1) as u32).to_be_bytes());
+        Ok(())
+    })?;
+    let output_budget = chunk_work.saturating_sub(work).max(1);
+    let progress = arinsal_bifs::with_binary_bytes(output, |view| {
+        arinsal_bifs::with_iolist_binary_output(compressed, |bytes| {
+            encoder.compress_into(&view.bytes()[1..], &mut bytes[6..], output_budget)
+        })
+    })??;
+    work += progress.1;
+    if progress.0 || encoder.compression_output_full() {
+        let value = if encoder.compression_is_useful() {
+            let final_size = 6usize
+                .checked_add(
+                    encoder
+                        .compressed_payload_len()
+                        .ok_or(BifError::SystemLimit)?,
+                )
+                .ok_or(BifError::SystemLimit)?;
+            arinsal_term::writable_resize_private(
+                compressed,
+                final_size.checked_mul(8).ok_or(BifError::SystemLimit)?,
+            )
+            .map_err(|_| BifError::SystemLimit)?;
+            arinsal_bifs::finish_iolist_binary_output(compressed);
+            compressed
+        } else {
+            arinsal_bifs::finish_iolist_binary_output(compressed);
+            output
+        };
+        let reductions = charge(&encoder, work);
+        process.set_gc_enabled(restore_gc);
+        return Ok(HandlerResult::Done { value, reductions });
+    }
+
+    let state = magic_binary_state(
+        Mutex::new(TermEncodeState {
+            encoder,
+            pending_work: 0,
+            output: Some(compressed),
+            raw: None,
+            source: Some(output),
+            compressing: true,
+            iovec: false,
+        }),
+        ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
+    );
+    Ok(HandlerResult::Yield {
+        continuation: TERM_TO_BINARY_CONTINUATION,
+        state,
+        reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+    })
 }
 
 fn term_encode(
@@ -4057,47 +4286,11 @@ fn term_encode(
     iovec: bool,
 ) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/external.c:2450-2567 (erts_term_to_binary_int), OTP-29.1.1.
-    const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
     let chunk_work =
         (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
-    let charge = |encoder: &arinsal_bifs::EncodeWalk, work: usize| {
-        if encoder.finishes_simple() {
-            1
-        } else {
-            (work / TERM_TO_BINARY_LOOP_FACTOR) as u32
-        }
-    };
+    let charge = term_encode_charge;
     if state.is_none() && !iovec {
-        let mut encoder = new_term_encoder(args)?;
-        let (sized, size_work) = encoder.step_size(chunk_work)?;
-        if sized && encoder.finishes_simple() {
-            let value = encoder
-                .encode_simple_binary(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))?;
-            process.set_gc_enabled(restore_gc);
-            return Ok(HandlerResult::Done {
-                value,
-                reductions: 1,
-            });
-        }
-        let context = magic_binary_state(
-            Mutex::new(TermEncodeState {
-                encoder,
-                pending_work: if sized { size_work } else { 0 },
-                output: None,
-                source: None,
-                compressing: false,
-                iovec: false,
-            }),
-            ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
-        );
-        if !sized {
-            return Ok(HandlerResult::Yield {
-                continuation: TERM_TO_BINARY_CONTINUATION,
-                state: context,
-                reductions: (size_work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
-            });
-        }
-        return term_encode(process, args, Some(&context), restore_gc, false);
+        return term_encode_first(process, args, restore_gc, chunk_work);
     }
     let state = match state {
         Some(state) => Arc::clone(state),
@@ -4109,6 +4302,7 @@ fn term_encode(
                     encoder,
                     pending_work: 0,
                     output: None,
+                    raw: None,
                     source: None,
                     compressing: false,
                     iovec,
@@ -4140,7 +4334,7 @@ fn term_encode(
     }
 
     let mut work = std::mem::take(&mut saved.pending_work);
-    if !saved.compressing && saved.output.is_none() {
+    if !saved.compressing && saved.output.is_none() && saved.raw.is_none() {
         let size_budget = chunk_work.saturating_sub(work);
         let (sized, size_work) = saved.encoder.step_size(size_budget)?;
         work += size_work;
@@ -4168,6 +4362,43 @@ fn term_encode(
             size,
         )?;
         saved.output = Some(output);
+    }
+
+    if saved.raw.is_some() {
+        let encode_budget = chunk_work.saturating_sub(work);
+        let size = saved.encoder.encoded_size().ok_or(BifError::SystemLimit)?;
+        let TermEncodeState { encoder, raw, .. } = &mut *saved;
+        let bytes = raw
+            .as_mut()
+            .and_then(arinsal_term::RefcBinary::bytes_mut_unique)
+            .ok_or(BifError::SystemLimit)?;
+        let (done, encode_work) = match encoder.step_into(bytes, encode_budget) {
+            Ok(progress) => progress,
+            Err(error) => {
+                process.set_gc_enabled(restore_gc);
+                return Err(error);
+            }
+        };
+        work += encode_work;
+        if !done {
+            drop(saved);
+            return Ok(HandlerResult::Yield {
+                continuation: TERM_TO_BINARY_CONTINUATION,
+                state,
+                reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+            });
+        }
+        let binary = saved.raw.take().ok_or(BifError::BADARG)?;
+        let reductions = charge(&saved.encoder, work);
+        *saved = TermEncodeState::completed();
+        drop(saved);
+        process.set_gc_enabled(restore_gc);
+        let value = arinsal_bifs::install_refc_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            binary,
+            size,
+        )?;
+        return Ok(HandlerResult::Done { value, reductions });
     }
 
     if !saved.compressing {

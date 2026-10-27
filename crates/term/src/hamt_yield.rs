@@ -1189,14 +1189,98 @@ impl HashmapBuild {
     }
 }
 
+/// Backwards walk over the children of one map or collision node.
+///
+/// `next` visits children in reverse storage order; `next_back` visits them in storage order.
+pub struct MapNodeChildren {
+    node: Term,
+    front: usize,
+    back: usize,
+    head: bool,
+}
+
+impl MapNodeChildren {
+    /// Start iterating the children of a HAMT node or collision tuple.
+    // Port of erts/emulator/beam/external.c:3411-3424 (ENC_HASHMAP_NODE), OTP-29.1.1.
+    pub fn new(node: Term) -> Option<Self> {
+        let header = node.header()?;
+        if !matches!(node.classify(), TermKind::Map | TermKind::Tuple) {
+            return None;
+        }
+        let front = if header & 63 == crate::MAP {
+            child_range(header, 0).start
+        } else {
+            1
+        };
+        // SAFETY: callers pass a live HAMT node or tuple; the header determines its allocation
+        // size, and the source heap remains live for the iterator's use.
+        let back = unsafe { boxed_object_words(header, node.raw_ptr()) };
+        Some(Self {
+            node,
+            front,
+            back,
+            head: header & 0x80 != 0,
+        })
+    }
+
+    /// Whether this is a HAMT head node that carries the map size and ETF header.
+    pub fn is_head(&self) -> bool {
+        self.head
+    }
+
+    fn child_at(&self, index: usize) -> Term {
+        // SAFETY: index is an initialized child slot in the live HAMT node or tuple.
+        Term(unsafe { *self.node.raw_ptr().add(index) })
+    }
+}
+
+impl Iterator for MapNodeChildren {
+    type Item = Term;
+
+    // Port of erts/emulator/beam/external.c:3411-3424 (ENC_HASHMAP_NODE), OTP-29.1.1.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.back <= self.front {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.child_at(self.back))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.back.saturating_sub(self.front);
+        (remaining, Some(remaining))
+    }
+}
+
+impl DoubleEndedIterator for MapNodeChildren {
+    // Port of erts/emulator/beam/external.c:3411-3424 (ENC_HASHMAP_NODE), OTP-29.1.1.
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.back <= self.front {
+            return None;
+        }
+        let index = self.front;
+        self.front += 1;
+        Some(self.child_at(index))
+    }
+}
+
+/// Read a HAMT leaf's key and value without exposing its heap pointer.
+// Port of erts/emulator/beam/external.c:3404-3419 (ENC_HASHMAP_NODE), OTP-29.1.1.
+pub fn hashmap_leaf_pair(leaf: Term) -> Option<(Term, Term)> {
+    if leaf.classify() != TermKind::List {
+        return None;
+    }
+    // SAFETY: HAMT leaves are live two-word cons cells.
+    unsafe { leaf.cons_ref() }
+}
+
 /// Backwards walk over a hashmap's entries, so that consing each one onto a list yields the
 /// entries in `maps:to_list/1` order.
 ///
 /// Port of erts/emulator/beam/erl_map.c:2337-2420 (hashmap_iterator_init with `reverse`,
 /// hashmap_iterator_prev), OTP-29.1.1.
 pub struct MapReverseIter {
-    /// Node and the index of the child visited last (one past the first child to visit).
-    nodes: SmallVec<[(Term, usize); 16]>,
+    nodes: SmallVec<[MapNodeChildren; 16]>,
 }
 
 impl MapReverseIter {
@@ -1213,12 +1297,8 @@ impl MapReverseIter {
     }
 
     fn push_node(&mut self, node: Term) {
-        // SAFETY: the map and its nodes stay live while the call is trapped (GC is disabled).
-        let end = unsafe {
-            let header = node.header().expect("HAMT node");
-            boxed_object_words(header, node.raw_ptr())
-        };
-        self.nodes.push((node, end));
+        self.nodes
+            .push(MapNodeChildren::new(node).expect("HAMT node"));
     }
 }
 
@@ -1227,23 +1307,12 @@ impl Iterator for MapReverseIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (node, idx) = *self.nodes.last()?;
-            let header = node.header().expect("HAMT node");
-            let first = if header & 63 == crate::MAP {
-                child_range(header, 0).start
-            } else {
-                1
-            };
-            if idx <= first {
+            let Some(child) = self.nodes.last_mut()?.next() else {
                 self.nodes.pop();
                 continue;
-            }
-            self.nodes.last_mut().expect("node").1 = idx - 1;
-            // SAFETY: idx - 1 is an initialized child slot of a live node.
-            let child = Term(unsafe { *node.raw_ptr().add(idx - 1) });
+            };
             if child.classify() == TermKind::List {
-                // SAFETY: HAMT leaves are two-word cons cells.
-                return unsafe { child.cons_ref() };
+                return hashmap_leaf_pair(child);
             }
             self.push_node(child);
         }

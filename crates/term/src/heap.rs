@@ -3204,6 +3204,15 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         )
     }
 
+    /// Wrap a filled refc binary in its heap term: the `erts_build_proc_bin` step after
+    /// `erts_bin_nrml_alloc` and the payload writes.
+    pub fn refc_binary(&mut self, binary: RefcBinary, bit_len: usize) -> Result<Term, TermError> {
+        if bit_len > binary.len().saturating_mul(8) {
+            return Err(TermError::BadArg);
+        }
+        self.install_refc_binary(binary, bit_len)
+    }
+
     fn install_refc_binary(
         &mut self,
         binary: RefcBinary,

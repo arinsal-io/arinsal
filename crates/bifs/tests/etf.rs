@@ -75,6 +75,175 @@ fn heap_etf_matches_otp_examples() {
     }
 }
 
+fn has_atom_key_flatmap(term: &O) -> bool {
+    match term {
+        O::List { elems, tail } => {
+            elems.iter().any(has_atom_key_flatmap) || has_atom_key_flatmap(tail)
+        }
+        O::Tuple(elements) => elements.iter().any(has_atom_key_flatmap),
+        O::Map(entries) => {
+            // OTP 29 release builds use MAP_SMALL_MAP_LIMIT = 32 (erl_map.h).
+            (entries.len() <= 32 && entries.iter().any(|(key, _)| matches!(key, O::Atom(_))))
+                || entries
+                    .iter()
+                    .any(|(key, value)| has_atom_key_flatmap(key) || has_atom_key_flatmap(value))
+        }
+        O::Fun { pid, free_vars, .. } => {
+            has_atom_key_flatmap(pid) || free_vars.iter().any(has_atom_key_flatmap)
+        }
+        O::Record { fields, .. } => fields.iter().any(|(_, value)| has_atom_key_flatmap(value)),
+        _ => false,
+    }
+}
+
+#[test]
+fn captured_gen_rpc_payloads_encode_byte_for_byte_like_otp() {
+    let Some(directory) = std::env::var_os("ARINSAL_ETF_PAYLOAD_DIR") else {
+        eprintln!("skip captured gen_rpc payloads: ARINSAL_ETF_PAYLOAD_DIR is unset");
+        return;
+    };
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let mut paths = std::fs::read_dir(directory)
+        .expect("read captured ETF payload directory")
+        .map(|entry| entry.expect("read captured ETF payload entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == std::ffi::OsStr::new("etf"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert!(!paths.is_empty(), "captured ETF payload directory is empty");
+
+    for path in &paths {
+        let bytes = std::fs::read(path).expect("read captured ETF payload");
+        let mut offset = 0usize;
+        let mut record = 0usize;
+        while offset < bytes.len() {
+            let length_end = offset.checked_add(4).expect("ETF length offset");
+            let length = u32::from_be_bytes(
+                bytes
+                    .get(offset..length_end)
+                    .expect("captured ETF record has a length")
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let value_start = length_end;
+            let value_end = value_start.checked_add(length).expect("ETF value offset");
+            let encoded = bytes
+                .get(value_start..value_end)
+                .expect("captured ETF record is complete");
+            offset = value_end;
+
+            let decoded =
+                reference.call("erlang", "binary_to_term", &[O::Binary(encoded.to_vec())]);
+            let CallResult::Ok(term) = decoded else {
+                panic!(
+                    "OTP could not decode {} record {record}: {decoded:?}",
+                    path.display()
+                );
+            };
+            let expected = reference.call("erlang", "term_to_binary", std::slice::from_ref(&term));
+            let CallResult::Ok(O::Binary(expected_bytes)) = &expected else {
+                panic!(
+                    "OTP could not encode {} record {record}: {expected:?}",
+                    path.display()
+                );
+            };
+            let expected_bytes = expected_bytes.clone();
+            let source_term = term;
+
+            let mut heap = ProcessHeap::with_words(encoded.len().div_ceil(8) + 4096);
+            let mut allocator = ProcessHeapHandle(&mut heap);
+            let term = from_owned(&source_term, &mut allocator).expect("build captured ETF term");
+            let encode = lookup("erlang", "term_to_binary", 1).expect("term_to_binary/1");
+            let mut encode_state = arinsal_bifs::BifState::default();
+            let actual = encode(&mut Ctx::new(&mut allocator, &mut encode_state), &[term])
+                .expect("Arinsal term_to_binary succeeds");
+            let actual = to_owned(actual).expect("own encoded ETF result");
+            let O::Binary(actual_bytes) = &actual else {
+                panic!(
+                    "Arinsal term_to_binary returned a non-binary for {} record {record}",
+                    path.display()
+                );
+            };
+            let actual_bytes = actual_bytes.clone();
+
+            if has_atom_key_flatmap(&source_term) {
+                let actual_size =
+                    reference.call("erlang", "byte_size", &[O::Binary(actual_bytes.clone())]);
+                let expected_size =
+                    reference.call("erlang", "byte_size", &[O::Binary(expected_bytes.clone())]);
+                assert_eq!(
+                    actual_size,
+                    expected_size,
+                    "{} record {record}",
+                    path.display()
+                );
+
+                let decoded_actual = reference.call(
+                    "erlang",
+                    "binary_to_term",
+                    &[O::Binary(actual_bytes.clone())],
+                );
+                let CallResult::Ok(decoded_actual) = decoded_actual else {
+                    panic!(
+                        "OTP could not decode Arinsal output for {} record {record}: {decoded_actual:?}",
+                        path.display()
+                    );
+                };
+                assert_eq!(
+                    reference.call("erlang", "=:=", &[decoded_actual, source_term.clone()]),
+                    CallResult::Ok(O::atom("true")),
+                    "OTP rejected Arinsal round trip for {} record {record}",
+                    path.display()
+                );
+
+                let expected_term = reference.call(
+                    "erlang",
+                    "binary_to_term",
+                    &[O::Binary(expected_bytes.clone())],
+                );
+                let CallResult::Ok(expected_term) = expected_term else {
+                    panic!(
+                        "OTP could not decode its output for {} record {record}: {expected_term:?}",
+                        path.display()
+                    );
+                };
+                assert_eq!(
+                    reference.call("erlang", "=:=", &[expected_term, source_term.clone()]),
+                    CallResult::Ok(O::atom("true")),
+                    "OTP output round trip failed for {} record {record}",
+                    path.display()
+                );
+
+                let expected_binary = from_owned(&O::Binary(expected_bytes), &mut allocator)
+                    .expect("build OTP output binary term");
+                let decode = lookup("erlang", "binary_to_term", 1).expect("binary_to_term/1");
+                let mut decode_state = arinsal_bifs::BifState::default();
+                let decoded = decode(
+                    &mut Ctx::new(&mut allocator, &mut decode_state),
+                    &[expected_binary],
+                )
+                .expect("Arinsal decodes OTP output");
+                assert!(
+                    exact_eq(decoded, term),
+                    "Arinsal rejected OTP round trip for {} record {record}",
+                    path.display()
+                );
+            } else {
+                assert_eq!(
+                    actual_bytes,
+                    expected_bytes,
+                    "{} record {record}",
+                    path.display()
+                );
+            }
+            record += 1;
+        }
+        assert!(record > 0, "{} contains no ETF records", path.display());
+    }
+}
+
 #[test]
 fn local_ext_round_trips_and_matches_otp_after_hash_normalization() {
     let reference = RefErl::shared().expect("OTP 29 reference");

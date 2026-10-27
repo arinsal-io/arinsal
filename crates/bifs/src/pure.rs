@@ -389,6 +389,16 @@ pub fn tuple_element(term: Term, index: usize) -> Result<Term, BifError> {
     tuple_view(&term)?.element(index).ok_or(BADARG)
 }
 
+/// The tuple element with `remaining` elements left from it to the end, in one tag check.
+// Port of the `ptr` walk of TERM_ARRAY_OP / ENC_LAST_ARRAY_ELEMENT in
+// erts/emulator/beam/external.c, OTP-29.1.1.
+#[inline]
+pub(crate) fn tuple_element_from_end(term: Term, remaining: usize) -> Result<Term, BifError> {
+    let view = tuple_view(&term)?;
+    view.element(view.len().checked_sub(remaining).ok_or(BADARG)?)
+        .ok_or(BADARG)
+}
+
 /// The elements of a proper list, `None` for any other term.
 pub fn proper_list_terms(term: Term) -> Option<Vec<Term>> {
     list(term).ok()
