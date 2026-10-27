@@ -2782,6 +2782,13 @@ fn enqueue_port_output_no_suspend_locked(
 
 /// Continue a fragmented dist send at the start of the sender's next slice.
 // Port of erts/emulator/beam/dist.c:3749-3753 (fragmented-send continuation), OTP-29.1.1.
+/// Whether any distribution entry has a deferred fragmented send, so a slice must visit
+/// [`continue_fragmented_send`].
+#[inline]
+pub(crate) fn fragment_continuation_pending() -> bool {
+    node_tables::ANY_FRAGMENT_CONTINUATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn continue_fragmented_send(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,

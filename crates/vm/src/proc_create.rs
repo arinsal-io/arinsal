@@ -185,9 +185,12 @@ impl ArgRegs {
         );
         assert!(self.attached != 0, "X registers are not attached");
         if arity <= 6 {
-            let mut saved = self.inline;
-            saved[..arity].copy_from_slice(&self[..arity]);
-            self.inline = saved;
+            // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_out_registers):
+            // only the `arity` live registers move; zero live registers is a length store.
+            for index in 0..arity {
+                let term = self[index];
+                self.inline[index] = term;
+            }
         } else {
             let mut block = std::mem::take(&mut self.extra);
             if block.len() < arity {
@@ -406,6 +409,10 @@ pub struct Process {
     /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
     /// like erts' `c_p->scheduler_data`.
     pub(crate) scheduler_id: u32,
+    /// `RunCtx::scheduler_key` the scheduler-derived state of `Process::run` was set up for.
+    pub(crate) run_key: u64,
+    /// The same for `Executor::run`'s per-scheduler state (pid words, reference state).
+    pub(crate) exec_key: u64,
     /// Reference and `unique_integer` counters of the scheduler running this process.
     /// Port of `c_p->scheduler_data` (`ref` and `unique`), OTP-29.1.1.
     pub(crate) scheduler_ref_state: Option<arinsal_bifs::SchedulerRefState>,
@@ -1143,6 +1150,31 @@ pub(crate) fn port_link(id: u64) -> crate::monitor_link::Link {
 #[derive(Clone, Debug)]
 pub(crate) struct OriginHalf {
     pub(crate) alias_mode: Option<AliasMode>,
+}
+
+impl ProcessCold {
+    /// Whether the cold state holds work the per-slice path must look at: everything the
+    /// scheduler-in half tests before it enters native code. Computed, so no writer can miss it.
+    // Port of erts/emulator/beam/erl_process.c (erts_schedule: one test of `p->state` and
+    // `p->flags` for the rare per-slice work), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn slice_work(&self) -> bool {
+        self.native_dirty_nif.is_some()
+            || self.initial_bif.is_some()
+            || self.dirty_sys_gc
+            || self.hibernate_sched
+            || self.timer_pause.is_some()
+            || self.bif_trap.is_some()
+            || self.debug_wait_completion.is_some()
+            || self.sys_tasks_deferred
+            || self.native_timeout_trace
+            || self.profile_active
+            || self.dirty_exited
+            || self.dirty_pickup.is_some()
+            || self.suspend_parked
+            || self.native_bif_error.is_some()
+            || self.native_trap.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -1997,6 +2029,8 @@ impl Process {
             pending_signal_waiter: None,
             scheduler_id: 0,
             scheduler_ref_state: None,
+            run_key: 0,
+            exec_key: 0,
             hibernated: false,
             signal_probe: None,
             native_wait: None,

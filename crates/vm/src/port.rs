@@ -192,6 +192,9 @@ fn process_send_inner(
 }
 
 /// True once, when the running BIF asked to suspend on a busy port.
+// Not inlined: inlined into the scheduler loop, the thread-local lookup is hoisted to every
+// slice's entry although only a busy-port failure reads it.
+#[inline(never)]
 pub(crate) fn take_busy_suspend() -> bool {
     BUSY_SUSPEND.with(|flag| flag.replace(false))
 }
