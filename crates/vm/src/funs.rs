@@ -1235,7 +1235,7 @@ impl Vm {
                     .is_some_and(|name| matches!(name, "error" | "exit" | "throw"))
         });
         // A native caller's frame comes from its recorded call site instead.
-        let native_caller = p.cold.as_ref().is_some_and(|cold| cold.native_apply);
+        let native_caller = p.native_apply;
         if tail && tail_applies_exception_bif && !native_caller {
             // Port of erts/emulator/beam/beam_common.c:1350-1427 (apply_bif_error_adjustment), OTP-29.1.1.
             let return_ip = p

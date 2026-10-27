@@ -241,11 +241,7 @@ fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
         Some(false) => return None,
     };
     // erts: `if (ERTS_PROC_HAS_INCOMING_SIGNALS(BIF_P))` reads `c_p->state` after the result.
-    let own_quiet = match process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
-    {
+    let own_quiet = match process.signal_probe.as_ref() {
         Some(probe) => probe.is_quiet(),
         None => scheduler.is_quiet_from(process.self_pid?, process.on_managed) == Some(true),
     };
@@ -2205,7 +2201,7 @@ pub(crate) fn monitor_light(
             pid,
             arinsal_sched::Signal::Monitor {
                 reference: id,
-                shared: arinsal_sched::SharedPayload(target.into_shared()),
+                shared: Box::new(arinsal_sched::SharedPayload(target.into_shared())),
             },
         )
         .is_err()
@@ -2628,7 +2624,7 @@ pub(crate) fn exit2_light(
     let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered(
         me,
         pid,
-        arinsal_sched::Signal::Exit(message),
+        arinsal_sched::Signal::Exit(Box::new(message)),
     );
     Some(Ok(atom("true")))
 }
@@ -3172,7 +3168,7 @@ fn call_resolved(
                 process.cold_mut().monitors.insert(origin);
                 let signal = arinsal_sched::Signal::Monitor {
                     reference: id,
-                    shared: arinsal_sched::SharedPayload(target_half.into_shared()),
+                    shared: Box::new(arinsal_sched::SharedPayload(target_half.into_shared())),
                 };
                 if let Err(error) = ctx.signal(pid, signal) {
                     process.cold_mut().monitors.remove(id);
@@ -4401,7 +4397,7 @@ fn send_noproc_down(
                 ctx.pid(),
                 Signal::MonitorDown {
                     reference: id,
-                    reason,
+                    reason: Box::new(reason),
                 },
             )
             .map_err(|error| VmError::Unsupported(format!("monitor: {error}")));
@@ -4533,7 +4529,7 @@ fn link_opt(
             let reason = Message::copy_from(atom("noproc"))?;
             runtime(process)?
                 .scheduler()?
-                .signal(pid, ctx.pid(), Signal::ExitLinked(reason))
+                .signal(pid, ctx.pid(), Signal::ExitLinked(Box::new(reason)))
                 .map_err(|_| badarg("link"))?;
         }
         Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
@@ -4645,7 +4641,7 @@ fn send_exit_signal_bif(
     if via_prio_alias {
         message = message.with_priority();
     }
-    let _ = ctx.signal(pid, Signal::Exit(message));
+    let _ = ctx.signal(pid, Signal::Exit(Box::new(message)));
     Ok(atom("true"))
 }
 

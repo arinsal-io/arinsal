@@ -29,8 +29,8 @@ mod native_code;
 
 pub use arinsal_alloc::raw::OwnedBinaryRef;
 pub use atom::{
-    Atom, AtomEncoding, AtomError, AtomTable, DEFAULT_ATOM_TABLE_LIMIT, HashInfo, IndexInfo, atoms,
-    global_atoms, set_atom_table_limit,
+    Atom, AtomEncoding, AtomError, AtomMemory, AtomTable, DEFAULT_ATOM_TABLE_LIMIT, HashInfo,
+    IndexInfo, atoms, global_atoms, set_atom_table_limit,
 };
 pub use bits::{
     BinaryOwner, ExternalBinary, PrivateAppendUpdate, RefcBinary, SUB_BITS_MUTABLE,

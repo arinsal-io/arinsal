@@ -531,6 +531,13 @@ impl Default for PortTable {
 }
 
 impl PortTable {
+    /// Bytes of the table's slot array and free identifier ring.
+    // Port of erts/emulator/beam/erl_ptab.c:349 (erts_ptab_mem_size), OTP-29.1.1, for this
+    // table's eagerly allocated slots and separately stored free-ID ring.
+    pub(crate) fn memory_bytes(&self, ids: &arinsal_term::ptab::PtabIdRing) -> u64 {
+        (self.slots.len() * std::mem::size_of::<PortSlot>() + ids.free_id_bytes()) as u64
+    }
+
     pub(crate) fn new(layout: arinsal_term::ptab::PtabLayout) -> Self {
         let slots = (0..layout.max() as usize)
             .map(|_| arinsal_sched::ProgressSlot::new())
@@ -2478,7 +2485,7 @@ impl arinsal_drv::PortHost for DrvHost {
             target,
             arinsal_sched::Signal::Monitor {
                 reference: monitor,
-                shared: arinsal_sched::SharedPayload(target_half.into_shared()),
+                shared: Box::new(arinsal_sched::SharedPayload(target_half.into_shared())),
             },
         );
         if sent.is_err() {
@@ -2865,7 +2872,10 @@ fn notify_links_monitors(
                 let _ = scheduler.signal(
                     from,
                     monitor.pid,
-                    arinsal_sched::Signal::MonitorDownMsg { reference, message },
+                    arinsal_sched::Signal::MonitorDownMsg {
+                        reference,
+                        message: Box::new(message),
+                    },
                 );
             }
         } else if let Ok(reason) = Message::copy_from(reason) {
@@ -2873,7 +2883,10 @@ fn notify_links_monitors(
             let _ = scheduler.signal(
                 from,
                 monitor.pid,
-                arinsal_sched::Signal::MonitorDown { reference, reason },
+                arinsal_sched::Signal::MonitorDown {
+                    reference,
+                    reason: Box::new(reason),
+                },
             );
         }
     }

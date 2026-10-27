@@ -27,7 +27,8 @@ impl MemMapper {
     /// Port of erts/emulator/sys/common/erl_mmap.c:1617 (erts_mmap), OTP-29.1.1.
     pub fn map(&mut self, size: usize, superaligned: bool) -> Result<MappedRegion, MapError> {
         let region = if superaligned {
-            RawRegion::map_aligned(size, 1 << 24)?
+            let align = crate::raw::ERTS_MMAP_SUPERALIGNED_SIZE.max(crate::raw::page_size());
+            RawRegion::map_aligned(size, align)?
         } else {
             RawRegion::map(size)?
         };

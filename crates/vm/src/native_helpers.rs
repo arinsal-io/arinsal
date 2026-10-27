@@ -161,9 +161,8 @@ pub extern "C" fn arinsal_beamasm_recv_marker_reserve(header: *mut ProcessHeader
     // there (or a process without a probe yet) send the instruction to the scheduler, which
     // fetches and reruns it.
     let pending = process
-        .cold
+        .signal_probe
         .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if pending {
         process.native_exit_kind = crate::proc_create::NativeExit::ReserveFetch;
@@ -232,9 +231,8 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
         return u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH);
     }
     let pending = process
-        .cold
+        .signal_probe
         .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if !pending {
         process.delay_gc = false;
@@ -258,9 +256,8 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // outer queue is handled by the scheduler.
     if fetched.is_ok()
         && process
-            .cold
+            .signal_probe
             .as_ref()
-            .and_then(|cold| cold.signal_probe.as_ref())
             .is_some_and(|probe| !probe.has_pending())
     {
         return 0;
@@ -335,10 +332,9 @@ pub extern "C" fn arinsal_beamasm_wait(header: *mut ProcessHeader, resume: usize
     if let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
         process.delay_gc = false;
-        let cold = process.cold_mut();
-        let timeout = cold.native_wait_timeout.take();
-        cold.native_wait = Some(timeout);
-        cold.native_wait_self = resume & 1 != 0;
+        let timeout = process.native_wait_timeout.take();
+        process.native_wait = Some(timeout);
+        process.native_wait_self = resume & 1 != 0;
         process.native_exit_kind = crate::proc_create::NativeExit::Wait;
     }
 }
@@ -361,7 +357,7 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
         Ok(Some(0)) => 0,
         Ok(remaining) => {
-            process.cold_mut().native_wait_timeout = remaining;
+            process.native_wait_timeout = remaining;
             1
         }
         Err(_) => {
@@ -1074,6 +1070,23 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
         .min(fcalls.max(0))
 }
 
+/// `ERTS_VBUMP_REDS`: take `reds` from the slice without counting them in the process's own
+/// reductions; the part beyond what is left ends the slice.
+// Port of erts/emulator/beam/bif.h:85 (ERTS_VBUMP_REDS), OTP-29.1.1.
+fn vbump_reds(process: &mut crate::Process, reds: i32) {
+    if process.reductions >= reds {
+        process.reductions -= reds;
+        process.virtual_reds = process.virtual_reds.saturating_add(reds as u32);
+    } else {
+        if process.reductions > 0 {
+            process.virtual_reds = process
+                .virtual_reds
+                .saturating_add(process.reductions as u32);
+        }
+        process.reductions = 0;
+    }
+}
+
 /// `send` from its own fragment. A traced send, a port id, or a registered port
 /// returns to the scheduler; a local pid or process name is delivered here.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 and bif.c:2458 (do_send), OTP-29.1.1.
@@ -1104,6 +1117,11 @@ fn dispatch_native_send(
     };
     match result {
         Ok(value) => {
+            // Port of erts/emulator/beam/bif.c:2861-2864 (erl_send: ERTS_VBUMP_REDS(p, 4) after a
+            // completed send) and bif.h:85 (ERTS_VBUMP_REDS), OTP-29.1.1: a send takes four
+            // virtual reductions out of the slice that are not the process's own work, so a
+            // sender yields to the receivers it fed after about a third of the sends.
+            vbump_reds(process, 4);
             // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send: save_calls(p, &exp_send)),
             // OTP-29.1.1.
             if !idle && crate::trace::saves_calls(process) {
@@ -1510,7 +1528,7 @@ fn park_executor(
     identity: u64,
     light_call: bool,
 ) -> u64 {
-    process.cold_mut().native_light_bif_call = light_call;
+    process.native_light_bif_call = light_call;
     process.header.arity = export.arity;
     process.reductions = process.header.fcalls;
     process.header.i = identity as *const u8 as *const _;
@@ -2991,7 +3009,7 @@ fn invoke_dispatch_bif_slow(
         process.header.arity = export.arity;
         process.header.i = identity as *const u8 as *const _;
         process.header.exc.freason = 1 << 10;
-        process.cold_mut().native_light_bif_call = !export_call;
+        process.native_light_bif_call = !export_call;
         process.sync_native_header();
         return None;
     }

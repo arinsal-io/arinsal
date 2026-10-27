@@ -347,7 +347,7 @@ pub struct Process {
     /// Contiguous process heap and Y stack.
     pub heap: ProcessHeap,
     /// The erts process dictionary pointer is part of the hot process structure.
-    pub(crate) dictionary: Option<ProcDict>,
+    pub(crate) dictionary: Option<Box<ProcDict>>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
     pub(crate) seq_trace_token: Option<Box<crate::seq_trace::Token>>,
     /// The token tuple that `SEQ_TRACE_TOKEN(p)` names on the young heap: a collection roots
@@ -411,6 +411,30 @@ pub struct Process {
     pub(crate) scheduler_ref_state: Option<arinsal_bifs::SchedulerRefState>,
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
+    /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
+    pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
+    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
+    /// `infinity`); the process resumes at the native `loop_rec` label.
+    pub(crate) native_wait: Option<Option<u64>>,
+    /// Export dispatch to redo after the process wakes from a parked native BIF call.
+    pub(crate) native_retry: Option<usize>,
+    /// The current apply comes from native code, whose call site names the caller frame.
+    pub(crate) native_apply: bool,
+    /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
+    pub(crate) native_call_pc: usize,
+    /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
+    pub(crate) native_wait_timeout: Option<u64>,
+    /// The pending native wait belongs to a receive without clauses.
+    pub(crate) native_wait_self: bool,
+    /// Return address and call site of the native call that `native_retry` redoes.
+    pub(crate) native_retry_site: Option<(usize, usize)>,
+    /// The BIF the scheduler runs for native code was called through `call_light_bif_shared`,
+    /// not through its export entry, so no return address is on the stack in erts.
+    pub(crate) native_light_bif_call: bool,
+    /// The interpreter returned only to hand control to `native_pc`; the slice continues.
+    pub(crate) native_transfer: bool,
+    /// Native continuation to install after an interpreted external call returns.
+    pub(crate) native_resume_after_call: Option<usize>,
     pub(crate) inbox: process::MessageQueue,
     /// `sig_qs.cont`: signals fetched from the outer queue and not handled yet.
     /// Port of erts/emulator/beam/erl_process.h (ErtsSignalInQueue `sig_qs`), OTP-29.1.1.
@@ -997,7 +1021,7 @@ pub(crate) fn remote_monitor_signal(
     );
     arinsal_sched::Signal::Monitor {
         reference,
-        shared: arinsal_sched::SharedPayload(target_half.into_shared()),
+        shared: Box::new(arinsal_sched::SharedPayload(target_half.into_shared())),
     }
 }
 
@@ -1153,19 +1177,12 @@ pub(crate) struct ProcessCold {
     pub(crate) prio_len: usize,
     /// Saved ordinary-message cursor while a newly arrived priority section is scanned.
     pub(crate) priority_resume_cursor: Option<usize>,
-    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
-    /// `infinity`); the process resumes at the native `loop_rec` label.
-    pub(crate) native_wait: Option<Option<u64>>,
-    /// Export dispatch to redo after the process wakes from a parked native BIF call.
-    pub(crate) native_retry: Option<usize>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
     pub(crate) native_return_events: Option<Box<NativeReturnEvents>>,
     /// Sessions whose return_to frame a traced BIF raised through; the exception's catch
     /// reports their return_to events.
     pub(crate) bif_return_to: Vec<u64>,
-    /// The current apply comes from native code, whose call site names the caller frame.
-    pub(crate) native_apply: bool,
     /// A tail `apply` has deallocated its caller's frame and runs its callee: a BIF that raises
     /// there has no caller continuation of its own (BeamAsm `emit_i_apply_last` deallocates first).
     // Deviation (interpreter only): erts has no such flag; the interpreter derives a BIF's return
@@ -1187,16 +1204,8 @@ pub(crate) struct ProcessCold {
     pub(crate) trace_flags: (u64, Vec<(u64, u64)>),
     /// Meta tracers named by return frames on the stack, one entry per frame.
     pub(crate) meta_frames: Vec<std::sync::Arc<crate::trace_bp::MetaTracer>>,
-    /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
-    pub(crate) native_call_pc: usize,
     /// `error_info` of the current native exception (erts keeps it with the stack trace).
     pub(crate) native_error_info: Option<Box<arinsal_etf::OwnedTerm>>,
-    /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
-    pub(crate) native_wait_timeout: Option<u64>,
-    /// The pending native wait belongs to a receive without clauses.
-    pub(crate) native_wait_self: bool,
-    /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
-    pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,
@@ -1209,18 +1218,9 @@ pub(crate) struct ProcessCold {
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
-    /// Return address and call site of the native call that `native_retry` redoes.
-    pub(crate) native_retry_site: Option<(usize, usize)>,
-    /// The BIF the scheduler runs for native code was called through `call_light_bif_shared`,
-    /// not through its export entry, so no return address is on the stack in erts.
-    pub(crate) native_light_bif_call: bool,
-    /// The interpreter returned only to hand control to `native_pc`; the slice continues.
-    pub(crate) native_transfer: bool,
     /// A system task woke the process while it was executing; it runs at the next scheduling
     /// point instead.
     pub(crate) sys_tasks_deferred: bool,
-    /// Native continuation to install after an interpreted external call returns.
-    pub(crate) native_resume_after_call: Option<usize>,
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
     /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
     pub(crate) native_bif_error: Option<NativeBifError>,
@@ -1511,10 +1511,7 @@ impl Process {
     /// Enter a tail apply whose caller frame is already deallocated (see `apply_frame_released`).
     /// Returns whether this call set the flag, for `end_tail_apply`.
     pub(crate) fn begin_tail_apply(&mut self, tail: bool, kind: u8) -> bool {
-        if !tail
-            || self.apply_frame_released()
-            || self.cold.as_ref().is_some_and(|c| c.native_apply)
-        {
+        if !tail || self.apply_frame_released() || self.native_apply {
             return false;
         }
         self.cold_mut().apply_frame_released = kind;
@@ -2001,6 +1998,17 @@ impl Process {
             scheduler_id: 0,
             scheduler_ref_state: None,
             hibernated: false,
+            signal_probe: None,
+            native_wait: None,
+            native_wait_timeout: None,
+            native_wait_self: false,
+            native_light_bif_call: false,
+            native_retry: None,
+            native_transfer: false,
+            native_apply: false,
+            native_call_pc: 0,
+            native_retry_site: None,
+            native_resume_after_call: None,
             inbox: process::MessageQueue::default(),
             sig_cont: arinsal_sched::SignalQueue::default(),
             sig_cont_taken: 0,
@@ -2742,5 +2750,286 @@ mod arg_regs_tests {
     #[should_panic(expected = "not attached")]
     fn detach_without_attach_panics() {
         owned(&[1]).detach_save(1);
+    }
+}
+
+#[cfg(test)]
+mod layout_report {
+    use super::*;
+    use std::mem::size_of;
+
+    /// Prints the size of `struct process` and of its largest members (`--nocapture`).
+    #[test]
+    #[ignore = "layout report"]
+    fn print_process_layout() {
+        let process = Process::new();
+        eprintln!("Process {}", size_of::<Process>());
+        eprintln!("  Process.header {}", size_of_val(&process.header));
+        eprintln!("  Process.x {}", size_of_val(&process.x));
+        eprintln!("  Process.fr {}", size_of_val(&process.fr));
+        eprintln!("  Process.heap {}", size_of_val(&process.heap));
+        eprintln!("  Process.dictionary {}", size_of_val(&process.dictionary));
+        eprintln!(
+            "  Process.seq_trace_token {}",
+            size_of_val(&process.seq_trace_token)
+        );
+        eprintln!(
+            "  Process.seq_token_root {}",
+            size_of_val(&process.seq_token_root)
+        );
+        eprintln!(
+            "  Process.seq_trace_clock {}",
+            size_of_val(&process.seq_trace_clock)
+        );
+        eprintln!(
+            "  Process.seq_trace_lastcnt {}",
+            size_of_val(&process.seq_trace_lastcnt)
+        );
+        eprintln!(
+            "  Process.seq_trace_epoch {}",
+            size_of_val(&process.seq_trace_epoch)
+        );
+        eprintln!(
+            "  Process.seq_trace_spawn_pending {}",
+            size_of_val(&process.seq_trace_spawn_pending)
+        );
+        eprintln!("  Process.module {}", size_of_val(&process.module));
+        eprintln!("  Process.ip {}", size_of_val(&process.ip()));
+        eprintln!(
+            "  Process.initial_call {}",
+            size_of_val(&process.initial_call)
+        );
+        eprintln!(
+            "  Process.initial_mfa {}",
+            size_of_val(&process.initial_mfa)
+        );
+        eprintln!("  Process.native_pc {}", size_of_val(&process.native_pc));
+        eprintln!(
+            "  Process.entry_started {}",
+            size_of_val(&process.entry_started)
+        );
+        eprintln!("  Process.gc_live {}", size_of_val(&process.gc_live));
+        eprintln!(
+            "  Process.max_heap_peak {}",
+            size_of_val(&process.max_heap_peak)
+        );
+        eprintln!("  Process.reductions {}", size_of_val(&process.reductions));
+        eprintln!(
+            "  Process.native_reds_in {}",
+            size_of_val(&process.native_reds_in)
+        );
+        eprintln!("  Process.trap_work {}", size_of_val(&process.trap_work));
+        eprintln!(
+            "  Process.virtual_reds {}",
+            size_of_val(&process.virtual_reds)
+        );
+        eprintln!(
+            "  Process.reductions_used {}",
+            size_of_val(&process.reductions_used)
+        );
+        eprintln!(
+            "  Process.gc_deferred {}",
+            size_of_val(&process.gc_deferred)
+        );
+        eprintln!("  Process.delay_gc {}", size_of_val(&process.delay_gc));
+        eprintln!(
+            "  Process.uniq_counter {}",
+            size_of_val(&process.uniq_counter)
+        );
+        eprintln!("  Process.stats {}", size_of_val(&process.stats));
+        eprintln!(
+            "  Process.final_exit_reason {}",
+            size_of_val(&process.final_exit_reason)
+        );
+        eprintln!("  Process.runtime {}", size_of_val(&process.runtime));
+        eprintln!("  Process.self_pid {}", size_of_val(&process.self_pid));
+        eprintln!(
+            "  Process.pending_signal_waiter {}",
+            size_of_val(&process.pending_signal_waiter)
+        );
+        eprintln!(
+            "  Process.scheduler_id {}",
+            size_of_val(&process.scheduler_id)
+        );
+        eprintln!(
+            "  Process.scheduler_ref_state {}",
+            size_of_val(&process.scheduler_ref_state)
+        );
+        eprintln!("  Process.hibernated {}", size_of_val(&process.hibernated));
+        eprintln!(
+            "  Process.signal_probe {}",
+            size_of_val(&process.signal_probe)
+        );
+        eprintln!(
+            "  Process.native_wait {}",
+            size_of_val(&process.native_wait)
+        );
+        eprintln!(
+            "  Process.native_retry {}",
+            size_of_val(&process.native_retry)
+        );
+        eprintln!(
+            "  Process.native_apply {}",
+            size_of_val(&process.native_apply)
+        );
+        eprintln!(
+            "  Process.native_call_pc {}",
+            size_of_val(&process.native_call_pc)
+        );
+        eprintln!(
+            "  Process.native_wait_timeout {}",
+            size_of_val(&process.native_wait_timeout)
+        );
+        eprintln!(
+            "  Process.native_wait_self {}",
+            size_of_val(&process.native_wait_self)
+        );
+        eprintln!(
+            "  Process.native_retry_site {}",
+            size_of_val(&process.native_retry_site)
+        );
+        eprintln!(
+            "  Process.native_light_bif_call {}",
+            size_of_val(&process.native_light_bif_call)
+        );
+        eprintln!(
+            "  Process.native_transfer {}",
+            size_of_val(&process.native_transfer)
+        );
+        eprintln!(
+            "  Process.native_resume_after_call {}",
+            size_of_val(&process.native_resume_after_call)
+        );
+        eprintln!("  Process.inbox {}", size_of_val(&process.inbox));
+        eprintln!("  Process.sig_cont {}", size_of_val(&process.sig_cont));
+        eprintln!(
+            "  Process.sig_cont_taken {}",
+            size_of_val(&process.sig_cont_taken)
+        );
+        eprintln!(
+            "  Process.receive_deadline {}",
+            size_of_val(&process.receive_deadline)
+        );
+        eprintln!(
+            "  Process.receive_deadline_ms {}",
+            size_of_val(&process.receive_deadline_ms)
+        );
+        eprintln!(
+            "  Process.receive_infinity {}",
+            size_of_val(&process.receive_infinity)
+        );
+        eprintln!("  Process.cold {}", size_of_val(&process.cold));
+        eprintln!(
+            "  Process.group_leader {}",
+            size_of_val(&process.group_leader)
+        );
+        eprintln!("  Process.parent {}", size_of_val(&process.parent));
+        eprintln!("  Process.exit_cont {}", size_of_val(&process.exit_cont));
+        eprintln!(
+            "  Process.apply_inline {}",
+            size_of_val(&process.apply_inline)
+        );
+        eprintln!(
+            "  Process.apply_inline_len {}",
+            size_of_val(&process.apply_inline_len)
+        );
+        eprintln!("  Process.trap_exit {}", size_of_val(&process.trap_exit));
+        eprintln!("  Process.exc_class {}", size_of_val(&process.exc_class));
+        eprintln!("  Process.entry {}", size_of_val(&process.entry));
+        eprintln!(
+            "  Process.force_yield {}",
+            size_of_val(&process.force_yield)
+        );
+        eprintln!(
+            "  Process.native_continuation_resume {}",
+            size_of_val(&process.native_continuation_resume)
+        );
+        eprintln!(
+            "  Process.native_arity_set {}",
+            size_of_val(&process.native_arity_set)
+        );
+        eprintln!(
+            "  Process.native_error_pc {}",
+            size_of_val(&process.native_error_pc)
+        );
+        eprintln!(
+            "  Process.native_exit_kind {}",
+            size_of_val(&process.native_exit_kind)
+        );
+        eprintln!("ProcessHeader {}", size_of::<ProcessHeader>());
+        eprintln!("ArgRegs {}", size_of::<ArgRegs>());
+        eprintln!("ProcessHeap {}", size_of::<ProcessHeap>());
+        eprintln!("Option<ProcDict> {}", size_of::<Option<ProcDict>>());
+        eprintln!("ProcessStats {}", size_of::<ProcessStats>());
+        eprintln!("MessageQueue {}", size_of::<crate::process::MessageQueue>());
+        eprintln!(
+            "sig_cont SignalQueue {}",
+            size_of::<arinsal_sched::SignalQueue<arinsal_sched::Event<crate::process::Message>>>()
+        );
+        eprintln!("Message {}", size_of::<crate::process::Message>());
+        eprintln!(
+            "Payload<Message> {}",
+            size_of::<arinsal_sched::Payload<crate::process::Message>>()
+        );
+        eprintln!(
+            "Signal<Message> {}",
+            size_of::<arinsal_sched::Signal<crate::process::Message>>()
+        );
+        eprintln!(
+            "Event<Message> {}",
+            size_of::<arinsal_sched::Event<crate::process::Message>>()
+        );
+        eprintln!(
+            "SignalNode<Event<Message>> {}",
+            size_of::<
+                arinsal_term::message::SignalNode<arinsal_sched::Event<crate::process::Message>>,
+            >()
+        );
+        eprintln!("ProcessCold {}", size_of::<ProcessCold>());
+        macro_rules! field {
+            ($name:literal, $ty:ty) => {
+                eprintln!("  cold.{} {}", $name, size_of::<$ty>());
+            };
+        }
+        field!("hibernate", Option<crate::process::HibernateCont>);
+        field!("max_heap", crate::process::MaxHeap);
+        field!("saved_calls", Option<crate::trace::SavedCalls>);
+        field!("dirty_bif", Option<crate::dirty::DirtyBif>);
+        field!(
+            "static_nif_done",
+            Option<Result<Term, arinsal_bifs::BifError>>
+        );
+        field!("catch_cache", Option<crate::code_ix::CatchCache>);
+        field!(
+            "traced_native_call",
+            Option<(usize, usize, Vec<crate::trace::CallActions>)>
+        );
+        field!("trace_flags", (u64, Vec<(u64, u64)>));
+        field!("timer_pause", Option<crate::process::TimerPause>);
+        field!("native_bif_error", Option<NativeBifError>);
+        field!("trap_return", Option<TrapReturn>);
+        field!("bif_trap", Option<BifTrapPending>);
+        field!("delayed_gc", Vec<DelayedGc>);
+        field!("dirty_gc", Option<DirtyGc>);
+        field!("dictionary_heap", arinsal_term::VecHeap);
+        field!("flags", ProcFlags);
+        field!("links", LinkTree);
+        field!("monitors", MonitorTree);
+        field!("lt_monitors", TargetMonitorList);
+        field!("btreeset", std::collections::BTreeSet<u64>);
+        field!("suspend_map", std::collections::BTreeMap<arinsal_sched::Pid, std::sync::Arc<crate::suspend::SuspendMonitor>>);
+        field!("initial_bif", Option<(String, String, u8)>);
+        field!(
+            "native_dirty_nif",
+            Option<(usize, usize, arinsal_bifs::SchedulerClass)>
+        );
+        eprintln!(
+            "Option<Waiter> {}",
+            size_of::<Option<crate::signals::Waiter>>()
+        );
+        eprintln!(
+            "Option<SchedulerRefState> {}",
+            size_of::<Option<arinsal_bifs::SchedulerRefState>>()
+        );
     }
 }

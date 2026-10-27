@@ -22,7 +22,8 @@ use crate::{Node, Term, TermError};
 pub struct SignalNode<T> {
     /// The next node of the queue holding this one (`next`).
     pub next: Option<NonNull<SignalNode<T>>>,
-    /// Words of the inline heap fragment (`hfrag.alloc_size`), 0 for a node without one.
+    /// Words of the inline heap fragment (`hfrag.alloc_size`), 0 for a node without one, or
+    /// [`EMBEDDED`] for a node inside another structure.
     fragment_words: usize,
     /// The signal.
     pub value: T,
@@ -156,11 +157,19 @@ impl<T> OwnedSignal<T> {
     /// &hp)`), empty until [`OwnedSignal::heap_fragment`] allocates in it.
     pub fn with_heap_fragment(value: T, words: usize) -> Self {
         let (layout, header_offset) = node_layout::<T>(words);
-        // SAFETY: the layout has a nonzero size (it holds at least the `next` link).
-        let raw = unsafe { std::alloc::alloc(layout) }.cast::<SignalNode<T>>();
-        let Some(node) = NonNull::new(raw) else {
-            std::alloc::handle_alloc_error(layout);
+        assert!(
+            layout.align() <= std::mem::align_of::<u64>(),
+            "allocator blocks are word aligned"
+        );
+        let block = if words == 0 {
+            arinsal_alloc::typed::msg_ref_alloc(layout.size()).map(|block| block.as_non_null())
+        } else {
+            arinsal_alloc::typed::msg_alloc(layout.size())
         };
+        let Ok(block) = block else {
+            std::alloc::handle_alloc_error(layout)
+        };
+        let node = block.cast::<SignalNode<T>>();
         // SAFETY: `node` is a fresh allocation of `layout`, which places the node at its start
         // and, when `words` is not 0, a fragment header at `header_offset` followed by `words`.
         unsafe {
@@ -191,8 +200,9 @@ impl<T> OwnedSignal<T> {
     fn header(&self) -> Option<NonNull<HeapFragment>> {
         // SAFETY: the handle owns the node; the header sits where `node_layout` put it.
         unsafe {
-            let words = (*self.node.as_ptr()).fragment_words;
-            if words == 0 || words == EMBEDDED {
+            let packed = (*self.node.as_ptr()).fragment_words;
+            let words = packed;
+            if words == 0 || packed == EMBEDDED {
                 return None;
             }
             let (_, offset) = node_layout::<T>(words);
@@ -269,19 +279,29 @@ impl<T> OwnedSignal<T> {
                 return (take_embedded(node), None);
             }
             let value = std::ptr::addr_of!((*node.as_ptr()).value).read();
-            let words = (*node.as_ptr()).fragment_words;
-            let (layout, _) = node_layout::<T>(words);
             match header {
-                Some(header) => (
-                    value,
-                    Some(NodeFragment {
-                        memory: node.cast(),
-                        layout,
-                        header,
-                    }),
-                ),
+                Some(header) => {
+                    if (*header.as_ptr()).used_size == 0 {
+                        // `erts_shrink_message(..., 0, ...)` frees the combined MSG block; the
+                        // caller that retains a queue node replaces it with a MSG_REF node.
+                        std::ptr::drop_in_place(header.as_ptr());
+                        arinsal_alloc::typed::msg_free(node.cast());
+                        (value, None)
+                    } else {
+                        (
+                            value,
+                            Some(NodeFragment {
+                                memory: node.cast(),
+                                header,
+                            }),
+                        )
+                    }
+                }
                 None => {
-                    std::alloc::dealloc(node.as_ptr().cast(), layout);
+                    // SAFETY: this node was allocated by `msg_ref_alloc` in `OwnedSignal::new`.
+                    arinsal_alloc::typed::msg_ref_free(
+                        arinsal_alloc::typed::MessageRefBlock::from_node(node.cast()),
+                    );
                     (value, None)
                 }
             }
@@ -342,16 +362,16 @@ impl<T> Drop for OwnedSignal<T> {
                 return;
             }
             std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.node.as_ptr()).value));
-            let words = (*self.node.as_ptr()).fragment_words;
-            let (layout, _) = node_layout::<T>(words);
             if let Some(header) = header {
                 drop(NodeFragment {
                     memory: self.node.cast(),
-                    layout,
                     header,
                 });
             } else {
-                std::alloc::dealloc(self.node.as_ptr().cast(), layout);
+                // SAFETY: this node was allocated by `msg_ref_alloc` in `OwnedSignal::new`.
+                arinsal_alloc::typed::msg_ref_free(
+                    arinsal_alloc::typed::MessageRefBlock::from_node(self.node.cast()),
+                );
             }
         }
     }
@@ -361,7 +381,6 @@ impl<T> Drop for OwnedSignal<T> {
 /// while the data is in use (a received message on the process's fragment list).
 pub struct NodeFragment {
     memory: NonNull<u8>,
-    layout: Layout,
     header: NonNull<HeapFragment>,
 }
 
@@ -411,11 +430,12 @@ impl NodeFragment {
 
 impl Drop for NodeFragment {
     fn drop(&mut self) {
-        // SAFETY: the fragment owns the header and the node memory, laid out by `layout`.
+        // SAFETY: the fragment owns the header, which is dropped once before the node memory
+        // goes back to the allocator.
         unsafe {
             std::ptr::drop_in_place(self.header.as_ptr());
-            std::alloc::dealloc(self.memory.as_ptr(), self.layout);
         }
+        arinsal_alloc::typed::msg_free(self.memory);
     }
 }
 
@@ -620,6 +640,7 @@ impl MessageHeap {
 mod tests {
     use super::*;
     use crate::{TermBuilder, to_owned};
+    use similar_asserts::assert_eq;
 
     #[test]
     fn a_message_is_built_in_its_node_and_kept_as_a_fragment() {
@@ -671,5 +692,15 @@ mod tests {
         assert!(fragment.alloc(2).is_some());
         assert!(fragment.alloc(1).is_none());
         assert_eq!(fragment.used(), 2);
+    }
+
+    #[test]
+    fn an_unused_combined_fragment_releases_its_msg_block() {
+        let node = OwnedSignal::with_heap_fragment((), 3);
+        let (value, fragment) = node.split_fragment();
+        assert_eq!(value, ());
+        assert!(fragment.is_none());
+        let replacement = OwnedSignal::new(value);
+        assert!(replacement.fragment_words().is_none());
     }
 }

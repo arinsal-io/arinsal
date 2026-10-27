@@ -12,7 +12,7 @@ impl Task for Sink {
     fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32) -> RunOutcome {
         while let Some(event) = ctx.receive() {
             match event.payload {
-                Payload::Timer { message, .. } => self.0.lock().unwrap().push(message),
+                Payload::Timer { message, .. } => self.0.lock().unwrap().push(*message),
                 Payload::Message(message) => self.0.lock().unwrap().push(message),
                 _ => unreachable!(),
             }

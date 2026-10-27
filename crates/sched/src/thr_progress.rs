@@ -140,6 +140,32 @@ pub(crate) struct ThrProgress {
     umrefc_waiting: std::sync::atomic::AtomicI32,
 }
 
+/// Give the allocator pool access to this runtime's existing thread-progress operations.
+pub(crate) fn install_sspa_progress(_: Arc<ThrProgress>) {
+    let _ = arinsal_alloc::sspa::install_progress_ops(arinsal_alloc::sspa::ProgressOps {
+        current: sspa_current,
+        has_reached: sspa_has_reached,
+        is_managed: sspa_is_managed,
+    });
+}
+
+fn sspa_current(_: usize) -> u64 {
+    SSPA_PROGRESS.with(|progress| {
+        progress
+            .borrow()
+            .as_ref()
+            .map_or(0, |progress| progress.current.load(Ordering::Acquire))
+    })
+}
+
+fn sspa_has_reached(scheduler: usize, value: u64) -> bool {
+    has_reached_this(sspa_current(scheduler), value)
+}
+
+fn sspa_is_managed() -> bool {
+    MANAGED_OF.with(|of| of.get() != 0)
+}
+
 /// Per thread data of a managed thread (erts `ErtsThrPrgrData`) and its later operations
 /// (erts `ErtsAuxWorkData.later_op`).
 struct ThrPrgrData {
@@ -164,6 +190,8 @@ struct ThrPrgrData {
 thread_local! {
     /// erts `erts_thr_prgr_data_key__`.
     static TPD: RefCell<Option<ManagedThread>> = const { RefCell::new(None) };
+    /// Shared progress counter for SSPA callbacks, independent of the mutable thread data borrow.
+    static SSPA_PROGRESS: RefCell<Option<Arc<ThrProgress>>> = const { RefCell::new(None) };
     /// Block nesting of an unmanaged thread (erts temporary `ErtsThrPrgrData`).
     static UNMANAGED_BLOCKING: Cell<u32> = const { Cell::new(0) };
     /// Later operations of a runtime without managed threads (the simulated scheduler):
@@ -661,6 +689,7 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
         leader_umrefc_current: 0,
     })));
     TPD.with(|tpd| *tpd.borrow_mut() = Some(managed.clone()));
+    SSPA_PROGRESS.with(|slot| *slot.borrow_mut() = Some(Arc::clone(progress)));
     MANAGED_OF.with(|of| of.set(Arc::as_ptr(progress) as usize));
     managed
 }
@@ -670,6 +699,7 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
 /// [`run_remaining_later_ops`] once every managed thread stopped, runs them.
 pub(crate) fn unregister_managed_thread() {
     MANAGED_OF.with(|of| of.set(0));
+    SSPA_PROGRESS.with(|slot| *slot.borrow_mut() = None);
     let Some(managed) = TPD.with(|tpd| tpd.borrow_mut().take()) else {
         return;
     };

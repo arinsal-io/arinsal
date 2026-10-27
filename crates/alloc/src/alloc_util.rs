@@ -37,17 +37,43 @@ pub(crate) type HashSet<K> = StdHashSet<K, BuildHasherDefault<FastHasher>>;
 
 const WORD: usize = std::mem::size_of::<usize>();
 const ALIGN: usize = 8;
-const BLOCK_HEADER: usize = 2 * WORD;
+/// Allocated block header size (`ABLK_HDR_SZ = offsetof(Block_t, u)` = 8 B on 64-bit).
+/// Port of erts/emulator/beam/erl_alloc_util.c:202 (`ABLK_HDR_SZ`), OTP-29.1.1.
+pub(crate) const BLOCK_HEADER: usize = WORD;
 const FOOTER: usize = WORD;
 const ALLOCATOR_COUNT: usize = 11;
 const FREE: usize = 1;
 const PREV_FREE: usize = 2;
 const LAST: usize = 4;
+const SBC_BLK_HDR_FLG: usize = FREE | PREV_FREE | LAST;
 const SBC: usize = 2;
 const MSEG_CARRIER: usize = 1;
 const CARRIER_FLAGS: usize = ALIGN - 1;
 const HIGH_BIT: usize = 1usize << (usize::BITS - 1);
 const BLOCK_FLAGS: usize = CARRIER_FLAGS | HIGH_BIT;
+
+/// Superaligned multiblock carrier geometry and allocated-block offset bit-packing.
+/// Port of erts/emulator/beam/erl_alloc_util.h:331-358 and erl_alloc_util.c:255, OTP-29.1.1.
+const SACRR_UNIT_SHIFT: u32 = crate::raw::ERTS_MMAP_SUPERALIGNED_BITS;
+const SACRR_UNIT_SZ: usize = 1usize << SACRR_UNIT_SHIFT;
+const SACRR_UNIT_MASK: usize = !0usize << SACRR_UNIT_SHIFT;
+const MBC_ABLK_OFFSET_BITS: u32 = 23;
+const MBC_ABLK_OFFSET_SHIFT: u32 = usize::BITS - 1 - MBC_ABLK_OFFSET_BITS;
+const MBC_ABLK_OFFSET_MASK: usize = ((1usize << MBC_ABLK_OFFSET_BITS) - 1) << MBC_ABLK_OFFSET_SHIFT;
+const MBC_ABLK_SZ_MASK: usize = !MBC_ABLK_OFFSET_MASK & !BLOCK_FLAGS;
+const MBC_FBLK_SZ_MASK: usize = !BLOCK_FLAGS;
+const SBC_BLK_SZ_MASK: usize = !BLOCK_FLAGS;
+const MBC_SZ_MAX_LIMIT: usize = ((1usize << MBC_ABLK_OFFSET_BITS) - 1) << SACRR_UNIT_SHIFT;
+
+// Port of ERTS_CT_ASSERTs in erts_alcu_start, erl_alloc_util.c:6713-6718, OTP-29.1.1.
+const _: () = {
+    assert!(MBC_ABLK_OFFSET_MASK & MBC_ABLK_SZ_MASK == 0);
+    assert!(MBC_ABLK_OFFSET_MASK & BLOCK_FLAGS == 0);
+    assert!(MBC_ABLK_SZ_MASK & BLOCK_FLAGS == 0);
+    assert!(MBC_FBLK_SZ_MASK & BLOCK_FLAGS == 0);
+    assert!(SBC_BLK_SZ_MASK & BLOCK_FLAGS == 0);
+};
+
 const TREE_NODE: usize = 1;
 const RED: usize = 2;
 const TREE_FLAGS_WORD: usize = 2;
@@ -64,6 +90,9 @@ const AOFF_FLAGS_WORD: usize = 5;
 const LIST_PREV_WORD: usize = 2;
 const LIST_NEXT_WORD: usize = 3;
 
+/// Free-block / homecoming `Block_t` prefix (`bhdr` + `u.carrier` when free; allocated blocks
+/// overlap `u.udata__` with `carrier` so `ABLK_HDR_SZ == WORD`).
+/// Port of `Block_t`, erts/emulator/beam/erl_alloc_util.h:373-383, OTP-29.1.1.
 #[allow(dead_code)]
 #[repr(C)]
 struct BlockLayout {
@@ -115,18 +144,74 @@ struct CarrierLayout {
     index: u32,
 }
 
+const CARRIER_ALLCTR_WORD: usize = std::mem::offset_of!(CarrierLayout, allocator) / WORD;
 const AOFF_ROOT_WORD: usize = (std::mem::offset_of!(CarrierLayout, root)) / WORD;
 const AOFF_BLK_ORDER_WORD: usize = (std::mem::offset_of!(CarrierLayout, blk_order)) / WORD;
 const AOFF_INDEX_SHIFT: u32 = 8
     * (std::mem::offset_of!(CarrierLayout, index) - std::mem::offset_of!(CarrierLayout, blk_order))
         as u32;
-const AOFF_ROOT_BYTE: usize = std::mem::offset_of!(CarrierLayout, root);
+const AOFF_ROOT_BYTE: usize = AOFF_ROOT_WORD * WORD;
 const MBC_HEADER: usize = std::mem::offset_of!(CarrierLayout, aoff_tree_node);
 const AOFF_MBC_HEADER: usize = std::mem::size_of::<CarrierLayout>();
 const SBC_HEADER: usize =
     align_const(std::mem::offset_of!(CarrierLayout, cpool) + BLOCK_HEADER) - BLOCK_HEADER;
+const LIST_NODE_SIZE: usize = std::mem::size_of::<BlockLayout>() + 2 * WORD;
 const RB_NODE_SIZE: usize = std::mem::size_of::<BlockLayout>() + 4 * WORD;
 const BF_NODE_SIZE: usize = RB_NODE_SIZE + WORD;
+
+/// Port of `IS_SBC_BLK`, erts/emulator/beam/erl_alloc_util.h:424, OTP-29.1.1.
+#[inline(always)]
+const fn is_sbc_blk_hdr(bhdr: usize) -> bool {
+    (bhdr & SBC_BLK_HDR_FLG) == SBC_BLK_HDR_FLG
+}
+
+/// Port of `BLK_CARRIER_OFFSET` and `SET_MBC_ABLK_HDR`,
+/// erts/emulator/beam/erl_alloc_util.c:257-262, OTP-29.1.1.
+#[inline(always)]
+fn mbc_ablk_hdr(blk: usize, crr: usize, sz: usize, flags: usize) -> usize {
+    debug_assert_eq!(sz & !MBC_ABLK_SZ_MASK, 0);
+    debug_assert_eq!(flags & (!BLOCK_FLAGS | FREE), 0);
+    debug_assert_eq!(crr & !SACRR_UNIT_MASK, 0);
+    let carrier_offset = (blk - crr) >> SACRR_UNIT_SHIFT;
+    debug_assert!(carrier_offset < (1usize << MBC_ABLK_OFFSET_BITS));
+    sz | flags | (carrier_offset << MBC_ABLK_OFFSET_SHIFT)
+}
+
+/// Port of `ABLK_TO_MBC`, erts/emulator/beam/erl_alloc_util.h:432-436, OTP-29.1.1.
+#[inline(always)]
+pub(crate) const fn ablk_to_mbc(blk: usize, bhdr: usize) -> usize {
+    let unit_floor = blk & SACRR_UNIT_MASK;
+    let byte_offset = ((bhdr & !BLOCK_FLAGS) >> MBC_ABLK_OFFSET_SHIFT) << SACRR_UNIT_SHIFT;
+    unit_floor.wrapping_sub(byte_offset)
+}
+
+/// Port of `BLK_TO_SBC`, erts/emulator/beam/erl_alloc_util.c:449-450, OTP-29.1.1.
+#[inline(always)]
+pub(crate) const fn blk_to_sbc(blk: usize) -> usize {
+    blk - SBC_HEADER
+}
+
+/// Recovers `(instance, block_addr, user_size)` from a live payload address `user`.
+///
+/// Port of `UMEM2BLK` and `get_used_allctr`,
+/// erts/emulator/beam/erl_alloc_util.c:220,1736-1758, OTP-29.1.1.
+#[inline]
+pub(crate) fn used_block_from_payload(user: usize) -> (usize, u64, usize) {
+    let blk = user - BLOCK_HEADER;
+    let bhdr = WordView::new(blk as *mut u64, 1)
+        .atomic_load(0, Ordering::Relaxed)
+        .expect("live block header word") as usize;
+    let (crr, blk_sz) = if is_sbc_blk_hdr(bhdr) {
+        (blk_to_sbc(blk), bhdr & SBC_BLK_SZ_MASK)
+    } else {
+        debug_assert_eq!(bhdr & FREE, 0, "live MBC block must not have FREE set");
+        (ablk_to_mbc(blk, bhdr), bhdr & MBC_ABLK_SZ_MASK)
+    };
+    let instance = WordView::new(crr as *mut u64, CARRIER_ALLCTR_WORD + 1)
+        .atomic_load(CARRIER_ALLCTR_WORD, Ordering::Acquire)
+        .expect("carrier header allctr word") as usize;
+    (instance, blk as u64, blk_sz - BLOCK_HEADER)
+}
 
 const fn align_const(value: usize) -> usize {
     (value + ALIGN - 1) & !(ALIGN - 1)
@@ -436,7 +521,7 @@ impl<const A: bool> TNode<A> {
     }
     #[inline(always)]
     fn size(self) -> usize {
-        self.raw.word(0) & !BLOCK_FLAGS
+        self.raw.word(0) & MBC_FBLK_SZ_MASK
     }
     #[inline(always)]
     fn max(self) -> usize {
@@ -551,6 +636,18 @@ impl CarrierSpan {
             .as_mut_slice()
             .get_mut((key - self.start) / WORD + word)? = value as u64;
         Some(())
+    }
+
+    #[inline(always)]
+    fn set_prev_free(self, addr: usize) {
+        debug_assert!(self.holds(addr), "word {addr:#x} outside {:#x}", self.start);
+        self.store(addr, self.load(addr) | PREV_FREE);
+    }
+
+    #[inline(always)]
+    fn clear_prev_free(self, addr: usize) {
+        debug_assert!(self.holds(addr), "word {addr:#x} outside {:#x}", self.start);
+        self.store(addr, self.load(addr) & !PREV_FREE);
     }
 }
 
@@ -723,25 +820,44 @@ impl CarrierArena {
         Self { free: vec![region] }
     }
 
-    fn allocate(&mut self, requested: usize) -> Result<RawRegion, AllocError> {
+    fn allocate(&mut self, requested: usize, flags: SegmentFlags) -> Result<RawRegion, AllocError> {
         let page = page_size();
+        let align = if flags == SegmentFlags::PowerOfTwo {
+            SACRR_UNIT_SZ.max(page)
+        } else {
+            page
+        };
         let size = requested
-            .checked_add(page - 1)
+            .max(1)
+            .checked_add(align - 1)
             .ok_or(AllocError::Overflow)?
-            & !(page - 1);
-        let index = self
+            & !(align - 1);
+        let (index, prefix) = self
             .free
             .iter()
-            .position(|region| region.len() >= size)
+            .enumerate()
+            .find_map(|(i, region)| {
+                let base = region.as_ptr() as usize;
+                let aligned = base.checked_add(align - 1)? & !(align - 1);
+                let prefix = aligned - base;
+                (prefix.checked_add(size)? <= region.len()).then_some((i, prefix))
+            })
             .ok_or(AllocError::NoSpace)?;
-        let region = self.free.remove(index);
-        if region.len() == size {
-            return Ok(region);
+        let mut region = self.free.remove(index);
+        if prefix > 0 {
+            let (head, rest) = region.split_at(prefix).map_err(|_| AllocError::Corrupt)?;
+            self.free.push(head);
+            region = rest;
         }
-        let (allocated, tail) = region.split_at(size).map_err(|_| AllocError::Corrupt)?;
-        self.free.push(tail);
-        self.sort_and_coalesce();
-        Ok(allocated)
+        if region.len() > size {
+            let (allocated, tail) = region.split_at(size).map_err(|_| AllocError::Corrupt)?;
+            self.free.push(tail);
+            region = allocated;
+        }
+        if prefix > 0 || !self.free.is_empty() {
+            self.sort_and_coalesce();
+        }
+        Ok(region)
     }
 
     fn release(&mut self, region: RawRegion) {
@@ -997,15 +1113,22 @@ impl AllocUtil {
         block_size: usize,
     ) -> Result<usize, AllocError> {
         let header = span.load(offset);
-        let actual = header & !BLOCK_FLAGS;
+        let actual = header & MBC_FBLK_SZ_MASK;
         debug_assert!(header & FREE != 0 && actual >= block_size);
-        self.unlink_free_in(span, offset, actual)?;
+        if is_aoff(self.strategy) {
+            self.unlink_aoff_free_in(span, offset);
+        } else {
+            self.unlink_free_in(span, offset, actual)?;
+        }
         let last = header & LAST;
         let prev_free = header & PREV_FREE;
         let remainder = actual - block_size;
         if remainder >= min_block_size(self.strategy) {
             let tail = offset + block_size;
-            span.store(offset, block_size | prev_free);
+            span.store(
+                offset,
+                mbc_ablk_hdr(offset, span.start, block_size, prev_free),
+            );
             span.store(tail, remainder | FREE | last);
             span.store(tail + WORD, span.start);
             if last == 0 {
@@ -1015,10 +1138,13 @@ impl AllocUtil {
             self.link_free_in(span, tail, remainder)?;
             Ok(block_size)
         } else {
-            span.store(offset, actual | prev_free | last);
+            span.store(
+                offset,
+                mbc_ablk_hdr(offset, span.start, actual, prev_free | last),
+            );
             if last == 0 {
                 let next = offset + actual;
-                span.store(next, span.load(next) & !PREV_FREE);
+                span.clear_prev_free(next);
             }
             Ok(actual)
         }
@@ -1059,7 +1185,7 @@ impl AllocUtil {
             return Err(AllocError::InvalidAllocation);
         }
         let header = span.load(key);
-        let size = header & !BLOCK_FLAGS;
+        let size = header & MBC_ABLK_SZ_MASK;
         if header & FREE != 0 || size == 0 {
             return Err(AllocError::InvalidAllocation);
         }
@@ -1074,33 +1200,55 @@ impl AllocUtil {
     #[inline(always)]
     fn mbc_free(&mut self, span: CarrierSpan, key: usize, header: usize) -> Result<(), AllocError> {
         let mut start = key;
-        let mut size = header & !BLOCK_FLAGS;
+        let mut size = header & MBC_ABLK_SZ_MASK;
         self.carrier_blk_free(span.index, size)?;
-        let mut prev_free = header & PREV_FREE;
         let mut last = header & LAST;
-        if prev_free != 0 {
+        if header & PREV_FREE != 0 {
             let footer = span.load(key - WORD);
             debug_assert!(footer != 0 && footer <= key - span.start - self.mbc_header_size());
             let prev = key - footer;
-            let prev_header = span.load(prev);
-            if prev_header & FREE != 0 {
+            if is_aoff(self.strategy) {
+                self.unlink_aoff_free_in(span, prev);
+            } else {
                 self.unlink_free_in(span, prev, footer)?;
-                start = prev;
-                size += footer;
-                prev_free = prev_header & PREV_FREE;
             }
+            let prev_header = span.load(prev);
+            debug_assert_ne!(prev_header & FREE, 0);
+            start = prev;
+            size += footer;
+            span.store(start, (prev_header & !MBC_FBLK_SZ_MASK) | size);
+        } else {
+            // Port of SET_BLK_FREE, erl_alloc_util.c:280 (`MBC_ABLK_OFFSET_BITS` path), OTP-29.1.1.
+            span.store(start, (header & (MBC_ABLK_SZ_MASK | LAST)) | FREE);
+            span.store(start + WORD, span.start);
         }
-        let mut next_free = false;
         if last == 0 {
             let next = start + size;
             let next_header = span.load(next);
             if next_header & FREE != 0 {
-                let next_size = next_header & !BLOCK_FLAGS;
-                self.unlink_free_in(span, next, next_size)?;
+                if is_aoff(self.strategy) {
+                    self.unlink_aoff_free_in(span, next);
+                } else {
+                    self.unlink_free_in(span, next, next_header & MBC_FBLK_SZ_MASK)?;
+                }
+                let next_header = span.load(next);
+                let next_size = next_header & MBC_FBLK_SZ_MASK;
                 size += next_size;
+                span.store(start, (span.load(start) & !MBC_FBLK_SZ_MASK) | size);
                 last = next_header & LAST;
-                next_free = true;
+                if last != 0 {
+                    span.store(start, span.load(start) | LAST);
+                } else {
+                    span.store(start, span.load(start) & !LAST);
+                    span.store(start + size - WORD, size);
+                }
+            } else {
+                span.set_prev_free(next);
+                span.store(start, span.load(start) & !LAST);
+                span.store(start + size - WORD, size);
             }
+        } else {
+            span.store(start, span.load(start) | LAST);
         }
         if last != 0
             && start == span.start + self.mbc_header_size()
@@ -1110,15 +1258,6 @@ impl AllocUtil {
                 .main
         {
             return self.remove_carrier(span.index);
-        }
-        span.store(start, size | FREE | prev_free | last);
-        span.store(start + WORD, span.start);
-        if last == 0 {
-            span.store(start + size - WORD, size);
-            if !next_free {
-                let next = start + size;
-                span.store(next, span.load(next) | PREV_FREE);
-            }
         }
         self.link_free_in(span, start, size)?;
         self.check_abandon_carrier(span)
@@ -1131,7 +1270,7 @@ impl AllocUtil {
         if key != span.start + SBC_HEADER || !span.holds(key) {
             return Err(AllocError::InvalidAllocation);
         }
-        let size = span.load(key) & !BLOCK_FLAGS;
+        let size = span.load(key) & SBC_BLK_SZ_MASK;
         if size == 0 {
             return Err(AllocError::InvalidAllocation);
         }
@@ -1294,22 +1433,27 @@ impl AllocUtil {
     fn decode_block(span: CarrierSpan, key: usize) -> Result<Block, AllocError> {
         let index = span.index;
         let header = span.read(key, 0).ok_or(AllocError::Corrupt)?;
-        let size = header & !BLOCK_FLAGS;
         if span.is_sbc() {
             return Ok(Block {
                 carrier: index,
                 offset: key,
-                size,
+                size: header & SBC_BLK_SZ_MASK,
                 allocated: true,
                 prev_free: true,
                 last: true,
             });
         }
+        let allocated = header & FREE == 0;
+        let size = if allocated {
+            header & MBC_ABLK_SZ_MASK
+        } else {
+            header & MBC_FBLK_SZ_MASK
+        };
         Ok(Block {
             carrier: index,
             offset: key,
             size,
-            allocated: header & FREE == 0,
+            allocated,
             prev_free: header & PREV_FREE != 0,
             last: header & LAST != 0,
         })
@@ -1578,7 +1722,7 @@ impl AllocUtil {
                 (
                     Allocation {
                         id: block.offset as u64,
-                        size: block.size,
+                        size: block.size - BLOCK_HEADER,
                     },
                     block.offset,
                 )
@@ -1594,6 +1738,13 @@ impl AllocUtil {
         let carrier = self
             .vacate_carrier(carrier_index)
             .ok_or(AllocError::Corrupt)?;
+        // Port of cpool_insert, erl_alloc_util.c:2185, OTP-29.1.1: while a carrier is in the
+        // pool or homecoming, crr->allctr names its origin instance.
+        carrier.memory.words().atomic_store(
+            std::mem::offset_of!(CarrierLayout, allocator) / WORD,
+            carrier.origin_instance as u64,
+            Ordering::Release,
+        );
         if carrier.mseg {
             self.mseg.release_transferred(carrier.size);
         }
@@ -1671,9 +1822,9 @@ impl AllocUtil {
             remapped.push((old, old));
         }
         for block in transfer.blocks {
-            let block = self.blk(block.offset)?;
-            self.write_block(&block)?;
             if !block.allocated {
+                let block = self.blk(block.offset)?;
+                self.write_block(&block)?;
                 self.link_free(block.offset)?;
             }
         }
@@ -2090,6 +2241,8 @@ impl AllocUtil {
                 (if c.sbc { SBC } else { 0 }) | (if c.mseg { MSEG_CARRIER } else { 0 });
             if carrier_header & !CARRIER_FLAGS != c.size
                 || carrier_header & CARRIER_FLAGS != expected_carrier_flags
+                || (!c.sbc && (c.key_base & !SACRR_UNIT_MASK) != 0)
+                || c.memory.read_word(CARRIER_ALLCTR_WORD * WORD) != Some(self.instance_index)
                 || c.start - c.key_base
                     != if c.sbc {
                         SBC_HEADER
@@ -2112,7 +2265,7 @@ impl AllocUtil {
                 }
                 let rel = pos - c.key_base;
                 let h = c.memory.read_word(rel).ok_or(AllocError::Corrupt)?;
-                if (c.sbc && h & (FREE | PREV_FREE | LAST) != FREE | PREV_FREE | LAST)
+                if (c.sbc && h & SBC_BLK_HDR_FLG != SBC_BLK_HDR_FLG)
                     || (!c.sbc && b.prev_free != previous_free)
                     || (!c.sbc && previous_free && !b.allocated)
                 {
@@ -2121,10 +2274,16 @@ impl AllocUtil {
                 previous_free = !b.allocated;
                 if !b.allocated && !c.sbc {
                     free.insert(pos);
+                    if c.memory.read_word(rel + WORD) != Some(c.key_base) {
+                        return Err(AllocError::Corrupt);
+                    }
                     if !b.last && c.memory.read_word(rel + b.size - WORD) != Some(b.size) {
                         return Err(AllocError::Corrupt);
                     }
                 } else {
+                    if !c.sbc && ablk_to_mbc(pos, h) != c.key_base {
+                        return Err(AllocError::Corrupt);
+                    }
                     count[usize::from(c.sbc)] += 1;
                     bytes[usize::from(c.sbc)] += b.size;
                     carrier_bytes += b.size;
@@ -2212,9 +2371,11 @@ impl AllocUtil {
             return Ok((1, 0));
         }
         let node_carrier = self.aoff_carrier_index(node).is_some();
+        let has_tree_flag = self.node_word(node, TREE_FLAGS_WORD)? as u32 & TREE_NODE as u32 != 0;
+        let expected_tree_flag = self.strategy == Strategy::AoffCbf && !carrier_tree;
         if node_carrier != carrier_tree
             || self.node_word(node, TREE_PARENT_WORD)? != parent
-            || self.node_word(node, TREE_FLAGS_WORD)? as u32 & TREE_NODE as u32 == 0
+            || has_tree_flag != expected_tree_flag
         {
             return Err(AllocError::Corrupt);
         }
@@ -2426,12 +2587,18 @@ impl AllocUtil {
         };
         size = size.max(self.mbc_header_size() + needed);
         size = align_up(size)?;
+        if size > MBC_SZ_MAX_LIMIT {
+            return Err(AllocError::Overflow);
+        }
         let (memory, mseg) = self.allocate_carrier(
             size,
             !is_main && self.stats.mseg_carriers < self.options.mmmbc,
             SegmentFlags::PowerOfTwo,
         )?;
         let size = memory.len();
+        if size > MBC_SZ_MAX_LIMIT {
+            return Err(AllocError::Overflow);
+        }
         let key_base = memory.as_ptr() as usize;
         let start = key_base + self.mbc_header_size();
         let ci = self.insert_carrier(Carrier {
@@ -2476,12 +2643,18 @@ impl AllocUtil {
     }
     fn write_carrier(&mut self, ci: usize) -> Result<(), AllocError> {
         let mbc_header_size = self.mbc_header_size();
+        let instance_index = self.instance_index as u64;
         let c = self.carriers[ci].as_mut().unwrap();
         let flags = (if c.sbc { SBC } else { 0 }) | (if c.mseg { MSEG_CARRIER } else { 0 });
         let _ = c.memory.write_word(0, c.size | flags);
         let _ = c.memory.write_word(WORD, 0);
         let _ = c.memory.write_word(2 * WORD, 0);
-        let _ = c.memory.write_word(3 * WORD, 0);
+        // Port of SET_CARRIER_HDR, erl_alloc_util.c:445-447, OTP-29.1.1: publish owning instance
+        // in `crr->allctr` so `get_used_allctr` (`used_block_from_payload`) can read it atomically.
+        let _ =
+            c.memory
+                .words()
+                .atomic_store(CARRIER_ALLCTR_WORD, instance_index, Ordering::Release);
         if !c.sbc {
             for offset in (4 * WORD..mbc_header_size).step_by(WORD) {
                 let _ = c.memory.write_word(offset, 0);
@@ -2498,7 +2671,7 @@ impl AllocUtil {
         if let Some(arena) = &mut self.carrier_arena {
             self.stats.sys_alloc_calls += 1;
             return arena
-                .allocate(size)
+                .allocate(size, mseg_flags)
                 .map(|region| (CarrierMemory::Arena(region), false));
         }
         if may_use_mseg {
@@ -2509,7 +2682,7 @@ impl AllocUtil {
         }
         self.stats.sys_alloc_calls += 1;
         let mapped = if mseg_flags == SegmentFlags::PowerOfTwo {
-            RawRegion::map_aligned(size, 1 << 24)
+            RawRegion::map_aligned(size, SACRR_UNIT_SZ.max(page_size()))
         } else {
             RawRegion::map(size)
         };
@@ -2525,25 +2698,30 @@ impl AllocUtil {
             Err(error) => Err(AllocError::mapped(error)),
         }
     }
-    /// Writes a block header, plus the carrier word and size footer of a free MBC block.
-    /// Port of SET_MBC_FBLK_HDR/SET_BLK_SZ_FTR, erl_alloc_util.c:225-262, OTP-29.1.1.
+    /// Writes a block header (encoding the superaligned carrier offset for allocated MBC blocks),
+    /// plus the carrier word and size footer of a free MBC block.
+    /// Port of SET_MBC_ABLK_HDR/SET_MBC_FBLK_HDR/SET_SBC_BLK_HDR/SET_BLK_SZ_FTR,
+    /// erl_alloc_util.c:225-269,323-325, OTP-29.1.1.
     #[inline(always)]
     fn write_block(&mut self, b: &Block) -> Result<(), AllocError> {
         let c = self.carriers[b.carrier]
             .as_mut()
             .ok_or(AllocError::Corrupt)?;
-        let flags = if c.sbc {
-            FREE | PREV_FREE | LAST
+        let header = if c.sbc {
+            b.size | SBC_BLK_HDR_FLG
+        } else if !b.allocated {
+            let flags =
+                FREE | (if b.prev_free { PREV_FREE } else { 0 }) | (if b.last { LAST } else { 0 });
+            b.size | flags
         } else {
-            (if !b.allocated { FREE } else { 0 })
-                | (if b.prev_free { PREV_FREE } else { 0 })
-                | (if b.last { LAST } else { 0 })
+            let flags = (if b.prev_free { PREV_FREE } else { 0 }) | (if b.last { LAST } else { 0 });
+            mbc_ablk_hdr(b.offset, c.key_base, b.size, flags)
         };
         let rel = b.offset - c.key_base;
-        if !c.memory.write_word(rel, b.size | flags) {
+        if !c.memory.write_word(rel, header) {
             return Err(AllocError::Corrupt);
         }
-        if !c.sbc && !b.allocated && !c.memory.write_word(rel + WORD, c.memory.as_ptr() as usize) {
+        if !c.sbc && !b.allocated && !c.memory.write_word(rel + WORD, c.key_base) {
             return Err(AllocError::Corrupt);
         }
         if !b.allocated && !b.last && !c.memory.write_word(rel + b.size - WORD, b.size) {
@@ -2555,26 +2733,24 @@ impl AllocUtil {
     /// Sets or clears PREV_FREE on the block following `b`.
     #[inline(always)]
     /// Port of SET_PREV_BLK_FREE/SET_PREV_BLK_ALLOCED, erl_alloc_util.c:237-250, OTP-29.1.1:
-    /// one read-modify-write of the next header in the same carrier.
+    /// the allocator owns this carrier, so the flag update is an ordinary header-word RMW.
     fn set_next_prev_free(&mut self, b: &Block, value: bool) -> Result<(), AllocError> {
         if b.last {
             return Ok(());
         }
-        let carrier = self.carriers[b.carrier]
-            .as_mut()
-            .ok_or(AllocError::Corrupt)?;
-        let rel = b.offset + b.size - carrier.key_base;
-        let header = carrier.memory.read_word(rel).ok_or(AllocError::Corrupt)?;
-        let header = if value {
-            header | PREV_FREE
-        } else {
-            header & !PREV_FREE
-        };
-        if carrier.memory.write_word(rel, header) {
-            Ok(())
-        } else {
-            Err(AllocError::Corrupt)
-        }
+        let span = self.carrier_span(b.carrier)?;
+        let next = b.offset + b.size;
+        debug_assert!(span.holds(next));
+        let header = span.load(next);
+        span.store(
+            next,
+            if value {
+                header | PREV_FREE
+            } else {
+                header & !PREV_FREE
+            },
+        );
+        Ok(())
     }
 
     #[inline]
@@ -2629,12 +2805,12 @@ impl AllocUtil {
     /// `root` of `AOFF_Carrier_t` in erl_ao_firstfit_alloc.c.
     #[inline(always)]
     fn aoff_root(&self, span: CarrierSpan) -> usize {
-        span.read(span.start, AOFF_ROOT_WORD).unwrap_or(0)
+        span.load(span.start + AOFF_ROOT_BYTE)
     }
 
     #[inline(always)]
     fn set_aoff_root(&mut self, span: CarrierSpan, root: usize) {
-        let _ = span.write(span.start, AOFF_ROOT_WORD, root);
+        span.store(span.start + AOFF_ROOT_BYTE, root);
     }
 
     /// The span of the indexed or about-to-be-indexed carrier `index`.
@@ -2742,7 +2918,7 @@ impl AllocUtil {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn aoff_lower_carrier_max(&mut self, span: CarrierSpan) {
         let crr = self.tn::<true>(span.start + MBC_HEADER);
         let root = self.aoff_root(span);
@@ -2778,12 +2954,10 @@ impl AllocUtil {
             _ => 1,
         };
         let index = u64::from(u32::try_from(carrier_index).map_err(|_| AllocError::Overflow)?);
-        span.write(
-            span.start,
-            AOFF_BLK_ORDER_WORD,
+        span.store(
+            span.start + AOFF_BLK_ORDER_WORD * WORD,
             (index << AOFF_INDEX_SHIFT | blk_order) as usize,
-        )
-        .ok_or(AllocError::Corrupt)?;
+        );
         self.insert_tree_node::<true>(node, 0, span);
         Ok(())
     }
@@ -2939,6 +3113,7 @@ impl AllocUtil {
         let by_address = !block_node || self.strategy == Strategy::Aoff;
         let bestfit = block_node && matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf);
         let blk = self.tn::<A>(node);
+        blk.set_flags(0);
         blk.set_left(0);
         blk.set_right(0);
         if A {
@@ -2947,52 +3122,50 @@ impl AllocUtil {
         let root = self.root_of::<A>(tree);
         if root == 0 {
             blk.set_parent(0);
-            blk.set_flags(TREE_NODE);
-            if bestfit {
-                blk.set_next(0);
-            }
+            blk.set_black();
             self.set_root_of::<A>(tree, node);
-            return;
-        }
-        let mut x = self.tn::<A>(root);
-        let go_left = loop {
-            let x_size = x.size();
-            if A && x.max() < size {
-                x.set_max(size);
-            }
-            if bestfit && size == x_size {
-                let head_next = x.next();
-                blk.set_flags(0);
-                blk.set_parent(x.key());
-                blk.set_next(head_next);
-                if head_next != 0 {
-                    self.tn::<A>(head_next).set_parent(node);
-                }
-                x.set_next(node);
-                return;
-            }
-            let go_left = if by_address {
-                node < x.key()
-            } else {
-                (size, node) < (x_size, x.key())
-            };
-            let child = if go_left { x.left() } else { x.right() };
-            if child == 0 {
-                break go_left;
-            }
-            x = self.tn::<A>(child);
-        };
-        blk.set_parent(x.key());
-        if go_left {
-            x.set_left(node);
         } else {
-            x.set_right(node);
-        }
-        blk.set_flags(TREE_NODE | RED);
-        if x.is_red() {
-            self.insert_fixup(tree, blk);
+            let mut x = self.tn::<A>(root);
+            let go_left = loop {
+                let x_size = x.size();
+                if A && x.max() < size {
+                    x.set_max(size);
+                }
+                if bestfit && size == x_size {
+                    let head_next = x.next();
+                    blk.set_flags(0);
+                    blk.set_parent(x.key());
+                    blk.set_next(head_next);
+                    if head_next != 0 {
+                        self.tn::<A>(head_next).set_parent(node);
+                    }
+                    x.set_next(node);
+                    return;
+                }
+                let go_left = if by_address {
+                    node < x.key()
+                } else {
+                    (size, node) < (x_size, x.key())
+                };
+                let child = if go_left { x.left() } else { x.right() };
+                if child == 0 {
+                    break go_left;
+                }
+                x = self.tn::<A>(child);
+            };
+            blk.set_parent(x.key());
+            if go_left {
+                x.set_left(node);
+            } else {
+                x.set_right(node);
+            }
+            blk.set_red();
+            if x.is_red() {
+                self.insert_fixup(tree, blk);
+            }
         }
         if bestfit {
+            blk.set_flags(blk.flags() | TREE_NODE);
             blk.set_next(0);
         }
     }
@@ -3164,8 +3337,7 @@ impl AllocUtil {
         size: usize,
     ) -> Result<(), AllocError> {
         if is_aoff(self.strategy) {
-            self.tree_span.set(span);
-            self.unlink_tree_node::<true>(span, node);
+            self.unlink_aoff_free_in(span, node);
             return Ok(());
         }
         if self.strategy == Strategy::GoodFit {
@@ -3183,6 +3355,12 @@ impl AllocUtil {
         self.tree_span.set(span);
         self.unlink_tree_node::<false>(span, node);
         Ok(())
+    }
+
+    #[inline(always)]
+    fn unlink_aoff_free_in(&mut self, span: CarrierSpan, node: usize) {
+        self.tree_span.set(span);
+        self.unlink_tree_node::<true>(span, node);
     }
 
     /// Port of aoff_unlink_free_block, erl_ao_firstfit_alloc.c, OTP-29.1.1, and of the tree part of
@@ -3304,7 +3482,7 @@ impl AllocUtil {
         sz
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn lower_max_size<const A: bool>(&self, node: TNode<A>, stop_at: usize) {
         let old_max = node.max();
         let new_max = self.node_max_size(node);
@@ -3554,7 +3732,8 @@ impl AllocUtil {
             let block = allocator.blk(node)?;
             if block.allocated
                 || allocator.node_word(node, TREE_PARENT_WORD)? != parent
-                || allocator.node_word(node, TREE_FLAGS_WORD)? & TREE_NODE == 0
+                || (allocator.node_word(node, TREE_FLAGS_WORD)? & TREE_NODE != 0)
+                    != matches!(allocator.strategy, Strategy::BestFit | Strategy::AoffCbf)
             {
                 return Err(AllocError::Corrupt);
             }
@@ -3827,13 +4006,17 @@ impl std::fmt::Display for AllocError {
 }
 impl std::error::Error for AllocError {}
 
-/// Port of the `min_block_size` setup in erts_alcu_start, erl_alloc_util.c, OTP-29.1.1: the node
-/// struct plus the free block footer, rounded to the unit. The aoff node carries the list word.
+/// Port of the `min_block_size` setup in erts_alcu_start (erl_alloc_util.c:6790),
+/// erl_goodfit_alloc.c:90 (`sizeof(GFFreeBlock_t)`), erl_afit_alloc.c:69 (`sizeof(AFFreeBlock_t)`),
+/// erl_bestfit_alloc.c:115 (`sizeof(RBTreeList_t)` / `sizeof(RBTree_t)`), and
+/// erl_ao_firstfit_alloc.c:190 (`sizeof(AOFF_RBTree_t)`), OTP-29.1.1.
 fn min_block_size(strategy: Strategy) -> usize {
-    let node_size = if strategy == Strategy::BestFit || is_aoff(strategy) {
-        BF_NODE_SIZE
-    } else {
-        RB_NODE_SIZE
+    let node_size = match strategy {
+        Strategy::BestFit | Strategy::Aoff | Strategy::AoffCbf | Strategy::AoffCaobf => {
+            BF_NODE_SIZE
+        }
+        Strategy::AddressOrderBestFit => RB_NODE_SIZE,
+        Strategy::GoodFit | Strategy::Afit => LIST_NODE_SIZE,
     };
     align_const(node_size + FOOTER)
 }
@@ -3919,14 +4102,21 @@ mod tests {
     use proptest::{prop_assert, prop_assert_eq, proptest, test_runner::Config as ProptestConfig};
     #[test]
     fn otp_header_layout_matches_arm64_abi() {
-        assert_eq!(std::mem::size_of::<BlockLayout>(), 2 * WORD);
-        assert_eq!(RB_NODE_SIZE, 6 * WORD);
-        assert_eq!(BF_NODE_SIZE, 7 * WORD);
-        assert_eq!(ALIGN, 8);
-        assert_eq!(SBC_HEADER, 32);
-        assert_eq!(MBC_HEADER, 352);
-        assert_eq!(AOFF_MBC_HEADER, 424);
-        assert_eq!(AOFF_ROOT_WORD * WORD, 408);
+        similar_asserts::assert_eq!(BLOCK_HEADER, WORD);
+        similar_asserts::assert_eq!(std::mem::size_of::<BlockLayout>(), 2 * WORD);
+        similar_asserts::assert_eq!(LIST_NODE_SIZE, 4 * WORD);
+        similar_asserts::assert_eq!(RB_NODE_SIZE, 6 * WORD);
+        similar_asserts::assert_eq!(BF_NODE_SIZE, 7 * WORD);
+        similar_asserts::assert_eq!(min_block_size(Strategy::GoodFit), GF_MIN_BLOCK);
+        similar_asserts::assert_eq!(min_block_size(Strategy::Afit), 40);
+        similar_asserts::assert_eq!(min_block_size(Strategy::AddressOrderBestFit), 56);
+        similar_asserts::assert_eq!(min_block_size(Strategy::BestFit), 64);
+        similar_asserts::assert_eq!(min_block_size(Strategy::AoffCbf), 64);
+        similar_asserts::assert_eq!(ALIGN, 8);
+        similar_asserts::assert_eq!(SBC_HEADER, 32);
+        similar_asserts::assert_eq!(MBC_HEADER, 352);
+        similar_asserts::assert_eq!(AOFF_MBC_HEADER, 424);
+        similar_asserts::assert_eq!(AOFF_ROOT_WORD * WORD, 408);
     }
     #[test]
     fn aoff_carrier_header_holds_block_root_and_order() {
@@ -4070,11 +4260,12 @@ mod tests {
         };
         let mut allocator = AllocUtil::new(Strategy::BestFit, options);
         let first = allocator.alloc(13_000).unwrap();
-        assert_eq!(allocator.stats().sys_alloc_carriers, 1);
+        similar_asserts::assert_eq!(allocator.stats().sys_alloc_carriers, 1);
         let second = allocator.alloc(13_000).unwrap();
-        assert_eq!(allocator.stats().mseg_carriers, 1);
+        similar_asserts::assert_eq!(allocator.stats().mseg_carriers, 1);
         let third = allocator.alloc(4000).unwrap();
-        assert_eq!(allocator.stats().sys_alloc_carriers, 1);
+        similar_asserts::assert_eq!(allocator.stats().mseg_carriers, 1);
+        similar_asserts::assert_eq!(allocator.stats().sys_alloc_carriers, 2);
         assert!(allocator.stats().mseg_alloc_calls >= 1);
         allocator.validate().unwrap();
         allocator.free(first).unwrap();
@@ -4707,5 +4898,150 @@ mod tests {
                 usize::MAX
             )
         );
+    }
+
+    #[test]
+    fn ablk_to_mbc_recovers_carrier_across_multi_unit_mbc_and_sbc() {
+        let opts = AllocUtilOptions {
+            sbct: 256 * 1024,
+            mmbcs: 128 * 1024,
+            smbcs: 512 * 1024,
+            lmbcs: 512 * 1024,
+            acul: 60,
+            acnl: 8,
+            cpool: Some('J'),
+            ..Default::default()
+        };
+        let mut a = AllocUtil::new_for_instance(Strategy::AoffCbf, opts, "ets_alloc", 3, true);
+        // Fill main MBC, then allocate across >16 superalignment units (16 KiB each) in a 512 KiB MBC.
+        let mut blocks = Vec::new();
+        for _ in 0..80 {
+            let alloc = a.alloc(4096).unwrap();
+            similar_asserts::assert_eq!(alloc.payload_address() - alloc.id() as usize, 8);
+            let (inst, id, umem) = used_block_from_payload(alloc.payload_address());
+            similar_asserts::assert_eq!(inst, 3);
+            similar_asserts::assert_eq!(id, alloc.id());
+            assert!(umem >= 4096);
+            blocks.push(alloc);
+        }
+        // Verify blocks at multi-unit offsets (>0 superaligned units from carrier base) existed.
+        assert!(
+            blocks.iter().any(|b| {
+                let blk = b.id() as usize;
+                let bhdr = a.word_at(blk, 0).unwrap();
+                ablk_to_mbc(blk, bhdr) != (blk & SACRR_UNIT_MASK)
+            }),
+            "expected blocks past the first 16 KiB superaligned unit of an MBC"
+        );
+        // SBC block recovery via BLK_TO_SBC + crr->allctr.
+        let sbc = a.alloc(300 * 1024).unwrap();
+        similar_asserts::assert_eq!(sbc.payload_address() - sbc.id() as usize, 8);
+        let (sbc_inst, sbc_id, sbc_umem) = used_block_from_payload(sbc.payload_address());
+        similar_asserts::assert_eq!((sbc_inst, sbc_id), (3, sbc.id()));
+        assert!(sbc_umem >= 300 * 1024);
+        a.free(sbc).unwrap();
+
+        // Free blocks in the second MBC until it abandons, then import into instance 7.
+        let survivor = blocks.pop().unwrap();
+        while let Some(alloc) = blocks.pop() {
+            a.free(alloc).unwrap();
+            if a.has_pending_carriers() {
+                break;
+            }
+        }
+        let mut transfers = a.take_pending_carriers();
+        assert!(!transfers.is_empty(), "expected abandoned carrier");
+        // While pooled, crr->allctr names origin instance 3.
+        let (pooled_inst, pooled_id, _) = used_block_from_payload(survivor.payload_address());
+        similar_asserts::assert_eq!((pooled_inst, pooled_id), (3, survivor.id()));
+
+        let mut b = AllocUtil::new_for_instance(Strategy::AoffCbf, opts, "ets_alloc", 7, true);
+        let mut imported = Vec::new();
+        for transfer in transfers.drain(..) {
+            for (_, new) in b.import_carrier_transfer(transfer).unwrap() {
+                imported.push(new);
+            }
+        }
+        assert!(imported.iter().any(|al| al.id() == survivor.id()));
+        // After import into instance 7, crr->allctr names instance 7.
+        let (moved_inst, moved_id, _) = used_block_from_payload(survivor.payload_address());
+        similar_asserts::assert_eq!((moved_inst, moved_id), (7, survivor.id()));
+        b.validate().unwrap();
+        while let Some(al) = imported.pop() {
+            b.free(al).unwrap();
+            if b.has_pending_carriers() {
+                break;
+            }
+        }
+        for homecoming in b.take_pending_carriers() {
+            // While homecoming, crr->allctr names origin instance 3.
+            if let Some(&(al, _)) = homecoming.allocations().first() {
+                let (hc_inst, hc_id, _) = used_block_from_payload(al.payload_address());
+                similar_asserts::assert_eq!((hc_inst, hc_id), (3, al.id()));
+            }
+            for (_, returned) in a.import_carrier_transfer(homecoming).unwrap() {
+                let (ret_inst, ret_id, _) = used_block_from_payload(returned.payload_address());
+                similar_asserts::assert_eq!((ret_inst, ret_id), (3, returned.id()));
+                blocks.push(returned);
+            }
+        }
+        while let Some(al) = blocks.pop() {
+            if !a.has_pending_carriers() {
+                let _ = a.free(al);
+            }
+        }
+        a.validate().unwrap();
+        b.validate().unwrap();
+    }
+
+    #[test]
+    fn ets_alloc_block_sizes_match_erl_differential() {
+        let eval = "\
+RowBytes = fun(TupleFn) -> \
+    T = ets:new(t, [ordered_set]), \
+    [ets:insert(T, TupleFn(K)) || K <- lists:seq(1, 1000)], \
+    B1 = erlang:memory(ets), \
+    [ets:insert(T, TupleFn(K)) || K <- lists:seq(1001, 2000)], \
+    B2 = erlang:memory(ets), \
+    ets:delete(T), \
+    (B2 - B1) div 1000 \
+end, \
+io:format(\"~p ~p ~p ~p\", [ \
+    RowBytes(fun(K) -> {K} end), \
+    RowBytes(fun(K) -> {K, a} end), \
+    RowBytes(fun(K) -> {K, a, b} end), \
+    RowBytes(fun(K) -> {K, a, b, c} end) \
+]), \
+erlang:halt(0).";
+        let output = std::process::Command::new("erl")
+            .args(["-noshell", "-eval", eval])
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skipping differential block-size check: erl is not installed");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "erl failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let erl_sizes: Vec<usize> = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(|tok| tok.parse::<usize>().expect("integer bytes/row"))
+            .collect();
+        // DbTreeTerm payload before ABLK_HDR_SZ: 5 header words + (arity + 1) tuple words.
+        let arinsal_sizes: Vec<usize> = [7 * WORD, 8 * WORD, 9 * WORD, 10 * WORD]
+            .into_iter()
+            .map(|payload_bytes| {
+                let mut alloc = AllocUtil::new(Strategy::AoffCbf, AllocUtilOptions::default());
+                let before = alloc.blocks_size();
+                let handle = alloc.alloc(payload_bytes).unwrap();
+                let delta = alloc.blocks_size() - before;
+                alloc.free(handle).unwrap();
+                delta
+            })
+            .collect();
+        similar_asserts::assert_eq!(arinsal_sizes, erl_sizes);
+        similar_asserts::assert_eq!(arinsal_sizes, vec![64, 72, 80, 88]);
     }
 }

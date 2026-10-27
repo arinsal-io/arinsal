@@ -8,6 +8,8 @@ pub mod mmap;
 pub mod mseg;
 #[allow(unsafe_code)]
 pub mod raw;
+#[allow(unsafe_code)]
+pub mod sspa;
 pub mod typed;
 pub mod types;
 

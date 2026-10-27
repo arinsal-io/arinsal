@@ -21,7 +21,7 @@ impl std::fmt::Debug for ErtsAlcType {
 
 /// Name and serving allocator (index in `ALLOCATOR_NAMES`, mapped like erl_alloc.types) of each
 /// type, indexed by the type number.
-const ALC_TYPES: [(&str, u8); 20] = [
+const ALC_TYPES: [(&str, u8); 21] = [
     ("HEAP", 4),
     ("OLD_HEAP", 4),
     ("HEAP_FRAG", 4),
@@ -42,6 +42,7 @@ const ALC_TYPES: [(&str, u8); 20] = [
     ("FUN_ENTRY", 3),
     ("TMP", 0),
     ("PROC", 6),
+    ("PRE_ALLOC_DATA", 3),
 ];
 
 impl ErtsAlcType {
@@ -85,6 +86,8 @@ impl ErtsAlcType {
     pub const TMP: Self = Self(18);
     /// Process structures (`ERTS_ALC_T_PROC`), a fixed-size type of fix_alloc.
     pub const PROC: Self = Self(19);
+    /// Permanent preallocation data (`ERTS_ALC_T_PRE_ALLOC_DATA`).
+    pub const PRE_ALLOC_DATA: Self = Self(20);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {
@@ -96,6 +99,7 @@ impl ErtsAlcType {
     const fn fix_index(self) -> Option<usize> {
         match self.0 {
             19 => Some(0),
+            8 => Some(1),
             _ => None,
         }
     }
@@ -121,6 +125,26 @@ pub struct BinaryBlock {
     memory: WordView,
     allocators: &'static ThreadSpecificAllocators,
     owned: bool,
+}
+
+/// One ERTS message reference node from the scheduler-specific preallocator or MSG_REF fix_alloc.
+pub struct MessageRefBlock(std::ptr::NonNull<u8>);
+
+impl MessageRefBlock {
+    /// Wrap a live zero-fragment message node so its allocator route can be recovered on free.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be the live payload returned by [`msg_ref_alloc`].
+    #[allow(unsafe_code)]
+    pub unsafe fn from_node(pointer: std::ptr::NonNull<u8>) -> Self {
+        Self(pointer)
+    }
+
+    /// Address of the message node.
+    pub fn as_non_null(&self) -> std::ptr::NonNull<u8> {
+        self.0
+    }
 }
 
 impl BinaryBlock {
@@ -861,6 +885,52 @@ pub fn fix_alloc_shrink(ix: usize, lower_limit: bool) -> crate::instances::FixSh
         .unwrap_or_default()
 }
 
+/// Bytes of the fixed-size type `allocation_type` allocated and in use on `instance`
+/// (`alloc_type_atoms` entries of `fix_types`), `None` for a type that is not fixed-size.
+pub fn fix_bytes(allocation_type: ErtsAlcType, instance: usize) -> Option<(usize, usize)> {
+    let fix_ix = allocation_type.fix_index()?;
+    Some(
+        allocator_for(allocation_type)
+            .ok()?
+            .fix_bytes(instance, fix_ix),
+    )
+}
+
+/// Names of the alloc_util allocators in `ALC_A` order.
+pub fn allocator_names() -> &'static [&'static str] {
+    &ALLOCATOR_NAMES
+}
+
+/// Instances `1..=n` that belong to scheduler threads of the allocator `name`; the instances above
+/// are dirty scheduler instances, instance 0 is global. `None` for an unknown allocator.
+pub fn scheduler_instances(name: &str) -> Option<usize> {
+    let index = ALLOCATOR_NAMES.iter().position(|known| *known == name)?;
+    registry()
+        .get(index)
+        .and_then(Option::as_ref)
+        .map(ThreadSpecificAllocators::scheduler_instance_count)
+}
+
+/// The `alloc_util` counters of instance `instance` of the allocator `name`.
+///
+/// Port of the data `erts_alcu_info` and `erts_alcu_sz_info` report, OTP-29.1.1; gathered on the
+/// instance's owner.
+pub fn allocator_info(name: &str, instance: usize) -> Option<crate::alloc_util::AllocatorInfo> {
+    let index = ALLOCATOR_NAMES.iter().position(|known| *known == name)?;
+    let allocators = registry().get(index).and_then(Option::as_ref)?;
+    (instance < allocators.instance_count()).then(|| allocators.info(instance))
+}
+
+/// Current allocated block bytes of the allocator `name` over all its instances
+/// (`alcu_size` of erl_alloc.c).
+pub fn allocator_blocks_bytes(name: &str) -> Option<u64> {
+    let index = ALLOCATOR_NAMES.iter().position(|known| *known == name)?;
+    registry()
+        .get(index)
+        .and_then(Option::as_ref)
+        .map(|allocators| allocators.current_blocks_size() as u64)
+}
+
 /// Blocks of the fixed-size type `allocation_type` in use and allocated on `instance`.
 pub fn fix_info(allocation_type: ErtsAlcType, instance: usize) -> Option<(usize, usize)> {
     let fix_ix = allocation_type.fix_index()?;
@@ -877,36 +947,22 @@ fn for_each_allocator(mut visit: impl FnMut(&ThreadSpecificAllocators)) {
     }
 }
 
-/// Bytes in front of a `driver_alloc` payload: the owning instance, which erts reads from the
-/// carrier header (`BLK_TO_MBC(blk)->allctr`) and which a block here does not carry.
-const DRV_PREFIX_BYTES: usize = 8;
-/// Distance from a block's allocation id (its address) to its payload (`BLOCK_HEADER`).
-const DRV_BLOCK_HEADER: usize = 16;
-
+#[inline]
 fn driver_handle(user: *mut u8) -> InstanceAllocation {
-    let base = user.wrapping_sub(DRV_PREFIX_BYTES).cast::<u64>();
-    let instance = crate::raw::words_at(base, 1)[0] as usize;
-    let id = base as usize - DRV_BLOCK_HEADER;
-    InstanceAllocation::from_parts(instance, id as u64, 0)
-}
-
-fn driver_publish(handle: InstanceAllocation, base: *mut u64) -> *mut u8 {
-    crate::raw::words_at_mut(base, 1)[0] = handle.instance() as u64;
-    base.cast::<u8>().wrapping_add(DRV_PREFIX_BYTES)
+    let (instance, id, size) = crate::alloc_util::used_block_from_payload(user as usize);
+    InstanceAllocation::from_parts(instance, id, size)
 }
 
 /// `erts_alloc(ERTS_ALC_T_DRV, bytes)`, which `driver_alloc` and `enif_alloc` (ERTS_ALC_T_NIF,
 /// also the driver allocator) both use. Null when the request cannot be served.
-// Port of erts/emulator/beam/io.c (driver_alloc) and erl_nif.c (enif_alloc), OTP-29.1.1.
+// Port of erts/emulator/beam/io.c (driver_alloc), erl_nif.c (enif_alloc), and
+// erl_alloc_util.c:1736 (get_used_allctr via ABLK_TO_MBC/BLK_TO_SBC -> crr->allctr), OTP-29.1.1.
 pub fn driver_alloc(bytes: usize) -> *mut u8 {
-    let Some(total) = bytes.checked_add(DRV_PREFIX_BYTES) else {
-        return std::ptr::null_mut();
-    };
     let Ok(allocators) = allocator_for(ErtsAlcType::DRV) else {
         return std::ptr::null_mut();
     };
-    match allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), total) {
-        Ok((handle, base)) => driver_publish(handle, base),
+    match allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes) {
+        Ok((_, base)) => base.cast::<u8>(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -916,14 +972,11 @@ pub fn driver_realloc(ptr: *mut u8, bytes: usize) -> *mut u8 {
     if ptr.is_null() {
         return driver_alloc(bytes);
     }
-    let Some(total) = bytes.checked_add(DRV_PREFIX_BYTES) else {
-        return std::ptr::null_mut();
-    };
     let Ok(allocators) = allocator_for(ErtsAlcType::DRV) else {
         return std::ptr::null_mut();
     };
-    match allocators.realloc_with_ptr(driver_handle(ptr), total) {
-        Ok((handle, base)) => driver_publish(handle, base),
+    match allocators.realloc_with_ptr(driver_handle(ptr), bytes) {
+        Ok((_, base)) => base.cast::<u8>(),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -938,27 +991,13 @@ pub fn driver_free(ptr: *mut u8) {
     }
 }
 
-/// Words in `alloc_util::BlockLayout` ahead of the user payload (`bhdr` + `carrier`).
-/// While a block is allocated (`!IS_FREE_BLK`), `alloc_util` leaves the second word
-/// (`base - 8`, `BlockLayout.carrier`) untouched, so `ets_alloc` stores the owning allocator
-/// instance there with zero extra prefix words (standing in for `BLK_TO_MBC(blk)->allctr` in
-/// `erts/emulator/beam/erl_alloc_util.h:376,441`, OTP-29.1.1).
-const ETS_BLOCK_HEADER_WORDS: usize = 2;
-
 #[inline]
 fn ets_handle(user: *mut u64, words: usize) -> Result<InstanceAllocation, AllocError> {
     let bytes = words
         .checked_mul(std::mem::size_of::<u64>())
         .ok_or(AllocError::OutOfBounds)?;
-    let instance = crate::raw::words_at(user.wrapping_sub(1), 1)[0] as usize;
-    let id = (user as usize - ETS_BLOCK_HEADER_WORDS * std::mem::size_of::<u64>()) as u64;
+    let (instance, id, _) = crate::alloc_util::used_block_from_payload(user as usize);
     Ok(InstanceAllocation::from_parts(instance, id, bytes))
-}
-
-#[inline]
-fn ets_publish(handle: InstanceAllocation, base: *mut u64) -> *mut u64 {
-    crate::raw::words_at_mut(base.wrapping_sub(1), 1)[0] = handle.instance() as u64;
-    base
 }
 
 /// Allocate `words` machine words in `ets_alloc` (`ERTS_ALC_T_DB_TERM`) without a heap prefix.
@@ -971,9 +1010,8 @@ pub fn ets_alloc_words(words: usize) -> Result<*mut u64, AllocError> {
         .checked_mul(std::mem::size_of::<u64>())
         .ok_or(AllocError::OutOfBounds)?;
     let allocators = allocator_for(ErtsAlcType::DB_TERM)?;
-    let (handle, base) =
-        allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)?;
-    Ok(ets_publish(handle, base))
+    let (_, base) = allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)?;
+    Ok(base)
 }
 
 /// Resize an `ets_alloc` block from `old_words` to `new_words` machine words.
@@ -995,8 +1033,8 @@ pub fn ets_realloc_words(
         .ok_or(AllocError::OutOfBounds)?;
     let allocators = allocator_for(ErtsAlcType::DB_TERM)?;
     let handle = ets_handle(user, old_words)?;
-    let (new_handle, new_base) = allocators.realloc_with_ptr(handle, new_bytes)?;
-    Ok(ets_publish(new_handle, new_base))
+    let (_, new_base) = allocators.realloc_with_ptr(handle, new_bytes)?;
+    Ok(new_base)
 }
 
 /// Free an `ets_alloc` block of `words` machine words; null is ignored.
@@ -1010,6 +1048,98 @@ pub fn ets_free_words(user: *mut u64, words: usize) {
     {
         let _ = allocators.free_at(crate::instances::thread_alloc_ix(), handle);
     }
+}
+
+/// `erts_alloc(ERTS_ALC_T_MSG, bytes)`: a message node of the eheap allocator, with no header of
+/// the caller's own; the owning instance is found from the block's carrier when it is freed.
+// Port of erts/emulator/beam/erl_message.c (erts_alloc_message), OTP-29.1.1.
+pub fn msg_alloc(bytes: usize) -> Result<std::ptr::NonNull<u8>, AllocError> {
+    let allocators = msg_allocators()?;
+    let (_, base) = allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)?;
+    std::ptr::NonNull::new(base.cast::<u8>()).ok_or(AllocError::InvalidAllocation)
+}
+
+/// Allocate an empty message node from the scheduler pool, falling back to `MSG_REF` fix_alloc.
+// Port of `ERTS_SCHED_PREF_QUICK_ALLOC_IMPL(message_ref, ...)`, erl_message.c, OTP-29.1.1.
+pub fn msg_ref_alloc(bytes: usize) -> Result<MessageRefBlock, AllocError> {
+    let (ix, scheduler) = crate::instances::thread_alloc_ix_and_scheduler();
+    if ix != 0
+        && scheduler
+        && let Some(pool) = msg_ref_pool(bytes)
+        && let Some(block) = pool.alloc(ix - 1)
+    {
+        return Ok(MessageRefBlock(block));
+    }
+    let (_, payload) = fix_alloc_at(ix, ErtsAlcType::MSG_REF, bytes)?;
+    std::ptr::NonNull::new(payload.cast::<u8>())
+        .map(MessageRefBlock)
+        .ok_or(AllocError::InvalidAllocation)
+}
+
+/// Free an empty message node to its SSPA chunk or to MSG_REF fix_alloc.
+// Port of `message_ref_free`, erl_message.c, OTP-29.1.1.
+pub fn msg_ref_free(block: MessageRefBlock) {
+    let (ix, scheduler) = crate::instances::thread_alloc_ix_and_scheduler();
+    let cix = if scheduler { (ix - 1) as isize } else { -1 };
+    if let Some(pool) = MSG_REF_POOL.get()
+        && pool.free(cix, block.0)
+    {
+        return;
+    }
+    let handle = driver_handle(block.0.as_ptr());
+    let _ = fix_free_at(ix, ErtsAlcType::MSG_REF, handle);
+}
+
+pub(crate) fn pre_alloc_data_alloc(
+    bytes: usize,
+) -> Result<(InstanceAllocation, *mut u64), AllocError> {
+    allocator_for(ErtsAlcType::PRE_ALLOC_DATA)?
+        .alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)
+}
+
+pub(crate) fn pre_alloc_data_free(handle: InstanceAllocation) {
+    if let Ok(allocators) = allocator_for(ErtsAlcType::PRE_ALLOC_DATA) {
+        let _ = allocators.free_at(crate::instances::thread_alloc_ix(), handle);
+    }
+}
+
+static MSG_REF_POOL: OnceLock<crate::sspa::SspaPool> = OnceLock::new();
+
+fn msg_ref_pool(bytes: usize) -> Option<&'static crate::sspa::SspaPool> {
+    if let Some(pool) = MSG_REF_POOL.get() {
+        return (pool.block_size() == bytes).then_some(pool);
+    }
+    let schedulers = configured()
+        .map(|(schedulers, _)| schedulers)
+        .unwrap_or_else(|| crate::cpuinfo::default_schedulers().0);
+    let prealloc_size = if cfg!(debug_assertions) {
+        500 / 10 + 10
+    } else {
+        500
+    };
+    let pool = crate::sspa::SspaPool::new(bytes, prealloc_size, schedulers)?;
+    let _ = MSG_REF_POOL.set(pool);
+    MSG_REF_POOL.get().filter(|pool| pool.block_size() == bytes)
+}
+
+/// `erts_free(ERTS_ALC_T_MSG, block)` of a block from [`msg_alloc`].
+// Port of erts/emulator/beam/erl_message.c (erts_free_message), OTP-29.1.1.
+pub fn msg_free(block: std::ptr::NonNull<u8>) {
+    let handle = driver_handle(block.as_ptr());
+    if let Ok(allocators) = msg_allocators() {
+        let _ = allocators.free_at(crate::instances::thread_alloc_ix(), handle);
+    }
+}
+
+/// The allocator of `ERTS_ALC_T_MSG`, looked up once.
+#[inline(always)]
+fn msg_allocators() -> Result<&'static ThreadSpecificAllocators, AllocError> {
+    static MSG: OnceLock<&'static ThreadSpecificAllocators> = OnceLock::new();
+    if let Some(allocators) = MSG.get() {
+        return Ok(allocators);
+    }
+    let allocators = allocator_for(ErtsAlcType::MSG)?;
+    Ok(MSG.get_or_init(|| allocators))
 }
 
 /// Apply the queued cross-thread frees of the instances no scheduler owns.
@@ -1152,5 +1282,57 @@ mod tests {
         assert!(second.dealloc);
         let third = fix_alloc_shrink(ix, false);
         assert!(!third.dealloc);
+    }
+
+    #[test]
+    fn ets_and_driver_blocks_round_trip_without_prefix() {
+        use super::{
+            driver_alloc, driver_free, driver_realloc, ets_alloc_words, ets_free_words,
+            ets_realloc_words,
+        };
+        use crate::raw::WordView;
+
+        let mut ets_ptrs = Vec::new();
+        for i in 0..80_u64 {
+            let p = ets_alloc_words(8).unwrap();
+            let mut v = WordView::new(p, 8);
+            for w in 0..8 {
+                v.write_word(w, i * 100 + w as u64);
+            }
+            ets_ptrs.push(p);
+        }
+        let grown = ets_realloc_words(ets_ptrs[0], 8, 96 * 1024).unwrap();
+        ets_ptrs[0] = grown;
+        let v0 = WordView::new(grown, 8);
+        for w in 0..8 {
+            similar_asserts::assert_eq!(v0.read_word(w), Some(w as u64));
+        }
+        let shrunk = ets_realloc_words(ets_ptrs[0], 96 * 1024, 8).unwrap();
+        ets_ptrs[0] = shrunk;
+        let v0 = WordView::new(shrunk, 8);
+        for w in 0..8 {
+            similar_asserts::assert_eq!(v0.read_word(w), Some(w as u64));
+        }
+        for p in ets_ptrs {
+            ets_free_words(p, 8);
+        }
+
+        let drv = driver_alloc(24);
+        assert!(!drv.is_null());
+        let mut dv = WordView::new(drv.cast::<u64>(), 3);
+        dv.write_word(0, 0x1122_3344_5566_7788);
+        dv.write_word(1, 0x99aa_bbcc_ddee_ff00);
+        dv.write_word(2, 0xdead_beef_cafe_babe);
+        let drv2 = driver_realloc(drv, 768 * 1024);
+        assert!(!drv2.is_null());
+        let dv2 = WordView::new(drv2.cast::<u64>(), 3);
+        similar_asserts::assert_eq!(dv2.read_word(0), Some(0x1122_3344_5566_7788));
+        similar_asserts::assert_eq!(dv2.read_word(1), Some(0x99aa_bbcc_ddee_ff00));
+        similar_asserts::assert_eq!(dv2.read_word(2), Some(0xdead_beef_cafe_babe));
+        let addr = drv2 as usize;
+        std::thread::spawn(move || driver_free(addr as *mut u8))
+            .join()
+            .unwrap();
+        crate::typed::drain_shared_deallocations();
     }
 }

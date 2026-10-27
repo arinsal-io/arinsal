@@ -8,7 +8,8 @@
 //! erts_schedule_thr_prgr_later_cleanup_op), OTP-29.1.1. Every `unsafe` of the process lifetime is
 //! in this module.
 
-use super::{Event, Incoming, Process, Task};
+use super::{Event, Incoming, Process, SignalMessage, Task};
+use crate::ptab_slot::Progress;
 use arinsal_alloc::instances::InstanceAllocation;
 use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_at, fix_free_at};
 use std::any::TypeId;
@@ -266,24 +267,27 @@ impl Drop for ErasedProcRef {
 
 /// What a process's own code reaches without a table lookup: its outer signal queue (erts
 /// `sig_inq`) and its state flags, which live in the process struct the probe keeps alive.
-pub struct SignalProbe<M> {
+pub struct SignalProbe<M: SignalMessage> {
     input: NonNull<Incoming<Event<M>>>,
     flags: NonNull<AtomicU32>,
+    /// The thread progress domain the process's signal buffers are read through.
+    progress: Progress,
     _owner: ErasedProcRef,
 }
 
 // SAFETY: the probe only gives shared access to the queue and the flags of a process it keeps
 // alive; both are shared between threads already (`Incoming` is the cross-thread signal queue).
-unsafe impl<M: Send> Send for SignalProbe<M> {}
+unsafe impl<M: SignalMessage> Send for SignalProbe<M> {}
 // SAFETY: as for `Send`: every access is through `&`.
-unsafe impl<M: Send> Sync for SignalProbe<M> {}
+unsafe impl<M: SignalMessage> Sync for SignalProbe<M> {}
 
-impl<M> SignalProbe<M> {
+impl<M: SignalMessage> SignalProbe<M> {
     /// The probe of `process`.
-    pub(crate) fn of<T: Task<Message = M>>(process: &ProcRef<T>) -> Self {
+    pub(crate) fn of<T: Task<Message = M>>(process: &ProcRef<T>, progress: Progress) -> Self {
         Self {
             input: NonNull::from(&process.input),
             flags: NonNull::from(&process.exit_flags),
+            progress,
             _owner: process.clone().erase(),
         }
     }
@@ -294,6 +298,11 @@ impl<M> SignalProbe<M> {
         unsafe { self.input.as_ref() }
     }
 
+    /// The thread progress domain of the runtime the process lives in.
+    pub(crate) fn progress(&self) -> &Progress {
+        &self.progress
+    }
+
     /// The process's state flags.
     pub(crate) fn flags(&self) -> &AtomicU32 {
         // SAFETY: the pointer is to a field of the process struct `_owner` keeps alive.
@@ -301,11 +310,12 @@ impl<M> SignalProbe<M> {
     }
 }
 
-impl<M> Clone for SignalProbe<M> {
+impl<M: SignalMessage> Clone for SignalProbe<M> {
     fn clone(&self) -> Self {
         Self {
             input: self.input,
             flags: self.flags,
+            progress: self.progress.clone(),
             _owner: self._owner.clone(),
         }
     }
