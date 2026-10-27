@@ -2419,10 +2419,10 @@ impl Executor {
                                         ));
                                     }
                                     let module_atom = arinsal_term::global_atoms()
-                                        .intern(&function.module)
+                                        .intern(function.module)
                                         .map_err(|_| VmError::Unsupported("atom table".into()))?;
                                     let function_atom = arinsal_term::global_atoms()
-                                        .intern(&function.function)
+                                        .intern(function.function)
                                         .map_err(|_| VmError::Unsupported("atom table".into()))?;
                                     let handler_module = arinsal_term::global_atoms()
                                         .intern("erts_internal")
@@ -4165,15 +4165,15 @@ fn native_caller_module(vm: &Vm, resume_pc: usize) -> Option<usize> {
         // The pc names exactly one code instance: the one being loaded, the old one or the
         // current one (a reload runs the new on_load while the previous code is current).
         [
-            vm.code.pending_on_load.get(&caller.module),
-            vm.code.loaded.get(&caller.module),
-            vm.code.old.get(&caller.module),
+            vm.code.pending_on_load.get(caller.module),
+            vm.code.loaded.get(caller.module),
+            vm.code.old.get(caller.module),
         ]
         .into_iter()
         .flatten()
         .copied()
         .find(|id| vm.native_code_contains(*id, resume_pc))
-        .or_else(|| vm.code.loaded.get(&caller.module).copied())
+        .or_else(|| vm.code.loaded.get(caller.module).copied())
     })
     .flatten();
     if memo {

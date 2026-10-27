@@ -189,11 +189,12 @@ impl<'a> LoaderState<'a> {
         are_nifs: Option<Vec<bool>>,
         debugger_flags: u64,
     ) -> Option<Self> {
-        let mut atoms = Vec::with_capacity(beam.atoms.len());
-        for name in &beam.atoms {
-            let atom = global_atoms().intern(name).ok()?;
-            atoms.push(atom);
-        }
+        let atoms: Vec<Atom> = beam
+            .resolved_atoms(|name| global_atoms().intern(name).map(|atom| atom.0))
+            .ok()?
+            .iter()
+            .map(|&index| Atom(index))
+            .collect();
         let literals = Literals::new(beam)?;
         let mut labels = vec![
             Label {

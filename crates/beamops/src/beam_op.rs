@@ -135,10 +135,11 @@ impl BeamOp {
     }
 }
 
-/// `BeamOpAllocator`: blocks of 32 operations and a free list, like `BeamOpBlock`.
+/// `BeamOpAllocator`: the operations in blocks of 32 and a free list, like `BeamOpBlock`. The
+/// blocks are one vector, as an [`OpId`] is an index and not a pointer.
 #[derive(Default)]
 pub(crate) struct BeamOpAllocator {
-    blocks: Vec<Box<[BeamOp; 32]>>,
+    ops: Vec<BeamOp>,
     free: Option<OpId>,
 }
 
@@ -150,13 +151,12 @@ impl BeamOpAllocator {
 
     /// `beamopallocator_expand__`.
     fn expand(&mut self) {
-        let first = self.blocks.len() * 32;
-        let mut block: Box<[BeamOp; 32]> = Box::new(std::array::from_fn(|_| BeamOp::empty()));
+        let first = self.ops.len();
+        self.ops.extend((0..32).map(|_| BeamOp::empty()));
         for index in 0..31 {
-            block[index].next = Some(OpId((first + index + 1) as u32));
+            self.ops[first + index].next = Some(OpId((first + index + 1) as u32));
         }
-        block[31].next = None;
-        self.blocks.push(block);
+        self.ops[first + 31].next = None;
         self.free = Some(OpId(first as u32));
     }
 
@@ -184,12 +184,14 @@ impl BeamOpAllocator {
         self.free = Some(id);
     }
 
+    #[inline]
     pub(crate) fn op(&self, id: OpId) -> &BeamOp {
-        &self.blocks[id.0 as usize / 32][id.0 as usize % 32]
+        &self.ops[id.0 as usize]
     }
 
+    #[inline]
     pub(crate) fn op_mut(&mut self, id: OpId) -> &mut BeamOp {
-        &mut self.blocks[id.0 as usize / 32][id.0 as usize % 32]
+        &mut self.ops[id.0 as usize]
     }
 }
 
@@ -729,7 +731,7 @@ mod tests {
         let mut alloc = BeamOpAllocator::new();
         let ids: Vec<OpId> = (0..33).map(|_| alloc.new_op()).collect();
         assert_eq!(ids.len(), 33);
-        assert_eq!(alloc.blocks.len(), 2);
+        assert_eq!(alloc.ops.len() / 32, 2);
     }
 
     #[test]

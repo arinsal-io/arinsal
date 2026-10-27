@@ -85,7 +85,7 @@ pub use ops::{
     loose_eq, size_object, size_object_litopt, size_object_preserving_sharing,
     size_object_preserving_sharing_after, size_shared, small_add, small_mul, small_sub,
 };
-pub use owned::{from_owned, to_owned};
+pub use owned::{decode_literal, from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence, term_sequence_small};
 pub use record_table::{
     delete_module_record_definitions, drop_record_scope, find_record_definition_in,

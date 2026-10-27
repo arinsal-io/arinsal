@@ -1801,7 +1801,11 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok(("erlang".to_owned(), "process_info".to_owned(), 2));
     }
     if let Some((function, _)) = native_call_site(process) {
-        return Ok((function.module, function.function, function.arity));
+        return Ok((
+            function.module.to_owned(),
+            function.function.to_owned(),
+            function.arity,
+        ));
     }
     // A process in native code (a receive wait, a yield) is at a native address;
     // `module`/`ip` only describe its interpreter state.
@@ -1811,7 +1815,11 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         .native_pc
         .or_else(|| Some(process.header.i as usize).filter(|&pc| pc != 0));
     if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
-        return Ok((function.module, function.function, function.arity));
+        return Ok((
+            function.module.to_owned(),
+            function.function.to_owned(),
+            function.arity,
+        ));
     }
     if let Some(vm) = vm {
         let module = vm.code.modules.get(process.module).ok_or_else(badarg)?;

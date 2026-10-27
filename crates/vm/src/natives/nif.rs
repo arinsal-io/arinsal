@@ -1499,9 +1499,9 @@ fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<
     let (caller, caller_instance) = match crate::natives::proc::native_call_site(process) {
         Some((function, pc)) => {
             let instance = [
-                vm.code.pending_on_load.get(&function.module),
-                vm.code.loaded.get(&function.module),
-                vm.code.old.get(&function.module),
+                vm.code.pending_on_load.get(function.module),
+                vm.code.loaded.get(function.module),
+                vm.code.old.get(function.module),
             ]
             .into_iter()
             .flatten()
@@ -1510,7 +1510,7 @@ fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<
                 crate::load::native_code_range(&vm.code.code_meta, id)
                     .is_some_and(|(start, end)| (start..end).contains(&pc))
             });
-            (function.module, instance)
+            (function.module.to_owned(), instance)
         }
         None => {
             let name = vm

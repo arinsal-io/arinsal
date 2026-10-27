@@ -1109,7 +1109,8 @@ fn parse(
                     stack.push(Frame {
                         kind: Kind::Tuple,
                         left: n,
-                        terms: Vec::new(),
+                        // `check_count` bounded `n` by the bytes left.
+                        terms: Vec::with_capacity(n),
                     });
                     None
                 }
@@ -1131,7 +1132,7 @@ fn parse(
                 stack.push(Frame {
                     kind: Kind::List,
                     left: n + 1,
-                    terms: Vec::new(),
+                    terms: Vec::with_capacity(n + 1),
                 });
                 None
             }

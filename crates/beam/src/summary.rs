@@ -60,7 +60,23 @@ impl Skim<'_> {
 
     /// `beamreader_read_tagged` without the integer conversions: a value that does not fit a
     /// word is skipped and reads as `u64::MAX`.
+    #[inline(always)]
     fn tagged(&mut self, depth: usize) -> Result<Raw, BeamError> {
+        // The one-byte form is nearly every operand.
+        if let Some(&first) = self.data.get(self.pos)
+            && first & 8 == 0
+        {
+            self.pos += 1;
+            return Ok(Raw {
+                tag: first & 7,
+                value: u64::from(first >> 4),
+            });
+        }
+        self.tagged_wide(depth)
+    }
+
+    #[inline(never)]
+    fn tagged_wide(&mut self, depth: usize) -> Result<Raw, BeamError> {
         if depth > 32 {
             return Err(bad("Code", self.pos, "compact length nesting too deep"));
         }

@@ -1111,14 +1111,8 @@ pub fn load_with_options(
 ) -> Result<Module, LoadError> {
     // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
     // OTP interns the complete Atom chunk in index order before resolving code.
-    for atom in &file.atoms {
-        global_atoms()
-            .intern(atom)
-            .map_err(|_| LoadError::Atom(atom.clone()))?;
-    }
-    let name_atom = global_atoms()
-        .get(&file.module)
-        .ok_or_else(|| LoadError::Atom(file.module.clone()))?;
+    let atom_ids = file_atoms(file)?;
+    let name_atom = Atom(atom_ids[0]);
     // Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals),
     // OTP-29.1.1: the literal chunk is decoded in index order right after the
     // atom chunk, so atoms first seen in literals get erts' table indices.
@@ -1865,14 +1859,8 @@ pub fn load_with_options(
 /// module: its code goes from `beamfile_read` through the transform engine to the emitter.
 pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
     // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
-    for atom in &file.atoms {
-        global_atoms()
-            .intern(atom)
-            .map_err(|_| LoadError::Atom(atom.clone()))?;
-    }
-    let name_atom = global_atoms()
-        .get(&file.module)
-        .ok_or_else(|| LoadError::Atom(file.module.clone()))?;
+    let atom_ids = file_atoms(file)?;
+    let name_atom = Atom(atom_ids[0]);
     let (mut literals, literal_terms) = decode_literals(file)?;
     let summary = &file.summary.functions;
     let mut labels = HashMap::with_capacity(summary.len());
@@ -1883,9 +1871,7 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         let name = file
             .atom(function.function_atom)
             .ok_or(LoadError::Index("atom", function.function_atom))?;
-        let atom = global_atoms()
-            .intern(name)
-            .map_err(|_| LoadError::Atom(name.into()))?;
+        let atom = Atom(atom_ids[function.function_atom as usize - 1]);
         let arity = u8::try_from(function.arity).map_err(|_| LoadError::Limit)?;
         // A native-only module has no instruction stream; a function is named by the virtual
         // offset of its `func_info` slot, two per function, and its entry is the one after.
@@ -1994,7 +1980,13 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
 pub(crate) fn decode_literals(file: &BeamFile) -> Result<(VecHeap, HashMap<u32, Term>), LoadError> {
     let mut literals = VecHeap::new_literal();
     let mut literal_terms = HashMap::new();
-    for index in 0..file.literals.len() {
+    for (index, raw) in file.literals.iter().enumerate() {
+        // The common kinds go straight onto the literal heap; anything else, and anything
+        // malformed, takes the general decoder.
+        if let Some(term) = arinsal_term::decode_literal(&raw.0, &mut literals) {
+            literal_terms.insert(index as u32, term);
+            continue;
+        }
         let Ok(owned) = file.literal(index as u32) else {
             continue;
         };
@@ -2004,8 +1996,20 @@ pub(crate) fn decode_literals(file: &BeamFile) -> Result<(VecHeap, HashMap<u32, 
     Ok((literals, literal_terms))
 }
 
+/// The global atom of each entry of the atom table of `file`, put once per file.
+// Port of erts/emulator/beam/beam_file.c (parse_atom_chunk), OTP-29.1.1.
+pub fn file_atoms(file: &BeamFile) -> Result<&[u32], LoadError> {
+    file.resolved_atoms(|name| {
+        global_atoms()
+            .intern(name)
+            .map(|atom| atom.0)
+            .map_err(|_| LoadError::Atom(name.to_owned()))
+    })
+}
+
 /// The import table of a module.
 pub(crate) fn build_imports(file: &BeamFile) -> Result<Vec<Import>, LoadError> {
+    let atom_ids = file_atoms(file)?;
     file.imports
         .iter()
         .map(|item| {
@@ -2019,12 +2023,8 @@ pub(crate) fn build_imports(file: &BeamFile) -> Result<Vec<Import>, LoadError> {
                 .to_owned();
             Ok(Import {
                 bif: arinsal_bifs::lookup(&module, &function, item.arity as u8),
-                module_atom: global_atoms()
-                    .get(&module)
-                    .ok_or_else(|| LoadError::Atom(module.clone()))?,
-                function_atom: global_atoms()
-                    .get(&function)
-                    .ok_or_else(|| LoadError::Atom(function.clone()))?,
+                module_atom: Atom(atom_ids[item.module_atom as usize - 1]),
+                function_atom: Atom(atom_ids[item.function_atom as usize - 1]),
                 fast: match (module.as_str(), function.as_str(), item.arity) {
                     ("erlang", "+", 2) => FastBif::Add,
                     ("erlang", "-", 2) => FastBif::Sub,
@@ -2108,6 +2108,7 @@ pub(crate) fn build_exports(
     file: &BeamFile,
     labels: &HashMap<u32, usize>,
 ) -> Result<Vec<Arc<ExportSlot>>, LoadError> {
+    let atom_ids = file_atoms(file)?;
     file.exports
         .iter()
         .map(|item| {
@@ -2118,12 +2119,8 @@ pub(crate) fn build_exports(
             let target = *labels
                 .get(&item.label)
                 .ok_or(LoadError::Index("label", item.label))?;
-            let module_atom = global_atoms()
-                .intern(&file.module)
-                .map_err(|_| LoadError::Atom(file.module.clone()))?;
-            let function_atom = global_atoms()
-                .intern(&function)
-                .map_err(|_| LoadError::Atom(function.clone()))?;
+            let module_atom = Atom(atom_ids[0]);
+            let function_atom = Atom(atom_ids[item.function_atom as usize - 1]);
             Ok(Arc::new(ExportSlot {
                 module: file.module.clone(),
                 function,

@@ -119,13 +119,73 @@ pub struct FinalizedModule {
     pub nif_patches: IdMap<usize>,
 }
 
+/// BEAM label ids below this are dense (the labels of the file); the compiler's own labels
+/// start far above and stay in a map.
+const DENSE_LABEL_IDS: u32 = 0x7000_0000;
+
+/// The assembler label of each BEAM label id: a vector for the dense ids, as asmjit's label
+/// entries are, and a map for the synthesized ones.
+#[derive(Default)]
+struct LabelIds {
+    dense: Vec<Option<Label>>,
+    sparse: IdMap<Option<Label>>,
+}
+
+impl LabelIds {
+    fn slot(&mut self, id: u32) -> &mut Option<Label> {
+        if id < DENSE_LABEL_IDS {
+            let index = id as usize;
+            if index >= self.dense.len() {
+                self.dense.resize(index + 1, None);
+            }
+            &mut self.dense[index]
+        } else {
+            self.sparse.entry(id).or_insert(None)
+        }
+    }
+
+    fn into_pairs(self) -> impl Iterator<Item = (u32, Label)> {
+        self.dense
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, label)| Some((id as u32, label?)))
+            .chain(
+                self.sparse
+                    .into_iter()
+                    .filter_map(|(id, label)| Some((id, label?))),
+            )
+    }
+}
+
+/// The BEAM label ids that are bound.
+#[derive(Default)]
+struct DefinedLabels {
+    dense: Vec<bool>,
+    sparse: IdMap<()>,
+}
+
+impl DefinedLabels {
+    /// Marks `id` bound; whether it already was.
+    fn insert(&mut self, id: u32) -> bool {
+        if id < DENSE_LABEL_IDS {
+            let index = id as usize;
+            if index >= self.dense.len() {
+                self.dense.resize(index + 1, false);
+            }
+            std::mem::replace(&mut self.dense[index], true)
+        } else {
+            self.sparse.insert(id, ()).is_some()
+        }
+    }
+}
+
 /// Source location attached to a native `line` instruction address.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleLine {
     /// Byte offset from the start of the finalized code mapping.
     pub offset: usize,
-    /// Source filename.
-    pub file: String,
+    /// Source filename, shared by all the entries of one file.
+    pub file: std::sync::Arc<str>,
     /// One-based source line.
     pub line: u32,
 }
@@ -163,8 +223,8 @@ pub struct BeamModuleAssembler {
     pub(super) arith_fail: u32,
     /// Compiler types of the next arithmetic instruction's operands, consumed by its emitter.
     pub(super) arith_types: Option<[crate::types::ArgType; 4]>,
-    labels: IdMap<Label>,
-    defined: IdMap<()>,
+    labels: LabelIds,
+    defined: DefinedLabels,
     lambda_labels: IdMap<Label>,
     lambda_specs: IdMap<(u32, u8, u8)>,
     pub(super) defined_lambdas: IdMap<()>,
@@ -219,6 +279,10 @@ pub struct BeamModuleAssembler {
     /// fall-through path is straight-line (erts `b.ls` / `b.ne` over a fragment).
     bs_cold: Vec<BsColdEmit>,
     line_table: Vec<ModuleLine>,
+    /// The file names of the line table, one `Arc` per distinct name.
+    line_files: Vec<std::sync::Arc<str>>,
+    /// The file of a location that names none: `<module>.erl`.
+    default_line_file: String,
     /// Return address of the latest emitted native exception branch, as used by `emit_line`.
     last_error_offset: usize,
     /// Location index of the latest line-table entry.
@@ -283,8 +347,8 @@ impl BeamModuleAssembler {
             code,
             reg_cache: crate::regcache::RegCache::default(),
             map_lookups: Vec::new(),
-            labels: IdMap::default(),
-            defined: IdMap::default(),
+            labels: LabelIds::default(),
+            defined: DefinedLabels::default(),
             lambda_labels: IdMap::default(),
             lambda_specs: IdMap::default(),
             defined_lambdas: IdMap::default(),
@@ -311,6 +375,8 @@ impl BeamModuleAssembler {
             entry_label: None,
             bs_cold: Vec::new(),
             line_table: Vec::new(),
+            line_files: Vec::new(),
+            default_line_file: String::new(),
             last_error_offset: 0,
             last_line_location: None,
             arith_fail: 0,
@@ -355,16 +421,37 @@ impl BeamModuleAssembler {
     /// Records the native PC corresponding to a BEAM source line marker.
     // Port of erts/emulator/beam/jit/asm_load.c (add_line_entry), OTP-29.1.1: a repeat of the
     // previous location index is skipped unless `insert_duplicates`.
-    pub fn record_line(&mut self, location: u64, file: String, line: u32, insert_duplicates: bool) {
+    pub fn record_line(
+        &mut self,
+        location: u64,
+        file: Option<&str>,
+        line: u32,
+        insert_duplicates: bool,
+    ) {
         if !insert_duplicates && self.last_line_location == Some(location) {
             return;
         }
         self.last_line_location = Some(location);
+        let name = file.unwrap_or(self.default_line_file.as_str());
+        // A module has a handful of files and a line mostly names the latest one.
+        let file = match self.line_files.iter().rposition(|known| &**known == name) {
+            Some(index) => std::sync::Arc::clone(&self.line_files[index]),
+            None => {
+                let shared: std::sync::Arc<str> = std::sync::Arc::from(name);
+                self.line_files.push(std::sync::Arc::clone(&shared));
+                shared
+            }
+        };
         self.line_table.push(ModuleLine {
             offset: self.code.offset(),
             file,
             line,
         });
+    }
+
+    /// Sets the file name a line location without a name gets (`<module>.erl`).
+    pub fn set_default_line_file(&mut self, file: String) {
+        self.default_line_file = file;
     }
 
     /// Moves past an exception return address before the next line mapping is registered.
@@ -408,10 +495,11 @@ impl BeamModuleAssembler {
     }
 
     pub(super) fn label(&mut self, id: u32) -> Label {
-        *self
-            .labels
-            .entry(id)
-            .or_insert_with(|| self.code.new_label())
+        let slot = self.labels.slot(id);
+        if slot.is_none() {
+            *slot = Some(self.code.new_label());
+        }
+        slot.expect("label was just created")
     }
 
     pub(super) fn lambda_label(&mut self, id: u32) -> Label {
@@ -487,7 +575,7 @@ impl BeamModuleAssembler {
     /// Binds a BEAM label at the current offset.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:541-548 (emit_label), OTP-29.1.1.
     pub fn emit_label(&mut self, id: u32) -> Result<(), ModuleError> {
-        if self.defined.insert(id, ()).is_some() {
+        if self.defined.insert(id) {
             return Err(ModuleError::DuplicateLabel(id));
         }
         let label = self.label(id);
@@ -504,7 +592,7 @@ impl BeamModuleAssembler {
     /// Binds the aligned entry label without changing the owning function label.
     // Port of erts/emulator/beam/jit/arm/ops.tab:925-936, OTP-29.1.1.
     pub fn emit_i_entry_label(&mut self, id: u32) -> Result<(), ModuleError> {
-        if self.defined.insert(id, ()).is_some() {
+        if self.defined.insert(id) {
             return Err(ModuleError::DuplicateLabel(id));
         }
         let label = self.label(id);
@@ -2350,7 +2438,10 @@ impl BeamModuleAssembler {
                 handler_offset
             })
             .collect::<Vec<_>>();
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut bytes = vec![0u8; words.len() * 4];
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
         if let Some(module) = &self.dump_module {
             let directory =
                 crate::dump_directory().expect("dump output directory was checked when enabled");
@@ -2370,7 +2461,7 @@ impl BeamModuleAssembler {
         }
         let entry_offsets: IdMap<_> = self
             .labels
-            .into_iter()
+            .into_pairs()
             .filter_map(|(id, label)| labels.get(&label).map(|&off| (id, offset + off)))
             .collect();
         let entries = entry_offsets
