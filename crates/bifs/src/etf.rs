@@ -7,10 +7,11 @@ use std::sync::{Arc, OnceLock};
 
 use arinsal_etf::DecodedSizeWalk;
 use arinsal_term::{
-    Atom, BinaryOwner, ConsListBuilder, ExportEntry, FunEntry, FunRef, HeapAlloc, HeapReservation,
-    HeapReservationState, Identity, Node, OwnedBinaryRef, RefcBinary, Term, TermBuilder, TermKind,
+    Atom, AtomEncoding, BinaryOwner, ConsListBuilder, ExportEntry, FunEntry, FunRef, HeapAlloc,
+    HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords, HeapTermSlot,
+    HxNode, Identity, Node, OwnedBinaryRef, ProcessHeap, RefcBinary, Term, TermBuilder, TermKind,
     atoms, binary_owner, cmp_exact, flat_key_cmp, global_atoms, hashmap_from_ks_and_vs_extra,
-    writable_finalize, writable_resize_private,
+    hashmap_from_unsorted_array, hashmap_key_hash, writable_finalize, writable_resize_private,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
@@ -23,6 +24,8 @@ use crate::{BifError, Ctx};
 static LOCAL_NODE_HASH: OnceLock<u32> = OnceLock::new();
 // Port of erts/emulator/beam/external.c:1768-1769, OTP-29.1.1.
 const B2T_MAX_DIRECT_UNCOMPRESSED_SIZE: usize = 32 * 1024 * 1024;
+// Port of erts/emulator/beam/external.c:1916, OTP-29.1.1.
+const B2T_MEMCPY_FACTOR: usize = 8;
 
 // Port of erts/emulator/beam/external.c:134-194, OTP-29.1.1.
 fn local_node_hash() -> u32 {
@@ -2436,11 +2439,7 @@ impl Reader<'_> {
     fn u64(&mut self) -> Result<u64, BifError> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn atom<H: HeapAlloc>(
-        &mut self,
-        safe: bool,
-        ctx: &mut Option<&mut Ctx<'_, H>>,
-    ) -> Result<(Term, Option<String>), BifError> {
+    fn atom(&mut self, safe: bool, has_heap: bool) -> Result<(Term, Option<String>), BifError> {
         let tag = self.u8()?;
         let (len, utf8) = match tag {
             100 => (self.u16()? as usize, false),
@@ -2450,27 +2449,42 @@ impl Reader<'_> {
             _ => return Err(BifError::BADARG),
         };
         let raw = self.take(len)?;
-        // UTF-8 and ASCII latin1 are decoded from the input bytes. A String is
-        // built only for non-ASCII latin1, which is not valid UTF-8 as-is.
-        let owned;
-        let name = if utf8 || raw.is_ascii() {
-            std::str::from_utf8(raw).map_err(|_| BifError::BADARG)?
+        let encoding = if utf8 {
+            AtomEncoding::Utf8
         } else {
-            owned = raw.iter().map(|b| char::from(*b)).collect::<String>();
-            owned.as_str()
+            AtomEncoding::Latin1
         };
-        if name.chars().count() > 255 {
+        let atoms = global_atoms();
+        let found = atoms.existing(raw, encoding);
+        if safe && found.is_none() {
             return Err(BifError::BADARG);
         }
-        let atoms = global_atoms();
-        let atom = if safe {
-            atoms.get(name).ok_or(BifError::BADARG)?
-        } else if ctx.is_some() {
-            atoms.intern(name).map_err(|_| BifError::SystemLimit)?
+        let (atom, unknown) = if let Some(atom) = found {
+            (atom, None)
+        } else if has_heap {
+            let atom = atoms
+                .put(raw, encoding, false)
+                .map_err(|error| match error {
+                    arinsal_term::AtomError::SystemLimit => BifError::SystemLimit,
+                    arinsal_term::AtomError::TooLong | arinsal_term::AtomError::BadEncoding => {
+                        BifError::BADARG
+                    }
+                })?;
+            (atom, None)
         } else {
-            atoms.get(name).unwrap_or(arinsal_term::atoms::NONAME)
+            let name = match encoding {
+                AtomEncoding::Ascii | AtomEncoding::Utf8 => std::str::from_utf8(raw)
+                    .map_err(|_| BifError::BADARG)?
+                    .to_owned(),
+                AtomEncoding::Latin1 => {
+                    raw.iter().map(|byte| char::from(*byte)).collect::<String>()
+                }
+            };
+            if name.chars().count() > 255 {
+                return Err(BifError::BADARG);
+            }
+            (arinsal_term::atoms::NONAME, Some(name))
         };
-        let unknown = (atom == arinsal_term::atoms::NONAME).then(|| name.to_owned());
         Ok((Term::atom(atom), unknown))
     }
 }
@@ -2515,6 +2529,56 @@ struct Frame {
     left: usize,
     values: SmallVec<[Term; 4]>,
     shapes: SmallVec<[Shape; 4]>,
+}
+
+#[derive(Clone, Copy)]
+enum DecodeTarget {
+    Root,
+    Heap(HeapTermSlot),
+}
+
+enum DecodeMap {
+    Flatmap {
+        keys: HeapTermSlot,
+        values: HeapTermSlot,
+        size: usize,
+    },
+    Hashmap {
+        target: DecodeTarget,
+        pairs: HeapTermSlot,
+        size: usize,
+    },
+}
+
+enum DecodePending {
+    Tuple {
+        block: HeapBlockBuilder,
+        arity: usize,
+        next_index: usize,
+        continuation: Option<HeapTermSlot>,
+    },
+    List {
+        block: HeapBlockBuilder,
+        size: usize,
+        next_index: usize,
+        chain: Option<HeapTermSlot>,
+        continuation: Option<HeapTermSlot>,
+    },
+    String {
+        target: DecodeTarget,
+        continuation: Option<HeapTermSlot>,
+        builder: ConsListBuilder,
+        source_at: usize,
+        size: usize,
+        written: usize,
+    },
+    Binary {
+        target: DecodeTarget,
+        continuation: Option<HeapTermSlot>,
+        binary: RefcBinary,
+        remaining: usize,
+        bit_len: usize,
+    },
 }
 
 fn built<H: HeapAlloc>(
@@ -2824,7 +2888,7 @@ fn parse_step<H: HeapAlloc>(
             }
             100 | 115 | 118 | 119 => {
                 r.at -= 1;
-                let (term, unknown) = r.atom(safe, &mut ctx)?;
+                let (term, unknown) = r.atom(safe, ctx.is_some())?;
                 Some((term, Shape::Atom(unknown)))
             }
             73 | 75 => {
@@ -2963,7 +3027,7 @@ fn parse_step<H: HeapAlloc>(
                     r.at += 1;
                     (Term::atom(arinsal_term::atoms::NONAME), None)
                 } else {
-                    r.atom(safe, &mut ctx)?
+                    r.atom(safe, ctx.is_some())?
                 };
                 let node = node_term.as_atom().unwrap();
                 let mut ids = [0; 5];
@@ -3160,6 +3224,913 @@ fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, u
     }
 }
 
+fn write_decode_target(
+    ctx: &mut Ctx<'_, &mut HeapReservationWords<'_>>,
+    target: DecodeTarget,
+    root: &mut Term,
+    term: Term,
+) -> Result<(), BifError> {
+    match target {
+        DecodeTarget::Root => *root = term,
+        DecodeTarget::Heap(slot) => ctx
+            .heap
+            .write_term_slot(slot, term)
+            .map_err(map_term_build_error)?,
+    }
+    Ok(())
+}
+
+// Port of erts/emulator/beam/external.c:5425-5460 (dec_term map_array post-pass), OTP-29.1.1.
+fn finish_decode_maps(
+    reservation: &mut HeapReservation<'_, ProcessHeap>,
+    maps: &mut SmallVec<[DecodeMap; 4]>,
+    root: &mut Term,
+) -> Result<(), BifError> {
+    while let Some(map) = maps.pop() {
+        match map {
+            DecodeMap::Flatmap { keys, values, size } => {
+                reservation
+                    .with_words(|words| {
+                        for index in 1..size {
+                            let mut current = index;
+                            while current > 0 {
+                                let key_slot = words
+                                    .offset_slot(keys, current)
+                                    .map_err(map_term_build_error)?;
+                                let prev_slot = words
+                                    .offset_slot(keys, current - 1)
+                                    .map_err(map_term_build_error)?;
+                                let key = words
+                                    .read_term_slot(key_slot)
+                                    .map_err(map_term_build_error)?;
+                                let prev = words
+                                    .read_term_slot(prev_slot)
+                                    .map_err(map_term_build_error)?;
+                                match flat_key_cmp(key, prev) {
+                                    Ordering::Greater => break,
+                                    Ordering::Equal => return Err(BifError::BADARG),
+                                    Ordering::Less => {
+                                        let value_slot = words
+                                            .offset_slot(values, current)
+                                            .map_err(map_term_build_error)?;
+                                        let prev_value_slot = words
+                                            .offset_slot(values, current - 1)
+                                            .map_err(map_term_build_error)?;
+                                        words
+                                            .swap_term_slots(key_slot, prev_slot)
+                                            .map_err(map_term_build_error)?;
+                                        words
+                                            .swap_term_slots(value_slot, prev_value_slot)
+                                            .map_err(map_term_build_error)?;
+                                        current -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                    .map_err(map_term_build_error)??;
+            }
+            DecodeMap::Hashmap {
+                target,
+                pairs,
+                size,
+            } => {
+                let mut hxns = reservation
+                    .with_words(|words| {
+                        let mut hxns = Vec::with_capacity(size);
+                        for index in 0..size {
+                            let key_slot = words
+                                .offset_slot(pairs, index * 2)
+                                .map_err(map_term_build_error)?;
+                            let key = words
+                                .read_term_slot(key_slot)
+                                .map_err(map_term_build_error)?;
+                            let leaf =
+                                words.list_term_at(key_slot).map_err(map_term_build_error)?;
+                            hxns.push(HxNode {
+                                hx: hashmap_key_hash(key),
+                                skip: 1,
+                                i: index,
+                                val: leaf,
+                            });
+                        }
+                        Ok(hxns)
+                    })
+                    .map_err(map_term_build_error)??;
+                let map = hashmap_from_unsorted_array(&mut hxns, true, reservation)
+                    .map_err(map_term_build_error)?
+                    .ok_or(BifError::BADARG)?;
+                reservation
+                    .with_words(|words| {
+                        match target {
+                            DecodeTarget::Root => *root = map,
+                            DecodeTarget::Heap(slot) => words
+                                .write_term_slot(slot, map)
+                                .map_err(map_term_build_error)?,
+                        }
+                        Ok(())
+                    })
+                    .map_err(map_term_build_error)??;
+            }
+        }
+    }
+    Ok(())
+}
+
+// Port of erts/emulator/beam/external.c:4452-4505 (integer tags), OTP-29.1.1.
+fn read_small_integer(r: &mut Reader<'_>) -> Result<i64, BifError> {
+    let tag = r.u8()?;
+    let number = match tag {
+        97 => r.u8()? as i64,
+        98 => r.u32()? as i32 as i64,
+        110 | 111 => {
+            let length = if tag == 110 {
+                r.u8()? as usize
+            } else {
+                r.u32()? as usize
+            };
+            let sign = r.u8()?;
+            BigInt::from_bytes_le(
+                if sign == 0 { Sign::Plus } else { Sign::Minus },
+                r.take(length)?,
+            )
+            .to_i64()
+            .ok_or(BifError::BADARG)?
+        }
+        _ => return Err(BifError::BADARG),
+    };
+    if Term::small(number).is_none() {
+        return Err(BifError::BADARG);
+    }
+    Ok(number)
+}
+
+// Port of erts/emulator/beam/external.c:4640-4694 (PID_EXT/NEW_PID_EXT), OTP-29.1.1.
+fn read_pid_term<H: HeapAlloc>(
+    r: &mut Reader<'_>,
+    safe: bool,
+    local_node: Option<(Atom, u32)>,
+    ctx: &mut Ctx<'_, H>,
+) -> Result<Term, BifError> {
+    let tag = r.u8()?;
+    if tag != 103 && tag != 88 {
+        return Err(BifError::BADARG);
+    }
+    let (node_term, _) = r.atom(safe, true)?;
+    let node = node_term.as_atom().ok_or(BifError::BADARG)?;
+    let id = r.u32()?;
+    let serial = r.u32()?;
+    let creation = if tag == 103 { r.u8()? as u32 } else { r.u32()? };
+    if tag == 103 && creation > 3 {
+        return Err(BifError::BADARG);
+    }
+    if node == atoms::NONAME && creation == 0
+        || local_node.is_some_and(|(name, current)| node == name && creation == current)
+    {
+        Term::pid(id, serial).ok_or(BifError::BADARG)
+    } else {
+        TermBuilder::new(&mut ctx.heap)
+            .external_pid(Node::new(node, creation), id, serial)
+            .map_err(map_term_build_error)
+    }
+}
+
+// Port of erts/emulator/beam/external.c:4325-5445 (`dec_term`, in-place `next` walk), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn decode_direct_step(
+    r: &mut Reader<'_>,
+    next: &mut Option<HeapTermSlot>,
+    root: &mut Term,
+    root_started: &mut bool,
+    maps: &mut SmallVec<[DecodeMap; 4]>,
+    pending: &mut Option<DecodePending>,
+    internal_nc: &mut bool,
+    safe: bool,
+    local_node: Option<(Atom, u32)>,
+    ctx: &mut Ctx<'_, &mut HeapReservationWords<'_>>,
+    budget: usize,
+) -> Result<(Option<(Term, usize)>, usize), BifError> {
+    let mut work = 0;
+    while !*root_started || work < budget {
+        if pending.is_some() {
+            if pending
+                .as_ref()
+                .is_some_and(|item| matches!(item, DecodePending::Tuple { .. }))
+            {
+                let Some(DecodePending::Tuple {
+                    block,
+                    arity,
+                    mut next_index,
+                    continuation,
+                }) = pending.take()
+                else {
+                    unreachable!();
+                };
+                let count = next_index.min(budget.saturating_sub(work));
+                for _ in 0..count {
+                    next_index -= 1;
+                    let slot = block
+                        .term_slot(next_index + 1)
+                        .map_err(map_term_build_error)?;
+                    let next_slot = if next_index + 1 == arity {
+                        continuation
+                    } else {
+                        Some(
+                            block
+                                .term_slot(next_index + 2)
+                                .map_err(map_term_build_error)?,
+                        )
+                    };
+                    ctx.heap
+                        .write_next_slot(slot, next_slot)
+                        .map_err(map_term_build_error)?;
+                }
+                work += count;
+                if next_index != 0 {
+                    *pending = Some(DecodePending::Tuple {
+                        block,
+                        arity,
+                        next_index,
+                        continuation,
+                    });
+                    return Ok((None, work));
+                }
+                *next = Some(block.term_slot(1).map_err(map_term_build_error)?);
+            }
+            if pending
+                .as_ref()
+                .is_some_and(|item| matches!(item, DecodePending::List { .. }))
+            {
+                let Some(DecodePending::List {
+                    block,
+                    size,
+                    mut next_index,
+                    mut chain,
+                    continuation,
+                }) = pending.take()
+                else {
+                    unreachable!();
+                };
+                let count = next_index.min(budget.saturating_sub(work));
+                for _ in 0..count {
+                    next_index -= 1;
+                    let car = block
+                        .term_slot(next_index * 2)
+                        .map_err(map_term_build_error)?;
+                    let cdr = block
+                        .term_slot(next_index * 2 + 1)
+                        .map_err(map_term_build_error)?;
+                    let next_list = block
+                        .list_at((next_index + 1) * 2)
+                        .map_err(map_term_build_error)?;
+                    ctx.heap
+                        .write_term_slot(cdr, next_list)
+                        .map_err(map_term_build_error)?;
+                    ctx.heap
+                        .write_next_slot(car, chain)
+                        .map_err(map_term_build_error)?;
+                    chain = Some(car);
+                }
+                work += count;
+                if next_index != 0 {
+                    *pending = Some(DecodePending::List {
+                        block,
+                        size,
+                        next_index,
+                        chain,
+                        continuation,
+                    });
+                    return Ok((None, work));
+                }
+                *next = chain;
+            }
+            if pending
+                .as_ref()
+                .is_some_and(|item| matches!(item, DecodePending::String { .. }))
+            {
+                let Some(DecodePending::String {
+                    target,
+                    continuation,
+                    mut builder,
+                    source_at,
+                    size,
+                    mut written,
+                }) = pending.take()
+                else {
+                    unreachable!();
+                };
+                let count = (size - written).min(budget.saturating_sub(work));
+                let source = r
+                    .bytes
+                    .get(source_at + written..source_at + written + count)
+                    .ok_or(BifError::BADARG)?;
+                for byte in source {
+                    builder
+                        .append(Term::small(i64::from(*byte)).ok_or(BifError::BADARG)?)
+                        .map_err(map_term_build_error)?;
+                }
+                written += count;
+                work += count;
+                if written != size {
+                    *pending = Some(DecodePending::String {
+                        target,
+                        continuation,
+                        builder,
+                        source_at,
+                        size,
+                        written,
+                    });
+                    return Ok((None, work));
+                }
+                let term = builder.finish(Term::NIL).map_err(map_term_build_error)?;
+                write_decode_target(ctx, target, root, term)?;
+                *root_started = true;
+                *next = continuation;
+            }
+            if pending
+                .as_ref()
+                .is_some_and(|item| matches!(item, DecodePending::Binary { .. }))
+            {
+                let Some(DecodePending::Binary {
+                    target,
+                    continuation,
+                    mut binary,
+                    mut remaining,
+                    bit_len,
+                }) = pending.take()
+                else {
+                    unreachable!();
+                };
+                let copy_limit = budget
+                    .saturating_sub(work)
+                    .saturating_mul(B2T_MEMCPY_FACTOR);
+                let copy_len = remaining.min(copy_limit);
+                let source = r.take(copy_len)?;
+                let destination_at = binary
+                    .len()
+                    .checked_sub(remaining)
+                    .ok_or(BifError::BADARG)?;
+                let destination = binary.bytes_mut_unique().ok_or(BifError::BADARG)?;
+                let destination_end = destination_at
+                    .checked_add(copy_len)
+                    .ok_or(BifError::BADARG)?;
+                destination
+                    .get_mut(destination_at..destination_end)
+                    .ok_or(BifError::BADARG)?
+                    .copy_from_slice(source);
+                remaining -= copy_len;
+                if remaining != 0 {
+                    *pending = Some(DecodePending::Binary {
+                        target,
+                        continuation,
+                        binary,
+                        remaining,
+                        bit_len,
+                    });
+                    return Ok((None, work + copy_len / B2T_MEMCPY_FACTOR));
+                }
+                let term = TermBuilder::new(&mut ctx.heap)
+                    .refc_binary(binary, bit_len)
+                    .map_err(map_term_build_error)?;
+                write_decode_target(ctx, target, root, term)?;
+                *root_started = true;
+                *next = continuation;
+                work += copy_len / B2T_MEMCPY_FACTOR;
+                continue;
+            }
+        }
+        if *root_started && next.is_none() {
+            return Ok((Some((*root, r.at)), work));
+        }
+        let target = if *root_started {
+            DecodeTarget::Heap(next.take().ok_or(BifError::BADARG)?)
+        } else {
+            DecodeTarget::Root
+        };
+        let continuation = match target {
+            DecodeTarget::Root => None,
+            DecodeTarget::Heap(slot) => ctx
+                .heap
+                .take_next_slot(slot)
+                .map_err(map_term_build_error)?,
+        };
+        let mut next_was_set = false;
+        let mut defer_output = false;
+        let mut reprocess_target = false;
+        let tag_start = r.at;
+        let tag = loop {
+            let tag = r.u8()?;
+            if tag == 121 {
+                r.take(4)?;
+                *internal_nc = true;
+            } else {
+                break tag;
+            }
+        };
+
+        let term = match tag {
+            97 | 98 => {
+                let number = if tag == 97 {
+                    r.u8()? as i64
+                } else {
+                    r.u32()? as i32 as i64
+                };
+                Some(Term::small(number).ok_or(BifError::BADARG)?)
+            }
+            110 | 111 => {
+                let length = if tag == 110 {
+                    r.u8()? as usize
+                } else {
+                    r.u32()? as usize
+                };
+                let sign = r.u8()?;
+                let number = BigInt::from_bytes_le(
+                    if sign == 0 { Sign::Plus } else { Sign::Minus },
+                    r.take(length)?,
+                );
+                Some(
+                    TermBuilder::new(&mut ctx.heap)
+                        .int_from_bigint(&number)
+                        .map_err(map_term_build_error)?,
+                )
+            }
+            70 | 99 => {
+                let value = if tag == 70 {
+                    f64::from_bits(r.u64()?)
+                } else {
+                    let raw = r.take(31)?;
+                    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(31);
+                    std::str::from_utf8(&raw[..end])
+                        .map_err(|_| BifError::BADARG)?
+                        .parse::<f64>()
+                        .map_err(|_| BifError::BADARG)?
+                };
+                if !value.is_finite() {
+                    return Err(BifError::BADARG);
+                }
+                Some(
+                    TermBuilder::new(&mut ctx.heap)
+                        .float(value)
+                        .map_err(map_term_build_error)?,
+                )
+            }
+            100 | 115 | 118 | 119 => {
+                r.at -= 1;
+                Some(r.atom(safe, true)?.0)
+            }
+            73 | 75 => {
+                let index = if tag == 73 {
+                    r.u16()? as u32
+                } else {
+                    let bytes = r.take(3)?;
+                    u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]])
+                };
+                let atom = Atom(index);
+                if global_atoms().text(atom).is_none() {
+                    return Err(BifError::BADARG);
+                }
+                Some(Term::atom(atom))
+            }
+            106 => Some(Term::NIL),
+            104 | 105 => {
+                let arity = if tag == 104 {
+                    r.u8()? as usize
+                } else {
+                    r.u32()? as usize
+                };
+                if arity == 0 {
+                    Some(
+                        TermBuilder::new(&mut ctx.heap)
+                            .tuple(&[])
+                            .map_err(map_term_build_error)?,
+                    )
+                } else {
+                    let block = TermBuilder::new(&mut ctx.heap)
+                        .reserve_tuple_block(arity)
+                        .map_err(map_term_build_error)?;
+                    let term = block.term_at(0).map_err(map_term_build_error)?;
+                    *pending = Some(DecodePending::Tuple {
+                        block,
+                        arity,
+                        next_index: arity,
+                        continuation,
+                    });
+                    next_was_set = true;
+                    Some(term)
+                }
+            }
+            107 => {
+                let size = r.u16()? as usize;
+                let source_at = r.at;
+                r.take(size)?;
+                if size == 0 {
+                    Some(Term::NIL)
+                } else {
+                    let builder = TermBuilder::new(&mut ctx.heap)
+                        .reserve_cons_list(size)
+                        .map_err(map_term_build_error)?;
+                    *pending = Some(DecodePending::String {
+                        target,
+                        continuation,
+                        builder,
+                        source_at,
+                        size,
+                        written: 0,
+                    });
+                    defer_output = true;
+                    None
+                }
+            }
+            108 => {
+                let size = r.u32()? as usize;
+                if size == 0 {
+                    if let DecodeTarget::Heap(slot) = target {
+                        ctx.heap
+                            .write_next_slot(slot, continuation)
+                            .map_err(map_term_build_error)?;
+                        *next = Some(slot);
+                        next_was_set = true;
+                    }
+                    reprocess_target = true;
+                    None
+                } else {
+                    let block = TermBuilder::new(&mut ctx.heap)
+                        .reserve_boxed_words(size * 2, 0)
+                        .map_err(map_term_build_error)?;
+                    let term = block.list_at(0).map_err(map_term_build_error)?;
+                    let last_car = block
+                        .term_slot((size - 1) * 2)
+                        .map_err(map_term_build_error)?;
+                    let last_cdr = block
+                        .term_slot((size - 1) * 2 + 1)
+                        .map_err(map_term_build_error)?;
+                    ctx.heap
+                        .write_next_slot(last_cdr, continuation)
+                        .map_err(map_term_build_error)?;
+                    ctx.heap
+                        .write_next_slot(last_car, Some(last_cdr))
+                        .map_err(map_term_build_error)?;
+                    *pending = Some(DecodePending::List {
+                        block,
+                        size,
+                        next_index: size - 1,
+                        chain: Some(last_car),
+                        continuation,
+                    });
+                    next_was_set = true;
+                    Some(term)
+                }
+            }
+            116 => {
+                let size = r.u32()? as usize;
+                if size == 0 {
+                    Some(
+                        arinsal_maps::from_pairs(&[], &mut ctx.heap)
+                            .map_err(|_| BifError::BADARG)?,
+                    )
+                } else if size <= 32 {
+                    let words = size
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(4))
+                        .ok_or(BifError::BADARG)?;
+                    let mut block = TermBuilder::new(&mut ctx.heap)
+                        .reserve_boxed_words(words, 0)
+                        .map_err(map_term_build_error)?;
+                    block
+                        .write_header((size as u64) << 6)
+                        .map_err(map_term_build_error)?;
+                    for _ in 0..size {
+                        block.write_term(Term::NIL).map_err(map_term_build_error)?;
+                    }
+                    let keys_term = block.term_at(0).map_err(map_term_build_error)?;
+                    block
+                        // Port of MAP_HEADER_FLATMAP (erl_map.h), OTP-29.1.1.
+                        .write_header(0x12c)
+                        .map_err(map_term_build_error)?;
+                    block
+                        .write_header(size as u64)
+                        .map_err(map_term_build_error)?;
+                    block.write_term(keys_term).map_err(map_term_build_error)?;
+                    for _ in 0..size {
+                        block.write_term(Term::NIL).map_err(map_term_build_error)?;
+                    }
+                    let term = block.term_at(size + 1).map_err(map_term_build_error)?;
+                    let keys = block.term_slot(1).map_err(map_term_build_error)?;
+                    let values = block.term_slot(size + 4).map_err(map_term_build_error)?;
+                    let mut child = continuation;
+                    for index in (0..size).rev() {
+                        let key = ctx
+                            .heap
+                            .offset_slot(keys, index)
+                            .map_err(map_term_build_error)?;
+                        let value = ctx
+                            .heap
+                            .offset_slot(values, index)
+                            .map_err(map_term_build_error)?;
+                        ctx.heap
+                            .write_next_slot(value, child)
+                            .map_err(map_term_build_error)?;
+                        ctx.heap
+                            .write_next_slot(key, Some(value))
+                            .map_err(map_term_build_error)?;
+                        child = Some(key);
+                    }
+                    maps.push(DecodeMap::Flatmap { keys, values, size });
+                    *next = child;
+                    next_was_set = true;
+                    Some(term)
+                } else {
+                    let block = TermBuilder::new(&mut ctx.heap)
+                        .reserve_boxed_words(size * 2, 0)
+                        .map_err(map_term_build_error)?;
+                    let pairs = block.term_slot(0).map_err(map_term_build_error)?;
+                    let mut child = continuation;
+                    for index in (0..size).rev() {
+                        let key = block.term_slot(index * 2).map_err(map_term_build_error)?;
+                        let value = block
+                            .term_slot(index * 2 + 1)
+                            .map_err(map_term_build_error)?;
+                        ctx.heap
+                            .write_next_slot(value, child)
+                            .map_err(map_term_build_error)?;
+                        ctx.heap
+                            .write_next_slot(key, Some(value))
+                            .map_err(map_term_build_error)?;
+                        child = Some(key);
+                    }
+                    maps.push(DecodeMap::Hashmap {
+                        target,
+                        pairs,
+                        size,
+                    });
+                    *next = child;
+                    next_was_set = true;
+                    defer_output = true;
+                    None
+                }
+            }
+            113 => {
+                let module = r.atom(safe, true)?.0.as_atom().ok_or(BifError::BADARG)?;
+                let function = r.atom(safe, true)?.0.as_atom().ok_or(BifError::BADARG)?;
+                let arity_tag = r.u8()?;
+                let arity = match arity_tag {
+                    97 => r.u8()? as i64,
+                    98 => r.u32()? as i32 as i64,
+                    110 | 111 => {
+                        let length = if arity_tag == 110 {
+                            r.u8()? as usize
+                        } else {
+                            r.u32()? as usize
+                        };
+                        let sign = r.u8()?;
+                        BigInt::from_bytes_le(
+                            if sign == 0 { Sign::Plus } else { Sign::Minus },
+                            r.take(length)?,
+                        )
+                        .to_i64()
+                        .ok_or(BifError::BADARG)?
+                    }
+                    _ => return Err(BifError::BADARG),
+                };
+                let arity = u8::try_from(arity).map_err(|_| BifError::BADARG)?;
+                Some(
+                    TermBuilder::new(&mut ctx.heap)
+                        .export_fun(Arc::new(ExportEntry::new(module, function, arity)))
+                        .map_err(map_term_build_error)?,
+                )
+            }
+            112 => {
+                r.u32()?;
+                let arity = r.u8()?;
+                let uniq: [u8; 16] = r.take(16)?.try_into().map_err(|_| BifError::BADARG)?;
+                let index = r.u32()?;
+                let free = r.u32()? as usize;
+                let module = r.atom(safe, true)?.0.as_atom().ok_or(BifError::BADARG)?;
+                let old_index =
+                    u32::try_from(read_small_integer(r)?).map_err(|_| BifError::BADARG)?;
+                let old_uniq =
+                    u32::try_from(read_small_integer(r)?).map_err(|_| BifError::BADARG)?;
+                let pid = read_pid_term(r, safe, local_node, ctx)?;
+                if pid.classify() != TermKind::Pid {
+                    return Err(BifError::BADARG);
+                }
+                let entry = Arc::new(FunEntry {
+                    dispatch_target: Default::default(),
+                    pend_purge_address: Default::default(),
+                    module,
+                    arity,
+                    index,
+                    uniq,
+                    old_index,
+                    old_uniq,
+                    pid,
+                    dispatch: Default::default(),
+                    dispatch_code: Default::default(),
+                    dispatch_epoch: Default::default(),
+                });
+                let (term, environment) = ctx
+                    .heap
+                    .reserve_local_fun_stub(entry, free)
+                    .map_err(map_term_build_error)?;
+                if let Some(first) = environment {
+                    let mut child = continuation;
+                    for offset in (0..free).rev() {
+                        let slot = ctx
+                            .heap
+                            .offset_slot(first, offset)
+                            .map_err(map_term_build_error)?;
+                        ctx.heap
+                            .write_next_slot(slot, child)
+                            .map_err(map_term_build_error)?;
+                        child = Some(slot);
+                    }
+                    *next = child;
+                    next_was_set = true;
+                }
+                Some(term)
+            }
+            103 | 88 | 102 | 89 | 120 | 101 | 114 | 90 => {
+                let count = if tag == 101 {
+                    1
+                } else if tag == 114 || tag == 90 {
+                    r.u16()? as usize
+                } else {
+                    0
+                };
+                if matches!(tag, 101 | 114 | 90) && !(1..=5).contains(&count) {
+                    return Err(BifError::BADARG);
+                }
+                let (node_term, _) = if *internal_nc && r.bytes.get(r.at) == Some(&106) {
+                    r.at += 1;
+                    (Term::atom(atoms::NONAME), None)
+                } else {
+                    r.atom(safe, true)?
+                };
+                let node = node_term.as_atom().ok_or(BifError::BADARG)?;
+                let mut ids = [0; 5];
+                let (id, serial, creation, ids_len) = if tag == 103 || tag == 88 {
+                    let id = r.u32()?;
+                    let serial = r.u32()?;
+                    let creation = if tag == 103 { r.u8()? as u32 } else { r.u32()? };
+                    if tag == 103 && creation > 3 {
+                        return Err(BifError::BADARG);
+                    }
+                    (id as u64, serial, creation, 0)
+                } else if matches!(tag, 102 | 89 | 120) {
+                    let id = if tag == 120 {
+                        r.u64()?
+                    } else {
+                        r.u32()? as u64
+                    };
+                    let creation = if tag == 102 { r.u8()? as u32 } else { r.u32()? };
+                    if tag == 102 && creation > 3 {
+                        return Err(BifError::BADARG);
+                    }
+                    (id, 0, creation, 0)
+                } else if tag == 101 {
+                    let id = r.u32()?;
+                    let creation = r.u8()? as u32;
+                    if id >= (1 << 18) || creation > 3 {
+                        return Err(BifError::BADARG);
+                    }
+                    ids[0] = id;
+                    (0, 0, creation, 1)
+                } else {
+                    let creation = if tag == 90 { r.u32()? } else { r.u8()? as u32 };
+                    if tag != 90 && creation > 3 {
+                        return Err(BifError::BADARG);
+                    }
+                    for (index, slot) in ids.iter_mut().take(count).enumerate() {
+                        let id = r.u32()?;
+                        if index == 0 && tag != 90 && id >= (1 << 18) {
+                            return Err(BifError::BADARG);
+                        }
+                        *slot = id;
+                    }
+                    (0, 0, creation, count)
+                };
+                let is_this_node =
+                    local_node.is_some_and(|(name, current)| node == name && creation == current);
+                let local = (node == atoms::NONAME && creation == 0) || is_this_node;
+                let term = if tag == 103 || tag == 88 {
+                    if local {
+                        Term::pid(id as u32, serial).ok_or(BifError::BADARG)?
+                    } else {
+                        TermBuilder::new(&mut ctx.heap)
+                            .external_pid(Node::new(node, creation), id as u32, serial)
+                            .map_err(map_term_build_error)?
+                    }
+                } else if matches!(tag, 102 | 89 | 120) {
+                    if local {
+                        Term::port(id).ok_or(BifError::BADARG)?
+                    } else {
+                        TermBuilder::new(&mut ctx.heap)
+                            .external_port(Node::new(node, creation), id)
+                            .map_err(map_term_build_error)?
+                    }
+                } else if local {
+                    let mut local_ids = [0; 3];
+                    for (slot, value) in local_ids.iter_mut().zip(&ids[..ids_len]) {
+                        *slot = *value;
+                    }
+                    let saved = (local_ids[2] == u32::MAX)
+                        .then(|| {
+                            arinsal_term::MagicRef::lookup_saved(
+                                u64::from(local_ids[0]) | (u64::from(local_ids[1]) << 32),
+                            )
+                        })
+                        .flatten();
+                    match saved {
+                        Some(owner) => TermBuilder::new(&mut ctx.heap)
+                            .magic_ref(owner)
+                            .map_err(map_term_build_error)?,
+                        None => TermBuilder::new(&mut ctx.heap)
+                            .local_ref(local_ids)
+                            .map_err(map_term_build_error)?,
+                    }
+                } else {
+                    TermBuilder::new(&mut ctx.heap)
+                        .external_ref(Node::new(node, creation), &ids[..ids_len])
+                        .map_err(map_term_build_error)?
+                };
+                Some(term)
+            }
+            109 | 77 => {
+                let size = r.u32()? as usize;
+                let bits = if tag == 77 { r.u8()? as usize } else { 8 };
+                if tag == 77 && (size == 0 || !(1..=8).contains(&bits)) {
+                    return Err(BifError::BADARG);
+                }
+                let bit_len = if tag == 109 {
+                    size.checked_mul(8)
+                } else {
+                    size.checked_sub(1)
+                        .and_then(|n| n.checked_mul(8))
+                        .and_then(|n| n.checked_add(bits))
+                }
+                .ok_or(BifError::BADARG)?;
+                if size > 64 {
+                    *pending = Some(DecodePending::Binary {
+                        target,
+                        continuation,
+                        binary: RefcBinary::new_zeroed(size).map_err(map_term_build_error)?,
+                        remaining: size,
+                        bit_len,
+                    });
+                    None
+                } else {
+                    let bytes = r.take(size)?;
+                    work += budget.saturating_sub(work).min(size / B2T_MEMCPY_FACTOR);
+                    Some(
+                        TermBuilder::new(&mut ctx.heap)
+                            .bitstring(bytes, bit_len)
+                            .map_err(map_term_build_error)?,
+                    )
+                }
+            }
+            _ => {
+                let mut legacy = Reader {
+                    bytes: r.bytes,
+                    at: tag_start,
+                };
+                let mut legacy_stack = SmallVec::new();
+                let parsed = parse_step(
+                    &mut legacy,
+                    &mut legacy_stack,
+                    safe,
+                    local_node,
+                    Some(ctx),
+                    usize::MAX,
+                    true,
+                )?;
+                let Some((term, _)) = parsed else {
+                    return Err(BifError::BADARG);
+                };
+                r.at = legacy.at;
+                Some(term)
+            }
+        };
+        if let Some(term) = term {
+            if !defer_output {
+                write_decode_target(ctx, target, root, term)?;
+            }
+            *root_started = true;
+            if !next_was_set {
+                *next = continuation;
+            }
+        } else if !reprocess_target && !*root_started {
+            *root_started = true;
+        }
+        work = work.saturating_add(1);
+    }
+    if pending.is_none() && *root_started && next.is_none() {
+        Ok((Some((*root, r.at)), work))
+    } else {
+        Ok((None, work))
+    }
+}
+
 /// Incremental ETF validator retained by `binary_to_term_trap/1`.
 pub struct DecodeWalk<'a> {
     input: DecodeInput<'a>,
@@ -3167,6 +4138,12 @@ pub struct DecodeWalk<'a> {
     validator_at: usize,
     decode_at: usize,
     stack: SmallVec<[Frame; 4]>,
+    decode_next: Option<HeapTermSlot>,
+    decode_root: Term,
+    decode_root_started: bool,
+    decode_maps: SmallVec<[DecodeMap; 4]>,
+    pending: Option<DecodePending>,
+    internal_nc: bool,
     safe: bool,
     local_node: Option<(arinsal_term::Atom, u32)>,
     used: bool,
@@ -3238,6 +4215,12 @@ impl<'a> DecodeWalk<'a> {
             validator_at: 0,
             decode_at: 0,
             stack: SmallVec::new(),
+            decode_next: None,
+            decode_root: Term::NIL,
+            decode_root_started: false,
+            decode_maps: SmallVec::new(),
+            pending: None,
+            internal_nc: false,
             safe: opts.safe,
             local_node: None,
             used: opts.used,
@@ -3270,6 +4253,12 @@ impl<'a> DecodeWalk<'a> {
             validator_at,
             decode_at,
             stack,
+            decode_next,
+            decode_root,
+            decode_root_started,
+            decode_maps,
+            pending,
+            internal_nc,
             safe,
             local_node,
             used,
@@ -3306,6 +4295,12 @@ impl<'a> DecodeWalk<'a> {
             validator_at,
             decode_at,
             stack,
+            decode_next,
+            decode_root,
+            decode_root_started,
+            decode_maps,
+            pending,
+            internal_nc,
             safe,
             local_node,
             used,
@@ -3469,88 +4464,99 @@ impl<'a> DecodeWalk<'a> {
             let Some(_) = checked else {
                 return Ok((None, consumed));
             };
-            self.decode_at = 0;
-            self.stack.clear();
-            self.decode_started = true;
+            self.begin_direct_decode();
             if consumed >= byte_budget.max(1) {
                 return Ok((None, consumed));
             }
         }
         if !self.decode_started {
-            self.decode_at = 0;
-            self.stack.clear();
-            self.decode_started = true;
+            self.begin_direct_decode();
         }
-        let Some(_heap_words) = self.heap_words else {
+        let Some(heap_words) = self.heap_words else {
             return Err((BifError::BADARG, consumed));
         };
-        let reservation = match self.reservation.take() {
-            Some(state) => HeapReservation::resume(&mut ctx.heap, state),
-            None => HeapReservation::new(&mut ctx.heap, _heap_words)
+        let process_heap = &mut *ctx.heap.0;
+        let mut reservation = match self.reservation.take() {
+            Some(state) => HeapReservation::resume(process_heap, state),
+            None => HeapReservation::new(process_heap, heap_words)
                 .map_err(|error| (map_term_build_error(error), consumed))?,
         };
-        let mut state = crate::BifState::default();
-        let mut decode_ctx = Ctx::with_allocator(reservation, &mut state);
         let budget = byte_budget.max(1).saturating_sub(consumed);
-        let mut decoded = 0;
-        let parsed = loop {
-            if decoded >= budget {
-                break Ok(None);
-            }
-            let before = self.decode_at;
-            let (parsed, after) = {
+        let before = self.decode_at;
+        let (parsed, after) = reservation
+            .with_words(|reserved_words| {
+                let mut state = crate::BifState::default();
+                let mut decode_ctx = Ctx::with_allocator(reserved_words, &mut state);
                 let bytes = if self.compressed {
                     &self.plain[..]
                 } else {
                     &self.input.bytes()[1..]
                 };
                 let mut reader = Reader { bytes, at: before };
-                let parsed = parse_step(
+                let parsed = decode_direct_step(
                     &mut reader,
-                    &mut self.stack,
+                    &mut self.decode_next,
+                    &mut self.decode_root,
+                    &mut self.decode_root_started,
+                    &mut self.decode_maps,
+                    &mut self.pending,
+                    &mut self.internal_nc,
                     self.safe,
                     self.local_node,
-                    Some(&mut decode_ctx),
-                    budget.saturating_sub(decoded).max(1),
-                    true,
+                    &mut decode_ctx,
+                    budget,
                 );
-                (parsed, reader.at)
-            };
-            self.decode_at = after;
-            match parsed {
-                Ok(Some((term, checked))) => {
-                    decoded += self.decode_at - before;
-                    if self.compressed && checked != self.plain_bytes().len() {
-                        break Err((BifError::BADARG, decoded));
-                    }
-                    break Ok(Some((term, checked)));
-                }
-                Ok(None) => decoded += self.decode_at - before,
-                Err(BifError::Unsupported("incomplete ETF input")) => {
-                    self.decode_at = before;
-                    break Err((BifError::BADARG, decoded));
-                }
-                Err(error) => break Err((error, decoded + self.decode_at - before)),
-            }
-        };
-        let reservation = decode_ctx.into_allocator();
+                let after = reader.at;
+                debug_assert_eq!(decode_ctx.into_allocator().as_mut_words().len(), heap_words);
+                (parsed, after)
+            })
+            .map_err(|error| (map_term_build_error(error), consumed))?;
+        self.decode_at = after;
+        let decoded = self.decode_at - before;
         match parsed {
-            Ok(Some((term, checked))) => {
+            Ok((Some((_term, checked)), decode_work)) => {
+                if self.compressed && checked != self.plain_bytes().len() {
+                    drop(reservation);
+                    return Err((BifError::BADARG, consumed + decoded));
+                }
+                finish_decode_maps(
+                    &mut reservation,
+                    &mut self.decode_maps,
+                    &mut self.decode_root,
+                )
+                .map_err(|error| (error, consumed + decode_work))?;
+                let term = self.decode_root;
                 drop(reservation);
                 let value = self
                     .wrap_used(ctx, term, checked)
-                    .map_err(|error| (error, consumed + decoded))?;
-                Ok((Some(value), consumed + decoded))
+                    .map_err(|error| (error, consumed + decode_work))?;
+                Ok((Some(value), consumed + decode_work))
             }
-            Ok(None) => {
+            Ok((None, decode_work)) => {
                 self.reservation = Some(reservation.suspend());
-                Ok((None, consumed + decoded))
+                Ok((None, consumed + decode_work))
             }
-            Err((error, work)) => {
+            Err(error) => {
                 drop(reservation);
-                Err((error, consumed + work))
+                let error = match error {
+                    BifError::Unsupported("incomplete ETF input") => BifError::BADARG,
+                    error => error,
+                };
+                Err((error, consumed + decoded))
             }
         }
+    }
+
+    fn begin_direct_decode(&mut self) {
+        self.decode_at = 0;
+        self.stack.clear();
+        self.decode_next = None;
+        self.decode_root = Term::NIL;
+        self.decode_root_started = false;
+        self.decode_maps.clear();
+        self.pending = None;
+        self.internal_nc = false;
+        self.decode_started = true;
     }
 
     fn size_step(

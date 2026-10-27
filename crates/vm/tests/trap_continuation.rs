@@ -171,7 +171,7 @@ fn trap_continuation_stack_matches_erts() {
     let actual = vm
         .eval_scheduled_reductions("trap_cont", "run", &[], 1, Some(0x7C0), 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn trap_frames_of_each_call_shape_match_erts() {
     let actual = vm
         .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, Some(0x7C2), 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn apply_of_a_trapping_bif_traps_like_a_direct_call_match_erts() {
         let actual = vm
             .eval_scheduled_reductions("trap_cont", "run_apply_traps", &[], 1, Some(seed), 4_000)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "seed {seed:#x}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "seed {seed:#x}");
     }
 }
 
@@ -224,7 +224,7 @@ fn trap_frames_of_a_tail_called_export_fun_match_erts() {
     let actual = vm
         .eval_scheduled_reductions("trap_cont", "run_fun_shapes", &[], 1, Some(0x7C3), 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
 #[test]
@@ -249,5 +249,29 @@ run() ->
     let actual = vm
         .eval_scheduled_reductions("rev_val", "run", &[], 1, Some(0x7C1), 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn external_term_entries_match_erts() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping external term entry differential test");
+        return;
+    };
+    let source = r#"
+-module(etf_entry).
+-export([run/0]).
+run() ->
+    {term_to_binary(ok), term_to_binary({1,2,3}),
+     term_to_binary([1,2,3,4,5,6,7,8,9,10]),
+     erlang:external_size(ok),
+     binary_to_term(<<131,100,0,2,111,107>>)}.
+"#;
+    let beam = reference.compile_named("etf_entry", source, &[]).unwrap();
+    reference.load("etf_entry", &beam).unwrap();
+    let expected = reference.call("etf_entry", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled("etf_entry", "run", &[], 1, None).unwrap();
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

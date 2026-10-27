@@ -252,6 +252,28 @@ pub fn hashmap_node_children(node: Term) -> Option<Vec<Term>> {
     )
 }
 
+/// Iterate the direct child terms of an OTP-layout hashmap node in storage order.
+///
+/// The hash walk pushes one frame of a HAMT at a time, like `make_hash2_helper`.
+pub(crate) struct HashNodeChildren(PairIter);
+impl Iterator for HashNodeChildren {
+    type Item = Term;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(child, _)| child)
+    }
+}
+
+/// Return a non-allocating iterator over a HAMT node's direct children.
+pub(crate) fn hash_node_children(node: Term) -> Option<HashNodeChildren> {
+    let is_map_node = node.is_hashmap();
+    let is_collision = node
+        .header()
+        .is_some_and(|header| header & 63 == crate::ARITY);
+    (is_map_node || is_collision).then(|| HashNodeChildren(PairIter::root_children(node)))
+}
+
 /// Return the stored flatmap keys in their tuple order.
 pub fn flatmap_keys(map: Term) -> Option<Vec<Term>> {
     if map.is_hashmap() || map.classify() != TermKind::Map {

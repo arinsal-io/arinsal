@@ -1436,6 +1436,31 @@ pub fn copy_binary_pattern(
         if !source_size.is_multiple_of(8) || source_size == 0 {
             return Err(BADARG);
         }
+        if copied_bits.is_multiple_of(8)
+            && trap_offset.is_multiple_of(8)
+            && view.start_bit().is_multiple_of(8)
+        {
+            // Port of copy_binary_to_buffer's byte-aligned sys_memcpy path, erl_bits.h:541-552.
+            let source = view.bytes();
+            let source_bytes = source_size / 8;
+            let source_base = view.start_bit() / 8;
+            let source_end = source_base.checked_add(source_bytes).ok_or(BADARG)?;
+            if source_end > source.len() {
+                return Err(BADARG);
+            }
+            let mut copied_bytes = copied_bits / 8;
+            let trap_bytes = trap_offset / 8;
+            while copied_bytes < trap_bytes {
+                let source_offset = copied_bytes % source_bytes;
+                let count = (trap_bytes - copied_bytes).min(source_bytes - source_offset);
+                let source_start = source_base + source_offset;
+                let target_end = copied_bytes + count;
+                destination[copied_bytes..target_end]
+                    .copy_from_slice(&source[source_start..source_start + count]);
+                copied_bytes = target_end;
+            }
+            return Ok(trap_offset);
+        }
         let mut copied_bits = copied_bits;
         while copied_bits < trap_offset {
             let source_offset = copied_bits % source_size;
