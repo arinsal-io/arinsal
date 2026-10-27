@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{Term, TermBuilder, TermKind, global_atoms};
+use arinsal_term::{Term, TermBuilder, TermKind, atoms, global_atoms};
 use smallvec::SmallVec;
 
 use crate::lists::DeferredTrap;
@@ -49,12 +49,12 @@ fn atom_name(term: Term) -> Option<String> {
 }
 
 fn encoding(term: Term) -> Result<Encoding, BifError> {
-    if let Some(name) = term.as_atom().and_then(|atom| global_atoms().text(atom)) {
-        return match name {
-            "latin1" => Ok(Encoding::Latin1),
-            "unicode" | "utf8" => Ok(Encoding::Utf8),
-            "utf16" => Ok(Encoding::Utf16Be),
-            "utf32" => Ok(Encoding::Utf32Be),
+    if let Some(atom) = term.as_atom() {
+        return match atom {
+            atoms::LATIN1 => Ok(Encoding::Latin1),
+            atoms::UNICODE | atoms::UTF8 => Ok(Encoding::Utf8),
+            atoms::UTF16 => Ok(Encoding::Utf16Be),
+            atoms::UTF32 => Ok(Encoding::Utf32Be),
             _ => Err(BifError::BADARG),
         };
     }
@@ -1069,7 +1069,7 @@ impl BinaryBuild {
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:787-851 (build_utf8_return), OTP-29.1.1.
-fn binary_build_return(ctx: &mut Ctx<'_>, output: Term, build: BinaryBuild) -> UnicodeStep {
+fn binary_build_return(ctx: &mut Ctx<'_>, output: Term, build: &BinaryBuild) -> UnicodeStep {
     if !build.done() {
         let mut rest = build.rest(ctx);
         if !build.leftover.is_empty() {
@@ -1124,6 +1124,14 @@ fn characters_to_utf8(
         root = head;
     }
     let need = check_structure(root, encoding)?;
+    if encoding == Encoding::Utf8
+        && root.classify() == TermKind::Bitstring
+        && crate::bitstring_bit_len(root)? / 8 == need.bytes
+        && analyze_utf8(&bytes(root)?)
+    {
+        cost_to_proc(ctx, need.cost / (LOOP_FACTOR_SIMPLE / LOOP_FACTOR));
+        return Ok(root);
+    }
     if encoding == Encoding::Latin1
         && root.classify() == TermKind::Bitstring
         && crate::bitstring_bit_len(root)? / 8 == need.bytes
@@ -1154,7 +1162,7 @@ fn characters_to_utf8(
         output
     };
     cost_to_proc(ctx, (initial - left) as usize);
-    match binary_build_return(ctx, output, build) {
+    match binary_build_return(ctx, output, &build) {
         UnicodeStep::Done(value) => Ok(value),
         UnicodeStep::More(cont) => {
             ctx.defer_trap(DeferredTrap::Unicode(cont));
@@ -1195,7 +1203,7 @@ pub fn unicode_utf8_binary_fast_path(args: &[Term]) -> Result<Option<Term>, BifE
     let Some(encoding_atom) = encoding.as_atom() else {
         return Ok(None);
     };
-    if !matches!(global_atoms().text(encoding_atom), Some("utf8" | "unicode")) {
+    if !matches!(encoding_atom, atoms::UTF8 | atoms::UNICODE) {
         return Ok(None);
     }
     let mut subject = *subject;
@@ -1582,7 +1590,7 @@ pub fn unicode_resume(ctx: &mut Ctx<'_>, cont: &UnicodeCont) -> UnicodeStep {
             let mut build = BinaryBuild::new(cont.rest, cont.work, encoding);
             fill_utf8_binary(cont.result, &mut build, &mut left);
             cost_to_proc(ctx, (initial - left) as usize);
-            binary_build_return(ctx, cont.result, build)
+            binary_build_return(ctx, cont.result, &build)
         }
         UnicodeStage::ListBuild => {
             let left = allowed_iterations_resumed(ctx);

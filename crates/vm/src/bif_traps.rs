@@ -2606,6 +2606,13 @@ impl TrapBody for IolistToIovec {
 impl TrapBody for IolistSize {
     const ARITY: Option<usize> = Some(1);
 
+    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
+        arinsal_bifs::iolist_size_direct(&mut ctx, args[0])
+    }
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -3197,39 +3204,10 @@ fn iolist_binary_direct(process: &mut Process, root: Term, allow_binary: bool) -
                 .expect("process HAlloc supplies the empty binary"),
         );
     }
-    let available = process.reductions.max(0) as usize;
-    let mut size = arinsal_bifs::IolistSizeWalk::new(root);
-    let (done, work) = size.step(available.saturating_mul(8).min(64)).ok()?;
-    if !done {
-        return None;
-    }
-    let bytes = size.take_size();
-    if bytes > 64 {
-        return None;
-    }
-    let size_reds = work.div_ceil(8);
-    let copy_budget = available.saturating_sub(size_reds).saturating_mul(8);
-    // Copy charges the same list cells, plus one unit per 32 binary bytes. The
-    // decrement before each cell must still leave a positive yield counter.
-    if bytes != 0 && work + bytes / 32 >= copy_budget {
-        return None;
-    }
-    let mut copy_work = 0;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let value = TermBuilder::new(&mut heap)
-        .binary_from_fn(bytes, |output| {
-            if bytes != 0 {
-                let mut copy = arinsal_bifs::IolistCopyWalk::new(root);
-                let (done, work) = copy
-                    .step(output, copy_budget)
-                    .expect("size pass validated iolist");
-                assert!(done);
-                copy_work = work;
-            }
-        })
-        .expect("process HAlloc supplies the measured small binary");
-    charge_light(process, (size_reds + copy_work.div_ceil(8)) as u32);
-    Some(value)
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
+    arinsal_bifs::iolist_to_binary_direct(&mut ctx, root)
 }
 
 fn iolist_to_binary(

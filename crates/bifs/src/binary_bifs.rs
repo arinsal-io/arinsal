@@ -54,12 +54,14 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 }
 
 // Port of erts/emulator/beam/erl_bif_guard.c:376 (byte_size_1), OTP-29.1.1.
+#[inline(always)]
 fn byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bits = bitstring_bit_len(args[0])?;
     integer(ctx, bits.div_ceil(8))
 }
 
 // Port of erts/emulator/beam/erl_bif_guard.c:354 (bit_size_1), OTP-29.1.1.
+#[inline(always)]
 fn bit_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, bitstring_bit_len(args[0])?)
 }
@@ -329,6 +331,173 @@ fn iolist_to_binary_result(ctx: &mut Ctx<'_>, root: Term) -> Result<Term, BifErr
     let result = write_binary(ctx, size, |output| copy_iolist(root, output))?;
     ctx.charge_reductions(size);
     Ok(result)
+}
+
+/// Finish a small, non-yielding iolist conversion on the direct BIF entry.
+///
+/// Port of erts/emulator/beam/erl_iolist.c:114-397,425-620 (generic_iolist_size,
+/// generic_iolist_copy), OTP-29.1.1. The local tail stack is the non-yielding
+/// ERTS estack; the resumable walkers are only needed after a call yields. The
+/// direct caller has already handled the binary, nil, singleton and type cases.
+pub fn iolist_to_binary_direct(ctx: &mut Ctx<'_>, root: Term) -> Option<Term> {
+    let available = ctx.reduction_budget();
+    let yield_budget = available.checked_mul(IOL2V_YIELDS_PER_RED)?;
+    let (byte_len, size_units) = direct_iolist_size_only(root, yield_budget)?;
+    if byte_len >= IOL2V_COPY_BITS_PER_YIELD / 8 {
+        return None;
+    }
+    let size_reds = crate::iolist_yield_reductions(size_units);
+    let copy_budget = available.checked_sub(size_reds)?;
+    let copy_yield_count = copy_budget.checked_mul(IOL2V_YIELDS_PER_RED)?;
+    if size_units >= copy_yield_count {
+        return None;
+    }
+    let copy_yield_count = i64::try_from(copy_yield_count).ok()?;
+    if byte_len == 0 {
+        direct_iolist_copy(root, &mut [], copy_yield_count)
+            .expect("the size pass validated this iolist");
+    }
+    let result = write_binary(ctx, byte_len, |output| {
+        if byte_len != 0 {
+            direct_iolist_copy(root, output, copy_yield_count)
+                .expect("the size pass validated this iolist");
+        }
+        Ok(())
+    })
+    .ok()?;
+    ctx.charge_reductions(size_reds + crate::iolist_yield_reductions(size_units));
+    Some(result)
+}
+
+/// Finish a small `iolist_size/1` call without constructing continuation state.
+// Port of erts/emulator/beam/erl_iolist.c:1005-1093 (iolist_size_dispatch, iolist_size_1), OTP-29.1.1.
+pub fn iolist_size_direct(ctx: &mut Ctx<'_>, root: Term) -> Option<Term> {
+    let yield_budget = ctx.reduction_budget().checked_mul(IOL2V_YIELDS_PER_RED)?;
+    let (size, work) = direct_iolist_size_only(root, yield_budget)?;
+    ctx.charge_reductions(iolist_yield_reductions(work));
+    integer(ctx, size).ok()
+}
+
+#[inline(always)]
+fn direct_iolist_size_only(root: Term, budget: usize) -> Option<(usize, usize)> {
+    let mut yield_count = i64::try_from(budget).ok()?;
+    let mut size_bits = 0_usize;
+    let mut work = 0_usize;
+    let mut pending = SmallVec::<[Term; 8]>::new();
+    let mut current = root;
+    loop {
+        while let Ok((head, tail)) = iolist_cons(current) {
+            yield_count -= 1;
+            if yield_count <= 0 {
+                return None;
+            }
+            work += 1;
+            if let Some(byte) = head.as_small() {
+                if !(0..=255).contains(&byte) {
+                    return None;
+                }
+                size_bits = size_bits.checked_add(8)?;
+            } else if head.classify() == TermKind::List {
+                pending.push(tail);
+                current = head;
+                continue;
+            } else if head != Term::NIL {
+                let bits = bitstring_bit_len(head).ok()?;
+                if !bits.is_multiple_of(8) {
+                    return None;
+                }
+                size_bits = size_bits.checked_add(bits)?;
+            }
+            current = tail;
+        }
+
+        yield_count -= 1;
+        if yield_count <= 0 {
+            return None;
+        }
+        work += 1;
+        if current != Term::NIL {
+            let bits = bitstring_bit_len(current).ok()?;
+            if !bits.is_multiple_of(8) {
+                return None;
+            }
+            size_bits = size_bits.checked_add(bits)?;
+        }
+        match pending.pop() {
+            Some(tail) => current = tail,
+            None => return Some((size_bits / 8, work)),
+        }
+    }
+}
+
+#[inline(always)]
+fn direct_iolist_copy(root: Term, output: &mut [u8], mut yield_count: i64) -> Result<(), BifError> {
+    let mut offset = 0_usize;
+    let mut pending = SmallVec::<[Term; 8]>::new();
+    let mut current = root;
+    loop {
+        while let Ok((head, tail)) = iolist_cons(current) {
+            // Port of the signed `--yield_count <= 0` check in
+            // erts/emulator/beam/erl_iolist.c (generic_iolist_copy), OTP-29.1.1.
+            yield_count -= 1;
+            if yield_count <= 0 {
+                return Err(BADARG);
+            }
+            if let Some(number) = head.as_small() {
+                output[offset] = u8::try_from(number).map_err(|_| BADARG)?;
+                offset += 1;
+            } else if head.classify() == TermKind::Bitstring {
+                offset += direct_copy_binary(head, output, offset)?;
+            } else if head.classify() == TermKind::List {
+                pending.push(tail);
+                current = head;
+                continue;
+            } else if head != Term::NIL {
+                return Err(BADARG);
+            }
+            current = tail;
+        }
+
+        yield_count -= 1;
+        if yield_count <= 0 {
+            return Err(BADARG);
+        }
+        if current.classify() == TermKind::Bitstring {
+            offset += direct_copy_binary(current, output, offset)?;
+        } else if current != Term::NIL {
+            return Err(BADARG);
+        }
+        match pending.pop() {
+            Some(tail) => current = tail,
+            None => return (offset == output.len()).then_some(()).ok_or(BADARG),
+        }
+    }
+}
+
+fn direct_copy_binary(term: Term, output: &mut [u8], offset: usize) -> Result<usize, BifError> {
+    with_binary_bytes(term, |view| {
+        let start = view.start_bit();
+        let bits = view.bit_len();
+        if !bits.is_multiple_of(8) {
+            return Err(BADARG);
+        }
+        let count = bits / 8;
+        let end = offset.checked_add(count).ok_or(BifError::SystemLimit)?;
+        let destination = output.get_mut(offset..end).ok_or(BifError::SystemLimit)?;
+        if start.is_multiple_of(8) {
+            let first = start / 8;
+            destination.copy_from_slice(view.bytes().get(first..first + count).ok_or(BADARG)?);
+        } else {
+            let first = start / 8;
+            let shift = start % 8;
+            for (index, slot) in destination.iter_mut().enumerate() {
+                let current = *view.bytes().get(first + index).ok_or(BADARG)?;
+                let next = view.bytes().get(first + index + 1).copied().unwrap_or(0);
+                *slot = (current << shift) | (next >> (8 - shift));
+            }
+        }
+        Ok(count)
+    })?
 }
 
 /// Bits at or below which `iolist_to_iovec/1` copies a binary into the shared run (OTP-29.1.1).
@@ -1297,6 +1466,7 @@ fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (erts_binary_part), OTP-29.1.1.
+#[inline(always)]
 fn binary_part_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let (mut position, mut length) = if args.len() == 2 {
         if tuple_arity(args[1])? != 2 {
@@ -1348,6 +1518,7 @@ pub fn binary_part_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
 }
 
 // Port of erts/emulator/beam/binary.c:476-513 (split_binary_2), OTP-29.1.1.
+#[inline(always)]
 fn split_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bits = bitstring_bit_len(args[0])?;
     let at = args[1].as_small().ok_or(BADARG)?;
@@ -1369,6 +1540,7 @@ fn split_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErro
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2286-2313 (binary_first_1), OTP-29.1.1.
+#[inline(always)]
 fn binary_first_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_input(args[0], |bytes| {
         let byte = bytes.first().ok_or(BADARG)?;
@@ -1377,6 +1549,7 @@ fn binary_first_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErro
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2316-2343 (binary_last_1), OTP-29.1.1.
+#[inline(always)]
 fn binary_last_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_input(args[0], |bytes| {
         let byte = bytes.last().ok_or(BADARG)?;
@@ -1385,6 +1558,7 @@ fn binary_last_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2335-2368 (binary_at_2), OTP-29.1.1.
+#[inline(always)]
 fn binary_at_result(_ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_bytes(args[0], |view| {
         if !view.bit_len().is_multiple_of(8) {
@@ -1445,6 +1619,7 @@ fn binary_copy_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2515-2555 (binary_referenced_byte_size_1), OTP-29.1.1.
+#[inline(always)]
 fn referenced_byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bytes = with_binary_bytes(args[0], |view| view.referenced_size())?;
     integer(ctx, bytes)
@@ -1847,6 +2022,7 @@ fn byte_order(args: &[Term]) -> Result<bool, BifError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2572-2647, 2818-2826 (encode_unsigned), OTP-29.1.1.
+#[inline(always)]
 fn encode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let value = bigint(args[0])?;
     if value.sign() == Sign::Minus {
@@ -1865,6 +2041,7 @@ fn encode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifE
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2649-2683, 2828-2835 (decode_unsigned), OTP-29.1.1.
+#[inline(always)]
 fn decode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let little_endian = byte_order(args)?;
     with_binary_input(args[0], |bytes| {
@@ -1881,6 +2058,7 @@ fn decode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifE
 
 macro_rules! word_result_body {
     ($name:ident, $result:ident) => {
+        #[inline(always)]
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
             match $result(ctx, args) {
                 Ok(value) => value,

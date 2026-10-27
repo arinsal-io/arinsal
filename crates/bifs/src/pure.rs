@@ -20,8 +20,9 @@ use crate::{BifError, Class, Ctx};
 mod binary_bifs;
 pub use binary_bifs::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistVecWalk,
-    allocate_iolist_binary, binary_part_2, finish_iolist_binary_output, iolist_to_iovec_shortcut,
-    iolist_yield_reductions, with_iolist_binary_output,
+    allocate_iolist_binary, binary_part_2, finish_iolist_binary_output, iolist_size_direct,
+    iolist_to_binary_direct, iolist_to_iovec_shortcut, iolist_yield_reductions,
+    with_iolist_binary_output,
 };
 
 const BADARG: BifError = BifError::BADARG;

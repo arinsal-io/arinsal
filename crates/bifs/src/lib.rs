@@ -49,10 +49,10 @@ pub use pure::{
     IolistVecWalk, Phash2Cont, Phash2Run, Phash2Step, allocate_iolist_binary, atom_to_list_term,
     binary_bytes, binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range,
     copy_bitstring_range, copy_bitstring_range_to, eval_unique_integer,
-    finish_iolist_binary_output, for_each_list_term, iolist_to_iovec_shortcut,
-    iolist_yield_reductions, next_ref_id, next_unique_monotonic, phash2_run, phash2_slice,
-    phash2_start, proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair,
-    tuple_terms, with_binary_bytes, with_iolist_binary_output,
+    finish_iolist_binary_output, for_each_list_term, iolist_size_direct, iolist_to_binary_direct,
+    iolist_to_iovec_shortcut, iolist_yield_reductions, next_ref_id, next_unique_monotonic,
+    phash2_run, phash2_slice, phash2_start, proper_list_terms, singleton_bitstring, tuple_arity,
+    tuple_element, tuple_pair, tuple_terms, with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
