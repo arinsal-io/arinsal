@@ -109,6 +109,16 @@ impl CheckedFlatMap {
     pub fn size(self) -> usize {
         self.0.size()
     }
+
+    /// Key and value stored at `index` of the key and value arrays.
+    ///
+    /// Port of the `kptr`/`vptr` array reads in erts/emulator/beam/external.c (MAP_DEF,
+    /// ENC_MAP_PAIR), OTP-29.1.1.
+    #[inline(always)]
+    pub fn pair_at(self, index: usize) -> Option<(Term, Term)> {
+        let (keys, values, _) = merge::flatmap_kv_with_size(self.term(), self.size());
+        Some((term(*keys.get(index)?), term(*values.get(index)?)))
+    }
 }
 
 impl CheckedHashMap {

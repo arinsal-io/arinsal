@@ -274,6 +274,16 @@ impl AtomTable {
         Some(rec.latin1_chars as usize == rec.name.len())
     }
 
+    /// UTF-8 text and Latin-1 character count of `atom` from one record lookup.
+    ///
+    /// Port of the `atom_tab(atom_val(atom))` reads in erts/emulator/beam/external.c
+    /// (enc_atom, encode_atom_size), OTP-29.1.1.
+    #[inline]
+    pub fn encoding_info(&self, atom: Atom) -> Option<(&str, Option<usize>)> {
+        let rec = self.record(atom)?;
+        Some((rec.name.as_ref(), usize::try_from(rec.latin1_chars).ok()))
+    }
+
     /// Number of Unicode scalar values in Latin-1 for this atom, or `None` if it is not.
     ///
     /// Port of erts/emulator/beam/atom.h (`Atom.latin1_chars`), OTP-29.1.1.

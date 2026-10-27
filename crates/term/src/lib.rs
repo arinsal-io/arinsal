@@ -61,7 +61,9 @@ pub use hamt::{
     hashmap_key_hash, hashmap_leaves, hashmap_leaves_hashed, hashmap_node_children, hashmap_pairs,
     swizzle_map_hash,
 };
-pub use hamt_yield::{HashmapBuild, MapReverseIter, initialize_scheduler_random};
+pub use hamt_yield::{
+    HashmapBuild, MapNodeChildren, MapReverseIter, hashmap_leaf_pair, initialize_scheduler_random,
+};
 pub use hash::{
     HASH2_ITERATIONS_PER_RED, Hash2Progress, Hash2Run, hash2_immediate, make_hash, make_hash2,
     phash, phash2, phash2_range,

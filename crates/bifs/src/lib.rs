@@ -34,7 +34,7 @@ mod unicode;
 mod unique;
 
 pub use checksum::{ChksumCont, ChksumKind, ChksumStep, chksum_resume, chksum_start};
-pub use etf::{DecodeWalk, EncodeWalk, encode_term_to_binary};
+pub use etf::{DecodeWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary};
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
     DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,

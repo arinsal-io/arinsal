@@ -8,14 +8,14 @@ use std::sync::{Arc, OnceLock};
 use arinsal_etf::DecodedSizeWalk;
 use arinsal_term::{
     Atom, BinaryOwner, ConsListBuilder, ExportEntry, FunEntry, FunRef, HeapAlloc, HeapReservation,
-    HeapReservationState, Identity, Node, OwnedBinaryRef, Term, TermBuilder, TermKind, atoms,
-    binary_owner, cmp_exact, flat_key_cmp, global_atoms, hashmap_from_ks_and_vs_extra,
+    HeapReservationState, Identity, Node, OwnedBinaryRef, RefcBinary, Term, TermBuilder, TermKind,
+    atoms, binary_owner, cmp_exact, flat_key_cmp, global_atoms, hashmap_from_ks_and_vs_extra,
     writable_finalize, writable_resize_private,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::pure::{Heap, integer, make_list, tuple_build};
 use crate::{BifError, Ctx};
@@ -370,6 +370,23 @@ impl ByteOutput for OutputSlice<'_> {
     fn failed(&self) -> bool {
         self.failed
     }
+
+    fn write_bitstring(
+        &mut self,
+        term: Term,
+        start: usize,
+        bit_count: usize,
+    ) -> Result<(), BifError> {
+        // The copy fills every byte of the range, so it needs no zeroed bytes first.
+        let end = self.position.saturating_add(bit_count.div_ceil(8));
+        let destination = self
+            .bytes
+            .get_mut(self.position..end)
+            .ok_or(BifError::SystemLimit)?;
+        crate::pure::copy_bitstring_range(term, start, destination, bit_count)?;
+        self.position = end;
+        Ok(())
+    }
 }
 
 fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
@@ -397,13 +414,22 @@ fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
 
 // Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
 fn atom_bytes(out: &mut impl ByteOutput, atom: Atom, minor: u8) -> Result<(), BifError> {
-    let table = global_atoms();
-    let name = table.text(atom).ok_or(BifError::BADARG)?;
+    atom_bytes_in(global_atoms(), out, atom, minor)
+}
+
+/// `enc_atom` with the atom table already in hand, one record lookup per atom.
+#[inline(always)]
+fn atom_bytes_in(
+    table: &arinsal_term::AtomTable,
+    out: &mut impl ByteOutput,
+    atom: Atom,
+    minor: u8,
+) -> Result<(), BifError> {
+    let (name, latin1_chars) = table.encoding_info(atom).ok_or(BifError::BADARG)?;
     if minor <= 1
-        && let Some(chars) = table.latin1_char_count(atom)
+        && let Some(chars) = latin1_chars
     {
-        out.push(100);
-        out.extend_from_slice(&(chars as u16).to_be_bytes());
+        out.extend_from_slice(&[100, (chars >> 8) as u8, chars as u8]);
         if chars == name.len() {
             out.extend_from_slice(name.as_bytes());
         } else {
@@ -415,11 +441,9 @@ fn atom_bytes(out: &mut impl ByteOutput, atom: Atom, minor: u8) -> Result<(), Bi
     }
     let bytes = name.as_bytes();
     if bytes.len() <= 255 {
-        out.push(119);
-        out.push(bytes.len() as u8);
+        out.extend_from_slice(&[119, bytes.len() as u8]);
     } else {
-        out.push(118);
-        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[118, (bytes.len() >> 8) as u8, bytes.len() as u8]);
     }
     out.extend_from_slice(bytes);
     Ok(())
@@ -430,19 +454,57 @@ fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), Bif
 }
 
 // Port of erts/emulator/beam/external.c:encode_atom_size, OTP-29.1.1.
-fn atom_size(atom: Atom, minor: u8) -> Result<usize, BifError> {
-    let table = global_atoms();
-    let name = table.text(atom).ok_or(BifError::BADARG)?;
-    let size = if minor <= 1
-        && let Some(chars) = table.latin1_char_count(atom)
+#[inline(always)]
+fn atom_size_in(table: &arinsal_term::AtomTable, atom: Atom, minor: u8) -> Result<usize, BifError> {
+    let (name, latin1_chars) = table.encoding_info(atom).ok_or(BifError::BADARG)?;
+    Ok(
+        if minor <= 1
+            && let Some(chars) = latin1_chars
+        {
+            3 + chars
+        } else if name.len() <= 255 {
+            2 + name.len()
+        } else {
+            3 + name.len()
+        },
+    )
+}
+
+/// Read the local node name and creation the first time a pid, port or reference needs them.
+#[inline(always)]
+fn resolve_local_node(opts: &mut EncodeOpts, source: Option<fn() -> (Atom, u32)>) {
+    if opts.local_node.is_none()
+        && let Some(source) = source
     {
-        3 + chars
-    } else if name.len() <= 255 {
-        2 + name.len()
+        opts.local_node = Some(source());
+    }
+}
+
+/// One cons of `ENC_ONE_CONS`: returns the head and queues the tail.
+// Port of erts/emulator/beam/external.c (encode_one_cons), OTP-29.1.1.
+#[inline(always)]
+fn encode_one_cons(
+    stack: &mut WStack,
+    out: &mut impl ByteOutput,
+    cons: Term,
+) -> Result<Term, BifError> {
+    let len_cnt = pop_stack_small(stack)?;
+    // SAFETY: the source cons stays live while this BIF is suspended.
+    let (head, tail) = unsafe { cons.cons_ref() }.ok_or(BifError::BADARG)?;
+    if is_list_term(tail) {
+        stack.push(stack_small(len_cnt + 1)?);
+        push_term_task(stack, ENC_ONE_CONS, tail);
     } else {
-        3 + name.len()
-    };
-    Ok(size)
+        let len_at = pop_stack_small(stack)?;
+        out.patch(
+            len_at,
+            &u32::try_from(len_cnt)
+                .map_err(|_| BifError::SystemLimit)?
+                .to_be_bytes(),
+        );
+        push_term_task(stack, ENC_TERM, tail);
+    }
+    Ok(head)
 }
 
 // Port of erts/emulator/beam/external.c:encode_small_size, OTP-29.1.1.
@@ -487,21 +549,6 @@ fn write_small(out: &mut impl ByteOutput, n: i64) {
     }
 }
 
-// Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
-fn external_string_len(mut term: Term) -> Result<Option<usize>, BifError> {
-    let mut len = 0usize;
-    while term.classify() == TermKind::List {
-        // SAFETY: the list cell remains live for the duration of this BIF.
-        let (head, tail) = unsafe { term.cons_ref() }.ok_or(BifError::BADARG)?;
-        if head.as_small().filter(|n| (0..=255).contains(n)).is_none() || len == 0xffff {
-            return Ok(None);
-        }
-        len += 1;
-        term = tail;
-    }
-    Ok((term == Term::NIL).then_some(len))
-}
-
 fn fun_of<'a>(term: Term) -> Result<FunRef<'a>, BifError> {
     // SAFETY: the live source heap retains the fun entry and its environment.
     unsafe { term.fun_ref() }.ok_or(BifError::BADARG)
@@ -516,11 +563,12 @@ fn record_of<'a>(term: Term) -> Result<arinsal_term::RecordRef<'a>, BifError> {
 // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
 fn external_string_prefix(mut term: Term) -> (usize, bool) {
     let mut len = 0usize;
-    while term.classify() == TermKind::List {
+    while is_list_term(term) {
         let Ok((head, tail)) = crate::pure::iolist_cons(term) else {
             return (len, false);
         };
-        if head.as_small().filter(|n| (0..=255).contains(n)).is_none() {
+        // A small integer in 0..=255: the low four tag bits are 1111 and the value is above.
+        if head.word() & 15 != 15 || head.word() >> 4 > 255 {
             return (len, false);
         }
         len += 1;
@@ -561,100 +609,320 @@ fn exact_key_cmp(left: Term, right: Term) -> Ordering {
     cmp_exact(left, right)
 }
 
-enum Work {
-    Term(Term),
-    Tuple {
-        term: Term,
-        next: usize,
-        arity: usize,
-    },
-    PatchFun(usize),
-    /// One cons of a `LIST_EXT`, length patched when the tail is not a list.
-    /// Port of erts/emulator/beam/external.c:3328 (ENC_ONE_CONS), OTP-29.1.1.
-    OneCons {
-        list: Term,
-        len_at: usize,
-        len: u32,
-    },
-    BinaryCopy {
-        term: Term,
-        bits: usize,
-        copied: usize,
-        start: usize,
-    },
-    FlatMapPairs {
-        keys: Box<arinsal_maps::FlatMapProjection>,
-        values: Box<arinsal_maps::FlatMapProjection>,
-        remaining: usize,
-    },
-    FlatMapPairValue {
-        keys: Box<arinsal_maps::FlatMapProjection>,
-        values: Box<arinsal_maps::FlatMapProjection>,
-        remaining: usize,
-        value: Term,
-    },
-    MapEntries(MapEntries),
-    MapPairValue {
-        entries: MapEntries,
-        value: Term,
-    },
-    MapPairs(std::vec::IntoIter<(Term, Term)>),
-    MapSortedValue {
-        pairs: std::vec::IntoIter<(Term, Term)>,
-        value: Term,
-    },
-    MapGather {
-        entries: MapEntries,
-        pairs: Vec<(Term, Term)>,
-    },
-    MapSort(Box<MapSort>),
+const WSTACK_INLINE: usize = 32;
+
+/// The work stack of the encoder passes.
+// Port of DECLARE_WSTACK / WSTACK_PUSH / WSTACK_POP in erts/emulator/beam/erl_term.h and
+// global.h, OTP-29.1.1: a default-size array that lives in the frame of the pass, a heap
+// overflow area, and `WSTACK_SAVE` / `WSTACK_RESTORE` to move the contents into the saved
+// context (`EncodeWalk::work`) when the pass yields.
+struct WStack {
+    len: usize,
+    inline: [Term; WSTACK_INLINE],
+    spill: Vec<Term>,
 }
 
-struct MapEntries {
-    size: usize,
-    entries: Box<MapEntryIter>,
-}
+impl WStack {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            len: 0,
+            inline: [Term::NON_VALUE; WSTACK_INLINE],
+            spill: Vec::new(),
+        }
+    }
 
-// Keeping the reverse iterator inline avoids one heap allocation per map.
-#[allow(clippy::large_enum_variant)]
-enum MapEntryIter {
-    Flat {
-        keys: Box<arinsal_maps::FlatMapProjection>,
-        values: Box<arinsal_maps::FlatMapProjection>,
-    },
-    Hash(arinsal_term::MapReverseIter),
-}
-
-impl MapEntries {
-    // Port of erts/emulator/beam/external.c:3745-3822 (MAP_DEF), OTP-29.1.1.
-    fn new(map: Term) -> Result<Self, BifError> {
-        let checked = arinsal_maps::checked_map(map).map_err(|_| BifError::BADARG)?;
-        let size = checked.size();
-        let entries = match checked.kind() {
-            arinsal_maps::CheckedMapKind::Flatmap(flat) => MapEntryIter::Flat {
-                keys: Box::new(arinsal_maps::flatmap_projection(flat, true)),
-                values: Box::new(arinsal_maps::flatmap_projection(flat, false)),
-            },
-            arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                MapEntryIter::Hash(arinsal_term::MapReverseIter::new(map).ok_or(BifError::BADARG)?)
+    /// `WSTACK_RESTORE`: take the words of a saved context.
+    #[inline(always)]
+    fn restore(&mut self, saved: &mut Vec<Term>) {
+        if !saved.is_empty() {
+            for term in saved.drain(..) {
+                self.push(term);
             }
-        };
-        Ok(Self {
-            size,
-            entries: Box::new(entries),
-        })
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, term: Term) {
+        if self.len < WSTACK_INLINE {
+            self.inline[self.len] = term;
+        } else {
+            self.push_spilled(term);
+        }
+        self.len += 1;
+    }
+
+    // `WSTACK_EXPAND`: the overflow area grows by doubling from a first block.
+    #[cold]
+    #[inline(never)]
+    fn push_spilled(&mut self, term: Term) {
+        if self.spill.capacity() == 0 {
+            self.spill.reserve(256);
+        }
+        self.spill.push(term);
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<Term> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        if self.len < WSTACK_INLINE {
+            Some(self.inline[self.len])
+        } else {
+            self.spill.pop()
+        }
+    }
+
+    #[inline(always)]
+    fn last(&self) -> Option<Term> {
+        match self.len {
+            0 => None,
+            len if len <= WSTACK_INLINE => Some(self.inline[len - 1]),
+            _ => self.spill.last().copied(),
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `WSTACK_SAVE`: move the contents, bottom first, into `saved`.
+    fn save(&mut self, saved: &mut Vec<Term>) {
+        if self.len == 0 {
+            return;
+        }
+        saved.clear();
+        saved.extend_from_slice(&self.inline[..self.len.min(WSTACK_INLINE)]);
+        saved.append(&mut self.spill);
+        self.len = 0;
     }
 }
 
-impl Iterator for MapEntries {
-    type Item = (Term, Term);
+// Size pass stack words. Port of LIST_TAIL_OP, HASHMAP_NODE_OP and TERM_ARRAY_OP(N) in
+// erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1: erts tells them from
+// terms because they are header-tagged; a `catch` immediate never occurs in a live term and
+// plays that role here, so plain terms are pushed as one word like `WSTACK_FAST_PUSH(s, node)`.
+const SIZE_LIST_TAIL: u64 = 0;
+const SIZE_HASHMAP_NODE: u64 = 1;
+const SIZE_ARRAY: u64 = 2;
 
-    // Port of erts/emulator/beam/external.c:3745-3822 (MAP_DEF), OTP-29.1.1.
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut *self.entries {
-            MapEntryIter::Flat { keys, values } => Some((keys.next()?, values.next()?)),
-            MapEntryIter::Hash(iter) => iter.next(),
+// Array kinds of TERM_ARRAY_OP: erts stores `Eterm*` plus the element count; here the
+// container term replaces the pointer and the kind says how to index into it.
+const ARRAY_TUPLE: u64 = 0;
+const ARRAY_FLAT_KEYS: u64 = 1;
+const ARRAY_FLAT_VALUES: u64 = 2;
+const ARRAY_FUN_ENV: u64 = 3;
+const ARRAY_RECORD: u64 = 4;
+
+const fn size_op(code: u64) -> Term {
+    Term::catch(code)
+}
+
+// Encode pass commands are small-integer terms below the term entry they belong to
+// (`WSTACK_PUSH2(s, obj, ENC_...)`). Codes from ENC_ARRAY up are
+// ENC_LAST_ARRAY_ELEMENT+N (tuple elements) and ENC_MAP_PAIR with the pairs left.
+const ENC_TERM_CODE: u64 = 0;
+const ENC_ONE_CONS_CODE: u64 = 1;
+const ENC_PATCH_FUN_SIZE_CODE: u64 = 2;
+const ENC_BIN_COPY_CODE: u64 = 3;
+const ENC_HASHMAP_NODE_CODE: u64 = 5;
+const ENC_START_SORTING_MAP_CODE: u64 = 7;
+const ENC_ARRAY: u64 = 16;
+const ENC_PAIR_KIND: u64 = 1;
+
+const ENC_TERM: Term = stack_command(ENC_TERM_CODE as i64);
+const ENC_ONE_CONS: Term = stack_command(ENC_ONE_CONS_CODE as i64);
+const ENC_PATCH_FUN_SIZE: Term = stack_command(ENC_PATCH_FUN_SIZE_CODE as i64);
+const ENC_BIN_COPY: Term = stack_command(ENC_BIN_COPY_CODE as i64);
+const ENC_HASHMAP_NODE: Term = stack_command(ENC_HASHMAP_NODE_CODE as i64);
+const ENC_START_SORTING_MAP: Term = stack_command(ENC_START_SORTING_MAP_CODE as i64);
+
+const fn stack_command(code: i64) -> Term {
+    match Term::small(code) {
+        Some(term) => term,
+        None => panic!("ETF stack command must fit a small integer"),
+    }
+}
+
+#[inline(always)]
+fn is_list_term(term: Term) -> bool {
+    term.word() & 3 == 1
+}
+
+// Port of WSTACK_PUSH2 in erts/emulator/beam/external.c, OTP-29.1.1.
+#[inline(always)]
+fn push_term_task(stack: &mut WStack, command: Term, term: Term) {
+    stack.push(term);
+    stack.push(command);
+}
+
+// Port of the `WSTACK_PUSH` calls that push a node without an operation word.
+#[inline(always)]
+fn push_task(stack: &mut WStack, command: Option<Term>, term: Term) {
+    stack.push(term);
+    if let Some(command) = command {
+        stack.push(command);
+    }
+}
+
+#[inline(always)]
+fn stack_small(value: usize) -> Result<Term, BifError> {
+    Term::small(i64::try_from(value).map_err(|_| BifError::SystemLimit)?)
+        .ok_or(BifError::SystemLimit)
+}
+
+#[inline(always)]
+fn pop_stack_small(stack: &mut WStack) -> Result<usize, BifError> {
+    usize::try_from(
+        stack
+            .pop()
+            .and_then(Term::as_small)
+            .ok_or(BifError::BADARG)?,
+    )
+    .map_err(|_| BifError::BADARG)
+}
+
+// Port of TERM_ARRAY_OP(N) pushes in erts/emulator/beam/external.c
+// (encode_size_struct_int), OTP-29.1.1: `remaining` elements still to read.
+#[inline(always)]
+fn push_size_array(stack: &mut WStack, container: Term, remaining: usize, kind: u64) {
+    stack.push(container);
+    stack.push(size_op(SIZE_ARRAY + (((remaining as u64) << 3) | kind)));
+}
+
+/// Element `len - remaining` of the array a TERM_ARRAY_OP walks.
+#[inline(always)]
+fn size_array_element(kind: u64, container: Term, remaining: usize) -> Result<Term, BifError> {
+    match kind {
+        ARRAY_TUPLE => crate::pure::tuple_element_from_end(container, remaining),
+        ARRAY_FLAT_KEYS | ARRAY_FLAT_VALUES => {
+            let (key, value) = flatmap_pair(container, remaining)?;
+            Ok(if kind == ARRAY_FLAT_KEYS { key } else { value })
         }
+        ARRAY_FUN_ENV => {
+            let fun = fun_of(container)?;
+            let index = fun
+                .num_free()
+                .checked_sub(remaining)
+                .ok_or(BifError::BADARG)?;
+            fun.free(index).ok_or(BifError::BADARG)
+        }
+        _ => {
+            let record = record_of(container)?;
+            let index = record
+                .len()
+                .checked_sub(remaining)
+                .ok_or(BifError::BADARG)?;
+            record.value(index).ok_or(BifError::BADARG)
+        }
+    }
+}
+
+/// Key and value of a flatmap with `remaining` pairs still to read.
+#[inline(always)]
+fn flatmap_pair(map: Term, remaining: usize) -> Result<(Term, Term), BifError> {
+    let checked = arinsal_maps::checked_map(map).map_err(|_| BifError::BADARG)?;
+    let arinsal_maps::CheckedMapKind::Flatmap(flat) = checked.kind() else {
+        return Err(BifError::BADARG);
+    };
+    flat.pair_at(flat.size().checked_sub(remaining).ok_or(BifError::BADARG)?)
+        .ok_or(BifError::BADARG)
+}
+
+/// Pop the next object of the size pass, resolving the operation words.
+// Port of the pop section of erts/emulator/beam/external.c (encode_size_struct_int),
+// OTP-29.1.1.
+#[inline(always)]
+fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
+    let Some(word) = stack.pop() else {
+        return Ok(None);
+    };
+    if word.word() & 63 != 0x1b {
+        return Ok(Some(word));
+    }
+    let code = word.word() >> 6;
+    if code == SIZE_LIST_TAIL {
+        let tail = stack.pop().ok_or(BifError::BADARG)?;
+        if is_list_term(tail) {
+            let (head, rest) = crate::pure::iolist_cons(tail)?;
+            push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
+            Ok(Some(head))
+        } else {
+            Ok(Some(tail))
+        }
+    } else if code == SIZE_HASHMAP_NODE {
+        let node = stack.pop().ok_or(BifError::BADARG)?;
+        Ok(Some(push_hashmap_node_tasks(
+            stack,
+            node,
+            Some(size_op(SIZE_HASHMAP_NODE)),
+            None,
+        )?))
+    } else {
+        let spec = code - SIZE_ARRAY;
+        let remaining = (spec >> 3) as usize;
+        let container = stack.pop().ok_or(BifError::BADARG)?;
+        let obj = size_array_element(spec & 7, container, remaining)?;
+        if remaining > 1 {
+            push_term_task(stack, size_op(code - 8), container);
+        }
+        Ok(Some(obj))
+    }
+}
+
+// Port of erts/emulator/beam/external.c:5812-5825 (HASHMAP_NODE_OP), OTP-29.1.1.
+#[inline(always)]
+fn push_hashmap_root_tasks(
+    stack: &mut WStack,
+    map: Term,
+    node_command: Term,
+    term_command: Option<Term>,
+) -> Result<(), BifError> {
+    let children = arinsal_term::MapNodeChildren::new(map).ok_or(BifError::BADARG)?;
+    for child in children.rev() {
+        let command = if matches!(child.classify(), TermKind::List | TermKind::Tuple) {
+            Some(node_command)
+        } else {
+            term_command
+        };
+        push_task(stack, command, child);
+    }
+    Ok(())
+}
+
+// Port of erts/emulator/beam/external.c:3404-3419 (ENC_HASHMAP_NODE), OTP-29.1.1.
+#[inline(always)]
+fn push_hashmap_node_tasks(
+    stack: &mut WStack,
+    node: Term,
+    node_command: Option<Term>,
+    value_command: Option<Term>,
+) -> Result<Term, BifError> {
+    if node.classify() == TermKind::List {
+        let (key, value) = arinsal_term::hashmap_leaf_pair(node).ok_or(BifError::BADARG)?;
+        push_task(stack, value_command, value);
+        return Ok(key);
+    }
+    let children = arinsal_term::MapNodeChildren::new(node).ok_or(BifError::BADARG)?;
+    let mut children = children;
+    let last = children.next().ok_or(BifError::BADARG)?;
+    for child in children.rev() {
+        push_task(stack, node_command, child);
+    }
+    let (key, value) = arinsal_term::hashmap_leaf_pair(last).ok_or(BifError::BADARG)?;
+    push_task(stack, value_command, value);
+    Ok(key)
+}
+
+#[inline(always)]
+fn push_sorted_map_tasks(stack: &mut WStack, pairs: Vec<(Term, Term)>) {
+    // Port of erts/emulator/beam/external.c:3491-3510 (ENC_PUSH_SORTED_MAP), OTP-29.1.1.
+    for (key, value) in pairs.into_iter().rev() {
+        push_term_task(stack, ENC_TERM, value);
+        push_term_task(stack, ENC_TERM, key);
     }
 }
 
@@ -740,82 +1008,287 @@ impl MapSort {
     }
 }
 
-fn push_map_terms(work: &mut SmallVec<[Work; 2]>, pairs: Vec<(Term, Term)>) {
-    work.push(Work::MapPairs(pairs.into_iter()));
+/// The body of `encode_size_struct_int`: `Ok(None)` when the pass finished, `Ok(Some(obj))`
+/// when the reduction budget ran out with `obj` still to be sized.
+#[inline(always)]
+fn size_walk(
+    opts: &mut EncodeOpts,
+    node_source: Option<fn() -> (Atom, u32)>,
+    stack: &mut WStack,
+    pending: Option<Term>,
+    result: &mut usize,
+    consumed: &mut usize,
+    budget: usize,
+) -> Result<Option<Term>, BifError> {
+    let table = global_atoms();
+    let minor = opts.minor;
+    let mut total = *result;
+    let mut work = *consumed;
+    let mut obj = match pending {
+        Some(obj) => obj,
+        None => match size_pop(stack)? {
+            Some(obj) => obj,
+            None => return Ok(None),
+        },
+    };
+    macro_rules! add {
+        ($size:expr) => {
+            total = total.checked_add($size).ok_or(BifError::SystemLimit)?
+        };
+    }
+    loop {
+        // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
+        if work + 1 >= budget {
+            *result = total;
+            *consumed = work;
+            return Ok(Some(obj));
+        }
+        work += 1;
+        match obj.classify() {
+            TermKind::Number => {
+                if let Some(value) = obj.as_small() {
+                    add!(small_size(value));
+                } else if obj.header().is_some_and(|header| header & 63 == 0x18) {
+                    add!(if minor == 0 { 32 } else { 9 });
+                } else {
+                    add!(bignum_size(obj)?);
+                }
+            }
+            TermKind::Atom => add!(atom_size_in(
+                table,
+                obj.as_atom().ok_or(BifError::BADARG)?,
+                minor
+            )?),
+            TermKind::Nil => add!(1),
+            TermKind::List => {
+                // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1:
+                // one scan returns both the string length and the work count.
+                let (len, is_string) = external_string_prefix(obj);
+                work += len / 2;
+                if is_string {
+                    add!(3 + len);
+                } else {
+                    add!(5);
+                    let (head, rest) = crate::pure::iolist_cons(obj)?;
+                    push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
+                    obj = head;
+                    continue;
+                }
+            }
+            TermKind::Tuple => {
+                let arity = crate::pure::tuple_arity(obj)?;
+                add!(if arity <= 255 { 2 } else { 5 });
+                if arity > 0 {
+                    if arity > 1 {
+                        push_size_array(stack, obj, arity - 1, ARRAY_TUPLE);
+                    }
+                    obj = crate::pure::tuple_element(obj, 0)?;
+                    continue;
+                }
+            }
+            TermKind::Map => {
+                let checked = arinsal_maps::checked_map(obj).map_err(|_| BifError::BADARG)?;
+                match checked.kind() {
+                    arinsal_maps::CheckedMapKind::Flatmap(_) => {
+                        let size = checked.size();
+                        add!(5);
+                        if size > 0 {
+                            push_size_array(stack, obj, size, ARRAY_FLAT_VALUES);
+                            push_size_array(stack, obj, size, ARRAY_FLAT_KEYS);
+                        }
+                    }
+                    arinsal_maps::CheckedMapKind::Hashmap(_) => {
+                        let children =
+                            arinsal_term::MapNodeChildren::new(obj).ok_or(BifError::BADARG)?;
+                        if children.is_head() {
+                            add!(5);
+                        }
+                        push_hashmap_root_tasks(stack, obj, size_op(SIZE_HASHMAP_NODE), None)?;
+                    }
+                }
+            }
+            TermKind::Bitstring => {
+                let bits = crate::pure::bitstring_bit_len(obj)?;
+                let len = bits.div_ceil(8);
+                let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
+                add!(header.checked_add(len).ok_or(BifError::SystemLimit)?);
+            }
+            TermKind::Pid | TermKind::Port | TermKind::Ref => {
+                // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
+                resolve_local_node(opts, node_source);
+                let identity = obj.identity().ok_or(BifError::BADARG)?;
+                let identity = local_identity(identity, opts.local_node);
+                let node_size = if opts.local {
+                    1
+                } else {
+                    atom_size_in(
+                        table,
+                        match identity {
+                            Identity::Pid { node, .. }
+                            | Identity::Port { node, .. }
+                            | Identity::Ref { node, .. } => node,
+                        },
+                        minor,
+                    )?
+                };
+                let size = match identity {
+                    Identity::Pid { .. } => 1 + node_size + 12,
+                    Identity::Port { .. } => 1 + node_size + 12,
+                    Identity::Ref { ids, .. } => 1 + 2 + node_size + 4 + 4 * ids.len(),
+                };
+                add!(size);
+            }
+            TermKind::Fun => {
+                let fun = fun_of(obj)?;
+                match &fun {
+                    FunRef::Export { entry } => {
+                        add!(
+                            1 + atom_size_in(table, entry.module, minor)?
+                                + atom_size_in(table, entry.function, minor)?
+                                + small_size(i64::from(entry.arity))
+                        );
+                    }
+                    FunRef::Local { entry, .. } => {
+                        add!(
+                            1 + 4
+                                + 1
+                                + 16
+                                + 4
+                                + 4
+                                + atom_size_in(table, entry.module, minor)?
+                                + small_size(i64::from(entry.old_index))
+                                + small_size(i64::from(entry.old_uniq))
+                        );
+                        stack.push(entry.pid);
+                        let free = fun.num_free();
+                        if free > 1 {
+                            push_size_array(stack, obj, free - 1, ARRAY_FUN_ENV);
+                        }
+                        if free != 0 {
+                            obj = fun.free(0).ok_or(BifError::BADARG)?;
+                            continue;
+                        }
+                    }
+                }
+            }
+            TermKind::Record => {
+                let record = record_of(obj)?;
+                let mut size = 1
+                    + 4
+                    + 1
+                    + atom_size_in(table, record.module(), minor)?
+                    + atom_size_in(table, record.name(), minor)?;
+                for index in 0..record.len() {
+                    let sorted = record.sorted_index(index).ok_or(BifError::BADARG)?;
+                    size = size
+                        .checked_add(atom_size_in(
+                            table,
+                            record.key(sorted).ok_or(BifError::BADARG)?,
+                            minor,
+                        )?)
+                        .ok_or(BifError::SystemLimit)?;
+                }
+                add!(size);
+                let values = record.len();
+                if values > 1 {
+                    push_size_array(stack, obj, values - 1, ARRAY_RECORD);
+                }
+                if values != 0 {
+                    obj = record.value(0).ok_or(BifError::BADARG)?;
+                    continue;
+                }
+            }
+            _ => return Err(BifError::Unsupported("ETF representation")),
+        }
+        match size_pop(stack)? {
+            Some(next) => obj = next,
+            None => {
+                *result = total;
+                *consumed = work;
+                return Ok(None);
+            }
+        }
+    }
 }
 
 type EncodedWithSplits = (Vec<u8>, Vec<(usize, usize)>);
 
+/// Build the heap term of a refc binary that holds a finished encoding of `size` bytes.
+pub fn install_refc_binary<H: HeapAlloc>(
+    heap: &mut H,
+    binary: RefcBinary,
+    size: usize,
+) -> Result<Term, BifError> {
+    let mut heap = Heap(heap);
+    TermBuilder::new(&mut heap)
+        .refc_binary(binary, size * 8)
+        .map_err(|_| BifError::SystemLimit)
+}
+
+/// Result of [`EncodeWalk::encode_into_refc`].
+pub enum RefcEncoded {
+    /// The finished binary term.
+    Done(Term),
+    /// The reduction budget ran out; the binary holds the bytes written so far.
+    Partial(RefcBinary),
+}
+
 /// Incremental ETF encoder used by the VM's trapping `term_to_binary` path.
 pub struct EncodeWalk {
     opts: EncodeOpts,
-    out: SmallVec<[u8; 64]>,
-    splits: SmallVec<[(usize, usize); 1]>,
-    work: SmallVec<[Work; 2]>,
+    /// The saved work stack of whichever pass is running (`ctx->wstack`).
+    work: Vec<Term>,
     current_term: Option<Term>,
-    size_work: SmallVec<[SizeItem; 2]>,
     size_current: Option<Term>,
     encoded_size: usize,
     written: usize,
     direct_started: bool,
-    local_hash: Option<BlockHashWalk>,
     sized: bool,
     free_first: bool,
     iovec: bool,
+    /// State that the plain `term_to_binary` path never touches, out of line so that the
+    /// walk stays small enough to be moved without a call to `memcpy`.
+    cold: Option<Box<EncodeCold>>,
+    /// Whether to record the boundaries of large binaries for `term_to_iovec`.
+    record_splits: bool,
+    /// Where to read the node name and creation when the first pid, port or reference needs
+    /// them; erts reads `erts_this_node` only when `enc_internal_pid` runs.
+    node_source: Option<fn() -> (Atom, u32)>,
+}
+
+/// The rarely used parts of an [`EncodeWalk`]: the owned output buffer of `step`, the iovec
+/// split points, the deterministic map sort, the local-hash walk and the zlib stream.
+#[derive(Default)]
+struct EncodeCold {
+    out: Vec<u8>,
+    splits: Vec<(usize, usize)>,
+    map_sort: Option<Box<MapSort>>,
+    local_hash: Option<BlockHashWalk>,
     compressor: Option<Compress>,
     compression_finished: bool,
 }
 
-/// A pending visit of the size pass.
-// Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
-// Keep HAMT traversal state inline in the saved size stack, as the OTP WStack does.
-#[allow(clippy::large_enum_variant)]
-enum SizeItem {
-    Term(Term),
-    Tuple {
-        term: Term,
-        next: usize,
-        arity: usize,
-    },
-    Tail(Term),
-    FlatMapPairs {
-        keys: Box<arinsal_maps::FlatMapProjection>,
-        values: Box<arinsal_maps::FlatMapProjection>,
-        remaining: usize,
-    },
-    FlatMapPairValue {
-        keys: Box<arinsal_maps::FlatMapProjection>,
-        values: Box<arinsal_maps::FlatMapProjection>,
-        remaining: usize,
-        value: Term,
-    },
-    Map(MapEntries),
-    MapValue {
-        entries: MapEntries,
-        value: Term,
-    },
-}
-
 impl EncodeWalk {
+    fn cold(&mut self) -> &mut EncodeCold {
+        self.cold.get_or_insert_with(Default::default)
+    }
+
     /// Empty state used after the source term has been fully encoded.
     pub fn completed() -> Self {
         Self {
             opts: EncodeOpts::default(),
-            out: SmallVec::new(),
-            splits: SmallVec::new(),
-            work: SmallVec::new(),
+            work: Vec::new(),
             current_term: None,
-            size_work: SmallVec::new(),
             size_current: None,
             encoded_size: 0,
             written: 0,
             direct_started: false,
-            local_hash: None,
             sized: true,
             free_first: false,
             iovec: false,
-            compressor: None,
-            compression_finished: false,
+            cold: None,
+            record_splits: false,
+            node_source: None,
         }
     }
 
@@ -838,37 +1311,40 @@ impl EncodeWalk {
         self.opts.local_node = Some((node, creation));
     }
 
+    /// Like [`Self::set_local_node`], but `source` runs only if the term holds a pid, port or
+    /// reference.
+    pub fn set_local_node_source(&mut self, source: fn() -> (Atom, u32)) {
+        self.node_source = Some(source);
+    }
+
+    #[inline(always)]
     fn start(term: Term, opts: EncodeOpts) -> Self {
-        let mut out = smallvec![131];
         let mut encoded_size = 1;
         if opts.local {
             // Port of erts/emulator/beam/external.c:3305 (encode LOCAL_EXT), OTP-29.1.1.
-            out.extend_from_slice(&[121, 0, 0, 0, 0]);
             encoded_size += 5;
         }
         Self {
             opts,
-            out,
-            splits: SmallVec::new(),
-            work: SmallVec::new(),
+            work: Vec::new(),
             current_term: Some(term),
-            size_work: SmallVec::new(),
             size_current: Some(term),
             encoded_size,
             written: 0,
             direct_started: false,
-            local_hash: None,
             sized: false,
             free_first: true,
             iovec: false,
-            compressor: None,
-            compression_finished: false,
+            cold: None,
+            record_splits: false,
+            node_source: None,
         }
     }
 
     /// Mark the walk as `term_to_iovec`, which references large aligned binaries in place.
     pub fn set_iovec(&mut self, iovec: bool) {
         self.iovec = iovec;
+        self.record_splits = iovec;
     }
 
     /// Exact serialized size after the `encode_size_struct_int` pass.
@@ -889,256 +1365,36 @@ impl EncodeWalk {
         !(self.iovec && plain) && self.encoded_size <= 64
     }
 
-    fn add_size(&mut self, size: usize) -> Result<(), BifError> {
-        self.encoded_size = self
-            .encoded_size
-            .checked_add(size)
-            .ok_or(BifError::SystemLimit)?;
-        Ok(())
-    }
-
     /// Count the yield counts of the size pass, at most `budget - 1` of them.
-    // Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
+    // Port of erts/emulator/beam/external.c:5579 (encode_size_struct_int), OTP-29.1.1.
     fn size_step(&mut self, budget: usize, consumed: &mut usize) -> Result<bool, BifError> {
-        while let Some(item) = self
-            .size_current
-            .take()
-            .map(SizeItem::Term)
-            .or_else(|| self.size_work.pop())
-        {
-            let item = match item {
-                SizeItem::Tuple { term, next, arity } => {
-                    // Port of external.c (encode_size_struct_int), OTP-29.1.1:
-                    // WSTACK retains the tuple array cursor while obj visits each element.
-                    self.size_current = Some(crate::pure::tuple_element(term, next)?);
-                    if next + 1 < arity {
-                        self.size_work.push(SizeItem::Tuple {
-                            term,
-                            next: next + 1,
-                            arity,
-                        });
-                    }
-                    continue;
-                }
-                SizeItem::Tail(tail) => {
-                    if tail.classify() == TermKind::List {
-                        let (head, rest) = crate::pure::iolist_cons(tail)?;
-                        self.size_work.push(SizeItem::Tail(rest));
-                        self.size_current = Some(head);
-                    } else {
-                        self.size_current = Some(tail);
-                    }
-                    continue;
-                }
-                SizeItem::FlatMapPairs {
-                    mut keys,
-                    mut values,
-                    remaining,
-                } => {
-                    if remaining > 0 {
-                        let key = keys.next().ok_or(BifError::BADARG)?;
-                        let value = values.next().ok_or(BifError::BADARG)?;
-                        self.size_work.push(SizeItem::FlatMapPairValue {
-                            keys,
-                            values,
-                            remaining: remaining - 1,
-                            value,
-                        });
-                        self.size_current = Some(key);
-                    }
-                    continue;
-                }
-                SizeItem::FlatMapPairValue {
-                    keys,
-                    values,
-                    remaining,
-                    value,
-                } => {
-                    self.size_work.push(SizeItem::FlatMapPairs {
-                        keys,
-                        values,
-                        remaining,
-                    });
-                    self.size_current = Some(value);
-                    continue;
-                }
-                SizeItem::Map(mut entries) => {
-                    if let Some((key, value)) = entries.next() {
-                        self.size_work.push(SizeItem::MapValue { entries, value });
-                        self.size_current = Some(key);
-                    }
-                    continue;
-                }
-                SizeItem::MapValue { entries, value } => {
-                    self.size_work.push(SizeItem::Map(entries));
-                    self.size_current = Some(value);
-                    continue;
-                }
-                item => item,
-            };
-            if *consumed + 1 >= budget {
-                match item {
-                    SizeItem::Term(term) => self.size_current = Some(term),
-                    other => self.size_work.push(other),
-                }
-                return Ok(false);
-            }
-            *consumed += 1;
-            let term = match item {
-                SizeItem::Term(term) => term,
-                SizeItem::Tuple { .. }
-                | SizeItem::Tail(_)
-                | SizeItem::FlatMapPairs { .. }
-                | SizeItem::FlatMapPairValue { .. }
-                | SizeItem::Map(_)
-                | SizeItem::MapValue { .. } => continue,
-            };
-            match term.classify() {
-                TermKind::Number => {
-                    let size = if let Some(value) = term.as_small() {
-                        small_size(value)
-                    } else if term.header().is_some_and(|header| header & 63 == 0x18) {
-                        if self.opts.minor == 0 { 32 } else { 9 }
-                    } else {
-                        bignum_size(term)?
-                    };
-                    self.add_size(size)?;
-                }
-                TermKind::Atom => self.add_size(atom_size(
-                    term.as_atom().ok_or(BifError::BADARG)?,
-                    self.opts.minor,
-                )?)?,
-                TermKind::Nil => self.add_size(1)?,
-                TermKind::List => {
-                    *consumed += external_string_prefix(term).0 / 2;
-                    if let Some(len) = external_string_len(term)? {
-                        self.add_size(3 + len)?;
-                    } else {
-                        self.add_size(5)?;
-                        let (head, rest) = crate::pure::iolist_cons(term)?;
-                        self.size_work.push(SizeItem::Tail(rest));
-                        self.size_current = Some(head);
-                    }
-                }
-                TermKind::Tuple => {
-                    let arity = crate::pure::tuple_arity(term)?;
-                    self.add_size(if arity <= 255 { 2 } else { 5 })?;
-                    if arity > 0 {
-                        self.size_current = Some(crate::pure::tuple_element(term, 0)?);
-                        if arity > 1 {
-                            self.size_work.push(SizeItem::Tuple {
-                                term,
-                                next: 1,
-                                arity,
-                            });
-                        }
-                    }
-                }
-                TermKind::Map => {
-                    let entries = MapEntries::new(term)?;
-                    let size = entries.size;
-                    self.add_size(5)?;
-                    if size > 0 {
-                        match *entries.entries {
-                            MapEntryIter::Flat { keys, values } => {
-                                self.size_work.push(SizeItem::FlatMapPairs {
-                                    keys,
-                                    values,
-                                    remaining: size,
-                                });
-                            }
-                            entries @ MapEntryIter::Hash(_) => {
-                                self.size_work.push(SizeItem::Map(MapEntries {
-                                    size,
-                                    entries: Box::new(entries),
-                                }));
-                            }
-                        }
-                    }
-                }
-                TermKind::Bitstring => {
-                    let bits = crate::pure::bitstring_bit_len(term)?;
-                    let len = bits.div_ceil(8);
-                    let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
-                    self.add_size(header.checked_add(len).ok_or(BifError::SystemLimit)?)?;
-                }
-                TermKind::Pid | TermKind::Port | TermKind::Ref => {
-                    // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
-                    let identity = term.identity().ok_or(BifError::BADARG)?;
-                    let identity = local_identity(identity, self.opts.local_node);
-                    let node_size = if self.opts.local {
-                        1
-                    } else {
-                        atom_size(
-                            match identity {
-                                Identity::Pid { node, .. }
-                                | Identity::Port { node, .. }
-                                | Identity::Ref { node, .. } => node,
-                            },
-                            self.opts.minor,
-                        )?
-                    };
-                    let size = match identity {
-                        Identity::Pid { .. } => 1 + node_size + 12,
-                        Identity::Port { .. } => 1 + node_size + 12,
-                        Identity::Ref { ids, .. } => 1 + 2 + node_size + 4 + 4 * ids.len(),
-                    };
-                    self.add_size(size)?;
-                }
-                TermKind::Fun => {
-                    let fun = fun_of(term)?;
-                    match &fun {
-                        FunRef::Export { entry } => {
-                            self.add_size(
-                                1 + atom_size(entry.module, self.opts.minor)?
-                                    + atom_size(entry.function, self.opts.minor)?
-                                    + small_size(i64::from(entry.arity)),
-                            )?;
-                        }
-                        FunRef::Local { entry, .. } => {
-                            self.add_size(
-                                1 + 4
-                                    + 1
-                                    + 16
-                                    + 4
-                                    + 4
-                                    + atom_size(entry.module, self.opts.minor)?
-                                    + small_size(i64::from(entry.old_index))
-                                    + small_size(i64::from(entry.old_uniq)),
-                            )?;
-                            self.size_work.push(SizeItem::Term(entry.pid));
-                            for index in (0..fun.num_free()).rev() {
-                                self.size_work
-                                    .push(SizeItem::Term(fun.free(index).ok_or(BifError::BADARG)?));
-                            }
-                        }
-                    }
-                }
-                TermKind::Record => {
-                    let record = record_of(term)?;
-                    let mut size = 1
-                        + 4
-                        + 1
-                        + atom_size(record.module(), self.opts.minor)?
-                        + atom_size(record.name(), self.opts.minor)?;
-                    for index in (0..record.len()).rev() {
-                        let sorted = record.sorted_index(index).ok_or(BifError::BADARG)?;
-                        size = size
-                            .checked_add(atom_size(
-                                record.key(sorted).ok_or(BifError::BADARG)?,
-                                self.opts.minor,
-                            )?)
-                            .ok_or(BifError::SystemLimit)?;
-                        self.size_work.push(SizeItem::Term(
-                            record.value(sorted).ok_or(BifError::BADARG)?,
-                        ));
-                    }
-                    self.add_size(size)?;
-                }
-                _ => return Err(BifError::Unsupported("ETF representation")),
+        let mut opts = self.opts;
+        let node_source = self.node_source;
+        let mut stack = WStack::new();
+        stack.restore(&mut self.work);
+        let mut result = self.encoded_size;
+        let mut work = *consumed;
+        let pending = self.size_current.take();
+        let outcome = size_walk(
+            &mut opts,
+            node_source,
+            &mut stack,
+            pending,
+            &mut result,
+            &mut work,
+            budget,
+        );
+        self.opts = opts;
+        stack.save(&mut self.work);
+        self.encoded_size = result;
+        *consumed = work;
+        match outcome? {
+            None => Ok(true),
+            Some(obj) => {
+                self.size_current = Some(obj);
+                Ok(false)
             }
         }
-        Ok(true)
     }
 
     /// Advance the exact size pass used before result allocation.
@@ -1156,9 +1412,15 @@ impl EncodeWalk {
 
     /// Encode at most `budget` pending terms and patch records into the owned byte buffer.
     pub fn step(&mut self, budget: usize) -> Result<(bool, usize), BifError> {
-        let mut output = std::mem::take(&mut self.out);
+        let mut output = std::mem::take(&mut self.cold().out);
+        if output.is_empty() {
+            output.push(131);
+            if self.opts.local {
+                output.extend_from_slice(&[121, 0, 0, 0, 0]);
+            }
+        }
         let result = self.step_with_output(budget, &mut output, 0);
-        self.out = output;
+        self.cold().out = output;
         result
     }
 
@@ -1186,7 +1448,9 @@ impl EncodeWalk {
             }
             self.written = writer.len();
             self.direct_started = true;
-            self.out.clear();
+            if let Some(cold) = self.cold.as_mut() {
+                cold.out.clear();
+            }
         }
         let mut writer = OutputSlice::new(output, self.written);
         let (mut done, used) = self.step_with_output(budget, &mut writer, size_work)?;
@@ -1195,12 +1459,14 @@ impl EncodeWalk {
             return Err(BifError::SystemLimit);
         }
         if done && self.opts.local {
+            let written = self.written;
             let hash_walk = self
+                .cold()
                 .local_hash
-                .get_or_insert_with(|| BlockHashWalk::new(self.written - 6, local_node_hash()));
+                .get_or_insert_with(|| BlockHashWalk::new(written - 6, local_node_hash()));
             let remaining_work = budget.saturating_sub(used);
             let hash_budget = (remaining_work / 32).saturating_mul(128);
-            let (hash_done, hash_work) = hash_walk.step(writer.slice(6..self.written), hash_budget);
+            let (hash_done, hash_work) = hash_walk.step(writer.slice(6..written), hash_budget);
             let consumed = (hash_work / 128).saturating_mul(32);
             if hash_done {
                 let hash = hash_walk.hash.ok_or(BifError::SystemLimit)?;
@@ -1218,6 +1484,28 @@ impl EncodeWalk {
             return Err(BifError::SystemLimit);
         }
         Ok((done, used))
+    }
+
+    /// Encode into a fresh refc binary of the sized length, as `erts_term_to_binary_int` fills
+    /// `erts_bin_nrml_alloc(size)` before the ProcBin is built. Returns the finished term, or
+    /// the partly filled binary if the budget ran out.
+    // Port of erts/emulator/beam/external.c:2519-2582 (erts_term_to_binary_int), OTP-29.1.1.
+    pub fn encode_into_refc<H: HeapAlloc>(
+        &mut self,
+        heap: &mut H,
+        budget: usize,
+    ) -> Result<(RefcEncoded, usize), BifError> {
+        let size = self.encoded_size().ok_or(BifError::SystemLimit)?;
+        let mut binary = RefcBinary::new_zeroed(size).map_err(|_| BifError::SystemLimit)?;
+        let (done, work) = self.step_into(
+            binary.bytes_mut_unique().ok_or(BifError::SystemLimit)?,
+            budget,
+        )?;
+        if !done {
+            return Ok((RefcEncoded::Partial(binary), work));
+        }
+        let term = install_refc_binary(heap, binary, size)?;
+        Ok((RefcEncoded::Done(term), work))
     }
 
     /// Encode a simple result directly into its final binary, using erts' stack buffer only
@@ -1287,7 +1575,8 @@ impl EncodeWalk {
             .compressed
             .filter(|level| *level > 0)
             .ok_or(BifError::BADARG)?;
-        let compressor = self
+        let cold = self.cold();
+        let compressor = cold
             .compressor
             .get_or_insert_with(|| Compress::new(Compression::new(level as u32), true));
         let input_at = usize::try_from(compressor.total_in()).map_err(|_| BifError::SystemLimit)?;
@@ -1297,7 +1586,7 @@ impl EncodeWalk {
             return Err(BifError::SystemLimit);
         }
         if output_at == output.len() {
-            return Ok((self.compression_finished, 0));
+            return Ok((cold.compression_finished, 0));
         }
         let end = output_at.saturating_add(budget.max(1)).min(output.len());
         let before = compressor.total_out();
@@ -1310,37 +1599,46 @@ impl EncodeWalk {
             .map_err(|_| BifError::SystemLimit)?;
         let written =
             usize::try_from(compressor.total_out() - before).map_err(|_| BifError::SystemLimit)?;
-        self.compression_finished = status == Status::StreamEnd;
-        Ok((self.compression_finished, written))
+        cold.compression_finished = status == Status::StreamEnd;
+        Ok((cold.compression_finished, written))
     }
 
     /// Whether the compressed stream fits the size of its plain ETF binary.
     pub fn compression_is_useful(&self) -> bool {
-        self.compression_finished
-            && self.compressor.as_ref().is_some_and(|compressor| {
-                compressor.total_out().saturating_add(6) <= self.encoded_size as u64
-            })
+        self.cold.as_ref().is_some_and(|cold| {
+            cold.compression_finished
+                && cold.compressor.as_ref().is_some_and(|compressor| {
+                    compressor.total_out().saturating_add(6) <= self.encoded_size as u64
+                })
+        })
     }
 
     /// Whether the zlib stream reached its final block.
     pub fn compression_finished(&self) -> bool {
-        self.compression_finished
+        self.cold
+            .as_ref()
+            .is_some_and(|cold| cold.compression_finished)
     }
 
     /// Number of compressed payload bytes emitted so far.
     pub fn compressed_payload_len(&self) -> Option<usize> {
-        self.compressor
+        self.cold
             .as_ref()
+            .and_then(|cold| cold.compressor.as_ref())
             .and_then(|compressor| usize::try_from(compressor.total_out()).ok())
     }
 
     /// Whether the destination has no remaining compressed payload capacity.
     pub fn compression_output_full(&self) -> bool {
-        self.compressor.as_ref().is_some_and(|compressor| {
-            compressor.total_out() >= self.encoded_size.saturating_sub(6) as u64
-        })
+        self.cold
+            .as_ref()
+            .and_then(|cold| cold.compressor.as_ref())
+            .is_some_and(|compressor| {
+                compressor.total_out() >= self.encoded_size.saturating_sub(6) as u64
+            })
     }
 
+    // Port of erts/emulator/beam/external.c:3253 (enc_term_int), OTP-29.1.1.
     fn step_with_output(
         &mut self,
         budget: usize,
@@ -1354,76 +1652,76 @@ impl EncodeWalk {
                 return Ok((false, budget));
             }
         }
-        let opts = self.opts;
-        let splits = &mut self.splits;
-        let work = &mut self.work;
+        let mut opts = self.opts;
+        let node_source = self.node_source;
+        let record_splits = self.record_splits;
         let iovec = self.iovec;
+        let table = global_atoms();
+        // The stack and the pending object live in locals so that the output writes cannot
+        // alias them; erts keeps them in registers (`DECLARE_WSTACK`, `obj`).
+        let mut stack = WStack::new();
+        stack.restore(&mut self.work);
+        let mut cur = self.current_term.take();
         let mut free_first = self.free_first;
-        while consumed + 1 < budget
-            || (free_first
-                && (self.current_term.is_some()
-                    || matches!(work.last(), Some(Work::Term(_) | Work::OneCons { .. }))))
-        {
-            let Some(item) = self
-                .current_term
-                .take()
-                .map(Work::Term)
-                .or_else(|| work.pop())
-            else {
+        loop {
+            if consumed + 1 >= budget
+                && !(free_first
+                    && (cur.is_some()
+                        || stack.last().is_some_and(|command| {
+                            let code = command.word() >> 4;
+                            code == ENC_TERM_CODE
+                                || code == ENC_ONE_CONS_CODE
+                                || code == ENC_HASHMAP_NODE_CODE
+                                || code >= ENC_ARRAY
+                        })))
+            {
                 break;
-            };
-            let term = match item {
-                Work::Tuple { term, next, arity } => {
-                    // Port of external.c (enc_term_int), OTP-29.1.1: keep the first
-                    // tuple element in obj and retain only the remaining array cursor.
-                    self.current_term = Some(crate::pure::tuple_element(term, next)?);
-                    if next + 1 < arity {
-                        work.push(Work::Tuple {
-                            term,
-                            next: next + 1,
-                            arity,
-                        });
+            }
+            let term = if let Some(term) = cur.take() {
+                term
+            } else {
+                // outer_loop
+                let Some(command) = stack.pop() else {
+                    break;
+                };
+                let code = command.word() >> 4;
+                if code == ENC_TERM_CODE {
+                    stack.pop().ok_or(BifError::BADARG)?
+                } else if code == ENC_ONE_CONS_CODE {
+                    let list = stack.pop().ok_or(BifError::BADARG)?;
+                    encode_one_cons(&mut stack, out, list)?
+                } else if code >= ENC_ARRAY {
+                    let spec = code - ENC_ARRAY;
+                    let remaining = (spec >> 3) as usize;
+                    let container = stack.pop().ok_or(BifError::BADARG)?;
+                    if spec & 7 == ENC_PAIR_KIND {
+                        // ENC_MAP_PAIR: one key/value pair of a flatmap.
+                        let (key, value) = flatmap_pair(container, remaining)?;
+                        if remaining > 1 {
+                            push_term_task(&mut stack, stack_command(code as i64 - 8), container);
+                        }
+                        push_term_task(&mut stack, ENC_TERM, value);
+                        key
+                    } else {
+                        // ENC_LAST_ARRAY_ELEMENT+N: the next tuple element.
+                        let element = crate::pure::tuple_element_from_end(container, remaining)?;
+                        if remaining > 1 {
+                            push_term_task(&mut stack, stack_command(code as i64 - 8), container);
+                        }
+                        element
                     }
-                    continue;
-                }
-                Work::PatchFun(at) => {
+                } else if code == ENC_PATCH_FUN_SIZE_CODE {
                     consumed += 1;
+                    let at = pop_stack_small(&mut stack)?;
                     let size = u32::try_from(out.len() - at).map_err(|_| BifError::SystemLimit)?;
                     out.patch(at, &size.to_be_bytes());
                     continue;
-                }
-                Work::Term(term) => {
-                    if !std::mem::take(&mut free_first) {
-                        consumed += 1;
-                    }
-                    term
-                }
-                Work::OneCons { list, len_at, len } => {
-                    if !std::mem::take(&mut free_first) {
-                        consumed += 1;
-                    }
-                    // SAFETY: the source cons stays live while this BIF is suspended.
-                    let (head, tail) = unsafe { list.cons_ref() }.ok_or(BifError::BADARG)?;
-                    let count = len.checked_add(1).ok_or(BifError::SystemLimit)?;
-                    if tail.classify() == TermKind::List {
-                        work.push(Work::OneCons {
-                            list: tail,
-                            len_at,
-                            len: count,
-                        });
-                    } else {
-                        out.patch(len_at, &count.to_be_bytes());
-                        work.push(Work::Term(tail));
-                    }
-                    head
-                }
-                Work::BinaryCopy {
-                    term,
-                    bits,
-                    copied,
-                    start,
-                } => {
-                    // Port of erts/emulator/beam/external.c:3820-3885 (ENC_BIN_COPY), OTP-29.1.1.
+                } else if code == ENC_BIN_COPY_CODE {
+                    let term = stack.pop().ok_or(BifError::BADARG)?;
+                    let bits = pop_stack_small(&mut stack)?;
+                    let copied = pop_stack_small(&mut stack)?;
+                    let start = pop_stack_small(&mut stack)?;
+                    // Port of erts/emulator/beam/external.c:3368 (ENC_BIN_COPY), OTP-29.1.1.
                     let len = bits.div_ceil(8);
                     let amount = len
                         .saturating_sub(copied)
@@ -1432,104 +1730,47 @@ impl EncodeWalk {
                     out.write_bitstring(term, copied * 8, bit_count)?;
                     consumed += amount;
                     if copied + amount < len {
-                        work.push(Work::BinaryCopy {
-                            term,
-                            bits,
-                            copied: copied + amount,
-                            start,
-                        });
+                        stack.push(stack_small(start)?);
+                        stack.push(stack_small(copied + amount)?);
+                        stack.push(stack_small(bits)?);
+                        stack.push(term);
+                        stack.push(ENC_BIN_COPY);
                     } else {
                         if bits % 8 != 0 {
                             out.mask_last(0xff << (8 - bits % 8));
                         }
-                        if len > 64 {
-                            splits.push((start, out.len()));
+                        if len > 64 && record_splits {
+                            self.cold().splits.push((start, out.len()));
                         }
                     }
                     continue;
-                }
-                Work::FlatMapPairs {
-                    mut keys,
-                    mut values,
-                    remaining,
-                } => {
-                    if remaining > 0 {
-                        let key = keys.next().ok_or(BifError::BADARG)?;
-                        let value = values.next().ok_or(BifError::BADARG)?;
-                        work.push(Work::FlatMapPairValue {
-                            keys,
-                            values,
-                            remaining: remaining - 1,
-                            value,
-                        });
-                        self.current_term = Some(key);
-                    }
+                } else if code == ENC_HASHMAP_NODE_CODE {
+                    let node = stack.pop().ok_or(BifError::BADARG)?;
+                    cur = Some(push_hashmap_node_tasks(
+                        &mut stack,
+                        node,
+                        Some(ENC_HASHMAP_NODE),
+                        Some(ENC_TERM),
+                    )?);
                     continue;
-                }
-                Work::FlatMapPairValue {
-                    keys,
-                    values,
-                    remaining,
-                    value,
-                } => {
-                    work.push(Work::FlatMapPairs {
-                        keys,
-                        values,
-                        remaining,
-                    });
-                    self.current_term = Some(value);
-                    continue;
-                }
-                Work::MapGather {
-                    mut entries,
-                    mut pairs,
-                } => {
-                    consumed += 1;
-                    if let Some(pair) = entries.next() {
-                        pairs.push(pair);
-                        work.push(Work::MapGather { entries, pairs });
-                    } else if opts.deterministic {
-                        work.push(Work::MapSort(Box::new(MapSort::new(pairs))));
-                    } else {
-                        push_map_terms(work, pairs);
-                    }
-                    continue;
-                }
-                Work::MapEntries(mut entries) => {
-                    if let Some((key, value)) = entries.next() {
-                        work.push(Work::MapPairValue { entries, value });
-                        self.current_term = Some(key);
-                    }
-                    continue;
-                }
-                Work::MapPairValue { entries, value } => {
-                    work.push(Work::MapEntries(entries));
-                    self.current_term = Some(value);
-                    continue;
-                }
-                Work::MapPairs(mut pairs) => {
-                    if let Some((key, value)) = pairs.next() {
-                        work.push(Work::MapSortedValue { pairs, value });
-                        self.current_term = Some(key);
-                    }
-                    continue;
-                }
-                Work::MapSortedValue { pairs, value } => {
-                    work.push(Work::MapPairs(pairs));
-                    self.current_term = Some(value);
-                    continue;
-                }
-                Work::MapSort(mut sorting) => {
+                } else if code == ENC_START_SORTING_MAP_CODE {
+                    let mut sorting = self.cold().map_sort.take().ok_or(BifError::BADARG)?;
                     let work_budget = budget.saturating_sub(consumed).max(1);
                     consumed += sorting.step(work_budget);
                     if sorting.is_done() {
-                        push_map_terms(work, sorting.finish());
+                        push_sorted_map_tasks(&mut stack, (*sorting).finish());
                     } else {
-                        work.push(Work::MapSort(sorting));
+                        self.cold().map_sort = Some(sorting);
+                        stack.push(ENC_START_SORTING_MAP);
                     }
                     continue;
+                } else {
+                    return Err(BifError::BADARG);
                 }
             };
+            if !std::mem::take(&mut free_first) {
+                consumed += 1;
+            }
             match term.classify() {
                 TermKind::Number => {
                     if let Some(n) = term.as_small() {
@@ -1563,16 +1804,22 @@ impl EncodeWalk {
                         }
                     }
                 }
-                TermKind::Atom => atom_term(out, term, opts.minor)?,
+                TermKind::Atom => atom_bytes_in(
+                    table,
+                    out,
+                    term.as_atom().ok_or(BifError::BADARG)?,
+                    opts.minor,
+                )?,
                 TermKind::Nil => out.push(106),
                 TermKind::List => {
                     // Port of erts/emulator/beam/external.c:3703 (LIST_DEF), OTP-29.1.1.
-                    if let Some(len) = external_string_len(term)? {
+                    let (len, is_string) = external_string_prefix(term);
+                    if is_string {
                         out.push(107);
                         out.extend_from_slice(&(len as u16).to_be_bytes());
                         let mut cursor = term;
                         for _ in 0..len {
-                            // SAFETY: external_string_len already walked these cons cells.
+                            // SAFETY: external_string_prefix already walked these cons cells.
                             let (head, tail) =
                                 unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)?;
                             out.push(head.as_small().ok_or(BifError::BADARG)? as u8);
@@ -1581,15 +1828,14 @@ impl EncodeWalk {
                         consumed += len;
                     } else {
                         // Port of erts/emulator/beam/external.c (LIST_DEF), OTP-29.1.1.
-                        consumed += external_string_prefix(term).0 / 2;
+                        consumed += len / 2;
                         out.push(108);
                         let len_at = out.len();
                         out.extend_from_slice(&0u32.to_be_bytes());
-                        work.push(Work::OneCons {
-                            list: term,
-                            len_at,
-                            len: 0,
-                        });
+                        // `WSTACK_PUSH2(s, ep, 1)` then `goto encode_one_cons`.
+                        stack.push(stack_small(len_at)?);
+                        stack.push(stack_small(1)?);
+                        cur = Some(encode_one_cons(&mut stack, out, term)?);
                     }
                 }
                 TermKind::Tuple => {
@@ -1601,53 +1847,72 @@ impl EncodeWalk {
                         out.extend_from_slice(&(arity as u32).to_be_bytes());
                     }
                     if arity > 0 {
-                        self.current_term = Some(crate::pure::tuple_element(term, 0)?);
-                        if arity > 1 {
-                            work.push(Work::Tuple {
-                                term,
-                                next: 1,
-                                arity,
-                            });
-                        }
+                        // WSTACK_PUSH2(s, ENC_LAST_ARRAY_ELEMENT+i-1, ptr)
+                        push_term_task(
+                            &mut stack,
+                            stack_command((ENC_ARRAY + ((arity as u64) << 3)) as i64),
+                            term,
+                        );
                     }
                 }
                 TermKind::Map => {
-                    out.push(116);
-                    let entries = MapEntries::new(term)?;
-                    let len = entries.size;
-                    out.extend_from_slice(
-                        &u32::try_from(len)
-                            .map_err(|_| BifError::SystemLimit)?
-                            .to_be_bytes(),
-                    );
-                    if opts.deterministic {
-                        work.push(Work::MapGather {
-                            entries,
-                            pairs: Vec::with_capacity(len),
-                        });
-                    } else {
-                        match *entries.entries {
-                            MapEntryIter::Flat {
-                                mut keys,
-                                mut values,
-                            } => {
-                                if len > 0 {
-                                    let key = keys.next().ok_or(BifError::BADARG)?;
-                                    let value = values.next().ok_or(BifError::BADARG)?;
-                                    work.push(Work::FlatMapPairValue {
-                                        keys,
-                                        values,
-                                        remaining: len - 1,
-                                        value,
-                                    });
-                                    self.current_term = Some(key);
-                                }
+                    let checked = arinsal_maps::checked_map(term).map_err(|_| BifError::BADARG)?;
+                    match checked.kind() {
+                        arinsal_maps::CheckedMapKind::Flatmap(_) => {
+                            let len = checked.size();
+                            out.push(116);
+                            out.extend_from_slice(
+                                &u32::try_from(len)
+                                    .map_err(|_| BifError::SystemLimit)?
+                                    .to_be_bytes(),
+                            );
+                            if len > 0 && opts.deterministic {
+                                let pairs = arinsal_maps::term_to_binary_pairs(term)
+                                    .map_err(|_| BifError::BADARG)?;
+                                self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
+                                stack.push(ENC_START_SORTING_MAP);
+                            } else if len > 0 {
+                                // WSTACK_PUSH4(s, kptr, vptr, ENC_MAP_PAIR, size)
+                                push_term_task(
+                                    &mut stack,
+                                    stack_command(
+                                        (ENC_ARRAY + (((len as u64) << 3) | ENC_PAIR_KIND)) as i64,
+                                    ),
+                                    term,
+                                );
                             }
-                            entries @ MapEntryIter::Hash(_) => {
-                                work.push(Work::MapEntries(MapEntries {
-                                    size: len,
-                                    entries: Box::new(entries),
-                                }));
+                        }
+                        arinsal_maps::CheckedMapKind::Hashmap(_) => {
+                            let children =
+                                arinsal_term::MapNodeChildren::new(term).ok_or(BifError::BADARG)?;
+                            if children.is_head() {
+                                let len = checked.size();
+                                out.push(116);
+                                out.extend_from_slice(
+                                    &u32::try_from(len)
+                                        .map_err(|_| BifError::SystemLimit)?
+                                        .to_be_bytes(),
+                                );
+                                if len > 0 && opts.deterministic {
+                                    let pairs = arinsal_maps::term_to_binary_pairs(term)
+                                        .map_err(|_| BifError::BADARG)?;
+                                    self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
+                                    stack.push(ENC_START_SORTING_MAP);
+                                } else {
+                                    push_hashmap_root_tasks(
+                                        &mut stack,
+                                        term,
+                                        ENC_HASHMAP_NODE,
+                                        Some(ENC_TERM),
+                                    )?;
+                                }
+                            } else {
+                                push_hashmap_root_tasks(
+                                    &mut stack,
+                                    term,
+                                    ENC_HASHMAP_NODE,
+                                    Some(ENC_TERM),
+                                )?;
                             }
                         }
                     }
@@ -1657,47 +1922,49 @@ impl EncodeWalk {
                     let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
                     let bits = view.bit_len();
                     let len = bits.div_ceil(8);
-                    let n = u32::try_from(len).map_err(|_| BifError::SystemLimit)?;
+                    let n = u32::try_from(len)
+                        .map_err(|_| BifError::SystemLimit)?
+                        .to_be_bytes();
                     if bits.is_multiple_of(8) {
-                        out.push(109);
-                        out.extend_from_slice(&n.to_be_bytes());
+                        out.extend_from_slice(&[109, n[0], n[1], n[2], n[3]]);
                     } else {
-                        out.push(77);
-                        out.extend_from_slice(&n.to_be_bytes());
-                        out.push((bits % 8) as u8);
+                        out.extend_from_slice(&[77, n[0], n[1], n[2], n[3], (bits % 8) as u8]);
                     }
                     let start = out.len();
                     if len != 0 {
                         // Port of erts/emulator/beam/external.c (BITSTRING_DEF), OTP-29.1.1.
-                        let copy_payload = bits <= 64 * 8
-                            || !iovec
-                            || crate::pure::with_binary_bytes(term, |view| {
-                                view.start_bit() % 8 != 0
-                            })?;
+                        let aligned = view.start_bit().is_multiple_of(8);
+                        let copy_payload = bits <= 64 * 8 || !iovec || !aligned;
                         let left = budget.saturating_sub(consumed);
                         if copy_payload && len > left.saturating_mul(8) {
-                            work.push(Work::BinaryCopy {
-                                term,
-                                bits,
-                                copied: 0,
-                                start,
-                            });
+                            stack.push(stack_small(start)?);
+                            stack.push(stack_small(0)?);
+                            stack.push(stack_small(bits)?);
+                            stack.push(term);
+                            stack.push(ENC_BIN_COPY);
                         } else {
-                            out.write_bitstring(term, 0, bits)?;
-                            if bits % 8 != 0 {
-                                out.mask_last(0xff << (8 - bits % 8));
+                            if aligned && bits.is_multiple_of(8) {
+                                // copy_binary_to_buffer: one memcpy of the payload.
+                                let from = view.start_bit() / 8;
+                                out.extend_from_slice(
+                                    view.bytes().get(from..from + len).ok_or(BifError::BADARG)?,
+                                );
+                            } else {
+                                out.write_bitstring(term, 0, bits)?;
+                                if bits % 8 != 0 {
+                                    out.mask_last(0xff << (8 - bits % 8));
+                                }
                             }
-                            if len > 64 {
-                                splits.push((start, out.len()));
+                            if len > 64 && record_splits {
+                                self.cold().splits.push((start, out.len()));
                             }
                         }
                     }
                 }
                 TermKind::Pid | TermKind::Port | TermKind::Ref => {
-                    let identity = local_identity(
-                        term.identity().ok_or(BifError::BADARG)?,
-                        self.opts.local_node,
-                    );
+                    resolve_local_node(&mut opts, node_source);
+                    let identity =
+                        local_identity(term.identity().ok_or(BifError::BADARG)?, opts.local_node);
                     match identity {
                         Identity::Pid {
                             node,
@@ -1739,8 +2006,8 @@ impl EncodeWalk {
                 TermKind::Fun => match fun_of(term)? {
                     FunRef::Export { entry } => {
                         out.push(113);
-                        atom_term(out, Term::atom(entry.module), opts.minor)?;
-                        atom_term(out, Term::atom(entry.function), opts.minor)?;
+                        atom_bytes_in(table, out, entry.module, opts.minor)?;
+                        atom_bytes_in(table, out, entry.function, opts.minor)?;
                         write_small(out, i64::from(entry.arity));
                     }
                     FunRef::Local { entry, free_vars } => {
@@ -1751,15 +2018,20 @@ impl EncodeWalk {
                         out.extend_from_slice(&entry.uniq);
                         out.extend_from_slice(&entry.index.to_be_bytes());
                         out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
-                        atom_term(out, Term::atom(entry.module), opts.minor)?;
+                        atom_bytes_in(table, out, entry.module, opts.minor)?;
                         write_small(out, i64::from(entry.old_index));
                         write_small(out, i64::from(entry.old_uniq));
-                        work.push(Work::PatchFun(at));
+                        stack.push(stack_small(at)?);
+                        stack.push(ENC_PATCH_FUN_SIZE);
                         let view = fun_of(term)?;
                         for i in (0..view.num_free()).rev() {
-                            work.push(Work::Term(view.free(i).ok_or(BifError::BADARG)?));
+                            push_term_task(
+                                &mut stack,
+                                ENC_TERM,
+                                view.free(i).ok_or(BifError::BADARG)?,
+                            );
                         }
-                        work.push(Work::Term(entry.pid));
+                        push_term_task(&mut stack, ENC_TERM, entry.pid);
                     }
                 },
                 TermKind::Record => {
@@ -1768,25 +2040,38 @@ impl EncodeWalk {
                     out.push(67);
                     out.extend_from_slice(&(record.len() as u32).to_be_bytes());
                     out.push(u8::from(record.is_exported()));
-                    atom_term(out, Term::atom(record.module()), opts.minor)?;
-                    atom_term(out, Term::atom(record.name()), opts.minor)?;
+                    atom_bytes_in(table, out, record.module(), opts.minor)?;
+                    atom_bytes_in(table, out, record.name(), opts.minor)?;
                     for i in 0..record.len() {
                         let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
-                        atom_term(
+                        atom_bytes_in(
+                            table,
                             out,
-                            Term::atom(record.key(sorted).ok_or(BifError::BADARG)?),
+                            record.key(sorted).ok_or(BifError::BADARG)?,
                             opts.minor,
                         )?;
                     }
                     for i in (0..record.len()).rev() {
                         let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
-                        work.push(Work::Term(record.value(sorted).ok_or(BifError::BADARG)?));
+                        push_term_task(
+                            &mut stack,
+                            ENC_TERM,
+                            record.value(sorted).ok_or(BifError::BADARG)?,
+                        );
                     }
                 }
                 _ => return Err(BifError::Unsupported("ETF representation")),
             }
         }
-        let done = work.is_empty() && self.current_term.is_none();
+        let done = stack.is_empty()
+            && cur.is_none()
+            && self
+                .cold
+                .as_ref()
+                .is_none_or(|cold| cold.map_sort.is_none());
+        self.opts = opts;
+        stack.save(&mut self.work);
+        self.current_term = cur;
         self.free_first = !done;
         if out.failed() || (done && !iovec && out.len() != self.encoded_size) {
             return Err(BifError::SystemLimit);
@@ -1803,15 +2088,20 @@ impl EncodeWalk {
     pub fn finish_binary_buffer(mut self) -> Result<SmallVec<[u8; 64]>, BifError> {
         self.patch_local_hash();
         if self.opts.compressed.is_some_and(|level| level > 0) {
-            return encode_bytes(self.out.into_vec(), self.opts).map(SmallVec::from_vec);
+            return encode_bytes(self.take_out(), self.opts).map(SmallVec::from_vec);
         }
-        Ok(self.out)
+        Ok(SmallVec::from_vec(self.take_out()))
+    }
+
+    fn take_out(&mut self) -> Vec<u8> {
+        self.cold.take().map(|cold| cold.out).unwrap_or_default()
     }
 
     fn patch_local_hash(&mut self) {
         if self.opts.local {
-            let hash = local_term_hash(&self.out[6..]);
-            self.out[2..6].copy_from_slice(&hash.to_be_bytes());
+            let out = &mut self.cold().out;
+            let hash = local_term_hash(&out[6..]);
+            out[2..6].copy_from_slice(&hash.to_be_bytes());
         }
     }
 
@@ -1819,9 +2109,9 @@ impl EncodeWalk {
     pub fn finish_iovec(mut self) -> Result<(Vec<Vec<u8>>, bool), BifError> {
         self.patch_local_hash();
         if self.opts.compressed.is_some_and(|level| level > 0) {
-            return Ok((vec![encode_bytes(self.out.into_vec(), self.opts)?], true));
+            return Ok((vec![encode_bytes(self.take_out(), self.opts)?], true));
         }
-        let Self { out, splits, .. } = self;
+        let EncodeCold { out, splits, .. } = *self.cold.take().unwrap_or_default();
         let mut at = 0;
         let mut parts = Vec::new();
         for (start, end) in splits {
@@ -1849,9 +2139,11 @@ pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, BifError> {
 
 fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithSplits, BifError> {
     let mut walk = EncodeWalk::start(term, opts);
+    walk.record_splits = true;
     walk.step(usize::MAX)?;
     walk.patch_local_hash();
-    Ok((walk.out.into_vec(), walk.splits.into_vec()))
+    let EncodeCold { out, splits, .. } = *walk.cold.take().unwrap_or_default();
+    Ok((out, splits))
 }
 
 // Port of erts/emulator/beam/external.c:3244 (enc_term, local pid/port/ref identity), OTP-29.1.1.
@@ -1961,6 +2253,15 @@ fn term_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
         // erts_term_to_binary_simple charges exactly one reduction, independent of size.
         ctx.charge_reductions(1);
         return Ok(binary);
+    }
+    if !encoder.uses_compression() {
+        match encoder.encode_into_refc(&mut ctx.heap, usize::MAX)? {
+            (RefcEncoded::Done(binary), _) => {
+                ctx.charge_reductions(size);
+                return Ok(binary);
+            }
+            (RefcEncoded::Partial(_), _) => return Err(BifError::SystemLimit),
+        }
     }
     let mut heap = Heap(&mut ctx.heap);
     let binary = crate::allocate_iolist_binary(&mut heap, size)?;
@@ -3392,17 +3693,16 @@ mod map_sort_tests {
     fn reports_encode_walk_layout() {
         use super::*;
         eprintln!(
-            "EncodeWalk={} Work={} SizeItem={} BlockHashWalk={} EncodeOpts={} Compress={} out={} splits={} work={} size_work={}",
+            "EncodeWalk={} WStack={} EncodeCold={} BlockHashWalk={} EncodeOpts={} Compress={} out={} splits={} work={}",
             std::mem::size_of::<EncodeWalk>(),
-            std::mem::size_of::<Work>(),
-            std::mem::size_of::<SizeItem>(),
+            std::mem::size_of::<WStack>(),
+            std::mem::size_of::<EncodeCold>(),
             std::mem::size_of::<BlockHashWalk>(),
             std::mem::size_of::<EncodeOpts>(),
             std::mem::size_of::<Option<Compress>>(),
-            std::mem::size_of::<SmallVec<[u8; 64]>>(),
-            std::mem::size_of::<SmallVec<[(usize, usize); 1]>>(),
-            std::mem::size_of::<SmallVec<[Work; 2]>>(),
-            std::mem::size_of::<SmallVec<[SizeItem; 2]>>(),
+            std::mem::size_of::<Vec<u8>>(),
+            std::mem::size_of::<Vec<(usize, usize)>>(),
+            std::mem::size_of::<Vec<Term>>(),
         );
     }
 

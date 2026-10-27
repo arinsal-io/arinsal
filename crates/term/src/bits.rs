@@ -121,7 +121,8 @@ pub struct RefcBinary {
 }
 
 impl RefcBinary {
-    /// A binary of `size` bytes the caller fills before sharing it (`erts_bin_nrml_alloc`).
+    /// A binary of `size` bytes the caller fills before sharing it (`erts_bin_nrml_alloc`); the
+    /// payload is not initialized.
     pub fn new_zeroed(size: usize) -> Result<Self, TermError> {
         let allocation = BinaryBlock::new(size, 0, size).map_err(|_| TermError::SystemLimit)?;
         Ok(Self { allocation })
