@@ -59,6 +59,16 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "process_info", 2) => {
             crate::native_helpers::process_info_2_light as *const () as usize
         }
+        // The C BIFs have direct entries in external.c rather than the generic trap adapter.
+        ("erlang", "term_to_binary", 1) => {
+            crate::bif_traps::term_to_binary_1_light as *const () as usize
+        }
+        ("erlang", "external_size", 1) => {
+            crate::bif_traps::external_size_1_light as *const () as usize
+        }
+        ("erlang", "binary_to_term", 1) => {
+            crate::bif_traps::binary_to_term_1_light as *const () as usize
+        }
         ("erlang", "put", 2) => put_2_light as *const () as usize,
         ("erlang", "get", 1) => get_1_light as *const () as usize,
         ("erlang", "erase", 1) => erase_1_light as *const () as usize,
@@ -176,7 +186,7 @@ impl arinsal_bifs::BifTableVisitor for Compile {
 
 #[cfg(test)]
 mod tests {
-    use super::{entry, trap_entry};
+    use super::{entry, special, trap_entry};
 
     #[test]
     fn every_bif_of_arinsal_bifs_has_its_own_entry() {
@@ -213,5 +223,28 @@ mod tests {
             trap_entry("erlang", "iolist_to_binary", 1).unwrap()
         );
         assert!(trap_entry("erlang", "not_a_binary_bif", 1).is_none());
+    }
+
+    #[test]
+    fn external_term_bifs_have_direct_arity_one_entries() {
+        let direct = [
+            (
+                "term_to_binary",
+                crate::bif_traps::term_to_binary_1_light as *const () as usize,
+            ),
+            (
+                "external_size",
+                crate::bif_traps::external_size_1_light as *const () as usize,
+            ),
+            (
+                "binary_to_term",
+                crate::bif_traps::binary_to_term_1_light as *const () as usize,
+            ),
+        ];
+        for (function, expected) in direct {
+            similar_asserts::assert_eq!(special("erlang", function, 1), Some(expected));
+        }
+        assert!(special("erlang", "term_to_binary", 2).is_none());
+        assert!(special("erlang", "binary_to_term", 2).is_none());
     }
 }

@@ -390,6 +390,7 @@ dependencies = [
  "arinsal-alloc",
  "arinsal-etf",
  "arrayvec",
+ "crossbeam-utils",
  "num-bigint",
  "num-traits",
  "proptest",

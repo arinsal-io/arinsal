@@ -2686,6 +2686,122 @@ impl TrapBody for BinaryToTerm {
     }
 }
 
+type NativeBifEntry =
+    extern "C" fn(*mut arinsal_beamasm::ProcessHeader, *mut u64, u64, u64, u64) -> u64;
+
+/// Calls an arity-one external-term BIF without constructing the generic trap-body adapter.
+// Port of erts/emulator/beam/external.c (term_to_binary_1, external_size_1,
+// binary_to_term_1), OTP-29.1.1: a completed BIF returns directly; only an error or trap
+// takes the cold continuation path.
+#[inline(always)]
+fn direct_external_term_entry<F>(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    regs: *mut u64,
+    instruction: u64,
+    descriptor: u64,
+    identity: u64,
+    fallback: NativeBifEntry,
+    run: F,
+) -> u64
+where
+    F: FnOnce(&mut Process, &[Term], bool) -> Result<HandlerResult, BifError>,
+{
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+        return fallback(header, regs, instruction, descriptor, identity);
+    }
+    let entry_top = process.heap.heap_top_index();
+    let gc_was_enabled = process.heap.gc_enabled;
+    let result = run(process, &registers.x_reg_array[..1], gc_was_enabled);
+    match result {
+        Ok(HandlerResult::Done { value, reductions }) => {
+            process.set_gc_enabled(gc_was_enabled);
+            charge_light(process, reductions);
+            crate::native_helpers::light_value_return(process, entry_top, value)
+        }
+        other => crate::native_helpers::trap_body_finish(
+            process,
+            registers,
+            identity as usize,
+            descriptor,
+            1,
+            entry_top,
+            gc_was_enabled,
+            other,
+        )
+        .unwrap_or(0),
+    }
+}
+
+/// Direct `erlang:term_to_binary/1` entry for its completed first call.
+// Port of erts/emulator/beam/external.c:1442 (`term_to_binary_1`), OTP-29.1.1.
+pub(crate) extern "C" fn term_to_binary_1_light(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    regs: *mut u64,
+    instruction: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    direct_external_term_entry(
+        header,
+        regs,
+        instruction,
+        descriptor,
+        identity,
+        crate::native_helpers::trap_bif_entry::<TermToBinary>,
+        |process, args, restore_gc| {
+            let chunk_work =
+                (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
+            term_encode_first(process, args, restore_gc, chunk_work)
+        },
+    )
+}
+
+/// Direct `erlang:external_size/1` entry.
+// Port of erts/emulator/beam/external.c:2197 (`external_size_1`), OTP-29.1.1.
+pub(crate) extern "C" fn external_size_1_light(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    regs: *mut u64,
+    instruction: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    direct_external_term_entry(
+        header,
+        regs,
+        instruction,
+        descriptor,
+        identity,
+        crate::native_helpers::trap_bif_light,
+        |process, args, restore_gc| external_size(process, args, None, None, restore_gc),
+    )
+}
+
+/// Direct `erlang:binary_to_term/1` entry for its first decode slice.
+// Port of erts/emulator/beam/external.c:2146 (`binary_to_term_1`), OTP-29.1.1.
+pub(crate) extern "C" fn binary_to_term_1_light(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    regs: *mut u64,
+    instruction: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    direct_external_term_entry(
+        header,
+        regs,
+        instruction,
+        descriptor,
+        identity,
+        crate::native_helpers::trap_bif_entry::<BinaryToTerm>,
+        |process, args, restore_gc| {
+            let pid = process.self_pid;
+            binary_to_term(process, args, None, pid, restore_gc)
+        },
+    )
+}
+
 /// Outcome of a trapping BIF run from a light BIF call.
 pub(crate) enum LightTrap {
     /// The BIF finished: its value or its error, like any light BIF's result.

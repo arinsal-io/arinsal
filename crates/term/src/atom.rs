@@ -4,9 +4,10 @@
 //! slots. The name is a global-literal binary (`atom_alloc`). Lookups take the
 //! frequent-read side of `ERTS_ATOM_TABLE_LOCK`; insertion takes the write side.
 
+use crossbeam_utils::atomic::AtomicCell;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use crate::Term;
 use crate::heap::{TermBuilder, VecHeap};
@@ -101,14 +102,17 @@ struct AtomRec {
     name: Box<str>,
 }
 
+// Port of erts/emulator/beam/index.c (index_put_entry) and index.h
+// (erts_index_lookup), OTP-29.1.1. AtomicCell keeps each pointer-sized slot safe to
+// publish while preserving the fixed-page layout and permanent record references.
 struct Page {
-    slots: Box<[OnceLock<Arc<AtomRec>>]>,
+    slots: [AtomicCell<Option<&'static AtomRec>>; INDEX_PAGE_SIZE],
 }
 
 impl Page {
     fn new() -> Self {
         Self {
-            slots: (0..INDEX_PAGE_SIZE).map(|_| OnceLock::new()).collect(),
+            slots: std::array::from_fn(|_| AtomicCell::new(None)),
         }
     }
 }
@@ -120,7 +124,7 @@ struct Inner {
     grow_threshold: i32,
     nobjs: i32,
     buckets: Vec<u32>,
-    atoms: Vec<Arc<AtomRec>>,
+    atoms: Vec<&'static AtomRec>,
     entries: i32,
     size: i32,
     limit: i32,
@@ -130,8 +134,8 @@ struct Inner {
 /// Global, append-only atom table.
 pub struct AtomTable {
     inner: FrequentReadRwLock<Inner>,
-    /// Pre-sized to `ceil(limit / 1024)` page slots. Pages are allocated on demand.
-    seg: Box<[OnceLock<Page>]>,
+    /// Pre-sized pointer table, with fixed 1024-slot pages allocated on demand.
+    seg: Box<[AtomicCell<Option<&'static Page>>]>,
 }
 
 impl AtomTable {
@@ -144,7 +148,7 @@ impl AtomTable {
         let pages = (limit as usize).div_ceil(INDEX_PAGE_SIZE).max(1);
         let table = Self {
             inner: FrequentReadRwLock::new(Inner::new(limit)),
-            seg: (0..pages).map(|_| OnceLock::new()).collect(),
+            seg: (0..pages).map(|_| AtomicCell::new(None)).collect(),
         };
         for name in atoms::PREDEFINED {
             table.intern(name).expect("predefined atoms fit");
@@ -460,15 +464,18 @@ impl AtomTable {
             // Port of index.c:85-94: allocate the next index page, then advance `size`.
             inner.size += INDEX_PAGE_SIZE as i32;
         }
-        let rec = Arc::clone(&inner.atoms[id as usize]);
+        let rec = inner.atoms[id as usize];
         rec.index.store(ix, Ordering::Relaxed);
-        let page = self.seg[(ix as usize) >> INDEX_PAGE_SHIFT].get_or_init(Page::new);
-        if page.slots[(ix as usize) & INDEX_PAGE_MASK]
-            .set(Arc::clone(&rec))
-            .is_err()
-        {
-            panic!("atom index published once");
-        }
+        let page_ix = (ix as usize) >> INDEX_PAGE_SHIFT;
+        let page = match self.seg[page_ix].load() {
+            Some(page) => page,
+            None => {
+                let page: &'static Page = Box::leak(Box::new(Page::new()));
+                self.seg[page_ix].store(Some(page));
+                page
+            }
+        };
+        page.slots[(ix as usize) & INDEX_PAGE_MASK].store(Some(rec));
         inner.entries = ix + 1;
         Ok(Atom(ix as u32))
     }
@@ -478,9 +485,8 @@ impl AtomTable {
     }
 
     fn published(&self, ix: usize) -> Option<&AtomRec> {
-        let page = self.seg.get(ix >> INDEX_PAGE_SHIFT)?.get()?;
-        let slot = page.slots.get(ix & INDEX_PAGE_MASK)?.get()?;
-        Some(slot.as_ref())
+        let page = self.seg.get(ix >> INDEX_PAGE_SHIFT)?.load()?;
+        page.slots.get(ix & INDEX_PAGE_MASK)?.load()
     }
 }
 
@@ -560,7 +566,7 @@ fn push_new(inner: &mut Inner, bytes: &[u8], latin1_chars: i16) -> u32 {
     let slot = hash_slot(inner.shift, hvalue);
     let id = inner.atoms.len() as u32;
     let (bin, name) = literal_atom(bytes);
-    let rec = Arc::new(AtomRec {
+    let rec = Box::leak(Box::new(AtomRec {
         id,
         next: AtomicU32::new(inner.buckets[slot]),
         hvalue,
@@ -569,7 +575,7 @@ fn push_new(inner: &mut Inner, bytes: &[u8], latin1_chars: i16) -> u32 {
         ord0: ord0_of(bytes),
         bin,
         name,
-    });
+    }));
     inner.buckets[slot] = id;
     inner.atoms.push(rec);
     inner.nobjs += 1;
@@ -875,6 +881,15 @@ mod tests {
     }
 
     #[test]
+    fn atom_index_slots_are_lock_free_pointer_cells() {
+        assert!(AtomicCell::<Option<&'static AtomRec>>::is_lock_free());
+        similar_asserts::assert_eq!(
+            std::mem::size_of::<AtomicCell<Option<&'static AtomRec>>>(),
+            std::mem::size_of::<*const AtomRec>()
+        );
+    }
+
+    #[test]
     fn fresh_table_matches_index_and_hash_shape() {
         let table = AtomTable::new(DEFAULT_ATOM_TABLE_LIMIT);
         let index = table.index_info();
@@ -900,6 +915,9 @@ mod tests {
         let need = 6554_usize.saturating_sub(start);
         for n in 0..need {
             table.intern(&format!("grow_{n}")).unwrap();
+        }
+        for ix in (0..table.len()).step_by(INDEX_PAGE_SIZE) {
+            assert!(table.text(Atom(ix as u32)).is_some(), "atom index {ix}");
         }
         assert_eq!(table.hash_info().size, 8192);
         assert_eq!(table.hash_info().objs, 6554);

@@ -1,10 +1,13 @@
 //! Stable external `phash2` hashing for implemented term kinds.
-use crate::{FLOAT, NEG_BIG, POS_BIG, Term, TermKind, global_atoms};
+use crate::{
+    ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FLOAT, FUN, HEAP_BITS, MAP, NEG_BIG,
+    POS_BIG, RECORD, REF, SUB_BITS, Term, TermKind, global_atoms,
+};
 const H: u32 = 0x9e37_79b9;
 type BinaryResume = (usize, (u32, u32, u32), Option<Vec<u8>>);
 
 // Port of erts/emulator/beam/erl_term_hashing.c:426 (MIX), OTP-29.1.1.
-#[inline]
+#[inline(always)]
 fn mix(mut a: u32, mut b: u32, mut c: u32) -> u32 {
     a = a.wrapping_sub(b).wrapping_sub(c) ^ (c >> 13);
     b = b.wrapping_sub(c).wrapping_sub(a) ^ (a << 8);
@@ -17,7 +20,7 @@ fn mix(mut a: u32, mut b: u32, mut c: u32) -> u32 {
     c = c.wrapping_sub(a).wrapping_sub(b) ^ (b >> 15);
     c
 }
-#[inline]
+#[inline(always)]
 fn combine(hash: &mut u32, a: u32, b: u32, constant: u32) {
     *hash = mix(constant.wrapping_add(a), constant.wrapping_add(b), *hash);
 }
@@ -61,20 +64,73 @@ fn mix_state(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
     (a, b, c)
 }
 
-enum Job {
-    Visit(Term),
-    Reset,
-    Xor,
-    Finish(u32),
-    /// A run of bytes in a list that trapped part way: the next cons and the packed word.
-    ListRun {
-        tail: Term,
-        packed: u32,
-        count: u8,
+const HASH_MAP_TAIL: Term = Term(1 << 6);
+const HASH_MAP_PAIR: Term = Term(2 << 6);
+
+/// Select the same primary-tag arm as `make_hash2_helper` before reading a boxed header.
+// Port of erts/emulator/beam/erl_term_hashing.c:1030 (make_hash2_helper), OTP-29.1.1.
+#[inline(always)]
+fn primary_kind(term: Term) -> TermKind {
+    let word = term.word();
+    match word & 3 {
+        1 => TermKind::List,
+        2 => match term.header().unwrap() & 63 {
+            ARITY => TermKind::Tuple,
+            POS_BIG | NEG_BIG | FLOAT => TermKind::Number,
+            REF | EXTERNAL_REF => TermKind::Ref,
+            EXTERNAL_PID => TermKind::Pid,
+            EXTERNAL_PORT => TermKind::Port,
+            FUN => TermKind::Fun,
+            RECORD => TermKind::Record,
+            MAP => TermKind::Map,
+            BIN_REF | HEAP_BITS | SUB_BITS => TermKind::Bitstring,
+            _ => TermKind::Invalid,
+        },
+        3 if word & 15 == 15 => TermKind::Number,
+        3 if word & 63 == 0x0b => TermKind::Atom,
+        3 if word & 63 == 0x3b => TermKind::Nil,
+        3 if word & 15 == 3 => TermKind::Pid,
+        3 if word & 15 == 7 => TermKind::Port,
+        3 => TermKind::Invalid,
+        _ => TermKind::Invalid,
+    }
+}
+
+enum Hash2Resume {
+    /// A byte run in a list that trapped part way.
+    ListRun { tail: Term, packed: u32, count: u8 },
+    /// A binary hashed in several slices.
+    Binary(BinaryJob),
+    /// Remaining words in a tuple, record, or local function environment.
+    Fields {
+        parent: Term,
+        kind: FieldKind,
+        next: usize,
     },
-    /// A binary hashed in several slices: the bytes done and the block hash state. Boxed so a
-    /// work-stack entry stays two words (erts pushes only words on its `ESTACK`).
-    Binary(Box<BinaryJob>),
+    /// Remaining digits in a bignum.
+    Big { term: Term, next: usize },
+    /// Remaining flatmap pairs after a trap in its array loop.
+    FlatMap { term: Term, next: usize },
+    /// Remaining direct children after a trap in a HAMT node loop.
+    MapChildren {
+        term: Term,
+        children: Box<crate::hamt::HashNodeChildren>,
+    },
+    /// Map pair setup completed immediately before the helper trapped.
+    Common,
+}
+
+#[derive(Clone, Copy)]
+enum FieldKind {
+    Tuple,
+    Record,
+    Fun,
+}
+
+enum FieldProgress {
+    Common,
+    Compound(Term),
+    Yield(usize),
 }
 
 /// The saved state of a binary hashed in several slices.
@@ -114,9 +170,17 @@ pub enum Hash2Progress {
 /// one iteration.
 pub struct Hash2Run {
     hash: u32,
-    stack: smallvec::SmallVec<[Job; 16]>,
-    xors: smallvec::SmallVec<[u32; 4]>,
+    term: Term,
+    stack: smallvec::SmallVec<[Term; 16]>,
+    hash_xor_pairs: u32,
+    resume: Option<Hash2Resume>,
     simple: Option<u32>,
+}
+
+struct Hash2Walk<'a> {
+    stack: &'a mut smallvec::SmallVec<[Term; 16]>,
+    left: &'a mut i64,
+    can_trap: bool,
 }
 
 fn small_hash(n: i64) -> u32 {
@@ -139,8 +203,7 @@ fn small_hash(n: i64) -> u32 {
     hash
 }
 
-/// `make_hash2` of a term that hashes without a work stack (small integers, atoms, `[]`, pids
-/// and ports); `None` for everything else.
+/// `make_hash2` of an atom or small integer, the cases erts handles before creating its ESTACK.
 // Port of erts/emulator/beam/erl_term_hashing.c (make_hash2_helper, the immediate cases),
 // OTP-29.1.1.
 pub fn hash2_immediate(term: Term) -> Option<u32> {
@@ -149,24 +212,14 @@ pub fn hash2_immediate(term: Term) -> Option<u32> {
 
 #[inline]
 fn simple_hash(term: Term) -> Option<u32> {
+    if term.word() & 3 != 3 {
+        return None;
+    }
     if let Some(n) = term.as_small() {
         return Some(small_hash(n));
     }
     if let Some(atom) = term.as_atom() {
         return Some(global_atoms().hash(atom).unwrap());
-    }
-    if term == Term::NIL {
-        return Some(3_468_870_702);
-    }
-    if let Some((index, _)) = term.as_pid() {
-        let mut hash = 0;
-        combine(&mut hash, index, 0, H.wrapping_mul(5));
-        return Some(hash);
-    }
-    if let Some(id) = term.as_port() {
-        let mut hash = 0;
-        combine(&mut hash, id as u32, (id >> 32) as u32, H.wrapping_mul(6));
-        return Some(hash);
     }
     None
 }
@@ -245,24 +298,216 @@ fn block_hash_final_bytes(state: (u32, u32, u32), remaining: &[u8], full_length:
 }
 
 impl Hash2Run {
+    // Port of the tuple, record, and local-fun field loops in
+    // erts/emulator/beam/erl_term_hashing.c (make_hash2_helper), OTP-29.1.1.
+    #[inline(always)]
+    fn push_fields(
+        hash: &mut u32,
+        parent: Term,
+        kind: FieldKind,
+        next: Option<usize>,
+        walk: &mut Hash2Walk<'_>,
+        initial: bool,
+    ) -> FieldProgress {
+        match kind {
+            FieldKind::Tuple => {
+                // SAFETY: the owning heap remains live during the walk.
+                let tuple = unsafe { parent.tuple_ref().unwrap() };
+                if initial {
+                    combine(hash, tuple.len() as u32, 0, H.wrapping_mul(9));
+                }
+                if tuple.is_empty() {
+                    return FieldProgress::Common;
+                }
+                let mut index = next.unwrap_or(tuple.len() - 1);
+                while index > 0 {
+                    walk.stack.push(Term(tuple.words()[index]));
+                    if walk.can_trap {
+                        *walk.left -= 1;
+                        if *walk.left <= 0 {
+                            return FieldProgress::Yield(index - 1);
+                        }
+                    }
+                    index -= 1;
+                }
+                FieldProgress::Compound(Term(tuple.words()[0]))
+            }
+            FieldKind::Record => {
+                // SAFETY: the record instance and definition remain live during the walk.
+                let record = unsafe { parent.record_ref().unwrap() };
+                if initial {
+                    combine(
+                        hash,
+                        record.len() as u32,
+                        record.definition_hash(),
+                        H.wrapping_mul(23),
+                    );
+                }
+                if record.is_empty() {
+                    return FieldProgress::Common;
+                }
+                let mut index = next.unwrap_or(record.len() - 1);
+                while index > 0 {
+                    walk.stack.push(record.value(index).unwrap());
+                    if walk.can_trap {
+                        *walk.left -= 1;
+                        if *walk.left <= 0 {
+                            return FieldProgress::Yield(index - 1);
+                        }
+                    }
+                    index -= 1;
+                }
+                FieldProgress::Compound(record.value(0).unwrap())
+            }
+            FieldKind::Fun => {
+                // SAFETY: the owning heap and process-lifetime fun entry remain live.
+                let fun = unsafe { parent.fun_ref().unwrap() };
+                match fun {
+                    crate::FunRef::Local { entry, free_vars } => {
+                        if initial {
+                            let module = global_atoms().text(entry.module).unwrap();
+                            combine(hash, free_vars.len() as u32, atom_hash(module), H);
+                            combine(hash, entry.index, entry.old_uniq, H);
+                        }
+                        if free_vars.is_empty() {
+                            return FieldProgress::Common;
+                        }
+                        let mut index = next.unwrap_or(free_vars.len() - 1);
+                        while index > 0 {
+                            walk.stack.push(Term(free_vars[index]));
+                            if walk.can_trap {
+                                *walk.left -= 1;
+                                if *walk.left <= 0 {
+                                    return FieldProgress::Yield(index - 1);
+                                }
+                            }
+                            index -= 1;
+                        }
+                        FieldProgress::Compound(Term(free_vars[0]))
+                    }
+                    crate::FunRef::Export { entry } => {
+                        if initial {
+                            let module = global_atoms().text(entry.module).unwrap();
+                            let function = global_atoms().text(entry.function).unwrap();
+                            combine(hash, entry.arity as u32, atom_hash(module), H);
+                            combine(hash, atom_hash(function), 0, H.wrapping_mul(14));
+                        }
+                        FieldProgress::Common
+                    }
+                }
+            }
+        }
+    }
+
+    // Port of the POS_BIG_SUBTAG and NEG_BIG_SUBTAG loops in make_hash2_helper,
+    // erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    #[inline(always)]
+    fn push_big_digits(
+        hash: &mut u32,
+        term: Term,
+        next: usize,
+        walk: &mut Hash2Walk<'_>,
+    ) -> Option<usize> {
+        let header = term.header().unwrap();
+        let digits = (header >> 6) as usize;
+        let constant = H.wrapping_mul(if header & 63 == NEG_BIG { 10 } else { 11 });
+        for index in next..digits {
+            // SAFETY: index is below the digit count encoded in the live bignum header.
+            let digit = unsafe { *term.raw_ptr().add(index + 1) };
+            combine(hash, digit as u32, (digit >> 32) as u32, constant);
+            if walk.can_trap {
+                *walk.left -= 1;
+                if *walk.left <= 0 {
+                    return Some(index + 1);
+                }
+            }
+        }
+        None
+    }
+
+    // Port of flatmap and HAMT child pushes in make_hash2_helper,
+    // erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    #[inline(always)]
+    fn push_map_child(child: Term, stack: &mut smallvec::SmallVec<[Term; 16]>) {
+        if child.bits() & 3 == 1 {
+            let mut pair = crate::ops::children(child);
+            let key = pair.next().unwrap();
+            let value = pair.next().unwrap();
+            stack.push(HASH_MAP_PAIR);
+            stack.push(value);
+            stack.push(key);
+        } else if child.header().is_some_and(|header| header & 63 == ARITY) {
+            for leaf in crate::ops::children(child) {
+                let mut pair = crate::ops::children(leaf);
+                let key = pair.next().unwrap();
+                let value = pair.next().unwrap();
+                stack.push(HASH_MAP_PAIR);
+                stack.push(value);
+                stack.push(key);
+            }
+        } else {
+            stack.push(child);
+        }
+    }
+
+    #[inline(always)]
+    fn push_flatmap_pairs(term: Term, next: usize, walk: &mut Hash2Walk<'_>) -> Option<usize> {
+        crate::hamt::with_flatmap_arrays(term, |keys, values| {
+            let mut index = next;
+            while index != usize::MAX && index < keys.len() {
+                walk.stack.push(HASH_MAP_PAIR);
+                walk.stack.push(Term(values[index]));
+                walk.stack.push(Term(keys[index]));
+                if walk.can_trap {
+                    *walk.left -= 1;
+                    if *walk.left <= 0 {
+                        return Some(index.checked_sub(1).unwrap_or(usize::MAX));
+                    }
+                }
+                if index == 0 {
+                    break;
+                }
+                index -= 1;
+            }
+            None
+        })
+        .expect("map branch distinguishes flatmaps from HAMTs")
+    }
+
+    #[inline(always)]
+    fn push_map_children(
+        mut children: crate::hamt::HashNodeChildren,
+        walk: &mut Hash2Walk<'_>,
+    ) -> Option<crate::hamt::HashNodeChildren> {
+        while let Some(child) = children.next() {
+            Self::push_map_child(child, walk.stack);
+            if walk.can_trap {
+                *walk.left -= 1;
+                if *walk.left <= 0 {
+                    return Some(children);
+                }
+            }
+        }
+        None
+    }
+
     /// Start hashing `term`.
     #[inline]
     pub fn new(term: Term) -> Self {
         let simple = simple_hash(term);
-        let mut stack: smallvec::SmallVec<[Job; 16]> = smallvec::SmallVec::new();
-        if simple.is_none() {
-            stack.push(Job::Visit(term));
-        }
         Self {
             hash: 0,
-            stack,
-            xors: smallvec::SmallVec::new(),
+            term,
+            stack: smallvec::SmallVec::new(),
+            hash_xor_pairs: 0,
+            resume: None,
             simple,
         }
     }
 
     /// Hash until done, or until `iterations` is used up (`None` never stops).
     // Port of erts/emulator/beam/erl_term_hashing.c:858 (make_hash2_helper), OTP-29.1.1.
+    #[inline(always)]
     pub fn run(&mut self, iterations: Option<i64>) -> Hash2Progress {
         if let Some(hash) = self.simple {
             return Hash2Progress::Done { hash, used: 0 };
@@ -270,65 +515,128 @@ impl Hash2Run {
         let can_trap = iterations.is_some();
         let max_iterations = iterations.unwrap_or(0);
         let mut left = max_iterations;
-        // The running hash lives in a register: helpers take and return it by value, so its
-        // address never escapes this loop.
         let mut running = self.hash;
         let hash = &mut running;
-        let stack = &mut self.stack;
-        let xors = &mut self.xors;
-        while let Some(job) = stack.pop() {
-            // Each job is one loop iteration of the erts loop, plus its inner iterations.
-            let mut ticks = 1_i64;
-            let mut marker = false;
-            match job {
-                Job::Reset => {
-                    *hash = 0;
-                    ticks = 0;
-                }
-                Job::Xor => {
-                    *xors.last_mut().unwrap() ^= *hash;
-                    marker = true;
-                }
-                Job::Finish(saved) => {
-                    let pairs = xors.pop().unwrap();
-                    *hash = saved;
-                    combine(hash, pairs, 0, H.wrapping_mul(19));
-                    marker = true;
-                }
-                Job::ListRun {
+        let mut walk = Hash2Walk {
+            stack: &mut self.stack,
+            left: &mut left,
+            can_trap,
+        };
+        let mut hash_xor_pairs = self.hash_xor_pairs;
+        let mut term = self.term;
+        let mut direct = false;
+        let mut start_common = false;
+        if let Some(resume) = self.resume.take() {
+            match resume {
+                Hash2Resume::ListRun {
                     tail,
                     packed,
                     count,
                 } => {
-                    if Self::list_by_value(hash, stack, tail, packed, count, &mut left, can_trap) {
-                        {
-                            self.hash = *hash;
-                            return Hash2Progress::Yield;
-                        }
-                    }
+                    let Some(active) =
+                        Self::list_by_value(hash, tail, packed, count, &mut walk, &mut self.resume)
+                    else {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = term;
+                        return Hash2Progress::Yield;
+                    };
+                    term = active;
+                    direct = true;
                 }
-                Job::Binary(job) => {
+                Hash2Resume::Binary(job) => {
                     let BinaryJob {
                         term,
                         processed,
                         state,
                         buffer,
-                    } = *job;
+                    } = job;
                     if Self::binary_by_value(
                         hash,
-                        stack,
                         term,
                         Some((processed, state, buffer)),
-                        &mut left,
-                        can_trap,
+                        walk.left,
+                        walk.can_trap,
+                        &mut self.resume,
                     ) {
-                        {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = term;
+                        return Hash2Progress::Yield;
+                    }
+                    start_common = true;
+                }
+                Hash2Resume::Fields { parent, kind, next } => {
+                    match Self::push_fields(hash, parent, kind, Some(next), &mut walk, false) {
+                        FieldProgress::Yield(next) => {
                             self.hash = *hash;
+                            self.hash_xor_pairs = hash_xor_pairs;
+                            self.term = parent;
+                            self.resume = Some(Hash2Resume::Fields { parent, kind, next });
                             return Hash2Progress::Yield;
                         }
+                        FieldProgress::Compound(active) => {
+                            term = active;
+                            direct = true;
+                        }
+                        FieldProgress::Common => start_common = true,
                     }
                 }
-                Job::Visit(term) => match term.classify() {
+                Hash2Resume::Big { term: parent, next } => {
+                    if let Some(next) = Self::push_big_digits(hash, parent, next, &mut walk) {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = parent;
+                        self.resume = Some(Hash2Resume::Big { term: parent, next });
+                        return Hash2Progress::Yield;
+                    }
+                    start_common = true;
+                }
+                Hash2Resume::FlatMap { term: parent, next } => {
+                    if let Some(next) = Self::push_flatmap_pairs(parent, next, &mut walk) {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = parent;
+                        self.resume = Some(Hash2Resume::FlatMap { term: parent, next });
+                        return Hash2Progress::Yield;
+                    }
+                    start_common = true;
+                }
+                Hash2Resume::MapChildren {
+                    term: parent,
+                    children,
+                } => {
+                    if let Some(children) = Self::push_map_children(*children, &mut walk) {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = parent;
+                        self.resume = Some(Hash2Resume::MapChildren {
+                            term: parent,
+                            children: Box::new(children),
+                        });
+                        return Hash2Progress::Yield;
+                    }
+                    start_common = true;
+                }
+                Hash2Resume::Common => start_common = true,
+            }
+        }
+        loop {
+            if direct {
+                direct = false;
+                if can_trap {
+                    *walk.left -= 1;
+                    if *walk.left <= 0 {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = term;
+                        return Hash2Progress::Yield;
+                    }
+                }
+                continue;
+            }
+            if !start_common {
+                match primary_kind(term) {
                     TermKind::Atom => {
                         let value = global_atoms().hash(term.as_atom().unwrap()).unwrap();
                         if *hash == 0 {
@@ -363,25 +671,23 @@ impl Hash2Run {
                             }
                         } else {
                             let header = term.header().unwrap();
-                            // SAFETY: numeric header determines the object words.
-                            let p = unsafe { term.raw_ptr() };
                             if header & 63 == FLOAT {
+                                // SAFETY: numeric header determines the object words.
+                                let p = unsafe { term.raw_ptr() };
                                 // SAFETY: float has one payload word.
                                 let mut bits = unsafe { *p.add(1) };
                                 if f64::from_bits(bits) == 0.0 {
                                     bits = 0;
                                 }
                                 combine(hash, (bits >> 32) as u32, bits as u32, H.wrapping_mul(12));
-                            } else if header & 63 == POS_BIG || header & 63 == NEG_BIG {
-                                let con =
-                                    H.wrapping_mul(if header & 63 == NEG_BIG { 10 } else { 11 });
-                                let digits = (header >> 6) as usize;
-                                for i in 0..digits {
-                                    // SAFETY: bignum header gives the digit count.
-                                    let digit = unsafe { *p.add(i + 1) };
-                                    combine(hash, digit as u32, (digit >> 32) as u32, con);
-                                }
-                                ticks += digits as i64;
+                            } else if (header & 63 == POS_BIG || header & 63 == NEG_BIG)
+                                && let Some(next) = Self::push_big_digits(hash, term, 0, &mut walk)
+                            {
+                                self.hash = *hash;
+                                self.hash_xor_pairs = hash_xor_pairs;
+                                self.term = term;
+                                self.resume = Some(Hash2Resume::Big { term, next });
+                                return Hash2Progress::Yield;
                             }
                         }
                     }
@@ -399,146 +705,254 @@ impl Hash2Run {
                         }
                     }
                     TermKind::Record => {
-                        // SAFETY: source record and definition remain live during hashing.
-                        let record = unsafe { term.record_ref().unwrap() };
-                        combine(
+                        match Self::push_fields(
                             hash,
-                            record.len() as u32,
-                            record.definition_hash(),
-                            H.wrapping_mul(23),
-                        );
-                        for i in (0..record.len()).rev() {
-                            stack.push(Job::Visit(record.value(i).unwrap()));
+                            term,
+                            FieldKind::Record,
+                            None,
+                            &mut walk,
+                            true,
+                        ) {
+                            FieldProgress::Yield(next) => {
+                                self.hash = *hash;
+                                self.hash_xor_pairs = hash_xor_pairs;
+                                self.term = term;
+                                self.resume = Some(Hash2Resume::Fields {
+                                    parent: term,
+                                    kind: FieldKind::Record,
+                                    next,
+                                });
+                                return Hash2Progress::Yield;
+                            }
+                            FieldProgress::Compound(active) => {
+                                term = active;
+                                direct = true;
+                            }
+                            FieldProgress::Common => {}
                         }
-                        ticks += record.len().saturating_sub(1) as i64;
                     }
                     TermKind::Fun => {
-                        // SAFETY: the owning heap retains the referenced entry.
-                        match unsafe { term.fun_ref().unwrap() } {
-                            crate::FunRef::Local { entry, free_vars } => {
-                                let module = global_atoms().text(entry.module).unwrap();
-                                combine(hash, free_vars.len() as u32, atom_hash(module), H);
-                                combine(hash, entry.index, entry.old_uniq, H);
-                                for value in free_vars.iter().rev() {
-                                    stack.push(Job::Visit(Term(*value)));
-                                }
-                                ticks += free_vars.len().saturating_sub(1) as i64;
+                        match Self::push_fields(hash, term, FieldKind::Fun, None, &mut walk, true) {
+                            FieldProgress::Yield(next) => {
+                                self.hash = *hash;
+                                self.hash_xor_pairs = hash_xor_pairs;
+                                self.term = term;
+                                self.resume = Some(Hash2Resume::Fields {
+                                    parent: term,
+                                    kind: FieldKind::Fun,
+                                    next,
+                                });
+                                return Hash2Progress::Yield;
                             }
-                            crate::FunRef::Export { entry } => {
-                                let module = global_atoms().text(entry.module).unwrap();
-                                let function = global_atoms().text(entry.function).unwrap();
-                                combine(hash, entry.arity as u32, atom_hash(module), H);
-                                combine(hash, atom_hash(function), 0, H.wrapping_mul(14));
+                            FieldProgress::Compound(active) => {
+                                term = active;
+                                direct = true;
                             }
+                            FieldProgress::Common => {}
                         }
                     }
                     TermKind::Tuple => {
-                        // SAFETY: source heap remains live throughout hashing.
-                        let tuple = unsafe { term.tuple_ref().unwrap() };
-                        combine(hash, tuple.len() as u32, 0, H.wrapping_mul(9));
-                        for &word in tuple.words().iter().rev() {
-                            stack.push(Job::Visit(Term(word)));
-                        }
-                        ticks += tuple.len().saturating_sub(1) as i64;
-                    }
-                    TermKind::List => {
-                        if Self::list_by_value(hash, stack, term, 0, 0, &mut left, can_trap) {
-                            {
+                        match Self::push_fields(hash, term, FieldKind::Tuple, None, &mut walk, true)
+                        {
+                            FieldProgress::Yield(next) => {
                                 self.hash = *hash;
+                                self.hash_xor_pairs = hash_xor_pairs;
+                                self.term = term;
+                                self.resume = Some(Hash2Resume::Fields {
+                                    parent: term,
+                                    kind: FieldKind::Tuple,
+                                    next,
+                                });
                                 return Hash2Progress::Yield;
                             }
+                            FieldProgress::Compound(active) => {
+                                term = active;
+                                direct = true;
+                            }
+                            FieldProgress::Common => {}
                         }
                     }
+                    TermKind::List => {
+                        let Some(active) =
+                            Self::list_by_value(hash, term, 0, 0, &mut walk, &mut self.resume)
+                        else {
+                            self.hash = *hash;
+                            self.hash_xor_pairs = hash_xor_pairs;
+                            self.term = term;
+                            return Hash2Progress::Yield;
+                        };
+                        term = active;
+                        direct = true;
+                    }
                     TermKind::Bitstring => {
-                        if Self::binary_by_value(hash, stack, term, None, &mut left, can_trap) {
+                        if Self::binary_by_value(
+                            hash,
+                            term,
+                            None,
+                            walk.left,
+                            walk.can_trap,
+                            &mut self.resume,
+                        ) {
                             {
                                 self.hash = *hash;
+                                self.hash_xor_pairs = hash_xor_pairs;
+                                self.term = term;
                                 return Hash2Progress::Yield;
                             }
                         }
                     }
                     TermKind::Map => {
-                        // Port of erts/emulator/beam/erl_term_hashing.c:1130-1215
-                        // (make_hash2_helper map branch), OTP-29.1.1.
-                        let n = crate::hamt::len(term);
-                        combine(hash, n as u32, 0, H.wrapping_mul(16));
-                        if n > 0 {
-                            let saved = *hash;
-                            xors.push(0);
-                            stack.push(Job::Finish(saved));
-                            // Port of the direct flatmap array loop in
-                            // erts/emulator/beam/erl_term_hashing.c (make_hash2_helper, OTP-29.1.1).
-                            if term.is_hashmap() {
-                                for (key, value) in crate::hamt::PairIter::new(term) {
-                                    stack.push(Job::Xor);
-                                    stack.push(Job::Visit(value));
-                                    stack.push(Job::Visit(key));
-                                    stack.push(Job::Reset);
-                                }
-                            } else {
-                                crate::hamt::with_flatmap_arrays(term, |keys, values| {
-                                    for index in (0..keys.len()).rev() {
-                                        stack.push(Job::Xor);
-                                        stack.push(Job::Visit(Term(values[index])));
-                                        stack.push(Job::Visit(Term(keys[index])));
-                                        stack.push(Job::Reset);
+                        let header = term.header().unwrap();
+                        match (header >> 6) & 3 {
+                            0 => {
+                                let size = crate::hamt::len(term);
+                                combine(hash, size as u32, 0, H.wrapping_mul(16));
+                                if size > 0 {
+                                    let saved = *hash;
+                                    walk.stack.push(Term(hash_xor_pairs as u64));
+                                    walk.stack.push(Term(saved as u64));
+                                    walk.stack.push(HASH_MAP_TAIL);
+                                    *hash = 0;
+                                    hash_xor_pairs = 0;
+                                    if let Some(next) =
+                                        Self::push_flatmap_pairs(term, size - 1, &mut walk)
+                                    {
+                                        self.hash = *hash;
+                                        self.hash_xor_pairs = hash_xor_pairs;
+                                        self.term = term;
+                                        self.resume = Some(Hash2Resume::FlatMap { term, next });
+                                        return Hash2Progress::Yield;
                                     }
-                                })
-                                .expect("map branch distinguishes flatmaps from HAMTs");
+                                }
                             }
-                            ticks += n as i64;
+                            1 => {
+                                let children = crate::hamt::hash_node_children(term)
+                                    .expect("bitmap node has direct HAMT children");
+                                if let Some(children) = Self::push_map_children(children, &mut walk)
+                                {
+                                    self.hash = *hash;
+                                    self.hash_xor_pairs = hash_xor_pairs;
+                                    self.term = term;
+                                    self.resume = Some(Hash2Resume::MapChildren {
+                                        term,
+                                        children: Box::new(children),
+                                    });
+                                    return Hash2Progress::Yield;
+                                }
+                            }
+                            2 | 3 => {
+                                let size = crate::hamt::len(term);
+                                combine(hash, size as u32, 0, H.wrapping_mul(16));
+                                if size > 0 {
+                                    let saved = *hash;
+                                    walk.stack.push(Term(hash_xor_pairs as u64));
+                                    walk.stack.push(Term(saved as u64));
+                                    walk.stack.push(HASH_MAP_TAIL);
+                                    *hash = 0;
+                                    hash_xor_pairs = 0;
+                                    let children = crate::hamt::hash_node_children(term)
+                                        .expect("HAMT head has direct children");
+                                    if let Some(children) =
+                                        Self::push_map_children(children, &mut walk)
+                                    {
+                                        self.hash = *hash;
+                                        self.hash_xor_pairs = hash_xor_pairs;
+                                        self.term = term;
+                                        self.resume = Some(Hash2Resume::MapChildren {
+                                            term,
+                                            children: Box::new(children),
+                                        });
+                                        return Hash2Progress::Yield;
+                                    }
+                                }
+                            }
+                            _ => unreachable!("map header subtype is two bits"),
                         }
                     }
                     other => panic!("unsupported term kind in make_hash2: {other:?}"),
-                },
-            }
-            if can_trap {
-                if stack.is_empty() && !marker {
-                    break;
                 }
-                left -= ticks;
-                if left <= 0 && !stack.is_empty() {
-                    {
+            }
+            start_common = false;
+            if direct {
+                direct = false;
+                if can_trap {
+                    *walk.left -= 1;
+                    if *walk.left <= 0 {
                         self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = term;
                         return Hash2Progress::Yield;
                     }
                 }
+                continue;
             }
-        }
-        self.hash = *hash;
-        Hash2Progress::Done {
-            hash: *hash,
-            used: max_iterations - left,
+            if walk.stack.is_empty() {
+                self.hash = *hash;
+                self.hash_xor_pairs = hash_xor_pairs;
+                return Hash2Progress::Done {
+                    hash: *hash,
+                    used: max_iterations - *walk.left,
+                };
+            }
+            term = walk.stack.pop().unwrap();
+            if term == HASH_MAP_PAIR {
+                hash_xor_pairs ^= *hash;
+                *hash = 0;
+            } else if term == HASH_MAP_TAIL {
+                *hash = walk.stack.pop().unwrap().word() as u32;
+                combine(hash, hash_xor_pairs, 0, H.wrapping_mul(19));
+                hash_xor_pairs = walk.stack.pop().unwrap().word() as u32;
+            } else if can_trap {
+                *walk.left -= 1;
+                if *walk.left <= 0 {
+                    self.hash = *hash;
+                    self.hash_xor_pairs = hash_xor_pairs;
+                    self.term = term;
+                    return Hash2Progress::Yield;
+                }
+            }
+            if term == HASH_MAP_PAIR || term == HASH_MAP_TAIL {
+                if can_trap {
+                    *walk.left -= 1;
+                    if *walk.left <= 0 {
+                        self.hash = *hash;
+                        self.hash_xor_pairs = hash_xor_pairs;
+                        self.term = term;
+                        self.resume = Some(Hash2Resume::Common);
+                        return Hash2Progress::Yield;
+                    }
+                }
+                start_common = true;
+            }
         }
     }
 
     #[inline(always)]
     fn list_by_value(
         hash: &mut u32,
-        stack: &mut smallvec::SmallVec<[Job; 16]>,
         term: Term,
         packed: u32,
         count: u8,
-        left: &mut i64,
-        can_trap: bool,
-    ) -> bool {
+        walk: &mut Hash2Walk<'_>,
+        resume: &mut Option<Hash2Resume>,
+    ) -> Option<Term> {
         let mut value = *hash;
-        let trapped = Self::list(&mut value, stack, term, packed, count, left, can_trap);
+        let active = Self::list(&mut value, term, packed, count, walk, resume);
         *hash = value;
-        trapped
+        active
     }
 
     #[inline(always)]
     fn binary_by_value(
         hash: &mut u32,
-        stack: &mut smallvec::SmallVec<[Job; 16]>,
         term: Term,
         resumed: Option<BinaryResume>,
         left: &mut i64,
         can_trap: bool,
+        resume_out: &mut Option<Hash2Resume>,
     ) -> bool {
         let mut value = *hash;
-        let trapped = Self::binary(&mut value, stack, term, resumed, left, can_trap);
+        let trapped = Self::binary(&mut value, term, resumed, left, can_trap, resume_out);
         *hash = value;
         trapped
     }
@@ -546,20 +960,20 @@ impl Hash2Run {
     /// The byte-run loop of the list case. Returns whether it trapped part way.
     // Port of the `TAG_PRIMARY_LIST` case of `make_hash2_helper`,
     // erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    #[inline(always)]
     fn list(
         hash: &mut u32,
-        stack: &mut smallvec::SmallVec<[Job; 16]>,
         term: Term,
         mut packed: u32,
         mut count: u8,
-        left: &mut i64,
-        can_trap: bool,
-    ) -> bool {
+        walk: &mut Hash2Walk<'_>,
+        resume: &mut Option<Hash2Resume>,
+    ) -> Option<Term> {
         let mut tail = term;
         // SAFETY: the list remains live throughout hashing.
         while let Some((head, next, next_is_cons)) = unsafe {
             tail.cons_ref()
-                .map(|(head, next)| (head, next, next.cons_ref().is_some()))
+                .map(|(head, next)| (head, next, next.word() & 3 == 1))
         } {
             let Some(byte) = head.as_small().filter(|n| (0..=255).contains(n)) else {
                 break;
@@ -572,15 +986,15 @@ impl Hash2Run {
                 count = 0;
             }
             tail = next;
-            if can_trap && next_is_cons {
-                *left -= 1;
-                if *left <= 0 {
-                    stack.push(Job::ListRun {
+            if walk.can_trap && next_is_cons {
+                *walk.left -= 1;
+                if *walk.left <= 0 {
+                    *resume = Some(Hash2Resume::ListRun {
                         tail,
                         packed,
                         count,
                     });
-                    return true;
+                    return None;
                 }
             }
         }
@@ -589,12 +1003,11 @@ impl Hash2Run {
         }
         // SAFETY: the list remains live throughout hashing.
         if let Some((head, next)) = unsafe { tail.cons_ref() } {
-            stack.push(Job::Visit(next));
-            stack.push(Job::Visit(head));
+            walk.stack.push(next);
+            Some(head)
         } else {
-            stack.push(Job::Visit(tail));
+            Some(tail)
         }
-        false
     }
 
     /// The binary case. Returns whether it trapped part way.
@@ -602,11 +1015,11 @@ impl Hash2Run {
     // `make_hash2_helper`, erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
     fn binary(
         hash: &mut u32,
-        stack: &mut smallvec::SmallVec<[Job; 16]>,
         term: Term,
         resumed: Option<BinaryResume>,
         left: &mut i64,
         can_trap: bool,
+        resume_out: &mut Option<Hash2Resume>,
     ) -> bool {
         // SAFETY: source heap and binary backing remain live.
         let view = unsafe { term.binary_ref().unwrap() };
@@ -652,12 +1065,12 @@ impl Hash2Run {
                 processed += to_process;
                 *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
                 if *left <= 0 {
-                    stack.push(Job::Binary(Box::new(BinaryJob {
+                    *resume_out = Some(Hash2Resume::Binary(BinaryJob {
                         term,
                         processed,
                         state,
                         buffer: None,
-                    })));
+                    }));
                     return true;
                 }
                 if size - processed < BLOCK_HASH_BYTES_PER_ITER {
@@ -717,12 +1130,12 @@ impl Hash2Run {
             processed += to_process;
             *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
             if *left <= 0 {
-                stack.push(Job::Binary(Box::new(BinaryJob {
+                *resume_out = Some(Hash2Resume::Binary(BinaryJob {
                     term,
                     processed,
                     state,
                     buffer: Some(buffer),
-                })));
+                }));
                 return true;
             }
             if size - processed < BLOCK_HASH_BYTES_PER_ITER {

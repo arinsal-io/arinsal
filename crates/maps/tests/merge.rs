@@ -209,8 +209,12 @@ fn finite_heap_returns_heap_full_without_replaying_construction() {
     let flat_left = int_map(&mut heap, 1..=20, 0);
     let pairs: Vec<_> = (1..=300).map(|k| (small(k % 250), small(k))).collect();
     let keys: Vec<_> = (1..=300).map(small).collect();
-    let attempts: [&Attempt<'_>; 4] = [
-        &|h| merge(left, right, h),
+    // Two hashmaps merge through `hashmap_merge`, which allocates with HAllocX (erl_map.c): on a
+    // full process heap it spills into a heap fragment instead of failing.
+    let mut tiny = ProcessHeap::with_words(16);
+    let merged = merge(left, right, &mut tiny).expect("hashmap merge spills to a heap fragment");
+    assert_eq!(arinsal_maps::to_list(merged).unwrap().len(), 400);
+    let attempts: [&Attempt<'_>; 3] = [
         &|h| merge(flat_left, right, h),
         &|h| from_list(&pairs, h),
         &|h| from_keys(&keys, small(0), h),

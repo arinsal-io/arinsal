@@ -2644,7 +2644,11 @@ fn light_trap_result(
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523 (call_light_bif_shared returns X0
 // to the call site), OTP-29.1.1.
 #[inline(always)]
-fn light_value_return(process: &mut crate::Process, entry_top: usize, value: Term) -> u64 {
+pub(crate) fn light_value_return(
+    process: &mut crate::Process,
+    entry_top: usize,
+    value: Term,
+) -> u64 {
     let top = process.heap.heap_top_index();
     if top != entry_top {
         process.header.htop = native_htop(process, top);
@@ -2848,7 +2852,7 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn trap_body_finish(
+pub(crate) fn trap_body_finish(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     identity: usize,
