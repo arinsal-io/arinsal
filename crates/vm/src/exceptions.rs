@@ -284,7 +284,7 @@ pub(crate) fn raise_from_ftrace(
     if let Some(cold) = p.cold.as_mut() {
         cold.nif_pending = None;
     }
-    if let Some(pending) = p.cold_mut().bif_trap.take() {
+    if let Some(pending) = p.take_work(|w| w.bif_trap.take()) {
         p.set_gc_enabled(pending.gc_was_enabled);
     }
     VmError::Trap(Trap {
@@ -323,7 +323,7 @@ pub(super) fn bif_error_with_atoms(
     if let Some(cold) = p.cold.as_mut() {
         cold.nif_pending = None;
     }
-    if let Some(pending) = p.cold_mut().bif_trap.take() {
+    if let Some(pending) = p.take_work(|w| w.bif_trap.take()) {
         p.set_gc_enabled(pending.gc_was_enabled);
     }
     if let BifError::Unsupported(reason) = error {
@@ -653,7 +653,7 @@ pub(super) fn resume(
 ) -> Result<Option<VmError>, VmError> {
     // An exception leaves the active BEAM call site. Any trap record belongs
     // to that abandoned call, even if the error did not originate in its BIF.
-    if let Some(pending) = p.cold_mut().bif_trap.take() {
+    if let Some(pending) = p.take_work(|w| w.bif_trap.take()) {
         p.set_gc_enabled(pending.gc_was_enabled);
     }
     // `save_direct` consumes the flag; a trace that is not saved from the raising BIF must not
@@ -753,7 +753,7 @@ pub(super) fn resume(
         {
             let target = match handler {
                 crate::native_bridge::CatchHandler::Native(handler) => {
-                    p.native_pc = Some(handler);
+                    p.set_native_pc(Some(handler));
                     crate::native_function_at(handler).map(|function| {
                         (
                             function.module.to_owned(),

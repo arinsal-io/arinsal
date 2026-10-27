@@ -749,9 +749,8 @@ pub(crate) fn commit_catch(
     process.header.exc.freason = 0;
     process.header.exc.fvalue = Term::NIL.tagged_word();
     process.header.exc.ftrace = 0;
+    process.clear_native_failure();
     if let Some(cold) = process.cold.as_mut() {
-        cold.native_bif_error = None;
-        cold.native_trap = None;
         cold.pending_trace_top = None;
         cold.explicit_raise = None;
     }
@@ -1070,7 +1069,6 @@ pub fn run_native(
     // Debug knobs are environment switches held in one byte: read once per entry.
     let debug = crate::debug_env::slice::get();
     let return_trace = debug & crate::debug_env::slice::RETURN_TRACE != 0;
-    let exception_trace = debug & crate::debug_env::slice::EXCEPTION_TRACE != 0;
     let lifetime_trace = debug & crate::debug_env::slice::LIFETIME_TRACE != 0;
     if debug & crate::debug_env::slice::BRIDGE_REGISTERED == 0 {
         register_bridge_continuation().map_err(|error| VmError::Unsupported(error.into()))?;
@@ -1158,10 +1156,7 @@ pub fn run_native(
     process.native_reds_in = process.header.fcalls;
     process.header.i = code_ptr;
     process.header.arity = arity;
-    if let Some(cold) = process.cold.as_mut() {
-        cold.native_bif_error = None;
-        cold.native_trap = None;
-    }
+    process.clear_native_failure();
     registers.tmp_mem[3] = 0;
     process.heap.set_native_allocation(true);
     // The scheduler set `esdp->current_process` when it scheduled the process in
@@ -1178,6 +1173,23 @@ pub fn run_native(
     let exit =
         unsafe { arinsal_beamasm::enter_native_raw(&mut process.header, registers, code_ptr) };
     process.heap.set_native_allocation(false);
+    native_exit(process, registers, code_address, code_ptr, exit, debug)
+}
+
+/// Leaves native code: classifies the exit, raises the exception it carries, or sets the
+/// continuation the process resumes at.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp (the code after a native call returns
+// to `process_main`) and beam_common.c (handle_error), OTP-29.1.1.
+fn native_exit(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    code_address: usize,
+    code_ptr: *const std::ffi::c_void,
+    exit: ExitReason,
+    debug: u8,
+) -> Result<ExitReason, VmError> {
+    let return_trace = debug & crate::debug_env::slice::RETURN_TRACE != 0;
+    let exception_trace = debug & crate::debug_env::slice::EXCEPTION_TRACE != 0;
     let native_ftrace = process.header.exc.ftrace;
     if exception_trace {
         let (base, end) = process.heap.heap_bounds();
@@ -1259,10 +1271,7 @@ pub fn run_native(
         trap.top = Some(crate::stacktrace::TopFrame::CurrentArgs(args));
         return Err(VmError::Trap(trap));
     } else if process.header.exc.freason != 0
-        && let Some(raised) = process
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.native_trap.take())
+        && let Some(raised) = process.take_work(|w| w.native_trap.take())
         && raised.freason == process.header.exc.freason
         && raised.fvalue == process.header.exc.fvalue
     {
@@ -1279,10 +1288,7 @@ pub fn run_native(
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
         return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
     } else if process.header.exc.freason != 0
-        && let Some(failure) = process
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.native_bif_error.take())
+        && let Some(failure) = process.take_work(|w| w.native_bif_error.take())
         && failure.freason == process.header.exc.freason
         && failure.fvalue == process.header.exc.fvalue
     {
@@ -1399,7 +1405,7 @@ pub fn run_native(
     }
     let outcome = match exit {
         ExitReason::CallUnported { .. } => {
-            process.native_pc = None;
+            process.set_native_pc(None);
             exit
         }
         ExitReason::Yield => {
@@ -1410,31 +1416,72 @@ pub fn run_native(
                 // The native function has returned into the exit bridge: the normal
                 // return path continues with what lies below (an interpreter caller,
                 // or nothing when the process is done).
-                process.native_pc = None;
+                process.set_native_pc(None);
                 ExitReason::Returned
             } else {
                 process.native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
                 process.native_arity_set = true;
                 process.gc_live = usize::from(process.header.arity);
-                process.native_pc = Some(if resume == 0 {
+                process.set_native_pc(Some(if resume == 0 {
                     code_ptr as usize
                 } else {
                     resume
-                });
+                }));
                 ExitReason::Yield
             }
         }
         ExitReason::Returned => {
-            process.native_pc = None;
+            process.set_native_pc(None);
             ExitReason::Returned
         }
         ExitReason::Unsupported => {
-            process.native_pc = None;
+            process.set_native_pc(None);
             ExitReason::Unsupported
         }
     };
     Ok(outcome)
+}
+
+/// [`run_native`] for the slice fast path: a native continuation (`native_arity_set`) with no
+/// debug knob set. The registry lookup, the entry-return peek and the bridge registration
+/// belong to function entries and to the first native call of the process; a continuation
+/// has none of them.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: copy_in_registers and
+// `br c_p->i`, no per-entry bookkeeping), OTP-29.1.1.
+pub fn run_native_resume(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    code_address: usize,
+) -> Result<ExitReason, VmError> {
+    let debug = crate::debug_env::slice::get();
+    if !crate::debug_env::slice::plain_entry(debug)
+        || !process.native_continuation_resume
+        || !process.native_arity_set
+    {
+        return run_native(process, registers, code_address);
+    }
+    process.native_continuation_resume = false;
+    process.native_arity_set = false;
+    process.native_error_pc = 0;
+    registers.tmp_mem[6] = 0;
+    let arity = process.header.arity;
+    process.heap.arm_native_redzone();
+    process.ensure_entry(0, usize::from(arity))?;
+    registers.entry_return = 0;
+    let code_ptr = code_address as *const std::ffi::c_void;
+    process.sync_header();
+    process.native_reds_in = process.header.fcalls;
+    process.header.i = code_ptr;
+    process.header.arity = arity;
+    process.clear_native_failure();
+    registers.tmp_mem[3] = 0;
+    process.heap.set_native_allocation(true);
+    // SAFETY: The caller supplies a registered executable function using the BeamAsm ABI.
+    let exit =
+        unsafe { arinsal_beamasm::enter_native_raw(&mut process.header, registers, code_ptr) };
+    process.heap.set_native_allocation(false);
+    native_exit(process, registers, code_address, code_ptr, exit, debug)
 }
 
 /// `ARINSAL_BEAMASM_RETURN_TRACE`: log native entries and exits.

@@ -156,7 +156,7 @@ fn bif_export_trap() {}
 /// address on the stack, the way `emit_enter_erlang_frame` leaves it for the export call.
 pub(crate) fn note_export_trap(process: &mut Process) {
     let resume = process
-        .native_retry_site
+        .native_retry_site()
         .map(|(pc, _)| pc)
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc));
     if let Some(resume) = resume {
@@ -172,7 +172,7 @@ pub(crate) fn note_export_trap(process: &mut Process) {
     }
     // `push_native_continuation` republishes the header and clears `i`.
     process.header.i = bif_export_trap as *const u8 as *const _;
-    let frame = if resume.is_none() && process.native_pc.is_none() {
+    let frame = if resume.is_none() && process.native_pc().is_none() {
         let released_by_call = process
             .cold
             .as_ref()
@@ -1849,10 +1849,7 @@ pub(crate) fn execute(
         if matches!(
             &result,
             Ok(ResumeResult::Handler(HandlerResult::Yield { .. }))
-        ) && let Some(pending) = process
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.bif_trap.as_mut())
+        ) && let Some(pending) = process.bif_trap_mut()
         {
             // Port of erts/emulator/beam/beam_common.c (BIF_TRAP), OTP-29.1.1: a continuation
             // that traps again returns to this gc_bif instruction before its result is stored.
@@ -1873,7 +1870,7 @@ pub(crate) fn execute(
             .map(|import| (import.module, import.function, usize::from(import.arity)))
     });
     let Some((module_name, function_name, import_arity)) = import_info else {
-        if let Some(pending) = process.cold_mut().bif_trap.take() {
+        if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
             process.set_gc_enabled(pending.gc_was_enabled);
         }
         return Some(Err(VmError::Unsupported(format!("import {import}"))));
@@ -2006,7 +2003,7 @@ pub(crate) fn run_trapped_export(
     // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
     // arguments), OTP-29.1.1.
     if target.entry.is_none() {
-        let pending = process.cold_mut().bif_trap.take()?;
+        let pending = process.take_work(|w| w.bif_trap.take())?;
         clear_export_trap(process);
         // The arguments are the live X registers the trap left (erts BIF_TRAPn, reg[0..n]).
         let args = process.x[..pending.arity].to_vec();
@@ -2051,7 +2048,7 @@ pub(crate) fn install_export_trap(
     process.x[..arity].copy_from_slice(&trap.args);
     process.gc_live = arity;
     let gc_was_enabled = process.heap.gc_enabled;
-    process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+    process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.trap_site().0,
         caller_ip: process.trap_site().1,
         schedule_out: true,
@@ -2147,7 +2144,7 @@ pub(crate) fn execute_named(
         // exception can redirect control without re-entering that call, so
         // discard its state before dispatching a call from another site. The
         // same site may first dispatch `apply` before reaching the trapped BIF.
-        if let Some(pending) = process.cold_mut().bif_trap.take() {
+        if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
             process.set_gc_enabled(pending.gc_was_enabled);
         }
     }
@@ -2179,7 +2176,7 @@ pub(crate) fn execute_named(
     let gc_was_enabled = pending.map_or(gc_enabled_on_entry, |pending| pending.gc_was_enabled);
     let (handler, state) = if let Some(pending) = pending {
         let Some(entry) = entry else {
-            if let Some(pending) = process.cold_mut().bif_trap.take() {
+            if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
                 process.set_gc_enabled(pending.gc_was_enabled);
             }
             return Some(Err(VmError::Unsupported(
@@ -2195,7 +2192,7 @@ pub(crate) fn execute_named(
             {
                 return Some(Err(VmError::TrapExport(trap)));
             }
-            if let Some(pending) = process.cold_mut().bif_trap.take() {
+            if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
                 process.set_gc_enabled(pending.gc_was_enabled);
             }
             return Some(Err(VmError::Unsupported(
@@ -2261,7 +2258,7 @@ pub(crate) fn execute_named(
     );
     Some(match result {
         Err(error) => {
-            process.cold_mut().bif_trap = None;
+            process.slice_mut().bif_trap = None;
             clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             // Re-enabling GC may collect: the X registers, not the copies, hold the live
@@ -2272,14 +2269,14 @@ pub(crate) fn execute_named(
             ))
         }
         Ok(HandlerResult::Done { value, reductions }) => {
-            process.cold_mut().bif_trap = None;
+            process.slice_mut().bif_trap = None;
             clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
             Ok(HandlerResult::Done { value, reductions })
         }
         Ok(HandlerResult::Failed { error, reductions }) => {
-            process.cold_mut().bif_trap = None;
+            process.slice_mut().bif_trap = None;
             clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
@@ -2309,7 +2306,7 @@ pub(crate) fn execute_named(
                 match trap_state_term(process, &state) {
                     Ok(state_term) => state_term,
                     Err(_) => {
-                        process.cold_mut().bif_trap = None;
+                        process.slice_mut().bif_trap = None;
                         clear_export_trap(process);
                         process.set_gc_enabled(gc_was_enabled);
                         let args = call_args(process, &args, report.2, resumed);
@@ -2361,7 +2358,7 @@ pub(crate) fn execute_named(
             let reverse_args = (continuation == REVERSE_CONTINUATION)
                 .then(|| reverse_trap_args(&state))
                 .flatten();
-            process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+            process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.trap_site().0,
                 caller_ip: process.trap_site().1,
                 schedule_out: false,
@@ -2406,7 +2403,7 @@ pub(crate) fn execute_named(
             })
         }
         Ok(HandlerResult::Export(trap)) => {
-            process.cold_mut().bif_trap = None;
+            process.slice_mut().bif_trap = None;
             clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, 0);
@@ -2904,7 +2901,7 @@ pub(crate) fn finish_light(
                 return LightTrap::Returned(Err(BifError::SystemLimit));
             };
             // The scheduler binds the trap to its call site when it context-switches.
-            process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+            process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.trap_site().0,
                 caller_ip: process.trap_site().1,
                 schedule_out: true,
@@ -2929,7 +2926,7 @@ pub(crate) fn finish_light(
             let mut saved = [Term::NIL; 3];
             let kept = trap.args.len().min(saved.len());
             saved[..kept].copy_from_slice(&trap.args[..kept]);
-            process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+            process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.trap_site().0,
                 caller_ip: process.trap_site().1,
                 schedule_out: false,
@@ -3027,7 +3024,7 @@ pub(crate) fn install_deferred_trap(
     {
         saved[..2].copy_from_slice(&trap_args);
     }
-    process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+    process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.trap_site().0,
         caller_ip: process.trap_site().1,
         schedule_out: true,

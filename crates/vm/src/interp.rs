@@ -1765,7 +1765,7 @@ impl Vm {
                 target,
             )
         {
-            p.native_pc = Some(native.start);
+            p.set_native_pc(Some(native.start));
             return;
         }
         p.module = module_id;
@@ -1812,7 +1812,7 @@ impl Vm {
     /// native code if it has any, as erts jumps to the export's code address.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     pub(crate) fn enter_native_at_jump(&mut self, p: &mut Process) {
-        if !crate::beamasm_integration::enabled() || p.native_pc.is_some() {
+        if !crate::beamasm_integration::enabled() || p.native_pc().is_some() {
             return;
         }
         let Some(module) = self.code.modules.get(p.module) else {
@@ -1824,7 +1824,7 @@ impl Vm {
             crate::load::native_code_range(&self.code.code_meta, p.module),
             p.ip(),
         ) {
-            p.native_pc = Some(native.start);
+            p.set_native_pc(Some(native.start));
         }
     }
 
@@ -1870,8 +1870,8 @@ impl Vm {
         // The call site of a native call into interpreted code is only for a native call the
         // scheduler redoes. Left behind, it makes a trap of an interpreted call push a native
         // return address that erts' interpreter-free frames never have, shifting every Y.
-        if p.native_retry.is_none() {
-            p.native_retry_site = None;
+        if p.native_retry().is_none() {
+            p.set_native_retry_site(None);
         }
         // A migrated process may already be inside a module this replica has
         // not copied yet. Sync only when the id is past the local table.
@@ -1909,7 +1909,7 @@ impl Vm {
                 crate::load::native_code_range(&self.code.code_meta, module_id),
                 p.ip(),
             ) {
-                p.native_pc = Some(native.start);
+                p.set_native_pc(Some(native.start));
                 p.native_transfer = true;
                 return Ok(RunState::Yield);
             }
@@ -2043,7 +2043,7 @@ impl Vm {
                     p.heap.release_stack(1);
                     p.native_continuation_resume = true;
                     p.set_native_resume_arity(1);
-                    p.native_pc = Some(cp as usize);
+                    p.set_native_pc(Some(cp as usize));
                     p.native_transfer = true;
                     return Ok(RunState::Yield);
                 }
@@ -2170,10 +2170,10 @@ impl Vm {
             // FCALLS exhaustion does not replace the BIF result; yielding is
             // handled at a switchable instruction boundary like emit_i_test_yield
             // in instr_common.cpp:3097-3118.
-            if (consumed == budget || reds <= 0 || p.force_yield)
+            if (consumed == budget || reds <= 0 || p.force_yield())
                 && let Some(live) = switch_out_live(module, fetched)
             {
-                p.force_yield = false;
+                p.set_force_yield(false);
                 p.gc_live = live;
                 sync_cursor(p, htop, &mut heap_dirty);
                 p.module = module_id;
@@ -2311,7 +2311,7 @@ impl Vm {
                                             instruction_offset(base, target),
                                         ) {
                                             sync_cursor(p, htop, &mut heap_dirty);
-                                            p.native_pc = Some(native.start);
+                                            p.set_native_pc(Some(native.start));
                                             p.native_transfer = true;
                                             return Ok(RunState::Yield);
                                         }
@@ -2356,7 +2356,7 @@ impl Vm {
                                 )
                             {
                                 sync_cursor(p, htop, &mut heap_dirty);
-                                p.native_pc = Some(native.start);
+                                p.set_native_pc(Some(native.start));
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
@@ -2615,7 +2615,7 @@ impl Vm {
                     // Port of erts/emulator/beam/erl_process.c:10190, OTP-29.1.1: a finished
                     // dirty job continues on a normal scheduler.
                     if arinsal_sched::current_scheduler_type().is_dirty() {
-                        p.force_yield = true;
+                        p.set_force_yield(true);
                     }
                     (htop, stop) = p.heap.heap_cursor();
                     depth = p.heap.stack_words();
@@ -2801,7 +2801,7 @@ impl Vm {
                                 instruction_offset(base, target),
                             ) {
                                 sync_cursor(p, htop, &mut heap_dirty);
-                                p.native_pc = Some(native.start);
+                                p.set_native_pc(Some(native.start));
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
@@ -2878,7 +2878,7 @@ impl Vm {
                             if let Some(resume) = p.native_resume_after_call.take()
                             {
                                 sync_cursor(p, htop, &mut heap_dirty);
-                                p.native_pc = Some(resume);
+                                p.set_native_pc(Some(resume));
                                 p.reductions = reds;
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
@@ -2977,7 +2977,7 @@ impl Vm {
                                 if let Some(resume) = p.native_resume_after_call.take()
                                 {
                                     sync_cursor(p, htop, &mut heap_dirty);
-                                    p.native_pc = Some(resume);
+                                    p.set_native_pc(Some(resume));
                                     p.reductions = reds;
                                     p.native_transfer = true;
                                     return Ok(RunState::Yield);
@@ -3052,7 +3052,7 @@ impl Vm {
                             }
                             outcome @ (ImportOutcome::Advanced | ImportOutcome::Yield) => {
                                 sync_cursor(p, htop, &mut heap_dirty);
-                                p.native_pc = Some(resume);
+                                p.set_native_pc(Some(resume));
                                 p.reductions = reds;
                                 if matches!(outcome, ImportOutcome::Advanced) {
                                     p.native_transfer = true;
@@ -3063,7 +3063,7 @@ impl Vm {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 // The BIF returned a value for the native caller in x[0].
                                 p.x[0] = value;
-                                p.native_pc = Some(resume);
+                                p.set_native_pc(Some(resume));
                                 p.reductions = reds;
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
@@ -3097,8 +3097,8 @@ impl Vm {
                     // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield), OTP-29.1.1.
                     // `yield/0` has already produced its result and advanced this call site;
                     // switch out here so the following opcode cannot absorb the yield.
-                    if p.force_yield && matches!(&outcome, ImportOutcome::Advanced) {
-                        p.force_yield = false;
+                    if p.force_yield() && matches!(&outcome, ImportOutcome::Advanced) {
+                        p.set_force_yield(false);
                         p.gc_live = 1;
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.reductions = reds;
@@ -3119,7 +3119,7 @@ impl Vm {
                             p.module = module_id;
                             p.set_ip(target_ip);
                             p.reductions = reds;
-                            p.native_pc = Some(native.start);
+                            p.set_native_pc(Some(native.start));
                             p.native_transfer = true;
                             return Ok(RunState::Yield);
                         }
@@ -3163,7 +3163,7 @@ impl Vm {
                         p.module = module_id;
                         p.set_ip(target as usize);
                         p.reductions = reds;
-                        p.native_pc = Some(native.start);
+                        p.set_native_pc(Some(native.start));
                         p.native_transfer = true;
                         return Ok(RunState::Yield);
                     }
@@ -3197,7 +3197,7 @@ impl Vm {
                         p.module = module_id;
                         p.set_ip(target as usize);
                         p.reductions = reds;
-                        p.native_pc = Some(native.start);
+                        p.set_native_pc(Some(native.start));
                         p.native_transfer = true;
                         return Ok(RunState::Yield);
                     }
@@ -3995,7 +3995,7 @@ impl Vm {
                         if outcome == process::ReceiveHelper::Yield {
                             // `goto loop_rec__`: schedule out at this `loop_rec`.
                             p.delay_gc = false;
-                            p.force_yield = true;
+                            p.set_force_yield(true);
                             continue;
                         }
                     }
@@ -4179,7 +4179,7 @@ impl Vm {
                                 p.module = module_id;
                                 p.set_ip(target_ip);
                                 p.reductions = reds;
-                                p.native_pc = Some(native.start);
+                                p.set_native_pc(Some(native.start));
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
@@ -4250,7 +4250,7 @@ impl Vm {
                                 p.module = module_id;
                                 p.set_ip(target_ip);
                                 p.reductions = reds;
-                                p.native_pc = Some(native.start);
+                                p.set_native_pc(Some(native.start));
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
@@ -5169,7 +5169,7 @@ impl Vm {
                             p.module = target_module;
                             p.set_ip(target_ip);
                             p.reductions = reds;
-                            p.native_pc = Some(native.start);
+                            p.set_native_pc(Some(native.start));
                             p.native_transfer = true;
                             return Ok(RunState::Yield);
                         }

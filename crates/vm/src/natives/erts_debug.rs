@@ -1931,7 +1931,7 @@ fn remote_relations(
         let Some(target) = task.downcast_mut::<Process>() else {
             return;
         };
-        let exiting = |target: &Process| target.dirty_exiting() || target.exit_cont.is_some();
+        let exiting = |target: &Process| target.dirty_exiting() || target.has_exit_cont();
         if !exiting(target)
             && let Err(error) = target.drain(target_ctx)
         {
@@ -1965,7 +1965,7 @@ fn current_relations(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<Option<Relations>, VmError> {
-    let exiting = |target: &Process| target.dirty_exiting() || target.exit_cont.is_some();
+    let exiting = |target: &Process| target.dirty_exiting() || target.has_exit_cont();
     if !exiting(process) {
         process.drain(ctx)?;
     }
@@ -2374,12 +2374,15 @@ fn internal_state_set(
         // erts yields and returns `ok` once, without re-running the BIF. A latch left by a
         // finished wait therefore belongs to that earlier call, not to this one; reusing it
         // made every second `wait` return at once (the BEAM JIT resumes after the call).
-        if let Some(completion) = process.cold_mut().debug_wait_completion.clone() {
+        let pending_wait = process
+            .slice()
+            .and_then(|work| work.debug_wait_completion.clone());
+        if let Some(completion) = pending_wait {
             if !completion.load(Ordering::Acquire) {
-                process.force_yield = true;
+                process.set_force_yield(true);
                 return Ok(atom("ok"));
             }
-            process.cold_mut().debug_wait_completion = None;
+            process.slice_mut().debug_wait_completion = None;
         }
         // Port of erts/emulator/beam/erl_process.c:2499 (erts_debug_wait_completed): only one
         // process at a time can wait.
@@ -2391,7 +2394,7 @@ fn internal_state_set(
             return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
         }
         let completion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        process.cold_mut().debug_wait_completion = Some(completion.clone());
+        process.slice_mut().debug_wait_completion = Some(completion.clone());
         let rounds = if kind == "aux_work" { 1 } else { 4 };
         debug_wait_round(
             runtime,
@@ -2402,7 +2405,7 @@ fn internal_state_set(
             drain_owned,
             &mut |work| ctx.request_aux_work_all(work),
         );
-        process.force_yield = true;
+        process.set_force_yield(true);
         return Ok(atom("ok"));
     }
     match arg_name(selector).as_deref() {

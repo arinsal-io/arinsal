@@ -2720,7 +2720,7 @@ fn enqueue_port_packets_locked(
             });
     }
     if deferred_count != 0 || has_older_continuation {
-        process.force_yield = true;
+        process.set_force_yield(true);
     }
     process.reductions = (process.reductions - (ready_count as i32 * 10)).max(1);
     if state.pending_bytes >= state.busy_limit {
@@ -2738,7 +2738,7 @@ fn finish_port_enqueue(
     if should_suspend {
         let suspended = suspend_dist_sender(process, sender);
         if suspended {
-            process.force_yield = true;
+            process.set_force_yield(true);
             let mut tables = node_tables::lock();
             if let Some(state) = tables.entries.values_mut().find_map(|entry| {
                 entry
@@ -2828,7 +2828,7 @@ pub(crate) fn continue_fragmented_send(
             .front()
             .is_none_or(|continuation| continuation.sender != Some(sender))
         {
-            process.force_yield = true;
+            process.set_force_yield(true);
             return Ok(());
         }
         let count = state
@@ -2882,7 +2882,7 @@ pub(crate) fn continue_fragmented_send(
     process.reductions = (process.reductions - (packet_count as i32 * 10)).max(1);
     ctx.consume(packet_count as u32 * 10);
     if more {
-        process.force_yield = true;
+        process.set_force_yield(true);
     }
     let busy = {
         let mut tables = node_tables::lock();
@@ -2902,7 +2902,7 @@ pub(crate) fn continue_fragmented_send(
         }
     };
     if busy && suspend_dist_sender(process, sender) {
-        process.force_yield = true;
+        process.set_force_yield(true);
         let mut tables = node_tables::lock();
         if let Some(state) = tables.entries.values_mut().find_map(|entry| {
             entry

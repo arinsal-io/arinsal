@@ -181,7 +181,7 @@ fn whereis_light_error(process: &mut Process, arg: Term, error: VmError) -> u64 
     let fvalue = crate::native_hooks::raw(trap.reason);
     process.header.exc.freason = freason;
     process.header.exc.fvalue = fvalue;
-    process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
+    process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
         fvalue,
@@ -241,7 +241,7 @@ fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
         Some(false) => return None,
     };
     // erts: `if (ERTS_PROC_HAS_INCOMING_SIGNALS(BIF_P))` reads `c_p->state` after the result.
-    let own_quiet = match process.signal_probe.as_ref() {
+    let own_quiet = match process.signal_probe() {
         Some(probe) => probe.is_quiet(),
         None => scheduler.is_quiet_from(process.self_pid?, process.on_managed) == Some(true),
     };
@@ -1073,7 +1073,7 @@ pub(crate) fn erl_create_process(
         child.set_entry_ip(0);
         child.initial_mfa = Some((m, f, arity as u8));
         if initial_bif.is_some() {
-            child.cold_mut().initial_bif = initial_bif.clone();
+            child.slice_mut().initial_bif = initial_bif.clone();
         }
         child.group_leader = Some(group_leader);
         child.parent = Some(parent_pid);
@@ -1706,11 +1706,11 @@ fn access_timer_sync(
         },
         _ => return Err(badarg("timer reference")),
     };
-    process.pending_signal_waiter = Some(Waiter {
+    process.set_pending_signal_waiter(Some(Waiter {
         id,
         kind: WaitKind::Info,
         save: process.inbox.len(),
-    });
+    }));
     *guard = TimerAccess::Parked {
         target: caller,
         reply,
@@ -3686,7 +3686,7 @@ pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
 // Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
 pub(crate) fn is_waiting_for_process_info(process: &Process) -> bool {
     process
-        .pending_signal_waiter
+        .pending_signal_waiter()
         .is_some_and(|waiter| matches!(waiter.kind, WaitKind::Info))
 }
 
@@ -3694,7 +3694,7 @@ pub(crate) fn is_waiting_for_process_info(process: &Process) -> bool {
 /// `Ok(Some(term))` when the reply has arrived.
 /// `Err(await)` when the reply is still pending.
 pub(crate) fn poll(process: &mut Process) -> Result<Option<Term>, VmError> {
-    let Some(waiter) = process.pending_signal_waiter else {
+    let Some(waiter) = process.pending_signal_waiter() else {
         return Ok(None);
     };
     let (id, kind, save) = (waiter.id, waiter.kind, waiter.save);
@@ -3712,7 +3712,7 @@ pub(crate) fn poll(process: &mut Process) -> Result<Option<Term>, VmError> {
     process.cold_mut().prio_len = new_prio_len;
     let term = removed.expect("reply index");
     process.message_removed(index);
-    process.pending_signal_waiter = None;
+    process.set_pending_signal_waiter(None);
     let inner = reply_inner(term, id, kind).ok_or_else(|| badarg("request reply"))?;
     interpret(kind, inner).map(Some)
 }
@@ -3825,11 +3825,11 @@ fn submit_from(
             None => queues.plain.push_back(pending),
         }
         if let Some(kind) = wait {
-            process.pending_signal_waiter = Some(Waiter {
+            process.set_pending_signal_waiter(Some(Waiter {
                 id,
                 kind,
                 save: process.inbox.len(),
-            });
+            }));
         }
         if !note_request(process, target) || proc_is_exiting(process, target) {
             if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
@@ -3842,10 +3842,10 @@ fn submit_from(
                 }
             }
             if process
-                .pending_signal_waiter
+                .pending_signal_waiter()
                 .is_some_and(|waiter| waiter.id == id)
             {
-                process.pending_signal_waiter = None;
+                process.set_pending_signal_waiter(None);
             }
             return Ok(Submit::Dead);
         }
@@ -3877,10 +3877,10 @@ fn submit_from(
                 }
             }
             if process
-                .pending_signal_waiter
+                .pending_signal_waiter()
                 .is_some_and(|waiter| waiter.id == id)
             {
-                process.pending_signal_waiter = None;
+                process.set_pending_signal_waiter(None);
             }
             Ok(Submit::Dead)
         }
@@ -3989,7 +3989,7 @@ pub(crate) fn handle_request(
             .is_some_and(|cold| cold.sys_task_point);
         let dirty_cpc = if plain.is_none() && !at_point {
             if queues.sys.iter().any(|queue| !queue.is_empty()) {
-                process.cold_mut().sys_tasks_deferred = true;
+                process.slice_mut().sys_tasks_deferred = true;
             }
             // Port of erts/emulator/beam/erl_process.c:11255 (dispatch_system_task),
             // OTP-29.1.1: check_process_code of a process executing dirty is run by the dirty
@@ -4027,7 +4027,7 @@ fn run_request(
     // a garbage_collect request waits (reply included) until GC is enabled again.
     if !process.heap.gc_enabled && matches!(pending.op, RemoteOp::Collect { .. }) {
         process
-            .cold_mut()
+            .slice_mut()
             .delayed_gc
             .push(crate::proc_create::DelayedGc::Request(pending));
         return Ok(());
@@ -4044,10 +4044,12 @@ fn run_request(
             .is_some_and(|cold| cold.sys_task_point)
         && potentially_long_gc(process, *major)
     {
-        let cold = process.cold_mut();
-        cold.delayed_gc
-            .push(crate::proc_create::DelayedGc::Request(pending));
-        cold.dirty_sys_gc = true;
+        {
+            let mut work = process.slice_mut();
+            work.delayed_gc
+                .push(crate::proc_create::DelayedGc::Request(pending));
+            work.dirty_sys_gc = true;
+        }
         return Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
     }
     reply_request(process, ctx, pending)
@@ -4071,7 +4073,7 @@ pub(crate) fn execute_sys_tasks(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<(), VmError> {
-    process.cold_mut().sys_tasks_deferred = false;
+    process.slice_mut().sys_tasks_deferred = false;
     loop {
         let pending = {
             let mut tables = tables().lock().unwrap();
@@ -4117,11 +4119,7 @@ pub(crate) fn reschedule_deferred_sys_tasks(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<(), VmError> {
-    if process
-        .cold
-        .as_ref()
-        .is_some_and(|cold| cold.sys_tasks_deferred)
-    {
+    if process.slice().is_some_and(|work| work.sys_tasks_deferred) {
         return wake_for_deferred_sys_tasks(process, ctx);
     }
     Ok(())
@@ -4135,11 +4133,11 @@ fn wake_for_deferred_sys_tasks(
     let priority = {
         let tables = tables().lock().unwrap();
         let Some(queues) = tables.requests.get(&(scope(process), ctx.pid())) else {
-            process.cold_mut().sys_tasks_deferred = false;
+            process.slice_mut().sys_tasks_deferred = false;
             return Ok(());
         };
         let Some(index) = queues.sys.iter().position(|queue| !queue.is_empty()) else {
-            process.cold_mut().sys_tasks_deferred = false;
+            process.slice_mut().sys_tasks_deferred = false;
             return Ok(());
         };
         [
@@ -4190,7 +4188,7 @@ pub(crate) fn reply_request(
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
 pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
     crate::natives::sys::release_multi_scheduling_blocks(process, ctx.pid());
-    process.pending_signal_waiter = None;
+    process.set_pending_signal_waiter(None);
     // OTP destroys the trapped BIF state together with the exiting process.
     // Persistent get/0's snapshot retains a table generation and its literals.
     if let Some(cold) = process.cold.as_mut() {
@@ -4217,8 +4215,8 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         all
     };
     let mut pending = pending;
-    if let Some(cold) = process.cold.as_mut() {
-        for task in std::mem::take(&mut cold.delayed_gc) {
+    {
+        for task in process.take_delayed_gc() {
             match task {
                 crate::proc_create::DelayedGc::Request(request) => pending.push_back(request),
                 // Port of erts/emulator/beam/erl_process.c:11039-11041 (cleanup_sys_tasks),

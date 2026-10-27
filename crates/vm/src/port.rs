@@ -176,7 +176,7 @@ fn process_send_inner(
         PortSend::Sent => Ok(()),
         PortSend::SentSuspended => {
             // SEND_YIELD_RETURN: the send is done; the process leaves the scheduler.
-            process.force_yield = true;
+            process.set_force_yield(true);
             Ok(())
         }
         PortSend::Busy if nosuspend => {

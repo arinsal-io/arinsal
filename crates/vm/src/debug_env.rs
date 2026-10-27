@@ -99,6 +99,13 @@ pub(crate) mod slice {
         FLAGS.load(Ordering::Relaxed)
     }
 
+    /// Whether no debug knob is set and the exit bridge is registered: nothing in the native
+    /// entry path needs the slow, logging variant.
+    #[inline(always)]
+    pub(crate) fn plain_entry(flags: u8) -> bool {
+        flags & !INIT == BRIDGE_REGISTERED
+    }
+
     /// The switches, sampled from the environment on first use.
     #[inline(always)]
     pub(crate) fn get() -> u8 {

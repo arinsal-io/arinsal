@@ -612,7 +612,7 @@ impl Vm {
                     p.heap.release_stack(1);
                     p.native_continuation_resume = true;
                     p.set_native_resume_arity(1);
-                    p.native_pc = Some(word);
+                    p.set_native_pc(Some(word));
                     return None;
                 }
                 break;
@@ -756,7 +756,7 @@ impl Vm {
             return Ok(match Self::ret(p) {
                 Some(value) => ImportOutcome::Returned(value),
                 None => {
-                    if p.native_pc.is_some() {
+                    if p.native_pc().is_some() {
                         // Returning into a native continuation is not a scheduling point.
                         p.native_transfer = true;
                         ImportOutcome::Yield

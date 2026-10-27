@@ -531,7 +531,7 @@ fn inspect_frames(
         ]));
         return frames;
     }
-    let mut current = match process.native_pc {
+    let mut current = match process.native_pc() {
         Some(address) => FramePc::Native(address),
         None => FramePc::Interpreted {
             module: process.module,
