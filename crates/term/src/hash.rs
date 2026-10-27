@@ -206,6 +206,7 @@ fn small_hash(n: i64) -> u32 {
 /// `make_hash2` of an atom or small integer, the cases erts handles before creating its ESTACK.
 // Port of erts/emulator/beam/erl_term_hashing.c (make_hash2_helper, the immediate cases),
 // OTP-29.1.1.
+#[inline(always)]
 pub fn hash2_immediate(term: Term) -> Option<u32> {
     simple_hash(term)
 }
@@ -505,6 +506,21 @@ impl Hash2Run {
         }
     }
 
+    /// Start the compound walk after the caller has checked `make_hash2_helper`'s immediate
+    /// cases.
+    // Port of erts/emulator/beam/erl_term_hashing.c:974-1000, OTP-29.1.1.
+    #[inline]
+    pub fn new_after_immediate_check(term: Term) -> Self {
+        Self {
+            hash: 0,
+            term,
+            stack: smallvec::SmallVec::new(),
+            hash_xor_pairs: 0,
+            resume: None,
+            simple: None,
+        }
+    }
+
     /// Hash until done, or until `iterations` is used up (`None` never stops).
     // Port of erts/emulator/beam/erl_term_hashing.c:858 (make_hash2_helper), OTP-29.1.1.
     #[inline(always)]
@@ -512,6 +528,13 @@ impl Hash2Run {
         if let Some(hash) = self.simple {
             return Hash2Progress::Done { hash, used: 0 };
         }
+        self.run_after_immediate_check(iterations)
+    }
+
+    /// Run the compound walk after the caller has checked `make_hash2_helper`'s immediate cases.
+    // Port of erts/emulator/beam/erl_term_hashing.c:974-1000, OTP-29.1.1.
+    #[inline(always)]
+    pub fn run_after_immediate_check(&mut self, iterations: Option<i64>) -> Hash2Progress {
         let can_trap = iterations.is_some();
         let max_iterations = iterations.unwrap_or(0);
         let mut left = max_iterations;

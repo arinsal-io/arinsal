@@ -341,6 +341,9 @@ impl AtomTable {
     ///
     /// `make_hash2` returns `slot.bucket.hvalue` as a `Uint32`, so this is the
     /// value `phash2` uses for an atom.
+    // Port of the direct atom-table slot read in erts/emulator/beam/erl_term_hashing.c:1515,
+    // OTP-29.1.1.
+    #[inline(always)]
     pub fn hash(&self, atom: Atom) -> Option<u32> {
         self.record(atom).map(|rec| rec.hvalue as u32)
     }

@@ -2628,6 +2628,17 @@ pub(crate) struct Phash2<const N: usize>;
 impl<const N: usize> TrapBody for Phash2<N> {
     const ARITY: Option<usize> = Some(N);
 
+    // Port of erts/emulator/beam/erl_term_hashing.c:974-980 (`make_hash2_helper`): immediates
+    // return before the trapping work loop, without a trap state or reduction charge.
+    #[inline(always)]
+    fn direct(_process: &mut Process, args: &[Term]) -> Option<Term> {
+        if N == 1 {
+            arinsal_bifs::phash2_immediate_1(args[0])
+        } else {
+            None
+        }
+    }
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2635,7 +2646,12 @@ impl<const N: usize> TrapBody for Phash2<N> {
         _pid: Option<arinsal_sched::Pid>,
         _restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
-        Ok(match arinsal_bifs::phash2_run(args, process.reductions)? {
+        let result = match N {
+            1 => arinsal_bifs::phash2_run_1_after_immediate_check(args[0], process.reductions)?,
+            2 => arinsal_bifs::phash2_run_2(args[0], args[1], process.reductions)?,
+            _ => unreachable!("phash2 BIF entry has arity one or two"),
+        };
+        Ok(match result {
             arinsal_bifs::Phash2Run::Done { value, reductions } => {
                 HandlerResult::Done { value, reductions }
             }

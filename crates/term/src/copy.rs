@@ -3,15 +3,65 @@ use crate::literal::LiteralAreas;
 use crate::ops::{LiteralSkip, size_object_inner, size_object_with_prior};
 use crate::{
     ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FUN, FunRef, HEAP_BITS,
-    HeapAlloc, MAP, Node, RECORD, REF, SUB_BITS, Term, TermError, TermKind, size_object,
+    HeapAlloc, MAP, Node, RECORD, REF, SUB_BITS, Term, TermError, size_object,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-enum Job {
-    /// Copy a term into a slot; `true` disables sharing for this subgraph.
-    Copy(Term, *mut u64, bool),
-    FixBase(*mut u64),
+const COPY_QUEUE_INLINE: usize = 16;
+
+/// The frame-local FIFO used by `copy_shared_perform_x`.
+struct CopyQueue {
+    inline: [u64; COPY_QUEUE_INLINE],
+    front: usize,
+    len: usize,
+    overflow: Option<VecDeque<u64>>,
+}
+
+impl CopyQueue {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: [0; COPY_QUEUE_INLINE],
+            front: 0,
+            len: 0,
+            overflow: None,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, word: u64) {
+        if let Some(overflow) = &mut self.overflow {
+            overflow.push_back(word);
+        } else if self.len < COPY_QUEUE_INLINE {
+            let index = (self.front + self.len) % COPY_QUEUE_INLINE;
+            self.inline[index] = word;
+            self.len += 1;
+        } else {
+            let mut overflow = VecDeque::with_capacity(COPY_QUEUE_INLINE * 2);
+            for offset in 0..self.len {
+                overflow.push_back(self.inline[(self.front + offset) % COPY_QUEUE_INLINE]);
+            }
+            overflow.push_back(word);
+            self.front = 0;
+            self.len = 0;
+            self.overflow = Some(overflow);
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<u64> {
+        if let Some(overflow) = &mut self.overflow {
+            return overflow.pop_front();
+        }
+        if self.len == 0 {
+            return None;
+        }
+        let word = self.inline[self.front];
+        self.front = (self.front + 1) % COPY_QUEUE_INLINE;
+        self.len -= 1;
+        Some(word)
+    }
 }
 
 /// Copy an Erlang term after sizing its entire reachable object graph.
@@ -297,6 +347,35 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
     litopt: Option<&LiteralAreas>,
     ets_element: bool,
 ) -> Result<Term, TermError> {
+    copy_struct_into_layout(root, base, size, dst, litopt, ets_element, true)
+        .map(|layout| layout.root)
+}
+
+struct CopyLayout {
+    root: Term,
+    front_words: usize,
+    back_words: usize,
+}
+
+fn copy_struct_into_partial<H: HeapAlloc + ?Sized>(
+    root: Term,
+    base: *mut u64,
+    available: usize,
+    dst: &mut H,
+    litopt: Option<&LiteralAreas>,
+) -> Result<CopyLayout, TermError> {
+    copy_struct_into_layout(root, base, available, dst, litopt, false, false)
+}
+
+fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
+    root: Term,
+    base: *mut u64,
+    size: usize,
+    dst: &mut H,
+    litopt: Option<&LiteralAreas>,
+    ets_element: bool,
+    require_full: bool,
+) -> Result<CopyLayout, TermError> {
     let hstart = base;
     let hsize = size * 8;
     let mut hp = base;
@@ -308,7 +387,13 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
     let mut at = match root.0 & 3 {
         1 => CopyAt::List(&mut res, root),
         2 => CopyAt::Boxed(&mut res, root),
-        _ => return Ok(root),
+        _ => {
+            return Ok(CopyLayout {
+                root,
+                front_words: 0,
+                back_words: 0,
+            });
+        }
     };
     // SAFETY: `base` is `size` writable words that do not alias `root`. Every
     // source pointer is a live cons or boxed object. Off-heap owners are
@@ -332,19 +417,30 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
                 *base.add(1) = copied_tail.0;
                 let copied = Term::from_ptr(base, 1);
                 debug_assert_eq!(copied.0 & !7, base as u64);
-                return Ok(copied);
+                return Ok(CopyLayout {
+                    root: copied,
+                    front_words: size,
+                    back_words: 0,
+                });
             }
         }
         loop {
             match at {
                 CopyAt::Scan => {
                     if hp == htop {
-                        debug_assert_eq!(
-                            htop, hbot,
-                            "copy_struct htop/hbot root={:#x} size={size}",
-                            root.0
-                        );
-                        return Ok(Term(res));
+                        if require_full {
+                            debug_assert_eq!(
+                                htop, hbot,
+                                "copy_struct htop/hbot root={:#x} size={size}",
+                                root.0
+                            );
+                        }
+                        let end = base.wrapping_add(size);
+                        return Ok(CopyLayout {
+                            root: Term(res),
+                            front_words: (htop as usize - base as usize) / 8,
+                            back_words: (end as usize - hbot as usize) / 8,
+                        });
                     }
                     let obj = Term(*hp);
                     match obj.0 & 3 {
@@ -715,186 +811,143 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
             .unwrap_or(root));
     }
     let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
-    let mut offset = 0;
-    let mut root_word = 0_u64;
-    let mut jobs: smallvec::SmallVec<[Job; 32]> = smallvec::SmallVec::new();
-    jobs.push(Job::Copy(root, &mut root_word, false));
-    while let Some(job) = jobs.pop() {
-        match job {
-            Job::FixBase(p) => {
-                // SAFETY: The original pointer in this copied SubBits has been rewritten.
-                unsafe {
-                    let original = Term(*p.add(4));
-                    let flags = *p.add(1) & 3;
-                    if let Some(h) = original.header() {
-                        if h & 63 == HEAP_BITS {
-                            *p.add(1) = (original.raw_ptr().add(2) as u64) | flags;
-                        } else if h & 63 == SUB_BITS {
-                            *p.add(1) = (*original.raw_ptr().add(1) & !3) | flags;
-                        }
-                    }
+    let mut hp = base;
+    let mut hbot = base.wrapping_add(size);
+    let mut hscan = base;
+    let mut remaining = 0;
+    let mut queue = CopyQueue::new();
+    let mut root_word = Term::NON_VALUE.bits();
+    let mut resp = &mut root_word as *mut u64;
+    let mut source = root;
+
+    loop {
+        if source.is_immed() {
+            crate::heap::store(resp, source.bits());
+        } else {
+            let source_address = source.bits() & !7;
+            if source.bits() == ((&EMPTY_TUPLE as *const u64 as u64) | 2)
+                || skip.skips(source_address)
+            {
+                crate::heap::store(resp, source.bits());
+            } else if preserve_sharing
+                && unshared_literals.is_some_and(|literals| literals.is_literal(source_address))
+            {
+                let available = (hbot as usize - hp as usize) / 8;
+                let layout = copy_struct_into_partial(source, hp, available, dst, None)?;
+                crate::heap::store(resp, layout.root.bits());
+                hp = hp.wrapping_add(layout.front_words);
+                hbot = hbot.wrapping_sub(layout.back_words);
+            } else if preserve_sharing && let Some(copied) = cache.copied.get(&source_address) {
+                crate::heap::store(resp, copied.bits());
+            } else if source.bits() & 3 == 1 {
+                // SAFETY: the list tag and live root guarantee a readable cons cell.
+                let from = unsafe { source.raw_ptr() };
+                let head = Term(crate::heap::load(from));
+                let tail = Term(crate::heap::load(from.wrapping_add(1)));
+                let to = hp;
+                hp = hp.wrapping_add(2);
+                crate::heap::store(resp, Term::from_ptr(to, 1).bits());
+                crate::heap::store(to, Term::NON_VALUE.bits());
+                if preserve_sharing {
+                    cache.copied.insert(source_address, Term::from_ptr(to, 1));
                 }
-            }
-            Job::Copy(source, slot, unshared) => {
-                if source.bits() == ((&EMPTY_TUPLE as *const u64 as u64) | 2) {
-                    // SAFETY: OTP's canonical empty tuple is static, not heap-owned.
-                    unsafe { *slot = source.bits() };
-                    continue;
-                }
-                // Port of erts/emulator/beam/copy.c:1164-1170 and copy.c:1450-1460
-                // (copy_shared_*): literals that must be copied are copied with
-                // copy_struct, i.e. without sharing, once per occurrence.
-                let unshared = unshared
-                    || (preserve_sharing
-                        && !skip.skips(source.bits() & !7)
-                        && unshared_literals.is_some_and(|l| l.is_literal(source.bits() & !7)));
-                let sharing = preserve_sharing && !unshared;
-                let shared_copy = if sharing {
-                    cache.copied.get(&(source.bits() & !7)).copied()
-                } else {
-                    None
-                };
-                // Port of erts/emulator/beam/copy.c:720,744 (literals are
-                // left in place by copy_struct_x with a litopt), OTP-29.1.1.
-                if !source.is_pointer() || shared_copy.is_some() || skip.skips(source.bits() & !7) {
-                    // SAFETY: slot belongs to the destination allocation.
-                    unsafe {
-                        *slot = shared_copy.unwrap_or(source).bits();
-                    }
-                    continue;
-                }
-                let source_address = source.bits() & !7;
-                let is_list = source.classify() == TermKind::List;
-                if is_list {
-                    // A cons run is laid out in one reserved span. Only boxed heads
-                    // need deferred work; ordinary integer lists use no host jobs.
-                    // SAFETY: source is a live cons pointer.
-                    let mut from = unsafe { source.raw_ptr() };
-                    let mut link = slot;
-                    loop {
-                        // SAFETY: each source cell is live and size_object reserved two
-                        // words for every occurrence in the run.
-                        let (head, tail) = unsafe { (Term(*from), Term(*from.add(1))) };
-                        // SAFETY: offset remains inside the single destination reservation.
-                        let to = unsafe { base.add(offset) };
-                        offset += 2;
-                        // SAFETY: to points at two writable destination words; link
-                        // points at either the root slot or the preceding tail word.
-                        unsafe {
-                            *link = Term::from_ptr(to, 1).bits();
-                            *to = head.bits();
-                        }
-                        if sharing {
-                            cache
-                                .copied
-                                .insert(from as usize as u64, Term::from_ptr(to, 1));
-                        }
-                        if head.is_pointer() {
-                            jobs.push(Job::Copy(head, to, unshared));
-                        }
-                        // SAFETY: the tail word belongs to this initialized cell.
-                        link = unsafe { to.add(1) };
-                        if tail.bits() & 3 == 1 && skip.skips(tail.bits() & !7) {
-                            // SAFETY: link is the last destination cons tail word.
-                            unsafe { *link = tail.bits() };
-                            break;
-                        }
-                        if tail.bits() == (from as u64).wrapping_sub(16) | 1 {
-                            // SAFETY: the tail tag proves the predecessor is live.
-                            from = unsafe { from.sub(2) };
-                            continue;
-                        }
-                        if tail.bits() & 3 == 1 {
-                            if sharing {
-                                jobs.push(Job::Copy(tail, link, unshared));
-                                break;
-                            }
-                            // SAFETY: a tagged cons pointer belongs to the live source.
-                            from = unsafe { tail.raw_ptr() };
-                            continue;
-                        }
-                        if tail.is_pointer() {
-                            jobs.push(Job::Copy(tail, link, unshared));
-                        } else {
-                            // SAFETY: link is the last destination cons tail word.
-                            unsafe { *link = tail.bits() };
-                        }
-                        break;
-                    }
-                    continue;
-                }
+                enqueue_shared_child(head, to, skip, &mut queue);
+                resp = to.wrapping_add(1);
+                source = tail;
+                continue;
+            } else if source.bits() & 3 == 2 {
                 crate::bits::writable_finalize(source);
-                let header = source.header().unwrap_or(0);
-                // SAFETY: source is live and its header describes the allocation.
-                let words = unsafe { crate::boxed_object_words(header, source.raw_ptr()) };
-                // SAFETY: source is live and size_object reserved enough destination words.
-                let (from, to) = unsafe { (source.raw_ptr(), base.add(offset)) };
-                offset += words;
-                // SAFETY: allocated ranges are disjoint and each has words initialized.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(from, to, words);
-                    *slot = Term::from_ptr(to, 2).bits();
-                }
-                if sharing {
-                    cache.copied.insert(source_address, Term::from_ptr(to, 2));
-                }
+                // SAFETY: the boxed tag and live root guarantee a readable boxed header.
+                let from = unsafe { source.raw_ptr() };
+                let header = crate::heap::load(from);
+                // SAFETY: `source` is a live boxed term and its header describes its extent.
+                let words = unsafe { crate::boxed_object_words(header, from) };
+                let to = hp;
+
                 match header & 63 {
-                    ARITY => {
-                        for i in (1..words).rev() {
-                            // SAFETY: tuple elements occupy words 1..words.
-                            unsafe {
-                                jobs.push(Job::Copy(Term(*to.add(i)), to.add(i), unshared));
-                            }
+                    ARITY | RECORD => {
+                        copy_shared_words(from, to, words);
+                        hp = hp.wrapping_add(words);
+                        crate::heap::store(resp, Term::from_ptr(to, 2).bits());
+                        if preserve_sharing {
+                            cache.copied.insert(source_address, Term::from_ptr(to, 2));
+                        }
+                        for index in 1..words {
+                            let child = Term(crate::heap::load(from.wrapping_add(index)));
+                            enqueue_shared_child(child, to.wrapping_add(index), skip, &mut queue);
                         }
                     }
                     MAP => {
-                        for i in crate::hamt::child_range(header, words).rev() {
-                            // SAFETY: the map header determines its term-bearing slots.
-                            unsafe {
-                                jobs.push(Job::Copy(Term(*to.add(i)), to.add(i), unshared));
-                            }
+                        copy_map(from, header, resp, &mut hp);
+                        if preserve_sharing {
+                            cache
+                                .copied
+                                .insert(source_address, Term(crate::heap::load(resp)));
                         }
-                    }
-                    RECORD => {
-                        for i in (1..words).rev() {
-                            // SAFETY: record definition and values are terms.
-                            unsafe {
-                                jobs.push(Job::Copy(Term(*to.add(i)), to.add(i), unshared));
-                            }
+                        for index in crate::hamt::child_range(header, words) {
+                            let child = Term(crate::heap::load(from.wrapping_add(index)));
+                            enqueue_shared_child(child, to.wrapping_add(index), skip, &mut queue);
                         }
                     }
                     SUB_BITS => {
-                        // SAFETY: offset four holds the original binary term.
-                        unsafe {
-                            jobs.push(Job::FixBase(to));
-                            jobs.push(Job::Copy(Term(*to.add(4)), to.add(4), unshared));
+                        let original = Term(crate::heap::load(from.wrapping_add(4)));
+                        // SAFETY: `SUB_BITS.orig` is a live boxed bitstring term.
+                        let underlying = unsafe { original.raw_ptr() };
+                        let underlying_header = crate::heap::load(underlying);
+                        if underlying_header & 63 == BIN_REF {
+                            copy_shared_words(from, to, words);
+                            hp = hp.wrapping_add(words);
+                            crate::heap::store(resp, Term::from_ptr(to, 2).bits());
+                            crate::heap::store(to.wrapping_add(4), Term::NON_VALUE.bits());
+                            if preserve_sharing {
+                                cache.copied.insert(source_address, Term::from_ptr(to, 2));
+                            }
+                            queue.push(original.bits());
+                        } else {
+                            copy_sub_bits(source, from, resp, &mut hbot, dst)?;
+                            if preserve_sharing {
+                                cache
+                                    .copied
+                                    .insert(source_address, Term(crate::heap::load(resp)));
+                            }
                         }
                     }
                     FUN => {
-                        // SAFETY: source fun entries are permanent code-table entries.
-                        match unsafe { source.fun_ref().unwrap() } {
-                            FunRef::Local { .. } => {
-                                for i in (2..words).rev() {
-                                    // SAFETY: local fun environment starts at word two.
-                                    unsafe {
-                                        jobs.push(Job::Copy(Term(*to.add(i)), to.add(i), unshared));
-                                    }
-                                }
+                        copy_shared_words(from, to, words);
+                        hp = hp.wrapping_add(words);
+                        crate::heap::store(resp, Term::from_ptr(to, 2).bits());
+                        if preserve_sharing {
+                            cache.copied.insert(source_address, Term::from_ptr(to, 2));
+                        }
+                        // SAFETY: fun entries are live and the header bounds their environment.
+                        if matches!(unsafe { source.fun_ref().unwrap() }, FunRef::Local { .. }) {
+                            for index in 2..words {
+                                let child = Term(crate::heap::load(from.wrapping_add(index)));
+                                enqueue_shared_child(
+                                    child,
+                                    to.wrapping_add(index),
+                                    skip,
+                                    &mut queue,
+                                );
                             }
-                            FunRef::Export { .. } => {}
                         }
                     }
                     EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
-                        // SAFETY: external identity word one stores a retained Arc<Node> pointer.
-                        unsafe {
-                            let ptr = *to.add(1) as *const Node;
-                            Arc::increment_strong_count(ptr);
-                            *to.add(2) = 0;
-                            dst.link_node(to, Arc::from_raw(ptr));
+                        copy_off_heap_thing(from, header, resp, &mut hp, dst, false)?;
+                        if preserve_sharing {
+                            cache
+                                .copied
+                                .insert(source_address, Term(crate::heap::load(resp)));
                         }
                     }
                     BIN_REF => {
-                        // SAFETY: a BinRef stores an Arc pointer selected by word two.
+                        copy_shared_words(from, to, words);
+                        hp = hp.wrapping_add(words);
+                        crate::heap::store(resp, Term::from_ptr(to, 2).bits());
+                        if preserve_sharing {
+                            cache.copied.insert(source_address, Term::from_ptr(to, 2));
+                        }
+                        // SAFETY: word two identifies the live binary owner retained by the copy.
                         unsafe {
                             let (ptr, flags, overhead, owner) =
                                 crate::bits::clone_binary_owner(source)?;
@@ -903,25 +956,127 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                             )?;
                         }
                     }
-                    // Port of erts/emulator/beam/copy.c:934-939 (copy_struct, magic ref), OTP-29.1.1.
                     REF if crate::is_magic_ref_thing_with_hdr(
                         header,
-                        crate::heap::load(to.wrapping_add(1)),
+                        crate::heap::load(from.wrapping_add(1)),
                     ) =>
                     {
                         let owner = crate::MagicRef::thing_owner(
-                            crate::heap::load(to.wrapping_add(1)),
+                            crate::heap::load(from.wrapping_add(1)),
                             true,
                         );
+                        copy_off_heap_thing(from, header, resp, &mut hp, dst, true)?;
                         dst.link_magic_ref(to, owner)?;
+                        if preserve_sharing {
+                            cache
+                                .copied
+                                .insert(source_address, Term(crate::heap::load(resp)));
+                        }
                     }
-                    _ => {}
+                    _ => {
+                        copy_shared_words(from, to, words);
+                        hp = hp.wrapping_add(words);
+                        crate::heap::store(resp, Term::from_ptr(to, 2).bits());
+                        if preserve_sharing {
+                            cache.copied.insert(source_address, Term::from_ptr(to, 2));
+                        }
+                    }
                 }
+            } else {
+                crate::heap::store(resp, source.bits());
             }
         }
+
+        let Some(next) = queue.pop() else {
+            break;
+        };
+        source = Term(next);
+        resp = next_shared_placeholder(&mut hscan, hp, &mut remaining).ok_or(TermError::BadArg)?;
     }
-    debug_assert_eq!(offset, size);
+    debug_assert_eq!(hp, hbot);
     Ok(Term(root_word))
+}
+
+#[inline(always)]
+fn enqueue_shared_child(term: Term, slot: *mut u64, skip: LiteralSkip<'_>, queue: &mut CopyQueue) {
+    if term.is_pointer() && !skip.skips(term.bits() & !7) {
+        queue.push(term.bits());
+        crate::heap::store(slot, Term::NON_VALUE.bits());
+    } else {
+        crate::heap::store(slot, term.bits());
+    }
+}
+
+#[inline(always)]
+fn copy_shared_words(from: *const u64, to: *mut u64, words: usize) {
+    // SAFETY: the caller validated the live source extent and destination reservation.
+    unsafe { std::ptr::copy_nonoverlapping(from, to, words) };
+}
+
+fn next_shared_placeholder(
+    scan: &mut *mut u64,
+    hp: *mut u64,
+    remaining: &mut usize,
+) -> Option<*mut u64> {
+    while (*scan as usize) < hp as usize {
+        let word = crate::heap::load(*scan);
+        if *remaining > 0 {
+            let slot = *scan;
+            *scan = scan.wrapping_add(1);
+            *remaining -= 1;
+            if word == Term::NON_VALUE.bits() {
+                return Some(slot);
+            }
+            continue;
+        }
+        if word == Term::NON_VALUE.bits() {
+            let slot = *scan;
+            *scan = scan.wrapping_add(1);
+            return Some(slot);
+        }
+        if word & 3 != 0 {
+            *scan = scan.wrapping_add(1);
+            continue;
+        }
+        match word & 63 {
+            ARITY | RECORD => {
+                *remaining = (word >> 6) as usize;
+                *scan = scan.wrapping_add(1);
+            }
+            FUN => {
+                *remaining = ((word >> 16) & 255) as usize;
+                *scan = scan.wrapping_add(2);
+            }
+            MAP => match (word >> 6) & 3 {
+                0 => {
+                    *remaining = crate::heap::load((*scan).wrapping_add(1)) as usize + 1;
+                    *scan = scan.wrapping_add(2);
+                }
+                1..=3 => {
+                    let bitmap_words = ((word >> 16) as u16).count_ones() as usize;
+                    let map_arity = if (word >> 6) & 3 == 1 {
+                        0
+                    } else {
+                        ((word >> 8) & 255) as usize
+                    };
+                    *remaining = bitmap_words;
+                    *scan = scan.wrapping_add(1 + map_arity);
+                }
+                _ => return None,
+            },
+            SUB_BITS => {
+                let original = (*scan).wrapping_add(4);
+                if crate::heap::load(original) == Term::NON_VALUE.bits() {
+                    *scan = original;
+                    *remaining = 1;
+                } else {
+                    *scan = scan.wrapping_add(copy_scan_skip(word));
+                }
+            }
+            _ => *scan = scan.wrapping_add(copy_scan_skip(word)),
+        }
+    }
+    None
 }
 
 #[cfg(test)]

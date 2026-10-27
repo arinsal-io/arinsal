@@ -1274,10 +1274,10 @@ fn insert_args(
     objects: Term,
 ) -> Result<Term, VmError> {
     // SAFETY: object terms remain in the caller's live process heap for this BIF.
-    let single = unsafe { objects.tuple_ref() }.is_some();
+    let is_tuple = unsafe { objects.tuple_ref() }.is_some();
     // Port of erts/emulator/beam/erl_db.c (ets_insert_2: a list of two or more
     // objects, or a trapped continuation, goes to ets_insert_2_list_driver).
-    if !single
+    if !is_tuple
         && (process
             .cold
             .as_ref()
@@ -1290,54 +1290,96 @@ fn insert_args(
         let ctx = ctx.ok_or(VmError::Yield)?;
         return insert_list(process, ctx, caller, insert_new, target, objects);
     }
+
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2), OTP-29.1.1: a singleton list
+    // supplies its object directly, while an empty list only resolves and checks the table.
+    let object = if is_tuple {
+        Some(objects)
+    } else {
+        list_next(objects).and_then(|(object, tail)| (tail == Term::NIL).then_some(object))
+    };
+    let single = object.is_some();
+    let object = object.unwrap_or(objects);
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let registry = rt.ets.read().unwrap();
-    let tid = handle(&registry, target)?;
-    let shared = registry.shared(tid).map_err(err)?.clone();
-    let options = shared.options();
-    if single
-        && options.write_concurrency != WriteConcurrency::Disabled
-        && options.table_type != TableType::OrderedSet
-    {
-        let table = shared.read();
+    let insert = |shared: &arinsal_ets::TableLock,
+                  name: Option<arinsal_term::Atom>|
+     -> Result<Term, VmError> {
+        let options = shared.options();
+        if objects == Term::NIL && options.write_concurrency != WriteConcurrency::Disabled {
+            let table = shared.read_at(reader_group(process));
+            if table.is_detached()
+                || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+            {
+                return Err(badarg_cause("id"));
+            }
+            if table.is_busy() {
+                return Err(VmError::Yield);
+            }
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
+            }
+            return Ok(boolean_term(true));
+        }
+        if single && options.write_concurrency != WriteConcurrency::Disabled {
+            let table = shared.read_at(reader_group(process));
+            if table.is_detached()
+                || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+            {
+                return Err(badarg_cause("id"));
+            }
+            if table.is_busy() {
+                return Err(VmError::Yield);
+            }
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
+            }
+            let yes = table.insert_term_shared(object, insert_new).map_err(err)?;
+            return Ok(if insert_new {
+                boolean_term(yes)
+            } else {
+                boolean_term(true)
+            });
+        }
+
+        let mut table = shared.write();
+        if table.is_detached()
+            || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+        {
+            return Err(badarg_cause("id"));
+        }
         if table.is_busy() {
             return Err(VmError::Yield);
         }
         if !allowed(&table, caller, true) {
             return Err(badarg_cause("access"));
         }
-        let yes = table.insert_term_shared(objects, insert_new).map_err(err)?;
-        return Ok(if insert_new {
+        let yes = if single {
+            table.insert_term(object, insert_new).map_err(err)?
+        } else {
+            let items = list(objects).ok_or_else(badarg)?;
+            if insert_new {
+                table.insert_new(&items).map_err(err)?
+            } else {
+                table.insert(&items).map_err(err)?;
+                true
+            }
+        };
+        Ok(if insert_new {
             boolean_term(yes)
         } else {
             boolean_term(true)
-        });
-    }
-    let mut table = registry.get_mut(tid).map_err(err)?;
-    if !allowed(&table, caller, true) {
-        return Err(badarg_cause("access"));
-    }
-    let yes = if single {
-        if insert_new {
-            table.insert_new(&[objects]).map_err(err)?
-        } else {
-            table.insert(&[objects]).map_err(err)?;
-            true
-        }
-    } else {
-        let items = list(objects).ok_or_else(badarg)?;
-        if insert_new {
-            table.insert_new(&items).map_err(err)?
-        } else {
-            table.insert(&items).map_err(err)?;
-            true
-        }
+        })
     };
-    Ok(if insert_new {
-        boolean_term(yes)
-    } else {
-        boolean_term(true)
-    })
+
+    if let Some(name) = target.as_atom() {
+        return rt
+            .named_ets
+            .with_table(name, |shared| insert(shared, Some(name)))
+            .unwrap_or_else(|| Err(badarg_cause("id")));
+    }
+    target
+        .with_magic_payload::<arinsal_ets::TableLock, _>(|shared| insert(shared, None))
+        .unwrap_or_else(|| Err(badarg_cause("type")))
 }
 
 /// `ets:insert/2` and `ets:insert_new/2` with a list of two or more objects.
@@ -1580,41 +1622,38 @@ fn lookup_args(
 ) -> Result<Term, VmError> {
     let group = reader_group(process);
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
+    let mut lookup = |shared: &arinsal_ets::TableLock,
+                      name: Option<arinsal_term::Atom>|
+     -> Result<Term, VmError> {
+        let table = shared.read_at(group);
+        if table.is_detached()
+            || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+        {
+            return Err(badarg_cause("id"));
+        }
+        if table.is_busy() {
+            return Err(err(arinsal_ets::EtsError::Busy));
+        }
+        if !allowed(&table, caller, false) {
+            return Err(badarg_cause("access"));
+        }
+        if member {
+            return Ok(boolean_term(table.member_at(key, group)));
+        }
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        table.lookup_list_at(key, group, &mut heap).map_err(err)
+    };
     if let Some(name) = target.as_atom() {
         // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
         // Keep the atom-hashed snapshot alive across the table lock instead of cloning its Arc.
-        let lookup = rt.named_ets.with_table(name, |shared| {
-            let table = shared.read_at(group);
-            if table.is_detached() || !table.options.named_table || table.options.name != name {
-                return Err(badarg_cause("id"));
-            }
-            if table.is_busy() {
-                return Err(err(arinsal_ets::EtsError::Busy));
-            }
-            if !allowed(&table, caller, false) {
-                return Err(badarg_cause("access"));
-            }
-            if member {
-                return Ok(boolean_term(table.member_at(key, group)));
-            }
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            table.lookup_list_at(key, group, &mut heap).map_err(err)
-        });
+        let lookup = rt
+            .named_ets
+            .with_table(name, |shared| lookup(shared, Some(name)));
         return lookup.unwrap_or_else(|| Err(badarg_cause("id")));
     }
-
-    let registry = rt.ets.read().unwrap();
-    let tid = handle(&registry, target)?;
-    let table = registry.get_shared(tid).map_err(err)?;
-    if !allowed(&table, caller, false) {
-        return Err(badarg_cause("access"));
-    }
-    if member {
-        Ok(boolean_term(table.member(key)))
-    } else {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        table.lookup_list(key, &mut heap).map_err(err)
-    }
+    target
+        .with_magic_payload::<arinsal_ets::TableLock, _>(|shared| lookup(shared, None))
+        .unwrap_or_else(|| Err(badarg_cause("type")))
 }
 
 fn lookup_element_locked(
