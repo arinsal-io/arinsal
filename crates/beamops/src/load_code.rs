@@ -428,7 +428,8 @@ fn emit_op<S: OpSink>(
         let arg = st.ops.op(genop).a(index);
         operands.push(operand(arg, use_types)?);
     }
-    sink.emit(op as u16, operands).map_err(error)
+    sink.emit(op as u16, specific as u16, operands)
+        .map_err(error)
 }
 
 /// The operand of the output for one `BeamOpArg`.

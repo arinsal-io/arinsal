@@ -104,9 +104,46 @@ pub trait OpSink {
     /// literal index, which operands name. Called once per literal, before the first operation
     /// that could use it.
     fn new_literal(&mut self, index: u32, literal: &NewLiteral) -> Result<(), String>;
-    /// `beamasm_emit`: one specific operation, by the number of its generic operation
-    /// ([`erts_tables::GENOP_I_FUNC_LABEL_1`] and its siblings), with its operands.
-    fn emit(&mut self, op: u16, operands: &[SpecificOperand]) -> Result<(), String>;
+    /// `beamasm_emit`: one selected specific operation and its generic operation number.
+    fn emit(&mut self, op: u16, specific: u16, operands: &[SpecificOperand]) -> Result<(), String>;
+}
+
+/// The generated opcode-table entry selected by the loader for one generic operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpecificOpInfo {
+    /// The generic operation number in `gen_opc[]`.
+    pub generic_op: u16,
+    /// The generic operation name.
+    pub generic_name: &'static str,
+    /// The specific operation's generated name in `opc[]`.
+    pub name: &'static str,
+    /// The specific operation's operand signature.
+    pub sign: &'static str,
+}
+
+/// Returns the number of specific operation entries in OTP's generated `opc[]` table.
+pub fn specific_op_count() -> usize {
+    erts_tables::NUM_SPECIFIC_OPS
+}
+
+/// Returns details for one specific operation in OTP's generated `opc[]` table.
+pub fn specific_op_info(specific: u16) -> Option<SpecificOpInfo> {
+    let specific = usize::from(specific);
+    let op = erts_tables::OPC.get(specific)?;
+    let (generic_op, generic) = erts_tables::GEN_OPC
+        .iter()
+        .enumerate()
+        .find(|(_, generic)| {
+            generic.specific >= 0
+                && specific >= generic.specific as usize
+                && specific < generic.specific as usize + generic.num_specific
+        })?;
+    Some(SpecificOpInfo {
+        generic_op: u16::try_from(generic_op).ok()?,
+        generic_name: generic.name,
+        name: op.name,
+        sign: op.sign,
+    })
 }
 
 /// The name of a generic operation, which is the name of its specific operation.
@@ -121,6 +158,7 @@ pub const NUM_GENERIC_OPS: usize = erts_tables::NUM_GENERIC_OPS;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpecificOp {
     op: u16,
+    specific: u16,
     operands: Vec<SpecificOperand>,
 }
 
@@ -128,6 +166,11 @@ impl SpecificOp {
     /// The generic operation number.
     pub fn id(&self) -> u16 {
         self.op
+    }
+
+    /// The selected OTP specific operation number.
+    pub fn specific_id(&self) -> u16 {
+        self.specific
     }
 
     /// The OTP operation name.
@@ -184,7 +227,7 @@ impl OpSink for Collect {
         Ok(())
     }
 
-    fn emit(&mut self, op: u16, operands: &[SpecificOperand]) -> Result<(), String> {
+    fn emit(&mut self, op: u16, specific: u16, operands: &[SpecificOperand]) -> Result<(), String> {
         if i32::from(op) == erts_tables::GENOP_I_FUNC_LABEL_1
             && self.functions.last().is_some_and(|range| !range.is_empty())
         {
@@ -195,6 +238,7 @@ impl OpSink for Collect {
             .expect("a first range")
             .push(SpecificOp {
                 op,
+                specific,
                 operands: operands.to_vec(),
             });
         Ok(())

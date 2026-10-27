@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
@@ -16,5 +17,8 @@ arinsal-etf.workspace = true
 arinsal-beamasm = { path = "../beamasm" }
 arinsal-a64 = { path = "../a64" }
 thiserror.workspace = true
+
+[build-dependencies]
+arinsal-beamops = { path = "../beamops" }
 
 [dev-dependencies]
