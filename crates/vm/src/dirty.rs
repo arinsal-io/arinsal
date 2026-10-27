@@ -306,8 +306,8 @@ impl Process {
     /// Record that this process exited while executing a dirty job. Call it before the
     /// exit releases the cold state, so the running job's flag is seen.
     pub(crate) fn set_dirty_exited(&mut self) {
+        self.slice_mut().dirty_exited = true;
         let cold = self.cold_mut();
-        cold.dirty_exited = true;
         if let Some(flag) = cold.dirty_exit_flag.as_ref() {
             flag.store(true, Ordering::Release);
         }

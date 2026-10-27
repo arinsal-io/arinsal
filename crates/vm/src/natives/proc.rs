@@ -1799,7 +1799,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok((module.to_owned(), function.to_owned(), arity));
     }
     // A send suspended on a busy port yields to the send/2 export (bif.c:2581 SEND_YIELD).
-    if process.native_retry == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
+    if process.native_retry() == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
         return Ok(("erlang".to_owned(), "send".to_owned(), 2));
     }
     if crate::signals::is_waiting_for_process_info(process) {
@@ -1817,7 +1817,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     // A process woken in native code handles its signals before the native entry takes
     // `native_pc`; its position is then still in `c_p->i`, which interpreted slices clear.
     let native_position = process
-        .native_pc
+        .native_pc()
         .or_else(|| Some(process.header.i as usize).filter(|&pc| pc != 0));
     if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
         return Ok((
@@ -1898,7 +1898,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
     // the caller's native function; the PC is the export-trap entry.
     let export_trap = process.header.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = process
-        .native_pc
+        .native_pc()
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
         .or_else(|| {
             let pc = process.native_call_pc;
@@ -2082,7 +2082,7 @@ pub(crate) fn process_info_light(
     // The process's own signal probe answers without the table lookup: erts reads the
     // `ERTS_PSFLG_SIG_IN_Q` and `ERTS_PSFLG_SUSPENDED` bits of the caller's state word. The
     // table is the fallback.
-    let busy = match process.signal_probe.as_ref() {
+    let busy = match process.signal_probe() {
         Some(probe) => {
             probe.has_pending()
                 || probe
@@ -2874,7 +2874,7 @@ fn call_values(
             // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield), OTP-29.1.1:
             // the process goes to the back of its run queue and returns `true`.
             ("yield", []) if module == "erlang" => {
-                process.force_yield = true;
+                process.set_force_yield(true);
                 Ok(atom("true"))
             }
             ("process_flag", [name, value]) => {
@@ -3321,7 +3321,7 @@ fn hibernate(
     });
     runtime.mark_hibernating(ctx.pid(), true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-    process.cold_mut().hibernate_sched = true;
+    process.slice_mut().hibernate_sched = true;
     Err(VmError::Unsupported("hibernate".into()))
 }
 
@@ -3354,7 +3354,7 @@ fn hibernate_zero(
     });
     runtime.mark_hibernating(pid, true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-    process.cold_mut().hibernate_sched = true;
+    process.slice_mut().hibernate_sched = true;
     Err(VmError::Unsupported("hibernate".into()))
 }
 

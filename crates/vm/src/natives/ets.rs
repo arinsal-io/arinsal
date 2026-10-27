@@ -632,7 +632,7 @@ fn finish_direct(
             let fvalue = crate::native_hooks::raw(trap.reason);
             process.header.exc.freason = class;
             process.header.exc.fvalue = fvalue;
-            process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
+            process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
                 trap,
                 freason: class,
                 fvalue,

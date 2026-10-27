@@ -1793,7 +1793,7 @@ pub(super) fn build(
     } else {
         // A process suspended inside native code: `p.module`/`p.ip()` still hold the last
         // interpreter position, so the current function comes from its native resume pc.
-        p.native_pc
+        p.native_pc()
             .or_else(|| Some(p.header.i as usize).filter(|&pc| pc != 0))
             .filter(|&pc| crate::native_bridge::is_native_function_at(pc))
     };

@@ -5124,6 +5124,19 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         }
         self.consts.worker.map_or(0, |worker| worker as u64 + 1)
     }
+    /// Whether the slice may skip the scheduling-in work a signal, a system task or a dirty
+    /// scheduler would add: a plain slice on a normal scheduler with reductions left.
+    // Port of erts/emulator/beam/erl_process.c (erts_schedule: `state & ERTS_PSFLG_RUNNING_SYS`,
+    // the scheduler type and `reds` tests), OTP-29.1.1.
+    #[inline(always)]
+    pub fn fast_slice_ok(&self) -> bool {
+        self.scheduler_key() != 0
+            && self.remaining != 0
+            && !self.sys_task_run
+            && !self.dirty_running
+            && !self.dirty_queued
+            && !self.proc.input.has_pending_nmsg()
+    }
     /// Whether this turn runs on a simulated scheduler: its thread is not dedicated to one
     /// scheduler, so thread-specific data must be selected for every turn.
     pub fn simulated(&self) -> bool {

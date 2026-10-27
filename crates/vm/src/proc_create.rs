@@ -371,9 +371,14 @@ pub struct Process {
     pub(crate) initial_call: Option<(usize, usize)>,
     /// `p->u.initial` (erl_process.c:12693): the MFA the process was spawned with, as atoms.
     pub(crate) initial_mfa: Option<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
-    pub(crate) native_pc: Option<usize>,
+    native_pc: Option<usize>,
+    /// The rare per-slice conditions, one bit each (`SLOW_*`): the slice fast path runs only
+    /// while this is zero. Every field behind a bit is private and has setters that keep it.
+    // Port of erts/emulator/beam/erl_process.h (`p->state` and `p->flags` as the one word
+    // erts_schedule reads), OTP-29.1.1.
+    slow: u32,
     /// The entry process has been scheduled once (its native start is decided then).
-    pub(crate) entry_started: bool,
+    entry_started: bool,
     // Last BEAM live operand or call arity for allocation instructions without one.
     pub(crate) gc_live: usize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
@@ -405,7 +410,7 @@ pub struct Process {
     pub(crate) on_managed: bool,
     /// Saved continuation data for the process's pending `erts_await_result` BIF.
     // Port of erts/emulator/beam/erl_bif_info.c:1480-1500, OTP-29.1.1.
-    pub(crate) pending_signal_waiter: Option<crate::signals::Waiter>,
+    pending_signal_waiter: Option<crate::signals::Waiter>,
     /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
     /// like erts' `c_p->scheduler_data`.
     pub(crate) scheduler_id: u32,
@@ -419,12 +424,12 @@ pub struct Process {
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
-    pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
+    signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
     /// `infinity`); the process resumes at the native `loop_rec` label.
     pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
-    pub(crate) native_retry: Option<usize>,
+    native_retry: Option<usize>,
     /// The current apply comes from native code, whose call site names the caller frame.
     pub(crate) native_apply: bool,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
@@ -434,7 +439,7 @@ pub struct Process {
     /// The pending native wait belongs to a receive without clauses.
     pub(crate) native_wait_self: bool,
     /// Return address and call site of the native call that `native_retry` redoes.
-    pub(crate) native_retry_site: Option<(usize, usize)>,
+    native_retry_site: Option<(usize, usize)>,
     /// The BIF the scheduler runs for native code was called through `call_light_bif_shared`,
     /// not through its export entry, so no return address is on the stack in erts.
     pub(crate) native_light_bif_call: bool,
@@ -445,6 +450,8 @@ pub struct Process {
     pub(crate) inbox: process::MessageQueue,
     /// `sig_qs.cont`: signals fetched from the outer queue and not handled yet.
     /// Port of erts/emulator/beam/erl_process.h (ErtsSignalInQueue `sig_qs`), OTP-29.1.1.
+    /// Reached through `sig_cont`/`sig_cont_mut`; the collector's root walk also borrows it
+    /// field-wise (updating message words never changes whether the queue is empty).
     pub(crate) sig_cont: arinsal_sched::SignalQueue<arinsal_sched::Event<crate::process::Message>>,
     /// Signals taken from the front of `sig_cont` so far; receive markers inserted into the
     /// middle queue are positioned by it.
@@ -462,7 +469,7 @@ pub struct Process {
     pub(crate) parent: Option<arinsal_sched::Pid>,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
-    pub(crate) exit_cont: Option<Box<ExitCont>>,
+    exit_cont: Option<Box<ExitCont>>,
     /// Outermost `apply` operands that must stay GC roots. Nested applies spill into
     /// `ProcessCold.apply_roots`.
     pub(crate) apply_inline: [Term; 3],
@@ -478,7 +485,7 @@ pub struct Process {
     pub(crate) exc_class: Option<arinsal_bifs::Class>,
     pub(crate) entry: bool,
     /// A dist send that suspended must yield even if the queue drains before return.
-    pub(crate) force_yield: bool,
+    force_yield: bool,
     /// The next native entry resumes a raw continuation already on the stack.
     pub(crate) native_continuation_resume: bool,
     /// `header.arity` already holds the live X register count of the resumed native
@@ -1152,13 +1159,79 @@ pub(crate) struct OriginHalf {
     pub(crate) alias_mode: Option<AliasMode>,
 }
 
+/// The fields of the cold state that the scheduling-in half tests before it enters native
+/// code. They are written only through `Process::slice_mut`, whose guard keeps the process'
+/// `SLOW_COLD` bit equal to [`SliceWork::any`].
+// Port of erts/emulator/beam/erl_process.c (erts_schedule: rare per-slice work is announced by
+// bits in `p->state` and `p->flags`), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct SliceWork {
+    /// The process already exited while its dirty job keeps running.
+    /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
+    pub(crate) dirty_exited: bool,
+    /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
+    pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether this process currently has a runnable profile activation.
+    pub(crate) profile_active: bool,
+    /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
+    /// yielded before finishing, with the trace actions its return events still need.
+    /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
+    pub(crate) native_timeout_trace: bool,
+    /// The last slice ended because the process is suspended, not because it waits in a
+    /// receive: it stays active (runnable once resumed).
+    pub(crate) suspend_parked: bool,
+    /// Receive-timeout pause of the active suspends (erts `common.timer` as `ErtsPausedProcTimer`).
+    pub(crate) timer_pause: Option<crate::process::TimerPause>,
+    /// Parked by hibernation until a message arrives (erts `F_HIBERNATE_SCHED`).
+    pub(crate) hibernate_sched: bool,
+    /// Static NIF identity, native return point and target scheduler class of a NIF call
+    /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
+    pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
+    /// A system task woke the process while it was executing; it runs at the next scheduling
+    /// point instead.
+    pub(crate) sys_tasks_deferred: bool,
+    /// The BIF failure behind the current native exception, so the scheduler can name the BIF
+    /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
+    pub(crate) native_bif_error: Option<NativeBifError>,
+    /// A table BIF failure raised from the direct path with its BIF frame already built, as
+    /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
+    pub(crate) native_trap: Option<Box<NativeTrap>>,
+    /// A process-local BIF trap waiting for its private continuation export.
+    pub(crate) bif_trap: Option<BifTrapPending>,
+    /// Spawned MFA entry that resolves to a runtime BIF export.
+    pub(crate) initial_bif: Option<(String, String, u8)>,
+    /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
+    /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
+    pub(crate) delayed_gc: Vec<DelayedGc>,
+    /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
+    pub(crate) dirty_sys_gc: bool,
+    /// When the dirty CPU scheduler picked the process (`start_time` of
+    /// erts_dirty_process_main); the time until it schedules again is the charge.
+    pub(crate) dirty_pickup: Option<std::time::Instant>,
+}
+
 impl ProcessCold {
-    /// Whether the cold state holds work the per-slice path must look at: everything the
-    /// scheduler-in half tests before it enters native code. Computed, so no writer can miss it.
-    // Port of erts/emulator/beam/erl_process.c (erts_schedule: one test of `p->state` and
-    // `p->flags` for the rare per-slice work), OTP-29.1.1.
+    /// The pending BIF trap, for a change that leaves it pending.
+    #[inline(always)]
+    pub(crate) fn bif_trap_mut(&mut self) -> Option<&mut BifTrapPending> {
+        self.work.bif_trap.as_mut()
+    }
+}
+
+/// Read access to the slice work through the cold part; writes go through
+/// `Process::slice_mut`, which keeps the `SLOW_COLD` bit.
+impl std::ops::Deref for ProcessCold {
+    type Target = SliceWork;
+    #[inline(always)]
+    fn deref(&self) -> &SliceWork {
+        &self.work
+    }
+}
+
+impl SliceWork {
+    /// Whether any of the fields holds work for the next slice.
     #[inline]
-    pub(crate) fn slice_work(&self) -> bool {
+    pub(crate) fn any(&self) -> bool {
         self.native_dirty_nif.is_some()
             || self.initial_bif.is_some()
             || self.dirty_sys_gc
@@ -1174,6 +1247,7 @@ impl ProcessCold {
             || self.suspend_parked
             || self.native_bif_error.is_some()
             || self.native_trap.is_some()
+            || !self.delayed_gc.is_empty()
     }
 }
 
@@ -1185,9 +1259,6 @@ pub(crate) struct ProcessCold {
     pub(crate) max_heap: crate::process::MaxHeap,
     /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
     pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
-    /// The process already exited while its dirty job keeps running.
-    /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
-    pub(crate) dirty_exited: bool,
     /// Shared copy of `dirty_exited` for a dirty job running without the process.
     pub(crate) dirty_exit_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// A dirty BIF call waiting for its dirty job, or the job's result.
@@ -1198,10 +1269,6 @@ pub(crate) struct ProcessCold {
     pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
     /// Catch table the last exception scan saw, see `CodeIndexes::active_catches_cached`.
     pub(crate) catch_cache: Option<crate::code_ix::CatchCache>,
-    /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
-    pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Whether this process currently has a runnable profile activation.
-    pub(crate) profile_active: bool,
     /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
     /// for events raised outside a scheduler context (GC trace).
     pub(crate) scheduler_id: usize,
@@ -1221,10 +1288,6 @@ pub(crate) struct ProcessCold {
     // address from `ip` instead of an explicit continuation. Remove once interpreter BIF calls
     // carry their return address the way erts does.
     pub(crate) apply_frame_released: u8,
-    /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
-    /// yielded before finishing, with the trace actions its return events still need.
-    /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
-    pub(crate) native_timeout_trace: bool,
     pub(crate) traced_native_call: Option<(usize, usize, Vec<crate::trace::CallActions>)>,
     /// Call time and call memory accounting of the process, per trace session.
     // Port of erts/emulator/beam/erl_process.h (ERTS_PSD_CALL_TIME_BP, ERTS_PSD_CALL_MEMORY_BP),
@@ -1238,27 +1301,8 @@ pub(crate) struct ProcessCold {
     pub(crate) meta_frames: Vec<std::sync::Arc<crate::trace_bp::MetaTracer>>,
     /// `error_info` of the current native exception (erts keeps it with the stack trace).
     pub(crate) native_error_info: Option<Box<arinsal_etf::OwnedTerm>>,
-    /// The last slice ended because the process is suspended, not because it waits in a
-    /// receive: it stays active (runnable once resumed).
-    pub(crate) suspend_parked: bool,
-    /// Receive-timeout pause of the active suspends (erts `common.timer` as `ErtsPausedProcTimer`).
-    pub(crate) timer_pause: Option<crate::process::TimerPause>,
-    /// Parked by hibernation until a message arrives (erts `F_HIBERNATE_SCHED`).
-    pub(crate) hibernate_sched: bool,
     /// `message_queue_data` is `off_heap` (erts `FS_OFF_HEAP_MSGQ` in `sig_qs.flags`).
     pub(crate) off_heap_msgq: bool,
-    /// Static NIF identity, native return point and target scheduler class of a NIF call
-    /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
-    pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
-    /// A system task woke the process while it was executing; it runs at the next scheduling
-    /// point instead.
-    pub(crate) sys_tasks_deferred: bool,
-    /// The BIF failure behind the current native exception, so the scheduler can name the BIF
-    /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
-    pub(crate) native_bif_error: Option<NativeBifError>,
-    /// A table BIF failure raised from the direct path with its BIF frame already built, as
-    /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
-    pub(crate) native_trap: Option<Box<NativeTrap>>,
     /// Stable snapshot and cursor for a trapped `persistent_term:get/0` call.
     pub(crate) persistent_get_all: Option<Box<PersistentGetAll>>,
     /// Result of a published `persistent_term` update, returned when the yielded
@@ -1284,8 +1328,6 @@ pub(crate) struct ProcessCold {
     pub(crate) ext_last_released: Option<Box<ReleasedFrame>>,
     /// The frames a trapped BIF call holds in erts but the interpreter does not push.
     pub(crate) trap_return: Option<TrapReturn>,
-    /// A process-local BIF trap waiting for its private continuation export.
-    pub(crate) bif_trap: Option<BifTrapPending>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
@@ -1295,21 +1337,11 @@ pub(crate) struct ProcessCold {
     /// while the stacktrace is built, so a raw `Term` here would dangle and
     /// monitors would observe a corrupted reason.
     pub(crate) exit_reason: Option<Term>,
-    /// Spawned MFA entry that resolves to a runtime BIF export.
-    pub(crate) initial_bif: Option<(String, String, u8)>,
-    /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
-    /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
-    pub(crate) delayed_gc: Vec<DelayedGc>,
     /// Set while the process handles its signals before executing code (erts
     /// `ERTS_PSFLG_RUNNING_SYS`): the only place system tasks execute (erl_process.c
     /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially
     /// long GC request there moves the process to a dirty CPU scheduler.
     pub(crate) sys_task_point: bool,
-    /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
-    pub(crate) dirty_sys_gc: bool,
-    /// When the dirty CPU scheduler picked the process (`start_time` of
-    /// erts_dirty_process_main); the time until it schedules again is the charge.
-    pub(crate) dirty_pickup: Option<std::time::Instant>,
     /// erts `F_DIRTY_MAJOR_GC` / `F_DIRTY_MINOR_GC`: a potentially long collection the
     /// process started itself waits for a dirty CPU scheduler.
     pub(crate) dirty_gc: Option<DirtyGc>,
@@ -1365,6 +1397,10 @@ pub(crate) struct ProcessCold {
     /// Port of erts/emulator/beam/bif.c:1641-1688 (`raise_3` stores the caller's list
     /// in `c_p->ftrace`), OTP-29.1.1. The list stays here until the catch reads it.
     pub(crate) explicit_raise: Option<Box<(u64, u64, arinsal_etf::OwnedTerm)>>,
+    /// Rare per-slice work (see [`SliceWork`]); reached through `Process::slice`/`slice_mut`.
+    /// Only the collector's root walk borrows it field-wise next to its sibling fields, for
+    /// roots whose update keeps the work pending.
+    pub(crate) work: SliceWork,
 }
 
 /// Entry arguments held aside while `-on_load` runs as that process's first function.
@@ -1881,6 +1917,287 @@ impl Process {
         adjustment + self.heap.words_since_high_water() as i64 + info.mbuf_size as i64
     }
 
+    /// Cold work pending (a [`SliceWork`] field is set).
+    pub(crate) const SLOW_COLD: u32 = 1 << 0;
+    /// `exit_cont` holds a suspended exit.
+    pub(crate) const SLOW_EXIT_CONT: u32 = 1 << 1;
+    /// `force_yield` is set.
+    pub(crate) const SLOW_FORCE_YIELD: u32 = 1 << 2;
+    /// The entry process has not run yet.
+    pub(crate) const SLOW_NOT_STARTED: u32 = 1 << 3;
+    /// A cross-process BIF waits for its reply message.
+    pub(crate) const SLOW_PENDING_WAITER: u32 = 1 << 4;
+    /// The middle signal queue is not empty.
+    pub(crate) const SLOW_SIG_CONT: u32 = 1 << 5;
+    /// No native continuation: the process runs in the interpreter.
+    pub(crate) const SLOW_NO_NATIVE_PC: u32 = 1 << 6;
+    /// A native call is redone by the scheduler (`native_retry`).
+    pub(crate) const SLOW_RETRY: u32 = 1 << 7;
+    /// The signal probe is not installed yet.
+    pub(crate) const SLOW_NO_PROBE: u32 = 1 << 8;
+
+    /// The `SLOW_*` word derived from the fields; `slow` must always equal it.
+    pub(crate) fn recompute_slow(&self) -> u32 {
+        let mut slow = 0;
+        if self.cold.as_deref().is_some_and(|cold| cold.work.any()) {
+            slow |= Self::SLOW_COLD;
+        }
+        if self.exit_cont.is_some() {
+            slow |= Self::SLOW_EXIT_CONT;
+        }
+        if self.force_yield {
+            slow |= Self::SLOW_FORCE_YIELD;
+        }
+        if !self.entry_started {
+            slow |= Self::SLOW_NOT_STARTED;
+        }
+        if self.pending_signal_waiter.is_some() {
+            slow |= Self::SLOW_PENDING_WAITER;
+        }
+        if !self.sig_cont.is_empty() {
+            slow |= Self::SLOW_SIG_CONT;
+        }
+        if self.native_pc.is_none() {
+            slow |= Self::SLOW_NO_NATIVE_PC;
+        }
+        if self.native_retry.is_some() {
+            slow |= Self::SLOW_RETRY;
+        }
+        if self.signal_probe.is_none() {
+            slow |= Self::SLOW_NO_PROBE;
+        }
+        slow
+    }
+
+    /// Whether the slice has none of the rare work behind the `SLOW_*` bits.
+    #[inline(always)]
+    pub(crate) fn slice_is_plain(&self) -> bool {
+        debug_assert_eq!(self.slow, self.recompute_slow(), "stale SLOW word");
+        self.slow == 0
+    }
+
+    #[inline(always)]
+    fn set_slow(&mut self, bit: u32, on: bool) {
+        if on {
+            self.slow |= bit;
+        } else {
+            self.slow &= !bit;
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn native_pc(&self) -> Option<usize> {
+        self.native_pc
+    }
+    #[inline(always)]
+    pub(crate) fn set_native_pc(&mut self, pc: Option<usize>) {
+        self.native_pc = pc;
+        self.set_slow(Self::SLOW_NO_NATIVE_PC, pc.is_none());
+    }
+    #[inline(always)]
+    pub(crate) fn entry_started(&self) -> bool {
+        self.entry_started
+    }
+    /// Sets the flag and returns the previous value.
+    #[inline(always)]
+    pub(crate) fn replace_entry_started(&mut self, started: bool) -> bool {
+        let previous = std::mem::replace(&mut self.entry_started, started);
+        self.set_slow(Self::SLOW_NOT_STARTED, !started);
+        previous
+    }
+    #[inline(always)]
+    pub(crate) fn force_yield(&self) -> bool {
+        self.force_yield
+    }
+    #[inline(always)]
+    pub(crate) fn set_force_yield(&mut self, yield_now: bool) {
+        self.force_yield = yield_now;
+        self.set_slow(Self::SLOW_FORCE_YIELD, yield_now);
+    }
+    #[inline(always)]
+    pub(crate) fn has_exit_cont(&self) -> bool {
+        self.exit_cont.is_some()
+    }
+    #[inline(always)]
+    pub(crate) fn set_exit_cont(&mut self, state: Option<Box<ExitCont>>) {
+        self.set_slow(Self::SLOW_EXIT_CONT, state.is_some());
+        self.exit_cont = state;
+    }
+    #[inline(always)]
+    pub(crate) fn take_exit_cont(&mut self) -> Option<Box<ExitCont>> {
+        self.set_slow(Self::SLOW_EXIT_CONT, false);
+        self.exit_cont.take()
+    }
+    #[inline(always)]
+    pub(crate) fn pending_signal_waiter(&self) -> Option<crate::signals::Waiter> {
+        self.pending_signal_waiter
+    }
+    #[inline(always)]
+    pub(crate) fn set_pending_signal_waiter(&mut self, waiter: Option<crate::signals::Waiter>) {
+        self.set_slow(Self::SLOW_PENDING_WAITER, waiter.is_some());
+        self.pending_signal_waiter = waiter;
+    }
+    #[inline(always)]
+    pub(crate) fn native_retry(&self) -> Option<usize> {
+        self.native_retry
+    }
+    #[inline(always)]
+    pub(crate) fn set_native_retry(&mut self, target: Option<usize>) {
+        self.native_retry = target;
+        self.set_slow(Self::SLOW_RETRY, target.is_some());
+    }
+    #[inline(always)]
+    pub(crate) fn take_native_retry(&mut self) -> Option<usize> {
+        self.set_slow(Self::SLOW_RETRY, false);
+        self.native_retry.take()
+    }
+    #[inline(always)]
+    pub(crate) fn native_retry_site(&self) -> Option<(usize, usize)> {
+        self.native_retry_site
+    }
+    #[inline(always)]
+    pub(crate) fn set_native_retry_site(&mut self, site: Option<(usize, usize)>) {
+        self.native_retry_site = site;
+    }
+    #[inline(always)]
+    pub(crate) fn take_native_retry_site(&mut self) -> Option<(usize, usize)> {
+        self.native_retry_site.take()
+    }
+    #[inline(always)]
+    pub(crate) fn signal_probe(
+        &self,
+    ) -> Option<&arinsal_sched::SignalProbe<crate::process::Message>> {
+        self.signal_probe.as_ref()
+    }
+    #[inline(always)]
+    pub(crate) fn set_signal_probe(
+        &mut self,
+        probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
+    ) {
+        self.set_slow(Self::SLOW_NO_PROBE, probe.is_none());
+        self.signal_probe = probe;
+    }
+    /// The middle signal queue.
+    #[inline(always)]
+    pub(crate) fn sig_cont(
+        &self,
+    ) -> &arinsal_sched::SignalQueue<arinsal_sched::Event<crate::process::Message>> {
+        &self.sig_cont
+    }
+    /// The middle signal queue for change; `SLOW_SIG_CONT` follows it when the guard drops.
+    #[inline(always)]
+    pub(crate) fn sig_cont_mut(&mut self) -> SigContMut<'_> {
+        SigContMut(self)
+    }
+    /// Runs `f` on the slice work when a cold part exists; `SLOW_COLD` follows the result.
+    #[inline(always)]
+    pub(crate) fn take_work<R>(
+        &mut self,
+        f: impl FnOnce(&mut SliceWork) -> Option<R>,
+    ) -> Option<R> {
+        // Nothing is pending (`SLOW_COLD` clear): every field is empty, nothing can be taken.
+        if self.slow & Self::SLOW_COLD == 0 {
+            return None;
+        }
+        let cold = self.cold.as_deref_mut()?;
+        let taken = f(&mut cold.work);
+        let busy = cold.work.any();
+        self.set_slow(Self::SLOW_COLD, busy);
+        taken
+    }
+    /// Clears the native failure records (`native_bif_error`, `native_trap`); both are empty
+    /// while `SLOW_COLD` is clear, so the common case is one test.
+    #[inline(always)]
+    pub(crate) fn clear_native_failure(&mut self) {
+        if self.slow & Self::SLOW_COLD != 0 {
+            self.update_work(|work| {
+                work.native_bif_error = None;
+                work.native_trap = None;
+            });
+        }
+    }
+    /// Runs `f` on the slice work of the existing cold part, if any.
+    #[inline(always)]
+    pub(crate) fn update_work(&mut self, f: impl FnOnce(&mut SliceWork)) {
+        if let Some(cold) = self.cold.as_deref_mut() {
+            f(&mut cold.work);
+            let busy = cold.work.any();
+            self.set_slow(Self::SLOW_COLD, busy);
+        }
+    }
+    /// The pending BIF trap, for a change that leaves it pending.
+    #[inline(always)]
+    pub(crate) fn bif_trap_mut(&mut self) -> Option<&mut BifTrapPending> {
+        self.cold.as_deref_mut()?.bif_trap_mut()
+    }
+    /// The timer pause, for a change that leaves it in place.
+    #[inline(always)]
+    pub(crate) fn timer_pause_mut(&mut self) -> Option<&mut crate::process::TimerPause> {
+        self.cold.as_deref_mut()?.work.timer_pause.as_mut()
+    }
+    /// The pending dirty NIF, for a change that leaves it pending.
+    #[inline(always)]
+    pub(crate) fn native_dirty_nif_mut(
+        &mut self,
+    ) -> Option<&mut (usize, usize, arinsal_bifs::SchedulerClass)> {
+        self.cold.as_deref_mut()?.work.native_dirty_nif.as_mut()
+    }
+    /// Clears and returns the native `timeout` trace request.
+    #[inline(always)]
+    pub(crate) fn take_native_timeout_trace(&mut self) -> bool {
+        self.take_work(|work| std::mem::take(&mut work.native_timeout_trace).then_some(()))
+            .is_some()
+    }
+    /// Takes the delayed GC requests.
+    #[inline(always)]
+    pub(crate) fn take_delayed_gc(&mut self) -> Vec<DelayedGc> {
+        self.take_work(|work| Some(std::mem::take(&mut work.delayed_gc)))
+            .unwrap_or_default()
+    }
+    /// Removes the first signal of the middle queue.
+    #[inline(always)]
+    pub(crate) fn pop_sig_cont_signal(
+        &mut self,
+    ) -> Option<arinsal_sched::OwnedSignal<arinsal_sched::Event<crate::process::Message>>> {
+        self.sig_cont_mut().pop_front_signal()
+    }
+    /// Moves the ordinary messages of the outer queue to the middle queue through the signal
+    /// probe, leaving the probe in place. `None` without a probe.
+    #[inline(always)]
+    pub(crate) fn probe_fetch_messages(&mut self) -> Option<usize> {
+        let probe = self.signal_probe.as_ref()?;
+        let fetched =
+            probe.fetch_messages_if(|message| !message.is_altact_msg(), &mut self.sig_cont);
+        let busy = !self.sig_cont.is_empty();
+        self.set_slow(Self::SLOW_SIG_CONT, busy);
+        Some(fetched)
+    }
+    /// Moves the whole outer queue to the middle queue through the signal probe.
+    #[inline(always)]
+    pub(crate) fn probe_fetch_all(&mut self) -> bool {
+        let Some(probe) = self.signal_probe.as_ref() else {
+            return false;
+        };
+        probe.fetch_all(&mut self.sig_cont);
+        let busy = !self.sig_cont.is_empty();
+        probe.set_sig_q(busy);
+        self.set_slow(Self::SLOW_SIG_CONT, busy);
+        true
+    }
+    /// The slice work of the cold state, if a cold part exists.
+    #[inline(always)]
+    pub(crate) fn slice(&self) -> Option<&SliceWork> {
+        self.cold.as_deref().map(|cold| &cold.work)
+    }
+    /// The slice work for change; `SLOW_COLD` follows it when the guard drops.
+    #[inline(always)]
+    pub(crate) fn slice_mut(&mut self) -> SliceWorkMut<'_> {
+        if self.cold.is_none() {
+            self.allocate_cold();
+        }
+        SliceWorkMut(self)
+    }
+
     #[inline]
     pub(crate) fn cold_mut(&mut self) -> &mut ProcessCold {
         if self.cold.is_none() {
@@ -2010,6 +2327,7 @@ impl Process {
             initial_call: None,
             initial_mfa: None,
             native_pc: None,
+            slow: Self::SLOW_NOT_STARTED | Self::SLOW_NO_NATIVE_PC | Self::SLOW_NO_PROBE,
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
@@ -2451,6 +2769,59 @@ impl EtsInsert {
             Self::Check { cursor, .. } | Self::Copy { cursor, .. } => Some(cursor),
             Self::Global(_) => None,
         }
+    }
+}
+
+/// Mutable access to `Process::sig_cont`; keeps `SLOW_SIG_CONT` right on drop.
+pub(crate) struct SigContMut<'a>(&'a mut Process);
+
+impl std::ops::Deref for SigContMut<'_> {
+    type Target = arinsal_sched::SignalQueue<arinsal_sched::Event<crate::process::Message>>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0.sig_cont
+    }
+}
+impl std::ops::DerefMut for SigContMut<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.sig_cont
+    }
+}
+impl Drop for SigContMut<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let busy = !self.0.sig_cont.is_empty();
+        self.0.set_slow(Process::SLOW_SIG_CONT, busy);
+    }
+}
+
+/// Mutable access to the [`SliceWork`] of the cold part; keeps `SLOW_COLD` right on drop.
+pub(crate) struct SliceWorkMut<'a>(&'a mut Process);
+
+impl std::ops::Deref for SliceWorkMut<'_> {
+    type Target = SliceWork;
+    #[inline(always)]
+    fn deref(&self) -> &SliceWork {
+        &self.0.cold.as_deref().expect("cold part allocated").work
+    }
+}
+impl std::ops::DerefMut for SliceWorkMut<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut SliceWork {
+        &mut self
+            .0
+            .cold
+            .as_deref_mut()
+            .expect("cold part allocated")
+            .work
+    }
+}
+impl Drop for SliceWorkMut<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let busy = self.0.cold.as_deref().is_some_and(|cold| cold.work.any());
+        self.0.set_slow(Process::SLOW_COLD, busy);
     }
 }
 

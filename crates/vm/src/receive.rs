@@ -396,7 +396,7 @@ impl Process {
         // Without a middle queue the marker goes to the end of the message queue; otherwise
         // to the end of the middle queue.
         let position = self.inbox.len();
-        let in_sigq = cont.then(|| self.sig_cont_taken + self.sig_cont.len() as u64);
+        let in_sigq = cont.then(|| self.sig_cont_taken + self.sig_cont().len() as u64);
         let cold = self.cold_mut();
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4084
         // (recv_marker_uniq), OTP-29.1.1.
@@ -416,7 +416,7 @@ impl Process {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:4366
     // (erts_msgq_recv_marker_create_insert_set_save), OTP-29.1.1.
     pub(crate) fn recv_marker_create_insert_set_save(&mut self, index: Option<usize>) {
-        let index = index.unwrap_or(self.sig_cont.len());
+        let index = index.unwrap_or(self.sig_cont().len());
         let in_sigq = self.sig_cont_taken + index as u64;
         self.cold_mut()
             .receive_markers
@@ -427,7 +427,7 @@ impl Process {
     /// Whether the middle signal queue is empty (`!c_p->sig_qs.cont`): no fetched signal is
     /// unhandled and no receive marker waits there.
     pub(crate) fn sig_cont_empty(&self) -> bool {
-        self.sig_cont.is_empty()
+        self.sig_cont().is_empty()
             && self
                 .cold
                 .as_ref()

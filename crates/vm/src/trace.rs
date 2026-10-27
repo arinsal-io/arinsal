@@ -3820,7 +3820,7 @@ pub(crate) fn send_hooks_idle(process: &Process) -> bool {
             .cold
             .as_deref()
             .is_none_or(|cold| cold.saved_calls.is_none())
-        && process.signal_probe.as_ref().is_some_and(|probe| {
+        && process.signal_probe().is_some_and(|probe| {
             probe.proc_flags().load(Ordering::Relaxed) & arinsal_sched::proc_flags::TRACE == 0
         })
 }
@@ -4020,7 +4020,7 @@ pub(crate) fn running_mfa(
     // Port of erts/emulator/beam/erl_process.c:12604 (`p->current = &p->u.initial`) and
     // erl_trace.c:752-760 (trace_sched_session), OTP-29.1.1: a process that has not run yet
     // is at its initial function.
-    if !process.entry_started
+    if !process.entry_started()
         && process.module == crate::process::RUN_PROCESS
         && let Some((module, function, arity)) = process.initial_mfa
     {
@@ -4043,7 +4043,7 @@ pub(crate) fn running_mfa(
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:944-946 (c_p->current is set when a
     // process yields): a process that yielded in native code runs the function it resumes in.
     let native = process
-        .native_pc
+        .native_pc()
         .and_then(crate::native_bridge::native_function_at);
     let (module, function, arity) = if let Some(finalizer) = dirty_finalizer {
         finalizer

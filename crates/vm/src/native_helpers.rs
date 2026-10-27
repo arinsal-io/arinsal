@@ -161,8 +161,7 @@ pub extern "C" fn arinsal_beamasm_recv_marker_reserve(header: *mut ProcessHeader
     // there (or a process without a probe yet) send the instruction to the scheduler, which
     // fetches and reruns it.
     let pending = process
-        .signal_probe
-        .as_ref()
+        .signal_probe()
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if pending {
         process.native_exit_kind = crate::proc_create::NativeExit::ReserveFetch;
@@ -231,8 +230,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
         return u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH);
     }
     let pending = process
-        .signal_probe
-        .as_ref()
+        .signal_probe()
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if !pending {
         process.delay_gc = false;
@@ -256,8 +254,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // outer queue is handled by the scheduler.
     if fetched.is_ok()
         && process
-            .signal_probe
-            .as_ref()
+            .signal_probe()
             .is_some_and(|probe| !probe.has_pending())
     {
         return 0;
@@ -380,7 +377,7 @@ pub extern "C" fn arinsal_beamasm_timeout(header: *mut ProcessHeader) {
             crate::trace::save_call(process, crate::trace::SavedCall::Timeout);
         }
         if crate::trace::active() {
-            process.cold_mut().native_timeout_trace = true;
+            process.slice_mut().native_timeout_trace = true;
             process.native_exit_kind = crate::proc_create::NativeExit::TimeoutTrace;
         }
     }
@@ -750,7 +747,7 @@ fn trap_to_dirty_nif(
     class: arinsal_bifs::SchedulerClass,
     arity: u8,
 ) -> u64 {
-    process.cold_mut().native_dirty_nif = Some((identity, 0, class));
+    process.slice_mut().native_dirty_nif = Some((identity, 0, class));
     process.header.arity = arity;
     process.gc_live = usize::from(arity);
     process.header.i =
@@ -1059,7 +1056,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
     // returns the reductions left), OTP-29.1.1: FCALLS runs out and the process yields at
     // its next reduction check.
-    if process.force_yield {
+    if process.force_yield() {
         return fcalls.max(0);
     }
     // Port of erts/emulator/beam/erl_gc.c (erts_garbage_collect_nobump), OTP-29.1.1:
@@ -1443,7 +1440,7 @@ fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool)
     let reference = registers.x_reg_array[0];
     // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): a reference made on
     // this scheduler names a timer on its own wheel, which answers without any request.
-    if process.pending_signal_waiter.is_none()
+    if process.pending_signal_waiter().is_none()
         && let Some(key) = crate::signals::ref_id(reference)
         && let Some(remaining) =
             arinsal_sched::native_access_timer::<crate::process::Message>(key, cancel)
@@ -3102,7 +3099,7 @@ fn call_direct_bif(
 #[cold]
 #[inline(never)]
 fn direct_bif_error_gc(process: &mut crate::Process, arity: usize) -> bool {
-    let Some(mut parked) = process.cold_mut().native_trap.take() else {
+    let Some(mut parked) = process.take_work(|w| w.native_trap.take()) else {
         return true;
     };
     let mut args = argument_registers(process, arity);
@@ -3110,7 +3107,7 @@ fn direct_bif_error_gc(process: &mut crate::Process, arity: usize) -> bool {
         crate::calls::gc_after_native_parts(process, &mut args, None, Some(&mut parked.trap));
     parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
     process.header.exc.fvalue = parked.fvalue;
-    process.cold_mut().native_trap = Some(parked);
+    process.slice_mut().native_trap = Some(parked);
     if collected.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
         process.sync_native_header();
@@ -3628,7 +3625,7 @@ fn call_process_bif(
                 // the next call. `leave_runtime` reloads FCALLS, and the next
                 // `call_light_bif` yields when it is exhausted.
                 // Port of erl_gc.c:588-597 (`force_reschedule`), OTP-29.1.1.
-                if process.force_yield {
+                if process.force_yield() {
                     process.reductions = 0;
                     process.header.fcalls = 0;
                 }
@@ -3726,7 +3723,7 @@ fn process_bif_error(
     let fvalue = crate::native_hooks::raw(trap.reason);
     process.header.exc.freason = freason;
     process.header.exc.fvalue = fvalue;
-    process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
+    process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
         fvalue,
@@ -3950,7 +3947,7 @@ pub(crate) fn set_native_bif_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
-    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+    process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Owned {
             module: module.to_owned(),
             function: function.to_owned(),
@@ -3973,7 +3970,7 @@ pub(crate) fn set_native_bif_register_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
-    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+    process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Registers {
             module,
             function,
@@ -4000,7 +3997,7 @@ fn set_native_bif_export_error(
         return;
     }
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
-    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+    process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
         error,
         freason,
@@ -4300,8 +4297,8 @@ fn inline_bif_top(slot: u64) -> Option<crate::stacktrace::TopFrame> {
 #[inline(never)]
 fn note_owned_failure(process: &mut crate::Process) {
     // Only an owned record needs the move below; the record of an export failure stays put.
-    if !process.cold.as_ref().is_some_and(|cold| {
-        cold.native_bif_error.as_ref().is_some_and(|failure| {
+    if !process.slice().is_some_and(|work| {
+        work.native_bif_error.as_ref().is_some_and(|failure| {
             failure.freason == process.header.exc.freason
                 && failure.fvalue == process.header.exc.fvalue
                 && matches!(
@@ -4312,11 +4309,7 @@ fn note_owned_failure(process: &mut crate::Process) {
     }) {
         return;
     }
-    let Some(failure) = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.native_bif_error.take())
-    else {
+    let Some(failure) = process.take_work(|w| w.native_bif_error.take()) else {
         return;
     };
     if failure.freason == process.header.exc.freason
@@ -4329,7 +4322,7 @@ fn note_owned_failure(process: &mut crate::Process) {
     {
         crate::stacktrace::note_caught_bif_frame(process, module, function, args, &failure.error);
     }
-    process.cold_mut().native_bif_error = Some(failure);
+    process.slice_mut().native_bif_error = Some(failure);
 }
 
 /// The top frame of a BIF failure parked by the native BIF helpers, built from the live

@@ -461,7 +461,7 @@ impl Vm {
             {
                 crate::suspend::suspend_self(p);
                 // ERTS_VBUMP_ALL_REDS: leave the scheduler at the next instruction.
-                p.force_yield = true;
+                p.set_force_yield(true);
             }
             ("erts_code_purger".to_owned(), "pending_purge_lambda")
         } else {
