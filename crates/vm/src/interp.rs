@@ -1780,7 +1780,7 @@ impl Vm {
     pub(crate) fn native_entry_address(&self, module_id: usize, ip: usize) -> Option<usize> {
         let module = self.code.modules.get(module_id)?;
         let (_, function, arity) = module.functions.get(module.function_by_entry(ip)?)?;
-        let (function, arity) = (function.as_str(), *arity);
+        let (function, arity) = (*function, *arity);
         // The entry belongs to the module instance the process was spawned in; another
         // loaded version of the same module (old or current) has its own code. A module
         // loaded for the interpreter only may have native functions registered separately.
@@ -3573,8 +3573,8 @@ impl Vm {
                                 let import = &module.imports[import as usize];
                                 return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &import.module,
-                                    &import.function,
+                                    import.module,
+                                    import.function,
                                     import.module_atom,
                                     import.function_atom,
                                     &[left, right],
@@ -3635,8 +3635,8 @@ impl Vm {
                                 let import = &module.imports[import as usize];
                                 return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &import.module,
-                                    &import.function,
+                                    import.module,
+                                    import.function,
                                     import.module_atom,
                                     import.function_atom,
                                     &[left, right],
@@ -3698,8 +3698,8 @@ impl Vm {
                                 let import = &module.imports[import as usize];
                                 return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &import.module,
-                                    &import.function,
+                                    import.module,
+                                    import.function,
                                     import.module_atom,
                                     import.function_atom,
                                     &[left, value],
@@ -3762,8 +3762,8 @@ impl Vm {
                                 let import = &module.imports[import as usize];
                                 return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &import.module,
-                                    &import.function,
+                                    import.module,
+                                    import.function,
                                     import.module_atom,
                                     import.function_atom,
                                     &[left, value],

@@ -152,6 +152,36 @@ impl AtomTable {
         table
     }
 
+    /// Interns the UTF-8 names of an atom chunk in order. The names the table already has are
+    /// found under one read lock; the others are put afterwards, in order. An error names the
+    /// position of the atom the table refused.
+    // Port of erts/emulator/beam/beam_file.c (parse_atom_chunk: erts_atom_put per entry),
+    // OTP-29.1.1; the lock is taken once for the chunk instead of once per entry.
+    pub fn intern_all<'a>(
+        &self,
+        names: impl ExactSizeIterator<Item = &'a str> + Clone,
+    ) -> Result<Vec<Atom>, (usize, AtomError)> {
+        const MISSING: u32 = u32::MAX;
+        let mut atoms = Vec::with_capacity(names.len());
+        let mut missing = false;
+        {
+            let inner = self.inner.read();
+            for name in names.clone() {
+                let found = find(&inner, name.as_bytes());
+                missing |= found.is_none();
+                atoms.push(Atom(found.unwrap_or(MISSING)));
+            }
+        }
+        if missing {
+            for (index, (atom, name)) in atoms.iter_mut().zip(names).enumerate() {
+                if atom.0 == MISSING {
+                    *atom = self.intern(name).map_err(|error| (index, error))?;
+                }
+            }
+        }
+        Ok(atoms)
+    }
+
     /// Find an atom without writing to the table. `name` is UTF-8 text.
     pub fn get(&self, name: &str) -> Option<Atom> {
         self.lookup(name.as_bytes())

@@ -12,6 +12,7 @@ mod heap;
 mod identity;
 mod internal_hash;
 mod literal;
+mod literal_decode;
 mod magic;
 pub mod message;
 mod ops;
@@ -77,6 +78,7 @@ pub use heap::{
 pub use identity::{Identity, Node, set_this_node, this_node};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
+pub use literal_decode::decode_literal;
 pub use magic::{MAGIC_BIN_DATA_OFFSET, MagicRef};
 pub use native_code::{
     is_cp, is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
@@ -87,7 +89,7 @@ pub use ops::{
     loose_eq, size_object, size_object_litopt, size_object_preserving_sharing,
     size_object_preserving_sharing_after, size_shared, small_add, small_mul, small_sub,
 };
-pub use owned::{decode_literal, from_owned, to_owned};
+pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence, term_sequence_small};
 pub use record_table::{
     delete_module_record_definitions, drop_record_scope, find_record_definition_in,

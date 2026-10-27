@@ -5647,17 +5647,17 @@ pub(crate) fn bp_functions(
             continue;
         }
         for (entry, name, function_arity) in &loaded.functions {
-            if (function != "_" && name != function)
+            if (function != "_" && *name != function)
                 || arity.is_some_and(|requested| requested != *function_arity)
             {
                 continue;
             }
-            let key = (loaded.name.clone(), name.clone(), *function_arity);
+            let key = (loaded.name.clone(), (*name).to_owned(), *function_arity);
             let index = functions.len();
             positions.insert(key, index);
             functions.push(crate::trace_bp::BpFunction {
                 module: loaded.name.clone(),
-                function: name.clone(),
+                function: (*name).to_owned(),
                 arity: *function_arity,
                 entry: entry + 1,
                 exported: loaded

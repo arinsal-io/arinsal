@@ -102,10 +102,10 @@ pub enum ImportClass {
 
 /// Resolved external call.
 pub struct Import {
-    /// Module name.
-    pub module: String,
-    /// Function name.
-    pub function: String,
+    /// Module name: the text of `module_atom`.
+    pub module: &'static str,
+    /// Function name: the text of `function_atom`.
+    pub function: &'static str,
     /// Module atom resolved while loading the BEAM import.
     pub module_atom: Atom,
     /// Function atom resolved while loading the BEAM import.
@@ -132,8 +132,8 @@ pub struct Import {
 impl Clone for Import {
     fn clone(&self) -> Self {
         Self {
-            module: self.module.clone(),
-            function: self.function.clone(),
+            module: self.module,
+            function: self.function,
             module_atom: self.module_atom,
             function_atom: self.function_atom,
             arity: self.arity,
@@ -289,10 +289,10 @@ pub enum FastBif {
 
 /// A replaceable export target for future hot code loading.
 pub struct ExportSlot {
-    /// Module name.
-    pub module: String,
-    /// Function name.
-    pub function: String,
+    /// Module name: the text of `module_atom`.
+    pub module: &'static str,
+    /// Function name: the text of `function_atom`.
+    pub function: &'static str,
     /// Arity.
     pub arity: u8,
     /// Module atom index used by the VM export table.
@@ -433,13 +433,13 @@ pub struct Module {
     /// Reason for each explicit unsupported opcode.
     pub unsupported_reasons: Vec<String>,
     /// Function names and arities at their `func_info` instruction offsets.
-    pub functions: Vec<(usize, String, u8)>,
+    pub functions: Vec<(usize, &'static str, u8)>,
     /// Function atoms parallel to `functions`.
     pub function_atoms: Vec<Atom>,
     /// Functions whose code starts with `nif_start`: the stubs `erlang:load_nif/2` may bind.
     /// `None` when the module has no `nif_start` at all, in which case any function may.
     // Port of erts `BeamCodeHeader.are_nifs` (erts/emulator/beam/beam_code.h:127), OTP-29.1.1.
-    pub nif_stubs: Option<Vec<(String, u8)>>,
+    pub nif_stubs: Option<Vec<(&'static str, u8)>>,
     /// The NIF body bound to each function of `functions` (an index into the node's native
     /// function table), or [`NO_NIF_BODY`]. Written by the loader for static NIFs and by
     /// `load_nif`; `Instr::NativeBody` mirrors it for the interpreter flavor.
@@ -779,7 +779,8 @@ impl Module {
         self._literals.clone()
     }
 
-    /// The literal-area term of BEAM literal `index`, if an instruction of the module uses it.
+    /// The literal-area term of BEAM literal `index` (every literal of the file is decoded when
+    /// the module is loaded, as `beamfile_read` does).
     pub fn literal_term(&self, index: u32) -> Option<Term> {
         self.literal_terms.get(&index).copied()
     }
@@ -879,7 +880,7 @@ impl Module {
             .iter()
             .rev()
             .find(|(start, _, _)| *start <= ip)
-            .map(|(_, name, arity)| (name.as_str(), *arity))
+            .map(|(_, name, arity)| (*name, *arity))
     }
     /// The ordinal in `functions` of the function whose entry is code offset `entry`.
     pub fn function_by_entry(&self, entry: usize) -> Option<usize> {
@@ -1289,7 +1290,7 @@ pub fn load_with_options(
         *target = remap(*target);
     }
     // ---- vm_funs ----
-    let funs = funs::load_funs(file, &labels)?;
+    let funs = funs::load_funs(file, Some(&labels))?;
     let mut imports = build_imports(file)?;
     let has_debug_line = debugger_lines
         && file
@@ -1303,8 +1304,8 @@ pub fn load_with_options(
             bif: None,
             fast: FastBif::None,
             fast_op: ImportFastOp::None,
-            module: "erts_internal".into(),
-            function: "breakpoint".into(),
+            module: "erts_internal",
+            function: "breakpoint",
             module_atom: global_atoms()
                 .intern("erts_internal")
                 .map_err(|_| LoadError::Atom("erts_internal".into()))?,
@@ -1342,8 +1343,8 @@ pub fn load_with_options(
     let mut current_line = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
-    let mut functions: Vec<(usize, String, u8)> = Vec::new();
-    let mut nif_stubs: Option<Vec<(String, u8)>> = None;
+    let mut functions: Vec<(usize, &'static str, u8)> = Vec::new();
+    let mut nif_stubs: Option<Vec<(&'static str, u8)>> = None;
     let mut function_atoms = Vec::new();
     let mut debug_line_points = Vec::new();
     let mut debug_line_items = Vec::new();
@@ -1385,14 +1386,14 @@ pub fn load_with_options(
         if instruction.op == Opcode::NifStart {
             let stubs = nif_stubs.get_or_insert_with(Vec::new);
             if let Some((_, name, arity)) = functions.last() {
-                stubs.push((name.clone(), *arity));
+                stubs.push((*name, *arity));
             }
             continue;
         }
         if file.module == "erts_internal"
             && instruction.op == Opcode::CallExtOnly
             && let Some((function_ip, function, 3)) = functions.last()
-            && function == "notify_breakpoint_hit"
+            && *function == "notify_breakpoint_hit"
             && let Some(Operand::U(import_index)) = instruction.args.get(1)
             && file
                 .imports
@@ -1409,8 +1410,8 @@ pub fn load_with_options(
                 bif: None,
                 fast: FastBif::None,
                 fast_op: ImportFastOp::None,
-                module: "erts_internal".into(),
-                function: "notify_breakpoint_hit".into(),
+                module: "erts_internal",
+                function: "notify_breakpoint_hit",
                 module_atom: global_atoms()
                     .intern("erts_internal")
                     .map_err(|_| LoadError::Atom("erts_internal".into()))?,
@@ -1509,10 +1510,7 @@ pub fn load_with_options(
                     .intern("?")
                     .map_err(|_| LoadError::Atom("?".into()))?,
             };
-            let name = global_atoms()
-                .text(function_atom)
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| "?".into());
+            let name = global_atoms().text(function_atom).unwrap_or("?");
             functions.push((code.len(), name, args[2].value() as u8));
             function_atoms.push(function_atom);
         }
@@ -1852,57 +1850,34 @@ pub fn load_with_options(
     })
 }
 
-/// The module of a function-only form, for code that runs natively: all its tables (functions,
-/// exports, imports, lines, literals, NIF stubs), taken from the chunk tables and the code
-/// summary, with two placeholder instructions per function (its `func_info` and its entry) in
-/// place of its instructions, which the loader never decodes. erts has no other form of a
-/// module: its code goes from `beamfile_read` through the transform engine to the emitter.
+/// What the emitter found out about one function: the facts [`Module::finish_native`] builds the
+/// function table, the exports and the lambda targets from.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeFunction {
+    /// The global atom of the function name.
+    pub atom: Atom,
+    /// Function arity.
+    pub arity: u8,
+    /// The entry label: the label that follows the function's `func_info`.
+    pub entry_label: u32,
+    /// Whether a `nif_start` follows the entry label.
+    pub nif_stub: bool,
+}
+
+/// The tables of a function-only module, before its code is emitted: the atoms, literals,
+/// lambdas, imports and records that `beam_load_prepare_emit` and `beamfile_read` of erts have
+/// built when `load_code` starts. The function table, the exports and the lambda targets come
+/// from [`Module::finish_native`], once the emitter has seen the functions
+/// (`beam_load_finalize_code`). erts has no other form of a module: its code goes from
+/// `beamfile_read` through the transform engine to the emitter.
 pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
     // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
     let atom_ids = file_atoms(file)?;
     let name_atom = Atom(atom_ids[0]);
     let (mut literals, literal_terms) = decode_literals(file)?;
-    let summary = &file.summary.functions;
-    let mut labels = HashMap::with_capacity(summary.len());
-    let mut functions = Vec::with_capacity(summary.len());
-    let mut function_atoms = Vec::with_capacity(summary.len());
-    let mut nif_stubs: Option<Vec<(String, u8)>> = None;
-    for function in summary {
-        let name = file
-            .atom(function.function_atom)
-            .ok_or(LoadError::Index("atom", function.function_atom))?;
-        let atom = Atom(atom_ids[function.function_atom as usize - 1]);
-        let arity = u8::try_from(function.arity).map_err(|_| LoadError::Limit)?;
-        // A native-only module has no instruction stream; a function is named by the virtual
-        // offset of its `func_info` slot, two per function, and its entry is the one after.
-        let start = 2 * functions.len();
-        functions.push((start, name.to_owned(), arity));
-        function_atoms.push(atom);
-        if function.nif_stub {
-            nif_stubs
-                .get_or_insert_with(Vec::new)
-                .push((name.to_owned(), arity));
-        }
-        // The entry label is the label after the `func_info`: it names the instruction after
-        // the function's `func_info` slot.
-        labels.insert(function.entry_label, start + 1);
-    }
-    if 2 * functions.len() > u32::MAX as usize {
-        return Err(LoadError::Limit);
-    }
-    let funs = funs::load_funs(file, &labels)?;
+    let funs = funs::load_funs(file, None)?;
     let mut imports = build_imports(file)?;
     let debug_breakpoint_import = push_breakpoint_import(&mut imports)?;
-    let exports = build_exports(file, &labels)?;
-    let export_atoms = exports
-        .iter()
-        .enumerate()
-        .map(|(index, export)| ((export.function_atom, export.arity), index))
-        .collect();
-    let export_entry_targets = exports
-        .iter()
-        .map(|export| export.target())
-        .collect::<Vec<_>>();
     // The file names of the line table, as the terms stack traces carry.
     let mut line_file_terms = HashMap::new();
     if let Some(table) = &file.lines {
@@ -1923,23 +1898,18 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
             }
         }
     }
-    let code: Box<[Instr]> = Box::new([]);
-    for export in &exports {
-        export.bind_code(code.as_ptr(), code.len());
-    }
     let record_defs = build_record_defs(file, name_atom, &mut literals)?;
-    let function_count = functions.len();
     Ok(Module {
         name: file.module.clone(),
         name_atom,
         records: file.records.clone(),
         record_defs,
-        code,
+        code: Box::new([]),
         generic: Vec::new(),
         selects: Vec::new(),
         imports,
-        exports,
-        export_atoms,
+        exports: Vec::new(),
+        export_atoms: HashMap::new(),
         tails: Vec::new(),
         lists: Vec::new(),
         bit_commands: Vec::new(),
@@ -1950,10 +1920,10 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         line_terms: LineRuns::default(),
         unsupported: HashMap::new(),
         unsupported_reasons: Vec::new(),
-        functions,
-        function_atoms,
-        nif_stubs,
-        nif_bodies: unbound_nif_bodies(function_count),
+        functions: Vec::new(),
+        function_atoms: Vec::new(),
+        nif_stubs: None,
+        nif_bodies: unbound_nif_bodies(0),
         on_entry_fn: Box::new([]),
         entry_arity: Box::new([]),
         breakpoint_originals: HashMap::new(),
@@ -1961,7 +1931,7 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         return_call_acc_trace_ip: 0,
         return_to_trace_ip: 0,
         export_breakpoint_base: 0,
-        export_entry_targets: export_entry_targets.into_boxed_slice(),
+        export_entry_targets: Box::new([]),
         coverage: None,
         coverage_probes: Vec::new(),
         line_breakpoints_supported: false,
@@ -1974,23 +1944,85 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
     })
 }
 
+impl Module {
+    /// Whether this module came from [`load_native`] and still awaits
+    /// [`finish_native`](Self::finish_native).
+    pub fn awaits_native_functions(&self) -> bool {
+        self.code.is_empty() && self.functions.is_empty()
+    }
+
+    /// Completes the module that [`load_native`] began with what the emitter found: the function
+    /// table, the NIF stubs, the exports and the targets of the lambdas.
+    // Port of erts/emulator/beam/jit/asm_load.c:1177-1260 (beam_load_finalize_code: the code
+    // header's function table, then `erts_export_put` per export), OTP-29.1.1.
+    pub fn finish_native(
+        &mut self,
+        file: &BeamFile,
+        found: &[NativeFunction],
+    ) -> Result<(), LoadError> {
+        if 2 * found.len() > u32::MAX as usize {
+            return Err(LoadError::Limit);
+        }
+        let mut labels = HashMap::with_capacity(found.len());
+        let mut functions = Vec::with_capacity(found.len());
+        let mut function_atoms = Vec::with_capacity(found.len());
+        let mut nif_stubs: Option<Vec<(&'static str, u8)>> = None;
+        for function in found {
+            let name = global_atoms()
+                .text(function.atom)
+                .ok_or(LoadError::Index("atom", function.atom.0))?;
+            // A native-only module has no instruction stream; a function is named by the
+            // virtual offset of its `func_info` slot, two per function, and its entry is the one
+            // after.
+            let start = 2 * functions.len();
+            functions.push((start, name, function.arity));
+            function_atoms.push(function.atom);
+            if function.nif_stub {
+                nif_stubs
+                    .get_or_insert_with(Vec::new)
+                    .push((name, function.arity));
+            }
+            labels.insert(function.entry_label, start + 1);
+        }
+        for (slot, lambda) in self.funs.iter_mut().zip(&file.lambdas) {
+            slot.target = *labels
+                .get(&lambda.label)
+                .ok_or(LoadError::Index("label", lambda.label))?;
+        }
+        let exports = build_exports(file, &labels)?;
+        self.export_atoms = exports
+            .iter()
+            .enumerate()
+            .map(|(index, export)| ((export.function_atom, export.arity), index))
+            .collect();
+        self.export_entry_targets = exports
+            .iter()
+            .map(|export| export.target())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        for export in &exports {
+            export.bind_code(self.code.as_ptr(), self.code.len());
+        }
+        self.exports = exports;
+        self.nif_bodies = unbound_nif_bodies(functions.len());
+        self.functions = functions;
+        self.function_atoms = function_atoms;
+        self.nif_stubs = nif_stubs;
+        Ok(())
+    }
+}
+
 /// Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals), OTP-29.1.1: the
 /// literal chunk is decoded in index order right after the atom chunk, so atoms first seen in
 /// literals get erts' table indices.
 pub(crate) fn decode_literals(file: &BeamFile) -> Result<(VecHeap, HashMap<u32, Term>), LoadError> {
     let mut literals = VecHeap::new_literal();
-    let mut literal_terms = HashMap::new();
+    let mut literal_terms = HashMap::with_capacity(file.literals.len());
     for (index, raw) in file.literals.iter().enumerate() {
-        // The common kinds go straight onto the literal heap; anything else, and anything
-        // malformed, takes the general decoder.
-        if let Some(term) = arinsal_term::decode_literal(&raw.0, &mut literals) {
-            literal_terms.insert(index as u32, term);
-            continue;
-        }
-        let Ok(owned) = file.literal(index as u32) else {
-            continue;
-        };
-        let term = from_owned(&owned, &mut literals).map_err(|_| LoadError::Limit)?;
+        // A literal that does not decode fails the load, as `LoadAssert(!is_non_value(value))`
+        // does in erts.
+        let term = arinsal_term::decode_literal(&raw.0, &mut literals)
+            .ok_or(LoadError::Index("literal", index as u32))?;
         literal_terms.insert(index as u32, term);
     }
     Ok((literals, literal_terms))
@@ -1999,11 +2031,11 @@ pub(crate) fn decode_literals(file: &BeamFile) -> Result<(VecHeap, HashMap<u32, 
 /// The global atom of each entry of the atom table of `file`, put once per file.
 // Port of erts/emulator/beam/beam_file.c (parse_atom_chunk), OTP-29.1.1.
 pub fn file_atoms(file: &BeamFile) -> Result<&[u32], LoadError> {
-    file.resolved_atoms(|name| {
+    file.resolved_atoms(|names| {
         global_atoms()
-            .intern(name)
-            .map(|atom| atom.0)
-            .map_err(|_| LoadError::Atom(name.to_owned()))
+            .intern_all(names.iter())
+            .map(|atoms| atoms.into_iter().map(|atom| atom.0).collect())
+            .map_err(|(index, _)| LoadError::Atom(names.get(index).unwrap_or_default().to_owned()))
     })
 }
 
@@ -2013,19 +2045,28 @@ pub(crate) fn build_imports(file: &BeamFile) -> Result<Vec<Import>, LoadError> {
     file.imports
         .iter()
         .map(|item| {
-            let module = file
-                .atom(item.module_atom)
-                .ok_or(LoadError::Index("atom", item.module_atom))?
-                .to_owned();
-            let function = file
-                .atom(item.function_atom)
-                .ok_or(LoadError::Index("atom", item.function_atom))?
-                .to_owned();
+            let module_atom = Atom(
+                *atom_ids
+                    .get(item.module_atom as usize - 1)
+                    .ok_or(LoadError::Index("atom", item.module_atom))?,
+            );
+            let function_atom = Atom(
+                *atom_ids
+                    .get(item.function_atom as usize - 1)
+                    .ok_or(LoadError::Index("atom", item.function_atom))?,
+            );
+            // The names are the text of the atoms the file's table put.
+            let module = global_atoms()
+                .text(module_atom)
+                .ok_or(LoadError::Index("atom", item.module_atom))?;
+            let function = global_atoms()
+                .text(function_atom)
+                .ok_or(LoadError::Index("atom", item.function_atom))?;
             Ok(Import {
-                bif: arinsal_bifs::lookup(&module, &function, item.arity as u8),
-                module_atom: Atom(atom_ids[item.module_atom as usize - 1]),
-                function_atom: Atom(atom_ids[item.function_atom as usize - 1]),
-                fast: match (module.as_str(), function.as_str(), item.arity) {
+                bif: arinsal_bifs::lookup(module, function, item.arity as u8),
+                module_atom,
+                function_atom,
+                fast: match (module, function, item.arity) {
                     ("erlang", "+", 2) => FastBif::Add,
                     ("erlang", "-", 2) => FastBif::Sub,
                     ("erlang", "*", 2) => FastBif::Mul,
@@ -2036,7 +2077,7 @@ pub(crate) fn build_imports(file: &BeamFile) -> Result<Vec<Import>, LoadError> {
                     ("erlang", "bsr", 2) => FastBif::Bsr,
                     _ => FastBif::None,
                 },
-                fast_op: match (module.as_str(), function.as_str(), item.arity) {
+                fast_op: match (module, function, item.arity) {
                     ("erlang", "element", 2) => ImportFastOp::Element,
                     ("erlang", "setelement", 3) => ImportFastOp::SetElement,
                     ("erlang", "rem", 2) => ImportFastOp::Rem,
@@ -2082,8 +2123,8 @@ pub(crate) fn push_breakpoint_import(imports: &mut Vec<Import>) -> Result<u32, L
         bif: None,
         fast: FastBif::None,
         fast_op: ImportFastOp::None,
-        module: "error_handler".into(),
-        function: "breakpoint".into(),
+        module: "error_handler",
+        function: "breakpoint",
         module_atom: global_atoms()
             .intern("error_handler")
             .map_err(|_| LoadError::Atom("error_handler".into()))?,
@@ -2112,18 +2153,21 @@ pub(crate) fn build_exports(
     file.exports
         .iter()
         .map(|item| {
-            let function = file
-                .atom(item.function_atom)
-                .ok_or(LoadError::Index("atom", item.function_atom))?
-                .to_owned();
             let target = *labels
                 .get(&item.label)
                 .ok_or(LoadError::Index("label", item.label))?;
             let module_atom = Atom(atom_ids[0]);
-            let function_atom = Atom(atom_ids[item.function_atom as usize - 1]);
+            let function_atom = Atom(
+                *atom_ids
+                    .get(item.function_atom as usize - 1)
+                    .ok_or(LoadError::Index("atom", item.function_atom))?,
+            );
+            let names = global_atoms();
             Ok(Arc::new(ExportSlot {
-                module: file.module.clone(),
-                function,
+                module: names.text(module_atom).ok_or(LoadError::Index("atom", 1))?,
+                function: names
+                    .text(function_atom)
+                    .ok_or(LoadError::Index("atom", item.function_atom))?,
                 arity: item.arity as u8,
                 module_atom,
                 function_atom,

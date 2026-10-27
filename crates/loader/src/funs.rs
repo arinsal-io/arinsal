@@ -115,9 +115,11 @@ pub fn beamfile_chunk(bytes: &[u8], chunk_id: [u8; 4]) -> Result<Option<Vec<u8>>
     Ok(None)
 }
 
+/// The lambda table. `labels` maps entry labels to code indexes; a module whose code is not
+/// emitted yet passes `None` and gets the targets later (`Module::finish_native`).
 pub(crate) fn load_funs(
     file: &BeamFile,
-    labels: &HashMap<u32, usize>,
+    labels: Option<&HashMap<u32, usize>>,
 ) -> Result<Vec<FunSlot>, LoadError> {
     let module = global_atoms()
         .intern(&file.module)
@@ -128,9 +130,12 @@ pub(crate) fn load_funs(
         let free = usize::try_from(lambda.num_free).map_err(|_| LoadError::Limit)?;
         let arity = total.checked_sub(free).ok_or(LoadError::Limit)?;
         let arity = u8::try_from(arity).map_err(|_| LoadError::Limit)?;
-        let target = *labels
-            .get(&lambda.label)
-            .ok_or(LoadError::Index("label", lambda.label))?;
+        let target = match labels {
+            Some(labels) => *labels
+                .get(&lambda.label)
+                .ok_or(LoadError::Index("label", lambda.label))?,
+            None => 0,
+        };
         slots.push(FunSlot {
             entry: Arc::new(FunEntry {
                 dispatch_target: Default::default(),

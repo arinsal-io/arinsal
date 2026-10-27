@@ -84,6 +84,8 @@ dependencies = [
  "arinsal-beamasm",
  "arinsal-beamops",
  "arinsal-etf",
+ "arinsal-spec",
+ "smallvec",
  "thiserror",
 ]
 

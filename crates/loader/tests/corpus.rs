@@ -54,7 +54,7 @@ fn otp_and_elixir_corpus_loads() {
         for (index, (_, name, _)) in module.functions.iter().enumerate() {
             assert_eq!(
                 arinsal_term::global_atoms().text(module.function_atoms[index]),
-                Some(name.as_str()),
+                Some(*name),
                 "cached function atom for {}",
                 path.display()
             );

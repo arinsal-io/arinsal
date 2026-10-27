@@ -704,3 +704,69 @@ fn map_fragments(
         arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
     ))
 }
+
+/// What the emitter reports of the functions (names, arities, entry labels, NIF stubs and the
+/// `-on_load` function) is what the decoded instructions give: the module code header of erts
+/// (`are_nifs`, `on_load`) is built from the same operations.
+#[test]
+fn emitter_reports_functions_entry_labels_nif_stubs_and_on_load() {
+    use arinsal_spec::Opcode;
+    if !cfg!(target_arch = "aarch64") {
+        eprintln!("native bridge test requires AArch64");
+        return;
+    }
+    let bytes = erlc_fixture("emit_facts.erl");
+    let compiled = compile_module_with_env(&bytes, &TestEnv).unwrap();
+    let beam = arinsal_beam::parse(&bytes).unwrap();
+    let mut expected: Vec<(String, u32, u32, bool)> = Vec::new();
+    let mut on_load = None;
+    let mut after_info = false;
+    for instruction in &beam.code.instructions {
+        match instruction.op {
+            Opcode::FuncInfo => {
+                let (
+                    Some(arinsal_beam::Operand::Atom(name)),
+                    Some(arinsal_beam::Operand::U(arity)),
+                ) = (instruction.args.get(1), instruction.args.get(2))
+                else {
+                    panic!("func_info operands");
+                };
+                expected.push((
+                    beam.atom(*name).unwrap().to_owned(),
+                    *arity as u32,
+                    0,
+                    false,
+                ));
+                after_info = true;
+            }
+            Opcode::Label if after_info => {
+                if let Some(arinsal_beam::Operand::U(label)) = instruction.args.first() {
+                    expected.last_mut().unwrap().2 = *label as u32;
+                }
+                after_info = false;
+            }
+            Opcode::NifStart => expected.last_mut().unwrap().3 = true,
+            Opcode::OnLoad => on_load = expected.len().checked_sub(1),
+            _ => {}
+        }
+    }
+    let found: Vec<_> = compiled
+        .functions
+        .iter()
+        .map(|function| {
+            (
+                function.name.to_owned(),
+                u32::from(function.arity),
+                function.entry_label,
+                function.nif_stub,
+            )
+        })
+        .collect();
+    assert_eq!(found, expected);
+    assert_eq!(compiled.on_load, on_load);
+    assert!(on_load.is_some(), "the fixture has an on_load function");
+    assert!(
+        expected.iter().any(|function| function.3),
+        "the fixture has a NIF stub"
+    );
+}

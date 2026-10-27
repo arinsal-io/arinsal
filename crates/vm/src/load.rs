@@ -172,16 +172,38 @@ pub(crate) struct CodeTables {
 }
 
 fn bind_import_targets(module: &mut Module) {
-    for import in &mut module.imports {
+    bind_import_targets_of(module, &[]);
+}
+
+/// [`bind_import_targets`] for a module whose imports to MFAs the node's export table knows
+/// already (`known`, by import) keep what the table has.
+fn bind_import_targets_of(
+    module: &mut Module,
+    known: &[Option<(arinsal_loader::ImportClass, usize, bool)>],
+) {
+    for (index, import) in module.imports.iter_mut().enumerate() {
+        if let Some(&Some((class, bits, traps))) = known.get(index) {
+            if bits != 0 {
+                import.set_native_bits(bits);
+            }
+            import.set_class(class);
+            if class == arinsal_loader::ImportClass::Pure
+                && import.fast_op == arinsal_loader::ImportFastOp::None
+                && traps
+            {
+                import.fast_op = arinsal_loader::ImportFastOp::Trapping;
+            }
+            continue;
+        }
         if import.bif.is_none()
             && let Some(bif) =
-                natives::plain_static_nif_lookup(&import.module, &import.function, import.arity)
+                natives::plain_static_nif_lookup(import.module, import.function, import.arity)
         {
             import.set_extra_bif(bif);
         }
         let (class, bits) = natives::classify(
-            &import.module,
-            &import.function,
+            import.module,
+            import.function,
             import.arity,
             import.bif_fn().is_some(),
         );
@@ -193,19 +215,17 @@ fn bind_import_targets(module: &mut Module) {
         import.set_class(class);
         if class == arinsal_loader::ImportClass::Pure
             && import.fast_op == arinsal_loader::ImportFastOp::None
-            && crate::bif_traps::traps(&import.module, &import.function, import.arity)
+            && crate::bif_traps::traps(import.module, import.function, import.arity)
         {
             import.fast_op = arinsal_loader::ImportFastOp::Trapping;
         }
     }
 }
 
-fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) {
-    // Classify every import before the module is shared, including modules
-    // that have no static NIF body.
-    bind_import_targets(module);
-    if !matches!(
-        module.name.as_str(),
+/// The modules whose NIFs are in this runtime (`erl_nif.c` `erts_load_static_nif`).
+pub(crate) fn static_nif_module(name: &str) -> bool {
+    matches!(
+        name,
         "prim_file"
             | "prim_buffer"
             | "zlib"
@@ -215,18 +235,28 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
             | "prim_net"
             | "re"
             | "erts_debug"
-    ) {
+    )
+}
+
+/// The static NIF of a function of a module in [`static_nif_module`].
+fn static_nif_body(module: &str, function: &str, arity: u8) -> Option<arinsal_bifs::BifFn> {
+    natives::static_nif_lookup(module, function, arity).or_else(|| {
+        (module == "erts_debug")
+            .then(|| arinsal_bifs::lookup(module, function, arity))
+            .flatten()
+    })
+}
+
+fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) {
+    // Classify every import before the module is shared, including modules
+    // that have no static NIF body.
+    bind_import_targets(module);
+    if !static_nif_module(&module.name) {
         arinsal_loader::specialize_bif_calls(module);
         return;
     }
     for (ordinal, (entry, function, arity)) in module.functions.iter().enumerate() {
-        let Some(native) =
-            natives::static_nif_lookup(&module.name, function, *arity).or_else(|| {
-                (module.name == "erts_debug")
-                    .then(|| arinsal_bifs::lookup(&module.name, function, *arity))
-                    .flatten()
-            })
-        else {
+        let Some(native) = static_nif_body(&module.name, function, *arity) else {
             continue;
         };
         let Some(index) = code_ix.push_native_fn(crate::natives::nif::NativeFn::Bif(native)) else {
@@ -238,6 +268,22 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
         }
     }
     arinsal_loader::specialize_bif_calls(module);
+}
+
+/// [`bind_static_nifs`] for a module whose functions the emitter has just found: no code to
+/// patch, the NIF bodies only.
+pub(crate) fn bind_native_static_nifs(module: &Module, code_ix: &crate::code_ix::CodeIndexes) {
+    if !static_nif_module(&module.name) {
+        return;
+    }
+    for (ordinal, (_, function, arity)) in module.functions.iter().enumerate() {
+        let Some(native) = static_nif_body(&module.name, function, *arity) else {
+            continue;
+        };
+        if let Some(index) = code_ix.push_native_fn(crate::natives::nif::NativeFn::Bif(native)) {
+            module.set_nif_body(ordinal, index);
+        }
+    }
 }
 #[derive(Clone)]
 pub(crate) struct CodeMeta {
@@ -281,18 +327,20 @@ pub(crate) fn native_code_contains(
     })
 }
 impl CodeMeta {
+    /// Takes the `-on_load` function from the decoded instructions. OTP encodes -on_load as a
+    /// Code instruction following that function's label. A module that is not decoded learns
+    /// it when it is emitted (`compile_native`).
+    pub(crate) fn note_decoded_on_load(&mut self) {
+        self.on_load = self.beam.code.on_load.and_then(|(name, arity)| {
+            Some((self.beam.atom(name)?.to_owned(), u8::try_from(arity).ok()?))
+        });
+    }
+
     /// The metadata of a module that takes over its parsed file.
     pub(crate) fn from_beam_owned(beam: BeamFile, bytes: Option<&[u8]>) -> Self {
-        // OTP encodes -on_load as a Code instruction following that function's label; the code
-        // summary found the function it follows.
-        let on_load = beam.summary.on_load.and_then(|index| {
-            let function = beam.summary.functions.get(index)?;
-            let name = beam.atom(function.function_atom)?.to_owned();
-            Some((name, u8::try_from(function.arity).ok()?))
-        });
         Self {
             md5: bytes.and_then(|bytes| arinsal_loader::module_uniq(bytes).ok()),
-            on_load,
+            on_load: None,
             has_beam_bytes: bytes.is_some(),
             beamasm: None,
             beam,
@@ -887,7 +935,14 @@ impl Vm {
             };
             funs::set_module_uniq(&mut module, uniq);
         }
-        bind_static_nifs(&mut module, &self.code_ix);
+        if specialize {
+            bind_static_nifs(&mut module, &self.code_ix);
+        } else {
+            // The functions of a module that is not emitted yet are not known: its NIF bodies
+            // are bound after the emitter has found them (`bind_native_static_nifs`).
+            let known = beamasm_integration::known_imports(self.code_scope, &module.imports);
+            bind_import_targets_of(&mut module, &known);
+        }
         Ok(module)
     }
 
@@ -915,7 +970,13 @@ impl Vm {
             module,
             self.code_scope,
             crate::trace_bp::line_breakpoints_instrumented(),
+            &self.code_ix,
         ) {
+            // Port of erts/emulator/beam/jit/asm_load.c:1020 (stp->on_load = beamasm_get_on_load):
+            // the emitter found the function.
+            if meta.on_load.is_none() {
+                meta.on_load = native.on_load.clone();
+            }
             meta.beamasm = Some(native);
         }
     }
@@ -951,8 +1012,9 @@ impl Vm {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
         let mut module = self.prepare_module(&beam, Some(bytes))?;
         let name = module.name.clone();
-        let registers = (beam.summary.x_registers, beam.summary.float_registers);
+        let registers = (beam.code.x_registers, beam.code.float_registers);
         let mut meta = CodeMeta::from_beam_owned(beam, Some(bytes));
+        meta.note_decoded_on_load();
         let staging = self.code_ix.start_staging();
         let mut released = None;
         staging.with(|tables| {
@@ -1044,12 +1106,10 @@ impl Vm {
             meta.beam
                 .decode_code()
                 .map_err(|e| VmError::Load(e.to_string()))?;
+            meta.note_decoded_on_load();
         }
         let mut module = self.prepare_module_with(&meta.beam, bytes, meta.md5, !native_only)?;
-        let registers = (
-            meta.beam.summary.x_registers,
-            meta.beam.summary.float_registers,
-        );
+        let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
         let staging = self.code_ix.start_staging();
         // Another scheduler may have loaded the module since this one looked.
         if let Some(id) = staging.with(|tables| tables.loaded.get(&module_name).copied()) {
@@ -1250,7 +1310,7 @@ impl Vm {
     pub(crate) fn patch_trace_functions(
         &mut self,
         module_id: usize,
-        targets: &[(usize, String, u8)],
+        targets: &[(usize, &str, u8)],
         process: &Process,
     ) {
         let Some(module) = self.code.modules.get(module_id).cloned() else {
@@ -1272,13 +1332,13 @@ impl Vm {
                 )
                 .is_some()
             {
-                native_patches.push((function.as_str(), *arity, local));
+                native_patches.push((*function, *arity, local));
             }
             if module.breakpoint_originals.contains_key(entry) != local {
                 local_patches.push((*entry, local));
             }
             global_patches.push((
-                function.as_str(),
+                *function,
                 *arity,
                 global,
                 global || crate::trace_bp::any_breakpoint(process, &module.name, function, *arity),
@@ -1296,14 +1356,14 @@ impl Vm {
             .collect::<HashMap<_, _>>();
         for (index, export) in module.exports.iter().enumerate() {
             if let Some(&(global, bif_traced)) =
-                global_patches.get(&(export.function.as_str(), export.arity))
+                global_patches.get(&(export.function, export.arity))
             {
                 module.set_global_trace_breakpoint(index, global);
                 exports_retargeted = true;
                 crate::beamasm_integration::set_global_breakpoint(
                     self.code_scope,
                     &module.name,
-                    &export.function,
+                    export.function,
                     export.arity,
                     export.target(),
                     global,
@@ -1369,6 +1429,10 @@ impl Vm {
             }
         }
         for (module_id, functions) in by_module {
+            let functions = functions
+                .iter()
+                .map(|(entry, function, arity)| (*entry, function.as_str(), *arity))
+                .collect::<Vec<_>>();
             self.patch_trace_functions(module_id, &functions, process);
         }
     }
@@ -1391,10 +1455,10 @@ impl Vm {
                     .functions
                     .iter()
                     .filter(|(_, function, function_arity)| {
-                        (function_name == "_" || function == function_name)
+                        (function_name == "_" || *function == function_name)
                             && arity.is_none_or(|arity| arity == *function_arity)
                     })
-                    .map(|(start, function, arity)| (start + 1, function.clone(), *arity))
+                    .map(|(start, function, arity)| (start + 1, *function, *arity))
                     .collect::<Vec<_>>();
                 (module_id, functions)
             })
@@ -1414,7 +1478,7 @@ impl Vm {
                 let functions = module
                     .functions
                     .iter()
-                    .map(|(start, function, arity)| (start + 1, function.clone(), *arity))
+                    .map(|(start, function, arity)| (start + 1, *function, *arity))
                     .collect::<Vec<_>>();
                 (module_id, functions)
             })
@@ -1441,7 +1505,8 @@ impl Vm {
             let Ok(beam) = arinsal_beam::read(&bytes) else {
                 continue;
             };
-            return beam.summary.on_load.is_some();
+            return arinsal_beam::scan(&beam.code.bytes, beam.code.max_opcode)
+                .is_ok_and(|found| found.on_load);
         }
         false
     }
@@ -1479,7 +1544,7 @@ impl Vm {
             module
                 .functions
                 .iter()
-                .find(|(_, name, found)| name == function && *found == arity)
+                .find(|(_, name, found)| *name == function && *found == arity)
                 .map(|(start, _, _)| start + 1)
         })
     }

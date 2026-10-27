@@ -1492,14 +1492,19 @@ pub static PORTED_OPS: &[PortedOp] = &[
 
 /// A successfully compiled BEAM function.
 pub struct CompiledFunction {
-    /// Function name from the BEAM function metadata.
-    pub name: String,
+    /// Function name: the text of `atom`.
+    pub name: &'static str,
     /// Function arity.
     pub arity: u8,
-    /// Entry label in the source module.
+    /// The label of its `func_info` in the source module (`i_func_label`).
     pub label: u32,
-    /// One-based atom table index of the function name.
-    pub atom_index: u32,
+    /// The entry label: the label that follows its `func_info` (the target of exports and
+    /// lambdas).
+    pub entry_label: u32,
+    /// The global atom index of the function name.
+    pub atom: u32,
+    /// Whether a `nif_start` follows its entry label (a stub a `load_nif` can replace).
+    pub nif_stub: bool,
 }
 
 /// Parsed module and its native function entries.
@@ -1508,6 +1513,10 @@ pub struct CompiledModule {
     pub name: String,
     /// Native functions that can be entered while this object is alive.
     pub functions: Vec<CompiledFunction>,
+    /// The index in `functions` of the `-on_load` function.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_on_load, getOnLoad),
+    // OTP-29.1.1.
+    pub on_load: Option<usize>,
     /// Owns the executable mapping containing `functions` entries.
     pub native: FinalizedModule,
 }
@@ -1599,7 +1608,7 @@ impl OpView<'_> {
 
 /// The function being emitted.
 struct CurrentFunction {
-    name: String,
+    name: &'static str,
     arity: u8,
     /// Its body is a native stub: the rest of its operations are not emitted.
     skip: bool,
@@ -1614,43 +1623,64 @@ struct ModuleCompiler<'a, E: ModuleEnv> {
     beam: &'a BeamFile,
     env: &'a E,
     assembler: BeamModuleAssembler,
-    /// Index in the code summary of the next function to start.
-    next_function: usize,
     current: Option<CurrentFunction>,
     compiled: Vec<CompiledFunction>,
-    may_load_nif: bool,
+    on_load: Option<usize>,
+    /// For each function, whether it begins with `nif_start`; only for a module that may
+    /// call `load_nif`, whose functions are padded at their start here (see `begin_function`).
+    nif_stubs: Option<Vec<bool>>,
     has_nif_start: bool,
 }
 
 impl<E: ModuleEnv> ModuleCompiler<'_, E> {
-    /// `i_func_label` starts the next function of the code summary.
-    fn begin_function(&mut self, label: u32) -> Result<(), String> {
-        let function = self
-            .beam
-            .summary
-            .functions
-            .get(self.next_function)
-            .ok_or_else(|| format!("function label {label} has no function in the Code chunk"))?;
-        self.next_function += 1;
-        let name = self
-            .beam
-            .atom(function.function_atom)
-            .unwrap_or("<unknown>")
-            .to_owned();
-        let arity = function.arity.min(255) as u8;
-        let nif_stub = function.nif_stub;
-        self.assembler.begin_dump_function(&name, arity);
+    /// `i_func_label` starts a function; its name and arity arrive with its `i_func_info`
+    /// (`name_function`), as the `int_func_start` generator of erts orders them.
+    fn begin_function(&mut self, label: u32) {
+        self.assembler.begin_dump_function_unnamed();
         self.compiled.push(CompiledFunction {
-            name: name.clone(),
-            arity,
+            name: "",
+            arity: 0,
             label,
-            atom_index: function.function_atom,
+            entry_label: 0,
+            atom: 0,
+            nif_stub: false,
         });
-        let native_body = self.env.native_body(&name, arity);
+        self.current = Some(CurrentFunction {
+            name: "",
+            arity: 0,
+            skip: false,
+            native_body: None,
+            nif_candidate: false,
+        });
+    }
+
+    /// `i_func_info` names the function that `begin_function` started.
+    fn name_function(&mut self, operands: &[SpecificOperand]) -> Result<(), String> {
+        let (Some(SpecificOperand::Atom(atom)), Some(arity)) = (
+            operands.get(2),
+            operands.get(3).and_then(|operand| as_u32(Some(operand))),
+        ) else {
+            return Err("i_func_info expects atom and arity operands".to_owned());
+        };
+        let name = beamops::atom_name(*atom).unwrap_or("<unknown>");
+        let arity = arity.min(255) as u8;
+        let index = self
+            .compiled
+            .len()
+            .checked_sub(1)
+            .ok_or("i_func_info outside a function")?;
+        let function = &mut self.compiled[index];
+        function.name = name;
+        function.arity = arity;
+        function.atom = *atom;
+        self.assembler.name_dump_function(name, arity);
+        let native_body = self.env.native_body(name, arity);
         // Port of erts/emulator/beam/jit/arm/generators.tab:403-412 and asm_load.c:185-190
         // (may_load_nif, are_nifs), OTP-29.1.1: functions a load_nif can replace.
-        let nif_candidate =
-            native_body.is_none() && self.may_load_nif && (!self.has_nif_start || nif_stub);
+        let nif_candidate = native_body.is_none()
+            && self.nif_stubs.as_ref().is_some_and(|stubs| {
+                !self.has_nif_start || stubs.get(index).copied().unwrap_or(false)
+            });
         self.current = Some(CurrentFunction {
             name,
             arity,
@@ -1672,7 +1702,24 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
         let view = OpView { id: op, operands };
         if id == erts_tables::GENOP_I_FUNC_LABEL_1 {
             let label = as_u32(operands.first()).ok_or("i_func_label without a label")?;
-            self.begin_function(label)?;
+            self.begin_function(label);
+        } else if id == erts_tables::GENOP_I_FUNC_INFO_4 {
+            self.name_function(operands)?;
+        } else if id == erts_tables::GENOP_ALIGNED_LABEL_2
+            || id == erts_tables::GENOP_FUNC_PROLOGUE_2
+        {
+            // The first label after the `func_info` is the entry label.
+            if let Some(function) = self.compiled.last_mut()
+                && function.entry_label == 0
+            {
+                function.entry_label = as_u32(operands.first()).unwrap_or(0);
+            }
+        } else if id == erts_tables::GENOP_NIF_START_0 {
+            if let Some(function) = self.compiled.last_mut() {
+                function.nif_stub = true;
+            }
+        } else if id == erts_tables::GENOP_ON_LOAD_0 {
+            self.on_load = self.compiled.len().checked_sub(1);
         }
 
         // Veneers are flushed before every function, whether it is emitted or not, so they
@@ -1688,7 +1735,7 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
         let (name, arity, native_body, nif_candidate) = match current.as_ref() {
             Some(function) if function.skip && !flush => return Ok(()),
             Some(function) => (
-                function.name.as_str(),
+                function.name,
                 function.arity,
                 function.native_body,
                 function.nif_candidate,
@@ -1751,7 +1798,6 @@ fn compile_parsed_module_with_options_in_arena(
     transform_arena: &mut TransformArena,
 ) -> Result<CompiledModule, CompileError> {
     let fail = |error: String| CompileError::Assemble(format!("{}: {error}", beam.module));
-    let summary = &beam.summary;
     let mut assembler = BeamModuleAssembler::new();
     assembler.set_exception_resolver(env.exception_resolver() as usize);
     if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
@@ -1777,16 +1823,30 @@ fn compile_parsed_module_with_options_in_arena(
             && beam.atom(import.module_atom) == Some("erlang")
             && beam.atom(import.function_atom) == Some("load_nif")
     });
+    // The skim only for a module that may call `load_nif`: its padding is decided at the start
+    // of a function here, where erts decides it at the end (`are_nifs`).
+    let nif_stubs = if may_load_nif {
+        Some(
+            beam::scan(&beam.code.bytes, beam.code.max_opcode)
+                .map_err(|error| fail(error.to_string()))?
+                .nif_stubs,
+        )
+    } else {
+        None
+    };
     let mut compiler = ModuleCompiler {
         beam,
         env,
         assembler,
-        next_function: 0,
         current: None,
         compiled: Vec::new(),
-        may_load_nif,
-        has_nif_start: summary.functions.iter().any(|function| function.nif_stub),
+        on_load: None,
+        has_nif_start: nif_stubs
+            .as_ref()
+            .is_some_and(|stubs| stubs.contains(&true)),
+        nif_stubs,
     };
+
     // The lambdas of functions that are emitted get their table entries first, so the
     // `make_fun` and `call_fun` operations find them.
     for lambda in &beam.lambdas {
@@ -1813,6 +1873,7 @@ fn compile_parsed_module_with_options_in_arena(
     let ModuleCompiler {
         mut assembler,
         compiled,
+        on_load,
         ..
     } = compiler;
     assembler
@@ -1837,6 +1898,7 @@ fn compile_parsed_module_with_options_in_arena(
     Ok(CompiledModule {
         name: beam.module.clone(),
         functions,
+        on_load,
         native,
     })
 }
@@ -3616,7 +3678,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 let elements = args[2..]
                     .iter()
                     .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<smallvec::SmallVec<[ArgVal; 8]>, _>>()?;
                 assembler.emit_put_tuple2(value(0)?, &elements)
             }
             erts_tables::GENOP_GET_LIST_3 => {
@@ -4008,7 +4070,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         arg(Some(item), beam, env).map_err(EmitError::Operand)
                     }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<smallvec::SmallVec<[ArgVal; 16]>, _>>()?;
             // The loader's gen.select_val and gen.select_tuple_arity (generators.tab) already
             // sorted the values (beam_load_sort_select_vals) and laid the operands out as the
             // emitter takes them: all values, then all labels.
