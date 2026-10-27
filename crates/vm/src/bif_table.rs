@@ -93,7 +93,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{
         BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsFromList,
-        MapsKeys, MapsMerge, MapsValues, TermToBinary,
+        MapsKeys, MapsMerge, MapsValues, Phash2, TermToBinary,
     };
     use crate::native_helpers::trap_bif_entry;
     if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
@@ -111,6 +111,8 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
         ("erlang", "iolist_size", 1) => trap_bif_entry::<IolistSize> as *const () as usize,
         ("erlang", "iolist_to_iovec", 1) => trap_bif_entry::<IolistToIovec> as *const () as usize,
         ("erlang", "term_to_binary", 1 | 2) => trap_bif_entry::<TermToBinary> as *const () as usize,
+        ("erlang", "phash2", 1) => trap_bif_entry::<Phash2<1>> as *const () as usize,
+        ("erlang", "phash2", 2) => trap_bif_entry::<Phash2<2>> as *const () as usize,
         ("erlang", "binary_to_term", 1 | 2) => trap_bif_entry::<BinaryToTerm> as *const () as usize,
         ("lists", "reverse", 2) => crate::native_helpers::list_reverse_entry as *const () as usize,
         _ => return None,

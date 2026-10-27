@@ -1840,12 +1840,11 @@ pub(crate) fn execute(
                 && pending.import == import
         });
     if resumes_here
-        && let Some((module, function, continuation_arity)) = process
+        && process
             .cold
             .as_ref()
             .and_then(|cold| cold.bif_trap.as_ref())
-            .and_then(|pending| continuation_parts(pending.continuation))
-        && lookup_entry(module, function, continuation_arity).is_some()
+            .is_some_and(|pending| pending.target.entry.is_some())
     {
         let result = run_trapped_export(process, ctx)?;
         let trap_site = process.trap_site();
@@ -1944,14 +1943,60 @@ fn lookup_entry(module: &str, function: &str, arity: usize) -> Option<&'static E
         .map(|&position| &ENTRIES[position])
 }
 
-fn continuation_is(continuation: &str, module: &str, function: &str, arity: usize) -> bool {
-    let Some((mod_name, rest)) = continuation.split_once(':') else {
-        return false;
-    };
-    let Some((fun_name, arity_text)) = rest.rsplit_once('/') else {
-        return false;
-    };
-    mod_name == module && fun_name == function && arity_text.parse::<usize>().ok() == Some(arity)
+/// The export a trap continues in. erts `BIF_TRAP` names the trap `Export*` directly; here the
+/// name-keyed lookup is done once, when the trap is installed, and a resume reads the result.
+pub(crate) struct ContinuationTarget {
+    pub(crate) module: &'static str,
+    pub(crate) function: &'static str,
+    pub(crate) arity: usize,
+    /// The Rust handler of the continuation, absent when it is an Erlang export.
+    pub(crate) entry: Option<&'static Entry>,
+}
+
+impl ContinuationTarget {
+    fn is(&self, module: &str, function: &str, arity: usize) -> bool {
+        self.arity == arity && self.function == function && self.module == module
+    }
+}
+
+/// The target of a continuation string, cached per string address so a trap pays no hashing.
+pub(crate) fn continuation_target(continuation: &'static str) -> &'static ContinuationTarget {
+    use std::cell::Cell;
+    const SLOTS: usize = 64;
+    type Slot = Option<(usize, usize, &'static ContinuationTarget)>;
+    thread_local! {
+        static RECENT: Cell<[Slot; SLOTS]> = const { Cell::new([None; SLOTS]) };
+    }
+    let key = (continuation.as_ptr() as usize, continuation.len());
+    let slot = (key.0 >> 3) % SLOTS;
+    if let Some(target) = RECENT.with(|recent| {
+        recent.get()[slot].and_then(|(ptr, len, target)| ((ptr, len) == key).then_some(target))
+    }) {
+        return target;
+    }
+    static ALL: OnceLock<Mutex<HashMap<&'static str, &'static ContinuationTarget>>> =
+        OnceLock::new();
+    let target = *ALL
+        .get_or_init(Default::default)
+        .lock()
+        .expect("continuation targets")
+        .entry(continuation)
+        .or_insert_with(|| {
+            let (module, function, arity) = continuation_parts(continuation)
+                .expect("a continuation is `module:function/arity`");
+            Box::leak(Box::new(ContinuationTarget {
+                module,
+                function,
+                arity,
+                entry: lookup_entry(module, function, arity),
+            }))
+        });
+    RECENT.with(|recent| {
+        let mut slots = recent.get();
+        slots[slot] = Some((key.0, key.1, target));
+        recent.set(slots);
+    });
+    target
 }
 
 /// Run the trap continuation export. `beam_bif_export_trap` does this on schedule-in:
@@ -1960,15 +2005,12 @@ pub(crate) fn run_trapped_export(
     process: &mut Process,
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<ResumeResult, VmError>> {
-    let (module, function, arity) = {
-        let pending = process.cold.as_ref()?.bif_trap.as_ref()?;
-        let (module, function, arity) = continuation_parts(pending.continuation)?;
-        (module.to_owned(), function.to_owned(), arity)
-    };
+    let target = process.cold.as_ref()?.bif_trap.as_ref()?.target;
+    let (module, function, arity) = (target.module, target.function, target.arity);
     // An Erlang export has no Rust handler: the trap calls it with the saved arguments.
     // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
     // arguments), OTP-29.1.1.
-    if lookup_entry(&module, &function, arity).is_none() {
+    if target.entry.is_none() {
         let pending = process.cold_mut().bif_trap.take()?;
         clear_export_trap(process);
         // The arguments are the live X registers the trap left (erts BIF_TRAPn, reg[0..n]).
@@ -1986,8 +2028,8 @@ pub(crate) fn run_trapped_export(
     ];
     execute_named(
         process,
-        &module,
-        &function,
+        module,
+        function,
         bif_export_trap_pc(),
         arity,
         args,
@@ -2020,6 +2062,7 @@ pub(crate) fn install_export_trap(
         schedule_out: true,
         import,
         continuation: trap.continuation,
+        target: continuation_target(trap.continuation),
         state: argument_trap_state(Mutex::new(())),
         state_term: None,
         gc_was_enabled,
@@ -2030,7 +2073,9 @@ pub(crate) fn install_export_trap(
     });
 }
 
-pub(crate) fn continuation_parts(continuation: &str) -> Option<(&str, &str, usize)> {
+pub(crate) fn continuation_parts(
+    continuation: &'static str,
+) -> Option<(&'static str, &'static str, usize)> {
     let (module, rest) = continuation.split_once(':')?;
     let (function, arity_text) = rest.rsplit_once('/')?;
     Some((module, function, arity_text.parse().ok()?))
@@ -2038,30 +2083,26 @@ pub(crate) fn continuation_parts(continuation: &str) -> Option<(&str, &str, usiz
 
 /// The BIF a trap error is blamed on. `ERTS_BIF_ERROR_TRAPPED` names `sp->bif`, the
 /// export that first trapped, not the continuation that was running when it failed.
-fn original_trap_report(
+fn original_trap_report<'a>(
     process: &Process,
-    module_name: &str,
-    function_name: &str,
+    module_name: &'a str,
+    function_name: &'a str,
     arity: usize,
     continuation_resume: bool,
-) -> (String, String, usize) {
+) -> (&'a str, &'a str, usize) {
     if continuation_resume
         && let Some(pending) = process
             .cold
             .as_ref()
             .and_then(|cold| cold.bif_trap.as_ref())
     {
-        let module = global_atoms()
-            .text(pending.callee.0)
-            .unwrap_or(module_name)
-            .to_owned();
+        let module = global_atoms().text(pending.callee.0).unwrap_or(module_name);
         let function = global_atoms()
             .text(pending.callee.1)
-            .unwrap_or(function_name)
-            .to_owned();
+            .unwrap_or(function_name);
         return (module, function, pending.arity);
     }
-    (module_name.to_owned(), function_name.to_owned(), arity)
+    (module_name, function_name, arity)
 }
 
 /// Point `c_p->i` at `beam_bif_export_trap` and record the continuation export's arity.
@@ -2104,9 +2145,7 @@ pub(crate) fn execute_named(
         .cold
         .as_ref()
         .and_then(|cold| cold.bif_trap.as_ref())
-        .is_some_and(|pending| {
-            continuation_is(pending.continuation, module_name, function_name, arity)
-        });
+        .is_some_and(|pending| pending.target.is(module_name, function_name, arity));
     let pending_matches = pending_site == Some((true, true)) || continuation_resume;
     if pending_site.is_some_and(|(same_site, _)| !same_site) && !continuation_resume {
         // A trap continuation belongs to exactly one interrupted call. An
@@ -2124,7 +2163,16 @@ pub(crate) fn execute_named(
     {
         return None;
     }
-    let entry = lookup_entry(module_name, function_name, arity);
+    // A resume names its handler through the trap, the way BIF_TRAP names the `Export*`.
+    let entry = if continuation_resume {
+        process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.bif_trap.as_ref())
+            .and_then(|pending| pending.target.entry)
+    } else {
+        lookup_entry(module_name, function_name, arity)
+    };
     let pending = pending_matches
         .then(|| {
             process
@@ -2146,8 +2194,7 @@ pub(crate) fn execute_named(
         if entry.continuation != pending.continuation {
             if pending_site == Some((true, true))
                 && !continuation_resume
-                && let Some((module, function, arity)) = continuation_parts(pending.continuation)
-                && lookup_entry(module, function, arity).is_none()
+                && pending.target.entry.is_none()
                 && let Some(Ok(ResumeResult::Export(trap))) =
                     run_trapped_export(process, ctx.as_deref_mut())
             {
@@ -2226,7 +2273,7 @@ pub(crate) fn execute_named(
             // arguments.
             let args = call_args(process, &args, report.2, resumed);
             Err(exceptions::bif_error(
-                process, &report.0, &report.1, &args, error,
+                process, report.0, report.1, &args, error,
             ))
         }
         Ok(HandlerResult::Done { value, reductions }) => {
@@ -2243,7 +2290,7 @@ pub(crate) fn execute_named(
             charge(process, ctx, reductions);
             let args = call_args(process, &args, report.2, resumed);
             Err(exceptions::bif_error(
-                process, &report.0, &report.1, &args, error,
+                process, report.0, report.1, &args, error,
             ))
         }
         Ok(HandlerResult::Yield {
@@ -2273,8 +2320,8 @@ pub(crate) fn execute_named(
                         let args = call_args(process, &args, report.2, resumed);
                         return Some(Err(exceptions::bif_error(
                             process,
-                            &report.0,
-                            &report.1,
+                            report.0,
+                            report.1,
                             &args,
                             BifError::SystemLimit,
                         )));
@@ -2325,6 +2372,7 @@ pub(crate) fn execute_named(
                 schedule_out: false,
                 import,
                 continuation,
+                target: continuation_target(continuation),
                 state,
                 state_term,
                 gc_was_enabled,
@@ -2570,6 +2618,38 @@ impl TrapBody for IolistSize {
     }
 }
 
+/// `erlang:phash2/N` as its own light entry.
+// Port of erts/emulator/beam/bif.c (phash2_1, phash2_2), OTP-29.1.1: the BIF hashes on the C
+// stack and traps only when `trapping_make_hash2` runs out of reductions.
+pub(crate) struct Phash2<const N: usize>;
+
+impl<const N: usize> TrapBody for Phash2<N> {
+    const ARITY: Option<usize> = Some(N);
+
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        _instruction: usize,
+        _pid: Option<arinsal_sched::Pid>,
+        _restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        Ok(match arinsal_bifs::phash2_run(args, process.reductions)? {
+            arinsal_bifs::Phash2Run::Done { value, reductions } => {
+                HandlerResult::Done { value, reductions }
+            }
+            arinsal_bifs::Phash2Run::More(cont) => {
+                // BUMP_ALL_REDS before BIF_TRAP.
+                process.reductions = 0;
+                HandlerResult::Yield {
+                    continuation: cont.continuation(),
+                    state: magic_binary_state(Mutex::new(*cont), ERTS_HASH2_CONTEXT_SIZE),
+                    reductions: 0,
+                }
+            }
+        })
+    }
+}
+
 /// `term_to_binary/1,2` entered directly from the light-BIF fragment.
 pub(crate) struct TermToBinary;
 
@@ -2696,6 +2776,7 @@ pub(crate) fn finish_light(
                 schedule_out: true,
                 import,
                 continuation,
+                target: continuation_target(continuation),
                 state,
                 state_term,
                 gc_was_enabled,
@@ -2720,6 +2801,7 @@ pub(crate) fn finish_light(
                 schedule_out: false,
                 import,
                 continuation: trap.continuation,
+                target: continuation_target(trap.continuation),
                 state,
                 state_term,
                 gc_was_enabled,
@@ -2817,6 +2899,7 @@ pub(crate) fn install_deferred_trap(
         schedule_out: true,
         import,
         continuation,
+        target: continuation_target(continuation),
         state,
         state_term,
         gc_was_enabled,

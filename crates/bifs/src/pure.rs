@@ -695,6 +695,46 @@ pub fn phash2_slice(ctx: &mut Ctx<'_>, cont: &mut Phash2Cont) -> Result<Option<T
     }
 }
 
+/// Outcome of [`phash2_run`].
+pub enum Phash2Run {
+    /// The hash, and the reductions the walk used.
+    Done {
+        /// The `phash2` value (always a small on a 64-bit build).
+        value: Term,
+        /// `(max_iterations - iterations_until_trap) / ITERATIONS_PER_RED`.
+        reductions: u32,
+    },
+    /// The walk used up the process's reductions; the saved state to trap with.
+    More(Box<Phash2Cont>),
+}
+
+/// `phash2/1,2` against the reductions left, building the trap state only when the walk
+/// yields; the common call hashes on the stack and returns a small.
+// Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`, OTP-29.1.1.
+pub fn phash2_run(args: &[Term], fcalls: i32) -> Result<Phash2Run, BifError> {
+    let range = match args.get(1) {
+        Some(range) => Some(phash2_range_arg(*range)?),
+        None => None,
+    };
+    let iterations =
+        i64::from(fcalls.max(0)).saturating_mul(arinsal_term::HASH2_ITERATIONS_PER_RED);
+    let mut run = arinsal_term::Hash2Run::new(args[0]);
+    Ok(match run.run(Some(iterations)) {
+        arinsal_term::Hash2Progress::Done { hash, used } => {
+            let value = match range {
+                None => u64::from(hash & ((1 << 27) - 1)),
+                Some(range) if range == 1_u64 << 32 => u64::from(hash),
+                Some(range) => u64::from(hash % range as u32),
+            };
+            Phash2Run::Done {
+                value: Term::small(value as i64).ok_or(BifError::SystemLimit)?,
+                reductions: (used / arinsal_term::HASH2_ITERATIONS_PER_RED).max(0) as u32,
+            }
+        }
+        arinsal_term::Hash2Progress::Yield => Phash2Run::More(Box::new(Phash2Cont { run, range })),
+    })
+}
+
 /// The range argument of `phash2/2`.
 pub fn phash2_range_arg(term: Term) -> Result<u64, BifError> {
     let range: u64 = term

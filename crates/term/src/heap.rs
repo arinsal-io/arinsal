@@ -1526,13 +1526,15 @@ impl ProcessHeap {
     pub fn set_heap_top(&mut self, top: *mut u64) {
         let base = self.words.as_ptr() as usize;
         let address = top as usize;
-        assert!(
+        // The cursor is the BIF's own bump of the native HTOP (erts stores `HEAP_TOP` unchecked),
+        // so the range test is a debug check, not a release cost on every light BIF.
+        debug_assert!(
             address >= base && address <= base + self.stop_index() * 8,
             "heap top={address:#x} base={base:#x} stop={:#x} end={:#x}",
             base + self.stop_index() * 8,
             base + self.words.len() * 8,
         );
-        assert_eq!((address - base) % 8, 0);
+        debug_assert_eq!((address - base) % 8, 0);
         self.set_htop_index((address - base) / 8);
     }
     /// Commit both native cursors at once when native code enters the runtime.

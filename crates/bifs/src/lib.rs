@@ -46,12 +46,13 @@ pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
-    IolistVecWalk, Phash2Cont, Phash2Step, allocate_iolist_binary, atom_to_list_term, binary_bytes,
-    binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range, copy_bitstring_range,
-    copy_bitstring_range_to, eval_unique_integer, finish_iolist_binary_output, for_each_list_term,
-    iolist_to_iovec_shortcut, iolist_yield_reductions, next_ref_id, next_unique_monotonic,
-    phash2_slice, phash2_start, proper_list_terms, singleton_bitstring, tuple_arity, tuple_element,
-    tuple_pair, tuple_terms, with_binary_bytes, with_iolist_binary_output,
+    IolistVecWalk, Phash2Cont, Phash2Run, Phash2Step, allocate_iolist_binary, atom_to_list_term,
+    binary_bytes, binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range,
+    copy_bitstring_range, copy_bitstring_range_to, eval_unique_integer,
+    finish_iolist_binary_output, for_each_list_term, iolist_to_iovec_shortcut,
+    iolist_yield_reductions, next_ref_id, next_unique_monotonic, phash2_run, phash2_slice,
+    phash2_start, proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair,
+    tuple_terms, with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
@@ -235,8 +236,13 @@ impl BifState {
         self.initial_fcalls = self.fcalls;
         self.fallback_reductions = 0;
         self.budget = usize::MAX;
-        self.deferred = None;
-        self.error = None;
+        // Both fields are `None` on every value path; assigning drops the old value each call.
+        if self.deferred.is_some() {
+            self.deferred = None;
+        }
+        if self.error.is_some() {
+            self.error = None;
+        }
         self.has_fcalls = true;
         self.uses_process_exc = false;
     }

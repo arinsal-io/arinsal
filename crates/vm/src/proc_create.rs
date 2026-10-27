@@ -1401,6 +1401,9 @@ pub(crate) struct BifTrapPending {
     pub(crate) schedule_out: bool,
     pub(crate) import: usize,
     pub(crate) continuation: &'static str,
+    /// The continuation export, resolved when the trap is installed (erts BIF_TRAP names the
+    /// trap `Export*` directly).
+    pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
     pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,
     /// The live magic-reference thing passed to the continuation export, when erts allocates one.
     pub(crate) state_term: Option<Term>,
