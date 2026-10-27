@@ -94,6 +94,8 @@ dependencies = [
  "arinsal-beam",
  "arinsal-etf",
  "arinsal-spec",
+ "arinsal-term",
+ "num-bigint",
  "similar-asserts",
  "smallvec",
 ]

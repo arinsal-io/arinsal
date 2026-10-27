@@ -194,7 +194,7 @@ impl BeamOpAllocator {
 }
 
 /// Why an instruction could not be read: the `LoadAssert` and `LoadError` of beam_file.c.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadError(pub &'static str);
 
 /// `TaggedNumber` (beam_file.c): a tagged value of the code stream. `big` is the
@@ -223,6 +223,7 @@ pub(crate) struct BeamCodeReader<'a> {
     /// The number of literals before `bignum_literals` (`beam.literals.count`, which grows with
     /// every literal the loader adds).
     pub(crate) literal_base: usize,
+    tagged_error: Option<ReadError>,
 }
 
 impl<'a> BeamCodeReader<'a> {
@@ -239,6 +240,7 @@ impl<'a> BeamCodeReader<'a> {
             first: true,
             bignum_literals: Vec::new(),
             literal_base: file.literals.len(),
+            tagged_error: None,
         }
     }
 
@@ -265,7 +267,25 @@ impl<'a> BeamCodeReader<'a> {
     }
 
     /// `beamreader_read_tagged`.
-    fn read_tagged(&mut self) -> Result<Tagged<'a>, ReadError> {
+    fn read_tagged(&mut self) -> Tagged<'a> {
+        match self.read_tagged_inner() {
+            Ok(tagged) => tagged,
+            Err(error) => self.read_tagged_error(error),
+        }
+    }
+
+    /// The single cold error path used by `beamreader_read_tagged`'s `LoadError` exits.
+    #[cold]
+    fn read_tagged_error(&mut self, error: ReadError) -> Tagged<'a> {
+        self.tagged_error.get_or_insert(error);
+        Tagged {
+            tag: TAG_U,
+            value: 0,
+            big: None,
+        }
+    }
+
+    fn read_tagged_inner(&mut self) -> Result<Tagged<'a>, ReadError> {
         let mut len_code = self.read_u8()?;
         let mut tag = len_code & 0x07;
         if len_code & 0x08 == 0 {
@@ -287,7 +307,10 @@ impl<'a> BeamCodeReader<'a> {
         let count = if len_code < 7 {
             usize::from(len_code) + 2
         } else {
-            let prefix = self.read_tagged()?;
+            let prefix = self.read_tagged();
+            if let Some(error) = self.tagged_error {
+                return Err(error);
+            }
             if prefix.tag != TAG_U || prefix.big.is_some() {
                 return Err(ReadError("bad size prefix"));
             }
@@ -348,17 +371,26 @@ impl<'a> BeamCodeReader<'a> {
 
     /// `marshal_allocation_list`: the size of the allocation list in words.
     fn marshal_allocation_list(&mut self) -> Result<u64, ReadError> {
-        let count = self.read_tagged()?;
+        let count = self.read_tagged();
+        if let Some(error) = self.tagged_error {
+            return Err(error);
+        }
         if count.tag != TAG_U || count.big.is_some() || count.value > 3 {
             return Err(ReadError("bad allocation list"));
         }
         let mut sum: u64 = 0;
         for _ in 0..count.value {
-            let kind = self.read_tagged()?;
+            let kind = self.read_tagged();
+            if let Some(error) = self.tagged_error {
+                return Err(error);
+            }
             if kind.tag != TAG_U || kind.big.is_some() || kind.value > i32::MAX as u64 {
                 return Err(ReadError("bad allocation list"));
             }
-            let number = self.read_tagged()?;
+            let number = self.read_tagged();
+            if let Some(error) = self.tagged_error {
+                return Err(error);
+            }
             if number.tag != TAG_U || number.big.is_some() || number.value > (i32::MAX as u64) / 3 {
                 return Err(ReadError("bad allocation list"));
             }
@@ -384,14 +416,15 @@ impl<'a> BeamCodeReader<'a> {
         let mut arity = GEN_OPC[opcode].arity;
         debug_assert!(arity <= ERTS_BEAM_MAX_OPARGS);
         let id = alloc.new_op();
-        {
-            let op = alloc.op_mut(id);
-            op.op = opcode as i32;
-            op.arity = arity;
-        }
+        let op = alloc.op_mut(id);
+        op.op = opcode as i32;
+        op.arity = arity;
         let mut i = 0;
         while i < arity {
-            let mut raw = self.read_tagged()?;
+            let mut raw = self.read_tagged();
+            if let Some(error) = self.tagged_error.take() {
+                return Err(error);
+            }
             let mut arg = BeamOpArg::new(raw.tag, raw.value);
             match raw.tag {
                 TAG_U | TAG_Q | TAG_O => {}
@@ -433,7 +466,10 @@ impl<'a> BeamCodeReader<'a> {
                         if i + 1 != arity {
                             return Err(ReadError("a list that is not the last operand"));
                         }
-                        let extra = self.read_tagged()?;
+                        let extra = self.read_tagged();
+                        if let Some(error) = self.tagged_error.take() {
+                            return Err(error);
+                        }
                         if extra.tag != TAG_U || extra.big.is_some() {
                             return Err(ReadError("bad list count"));
                         }
@@ -442,7 +478,6 @@ impl<'a> BeamCodeReader<'a> {
                             return Err(ReadError("list count exceeds code"));
                         }
                         arity += extra.value as usize;
-                        let op = alloc.op_mut(id);
                         op.arity = arity;
                         // Expand the argument array if necessary.
                         if arity > ERTS_BEAM_MAX_OPARGS && op.uses_def_args() {
@@ -452,7 +487,10 @@ impl<'a> BeamCodeReader<'a> {
                     }
                     // Float register.
                     2 => {
-                        let index = self.read_tagged()?;
+                        let index = self.read_tagged();
+                        if let Some(error) = self.tagged_error.take() {
+                            return Err(error);
+                        }
                         if index.tag != TAG_U || index.big.is_some() || index.value >= MAX_REG {
                             return Err(ReadError("register out of range"));
                         }
@@ -462,7 +500,10 @@ impl<'a> BeamCodeReader<'a> {
                     3 => arg = BeamOpArg::new(TAG_U, self.marshal_allocation_list()?),
                     // Literal.
                     4 => {
-                        let index = self.read_tagged()?;
+                        let index = self.read_tagged();
+                        if let Some(error) = self.tagged_error.take() {
+                            return Err(error);
+                        }
                         // The referenced literal must be defined in the file, it must not have
                         // been created at runtime.
                         if index.tag != TAG_U
@@ -475,14 +516,20 @@ impl<'a> BeamCodeReader<'a> {
                     }
                     // Register with type hint.
                     5 => {
-                        raw = self.read_tagged()?;
+                        raw = self.read_tagged();
+                        if let Some(error) = self.tagged_error.take() {
+                            return Err(error);
+                        }
                         if (raw.tag != TAG_X && raw.tag != TAG_Y) || raw.big.is_some() {
                             return Err(ReadError("a type hint on a non-register"));
                         }
                         if raw.value >= MAX_REG {
                             return Err(ReadError("register out of range"));
                         }
-                        let index = self.read_tagged()?;
+                        let index = self.read_tagged();
+                        if let Some(error) = self.tagged_error.take() {
+                            return Err(error);
+                        }
                         if index.tag != TAG_U || index.big.is_some() {
                             return Err(ReadError("bad type index"));
                         }
@@ -504,8 +551,11 @@ impl<'a> BeamCodeReader<'a> {
             if raw.big.is_some() && arg.ty != TAG_O && arg.ty != TAG_Q {
                 return Err(ReadError("operand wider than a word"));
             }
-            alloc.op_mut(id).set_a(i, arg);
+            op.set_a(i, arg);
             i += 1;
+        }
+        if let Some(error) = self.tagged_error.take() {
+            return Err(error);
         }
         Ok(id)
     }

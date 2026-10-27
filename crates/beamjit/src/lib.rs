@@ -1593,10 +1593,6 @@ impl OpView<'_> {
     fn operands(&self) -> &[SpecificOperand] {
         self.operands
     }
-
-    fn is(&self, generic: i32) -> bool {
-        i32::from(self.id) == generic
-    }
 }
 
 /// The function being emitted.
@@ -1668,7 +1664,7 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
         resolve_new_literal(self.beam, self.env, index, literal)
     }
 
-    fn emit(&mut self, op: u16, operands: &[SpecificOperand]) -> Result<(), String> {
+    fn emit(&mut self, op: u16, specific: u16, operands: &[SpecificOperand]) -> Result<(), String> {
         let id = i32::from(op);
         let view = OpView { id: op, operands };
         if id == erts_tables::GENOP_I_FUNC_LABEL_1 {
@@ -1714,7 +1710,7 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
                 .map_err(|error| format!("{name}/{arity}: nif_start: {error:?}"))?;
             ends_function = true;
         } else {
-            emit_op(assembler, &view, beam, *env, name, arity)
+            dispatch_specific_op(specific, assembler, &view, beam, *env, name, arity)
                 .map_err(|error| describe(&view, &error))?;
             if nif_candidate
                 && id == erts_tables::GENOP_I_BREAKPOINT_TRAMPOLINE_0
@@ -2260,7 +2256,9 @@ fn erlang_get_import(beam: &BeamFile, index: u32) -> bool {
         && import.arity == 1
 }
 
-fn emit_op(
+include!(concat!(env!("OUT_DIR"), "/specific_dispatch.rs"));
+
+fn emit_op<const GENERIC: i32, const EMITTER: u8>(
     assembler: &mut BeamModuleAssembler,
     op: &OpView<'_>,
     beam: &BeamFile,
@@ -2268,6 +2266,7 @@ fn emit_op(
     function: &str,
     arity: u8,
 ) -> Result<(), EmitError> {
+    let emitter = emitter_from_id(EMITTER);
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452 (BeamModuleAssembler::emit),
     // OTP-29.1.1: `tbz`/`tbnz` reach only ±32KB, so each instruction flushes a veneer before a
     // forward short branch (such as `is_map`'s boxed test) falls out of range.
@@ -2287,7 +2286,7 @@ fn emit_op(
     };
     let n = |index| number(args.get(index)).map_err(EmitError::Operand);
     let helper = env.arithmetic_helper();
-    if op.is(erts_tables::GENOP_I_GET_MAP_ELEMENTS_3) {
+    if GENERIC == erts_tables::GENOP_I_GET_MAP_ELEMENTS_3 {
         count_at_least(args, 3, op.name())?;
         let size = usize::try_from(n(2)?)
             .map_err(|_| EmitError::Operand("map element size overflows usize".to_owned()))?;
@@ -2309,34 +2308,26 @@ fn emit_op(
     // Guard-context arithmetic branches to its failure label instead of raising.
     assembler.set_arith_fail(0);
     if matches!(
-        ported_op(op),
-        Some(
-            EmitterKind::Plus
-                | EmitterKind::Minus
-                | EmitterKind::Times
-                | EmitterKind::IntDiv
-                | EmitterKind::Rem
-                | EmitterKind::Band
-                | EmitterKind::Bor
-                | EmitterKind::Bxor
-                | EmitterKind::Bsl
-                | EmitterKind::Bsr
-                | EmitterKind::Bnot
-                | EmitterKind::UnaryMinus
-                | EmitterKind::MulAdd
-        )
+        emitter,
+        EmitterKind::Plus
+            | EmitterKind::Minus
+            | EmitterKind::Times
+            | EmitterKind::IntDiv
+            | EmitterKind::Rem
+            | EmitterKind::Band
+            | EmitterKind::Bor
+            | EmitterKind::Bxor
+            | EmitterKind::Bsl
+            | EmitterKind::Bsr
+            | EmitterKind::Bnot
+            | EmitterKind::UnaryMinus
+            | EmitterKind::MulAdd
     ) && let Some(fail) = args.first().and_then(|operand| as_u32(Some(operand)))
     {
         assembler.set_arith_fail(fail);
     }
-    let Some(emitter) = ported_op(op) else {
-        return Err(EmitError::Operand(format!(
-            "no emitter for operation {}",
-            op.name()
-        )));
-    };
     let result = match emitter {
-        EmitterKind::Metadata => match i32::from(op.id) {
+        EmitterKind::Metadata => match GENERIC {
             erts_tables::GENOP_I_FLUSH_STUBS_0 => {
                 count(0)?;
                 assembler.flush_yield_stubs()
@@ -2387,9 +2378,9 @@ fn emit_op(
                 // OTP-29.1.1: `line` flushes a pending exception return address first;
                 // `func_line` keeps a duplicate entry, the others skip a repeat of the
                 // previous location.
-                let is_line = op.is(erts_tables::GENOP_LINE_1);
-                let is_func_line = op.is(erts_tables::GENOP_FUNC_LINE_1);
-                count(if op.is(erts_tables::GENOP_EXECUTABLE_LINE_2) {
+                let is_line = GENERIC == erts_tables::GENOP_LINE_1;
+                let is_func_line = GENERIC == erts_tables::GENOP_FUNC_LINE_1;
+                count(if GENERIC == erts_tables::GENOP_EXECUTABLE_LINE_2 {
                     2
                 } else {
                     1
@@ -2416,7 +2407,7 @@ fn emit_op(
                     };
                     assembler.record_line(u64::from(location), file, line, is_func_line);
                 }
-                if op.is(erts_tables::GENOP_EXECUTABLE_LINE_2) {
+                if GENERIC == erts_tables::GENOP_EXECUTABLE_LINE_2 {
                     let cover_id = n(1)?;
                     if let Some(probe) = env.line_coverage_probe(location, cover_id) {
                         assembler.emit_coverage(probe.address, probe.flags)?;
@@ -2504,11 +2495,7 @@ fn emit_op(
             assembler.swap(value(1)?, value(2)?)
         }
         EmitterKind::Swap3 | EmitterKind::Swap4 => {
-            let swaps = if matches!(ported_op(op), Some(EmitterKind::Swap3)) {
-                3
-            } else {
-                4
-            };
+            let swaps = if emitter == EmitterKind::Swap3 { 3 } else { 4 };
             count(swaps + 1)?;
             for index in 0..swaps {
                 assembler.swap(value(index)?, value(index + 1)?)?;
@@ -2596,7 +2583,7 @@ fn emit_op(
             assembler.call_only(n(0)?)
         }
         EmitterKind::ProcessDictionaryGet => {
-            let destination = if op.is(erts_tables::GENOP_I_GET_2) {
+            let destination = if GENERIC == erts_tables::GENOP_I_GET_2 {
                 count(2)?;
                 value(1)?
             } else {
@@ -2653,7 +2640,7 @@ fn emit_op(
                 helper,
             )
         }
-        EmitterKind::IntDiv if op.is(erts_tables::GENOP_I_M_DIV_5) => {
+        EmitterKind::IntDiv if GENERIC == erts_tables::GENOP_I_M_DIV_5 => {
             count(5)?;
             assembler.emit_i_m_div(value(2)?, value(3)?, value(4)?, helper)
         }
@@ -2665,7 +2652,7 @@ fn emit_op(
             );
             assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
-        EmitterKind::Rem if op.is(erts_tables::GENOP_I_DIV_REM_6) => {
+        EmitterKind::Rem if GENERIC == erts_tables::GENOP_I_DIV_REM_6 => {
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
             count(6)?;
             assembler.set_arith_types(
@@ -2681,7 +2668,7 @@ fn emit_op(
                 helper,
             )
         }
-        EmitterKind::Rem if op.is(erts_tables::GENOP_I_REM_DIV_6) => {
+        EmitterKind::Rem if GENERIC == erts_tables::GENOP_I_REM_DIV_6 => {
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
             count(6)?;
             assembler.set_arith_types(
@@ -2756,7 +2743,7 @@ fn emit_op(
         EmitterKind::Guard => {
             let fail = n(0)?;
             'body: {
-                if op.is(erts_tables::GENOP_IS_IN_RANGE_5) {
+                if GENERIC == erts_tables::GENOP_IS_IN_RANGE_5 {
                     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2537-2634, OTP-29.1.1.
                     count(5)?;
                     let helper = env.guard_helper();
@@ -2766,14 +2753,14 @@ fn emit_op(
                     break 'body;
                 }
                 let source_index = usize::from(matches!(
-                    i32::from(op.id),
+                    GENERIC,
                     erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4
                         | erts_tables::GENOP_I_IS_TAGGED_TUPLE_FF_5
                 )) + 1;
                 let source = value(source_index)?;
                 let typed_source =
                     TypedArg::new(source, operand_type(args.get(source_index), beam));
-                if op.is(erts_tables::GENOP_IS_INT_IN_RANGE_4) {
+                if GENERIC == erts_tables::GENOP_IS_INT_IN_RANGE_4 {
                     count(4)?;
                     if fail == 0 {
                         return Err(EmitError::Operand(
@@ -2789,12 +2776,12 @@ fn emit_op(
                     )?;
                     break 'body;
                 }
-                if op.is(erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4) {
+                if GENERIC == erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4 {
                     count(4)?;
                     assembler.emit_is_tuple_of_arity(typed_source, value(3)?, fail, n(1)?)?;
                     break 'body;
                 }
-                if op.is(erts_tables::GENOP_I_IS_TAGGED_TUPLE_FF_5) {
+                if GENERIC == erts_tables::GENOP_I_IS_TAGGED_TUPLE_FF_5 {
                     count(5)?;
                     assembler.emit_is_tagged_tuple_ff(
                         typed_source,
@@ -2805,7 +2792,7 @@ fn emit_op(
                     )?;
                     break 'body;
                 }
-                match i32::from(op.id) {
+                match GENERIC {
                     erts_tables::GENOP_IS_INTEGER_2 => {
                         assembler.emit_is_integer(typed_source, fail)?
                     }
@@ -2892,7 +2879,7 @@ fn emit_op(
                     | erts_tables::GENOP_IS_INT_GE_3 => {
                         let lhs = value(1)?;
                         let rhs = value(2)?;
-                        match i32::from(op.id) {
+                        match GENERIC {
                             erts_tables::GENOP_IS_EQ_EXACT_3 => assembler.emit_is_eq_exact(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
@@ -2962,7 +2949,7 @@ fn emit_op(
             // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2696-2755, OTP-29.1.1.
             let source = TypedArg::new(value(2)?, operand_type(args.get(2), beam));
             assembler.emit_is_ge(source, value(3)?, n(0)?, env.guard_helper())?;
-            if op.is(erts_tables::GENOP_IS_GE_LT_5) {
+            if GENERIC == erts_tables::GENOP_IS_GE_LT_5 {
                 // `is_ge_lt` is `is_ge Src A` followed by `is_lt B Src` (instr_common.cpp:2713-2716).
                 assembler.emit_is_lt(value(4)?, source, n(1)?, env.guard_helper())?;
             } else {
@@ -2974,7 +2961,7 @@ fn emit_op(
             // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390 and 511-542,
             // OTP-29.1.1: immediate keys are looked up inline, others in the runtime.
             let runtime = env.map_runtime();
-            if op.is(erts_tables::GENOP_I_GET_MAP_ELEMENT_HASH_5) {
+            if GENERIC == erts_tables::GENOP_I_GET_MAP_ELEMENT_HASH_5 {
                 count(5)?;
                 // The hash is the loader's `hashmap_make_hash` of the key (gen.get_map_element).
                 assembler.emit_i_get_map_element_hash(
@@ -3000,7 +2987,7 @@ fn emit_op(
         EmitterKind::MapElements => unreachable!("map elements were emitted before dispatch"),
         EmitterKind::MapUpdate => {
             let runtime = env.map_runtime();
-            if op.is(erts_tables::GENOP_UPDATE_MAP_ASSOC_4) {
+            if GENERIC == erts_tables::GENOP_UPDATE_MAP_ASSOC_4 {
                 count_at_least(args, 4, op.name())?;
                 let size = usize::try_from(n(3)?)
                     .map_err(|_| EmitError::Operand("map update size overflow".to_owned()))?;
@@ -3033,7 +3020,7 @@ fn emit_op(
                 )
             }
         }
-        EmitterKind::MapCreate if op.is(erts_tables::GENOP_NEW_MAP_3) => {
+        EmitterKind::MapCreate if GENERIC == erts_tables::GENOP_NEW_MAP_3 => {
             // Port of erts/emulator/beam/jit/arm/instr_map.cpp:228-265, OTP-29.1.1.
             count_at_least(args, 3, op.name())?;
             let size = usize::try_from(n(2)?)
@@ -3066,7 +3053,7 @@ fn emit_op(
             assembler.emit_test_heap(words, n(1)?, env.gc_hook())?;
             assembler.emit_i_new_small_map_lit(value(0)?, value(2)?, &values)
         }
-        EmitterKind::BsConstruct if op.is(erts_tables::GENOP_BS_INIT_WRITABLE_0) => {
+        EmitterKind::BsConstruct if GENERIC == erts_tables::GENOP_BS_INIT_WRITABLE_0 => {
             count(0)?;
             // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000, OTP-29.1.1.
             assembler.emit_bs_init_writable(ArgVal::X(0), env.bs_init_writable_helper())
@@ -3154,7 +3141,7 @@ fn emit_op(
         }
         EmitterKind::Bif => {
             // Port of erts/emulator/beam/jit/arm/ops.tab:812-836 and instr_bif.cpp:110-200.
-            let (arity, has_fail) = match i32::from(op.id) {
+            let (arity, has_fail) = match GENERIC {
                 erts_tables::GENOP_I_BIF1_4 => (1, true),
                 erts_tables::GENOP_I_BIF2_5 => (2, true),
                 erts_tables::GENOP_I_BIF3_6 => (3, true),
@@ -3225,7 +3212,7 @@ fn emit_op(
                     .map(|index| (pairs[index].1, pairs[index].2))
                     .collect())
             };
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_GET_RECORD_FIELD_5 => {
                     count(5)?;
                     assembler.emit_get_record_field(
@@ -3251,7 +3238,7 @@ fn emit_op(
                         .into_iter()
                         .flat_map(|(key, val)| [key, val])
                         .collect();
-                    if op.is(erts_tables::GENOP_I_CREATE_LOCAL_NATIVE_RECORD_4) {
+                    if GENERIC == erts_tables::GENOP_I_CREATE_LOCAL_NATIVE_RECORD_4 {
                         assembler.emit_i_create_local_native_record(
                             value(0)?,
                             value(1)?,
@@ -3289,7 +3276,7 @@ fn emit_op(
         EmitterKind::Receive => {
             // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:25-295, OTP-29.1.1.
             let hooks = env.receive_hooks();
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_RECV_MARKER_RESERVE_1 => {
                     count(1)?;
                     assembler.emit_recv_marker_reserve(value(0)?, hooks)
@@ -3352,7 +3339,7 @@ fn emit_op(
                     _ => Err(EmitError::Operand("expected a float register".to_owned())),
                 }
             };
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_FLOAD_2 => {
                     count(2)?;
                     assembler.emit_fload_native(value(0)?, fr(1)?)
@@ -3387,7 +3374,7 @@ fn emit_op(
             use arinsal_beamasm::misc::{ApplyKind, emit_apply_call, emit_apply_tail};
             let runtime = env.apply_runtime();
             // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-320, OTP-29.1.1.
-            let (kind, tail, dealloc) = match i32::from(op.id) {
+            let (kind, tail, dealloc) = match GENERIC {
                 erts_tables::GENOP_APPLY_1 => (ApplyKind::Fixed(n(0)?), false, None),
                 erts_tables::GENOP_APPLY_LAST_2 => (ApplyKind::Fixed(n(0)?), true, Some(1)),
                 erts_tables::GENOP_I_APPLY_0 => (ApplyKind::Apply3, false, None),
@@ -3397,7 +3384,7 @@ fn emit_op(
                 erts_tables::GENOP_I_APPLY_FUN_LAST_1 => (ApplyKind::Apply2, true, Some(0)),
                 _ => (ApplyKind::Apply2, true, None),
             };
-            count(match i32::from(op.id) {
+            count(match GENERIC {
                 erts_tables::GENOP_APPLY_LAST_2 => 2,
                 erts_tables::GENOP_APPLY_1
                 | erts_tables::GENOP_I_APPLY_LAST_1
@@ -3419,7 +3406,7 @@ fn emit_op(
         EmitterKind::Catch => {
             use arinsal_beamasm::catch::ExceptionResolver;
             let resolver: ExceptionResolver = env.exception_resolver();
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_CATCH_2 | erts_tables::GENOP_TRY_2 => {
                     count(2)?;
                     assembler.emit_catch(value(0)?, n(1)?)
@@ -3489,7 +3476,7 @@ fn emit_op(
                 )),
             }
         }
-        EmitterKind::Fun => match i32::from(op.id) {
+        EmitterKind::Fun => match GENERIC {
             erts_tables::GENOP_I_LAMBDA_TRAMPOLINE_4 => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:167-205, OTP-29.1.1.
@@ -3608,7 +3595,7 @@ fn emit_op(
             })?;
             assembler.return_()
         }
-        EmitterKind::Construct => match i32::from(op.id) {
+        EmitterKind::Construct => match GENERIC {
             erts_tables::GENOP_PUT_LIST_3 => {
                 count(3)?;
                 assembler.emit_put_list(value(0)?, value(1)?, value(2)?)
@@ -3704,7 +3691,7 @@ fn emit_op(
         },
         EmitterKind::Heap => {
             let hook = env.gc_hook();
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_TEST_HEAP_2 => {
                     count(2)?;
                     let (words, live) = (number(args.first())?, number(args.get(1))?);
@@ -3731,7 +3718,7 @@ fn emit_op(
                 _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
             }
         }
-        EmitterKind::Fused => match i32::from(op.id) {
+        EmitterKind::Fused => match GENERIC {
             erts_tables::GENOP_STORE_TWO_VALUES_4 => {
                 count(4)?;
                 assembler.emit_store_two_values(value(0)?, value(1)?, value(2)?, value(3)?)
@@ -3778,7 +3765,7 @@ fn emit_op(
             }
             _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
         },
-        EmitterKind::CallExternal => match i32::from(op.id) {
+        EmitterKind::CallExternal => match GENERIC {
             erts_tables::GENOP_I_CALL_EXT_1 => {
                 count(1)?;
                 let import = n(0)?;
@@ -3807,7 +3794,7 @@ fn emit_op(
                 // scheduler-visible behaviour by calling the BIF's export, whose import the
                 // module still carries.
                 count(0)?;
-                let (module, function, arity) = match i32::from(op.id) {
+                let (module, function, arity) = match GENERIC {
                     erts_tables::GENOP_I_HIBERNATE_0 => ("erlang", "hibernate", 0),
                     erts_tables::GENOP_I_LOAD_NIF_0 => ("erlang", "load_nif", 2),
                     _ => ("erlang", "call_on_load_function", 1),
@@ -3863,7 +3850,7 @@ fn emit_op(
         },
         EmitterKind::GuardBif => {
             let runtime = env.guard_helper();
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_BIF_AND_4 => {
                     count(4)?;
                     assembler.emit_bif_and(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
@@ -3878,7 +3865,7 @@ fn emit_op(
                 }
                 erts_tables::GENOP_BIF_HD_2 | erts_tables::GENOP_BIF_TL_2 => {
                     count(2)?;
-                    if op.is(erts_tables::GENOP_BIF_HD_2) {
+                    if GENERIC == erts_tables::GENOP_BIF_HD_2 {
                         assembler.emit_bif_hd(value(0)?, value(1)?, runtime)
                     } else {
                         assembler.emit_bif_tl(value(0)?, value(1)?, runtime)
@@ -3902,7 +3889,7 @@ fn emit_op(
                     count(3)?;
                     let source = value(1)?;
                     let destination = value(2)?;
-                    match i32::from(op.id) {
+                    match GENERIC {
                         erts_tables::GENOP_BIF_NODE_3 => {
                             assembler.emit_bif_node(n(0)?, source, destination, runtime)
                         }
@@ -3925,14 +3912,14 @@ fn emit_op(
                     }
                 }
                 erts_tables::GENOP_BIF_MAP_GET_4 | erts_tables::GENOP_BIF_IS_MAP_KEY_5 => {
-                    let (key_at, map_at, dest_at) = if op.is(erts_tables::GENOP_BIF_MAP_GET_4) {
+                    let (key_at, map_at, dest_at) = if GENERIC == erts_tables::GENOP_BIF_MAP_GET_4 {
                         count(4)?;
                         (1, 2, 3)
                     } else {
                         count(5)?;
                         (2, 3, 4)
                     };
-                    if op.is(erts_tables::GENOP_BIF_MAP_GET_4) {
+                    if GENERIC == erts_tables::GENOP_BIF_MAP_GET_4 {
                         assembler.emit_bif_map_get(
                             n(0)?,
                             value(key_at)?,
@@ -3960,7 +3947,7 @@ fn emit_op(
                 }
                 erts_tables::GENOP_BIF_MAX_3 | erts_tables::GENOP_BIF_MIN_3 => {
                     count(3)?;
-                    if op.is(erts_tables::GENOP_BIF_MAX_3) {
+                    if GENERIC == erts_tables::GENOP_BIF_MAX_3 {
                         assembler.emit_bif_max(value(0)?, value(1)?, value(2)?, runtime)
                     } else {
                         assembler.emit_bif_min(value(0)?, value(1)?, value(2)?, runtime)
@@ -3973,7 +3960,7 @@ fn emit_op(
                     count(3)?;
                     // Port of erts/emulator/beam/jit/arm/ops.tab:819-840 and
                     // instr_guard_bifs.cpp:157-262, OTP-29.1.1.
-                    let operation = match i32::from(op.id) {
+                    let operation = match GENERIC {
                         erts_tables::GENOP_BIF_IS_EQ_EXACT_3 => 19,
                         erts_tables::GENOP_BIF_IS_NE_EXACT_3 => 20,
                         erts_tables::GENOP_BIF_IS_LT_3 => 23,
@@ -4006,7 +3993,7 @@ fn emit_op(
                     op.name()
                 )));
             }
-            let is_tuple_arity = matches!(ported_op(op), Some(EmitterKind::SelectTupleArity));
+            let is_tuple_arity = emitter == EmitterKind::SelectTupleArity;
             let payload = args[3..]
                 .iter()
                 .enumerate()
@@ -4026,10 +4013,10 @@ fn emit_op(
             // sorted the values (beam_load_sort_select_vals) and laid the operands out as the
             // emitter takes them: all values, then all labels.
             let pairs = payload;
-            if matches!(ported_op(op), Some(EmitterKind::SelectVal)) {
+            if emitter == EmitterKind::SelectVal {
                 let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190, OTP-29.1.1.
-                if op.is(erts_tables::GENOP_I_SELECT_VAL_LINS_3) {
+                if GENERIC == erts_tables::GENOP_I_SELECT_VAL_LINS_3 {
                     assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
                 } else {
                     assembler.emit_i_select_val_bins(source, value(1)?, size, &pairs)
@@ -4043,7 +4030,7 @@ fn emit_op(
             count(6)?;
             let src = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
             let fail = value(1)?;
-            let is_tuple_arity = matches!(ported_op(op), Some(EmitterKind::SelectTupleArity2));
+            let is_tuple_arity = emitter == EmitterKind::SelectTupleArity2;
             let first = if is_tuple_arity {
                 match args.get(2) {
                     Some(SpecificOperand::SmallInt(val)) => ArgVal::Immediate(*val as u64),
@@ -4064,7 +4051,7 @@ fn emit_op(
                 value(4)?
             };
             let second_label = value(5)?;
-            if matches!(ported_op(op), Some(EmitterKind::SelectVal2)) {
+            if emitter == EmitterKind::SelectVal2 {
                 assembler.emit_i_select_val2(src, fail, first, first_label, second, second_label)
             } else {
                 assembler.emit_i_select_tuple_arity2(
@@ -4078,7 +4065,7 @@ fn emit_op(
             }
         }
         EmitterKind::JumpOnVal | EmitterKind::JumpOnValZero => {
-            let (base, size_at, target_at) = if op.is(erts_tables::GENOP_I_JUMP_ON_VAL_4) {
+            let (base, size_at, target_at) = if GENERIC == erts_tables::GENOP_I_JUMP_ON_VAL_4 {
                 count_at_least(args, 5, op.name())?;
                 // The base is a full machine word, so a negative base arrives as its
                 // two's-complement bit pattern.
@@ -4118,7 +4105,7 @@ fn emit_op(
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
             let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
-            if op.is(erts_tables::GENOP_I_JUMP_ON_VAL_4) {
+            if GENERIC == erts_tables::GENOP_I_JUMP_ON_VAL_4 {
                 assembler.emit_i_jump_on_val(source, value(1)?, base, size_at, &targets)
             } else {
                 assembler.emit_i_jump_on_val_zero(source, value(1)?, size_at, &targets)
@@ -4131,7 +4118,7 @@ fn emit_op(
         }
         EmitterKind::BsMatch => {
             let helper = env.bs_match_helper();
-            match i32::from(op.id) {
+            match GENERIC {
                 erts_tables::GENOP_I_BS_START_MATCH3_4 => {
                     count(4)?;
                     assembler.emit_i_bs_start_match3(
@@ -4167,7 +4154,7 @@ fn emit_op(
                     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live):
                     // the heap test of `i_bs_match_test_heap` is merged into the segment list.
                     let (mut need, mut live) = (0u64, 0u32);
-                    if op.is(erts_tables::GENOP_I_BS_MATCH_TEST_HEAP_4) {
+                    if GENERIC == erts_tables::GENOP_I_BS_MATCH_TEST_HEAP_4 {
                         count_at_least(args, 4, op.name())?;
                         need = u64::from(number(args.get(2)).map_err(EmitError::Operand)?);
                         live = n(3)?;
@@ -4403,17 +4390,6 @@ fn emit_op(
 
 fn ported(name: &str) -> Option<EmitterKind> {
     ported_index().get(name).copied()
-}
-
-/// The emitter of `op`, from a table indexed by the generic operation number.
-fn ported_op(op: &OpView<'_>) -> Option<EmitterKind> {
-    static TABLE: std::sync::OnceLock<Vec<Option<EmitterKind>>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        (0..beamops::NUM_GENERIC_OPS)
-            .map(|id| ported(beamops::generic_op_name(id as u16)))
-            .collect()
-    });
-    table.get(usize::from(op.id)).copied().flatten()
 }
 
 /// Error returned for invalid input files or module-wide emission failures.

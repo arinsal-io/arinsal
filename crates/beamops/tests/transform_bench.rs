@@ -13,7 +13,12 @@ impl OpSink for Null {
         Ok(())
     }
 
-    fn emit(&mut self, _op: u16, _operands: &[SpecificOperand]) -> Result<(), String> {
+    fn emit(
+        &mut self,
+        _op: u16,
+        _specific: u16,
+        _operands: &[SpecificOperand],
+    ) -> Result<(), String> {
         Ok(())
     }
 }
