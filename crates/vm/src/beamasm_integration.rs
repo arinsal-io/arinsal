@@ -468,15 +468,15 @@ fn fragments() -> Option<&'static DispatchFragments> {
                     scope: 0,
                     start,
                     end,
-                    module: module.to_owned(),
+                    module,
                     module_atom: undefined,
-                    function: module.to_owned(),
+                    function: module,
                     function_atom: undefined,
                     arity: 3,
                     line: None,
                     file: None,
                     file_term: None,
-                    line_table: Vec::new(),
+                    line_table: Default::default(),
                 };
                 crate::register_native_function(info).expect("register run-process stub");
             }
@@ -737,9 +737,7 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
     let save_calls = fragments().map_or(0, DispatchFragments::save_calls_export);
     let mut dispatch_entries = Vec::with_capacity(module.exports.len());
     for export in &module.exports {
-        let Ok(function_atom) = global_atoms().intern(&export.function) else {
-            continue;
-        };
+        let function_atom = export.function_atom;
         let mfa = (module.name_atom, function_atom, export.arity);
         let bif = arinsal_bifs::lookup(&module.name, &export.function, export.arity);
         let (class, bits) =
@@ -820,10 +818,7 @@ fn publish_module_exports(
             }
         });
     for export in &module.exports {
-        let Ok(function) = global_atoms().intern(&export.function) else {
-            continue;
-        };
-        let mfa = (name, function, export.arity);
+        let mfa = (name, export.function_atom, export.arity);
         exports.target_indices.insert(mfa, export.target());
         affected.push(mfa);
     }
@@ -1220,7 +1215,9 @@ pub(crate) struct CompiledVersion {
     installed: AtomicBool,
     pub(crate) map_lookups: Box<[arinsal_beamasm::map::MapLookupTable]>,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
-    trace_breakpoints: Vec<((String, String, u8), usize, u32)>,
+    /// The native entry breakpoint of each function: its name atom and arity, the patch site
+    /// and the branch the site holds while the breakpoint is off.
+    trace_breakpoints: Vec<((arinsal_term::Atom, u8), usize, u32)>,
     // Line breakpoint patch sites: source line, branch word offset, original branch.
     line_breakpoints: Vec<(u32, usize, u32)>,
     // Return addresses of enabled line-breakpoint hits, ascending.
@@ -1259,9 +1256,10 @@ pub(crate) fn patch_native_breakpoints(scope: u64, module: &str, wanted: &[(&str
     let Ok(versions) = compiled_versions().read() else {
         return;
     };
+    let atoms = global_atoms();
     let wanted = wanted
         .iter()
-        .map(|&(function, arity, enabled)| ((function, arity), enabled))
+        .filter_map(|&(function, arity, enabled)| Some(((atoms.get(function)?, arity), enabled)))
         .collect::<HashMap<_, _>>();
     for version in versions
         .iter()
@@ -1271,11 +1269,8 @@ pub(crate) fn patch_native_breakpoints(scope: u64, module: &str, wanted: &[(&str
         let Ok(mut memory) = version.memory.lock() else {
             continue;
         };
-        for ((owner, name, found_arity), offset, branch) in &version.trace_breakpoints {
-            if owner != module {
-                continue;
-            }
-            let Some(&enabled) = wanted.get(&(name.as_str(), *found_arity)) else {
+        for (key, offset, branch) in &version.trace_breakpoints {
+            let Some(&enabled) = wanted.get(key) else {
                 continue;
             };
             let instruction = if enabled { 0xd503_201f_u32 } else { *branch };
@@ -1902,6 +1897,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn native_body(&self, name: &str, arity: u8) -> Option<(usize, usize)> {
+        // Almost no module has a static NIF: skip building the key.
+        if self.native_bodies.is_empty() {
+            return None;
+        }
         self.native_bodies.get(&(name.to_owned(), arity)).copied()
     }
 
@@ -2159,6 +2158,7 @@ pub(crate) fn compile(
         );
     }
     let fragments = fragments()?;
+    let atom_ids = arinsal_loader::file_atoms(beam).ok()?;
     let export_entries = import_entries(scope, module)?;
     let module_handle = NEXT_MODULE_HANDLE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handle| {
@@ -2302,7 +2302,7 @@ pub(crate) fn compile(
             if arinsal_spec::bif_lookup(&compiled.name, &function.name, function.arity).is_some() {
                 return None;
             }
-            let name = global_atoms().intern(&function.name).ok()?;
+            let name = arinsal_term::Atom(*atom_ids.get(function.atom_index as usize - 1)?);
             module.export_slot_atom(name, function.arity)?;
             let entry = compiled.native.entries.get(&function.label)?;
             Some((
@@ -2311,6 +2311,7 @@ pub(crate) fn compile(
             ))
         })
         .collect::<Vec<_>>();
+    let module_text = global_atoms().text(module.name_atom)?;
     let mut native_functions = Vec::with_capacity(compiled.functions.len());
     let mut line_entries = compiled
         .native
@@ -2319,6 +2320,23 @@ pub(crate) fn compile(
         .map(|entry| (code_start + entry.offset, entry))
         .collect::<Vec<_>>();
     line_entries.sort_by_key(|(address, _)| *address);
+    // One location table for the module, with one file name per distinct file; each function
+    // gets a window onto it (`BeamCodeLineTab` of erts).
+    let location_table: Arc<[crate::NativeLine]> = line_entries
+        .iter()
+        .map(|&(address, entry)| crate::NativeLine {
+            address,
+            file: Arc::clone(&entry.file),
+            file_term: module.line_file_terms.get(&*entry.file).copied(),
+            // Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION),
+            // OTP-29.1.1: a line that does not fit in 24 bits has no location.
+            line: if u64::from(entry.line) < (1 << 24) - 1 {
+                entry.line
+            } else {
+                0
+            },
+        })
+        .collect();
     for function in &compiled.functions {
         let Some(start) = compiled
             .native
@@ -2342,34 +2360,24 @@ pub(crate) fn compile(
             scope,
             start,
             end,
-            module: compiled.name.clone(),
-            module_atom: global_atoms().get(&compiled.name)?,
-            function: function.name.clone(),
-            function_atom: global_atoms().get(&function.name)?,
+            module: module_text,
+            module_atom: module.name_atom,
+            function: global_atoms().text(arinsal_term::Atom(
+                *atom_ids.get(function.atom_index as usize - 1)?,
+            ))?,
+            function_atom: arinsal_term::Atom(*atom_ids.get(function.atom_index as usize - 1)?),
             arity: function.arity,
             line: None,
             file: None,
             // A `line` instruction before the function's `func_info` still names its first
             // instructions, so the nearest preceding entry belongs to the function.
             line_table: {
-                let before = line_entries.partition_point(|(address, _)| *address <= start);
+                let before = location_table.partition_point(|entry| entry.address <= start);
                 let first = before.saturating_sub(1);
-                line_entries[first..]
-                    .iter()
-                    .take_while(|(address, _)| *address < end)
-                    .map(|&(address, entry)| crate::NativeLine {
-                        address: address.max(start),
-                        file: Arc::from(entry.file.as_str()),
-                        file_term: module.line_file_terms.get(&entry.file).copied(),
-                        // Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION),
-                        // OTP-29.1.1: a line that does not fit in 24 bits has no location.
-                        line: if u64::from(entry.line) < (1 << 24) - 1 {
-                            entry.line
-                        } else {
-                            0
-                        },
-                    })
-                    .collect()
+                let last = location_table
+                    .partition_point(|entry| entry.address < end)
+                    .max(first);
+                crate::NativeLines::window(&location_table, first, last)
             },
             file_term: None,
         });
@@ -2385,22 +2393,19 @@ pub(crate) fn compile(
             native_functions.len()
         );
     }
+    let by_label = compiled
+        .functions
+        .iter()
+        .map(|function| (function.label, function))
+        .collect::<HashMap<_, _>>();
     let trace_breakpoints = compiled
         .native
         .trace_breakpoints
         .iter()
         .filter_map(|(&label, &(offset, branch))| {
-            compiled
-                .functions
-                .iter()
-                .find(|function| function.label == label)
-                .map(|function| {
-                    (
-                        (compiled.name.clone(), function.name.clone(), function.arity),
-                        offset,
-                        branch,
-                    )
-                })
+            let function = by_label.get(&label)?;
+            let atom = arinsal_term::Atom(*atom_ids.get(function.atom_index as usize - 1)?);
+            Some(((atom, function.arity), offset, branch))
         })
         .collect();
     let version = Arc::new(CompiledVersion {

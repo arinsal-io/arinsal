@@ -805,9 +805,12 @@ impl Emitter {
             self.emit(0xf280_0000 | (2 << 21) | ((((value >> 32) & 0xffff) as u32) << 5) | d);
             return Ok(());
         }
-        let chunks: Vec<u16> = (0..halfs)
-            .map(|i| ((value >> (i * 16)) & 0xffff) as u16)
-            .collect();
+        // At most four halfwords: a stack array, as this runs for most constants of a module.
+        let mut halfwords = [0u16; 4];
+        for (i, half) in halfwords.iter_mut().enumerate().take(halfs) {
+            *half = ((value >> (i * 16)) & 0xffff) as u16;
+        }
+        let chunks = &halfwords[..halfs];
         let zeros = chunks.iter().filter(|&&v| v == 0).count();
         let ones = chunks.iter().filter(|&&v| v == 0xffff).count();
         let use_n = ones > zeros;

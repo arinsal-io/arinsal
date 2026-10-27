@@ -45,6 +45,55 @@ pub type IdMap<V> = HashMap<u32, V, BuildHasherDefault<LabelHasher>>;
 /// A map keyed by label.
 pub type LabelMap<V> = HashMap<Label, V, BuildHasherDefault<LabelHasher>>;
 
+/// The bound offset of each label of a [`CodeBuffer`]. Label ids are dense, so a vector indexed
+/// by the id does what asmjit's label-entry array does, without hashing.
+#[derive(Clone, Debug, Default)]
+pub struct LabelTable {
+    offsets: Vec<usize>,
+}
+
+const UNBOUND: usize = usize::MAX;
+
+impl LabelTable {
+    /// The offset `label` is bound at.
+    pub fn get(&self, label: &Label) -> Option<&usize> {
+        self.offsets
+            .get(label.0 as usize)
+            .filter(|offset| **offset != UNBOUND)
+    }
+
+    /// Whether `label` is bound.
+    pub fn contains_key(&self, label: &Label) -> bool {
+        self.get(label).is_some()
+    }
+
+    /// The bound labels and their offsets, in label order.
+    pub fn iter(&self) -> impl Iterator<Item = (Label, usize)> + '_ {
+        self.offsets
+            .iter()
+            .enumerate()
+            .filter(|(_, offset)| **offset != UNBOUND)
+            .map(|(id, offset)| (Label(id as u32), *offset))
+    }
+
+    /// Number of bound labels.
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Whether no label is bound.
+    pub fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+}
+
+impl std::ops::Index<&Label> for LabelTable {
+    type Output = usize;
+    fn index(&self, label: &Label) -> &usize {
+        self.get(label).expect("label is bound")
+    }
+}
+
 /// Opaque label allocated by [`CodeBuffer`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Label(u32);
@@ -112,7 +161,12 @@ struct Fixup {
     kind: BranchKind,
     veneer: Option<usize>,
     resolved: bool,
+    /// The next unresolved branch to the same label (`NO_FIXUP` ends the list), the way the
+    /// fixups of an asmjit label entry form a linked list.
+    next: u32,
 }
+
+const NO_FIXUP: u32 = u32::MAX;
 
 #[derive(Clone, Debug)]
 struct Literal {
@@ -125,13 +179,15 @@ struct Literal {
 pub struct CodeBuffer {
     emitter: Emitter,
     next_label: u32,
-    labels: LabelMap<usize>,
+    labels: LabelTable,
     /// Unresolved branches in emission order; a resolved one stays until the next flush as a
     /// tombstone so the indices of `waiting` hold.
     fixups: Vec<Fixup>,
-    /// Indices into `fixups` of the unresolved branches to each label, in emission order.
-    waiting: LabelMap<Vec<usize>>,
+    /// The newest unresolved branch to each label; the older ones follow through `Fixup::next`.
+    waiting: Vec<u32>,
     literals: Vec<Literal>,
+    /// Index into `literals` of the pending literal with a value.
+    pending_literals: HashMap<u64, usize, BuildHasherDefault<LabelHasher>>,
     literal_sites: HashMap<u64, Vec<usize>, BuildHasherDefault<LabelHasher>>,
     unreachable: bool,
     last_check: usize,
@@ -160,6 +216,8 @@ impl CodeBuffer {
     pub fn new_label(&mut self) -> Label {
         let label = Label(self.next_label);
         self.next_label = self.next_label.checked_add(1).expect("label id exhausted");
+        self.labels.offsets.push(UNBOUND);
+        self.waiting.push(NO_FIXUP);
         label
     }
     /// Returns a label's bound byte offset, if bound.
@@ -167,28 +225,30 @@ impl CodeBuffer {
         self.labels.get(&label).copied()
     }
     /// Returns all currently bound labels and their byte offsets.
-    pub fn label_offsets(&self) -> &LabelMap<usize> {
+    pub fn label_offsets(&self) -> &LabelTable {
         &self.labels
     }
 
     /// Binds a label at the current offset and resolves waiting fixups.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:590-610, OTP-29.1.1
     pub fn bind(&mut self, label: Label) -> Result<(), BufferError> {
-        if self.labels.contains_key(&label) {
-            return Err(BufferError::AlreadyBound(label));
-        }
         if label.0 >= self.next_label {
             return Err(BufferError::InvalidLabel(label));
         }
+        if self.labels.contains_key(&label) {
+            return Err(BufferError::AlreadyBound(label));
+        }
         let offset = self.offset();
         self.binds += 1;
-        self.labels.insert(label, offset);
+        self.labels.offsets[label.0 as usize] = offset;
         // Only the branches waiting for this label: scanning every pending branch per bind is
         // quadratic in the size of a module.
-        for index in self.waiting.remove(&label).unwrap_or_default() {
-            let fixup = &mut self.fixups[index];
+        let mut next = std::mem::replace(&mut self.waiting[label.0 as usize], NO_FIXUP);
+        while next != NO_FIXUP {
+            let fixup = &mut self.fixups[next as usize];
             fixup.resolved = true;
             let (site, kind, veneer) = (fixup.site, fixup.kind, fixup.veneer);
+            next = fixup.next;
             self.patch(site, kind, veneer.unwrap_or(offset))?;
         }
         Ok(())
@@ -199,7 +259,9 @@ impl CodeBuffer {
             return Err(BufferError::InvalidLabel(label));
         }
         let site = self.offset();
-        let mut e = Emitter::new();
+        // The branch is encoded straight into the buffer: a scratch emitter would cost a heap
+        // allocation per branch.
+        let e = &mut self.emitter;
         match kind {
             BranchKind::B => e.b(0)?,
             BranchKind::Bl => e.bl(0)?,
@@ -211,7 +273,6 @@ impl CodeBuffer {
             BranchKind::Adr(r) => e.adr(r, 0)?,
             BranchKind::Literal(r) => e.ldr_literal(r, 0)?,
         }
-        self.emitter.word(e.words[0]);
         if let Some(&target) = self.labels.get(&label) {
             if kind.is_control() && !branch_fits(kind, site, target) {
                 let after = self.new_label();
@@ -224,10 +285,10 @@ impl CodeBuffer {
                 self.patch(site, kind, target)?;
             }
         } else {
-            self.waiting
-                .entry(label)
-                .or_default()
-                .push(self.fixups.len());
+            let previous = std::mem::replace(
+                &mut self.waiting[label.0 as usize],
+                self.fixups.len() as u32,
+            );
             if kind.is_control() {
                 let deadline = site.saturating_add(kind.reach() as usize);
                 self.min_stub_deadline =
@@ -239,6 +300,7 @@ impl CodeBuffer {
                 kind,
                 veneer: None,
                 resolved: false,
+                next: previous,
             });
         }
         Ok(())
@@ -289,9 +351,7 @@ impl CodeBuffer {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:736-769, OTP-29.1.1
     pub fn ldr_literal(&mut self, reg: Gpr, value: u64) -> Result<(), BufferError> {
         let site = self.offset();
-        let mut e = Emitter::new();
-        e.ldr_literal(reg, 0)?;
-        self.emitter.word(e.words[0]);
+        self.emitter.ldr_literal(reg, 0)?;
         if let Some(&offset) = self.literal_sites.get(&value).and_then(|v| {
             v.iter()
                 .find(|&&p| (p as i64 - site as i64).abs() < COND_RANGE - 16)
@@ -300,9 +360,10 @@ impl CodeBuffer {
             return Ok(());
         }
         self.min_literal_site = Some(self.min_literal_site.map_or(site, |m| m.min(site)));
-        if let Some(pending) = self.literals.iter_mut().find(|l| l.value == value) {
-            pending.sites.push((site, reg));
+        if let Some(&index) = self.pending_literals.get(&value) {
+            self.literals[index].sites.push((site, reg));
         } else {
+            self.pending_literals.insert(value, self.literals.len());
             self.literals.push(Literal {
                 sites: vec![(site, reg)],
                 value,
@@ -360,10 +421,13 @@ impl CodeBuffer {
         }
         // Drop the resolved branches and renumber the waiting lists.
         if self.fixups.iter().any(|fixup| fixup.resolved) {
+            for fixup in &self.fixups {
+                self.waiting[fixup.label.0 as usize] = NO_FIXUP;
+            }
             self.fixups.retain(|fixup| !fixup.resolved);
-            self.waiting.clear();
-            for (index, fixup) in self.fixups.iter().enumerate() {
-                self.waiting.entry(fixup.label).or_default().push(index);
+            for (index, fixup) in self.fixups.iter_mut().enumerate() {
+                fixup.next =
+                    std::mem::replace(&mut self.waiting[fixup.label.0 as usize], index as u32);
             }
         }
         let due_fixups: Vec<usize> = self
@@ -405,6 +469,10 @@ impl CodeBuffer {
             self.emit_veneer(label)?;
         }
         let due: Vec<Literal> = self.literals.drain_filter_due(now, range);
+        self.pending_literals.clear();
+        for (index, literal) in self.literals.iter().enumerate() {
+            self.pending_literals.insert(literal.value, index);
+        }
         for literal in due {
             self.align8();
             let offset = self.offset();
@@ -523,7 +591,7 @@ impl CodeBuffer {
     }
 
     /// Finalizes the buffer and returns both words and the label offset map.
-    pub fn finish_with_labels(mut self) -> Result<(Vec<u32>, LabelMap<usize>), BufferError> {
+    pub fn finish_with_labels(mut self) -> Result<(Vec<u32>, LabelTable), BufferError> {
         self.flush_pending_stubs(usize::MAX / 2)?;
         if let Some(fixup) = self.fixups.iter().find(|fixup| !fixup.resolved) {
             return Err(BufferError::UnboundLabel(fixup.label));
@@ -537,10 +605,11 @@ impl Default for CodeBuffer {
         Self {
             emitter: Emitter::with_capacity(CODE_BUFFER_INITIAL_BYTES / 4),
             next_label: 0,
-            labels: LabelMap::default(),
+            labels: LabelTable::default(),
             fixups: Vec::new(),
-            waiting: LabelMap::default(),
+            waiting: Vec::new(),
             literals: Vec::new(),
+            pending_literals: HashMap::default(),
             literal_sites: HashMap::default(),
             unreachable: false,
             last_check: 0,

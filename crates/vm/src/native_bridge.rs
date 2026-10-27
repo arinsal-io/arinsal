@@ -73,12 +73,12 @@ pub struct NativeFunction {
     pub start: usize,
     /// Exclusive end of generated code.
     pub end: usize,
-    /// Erlang module name.
-    pub module: String,
+    /// Erlang module name: the text of `module_atom`, which the atom table keeps for good.
+    pub module: &'static str,
     /// Module atom resolved when the native function was registered.
     pub module_atom: arinsal_term::Atom,
-    /// Erlang function name.
-    pub function: String,
+    /// Erlang function name: the text of `function_atom`.
+    pub function: &'static str,
     /// Function atom resolved when the native function was registered.
     pub function_atom: arinsal_term::Atom,
     /// Erlang function arity.
@@ -89,9 +89,47 @@ pub struct NativeFunction {
     pub file: Option<Arc<str>>,
     /// Cached literal filename list, when source location metadata is available.
     pub file_term: Option<Term>,
-    /// Native PCs and their source locations, sorted by address.
-    pub line_table: Vec<NativeLine>,
+    /// Native PCs and their source locations, sorted by address: the function's part of the
+    /// module's one location table (`BeamCodeLineTab::loc_tab` of erts).
+    pub line_table: NativeLines,
 }
+
+/// A function's window onto the location table its module shares between all its functions.
+// Port of erts/emulator/beam/beam_file.h (BeamCodeLineTab: one `loc_tab` per module,
+// `func_tab` pointing into it), OTP-29.1.1.
+#[derive(Clone, Debug, Default)]
+pub struct NativeLines {
+    table: Option<Arc<[NativeLine]>>,
+    lo: u32,
+    hi: u32,
+}
+
+impl NativeLines {
+    /// The entries `lo..hi` of `table`.
+    pub fn window(table: &Arc<[NativeLine]>, lo: usize, hi: usize) -> Self {
+        Self {
+            table: Some(Arc::clone(table)),
+            lo: lo as u32,
+            hi: hi as u32,
+        }
+    }
+}
+
+impl std::ops::Deref for NativeLines {
+    type Target = [NativeLine];
+    fn deref(&self) -> &[NativeLine] {
+        self.table
+            .as_deref()
+            .map_or(&[], |table| &table[self.lo as usize..self.hi as usize])
+    }
+}
+
+impl PartialEq for NativeLines {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for NativeLines {}
 
 /// One native PC to source location mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,17 +180,9 @@ pub(crate) struct FunctionRange {
     arity: u8,
     /// `loc_tab` entries retain the literal filename term used by the module.
     // Port of erts/emulator/beam/beam_ranges.c:353-357, OTP-29.1.1.
-    locs: Arc<[LineLoc]>,
-    /// `lines[i].address`, packed so `find_line` does not chase the filename Arc.
     /// Port of beam_ranges.c:331 (`lookup_loc` binary-searches `func_tab` pointers,
     /// then indexes `loc_tab`), OTP-29.1.1.
-    line_addrs: Arc<[usize]>,
-}
-
-struct LineLoc {
-    line: u32,
-    file_term: Option<Term>,
-    file: Arc<str>,
+    lines: NativeLines,
 }
 
 /// One module's native code in the active code index, sorted by `start`.
@@ -203,16 +233,6 @@ pub(crate) fn scope0_code_ranges() -> Arc<Vec<ModuleRange>> {
 }
 
 fn function_range(info: &NativeFunction) -> FunctionRange {
-    let line_addrs: Arc<[usize]> = info.line_table.iter().map(|entry| entry.address).collect();
-    let locs: Arc<[LineLoc]> = info
-        .line_table
-        .iter()
-        .map(|entry| LineLoc {
-            line: entry.line,
-            file_term: entry.file_term,
-            file: entry.file.clone(),
-        })
-        .collect();
     FunctionRange {
         scope: info.scope,
         start: info.start,
@@ -220,8 +240,7 @@ fn function_range(info: &NativeFunction) -> FunctionRange {
         module_atom: info.module_atom,
         function_atom: info.function_atom,
         arity: info.arity,
-        locs,
-        line_addrs,
+        lines: info.line_table.clone(),
     }
 }
 
@@ -448,10 +467,10 @@ fn frame_in(ranges: &[ModuleRange], address: usize) -> Option<NativeStackFrame> 
     // Port of beam_ranges.c:331 (`lookup_loc`): binary search the function's pc table,
     // then index its parallel location table. Filenames remain module literals.
     let loc = function
-        .line_addrs
-        .partition_point(|start| *start <= address)
+        .lines
+        .partition_point(|entry| entry.address <= address)
         .checked_sub(1)
-        .and_then(|index| function.locs.get(index))
+        .and_then(|index| function.lines.get(index))
         .filter(|entry| entry.line != 0);
     let file_term = loc.as_ref().and_then(|entry| entry.file_term);
     // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
@@ -921,26 +940,25 @@ pub(crate) fn register_native_module(
     }
     arinsal_term::register_native_code_range(code_start, code_end)?;
     let mut registered = native_functions().write();
-    for function in &ordered {
-        let index = registered.partition_point(|entry| entry.start < function.start);
-        let overlaps_previous = index
-            .checked_sub(1)
-            .and_then(|previous| registered.get(previous))
-            .is_some_and(|previous| function.start < previous.end);
-        let overlaps_next = registered
-            .get(index)
-            .is_some_and(|next| next.start < function.end);
-        if overlaps_previous || overlaps_next {
-            drop(registered);
-            arinsal_term::unregister_native_code_range(code_start, code_end);
-            return Err("native function ranges must not overlap");
-        }
+    // The functions of a module are contiguous in the registry (the module's code range holds no
+    // other module): they overlap nothing when the neighbours of the whole run are clear of it.
+    let first_start = ordered[0].start;
+    let last_end = ordered[ordered.len() - 1].end;
+    let at = registered.partition_point(|entry| entry.start < first_start);
+    let overlaps_previous = at
+        .checked_sub(1)
+        .and_then(|previous| registered.get(previous))
+        .is_some_and(|previous| first_start < previous.end);
+    let overlaps_next = registered.get(at).is_some_and(|next| next.start < last_end);
+    if overlaps_previous || overlaps_next {
+        drop(registered);
+        arinsal_term::unregister_native_code_range(code_start, code_end);
+        return Err("native function ranges must not overlap");
     }
     for function in &ordered {
         update_perf_map(function);
     }
-    registered.extend(ordered.iter().cloned());
-    registered.sort_unstable_by_key(|function| function.start);
+    registered.splice(at..at, ordered.iter().cloned());
     drop(registered);
     let range = native_module_range(code_start, code_end, first.module_atom, &ordered);
     publish_native_module_range(first.scope, range);
@@ -1149,7 +1167,7 @@ pub(crate) fn native_functions_of(
         .iter()
         .filter(|entry| entry.scope == scope)
         .filter(in_version)
-        .map(|entry| ((entry.function.clone(), entry.arity), entry.clone()))
+        .map(|entry| ((entry.function.to_owned(), entry.arity), entry.clone()))
         .collect::<std::collections::HashMap<_, _>>();
     if scope != 0 {
         for entry in functions
@@ -1158,7 +1176,7 @@ pub(crate) fn native_functions_of(
             .filter(in_version)
         {
             scoped
-                .entry((entry.function.clone(), entry.arity))
+                .entry((entry.function.to_owned(), entry.arity))
                 .or_insert_with(|| entry.clone());
         }
     }
@@ -1315,7 +1333,7 @@ pub fn run_native(
         let requested_stop = process.header.stop as usize;
         if requested_stop < base as usize || requested_stop > end as usize {
             let module = native_function_at(code_address)
-                .map_or_else(|| "?".to_owned(), |function| function.module);
+                .map_or_else(|| "?".to_owned(), |function| function.module.to_owned());
             eprintln!(
                 "native return stack pointer out of range module={} pc={code_address:#x} exit={exit:?} base={base:p} end={end:p} current_stop={current_stop:p} requested_stop={:#x} htop={:p}",
                 module, requested_stop, process.header.htop
@@ -1729,12 +1747,7 @@ extern "C" fn crash_dump_handler(
         let (file, line_no) = function.line_at(pc as usize).unwrap_or(("?", 0));
         let mut text = [0u8; 240];
         let mut n = 0;
-        for part in [
-            function.module.as_str(),
-            ":",
-            function.function.as_str(),
-            "/",
-        ] {
+        for part in [function.module, ":", function.function, "/"] {
             for byte in part.bytes() {
                 if n < text.len() {
                     text[n] = byte;
@@ -1824,15 +1837,17 @@ mod version_selection_tests {
             scope,
             start,
             end: start + 16,
-            module: module.to_owned(),
+            module: atoms
+                .text(atoms.intern(module).expect("module atom"))
+                .expect("text"),
             module_atom: atoms.intern(module).expect("module atom"),
-            function: "spin".to_owned(),
+            function: "spin",
             function_atom: atoms.intern("spin").expect("function atom"),
             arity: 0,
             line: None,
             file: None,
             file_term: None,
-            line_table: Vec::new(),
+            line_table: NativeLines::default(),
         }
     }
 
@@ -1872,15 +1887,15 @@ mod version_selection_tests {
             scope,
             start,
             end,
-            module: "native_bridge_purge_reload".to_owned(),
+            module: "native_bridge_purge_reload",
             module_atom,
-            function: "f".to_owned(),
+            function: "f",
             function_atom,
             arity: 0,
             line: None,
             file: None,
             file_term: None,
-            line_table: Vec::new(),
+            line_table: NativeLines::default(),
         };
         let range =
             || native_module_range(start, end, module_atom, std::slice::from_ref(&function));

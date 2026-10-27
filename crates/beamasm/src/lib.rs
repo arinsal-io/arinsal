@@ -191,23 +191,29 @@ const X_REG_CACHE: [u8; 6] = [25, 26, 27, 28, 15, 16];
 /// saved: with `Update::X_REGS` the callee-saved X0..X3 as well, otherwise just the fragile ones.
 /// Registers at or above `live` are dead across the call, so a caller that still needs them
 /// passes a larger count (erts defaults to all six).
-fn cached_x_regs(live: usize, update: Update) -> Vec<(usize, Option<usize>)> {
-    let mut indexes = Vec::with_capacity(6);
-    if update.contains(Update::X_REGS) {
-        indexes.extend(0..live.min(4));
-    }
-    indexes.extend(4..live.min(6));
-    let mut pairs = Vec::with_capacity(3);
-    let mut iter = indexes.into_iter().peekable();
-    while let Some(first) = iter.next() {
-        if first % 2 == 0 && iter.peek() == Some(&(first + 1)) {
-            iter.next();
-            pairs.push((first, Some(first + 1)));
-        } else {
-            pairs.push((first, None));
+fn cached_x_regs(live: usize, update: Update) -> impl Iterator<Item = (usize, Option<usize>)> {
+    // The saved registers are the contiguous run `start..end` of the six cached ones (X0..X3
+    // when `X_REGS`, then X4 and X5), so there are three pairs at most and no list is needed.
+    let start = if update.contains(Update::X_REGS) {
+        0
+    } else {
+        4
+    };
+    let end = live.min(6).max(start);
+    let mut next = start;
+    std::iter::from_fn(move || {
+        if next >= end {
+            return None;
         }
-    }
-    pairs
+        let first = next;
+        if first % 2 == 0 && first + 1 < end {
+            next += 2;
+            Some((first, Some(first + 1)))
+        } else {
+            next += 1;
+            Some((first, None))
+        }
+    })
 }
 
 pub fn emit_enter_runtime(

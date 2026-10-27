@@ -654,7 +654,8 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
             return Ok(error);
         }
     }
-    let Ok(mut module) = vm.prepare_module_with(&meta.beam, Some(&bytes), !native_only) else {
+    let Ok(mut module) = vm.prepare_module_with(&meta.beam, Some(&bytes), meta.md5, !native_only)
+    else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };

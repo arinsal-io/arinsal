@@ -285,8 +285,12 @@ pub struct BeamFile {
     pub records: Vec<NativeRecord>,
     /// Chunk identifiers and payload sizes in file order.
     pub chunks: Vec<(ChunkId, usize)>,
-    /// Unknown chunk payloads.
+    /// The payloads of the unknown chunks a loaded module still needs (`DbgB`). The other
+    /// unknown chunks (`Dbgi`, `Docs`) stay in the file bytes, as erts leaves them there.
     pub other_chunks: Vec<(ChunkId, Vec<u8>)>,
+    /// The global atom of each atom table entry, put once by the loader that first needs them
+    /// (`beamfile_read` of erts puts every atom while it reads the table).
+    resolved_atoms: std::sync::OnceLock<Vec<u32>>,
 }
 
 /// One compiler-emitted native record definition.
@@ -316,6 +320,24 @@ impl BeamFile {
         self.lines = None;
         self.types = None;
         self.records = Vec::new();
+    }
+
+    /// The global atom (as its table index) of each atom table entry, in table order. `intern`
+    /// puts the atoms on the first call; later calls return the same slice.
+    // Port of erts/emulator/beam/beam_file.c (parse_atom_chunk: erts_atom_put per entry).
+    pub fn resolved_atoms<E>(
+        &self,
+        mut intern: impl FnMut(&str) -> Result<u32, E>,
+    ) -> Result<&[u32], E> {
+        if let Some(atoms) = self.resolved_atoms.get() {
+            return Ok(atoms);
+        }
+        let ids = self
+            .atoms
+            .iter()
+            .map(|name| intern(name))
+            .collect::<Result<Vec<_>, E>>()?;
+        Ok(self.resolved_atoms.get_or_init(|| ids))
     }
 
     /// Resolve a one-based atom index; zero is not a table entry.
@@ -452,7 +474,7 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     ];
     let other_chunks = chunks
         .iter()
-        .filter(|(id, _)| !known.contains(id))
+        .filter(|(id, _)| !known.contains(id) && id == b"DbgB")
         .map(|(id, _)| (*id, map[id].to_vec()))
         .collect();
     Ok(BeamFile {
@@ -474,6 +496,7 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
         records,
         chunks,
         other_chunks,
+        resolved_atoms: std::sync::OnceLock::new(),
     })
 }
 

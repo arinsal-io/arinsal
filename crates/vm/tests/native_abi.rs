@@ -478,16 +478,16 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
         scope: 0,
         start: entry,
         end: entry + bytes.len(),
-        module: "native_abi_test".into(),
+        module: "native_abi_test",
         module_atom: arinsal_term::global_atoms()
             .intern("native_abi_test")
             .unwrap(),
-        function: "bridge".into(),
+        function: "bridge",
         function_atom: arinsal_term::global_atoms().intern("bridge").unwrap(),
         arity: 0,
         line: Some(17),
         file: Some("native_abi_test.erl".into()),
-        line_table: Vec::new(),
+        line_table: Default::default(),
         file_term: None,
     })
     .unwrap();

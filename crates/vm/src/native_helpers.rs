@@ -1187,12 +1187,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     let Some((_, line)) = function.line_at(pc as usize) else {
         return 0;
     };
-    if (
-        function.module.as_str(),
-        function.function.as_str(),
-        function.arity,
-    ) == ("erts_internal", "breakpoint", 4)
-    {
+    if (function.module, function.function, function.arity) == ("erts_internal", "breakpoint", 4) {
         return 0;
     }
     let Some(runtime) = process.runtime.as_ref() else {

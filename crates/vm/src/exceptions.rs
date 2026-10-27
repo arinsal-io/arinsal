@@ -754,8 +754,13 @@ pub(super) fn resume(
             let target = match handler {
                 crate::native_bridge::CatchHandler::Native(handler) => {
                     p.native_pc = Some(handler);
-                    crate::native_function_at(handler)
-                        .map(|function| (function.module, function.function, function.arity))
+                    crate::native_function_at(handler).map(|function| {
+                        (
+                            function.module.to_owned(),
+                            function.function.to_owned(),
+                            function.arity,
+                        )
+                    })
                 }
                 crate::native_bridge::CatchHandler::Interpreted => {
                     vm.code.modules.get(p.module).and_then(|module| {

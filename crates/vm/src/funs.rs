@@ -8,14 +8,12 @@ use arinsal_sched::RunCtx;
 use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
 use std::sync::Arc;
 
-pub(super) fn set_module_uniq(module: &mut Module, bytes: &[u8]) -> Result<(), VmError> {
-    let uniq = arinsal_loader::module_uniq(bytes).map_err(|e| VmError::Load(e.to_string()))?;
+pub(super) fn set_module_uniq(module: &mut Module, uniq: [u8; 16]) {
     for slot in &mut module.funs {
         if let Some(entry) = Arc::get_mut(&mut slot.entry) {
             entry.uniq = uniq;
         }
     }
-    Ok(())
 }
 
 #[inline]

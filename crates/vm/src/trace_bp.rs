@@ -1171,8 +1171,8 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
                 &table,
                 runtime,
                 code,
-                &function.module,
-                &function.function,
+                function.module,
+                function.function,
                 function.arity,
             )
             .map(|g| SiteBp {
@@ -1186,8 +1186,8 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
             (
                 bps,
                 function.arity,
-                function.module.clone(),
-                function.function.clone(),
+                function.module.to_owned(),
+                function.function.to_owned(),
             )
         })?;
     drop(table);

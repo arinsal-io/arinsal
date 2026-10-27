@@ -838,7 +838,7 @@ impl Vm {
         beam: &BeamFile,
         bytes: Option<&[u8]>,
     ) -> Result<Module, VmError> {
-        self.prepare_module_with(beam, bytes, true)
+        self.prepare_module_with(beam, bytes, None, true)
     }
 
     /// Whether a module may be loaded without the interpreter form of its code: BeamAsm is
@@ -863,6 +863,7 @@ impl Vm {
         &self,
         beam: &BeamFile,
         bytes: Option<&[u8]>,
+        uniq: Option<[u8; 16]>,
         specialize: bool,
     ) -> Result<Module, VmError> {
         let mut module = if specialize {
@@ -876,8 +877,15 @@ impl Vm {
             arinsal_loader::load_native(beam)
         }
         .map_err(|e| VmError::Load(e.to_string()))?;
+        // The checksum is computed once per file, like erts' beamfile_read does.
         if let Some(bytes) = bytes {
-            funs::set_module_uniq(&mut module, bytes)?;
+            let uniq = match uniq {
+                Some(uniq) => uniq,
+                None => {
+                    arinsal_loader::module_uniq(bytes).map_err(|e| VmError::Load(e.to_string()))?
+                }
+            };
+            funs::set_module_uniq(&mut module, uniq);
         }
         bind_static_nifs(&mut module, &self.code_ix);
         Ok(module)
@@ -1037,7 +1045,7 @@ impl Vm {
                 .decode_code()
                 .map_err(|e| VmError::Load(e.to_string()))?;
         }
-        let mut module = self.prepare_module_with(&meta.beam, bytes, !native_only)?;
+        let mut module = self.prepare_module_with(&meta.beam, bytes, meta.md5, !native_only)?;
         let registers = (
             meta.beam.summary.x_registers,
             meta.beam.summary.float_registers,

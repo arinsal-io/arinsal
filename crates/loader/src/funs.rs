@@ -31,7 +31,13 @@ impl FunSlot {
 /// Compute the OTP 29 module checksum carried by local fun identities.
 pub fn module_uniq(bytes: &[u8]) -> Result<[u8; 16], LoadError> {
     // Port of erts/emulator/beam/beam_file.c:1753 (module checksum), OTP-29.1.1.
-    let mut chunks = HashMap::<[u8; 4], &[u8]>::new();
+    // The ids the checksum covers, in the order erts hashes them; a later duplicate replaces an
+    // earlier chunk, as the table insert did.
+    const IDS: [[u8; 4]; 10] = [
+        *b"AtU8", *b"Code", *b"StrT", *b"ImpT", *b"ExpT", *b"FunT", *b"LitT", *b"Meta", *b"Recs",
+        *b"DbgB",
+    ];
+    let mut slots = [None::<&[u8]>; 10];
     let mut position = 12_usize;
     while position + 8 <= bytes.len() {
         let id: [u8; 4] = bytes[position..position + 4]
@@ -47,16 +53,16 @@ pub fn module_uniq(bytes: &[u8]) -> Result<[u8; 16], LoadError> {
             .and_then(|value| value.checked_add(length))
             .ok_or(LoadError::Limit)?;
         let data = bytes.get(position + 8..end).ok_or(LoadError::Limit)?;
-        chunks.insert(id, data);
+        if let Some(slot) = IDS.iter().position(|wanted| *wanted == id) {
+            slots[slot] = Some(data);
+        }
         position = (end + 3) & !3;
     }
     let mut digest = Md5::new();
-    for id in [*b"AtU8", *b"Code", *b"StrT", *b"ImpT", *b"ExpT"] {
-        if let Some(data) = chunks.get(&id) {
-            digest.update(data);
-        }
+    for data in slots[..5].iter().flatten() {
+        digest.update(data);
     }
-    if let Some(fun_t) = chunks.get(b"FunT") {
+    if let Some(fun_t) = slots[5] {
         if fun_t.len() < 4 || (fun_t.len() - 4) % 24 != 0 {
             return Err(LoadError::Limit);
         }
@@ -66,10 +72,8 @@ pub fn module_uniq(bytes: &[u8]) -> Result<[u8; 16], LoadError> {
             digest.update([0; 4]);
         }
     }
-    for id in [*b"LitT", *b"Meta", *b"Recs", *b"DbgB"] {
-        if let Some(data) = chunks.get(&id) {
-            digest.update(data);
-        }
+    for data in slots[6..].iter().flatten() {
+        digest.update(data);
     }
     Ok(digest.finalize().into())
 }

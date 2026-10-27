@@ -2954,8 +2954,8 @@ pub(crate) fn executor_native_call_event(
         vm,
         process,
         ctx,
-        &function.module,
-        &function.function,
+        function.module,
+        function.function,
         &args,
         local,
     )?;
@@ -3150,10 +3150,10 @@ pub(crate) fn native_return_events(
                     let built =
                         TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                             .tuple(&[
-                                Term::atom(global_atoms().intern(&function.module).map_err(
+                                Term::atom(global_atoms().intern(function.module).map_err(
                                     |_| VmError::Unsupported("trace module atom".into()),
                                 )?),
-                                Term::atom(global_atoms().intern(&function.function).map_err(
+                                Term::atom(global_atoms().intern(function.function).map_err(
                                     |_| VmError::Unsupported("trace function atom".into()),
                                 )?),
                                 Term::small(i64::from(function.arity))
@@ -3407,7 +3407,11 @@ fn caller_mfa_name(
     if module_id == usize::MAX {
         // A native call site: the pc names the caller's native function.
         let function = crate::native_function_at(ip)?;
-        return Some((function.module, function.function, function.arity));
+        return Some((
+            function.module.to_owned(),
+            function.function.to_owned(),
+            function.arity,
+        ));
     }
     let module = vm.code.modules.get(module_id)?;
     let (function, arity) = module.function_at(ip)?;
@@ -3477,7 +3481,11 @@ pub(crate) fn native_return_to_event(
     // The native frame's CP was consumed by the return: a native caller is named by it,
     // an interpreted one by the continuation the bridge left on the stack.
     let target = match crate::native_function_at(caller) {
-        Some(function) => Some((function.module, function.function, function.arity)),
+        Some(function) => Some((
+            function.module.to_owned(),
+            function.function.to_owned(),
+            function.arity,
+        )),
         None => return_to_target(vm, process, 0),
     };
     emit_return_to(vm, process, ctx, session, target)
@@ -3501,7 +3509,11 @@ fn return_to_target(vm: &Vm, process: &Process, start: usize) -> Option<(String,
             continue;
         }
         if let Some(function) = crate::native_function_at(raw) {
-            return Some((function.module, function.function, function.arity));
+            return Some((
+                function.module.to_owned(),
+                function.function.to_owned(),
+                function.arity,
+            ));
         }
         let Some((is_handler, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
             index += 1;
@@ -4042,7 +4054,7 @@ pub(crate) fn running_mfa(
     } else if let Some(continuation) = continuation {
         continuation
     } else if let Some(native) = native.as_ref() {
-        (&*native.module, &*native.function, native.arity)
+        (native.module, native.function, native.arity)
     } else {
         let Some(module) = vm.code.modules.get(process.module) else {
             return Ok(None);

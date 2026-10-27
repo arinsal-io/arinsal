@@ -1498,6 +1498,8 @@ pub struct CompiledFunction {
     pub arity: u8,
     /// Entry label in the source module.
     pub label: u32,
+    /// One-based atom table index of the function name.
+    pub atom_index: u32,
 }
 
 /// Parsed module and its native function entries.
@@ -1642,6 +1644,7 @@ impl<E: ModuleEnv> ModuleCompiler<'_, E> {
             name: name.clone(),
             arity,
             label,
+            atom_index: function.function_atom,
         });
         let native_body = self.env.native_body(&name, arity);
         // Port of erts/emulator/beam/jit/arm/generators.tab:403-412 and asm_load.c:185-190
@@ -1671,6 +1674,7 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
             let label = as_u32(operands.first()).ok_or("i_func_label without a label")?;
             self.begin_function(label)?;
         }
+
         // Veneers are flushed before every function, whether it is emitted or not, so they
         // never land in a prologue (ops.tab: i_flush_stubs).
         let flush = id == erts_tables::GENOP_I_FLUSH_STUBS_0;
@@ -1767,6 +1771,7 @@ fn compile_parsed_module_with_options_in_arena(
         assembler.set_map_error_fragments(badmap, badkey, size_error);
     }
     assembler.enable_dump(&beam.module);
+    assembler.set_default_line_file(format!("{}.erl", beam.module));
     let may_load_nif = beam.imports.iter().any(|import| {
         import.arity == 2
             && beam.atom(import.module_atom) == Some("erlang")
@@ -2396,14 +2401,13 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }) && let Ok(line) = u32::try_from(item.line)
                 {
                     let file = if item.name_index == 0 {
-                        format!("{}.erl", beam.module)
+                        None
                     } else {
                         beam.lines
                             .as_ref()
                             .and_then(|table| table.names.get(item.name_index as usize - 1))
                             .filter(|name| !name.is_empty())
-                            .cloned()
-                            .unwrap_or_else(|| format!("{}.erl", beam.module))
+                            .map(String::as_str)
                     };
                     assembler.record_line(u64::from(location), file, line, is_func_line);
                 }
@@ -2438,22 +2442,18 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 // Each i_debug_line is a distinct line-table entry, duplicates included
                 // (asm_load.c:714-737).
                 if line != 0 {
-                    let file = beam
-                        .lines
-                        .as_ref()
-                        .and_then(|table| {
-                            let item = table.items.get(n(0).ok()?.checked_sub(1)? as usize)?;
-                            if item.name_index == 0 {
-                                None
-                            } else {
-                                table
-                                    .names
-                                    .get(item.name_index as usize - 1)
-                                    .filter(|name| !name.is_empty())
-                                    .cloned()
-                            }
-                        })
-                        .unwrap_or_else(|| format!("{}.erl", beam.module));
+                    let file = beam.lines.as_ref().and_then(|table| {
+                        let item = table.items.get(n(0).ok()?.checked_sub(1)? as usize)?;
+                        if item.name_index == 0 {
+                            None
+                        } else {
+                            table
+                                .names
+                                .get(item.name_index as usize - 1)
+                                .filter(|name| !name.is_empty())
+                                .map(String::as_str)
+                        }
+                    });
                     assembler.record_line(u64::from(n(0)?), file, line, true);
                 }
                 Ok(())
