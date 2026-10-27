@@ -685,8 +685,8 @@ impl CodeIndexes {
         self.active.store(ix as u32, Ordering::Release);
         self.staging
             .store(((ix + 1) % ERTS_NUM_CODE_IX) as u32, Ordering::Release);
-        if code_barrier_pending {
-            CODE_BARRIER_PENDING.set(true);
+        if code_barrier_pending && !CODE_BARRIER_PENDING.replace(true) && runs_native_slices() {
+            CODE_BARRIER_THREADS.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -820,8 +820,45 @@ thread_local! {
 /// rescheduled before the committing process continues.
 // Port of erts/emulator/beam/code_ix.c:558-575 (erts_schedule_code_barrier) and beam_bif_load.c:551-560, OTP-29.1.1.
 pub(crate) fn take_code_barrier() -> bool {
-    CODE_BARRIER_PENDING.replace(false)
+    // Every native entry asks; a process-wide count of threads owing a barrier keeps the
+    // common answer off the thread-local lookup.
+    if CODE_BARRIER_THREADS.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    take_code_barrier_slow()
 }
+
+#[inline(never)] // Keeps the thread-local lookup out of the scheduler loop.
+fn take_code_barrier_slow() -> bool {
+    let pending = CODE_BARRIER_PENDING.replace(false);
+    if pending && runs_native_slices() {
+        CODE_BARRIER_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+    pending
+}
+
+/// Whether the calling thread asks [`take_code_barrier`] between native slices, so a flag it
+/// sets is eventually taken. Other threads (boot, tests, helpers) never reach a native entry:
+/// counting them would pin [`CODE_BARRIER_THREADS`] above zero for the VM's life.
+fn runs_native_slices() -> bool {
+    #[cfg(test)]
+    if let Some(counted) = TEST_COUNTS_BARRIER.with(std::cell::Cell::get) {
+        return counted;
+    }
+    arinsal_sched::current_normal_scheduler().is_some()
+        || arinsal_sched::current_scheduler_type().is_dirty()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test thread stand in for a scheduler thread (`Some(true)`) or for a thread that
+    /// never runs native slices (`Some(false)`).
+    static TEST_COUNTS_BARRIER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Threads whose [`CODE_BARRIER_PENDING`] is set and which take it.
+static CODE_BARRIER_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn scopes() -> &'static RwLock<HashMap<u64, Arc<CodeIndexes>>> {
     // Scope entries are not evicted: their fun and export tables own entries for the VM life.
@@ -927,6 +964,7 @@ mod tests {
 
     #[test]
     fn ended_staging_committed_after_thread_progress_does_not_schedule_a_second_barrier() {
+        TEST_COUNTS_BARRIER.with(|counted| counted.set(Some(true)));
         let (scope, code) = node();
         let staging = code.start_staging();
         staging.with(|tables| {
@@ -940,6 +978,22 @@ mod tests {
 
         drop(code.start_staging());
         assert!(take_code_barrier());
+        crate::beamasm_integration::release_code_scope(scope);
+    }
+
+    #[test]
+    fn code_barrier_count_returns_to_zero_once_the_scheduler_thread_takes_it() {
+        TEST_COUNTS_BARRIER.with(|counted| counted.set(Some(true)));
+        let (scope, code) = node();
+        let before = CODE_BARRIER_THREADS.load(Ordering::SeqCst);
+        drop(code.start_staging());
+        assert_eq!(CODE_BARRIER_THREADS.load(Ordering::SeqCst), before + 1);
+        assert!(take_code_barrier());
+        assert_eq!(CODE_BARRIER_THREADS.load(Ordering::SeqCst), before);
+        // A thread that never runs native slices does not count.
+        TEST_COUNTS_BARRIER.with(|counted| counted.set(Some(false)));
+        drop(code.start_staging());
+        assert_eq!(CODE_BARRIER_THREADS.load(Ordering::SeqCst), before);
         crate::beamasm_integration::release_code_scope(scope);
     }
 

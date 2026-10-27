@@ -651,7 +651,10 @@ impl Process {
         if on_heap_words != 0 {
             crate::trace_bp::adjust_memory_break(self, on_heap_words as i64);
         }
-        self.cold_mut().prio_len = new_prio_len;
+        // Priority messages are rare: the cold box is allocated only when the count changes.
+        if new_prio_len != old_prio_len {
+            self.cold_mut().prio_len = new_prio_len;
+        }
         let (term, state) = removed_message
             .ok_or_else(|| VmError::Unsupported("remove_message without current message".into()))?;
 

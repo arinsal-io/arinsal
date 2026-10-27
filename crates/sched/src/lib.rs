@@ -747,15 +747,30 @@ pub fn current_scheduler_type() -> SchedulerType {
 /// Take the held process monitor of this scheduler when it is for `to`, so the signal to `to`
 /// is sent after it. Port of erl_proc_sig_queue.c:1141-1150, OTP-29.1.1.
 fn take_held_monitor_for(to: Pid) -> Option<PendingProcMonitor> {
+    // Every send asks; erts tests `esdp->pending_signal.sig` through the scheduler data it
+    // already holds. A count of the threads that hold one keeps the common answer off the
+    // thread-local lookup.
+    if HELD_MONITOR_THREADS.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    take_held_monitor_for_slow(to)
+}
+
+#[inline(never)]
+fn take_held_monitor_for_slow(to: Pid) -> Option<PendingProcMonitor> {
     PENDING_PROC_MONITOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_ref().is_some_and(|held| held.to == to) {
+            HELD_MONITOR_THREADS.fetch_sub(1, Ordering::Relaxed);
             slot.take()
         } else {
             None
         }
     })
 }
+
+/// Threads whose [`PENDING_PROC_MONITOR`] slot is occupied.
+static HELD_MONITOR_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// A VM process or a benchmark dummy task.
 pub trait Task: Send + 'static {
@@ -1230,7 +1245,10 @@ pub mod proc_flags {
     }
 }
 
-struct Process<T: Task> {
+/// Everything of a process the scheduler and a running task's context reach without the task
+/// cell. Port of erts/emulator/beam/erl_process.h (`struct process`: the scheduling fields
+/// next to the pointer the emulator passes around as `c_p`), OTP-29.1.1.
+struct ProcShared<M: SignalMessage> {
     pid: Pid,
     /// `common.id`: the tagged pid, which a lookup by identifier word compares.
     word: u64,
@@ -1268,7 +1286,7 @@ struct Process<T: Task> {
     /// wheel holds it. Inserted when the timer is created, removed when it fires or is
     /// canceled, and walked on exit (erts_cancel_bif_timers). The lock is the timer's own
     /// (ERTS_PROC_LOCK_BTM), not a global one.
-    btm: parking_lot::Mutex<ProcBtm<T::Message>>,
+    btm: parking_lot::Mutex<ProcBtm<M>>,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
     exit_flags: AtomicU32,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
@@ -1276,7 +1294,7 @@ struct Process<T: Task> {
     reg_atom: AtomicU32,
     wait_timer: AtomicU64,
     // Port of erts `Process.sig_inq`; shared with the task so receive can fetch in place.
-    input: Incoming<Event<T::Message>>,
+    input: Incoming<Event<M>>,
     /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
     wait_timer_worker: AtomicUsize,
     /// Dirty run queue that owns this process: 0 normal, 1 dirty CPU, 2 dirty I/O.
@@ -1287,11 +1305,23 @@ struct Process<T: Task> {
     dirty_runner: AtomicUsize,
     /// Priority level whose run queue length counts this queued process.
     queued_prio: AtomicU8,
+}
+
+struct Process<T: Task> {
+    shared: ProcShared<T::Message>,
     /// The process main lock: embedded in the process, as erts' `p->lock`, with no allocation.
     cell: parking_lot::Mutex<TaskCell<T>>,
 }
 
-impl<T: Task> Process<T> {
+impl<T: Task> std::ops::Deref for Process<T> {
+    type Target = ProcShared<T::Message>;
+    #[inline(always)]
+    fn deref(&self) -> &ProcShared<T::Message> {
+        &self.shared
+    }
+}
+
+impl<M: SignalMessage> ProcShared<M> {
     /// The scheduling bits of the process state word (`p->state`).
     fn run_state(&self) -> RunStateWord<'_> {
         RunStateWord(self.input.state())
@@ -1659,35 +1689,37 @@ impl<T: Task> ProcessTable<T> {
                 })
             },
             |context| Process {
-                pid: context.pid,
-                word: context
-                    .pid
-                    .to_term()
-                    .map_or(0, arinsal_term::Term::tagged_word),
-                // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
-                // erts_current_interval_nob), OTP-29.1.1.
-                started_interval: context.started_interval,
-                user_priority: AtomicU8::new(priority.index() as u8),
-                active: AtomicBool::new(true),
-                sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
-                run_epoch: AtomicU64::new(0),
-                bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
-                scheduler_id: AtomicUsize::new(0),
-                wait_epoch: AtomicU64::new(0),
-                timer_epoch_used: AtomicBool::new(false),
-                bif_timer_wheels: AtomicU64::new(0),
-                btm: parking_lot::Mutex::new(ProcBtm {
-                    tree: std::collections::BTreeMap::new(),
-                    paused: None,
-                }),
-                exit_flags: AtomicU32::new(0),
-                reg_atom: AtomicU32::new(u32::MAX),
-                wait_timer: AtomicU64::new(0),
-                input: Incoming::default(),
-                wait_timer_worker: AtomicUsize::new(0),
-                dirty: AtomicU8::new(0),
-                dirty_runner: AtomicUsize::new(0),
-                queued_prio: AtomicU8::new(0),
+                shared: ProcShared {
+                    pid: context.pid,
+                    word: context
+                        .pid
+                        .to_term()
+                        .map_or(0, arinsal_term::Term::tagged_word),
+                    // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
+                    // erts_current_interval_nob), OTP-29.1.1.
+                    started_interval: context.started_interval,
+                    user_priority: AtomicU8::new(priority.index() as u8),
+                    active: AtomicBool::new(true),
+                    sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
+                    run_epoch: AtomicU64::new(0),
+                    bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
+                    scheduler_id: AtomicUsize::new(0),
+                    wait_epoch: AtomicU64::new(0),
+                    timer_epoch_used: AtomicBool::new(false),
+                    bif_timer_wheels: AtomicU64::new(0),
+                    btm: parking_lot::Mutex::new(ProcBtm {
+                        tree: std::collections::BTreeMap::new(),
+                        paused: None,
+                    }),
+                    exit_flags: AtomicU32::new(0),
+                    reg_atom: AtomicU32::new(u32::MAX),
+                    wait_timer: AtomicU64::new(0),
+                    input: Incoming::default(),
+                    wait_timer_worker: AtomicUsize::new(0),
+                    dirty: AtomicU8::new(0),
+                    dirty_runner: AtomicUsize::new(0),
+                    queued_prio: AtomicU8::new(0),
+                },
                 cell: parking_lot::Mutex::new(TaskCell::uninit()),
             },
             |process, _context| {
@@ -2631,6 +2663,15 @@ impl<T: Task> Inner<T> {
         self.wake_worker(worker);
     }
 
+    /// Tell `worker` that a timer request was queued for it. Called after the push, so a
+    /// scheduler that takes the flag sees the request.
+    #[inline]
+    fn flag_timer_work(&self, worker: usize) {
+        if let Some(flags) = self.aux_work_flags.get(worker) {
+            flags.fetch_or(AUX_WORK_TIMER_CMDS, Ordering::Release);
+        }
+    }
+
     /// Take the auxiliary work flags of `worker`; work requested after this sets them again.
     fn take_aux_work(&self, worker: usize) -> u32 {
         let flags = self.aux_work_flags[worker].load(Ordering::Acquire);
@@ -2709,6 +2750,9 @@ impl<T: Task> Inner<T> {
             }
             // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
             // debug-wait completion), OTP-29.1.1.
+            if aux_work & AUX_WORK_TIMER_CMDS != 0 {
+                self.apply_timer_commands(local);
+            }
             self.poll_timers(worker, Some(local), halting);
         }
         if aux_work & AUX_WORK_FUNC != 0 {
@@ -3683,6 +3727,7 @@ impl<T: Task> Inner<T> {
                 continue;
             }
             queue.push(TimerCommand::PauseTarget { pid, ids });
+            self.flag_timer_work(worker);
             self.wake_worker(worker);
         }
     }
@@ -3956,9 +4001,15 @@ impl<T: Task> Inner<T> {
         if let Some(local) = local
             && item.process.bound_worker().is_none()
             && self.sim.is_none()
-            && self.online_schedulers.load(Ordering::Acquire) > 1
+            && (self.online_schedulers.load(Ordering::Acquire) > 1 || local.worker_id == 0)
         {
-            let scheduler = self.enqueue_run_queue(&item.process);
+            // With one scheduler online the target run queue is run queue 0, this one
+            // (select_enqueue_run_queue returns the only online queue).
+            let scheduler = if self.online_schedulers.load(Ordering::Acquire) > 1 {
+                self.enqueue_run_queue(&item.process)
+            } else {
+                0
+            };
             if scheduler == local.worker_id {
                 local.record_queued(&item.process, local.worker_id, false);
                 local.queues[item.queue()].push(item);
@@ -3993,6 +4044,7 @@ impl<T: Task> Inner<T> {
             }
         } else if let Some(queue) = self.canceled_timers.get(worker) {
             queue.push(CanceledTimer { id });
+            self.flag_timer_work(worker);
             self.wake_worker(worker);
         }
     }
@@ -4017,7 +4069,9 @@ impl<T: Task> Inner<T> {
     /// path never locks the timer wheel.
     #[inline]
     fn poll_pending_waits(&self, local: &mut Local<T>, force: bool) {
-        if !local.pending_waits.is_empty() {
+        if !local.pending_waits.is_empty()
+            && (force || local.check_time_reds >= self.config.reductions)
+        {
             self.poll_pending_waits_due(local, force);
         }
     }
@@ -4077,8 +4131,10 @@ impl<T: Task> Inner<T> {
             let now = self.scheduler_time(local, force);
             {
                 let service = local.timer_service.borrow();
-                if service.commands.is_empty()
-                    && service.canceled.is_empty()
+                // A scheduling pass (not forced) learns about requests from other threads
+                // through AUX_WORK_TIMER_CMDS, which handle_local_aux_work serves; the queues
+                // are looked at directly only by the parking paths.
+                if (!force || (service.commands.is_empty() && service.canceled.is_empty()))
                     && (!service.wheel.has_timers() || service.wheel.quiet_at(now))
                 {
                     return;
@@ -4437,6 +4493,7 @@ impl<T: Task> Inner<T> {
                 deadline,
                 payload,
             });
+            self.flag_timer_work(worker);
             self.wake_worker(worker);
         } else {
             return Err(Error::NoProcess);
@@ -4506,6 +4563,7 @@ impl<T: Task> Inner<T> {
         });
         // Port of erts/emulator/beam/erl_hl_timer.c:2083 (bif_timer_access_request),
         // OTP-29.1.1: the owner answers from its next aux point.
+        self.flag_timer_work(reference.worker);
         self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
     }
 
@@ -4578,6 +4636,7 @@ impl<T: Task> Inner<T> {
             id: reference.id,
             callback,
         });
+        self.flag_timer_work(reference.worker);
         self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
     }
 }
@@ -4891,31 +4950,30 @@ impl<T: Task> TimerCallbackCtx<T::Message> for CallbackCtx<'_, T> {
 
 pub struct RunCtx<'a, M: SignalMessage> {
     inner: &'a mut dyn ContextOps<M>,
-    pid: Pid,
-    input: &'a Incoming<Event<M>>,
-    backlog: &'a AtomicUsize,
-    bound_worker: &'a AtomicUsize,
-    worker: Option<usize>,
-    worker_count: usize,
+    /// The running process: the pointer erts passes around as `c_p`.
+    proc: &'a ProcShared<M>,
+    /// The constants of the scheduler thread running the slice (`esdp`).
+    consts: &'a SliceConsts,
     remaining: u32,
     budget: u32,
     msacc_enabled: bool,
     wall_enabled: bool,
     gc_accounted_total: u64,
-    sched_type: SchedulerType,
-    user_priority: &'a AtomicU8,
-    sys_priority: &'a AtomicU8,
-    active: &'a AtomicBool,
-    /// [`proc_flags`] of the running process. Exit tests this before any global table.
-    exit_flags: &'a AtomicU32,
-    /// The running process state word, accessed directly at exit like erts' `Process *p`.
-    run_state: RunStateWord<'a>,
     sys_task_run: bool,
     /// A dirty signal handler acts for a process whose dirty job is executing.
     dirty_running: bool,
     /// A dirty signal handler acts for a process queued on a dirty run queue but not yet
     /// executing (erts `ERTS_PSFLG_DIRTY_ACTIVE_SYS` without `ERTS_PSFLG_DIRTY_RUNNING`).
     dirty_queued: bool,
+}
+
+/// What a slice's context knows about the scheduler thread it runs on; fixed for the thread's
+/// lifetime, like the fields of erts' `ErtsSchedulerData` that `process_main` reads.
+#[derive(Clone, Copy)]
+struct SliceConsts {
+    worker: Option<usize>,
+    worker_count: usize,
+    sched_type: SchedulerType,
     /// The turn runs on a simulated scheduler, whose thread steps other runtimes too.
     simulated: bool,
 }
@@ -5001,21 +5059,21 @@ trait ContextOps<M: SignalMessage> {
 
 impl<M: SignalMessage> RunCtx<'_, M> {
     fn consumed_event(&self) {
-        if self.backlog.load(Ordering::Relaxed) != 0 {
-            self.backlog.fetch_sub(1, Ordering::Relaxed);
+        if self.proc.input.backlog.load(Ordering::Relaxed) != 0 {
+            self.proc.input.backlog.fetch_sub(1, Ordering::Relaxed);
         }
     }
     /// Pid of the running task.
     pub fn pid(&self) -> Pid {
-        self.pid
+        self.proc.pid
     }
     /// Process-local exit words (`p->flags`, `p->reg`, `p->bif_timers`, trace flags).
     pub fn exit_flags(&self) -> &AtomicU32 {
-        self.exit_flags
+        &self.proc.exit_flags
     }
     /// Return the scheduler worker currently running this process.
     pub fn worker_id(&self) -> Option<usize> {
-        self.worker
+        self.consts.worker
     }
     /// Reject further mailbox publishes and delete this pid from the process table.
     /// In-flight publishers that already resolved the slot still land; a later
@@ -5025,8 +5083,8 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Port of erts/emulator/beam/erl_process.c:14438-14456
     /// (`erts_ptab_delete_element` at `ERTS_CONTINUE_EXIT_FREE`), OTP-29.1.1.
     pub fn begin_exit(&mut self) {
-        self.run_state.store(EXITED, Ordering::SeqCst);
-        self.inner.mark_exited(self.pid);
+        self.proc.run_state().store(EXITED, Ordering::SeqCst);
+        self.inner.mark_exited(self.proc.pid);
     }
     /// Cancel pending BIF timers aimed at a terminating process.
     pub fn cancel_target_timers(&mut self, pid: Pid) {
@@ -5048,20 +5106,32 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Number of scheduler workers available to this runtime.
     pub fn scheduler_count(&self) -> usize {
-        self.worker_count
+        self.consts.worker_count
     }
     /// One-based id of the worker executing this process turn.
     pub fn scheduler_id(&self) -> Option<usize> {
-        self.worker.map(|worker| worker + 1)
+        self.consts.worker.map(|worker| worker + 1)
+    }
+    /// Identity of the normal scheduler thread running this slice, zero on a dirty or simulated
+    /// scheduler. A task caches what it derived from the scheduler (its `esdp`) under this key
+    /// and redoes it only when the process moves to another scheduler.
+    // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData: the per-scheduler values
+    // process_main reads once per scheduler, not once per process switch), OTP-29.1.1.
+    #[inline(always)]
+    pub fn scheduler_key(&self) -> u64 {
+        if self.consts.simulated || self.consts.sched_type != SchedulerType::Normal {
+            return 0;
+        }
+        self.consts.worker.map_or(0, |worker| worker as u64 + 1)
     }
     /// Whether this turn runs on a simulated scheduler: its thread is not dedicated to one
     /// scheduler, so thread-specific data must be selected for every turn.
     pub fn simulated(&self) -> bool {
-        self.simulated
+        self.consts.simulated
     }
     /// Type of the scheduler executing this process turn.
     pub fn scheduler_type(&self) -> SchedulerType {
-        self.sched_type
+        self.consts.sched_type
     }
     /// Publish messages and signals this turn has buffered so far. A long dirty job
     /// calls this so its sends do not wait for the job to return.
@@ -5070,30 +5140,31 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Whether events wait in this process's shared input queue.
     pub fn has_pending_input(&self) -> bool {
-        self.input.has_pending()
+        self.proc.input.has_pending()
     }
     /// Whether non-message signals wait in this process's shared input queue. A process
     /// with only messages queued handles them in its receive, not at schedule-in.
     // Port of erts/emulator/beam/erl_process.c (schedule: signals are handled before Erlang
     // code only for ERTS_PSFLG_RUNNING_SYS, which a message does not set), OTP-29.1.1.
     pub fn has_pending_nmsg(&self) -> bool {
-        self.input.has_pending_nmsg()
+        self.proc.input.has_pending_nmsg()
     }
     /// A handle that tells, without this context, whether signals wait in this process's
     /// shared input queue.
     pub fn signal_probe(&mut self) -> Option<SignalProbe<M>> {
-        self.inner.signal_probe(self.pid)
+        self.inner.signal_probe(self.proc.pid)
     }
     /// Configure the receiver's parallel sender buffers for off heap mailboxes.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
     pub fn set_parallel_signal_buffers(&mut self, enabled: bool) {
-        self.input.set_buffers_enabled(enabled);
+        self.proc.input.set_buffers_enabled(enabled);
     }
 
     /// Force installation of parallel sender buffers for runtime regression tests.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10700-10718, OTP-29.1.1.
     pub fn force_parallel_signal_buffers(&mut self) -> bool {
-        self.input
+        self.proc
+            .input
             .force_buffers_enabled(self.inner.progress_domain());
         true
     }
@@ -5164,7 +5235,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         complete: impl FnOnce(i32) + Send + 'static,
     ) -> bool {
         self.inner.begin_halt(
-            self.pid,
+            self.proc.pid,
             code,
             timeout,
             HaltActions {
@@ -5184,7 +5255,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         wrapped: bool,
     ) -> Result<TimerRef, Error> {
         self.inner
-            .start_timer(self.pid, target, ms, message, wrapped)
+            .start_timer(self.proc.pid, target, ms, message, wrapped)
     }
     /// Schedule a timer whose registered process name is resolved when it expires.
     pub fn schedule_resolved_timer(
@@ -5195,20 +5266,20 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         resolve: impl Fn() -> Option<Pid> + Send + Sync + 'static,
     ) -> Result<TimerRef, Error> {
         self.inner
-            .start_resolved_timer(self.pid, ms, Arc::new(resolve), message, wrapped)
+            .start_resolved_timer(self.proc.pid, ms, Arc::new(resolve), message, wrapped)
     }
     /// Change the process scheduler binding and return its previous scheduler id.
     /// Scheduler ids are one-based; zero clears the binding.
     pub fn bind_scheduler(&mut self, scheduler_id: usize) -> (usize, bool) {
         let target = scheduler_id.checked_sub(1).unwrap_or(UNBOUND_WORKER);
-        let previous = self.bound_worker.swap(target, Ordering::AcqRel);
+        let previous = self.proc.bound_worker.swap(target, Ordering::AcqRel);
         let previous_id = if previous == UNBOUND_WORKER {
             0
         } else {
             previous + 1
         };
         let should_yield =
-            target != UNBOUND_WORKER && self.worker.is_some_and(|worker| worker != target);
+            target != UNBOUND_WORKER && self.consts.worker.is_some_and(|worker| worker != target);
         (previous_id, should_yield)
     }
     /// Remaining reductions in this quantum.
@@ -5276,7 +5347,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // fetches from the outer queue), OTP-29.1.1.
     pub fn receive(&mut self) -> Option<Event<M>> {
         self.inner.flush();
-        self.input.fetch_first_if(|_| true)
+        self.proc.input.fetch_first_if(|_| true)
     }
     /// Move every signal published to this process into `into`, after the signals it already
     /// holds: the process's inner signal queue receives the outer one. Each event taken out of
@@ -5285,12 +5356,12 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // queue is appended to the inner one), OTP-29.1.1.
     pub fn fetch_signals(&mut self, into: &mut SignalQueue<Event<M>>) {
         self.inner.flush();
-        self.input.take_all(into);
+        self.proc.input.take_all(into);
     }
     /// Record whether this process's middle signal queue holds unhandled signals
     /// (`ERTS_PSFLG_SIG_Q`).
     pub fn set_sig_q(&self, unhandled: bool) {
-        self.input.set_sig_q(unhandled);
+        self.proc.input.set_sig_q(unhandled);
     }
     /// Account one event taken from [`Self::fetch_signals`].
     pub fn consume_fetched(&self) {
@@ -5298,9 +5369,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Account `count` events taken from [`Self::fetch_signals`] at once.
     pub fn consume_fetched_many(&self, count: usize) {
-        let backlog = self.backlog.load(Ordering::Relaxed);
+        let backlog = self.proc.input.backlog.load(Ordering::Relaxed);
         if backlog != 0 {
-            self.backlog
+            self.proc
+                .input
+                .backlog
                 .fetch_sub(backlog.min(count), Ordering::Relaxed);
         }
     }
@@ -5308,11 +5381,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // Port of erts/emulator/beam/erl_process.c (ERTS_PSFLG_ACTIVE in the process state
     // word, read by erts_process_state2status), OTP-29.1.1.
     pub fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::Release);
+        self.proc.active.store(active, Ordering::Release);
     }
     /// Send an opaque envelope to another process.
     pub fn send(&mut self, to: Pid, msg: M) -> Result<(), Error> {
-        self.inner.deliver(self.pid, to, Payload::Message(msg))
+        self.inner.deliver(self.proc.pid, to, Payload::Message(msg))
     }
     /// Send a message node this process allocated (erts queues the `ErtsMessage` it built).
     pub fn send_node(&mut self, to: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
@@ -5320,7 +5393,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Send an opaque envelope to this process itself (see [`SignalProbe::send_self`]).
     pub fn send_self(&mut self, msg: M) -> Result<(), Error> {
-        let pid = self.pid;
+        let pid = self.proc.pid;
         self.send_self_node(OwnedSignal::new(Event {
             from: pid,
             payload: Payload::Message(msg),
@@ -5328,29 +5401,33 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// [`Self::send_self`] of a message node this process allocated.
     pub fn send_self_node(&mut self, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
-        let pid = self.pid;
-        self.input
+        let pid = self.proc.pid;
+        self.proc
+            .input
             .push_routed_node(
                 self.inner.progress_domain(),
                 || signal_buffer_slot(pid),
                 signal,
             )
             .map_err(|_| Error::NoProcess)?;
-        self.backlog.fetch_add(1, Ordering::Relaxed);
+        self.proc.input.backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     /// Set this process's user priority; it takes effect when the process is next queued.
     ///
     /// Port of erts/emulator/beam/erl_process.c (erts_set_process_priority), OTP-29.1.1.
     pub fn set_priority(&mut self, priority: Priority) {
-        self.user_priority
+        self.proc
+            .user_priority
             .store(priority.index() as u8, Ordering::Release);
     }
     /// Clear the active system-task priority after its queued work has drained.
     ///
     /// Port of erts/emulator/beam/erl_process.c:10737 (`fetch_sys_task`), OTP-29.1.1.
     pub fn clear_sys_task_priority(&self) {
-        self.sys_priority.store(NO_SYS_PRIORITY, Ordering::Release);
+        self.proc
+            .sys_priority
+            .store(NO_SYS_PRIORITY, Ordering::Release);
     }
     /// Whether this run was scheduled for system tasks (erts `ERTS_PSFLG_RUNNING_SYS`).
     /// The task should handle its queued signals before executing code.
@@ -5373,21 +5450,24 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         priority: Priority,
     ) -> Result<(), Error> {
         self.inner
-            .deliver_sys_task(self.pid, to, Payload::Signal(signal), priority)
+            .deliver_sys_task(self.proc.pid, to, Payload::Signal(signal), priority)
     }
     /// Send an ordered control signal.
     pub fn signal(&mut self, to: Pid, signal: Signal<M>) -> Result<(), Error> {
-        self.inner.deliver(self.pid, to, Payload::Signal(signal))
+        self.inner
+            .deliver(self.proc.pid, to, Payload::Signal(signal))
     }
     /// Start an Erlang-style timer. The VM may wrap the received envelope as `{timeout, Ref, Msg}`.
     pub fn start_timer(&mut self, ms: u64, msg: M) -> Result<TimerRef, Error> {
         self.inner.flush();
-        self.inner.start_timer(self.pid, self.pid, ms, msg, true)
+        self.inner
+            .start_timer(self.proc.pid, self.proc.pid, ms, msg, true)
     }
     /// Schedule a plain message without a timer-reference wrapper.
     pub fn send_after(&mut self, ms: u64, msg: M) -> Result<TimerRef, Error> {
         self.inner.flush();
-        self.inner.start_timer(self.pid, self.pid, ms, msg, false)
+        self.inner
+            .start_timer(self.proc.pid, self.proc.pid, ms, msg, false)
     }
     /// Start a runtime timer callback owned by this process.
     /// Port of erts/emulator/beam/erl_hl_timer.c (erts_start_timer_callback), OTP-29.1.1.
@@ -5397,7 +5477,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         callback: TimerCallback<M>,
     ) -> Result<TimerRef, Error> {
         self.inner.flush();
-        self.inner.start_timer_callback(self.pid, ms, callback)
+        self.inner.start_timer_callback(self.proc.pid, ms, callback)
     }
     /// Schedule a timer for a pid using this task's current scheduler worker.
     pub fn start_timer_to(
@@ -5550,7 +5630,11 @@ impl<T: Task> Runner<'_, T> {
 
     /// Publish the held monitor of this scheduler, if any.
     fn publish_deferred_monitor(&mut self) {
+        if HELD_MONITOR_THREADS.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         if let Some(held) = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().take()) {
+            HELD_MONITOR_THREADS.fetch_sub(1, Ordering::Relaxed);
             self.publish_monitor(held);
         }
     }
@@ -5611,33 +5695,27 @@ impl<T: Task> Runner<'_, T> {
         remaining: u32,
         handle: &mut TargetHandler<'_, T::Message>,
     ) -> bool {
-        let workers = self.inner.config.workers;
-        let simulated = self.inner.sim.is_some();
+        debug_assert_eq!(pid, process.pid);
+        let consts = SliceConsts {
+            worker: None,
+            worker_count: self.inner.config.workers,
+            sched_type: SchedulerType::Normal,
+            simulated: self.inner.sim.is_some(),
+        };
         let task = cell.task_mut();
         let mut ctx = RunCtx {
             inner: self,
-            pid,
-            input: &process.input,
-            backlog: &process.input.backlog,
-            bound_worker: &process.bound_worker,
-            worker: None,
-            worker_count: workers,
+            proc: &process.shared,
+            consts: &consts,
             remaining,
             budget: remaining,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
-            sched_type: SchedulerType::Normal,
-            user_priority: &process.user_priority,
-            sys_priority: &process.sys_priority,
-            active: &process.active,
-            exit_flags: &process.exit_flags,
-            run_state: process.run_state(),
             sys_task_run: false,
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
             dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
                 && process.dirty_runner.load(Ordering::SeqCst) == 0,
-            simulated,
         };
         handle(task, &mut ctx)
     }
@@ -5836,6 +5914,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 continue;
             };
             queue.push(TimerCommand::CancelTarget { ids });
+            self.inner.flag_timer_work(worker);
             self.inner.wake_worker(worker);
         }
     }
@@ -5870,6 +5949,8 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
                 self.publish_monitor(previous);
+            } else {
+                HELD_MONITOR_THREADS.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(());
         }
@@ -7576,7 +7657,8 @@ mod msgq_stage_microbench {
 
         let scheduler = Scheduler::<Idle>::simulation(Config::default(), 3);
         let process = scheduler.spawn(Idle).unwrap();
-        let input = Incoming::default();
+        let process_ref = scheduler.inner.table.lookup(process).unwrap();
+        let input = &process_ref.input;
         let blocks = (0..N / 32)
             .map(|block| {
                 (0..32)
@@ -7595,36 +7677,25 @@ mod msgq_stage_microbench {
             inner: &scheduler.inner,
             local: None,
         };
-        let backlog = AtomicUsize::new(N);
-        let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
-        let user_priority = AtomicU8::new(Priority::Normal.index() as u8);
-        let sys_priority = AtomicU8::new(NO_SYS_PRIORITY);
-        let active = AtomicBool::new(true);
-        let exit_flags = AtomicU32::new(0);
-        let run_state = AtomicU32::new(0);
-        let mut context = RunCtx {
-            inner: &mut receive_runner,
-            pid: process,
-            input: &input,
-            backlog: &backlog,
-            bound_worker: &bound_worker,
+        input.backlog.store(N, Ordering::Relaxed);
+        let consts = SliceConsts {
             worker: None,
             worker_count: scheduler.inner.config.workers,
+            sched_type: SchedulerType::Normal,
+            simulated: scheduler.inner.sim.is_some(),
+        };
+        let mut context = RunCtx {
+            inner: &mut receive_runner,
+            proc: &process_ref.shared,
+            consts: &consts,
             remaining: 1_000,
             budget: 1_000,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
-            sched_type: SchedulerType::Normal,
-            user_priority: &user_priority,
-            sys_priority: &sys_priority,
-            active: &active,
-            exit_flags: &exit_flags,
-            run_state: RunStateWord(&run_state),
             sys_task_run: false,
             dirty_running: false,
             dirty_queued: false,
-            simulated: scheduler.inner.sim.is_some(),
         };
         let started = Instant::now();
         let mut fetched = SignalQueue::default();
@@ -8026,155 +8097,67 @@ fn run_one<T: Task>(
     worker: Option<usize>,
     dirty: Option<DirtyKind>,
 ) {
-    run_slice(inner, item, None, data, worker, dirty);
+    run_slice(inner, item, data, worker, dirty);
     // A runtime without managed threads runs later operations after the slice.
     thr_progress::run_unmanaged_later_ops();
 }
 
-fn run_slice<'a, T: Task>(
-    inner: &'a Inner<T>,
-    item: Scheduled<T>,
-    local_cell: Option<&'a RefCell<Local<T>>>,
-    data: &mut T::SchedulerData,
+/// What a finished slice leaves for the schedule-out half of `erts_schedule`.
+struct SliceEnd<T: Task> {
+    process: ProcRef<T>,
+    outcome: RunOutcome,
+    remaining: u32,
+    budget: u32,
+    /// Wall time of the slice, only measured when wall accounting is on.
+    active_ns: u64,
+    /// The scheduler's reduction count when the slice was dequeued (`wakeup_other_reds`).
+    reductions_before: u64,
+}
+
+/// The part of a process exit that needs the process cell: close the in-queue, reap what it
+/// holds, delete the process.
+// Port of erts/emulator/beam/erl_process.c (erts_schedule: the exiting process is handed to
+// erts_continue_exit_process while it is still locked), OTP-29.1.1.
+fn exit_cleanup<T: Task>(inner: &Inner<T>, process: &Process<T>, cell: &mut TaskCell<T>) {
+    process.run_state().store(EXITED, Ordering::SeqCst);
+    // Close the in-queue under the msgq lock and reap what it still holds; a later
+    // enqueue fails and the sender sees the process gone.
+    let mut remaining = SignalQueue::default();
+    if process.input.close_into(&mut remaining) > 0 {
+        let events = std::iter::from_fn(|| remaining.pop_front()).collect();
+        cell.task_mut().reap_signals(process.pid, events);
+    }
+    cell.task_mut().delete_process();
+    // `begin_exit` already deleted the element (erts deletes once, at
+    // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
+    // this pix again would free the new occupant. A forced exit that never
+    // reached `begin_exit` still owns the slot.
+    if inner.table.lookup(process.pid).is_some() {
+        inner.table.remove(process.pid);
+    }
+}
+
+/// Schedule a finished slice out: reductions executed, the outcome's state transition and the
+/// enqueue decision. Shared by the normal scheduler loop (inside `erts_schedule`'s one borrow
+/// of the scheduler state) and by `run_slice` (dirty and simulated schedulers, no `Local`).
+// Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule_out_process and
+// ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1.
+fn schedule_out<T: Task>(
+    inner: &Inner<T>,
+    mut local: Option<&mut Local<T>>,
+    end: SliceEnd<T>,
     worker: Option<usize>,
     dirty: Option<DirtyKind>,
 ) {
-    // The scheduler-local state is lent out while the task runs: native code reaches this
-    // scheduler's run queue through [`NativeSender`], like erts BIFs get `esdp`.
-    let mut local_guard = local_cell.map(RefCell::borrow_mut);
-    let mut local = local_guard.as_deref_mut();
-    let process = item.process;
-    // Claim this queue entry's epoch first: a stale duplicate entry (see
-    // `Process::run_epoch`) must not run a process that was queued again later.
-    if process
-        .run_epoch
-        .compare_exchange(
-            item.epoch,
-            item.epoch.wrapping_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return;
-    }
-    if process
-        .run_state()
-        .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    // Port of erts/emulator/beam/erl_process.c:7028-7134 (active_sys_enqueue), OTP-29.1.1:
-    // keep the elevated priority while ordered system-task signals are still pending.
-    // Dirty schedulers never execute system tasks (erl_process.c:10255).
-    let sys_task_run =
-        dirty.is_none() && process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
+    let SliceEnd {
+        process,
+        outcome,
+        remaining,
+        budget,
+        active_ns,
+        reductions_before: _,
+    } = end;
     let worker_id = worker.unwrap_or(0);
-    // A process on a dirty run queue left the normal run queue accounting when it migrated.
-    if dirty.is_none() {
-        if let Some(local) = local.as_deref_mut() {
-            local.record_running(&process, local.worker_id);
-            local.context_switches += 1;
-        } else {
-            inner.record_running(&process, worker_id);
-            inner.worker_stats[worker_id]
-                .context_switches
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    // Port of erts/emulator/beam/erl_process.c:10183 (schedule: `reds = context_reds` for
-    // every process scheduled in), OTP-29.1.1.
-    let budget = inner.config.reductions;
-    // Port of erts/emulator/beam/erl_thr_progress.c: dirty schedulers are unmanaged threads
-    // and never delay thread progress, OTP-29.1.1.
-    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
-    let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
-    if let Some(local) = local {
-        local.set_msacc_enabled(msacc_enabled);
-        let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
-        let started_at = (wall_enabled && !local.wall_enabled)
-            .then(|| inner.take_wall_start(local.worker_id))
-            .flatten();
-        local.set_wall_enabled_at(wall_enabled, started_at);
-    }
-    let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
-    let mut cell = lock_cell(&process);
-    if let Some(kind) = dirty
-        && let Some(job) = cell.task_mut().take_dirty_job(kind)
-    {
-        // Port of erts/emulator/beam/erl_nif.c:468-499 (erts_call_dirty_nif), OTP-29.1.1:
-        // the job runs without the main lock, so a dirty signal handler can take it.
-        drop(cell);
-        // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
-        let thread_type = SCHEDULER_TYPE.with(|current| current.replace(kind.into()));
-        let result = job();
-        SCHEDULER_TYPE.with(|current| current.set(thread_type));
-        cell = lock_cell(&process);
-        cell.task_mut().finish_dirty_job(result);
-    }
-    drop(local_guard);
-    let (outcome, remaining, active_ns) = {
-        let mut runner = Runner {
-            inner,
-            local: local_cell,
-        };
-        let result = {
-            let task = cell.task_mut();
-            let mut ctx = RunCtx {
-                inner: &mut runner,
-                pid: process.pid,
-                input: &process.input,
-                backlog: &process.input.backlog,
-                bound_worker: &process.bound_worker,
-                worker,
-                worker_count: inner.config.workers,
-                remaining: budget,
-                budget,
-                msacc_enabled,
-                wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
-                gc_accounted_total: if msacc_enabled {
-                    task.gc_nanoseconds()
-                } else {
-                    0
-                },
-                sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
-                user_priority: &process.user_priority,
-                sys_priority: &process.sys_priority,
-                active: &process.active,
-                exit_flags: &process.exit_flags,
-                run_state: process.run_state(),
-                sys_task_run,
-                dirty_running: false,
-                dirty_queued: false,
-                simulated: inner.sim.is_some(),
-            };
-            if msacc_enabled {
-                ctx.set_msacc_state(MsaccState::Emulator);
-            }
-            // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
-            // A normal scheduler thread already has its type, like `esdp->type`.
-            let thread_type = worker
-                .is_none()
-                .then(|| SCHEDULER_TYPE.with(|current| current.replace(ctx.sched_type)));
-            let outcome = task.run(&mut ctx, data, budget);
-            if let Some(thread_type) = thread_type {
-                SCHEDULER_TYPE.with(|current| current.set(thread_type));
-            }
-            if ctx.msacc_enabled {
-                ctx.set_msacc_state(MsaccState::Other);
-                ctx.account_gc_total(task.gc_nanoseconds());
-            }
-            let active_ns = accounting_started.map_or(0, |started| {
-                started.elapsed().as_nanos().min(u64::MAX as u128) as u64
-            });
-            (outcome, ctx.remaining, active_ns)
-        };
-        runner.flush();
-        result
-    };
-    let mut local_guard = local_cell.map(RefCell::borrow_mut);
-    let mut local = local_guard.as_deref_mut();
     let consumed = u64::from(budget.saturating_sub(remaining));
     if dirty.is_none() {
         // Port of erts/emulator/beam/erl_process.c:10200 (ERTS_PROC_REDUCTIONS_EXECUTED
@@ -8363,7 +8346,6 @@ fn run_slice<'a, T: Task>(
             }
         }
         RunOutcome::Exit(_) => {
-            process.run_state().store(EXITED, Ordering::SeqCst);
             if dirty.is_some() {
                 // Already outside the normal run queue accounting.
             } else if let Some(local) = local.as_deref_mut() {
@@ -8371,27 +8353,244 @@ fn run_slice<'a, T: Task>(
             } else {
                 inner.record_waiting(&process);
             }
-            // Close the in-queue under the msgq lock and reap what it still holds; a later
-            // enqueue fails and the sender sees the process gone.
-            let mut remaining = SignalQueue::default();
-            if process.input.close_into(&mut remaining) > 0 {
-                let events = std::iter::from_fn(|| remaining.pop_front()).collect();
-                cell.task_mut().reap_signals(process.pid, events);
-            }
-            cell.task_mut().delete_process();
-            // `begin_exit` already deleted the element (erts deletes once, at
-            // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
-            // this pix again would free the new occupant. A forced exit that never
-            // reached `begin_exit` still owns the slot.
-            if inner.table.lookup(process.pid).is_some() {
-                inner.table.remove(process.pid);
-            }
+            // The in-queue was closed and reaped by `exit_cleanup` under the cell.
         }
     }
     if let Some(local) = local {
         inner.flush_local_metrics(local);
     }
+}
+
+/// Run one slice of a process on a dirty scheduler or the simulator (no per-scheduler
+/// `Local`), as erts' `erts_dirty_process_main` keeps its own loop.
+fn run_slice<T: Task>(
+    inner: &Inner<T>,
+    item: Scheduled<T>,
+    data: &mut T::SchedulerData,
+    worker: Option<usize>,
+    dirty: Option<DirtyKind>,
+) {
+    let process = item.process;
+    // Claim this queue entry's epoch first: a stale duplicate entry (see
+    // `Process::run_epoch`) must not run a process that was queued again later.
+    if process
+        .run_epoch
+        .compare_exchange(
+            item.epoch,
+            item.epoch.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    if process
+        .run_state()
+        .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    // Port of erts/emulator/beam/erl_process.c:7028-7134 (active_sys_enqueue), OTP-29.1.1:
+    // keep the elevated priority while ordered system-task signals are still pending.
+    // Dirty schedulers never execute system tasks (erl_process.c:10255).
+    let sys_task_run =
+        dirty.is_none() && process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
+    let worker_id = worker.unwrap_or(0);
+    // A process on a dirty run queue left the normal run queue accounting when it migrated.
+    if dirty.is_none() {
+        inner.record_running(&process, worker_id);
+        inner.worker_stats[worker_id]
+            .context_switches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    // Port of erts/emulator/beam/erl_process.c:10183 (schedule: `reds = context_reds` for
+    // every process scheduled in), OTP-29.1.1.
+    let budget = inner.config.reductions;
+    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+    let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
+    let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
+    let mut cell = lock_cell(&process);
+    if let Some(kind) = dirty
+        && let Some(job) = cell.task_mut().take_dirty_job(kind)
+    {
+        // Port of erts/emulator/beam/erl_nif.c:468-499 (erts_call_dirty_nif), OTP-29.1.1:
+        // the job runs without the main lock, so a dirty signal handler can take it.
+        drop(cell);
+        // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
+        let thread_type = SCHEDULER_TYPE.with(|current| current.replace(kind.into()));
+        let result = job();
+        SCHEDULER_TYPE.with(|current| current.set(thread_type));
+        cell = lock_cell(&process);
+        cell.task_mut().finish_dirty_job(result);
+    }
+    let consts = SliceConsts {
+        worker,
+        worker_count: inner.config.workers,
+        sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
+        simulated: inner.sim.is_some(),
+    };
+    let (outcome, remaining, active_ns) = {
+        let mut runner = Runner { inner, local: None };
+        let result = {
+            let task = cell.task_mut();
+            let mut ctx = RunCtx {
+                inner: &mut runner,
+                proc: &process.shared,
+                consts: &consts,
+                remaining: budget,
+                budget,
+                msacc_enabled,
+                wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
+                gc_accounted_total: if msacc_enabled {
+                    task.gc_nanoseconds()
+                } else {
+                    0
+                },
+                sys_task_run,
+                dirty_running: false,
+                dirty_queued: false,
+            };
+            if msacc_enabled {
+                ctx.set_msacc_state(MsaccState::Emulator);
+            }
+            // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
+            // A normal scheduler thread already has its type, like `esdp->type`.
+            let thread_type = worker
+                .is_none()
+                .then(|| SCHEDULER_TYPE.with(|current| current.replace(ctx.consts.sched_type)));
+            let outcome = task.run(&mut ctx, data, budget);
+            if let Some(thread_type) = thread_type {
+                SCHEDULER_TYPE.with(|current| current.set(thread_type));
+            }
+            if ctx.msacc_enabled {
+                ctx.set_msacc_state(MsaccState::Other);
+                ctx.account_gc_total(task.gc_nanoseconds());
+            }
+            let active_ns = accounting_started.map_or(0, |started| {
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+            });
+            (outcome, ctx.remaining, active_ns)
+        };
+        runner.flush();
+        result
+    };
+    if matches!(outcome, RunOutcome::Exit(_)) {
+        exit_cleanup(inner, &process, &mut cell);
+    }
     drop(cell);
+    schedule_out(
+        inner,
+        None,
+        SliceEnd {
+            process,
+            outcome,
+            remaining,
+            budget,
+            active_ns,
+            reductions_before: 0,
+        },
+        worker,
+        dirty,
+    );
+}
+
+/// Run one slice of a process on a normal scheduler. The schedule-out half is left in the
+/// returned [`SliceEnd`]: `erts_schedule` does it under its single borrow of the scheduler
+/// state, as erts' `schedule()` does after `process_main` returns.
+// Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-in half) and
+// jit/arm/process_main.cpp (process_main), OTP-29.1.1.
+fn run_process<T: Task>(
+    inner: &Inner<T>,
+    local_cell: &RefCell<Local<T>>,
+    item: Scheduled<T>,
+    data: &mut T::SchedulerData,
+    id: usize,
+    consts: &SliceConsts,
+    reductions_before: u64,
+) -> Option<SliceEnd<T>> {
+    let process = item.process;
+    if process
+        .run_epoch
+        .compare_exchange(
+            item.epoch,
+            item.epoch.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    if process
+        .run_state()
+        .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let sys_task_run = process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
+    {
+        let mut local = local_cell.borrow_mut();
+        local.record_running(&process, id);
+        local.context_switches += 1;
+    }
+    let budget = inner.config.reductions;
+    // `schedule_next` has synchronized the scheduler's accounting state with these flags.
+    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+    let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
+    let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
+    let mut cell = lock_cell(&process);
+    let mut runner = Runner {
+        inner,
+        local: Some(local_cell),
+    };
+    let (outcome, remaining, active_ns) = {
+        let task = cell.task_mut();
+        let mut ctx = RunCtx {
+            inner: &mut runner,
+            proc: &process.shared,
+            consts,
+            remaining: budget,
+            budget,
+            msacc_enabled,
+            wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
+            gc_accounted_total: if msacc_enabled {
+                task.gc_nanoseconds()
+            } else {
+                0
+            },
+            sys_task_run,
+            dirty_running: false,
+            dirty_queued: false,
+        };
+        if msacc_enabled {
+            ctx.set_msacc_state(MsaccState::Emulator);
+        }
+        let outcome = task.run(&mut ctx, data, budget);
+        if ctx.msacc_enabled {
+            ctx.set_msacc_state(MsaccState::Other);
+            ctx.account_gc_total(task.gc_nanoseconds());
+        }
+        let active_ns = accounting_started.map_or(0, |started| {
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+        });
+        (outcome, ctx.remaining, active_ns)
+    };
+    runner.flush();
+    if matches!(outcome, RunOutcome::Exit(_)) {
+        exit_cleanup(inner, &process, &mut cell);
+    }
+    drop(cell);
+    Some(SliceEnd {
+        process,
+        outcome,
+        remaining,
+        budget,
+        active_ns,
+        reductions_before,
+    })
 }
 
 /// Signal operations a task's native code performs on the normal scheduler it runs on.
@@ -8819,6 +9018,492 @@ impl Drop for AllocOwnerWaker {
     }
 }
 
+/// One pass of the erts `erts_schedule` equivalent: progress point, aux work, timers, balance,
+/// ports, then the dequeue. `Some` is the process to run, with the scheduler's reduction count
+/// before it; `None` means this pass ran a port, slept, stole nothing, or must be repeated.
+// Port of erts/emulator/beam/erl_process.c:9600 (erts_schedule), OTP-29.1.1.
+fn schedule_next<T: Task>(
+    inner: &Arc<Inner<T>>,
+    id: usize,
+    local_cell: &Rc<RefCell<Local<T>>>,
+    managed_thread: &thr_progress::ManagedThread,
+    spin_count: u32,
+    steal_armed: &mut bool,
+    previous: Option<SliceEnd<T>>,
+) -> Option<(Scheduled<T>, u64)> {
+    let mut local_guard = local_cell.borrow_mut();
+    let local = &mut *local_guard;
+    // The schedule-out half of the slice that just ran comes first and shares this borrow
+    // (erts_schedule: schedule_out_process, then check_activities_to_run and the dequeue).
+    // Every `None` below happens after it.
+    if let Some(end) = previous {
+        let reductions_before = end.reductions_before;
+        schedule_out(inner, Some(&mut *local), end, Some(id), None);
+        local.wakeup_other_reds += (local.reductions - reductions_before) as i64;
+    }
+    // Port of erts/emulator/beam/erl_process.c:9857-9866 (schedule: the progress point
+    // between two scheduled processes), OTP-29.1.1.
+    thr_progress::scheduler_progress(managed_thread);
+    if halting() {
+        // The halting scheduler terminates the OS process; the others stay idle.
+        thr_progress::scheduler_prepare_wait();
+        thread::park();
+        thr_progress::scheduler_finalize_wait();
+        return None;
+    }
+    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+    let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
+    if local.msacc_enabled != (accounting_flags & ACCOUNTING_MSACC != 0)
+        || local.wall_enabled != wall_enabled
+    {
+        local.set_msacc_enabled(accounting_flags & ACCOUNTING_MSACC != 0);
+        let started_at = (wall_enabled && !local.wall_enabled)
+            .then(|| inner.take_wall_start(id))
+            .flatten();
+        local.set_wall_enabled_at(wall_enabled, started_at);
+    }
+    // Microstate accounting is off in the common case: one test per pass, not one per state.
+    let msacc = local.msacc_enabled;
+    if msacc {
+        local.set_msacc_state(MsaccState::Other);
+    }
+    let aux_work = inner.take_aux_work(id);
+    if aux_work & AUX_WORK_STATS != 0 {
+        while let Some(reply) = inner.stats_requests[id].pop() {
+            let _ = reply.send(local.stats_snapshot(local.msacc_enabled, local.wall_enabled));
+        }
+    }
+    if msacc {
+        local.set_msacc_state(MsaccState::Aux);
+    }
+    inner.handle_local_aux_work(id, &mut *local, aux_work);
+    if msacc {
+        local.set_msacc_state(MsaccState::Other);
+    }
+    if inner.runq_halting[id].load(Ordering::Acquire) {
+        if inner.execute_port(local) {
+            return None;
+        }
+        let observed = inner.work_epochs[id].load(Ordering::SeqCst);
+        inner.parked[id].store(true, Ordering::SeqCst);
+        local.set_msacc_state(MsaccState::Aux);
+        inner.poll_timers(id, Some(&mut *local), true);
+        inner.handle_aux_work(id);
+        local.set_msacc_state(MsaccState::Other);
+        if !inner.port_queues[id].is_empty()
+            || !inner.aux_work[id].is_empty()
+            || inner.work_epochs[id].load(Ordering::SeqCst) != observed
+            // The sleeping flag is published: look at the thread progress value again
+            // (scheduler_wait re-reads its aux work after ERTS_SSI_FLG_SLEEPING is set).
+            || thr_progress::scheduler_later_op_ready()
+        {
+            inner.parked[id].store(false, Ordering::SeqCst);
+            return None;
+        }
+        let timer_ms = local
+            .timer_service
+            .borrow_mut()
+            .wheel
+            .next_timeout()
+            .map(|next| next.saturating_sub(inner.clock.now_ms()));
+        local.set_wall_enabled(false);
+        thr_progress::scheduler_prepare_wait();
+        // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
+        // covers only the blocking wait.
+        local.set_msacc_state(MsaccState::Sleep);
+        if let Some(ms) = timer_ms {
+            thread::park_timeout(Duration::from_millis(ms.max(1)));
+        } else {
+            thread::park();
+        }
+        local.set_msacc_state(MsaccState::Other);
+        thr_progress::scheduler_finalize_wait();
+        inner.parked[id].store(false, Ordering::SeqCst);
+        return None;
+    }
+    if id >= inner.online_schedulers.load(Ordering::Acquire)
+        || (inner.scheduling_blocked.load(Ordering::Acquire)
+            && id != inner.scheduling_blocker.load(Ordering::Acquire))
+    {
+        // An offline or blocked scheduler hands its queued work and due timers to the
+        // schedulers still running.
+        inner.poll_timers(id, Some(&mut *local), true);
+        inner.poll_pending_waits(&mut *local, true);
+        inner.evacuate_offline_local(&mut *local);
+        local.set_wall_enabled(false);
+        // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait), OTP-29.1.1.
+        // Publish the sleeping flag, then look again. An enqueue that does not
+        // see the flag advances work_epochs; one that does calls ssi_wake.
+        // Sleeping without this look loses the enqueue: the scheduler parks
+        // with work on its queue, and a later SIGTERM notify never runs.
+        let observed = inner.work_epochs[id].load(Ordering::SeqCst);
+        inner.parked[id].store(true, Ordering::SeqCst);
+        let still_suspended = id >= inner.online_schedulers.load(Ordering::Acquire)
+            || (inner.scheduling_blocked.load(Ordering::Acquire)
+                && id != inner.scheduling_blocker.load(Ordering::Acquire));
+        let arrived = inner.work_epochs[id].load(Ordering::SeqCst) != observed
+            || thr_progress::scheduler_later_op_ready()
+            || inner.run_queues[id].iter().any(|queue| !queue.is_empty())
+            || local.queues.iter().any(|queue| !queue.is_empty())
+            || !inner.port_queues[id].is_empty()
+            || inner.pinned_injectors[id]
+                .iter()
+                .any(|queue| !queue.is_empty())
+            || !inner.aux_work[id].is_empty()
+            || !inner.stats_requests[id].is_empty()
+            || inner.halt_requested.load(Ordering::Acquire)
+            || !still_suspended;
+        if arrived {
+            inner.parked[id].store(false, Ordering::SeqCst);
+            return None;
+        }
+        let has_local_timers =
+            !local.pending_waits.is_empty() || local.timer_service.borrow().wheel.has_timers();
+        thr_progress::scheduler_prepare_wait();
+        // Port of erl_process.c:3065 (sched_spin_wait): a wake that lands in this
+        // window clears `parked` and must not fall into a blocking park.
+        let mut spins = spin_count;
+        let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
+        while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
+            scheduler_spin_body();
+            until_yield -= 1;
+            if until_yield == 0 {
+                until_yield = SCHED_SPIN_UNTIL_YIELD;
+                thread::yield_now();
+            }
+            spins -= 1;
+        }
+        if inner.parked[id].load(Ordering::SeqCst) {
+            local.set_msacc_state(MsaccState::Sleep);
+            if has_local_timers {
+                thread::park_timeout(Duration::from_millis(10));
+            } else {
+                while inner.parked[id].load(Ordering::SeqCst)
+                    && !inner.stopped.load(Ordering::Acquire)
+                    && !inner.halt_requested.load(Ordering::Acquire)
+                {
+                    thread::park();
+                }
+            }
+            local.set_msacc_state(MsaccState::Other);
+        }
+        thr_progress::scheduler_finalize_wait();
+        inner.parked[id].store(false, Ordering::SeqCst);
+        return None;
+    }
+    // Port of erts/emulator/beam/erl_process.c:2683 (auxiliary work), OTP-29.1.1.
+    if msacc {
+        local.set_msacc_state(MsaccState::Aux);
+    }
+    // Port of erts/emulator/beam/erl_process.c:9803 (check_time_reds) and
+    // erl_time_sup.c (erts_get_monotonic_time resets check_time_reds), OTP-29.1.1: a
+    // busy scheduler reads the clock once per ERTS_CHECK_TIME_REDS reductions.
+    let check_time = local.check_time_reds >= inner.config.reductions;
+    inner.poll_pending_waits(&mut *local, check_time);
+    inner.poll_timers(id, Some(&mut *local), false);
+    if check_time {
+        local.check_time_reds = 0;
+    }
+    if msacc {
+        local.set_msacc_state(MsaccState::Other);
+    }
+    inner.flush_local_metrics(&mut *local);
+    // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:
+    // check_balance and immigrate), OTP-29.1.1.
+    if inner.balance.rqs[id]
+        .check_balance_reds
+        .load(Ordering::Relaxed)
+        <= 0
+    {
+        inner.balance.check_balance(id);
+    }
+    if inner.balance.path_flags(id) & balance::IMMIGRATE_QMASK != 0 {
+        inner.immigrate(&mut *local);
+    }
+    // Processes enqueued on this run queue from other threads join the local deques in
+    // arrival order, so the local queue is this scheduler's whole run queue.
+    inner.take_injected(local);
+    // Port of erts/emulator/beam/erl_process.c:9953 (schedule: "Schedule system-level
+    // activities" once the schedulers executed twice a context's reductions), OTP-29.1.1.
+    if FUNCTION_CALLS.load(Ordering::Relaxed) > 2 * CONTEXT_REDS_SYS
+        && let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll))
+    {
+        local.set_msacc_state(MsaccState::CheckIo);
+        poll.poll(Some(Duration::ZERO));
+        local.set_msacc_state(MsaccState::Other);
+        clear_sys_scheduling();
+    }
+    // Hold the run-queue lock across the wakeup check. A scheduler woken here
+    // must not steal the process this scheduler is about to run.
+    // Port of erts/emulator/beam/erl_process.c:4631 (trylock EBUSY), OTP-29.1.1.
+    inner.in_schedule[id].store(true, Ordering::Release);
+    // Port of erts/emulator/beam/erl_process.c:9976 (wakeup_other check), OTP-29.1.1.
+    wakeup_other_check(inner, &mut *local);
+    // Port execution releases the run queue, so another scheduler can steal a
+    // port while this one is inside erts_port_task_execute. Without a queued port
+    // the run queue stays held up to the dequeue below.
+    let mut run_queue_held = true;
+    let port_queued = inner.balance.rqs[id].len(balance::PORT_PRIO_LEVEL) > 0;
+    if port_queued {
+        inner.in_schedule[id].store(false, Ordering::Release);
+        run_queue_held = false;
+    }
+    // Port of erts/emulator/beam/erl_process.c:9977-9986 (find a new port to run),
+    // OTP-29.1.1.
+    let ran_port = port_queued && {
+        if !local.profile_active {
+            let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
+            local.profile_active = true;
+            if let Some(process) = local.last_process.and_then(|pid| inner.table.lookup(pid)) {
+                profile_scheduler_transition(inner, &process, id, true, count, &mut *local);
+            }
+        }
+        inner.execute_port(&mut *local)
+    };
+    if inner.scheduling_blocked.load(Ordering::Acquire) && inner.sim.is_none() {
+        inner.in_schedule[id].store(false, Ordering::Release);
+        run_queue_held = false;
+        let pinned = (0..4).find(|&p| !inner.pinned_injectors[id][p].is_empty());
+        let normal_prio = match (local.best_priority(), pinned) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if inner.dirty_best_priority(DirtyKind::Cpu).is_some()
+            || inner.dirty_best_priority(DirtyKind::Io).is_some()
+        {
+            local.set_msacc_state(MsaccState::Sleep);
+            local.set_wall_enabled(false);
+            let switched = inner.msb_switch_to_dirty(normal_prio);
+            local.set_msacc_state(MsaccState::Other);
+            if switched {
+                inner.in_schedule[id].store(false, Ordering::Release);
+                return None;
+            }
+            local.set_wall_enabled(wall_enabled);
+        }
+    }
+    // Dequeue holds the run queue again so a concurrent steal cannot take the
+    // process this scheduler is about to run.
+    if !run_queue_held {
+        inner.in_schedule[id].store(true, Ordering::Release);
+    }
+    let mut item = None;
+    // Port of erts/emulator/beam/erl_process.c:9603 (one run queue per scheduler,
+    // FIFO within a priority), OTP-29.1.1: bound processes share their scheduler with
+    // other work, so a yielding bound process alternates with equal-priority work and
+    // never runs ahead of higher-priority work.
+    let has_pinned = inner.run_queue_flags[id].load(Ordering::Acquire) >> PINNED_FLAGS_SHIFT != 0;
+    let other = if has_pinned {
+        local.best_priority()
+    } else {
+        None
+    };
+    for priority in 0..if has_pinned { PROC_QUEUES } else { 0 } {
+        if let Some(other) = other
+            && (other < priority || (other == priority && local.pinned_turn))
+        {
+            break;
+        }
+        let bit = 1 << (PINNED_FLAGS_SHIFT + priority as u32);
+        if inner.run_queue_flags[id].load(Ordering::Acquire) & bit == 0 {
+            continue;
+        }
+        let pinned = &inner.pinned_injectors[id][priority];
+        item = pop_requeue(
+            || pinned.pop(),
+            |item| pinned.push(item),
+            || pinned.is_empty(),
+        );
+        if pinned.is_empty() {
+            // A push racing with this clear finds its bit cleared and sets it again
+            // after its push; one that pushed before the clear is seen here.
+            inner.run_queue_flags[id].fetch_and(!bit, Ordering::AcqRel);
+            if !pinned.is_empty() {
+                inner.run_queue_flags[id].fetch_or(bit, Ordering::Release);
+            }
+        }
+        if item.is_some() {
+            break;
+        }
+    }
+    local.pinned_turn = item.is_some();
+    if item.is_none() {
+        item = local.pop();
+    }
+    if item.is_none() && *steal_armed {
+        // Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1.
+        // A scheduler steals only after it has run out of work and been through
+        // scheduler_wait, or after it has already executed. The first look at an
+        // empty queue waits, the way a booted scheduler sleeps before user work
+        // exists, so it does not take processes another scheduler just enqueued
+        // on its own run queue.
+        let limit = inner.config.workers.div_ceil(2) as u32;
+        if inner.searching.fetch_add(1, Ordering::AcqRel) < limit {
+            match inner.try_steal_task(&mut *local) {
+                Some(Stolen::Process(found)) => item = Some(found),
+                Some(Stolen::Port) => {
+                    inner.searching.fetch_sub(1, Ordering::AcqRel);
+                    inner.in_schedule[id].store(false, Ordering::Release);
+                    return None;
+                }
+                None => {}
+            }
+        }
+        inner.searching.fetch_sub(1, Ordering::AcqRel);
+    }
+    if item.is_none() {
+        item = local.pop();
+    }
+    if let Some(item) = item {
+        if !local.profile_active {
+            let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
+            local.profile_active = true;
+            profile_scheduler_transition(inner, &item.process, id, true, count, &mut *local);
+        }
+        local.last_process = Some(item.process.pid);
+        let reductions = local.reductions;
+        // The chosen process is off the run queue. Release the lock for the
+        // slice so another scheduler can steal work that is still queued.
+        inner.in_schedule[id].store(false, Ordering::Release);
+        *steal_armed = true;
+        drop(local_guard);
+        return Some((item, reductions));
+    }
+    if ran_port {
+        // erl_process.c:10047 (no process to run after a port: check activities again).
+        inner.in_schedule[id].store(false, Ordering::Release);
+        return None;
+    }
+    inner.in_schedule[id].store(false, Ordering::Release);
+    // A worker advertises parking before its final work check. An enqueuer
+    // publishes to this run queue, advances this run queue's epoch, then
+    // wakes this worker if it sleeps. The SeqCst order makes either this
+    // check observe the publication or the enqueuer observe our parked
+    // flag. Another run queue's enqueue does not abort this wait: that
+    // scheduler is poked by smp_notify_inc_runq only when the work is
+    // its own, or later by wakeup_other_check.
+    let observed = inner.work_epochs[id].load(Ordering::SeqCst);
+    // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait), OTP-29.1.1.
+    local.wakeup_other = 0;
+    local.wakeup_other_reds = 0;
+    inner.parked[id].store(true, Ordering::SeqCst);
+    local.set_msacc_state(MsaccState::Aux);
+    inner.poll_pending_waits(&mut *local, true);
+    inner.poll_timers(id, Some(&mut *local), true);
+    local.set_msacc_state(MsaccState::Other);
+    if local.queues.iter().any(|queue| !queue.is_empty())
+        || inner.run_queues[id].iter().any(|queue| !queue.is_empty())
+        || !inner.port_queues[id].is_empty()
+        || inner.pinned_injectors[id]
+            .iter()
+            .any(|queue| !queue.is_empty())
+        || !local.timer_service.borrow().commands.is_empty()
+        || !local.timer_service.borrow().canceled.is_empty()
+        || !inner.stats_requests[id].is_empty()
+        || !inner.aux_work[id].is_empty()
+        || inner.work_epochs[id].load(Ordering::SeqCst) != observed
+            // The sleeping flag is published: look at the thread progress value again
+            // (scheduler_wait re-reads its aux work after ERTS_SSI_FLG_SLEEPING is set).
+            || thr_progress::scheduler_later_op_ready()
+    {
+        inner.parked[id].store(false, Ordering::SeqCst);
+        return None;
+    }
+    if local.profile_active {
+        let count = inner.active_schedulers.fetch_sub(1, Ordering::Relaxed) - 1;
+        local.profile_active = false;
+        if let Some(process) = local.last_process.and_then(|pid| inner.table.lookup(pid)) {
+            profile_scheduler_transition(inner, &process, id, false, count, &mut *local);
+        }
+    }
+    // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait: sleep until the
+    // next timeout, erts_check_next_timeout_time), OTP-29.1.1.
+    let timer_ns = {
+        let mut service = local.timer_service.borrow_mut();
+        if !service.commands.is_empty() || !service.canceled.is_empty() {
+            Some(1_000_000)
+        } else {
+            service
+                .wheel
+                .next_timeout()
+                .map(|next| inner.clock.ns_until_pos(next))
+        }
+    };
+    let wait_ns = match (
+        inner
+            .nearest_wait_ms(&*local)
+            .map(|ms| ms.saturating_mul(1_000_000)),
+        timer_ns,
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    // Port of erts/emulator/beam/erl_process.c:suspend_scheduler_sleep, OTP-29.1.1:
+    // ERTS carries an absolute timeout across scheduler spin; subtract spin time from the
+    // pre-spin delay before converting it back into a poll/park timeout.
+    let wait_started = Instant::now();
+
+    local.set_wall_enabled(false);
+    inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
+    inner.balance.set_waiting(id, true);
+    // Port of erts/emulator/beam/erl_process.c:3576-3579 (erts_thr_progress_active(0),
+    // erts_thr_progress_prepare_wait before the spin), OTP-29.1.1.
+    thr_progress::scheduler_prepare_wait();
+    // Port of erts/emulator/beam/erl_process.c:3065 (sched_spin_wait), OTP-29.1.1: spin
+    // before sleeping so a wakeup that comes soon costs no system call.
+    let mut spins = spin_count;
+    let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
+    while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
+        scheduler_spin_body();
+        until_yield -= 1;
+        if until_yield == 0 {
+            until_yield = SCHED_SPIN_UNTIL_YIELD;
+            thread::yield_now();
+        }
+        spins -= 1;
+    }
+    let wait_remaining_ns = wait_ns.map(|ns| {
+        ns.saturating_sub(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    });
+    if !inner.parked[id].load(Ordering::SeqCst) {
+        // Woken while spinning.
+    } else {
+        // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
+        // wraps only the blocking wait, the spin above counts as `other`.
+        local.set_msacc_state(MsaccState::Sleep);
+        if let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll)) {
+            // Port of erts/emulator/beam/erl_process.c (scheduler_wait: "We sleep in
+            // check_io, only for normal schedulers"), OTP-29.1.1.
+            inner.poll_sleeping[id].store(true, Ordering::SeqCst);
+            *POLL_SLEEPER.lock().unwrap() = Some(thread::current().id());
+            POLL_SLEEPER_SET.store(true, Ordering::SeqCst);
+            if inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire) {
+                poll.poll(wait_remaining_ns.map(Duration::from_nanos));
+            }
+            POLL_SLEEPER_SET.store(false, Ordering::SeqCst);
+            inner.poll_sleeping[id].store(false, Ordering::SeqCst);
+            clear_sys_scheduling();
+        } else if let Some(ns) = wait_remaining_ns {
+            park_until(inner, id, ns);
+        } else {
+            // `Thread::park` can return spuriously. A real wake clears `parked`
+            // before `unpark` (ssi_wake). Stay asleep until that happens so a
+            // spurious return does not fall into `try_steal_task`.
+            while inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire)
+            {
+                thread::park();
+            }
+        }
+        local.set_msacc_state(MsaccState::Other);
+    }
+    *steal_armed = true;
+    thr_progress::scheduler_finalize_wait();
+    inner.waiting_schedulers.fetch_sub(1, Ordering::Relaxed);
+    inner.balance.set_waiting(id, false);
+    inner.parked[id].store(false, Ordering::SeqCst);
+    None
+}
+
 fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     inner.sleepers[id]
         .set(thread::current())
@@ -8861,6 +9546,13 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
     #[cfg(target_os = "linux")]
     let mut applied_binding = None;
+    let consts = SliceConsts {
+        worker: Some(id),
+        worker_count: inner.config.workers,
+        sched_type: SchedulerType::Normal,
+        simulated: false,
+    };
+    let mut previous: Option<SliceEnd<T>> = None;
     while !inner.stopped.load(Ordering::Acquire) {
         #[cfg(target_os = "linux")]
         apply_scheduler_cpu_binding(
@@ -8869,471 +9561,33 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             &mut applied_binding,
             inherited_affinity.as_ref(),
         );
-        let mut local_guard = local_cell.borrow_mut();
-        let local = &mut *local_guard;
-        // Port of erts/emulator/beam/erl_process.c:9857-9866 (schedule: the progress point
-        // between two scheduled processes), OTP-29.1.1.
-        thr_progress::scheduler_progress(&managed_thread);
-        if halting() {
-            // The halting scheduler terminates the OS process; the others stay idle.
-            thr_progress::scheduler_prepare_wait();
-            thread::park();
-            thr_progress::scheduler_finalize_wait();
+        let Some((item, reductions)) = schedule_next(
+            &inner,
+            id,
+            &local_cell,
+            &managed_thread,
+            spin_count,
+            &mut steal_armed,
+            previous.take(),
+        ) else {
             continue;
-        }
-        let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
-        let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
-        if local.msacc_enabled != (accounting_flags & ACCOUNTING_MSACC != 0)
-            || local.wall_enabled != wall_enabled
-        {
-            local.set_msacc_enabled(accounting_flags & ACCOUNTING_MSACC != 0);
-            let started_at = (wall_enabled && !local.wall_enabled)
-                .then(|| inner.take_wall_start(id))
-                .flatten();
-            local.set_wall_enabled_at(wall_enabled, started_at);
-        }
-        local.set_msacc_state(MsaccState::Other);
-        let aux_work = inner.take_aux_work(id);
-        if aux_work & AUX_WORK_STATS != 0 {
-            while let Some(reply) = inner.stats_requests[id].pop() {
-                let _ = reply.send(local.stats_snapshot(local.msacc_enabled, local.wall_enabled));
-            }
-        }
-        local.set_msacc_state(MsaccState::Aux);
-        inner.handle_local_aux_work(id, &mut *local, aux_work);
-        local.set_msacc_state(MsaccState::Other);
-        if inner.runq_halting[id].load(Ordering::Acquire) {
-            if inner.execute_port(local) {
-                continue;
-            }
-            let observed = inner.work_epochs[id].load(Ordering::SeqCst);
-            inner.parked[id].store(true, Ordering::SeqCst);
-            local.set_msacc_state(MsaccState::Aux);
-            inner.poll_timers(id, Some(&mut *local), true);
-            inner.handle_aux_work(id);
-            local.set_msacc_state(MsaccState::Other);
-            if !inner.port_queues[id].is_empty()
-                || !inner.aux_work[id].is_empty()
-                || inner.work_epochs[id].load(Ordering::SeqCst) != observed
-                // The sleeping flag is published: look at the thread progress value again
-                // (scheduler_wait re-reads its aux work after ERTS_SSI_FLG_SLEEPING is set).
-                || thr_progress::scheduler_later_op_ready()
-            {
-                inner.parked[id].store(false, Ordering::SeqCst);
-                continue;
-            }
-            let timer_ms = local
-                .timer_service
-                .borrow_mut()
-                .wheel
-                .next_timeout()
-                .map(|next| next.saturating_sub(inner.clock.now_ms()));
-            local.set_wall_enabled(false);
-            thr_progress::scheduler_prepare_wait();
-            // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
-            // covers only the blocking wait.
-            local.set_msacc_state(MsaccState::Sleep);
-            if let Some(ms) = timer_ms {
-                thread::park_timeout(Duration::from_millis(ms.max(1)));
-            } else {
-                thread::park();
-            }
-            local.set_msacc_state(MsaccState::Other);
-            thr_progress::scheduler_finalize_wait();
-            inner.parked[id].store(false, Ordering::SeqCst);
-            continue;
-        }
-        if id >= inner.online_schedulers.load(Ordering::Acquire)
-            || (inner.scheduling_blocked.load(Ordering::Acquire)
-                && id != inner.scheduling_blocker.load(Ordering::Acquire))
-        {
-            // An offline or blocked scheduler hands its queued work and due timers to the
-            // schedulers still running.
-            inner.poll_timers(id, Some(&mut *local), true);
-            inner.poll_pending_waits(&mut *local, true);
-            inner.evacuate_offline_local(&mut *local);
-            local.set_wall_enabled(false);
-            // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait), OTP-29.1.1.
-            // Publish the sleeping flag, then look again. An enqueue that does not
-            // see the flag advances work_epochs; one that does calls ssi_wake.
-            // Sleeping without this look loses the enqueue: the scheduler parks
-            // with work on its queue, and a later SIGTERM notify never runs.
-            let observed = inner.work_epochs[id].load(Ordering::SeqCst);
-            inner.parked[id].store(true, Ordering::SeqCst);
-            let still_suspended = id >= inner.online_schedulers.load(Ordering::Acquire)
-                || (inner.scheduling_blocked.load(Ordering::Acquire)
-                    && id != inner.scheduling_blocker.load(Ordering::Acquire));
-            let arrived = inner.work_epochs[id].load(Ordering::SeqCst) != observed
-                || thr_progress::scheduler_later_op_ready()
-                || inner.run_queues[id].iter().any(|queue| !queue.is_empty())
-                || local.queues.iter().any(|queue| !queue.is_empty())
-                || !inner.port_queues[id].is_empty()
-                || inner.pinned_injectors[id]
-                    .iter()
-                    .any(|queue| !queue.is_empty())
-                || !inner.aux_work[id].is_empty()
-                || !inner.stats_requests[id].is_empty()
-                || inner.halt_requested.load(Ordering::Acquire)
-                || !still_suspended;
-            if arrived {
-                inner.parked[id].store(false, Ordering::SeqCst);
-                continue;
-            }
-            let has_local_timers =
-                !local.pending_waits.is_empty() || local.timer_service.borrow().wheel.has_timers();
-            thr_progress::scheduler_prepare_wait();
-            // Port of erl_process.c:3065 (sched_spin_wait): a wake that lands in this
-            // window clears `parked` and must not fall into a blocking park.
-            let mut spins = spin_count;
-            let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
-            while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
-                scheduler_spin_body();
-                until_yield -= 1;
-                if until_yield == 0 {
-                    until_yield = SCHED_SPIN_UNTIL_YIELD;
-                    thread::yield_now();
-                }
-                spins -= 1;
-            }
-            if inner.parked[id].load(Ordering::SeqCst) {
-                local.set_msacc_state(MsaccState::Sleep);
-                if has_local_timers {
-                    thread::park_timeout(Duration::from_millis(10));
-                } else {
-                    while inner.parked[id].load(Ordering::SeqCst)
-                        && !inner.stopped.load(Ordering::Acquire)
-                        && !inner.halt_requested.load(Ordering::Acquire)
-                    {
-                        thread::park();
-                    }
-                }
-                local.set_msacc_state(MsaccState::Other);
-            }
-            thr_progress::scheduler_finalize_wait();
-            inner.parked[id].store(false, Ordering::SeqCst);
-            continue;
-        }
-        // Port of erts/emulator/beam/erl_process.c:2683 (auxiliary work), OTP-29.1.1.
-        local.set_msacc_state(MsaccState::Aux);
-        // Port of erts/emulator/beam/erl_process.c:9803 (check_time_reds) and
-        // erl_time_sup.c (erts_get_monotonic_time resets check_time_reds), OTP-29.1.1: a
-        // busy scheduler reads the clock once per ERTS_CHECK_TIME_REDS reductions.
-        let check_time = local.check_time_reds >= inner.config.reductions;
-        inner.poll_pending_waits(&mut *local, check_time);
-        inner.poll_timers(id, Some(&mut *local), false);
-        if check_time {
-            local.check_time_reds = 0;
-        }
-        local.set_msacc_state(MsaccState::Other);
-        inner.flush_local_metrics(&mut *local);
-        // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:
-        // check_balance and immigrate), OTP-29.1.1.
-        if inner.balance.rqs[id]
-            .check_balance_reds
-            .load(Ordering::Relaxed)
-            <= 0
-        {
-            inner.balance.check_balance(id);
-        }
-        if inner.balance.path_flags(id) & balance::IMMIGRATE_QMASK != 0 {
-            inner.immigrate(&mut *local);
-        }
-        // Processes enqueued on this run queue from other threads join the local deques in
-        // arrival order, so the local queue is this scheduler's whole run queue.
-        inner.take_injected(local);
-        // Port of erts/emulator/beam/erl_process.c:9953 (schedule: "Schedule system-level
-        // activities" once the schedulers executed twice a context's reductions), OTP-29.1.1.
-        if FUNCTION_CALLS.load(Ordering::Relaxed) > 2 * CONTEXT_REDS_SYS
-            && let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll))
-        {
-            local.set_msacc_state(MsaccState::CheckIo);
-            poll.poll(Some(Duration::ZERO));
-            local.set_msacc_state(MsaccState::Other);
-            clear_sys_scheduling();
-        }
-        // Hold the run-queue lock across the wakeup check. A scheduler woken here
-        // must not steal the process this scheduler is about to run.
-        // Port of erts/emulator/beam/erl_process.c:4631 (trylock EBUSY), OTP-29.1.1.
-        inner.in_schedule[id].store(true, Ordering::Release);
-        // Port of erts/emulator/beam/erl_process.c:9976 (wakeup_other check), OTP-29.1.1.
-        wakeup_other_check(&inner, &mut *local);
-        // Port execution releases the run queue, so another scheduler can steal a
-        // port while this one is inside erts_port_task_execute. Without a queued port
-        // the run queue stays held up to the dequeue below.
-        let mut run_queue_held = true;
-        let port_queued = inner.balance.rqs[id].len(balance::PORT_PRIO_LEVEL) > 0;
-        if port_queued {
-            inner.in_schedule[id].store(false, Ordering::Release);
-            run_queue_held = false;
-        }
-        // Port of erts/emulator/beam/erl_process.c:9977-9986 (find a new port to run),
-        // OTP-29.1.1.
-        let ran_port = port_queued && {
-            if !local.profile_active {
-                let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
-                local.profile_active = true;
-                if let Some(process) = local.last_process.and_then(|pid| inner.table.lookup(pid)) {
-                    profile_scheduler_transition(&inner, &process, id, true, count, &mut *local);
-                }
-            }
-            inner.execute_port(&mut *local)
         };
-        if inner.scheduling_blocked.load(Ordering::Acquire) && inner.sim.is_none() {
-            inner.in_schedule[id].store(false, Ordering::Release);
-            run_queue_held = false;
-            let pinned = (0..4).find(|&p| !inner.pinned_injectors[id][p].is_empty());
-            let normal_prio = match (local.best_priority(), pinned) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-            if inner.dirty_best_priority(DirtyKind::Cpu).is_some()
-                || inner.dirty_best_priority(DirtyKind::Io).is_some()
-            {
-                local.set_msacc_state(MsaccState::Sleep);
-                local.set_wall_enabled(false);
-                let switched = inner.msb_switch_to_dirty(normal_prio);
-                local.set_msacc_state(MsaccState::Other);
-                if switched {
-                    inner.in_schedule[id].store(false, Ordering::Release);
-                    continue;
-                }
-                local.set_wall_enabled(wall_enabled);
-            }
-        }
-        // Dequeue holds the run queue again so a concurrent steal cannot take the
-        // process this scheduler is about to run.
-        if !run_queue_held {
-            inner.in_schedule[id].store(true, Ordering::Release);
-        }
-        let mut item = None;
-        // Port of erts/emulator/beam/erl_process.c:9603 (one run queue per scheduler,
-        // FIFO within a priority), OTP-29.1.1: bound processes share their scheduler with
-        // other work, so a yielding bound process alternates with equal-priority work and
-        // never runs ahead of higher-priority work.
-        let has_pinned =
-            inner.run_queue_flags[id].load(Ordering::Acquire) >> PINNED_FLAGS_SHIFT != 0;
-        let other = if has_pinned {
-            local.best_priority()
-        } else {
-            None
-        };
-        for priority in 0..if has_pinned { PROC_QUEUES } else { 0 } {
-            if let Some(other) = other
-                && (other < priority || (other == priority && local.pinned_turn))
-            {
-                break;
-            }
-            let bit = 1 << (PINNED_FLAGS_SHIFT + priority as u32);
-            if inner.run_queue_flags[id].load(Ordering::Acquire) & bit == 0 {
-                continue;
-            }
-            let pinned = &inner.pinned_injectors[id][priority];
-            item = pop_requeue(
-                || pinned.pop(),
-                |item| pinned.push(item),
-                || pinned.is_empty(),
-            );
-            if pinned.is_empty() {
-                // A push racing with this clear finds its bit cleared and sets it again
-                // after its push; one that pushed before the clear is seen here.
-                inner.run_queue_flags[id].fetch_and(!bit, Ordering::AcqRel);
-                if !pinned.is_empty() {
-                    inner.run_queue_flags[id].fetch_or(bit, Ordering::Release);
-                }
-            }
-            if item.is_some() {
-                break;
-            }
-        }
-        local.pinned_turn = item.is_some();
-        if item.is_none() {
-            item = local.pop();
-        }
-        if item.is_none() && steal_armed {
-            // Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1.
-            // A scheduler steals only after it has run out of work and been through
-            // scheduler_wait, or after it has already executed. The first look at an
-            // empty queue waits, the way a booted scheduler sleeps before user work
-            // exists, so it does not take processes another scheduler just enqueued
-            // on its own run queue.
-            let limit = inner.config.workers.div_ceil(2) as u32;
-            if inner.searching.fetch_add(1, Ordering::AcqRel) < limit {
-                match inner.try_steal_task(&mut *local) {
-                    Some(Stolen::Process(found)) => item = Some(found),
-                    Some(Stolen::Port) => {
-                        inner.searching.fetch_sub(1, Ordering::AcqRel);
-                        inner.in_schedule[id].store(false, Ordering::Release);
-                        continue;
-                    }
-                    None => {}
-                }
-            }
-            inner.searching.fetch_sub(1, Ordering::AcqRel);
-        }
-        if item.is_none() {
-            item = local.pop();
-        }
-        if let Some(item) = item {
-            if !local.profile_active {
-                let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
-                local.profile_active = true;
-                profile_scheduler_transition(&inner, &item.process, id, true, count, &mut *local);
-            }
-            local.last_process = Some(item.process.pid);
-            let reductions = local.reductions;
-            // The chosen process is off the run queue. Release the lock for the
-            // slice so another scheduler can steal work that is still queued.
-            inner.in_schedule[id].store(false, Ordering::Release);
-            steal_armed = true;
-            drop(local_guard);
-            // A managed thread runs its later operations at its progress point
-            // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
-            run_slice(
-                &inner,
-                item,
-                Some(&local_cell),
-                &mut scheduler_data,
-                Some(id),
-                None,
-            );
-            let mut local = local_cell.borrow_mut();
-            local.wakeup_other_reds += (local.reductions - reductions) as i64;
-            continue;
-        }
-        if ran_port {
-            // erl_process.c:10047 (no process to run after a port: check activities again).
-            inner.in_schedule[id].store(false, Ordering::Release);
-            continue;
-        }
-        inner.in_schedule[id].store(false, Ordering::Release);
-        // A worker advertises parking before its final work check. An enqueuer
-        // publishes to this run queue, advances this run queue's epoch, then
-        // wakes this worker if it sleeps. The SeqCst order makes either this
-        // check observe the publication or the enqueuer observe our parked
-        // flag. Another run queue's enqueue does not abort this wait: that
-        // scheduler is poked by smp_notify_inc_runq only when the work is
-        // its own, or later by wakeup_other_check.
-        let observed = inner.work_epochs[id].load(Ordering::SeqCst);
-        // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait), OTP-29.1.1.
-        local.wakeup_other = 0;
-        local.wakeup_other_reds = 0;
-        inner.parked[id].store(true, Ordering::SeqCst);
-        local.set_msacc_state(MsaccState::Aux);
-        inner.poll_pending_waits(&mut *local, true);
-        inner.poll_timers(id, Some(&mut *local), true);
-        local.set_msacc_state(MsaccState::Other);
-        if local.queues.iter().any(|queue| !queue.is_empty())
-            || inner.run_queues[id].iter().any(|queue| !queue.is_empty())
-            || !inner.port_queues[id].is_empty()
-            || inner.pinned_injectors[id]
-                .iter()
-                .any(|queue| !queue.is_empty())
-            || !local.timer_service.borrow().commands.is_empty()
-            || !local.timer_service.borrow().canceled.is_empty()
-            || !inner.stats_requests[id].is_empty()
-            || !inner.aux_work[id].is_empty()
-            || inner.work_epochs[id].load(Ordering::SeqCst) != observed
-                // The sleeping flag is published: look at the thread progress value again
-                // (scheduler_wait re-reads its aux work after ERTS_SSI_FLG_SLEEPING is set).
-                || thr_progress::scheduler_later_op_ready()
-        {
-            inner.parked[id].store(false, Ordering::SeqCst);
-            continue;
-        }
-        if local.profile_active {
-            let count = inner.active_schedulers.fetch_sub(1, Ordering::Relaxed) - 1;
-            local.profile_active = false;
-            if let Some(process) = local.last_process.and_then(|pid| inner.table.lookup(pid)) {
-                profile_scheduler_transition(&inner, &process, id, false, count, &mut *local);
-            }
-        }
-        // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait: sleep until the
-        // next timeout, erts_check_next_timeout_time), OTP-29.1.1.
-        let timer_ns = {
-            let mut service = local.timer_service.borrow_mut();
-            if !service.commands.is_empty() || !service.canceled.is_empty() {
-                Some(1_000_000)
-            } else {
-                service
-                    .wheel
-                    .next_timeout()
-                    .map(|next| inner.clock.ns_until_pos(next))
-            }
-        };
-        let wait_ns = match (
-            inner
-                .nearest_wait_ms(&*local)
-                .map(|ms| ms.saturating_mul(1_000_000)),
-            timer_ns,
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        // Port of erts/emulator/beam/erl_process.c:suspend_scheduler_sleep, OTP-29.1.1:
-        // ERTS carries an absolute timeout across scheduler spin; subtract spin time from the
-        // pre-spin delay before converting it back into a poll/park timeout.
-        let wait_started = Instant::now();
-
-        local.set_wall_enabled(false);
-        inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
-        inner.balance.set_waiting(id, true);
-        // Port of erts/emulator/beam/erl_process.c:3576-3579 (erts_thr_progress_active(0),
-        // erts_thr_progress_prepare_wait before the spin), OTP-29.1.1.
-        thr_progress::scheduler_prepare_wait();
-        // Port of erts/emulator/beam/erl_process.c:3065 (sched_spin_wait), OTP-29.1.1: spin
-        // before sleeping so a wakeup that comes soon costs no system call.
-        let mut spins = spin_count;
-        let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
-        while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
-            scheduler_spin_body();
-            until_yield -= 1;
-            if until_yield == 0 {
-                until_yield = SCHED_SPIN_UNTIL_YIELD;
-                thread::yield_now();
-            }
-            spins -= 1;
-        }
-        let wait_remaining_ns = wait_ns.map(|ns| {
-            ns.saturating_sub(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
-        });
-        if !inner.parked[id].load(Ordering::SeqCst) {
-            // Woken while spinning.
-        } else {
-            // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
-            // wraps only the blocking wait, the spin above counts as `other`.
-            local.set_msacc_state(MsaccState::Sleep);
-            if let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll)) {
-                // Port of erts/emulator/beam/erl_process.c (scheduler_wait: "We sleep in
-                // check_io, only for normal schedulers"), OTP-29.1.1.
-                inner.poll_sleeping[id].store(true, Ordering::SeqCst);
-                *POLL_SLEEPER.lock().unwrap() = Some(thread::current().id());
-                POLL_SLEEPER_SET.store(true, Ordering::SeqCst);
-                if inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire)
-                {
-                    poll.poll(wait_remaining_ns.map(Duration::from_nanos));
-                }
-                POLL_SLEEPER_SET.store(false, Ordering::SeqCst);
-                inner.poll_sleeping[id].store(false, Ordering::SeqCst);
-                clear_sys_scheduling();
-            } else if let Some(ns) = wait_remaining_ns {
-                park_until(&inner, id, ns);
-            } else {
-                // `Thread::park` can return spuriously. A real wake clears `parked`
-                // before `unpark` (ssi_wake). Stay asleep until that happens so a
-                // spurious return does not fall into `try_steal_task`.
-                while inner.parked[id].load(Ordering::SeqCst)
-                    && !inner.stopped.load(Ordering::Acquire)
-                {
-                    thread::park();
-                }
-            }
-            local.set_msacc_state(MsaccState::Other);
-        }
-        steal_armed = true;
-        thr_progress::scheduler_finalize_wait();
-        inner.waiting_schedulers.fetch_sub(1, Ordering::Relaxed);
-        inner.balance.set_waiting(id, false);
-        inner.parked[id].store(false, Ordering::SeqCst);
+        // A managed thread runs its later operations at its progress point
+        // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
+        previous = run_process(
+            &inner,
+            &local_cell,
+            item,
+            &mut scheduler_data,
+            id,
+            &consts,
+            reductions,
+        );
+    }
+    // A stop never drops a finished slice.
+    if let Some(end) = previous.take() {
+        let mut local = local_cell.borrow_mut();
+        schedule_out(&inner, Some(&mut *local), end, Some(id), None);
     }
     native_sender::clear();
     // A stopped scheduler waits forever: it must not hold back blockers.
@@ -9442,6 +9696,11 @@ fn timer_wheel_bit(worker: usize) -> u64 {
 const AUX_WORK_FUNC: u32 = 1 << 0;
 /// Auxiliary work: statistics snapshot requests.
 const AUX_WORK_STATS: u32 = 1 << 1;
+/// Auxiliary work: timer requests queued by other threads (`TimerService::commands`,
+/// `TimerService::canceled`).
+// Port of erts/emulator/beam/erl_process.c (ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP family: timer
+// requests reach the owning scheduler as aux work), OTP-29.1.1.
+const AUX_WORK_TIMER_CMDS: u32 = 1 << 2;
 /// First `run_queue_flags` bit of the bound-process priority queues.
 const PINNED_FLAGS_SHIFT: u32 = 8;
 

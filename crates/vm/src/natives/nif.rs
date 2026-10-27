@@ -1842,6 +1842,7 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(atom("ok"))
 }
 
+#[inline(never)]
 pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
     let pid = ctx.pid();
     let current = HUB.with(|hub| {
@@ -1858,6 +1859,7 @@ fn install_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
     install_hub_for(process, ctx.pid());
 }
 
+#[inline(never)]
 pub(crate) fn refresh_hub_native(process: &Process) {
     let Some(pid) = process.self_pid.as_ref() else {
         return;
@@ -1885,6 +1887,7 @@ pub(crate) fn refresh_hub_native(process: &Process) {
 /// Install this scheduler thread's hub for `process`'s runtime and bind it to the
 /// scheduler's current-process slot, so scheduling a process in is a plain store.
 /// Returns whether the hub is bound.
+#[inline(never)] // Once per scheduler thread; inlined, its thread-locals load on every slice.
 pub(crate) fn bind_scheduler_hub(process: &Process, current: &CurrentProcess) -> bool {
     let Some(pid) = process.self_pid else {
         return false;
