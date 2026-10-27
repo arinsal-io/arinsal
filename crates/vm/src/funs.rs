@@ -304,7 +304,7 @@ impl Vm {
         if import.module != "erlang" {
             return Ok(None);
         }
-        let function = import.function.as_str();
+        let function = import.function;
         if function == "apply" && (arity == 2 || arity == 3) {
             return self.apply_bif(p, arity, tail, 0, ctx).map(Some);
         }

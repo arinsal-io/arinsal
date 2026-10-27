@@ -3494,6 +3494,28 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         let values: Vec<Term> = unique.iter().map(|p| p.1).collect();
         self.flatmap_with_key_tuple(keys, &values)
     }
+    /// Construct the map of a decoded `MAP_EXT`: the pairs come in stream order, are sorted by
+    /// key, and a repeated key is an error.
+    // Port of erts/emulator/beam/external.c:5047-5060, 5428-5445 (dec_term maps: the keys are
+    // sorted and a duplicate fails the decode), OTP-29.1.1.
+    pub fn map_from_decoded_pairs(
+        &mut self,
+        pairs: &mut [(Term, Term)],
+    ) -> Result<Term, TermError> {
+        if pairs.is_empty() {
+            return self.flatmap_from_pairs(&[]);
+        }
+        pairs.sort_by(|a, b| flat_key_cmp(a.0, b.0));
+        if pairs.windows(2).any(|pair| exact_eq(pair[0].0, pair[1].0)) {
+            return Err(TermError::BadArg);
+        }
+        if pairs.len() > 32 {
+            return crate::hamt::build_hamt_from_unique(pairs, self.heap);
+        }
+        let keys: Vec<Term> = pairs.iter().map(|pair| pair.0).collect();
+        let values: Vec<Term> = pairs.iter().map(|pair| pair.1).collect();
+        self.flatmap_from_sorted_arrays(&keys, &values)
+    }
     /// Construct a flatmap that shares a sorted key tuple, allocating its header and values.
     ///
     /// Port of erts/emulator/beam/beam_common.c:2203-2283 (`erts_gc_update_map_exact`), OTP-29.1.1.

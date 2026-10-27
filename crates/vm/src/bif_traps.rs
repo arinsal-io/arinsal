@@ -1869,13 +1869,10 @@ pub(crate) fn execute(
         }));
     }
     let import_info = vm.code.modules.get(process.module).and_then(|module| {
-        module.imports.get(import).map(|import| {
-            (
-                import.module.as_str(),
-                import.function.as_str(),
-                usize::from(import.arity),
-            )
-        })
+        module
+            .imports
+            .get(import)
+            .map(|import| (import.module, import.function, usize::from(import.arity)))
     });
     let Some((module_name, function_name, import_arity)) = import_info else {
         if let Some(pending) = process.cold_mut().bif_trap.take() {

@@ -2362,7 +2362,7 @@ impl Executor {
                                         self.vm.load_named("erts_internal").is_ok_and(|id| {
                                             self.vm.code.modules[id].functions.iter().any(
                                                 |(_, name, arity)| {
-                                                    name == "breakpoint" && *arity == 4
+                                                    *name == "breakpoint" && *arity == 4
                                                 },
                                             )
                                         });
@@ -4273,7 +4273,7 @@ pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError>
     let entry = vm.code.modules[module_id]
         .functions
         .iter()
-        .find(|(_, name, arity)| name == "apply" && *arity == 3)
+        .find(|(_, name, arity)| *name == "apply" && *arity == 3)
         .map(|(ip, _, _)| ip + 1)
         .ok_or_else(|| VmError::Unsupported("erlang:apply/3 is not loaded".into()))?;
     vm.apply3_entry = Some((module_id, entry));

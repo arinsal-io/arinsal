@@ -131,17 +131,23 @@ impl BeamModuleAssembler {
     pub fn emit_put_tuple2(&mut self, dst: ArgVal, elements: &[ArgVal]) -> Result<(), ModuleError> {
         let arity = u64::try_from(elements.len())
             .map_err(|_| ModuleError::InvalidOperand("tuple arity overflow"))?;
-        let mut data = Vec::with_capacity(elements.len() + 1);
-        data.push(ArgVal::Immediate(arity << 6));
-        data.extend_from_slice(elements);
-        let size = data.len();
+        // The header word, then the elements: `data` of the C version without the copy.
+        let header = ArgVal::Immediate(arity << 6);
+        let data = |index: usize| {
+            if index == 0 {
+                header
+            } else {
+                elements[index - 1]
+            }
+        };
+        let size = elements.len() + 1;
         let mut value: Option<ArgVal> = None;
         let mut index = 0;
         while index + 1 < size {
             if index % 128 == 0 {
                 self.check_pending_stubs()?;
             }
-            let (first, second) = (data[index], data[index + 1]);
+            let (first, second) = (data(index), data(index + 1));
             let is_register =
                 |arg: ArgVal| matches!(arg, ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_));
             let (left, right) = if !is_register(first) && first == second {
@@ -163,10 +169,10 @@ impl BeamModuleAssembler {
             index += 2;
         }
         if index < size {
-            if value == Some(data[index]) {
+            if value == Some(data(index)) {
                 self.code.emit(|e| e.str_post(SCRATCH[0], HTOP, 8))?;
             } else {
-                let last = self.source_reg_into(data[index], Gpr::x(17))?;
+                let last = self.source_reg_into(data(index), Gpr::x(17))?;
                 self.code.emit(|e| e.str_post(last, HTOP, 8))?;
             }
         }

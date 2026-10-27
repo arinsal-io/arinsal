@@ -2,7 +2,6 @@
 
 use crate::process::Runtime;
 use crate::{CodeMeta, Process, Vm, VmError, exceptions};
-use arinsal_beam::BeamFile;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::CoverageMode;
@@ -365,11 +364,6 @@ impl Prepared {
     }
 }
 
-// boot_loop1: preserve the on_load decision made by OTP's loader attributes.
-fn has_on_load_opcode(beam: &BeamFile) -> bool {
-    beam.summary.on_load.is_some()
-}
-
 fn has_prepared_code_on_load(term: Term) -> Result<Term, VmError> {
     // SAFETY: The caller keeps the argument's heap live during this BIF.
     let prepared = unsafe { term.magic_ref() }
@@ -628,7 +622,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     if [&beam.attributes, &beam.compile_info]
         .into_iter()
         .flatten()
-        .any(|chunk| !chunk.is_empty() && arinsal_etf::decode(chunk).is_err())
+        .any(|chunk| !chunk.is_empty() && arinsal_etf::decode_ext_size(chunk).is_err())
     {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
@@ -638,8 +632,6 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // a malformed module is `{error, badfile}` before finish_loading.
     // Static NIF bodies and import classes are bound here, like erts' loader does for the
     // static NIF table (erl_nif.c erts_load_static_nif at load_nif time).
-    let has_on_load = has_on_load_opcode(&beam);
-    let registers = (beam.summary.x_registers, beam.summary.float_registers);
     let mut meta = CodeMeta::from_beam_owned(beam, Some(&bytes));
     // As erts has no interpreter form of a module, decode the instructions for the interpreter
     // only when it may run them.
@@ -653,7 +645,9 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
             let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
             return Ok(error);
         }
+        meta.note_decoded_on_load();
     }
+    let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
     let Ok(mut module) = vm.prepare_module_with(&meta.beam, Some(&bytes), meta.md5, !native_only)
     else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
@@ -669,7 +663,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     }
     vm.release_loaded_tables(&mut module, &mut meta);
     let prepared = Prepared {
-        has_on_load,
+        has_on_load: meta.on_load.is_some(),
         registers,
         bytes: Mutex::new(bytes),
         module: Mutex::new(Some(module)),
@@ -959,7 +953,7 @@ fn get_coverage(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     }
     let mut rows = Vec::new();
     for (index, (_, function, arity)) in module.functions.iter().enumerate() {
-        if function == "module_info" && *arity <= 1 {
+        if *function == "module_info" && *arity <= 1 {
             continue;
         }
         let count = if function_from_lines {

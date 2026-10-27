@@ -89,7 +89,7 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
         let native_fns = vm.code_ix.native_fns();
         for &(name, expected_arity) in TRACER_FUNCTIONS {
             let Some(ordinal) = module.functions.iter().position(|(_, found, found_arity)| {
-                found == name && *found_arity == expected_arity
+                *found == name && *found_arity == expected_arity
             }) else {
                 continue;
             };
@@ -870,10 +870,12 @@ fn filename_bytes(term: Term) -> Option<Vec<u8>> {
 // at the first `nif_start`, NULL without one), OTP-29.1.1. The loaded module is the source, not
 // a beam file on a path, so a module loaded from a binary works.
 fn declared_nifs(module: &arinsal_loader::Module) -> Option<HashSet<(String, u8)>> {
-    module
-        .nif_stubs
-        .as_ref()
-        .map(|stubs| stubs.iter().cloned().collect())
+    module.nif_stubs.as_ref().map(|stubs| {
+        stubs
+            .iter()
+            .map(|(name, arity)| ((*name).to_owned(), *arity))
+            .collect()
+    })
 }
 
 /// A dirty NIF call or `enif_schedule_nif` continuation waiting for a scheduler of
@@ -1301,7 +1303,7 @@ fn finish_stubs(
                 .ok_or_else(|| VmError::Unsupported("nif entry".into()))?;
             Ok(NifStub {
                 entry,
-                name: name.clone(),
+                name: (*name).to_owned(),
                 arity: *arity,
                 call: NifBinding {
                     lib: Arc::clone(lib),
@@ -1391,7 +1393,7 @@ fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
     let module = Arc::clone(&vm.code.modules[module_id]);
     let find = |wanted: &str, wanted_arity: u8| {
         module.functions.iter().find_map(|(entry, name, arity)| {
-            (name == wanted && *arity == wanted_arity).then_some(*entry)
+            (*name == wanted && *arity == wanted_arity).then_some(*entry)
         })
     };
     let (Some(enabled), Some(trace)) = (find("enabled", 3), find("trace", 5)) else {
@@ -1626,7 +1628,7 @@ fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term
         .functions
         .iter()
         .find_map(|(entry, function, arity)| {
-            (function == "on_load" && *arity == 0).then_some(*entry)
+            (*function == "on_load" && *arity == 0).then_some(*entry)
         })
         .ok_or_else(badarg)?;
     let caller = process.module;

@@ -328,7 +328,7 @@ fn breakpoints(
             .map(|(line, enabled)| (O::Int(i64::from(line)), enabled))
             .collect();
         functions.push((
-            O::Tuple(vec![O::Atom(name.clone()), O::Int(i64::from(*arity))]),
+            O::Tuple(vec![O::Atom((*name).to_owned()), O::Int(i64::from(*arity))]),
             O::Map(lines),
         ));
     }
@@ -805,7 +805,7 @@ fn debugger_frame_line(module: &arinsal_loader::Module, function: &str, arity: u
     let start = module
         .functions
         .iter()
-        .find(|(_, name, candidate_arity)| name == function && *candidate_arity == arity)
+        .find(|(_, name, candidate_arity)| *name == function && *candidate_arity == arity)
         .map(|(start, _, _)| *start)
         .unwrap_or(0);
     let next_line = module

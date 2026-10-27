@@ -415,6 +415,13 @@ fn emit_op<S: OpSink>(
         }
         st.function_number += 1;
     }
+    // Port of erts/emulator/beam/jit/asm_load.c:741 (beam_load_emit_op, op_int_code_end).
+    if op == GENOP_INT_CODE_END_0 && st.function_number != st.beam.code.function_count as usize {
+        return Err(error(format!(
+            "too few functions ({}) in module (header said {})",
+            st.function_number, st.beam.code.function_count
+        )));
+    }
     // The literals the load added so far are the assembler's from now on.
     while *announced < st.literals.extra.len() {
         let index = (st.literals.len() - st.literals.extra.len() + *announced) as u32;

@@ -398,11 +398,11 @@ impl Vm {
         else {
             return untraced(p);
         };
-        let (module, function) = (entry.module.clone(), entry.function.clone());
+        let (module, function) = (entry.module, entry.function);
         let Some(ctx) = ctx else {
             return untraced(p);
         };
-        self.call_bif_traced_named(p, ctx, &module, &function, bif, arity)
+        self.call_bif_traced_named(p, ctx, module, function, bif, arity)
     }
 
     /// Call a BIF by name, emitting call and return events when a pattern selects it.
@@ -489,12 +489,12 @@ impl Vm {
             return None;
         }
         let entry = self.code.modules.get(caller_module)?.imports.get(import)?;
-        let (module, function) = (entry.module.clone(), entry.function.clone());
+        let (module, function) = (entry.module, entry.function);
         self.trace_native_call_named(
             p,
             ctx,
-            &module,
-            &function,
+            module,
+            function,
             arity,
             (caller_module, caller_ip),
             crate::trace::StackScan::None,
@@ -637,13 +637,13 @@ impl Vm {
         if import.class() == ImportClass::Fresh {
             if import.bif.is_none()
                 && let Some(bif) =
-                    natives::plain_static_nif_lookup(&import.module, &import.function, import.arity)
+                    natives::plain_static_nif_lookup(import.module, import.function, import.arity)
             {
                 import.set_extra_bif(bif);
             }
             let (class, bits) = natives::classify(
-                &import.module,
-                &import.function,
+                import.module,
+                import.function,
                 import.arity,
                 import.bif_fn().is_some(),
             );
@@ -690,8 +690,8 @@ impl Vm {
         let import = &self.code.modules[module].imports[index];
         exceptions::bif_error_with_atoms(
             p,
-            &import.module,
-            &import.function,
+            import.module,
+            import.function,
             import.module_atom,
             import.function_atom,
             &args,
@@ -790,8 +790,8 @@ impl Vm {
                 let import = &self.code.modules[p.module].imports[index];
                 return Err(exceptions::bif_error_with_atoms(
                     p,
-                    &import.module,
-                    &import.function,
+                    import.module,
+                    import.function,
                     import.module_atom,
                     import.function_atom,
                     &args,
@@ -939,8 +939,8 @@ impl Vm {
             .imports
             .get(index)
             .ok_or_else(|| VmError::Unsupported(format!("import {index}")))?;
-        let module_name = import.module.as_str();
-        let function_name = import.function.as_str();
+        let module_name = import.module;
+        let function_name = import.function;
         let import_arity = import.arity;
         let bif = import.bif_fn();
         let native_bits = import.native_bits();

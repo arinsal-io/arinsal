@@ -478,6 +478,33 @@ impl BeamModuleAssembler {
         }
     }
 
+    /// Starts collecting records for a function whose name arrives with its `i_func_info`.
+    pub fn begin_dump_function_unnamed(&mut self) {
+        self.dump_recording_function = self.dump_module.is_some();
+        if self.dump_recording_function {
+            self.dump_functions.push(crate::dump::FunctionRecord {
+                name: String::new(),
+                arity: 0,
+                instructions: Vec::new(),
+            });
+        }
+    }
+
+    /// Names the function that [`begin_dump_function_unnamed`](Self::begin_dump_function_unnamed)
+    /// started.
+    pub fn name_dump_function(&mut self, name: &str, arity: u8) {
+        if !self.dump_recording_function {
+            return;
+        }
+        if name == "<unknown>" {
+            self.dump_recording_function = false;
+            self.dump_functions.pop();
+        } else if let Some(function) = self.dump_functions.last_mut() {
+            function.name = name.to_owned();
+            function.arity = arity;
+        }
+    }
+
     /// Returns the current module-local machine-code offset.
     pub fn code_offset(&self) -> usize {
         self.code.offset()

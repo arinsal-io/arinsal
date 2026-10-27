@@ -595,6 +595,23 @@ pub fn decode_prefix(bytes: &[u8]) -> Result<(OwnedTerm, usize), DecodeError> {
     Ok((term, used + r.at))
 }
 
+/// The heap words `erts_decode_ext` needs for the external term in `bytes` (the version byte
+/// first), without decoding it. An error is what `erts_decode_ext_size` reports as `-1`: no
+/// version byte, a malformed or truncated term. Bytes after the term are not looked at.
+// Port of erts/emulator/beam/external.c (erts_decode_ext_size), OTP-29.1.1.
+pub fn decode_ext_size(bytes: &[u8]) -> Result<usize, DecodeError> {
+    let (&version, body) = bytes.split_first().ok_or(DecodeError::Eof(0))?;
+    if version != 131 {
+        return Err(DecodeError::BadVersion(version));
+    }
+    // A `LOCAL_EXT` hash is the hash of the node that made the term; a term in a file has none.
+    let mut walk = DecodedSizeWalk::new();
+    match walk.step(body, usize::MAX, true, |_| u32::MAX)? {
+        (Some((heap_words, _)), _) => Ok(heap_words),
+        (None, _) => Err(DecodeError::Eof(body.len())),
+    }
+}
+
 /// Incremental heap-size and structure pass for one uncompressed ETF term body.
 ///
 /// The input excludes the ETF version byte. A completed walk returns the heap

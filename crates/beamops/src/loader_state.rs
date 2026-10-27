@@ -116,9 +116,10 @@ impl<'a> Literals<'a> {
             if let Some(term) = self.terms[index] {
                 return Some(term);
             }
-            self.owned(index as u64)?;
-            let value = self.owned[index].as_ref()?;
-            let term = from_owned(value, &mut self.heap).ok()?;
+            // Port of erts/emulator/beam/beam_file.c (parse_decompressed_literals): the term of a
+            // file literal is the one `erts_decode_ext` builds.
+            let raw = self.beam.literals.get(index)?;
+            let term = arinsal_term::decode_literal(&raw.0, &mut self.heap)?;
             self.terms[index] = Some(term);
             return Some(term);
         }
@@ -190,7 +191,11 @@ impl<'a> LoaderState<'a> {
         debugger_flags: u64,
     ) -> Option<Self> {
         let atoms: Vec<Atom> = beam
-            .resolved_atoms(|name| global_atoms().intern(name).map(|atom| atom.0))
+            .resolved_atoms(|names| {
+                global_atoms()
+                    .intern_all(names.iter())
+                    .map(|atoms| atoms.into_iter().map(|atom| atom.0).collect())
+            })
             .ok()?
             .iter()
             .map(|&index| Atom(index))

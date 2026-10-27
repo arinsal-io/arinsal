@@ -168,10 +168,19 @@ struct Fixup {
 
 const NO_FIXUP: u32 = u32::MAX;
 
+/// A pending literal: the loads waiting for its pool entry. Most have one, which needs no
+/// allocation.
 #[derive(Clone, Debug)]
 struct Literal {
-    sites: Vec<(usize, Gpr)>,
+    first: (usize, Gpr),
+    more: Vec<(usize, Gpr)>,
     value: u64,
+}
+
+impl Literal {
+    fn sites(&self) -> impl Iterator<Item = (usize, Gpr)> + '_ {
+        std::iter::once(self.first).chain(self.more.iter().copied())
+    }
 }
 
 /// AArch64 code builder. Offsets returned by [`label_offset`](Self::label_offset) are bytes.
@@ -188,7 +197,9 @@ pub struct CodeBuffer {
     literals: Vec<Literal>,
     /// Index into `literals` of the pending literal with a value.
     pending_literals: HashMap<u64, usize, BuildHasherDefault<LabelHasher>>,
-    literal_sites: HashMap<u64, Vec<usize>, BuildHasherDefault<LabelHasher>>,
+    /// The offset of the last pool entry emitted for a value: the entries only move forward, so
+    /// when it is out of reach of a load, so are the older ones.
+    literal_sites: HashMap<u64, usize, BuildHasherDefault<LabelHasher>>,
     unreachable: bool,
     last_check: usize,
     binds: u64,
@@ -196,6 +207,8 @@ pub struct CodeBuffer {
     min_stub_deadline: Option<usize>,
     /// Lower bound of the sites of the pending literal loads.
     min_literal_site: Option<usize>,
+    /// The fixups a flush turns into veneers, kept between flushes.
+    due_fixups: Vec<usize>,
 }
 
 impl CodeBuffer {
@@ -352,20 +365,22 @@ impl CodeBuffer {
     pub fn ldr_literal(&mut self, reg: Gpr, value: u64) -> Result<(), BufferError> {
         let site = self.offset();
         self.emitter.ldr_literal(reg, 0)?;
-        if let Some(&offset) = self.literal_sites.get(&value).and_then(|v| {
-            v.iter()
-                .find(|&&p| (p as i64 - site as i64).abs() < COND_RANGE - 16)
-        }) {
+        if let Some(&offset) = self
+            .literal_sites
+            .get(&value)
+            .filter(|&&p| (p as i64 - site as i64).abs() < COND_RANGE - 16)
+        {
             self.patch(site, BranchKind::Literal(reg), offset)?;
             return Ok(());
         }
         self.min_literal_site = Some(self.min_literal_site.map_or(site, |m| m.min(site)));
         if let Some(&index) = self.pending_literals.get(&value) {
-            self.literals[index].sites.push((site, reg));
+            self.literals[index].more.push((site, reg));
         } else {
             self.pending_literals.insert(value, self.literals.len());
             self.literals.push(Literal {
-                sites: vec![(site, reg)],
+                first: (site, reg),
+                more: Vec::new(),
                 value,
             });
         }
@@ -430,26 +445,24 @@ impl CodeBuffer {
                     std::mem::replace(&mut self.waiting[fixup.label.0 as usize], index as u32);
             }
         }
-        let due_fixups: Vec<usize> = self
-            .fixups
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| {
-                let deadline = f
-                    .site
-                    .saturating_add(f.kind.reach() as usize)
-                    .saturating_sub(range);
-                (f.kind.is_control() && f.veneer.is_none() && deadline <= now).then_some(i)
-            })
-            .collect();
+        let mut due_fixups = std::mem::take(&mut self.due_fixups);
+        due_fixups.clear();
+        due_fixups.extend(self.fixups.iter().enumerate().filter_map(|(i, f)| {
+            let deadline = f
+                .site
+                .saturating_add(f.kind.reach() as usize)
+                .saturating_sub(range);
+            (f.kind.is_control() && f.veneer.is_none() && deadline <= now).then_some(i)
+        }));
         let due_literals = self.literals.iter().any(|l| {
-            l.sites.iter().any(|(site, _)| {
+            l.sites().any(|(site, _)| {
                 site.saturating_add(COND_RANGE as usize)
                     .saturating_sub(range)
                     <= now
             })
         });
         if due_fixups.is_empty() && !due_literals {
+            self.due_fixups = due_fixups;
             self.recompute_stub_bounds();
             return Ok(());
         }
@@ -459,7 +472,7 @@ impl CodeBuffer {
         if !self.unreachable {
             self.emit_branch(after, BranchKind::B)?;
         }
-        for idx in due_fixups {
+        for &idx in &due_fixups {
             let site = self.fixups[idx].site;
             let label = self.fixups[idx].label;
             let kind = self.fixups[idx].kind;
@@ -468,7 +481,17 @@ impl CodeBuffer {
             self.patch(site, kind, veneer)?;
             self.emit_veneer(label)?;
         }
-        let due: Vec<Literal> = self.literals.drain_filter_due(now, range);
+        self.due_fixups = due_fixups;
+        let due: Vec<Literal> = self
+            .literals
+            .extract_if(.., |item| {
+                item.sites().any(|(site, _)| {
+                    site.saturating_add(COND_RANGE as usize)
+                        .saturating_sub(range)
+                        <= now
+                })
+            })
+            .collect();
         self.pending_literals.clear();
         for (index, literal) in self.literals.iter().enumerate() {
             self.pending_literals.insert(literal.value, index);
@@ -476,14 +499,11 @@ impl CodeBuffer {
         for literal in due {
             self.align8();
             let offset = self.offset();
-            for (site, reg) in literal.sites {
+            for (site, reg) in literal.sites() {
                 self.patch(site, BranchKind::Literal(reg), offset)?;
             }
             self.emitter.embed_uint64(literal.value);
-            self.literal_sites
-                .entry(literal.value)
-                .or_default()
-                .push(offset);
+            self.literal_sites.insert(literal.value, offset);
         }
         self.recompute_stub_bounds();
         self.bind(after)?;
@@ -504,7 +524,7 @@ impl CodeBuffer {
         self.min_literal_site = self
             .literals
             .iter()
-            .flat_map(|l| l.sites.iter().map(|(site, _)| *site))
+            .flat_map(|l| l.sites().map(|(site, _)| site))
             .min();
     }
 
@@ -616,6 +636,7 @@ impl Default for CodeBuffer {
             binds: 0,
             min_stub_deadline: None,
             min_literal_site: None,
+            due_fixups: Vec::new(),
         }
     }
 }
@@ -639,29 +660,6 @@ fn branch_fits(kind: BranchKind, site: usize, target: usize) -> bool {
                 BranchKind::Adr(_) | BranchKind::Literal(_) => 19,
             },
         )
-}
-
-trait DrainDue {
-    fn drain_filter_due(&mut self, now: usize, range: usize) -> Vec<Literal>;
-}
-impl DrainDue for Vec<Literal> {
-    fn drain_filter_due(&mut self, now: usize, range: usize) -> Vec<Literal> {
-        let mut due = Vec::new();
-        let mut keep = Vec::new();
-        for item in self.drain(..) {
-            if item.sites.iter().any(|(site, _)| {
-                site.saturating_add(COND_RANGE as usize)
-                    .saturating_sub(range)
-                    <= now
-            }) {
-                due.push(item);
-            } else {
-                keep.push(item);
-            }
-        }
-        *self = keep;
-        due
-    }
 }
 
 #[cfg(test)]

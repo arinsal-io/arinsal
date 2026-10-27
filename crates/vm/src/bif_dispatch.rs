@@ -208,8 +208,8 @@ impl Vm {
                     let import = &self.code.modules[p.module].imports[index];
                     Err(exceptions::bif_error_with_atoms(
                         p,
-                        &import.module,
-                        &import.function,
+                        import.module,
+                        import.function,
                         import.module_atom,
                         import.function_atom,
                         args,
@@ -221,8 +221,8 @@ impl Vm {
         } else {
             let caller_module = Arc::clone(&self.code.modules[p.module]);
             let import = &caller_module.imports[index];
-            let module_name = import.module.as_str();
-            let function_name = import.function.as_str();
+            let module_name = import.module;
+            let function_name = import.function;
             let bif = import.bif_fn();
             let bits = import.native_bits();
             let native = if matches!(class, ImportClass::Native | ImportClass::Dynamic) {
@@ -284,15 +284,15 @@ impl Vm {
                 p,
                 index,
                 (import.module_atom, import.function_atom),
-                &import.function,
+                import.function,
                 args,
                 trap,
             )
             .map_err(|_| {
                 exceptions::bif_error_with_atoms(
                     p,
-                    &import.module,
-                    &import.function,
+                    import.module,
+                    import.function,
                     import.module_atom,
                     import.function_atom,
                     args,

@@ -5,11 +5,11 @@
 use arinsal_etf::{DecodeError, OwnedTerm, decode};
 use arinsal_spec::{BEAM_FORMAT_NUMBER, Opcode};
 
-mod summary;
+mod scan;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use num_bigint::BigInt;
+pub use scan::{CodeScan, scan};
 use std::{collections::HashMap, io::Read};
-pub use summary::{CodeSummary, FunctionSummary};
 
 /// A four-byte IFF chunk identifier.
 pub type ChunkId = [u8; 4];
@@ -246,19 +246,103 @@ pub struct CodeChunk {
     pub instructions: Vec<Instr>,
     /// The instructions as the file stores them: the Code chunk after its header.
     pub bytes: Vec<u8>,
+    /// X registers the decoded instructions need, counting call arities (at least 2, at most
+    /// 1024). Set by [`BeamFile::decode_code`]; the interpreter sizes its register file by it.
+    pub x_registers: usize,
+    /// Float registers the decoded instructions need (at least 1, at most 1024). Set by
+    /// [`BeamFile::decode_code`].
+    pub float_registers: usize,
+    /// The `-on_load` function (atom index, arity) found by [`BeamFile::decode_code`].
+    pub on_load: Option<(u32, u32)>,
 }
+/// The atom table of a file: the names, one after the other in a single buffer (a table has
+/// hundreds of names, and the loader reads every one of them once).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AtomNames {
+    text: String,
+    /// The end in `text` of each name.
+    ends: Vec<u32>,
+}
+
+impl AtomNames {
+    fn with_capacity(count: usize, bytes: usize) -> Self {
+        Self {
+            text: String::with_capacity(bytes),
+            ends: Vec::with_capacity(count),
+        }
+    }
+
+    fn push(&mut self, name: &str) {
+        self.text.push_str(name);
+        self.ends.push(self.text.len() as u32);
+    }
+
+    /// The number of names.
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The name at zero-based position `index`.
+    pub fn get(&self, index: usize) -> Option<&str> {
+        let end = *self.ends.get(index)? as usize;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |before| self.ends[before] as usize);
+        Some(&self.text[start..end])
+    }
+
+    /// The first name.
+    pub fn first(&self) -> Option<&str> {
+        self.get(0)
+    }
+
+    /// The names in table order.
+    pub fn iter(&self) -> AtomNamesIter<'_> {
+        AtomNamesIter {
+            names: self,
+            next: 0,
+        }
+    }
+}
+
+/// The names of an [`AtomNames`] in table order.
+#[derive(Clone)]
+pub struct AtomNamesIter<'a> {
+    names: &'a AtomNames,
+    next: usize,
+}
+
+impl<'a> Iterator for AtomNamesIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let name = self.names.get(self.next)?;
+        self.next += 1;
+        Some(name)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.names.len() - self.next;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for AtomNamesIter<'_> {}
+
 /// A decoded BEAM file. `atoms[0]` is atom index 1; index 0 denotes nil only in operands.
 #[derive(Clone, Debug)]
 pub struct BeamFile {
     /// Module atom text.
     pub module: String,
     /// One-based atom table stored at zero-based vector positions.
-    pub atoms: Vec<String>,
+    pub atoms: AtomNames,
     /// Code chunk.
     pub code: CodeChunk,
-    /// The functions, register needs and `-on_load` function of the code, from one pass over
-    /// its bytes.
-    pub summary: CodeSummary,
     /// Import table.
     pub imports: Vec<Import>,
     /// Export table.
@@ -310,7 +394,6 @@ impl BeamFile {
     pub fn release_decoded(&mut self) {
         self.code.instructions = Vec::new();
         self.code.bytes = Vec::new();
-        self.summary = CodeSummary::default();
         self.imports = Vec::new();
         self.exports = Vec::new();
         self.locals = Vec::new();
@@ -327,16 +410,12 @@ impl BeamFile {
     // Port of erts/emulator/beam/beam_file.c (parse_atom_chunk: erts_atom_put per entry).
     pub fn resolved_atoms<E>(
         &self,
-        mut intern: impl FnMut(&str) -> Result<u32, E>,
+        intern: impl FnOnce(&AtomNames) -> Result<Vec<u32>, E>,
     ) -> Result<&[u32], E> {
         if let Some(atoms) = self.resolved_atoms.get() {
             return Ok(atoms);
         }
-        let ids = self
-            .atoms
-            .iter()
-            .map(|name| intern(name))
-            .collect::<Result<Vec<_>, E>>()?;
+        let ids = intern(&self.atoms)?;
         Ok(self.resolved_atoms.get_or_init(|| ids))
     }
 
@@ -345,7 +424,6 @@ impl BeamFile {
         index
             .checked_sub(1)
             .and_then(|i| self.atoms.get(i as usize))
-            .map(String::as_str)
     }
     /// Decode a literal only when requested.
     pub fn literal(&self, index: u32) -> Result<OwnedTerm, BeamError> {
@@ -383,7 +461,58 @@ impl BeamFile {
         );
         self.code.bytes = bytes;
         self.code.instructions = result?;
+        self.note_code_facts();
         Ok(())
+    }
+
+    /// The register needs and the `-on_load` function of the decoded instructions.
+    fn note_code_facts(&mut self) {
+        fn registers(operand: &Operand, x: &mut usize, fr: &mut usize) {
+            match operand {
+                Operand::X(index) => *x = (*x).max(*index as usize + 1),
+                Operand::FR(index) => *fr = (*fr).max(*index as usize + 1),
+                Operand::List(items) => items.iter().for_each(|item| registers(item, x, fr)),
+                Operand::TypedReg { reg, .. } => registers(reg, x, fr),
+                _ => {}
+            }
+        }
+        let (mut x, mut fr) = (2, 1);
+        let mut on_load = None;
+        let mut function = None;
+        for instruction in &self.code.instructions {
+            for operand in &instruction.args {
+                registers(operand, &mut x, &mut fr);
+            }
+            // Calls and function entries need their arity of X registers.
+            let arity = match instruction.op {
+                Opcode::FuncInfo => instruction.args.get(2),
+                Opcode::Call
+                | Opcode::CallLast
+                | Opcode::CallOnly
+                | Opcode::CallExt
+                | Opcode::CallExtLast
+                | Opcode::CallExtOnly => instruction.args.first(),
+                Opcode::CallFun2 => instruction.args.get(1),
+                _ => None,
+            };
+            if let Some(Operand::U(count)) = arity {
+                x = x.max(*count as usize + 1);
+            }
+            match instruction.op {
+                Opcode::FuncInfo => {
+                    if let (Some(Operand::Atom(name)), Some(Operand::U(arity))) =
+                        (instruction.args.get(1), instruction.args.get(2))
+                    {
+                        function = u32::try_from(*arity).ok().map(|arity| (*name, arity));
+                    }
+                }
+                Opcode::OnLoad if on_load.is_none() => on_load = function,
+                _ => {}
+            }
+        }
+        self.code.x_registers = x.min(1024);
+        self.code.float_registers = fr.min(1024);
+        self.code.on_load = on_load;
     }
 }
 
@@ -435,7 +564,7 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     let module = atoms
         .first()
         .ok_or_else(|| bad("AtU8", 0, "empty atom table"))?
-        .clone();
+        .to_owned();
     let imports = parse_imports(required(&map, *b"ImpT")?, atoms.len())?;
     let exports = parse_exports(required(&map, *b"ExpT")?, atoms.len(), "ExpT")?;
     let locals = map
@@ -461,7 +590,6 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     let lines = map.get(b"Line").map(|v| parse_lines(v)).transpose()?;
     let types = map.get(b"Type").map(|v| parse_types(v)).transpose()?;
     let code = parse_code_header(required(&map, *b"Code")?)?;
-    let summary = summary::summarize(&code.bytes, code.max_opcode, code.function_count)?;
     for lambda in &lambdas {
         if lambda.label == 0 || lambda.label >= code.label_count {
             return Err(bad("FunT", 0, "lambda label out of range"));
@@ -481,7 +609,6 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
         module,
         atoms,
         code,
-        summary,
         imports,
         exports,
         locals,
@@ -524,7 +651,7 @@ fn read_limited<R: Read>(
     }
     Ok(out)
 }
-fn parse_atoms(data: &[u8], utf8: bool) -> Result<Vec<String>, BeamError> {
+fn parse_atoms(data: &[u8], utf8: bool) -> Result<AtomNames, BeamError> {
     let mut r = Reader::new(data, "atoms");
     let raw_count = r.u32()? as i32;
     let long = raw_count < 0;
@@ -532,7 +659,7 @@ fn parse_atoms(data: &[u8], utf8: bool) -> Result<Vec<String>, BeamError> {
     if count > data.len() - r.pos {
         return Err(bad("atoms", r.pos, "count exceeds chunk"));
     }
-    let mut atoms = Vec::with_capacity(count);
+    let mut atoms = AtomNames::with_capacity(count, data.len() - r.pos);
     for _ in 0..count {
         let len = if long {
             compact_u(&mut r)? as usize
@@ -540,14 +667,11 @@ fn parse_atoms(data: &[u8], utf8: bool) -> Result<Vec<String>, BeamError> {
             r.u8()? as usize
         };
         let bytes = r.take(len)?;
-        let value = if utf8 {
-            std::str::from_utf8(bytes)
-                .map_err(|e| bad("atoms", r.pos, e.to_string()))?
-                .to_owned()
+        if utf8 {
+            atoms.push(std::str::from_utf8(bytes).map_err(|e| bad("atoms", r.pos, e.to_string()))?);
         } else {
-            bytes.iter().map(|&b| char::from(b)).collect()
-        };
-        atoms.push(value);
+            atoms.push(&bytes.iter().map(|&b| char::from(b)).collect::<String>());
+        }
     }
     r.done()?;
     Ok(atoms)
@@ -657,7 +781,7 @@ fn parse_literals(data: &[u8]) -> Result<Vec<LiteralRaw>, BeamError> {
 // Port of erts/emulator/beam/beam_file.c:1077-1317 (parse_record_chunk_data), OTP-29.1.1.
 fn parse_records(
     data: &[u8],
-    atoms: &[String],
+    atoms: &AtomNames,
     literals: &[LiteralRaw],
 ) -> Result<Vec<NativeRecord>, BeamError> {
     let mut r = Reader::new(data, "Recs");
@@ -689,12 +813,12 @@ fn parse_records(
         let name = match &args[0] {
             Operand::Atom(index) => atoms
                 .get(*index as usize - 1)
-                .cloned()
+                .map(str::to_owned)
                 .ok_or_else(|| bad("Recs", offset, "record name atom out of range"))?,
             _ => return Err(bad("Recs", offset, "record name is not an atom")),
         };
         let is_exported = match &args[1] {
-            Operand::Atom(index) => match atoms.get(*index as usize - 1).map(String::as_str) {
+            Operand::Atom(index) => match atoms.get(*index as usize - 1) {
                 Some("true") => true,
                 Some("false") => false,
                 _ => return Err(bad("Recs", offset, "invalid record exported flag")),
@@ -710,7 +834,7 @@ fn parse_records(
             let field_name = match pair[0] {
                 Operand::Atom(index) => atoms
                     .get(index as usize - 1)
-                    .cloned()
+                    .map(str::to_owned)
                     .ok_or_else(|| bad("Recs", offset, "record field atom out of range"))?,
                 _ => return Err(bad("Recs", offset, "record field name is not an atom")),
             };
@@ -738,14 +862,14 @@ fn parse_records(
 
 fn record_operand_to_owned(
     operand: &Operand,
-    atoms: &[String],
+    atoms: &AtomNames,
     literals: &[LiteralRaw],
     offset: usize,
 ) -> Result<OwnedTerm, BeamError> {
     match operand {
         Operand::Atom(index) => atoms
             .get(*index as usize - 1)
-            .map(|name| OwnedTerm::Atom(name.clone()))
+            .map(|name| OwnedTerm::Atom(name.to_owned()))
             .ok_or_else(|| bad("Recs", offset, "default atom out of range")),
         Operand::Int(value) => Ok(OwnedTerm::Int(*value)),
         Operand::BigInt(value) => Ok(OwnedTerm::BigInt((**value).clone())),
@@ -778,21 +902,21 @@ fn parse_lines(data: &[u8]) -> Result<LineTable, BeamError> {
     let mut items = Vec::with_capacity(item_count);
     let mut current_name = 0;
     while items.len() < item_count {
-        let (tag, value) = compact(&mut r)?;
+        let (tag, value) = compact_word(&mut r)?;
         match tag {
             2 => {
-                current_name = u32::try_from(small_u(value, "Line", r.pos)?)
-                    .map_err(|_| bad("Line", r.pos, "name index overflow"))?;
+                let value = value.ok_or_else(|| bad("Line", r.pos, "integer out of range"))?;
+                current_name =
+                    u32::try_from(value).map_err(|_| bad("Line", r.pos, "name index overflow"))?;
                 if current_name as usize > name_count {
                     return Err(bad("Line", r.pos, "name index out of range"));
                 }
             }
             1 => {
-                let line = i64::try_from(&value)
-                    .ok()
-                    .filter(|&n| n >= 0)
-                    .ok_or_else(|| bad("Line", r.pos, "invalid line"))?
-                    as u64;
+                let line = value.ok_or_else(|| bad("Line", r.pos, "invalid line"))?;
+                if i64::try_from(line).is_err() {
+                    return Err(bad("Line", r.pos, "invalid line"));
+                }
                 items.push(LineItem {
                     name_index: current_name,
                     line,
@@ -878,6 +1002,33 @@ fn parse_types(data: &[u8]) -> Result<TypeTable, BeamError> {
 // Port of erts/emulator/beam/beam_file.c:167 (beamreader_read_tagged), OTP-29.1.1.
 fn compact(r: &mut Reader<'_>) -> Result<(u8, BigInt), BeamError> {
     compact_inner(r, 0)
+}
+
+/// [`compact`] for a caller that takes a non-negative word: the one- and two-byte forms, which
+/// are nearly every value, need no big integer. `None` when the value is negative or does not
+/// fit a word.
+fn compact_word(r: &mut Reader<'_>) -> Result<(u8, Option<u64>), BeamError> {
+    let first = *r
+        .data
+        .get(r.pos)
+        .ok_or_else(|| bad(r.context, r.pos, "truncated data"))?;
+    if first & 8 == 0 {
+        r.pos += 1;
+        return Ok((first & 7, Some(u64::from(first >> 4))));
+    }
+    if first & 16 == 0 {
+        let second = *r
+            .data
+            .get(r.pos + 1)
+            .ok_or_else(|| bad(r.context, r.pos, "truncated data"))?;
+        r.pos += 2;
+        return Ok((
+            first & 7,
+            Some((u64::from(first >> 5) << 8) | u64::from(second)),
+        ));
+    }
+    let (tag, number) = compact_inner(r, 0)?;
+    Ok((tag, u64::try_from(number).ok()))
 }
 fn compact_inner(r: &mut Reader<'_>, depth: usize) -> Result<(u8, BigInt), BeamError> {
     if depth > 32 {
@@ -1075,6 +1226,9 @@ fn parse_code_header(data: &[u8]) -> Result<CodeChunk, BeamError> {
         function_count,
         instructions: Vec::new(),
         bytes: data[header_end..].to_vec(),
+        x_registers: 2,
+        float_registers: 1,
+        on_load: None,
     })
 }
 
