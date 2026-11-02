@@ -2693,7 +2693,7 @@ fn enqueue_port_packets_locked(
     packets: Vec<Vec<u8>>,
 ) -> bool {
     let packet_count = packets.len();
-    let send_count = (process.reductions.max(10) as usize / 10)
+    let send_count = (process.header.fcalls.max(10) as usize / 10)
         .max(1)
         .min(packet_count);
     let packet_bytes: Vec<u64> = packets.iter().map(|packet| packet.len() as u64).collect();
@@ -2722,7 +2722,7 @@ fn enqueue_port_packets_locked(
     if deferred_count != 0 || has_older_continuation {
         process.set_force_yield(true);
     }
-    process.reductions = (process.reductions - (ready_count as i32 * 10)).max(1);
+    process.header.fcalls = (process.header.fcalls - (ready_count as i32 * 10)).max(1);
     if state.pending_bytes >= state.busy_limit {
         state.busy = true;
     }
@@ -2879,7 +2879,7 @@ pub(crate) fn continue_fragmented_send(
         }
         (port_id, count, more)
     };
-    process.reductions = (process.reductions - (packet_count as i32 * 10)).max(1);
+    process.header.fcalls = (process.header.fcalls - (packet_count as i32 * 10)).max(1);
     ctx.consume(packet_count as u32 * 10);
     if more {
         process.set_force_yield(true);
@@ -3128,11 +3128,13 @@ pub(crate) fn local_reg_name(target: Term) -> Result<Option<Term>, VmError> {
     let Some((name, node)) = name_node_tuple(target)? else {
         return Ok(None);
     };
-    let local = node_tables::lock().local_name.clone();
+    let local = arinsal_term::this_node().0;
+    let local = global_atoms().text(local).ok_or_else(badarg)?;
     if node != local && node != "nonode@nohost" {
         return Ok(None);
     }
-    Ok(Some(atom(&name)))
+    let name = global_atoms().get(&name).ok_or_else(badarg)?;
+    Ok(Some(Term::atom(name)))
 }
 
 pub(crate) fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, VmError> {

@@ -383,7 +383,6 @@ pub struct Process {
     pub(crate) gc_live: usize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
     pub(crate) max_heap_peak: usize,
-    pub(crate) reductions: i32,
     /// `REDS_IN`: FCALLS at the start of the current native slice.
     /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
     pub(crate) native_reds_in: i32,
@@ -1828,7 +1827,6 @@ impl Process {
         self.header.heap = heap;
         self.header.hend = hend;
         self.header.high_water = self.heap.high_water_ptr();
-        self.header.fcalls = self.reductions;
         self.header.i = std::ptr::null();
         self.header.arity = 0;
         self.header.current = std::ptr::null();
@@ -1863,7 +1861,6 @@ impl Process {
         let (heap, hend) = self.heap.heap_bounds();
         self.header.heap = heap;
         self.header.hend = hend;
-        self.header.fcalls = self.reductions;
     }
 
     /// Publish only the young-heap state (cursors, bounds, high water) to the ABI prefix,
@@ -1889,7 +1886,6 @@ impl Process {
         self.header.heap = heap;
         self.header.hend = hend;
         self.header.high_water = self.heap.high_water_ptr();
-        self.header.fcalls = self.reductions;
     }
 
     /// Satisfy `need` words in a fresh heap fragment without collecting, keeping the call_memory
@@ -2313,7 +2309,11 @@ impl Process {
         #[cfg(feature = "pf-mem-counters")]
         let min_heap = heap.min_heap_size_words();
         let process = slot.write(Self {
-            header: ProcessHeader::default(),
+            // `c_p->fcalls` starts at a full slice; there is no separate counter to refill it.
+            header: ProcessHeader {
+                fcalls: crate::process::CONTEXT_REDS,
+                ..ProcessHeader::default()
+            },
             x: ArgRegs::new(x_registers),
             fr: vec![0.0; float_registers].into_boxed_slice(),
             heap,
@@ -2333,7 +2333,6 @@ impl Process {
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
-            reductions: 4000,
             native_reds_in: 4000,
             trap_work: 0,
             virtual_reds: 0,
@@ -2436,8 +2435,9 @@ impl Process {
     // (`erts_gc_after_bif_call_lhf`, `erts_garbage_collect`), OTP-29.1.1.
     pub(crate) fn bump_gc_reds(&mut self, cost: u32) {
         if self.heap.native_active() {
-            self.reductions = self
-                .reductions
+            self.header.fcalls = self
+                .header
+                .fcalls
                 .saturating_sub(cost.min(i32::MAX as u32) as i32)
                 .max(0);
         } else {
@@ -2451,7 +2451,7 @@ impl Process {
     // OTP-29.1.1. The part of it that is not the process's own work is already in `virtual_reds`.
     pub(crate) fn charge_gc_stats(&mut self, stats: &arinsal_term::GcStats) {
         if stats.collections == 0 && self.heap.native_active() {
-            self.reductions = 0;
+            self.header.fcalls = 0;
             return;
         }
         self.bump_gc_reds(stats.reductions);
@@ -2623,9 +2623,9 @@ impl Process {
         self.write(dst, term)
     }
     pub(crate) fn tick(&mut self) {
-        self.reductions -= 1;
-        if self.reductions == 0 {
-            self.reductions = 4000;
+        self.header.fcalls -= 1;
+        if self.header.fcalls == 0 {
+            self.header.fcalls = 4000;
         }
     }
 }
@@ -3220,7 +3220,10 @@ mod layout_report {
             "  Process.max_heap_peak {}",
             size_of_val(&process.max_heap_peak)
         );
-        eprintln!("  Process.reductions {}", size_of_val(&process.reductions));
+        eprintln!(
+            "  Process.reductions {}",
+            size_of_val(&process.header.fcalls)
+        );
         eprintln!(
             "  Process.native_reds_in {}",
             size_of_val(&process.native_reds_in)

@@ -268,7 +268,7 @@ fn hamt_next(
     list_mode: bool,
     acc: Term,
 ) -> Result<Term, Trap> {
-    let mut elems = chunk_len(process.reductions, map_size);
+    let mut elems = chunk_len(process.header.fcalls, map_size);
     let digits = path_digits(path)?;
     if digits.is_zero_small && elems > MAP_SMALL_MAP_LIMIT {
         elems = MAP_SMALL_MAP_LIMIT;
@@ -473,7 +473,7 @@ fn hamt_next(
     } else {
         chain.finish(NONE)
     };
-    process.reductions -= (4 * (orig_elems as i64 - elems as i64)) as i32;
+    process.header.fcalls -= (4 * (orig_elems as i64 - elems as i64)) as i32;
     Ok(result)
 }
 
@@ -505,7 +505,7 @@ fn ordered_next(
     mut path: Term,
     map: arinsal_maps::CheckedMap,
 ) -> Result<Term, Trap> {
-    let orig_elems = (process.reductions / ORDERED_ITER_FACTOR).max(1) as usize;
+    let orig_elems = (process.header.fcalls / ORDERED_ITER_FACTOR).max(1) as usize;
     let mut elems = orig_elems;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut region = HeapReservation::new(&mut heap, 4 * elems + 2).map_err(|_| system_limit())?;
@@ -526,11 +526,12 @@ fn ordered_next(
     }
     if path.classify() == TermKind::List {
         let next = builder.cons(path, map.term()).map_err(|_| system_limit())?;
-        process.reductions = 0;
+        process.header.fcalls = 0;
         Ok(chain.finish(next))
     } else if path == Term::NIL {
-        process.reductions = process
-            .reductions
+        process.header.fcalls = process
+            .header
+            .fcalls
             .saturating_sub(ORDERED_ITER_FACTOR * (orig_elems - elems) as i32);
         Ok(chain.finish(NONE))
     } else {

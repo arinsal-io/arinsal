@@ -123,20 +123,13 @@ pub fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, B
             // Port of erts/emulator/beam/binary.c (erts_bin_bytes_to_list), OTP-29.1.1.
             // `binary_to_list_chunk` bumps reductions immediately before its CONS loop.
             ctx.charge_reductions(len.div_ceil(B2L_BYTES_PER_REDUCTION));
-            let value = reservation
-                .prepend_exact_with_tail(
-                    (source_start..source_start + len).rev().map(|index| {
-                        Term::small(i64::from(binary_to_list_byte(
-                            view.bytes(),
-                            index,
-                            bit_offset,
-                        )))
-                        .expect("byte fits small")
-                    }),
-                    Term::NIL,
-                )
+            let mut reservation = reservation;
+            reservation
+                .prepend_binary_bytes(view.bytes(), source_start, len, bit_offset)
                 .map_err(|_| BifError::SystemLimit)?;
-            return Ok(value);
+            return reservation
+                .finish(Term::NIL)
+                .map_err(|_| BifError::SystemLimit);
         }
         let mut walk = BinaryToListWalk {
             source: args[0],
@@ -177,15 +170,6 @@ fn validate_binary_to_list_range(
         return Err(BADARG);
     }
     Ok(())
-}
-
-// Port of erts/emulator/beam/binary.c (erts_bin_bytes_to_list), OTP-29.1.1.
-fn binary_to_list_byte(bytes: &[u8], index: usize, bit_offset: usize) -> u8 {
-    if bit_offset == 0 {
-        bytes[index]
-    } else {
-        (bytes[index] << bit_offset) | (bytes[index + 1] >> (8 - bit_offset))
-    }
 }
 
 const B2L_BYTES_PER_REDUCTION: usize = 256;
@@ -238,14 +222,8 @@ impl BinaryToListWalk {
         let list = self.list.as_mut().ok_or(BifError::SystemLimit)?;
         // The exact chunk count is known, so check the reservation once and keep the
         // inner loop to the two CONS stores and cursor advance used by erts.
-        list.prepend_chunk(
-            count,
-            (from..from + count).rev().map(|index| {
-                Term::small(i64::from(binary_to_list_byte(bytes, index, bit_offset)))
-                    .expect("byte fits small integer")
-            }),
-        )
-        .map_err(|_| BifError::SystemLimit)?;
+        list.prepend_binary_bytes(bytes, from, count, bit_offset)
+            .map_err(|_| BifError::SystemLimit)?;
         self.remaining -= count;
         if self.remaining == 0 {
             let value = self

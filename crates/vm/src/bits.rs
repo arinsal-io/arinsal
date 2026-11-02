@@ -621,8 +621,9 @@ pub(super) fn execute(
                 frame,
             )?;
             p.reductions_used = p.reductions_used.saturating_add(bit_copy_cost as u64);
-            p.reductions = p
-                .reductions
+            p.header.fcalls = p
+                .header
+                .fcalls
                 .saturating_sub(bit_copy_cost.min(i32::MAX as usize) as i32);
             p.write(module.arg(op, 4), value)?;
             p.set_ip(p.ip() + 1);

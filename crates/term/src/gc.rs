@@ -2264,37 +2264,6 @@ fn heap_sizes() -> &'static [usize] {
     &HEAP_SIZES
 }
 
-/// For each bit length of a request, the first table index whose size reaches `2^(k-1)`: the
-/// answer for a request of that length is at or after it, and at most a few entries later
-/// because the table grows by a fifth per step. `erts_next_heap_size` bisects the whole table
-/// instead; the entry found is the same.
-static HEAP_SIZE_START: [u8; usize::BITS as usize + 1] = {
-    let mut start = [0u8; usize::BITS as usize + 1];
-    let mut bits = 1;
-    while bits <= usize::BITS as usize {
-        let floor = 1usize << (bits - 1);
-        let mut index = 0;
-        while index < HEAP_SIZE_COUNT && HEAP_SIZES[index] < floor {
-            index += 1;
-        }
-        start[bits] = index as u8;
-        bits += 1;
-    }
-    start
-};
-
-/// Index of the first table size not below `target`, which must not exceed the first size.
-/// `HEAP_SIZE_COUNT` when `target` is above the table.
-#[inline]
-fn heap_size_index(target: usize) -> usize {
-    let bits = (usize::BITS - target.leading_zeros()) as usize;
-    let mut index = usize::from(HEAP_SIZE_START[bits]);
-    while index < HEAP_SIZE_COUNT && HEAP_SIZES[index] < target {
-        index += 1;
-    }
-    index
-}
-
 /// Words of the initial heap of a spawned process whose arguments and reserved words need
 /// `heap_need`, with `min_heap` the process's minimum heap size.
 ///
@@ -2321,13 +2290,32 @@ fn next_heap_size(minimum: usize, offset: usize, min_heap_size: usize) -> Result
     if minimum < sizes[0] {
         return Ok(sizes[0].max(min_heap_size));
     }
-    let index = heap_size_index(minimum);
-    let index = index.checked_add(offset).ok_or(TermError::SystemLimit)?;
-    sizes
-        .get(index)
-        .copied()
-        .map(|size| size.max(min_heap_size))
-        .ok_or(TermError::SystemLimit)
+    let mut low = 0;
+    let mut high = sizes.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if minimum < sizes[mid] {
+            high = mid;
+        } else if minimum == sizes[mid] {
+            let index = mid.checked_add(offset).ok_or(TermError::SystemLimit)?;
+            return match sizes.get(index) {
+                Some(size) => Ok((*size).max(min_heap_size)),
+                None => Err(TermError::SystemLimit),
+            };
+        } else if mid + 1 < sizes.len() && minimum < sizes[mid + 1] {
+            let index = mid
+                .checked_add(offset)
+                .and_then(|index| index.checked_add(1))
+                .ok_or(TermError::SystemLimit)?;
+            return match sizes.get(index) {
+                Some(size) => Ok((*size).max(min_heap_size)),
+                None => Err(TermError::SystemLimit),
+            };
+        } else {
+            low = mid + 1;
+        }
+    }
+    Err(TermError::SystemLimit)
 }
 
 // Port of erts/emulator/beam/erl_gc.c:2915-2958 (do_next_vheap_size), OTP-29.1.1.
@@ -2355,17 +2343,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heap_size_index_matches_a_bisection_of_the_table() {
+    fn next_heap_size_matches_erts_table_bisection() {
         let mut probes: Vec<usize> = (1..5000).collect();
         for &size in &HEAP_SIZES {
             probes.extend([size - 1, size, size + 1]);
         }
-        probes.extend([usize::MAX, usize::MAX / 2, 1 << 40]);
+        probes.extend([usize::MAX / 2, 1 << 40]);
         for target in probes {
+            let index = HEAP_SIZES.partition_point(|&size| size < target);
+            let expected = HEAP_SIZES.get(index).copied();
             assert_eq!(
-                heap_size_index(target),
-                HEAP_SIZES.partition_point(|&size| size < target),
+                next_heap_size(target, 0, 0).ok(),
+                expected,
                 "target {target}"
+            );
+            let expected_offset = if target < HEAP_SIZES[0] {
+                Some(HEAP_SIZES[0])
+            } else {
+                index
+                    .checked_add(1)
+                    .and_then(|next| HEAP_SIZES.get(next).copied())
+            };
+            assert_eq!(
+                next_heap_size(target, 1, 0).ok(),
+                expected_offset,
+                "offset target {target}"
             );
         }
     }

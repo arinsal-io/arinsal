@@ -8,9 +8,7 @@ use super::dmc::{Fast, GuardBif, Op};
 use super::{MatchContext, MatchProgram, bool_term, boolean, builtin, float_bits, is_float_term};
 use super::{cons, tuple_view};
 use crate::EtsError;
-use arinsal_term::{
-    Atom, Term, TermBuilder, TermKind, TupleRef, VecHeap, cmp, exact_eq, global_atoms,
-};
+use arinsal_term::{Term, TermBuilder, TermKind, TupleRef, VecHeap, atoms, cmp, exact_eq};
 use std::cmp::Ordering;
 
 /// The `Eterm*` cursors of db_prog_match: where the next match instruction reads.
@@ -138,8 +136,9 @@ impl PamState {
 }
 
 fn exit_atom() -> Term {
-    static EXIT: std::sync::OnceLock<Atom> = std::sync::OnceLock::new();
-    Term::atom(*EXIT.get_or_init(|| global_atoms().intern("EXIT").unwrap()))
+    // Port of erts/emulator/beam/erl_db_util.c (db_prog_match), OTP-29.1.1:
+    // the match interpreter uses the preloaded EXIT atom directly.
+    Term::atom(atoms::EXIT_2)
 }
 
 fn small_pair(a: Term, b: Term) -> Option<(i64, i64)> {

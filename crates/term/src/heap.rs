@@ -4885,6 +4885,68 @@ impl ConsListBuilder {
         Ok(())
     }
 
+    /// Prepend bytes from one reserved binary range using OTP's backward `CONS` loop.
+    ///
+    /// Port of `erts_bin_bytes_to_list` in erts/emulator/beam/binary.c, OTP-29.1.1.
+    #[inline(always)]
+    pub fn prepend_binary_bytes(
+        &mut self,
+        bytes: &[u8],
+        start: usize,
+        count: usize,
+        bitoffs: usize,
+    ) -> Result<(), TermError> {
+        let end_written = self
+            .written
+            .checked_add(count)
+            .ok_or(TermError::SystemLimit)?;
+        let end = start.checked_add(count).ok_or(TermError::SystemLimit)?;
+        let required_end = end
+            .checked_add(usize::from(bitoffs != 0))
+            .ok_or(TermError::SystemLimit)?;
+        if end_written > self.len || bitoffs >= 8 || (count != 0 && required_end > bytes.len()) {
+            return Err(TermError::BadArg);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        let mut cell = (self.start as *mut u64).wrapping_add(2 * self.written);
+        if self.written == 0 {
+            self.first_cdr = Some(cell.wrapping_add(1) as usize);
+        }
+        let mut head = self.head;
+        if bitoffs == 0 {
+            let mut remaining = count;
+            while remaining != 0 {
+                remaining -= 1;
+                let value = Term::small(i64::from(bytes[start + remaining]))
+                    .expect("byte fits small integer");
+                store(cell, value.bits());
+                store(cell.wrapping_add(1), head.bits());
+                head = Term::from_ptr(cell, 1);
+                cell = cell.wrapping_add(2);
+            }
+        } else {
+            let mut remaining = count;
+            let mut next = bytes[end];
+            while remaining != 0 {
+                let present = next;
+                remaining -= 1;
+                next = bytes[start + remaining];
+                let byte = (present >> (8 - bitoffs)) | (next << bitoffs);
+                let value = Term::small(i64::from(byte)).expect("byte fits small integer");
+                store(cell, value.bits());
+                store(cell.wrapping_add(1), head.bits());
+                head = Term::from_ptr(cell, 1);
+                cell = cell.wrapping_add(2);
+            }
+        }
+        self.head = head;
+        self.written = end_written;
+        Ok(())
+    }
+
     /// Finish the list with `tail`; every reserved cell must have been filled.
     #[inline(always)]
     pub fn finish(self, tail: Term) -> Result<Term, TermError> {

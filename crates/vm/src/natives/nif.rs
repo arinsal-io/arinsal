@@ -1092,7 +1092,7 @@ pub(crate) fn invoke_tracer(
     let native = specialized
         .and_then(|specialized| tracer_callback(vm, module, specialized, arity))
         .or_else(|| tracer_callback(vm, module, function, arity))?;
-    call_native(&mut process.heap, &mut process.reductions, &native, args).ok()
+    call_native(&mut process.heap, &mut process.header.fcalls, &native, args).ok()
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {

@@ -369,7 +369,7 @@ impl Vm {
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
         let untraced = |p: &mut Process| {
-            calls::call_bif_metered(&mut p.heap, &mut p.reductions, bif, &p.x[..arity])
+            calls::call_bif_metered(&mut p.heap, &mut p.header.fcalls, bif, &p.x[..arity])
         };
         if crate::trace::saves_calls(p)
             && let Some(import) = self
@@ -416,7 +416,7 @@ impl Vm {
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
         let untraced = |p: &mut Process| {
-            calls::call_bif_metered(&mut p.heap, &mut p.reductions, bif, &p.x[..arity])
+            calls::call_bif_metered(&mut p.heap, &mut p.header.fcalls, bif, &p.x[..arity])
         };
         if !crate::trace_bp::any_pattern()
             || !crate::trace_bp::selects(p, module, function, arity as u8)
@@ -802,11 +802,11 @@ impl Vm {
         let value = p.gc_after_bif(value)?;
         let charge = bif_reductions.saturating_add(1);
         // The BIF body has already applied its BUMP_REDS directly to FCALLS.
-        p.reductions = p.reductions.saturating_sub(1);
+        p.header.fcalls = p.header.fcalls.saturating_sub(1);
         let exhausted = ctx.is_some_and(|run| !run.consume(charge));
         let outcome = self.finish_native_value(p, tail, value)?;
         if exhausted && matches!(outcome, ImportOutcome::Advanced | ImportOutcome::Jump(_)) {
-            p.reductions = 4000;
+            p.header.fcalls = 4000;
             Ok(ImportOutcome::Yield)
         } else {
             Ok(outcome)

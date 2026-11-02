@@ -70,7 +70,7 @@ pub(crate) fn decode_packet_light(
     }
     crate::calls::call_bif(
         &mut process.heap,
-        &mut process.reductions,
+        &mut process.header.fcalls,
         arinsal_packet::DECODE_PACKET_3,
         args,
     )
@@ -90,7 +90,7 @@ pub(crate) fn call(
         if module == "erlang" && function == "decode_packet" && args.len() == 3 {
             let bif = arinsal_packet::lookup(module, function, 3).expect("registered packet BIF");
             return Some(
-                crate::calls::call_bif(&mut process.heap, &mut process.reductions, bif, args)
+                crate::calls::call_bif(&mut process.heap, &mut process.header.fcalls, bif, args)
                     .map_err(|error| {
                         crate::exceptions::bif_error(process, module, function, args, error)
                     }),

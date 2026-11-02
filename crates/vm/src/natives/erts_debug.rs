@@ -2055,7 +2055,7 @@ fn internal_state_get(
         return Ok(result);
     }
     match arg_name(selector).as_deref() {
-        Some("reds_left") => int(process, process.reductions.max(0) as usize),
+        Some("reds_left") => int(process, process.header.fcalls.max(0) as usize),
         Some("available_internal_state") => Ok(atom("true")),
         Some("force_heap_frags" | "scheduler_dump" | "hashmap_collision_bonanza") => {
             Ok(atom("false"))
@@ -2414,7 +2414,7 @@ fn internal_state_set(
                 return Err(badarg());
             };
             if (0..=4000).contains(&reductions) {
-                process.reductions = reductions as i32;
+                process.header.fcalls = reductions as i32;
             }
             return Ok(atom("true"));
         }

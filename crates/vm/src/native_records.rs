@@ -142,7 +142,6 @@ fn create(
     let Some((process, _registers)) = enter_runtime(header) else {
         return 0;
     };
-    process.reductions = process.header.fcalls;
     let (Ok(live), Ok(count), Ok(base)) = (
         usize::try_from(live),
         usize::try_from(count),
@@ -254,7 +253,6 @@ pub extern "C" fn arinsal_beamasm_update_record(
     let Some((process, _registers)) = enter_runtime(header) else {
         return 0;
     };
-    process.reductions = process.header.fcalls;
     let (Ok(live), Ok(count), Ok(base)) = (
         usize::try_from(live),
         usize::try_from(count),
@@ -409,7 +407,6 @@ fn get_field(
         Ok(value) => native_hooks::raw(value),
         Err(_) if raise == 0 => 0,
         Err(failure) => {
-            process.reductions = process.header.fcalls;
             report(process, failure);
             0
         }

@@ -3,6 +3,7 @@
 use arinsal_etf::{AtomCache, DistributionPacket, OwnedTerm};
 use arinsal_sched::Pid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -359,6 +360,25 @@ pub(crate) struct NodeTables {
     pub(crate) disconnected_monitor_pids: HashMap<Pid, OwnedTerm>,
 }
 
+pub(crate) struct NodeTablesGuard(MutexGuard<'static, NodeTables>);
+
+impl Deref for NodeTablesGuard {
+    type Target = NodeTables;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for NodeTablesGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Port of erl_node_tables.c (erts_schedule_delete_node/try_delete_node):
+        // delayed removals are serviced by the writer path, not by node lookups.
+        self.0.prune_deleted();
+        &mut self.0
+    }
+}
+
 impl Default for NodeTables {
     fn default() -> Self {
         let mut entries = BTreeMap::new();
@@ -460,13 +480,13 @@ pub(crate) fn set_this_node(name: String, creation: u32) -> bool {
     true
 }
 
-pub(crate) fn lock() -> MutexGuard<'static, NodeTables> {
-    let mut tables = TABLES
-        .get_or_init(|| Mutex::new(NodeTables::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    tables.prune_deleted();
-    tables
+pub(crate) fn lock() -> NodeTablesGuard {
+    NodeTablesGuard(
+        TABLES
+            .get_or_init(|| Mutex::new(NodeTables::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 fn dist_ports() -> MutexGuard<'static, HashMap<u64, String>> {

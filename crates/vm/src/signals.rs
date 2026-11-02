@@ -18,6 +18,7 @@ pub(crate) static PF_SPAWN_FUN_SETUP_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static PF_SPAWN_FUN_SCHED_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+#[inline]
 pub(crate) fn atom(name: &str) -> Term {
     // Predefined OTP atoms. Interning on every monitor/send/demonitor took the
     // atom-table lock on the `gen_server:call` path.
@@ -54,6 +55,15 @@ pub(crate) fn atom(name: &str) -> Term {
         "reply_demonitor" => arinsal_term::atoms::REPLY_DEMONITOR,
         "garbage_collect" => arinsal_term::atoms::GARBAGE_COLLECT,
         "async" => arinsal_term::atoms::ASYNC,
+        "all" => arinsal_term::atoms::ALL,
+        "clock_service" => arinsal_term::atoms::CLOCK_SERVICE,
+        "off_heap" => arinsal_term::atoms::OFF_HEAP,
+        "on_heap" => arinsal_term::atoms::ON_HEAP,
+        "priority" => arinsal_term::atoms::PRIORITY,
+        "reply" => arinsal_term::atoms::REPLY,
+        "spawn_reply" => arinsal_term::atoms::SPAWN_REPLY,
+        "spawn_request" => arinsal_term::atoms::SPAWN_REQUEST,
+        "time_offset" => arinsal_term::atoms::TIME_OFFSET,
         _ => {
             return Term::atom(global_atoms().intern(name).expect("short built-in atom"));
         }

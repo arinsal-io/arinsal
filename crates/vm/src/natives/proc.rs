@@ -2462,7 +2462,6 @@ fn process_info_single(
 /// after its values are built, so this call's bump is visible to the next `process_info`.
 fn charge_info_reductions(process: &mut Process, info_reds: i32) {
     if process.heap.native_active() {
-        process.reductions = process.reductions.saturating_sub(info_reds);
         process.header.fcalls = process.header.fcalls.saturating_sub(info_reds);
     } else {
         process.reductions_used = process
