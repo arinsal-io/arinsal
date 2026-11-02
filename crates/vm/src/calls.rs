@@ -892,6 +892,7 @@ impl Vm {
                     unreachable!("failed trapping BIFs become VM exceptions")
                 }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
+                crate::bif_traps::HandlerResult::YieldDirect { .. } => Ok(ImportOutcome::Yield),
                 crate::bif_traps::HandlerResult::Export(trap) => {
                     self.trap_to_export(p, trap, tail, ctx)
                 }

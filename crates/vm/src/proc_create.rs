@@ -1473,12 +1473,14 @@ pub(crate) struct BifTrapPending {
     /// trap `Export*` directly).
     pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
     pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,
+    /// Native continuation payloads are owned by the suspended call and need no shared lock.
+    pub(crate) direct_state: Option<Box<crate::bif_traps::DirectContinuation>>,
     /// The live magic-reference thing passed to the continuation export, when erts allocates one.
     pub(crate) state_term: Option<Term>,
     pub(crate) gc_was_enabled: bool,
     /// The call's arguments, kept with the trap state like the arguments of a BIF_TRAP export:
     /// a retry never reads them back from the X registers.
-    pub(crate) args: [Term; 3],
+    pub(crate) args: [Term; 4],
     /// Number of meaningful entries in `args`.
     pub(crate) arity: usize,
     /// The trapped BIF's module and function: an `apply` that trapped is redone as

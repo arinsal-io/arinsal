@@ -442,9 +442,8 @@ fn emit_op<S: OpSink>(
 /// The operand of the output for one `BeamOpArg`.
 fn operand(arg: BeamOpArg, keep_type: bool) -> Result<SpecificOperand, LoadCodeError> {
     Ok(match arg.ty {
-        // An untagged word: counts, indexes, hashes. Only values that fit a small integer are
-        // `SmallInt`; a hash is a raw word whatever its value.
-        TAG_U if arg.val < (1 << 59) => SpecificOperand::SmallInt(arg.val as i64),
+        // Port of erts/emulator/beam/jit/asm_load.c (beam_load_emit_op), OTP-29.1.1:
+        // TAG_u is an ArgWord and stays untyped; only TAG_i denotes a tagged small integer.
         TAG_U => SpecificOperand::Unsigned(arg.val),
         TAG_I => SpecificOperand::SmallInt(arg.val as i64),
         TAG_A => SpecificOperand::Atom(arg.val as u32),

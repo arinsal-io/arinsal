@@ -4509,6 +4509,122 @@ impl HeapBlockBuilder {
         }
     }
 
+    /// Initialize consecutive tuple slots as a reverse `dec_term` work chain.
+    // Port of the `tuple_loop` slot chain in erts/emulator/beam/external.c (dec_term), OTP-29.1.1.
+    #[inline(always)]
+    pub fn write_next_chain(
+        &self,
+        first_word_offset: usize,
+        count: usize,
+        continuation: Option<HeapTermSlot>,
+    ) -> Result<HeapTermSlot, TermError> {
+        let end = first_word_offset
+            .checked_add(count)
+            .filter(|end| first_word_offset > 0 && *end <= self.words)
+            .ok_or(TermError::BadArg)?;
+        if count == 0 || !self.slot_base.indexed {
+            return Err(TermError::BadArg);
+        }
+        let mut next = match continuation {
+            Some(slot) if slot.indexed => slot.value.checked_add(1).ok_or(TermError::BadArg)?,
+            Some(_) => return Err(TermError::BadArg),
+            None => 0,
+        };
+        let first = self
+            .slot_base
+            .value
+            .checked_add(first_word_offset)
+            .ok_or(TermError::BadArg)?;
+        for offset in (first_word_offset..end).rev() {
+            let index = self
+                .slot_base
+                .value
+                .checked_add(offset)
+                .ok_or(TermError::BadArg)?;
+            store((self.start as *mut u64).wrapping_add(offset), next as u64);
+            next = index.checked_add(1).ok_or(TermError::BadArg)?;
+        }
+        Ok(HeapTermSlot::index(first))
+    }
+
+    /// Initialize the final cell of a decoded external list as the chain's tail.
+    // Port of the final-cell setup in erts/emulator/beam/external.c (dec_term, LIST_EXT), OTP-29.1.1.
+    #[inline(always)]
+    pub fn write_list_tail(
+        &self,
+        continuation: Option<HeapTermSlot>,
+    ) -> Result<HeapTermSlot, TermError> {
+        if self.words < 2 || !self.words.is_multiple_of(2) || !self.slot_base.indexed {
+            return Err(TermError::BadArg);
+        }
+        let car_offset = self.words - 2;
+        let cdr_offset = self.words - 1;
+        let car = self
+            .slot_base
+            .value
+            .checked_add(car_offset)
+            .ok_or(TermError::BadArg)?;
+        let cdr = self
+            .slot_base
+            .value
+            .checked_add(cdr_offset)
+            .ok_or(TermError::BadArg)?;
+        let continuation = match continuation {
+            Some(slot) if slot.indexed => slot.value.checked_add(1).ok_or(TermError::BadArg)?,
+            Some(_) => return Err(TermError::BadArg),
+            None => 0,
+        };
+        store(
+            (self.start as *mut u64).wrapping_add(cdr_offset),
+            continuation as u64,
+        );
+        store(
+            (self.start as *mut u64).wrapping_add(car_offset),
+            cdr.checked_add(1).ok_or(TermError::BadArg)? as u64,
+        );
+        Ok(HeapTermSlot::index(car))
+    }
+
+    /// Link decoded list cells from the end toward the first unfilled element slot.
+    // Port of the LIST_EXT loop in erts/emulator/beam/external.c (dec_term), OTP-29.1.1.
+    #[inline(always)]
+    pub fn write_list_chain(
+        &self,
+        first_cell: usize,
+        count: usize,
+        mut chain: HeapTermSlot,
+    ) -> Result<HeapTermSlot, TermError> {
+        let cells = self.words / 2;
+        let end = first_cell
+            .checked_add(count)
+            .filter(|end| count > 0 && *end < cells && self.words.is_multiple_of(2))
+            .ok_or(TermError::BadArg)?;
+        if !self.slot_base.indexed || !chain.indexed {
+            return Err(TermError::BadArg);
+        }
+        for cell in (first_cell..end).rev() {
+            let car_offset = cell.checked_mul(2).ok_or(TermError::BadArg)?;
+            let cdr_offset = car_offset.checked_add(1).ok_or(TermError::BadArg)?;
+            let car = self
+                .slot_base
+                .value
+                .checked_add(car_offset)
+                .ok_or(TermError::BadArg)?;
+            let next_cell =
+                Term::from_ptr((self.start as *mut u64).wrapping_add(cdr_offset + 1), 1);
+            store(
+                (self.start as *mut u64).wrapping_add(cdr_offset),
+                next_cell.bits(),
+            );
+            store(
+                (self.start as *mut u64).wrapping_add(car_offset),
+                chain.value.checked_add(1).ok_or(TermError::BadArg)? as u64,
+            );
+            chain = HeapTermSlot::index(car);
+        }
+        Ok(chain)
+    }
+
     /// Return a list term pointing at two words in the reserved object.
     pub fn list_at(&self, word_offset: usize) -> Result<Term, TermError> {
         if word_offset >= self.words.saturating_sub(1) {

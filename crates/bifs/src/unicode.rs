@@ -1360,6 +1360,43 @@ impl UnicodeCont {
             UnicodeStage::ListFromBinary => "erlang:characters_to_list_trap_4/1",
         }
     }
+
+    /// Return the four live arguments used by ERTS `characters_to_utf8_trap/4`.
+    pub fn binary_trap_arguments(&self) -> Option<[Term; 4]> {
+        if self.stage != UnicodeStage::ToBinary {
+            return None;
+        }
+        Some([
+            self.result,
+            Term::small(i64::try_from(self.work).ok()?)?,
+            self.rest,
+            Term::atom(if self.latin1 {
+                atoms::LATIN1
+            } else {
+                atoms::UTF8
+            }),
+        ])
+    }
+
+    /// Restore `characters_to_utf8_trap/4` state from its live BIF arguments.
+    pub fn from_binary_trap_arguments(args: &[Term]) -> Option<Self> {
+        let [result, position, rest, encoding] = args else {
+            return None;
+        };
+        let work = usize::try_from(position.as_small()?).ok()?;
+        let latin1 = encoding.as_atom()? == atoms::LATIN1;
+        if !latin1 && encoding.as_atom()? != atoms::UTF8 {
+            return None;
+        }
+        Some(Self {
+            stage: UnicodeStage::ToBinary,
+            result: *result,
+            work,
+            chars: 0,
+            rest: *rest,
+            latin1,
+        })
+    }
 }
 
 /// One slice of a conversion.

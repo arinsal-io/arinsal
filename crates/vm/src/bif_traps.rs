@@ -20,6 +20,12 @@ pub(crate) enum HandlerResult {
         state: Arc<MagicRef>,
         reductions: u32,
     },
+    /// A continuation state owned by the suspended process, like an ERTS trap argument.
+    YieldDirect {
+        continuation: &'static str,
+        state: Box<DirectContinuation>,
+        reductions: u32,
+    },
     /// Transfer directly to the BIF's export continuation without scheduling out.
     Export(crate::ExportTrap),
 }
@@ -30,10 +36,16 @@ impl HandlerResult {
         match self {
             Self::Done { reductions, .. }
             | Self::Failed { reductions, .. }
-            | Self::Yield { reductions, .. } => *reductions,
+            | Self::Yield { reductions, .. }
+            | Self::YieldDirect { reductions, .. } => *reductions,
             Self::Export(_) => 0,
         }
     }
+}
+
+/// State copied into an ERTS-shaped trap continuation without a shared MagicRef mutex.
+pub(crate) enum DirectContinuation {
+    Iolist { root: Term, state: ErtsL2BState },
 }
 
 /// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
@@ -105,7 +117,6 @@ const ERTS_YCF_TRAP_HOLDER_SIZE: usize = 24;
 const ERTS_HASHMAP_MERGE_CONTEXT_SIZE: usize = 56;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
-const ERTS_L2B_STATE_SIZE: usize = 176;
 const ERTS_IOLIST_SIZE_STATE_SIZE: usize = 88;
 const ERTS_IOLIST_TO_IOVEC_STATE_SIZE: usize = 152;
 // Port of erts/emulator/beam/external.c (B2TContext), including its decode union.
@@ -140,6 +151,37 @@ fn trap_state_term(
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let term = arinsal_term::TermBuilder::new(&mut heap).magic_ref(Arc::clone(state))?;
     Ok(Some(term))
+}
+
+// Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState): the suspended state belongs to the
+// trapped process and is passed to the continuation without a shared MagicRef mutex.
+fn install_direct_iolist_trap(
+    process: &mut Process,
+    import: usize,
+    callee: (arinsal_term::Atom, arinsal_term::Atom),
+    gc_was_enabled: bool,
+    schedule_out: bool,
+    root: Term,
+    state: Box<DirectContinuation>,
+) -> Arc<MagicRef> {
+    let state_ref = argument_trap_state(());
+    process.set_gc_enabled(false);
+    process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+        caller_module: process.trap_site().0,
+        caller_ip: process.trap_site().1,
+        schedule_out,
+        import,
+        continuation: IOLIST_CONTINUATION,
+        target: continuation_target(IOLIST_CONTINUATION),
+        state: Arc::clone(&state_ref),
+        direct_state: Some(state),
+        state_term: None,
+        gc_was_enabled,
+        arity: 1,
+        callee,
+        args: [root, Term::NIL, Term::NIL, Term::NIL],
+    });
+    state_ref
 }
 
 /// `beam_bif_export_trap`. `BIF_TRAP` points `c_p->i` here; it is not a BEAM function, so a
@@ -707,6 +749,36 @@ fn unicode_trap(
     })
 }
 
+// Port of erts/emulator/beam/erl_unicode.c:851 (characters_to_utf8_trap), OTP-29.1.1.
+fn unicode_binary_trap(
+    process: &mut Process,
+    state: Option<&Arc<MagicRef>>,
+) -> Result<HandlerResult, BifError> {
+    // BIF_TRAP4 restores the continuation arguments in the live X registers.
+    let cont = arinsal_bifs::UnicodeCont::from_binary_trap_arguments(&process.x[..4])
+        .ok_or(BifError::BADARG)?;
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
+    match arinsal_bifs::unicode_resume(&mut ctx, &cont) {
+        arinsal_bifs::UnicodeStep::Done(value) => Ok(HandlerResult::Done {
+            value,
+            reductions: 0,
+        }),
+        arinsal_bifs::UnicodeStep::More(cont) => {
+            let trap_args = cont.binary_trap_arguments().ok_or(BifError::BADARG)?;
+            process.x.ensure_x(trap_args.len());
+            process.x[..trap_args.len()].copy_from_slice(&trap_args);
+            process.gc_live = trap_args.len();
+            Ok(HandlerResult::Yield {
+                continuation: cont.continuation(),
+                state: state.cloned().unwrap_or_else(|| argument_trap_state(())),
+                reductions: 0,
+            })
+        }
+    }
+}
+
 fn unicode_convert_start(
     process: &mut Process,
     args: &[Term],
@@ -729,6 +801,19 @@ fn unicode_convert_start(
         (result, deferred)
     };
     match deferred.map(|trap| *trap) {
+        Some(arinsal_bifs::DeferredTrap::Unicode(cont))
+            if cont.continuation() == "erlang:characters_to_utf8_trap/4" =>
+        {
+            let trap_args = cont.binary_trap_arguments().ok_or(BifError::BADARG)?;
+            process.x.ensure_x(trap_args.len());
+            process.x[..trap_args.len()].copy_from_slice(&trap_args);
+            process.gc_live = trap_args.len();
+            Ok(HandlerResult::Yield {
+                continuation: cont.continuation(),
+                state: argument_trap_state(()),
+                reductions: 0,
+            })
+        }
         Some(arinsal_bifs::DeferredTrap::Unicode(cont)) => Ok(HandlerResult::Yield {
             continuation: cont.continuation(),
             state: magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
@@ -786,7 +871,15 @@ macro_rules! unicode_trap_entry {
     };
 }
 
-unicode_trap_entry!(erlang_characters_to_utf8_trap);
+fn erlang_characters_to_utf8_trap(
+    process: &mut Process,
+    _args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    unicode_binary_trap(process, state)
+}
 unicode_trap_entry!(erlang_characters_to_list_trap_1);
 unicode_trap_entry!(erlang_characters_to_list_trap_2);
 unicode_trap_entry!(erlang_characters_to_list_trap_3);
@@ -1271,7 +1364,7 @@ struct BinaryCopyState {
     copied_bits: usize,
 }
 
-enum IolistBinaryPhase {
+pub(crate) enum ErtsL2BState {
     Size(arinsal_bifs::IolistSizeWalk),
     Copy {
         output: IolistOutput,
@@ -1285,7 +1378,7 @@ enum IolistBinaryPhase {
 
 /// Output staging for `erts_new_bitstring`: up to 64 bytes stay on heap after the walk completes.
 // Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
-enum IolistOutput {
+pub(crate) enum IolistOutput {
     Small(arinsal_term::HeapBinaryWriter),
     Bitstring(Vec<u8>),
     Writable(Term),
@@ -1608,7 +1701,7 @@ fn maps_build(
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let Some(state) = state else {
+    if state.is_none() {
         // A new call runs on a walk of its own; the magic state is only created when it
         // yields (erts_ycf_trap_driver allocates its state binary after the first yield).
         let mut walk = if from_keys {
@@ -1628,6 +1721,9 @@ fn maps_build(
                 reductions: reductions(reds),
             },
         });
+    }
+    let Some(state) = state else {
+        return Err(BifError::BADARG);
     };
     let state = Arc::clone(state);
     let mut guard = state
@@ -1846,7 +1942,9 @@ pub(crate) fn execute(
         let trap_site = process.trap_site();
         if matches!(
             &result,
-            Ok(ResumeResult::Handler(HandlerResult::Yield { .. }))
+            Ok(ResumeResult::Handler(
+                HandlerResult::Yield { .. } | HandlerResult::YieldDirect { .. }
+            ))
         ) && let Some(pending) = process.bif_trap_mut()
         {
             // Port of erts/emulator/beam/beam_common.c (BIF_TRAP), OTP-29.1.1: a continuation
@@ -1857,6 +1955,7 @@ pub(crate) fn execute(
             (pending.caller_module, pending.caller_ip) = trap_site;
         }
         return Some(result.and_then(|result| match result {
+            ResumeResult::Handler(HandlerResult::Export(trap)) => Err(VmError::TrapExport(trap)),
             ResumeResult::Handler(result) => Ok(result),
             ResumeResult::Export(trap) => Err(VmError::TrapExport(trap)),
         }));
@@ -2025,12 +2124,17 @@ pub(crate) fn run_trapped_export(
         args,
         ctx,
     )
-    .map(|result| result.map(ResumeResult::Handler))
+    .map(|result| {
+        result.map(|handler| match handler {
+            HandlerResult::Export(trap) => ResumeResult::Export(trap),
+            handler => ResumeResult::Handler(handler),
+        })
+    })
 }
 
 /// Install the trap state of a BIF that traps to an Erlang export. The scheduler then runs
 /// the export at `beam_bif_export_trap`, the way an export trap of a Rust continuation runs.
-// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: at most three arguments in X0-X2),
+// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: up to four arguments in X0-X3),
 // OTP-29.1.1.
 pub(crate) fn install_export_trap(
     process: &mut Process,
@@ -2039,7 +2143,7 @@ pub(crate) fn install_export_trap(
     trap: &crate::ExportTrap,
 ) {
     let arity = trap.args.len();
-    assert!(arity <= 3, "BIF traps pass at most three arguments");
+    assert!(arity <= 4, "BIF traps pass at most four arguments");
     // erts BIF_TRAPn writes the arguments to reg[0..n] and sets c_p->arity: they are the live
     // X registers of the export call, rooted like any other. GC stays enabled while trapped.
     process.x.ensure_x(arity);
@@ -2053,13 +2157,17 @@ pub(crate) fn install_export_trap(
         import,
         continuation: trap.continuation,
         target: continuation_target(trap.continuation),
-        state: argument_trap_state(Mutex::new(())),
+        state: argument_trap_state(()),
+        direct_state: None,
         state_term: None,
         gc_was_enabled,
         arity,
         callee,
-        // Export traps keep their arguments in X; this field is for BIF continuations only.
-        args: [Term::NIL; 3],
+        args: {
+            let mut saved = [Term::NIL; 4];
+            saved[..arity].copy_from_slice(&trap.args);
+            saved
+        },
     });
 }
 
@@ -2199,7 +2307,7 @@ pub(crate) fn execute_named(
         }
         // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
         // arguments), OTP-29.1.1: a resumed call takes its arguments from the trap state.
-        args = [pending.args[0], pending.args[1], pending.args[2], Term::NIL];
+        args = pending.args;
         (entry.handler, Some(Arc::clone(&pending.state)))
     } else {
         (entry?.handler, None)
@@ -2328,6 +2436,7 @@ pub(crate) fn execute_named(
                 && continuation != REVERSE_CONTINUATION
                 && continuation != RE_GRUN_CONTINUATION
                 && continuation != RE_URUN_CONTINUATION
+                && continuation != "erlang:characters_to_utf8_trap/4"
             {
                 process.set_gc_enabled(false);
             }
@@ -2364,19 +2473,20 @@ pub(crate) fn execute_named(
                 continuation,
                 target: continuation_target(continuation),
                 state,
+                direct_state: None,
                 state_term,
                 gc_was_enabled,
                 arity: trap_arity,
                 callee,
                 args: if let Some(trap_args) = reverse_args {
-                    [trap_args[0], trap_args[1], Term::NIL]
+                    [trap_args[0], trap_args[1], Term::NIL, Term::NIL]
                 } else if continuation == PTAB_LIST_CONTINUATION {
-                    [process.x[0], Term::NIL, Term::NIL]
+                    [process.x[0], Term::NIL, Term::NIL, Term::NIL]
                 } else if resumed {
-                    [args[0], args[1], args[2]]
+                    args
                 } else {
-                    let live = live_args(process, &args, arity.min(3));
-                    let mut saved = [Term::NIL; 3];
+                    let live = live_args(process, &args, arity.min(4));
+                    let mut saved = [Term::NIL; 4];
                     saved[..live.len()].copy_from_slice(&live);
                     saved
                 },
@@ -2397,6 +2507,45 @@ pub(crate) fn execute_named(
                     .and_then(|cold| cold.bif_trap.as_ref())
                     .map(|pending| Arc::clone(&pending.state))
                     .expect("stored continuation"),
+                reductions,
+            })
+        }
+        Ok(HandlerResult::YieldDirect {
+            continuation,
+            state,
+            reductions,
+        }) => {
+            let root = match state.as_ref() {
+                DirectContinuation::Iolist { root, .. } => *root,
+            };
+            let callee = if resumed {
+                process
+                    .cold
+                    .as_ref()
+                    .and_then(|cold| cold.bif_trap.as_ref())
+                    .map(|pending| pending.callee)
+                    .expect("resumed direct trap")
+            } else {
+                (
+                    global_atoms().intern(module_name).expect("BIF module atom"),
+                    global_atoms()
+                        .intern(function_name)
+                        .expect("BIF function atom"),
+                )
+            };
+            let state = install_direct_iolist_trap(
+                process,
+                import,
+                callee,
+                gc_was_enabled,
+                false,
+                root,
+                state,
+            );
+            charge(process, ctx, reductions);
+            Ok(HandlerResult::Yield {
+                continuation,
+                state,
                 reductions,
             })
         }
@@ -2544,9 +2693,8 @@ impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
 impl TrapBody for ListToBinary {
     const ARITY: Option<usize> = Some(1);
 
-    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
-        iolist_binary_direct(process, args[0], false)
-    }
+    // Port of erts/emulator/beam/erl_iolist.c (`list_to_bitstring_dispatch`):
+    // keep one size walk so its state can continue into copying or a trap.
 
     fn run(
         process: &mut Process,
@@ -2878,12 +3026,13 @@ pub(crate) fn finish_light(
                 && continuation != REVERSE_CONTINUATION
                 && continuation != RE_GRUN_CONTINUATION
                 && continuation != RE_URUN_CONTINUATION
+                && continuation != "erlang:characters_to_utf8_trap/4"
                 && !binary_to_list_retry
             {
                 process.set_gc_enabled(false);
             }
-            let mut saved = [Term::NIL; 3];
-            let kept = args.len().min(3);
+            let mut saved = [Term::NIL; 4];
+            let kept = args.len().min(4);
             saved[..kept].copy_from_slice(&args[..kept]);
             if continuation == PTAB_LIST_CONTINUATION {
                 // BIF_TRAP1 carries the accumulator in X0; it does not change the trapped
@@ -2907,6 +3056,7 @@ pub(crate) fn finish_light(
                 continuation,
                 target: continuation_target(continuation),
                 state,
+                direct_state: None,
                 state_term,
                 gc_was_enabled,
                 arity: kept,
@@ -2916,12 +3066,24 @@ pub(crate) fn finish_light(
             charge_light(process, reductions);
             return LightTrap::Trapped;
         }
+        Ok(HandlerResult::YieldDirect {
+            continuation: _,
+            state,
+            reductions,
+        }) => {
+            let root = match state.as_ref() {
+                DirectContinuation::Iolist { root, .. } => *root,
+            };
+            install_direct_iolist_trap(process, import, callee, gc_was_enabled, true, root, state);
+            charge_light(process, reductions);
+            return LightTrap::Trapped;
+        }
         Ok(HandlerResult::Export(trap)) => {
             let state = argument_trap_state(Mutex::new(()));
             let Ok(state_term) = trap_state_term(process, &state) else {
                 return LightTrap::Returned(Err(BifError::SystemLimit));
             };
-            let mut saved = [Term::NIL; 3];
+            let mut saved = [Term::NIL; 4];
             let kept = trap.args.len().min(saved.len());
             saved[..kept].copy_from_slice(&trap.args[..kept]);
             process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
@@ -2932,6 +3094,7 @@ pub(crate) fn finish_light(
                 continuation: trap.continuation,
                 target: continuation_target(trap.continuation),
                 state,
+                direct_state: None,
                 state_term,
                 gc_was_enabled,
                 arity: kept,
@@ -3014,8 +3177,8 @@ pub(crate) fn install_deferred_trap(
     if disable_gc && continuation != REVERSE_CONTINUATION {
         process.set_gc_enabled(false);
     }
-    let mut saved = [Term::NIL; 3];
-    let arity = args.len().min(3);
+    let mut saved = [Term::NIL; 4];
+    let arity = args.len().min(4);
     saved[..arity].copy_from_slice(&args[..arity]);
     if continuation == REVERSE_CONTINUATION
         && let Some(trap_args) = reverse_trap_args(&state)
@@ -3030,6 +3193,7 @@ pub(crate) fn install_deferred_trap(
         continuation,
         target: continuation_target(continuation),
         state,
+        direct_state: None,
         state_term,
         gc_was_enabled,
         arity,
@@ -3646,33 +3810,36 @@ fn iolist_binary_conversion(
             reductions: 0,
         });
     }
-    let Some(state) = state else {
-        let mut phase = IolistBinaryPhase::Size(if bitstring {
+    if state.is_none() {
+        let mut phase = ErtsL2BState::Size(if bitstring {
             arinsal_bifs::IolistSizeWalk::new_bits(root)
         } else {
             arinsal_bifs::IolistSizeWalk::new(root)
         });
         return Ok(match iolist_binary_step(process, root, &mut phase)? {
             IolistStep::Finished(result) => result,
-            IolistStep::Yield(reductions) => HandlerResult::Yield {
+            IolistStep::Yield(reductions) => HandlerResult::YieldDirect {
                 continuation: IOLIST_CONTINUATION,
-                state: magic_binary_state(Mutex::new(Box::new(phase)), ERTS_L2B_STATE_SIZE),
+                state: Box::new(DirectContinuation::Iolist { root, state: phase }),
                 reductions,
             },
         });
     };
-    let state = Arc::clone(state);
-    let phase = state
-        .downcast_ref::<Mutex<Box<IolistBinaryPhase>>>()
-        .ok_or(BifError::BADARG)?;
-    let mut phase = phase.lock().map_err(|_| BifError::SystemLimit)?;
+    let mut phase = match process
+        .bif_trap_mut()
+        .and_then(|pending| pending.direct_state.take())
+    {
+        Some(state) => match *state {
+            DirectContinuation::Iolist { state: phase, .. } => phase,
+        },
+        _ => return Err(BifError::BADARG),
+    };
     let step = iolist_binary_step(process, root, &mut phase)?;
-    drop(phase);
     Ok(match step {
         IolistStep::Finished(result) => result,
-        IolistStep::Yield(reductions) => HandlerResult::Yield {
+        IolistStep::Yield(reductions) => HandlerResult::YieldDirect {
             continuation: IOLIST_CONTINUATION,
-            state,
+            state: Box::new(DirectContinuation::Iolist { root, state: phase }),
             reductions,
         },
     })
@@ -3686,7 +3853,7 @@ enum IolistStep {
 fn iolist_binary_step(
     process: &mut Process,
     root: Term,
-    phase: &mut IolistBinaryPhase,
+    phase: &mut ErtsL2BState,
 ) -> Result<IolistStep, BifError> {
     const SIZE_YIELDS_PER_RED: usize = 8;
     let finished = |result| Ok(IolistStep::Finished(result));
@@ -3694,7 +3861,7 @@ fn iolist_binary_step(
     let mut size_reductions = 0_usize;
 
     match phase {
-        IolistBinaryPhase::Size(walk) => {
+        ErtsL2BState::Size(walk) => {
             let initial_yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
             let (done, work) = match walk.step(initial_yield_count) {
                 Ok(progress) => progress,
@@ -3710,7 +3877,7 @@ fn iolist_binary_step(
             let bitstring = walk.is_bits();
             let setup = iolist_copy_setup(process, walk, root)?;
             if let Some(value) = setup.empty {
-                *phase = IolistBinaryPhase::Done;
+                *phase = ErtsL2BState::Done;
                 return finished(HandlerResult::Done {
                     value,
                     reductions: size_reductions as u32,
@@ -3719,7 +3886,7 @@ fn iolist_binary_step(
             let (output, bit_len, walk, restore_gc) = setup
                 .ready
                 .expect("nonempty iolist output has a copy state");
-            *phase = IolistBinaryPhase::Copy {
+            *phase = ErtsL2BState::Copy {
                 output,
                 bit_len,
                 bitstring,
@@ -3731,11 +3898,11 @@ fn iolist_binary_step(
                 return Ok(IolistStep::Yield(size_reductions as u32));
             }
         }
-        IolistBinaryPhase::Copy { .. } => {}
-        IolistBinaryPhase::Done => return Err(BifError::BADARG),
+        ErtsL2BState::Copy { .. } => {}
+        ErtsL2BState::Done => return Err(BifError::BADARG),
     }
 
-    let IolistBinaryPhase::Copy {
+    let ErtsL2BState::Copy {
         output,
         bit_len,
         bitstring,
@@ -3805,7 +3972,7 @@ fn iolist_binary_step(
         }
     };
     process.set_gc_enabled(*restore_gc);
-    *phase = IolistBinaryPhase::Done;
+    *phase = ErtsL2BState::Done;
     finished(HandlerResult::Done { value, reductions })
 }
 
@@ -3854,13 +4021,8 @@ fn binary_to_term(
     }
 
     let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
-    let (node_name, creation) = {
-        let tables = crate::node_tables::lock();
-        (tables.local_name.clone(), tables.local_creation)
-    };
-    let node = global_atoms()
-        .intern(&node_name)
-        .map_err(|_| BifError::SystemLimit)?;
+    // Port of erts/emulator/beam/external.c:3123 (`dec_is_this_node`), OTP-29.1.1.
+    let (node, creation) = arinsal_term::this_node();
     decoder.set_local_node(node, creation);
     match decode_step(process, &mut decoder, chunk_bytes) {
         Ok((None, consumed)) => {

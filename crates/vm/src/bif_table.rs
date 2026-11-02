@@ -16,17 +16,33 @@ use crate::native_helpers::{
 pub(crate) enum BinaryGuard {
     ByteSize,
     BitSize,
-    BinaryPart,
+    BinaryPart2,
+    BinaryPart3,
 }
 
 pub(crate) fn binary_guard(module: &str, function: &str, arity: u8) -> Option<BinaryGuard> {
     match (module, function, arity) {
         ("erlang", "byte_size", 1) => Some(BinaryGuard::ByteSize),
         ("erlang", "bit_size", 1) => Some(BinaryGuard::BitSize),
-        ("erlang", "binary_part", 2) | ("binary", "part", 2) => Some(BinaryGuard::BinaryPart),
-        ("erlang", "binary_part", 3) | ("binary", "part", 3) => Some(BinaryGuard::BinaryPart),
+        ("erlang", "binary_part", 2) | ("binary", "part", 2) => Some(BinaryGuard::BinaryPart2),
+        ("erlang", "binary_part", 3) | ("binary", "part", 3) => Some(BinaryGuard::BinaryPart3),
         _ => None,
     }
+}
+
+/// The `i_bif*` function of a binary guard BIF, chosen when the call site is emitted.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (`mov ARG, bif->f` at load time),
+// OTP-29.1.1: the guard is known from the import, never recognised by name per call.
+pub(crate) fn guard_helper(module: &str, function: &str, arity: u8) -> Option<usize> {
+    use crate::native_helpers::{
+        binary_part_2_guard, binary_part_3_guard, bit_size_guard, byte_size_guard,
+    };
+    Some(match binary_guard(module, function, arity)? {
+        BinaryGuard::ByteSize => byte_size_guard as *const () as usize,
+        BinaryGuard::BitSize => bit_size_guard as *const () as usize,
+        BinaryGuard::BinaryPart2 => binary_part_2_guard as *const () as usize,
+        BinaryGuard::BinaryPart3 => binary_part_3_guard as *const () as usize,
+    })
 }
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
