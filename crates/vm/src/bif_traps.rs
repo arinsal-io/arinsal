@@ -251,12 +251,12 @@ fn lists_reverse(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
-    let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
+    let reds = process.header.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
     let max_cells = reds
         .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
         .max(1);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step = arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells);
     drop(bif_state);
@@ -292,7 +292,7 @@ fn lists_member_trap(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
-    let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
+    let reds = process.header.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
     let max_iter = reds.saturating_mul(arinsal_bifs::MEMBER_PER_RED);
     let (term, list) = if let Some(state) = state {
         let saved = state
@@ -305,7 +305,7 @@ fn lists_member_trap(
         (args[0], args[1])
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step = match arinsal_bifs::lists_member(&mut ctx, term, list, max_iter) {
         Ok(step) => step,
@@ -349,7 +349,7 @@ fn lists_key_trap(
         (args[0], args[1], args[2])
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step =
         match arinsal_bifs::lists_key(&mut ctx, op, key, pos, list, arinsal_bifs::KEYFIND_MAX_ITER)
@@ -439,7 +439,7 @@ fn erlang_append(
     state: Option<&Arc<MagicRef>>,
     continuation: &'static str,
 ) -> Result<HandlerResult, BifError> {
-    let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
+    let reds = process.header.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
     let cont = if let Some(state) = state {
         let mut saved = state
             .downcast_ref::<Mutex<arinsal_bifs::AppendCont>>()
@@ -462,7 +462,7 @@ fn erlang_append(
         )
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step = match arinsal_bifs::lists_append(&mut ctx, cont, onheap, alloc) {
         Ok(step) => step,
@@ -546,7 +546,7 @@ fn chksum_trap(
         None => None,
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step = match &resumed {
         Some(cont) => arinsal_bifs::chksum_resume(&mut ctx, cont),
@@ -626,7 +626,7 @@ fn phash2_trap(
     state: Option<&Arc<MagicRef>>,
 ) -> Result<HandlerResult, BifError> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let Some(state) = state else {
         let step = arinsal_bifs::phash2_start(&mut ctx, args);
@@ -699,7 +699,7 @@ fn erlang_length_trap(
         (saved.list(), saved.acc())
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step = arinsal_bifs::length_slice(&mut ctx, list, acc);
     drop(bif_state);
@@ -732,7 +732,7 @@ fn unicode_trap(
         .map_err(|_| BifError::SystemLimit)?
         .clone();
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let step = arinsal_bifs::unicode_resume(&mut ctx, &cont);
     drop(bif_state);
@@ -758,7 +758,7 @@ fn unicode_binary_trap(
     let cont = arinsal_bifs::UnicodeCont::from_binary_trap_arguments(&process.x[..4])
         .ok_or(BifError::BADARG)?;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     match arinsal_bifs::unicode_resume(&mut ctx, &cont) {
         arinsal_bifs::UnicodeStep::Done(value) => Ok(HandlerResult::Done {
@@ -788,13 +788,28 @@ fn unicode_convert_start(
     if state.is_some() {
         return unicode_trap(process, state);
     }
-    let bif =
-        arinsal_bifs::lookup("unicode", function, args.len() as u8).ok_or(BifError::BADARG)?;
+    // erts binds this continuation BIF when its export is loaded. Resolve the
+    // Rust function pointer once, then keep the call path to the body itself.
+    static CHARACTERS_TO_BINARY: std::sync::OnceLock<arinsal_bifs::BifFn> =
+        std::sync::OnceLock::new();
+    static CHARACTERS_TO_LIST: std::sync::OnceLock<arinsal_bifs::BifFn> =
+        std::sync::OnceLock::new();
+    let bif = match function {
+        "characters_to_binary" => CHARACTERS_TO_BINARY.get_or_init(|| {
+            arinsal_bifs::lookup("unicode", function, args.len() as u8)
+                .expect("registered Unicode BIF")
+        }),
+        "characters_to_list" => CHARACTERS_TO_LIST.get_or_init(|| {
+            arinsal_bifs::lookup("unicode", function, args.len() as u8)
+                .expect("registered Unicode BIF")
+        }),
+        _ => return Err(BifError::BADARG),
+    };
     let (result, deferred) = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         // Port of erts/emulator/beam/erl_unicode.c:166 (allowed_iterations), OTP-29.1.1:
         // the loop budget rereads FCALLS after cost_to_proc charges it.
-        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
         let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state);
         let result = bif(&mut ctx, args)?;
         let deferred = ctx.take_deferred();
@@ -1462,7 +1477,7 @@ fn re_run_trap(
         None => None,
     };
     // loop_limit = MIN(reds_initial * LOOP_FACTOR, max_loop_limit), max = CONTEXT_REDS * LOOP_FACTOR
-    let reds_left = process.reductions.clamp(1, CONTEXT_REDS as i32);
+    let reds_left = process.header.fcalls.clamp(1, CONTEXT_REDS as i32);
     let budget = reds_left * arinsal_re::LOOP_FACTOR;
     let dispatch = {
         let mut heap = crate::ProcessHeapHandle(&mut process.heap);
@@ -1546,7 +1561,7 @@ fn binary_to_list_trap(
         .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
         .ok_or(BifError::BADARG)?;
     let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
-    let reds_left = process.reductions.max(0) as usize;
+    let reds_left = process.header.fcalls.max(0) as usize;
     let chunk = reds_left.saturating_add(1).saturating_mul(256);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let (value, used) = walk.step(&mut heap, chunk)?;
@@ -1572,7 +1587,7 @@ fn binary_to_list_start(
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut state = arinsal_bifs::BifState::default();
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap, &mut state);
-    ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    ctx.set_reduction_budget(process.header.fcalls.max(0) as usize);
     // Port of erts/emulator/beam/binary.c (`binary_to_list_1`), OTP-29.1.1:
     // enter the concrete BIF directly; the trap path carries the same arguments.
     let value = arinsal_bifs::erlang_binary_to_list(&mut ctx, args)?;
@@ -1598,7 +1613,7 @@ fn binary_search(
     // Port of erts/emulator/beam/erl_bif_binary.c:1433-1528 (do_binary_find), OTP-29.1.1.
     // Port of erts/emulator/beam/erl_bif_binary.c:110 (get_reds), OTP-29.1.1.
     const SEARCH_LOOP_FACTOR: usize = 10;
-    let budget = (process.reductions.max(0) as usize)
+    let budget = (process.header.fcalls.max(0) as usize)
         .saturating_mul(SEARCH_LOOP_FACTOR)
         .max(1);
     if let Some(state) = state {
@@ -1691,7 +1706,7 @@ fn maps_build(
     from_keys: bool,
 ) -> Result<HandlerResult, BifError> {
     const ITERATIONS_PER_RED: i64 = 40;
-    let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
+    let initial = i64::from(process.header.fcalls.max(0)) * ITERATIONS_PER_RED;
     let mut reds = initial;
     let continuation = if from_keys {
         MAPS_FROM_KEYS_CONTINUATION
@@ -1699,7 +1714,7 @@ fn maps_build(
         MAPS_FROM_LIST_CONTINUATION
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     if state.is_none() {
         // A new call runs on a walk of its own; the magic state is only created when it
@@ -1779,7 +1794,7 @@ fn maps_projection(
     keys: bool,
 ) -> Result<HandlerResult, BifError> {
     const ITERATIONS_PER_RED: i64 = 15;
-    let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
+    let initial = i64::from(process.header.fcalls.max(0)) * ITERATIONS_PER_RED;
     let mut reds = initial;
     if let Some(state) = state {
         let state = Arc::clone(state);
@@ -1814,7 +1829,7 @@ fn maps_projection(
     // erts maps_keys_1 handles a flatmap before any yielding state exists.
     let mut walk = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
         let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
         if let Some(value) = arinsal_bifs::MapsProjectionWalk::start_flat(&mut ctx, args[0], keys)?
         {
@@ -1852,7 +1867,8 @@ fn maps_merge(
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
     use arinsal_maps::{MAP_MERGE_LOOP_FACTOR, MergeStart};
-    let initial_reds = (process.reductions.max(0) as isize).saturating_mul(MAP_MERGE_LOOP_FACTOR);
+    let initial_reds =
+        (process.header.fcalls.max(0) as isize).saturating_mul(MAP_MERGE_LOOP_FACTOR);
     let mut reds = initial_reds;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if let Some(state) = state {
@@ -1870,7 +1886,7 @@ fn maps_merge(
             return Ok(HandlerResult::Yield {
                 continuation: MAPS_MERGE_CONTINUATION,
                 state,
-                reductions: process.reductions.max(0) as u32,
+                reductions: process.header.fcalls.max(0) as u32,
             });
         };
         *guard = None;
@@ -1902,7 +1918,7 @@ fn maps_merge(
                 MapsMergeState::new(Some(merge)),
                 ERTS_HASHMAP_MERGE_CONTEXT_SIZE,
             ),
-            reductions: process.reductions.max(0) as u32,
+            reductions: process.header.fcalls.max(0) as u32,
         });
     };
     Ok(HandlerResult::Done {
@@ -2344,7 +2360,7 @@ pub(crate) fn execute_named(
     } else {
         arity
     };
-    let fcalls_in = process.reductions;
+    let fcalls_in = process.header.fcalls;
     let result = handler(
         process,
         &args[..call_arity.min(args.len())],
@@ -2352,7 +2368,7 @@ pub(crate) fn execute_named(
         pid,
         gc_was_enabled,
     );
-    process.trap_work = fcalls_in.saturating_sub(process.reductions).max(0);
+    process.trap_work = fcalls_in.saturating_sub(process.header.fcalls).max(0);
     // Captured before the match drops the trap state. A continuation failure is still
     // the original BIF's error (erl_iolist.c ERTS_BIF_ERROR_TRAPPED1(c_p, reason, sp->bif, sp->arg)).
     let report = original_trap_report(
@@ -2746,7 +2762,7 @@ impl TrapBody for IolistSize {
 
     fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
         let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
         arinsal_bifs::iolist_size_direct(&mut ctx, args[0])
     }
@@ -2790,8 +2806,8 @@ impl<const N: usize> TrapBody for Phash2<N> {
         _restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
         let result = match N {
-            1 => arinsal_bifs::phash2_run_1_after_immediate_check(args[0], process.reductions)?,
-            2 => arinsal_bifs::phash2_run_2(args[0], args[1], process.reductions)?,
+            1 => arinsal_bifs::phash2_run_1_after_immediate_check(args[0], process.header.fcalls)?,
+            2 => arinsal_bifs::phash2_run_2(args[0], args[1], process.header.fcalls)?,
             _ => unreachable!("phash2 BIF entry has arity one or two"),
         };
         Ok(match result {
@@ -2800,7 +2816,7 @@ impl<const N: usize> TrapBody for Phash2<N> {
             }
             arinsal_bifs::Phash2Run::More(cont) => {
                 // BUMP_ALL_REDS before BIF_TRAP.
-                process.reductions = 0;
+                process.header.fcalls = 0;
                 HandlerResult::Yield {
                     continuation: cont.continuation(),
                     state: magic_binary_state(Mutex::new(*cont), ERTS_HASH2_CONTEXT_SIZE),
@@ -2910,7 +2926,7 @@ pub(crate) extern "C" fn term_to_binary_1_light(
         crate::native_helpers::trap_bif_entry::<TermToBinary>,
         |process, args, restore_gc| {
             let chunk_work =
-                (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
+                (process.header.fcalls.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
             term_encode_first(process, args, restore_gc, chunk_work)
         },
     )
@@ -3214,8 +3230,9 @@ fn key_continuation(function: &str) -> &'static str {
 /// Charges a light trapping BIF's reductions against FCALLS (BUMP_REDS, bif.h); the call site
 /// has charged the call itself.
 pub(crate) fn charge_light(process: &mut Process, reductions: u32) {
-    process.reductions = process
-        .reductions
+    process.header.fcalls = process
+        .header
+        .fcalls
         .saturating_sub(reductions.min(i32::MAX as u32) as i32)
         .max(0);
 }
@@ -3259,7 +3276,7 @@ impl TrapMeter {
         ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
     ) -> Self {
         Self {
-            fcalls: process.reductions,
+            fcalls: process.header.fcalls,
             used: process.reductions_used,
             consumed: ctx.map_or(0, |run| run.consumed()),
             call_counted: true,
@@ -3289,7 +3306,7 @@ impl TrapMeter {
         let held = u32::try_from(self.fcalls.max(1)).unwrap_or(1);
         let work = inside.max(returned.max(1)).min(held);
         let virtual_reds = std::mem::take(&mut process.virtual_reds);
-        process.reductions = self
+        process.header.fcalls = self
             .fcalls
             .saturating_sub(i32::try_from(work).unwrap_or(i32::MAX))
             .max(0);
@@ -3314,8 +3331,9 @@ fn charge(
     reductions: u32,
 ) {
     let charge = reductions.max(1);
-    process.reductions = process
-        .reductions
+    process.header.fcalls = process
+        .header
+        .fcalls
         .saturating_sub(charge.min(i32::MAX as u32) as i32)
         .max(0);
     if let Some(run) = ctx {
@@ -3403,7 +3421,7 @@ fn subtract_with(
     _gc_changed: bool,
     continuation: &'static str,
 ) -> Result<HandlerResult, BifError> {
-    let reductions_left = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
+    let reductions_left = process.header.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
     if let Some(state) = state {
         let state = Arc::clone(state);
         let mut walk = state
@@ -3440,7 +3458,7 @@ fn subtract_step(
     reductions_left: usize,
 ) -> Result<(Option<Term>, u32), BifError> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     let result = walk.step(&mut ctx, reductions_left)?;
     Ok((result, ctx.reductions()))
@@ -3491,7 +3509,7 @@ fn iolist_binary_direct(process: &mut Process, root: Term, allow_binary: bool) -
         );
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     arinsal_bifs::iolist_to_binary_direct(&mut ctx, root)
 }
@@ -3552,7 +3570,7 @@ fn iolist_size(
     // `iolist_size_continue`), OTP-29.1.1: the walk gets `reds_left * 8` yield counts and
     // charges one reduction per eight of them.
     let root = args[0];
-    let reds_left = process.reductions.max(0) as usize;
+    let reds_left = process.header.fcalls.max(0) as usize;
     // erts walks on the C stack and allocates trap state only when it yields, so the common
     // call that finishes in one go allocates nothing.
     let (progress, size, parked) = match state {
@@ -3659,7 +3677,7 @@ fn iolist_to_iovec(
         .downcast_ref::<Mutex<arinsal_bifs::IolistVecWalk>>()
         .ok_or(BifError::BADARG)?;
     let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
-    let entry_reds = process.reductions.max(0) as usize;
+    let entry_reds = process.header.fcalls.max(0) as usize;
     let mut spent = 0_usize;
     let mut reds_left = entry_reds;
     let yielded = |state: Arc<MagicRef>, reductions: usize| {
@@ -3857,7 +3875,7 @@ fn iolist_binary_step(
 ) -> Result<IolistStep, BifError> {
     const SIZE_YIELDS_PER_RED: usize = 8;
     let finished = |result| Ok(IolistStep::Finished(result));
-    let mut available_reductions = process.reductions.max(0) as usize;
+    let mut available_reductions = process.header.fcalls.max(0) as usize;
     let mut size_reductions = 0_usize;
 
     match phase {
@@ -3985,7 +4003,7 @@ fn binary_to_term(
 ) -> Result<HandlerResult, BifError> {
     const BYTES_PER_REDUCTION: usize = 128;
     // Port of erts/emulator/beam/external.c:116 (B2T_BYTES_PER_REDUCTION), OTP-29.1.1.
-    let reds = (process.reductions.max(0) as usize).max(1);
+    let reds = (process.header.fcalls.max(0) as usize).max(1);
     let chunk_bytes = reds.saturating_mul(BYTES_PER_REDUCTION);
     if let Some(state) = state {
         let state = Arc::clone(state);
@@ -4056,7 +4074,7 @@ fn decode_step(
     chunk_bytes: usize,
 ) -> Result<(Option<Term>, usize), (BifError, usize)> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
     decoder.step_into(chunk_bytes, &mut ctx)
 }
@@ -4075,18 +4093,18 @@ const BITSTRING_COPY_LOOP_FACTOR: u64 = 64 * 8;
 /// work. The scheduler leaves the process at the next reduction check, and `virtual_reds`
 /// keeps the given-up amount out of the process's reduction count.
 fn vbump_all_reds(process: &mut Process) {
-    if process.reductions > 0 {
+    if process.header.fcalls > 0 {
         process.virtual_reds = process
             .virtual_reds
-            .saturating_add(process.reductions as u32);
+            .saturating_add(process.header.fcalls as u32);
     }
-    process.reductions = 0;
+    process.header.fcalls = 0;
 }
 
 /// `get_reds`: the loop budget of one slice, `ERTS_BIF_REDS_LEFT * loop_factor`, capped by
 /// the `binary_loop_limit` debug state and never zero.
 fn binary_loop_budget(process: &Process, loop_factor: u64) -> u64 {
-    let reds = u64::try_from(process.reductions.max(0))
+    let reds = u64::try_from(process.header.fcalls.max(0))
         .unwrap_or(0)
         .saturating_mul(loop_factor);
     let limit = crate::natives::erts_debug::binary_loop_limit();
@@ -4549,7 +4567,7 @@ fn term_encode(
 ) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/external.c:2450-2567 (erts_term_to_binary_int), OTP-29.1.1.
     let chunk_work =
-        (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
+        (process.header.fcalls.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
     let charge = term_encode_charge;
     if state.is_none() && !iovec {
         return term_encode_first(process, args, restore_gc, chunk_work);
@@ -4833,7 +4851,7 @@ fn processes(
     const CHUNK_SIZE: u32 = 1000;
     const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
     let table_max = arinsal_term::ptab::process_table_layout().max();
-    let reds_left = process.reductions.max(0) as u32;
+    let reds_left = process.header.fcalls.max(0) as u32;
     if let Some(state) = state {
         let state = Arc::clone(state);
         let list = state
@@ -5071,7 +5089,7 @@ fn ports(
     const INDICES_PER_RED: u32 = 25;
     const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
     let table_max = arinsal_term::ptab::port_table_layout().max();
-    let reds_left = process.reductions.max(0) as u32;
+    let reds_left = process.header.fcalls.max(0) as u32;
     let Some(state) = state else {
         if process.runtime.is_none() {
             let port = Term::port(0).ok_or(BifError::SystemLimit)?;

@@ -371,8 +371,8 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
 /// One level of the parallel HAMT walk (`struct HashmapMergePStackType`).
 ///
 /// Port of erts/emulator/beam/erl_map.c:1467-1476, OTP-29.1.1. `srcA`/`srcB`
-/// are pointers into the parent's child words in erts; here they are a node
-/// and a word index, or the root term held by the frame itself.
+/// are pointers into the parent's child words in erts; here they are a slice
+/// and an index, while the root terms begin in the first frame's node fields.
 struct Frame {
     node_a: Term,
     node_b: Term,
@@ -384,49 +384,55 @@ struct Frame {
     /// `&1`: unique A content in this node; `&2`: unique B content.
     mix: u8,
     ix: usize,
-    array: SmallVec<[u64; 16]>,
+    array: [u64; 16],
 }
 
+impl Frame {
+    fn new(node_a: Term, node_b: Term, src_a: Src, src_b: Src) -> Self {
+        Self {
+            node_a,
+            node_b,
+            src_a,
+            src_b,
+            abm: 0,
+            bbm: 0,
+            rbm: 0,
+            mix: 0,
+            ix: 0,
+            array: [0; 16],
+        }
+    }
+}
+
+/// Safe slice cursor matching erts's advancing `Eterm*` source pointers.
 #[derive(Clone, Copy)]
-enum Src {
-    /// The root map term.
-    Root(Term),
-    /// Remaining child words, corresponding to ERTS's advancing `Eterm*`.
-    Slots(&'static [u64]),
+struct Src {
+    words: &'static [u64],
+    index: usize,
 }
 impl Src {
-    fn get(self) -> Term {
-        match self {
-            Self::Root(t) => t,
-            Self::Slots(words) => term(*words.first().expect("merge source slot")),
+    const fn empty() -> Self {
+        Self {
+            words: &[],
+            index: 0,
         }
     }
+
+    fn current(self) -> Term {
+        term(self.words[self.index])
+    }
+
     // Port of `*srcA++` / `*srcB++` in erl_map.c:1758-1763, OTP-29.1.1.
     fn next(&mut self) -> Term {
-        match self {
-            Self::Root(t) => *t,
-            Self::Slots(words) => {
-                let (word, remaining) = words.split_first().expect("merge source slot");
-                *words = remaining;
-                term(*word)
-            }
-        }
+        let value = term(self.words[self.index]);
+        self.index += 1;
+        value
     }
     fn advance(&mut self) {
-        if let Self::Slots(words) = self
-            && let Some((_, remaining)) = words.split_first()
-        {
-            *words = remaining;
-        }
+        self.index += 1;
     }
     fn get_at(self, offset: usize) -> Term {
-        match self {
-            Self::Root(t) => {
-                debug_assert_eq!(offset, 0);
-                t
-            }
-            Self::Slots(words) => term(words[offset]),
-        }
+        term(self.words[self.index + offset])
     }
 }
 
@@ -438,7 +444,9 @@ impl Src {
 pub struct HashmapMergeContext {
     size: usize,
     lvl: usize,
-    stack: SmallVec<[Frame; 4]>,
+    stack: Vec<Frame>,
+    depth: usize,
+    root_pending: bool,
     started: bool,
 }
 impl std::fmt::Debug for HashmapMergeContext {
@@ -446,7 +454,7 @@ impl std::fmt::Debug for HashmapMergeContext {
         f.debug_struct("HashmapMergeContext")
             .field("size", &self.size)
             .field("lvl", &self.lvl)
-            .field("depth", &self.stack.len())
+            .field("depth", &self.depth)
             .finish()
     }
 }
@@ -459,23 +467,13 @@ impl HashmapMergeContext {
         } else {
             (map_a, map_b)
         };
-        let mut stack = SmallVec::new();
-        stack.push(Frame {
-            node_a: Term::NIL,
-            node_b: Term::NIL,
-            src_a: Src::Root(src_a),
-            src_b: Src::Root(src_b),
-            abm: 0,
-            bbm: 0,
-            rbm: 0,
-            mix: 0,
-            ix: 0,
-            array: SmallVec::new(),
-        });
+        let stack = vec![Frame::new(src_a, src_b, Src::empty(), Src::empty())];
         Self {
             size: hashmap_size(map_a) + hashmap_size(map_b),
             lvl: 0,
             stack,
+            depth: 1,
+            root_pending: true,
             started: false,
         }
     }
@@ -563,22 +561,34 @@ fn open_node(node: Term, src: &mut Src, lvl: usize, bm: &mut u32, coll_sz: &mut 
         debug_assert!(lvl < HAMT_MAX_LEVEL);
         match (header >> 6) & 3 {
             HEAD_ARRAY => {
-                *src = Src::Slots(&boxed_words(node, 18)[2..]);
+                *src = Src {
+                    words: &boxed_words(node, 18)[2..],
+                    index: 0,
+                };
                 *bm = 0xffff;
             }
             HEAD_BITMAP => {
                 *bm = ((header >> 16) & 0xffff) as u32;
-                *src = Src::Slots(&boxed_words(node, 2 + bm.count_ones() as usize)[2..]);
+                *src = Src {
+                    words: &boxed_words(node, 2 + bm.count_ones() as usize)[2..],
+                    index: 0,
+                };
             }
             _ => {
                 *bm = ((header >> 16) & 0xffff) as u32;
-                *src = Src::Slots(&boxed_words(node, 1 + bm.count_ones() as usize)[1..]);
+                *src = Src {
+                    words: &boxed_words(node, 1 + bm.count_ones() as usize)[1..],
+                    index: 0,
+                };
             }
         }
     } else {
         debug_assert_eq!(lvl, HAMT_MAX_LEVEL);
         *coll_sz = (header >> 6) as usize;
-        *src = Src::Slots(&boxed_words(node, 1 + *coll_sz)[1..]);
+        *src = Src {
+            words: &boxed_words(node, 1 + *coll_sz)[1..],
+            index: 0,
+        };
         debug_assert!(*coll_sz >= 2);
     }
 }
@@ -612,13 +622,20 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
     let (mut coll_sz_a, mut coll_sz_b) = (0, 0);
     let mut resume_saved = ctx.started;
     ctx.started = true;
+    let mut depth = ctx.depth;
+    let mut loop_reds = *reds;
     'traverse: loop {
         if !resume_saved {
             // Port of the `recurse` label in erl_map.c:1608-1679, OTP-29.1.1.
             let lvl = ctx.lvl;
-            let sp = ctx.stack.last_mut().expect("merge stack");
-            sp.node_a = sp.src_a.get();
-            sp.node_b = sp.src_b.get();
+            let root_pending = ctx.root_pending;
+            let sp = &mut ctx.stack[depth - 1];
+            if root_pending {
+                ctx.root_pending = false;
+            } else {
+                sp.node_a = sp.src_a.current();
+                sp.node_b = sp.src_b.current();
+            }
             if sp.node_a == sp.node_b {
                 res = Some(sp.node_a);
                 ctx.size -= if is_leaf(sp.node_b) {
@@ -654,12 +671,15 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                 if let Some(child) = res.take() {
                     if ctx.lvl == 0 {
                         debug_assert_eq!(hashmap_size(child), ctx.size);
+                        *reds = loop_reds;
+                        ctx.depth = depth;
                         return Ok(Some(child));
                     }
                     ctx.lvl -= 1;
-                    let child_mix = ctx.stack.pop().expect("merge stack").mix;
-                    let sp = ctx.stack.last_mut().expect("merge stack");
-                    sp.array.push(bits(child));
+                    depth -= 1;
+                    let child_mix = ctx.stack[depth].mix;
+                    let sp = &mut ctx.stack[depth - 1];
+                    sp.array[sp.ix] = bits(child);
                     sp.ix += 1;
                     sp.mix |= child_mix;
                     if sp.rbm != 0 {
@@ -667,29 +687,39 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                         sp.src_b.advance();
                     }
                 } else if ctx.lvl < HAMT_MAX_LEVEL {
-                    let sp = ctx.stack.last_mut().expect("merge stack");
+                    let sp = &mut ctx.stack[depth - 1];
                     sp.ix = 0;
-                    sp.array.clear();
                     sp.rbm = sp.abm | sp.bbm;
                     debug_assert!(!(sp.rbm == 0 && ctx.lvl > 0));
                 } else {
-                    let sp = ctx.stack.last_mut().expect("merge stack");
-                    res = Some(merge_collision_node(
-                        sp.src_a,
-                        coll_sz_a,
-                        sp.src_b,
-                        coll_sz_b,
-                        &mut ctx.size,
-                        heap,
-                    )?);
+                    let sp = &mut ctx.stack[depth - 1];
+                    res = Some(
+                        match merge_collision_node(
+                            sp.src_a,
+                            coll_sz_a,
+                            sp.src_b,
+                            coll_sz_b,
+                            &mut ctx.size,
+                            heap,
+                        ) {
+                            Ok(term) => term,
+                            Err(error) => {
+                                *reds = loop_reds;
+                                ctx.depth = depth;
+                                return Err(error);
+                            }
+                        },
+                    );
                     sp.mix = 3;
                     coll_sz_a = 0;
                     coll_sz_b = 0;
                     continue;
                 }
-                *reds -= 1;
-                if *reds <= 0 {
+                loop_reds -= 1;
+                if loop_reds <= 0 {
                     debug_assert!(coll_sz_a == 0 && coll_sz_b == 0);
+                    *reds = loop_reds;
+                    ctx.depth = depth;
                     return Ok(None);
                 }
             }
@@ -697,7 +727,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
 
             // Port of the `resume_from_trap` label in erl_map.c:1727-1804.
             let lvl = ctx.lvl;
-            let sp = ctx.stack.last_mut().expect("merge stack");
+            let sp = &mut ctx.stack[depth - 1];
             let mut clash = false;
             while sp.rbm != 0 {
                 let next = sp.rbm & (sp.rbm - 1);
@@ -708,12 +738,12 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                         clash = true;
                         break;
                     }
-                    sp.array.push(bits(sp.src_a.next()));
+                    sp.array[sp.ix] = bits(sp.src_a.next());
                     sp.ix += 1;
                     sp.mix |= 1;
                 } else {
                     debug_assert!(sp.bbm & bit != 0);
-                    sp.array.push(bits(sp.src_b.next()));
+                    sp.array[sp.ix] = bits(sp.src_b.next());
                     sp.ix += 1;
                     sp.mix |= 2;
                 }
@@ -721,18 +751,16 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
             if clash {
                 let (src_a, src_b) = (sp.src_a, sp.src_b);
                 ctx.lvl += 1;
-                ctx.stack.push(Frame {
-                    node_a: Term::NIL,
-                    node_b: Term::NIL,
-                    src_a,
-                    src_b,
-                    abm: 0,
-                    bbm: 0,
-                    rbm: 0,
-                    mix: 0,
-                    ix: 0,
-                    array: SmallVec::new(),
-                });
+                if depth == ctx.stack.len() {
+                    ctx.stack
+                        .push(Frame::new(Term::NIL, Term::NIL, src_a, src_b));
+                } else {
+                    let child = &mut ctx.stack[depth];
+                    child.src_a = src_a;
+                    child.src_b = src_b;
+                    child.mix = 0;
+                }
+                depth += 1;
                 continue 'traverse;
             }
             res = Some(match sp.mix {
@@ -744,7 +772,14 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     let header_words = if lvl == 0 { 2 } else { 1 };
                     // Port of HAllocX(..., HALLOC_EXTRA) in erl_map.c:1783-1790.
                     let (words, ptr) =
-                        produce_with_extra(heap, header_words + sp.ix, HALLOC_EXTRA)?;
+                        match produce_with_extra(heap, header_words + sp.ix, HALLOC_EXTRA) {
+                            Ok(allocation) => allocation,
+                            Err(error) => {
+                                *reds = loop_reds;
+                                ctx.depth = depth;
+                                return Err(error);
+                            }
+                        };
                     if lvl == 0 {
                         words[0].write(if sp.ix == 16 {
                             super::header(HEAD_ARRAY, 0xffff)
@@ -758,7 +793,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     // Port of sys_memcpy(hp, sp->array, sp->ix * sizeof(Eterm)),
                     // erl_map.c:1793, OTP-29.1.1.
                     words[header_words..header_words + sp.ix]
-                        .write_copy_of_slice(sp.array.as_slice());
+                        .write_copy_of_slice(&sp.array[..sp.ix]);
                     boxed(ptr)
                 }
                 mix => unreachable!("strange mix {mix}"),

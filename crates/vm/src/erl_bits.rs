@@ -69,8 +69,9 @@ pub extern "C" fn append_binary(
         arinsal_bits::create_bin_reductions(&build(process.x[src_index], process.x[extra_index]))
             .unwrap_or(0);
     let charge = |process: &mut crate::Process| {
-        process.reductions = process
-            .reductions
+        process.header.fcalls = process
+            .header
+            .fcalls
             .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32)
             .max(0);
     };

@@ -75,7 +75,7 @@ fn native_transfer_continues(process: &mut Process, ctx: &RunCtx<'_, Message>) -
     if !transfer || remaining == 0 {
         return false;
     }
-    process.reductions = process.reductions.min(remaining);
+    process.header.fcalls = process.header.fcalls.min(remaining);
     true
 }
 
@@ -1746,13 +1746,13 @@ impl Executor {
             *ran = true;
             process.native_transfer = false;
             process.set_native_pc(None);
-            if process.reductions <= 0
+            if process.header.fcalls <= 0
                 && let Ok(remaining) = i32::try_from(ctx.remaining())
                 && remaining > 0
             {
-                process.reductions = remaining;
+                process.header.fcalls = remaining;
             }
-            let fcalls_before = process.reductions;
+            let fcalls_before = process.header.fcalls;
             if crate::code_ix::take_code_barrier() {
                 ctx.block_thread_progress(std::time::Duration::ZERO);
             }
@@ -1765,7 +1765,7 @@ impl Executor {
                 &mut self.native_registers,
                 code_ptr,
             );
-            let consumed = fcalls_before.saturating_sub(process.reductions);
+            let consumed = fcalls_before.saturating_sub(process.header.fcalls);
             ctx.consume(u32::try_from(consumed).unwrap_or(0));
             // Native `timeout` has no scheduler context to send its trace event.
             if process.native_exit_kind != crate::proc_create::NativeExit::None
@@ -2158,9 +2158,9 @@ impl Executor {
                     // the budget is used up (erts counts reductions per call).
                     // The breakpoint left native code before its call's reduction was
                     // charged.
-                    process.reductions = process.reductions.saturating_sub(1);
+                    process.header.fcalls = process.header.fcalls.saturating_sub(1);
                     process.reductions_used = process.reductions_used.saturating_add(1);
-                    if !ctx.consume(1) || process.reductions <= 0 {
+                    if !ctx.consume(1) || process.header.fcalls <= 0 {
                         return Ok(Flow::Break(Ok(RunState::Yield)));
                     }
                     return Ok(Flow::Continue);
@@ -3319,15 +3319,15 @@ impl Executor {
         // enters the BIF. Leave a positive count alone in that case.
         let reds = budget.min(i32::MAX as u32) as i32;
         if process.native_pc().is_some() {
-            if reds > 1 || process.reductions <= 0 {
-                process.reductions = reds;
+            if reds > 1 || process.header.fcalls <= 0 {
+                process.header.fcalls = reds;
             }
-        } else if process.reductions <= 0 && reds > 0 {
+        } else if process.header.fcalls <= 0 && reds > 0 {
             // Interpreted schedule-in. A trapping BIF charges FCALLS to 0 when it
             // yields; the continuation (lists:member/2) reads that counter as its
             // scan budget. Leaving it at 0 makes every resume yield without
             // scanning, and the process never reaches halt.
-            process.reductions = reds;
+            process.header.fcalls = reds;
         }
         // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
         // export's code address), OTP-29.1.1: every process starts its function natively on
@@ -3421,7 +3421,7 @@ impl Executor {
                         };
                         let mut result = crate::calls::call_bif(
                             &mut process.heap,
-                            &mut process.reductions,
+                            &mut process.header.fcalls,
                             bif,
                             &args,
                         );
@@ -3479,7 +3479,8 @@ impl Executor {
                         // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
                         // then `p->fcalls = reds`; the process's reductions are what the slice
                         // used), OTP-29.1.1: the signal handling is the process's own work.
-                        process.reductions = process.reductions.saturating_sub(sig_reds.max(0));
+                        process.header.fcalls =
+                            process.header.fcalls.saturating_sub(sig_reds.max(0));
                         process.reductions_used = process
                             .reductions_used
                             .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
@@ -3694,13 +3695,13 @@ impl Executor {
                                 // has reductions; refilling avoids yielding before the next
                                 // instruction (the send after a code-permission release).
                                 let native = {
-                                    if process.reductions <= 0
+                                    if process.header.fcalls <= 0
                                         && let Ok(remaining) = i32::try_from(ctx.remaining())
                                         && remaining > 0
                                     {
-                                        process.reductions = remaining;
+                                        process.header.fcalls = remaining;
                                     }
-                                    let fcalls_before = process.reductions;
+                                    let fcalls_before = process.header.fcalls;
                                     // A code change this scheduler committed waits for thread
                                     // progress first: every other scheduler then finishes the slice it
                                     // runs with the previous code index (erts' code barrier).
@@ -3717,7 +3718,8 @@ impl Executor {
                                         &mut self.native_registers,
                                         code_ptr,
                                     );
-                                    let consumed = fcalls_before.saturating_sub(process.reductions);
+                                    let consumed =
+                                        fcalls_before.saturating_sub(process.header.fcalls);
                                     ctx.consume(u32::try_from(consumed).unwrap_or(0));
                                     // Native `timeout` has no scheduler context to send its trace event.
                                     if process.native_exit_kind
@@ -6190,8 +6192,8 @@ impl Process {
             return;
         }
         let reds = (words / ERTS_MSG_COPY_WORDS_PER_REDUCTION).min(CONTEXT_REDS as usize) as i32;
-        let applied = reds.min(self.reductions.max(0));
-        self.reductions -= applied;
+        let applied = reds.min(self.header.fcalls.max(0));
+        self.header.fcalls -= applied;
         if self.heap.native_active() {
             return;
         }
@@ -7537,10 +7539,10 @@ impl Process {
         // are spent, and all but ERTS_ABANDON_HEAP_COST of them are not the process's own
         // work. The interpreter keeps its slice in the scheduler and never charges the rest
         // of it.
-        if self.heap.native_active() && self.reductions > ABANDON_HEAP_COST {
+        if self.heap.native_active() && self.header.fcalls > ABANDON_HEAP_COST {
             self.virtual_reds = self
                 .virtual_reds
-                .saturating_add((self.reductions - ABANDON_HEAP_COST) as u32);
+                .saturating_add((self.header.fcalls - ABANDON_HEAP_COST) as u32);
         }
         self.set_force_yield(true);
         true

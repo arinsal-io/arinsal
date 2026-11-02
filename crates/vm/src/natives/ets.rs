@@ -1749,7 +1749,7 @@ impl arinsal_ets::match_spec::MatchContext for ProcessMatchContext {
 /// Port of erts/emulator/beam/erl_bif_info.c (BUMP_REDS), OTP-29.1.1.
 fn bump_reds(process: &mut Process, ctx: &mut RunCtx<'_, Message>, used: isize) {
     let used = used.clamp(0, ctx.remaining() as isize) as u32;
-    process.reductions -= used as i32;
+    process.header.fcalls -= used as i32;
     process.reductions_used = process.reductions_used.saturating_add(u64::from(used));
     ctx.consume(used);
 }
@@ -1762,7 +1762,6 @@ fn bump_direct(process: &mut Process, used: isize) {
     let used = used.clamp(0, i32::MAX as isize) as i32;
     let live = process.header.fcalls.saturating_sub(used).max(0);
     process.header.fcalls = live;
-    process.reductions = live;
 }
 
 /// Whether the BIF looks its first argument up as a table (`db_get_table`), and so has to wait

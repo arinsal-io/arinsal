@@ -172,9 +172,10 @@ pub(crate) struct NativeStackFrame {
     pub module_atom: arinsal_term::Atom,
     pub function_atom: arinsal_term::Atom,
     pub arity: u8,
+    /// Resolved source location, like `FunctionInfo.loc` plus `fname_ptr[file]` in erts.
+    pub location: Option<(Term, u64)>,
     pub line: Option<u32>,
     pub file_term: Option<Term>,
-    pub file: Option<Arc<str>>,
 }
 
 /// The functions of one native module version, ordered by address: the function table of its
@@ -198,6 +199,9 @@ pub(crate) struct ModuleRange {
     /// The code header's function table. `erts_lookup_function_info` binary-searches the
     /// function start addresses (beam_ranges.c:262-278), OTP-29.1.1.
     functions: FunctionTable,
+    /// Compact `BeamCodeHeader.functions`-shaped search keys. Keeping metadata out of this
+    /// array makes each binary-search probe touch only one address, as in erts.
+    function_starts: Arc<[usize]>,
 }
 
 impl ModuleRange {
@@ -243,6 +247,11 @@ fn module_range(
         start,
         end: Arc::new(AtomicUsize::new(end)),
         module_atom,
+        function_starts: functions
+            .iter()
+            .map(|function| function.start)
+            .collect::<Vec<_>>()
+            .into(),
         functions,
     }
 }
@@ -379,15 +388,10 @@ fn frame_in(
     ranges: &[ModuleRange],
     address: usize,
     hint: &AtomicUsize,
+    line_file_terms: Option<&std::collections::HashMap<String, Term>>,
 ) -> Option<NativeStackFrame> {
     let range = find_range_with(ranges, address, hint)?;
-    let index = range
-        .functions
-        .partition_point(|function| function.start <= address);
-    let function = range.functions.get(index.checked_sub(1)?)?;
-    if address >= function.end {
-        return None;
-    }
+    let function = function_in(range, address)?;
     // Port of beam_ranges.c:331 (`lookup_loc`): binary search the function's pc table,
     // then index its parallel location table. Filenames remain module literals.
     let loc = function
@@ -396,19 +400,21 @@ fn frame_in(
         .checked_sub(1)
         .and_then(|index| function.line_table.get(index))
         .filter(|entry| entry.line != 0);
-    let file_term = loc.as_ref().and_then(|entry| entry.file_term);
-    // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
-    let file = loc
+    let file_term = loc.as_ref().and_then(|entry| {
+        entry
+            .file_term
+            .or_else(|| line_file_terms?.get(entry.file.as_ref()).copied())
+    });
+    let location = loc
         .as_ref()
-        .filter(|_| file_term.is_none())
-        .map(|entry| entry.file.clone());
+        .and_then(|entry| file_term.map(|file| (file, u64::from(entry.line))));
     Some(NativeStackFrame {
         module_atom: function.module_atom,
         function_atom: function.function_atom,
         arity: function.arity,
+        location,
         line: loc.map(|entry| entry.line),
         file_term,
-        file,
     })
 }
 
@@ -418,15 +424,16 @@ fn frame_in(
 pub(crate) fn stack_frame_in(
     ranges: Option<&[ModuleRange]>,
     address: usize,
+    line_file_terms: Option<&std::collections::HashMap<String, Term>>,
 ) -> Option<NativeStackFrame> {
     let Some(ranges) = ranges else {
         if !arinsal_term::may_be_native_code_pointer(address) {
             return None;
         }
-        return native_stack_frame_at(address);
+        return native_frame_at(address, line_file_terms);
     };
     static HINT: AtomicUsize = AtomicUsize::new(0);
-    frame_in(ranges, address, &HINT)
+    frame_in(ranges, address, &HINT, line_file_terms)
 }
 
 /// Runs `visit` on the function of a registered native module that contains `address`.
@@ -436,11 +443,19 @@ fn lookup_function<R>(address: usize, visit: impl FnOnce(&NativeFunction) -> R) 
     static HINT: AtomicUsize = AtomicUsize::new(0);
     let ranges = all_ranges().load();
     let range = find_range_with(&ranges, address, &HINT)?;
+    let function = function_in(range, address)?;
+    Some(visit(function))
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:262-278 (`erts_lookup_function_info`), OTP-29.1.1:
+// search the compact code-header function address table, then read metadata for the hit only.
+fn function_in(range: &ModuleRange, address: usize) -> Option<&NativeFunction> {
     let index = range
-        .functions
-        .partition_point(|function| function.start <= address);
-    let function = range.functions.get(index.checked_sub(1)?)?;
-    (address < function.end).then(|| visit(function))
+        .function_starts
+        .partition_point(|start| *start <= address)
+        .checked_sub(1)?;
+    let function = range.functions.get(index)?;
+    (address < function.end).then_some(function)
 }
 
 fn native_generation() -> &'static AtomicU64 {
@@ -986,11 +1001,19 @@ pub(crate) fn is_native_continuation(address: usize) -> bool {
 }
 
 pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> {
+    native_frame_at(address, None)
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:245-280 (`erts_lookup_function_info`), OTP-29.1.1.
+fn native_frame_at(
+    address: usize,
+    line_file_terms: Option<&std::collections::HashMap<String, Term>>,
+) -> Option<NativeStackFrame> {
     static HINT: AtomicUsize = AtomicUsize::new(0);
     if !arinsal_term::may_be_native_code_pointer(address) {
         return None;
     }
-    frame_in(&all_ranges().load(), address, &HINT)
+    frame_in(&all_ranges().load(), address, &HINT, line_file_terms)
 }
 
 /// Every registered native function of `module`, keyed by name and arity, restricted to the
@@ -1207,7 +1230,6 @@ fn native_exit(
     // Native returns may release stack slots and allocate into the newly freed gap.
     process.heap.set_stack_pointer(process.header.stop);
     process.heap.set_heap_top(process.header.htop);
-    process.reductions = process.header.fcalls;
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
             "[native-exit] {}:{}/{} pc={code_address:#x} exit={exit:?} x0={:#x} i={:p} stop={:p}",
@@ -1748,6 +1770,33 @@ mod version_selection_tests {
             file_term: None,
             line_table: NativeLines::default(),
         }
+    }
+
+    #[test]
+    fn function_lookup_searches_compact_starts_then_checks_the_hit() {
+        let atoms = arinsal_term::global_atoms();
+        let module_atom = atoms
+            .intern("native_bridge_compact_functions")
+            .expect("module atom");
+        let first = function(0, 0x1000, "native_bridge_compact_functions");
+        let second = function(0, 0x1020, "native_bridge_compact_functions");
+        let range = module_range(
+            0x1000,
+            0x1040,
+            module_atom,
+            Arc::from(vec![first.clone(), second.clone()]),
+        );
+
+        similar_asserts::assert_eq!(range.function_starts.as_ref(), &[0x1000, 0x1020]);
+        similar_asserts::assert_eq!(
+            function_in(&range, 0x100f).map(|f| f.start),
+            Some(first.start)
+        );
+        similar_asserts::assert_eq!(function_in(&range, 0x1010), None);
+        similar_asserts::assert_eq!(
+            function_in(&range, 0x1020).map(|f| f.start),
+            Some(second.start)
+        );
     }
 
     // An old and a current version of one module are registered at once; the current one

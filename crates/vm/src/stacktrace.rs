@@ -1671,20 +1671,6 @@ fn bif_error_info(
     Ok(Some(map))
 }
 
-fn literal_location(
-    frame: &crate::native_bridge::NativeStackFrame,
-    current: Option<&Module>,
-) -> Option<(Term, u64)> {
-    let line = frame.line?;
-    let file = frame.file_term.or_else(|| {
-        frame
-            .file
-            .as_deref()
-            .and_then(|file| current?.line_file_terms.get(file).copied())
-    })?;
-    Some((file, u64::from(line)))
-}
-
 fn build_frame(
     heap: &mut TraceHeap,
     module: Atom,
@@ -1915,27 +1901,20 @@ fn prepare_frames(
             Some((module.name_atom, function, arity, module.line_term_at(ip)))
         })
     } else {
-        crate::native_bridge::stack_frame_in(ranges, usize::try_from(pc).unwrap_or(0)).map(
-            |frame| {
-                let location = frame.line.and_then(|line| {
-                    frame
-                        .file_term
-                        .or_else(|| {
-                            frame.file.as_deref().and_then(|file| {
-                                current_module
-                                    .and_then(|module| module.line_file_terms.get(file).copied())
-                            })
-                        })
-                        .map(|file| (file, u64::from(line)))
-                });
-                (
-                    frame.module_atom,
-                    frame.function_atom,
-                    frame.arity,
-                    location,
-                )
-            },
+        crate::native_bridge::stack_frame_in(
+            ranges,
+            usize::try_from(pc).unwrap_or(0),
+            current_module.map(|module| &module.line_file_terms),
         )
+        .map(|frame| {
+            let location = frame.location;
+            (
+                frame.module_atom,
+                frame.function_atom,
+                frame.arity,
+                location,
+            )
+        })
     };
     if let Some((module, function, arity, location)) = frame {
         words += write_frame(block, module, function, arity, location) + 2;
@@ -1955,16 +1934,19 @@ fn prepare_frames(
             let Some(address) = usize::try_from(*word).ok() else {
                 continue;
             };
-            let Some(resolved) = crate::native_bridge::stack_frame_in(ranges, address) else {
+            let Some(resolved) = crate::native_bridge::stack_frame_in(
+                ranges,
+                address,
+                current_module.map(|module| &module.line_file_terms),
+            ) else {
                 continue;
             };
-            let location = literal_location(&resolved, current_module);
             words += write_frame(
                 block,
                 resolved.module_atom,
                 resolved.function_atom,
                 resolved.arity,
-                location,
+                resolved.location,
             ) + 2;
             frames += 1;
             continue;
@@ -2040,17 +2022,16 @@ fn prepare_bif_frames(
         } else {
             let Some(frame) = usize::try_from(word)
                 .ok()
-                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address))
+                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address, None))
             else {
                 return Ok(FramePrep::Fallback);
             };
-            let location = literal_location(&frame, None);
             words += write_frame(
                 block,
                 frame.module_atom,
                 frame.function_atom,
                 frame.arity,
-                location,
+                frame.location,
             ) + 2;
         }
         frames += 1;
@@ -2060,17 +2041,16 @@ fn prepare_bif_frames(
         if word & CURRENT_IS_FUNCTION == 0 {
             let Some(frame) = usize::try_from(*word)
                 .ok()
-                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address))
+                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address, None))
             else {
                 continue;
             };
-            let location = literal_location(&frame, None);
             words += write_frame(
                 block,
                 frame.module_atom,
                 frame.function_atom,
                 frame.arity,
-                location,
+                frame.location,
             ) + 2;
             frames += 1;
             continue;
@@ -2321,7 +2301,15 @@ fn build_saved_active(
                 .or_else(|| fallback_modules.get(slot).cloned())
         });
     let native_frame = native_top.and_then(|pc| {
-        ranges.and_then(|ranges| crate::native_bridge::stack_frame_in(Some(ranges), pc))
+        ranges.and_then(|ranges| {
+            crate::native_bridge::stack_frame_in(
+                Some(ranges),
+                pc,
+                table_module
+                    .as_deref()
+                    .map(|module| &module.line_file_terms),
+            )
+        })
     });
     if raw.module.is_none() {
         raw.module = table_module;
@@ -2332,17 +2320,7 @@ fn build_saved_active(
         None
     } else if let Some(frame) = native_frame {
         // Port of erts/emulator/beam/utils.c:3430 (`erts_build_mfa_item`), OTP-29.1.1.
-        let location = frame.line.and_then(|line| {
-            frame
-                .file_term
-                .or_else(|| {
-                    frame
-                        .file
-                        .as_deref()
-                        .and_then(|file| current?.line_file_terms.get(file).copied())
-                })
-                .map(|file| (file, u64::from(line)))
-        });
+        let location = frame.location;
         Some((
             frame.module_atom,
             frame.function_atom,
@@ -2454,16 +2432,20 @@ fn build_saved_active(
         }
         if let Continuation::Native(address) = continuation {
             // Resolved lazily like erts, which saves raw pcs and decodes them in build_stacktrace.
-            let Some(resolved) = ranges
-                .and_then(|ranges| crate::native_bridge::stack_frame_in(Some(ranges), *address))
-            else {
+            let Some(resolved) = ranges.and_then(|ranges| {
+                crate::native_bridge::stack_frame_in(
+                    Some(ranges),
+                    *address,
+                    current.map(|module| &module.line_file_terms),
+                )
+            }) else {
                 continue;
             };
             items.push(Item::Plain(Plain {
                 module: resolved.module_atom,
                 function: resolved.function_atom,
                 args: Term::small(i64::from(resolved.arity)).expect("arity is small"),
-                location: literal_location(&resolved, current),
+                location: resolved.location,
             }));
             continue;
         }
