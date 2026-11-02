@@ -156,21 +156,28 @@ fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let result = Term::small(if negative { -value } else { value }).expect("small parser limit");
     crate::pure::tuple_build(ctx, &[result, cursor])
 }
-fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+fn binary_to_integer(_ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/big.c:4231 (erts_internal_binary_to_integer_2), OTP-29.1.1.
     let Some(base) = valid_base(args[1]) else {
         return status!("badarg");
     };
-    let Ok(bytes) = crate::pure::binary_bytes(args[0]) else {
-        return status!("badarg");
-    };
+    match crate::pure::with_aligned_binary_bytes(args[0], |bytes| parse_binary_integer(bytes, base))
+    {
+        Ok(result) => result,
+        Err(_) => status!("badarg"),
+    }
+}
+
+#[inline(always)]
+fn parse_binary_integer(bytes: &[u8], base: u32) -> Term {
+    // Port of erts/emulator/beam/big.c:4162 (chars_to_integer), OTP-29.1.1.
     if bytes.is_empty() {
         return status!("badarg");
     }
     let (negative, mut text) = match bytes[0] {
         b'-' => (true, &bytes[1..]),
         b'+' => (false, &bytes[1..]),
-        _ => (false, bytes.as_slice()),
+        _ => (false, bytes),
     };
     if text.is_empty() {
         return status!("badarg");
@@ -185,14 +192,23 @@ fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         return status!("big");
     }
     let mut value = 0_i64;
-    for &byte in text {
-        let Some(d) = digit(byte as i64, base) else {
-            return status!("badarg");
-        };
-        value = value * base as i64 + d as i64;
+    if base <= 10 {
+        for &byte in text {
+            let d = byte.wrapping_sub(b'0');
+            if u32::from(d) >= base {
+                return status!("badarg");
+            }
+            value = value * base as i64 + i64::from(d);
+        }
+    } else {
+        for &byte in text {
+            let Some(d) = digit(i64::from(byte), base) else {
+                return status!("badarg");
+            };
+            value = value * base as i64 + i64::from(d);
+        }
     }
     let value = if negative { -value } else { value };
-    let _ = ctx;
     Term::small(value).expect("small parser limit")
 }
 

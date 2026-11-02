@@ -242,8 +242,52 @@ impl Table {
         };
         let mut slot = from;
         loop {
-            iterations -= step(slot)?;
-            slot += nlocks;
+            let mut boundary = None;
+            let (next_slot, stopped) = storage.try_with_ordered_stripe(
+                slot,
+                nlocks,
+                false,
+                visit,
+                &mut |current, visited| {
+                    iterations -= visited as isize;
+                    let mut next = current + nlocks;
+                    if next >= storage.nactive() {
+                        next = (next + 1) & (nlocks - 1);
+                        if next == 0 {
+                            boundary = Some(HashScanEnd {
+                                iterations_left: iterations,
+                                trap_slot: None,
+                                chunk_slot: None,
+                            });
+                            return Ok(true);
+                        }
+                    }
+                    if full() {
+                        boundary = Some(HashScanEnd {
+                            iterations_left: iterations,
+                            trap_slot: None,
+                            chunk_slot: Some(next),
+                        });
+                        return Ok(true);
+                    }
+                    if iterations <= 0 {
+                        boundary = Some(HashScanEnd {
+                            iterations_left: iterations,
+                            trap_slot: Some(next),
+                            chunk_slot: None,
+                        });
+                        return Ok(true);
+                    }
+                    Ok(false)
+                },
+            )?;
+            if let Some(end) = boundary {
+                return Ok(end);
+            }
+            if stopped {
+                unreachable!("stopped traversal sets a boundary result");
+            }
+            slot = next_slot;
             if slot >= storage.nactive() {
                 slot = (slot + 1) & (nlocks - 1);
                 if slot == 0 {
@@ -253,20 +297,6 @@ impl Table {
                         chunk_slot: None,
                     });
                 }
-            }
-            if full() {
-                return Ok(HashScanEnd {
-                    iterations_left: iterations,
-                    trap_slot: None,
-                    chunk_slot: Some(slot),
-                });
-            }
-            if iterations <= 0 {
-                return Ok(HashScanEnd {
-                    iterations_left: iterations,
-                    trap_slot: Some(slot),
-                    chunk_slot: None,
-                });
             }
         }
     }

@@ -3145,8 +3145,8 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 let size_is_units = matches!(fields.get(5), Some(SpecificOperand::Unsigned(_)));
                 let size = arg(fields.get(5), beam, env).map_err(EmitError::Operand)?;
                 if name == "string" {
-                    // erts_bs_put_string copies the bytes; a binary segment of the same
-                    // bytes builds the same bits.
+                    // Port of instr_bs.cpp am_string handling: retain the module string bytes
+                    // as a string segment so construction copies them directly.
                     let start = number(fields.get(4)).map_err(EmitError::Operand)? as usize;
                     let length = match fields.get(5) {
                         Some(SpecificOperand::Unsigned(n)) => *n as usize,
@@ -3159,11 +3159,18 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         .strings
                         .get(start..start.saturating_add(length))
                         .ok_or_else(|| EmitError::Operand("string table range".to_owned()))?;
-                    let literal = env.binary_literal(bytes).map_err(EmitError::Operand)?;
+                    let string = env.match_string(bytes).map_err(EmitError::Operand)?;
                     segments.push(BsSegment {
-                        kind: BsSegmentKind::Binary,
+                        kind: BsSegmentKind::String,
                         index: number(fields.get(1)).map_err(EmitError::Operand)?,
-                        src: ArgVal::Literal(literal),
+                        src: ArgVal::Immediate(
+                            string
+                                .checked_shl(4)
+                                .and_then(|tagged| tagged.checked_add(0xf))
+                                .ok_or_else(|| {
+                                    EmitError::Operand("string handle overflow".to_owned())
+                                })?,
+                        ),
                         size: ArgVal::Immediate(length as u64),
                         size_is_units: true,
                         unit: 8,

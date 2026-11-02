@@ -48,7 +48,7 @@ pub use pure::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
     IolistVecWalk, Phash2Cont, Phash2Run, Phash2Step, allocate_iolist_binary, atom_to_list_term,
     binary_bytes, binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range,
-    copy_bitstring_range, copy_bitstring_range_to, eval_unique_integer,
+    copy_bitstring_range, copy_bitstring_range_to, erlang_binary_to_list, eval_unique_integer,
     finish_iolist_binary_output, for_each_list_term, iolist_size_direct, iolist_to_binary_direct,
     iolist_to_iovec_shortcut, iolist_yield_reductions, next_ref_id, next_unique_monotonic,
     phash2_immediate_1, phash2_immediate_result, phash2_run, phash2_run_1,

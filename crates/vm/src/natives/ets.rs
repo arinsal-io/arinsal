@@ -2067,7 +2067,6 @@ struct Start {
     saved: arinsal_ets::SavedMatches,
     safety: arinsal_ets::IterSafety,
     plan: ScanPlan,
-    fresh_plan: bool,
     continued: bool,
 }
 
@@ -2211,7 +2210,6 @@ fn hash_select(
                 got: state.got,
                 saved: state.saved,
                 safety: state.safety,
-                fresh_plan: false,
                 continued: true,
             },
             None if items.is_some() => {
@@ -2241,7 +2239,6 @@ fn hash_select(
                     } else {
                         IterSafety::Safe
                     },
-                    fresh_plan: false,
                     continued: true,
                 }
             }
@@ -2316,7 +2313,6 @@ fn hash_select(
                     got: 0,
                     saved: arinsal_ets::SavedMatches::new(),
                     safety,
-                    fresh_plan: true,
                     continued: false,
                 }
             }
@@ -2341,12 +2337,11 @@ fn hash_select(
         count,
         chunk,
         backwards,
-        position,
+        position: _,
         got,
         mut saved,
         safety,
         plan,
-        fresh_plan,
         continued,
     } = start;
     let mut cycle = match cycle {
@@ -2370,11 +2365,11 @@ fn hash_select(
             None => Next::Return,
         }
     };
-    let mut next = next_of(&mut cycle);
+    let next = next_of(&mut cycle);
     let mut fixed_now = false;
     if !matches!(next, Next::Return) && !was_resumed {
-        // The first trap of a table that other processes may write: fix it under the write
-        // lock, redoing the cycle in case the table changed in between.
+        // Port of erts/emulator/beam/erl_db.c (ets_select2, ets_select3), OTP-29.1.1:
+        // fix immediately after the first trap; the traversal is not replayed.
         if ctx.is_none() {
             return Err(VmError::Yield);
         }
@@ -2382,24 +2377,8 @@ fn hash_select(
             let registry = rt.ets.read().unwrap();
             let mut table = registry.get_mut(tid).map_err(err)?;
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let redo = if fresh_plan {
-                ScanPlan::Hash(table.hash_scan_plan(&program))
-            } else {
-                ScanPlan::Hash(arinsal_ets::HashScanPlan::all_slots())
-            };
-            let shape = CycleShape {
-                count,
-                backwards,
-                chunk,
-                held: saved.len(),
-                from: position.as_ref(),
-            };
-            cycle = select_cycle(&table, &redo, &program, shape, &mut heap).map_err(err)?;
-            next = next_of(&mut cycle);
-            if !matches!(next, Next::Return) {
-                fix_table(&mut heap, &mut table, caller)?;
-                fixed_now = true;
-            }
+            fix_table(&mut heap, &mut table, caller)?;
+            fixed_now = true;
         }
     }
     if fixed_now {

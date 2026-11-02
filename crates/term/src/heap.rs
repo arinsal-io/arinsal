@@ -3294,6 +3294,15 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     }
 }
 
+// Port of erts/emulator/beam/big.c (small_to_big), OTP-29.1.1.
+fn small_to_big_words(value: i64) -> [u64; 2] {
+    let negative = value < 0;
+    [
+        (1 << 6) | if negative { NEG_BIG } else { POS_BIG },
+        value.unsigned_abs(),
+    ]
+}
+
 /// File and line of one MFA frame: `[{file, File}, {line, Line}]`.
 ///
 /// `file_atom` and `line_atom` are the predefined `file` and `line` atoms.
@@ -3364,6 +3373,21 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             store(p.wrapping_add(1 + index), 0);
         }
         Ok(Term::from_ptr(p, 2))
+    }
+
+    /// Reserve a positive bignum as an incremental heap block, without touching its digits.
+    ///
+    /// The caller must initialize every digit it will later read before exposing the term.
+    /// Port of the `HAlloc` and header store for `struct StackTrace` in
+    /// erts/emulator/beam/beam_common.c:889-893, OTP-29.1.1.
+    pub fn pos_bignum_block(&mut self, digits: usize) -> Result<HeapBlockBuilder, TermError> {
+        if digits == 0 || digits > 65_535 {
+            return Err(TermError::SystemLimit);
+        }
+        let words = digits.checked_add(1).ok_or(TermError::SystemLimit)?;
+        let mut block = self.reserve_boxed_words(words, 0)?;
+        block.write_header(((digits as u64) << 6) | POS_BIG)?;
+        Ok(block)
     }
 
     /// Cons `{Module, Function, ArityOrArgs, Location}` onto `tail`.
@@ -3525,6 +3549,169 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         self.write_bignum(p, 1, Sign::Plus, |index| if index == 0 { value } else { 0 });
         Ok(Term::from_ptr(p, 2))
     }
+    /// Multiply two small integers using the temporary bignum used by `small_times`.
+    ///
+    /// Port of `small_times` in erts/emulator/beam/big.c and its stack-result copy in
+    /// `erts_mixed_times`, erts/emulator/beam/erl_arith.c, OTP-29.1.1.
+    pub fn small_times(&mut self, x: i64, y: i64) -> Result<Term, TermError> {
+        if x == 0 || y == 0 {
+            return Ok(Term::small(0).unwrap());
+        }
+        if x == 1 {
+            return Term::small(y).ok_or(TermError::BadArg);
+        }
+        if y == 1 {
+            return Term::small(x).ok_or(TermError::BadArg);
+        }
+
+        let negative = (x < 0) != (y < 0);
+        let product = (x.unsigned_abs() as u128) * (y.unsigned_abs() as u128);
+        let low = product as u64;
+        let high = (product >> 64) as u64;
+        let small_magnitude = if negative {
+            MAX_SMALL as u64 + 1
+        } else {
+            MAX_SMALL as u64
+        };
+        if high == 0 && low <= small_magnitude {
+            let value = if negative { -(low as i64) } else { low as i64 };
+            return Ok(Term::small(value).unwrap());
+        }
+
+        let arity = if high == 0 { 1 } else { 2 };
+        let mut temporary = [0_u64; 3];
+        temporary[0] = ((arity as u64) << 6) | if negative { NEG_BIG } else { POS_BIG };
+        temporary[1] = low;
+        temporary[2] = high;
+
+        let words = arity + 1;
+        let p = self
+            .heap
+            .alloc_fragment_only(words)
+            .ok_or(TermError::HeapFull)?;
+        for (index, word) in temporary[..words].iter().copied().enumerate() {
+            store(p.wrapping_add(index), word);
+        }
+        Ok(Term::from_ptr(p, 2))
+    }
+
+    /// Multiply boxed bignums and small integers directly into their result allocation.
+    ///
+    /// Port of `erts_mixed_times` in erts/emulator/beam/erl_arith.c and `big_times` in
+    /// erts/emulator/beam/big.c, OTP-29.1.1.
+    pub fn bignum_times(&mut self, a: Term, b: Term) -> Result<Term, TermError> {
+        if let Some(small) = a.as_small() {
+            return b
+                .with_bignum_parts_mut(|digits, negative| {
+                    if small == 0 {
+                        return Ok(Term::small(0).unwrap());
+                    }
+                    if small == 1 {
+                        return Ok(b);
+                    }
+                    let temporary = small_to_big_words(small);
+                    self.bignum_product(
+                        &temporary[1..],
+                        digits,
+                        (small < 0) != negative,
+                        digits.len() + 3,
+                    )
+                })
+                .ok_or(TermError::BadArg)?;
+        }
+
+        if let Some(small) = b.as_small() {
+            return a
+                .with_bignum_parts_mut(|digits, negative| {
+                    if small == 0 {
+                        return Ok(Term::small(0).unwrap());
+                    }
+                    if small == 1 {
+                        return Ok(a);
+                    }
+                    let temporary = small_to_big_words(small);
+                    self.bignum_product(
+                        digits,
+                        &temporary[1..],
+                        negative != (small < 0),
+                        digits.len() + 3,
+                    )
+                })
+                .ok_or(TermError::BadArg)?;
+        }
+
+        if a.bits() == b.bits() {
+            return a
+                .with_bignum_parts_mut(|digits, _negative| {
+                    self.bignum_product(digits, digits, false, digits.len() * 2 + 1)
+                })
+                .ok_or(TermError::BadArg)?;
+        }
+
+        a.with_bignum_parts_mut(|x, x_negative| {
+            b.with_bignum_parts_mut(|y, y_negative| {
+                self.bignum_product(x, y, x_negative != y_negative, x.len() + y.len() + 1)
+            })
+        })
+        .ok_or(TermError::BadArg)?
+        .ok_or(TermError::BadArg)?
+    }
+
+    fn bignum_product(
+        &mut self,
+        x: &[u64],
+        y: &[u64],
+        negative: bool,
+        allocated_words: usize,
+    ) -> Result<Term, TermError> {
+        let result_words = x
+            .len()
+            .checked_add(y.len())
+            .and_then(|digits| digits.checked_add(1))
+            .ok_or(TermError::SystemLimit)?;
+        let allocated_words = allocated_words.max(result_words);
+        let p = self
+            .heap
+            .alloc_fragment_only(allocated_words)
+            .ok_or(TermError::HeapFull)?;
+        let r = p.wrapping_add(1);
+        let result_digits = crate::bignum::times_into(x, y, r);
+
+        if result_digits == 1 {
+            let magnitude = load(r);
+            let small_magnitude = if negative {
+                MAX_SMALL as u64 + 1
+            } else {
+                MAX_SMALL as u64
+            };
+            if magnitude <= small_magnitude {
+                self.heap.release(p.wrapping_add(allocated_words), p);
+                let value = if negative {
+                    -(magnitude as i64)
+                } else {
+                    magnitude as i64
+                };
+                return Ok(Term::small(value).unwrap());
+            }
+        }
+
+        if result_digits > 65_535 {
+            self.heap.release(p.wrapping_add(allocated_words), p);
+            return Err(TermError::SystemLimit);
+        }
+
+        store(
+            p,
+            ((result_digits as u64) << 6) | if negative { NEG_BIG } else { POS_BIG },
+        );
+        let used_words = result_digits + 1;
+        if used_words < allocated_words {
+            self.heap
+                .release(p.wrapping_add(allocated_words), p.wrapping_add(used_words));
+        }
+        Ok(Term::from_ptr(p, 2))
+    }
+
     /// Box little-endian 64-bit magnitude digits when outside the small range.
     pub fn int_from_bigint(&mut self, value: &BigInt) -> Result<Term, TermError> {
         if let Some(n) = value.to_i64()
@@ -4409,6 +4596,26 @@ impl ConsListBuilder {
         Ok(head)
     }
 
+    /// Build an integer character list directly from its ASCII byte buffer.
+    ///
+    /// Port of `buf_to_intlist` in erts/emulator/beam/utils.c, OTP-29.1.1.
+    #[inline(always)]
+    pub fn prepend_bytes_with_tail(self, bytes: &[u8], tail: Term) -> Result<Term, TermError> {
+        if self.written != 0 || bytes.len() != self.len {
+            return Err(TermError::BadArg);
+        }
+        let mut head = tail;
+        let mut cell = self.start as *mut u64;
+        for &byte in bytes.iter().rev() {
+            let value = Term::small(i64::from(byte)).ok_or(TermError::BadArg)?;
+            store(cell, value.bits());
+            store(cell.wrapping_add(1), head.bits());
+            head = Term::from_ptr(cell, 1);
+            cell = cell.wrapping_add(2);
+        }
+        Ok(head)
+    }
+
     /// Build a list directly from a flatmap's stored tagged-word array.
     ///
     /// Port of the indexed `while(n--) { CONS(hp, ks[n], res); hp += 2; }`
@@ -4744,6 +4951,21 @@ mod heap_block_tests {
     use super::{
         HeapAlloc, HeapReservation, ProcessHeap, Term, TermBuilder, TermError, TermKind, VecHeap,
     };
+
+    #[test]
+    fn positive_bignum_block_leaves_digits_for_incremental_fill() {
+        let mut heap = VecHeap::new();
+        let mut block = TermBuilder::new(&mut heap).pos_bignum_block(3).unwrap();
+        let term = block.term_at(0).unwrap();
+        for digit in [11, 22, 33] {
+            block.write_header(digit).unwrap();
+        }
+        similar_asserts::assert_eq!(block.finish_at(0).unwrap(), term);
+        similar_asserts::assert_eq!(
+            term.with_bignum_digits_mut(|digits| digits.to_vec()),
+            Some(vec![11, 22, 33])
+        );
+    }
 
     #[test]
     #[ignore = "timing: cargo test --release -p arinsal-term heap_fragment_cycle_bench -- --ignored --nocapture"]

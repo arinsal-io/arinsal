@@ -67,7 +67,7 @@ impl SearchPattern {
 }
 
 pub(crate) struct BoyerMoore {
-    data: Vec<u64>,
+    data: Vec<[u8; 8]>,
     width: usize,
     pattern_offset: usize,
     good_shift_offset: usize,
@@ -99,32 +99,34 @@ impl BoyerMoore {
         let mut data = Vec::new();
         data.try_reserve_exact(data_words)
             .map_err(|_| BifError::SystemLimit)?;
-        data.resize(data_words, 0);
-        data[0] = width as u64;
-        data[1] = pattern_offset as u64;
-        data[2] = good_shift_offset as u64;
-        data[3] = bad_shift_offset as u64;
+        data.resize(data_words, [0; 8]);
+        data[0] = (width as u64).to_ne_bytes();
+        data[1] = (pattern_offset as u64).to_ne_bytes();
+        data[2] = (good_shift_offset as u64).to_ne_bytes();
+        data[3] = (bad_shift_offset as u64).to_ne_bytes();
         for (index, byte) in pattern.iter().copied().enumerate() {
-            data[pattern_offset + index / 8] |= u64::from(byte) << ((index % 8) * 8);
+            data[pattern_offset + index / 8][index % 8] = byte;
         }
 
         if width > 1 {
             for index in 0..width {
-                data[good_shift_offset + index] = width as u64;
+                data[good_shift_offset + index] = (width as u64).to_ne_bytes();
             }
             for index in 0..ALPHABET_SIZE {
-                data[bad_shift_offset + index] = width as u64;
+                data[bad_shift_offset + index] = (width as u64).to_ne_bytes();
             }
             for index in 0..width - 1 {
-                data[bad_shift_offset + pattern[index] as usize] = (width - index - 1) as u64;
+                data[bad_shift_offset + pattern[index] as usize] =
+                    ((width - index - 1) as u64).to_ne_bytes();
             }
             let suffixes = suffixes(pattern)?;
             let mut j = 0;
             for i in (-1_isize..=(width as isize - 1)).rev() {
                 if i == -1 || suffixes[i as usize] == i + 1 {
                     while j < width as isize - 1 - i {
-                        if data[good_shift_offset + j as usize] == width as u64 {
-                            data[good_shift_offset + j as usize] = (width as isize - 1 - i) as u64;
+                        let slot = good_shift_offset + j as usize;
+                        if u64::from_ne_bytes(data[slot]) == width as u64 {
+                            data[slot] = ((width as isize - 1 - i) as u64).to_ne_bytes();
                         }
                         j += 1;
                     }
@@ -132,7 +134,7 @@ impl BoyerMoore {
             }
             for i in 0..=(width as isize - 2) {
                 data[good_shift_offset + width - 1 - suffixes[i as usize] as usize] =
-                    (width as isize - 1 - i) as u64;
+                    ((width as isize - 1 - i) as u64).to_ne_bytes();
             }
         }
 
@@ -147,15 +149,15 @@ impl BoyerMoore {
     }
 
     fn pattern_byte(&self, index: usize) -> u8 {
-        (self.data[self.pattern_offset + index / 8] >> ((index % 8) * 8)) as u8
+        self.data[self.pattern_offset + index / 8][index % 8]
     }
 
     fn good_shift(&self, index: usize) -> usize {
-        self.data[self.good_shift_offset + index] as usize
+        u64::from_ne_bytes(self.data[self.good_shift_offset + index]) as usize
     }
 
     fn bad_shift(&self, index: usize) -> usize {
-        self.data[self.bad_shift_offset + index] as usize
+        u64::from_ne_bytes(self.data[self.bad_shift_offset + index]) as usize
     }
 }
 
@@ -476,115 +478,161 @@ impl SearchWalk {
                 position,
                 found,
                 done,
-            } => Self::step_boyer_moore_loop(
-                pattern,
-                bytes,
-                end,
-                budget,
-                position,
-                done,
-                |result, _, done| {
-                    *found = Some(result);
-                    *done = true;
-                },
-            ),
+            } => {
+                let mut j = *position;
+                let mut result = *found;
+                let mut finished = *done;
+                let mut work = 0;
+                let width = pattern.width;
+                let last = width - 1;
+
+                if !finished {
+                    let Some(last_byte_start) = j.checked_add(last) else {
+                        *done = true;
+                        return (true, work);
+                    };
+                    if last_byte_start >= end {
+                        *done = true;
+                        return (true, work);
+                    }
+
+                    let available = end - last_byte_start;
+                    let read_limit = 1_usize
+                        .saturating_add(budget.saturating_sub(1).saturating_mul(MC_LOOP_FACTOR));
+                    let mem_read = available.min(read_limit);
+                    if let Some(offset) = memchr::memchr(
+                        pattern.pattern_byte(last),
+                        &bytes[last_byte_start..last_byte_start + mem_read],
+                    ) {
+                        work = work.saturating_add((last + offset) / MC_LOOP_FACTOR);
+                        j += offset;
+                    } else {
+                        work = work.saturating_add(mem_read / MC_LOOP_FACTOR);
+                        j = j.saturating_add(mem_read);
+                    }
+
+                    loop {
+                        if width > end || j > end - width {
+                            finished = true;
+                            break;
+                        }
+                        if work.saturating_add(1) >= budget {
+                            work = budget;
+                            break;
+                        }
+                        work += 1;
+                        let mut index = width;
+                        while index > 0 && pattern.pattern_byte(index - 1) == bytes[j + index - 1] {
+                            index -= 1;
+                        }
+                        if index == 0 {
+                            result = Some((j, width));
+                            finished = true;
+                            break;
+                        }
+                        let index = index - 1;
+                        let hay_byte = bytes[j + index] as usize;
+                        let bad = pattern.bad_shift(hay_byte) as isize - width as isize
+                            + 1
+                            + index as isize;
+                        let good = pattern.good_shift(index) as isize;
+                        j = j.saturating_add(good.max(bad) as usize);
+                    }
+                }
+
+                *position = j;
+                *found = result;
+                *done = finished;
+                (finished, work)
+            }
             SearchState::BoyerMooreAll {
                 position,
                 found,
                 done,
-            } => Self::step_boyer_moore_loop(
-                pattern,
-                bytes,
-                end,
-                budget,
-                position,
-                done,
-                |result, position, _| {
-                    if found.len() == found.capacity() {
-                        let additional = if found.capacity() == 0 {
-                            10
-                        } else {
-                            found.capacity()
+            } => {
+                let mut j = *position;
+                let mut matches = std::mem::take(found);
+                let mut finished = *done;
+                let mut work = 0;
+                let width = pattern.width;
+                let last = width - 1;
+                let mut skip_memchr = false;
+
+                while !finished {
+                    if !skip_memchr {
+                        let Some(last_byte_start) = j.checked_add(last) else {
+                            finished = true;
+                            break;
                         };
-                        found.reserve_exact(additional);
+                        if last_byte_start >= end {
+                            finished = true;
+                            break;
+                        }
+
+                        let available = end - last_byte_start;
+                        let read_limit = 1_usize.saturating_add(
+                            budget
+                                .saturating_sub(work)
+                                .saturating_sub(1)
+                                .saturating_mul(MC_LOOP_FACTOR),
+                        );
+                        let mem_read = available.min(read_limit);
+                        if let Some(offset) = memchr::memchr(
+                            pattern.pattern_byte(last),
+                            &bytes[last_byte_start..last_byte_start + mem_read],
+                        ) {
+                            work = work.saturating_add((last + offset) / MC_LOOP_FACTOR);
+                            j += offset;
+                        } else {
+                            work = work.saturating_add(mem_read / MC_LOOP_FACTOR);
+                            j = j.saturating_add(mem_read);
+                        }
                     }
-                    found.push(result);
-                    *position += result.1;
-                },
-            ),
+
+                    if width > end || j > end - width {
+                        finished = true;
+                        break;
+                    }
+                    if work.saturating_add(1) >= budget {
+                        work = budget;
+                        break;
+                    }
+                    work += 1;
+                    let mut index = width;
+                    while index > 0 && pattern.pattern_byte(index - 1) == bytes[j + index - 1] {
+                        index -= 1;
+                    }
+                    if index == 0 {
+                        if matches.len() == matches.capacity() {
+                            let additional = if matches.capacity() == 0 {
+                                10
+                            } else {
+                                matches.capacity()
+                            };
+                            matches.reserve_exact(additional);
+                        }
+                        matches.push((j, width));
+                        j += width;
+                        skip_memchr = false;
+                    } else {
+                        let index = index - 1;
+                        let hay_byte = bytes[j + index] as usize;
+                        let bad = pattern.bad_shift(hay_byte) as isize - width as isize
+                            + 1
+                            + index as isize;
+                        let good = pattern.good_shift(index) as isize;
+                        j = j.saturating_add(good.max(bad) as usize);
+                        skip_memchr = true;
+                    }
+                }
+
+                *position = j;
+                *found = matches;
+                *done = finished;
+                (finished, work)
+            }
             _ => unreachable!("Boyer–Moore uses a Boyer–Moore state"),
         }
-    }
-
-    fn step_boyer_moore_loop(
-        pattern: &BoyerMoore,
-        bytes: &[u8],
-        end: usize,
-        budget: usize,
-        position: &mut usize,
-        done: &mut bool,
-        mut on_match: impl FnMut((usize, usize), &mut usize, &mut bool),
-    ) -> (bool, usize) {
-        let width = pattern.width;
-        let last = width - 1;
-        let mut work = 0;
-        while !*done && work < budget {
-            let Some(last_byte_start) = position.checked_add(last) else {
-                *done = true;
-                break;
-            };
-            if last_byte_start >= end {
-                *done = true;
-                break;
-            }
-            let available = end - last_byte_start;
-            let read_limit = 1_usize.saturating_add(
-                budget
-                    .saturating_sub(work)
-                    .saturating_sub(1)
-                    .saturating_mul(MC_LOOP_FACTOR),
-            );
-            let mem_read = available.min(read_limit);
-            let haystack = &bytes[last_byte_start..last_byte_start + mem_read];
-            if let Some(offset) = memchr::memchr(pattern.pattern_byte(last), haystack) {
-                work = work.saturating_add((last + offset) / MC_LOOP_FACTOR);
-                *position += offset;
-            } else {
-                // Port of bm_find_first_match (erl_bif_binary.c:862-874): a memchr
-                // miss never reaches the shift. create_bmdata leaves goodshift and
-                // badshift unallocated when the pattern length is 1, so the search
-                // is memchr only (erl_bif_binary.c:467-497).
-                work = work.saturating_add(mem_read / MC_LOOP_FACTOR);
-                *position = position.saturating_add(mem_read);
-                if width > end || *position > end - width {
-                    *done = true;
-                }
-                break;
-            }
-            if *position > end - width {
-                *done = true;
-                break;
-            }
-            if work >= budget {
-                break;
-            }
-            work += 1;
-            let mut index = width;
-            while index > 0 && pattern.pattern_byte(index - 1) == bytes[*position + index - 1] {
-                index -= 1;
-            }
-            if index > 0 {
-                let index = (index - 1) as isize;
-                let hay_byte = bytes[*position + index as usize] as usize;
-                let bad = pattern.bad_shift(hay_byte) as isize - width as isize + 1 + index;
-                let good = pattern.good_shift(index as usize) as isize;
-                *position = position.saturating_add(good.max(bad) as usize);
-            } else {
-                let result = (*position, width);
-                on_match(result, position, done);
-            }
-        }
-        (*done, work)
     }
 
     // Port of erts/emulator/beam/erl_bif_binary.c:637-699 (ac_find_first_match),
@@ -597,54 +645,60 @@ impl SearchWalk {
         state: &mut SearchState,
     ) -> (bool, usize) {
         let SearchState::AhoCorasickFirst {
-            state: current,
-            position,
-            candidate,
-            done,
+            state: saved_state,
+            position: saved_position,
+            candidate: saved_candidate,
+            done: saved_done,
         } = state
         else {
             unreachable!("Aho–Corasick first uses a first-match state")
         };
+        let mut current = *saved_state;
+        let mut position = *saved_position;
+        let mut candidate = *saved_candidate;
+        let mut done = *saved_done;
         let mut work = 0;
-        while !*done && *position < scope.1 && work < budget {
-            let byte = bytes[*position] as usize;
-            while pattern.nodes[*current].edges[byte] == NO_NODE
-                && pattern.nodes[*current].failure != *current
+        while !done && position < scope.1 && work < budget {
+            let byte = bytes[position] as usize;
+            while pattern.nodes[current].edges[byte] == NO_NODE
+                && pattern.nodes[current].failure != current
             {
-                *current = pattern.nodes[*current].failure;
+                current = pattern.nodes[current].failure;
             }
-            let next = pattern.nodes[*current].edges[byte];
+            let next = pattern.nodes[current].edges[byte];
             if next != NO_NODE {
-                *current = next;
+                current = next;
             }
-            *position += 1;
+            position += 1;
             work += 1;
-            if let Some((_, candidate_start)) = *candidate
-                && (*position - pattern.nodes[*current].depth as usize) > candidate_start
+            if let Some((_, candidate_start)) = candidate
+                && (position - pattern.nodes[current].depth as usize) > candidate_start
             {
-                *done = true;
+                done = true;
                 break;
             }
-            if pattern.nodes[*current].final_pattern != 0 {
-                let mut result_node = *current;
+            if pattern.nodes[current].final_pattern != 0 {
+                let mut result_node = current;
                 while pattern.nodes[result_node].final_pattern < 0 {
                     result_node = pattern.nodes[result_node].failure;
                 }
-                let start = *position - pattern.nodes[result_node].depth as usize;
+                let start = position - pattern.nodes[result_node].depth as usize;
                 let replace = candidate.is_none_or(|(old_node, old_start)| {
                     start < old_start
                         || (start == old_start
-                            && pattern.nodes[old_node].depth < pattern.nodes[*current].depth)
+                            && pattern.nodes[old_node].depth < pattern.nodes[current].depth)
                 });
                 if replace {
-                    *candidate = Some((result_node, start));
+                    candidate = Some((result_node, start));
                 }
             }
         }
-        if *position >= scope.1 {
-            *done = true;
-        }
-        (*done, work)
+        done |= position >= scope.1;
+        *saved_state = current;
+        *saved_position = position;
+        *saved_candidate = candidate;
+        *saved_done = done;
+        (done, work)
     }
 
     // Port of erts/emulator/beam/erl_bif_binary.c:729-824
@@ -657,35 +711,39 @@ impl SearchWalk {
         state: &mut SearchState,
     ) -> (bool, usize) {
         let SearchState::AhoCorasickAll {
-            state: current,
-            position,
-            found,
-            done,
+            state: saved_state,
+            position: saved_position,
+            found: saved_found,
+            done: saved_done,
         } = state
         else {
             unreachable!("Aho–Corasick all uses a match-all state")
         };
+        let mut current = *saved_state;
+        let mut position = *saved_position;
+        let mut found = std::mem::take(saved_found);
+        let mut done = *saved_done;
         let mut work = 0;
-        while !*done && *position < end && work < budget {
-            let byte = bytes[*position] as usize;
-            while pattern.nodes[*current].edges[byte] == NO_NODE
-                && pattern.nodes[*current].failure != *current
+        while !done && position < end && work < budget {
+            let byte = bytes[position] as usize;
+            while pattern.nodes[current].edges[byte] == NO_NODE
+                && pattern.nodes[current].failure != current
             {
-                *current = pattern.nodes[*current].failure;
+                current = pattern.nodes[current].failure;
             }
-            let next = pattern.nodes[*current].edges[byte];
+            let next = pattern.nodes[current].edges[byte];
             if next != NO_NODE {
-                *current = next;
+                current = next;
             }
-            *position += 1;
+            position += 1;
             work += 1;
-            if pattern.nodes[*current].final_pattern != 0 {
-                let mut result_node = *current;
+            if pattern.nodes[current].final_pattern != 0 {
+                let mut result_node = current;
                 while pattern.nodes[result_node].final_pattern != 0 {
                     while pattern.nodes[result_node].final_pattern < 0 {
                         result_node = pattern.nodes[result_node].failure;
                     }
-                    let result_start = *position - pattern.nodes[result_node].depth as usize;
+                    let result_start = position - pattern.nodes[result_node].depth as usize;
                     let mut retained = found.len();
                     while retained > 0
                         && (found[retained - 1].0 > result_start
@@ -714,16 +772,19 @@ impl SearchWalk {
                 }
             }
         }
-        if *position >= end {
-            *done = true;
-        }
-        (*done, work)
+        done |= position >= end;
+        *saved_state = current;
+        *saved_position = position;
+        *saved_found = found;
+        *saved_done = done;
+        (done, work)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use similar_asserts::assert_eq;
 
     fn search(
         bytes: &[u8],
@@ -735,7 +796,7 @@ mod tests {
             SearchPatternHandle::Owned(SearchPattern::compile(vec![needle.to_vec()]).unwrap());
         let mut walk = SearchWalk::new(bytes.len(), pattern, scope, first_only);
         let mut steps = 0;
-        while !walk.step(bytes, 1).0 {
+        while !walk.step(bytes, 10).0 {
             steps += 1;
             assert!(steps < bytes.len() + 2, "search made no progress");
         }
@@ -745,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn one_byte_pattern_one_reduction_window_matches_a_full_scan() {
+    fn one_byte_pattern_minimum_search_window_matches_a_full_scan() {
         let bytes = b"zzzzzzzzzzza-z-a";
         for (needle, scope, first_only, expected) in [
             (&b"a"[..], (0, bytes.len()), true, vec![(11, 1)]),

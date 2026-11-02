@@ -820,7 +820,7 @@ impl MatchProgram {
     pub(crate) fn runner(&self) -> MatchRunner<'_> {
         MatchRunner {
             program: self,
-            state: pam::PamState::new(),
+            state: pam::PamState::new(self.stack_need, self.num_bindings),
         }
     }
 
@@ -1072,7 +1072,7 @@ impl MatchProgram {
         }
         let mut state = STATE
             .take()
-            .unwrap_or_else(|| Box::new(pam::PamState::new()));
+            .unwrap_or_else(|| Box::new(pam::PamState::new(self.stack_need, self.num_bindings)));
         let result = self.run_program(object, dst, context, &mut state, None);
         if state.heap.used_words() != 0 {
             state.heap.reset(128);
@@ -1081,6 +1081,7 @@ impl MatchProgram {
         result
     }
 
+    #[inline(always)]
     fn run_program<H: HeapAlloc, C: MatchContext>(
         &self,
         object: Term,
@@ -1384,6 +1385,7 @@ impl MatchRunner<'_> {
 
     /// Run a stored ETS object, reusing its known size if the clause returns that object.
     // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets), OTP-29.1.1.
+    #[inline(always)]
     pub(crate) fn run_with_context_sized<H: HeapAlloc, C: MatchContext>(
         &mut self,
         object: Term,
@@ -1400,6 +1402,7 @@ impl MatchRunner<'_> {
         result
     }
 
+    #[inline(always)]
     pub(crate) fn run_sized<H: HeapAlloc>(
         &mut self,
         object: Term,

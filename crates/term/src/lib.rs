@@ -1,5 +1,6 @@
 //! OTP 29 tagged words and heap-backed runtime terms.
 mod atom;
+mod bignum;
 mod bits;
 mod copy;
 pub mod exc;
@@ -35,11 +36,12 @@ pub use atom::{
 pub use bits::{
     BinaryOwner, ExternalBinary, PrivateAppendUpdate, RefcBinary, SUB_BITS_MUTABLE,
     SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes, binary_offset_adjustment, binary_owner,
-    erts_bs_private_append_checked, erts_bs_private_append_checked_with_update,
-    erts_bs_private_append_fast, erts_bs_private_append_fast_with_update, external_binary_magic,
-    is_match_context, is_writable_binary, match_position, set_match_position, sub_bits_flags,
-    writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
-    writable_gc_visit, writable_resize_private,
+    erts_bs_private_append_checked, erts_bs_private_append_checked_with_heap,
+    erts_bs_private_append_checked_with_update, erts_bs_private_append_fast,
+    erts_bs_private_append_fast_with_update, external_binary_magic, is_match_context,
+    is_writable_binary, match_position, set_match_position, sub_bits_flags, writable_bytes_mut,
+    writable_capacity, writable_extend_private, writable_finalize, writable_gc_visit,
+    writable_resize_private,
 };
 pub use copy::{
     SharedCopyCache, copy_ets_element, copy_flat_tuple, copy_shallow, copy_shared, copy_struct,
@@ -476,6 +478,16 @@ impl Term {
     #[inline]
     pub fn is_negative_bignum(self) -> bool {
         self.header().is_some_and(|header| header & 63 == NEG_BIG)
+    }
+    /// Read the value of a boxed float without materializing an owned term.
+    #[inline]
+    pub fn float_value(self) -> Option<f64> {
+        let header = self.header()?;
+        if header & 63 != FLOAT {
+            return None;
+        }
+        let data = (self.0 & !7) as *const u64;
+        Some(f64::from_bits(crate::heap::load(data.wrapping_add(1))))
     }
     /// Whether a boxed term is an internal magic reference.
     #[inline]

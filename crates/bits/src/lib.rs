@@ -145,6 +145,19 @@ pub struct BinSize {
     pub heap_words: usize,
 }
 
+/// Writable destination established by the checked binary append step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendStart {
+    /// New visible binary term.
+    pub term: Term,
+    /// Address of its backing writable buffer.
+    pub data_address: usize,
+    /// Bit offset where the appended segments begin.
+    pub offset_bits: usize,
+    /// Prefix bits copied or moved during this operation, for reduction charging.
+    pub copied_bits: usize,
+}
+
 /// BEAM exception or allocation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BitsError {
@@ -870,7 +883,6 @@ pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Resul
         let mut failure = None;
         let term = TermBuilder::new(heap)
             .binary_from_fn(size.bits / 8, |destination| {
-                destination.fill(0);
                 failure = write_segments(segments, destination, 0).err();
             })
             .map_err(|e| term_error(e, segments.last().map_or(0, |s| s.index), size.heap_words))?;
@@ -1047,6 +1059,88 @@ pub fn append<H: HeapAlloc>(
     heap: &mut H,
 ) -> Result<Term, BitsError> {
     append_inner(source, suffix, suffix_bits, heap, false)
+}
+
+/// Start `bs_create_bin`'s append path and leave the appended fields for native stores.
+// Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.
+pub fn append_start<H: HeapAlloc>(
+    source: Term,
+    extra_bits: usize,
+    unit: usize,
+    heap: &mut H,
+) -> Result<Option<AppendStart>, BitsError> {
+    if extra_bits == 0 {
+        return Ok(None);
+    }
+    if let Some(start) = append_writer_start(source, extra_bits, unit, heap)? {
+        return Ok(Some(start));
+    }
+    append_start_nonwritable(source, extra_bits, unit, heap).map(Some)
+}
+
+/// Try erts' active writable binary branch, without inspecting a nonwriter's bitstring.
+// Port of erts/emulator/beam/erl_bits.c:1750-1829 (`erts_bs_append_checked`), OTP-29.1.1.
+pub fn append_writer_start<H: HeapAlloc>(
+    source: Term,
+    extra_bits: usize,
+    unit: usize,
+    heap: &mut H,
+) -> Result<Option<AppendStart>, BitsError> {
+    if extra_bits == 0 {
+        return Ok(None);
+    }
+    Ok(TermBuilder::new(heap)
+        .writable_append_with_address(source, extra_bits, unit)
+        .map_err(|error| term_error(error, 1, 5))?
+        .map(|(term, data_address, offset_bits, grew)| AppendStart {
+            term,
+            data_address,
+            offset_bits,
+            copied_bits: if grew { offset_bits } else { 0 },
+        }))
+}
+
+/// Build the new writable proc binary after erts' active writer check failed.
+// Port of erts/emulator/beam/erl_bits.c:1854-1917 (`erts_bs_append_checked`), OTP-29.1.1.
+pub fn append_start_nonwritable<H: HeapAlloc>(
+    source: Term,
+    extra_bits: usize,
+    unit: usize,
+    heap: &mut H,
+) -> Result<AppendStart, BitsError> {
+    let prefix_bits =
+        with_binary(source, |_, _, bits| bits).ok_or(BitsError::BadArg { segment: 1 })?;
+    if unit > 1 && !prefix_bits.is_multiple_of(unit) {
+        return Err(BitsError::BadArg { segment: 1 });
+    }
+    let total_bits = prefix_bits
+        .checked_add(extra_bits)
+        .filter(|bits| *bits <= isize::MAX as usize)
+        .ok_or(BitsError::SystemLimit { segment: 1 })?;
+
+    let total_bytes = total_bits.div_ceil(8);
+    let capacity = grow_proc_binary_size(total_bytes)?.max(256);
+    with_binary(source, |payload, start_bit, source_bits| {
+        if source_bits != prefix_bits {
+            return Err(BitsError::BadArg { segment: 1 });
+        }
+        TermBuilder::new(heap)
+            .writable_binary_from_bit_prefix_with_address(
+                payload,
+                start_bit,
+                prefix_bits,
+                total_bits,
+                capacity,
+            )
+            .map(|(term, data_address)| AppendStart {
+                term,
+                data_address,
+                offset_bits: prefix_bits,
+                copied_bits: prefix_bits,
+            })
+            .map_err(|error| term_error(error, 1, 8))
+    })
+    .ok_or(BitsError::BadArg { segment: 1 })?
 }
 
 fn append_inner<H: HeapAlloc>(
