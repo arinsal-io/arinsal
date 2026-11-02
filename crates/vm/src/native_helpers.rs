@@ -383,13 +383,78 @@ pub extern "C" fn arinsal_beamasm_timeout(header: *mut ProcessHeader) {
     }
 }
 
+// Adapter for erts/emulator/beam/jit/arm/instr_bs.cpp:2387-2400, OTP-29.1.1:
+// this table retains module string bytes used by `am_string` segments.
 fn match_strings() -> &'static std::sync::RwLock<Vec<std::sync::Arc<[u8]>>> {
     static STRINGS: std::sync::OnceLock<std::sync::RwLock<Vec<std::sync::Arc<[u8]>>>> =
         std::sync::OnceLock::new();
     STRINGS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
 }
 
+// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1442-1600 and 2387-2400, OTP-29.1.1.
+fn parse_bs_create_bin_segments<'a>(
+    process: &crate::Process,
+    count: usize,
+    base_slot: usize,
+    all: Term,
+    strings: Option<&'a [std::sync::Arc<[u8]>]>,
+) -> Option<smallvec::SmallVec<[arinsal_bits::Segment<'a>; 4]>> {
+    use arinsal_bits::{SegFlags, SegSize, SegType, Segment, SegmentValue};
+
+    let mut segments = smallvec::SmallVec::with_capacity(count);
+    for index in 0..count {
+        let base = base_slot + index * 7;
+        let small = |offset: usize| {
+            process.x[base + offset]
+                .as_small()
+                .and_then(|n| u64::try_from(n).ok())
+        };
+        let ty = match small(0)? {
+            0 => SegType::Integer,
+            1 => SegType::Float,
+            2 => SegType::Binary,
+            3 => SegType::Append,
+            4 => SegType::PrivateAppend,
+            5 => SegType::Utf8,
+            6 => SegType::Utf16,
+            7 => SegType::Utf32,
+            8 => SegType::String,
+            _ => return None,
+        };
+        let source = process.x[base + 5];
+        let value = if ty == SegType::String {
+            let string = usize::try_from(source.as_small()?).ok()?;
+            SegmentValue::String(strings?.get(string)?.as_ref())
+        } else {
+            SegmentValue::Term(source)
+        };
+        let flags = small(3)?;
+        let size_term = process.x[base + 6];
+        let size = if small(4)? != 0 {
+            SegSize::Units(size_term.as_small().and_then(|n| u64::try_from(n).ok())?)
+        } else if size_term == all {
+            SegSize::All
+        } else {
+            SegSize::Term(size_term)
+        };
+        segments.push(Segment {
+            ty,
+            index: usize::try_from(small(1)?).ok()?,
+            unit: u8::try_from(small(2)?).ok()?,
+            flags: SegFlags {
+                little: flags & 2 != 0,
+                signed: flags & 4 != 0,
+                native: flags & 16 != 0,
+            },
+            value,
+            size,
+        });
+    }
+    Some(segments)
+}
+
 /// Registers a string-table constant matched by `i_bs_match_string` and returns its handle.
+// Adapter for erts/emulator/beam/jit/arm/instr_bs.cpp:2387-2400, OTP-29.1.1.
 pub(crate) fn register_match_string(bytes: &[u8]) -> u64 {
     let mut strings = match_strings().write().unwrap_or_else(|e| e.into_inner());
     strings.push(std::sync::Arc::from(bytes));
@@ -5029,7 +5094,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     live: u64,
     alloc: u64,
 ) -> u64 {
-    use arinsal_bits::{BitsError, SegFlags, SegSize, SegType, Segment, SegmentValue};
+    use arinsal_bits::{BitsError, SegSize, SegType};
     let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -5049,49 +5114,15 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     // Dead X registers below the staged segments must not become GC roots.
     process.x[live..base_slot].fill(Term::NIL);
     let all = crate::signals::atom("all");
-    let parse = |process: &crate::Process| -> Option<smallvec::SmallVec<[Segment<'static>; 4]>> {
-        let mut segments = smallvec::SmallVec::with_capacity(count);
-        for index in 0..count {
-            let base = base_slot + index * 7;
-            let small = |offset: usize| {
-                process.x[base + offset]
-                    .as_small()
-                    .and_then(|n| u64::try_from(n).ok())
-            };
-            let ty = match small(0)? {
-                0 => SegType::Integer,
-                1 => SegType::Float,
-                2 => SegType::Binary,
-                3 => SegType::Append,
-                4 => SegType::PrivateAppend,
-                5 => SegType::Utf8,
-                6 => SegType::Utf16,
-                7 => SegType::Utf32,
-                _ => return None,
-            };
-            let flags = small(3)?;
-            let size_term = process.x[base + 6];
-            let size = if small(4)? != 0 {
-                SegSize::Units(size_term.as_small().and_then(|n| u64::try_from(n).ok())?)
-            } else if size_term == all {
-                SegSize::All
-            } else {
-                SegSize::Term(size_term)
-            };
-            segments.push(Segment {
-                ty,
-                index: usize::try_from(small(1)?).ok()?,
-                unit: u8::try_from(small(2)?).ok()?,
-                flags: SegFlags {
-                    little: flags & 2 != 0,
-                    signed: flags & 4 != 0,
-                    native: flags & 16 != 0,
-                },
-                value: SegmentValue::Term(process.x[base + 5]),
-                size,
-            });
-        }
-        Some(segments)
+    let has_string = (0..count).any(|index| process.x[base_slot + index * 7].as_small() == Some(8));
+    let string_table = has_string.then(|| {
+        match_strings()
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    });
+    let strings = string_table.as_deref().map(Vec::as_slice);
+    let parse = |process: &crate::Process| {
+        parse_bs_create_bin_segments(process, count, base_slot, all, strings)
     };
     let Some(initial) = parse(process) else {
         crate::native_hooks::set_error(process, "badarg");
@@ -5164,47 +5195,104 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     }
 }
 
-/// Runs the no-growth private append and charges its writable-binary overhead on the process.
-// Port of erts/emulator/beam/erl_bits.c:1961-1983 (`erts_bs_private_append_checked`), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_bs_private_append_fast(
-    ebs: *mut u64,
+/// Starts `bs_create_bin` append and publishes its writable buffer to native stores.
+// Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_bs_append_checked(
     process_header: *mut ProcessHeader,
-    bin: u64,
+    source_index: u64,
     extra_bits: u64,
+    unit: u64,
+    live: u64,
+    alloc: u64,
 ) -> u64 {
-    private_append(process_header, ebs, bin, extra_bits, false)
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(process_header) else {
+        return 0;
+    };
+    let (Ok(source_index), Ok(extra_bits), Ok(unit), Ok(live), Ok(alloc)) = (
+        usize::try_from(source_index),
+        usize::try_from(extra_bits),
+        usize::try_from(unit),
+        usize::try_from(live),
+        usize::try_from(alloc),
+    ) else {
+        return 0;
+    };
+    if unit == 0 || source_index >= process.x.len() || live > process.x.len() {
+        return 0;
+    }
+    let mut request = 5_usize.saturating_add(alloc);
+    let mut collect_before_append = false;
+    let start = 'append: loop {
+        if collect_before_append && process.ensure_native_roots(request, live).is_err() {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return u64::MAX;
+        }
+        let source = process.x[source_index];
+        match arinsal_bits::append_writer_start(source, extra_bits, unit, &mut process.heap) {
+            Ok(Some(start)) => break 'append start,
+            Ok(None) => {
+                let mut fresh_request = 8_usize.saturating_add(alloc);
+                loop {
+                    if process.ensure_native_roots(fresh_request, live).is_err() {
+                        crate::native_hooks::set_error(process, "system_limit");
+                        process.sync_native_header();
+                        return u64::MAX;
+                    }
+                    let source = process.x[source_index];
+                    match arinsal_bits::append_start_nonwritable(
+                        source,
+                        extra_bits,
+                        unit,
+                        &mut process.heap,
+                    ) {
+                        Ok(start) => break 'append start,
+                        Err(arinsal_bits::BitsError::HeapFull { need_words }) => {
+                            fresh_request = need_words
+                                .saturating_add(alloc)
+                                .max(fresh_request.saturating_mul(2));
+                        }
+                        Err(_) => return 0,
+                    }
+                }
+            }
+            Err(arinsal_bits::BitsError::HeapFull { need_words }) => {
+                request = need_words
+                    .saturating_add(alloc)
+                    .max(request.saturating_mul(2));
+                collect_before_append = true;
+            }
+            Err(_) => return 0,
+        }
+    };
+    registers.erl_bits_state = [start.data_address as u64, start.offset_bits as u64];
+    process.reductions = process
+        .reductions
+        .saturating_sub((start.copied_bits / (8 * 1024)).min(i32::MAX as usize) as i32);
+    process.sync_native_header();
+    crate::native_hooks::raw(start.term)
 }
 
-/// Runs the reallocating private append outside the byte-copy loop and updates process accounting.
-// Port of erts/emulator/beam/erl_bits.c:1928-1934 and 1961-1983, OTP-29.1.1.
+/// Runs the checked private append and charges its writable-binary overhead on the process.
+// Port of erts/emulator/beam/erl_bits.c:1928-2017 (`erts_bs_private_append_checked`), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_bs_private_append_checked(
     ebs: *mut u64,
     process_header: *mut ProcessHeader,
     bin: u64,
     extra_bits: u64,
 ) -> u64 {
-    private_append(process_header, ebs, bin, extra_bits, true)
-}
-
-#[inline(always)]
-fn private_append(
-    process_header: *mut ProcessHeader,
-    ebs: *mut u64,
-    bin: u64,
-    extra_bits: u64,
-    checked: bool,
-) -> u64 {
     // BeamAsm already committed native cursors before the direct C-style helper call.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 and erl_bits.c:1928-1983,
     // OTP-29.1.1.
-    let Some(process) = crate::native_hooks::process_from_header(process_header) else {
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime(process_header) else {
         return 0;
     };
-    let update = if checked {
-        arinsal_term::erts_bs_private_append_checked_with_update(ebs, bin, extra_bits)
-    } else {
-        arinsal_term::erts_bs_private_append_fast_with_update(ebs, bin, extra_bits)
-    };
+    let update = arinsal_term::erts_bs_private_append_checked_with_heap(
+        ebs,
+        bin,
+        extra_bits,
+        &mut process.heap,
+    );
     if update.result != 0 && update.result != u64::MAX {
         process.heap.update_writable_binary_overhead_at(
             crate::native_hooks::from_raw(bin),
@@ -5212,6 +5300,10 @@ fn private_append(
             update.old_size_bits,
             update.new_size_bits,
         );
+        process.reductions = process
+            .reductions
+            .saturating_sub((update.copied_bits / (8 * 1024)).min(i32::MAX as usize) as i32);
+        process.sync_native_header();
     }
     update.result
 }

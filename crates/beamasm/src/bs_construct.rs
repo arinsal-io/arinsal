@@ -1,6 +1,8 @@
 //! AArch64 emitters for BEAM bit syntax construction.
 
-pub use crate::bs_fast::{install_bs_append_binary, install_bs_gc, install_bs_private_append};
+pub use crate::bs_fast::{
+    install_bs_append_binary, install_bs_append_checked, install_bs_gc, install_bs_private_append,
+};
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::Gpr;
@@ -31,6 +33,8 @@ pub enum BsSegmentKind {
     Utf16 = 6,
     /// UTF-32 code point.
     Utf32 = 7,
+    /// Literal bytes from the module string table.
+    String = 8,
 }
 
 /// One segment operand group (`Type Seg Unit Flags Src Size`) of `bs_create_bin`.

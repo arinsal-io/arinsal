@@ -191,12 +191,26 @@ struct StackTrace;
 
 impl StackTrace {
     /// Reserves the exact bignum extent so the CP walk can fill `trace[]` in place.
-    fn reserve(heap: &mut impl HeapAlloc, max_depth: usize) -> Result<Term, VmError> {
+    fn reserve(
+        heap: &mut impl HeapAlloc,
+        max_depth: usize,
+        freason: u64,
+        pc: u64,
+        current: u64,
+    ) -> Result<Term, VmError> {
         let digits = 5usize
             .checked_add(max_depth)
             .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
-        TermBuilder::new(heap)
-            .pos_bignum_reserve(digits)
+        let mut block = TermBuilder::new(heap)
+            .pos_bignum_block(digits)
+            .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))?;
+        for field in [freason, pc, current, 0, max_depth as u64] {
+            block.write_header(field).map_err(|error| {
+                VmError::Unsupported(format!("stacktrace allocation {error:?}"))
+            })?;
+        }
+        block
+            .term_at(0)
             .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))
     }
 
@@ -874,10 +888,9 @@ pub(super) fn save_direct(
     // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1: the trace, its
     // argument list, the `error_info` map and the ftrace tuple are carved from one block that is
     // sized first. A full young heap then costs one heap fragment per raise, not one per term.
-    let words = save_block_words(top, max_depth);
     let (stack_trace, ftrace) = {
-        let mut heap = TraceHeap::with_block(&mut p.heap, words);
-        let stack_trace = StackTrace::reserve(&mut heap, max_depth)?;
+        let mut heap = TraceHeap::new(&mut p.heap);
+        let stack_trace = StackTrace::reserve(&mut heap, max_depth, freason, pc, current)?;
         let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
         let ftrace = Ftrace {
             stack_trace,
@@ -889,10 +902,6 @@ pub(super) fn save_direct(
     };
     stack_trace
         .with_bignum_digits_mut(|digits| {
-            digits[0] = freason;
-            digits[1] = pc;
-            digits[2] = current;
-            digits[4] = max_depth as u64;
             let mut offset = 0;
             if bif_top
                 && max_depth > 0
@@ -918,46 +927,6 @@ pub(super) fn save_direct(
         })
         .ok_or_else(|| VmError::Unsupported("stacktrace bignum".into()))?;
     Ok(ftrace)
-}
-
-/// Words `save_stacktrace` allocates for one raise: the StackTrace bignum, the argument list,
-/// the `error_info` map and the `{StackTrace, Args, ErrorInfo}` tuple. An estimate only; a
-/// shortfall falls back to ordinary allocation.
-fn save_block_words(top: Option<SaveTop<'_>>, max_depth: usize) -> usize {
-    let mut words = 1 + 5 + max_depth + 4;
-    let info = match top {
-        Some(SaveTop::Live(TopFrame::BifRegisters {
-            arity,
-            module,
-            info,
-            ..
-        })) => {
-            words += 2 * arity;
-            Some((*module, *info))
-        }
-        Some(SaveTop::Live(TopFrame::Bif { module, info, .. })) => Some((*module, *info)),
-        Some(SaveTop::Live(
-            TopFrame::CurrentArgsWithInfo(..) | TopFrame::CurrentArgsInfoTerm(..),
-        )) => {
-            words += 5;
-            None
-        }
-        _ => None,
-    };
-    if let Some((module, info)) = info {
-        let has_format = trace_atoms()
-            .format_modules
-            .iter()
-            .any(|(bif, _)| *bif == module);
-        match info {
-            BifErrorInfo::None => {}
-            BifErrorInfo::Map(_) => words += 5,
-            BifErrorInfo::Plain if has_format => words += 6 + 5,
-            BifErrorInfo::Cause(_) if has_format => words += 8 + 5,
-            BifErrorInfo::Plain | BifErrorInfo::Cause(_) => {}
-        }
-    }
-    words
 }
 
 pub(super) struct StackTraceSave<'a> {
@@ -1819,13 +1788,18 @@ pub(super) fn build(
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
-/// `FunctionInfo` scratch storage from `global.h`: MFA, needed, loc and filename pointer.
-const FRAME_INFO_WORDS: usize = 4;
+/// The frame lookups of one trace (`FunctionInfo` in `global.h`).
+type FrameScratch = smallvec::SmallVec<[PreparedFrame; 10]>;
 
-/// The frame lookups of one trace (`ERTS_ALC_T_TMP` in erts): inline for the default
-/// backtrace depth, so building a trace does not allocate for them. The caller owns it, so the
-/// prepared result stays small and is not copied between the builders.
-type FrameScratch = smallvec::SmallVec<[u64; 40]>;
+#[derive(Clone, Copy)]
+struct PreparedFrame {
+    module: Atom,
+    function: Atom,
+    arity: u8,
+    location: Option<(Term, u64)>,
+    /// `FunctionInfo.needed` (`erts_build_mfa_item` words), before the list cell.
+    needed: usize,
+}
 
 struct PreparedFrames {
     frames: usize,
@@ -1902,6 +1876,7 @@ pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, V
     }
 }
 
+// Port of erts/emulator/beam/beam_common.c:1205-1267 (`build_stacktrace`), OTP-29.1.1.
 fn prepare_frames(
     digits: &[u64],
     ranges: Option<&[crate::native_bridge::ModuleRange]>,
@@ -1931,10 +1906,6 @@ fn prepare_frames(
         .map(std::convert::AsRef::as_ref);
     let mut frames = 0usize;
     let mut words = 0usize;
-    let capacity = (1 + count).min(depth);
-    block.clear();
-    block.resize(capacity * FRAME_INFO_WORDS, 0);
-    let slots = &mut block[..];
     let frame = if pc & (1 << 63) != 0 {
         let payload = pc & !(1 << 63);
         let module = tables.and_then(|tables| tables.modules.get((payload >> 32) as usize));
@@ -1967,9 +1938,7 @@ fn prepare_frames(
         )
     };
     if let Some((module, function, arity, location)) = frame {
-        let located = location.is_some();
-        write_frame(slots, frames, module, function, arity, location);
-        words += if located { 17 } else { 7 };
+        words += write_frame(block, module, function, arity, location) + 2;
         frames += 1;
     }
     if pc & (1 << 63) == 0 && frames == 0 {
@@ -1990,16 +1959,13 @@ fn prepare_frames(
                 continue;
             };
             let location = literal_location(&resolved, current_module);
-            let located = location.is_some();
-            write_frame(
-                slots,
-                frames,
+            words += write_frame(
+                block,
                 resolved.module_atom,
                 resolved.function_atom,
                 resolved.arity,
                 location,
-            );
-            words += if located { 17 } else { 7 };
+            ) + 2;
             frames += 1;
             continue;
         }
@@ -2014,9 +1980,7 @@ fn prepare_frames(
             continue;
         };
         let location = module.line_term_at(call_site);
-        let located = location.is_some();
-        write_frame(slots, frames, module.name_atom, function, arity, location);
-        words += if located { 17 } else { 7 };
+        words += write_frame(block, module.name_atom, function, arity, location) + 2;
         frames += 1;
     }
     Ok(FramePrep::Ready(PreparedFrames {
@@ -2056,8 +2020,6 @@ fn prepare_bif_frames(
         return Ok(FramePrep::Fallback);
     }
     block.clear();
-    block.resize(count.max(1) * FRAME_INFO_WORDS, 0);
-    let slots = &mut block[..];
     let mut frames = 0usize;
     let mut words = 0usize;
     let mut first_continuation = 5;
@@ -2074,9 +2036,7 @@ fn prepare_bif_frames(
                 return Ok(FramePrep::Fallback);
             };
             let location = module.line_term_at(ip);
-            let located = location.is_some();
-            write_frame(slots, frames, module.name_atom, function, arity, location);
-            words += if located { 17 } else { 7 };
+            words += write_frame(block, module.name_atom, function, arity, location) + 2;
         } else {
             let Some(frame) = usize::try_from(word)
                 .ok()
@@ -2085,16 +2045,13 @@ fn prepare_bif_frames(
                 return Ok(FramePrep::Fallback);
             };
             let location = literal_location(&frame, None);
-            let located = location.is_some();
-            write_frame(
-                slots,
-                frames,
+            words += write_frame(
+                block,
                 frame.module_atom,
                 frame.function_atom,
                 frame.arity,
                 location,
-            );
-            words += if located { 17 } else { 7 };
+            ) + 2;
         }
         frames += 1;
         first_continuation += 1;
@@ -2108,16 +2065,13 @@ fn prepare_bif_frames(
                 continue;
             };
             let location = literal_location(&frame, None);
-            let located = location.is_some();
-            write_frame(
-                slots,
-                frames,
+            words += write_frame(
+                block,
                 frame.module_atom,
                 frame.function_atom,
                 frame.arity,
                 location,
-            );
-            words += if located { 17 } else { 7 };
+            ) + 2;
             frames += 1;
             continue;
         }
@@ -2131,9 +2085,7 @@ fn prepare_bif_frames(
             continue;
         };
         let location = module.line_term_at(call_site);
-        let located = location.is_some();
-        write_frame(slots, frames, module.name_atom, function, arity, location);
-        words += if located { 17 } else { 7 };
+        words += write_frame(block, module.name_atom, function, arity, location) + 2;
         frames += 1;
     }
     Ok(FramePrep::Ready(PreparedFrames {
@@ -2149,43 +2101,45 @@ fn prepare_bif_frames(
 }
 
 fn write_frame(
-    slots: &mut [u64],
-    index: usize,
+    frames: &mut FrameScratch,
     module: Atom,
     function: Atom,
     arity: u8,
     location: Option<(Term, u64)>,
-) {
-    let base = index * FRAME_INFO_WORDS;
-    slots[base] = (u64::from(module.0) << 32) | u64::from(function.0);
-    if let Some((file, line)) = location {
-        slots[base + 1] = 17;
-        slots[base + 2] = (line << 32) | u64::from(arity);
-        slots[base + 3] = file.tagged_word();
-    } else {
-        slots[base + 1] = 7;
-        slots[base + 2] = u64::from(arity);
-        slots[base + 3] = 0;
-    }
+) -> usize {
+    // Port of erts/emulator/beam/beam_common.c:1236-1278 (`build_stacktrace`): retain the
+    // lookup result and the `needed` field used by the single heap-size pass.
+    let (frame, needed) = prepare_frame(module, function, arity, location);
+    frames.push(frame);
+    needed
 }
 
-fn read_frame(slots: &[u64], index: usize) -> (Atom, Atom, u8, Option<(Term, u64)>) {
-    let base = index * FRAME_INFO_WORDS;
-    let location = (slots[base + 1] == 17).then(|| {
-        (
-            crate::native_hooks::from_raw(slots[base + 3]),
-            slots[base + 2] >> 32,
-        )
-    });
+// Port of erts/emulator/beam/beam_common.c:1205-1267 (`build_stacktrace`), OTP-29.1.1.
+fn prepare_frame(
+    module: Atom,
+    function: Atom,
+    arity: u8,
+    location: Option<(Term, u64)>,
+) -> (PreparedFrame, usize) {
+    let needed = if location.is_some() { 15 } else { 5 };
     (
-        Atom((slots[base] >> 32) as u32),
-        Atom(slots[base] as u32),
-        slots[base + 2] as u8,
-        location,
+        PreparedFrame {
+            module,
+            function,
+            arity,
+            location,
+            needed,
+        },
+        needed,
     )
 }
 
-fn cons_prepared(p: &mut Process, ready: PreparedFrames, block: &[u64]) -> Result<Term, VmError> {
+// Port of erts/emulator/beam/beam_common.c:1267-1284 (`erts_build_mfa_item` loop), OTP-29.1.1.
+fn cons_prepared(
+    p: &mut Process,
+    ready: PreparedFrames,
+    block: &[PreparedFrame],
+) -> Result<Term, VmError> {
     let bif_words = ready
         .bif
         .map_or(0, |bif| if bif.error_info.is_some() { 12 } else { 7 });
@@ -2199,18 +2153,21 @@ fn cons_prepared(p: &mut Process, ready: PreparedFrames, block: &[u64]) -> Resul
     {
         let mut builder = TermBuilder::new(&mut heap);
         for index in (0..ready.frames).rev() {
-            let (module, function, arity, location) = read_frame(block, index);
-            let location = location.map(|(file, number)| arinsal_term::MfaLocation {
-                file_atom,
-                file,
-                line_atom,
-                line: Term::small(number as i64).expect("source line is a small"),
-            });
+            let frame = block[index];
+            debug_assert_eq!(frame.needed, if frame.location.is_some() { 15 } else { 5 });
+            let location = frame
+                .location
+                .map(|(file, number)| arinsal_term::MfaLocation {
+                    file_atom,
+                    file,
+                    line_atom,
+                    line: Term::small(number as i64).expect("source line is a small"),
+                });
             list = builder
                 .cons_mfa_frame(
-                    Term::atom(module),
-                    Term::atom(function),
-                    Term::small(i64::from(arity)).expect("arity is small"),
+                    Term::atom(frame.module),
+                    Term::atom(frame.function),
+                    Term::small(i64::from(frame.arity)).expect("arity is small"),
                     location,
                     list,
                 )

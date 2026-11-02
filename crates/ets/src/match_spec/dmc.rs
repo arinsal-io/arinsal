@@ -33,7 +33,7 @@ const DBIF_ALL: u32 = DBIF_TABLE_GUARD | DBIF_TABLE_BODY | DBIF_TRACE_GUARD | DB
 /// `DMC_DEFAULT_SIZE`: variables numbered at or above this force a compaction.
 const DMC_DEFAULT_SIZE: usize = 100;
 
-/// Guard BIFs with an allocation-free small-integer or type-test fast path.
+/// Guard BIFs with an allocation-free small-integer or type-test implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Fast {
     Eq,
@@ -70,7 +70,7 @@ pub(super) struct GuardBif {
     pub name: &'static str,
     pub arity: usize,
     flags: u32,
-    pub fast: Fast,
+    pub fast_fn: Option<super::pam::FastBifFn>,
 }
 
 macro_rules! bif {
@@ -79,7 +79,7 @@ macro_rules! bif {
             name: $name,
             arity: $arity,
             flags: $flags,
-            fast: Fast::$fast,
+            fast_fn: super::pam::fast_fn_for(Fast::$fast),
         }
     };
 }

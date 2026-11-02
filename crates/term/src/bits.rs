@@ -83,7 +83,6 @@ fn grow_proc_binary_size(size: usize) -> Result<usize, TermError> {
 
 fn resize_writable_binary(allocation: &mut BinaryBlock, new_len: usize) -> Result<(), TermError> {
     // Port of erts/emulator/beam/erl_binary.h:321 (erts_bin_realloc_fnf), OTP-29.1.1.
-    let old_len = allocation.apparent_size();
     let old_capacity = allocation.size();
     let new_capacity = if new_len > old_capacity {
         grow_proc_binary_size(new_len)?
@@ -94,9 +93,6 @@ fn resize_writable_binary(allocation: &mut BinaryBlock, new_len: usize) -> Resul
         allocation
             .realloc(new_capacity)
             .map_err(|_| TermError::SystemLimit)?;
-    }
-    if new_len > old_len {
-        allocation.bytes_mut_unique().ok_or(TermError::BadArg)?[old_len..new_len].fill(0);
     }
     allocation.set_flag_bits(BINARY_FLAG_ACTIVE_WRITER);
     allocation.set_apparent_size(new_len);
@@ -344,6 +340,14 @@ fn sub_bits_original(term: Term) -> Term {
 
 #[inline(always)]
 fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
+    let (bin_ref, binary) = owner_any(term)?;
+    binary
+        .has_flags(BINARY_FLAG_WRITABLE)
+        .then_some((bin_ref, binary))
+}
+
+// Port of BinRef and SUB_BITS resolution in erts/emulator/beam/erl_bits.c:1928-2009, OTP-29.1.1.
+fn owner_any(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
     if term.header()? & 63 != SUB_BITS {
         return None;
     }
@@ -359,9 +363,6 @@ fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
             return None;
         }
         let header = *p.add(1) as *const u64;
-        if *header & BINARY_FLAG_WRITABLE == 0 {
-            return None;
-        }
         let capacity = *header.add(3) as usize;
         let words = BINARY_HEADER_WORDS + capacity.div_ceil(8);
         Some((p, BinaryView::from_header(header, words)))
@@ -478,7 +479,7 @@ pub fn writable_finalize(term: Term) {
         && sub_bits_flags(term) & SUB_BITS_VOLATILE != 0
     {
         let capacity = binary.capacity().unwrap_or(0);
-        binary.clear_flags(BINARY_FLAG_ACTIVE_WRITER);
+        binary.clear_flags(BINARY_FLAG_WRITABLE | BINARY_FLAG_ACTIVE_WRITER);
         // Port of erts/emulator/beam/erl_bits.c:2053 (erts_pin_writable_binary), OTP-29.1.1.
         // SAFETY: the process owns the writer and no binary view is retained.
         unsafe {
@@ -716,6 +717,8 @@ pub struct PrivateAppendUpdate {
     pub old_size_bits: usize,
     /// Position after the append in bits.
     pub new_size_bits: usize,
+    /// Prefix bits copied when the backing binary had to be reallocated.
+    pub copied_bits: usize,
 }
 
 impl PrivateAppendUpdate {
@@ -725,6 +728,7 @@ impl PrivateAppendUpdate {
             bin_ref: 0,
             old_size_bits: 0,
             new_size_bits: 0,
+            copied_bits: 0,
         }
     }
 }
@@ -760,7 +764,10 @@ pub fn erts_bs_private_append_fast_with_update(
         let header = *br.add(1) as *const u64;
         let capacity = *header.add(3) as usize;
         let view = BinaryView::from_header(header, BINARY_HEADER_WORDS + capacity.div_ceil(8));
-        if !view.has_flags(BINARY_FLAG_ACTIVE_WRITER) {
+        if !view.has_flags(BINARY_FLAG_WRITABLE) {
+            return PrivateAppendUpdate::new(u64::MAX);
+        }
+        if *header.add(2) != 1 {
             return PrivateAppendUpdate::new(0);
         }
         let adjustment = view.bytes_ptr() as usize & 3;
@@ -794,6 +801,7 @@ pub fn erts_bs_private_append_fast_with_update(
             bin_ref: br as usize,
             old_size_bits: current,
             new_size_bits: new_bits,
+            copied_bits: 0,
         }
     }
 }
@@ -815,6 +823,32 @@ pub fn erts_bs_private_append_checked_with_update(
     };
     match prepare_private_append(bin, extra, false, false, ebs) {
         Ok(update) => update,
+        Err(_) => PrivateAppendUpdate::new(0),
+    }
+}
+
+/// Private append checked path including erts' call-tracing copy-on-write branch.
+// Port of erts/emulator/beam/erl_bits.c:1928-2017, OTP-29.1.1.
+pub fn erts_bs_private_append_checked_with_heap<H: HeapAlloc>(
+    ebs: *mut u64,
+    bin: u64,
+    extra_bits: u64,
+    heap: &mut H,
+) -> PrivateAppendUpdate {
+    let fast = erts_bs_private_append_fast_with_update(ebs, bin, extra_bits);
+    if fast.result != u64::MAX {
+        return fast;
+    }
+    let Ok(extra) = usize::try_from(extra_bits) else {
+        return PrivateAppendUpdate::new(0);
+    };
+    let writable = prepare_private_append(bin, extra, false, false, ebs);
+    match writable {
+        Ok(update) if update.result != 0 => update,
+        Ok(_) => match prepare_private_append_nonwritable(bin, extra, ebs, heap) {
+            Ok(update) => update,
+            Err(_) => PrivateAppendUpdate::new(0),
+        },
         Err(_) => PrivateAppendUpdate::new(0),
     }
 }
@@ -850,6 +884,7 @@ fn prepare_private_append(
         };
         if sub_bits_flags(term) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE
             || !binary.has_flags(BINARY_FLAG_WRITABLE)
+            || binary.load(2, Ordering::Relaxed) != Some(1)
         {
             return Ok(PrivateAppendUpdate::new(0));
         }
@@ -872,7 +907,13 @@ fn prepare_private_append(
         // erl_bits.c:72 (GROW_PROC_BIN_SIZE), OTP-29.1.1.
         let mut allocation = BinaryBlock::borrow_from_view(binary)
             .expect("live writable Binary has allocator metadata");
+        let old_capacity = allocation.size();
         resize_writable_binary(&mut allocation, new_bits.div_ceil(8))?;
+        let copied_bits = if allocation.size() > old_capacity {
+            current
+        } else {
+            0
+        };
         *bin_ref.cast_mut().add(1) = allocation.header_ptr() as u64;
         *term.raw_ptr().add(1).cast_mut() = (allocation.header_ptr().wrapping_add(4) as u64 & !3)
             | SUB_BITS_MUTABLE
@@ -893,11 +934,79 @@ fn prepare_private_append(
             bin_ref: bin_ref as usize,
             old_size_bits: current,
             new_size_bits: new_bits,
+            copied_bits,
+        })
+    }
+}
+
+#[cold]
+#[inline(never)]
+// Port of erts/emulator/beam/erl_bits.c:1994-2017, OTP-29.1.1.
+fn prepare_private_append_nonwritable<H: HeapAlloc>(
+    bin: u64,
+    extra_bits: usize,
+    ebs: *mut u64,
+    heap: &mut H,
+) -> Result<PrivateAppendUpdate, TermError> {
+    // SAFETY: `bin` is a live SUB_BITS whose original BinRef keeps its Binary alive.
+    unsafe {
+        let term = Term::from_raw_bits(bin);
+        let Some((bin_ref, binary)) = owner_any(term) else {
+            return Ok(PrivateAppendUpdate::new(0));
+        };
+        if sub_bits_flags(term) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE
+            || binary.has_flags(BINARY_FLAG_WRITABLE)
+        {
+            return Ok(PrivateAppendUpdate::new(0));
+        }
+        let adjustment = binary.bytes_ptr() as usize & 3;
+        let current = (*term.raw_ptr().add(3) as usize)
+            .checked_sub(adjustment * 8)
+            .ok_or(TermError::BadArg)?;
+        let new_bits = current
+            .checked_add(extra_bits)
+            .filter(|bits| *bits <= isize::MAX as usize)
+            .ok_or(TermError::SystemLimit)?;
+        let used_size = new_bits.div_ceil(8);
+        // Port of GROW_PROC_BIN_SIZE plus sys_memcpy(min(old orig_size,new size)); OTP-29.1.1.
+        let capacity = grow_proc_binary_size(used_size)?;
+        let copy_size = binary.capacity().ok_or(TermError::BadArg)?.min(capacity);
+        let prefix = binary.bytes(copy_size).ok_or(TermError::BadArg)?;
+        let (result, data_address) = TermBuilder::new(heap)
+            .writable_binary_copy_in_fragment_with_address(prefix, new_bits, capacity)?;
+        if !ebs.is_null() {
+            publish_ebs(ebs, data_address as u64, current as u64);
+        }
+        Ok(PrivateAppendUpdate {
+            result: result.tagged_word(),
+            bin_ref: bin_ref as usize,
+            old_size_bits: current,
+            new_size_bits: new_bits,
+            copied_bits: current,
         })
     }
 }
 
 impl<H: HeapAlloc> TermBuilder<'_, H> {
+    /// Copy a nonwritable private-append Binary into its new heap-fragment writer.
+    // Port of erts/emulator/beam/erl_bits.c:1994-2009 (`HeapFragOnlyAlloc` and `build_writable_bitstring`), OTP-29.1.1.
+    pub fn writable_binary_copy_in_fragment_with_address(
+        &mut self,
+        prefix: &[u8],
+        visible_bits: usize,
+        capacity: usize,
+    ) -> Result<(Term, usize), TermError> {
+        if visible_bits > isize::MAX as usize || prefix.len() > capacity {
+            return Err(TermError::BadArg);
+        }
+        if !self.heap.supports_writable_binary() {
+            return Err(TermError::Unsupported("writable binary heap owner"));
+        }
+        let binary =
+            WritableBinary::from_prefix(prefix, prefix.len(), capacity, visible_bits.div_ceil(8))?;
+        self.install_writable_binary(binary, visible_bits, visible_bits, true)
+    }
+
     /// Box a byte range owned by an opaque native resource without copying it.
     pub fn external_binary(&mut self, owner: Arc<ExternalBinary>) -> Result<Term, TermError> {
         if !self.heap.supports_external_binary() {
@@ -1091,6 +1200,55 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         self.install_writable_binary(binary, visible_bits, visible_bits, false)
     }
 
+    /// Build an append destination from a byte-sized prefix that starts at any bit offset.
+    ///
+    /// The source range is copied into its final writable allocation without an intermediate
+    /// buffer. `prefix_bits` must be byte aligned because the native append stores begin at the
+    /// resulting cursor.
+    // Port of erts/emulator/beam/erl_bits.c:1812-1917 (`erts_bs_append_checked`), OTP-29.1.1.
+    pub fn writable_binary_from_bit_prefix_with_address(
+        &mut self,
+        source: &[u8],
+        source_offset_bits: usize,
+        prefix_bits: usize,
+        visible_bits: usize,
+        capacity: usize,
+    ) -> Result<(Term, usize), TermError> {
+        if !prefix_bits.is_multiple_of(8)
+            || prefix_bits > visible_bits
+            || visible_bits > isize::MAX as usize
+            || source_offset_bits
+                .checked_add(prefix_bits)
+                .is_none_or(|end| end > source.len().saturating_mul(8))
+        {
+            return Err(TermError::BadArg);
+        }
+        if !self.heap.supports_writable_binary() {
+            return Err(TermError::Unsupported("writable binary heap owner"));
+        }
+        let visible_bytes = visible_bits.div_ceil(8);
+        let mut binary = WritableBinary::from_prefix(&[], visible_bytes, capacity, visible_bytes)?;
+        if prefix_bits != 0 {
+            let output = binary
+                .allocation
+                .bytes_mut_unique()
+                .ok_or(TermError::BadArg)?;
+            let byte_offset = source_offset_bits / 8;
+            let bit_offset = source_offset_bits % 8;
+            let prefix_bytes = prefix_bits / 8;
+            if bit_offset == 0 {
+                output[..prefix_bytes]
+                    .copy_from_slice(&source[byte_offset..byte_offset + prefix_bytes]);
+            } else {
+                for index in 0..prefix_bytes {
+                    output[index] = (source[byte_offset + index] << bit_offset)
+                        | (source[byte_offset + index + 1] >> (8 - bit_offset));
+                }
+            }
+        }
+        self.install_writable_binary(binary, visible_bits, visible_bits, false)
+    }
+
     fn writable_binary_with_allocation(
         &mut self,
         bytes: &[u8],
@@ -1206,7 +1364,8 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
             return Ok(None);
         };
         if sub_bits_flags(source) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE
-            || !binary.has_flags(BINARY_FLAG_ACTIVE_WRITER)
+            || !binary.has_flags(BINARY_FLAG_WRITABLE)
+            || binary.load(2, Ordering::Relaxed) != Some(1)
         {
             return Ok(None);
         }
@@ -1234,16 +1393,27 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         let old_capacity = binary.capacity().ok_or(TermError::BadArg)?;
         let p = self.words(5)?;
         self.heap
-            .update_writable_binary_overhead(source, end, new_bits);
-        let (_, binary) = owner(source).unwrap();
+            .update_writable_binary_overhead_at(source, bin_ref as usize, end, new_bits);
         // SAFETY: this process owns the active writer and no bytes are borrowed.
         let (term, data_address, grew) = unsafe {
-            let mut allocation = BinaryBlock::borrow_from_view(binary)
-                .expect("live writable Binary has allocator metadata");
-            resize_writable_binary(&mut allocation, new_bits.div_ceil(8))?;
-            *bin_ref.cast_mut().add(1) = allocation.header_ptr() as u64;
+            let new_len = new_bits.div_ceil(8);
+            let (header, data, grew) = if new_len > old_capacity {
+                let mut allocation = BinaryBlock::borrow_from_view(binary)
+                    .expect("live writable Binary has allocator metadata");
+                resize_writable_binary(&mut allocation, new_len)?;
+                (
+                    allocation.header_ptr(),
+                    allocation.header_ptr().wrapping_add(4).cast::<u8>(),
+                    true,
+                )
+            } else {
+                binary.set_flags(BINARY_FLAG_ACTIVE_WRITER);
+                binary.set_apparent_size(new_len);
+                (binary.header_ptr(), binary.bytes_ptr(), false)
+            };
+            *bin_ref.cast_mut().add(1) = header as u64;
             let old = source.raw_ptr().cast_mut();
-            *old.add(1) = (allocation.header_ptr().wrapping_add(4) as u64 & !3)
+            *old.add(1) = (data as u64 & !3)
                 | (if *old.add(1) & SUB_BITS_VOLATILE != 0 {
                     SUB_BITS_VOLATILE
                 } else {
@@ -1253,12 +1423,7 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
             std::ptr::copy_nonoverlapping(old, p, 5);
             *p.add(1) |= SUB_BITS_MUTABLE;
             *p.add(3) = (new_bits + adjustment * 8) as u64;
-            let address = allocation.header_ptr().wrapping_add(4).cast::<u8>() as usize;
-            (
-                Term::from_ptr(p, 2),
-                address,
-                allocation.size() > old_capacity,
-            )
+            (Term::from_ptr(p, 2), data as usize, grew)
         };
         Ok(Some((term, data_address, end, grew)))
     }

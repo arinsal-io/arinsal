@@ -1578,6 +1578,44 @@ impl HashStorage {
         .unwrap_or(Ok(()))
     }
 
+    /// Visit consecutive buckets assigned to one lock, keeping its read guard until the
+    /// traversal leaves that stripe or stops at a bucket boundary.
+    // Port of erts/emulator/beam/erl_db_hash.c (match_traverse, next_slot), OTP-29.1.1.
+    pub(super) fn try_with_ordered_stripe<E>(
+        &self,
+        from: usize,
+        stride: usize,
+        with_deleted: bool,
+        visit: &mut dyn FnMut(&StoredTerm) -> Result<(), E>,
+        after_bucket: &mut dyn FnMut(usize, usize) -> Result<bool, E>,
+    ) -> Result<(usize, bool), E> {
+        debug_assert!(stride > 0);
+        let active = self.nactive();
+        let stripe_index = self.stripe_index(from);
+        let stripe = &self.stripes[stripe_index];
+        let buckets = stripe.buckets.read();
+        let mut slot = from;
+        loop {
+            if slot >= active || self.stripe_index(slot) != stripe_index {
+                return Ok((slot, false));
+            }
+            let mut visited = 0;
+            for node in (RawHashIter {
+                next: buckets[slot / self.nlocks].head.as_deref(),
+            }) {
+                let deleted = node.prefix.pseudo_deleted();
+                if with_deleted || !deleted {
+                    visit(node)?;
+                    visited += 1;
+                }
+            }
+            if after_bucket(slot, visited)? {
+                return Ok((slot, true));
+            }
+            slot = slot.saturating_add(stride);
+        }
+    }
+
     /// First live object of the first non-empty slot at or after `slot`, in traversal order.
     pub(super) fn with_first_from_slot<R>(
         &self,

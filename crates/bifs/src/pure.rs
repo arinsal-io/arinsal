@@ -20,8 +20,8 @@ use crate::{BifError, Class, Ctx};
 mod binary_bifs;
 pub use binary_bifs::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistVecWalk,
-    allocate_iolist_binary, binary_part_2, finish_iolist_binary_output, iolist_size_direct,
-    iolist_to_binary_direct, iolist_to_iovec_shortcut, iolist_yield_reductions,
+    allocate_iolist_binary, binary_part_2, erlang_binary_to_list, finish_iolist_binary_output,
+    iolist_size_direct, iolist_to_binary_direct, iolist_to_iovec_shortcut, iolist_yield_reductions,
     with_iolist_binary_output,
 };
 
@@ -1304,6 +1304,34 @@ pub fn binary_bytes(term: Term) -> Result<Vec<u8>, BifError> {
     Ok(bytes)
 }
 
+/// Borrow aligned bytes directly, copying only when a byte-aligned bitstring starts mid-byte.
+///
+/// Port of erts/emulator/beam/erl_bits.h:596-638 (`erts_get_aligned_binary_bytes`), OTP-29.1.1.
+/// Ordinary binaries require no scratch buffer.
+pub(crate) fn with_aligned_binary_bytes<R>(
+    term: Term,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<R, BifError> {
+    with_binary_bytes(term, |view| {
+        let bits = view.bit_len();
+        if !bits.is_multiple_of(8) {
+            return Err(BADARG);
+        }
+        let len = bits / 8;
+        let start_bit = view.start_bit();
+        if start_bit.is_multiple_of(8) {
+            let start = start_bit / 8;
+            let end = start.checked_add(len).ok_or(BADARG)?;
+            let bytes = view.bytes().get(start..end).ok_or(BADARG)?;
+            return Ok(f(bytes));
+        }
+
+        let mut aligned = vec![0; len];
+        copy_bitstring_view_range_to(&view, 0, &mut aligned, 0, bits)?;
+        Ok(f(&aligned))
+    })?
+}
+
 /// Copy a bounded byte range from a live, byte-aligned bitstring.
 pub fn copy_binary_range(term: Term, start: usize, output: &mut [u8]) -> Result<(), BifError> {
     let bits = output.len().checked_mul(8).ok_or(BADARG)?;
@@ -1620,48 +1648,66 @@ fn float_opts(args: &[Term]) -> Result<arinsal_float::FloatFormatOpts, BifError>
     if args.len() == 1 {
         return Ok(opts);
     }
-    for entry in list(args[1])? {
-        if let Some(name) = atom_name(entry) {
-            match name {
-                "compact" => opts.compact = true,
-                "short" => opts.notation = arinsal_float::FloatNotation::Short,
-                _ => return Err(BADARG),
-            }
-        } else {
-            if tuple_arity(entry)? != 2 {
-                return Err(BADARG);
-            }
-            let option = tuple_element(entry, 1)?;
+    // Port of erts/emulator/beam/bif.c:3378-3446 (do_float_to_charbuf), OTP-29.1.1.
+    let mut tail = args[1];
+    while let Some((entry, next)) = next_cons(tail) {
+        if entry == Term::atom(atoms::COMPACT) {
+            opts.compact = true;
+        } else if let Some((name, option)) = tuple_pair(entry) {
             let count = option
                 .as_small()
                 .and_then(|n| u16::try_from(n).ok())
                 .ok_or(BADARG)?;
-            opts.notation = match atom_name(tuple_element(entry, 0)?) {
-                Some("decimals") => arinsal_float::FloatNotation::Decimals(count),
-                Some("scientific") => arinsal_float::FloatNotation::Scientific(count),
-                _ => return Err(BADARG),
+            opts.notation = if name == Term::atom(atoms::DECIMALS) {
+                arinsal_float::FloatNotation::Decimals(count)
+            } else if name == Term::atom(atoms::SCIENTIFIC) {
+                arinsal_float::FloatNotation::Scientific(count)
+            } else {
+                Err(BADARG)?
             };
+        } else if entry == Term::atom(atoms::SHORT) {
+            opts.notation = arinsal_float::FloatNotation::Short;
+        } else {
+            return Err(BADARG);
         }
+        tail = next;
+    }
+    if tail != Term::NIL {
+        return Err(BADARG);
     }
     Ok(opts)
 }
-fn formatted_float(args: &[Term]) -> Result<String, BifError> {
+fn formatted_float(
+    args: &[Term],
+    buffer: &mut [u8; arinsal_float::FLOAT_BUFFER_SIZE],
+) -> Result<usize, BifError> {
     // SAFETY: The float's heap remains live during this BIF.
     let value = unsafe { args[0].float_ref() }.ok_or(BADARG)?.get();
-    arinsal_float::float_to_list(value, &float_opts(args)?).map_err(|_| BADARG)
+    arinsal_float::float_to_buffer(value, &float_opts(args)?, buffer).map_err(|_| BADARG)
 }
 fn float_to_list_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let text = formatted_float(args)?;
-    Ok(make_list(
-        ctx,
-        text.bytes().map(|b| Term::small(b as i64).unwrap()),
-        Term::NIL,
-    ))
+    // Port of erts/emulator/beam/bif.c (do_float_to_list), OTP-29.1.1.
+    let mut buffer = [0_u8; arinsal_float::FLOAT_BUFFER_SIZE];
+    let len = formatted_float(args, &mut buffer)?;
+    let reservation = TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .reserve_cons_list(len)
+        .expect("infallible BIF heap");
+    reservation
+        .prepend_exact_with_tail(
+            buffer[..len]
+                .iter()
+                .rev()
+                .map(|byte| Term::small(i64::from(*byte)).expect("ASCII byte fits small")),
+            Term::NIL,
+        )
+        .map_err(|_| BifError::SystemLimit)
 }
 fn float_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let text = formatted_float(args)?;
+    // Port of erts/emulator/beam/bif.c (do_float_to_binary), OTP-29.1.1.
+    let mut buffer = [0_u8; arinsal_float::FLOAT_BUFFER_SIZE];
+    let len = formatted_float(args, &mut buffer)?;
     Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .binary(text.as_bytes())
+        .binary(&buffer[..len])
         .expect("infallible BIF heap"))
 }
 fn list_to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

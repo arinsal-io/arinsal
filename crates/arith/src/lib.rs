@@ -267,19 +267,19 @@ fn as_integer(term: Term) -> Option<BigInt> {
     }
 }
 fn as_float(term: Term) -> Option<f64> {
-    let owned = owned_number(term)?;
-    match &owned {
-        OwnedTerm::Float(value) => Some(*value),
-        _ => None,
-    }
+    term.float_value()
 }
 fn number_float(term: Term) -> Result<f64, ArithError> {
     if let Some(f) = as_float(term) {
         return Ok(f);
     }
-    let i = as_integer(term).ok_or(ArithError::Badarith)?;
+    if let Some(value) = term.as_small() {
+        return Ok(value as f64);
+    }
     // Port of erts/emulator/beam/big.c:2412-2525 (big_to_double), OTP-29.1.1.
-    big_to_double(&i).ok_or(ArithError::Badarith)
+    term.with_bignum_digits_mut(|digits| big_to_double(digits, term.is_negative_bignum()))
+        .flatten()
+        .ok_or(ArithError::Badarith)
 }
 
 /// Convert an Erlang integer or float to a finite `f64` using OTP arithmetic rules.
@@ -287,24 +287,28 @@ pub fn number_to_f64(term: Term) -> Result<f64, ArithError> {
     number_float(term)
 }
 
-fn big_to_double(value: &BigInt) -> Option<f64> {
-    if value.is_zero() {
-        return Some(0.0);
-    }
-    let (sign, digits) = value.to_u64_digits();
+fn big_to_double(digits: &[u64], negative: bool) -> Option<f64> {
     let most = *digits.last()?;
     let bit_len = (digits.len() - 1) * 64 + (64 - most.leading_zeros() as usize);
     if bit_len > 1024 {
         return None;
     }
-    let negative = sign == Sign::Minus;
     if bit_len <= 53 {
         let magnitude = digits.first().copied().unwrap_or(0) as f64;
         return Some(if negative { -magnitude } else { magnitude });
     }
 
     let guard = bit_len - 54;
-    let top = (value.magnitude() >> guard).to_u64()?;
+    let top_index = guard / 64;
+    let top_shift = guard % 64;
+    let mut top = *digits.get(top_index)? >> top_shift;
+    if top_shift != 0 {
+        top |= digits
+            .get(top_index + 1)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_shl((64 - top_shift) as u32);
+    }
     let half_bit = top & 1 != 0;
     let mut mantissa = top >> 1;
     let full_digits = guard / 64;
@@ -331,6 +335,24 @@ fn big_to_double(value: &BigInt) -> Option<f64> {
     Some(f64::from_bits(
         sign_bit | ((biased as u64) << 52) | fraction,
     ))
+}
+fn small_product_heap_words(x: i64, y: i64) -> usize {
+    let product = (x as i128) * (y as i128);
+    if (MIN_SMALL as i128..=MAX_SMALL as i128).contains(&product) {
+        0
+    } else if product.unsigned_abs() > u64::MAX as u128 {
+        3
+    } else {
+        2
+    }
+}
+fn bignum_product_heap_words(a: Term, b: Term) -> usize {
+    match (a.bignum_digit_count(), b.bignum_digit_count()) {
+        (Some(a), Some(b)) => a.saturating_add(b).saturating_add(1),
+        (Some(a), None) => a.saturating_add(3),
+        (None, Some(b)) => b.saturating_add(3),
+        (None, None) => 0,
+    }
 }
 fn binary_arith<H: HeapAlloc + ?Sized>(
     a: Term,
@@ -378,21 +400,26 @@ pub fn sub<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H) -> ArithResult
 }
 /// `A * B`.
 pub fn mul<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H) -> ArithResult {
+    if as_float(a).is_some() || as_float(b).is_some() {
+        // Port of erts/emulator/beam/erl_arith.c:716 (erts_mixed_times), OTP-29.1.1.
+        return binary_arith(a, b, heap, |x, y| x * y, |x, y| x * y);
+    }
     if let (Some(x), Some(y)) = (a.as_small(), b.as_small()) {
-        return int128(x as i128 * y as i128, heap);
-    }
-    if let Some(k) = b.as_small().filter(|n| *n >= 0)
-        && let Some(words) = positive_words(a)
-    {
-        return mul_small_positive(words, k as u64, heap);
-    }
-    if let Some(k) = a.as_small().filter(|n| *n >= 0)
-        && let Some(words) = positive_words(b)
-    {
-        return mul_small_positive(words, k as u64, heap);
+        let need_words = small_product_heap_words(x, y);
+        return TermBuilder::new(&mut HeapProxy(heap))
+            .small_times(x, y)
+            .map_err(|error| construction_error(error, need_words));
     }
     // Port of erts/emulator/beam/erl_arith.c:716 (erts_mixed_times), OTP-29.1.1.
-    binary_arith(a, b, heap, |x, y| x * y, |x, y| x * y)
+    // Let the tag dispatch decode boxed headers once inside the direct digit path.
+    match TermBuilder::new(&mut HeapProxy(heap)).bignum_times(a, b) {
+        Ok(result) => Ok(result),
+        Err(TermError::HeapFull) => Err(ArithError::HeapFull {
+            need_words: bignum_product_heap_words(a, b),
+        }),
+        Err(TermError::BadArg) => Err(ArithError::Badarith),
+        Err(error) => Err(construction_error(error, 0)),
+    }
 }
 /// `A / B`, always a float.
 pub fn fdiv<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H) -> ArithResult {
@@ -454,26 +481,6 @@ fn add_small_to_positive<H: HeapAlloc + ?Sized>(
     }
     if carry != 0 {
         words.push(carry);
-    }
-    positive_result(words, heap)
-}
-fn mul_small_positive<H: HeapAlloc + ?Sized>(
-    mut words: Vec<u64>,
-    small: u64,
-    heap: &mut H,
-) -> ArithResult {
-    // Port of erts/emulator/beam/big.c:3827 (big_times), OTP-29.1.1.
-    if small == 0 || words.is_empty() {
-        return Ok(Term::small(0).unwrap());
-    }
-    let mut carry = 0u128;
-    for word in &mut words {
-        let product = (*word as u128) * (small as u128) + carry;
-        *word = product as u64;
-        carry = product >> 64;
-    }
-    if carry != 0 {
-        words.push(carry as u64);
     }
     positive_result(words, heap)
 }
@@ -587,8 +594,13 @@ pub fn to_float<H: HeapAlloc + ?Sized>(a: Term, heap: &mut H) -> ArithResult {
     if as_float(a).is_some() {
         return Ok(a);
     }
-    let i = as_integer(a).ok_or(ArithError::Badarg)?;
-    floating(big_to_double(&i).ok_or(ArithError::Badarg)?, heap)
+    let value = if let Some(value) = a.as_small() {
+        Some(value as f64)
+    } else {
+        a.with_bignum_digits_mut(|digits| big_to_double(digits, a.is_negative_bignum()))
+            .flatten()
+    };
+    floating(value.ok_or(ArithError::Badarg)?, heap)
 }
 fn float_integer<H: HeapAlloc + ?Sized>(
     a: Term,
@@ -632,11 +644,33 @@ fn text(int: Term, base: Term) -> Result<String, ArithError> {
 }
 /// `integer_to_list(Int, Base)`.
 pub fn integer_to_list<H: HeapAlloc + ?Sized>(int: Term, base: Term, heap: &mut H) -> ArithResult {
-    let s = text(int, base)?;
-    let need = s.len().checked_mul(2).ok_or(ArithError::SystemLimit)?;
-    TermBuilder::new(&mut HeapProxy(heap))
-        .string_to_list(&s)
-        .map_err(|e| construction_error(e, need))
+    integer_to_list_radix(int, base_value(base)?, heap)
+}
+
+fn integer_to_list_radix<H: HeapAlloc + ?Sized>(int: Term, base: u32, heap: &mut H) -> ArithResult {
+    // Port of erts/emulator/beam/bif.c:3266-3308 (integer_to_list) and
+    // utils.c:2994-3055 (Sint_to_buf, buf_to_intlist), OTP-29.1.1.
+    if let Some(value) = int.as_small() {
+        let mut buf = [0_u8; 128];
+        let digits = format_small(value, base, &mut buf);
+        return ascii_to_list(digits, heap);
+    }
+
+    let n = as_integer(int).ok_or(ArithError::Badarg)?;
+    let text = n.to_str_radix(base).to_ascii_uppercase();
+    ascii_to_list(text.as_bytes(), heap)
+}
+
+fn ascii_to_list<H: HeapAlloc + ?Sized>(bytes: &[u8], heap: &mut H) -> ArithResult {
+    let need = bytes.len().checked_mul(2).ok_or(ArithError::SystemLimit)?;
+    let mut proxy = HeapProxy(heap);
+    let mut builder = TermBuilder::new(&mut proxy);
+    let reservation = builder
+        .reserve_cons_list(bytes.len())
+        .map_err(|error| construction_error(error, need))?;
+    reservation
+        .prepend_bytes_with_tail(bytes, Term::NIL)
+        .map_err(|error| construction_error(error, need))
 }
 /// `integer_to_binary(Int, Base)`.
 pub fn integer_to_binary<H: HeapAlloc + ?Sized>(
@@ -758,7 +792,7 @@ pub fn binary_to_integer<H: HeapAlloc + ?Sized>(
 
 /// `integer_to_list(Int)` in decimal.
 pub fn integer_to_list_decimal<H: HeapAlloc + ?Sized>(int: Term, heap: &mut H) -> ArithResult {
-    integer_to_list(int, Term::small(10).unwrap(), heap)
+    integer_to_list_radix(int, 10, heap)
 }
 /// `integer_to_binary(Int)` in decimal.
 pub fn integer_to_binary_decimal<H: HeapAlloc + ?Sized>(int: Term, heap: &mut H) -> ArithResult {

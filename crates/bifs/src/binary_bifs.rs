@@ -67,7 +67,9 @@ fn bit_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 // Port of erts/emulator/beam/binary.c (binary_to_list_1/3), OTP-29.1.1.
-fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+/// Implements the process BIF entry used by the binary-to-list trap.
+// Port of erts/emulator/beam/binary.c (binary_to_list_1/3), OTP-29.1.1.
+pub fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_bytes(args[0], |view| {
         if !view.bit_len().is_multiple_of(8) {
             return Err(BADARG);
@@ -100,7 +102,8 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
         {
             ctx.defer_trap(DeferredTrap::BinaryToList(BinaryToListWalk {
                 source: args[0],
-                start,
+                source_start,
+                bit_offset,
                 remaining: len,
                 total: len,
                 list: None,
@@ -118,6 +121,8 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
         };
         if one_chunk {
             // Port of erts/emulator/beam/binary.c (erts_bin_bytes_to_list), OTP-29.1.1.
+            // `binary_to_list_chunk` bumps reductions immediately before its CONS loop.
+            ctx.charge_reductions(len.div_ceil(B2L_BYTES_PER_REDUCTION));
             let value = reservation
                 .prepend_exact_with_tail(
                     (source_start..source_start + len).rev().map(|index| {
@@ -131,12 +136,12 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
                     Term::NIL,
                 )
                 .map_err(|_| BifError::SystemLimit)?;
-            ctx.charge_reductions(len.div_ceil(B2L_BYTES_PER_REDUCTION));
             return Ok(value);
         }
         let mut walk = BinaryToListWalk {
             source: args[0],
-            start,
+            source_start,
+            bit_offset,
             remaining: len,
             total: len,
             list: Some(reservation),
@@ -146,12 +151,12 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
                 .saturating_add(1)
                 .saturating_mul(B2L_BYTES_PER_REDUCTION),
         );
-        let (result, used) = walk.step_bytes(view.bytes(), source_start, bit_offset, chunk)?;
+        // Port of BUMP_REDS in binary_to_list_chunk, before the backwards fill loop.
+        ctx.charge_reductions(chunk.div_ceil(B2L_BYTES_PER_REDUCTION));
+        let (result, _) = walk.step_bytes(view.bytes(), source_start, bit_offset, chunk)?;
         if let Some(result) = result {
-            ctx.charge_reductions(used.div_ceil(B2L_BYTES_PER_REDUCTION));
             Ok(result)
         } else {
-            ctx.charge_reductions(used.div_ceil(B2L_BYTES_PER_REDUCTION));
             ctx.defer_trap(DeferredTrap::BinaryToList(walk));
             Ok(Term::NIL)
         }
@@ -189,7 +194,8 @@ const B2L_BYTES_PER_REDUCTION: usize = 256;
 // Port of erts/emulator/beam/binary.c (binary_to_list_chunk), OTP-29.1.1.
 pub struct BinaryToListWalk {
     source: Term,
-    start: usize,
+    source_start: usize,
+    bit_offset: usize,
     remaining: usize,
     total: usize,
     list: Option<ConsListBuilder>,
@@ -216,15 +222,7 @@ impl BinaryToListWalk {
             );
         }
         with_binary_bytes(self.source, |view| {
-            if !view.bit_len().is_multiple_of(8) {
-                return Err(BADARG);
-            }
-            let bit_offset = view.start_bit() % 8;
-            let source_start = (view.start_bit() / 8)
-                .checked_add(self.start)
-                .ok_or(BADARG)?;
-            validate_binary_to_list_range(view.bytes(), source_start, self.remaining, bit_offset)?;
-            self.step_bytes(view.bytes(), source_start, bit_offset, max_bytes)
+            self.step_bytes(view.bytes(), self.source_start, self.bit_offset, max_bytes)
         })?
     }
 
@@ -238,11 +236,16 @@ impl BinaryToListWalk {
         let count = self.remaining.min(max_bytes);
         let from = source_start + self.remaining - count;
         let list = self.list.as_mut().ok_or(BifError::SystemLimit)?;
-        for index in (from..from + count).rev() {
-            let byte = binary_to_list_byte(bytes, index, bit_offset);
-            list.prepend(Term::small(i64::from(byte)).expect("byte fits small integer"))
-                .map_err(|_| BifError::SystemLimit)?;
-        }
+        // The exact chunk count is known, so check the reservation once and keep the
+        // inner loop to the two CONS stores and cursor advance used by erts.
+        list.prepend_chunk(
+            count,
+            (from..from + count).rev().map(|index| {
+                Term::small(i64::from(binary_to_list_byte(bytes, index, bit_offset)))
+                    .expect("byte fits small integer")
+            }),
+        )
+        .map_err(|_| BifError::SystemLimit)?;
         self.remaining -= count;
         if self.remaining == 0 {
             let value = self
@@ -1686,12 +1689,17 @@ fn compile_search_pattern(term: Term) -> Result<SearchPattern, BifError> {
                 return with_binary_input(head, SearchPattern::compile_single);
             }
             let mut patterns = Vec::new();
-            for candidate in list(term)? {
+            let mut remaining = term;
+            while remaining != Term::NIL {
+                let Some((candidate, tail)) = cons_cell(remaining) else {
+                    return Err(BADARG);
+                };
                 let bytes = binary_bytes(candidate)?;
                 if bytes.is_empty() {
                     return Err(BADARG);
                 }
                 patterns.push(bytes);
+                remaining = tail;
             }
             SearchPattern::compile(patterns)
         }
@@ -1835,7 +1843,7 @@ impl BinarySearchWalk {
         })
     }
 
-    /// Run at most `budget` ERTS search units, then the units of building a global result.
+    /// Run the search and result loops until completion or reduction exhaustion.
     // Port of erts/emulator/beam/erl_bif_binary.c (do_binary_find) and
     // 1671-1735, 1809-1915 (do_match_global_result, do_split_global_result), OTP-29.1.1.
     pub fn step(&mut self, budget: usize) -> (bool, usize) {
@@ -1849,6 +1857,8 @@ impl BinarySearchWalk {
             }
             work = used;
         }
+        // Port of do_match_global_result and do_split_global_result: the C callbacks
+        // count one or two result-building passes before the final heap construction.
         let mut left = *self.result_left.get_or_insert_with(|| {
             let found = self.walk.match_count();
             match (self.kind, self.global) {
@@ -1857,28 +1867,24 @@ impl BinarySearchWalk {
                 _ => 0,
             }
         });
-        while left > 0 {
-            if work + 1 >= budget {
-                self.result_left = Some(left);
-                return (false, budget.max(work));
-            }
+        while left > 0 && work < budget {
             work += 1;
             left -= 1;
         }
-        self.result_left = Some(0);
-        (true, work)
+        self.result_left = Some(left);
+        (left == 0, work)
     }
 
     /// Build the BIF result after searching completes.
-    pub fn finish(&self, ctx: &mut Ctx<'_>) -> Result<Term, BifError> {
+    pub fn finish<H: HeapAlloc + ?Sized>(&self, heap: &mut H) -> Result<Term, BifError> {
         let found_count = self.walk.match_count();
         match self.kind {
             BinarySearchKind::Match => match self.walk.match_at(0) {
-                Some((position, length)) => match_result(ctx, position, length),
+                Some((position, length)) => match_result(heap, position, length),
                 None => Ok(Term::atom(global_atoms().intern("nomatch").expect("atom"))),
             },
             BinarySearchKind::Matches => {
-                let mut heap = Heap(&mut ctx.heap);
+                let mut heap = Heap(heap);
                 let mut builder = TermBuilder::new(&mut heap);
                 let mut result = Term::NIL;
                 for index in (0..found_count).rev() {
@@ -1906,12 +1912,12 @@ impl BinarySearchWalk {
                     if (self.split_trim || self.split_trim_all) && self.walk.len() == 0 {
                         return Ok(Term::NIL);
                     }
-                    return TermBuilder::new(&mut Heap(&mut ctx.heap))
+                    return TermBuilder::new(&mut Heap(heap))
                         .cons(self.subject, Term::NIL)
                         .map_err(|_| BifError::SystemLimit);
                 }
 
-                let mut heap = Heap(&mut ctx.heap);
+                let mut heap = Heap(heap);
                 let mut builder = TermBuilder::new(&mut heap);
                 let mut result = Term::NIL;
                 let mut end = self.walk.len();
@@ -1949,8 +1955,12 @@ impl BinarySearchWalk {
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1840-1850 (match result), OTP-29.1.1.
-fn match_result(ctx: &mut Ctx<'_>, position: usize, length: usize) -> Result<Term, BifError> {
-    let mut heap = Heap(&mut ctx.heap);
+fn match_result<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    position: usize,
+    length: usize,
+) -> Result<Term, BifError> {
+    let mut heap = Heap(heap);
     let mut builder = TermBuilder::new(&mut heap);
     let position = builder
         .int_from_i128(position as i128)
@@ -1967,14 +1977,14 @@ fn match_result(ctx: &mut Ctx<'_>, position: usize, length: usize) -> Result<Ter
 fn binary_match_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut walk = BinarySearchWalk::new(BinarySearchKind::Match, args)?;
     while !walk.step(usize::MAX).0 {}
-    walk.finish(ctx)
+    walk.finish(&mut ctx.heap)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1589-1597 (binary_matches_2/3), OTP-29.1.1.
 fn binary_matches_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut walk = BinarySearchWalk::new(BinarySearchKind::Matches, args)?;
     while !walk.step(usize::MAX).0 {}
-    walk.finish(ctx)
+    walk.finish(&mut ctx.heap)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1346-1405 (parse_split_opts_list), OTP-29.1.1.
@@ -2006,7 +2016,7 @@ fn split_options(
 fn binary_split_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut walk = BinarySearchWalk::new(BinarySearchKind::Split, args)?;
     while !walk.step(usize::MAX).0 {}
-    walk.finish(ctx)
+    walk.finish(&mut ctx.heap)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2572-2683 (unsigned endian parsing), OTP-29.1.1.

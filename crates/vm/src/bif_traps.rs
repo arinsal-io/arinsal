@@ -1446,9 +1446,7 @@ fn binary_to_list_trap(
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
     if state.is_none() {
-        let bif = arinsal_bifs::lookup("erlang", "binary_to_list", args.len() as u8)
-            .ok_or(BifError::BADARG)?;
-        return binary_to_list_start(process, args, bif, _pid, restore_gc);
+        return binary_to_list_start(process, args, restore_gc);
     }
     let state = Arc::clone(state.ok_or(BifError::BADARG)?);
     let walk = state
@@ -1476,15 +1474,15 @@ fn binary_to_list_trap(
 fn binary_to_list_start(
     process: &mut Process,
     args: &[Term],
-    bif: arinsal_bifs::BifFn,
-    _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut state = arinsal_bifs::BifState::default();
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap, &mut state);
     ctx.set_reduction_budget(process.reductions.max(0) as usize);
-    let value = bif(&mut ctx, args)?;
+    // Port of erts/emulator/beam/binary.c (`binary_to_list_1`), OTP-29.1.1:
+    // enter the concrete BIF directly; the trap path carries the same arguments.
+    let value = arinsal_bifs::erlang_binary_to_list(&mut ctx, args)?;
     let reductions = ctx.reductions();
     match ctx.take_deferred().map(|trap| *trap) {
         Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(HandlerResult::Yield {
@@ -1550,10 +1548,10 @@ fn finish_binary_search(
     search: &arinsal_bifs::BinarySearchWalk,
     reductions: u32,
 ) -> Result<HandlerResult, BifError> {
+    // Port of erts/emulator/beam/erl_bif_binary.c result callbacks, OTP-29.1.1:
+    // allocate directly on the process heap after the search loop completes.
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let value = search.finish(&mut ctx)?;
+    let value = search.finish(&mut heap)?;
     Ok(HandlerResult::Done { value, reductions })
 }
 
@@ -2535,11 +2533,11 @@ impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
         process: &mut Process,
         args: &[Term],
         _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
+        _pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
         // Port of erts/emulator/beam/binary.c:202-239 (`binary_to_list_1/3`), OTP-29.1.1.
-        binary_to_list_start(process, args, B::call, pid, restore_gc)
+        binary_to_list_start(process, args, restore_gc)
     }
 }
 

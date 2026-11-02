@@ -29,7 +29,7 @@ const BSF_LITTLE_OR_NATIVE: u32 = 2;
 const TMP_MEM0: u32 = 16384;
 
 static APPEND_BINARY: AtomicUsize = AtomicUsize::new(0);
-static PRIVATE_APPEND_FAST: AtomicUsize = AtomicUsize::new(0);
+static APPEND_CHECKED: AtomicUsize = AtomicUsize::new(0);
 static PRIVATE_APPEND_CHECKED: AtomicUsize = AtomicUsize::new(0);
 static BS_GC: AtomicUsize = AtomicUsize::new(0);
 
@@ -38,9 +38,13 @@ pub fn install_bs_append_binary(function: usize) {
     APPEND_BINARY.store(function, Ordering::Relaxed);
 }
 
-/// Publishes VM-owned private append entries used by native bit syntax code.
-pub fn install_bs_private_append(fast: usize, checked: usize) {
-    PRIVATE_APPEND_FAST.store(fast, Ordering::Relaxed);
+/// Publishes the checked writable binary append entry used by native bit syntax code.
+pub fn install_bs_append_checked(function: usize) {
+    APPEND_CHECKED.store(function, Ordering::Relaxed);
+}
+
+/// Publishes the checked private append entry used by native bit syntax code.
+pub fn install_bs_private_append(checked: usize) {
     PRIVATE_APPEND_CHECKED.store(checked, Ordering::Relaxed);
 }
 
@@ -86,6 +90,13 @@ struct PrivatePlan {
     groups: Vec<Group>,
 }
 
+struct AppendPlan {
+    bin: ArgVal,
+    unit: u64,
+    extra_bits: u64,
+    groups: Vec<Group>,
+}
+
 /// Emits a specialized construction when the segment list matches one BeamAsm fast shape.
 /// Returns whether this call emitted the whole instruction, including its slow fallback.
 #[allow(clippy::too_many_arguments)]
@@ -100,6 +111,12 @@ pub(crate) fn emit_fast_bs_create_bin(
 ) -> Result<bool, ModuleError> {
     if let Some(plan) = private_plan(segments) {
         emit_private(asm, fail, alloc, live, dst, segments, helper, &plan)?;
+        return Ok(true);
+    }
+    if APPEND_CHECKED.load(Ordering::Relaxed) != 0
+        && let Some(plan) = append_plan(segments)
+    {
+        emit_append(asm, fail, alloc, live, dst, segments, helper, &plan)?;
         return Ok(true);
     }
     if let Some(plan) = fixed_plan(segments, alloc) {
@@ -133,6 +150,26 @@ fn private_plan(segments: &[BsSegment]) -> Option<PrivatePlan> {
         bin: first.src,
         extra_bits: raw.bits,
         groups,
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1.
+fn append_plan(segments: &[BsSegment]) -> Option<AppendPlan> {
+    let (first, rest) = segments.split_first()?;
+    if first.kind != BsSegmentKind::Append
+        || first.unit == 0
+        || first.unit % 8 != 0
+        || !is_all(first)
+        || x_index(first.src).is_none()
+    {
+        return None;
+    }
+    let tail = integer_group(rest)?;
+    Some(AppendPlan {
+        bin: first.src,
+        unit: u64::from(first.unit),
+        extra_bits: tail.bits,
+        groups: combine(&tail.segs),
     })
 }
 
@@ -305,13 +342,12 @@ fn emit_private(
             emit_is_small(asm, seg.src, slow)?;
         }
     }
-    // Port of instr_bs.cpp:1865-1880 (private append to binary).
-    // The callee is a C function. X4/X5 are caller-saved, so the call sits
-    // inside emit_enter_runtime / emit_leave_runtime like erts' checked entry.
-    // erts: `add x0, x19, #48; mov x1, c_p; mov x2, bin; mov x3, #bits; bl`.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 (`am_private_append`), OTP-29.1.1.
     let bin = asm.source_reg(plan.bin)?;
     let ebs = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u64;
-    let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
+    let update = crate::Update::HEAP_ALLOC
+        .union(crate::Update::X_REGS)
+        .union(crate::Update::REDUCTIONS);
     asm.code.emit(|e| {
         e.mov_const(Gpr::x(0), ebs)?;
         e.add_reg(Gpr::x(0), SCHEDULER_REGS, Gpr::x(0), Shift::Lsl, 0)?;
@@ -320,17 +356,9 @@ fn emit_private(
         e.mov_const(Gpr::x(3), plan.extra_bits)
     })?;
     crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
-    asm.fragment_call(PRIVATE_APPEND_FAST.load(Ordering::Relaxed))?;
+    asm.fragment_call(PRIVATE_APPEND_CHECKED.load(Ordering::Relaxed))?;
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
-    // `u64::MAX` is the grow sentinel from the leaf. The reallocating entry is
-    // off the byte loop (instr_bs.cpp calls one function; the leaf split keeps
-    // that function's no-realloc path frameless).
-    let grow = asm.code.new_label();
-    let store = asm.code.new_label();
     asm.code.cbz(Gpr::x(0), slow)?;
-    asm.code.emit(|e| e.cmn_imm(Gpr::x(0), 1, false))?;
-    asm.code.b_cond(Cond::Eq, grow)?;
-    asm.code.bind(store)?;
     asm.code
         .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
     let ebs_off = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32;
@@ -364,29 +392,92 @@ fn emit_private(
         bit_at += group.bits;
     }
     reload_boxed(asm, dst, TMP_MEM0)?;
-    // Grow and the generic builder sit with the yield stubs. Success falls through;
-    // erts' private-append body has no trailing branch (instr_bs.cpp:1865-1881).
     asm.code.bind(done)?;
     let segments = segments.to_vec();
-    let extra_bits = plan.extra_bits;
-    let bin_src = plan.bin;
     asm.push_bs_cold(Box::new(move |asm| {
-        asm.code.bind(grow)?;
-        // The fast call above clobbered the scratch register a Y or memory source was loaded
-        // into, so the source is read again, as erts' single checked call does.
-        let bin = asm.source_reg(bin_src)?;
-        asm.code.emit(|e| {
-            e.mov_const(Gpr::x(0), ebs)?;
-            e.add_reg(Gpr::x(0), SCHEDULER_REGS, Gpr::x(0), Shift::Lsl, 0)?;
-            e.mov_reg(Gpr::x(1), C_P)?;
-            e.mov_reg(Gpr::x(2), bin)?;
-            e.mov_const(Gpr::x(3), extra_bits)
-        })?;
-        crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
-        asm.fragment_call(PRIVATE_APPEND_CHECKED.load(Ordering::Relaxed))?;
-        crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
-        asm.code.cbz(Gpr::x(0), slow)?;
-        asm.code.b(store)?;
+        asm.code.bind(slow)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
+        asm.code.b(done)?;
+        Ok(())
+    }));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_append(
+    asm: &mut BeamModuleAssembler,
+    fail: u32,
+    alloc: u32,
+    live: u32,
+    dst: ArgVal,
+    segments: &[BsSegment],
+    helper: BsCreateBinHelper,
+    plan: &AppendPlan,
+) -> Result<(), ModuleError> {
+    let slow = asm.code.new_label();
+    let failed = asm.code.new_label();
+    let done = asm.code.new_label();
+    for group in &plan.groups {
+        for seg in &group.segs {
+            emit_is_small(asm, seg.src, slow)?;
+        }
+    }
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1.
+    let source_index = x_index(plan.bin).expect("append_plan requires an X register");
+    let root_live = live.max(source_index + 1);
+    let update = crate::Update::HEAP_ALLOC
+        .union(crate::Update::X_REGS)
+        .union(crate::Update::REDUCTIONS);
+    crate::emit_enter_runtime(&mut asm.code, root_live as usize, update)?;
+    asm.code.emit(|e| {
+        e.mov_reg(Gpr::x(0), C_P)?;
+        e.mov_const(Gpr::x(1), u64::from(source_index))?;
+        e.mov_const(Gpr::x(2), plan.extra_bits)?;
+        e.mov_const(Gpr::x(3), plan.unit)?;
+        e.mov_const(Gpr::x(4), u64::from(root_live))?;
+        e.mov_const(Gpr::x(5), u64::from(alloc))
+    })?;
+    asm.fragment_call(APPEND_CHECKED.load(Ordering::Relaxed))?;
+    crate::emit_leave_runtime(&mut asm.code, root_live as usize, update)?;
+    asm.code.cbz(Gpr::x(0), slow)?;
+    asm.code.emit(|e| e.cmn_imm(Gpr::x(0), 1, false))?;
+    asm.code.b_cond(Cond::Eq, failed)?;
+    asm.code
+        .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
+    let ebs_off = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32;
+    asm.code.emit(|e| {
+        e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, ebs_off)?;
+        e.ldr_uoff(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
+        e.lsr_imm(TMP, Gpr::x(9), 3)?;
+        e.add_reg(Gpr::x(8), Gpr::x(8), TMP, Shift::Lsl, 0)?;
+        e.add_imm(
+            Gpr::x(9),
+            Gpr::x(9),
+            u16::try_from(plan.extra_bits).unwrap_or(0),
+            false,
+        )?;
+        e.str_uoff(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
+        e.mov_reg(Gpr::x(14), Gpr::x(8))
+    })?;
+    let mut bit_at = 0u64;
+    for group in &plan.groups {
+        emit_group(asm, group)?;
+        let ptr = if bit_at == 0 {
+            Gpr::x(14)
+        } else {
+            asm.code
+                .emit(|e| e.add_imm(TMP, Gpr::x(14), (bit_at / 8) as u16, false))?;
+            TMP
+        };
+        emit_store(asm, ptr, group.bits, group.bits)?;
+        bit_at += group.bits;
+    }
+    reload_boxed(asm, dst, TMP_MEM0)?;
+    asm.code.bind(done)?;
+    let segments = segments.to_vec();
+    asm.push_bs_cold(Box::new(move |asm| {
+        asm.code.bind(failed)?;
+        asm.branch_error()?;
         asm.code.bind(slow)?;
         asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
         asm.code.b(done)?;

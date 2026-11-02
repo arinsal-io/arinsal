@@ -4,6 +4,9 @@
 
 use std::fmt::Write;
 
+/// Size of the stack buffer used by the float formatting BIFs in erts.
+pub const FLOAT_BUFFER_SIZE: usize = 256;
+
 /// The final format selector in an Erlang float option list.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FloatNotation {
@@ -45,32 +48,112 @@ pub enum ParseError {
 
 /// Format a float as `erlang:float_to_list/2` does in OTP 29.1.1.
 pub fn float_to_list(f: f64, opts: &FloatFormatOpts) -> Result<String, FloatFormatError> {
+    let mut buffer = [0_u8; FLOAT_BUFFER_SIZE];
+    let len = float_to_buffer(f, opts, &mut buffer)?;
+    Ok(std::str::from_utf8(&buffer[..len])
+        .expect("float formatting is ASCII")
+        .to_owned())
+}
+
+/// Format a float into the caller's erts-sized stack buffer and return the byte count.
+pub fn float_to_buffer(
+    f: f64,
+    opts: &FloatFormatOpts,
+    buffer: &mut [u8; FLOAT_BUFFER_SIZE],
+) -> Result<usize, FloatFormatError> {
+    // Port of erts/emulator/beam/bif.c (do_float_to_charbuf), OTP-29.1.1.
     if !f.is_finite() {
         return Err(FloatFormatError::BadArg);
     }
     match opts.notation {
-        FloatNotation::Short => Ok(format_shortest(f)),
-        FloatNotation::ScientificDefault => scientific(f, 20),
-        FloatNotation::Scientific(d) if d <= 249 => scientific(f, usize::from(d)),
-        FloatNotation::Decimals(d) if d <= 253 => fixed(f, usize::from(d), opts.compact),
+        FloatNotation::Short => shortest_into(f, buffer),
+        FloatNotation::ScientificDefault => scientific_into(f, 20, buffer),
+        FloatNotation::Scientific(d) if d <= 249 => scientific_into(f, usize::from(d), buffer),
+        FloatNotation::Decimals(d) if d <= 253 => {
+            fixed_into(f, usize::from(d), opts.compact, buffer)
+        }
         _ => Err(FloatFormatError::BadArg),
     }
 }
 
-fn scientific(f: f64, decimals: usize) -> Result<String, FloatFormatError> {
-    // Port of erts/emulator/sys/unix/sys_float.c:55 (sys_double_to_chars_ext), OTP-29.1.1.
-    // Rust and C both round the exact binary value to nearest, ties to even.
-    let mut out = String::with_capacity(decimals + 10);
-    let _ = write!(out, "{f:.decimals$e}");
-    let e = out.rfind('e').expect("Rust scientific format");
-    let exponent: i32 = out[e + 1..].parse().expect("Rust scientific exponent");
-    out.truncate(e);
-    let _ = write!(out, "e{exponent:+03}");
-    if out.len() >= 256 {
-        Err(FloatFormatError::BadArg)
-    } else {
-        Ok(out)
+struct BufferWriter<'a> {
+    bytes: &'a mut [u8; FLOAT_BUFFER_SIZE],
+    len: usize,
+}
+
+impl BufferWriter<'_> {
+    fn new(bytes: &mut [u8; FLOAT_BUFFER_SIZE]) -> BufferWriter<'_> {
+        BufferWriter { bytes, len: 0 }
     }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), FloatFormatError> {
+        if self.len + 1 >= self.bytes.len() {
+            return Err(FloatFormatError::BadArg);
+        }
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<usize, FloatFormatError> {
+        if self.len >= self.bytes.len() {
+            return Err(FloatFormatError::BadArg);
+        }
+        self.bytes[self.len] = 0;
+        Ok(self.len)
+    }
+
+    fn trim_compact(&mut self) {
+        while self.len != 0 && self.bytes[self.len - 1] == b'0' {
+            self.len -= 1;
+        }
+        if self.len != 0 && self.bytes[self.len - 1] == b'.' {
+            self.bytes[self.len] = b'0';
+            self.len += 1;
+        }
+    }
+}
+
+impl std::fmt::Write for BufferWriter<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(std::fmt::Error)?;
+        if end >= self.bytes.len() {
+            return Err(std::fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn scientific_into(
+    f: f64,
+    decimals: usize,
+    buffer: &mut [u8; FLOAT_BUFFER_SIZE],
+) -> Result<usize, FloatFormatError> {
+    // Port of erts/emulator/sys/unix/sys_float.c:55 (sys_double_to_chars_ext), OTP-29.1.1.
+    let mut out = BufferWriter::new(buffer);
+    write!(&mut out, "{f:.decimals$e}").map_err(|_| FloatFormatError::BadArg)?;
+    let e = out
+        .bytes()
+        .iter()
+        .rposition(|&byte| byte == b'e')
+        .expect("Rust scientific format");
+    let exponent = std::str::from_utf8(&out.bytes()[e + 1..])
+        .expect("Rust scientific exponent is ASCII")
+        .parse::<i32>()
+        .expect("Rust scientific exponent");
+    out.truncate(e);
+    write!(&mut out, "e{exponent:+03}").map_err(|_| FloatFormatError::BadArg)?;
+    out.finish()
 }
 
 const POW10: [f64; 19] = [
@@ -78,12 +161,22 @@ const POW10: [f64; 19] = [
     1e17, 1e18,
 ];
 
-fn fixed(f: f64, decimals: usize, compact: bool) -> Result<String, FloatFormatError> {
+fn fixed_into(
+    f: f64,
+    decimals: usize,
+    compact: bool,
+    buffer: &mut [u8; FLOAT_BUFFER_SIZE],
+) -> Result<usize, FloatFormatError> {
     // Port of erts/emulator/sys/common/erl_sys_common_misc.c:161
     // (sys_double_to_chars_fast), OTP-29.1.1.
     let af = f.abs();
-    let mut out = if af > 9_007_199_254_740_992.0 || decimals >= POW10.len() {
-        format!("{f:.decimals$}")
+    let has_decimals = decimals != 0;
+    let mut out = BufferWriter::new(buffer);
+    if af > 9_007_199_254_740_992.0 || decimals >= POW10.len() {
+        write!(&mut out, "{f:.decimals$}").map_err(|_| FloatFormatError::BadArg)?;
+        if compact {
+            out.trim_compact();
+        }
     } else {
         let mut int_part;
         let mut frac_part = 0_u64;
@@ -99,47 +192,74 @@ fn fixed(f: f64, decimals: usize, compact: bool) -> Result<String, FloatFormatEr
         } else {
             int_part = af.round() as u64;
         }
-        let mut out = String::with_capacity(32);
+
+        if has_decimals {
+            if frac_part == 0 {
+                for _ in 0..decimals {
+                    out.push(b'0')?;
+                }
+            } else {
+                for _ in 0..decimals {
+                    let quotient = frac_part / 10;
+                    out.push((frac_part - quotient * 10) as u8 + b'0')?;
+                    frac_part = quotient;
+                }
+            }
+            out.push(b'.')?;
+        }
+
+        if int_part == 0 {
+            out.push(b'0')?;
+        } else {
+            while int_part != 0 {
+                let quotient = int_part / 10;
+                out.push((int_part - quotient * 10) as u8 + b'0')?;
+                int_part = quotient;
+            }
+        }
         if f.is_sign_negative() {
-            out.push('-');
+            out.push(b'-')?;
         }
-        let _ = write!(out, "{int_part}");
-        if decimals != 0 {
-            let _ = write!(out, ".{frac_part:0decimals$}");
-        }
-        out
-    };
-    if out.len() >= 256 {
-        return Err(FloatFormatError::BadArg);
-    }
-    if compact && (decimals != 0 || af > 9_007_199_254_740_992.0) {
-        // The fallback trims even an integer with D=0; preserve this erts quirk.
-        let len = out.trim_end_matches('0').len();
-        out.truncate(len);
-        if out.ends_with('.') {
-            out.push('0');
+
+        out.bytes[..out.len].reverse();
+        if compact && has_decimals {
+            out.trim_compact();
         }
     }
-    Ok(out)
+    out.finish()
 }
 
 /// Format the shortest round-trip float used by `io_lib_format:fwrite_g/1`.
 pub fn format_shortest(f: f64) -> String {
+    let mut buffer = [0_u8; FLOAT_BUFFER_SIZE];
+    let len = shortest_into(f, &mut buffer).expect("shortest float fits the erts buffer");
+    std::str::from_utf8(&buffer[..len])
+        .expect("float formatting is ASCII")
+        .to_owned()
+}
+
+fn shortest_into(f: f64, buffer: &mut [u8; FLOAT_BUFFER_SIZE]) -> Result<usize, FloatFormatError> {
     // Port of erts/emulator/ryu/to_chars.h:36 (to_chars), OTP-29.1.1.
     // Ryu supplies the shortest decimal; OTP's modified layout chooses fixed
     // or scientific form and requires a fractional digit in either form.
+    let mut out = BufferWriter::new(buffer);
     if !f.is_finite() {
-        return ryu::Buffer::new().format(f).to_owned();
+        out.write_str(ryu::Buffer::new().format(f))
+            .map_err(|_| FloatFormatError::BadArg)?;
+        return out.finish();
     }
     if f == 0.0 {
-        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
+        out.write_str(if f.is_sign_negative() { "-0.0" } else { "0.0" })
+            .map_err(|_| FloatFormatError::BadArg)?;
+        return out.finish();
     }
     let mut buf = ryu::Buffer::new();
     let raw = buf.format_finite(f);
     // Ryū's scientific form with a fractional significand already matches
     // the OTP layout; only fixed forms and one-digit significands need work.
     if raw.contains('e') && raw.contains('.') {
-        return raw.to_owned();
+        out.write_str(raw).map_err(|_| FloatFormatError::BadArg)?;
+        return out.finish();
     }
     let negative = raw.starts_with('-');
     let raw = raw.trim_start_matches('-');
@@ -186,51 +306,50 @@ pub fn format_shortest(f: f64) -> String {
     let force_scientific = (mantissa >= (1_u64 << 53) && exponent == 0)
         || (mantissa > (1_u64 << 52) / 5 && exponent == 1)
         || (mantissa > (1_u64 << 51) / 25 && exponent == 2);
-    let mut out = String::with_capacity(26);
     if negative {
-        out.push('-');
+        out.push(b'-')?;
     }
     if exponent >= lower && exponent <= upper && !force_scientific {
         let whole = n as i32 + exponent;
         if exponent >= 0 {
             for &digit in &digits[..n] {
-                out.push(char::from(digit));
+                out.push(digit)?;
             }
             for _ in 0..exponent {
-                out.push('0');
+                out.push(b'0')?;
             }
-            out.push_str(".0");
+            out.write_str(".0").map_err(|_| FloatFormatError::BadArg)?;
         } else if whole > 0 {
             for &digit in &digits[..whole as usize] {
-                out.push(char::from(digit));
+                out.push(digit)?;
             }
-            out.push('.');
+            out.push(b'.')?;
             for &digit in &digits[whole as usize..n] {
-                out.push(char::from(digit));
+                out.push(digit)?;
             }
         } else {
-            out.push_str("0.");
+            out.write_str("0.").map_err(|_| FloatFormatError::BadArg)?;
             for _ in 0..-whole {
-                out.push('0');
+                out.push(b'0')?;
             }
             for &digit in &digits[..n] {
-                out.push(char::from(digit));
+                out.push(digit)?;
             }
         }
     } else {
-        out.push(char::from(digits[0]));
-        out.push('.');
+        out.push(digits[0])?;
+        out.push(b'.')?;
         if n == 1 {
-            out.push('0');
+            out.push(b'0')?;
         } else {
             for &digit in &digits[1..n] {
-                out.push(char::from(digit));
+                out.push(digit)?;
             }
         }
-        out.push('e');
-        let _ = write!(out, "{scientific_exponent}");
+        out.push(b'e')?;
+        write!(&mut out, "{scientific_exponent}").map_err(|_| FloatFormatError::BadArg)?;
     }
-    out
+    out.finish()
 }
 
 /// Parse the strict syntax accepted by `erlang:list_to_float/1` in OTP 29.1.1.

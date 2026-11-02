@@ -52,6 +52,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "proptest",
+ "similar-asserts",
 ]
 
 [[package]]
