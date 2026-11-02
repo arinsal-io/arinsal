@@ -1761,31 +1761,25 @@ pub(crate) extern "C" fn integer_to_binary_light(
 
 fn binary_guard_apply(
     process: &mut crate::Process,
-    export: ExportDispatch,
+    guard: crate::bif_table::BinaryGuard,
     args: &[Term],
 ) -> Result<Term, arinsal_bifs::BifError> {
-    match crate::bif_table::binary_guard(&export.module, &export.function, export.arity) {
-        Some(crate::bif_table::BinaryGuard::ByteSize | crate::bif_table::BinaryGuard::BitSize) => {
-            let is_byte_size = matches!(
-                crate::bif_table::binary_guard(&export.module, &export.function, export.arity),
-                Some(crate::bif_table::BinaryGuard::ByteSize)
-            );
-            let bits = arinsal_bifs::bitstring_bit_len(args[0]);
-            match bits {
-                Ok(bits) => {
-                    let value = if is_byte_size { bits.div_ceil(8) } else { bits };
-                    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                    arinsal_term::TermBuilder::new(&mut fragment)
-                        .int_from_u64(value as u64)
-                        .map_err(|_| arinsal_bifs::BifError::SystemLimit)
-                }
-                Err(error) => Err(error),
-            }
+    use crate::bif_table::BinaryGuard;
+    match guard {
+        BinaryGuard::ByteSize | BinaryGuard::BitSize => {
+            let bits = arinsal_bifs::bitstring_bit_len(args[0])?;
+            let value = if matches!(guard, BinaryGuard::ByteSize) {
+                bits.div_ceil(8)
+            } else {
+                bits
+            };
+            let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            arinsal_term::TermBuilder::new(&mut fragment)
+                .int_from_u64(value as u64)
+                .map_err(|_| arinsal_bifs::BifError::SystemLimit)
         }
-        Some(crate::bif_table::BinaryGuard::BinaryPart) => {
-            if export.arity == 3 {
-                return binary_part_3_apply(process, args);
-            }
+        BinaryGuard::BinaryPart3 => binary_part_3_apply(process, args),
+        BinaryGuard::BinaryPart2 => {
             let (result, reductions) = {
                 let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                 let mut ctx = arinsal_bifs::Ctx::new(&mut fragment, &mut process.header);
@@ -1795,7 +1789,6 @@ fn binary_guard_apply(
             charge_bif_reductions(process, reductions);
             result
         }
-        None => Err(arinsal_bifs::BifError::Badarg { cause: None }),
     }
 }
 
@@ -1843,12 +1836,13 @@ fn binary_guard_result(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     export: ExportDispatch,
+    guard: crate::bif_table::BinaryGuard,
     args: &[Term],
     light: bool,
 ) -> u64 {
     process.reductions = process.header.fcalls;
     let entry_top = process.heap.heap_top_index();
-    let result = binary_guard_apply(process, export, args);
+    let result = binary_guard_apply(process, guard, args);
     let top = process.heap.heap_top_index();
     if top != entry_top {
         process.header.htop = process.heap.word_address(top);
@@ -1872,20 +1866,82 @@ fn binary_guard_result(
     }
 }
 
-fn binary_guard_light(header: *mut ProcessHeader, descriptor: u64, arity: usize) -> u64 {
+fn binary_guard_light(
+    header: *mut ProcessHeader,
+    descriptor: u64,
+    guard: crate::bif_table::BinaryGuard,
+    arity: usize,
+) -> u64 {
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    if usize::from(export.arity) != arity {
-        return 0;
-    }
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let mut args = [Term::NIL; 3];
     args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-    binary_guard_result(process, registers, export, &args[..arity], true)
+    binary_guard_result(process, registers, export, guard, &args[..arity], true)
 }
+
+/// `i_bif*` entry of a binary guard: the guard kind is the function, bound at load time.
+fn binary_guard_i_bif(
+    header: *mut ProcessHeader,
+    export: Option<ExportDispatch>,
+    guard: crate::bif_table::BinaryGuard,
+    arity: usize,
+    args: [u64; 3],
+) -> u64 {
+    let Some(export) = export else {
+        return 0;
+    };
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let args = args.map(crate::native_hooks::from_raw);
+    binary_guard_result(process, registers, export, guard, &args[..arity], false)
+}
+
+macro_rules! binary_guard_i_bif {
+    ($(#[$doc:meta])* $name:ident, $guard:ident, $arity:literal) => {
+        $(#[$doc])*
+        pub(crate) extern "C" fn $name(
+            header: *mut ProcessHeader,
+            export: Option<ExportDispatch>,
+            first: u64,
+            second: u64,
+            third: u64,
+        ) -> u64 {
+            binary_guard_i_bif(
+                header,
+                export,
+                crate::bif_table::BinaryGuard::$guard,
+                $arity,
+                [first, second, third],
+            )
+        }
+    };
+}
+
+binary_guard_i_bif!(
+    /// `i_bif1` of `byte_size/1`.
+    // Port of erts/emulator/beam/erl_bif_guard.c:376 (`byte_size_1`), OTP-29.1.1.
+    byte_size_guard, ByteSize, 1
+);
+binary_guard_i_bif!(
+    /// `i_bif1` of `bit_size/1`.
+    // Port of erts/emulator/beam/erl_bif_guard.c:354 (`bit_size_1`), OTP-29.1.1.
+    bit_size_guard, BitSize, 1
+);
+binary_guard_i_bif!(
+    /// `i_bif2` of `binary_part/2`.
+    // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
+    binary_part_2_guard, BinaryPart2, 2
+);
+binary_guard_i_bif!(
+    /// `i_bif3` of `binary_part/3`.
+    // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
+    binary_part_3_guard, BinaryPart3, 3
+);
 
 /// Dedicated BeamAsm entry for `byte_size/1` and its guard form.
 // Port of erts/emulator/beam/erl_bif_guard.c:376 (`byte_size_1`), OTP-29.1.1.
@@ -1896,7 +1952,12 @@ pub(crate) extern "C" fn byte_size_light(
     descriptor: u64,
     _identity: u64,
 ) -> u64 {
-    binary_guard_light(header, descriptor, 1)
+    binary_guard_light(
+        header,
+        descriptor,
+        crate::bif_table::BinaryGuard::ByteSize,
+        1,
+    )
 }
 
 /// Dedicated BeamAsm entry for `bit_size/1` and its guard form.
@@ -1908,7 +1969,12 @@ pub(crate) extern "C" fn bit_size_light(
     descriptor: u64,
     _identity: u64,
 ) -> u64 {
-    binary_guard_light(header, descriptor, 1)
+    binary_guard_light(
+        header,
+        descriptor,
+        crate::bif_table::BinaryGuard::BitSize,
+        1,
+    )
 }
 
 /// Dedicated BeamAsm entry for `binary_part/2` and `binary:part/2`.
@@ -1920,7 +1986,12 @@ pub(crate) extern "C" fn binary_part_2_light(
     descriptor: u64,
     _identity: u64,
 ) -> u64 {
-    binary_guard_light(header, descriptor, 2)
+    binary_guard_light(
+        header,
+        descriptor,
+        crate::bif_table::BinaryGuard::BinaryPart2,
+        2,
+    )
 }
 
 /// Dedicated BeamAsm entry for `binary_part/3` and `binary:part/3`.
@@ -3923,16 +3994,10 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
     third: u64,
 ) -> u64 {
     // A guard BIF never collects (erts calls it with only Update::eReductions).
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let all_args = [first, second, third].map(crate::native_hooks::from_raw);
-    if let Some(export) = export
-        && crate::bif_table::binary_guard(&export.module, &export.function, export.arity).is_some()
-    {
-        let args = &all_args[..usize::from(export.arity).min(all_args.len())];
-        return binary_guard_result(process, registers, export, args, false);
-    }
     let Some((bif, arity)) = export.and_then(|export| Some((export.bif?, export.arity))) else {
         crate::native_hooks::set_error(process, "undef");
         return 0;
@@ -5583,7 +5648,7 @@ pub(crate) extern "C" fn process_info_2_light(
 }
 
 fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
-    let (process, _registers) = crate::native_hooks::enter_runtime(header)?;
+    let (process, registers) = crate::native_hooks::enter_runtime(header)?;
     let pid = arinsal_sched::Pid::from_term(process.x.first().copied()?)?;
     let item = process.x.get(1).copied()?;
     let result = crate::natives::proc::process_info_light(process, pid, item);
@@ -5592,7 +5657,23 @@ fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
     let top = process.heap.heap_top_index();
     process.header.htop = native_htop(process, top);
     match result {
-        Some(Ok(term)) => Some(crate::native_hooks::raw(term)),
+        Some(Ok(term)) => {
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523 (call_light_bif_shared,
+            // ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: a result that spilled into heap
+            // fragments larger than the free young area is collected right after the BIF, with
+            // the result as the only root.
+            if process.heap.gc_after_bif_desired() {
+                let mut result = Ok(term);
+                if !gc_after_plain_bif(process, 2, &mut result) {
+                    return Some(0);
+                }
+                let Ok(term) = result else { return Some(0) };
+                registers.x_reg_array[0] = term;
+                process.sync_native_header();
+                return Some(crate::native_hooks::raw(term));
+            }
+            Some(crate::native_hooks::raw(term))
+        }
         _ => None,
     }
 }

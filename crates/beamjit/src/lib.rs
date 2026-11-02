@@ -220,8 +220,9 @@ pub trait ModuleEnv {
             update: unused_record_create,
         }
     }
-    /// Runtime hook calling a plain BIF by export identity.
-    fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {
+    /// Runtime hook calling the plain BIF with export `identity`: the BIF's own function,
+    /// chosen at load time (`bif_table[].f`).
+    fn bif_identity_helper(&self, _identity: usize) -> arinsal_beamasm::bif::BifIdentityHelper {
         unused_bif_identity as *const () as usize
     }
     /// Export identity of an import that is a plain (pure or heap-allocating) BIF, if it is one.
@@ -2242,10 +2243,21 @@ fn literal_type_union(etf: &[u8]) -> u16 {
 // OTP-29.1.1: a single pair is already sorted; several pairs need literal keys.
 /// `Live` of a bit-syntax match command: `nil` when the command cannot allocate.
 fn number(value: Option<&SpecificOperand>) -> Result<u32, String> {
-    as_u32(value).ok_or_else(|| "expected nonnegative integer operand".to_owned())
+    match value {
+        Some(SpecificOperand::Label(value)) => Ok(*value),
+        Some(SpecificOperand::Unsigned(value)) => {
+            u32::try_from(*value).map_err(|_| "expected nonnegative integer operand".to_owned())
+        }
+        // TAG_i is still a tagged signed immediate; a few emitter paths use this helper for
+        // operands that are defined as a label-or-integer word.
+        Some(SpecificOperand::SmallInt(value)) => {
+            u32::try_from(*value).map_err(|_| "expected nonnegative integer operand".to_owned())
+        }
+        _ => Err("expected nonnegative integer operand".to_owned()),
+    }
 }
 
-/// Operand that is either an untagged unsigned count (tagged small here) or a term.
+/// Operand that is either an untagged count or an existing term for the bit-syntax API.
 fn small_or_arg(
     value: Option<&SpecificOperand>,
     beam: &BeamFile,
@@ -2258,6 +2270,20 @@ fn small_or_arg(
         Some(SpecificOperand::Unsigned(_)) => Err(EmitError::Operand(
             "unsigned operand does not fit a small integer".to_owned(),
         )),
+        other => arg(other, beam, env).map_err(EmitError::Operand),
+    }
+}
+
+/// Converts an untagged arity word to the tagged small value expected by the assembler API.
+fn tagged_small_number(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<ArgVal, EmitError> {
+    match value {
+        Some(SpecificOperand::Unsigned(value)) if *value < (1 << 59) => {
+            Ok(ArgVal::Immediate((value << 4) | 0xf))
+        }
         other => arg(other, beam, env).map_err(EmitError::Operand),
     }
 }
@@ -2840,14 +2866,19 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 if GENERIC == erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4 {
                     count(4)?;
-                    assembler.emit_is_tuple_of_arity(typed_source, value(3)?, fail, n(1)?)?;
+                    assembler.emit_is_tuple_of_arity(
+                        typed_source,
+                        tagged_small_number(args.get(3), beam, env)?,
+                        fail,
+                        n(1)?,
+                    )?;
                     break 'body;
                 }
                 if GENERIC == erts_tables::GENOP_I_IS_TAGGED_TUPLE_FF_5 {
                     count(5)?;
                     assembler.emit_is_tagged_tuple_ff(
                         typed_source,
-                        value(3)?,
+                        tagged_small_number(args.get(3), beam, env)?,
                         value(4)?,
                         fail,
                         n(1)?,
@@ -2923,14 +2954,28 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         assembler.emit_is_tuple(typed_source, fail)?
                     }
                     erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_3 => {
-                        assembler.emit_is_tuple_of_arity(typed_source, value(2)?, fail, fail)?;
+                        assembler.emit_is_tuple_of_arity(
+                            typed_source,
+                            tagged_small_number(args.get(2), beam, env)?,
+                            fail,
+                            fail,
+                        )?;
                     }
                     erts_tables::GENOP_TEST_ARITY_3 | erts_tables::GENOP_I_TEST_ARITY_3 => {
-                        assembler.emit_test_arity(typed_source, value(2)?, fail)?;
+                        assembler.emit_test_arity(
+                            typed_source,
+                            tagged_small_number(args.get(2), beam, env)?,
+                            fail,
+                        )?;
                     }
                     erts_tables::GENOP_IS_TAGGED_TUPLE_4
                     | erts_tables::GENOP_I_IS_TAGGED_TUPLE_4 => {
-                        assembler.emit_is_tagged_tuple(typed_source, value(2)?, value(3)?, fail)?;
+                        assembler.emit_is_tagged_tuple(
+                            typed_source,
+                            tagged_small_number(args.get(2), beam, env)?,
+                            value(3)?,
+                            fail,
+                        )?;
                     }
                     erts_tables::GENOP_IS_EQ_EXACT_3
                     | erts_tables::GENOP_IS_NE_EXACT_3
@@ -3251,7 +3296,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 &sources,
                 fail,
                 value(bif_at + 1)?,
-                env.bif_identity_helper(),
+                env.bif_identity_helper(identity),
             )
         }
         EmitterKind::Records => {
@@ -4069,7 +4114,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 .map(|(i, item)| {
                     if is_tuple_arity && i < size / 2 {
                         match item {
-                            SpecificOperand::SmallInt(val) => Ok(ArgVal::Immediate(*val as u64)),
                             SpecificOperand::Unsigned(val) => Ok(ArgVal::Immediate(*val)),
                             _ => arg(Some(item), beam, env).map_err(EmitError::Operand),
                         }
@@ -4102,7 +4146,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             let is_tuple_arity = emitter == EmitterKind::SelectTupleArity2;
             let first = if is_tuple_arity {
                 match args.get(2) {
-                    Some(SpecificOperand::SmallInt(val)) => ArgVal::Immediate(*val as u64),
                     Some(SpecificOperand::Unsigned(val)) => ArgVal::Immediate(*val),
                     _ => value(2)?,
                 }
@@ -4112,7 +4155,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             let first_label = value(3)?;
             let second = if is_tuple_arity {
                 match args.get(4) {
-                    Some(SpecificOperand::SmallInt(val)) => ArgVal::Immediate(*val as u64),
                     Some(SpecificOperand::Unsigned(val)) => ArgVal::Immediate(*val),
                     _ => value(4)?,
                 }
@@ -4140,7 +4182,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 // two's-complement bit pattern.
                 let base = match args.get(2) {
                     Some(SpecificOperand::Unsigned(word)) => *word,
-                    Some(SpecificOperand::SmallInt(word)) => *word as u64,
                     _ => {
                         return Err(EmitError::Operand(
                             "jump table base must be an integer".to_owned(),
@@ -4232,7 +4273,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     let word = |index: usize| -> Result<u64, EmitError> {
                         match args.get(index) {
                             Some(SpecificOperand::Unsigned(word)) => Ok(*word),
-                            Some(SpecificOperand::SmallInt(word)) => Ok(*word as u64),
                             _ => Err(EmitError::Operand(
                                 "bitstring match command expects an integer operand".to_owned(),
                             )),
@@ -4400,7 +4440,12 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 erts_tables::GENOP_I_BS_SKIP_UTF16_3 => {
                     count(3)?;
-                    assembler.emit_i_bs_skip_utf16(value(0)?, n(1)?, value(2)?, helper)
+                    assembler.emit_i_bs_skip_utf16(
+                        value(0)?,
+                        n(1)?,
+                        tagged_small_number(args.get(2), beam, env)?,
+                        helper,
+                    )
                 }
                 erts_tables::GENOP_I_BS_VALIDATE_UNICODE_RETRACT_3 => {
                     count(3)?;
@@ -4408,7 +4453,13 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 erts_tables::GENOP_I_BS_GET_UTF16_4 => {
                     count(4)?;
-                    assembler.emit_i_bs_get_utf16(value(0)?, n(1)?, value(2)?, value(3)?, helper)
+                    assembler.emit_i_bs_get_utf16(
+                        value(0)?,
+                        n(1)?,
+                        tagged_small_number(args.get(2), beam, env)?,
+                        value(3)?,
+                        helper,
+                    )
                 }
                 erts_tables::GENOP_I_BS_GET_FLOAT2_6 => {
                     count(6)?;

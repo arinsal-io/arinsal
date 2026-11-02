@@ -543,6 +543,9 @@ fn merge_collision_node<H: HeapAlloc + ?Sized>(
 
 /// Decode one side of a node pair for the walk: its bitmap at `lvl` (or its
 /// collision run length at the last level) and where its children start.
+// Port of erts/emulator/beam/erl_map.c:1615-1679 (hashmap_merge), OTP-29.1.1.
+// Keep this in the traversal loop like erts; an out-of-line call is measurable here.
+#[inline(always)]
 fn open_node(node: Term, src: &mut Src, lvl: usize, bm: &mut u32, coll_sz: &mut usize) {
     if is_leaf(node) {
         if lvl < HAMT_MAX_LEVEL {

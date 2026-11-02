@@ -3243,7 +3243,7 @@ fn write_decode_target(
 // Port of erts/emulator/beam/external.c:5425-5460 (dec_term map_array post-pass), OTP-29.1.1.
 fn finish_decode_maps(
     reservation: &mut HeapReservation<'_, ProcessHeap>,
-    maps: &mut SmallVec<[DecodeMap; 4]>,
+    maps: &mut SmallVec<[DecodeMap; 10]>,
     root: &mut Term,
 ) -> Result<(), BifError> {
     while let Some(map) = maps.pop() {
@@ -3403,7 +3403,7 @@ fn decode_direct_step(
     next: &mut Option<HeapTermSlot>,
     root: &mut Term,
     root_started: &mut bool,
-    maps: &mut SmallVec<[DecodeMap; 4]>,
+    maps: &mut SmallVec<[DecodeMap; 10]>,
     pending: &mut Option<DecodePending>,
     internal_nc: &mut bool,
     safe: bool,
@@ -3428,23 +3428,21 @@ fn decode_direct_step(
                     unreachable!();
                 };
                 let count = next_index.min(budget.saturating_sub(work));
-                for _ in 0..count {
-                    next_index -= 1;
-                    let slot = block
-                        .term_slot(next_index + 1)
-                        .map_err(map_term_build_error)?;
-                    let next_slot = if next_index + 1 == arity {
+                if count > 0 {
+                    let first = next_index - count + 1;
+                    let terminal = if next_index == arity {
                         continuation
                     } else {
                         Some(
                             block
-                                .term_slot(next_index + 2)
+                                .term_slot(next_index + 1)
                                 .map_err(map_term_build_error)?,
                         )
                     };
-                    ctx.heap
-                        .write_next_slot(slot, next_slot)
+                    block
+                        .write_next_chain(first, count, terminal)
                         .map_err(map_term_build_error)?;
+                    next_index -= count;
                 }
                 work += count;
                 if next_index != 0 {
@@ -3473,24 +3471,17 @@ fn decode_direct_step(
                     unreachable!();
                 };
                 let count = next_index.min(budget.saturating_sub(work));
-                for _ in 0..count {
-                    next_index -= 1;
-                    let car = block
-                        .term_slot(next_index * 2)
-                        .map_err(map_term_build_error)?;
-                    let cdr = block
-                        .term_slot(next_index * 2 + 1)
-                        .map_err(map_term_build_error)?;
-                    let next_list = block
-                        .list_at((next_index + 1) * 2)
-                        .map_err(map_term_build_error)?;
-                    ctx.heap
-                        .write_term_slot(cdr, next_list)
-                        .map_err(map_term_build_error)?;
-                    ctx.heap
-                        .write_next_slot(car, chain)
-                        .map_err(map_term_build_error)?;
-                    chain = Some(car);
+                if count > 0 {
+                    chain = Some(
+                        block
+                            .write_list_chain(
+                                next_index - count,
+                                count,
+                                chain.ok_or(BifError::BADARG)?,
+                            )
+                            .map_err(map_term_build_error)?,
+                    );
+                    next_index -= count;
                 }
                 work += count;
                 if next_index != 0 {
@@ -3760,16 +3751,7 @@ fn decode_direct_step(
                         .map_err(map_term_build_error)?;
                     let term = block.list_at(0).map_err(map_term_build_error)?;
                     let last_car = block
-                        .term_slot((size - 1) * 2)
-                        .map_err(map_term_build_error)?;
-                    let last_cdr = block
-                        .term_slot((size - 1) * 2 + 1)
-                        .map_err(map_term_build_error)?;
-                    ctx.heap
-                        .write_next_slot(last_cdr, continuation)
-                        .map_err(map_term_build_error)?;
-                    ctx.heap
-                        .write_next_slot(last_car, Some(last_cdr))
+                        .write_list_tail(continuation)
                         .map_err(map_term_build_error)?;
                     *pending = Some(DecodePending::List {
                         block,
@@ -4134,14 +4116,15 @@ fn decode_direct_step(
 /// Incremental ETF validator retained by `binary_to_term_trap/1`.
 pub struct DecodeWalk<'a> {
     input: DecodeInput<'a>,
-    plain: SmallVec<[u8; 128]>,
+    plain: Option<SmallVec<[u8; 128]>>,
     validator_at: usize,
     decode_at: usize,
     stack: SmallVec<[Frame; 4]>,
     decode_next: Option<HeapTermSlot>,
     decode_root: Term,
     decode_root_started: bool,
-    decode_maps: SmallVec<[DecodeMap; 4]>,
+    // Port of `PSTACK_DECLARE(map_array, 10)` in external.c:4316, OTP-29.1.1.
+    decode_maps: SmallVec<[DecodeMap; 10]>,
     pending: Option<DecodePending>,
     internal_nc: bool,
     safe: bool,
@@ -4190,28 +4173,30 @@ impl<'a> DecodeWalk<'a> {
         if bytes.first() != Some(&131) {
             return Err(BifError::BADARG);
         }
-        let (plain, used_prefix, compressed, expected_plain, decompressor) =
-            if bytes.get(1) == Some(&80) {
-                if bytes.len() < 6 {
-                    return Err(BifError::BADARG);
-                }
-                let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
-                // Port of erts/emulator/beam/external.c:1770-1779 (binary2term_prepare),
-                // OTP-29.1.1. ERTS validates oversized length claims by counting output in
-                // 64 KiB chunks before allocating the uncompressed external term.
-                if size > B2T_MAX_DIRECT_UNCOMPRESSED_SIZE
-                    && compressed_uncompressed_size(&bytes[6..])? != size
-                {
-                    return Err(BifError::BADARG);
-                }
-                (SmallVec::new(), 6, true, size, Some(Decompress::new(true)))
-            } else {
-                (SmallVec::new(), 1, false, 0, None)
-            };
+        let (used_prefix, compressed, expected_plain, decompressor) = if bytes.get(1) == Some(&80) {
+            if bytes.len() < 6 {
+                return Err(BifError::BADARG);
+            }
+            let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+            // Port of erts/emulator/beam/external.c:1770-1779 (binary2term_prepare),
+            // OTP-29.1.1. ERTS validates oversized length claims by counting output in
+            // 64 KiB chunks before allocating the uncompressed external term.
+            if size > B2T_MAX_DIRECT_UNCOMPRESSED_SIZE
+                && compressed_uncompressed_size(&bytes[6..])? != size
+            {
+                return Err(BifError::BADARG);
+            }
+            (6, true, size, Some(Decompress::new(true)))
+        } else {
+            (1, false, 0, None)
+        };
         let input_size = bytes.len();
         Ok(Self {
             input,
-            plain,
+            // Port of the compressed-input arm of B2TContext.u (binary_to_term_int),
+            // erts/emulator/beam/external.c, OTP-29.1.1: uncompressed input does not carry
+            // or initialize an inflation buffer.
+            plain: compressed.then(SmallVec::new),
             validator_at: 0,
             decode_at: 0,
             stack: SmallVec::new(),
@@ -4324,7 +4309,8 @@ impl<'a> DecodeWalk<'a> {
         if self.inflate_done {
             return Ok(0);
         }
-        let remaining = self.expected_plain.saturating_sub(self.plain.len());
+        let plain_len = self.plain.as_ref().ok_or(BifError::BADARG)?.len();
+        let remaining = self.expected_plain.saturating_sub(plain_len);
         let capacity = output_budget.max(1).min(remaining.saturating_add(1));
         let mut output = SmallVec::<[u8; 128]>::new();
         output.resize(capacity, 0);
@@ -4345,14 +4331,17 @@ impl<'a> DecodeWalk<'a> {
         let produced =
             usize::try_from(inflater.total_out() - before_out).map_err(|_| BifError::BADARG)?;
         self.input_offset = self.input_offset.saturating_add(consumed);
-        if self.plain.len().saturating_add(produced) > self.expected_plain {
+        if plain_len.saturating_add(produced) > self.expected_plain {
             return Err(BifError::BADARG);
         }
-        self.plain.extend_from_slice(&output[..produced]);
+        self.plain
+            .as_mut()
+            .ok_or(BifError::BADARG)?
+            .extend_from_slice(&output[..produced]);
         if status == Status::StreamEnd {
             self.inflate_done = true;
             self.used_prefix = 6 + self.input_offset;
-            if self.plain.len() != self.expected_plain {
+            if self.plain.as_ref().ok_or(BifError::BADARG)?.len() != self.expected_plain {
                 return Err(BifError::BADARG);
             }
         } else if consumed == 0 && produced == 0 {
@@ -4363,7 +4352,9 @@ impl<'a> DecodeWalk<'a> {
 
     fn plain_bytes(&self) -> &[u8] {
         if self.compressed {
-            &self.plain
+            self.plain
+                .as_deref()
+                .expect("compressed input has an inflate buffer")
         } else {
             &self.input.bytes()[1..]
         }
@@ -4401,7 +4392,9 @@ impl<'a> DecodeWalk<'a> {
             };
             let (parsed, after) = {
                 let bytes = if self.compressed {
-                    &self.plain[..]
+                    self.plain
+                        .as_deref()
+                        .expect("compressed input has an inflate buffer")
                 } else {
                     &self.input.bytes()[1..]
                 };
@@ -4488,7 +4481,9 @@ impl<'a> DecodeWalk<'a> {
                 let mut state = crate::BifState::default();
                 let mut decode_ctx = Ctx::with_allocator(reserved_words, &mut state);
                 let bytes = if self.compressed {
-                    &self.plain[..]
+                    self.plain
+                        .as_deref()
+                        .expect("compressed input has an inflate buffer")
                 } else {
                     &self.input.bytes()[1..]
                 };
@@ -4582,7 +4577,9 @@ impl<'a> DecodeWalk<'a> {
             let before = (self.input_offset, self.plain_bytes().len());
             let input_complete = !self.compressed || self.inflate_done;
             let bytes = if self.compressed {
-                &self.plain[..]
+                self.plain
+                    .as_deref()
+                    .expect("compressed input has an inflate buffer")
             } else {
                 &self.input.bytes()[1..]
             };

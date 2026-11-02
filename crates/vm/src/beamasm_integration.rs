@@ -2098,8 +2098,14 @@ impl ModuleEnv for VmModuleEnv<'_> {
             ),
         }
     }
-    fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {
-        crate::native_helpers::arinsal_beamasm_bif_by_identity as *const () as usize
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (i_bif*: `mov ARG, bif->f`), OTP-29.1.1:
+    // the BIF function is bound when the call site is emitted, never looked up by name per call.
+    fn bif_identity_helper(&self, identity: usize) -> arinsal_beamasm::bif::BifIdentityHelper {
+        export_dispatch(identity)
+            .and_then(|export| {
+                crate::bif_table::guard_helper(&export.module, &export.function, export.arity)
+            })
+            .unwrap_or(crate::native_helpers::arinsal_beamasm_bif_by_identity as *const () as usize)
     }
     fn plain_bif_identity(&self, _beam: &BeamFile, index: u32) -> Option<usize> {
         let identity = *self.export_entries.get(index as usize)?;
