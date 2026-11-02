@@ -1026,28 +1026,10 @@ pub(crate) fn erl_create_process(
         .monitor
         .as_ref()
         .map(|monitor| monitor.id.unwrap_or_else(arinsal_bifs::next_ref_id));
-    // Both halves of a spawn monitor share its data (erts `ErtsMonitorData`): the target half
-    // goes into the child's list here, the origin half into the parent's tree once the child
-    // has its pid.
-    let mut monitor_origin = None;
-    let mut monitor_target = None;
-    if let (Some(id), Some(monitor)) = (monitor_id, so.monitor.as_ref()) {
-        let (origin, target) = crate::proc_create::create_monitor(
-            id,
-            parent_pid.data(),
-            0,
-            crate::proc_create::MonitorInfo::new(monitor.tag.clone(), None),
-            crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
-                alias_mode: monitor.alias,
-            }),
-        );
-        monitor_target = Some(target);
-        monitor_origin = Some(origin);
-    }
     // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: alloc_process
     // takes the process struct and its table entry first, and the fields are then initialized
     // in place.
-    let init_child = |child: &mut Process| -> Result<(), VmError> {
+    let init_child = |child_pid: Pid, child: &mut Process| -> Result<(), VmError> {
         child.set_runtime_with_min_bin_vheap_size(Some(runtime), min_bin_vheap as u64);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process initializes both
         // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
@@ -1106,18 +1088,35 @@ pub(crate) fn erl_create_process(
             child.x[1] = function;
             child.x[2] = copied_args;
         }
-        // The link and monitor must be on the child before enqueue. Another scheduler can run
-        // `code_server`'s on_load fun to `exit/1` before a Monitor signal sent after `spawn` is
-        // delivered, and the DOWN is then lost. Port of erts/emulator/beam/erl_process.c
-        // (spawn_opt monitor before schedule), OTP-29.1.1.
+        // The link must be on the child before it becomes schedulable.
         if so.link {
             child
                 .cold_mut()
                 .links
                 .insert(crate::proc_create::process_link(parent_pid, false));
         }
-        if let Some(target) = monitor_target {
+        if let (Some(id), Some(monitor)) = (monitor_id, so.monitor.as_ref()) {
+            // Port of erts/emulator/beam/erl_process.c:12932-12942 (erl_create_process):
+            // the child has a pid and remains locked while both monitor halves are installed.
+            let (origin, target) = crate::proc_create::create_monitor(
+                id,
+                parent_pid.data(),
+                child_pid.data(),
+                crate::proc_create::MonitorInfo::new(monitor.tag.clone(), None),
+                crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
+                    alias_mode: monitor.alias,
+                }),
+            );
+            parent.cold_mut().monitors.insert(origin);
             child.cold_mut().lt_monitors.insert(target);
+            if monitor.priority {
+                parent.cold_mut().prio_monitors.insert(id);
+            }
+            if monitor.alias.is_some()
+                && let Some(rt) = parent.runtime
+            {
+                rt.alias_bind(id, Some(parent_pid));
+            }
         }
         Ok(())
     };
@@ -1204,20 +1203,6 @@ pub(crate) fn erl_create_process(
             (request_message, reply_message),
             so.reply.is_none(),
         ));
-    }
-    if let (Some(id), Some(mut origin), Some(monitor)) =
-        (monitor_id, monitor_origin, so.monitor.as_ref())
-    {
-        origin.view_mut().set_other(pid.data());
-        parent.cold_mut().monitors.insert(origin);
-        if monitor.priority {
-            parent.cold_mut().prio_monitors.insert(id);
-        }
-        if monitor.alias.is_some()
-            && let Some(rt) = parent.runtime
-        {
-            rt.alias_bind(id, Some(parent_pid));
-        }
     }
     if let Some(reply) = so.reply {
         // Port of erts/emulator/beam/erl_process.c:13146 (erts_send_local_spawn_reply), OTP-29.1.1:
@@ -2211,7 +2196,7 @@ pub(crate) fn monitor_light(
             pid,
             arinsal_sched::Signal::Monitor {
                 reference: id,
-                shared: Box::new(arinsal_sched::SharedPayload(target.into_shared())),
+                shared: target.into_shared(),
             },
         )
         .is_err()
@@ -3178,7 +3163,7 @@ fn call_resolved(
                 process.cold_mut().monitors.insert(origin);
                 let signal = arinsal_sched::Signal::Monitor {
                     reference: id,
-                    shared: Box::new(arinsal_sched::SharedPayload(target_half.into_shared())),
+                    shared: target_half.into_shared(),
                 };
                 if let Err(error) = ctx.signal(pid, signal) {
                     process.cold_mut().monitors.remove(id);

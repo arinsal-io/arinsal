@@ -123,6 +123,40 @@ pub fn reduction_charge(operation: &str, args: &[Term]) -> u32 {
     }
 }
 
+/// Estimate OTP's reduction charge for the multiplication fast path.
+///
+/// Port of `bump_reds_quadratic` in `erts/emulator/beam/erl_arith.c`, OTP-29.1.1. The direct
+/// form keeps the operand sizes gathered once, as `erts_mixed_times` does before `big_times`.
+pub fn mul_reduction_charge(left: Term, right: Term) -> u32 {
+    const WORDS_PER_REDUCTION: usize = 16;
+    const MAX_REDUCTIONS: usize = 4_000;
+
+    let left_small = left.as_small();
+    let right_small = right.as_small();
+    if matches!(left_small, Some(0 | 1)) || matches!(right_small, Some(0 | 1)) {
+        return 0;
+    }
+
+    let left_words = left_small.map(|_| 1).or_else(|| left.bignum_digit_count());
+    let right_words = right_small
+        .map(|_| 1)
+        .or_else(|| right.bignum_digit_count());
+    let (Some(left_words), Some(right_words)) = (left_words, right_words) else {
+        return 0;
+    };
+    if left_small.is_some() && right_small.is_some() {
+        return 0;
+    }
+
+    if left_words >= MAX_REDUCTIONS * WORDS_PER_REDUCTION
+        || right_words >= MAX_REDUCTIONS * WORDS_PER_REDUCTION
+    {
+        MAX_REDUCTIONS as u32
+    } else {
+        (left_words.saturating_mul(right_words) / WORDS_PER_REDUCTION + 1) as u32
+    }
+}
+
 // TermBuilder is sized; this proxy preserves the frozen ?Sized heap API.
 struct HeapProxy<'a, H: HeapAlloc + ?Sized>(&'a mut H);
 impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {

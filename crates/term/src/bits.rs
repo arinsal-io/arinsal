@@ -882,9 +882,9 @@ fn prepare_private_append(
         let Some((bin_ref, binary)) = owner(term) else {
             return Ok(PrivateAppendUpdate::new(0));
         };
+        // erts checks the refcount only in an ASSERT in `erts_bs_private_append_checked`.
         if sub_bits_flags(term) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE
             || !binary.has_flags(BINARY_FLAG_WRITABLE)
-            || binary.load(2, Ordering::Relaxed) != Some(1)
         {
             return Ok(PrivateAppendUpdate::new(0));
         }
@@ -1363,9 +1363,10 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         let Some((bin_ref, binary)) = owner(source) else {
             return Ok(None);
         };
+        // Port of the release checks in `erts_bs_append_checked`; writability carries the
+        // uniqueness invariant, so this path does not perform a redundant refcount read.
         if sub_bits_flags(source) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE
             || !binary.has_flags(BINARY_FLAG_WRITABLE)
-            || binary.load(2, Ordering::Relaxed) != Some(1)
         {
             return Ok(None);
         }
@@ -1413,16 +1414,16 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
             };
             *bin_ref.cast_mut().add(1) = header as u64;
             let old = source.raw_ptr().cast_mut();
-            *old.add(1) = (data as u64 & !3)
-                | (if *old.add(1) & SUB_BITS_VOLATILE != 0 {
-                    SUB_BITS_VOLATILE
-                } else {
-                    0
-                });
+            let writable_flags = *old.add(1) & SUB_BITS_VOLATILE;
+            *old.add(1) = (data as u64 & !3) | writable_flags;
             *old.add(1) &= !SUB_BITS_MUTABLE;
-            std::ptr::copy_nonoverlapping(old, p, 5);
-            *p.add(1) |= SUB_BITS_MUTABLE;
+            // Port of `erl_sub_bits_init` in erts_bs_append_checked: initialize the fresh
+            // SUB_BITS fields directly instead of copying the previous five-word term.
+            *p = (4 << 6) | SUB_BITS;
+            *p.add(2) = *old.add(2);
             *p.add(3) = (new_bits + adjustment * 8) as u64;
+            *p.add(1) = (data as u64 & !3) | writable_flags | SUB_BITS_MUTABLE;
+            *p.add(4) = *old.add(4);
             (Term::from_ptr(p, 2), data as usize, grew)
         };
         Ok(Some((term, data_address, end, grew)))

@@ -259,6 +259,46 @@ fn with_fragment_alloc(
     operation(lhs, rhs, &mut heap)
 }
 
+#[inline(always)]
+fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bool) -> u64 {
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:526-530 and
+    // erts/emulator/beam/erl_arith.c:716-858 (emit_mul_body_shared, erts_mixed_times).
+    let result = with_fragment_alloc(process, left, right, |a, b, heap| {
+        arinsal_arith::mul(a, b, heap)
+    })
+    .map(raw);
+    let charge = arinsal_arith::mul_reduction_charge(left, right);
+    // Port of erts/emulator/beam/bif.h (BUMP_REDS): the count never goes below zero.
+    process.header.fcalls = process
+        .header
+        .fcalls
+        .saturating_sub(charge.min(i32::MAX as u32) as i32)
+        .max(0);
+    let answer = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let error = match error {
+                ArithError::HeapFull { .. } | ArithError::SystemLimit => BifError::SystemLimit,
+                ArithError::Badarith | ArithError::Badarg => BifError::Badarith,
+            };
+            if quiet {
+                set_light_error(process, &error);
+            } else if let Some((function, arity)) = arith_bif(2) {
+                crate::native_helpers::set_native_bif_register_error(
+                    process,
+                    arinsal_term::atoms::ERLANG,
+                    function,
+                    arity,
+                    error,
+                );
+            }
+            0
+        }
+    };
+    process.sync_native_header();
+    answer
+}
+
 /// Arithmetic and float slow path. Returns an OTP term, except float-register
 /// operations (16, 18-23), whose payload is an IEEE-754 word.
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:145-1771, OTP-29.1.1.
@@ -287,6 +327,9 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     let right = from_raw(rhs);
     let mut guard_add_reductions = 0;
     let mut mul_add_failure = None;
+    if op == 2 {
+        return beamasm_mixed_times(process, left, right, quiet);
+    }
     let operation = match op {
         0 => Some(("+", &[left, right][..])),
         1 => Some(("-", &[left, right][..])),

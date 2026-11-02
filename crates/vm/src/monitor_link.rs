@@ -215,11 +215,6 @@ fn node_other(node: NodePtr) -> u64 {
     unsafe { (*node.as_ptr()).other }
 }
 
-fn set_node_other(node: NodePtr, other: u64) {
-    // SAFETY: as in `set_node_flags`.
-    unsafe { (*node.as_ptr()).other = other }
-}
-
 /// The containing structure of a node (`erts_ml_node_to_main_struct__`).
 fn node_to_main(node: NodePtr) -> NonNull<u8> {
     // SAFETY: `offset` is the distance from the start of the containing allocation to the node,
@@ -864,7 +859,7 @@ impl<I, O, S> MonitorList<I, O, S> {
 /// and so does a half in transit as a monitor or demonitor signal (`Arc<MonitorData>` coerced
 /// into the scheduler's `SharedPayload`, so the signal costs no allocation of its own).
 #[repr(C)]
-pub(crate) struct MonitorData<I, O, S = ()> {
+pub struct MonitorData<I, O, S = ()> {
     /// The halves are written by the process that holds each of them while the other process
     /// may read the shared fields, so they are interior-mutable.
     origin: UnsafeCell<MonLnkNode>,
@@ -1057,7 +1052,8 @@ impl<I, O, S> Monitor<I, O, S> {
         }
     }
 
-    pub(crate) fn view_mut(&mut self) -> MonitorMut<'_, I, O, S> {
+    #[cfg(test)]
+    fn view_mut(&mut self) -> MonitorMut<'_, I, O, S> {
         MonitorMut {
             node: self.node,
             _monitor: PhantomData,
@@ -1157,10 +1153,6 @@ pub(crate) struct MonitorMut<'a, I, O, S = ()> {
 }
 
 impl<'a, I, O, S> MonitorMut<'a, I, O, S> {
-    pub(crate) fn set_other(&mut self, other: u64) {
-        set_node_other(self.node, other);
-    }
-
     /// The origin state; `None` on a target half.
     pub(crate) fn origin_state(self) -> Option<&'a mut O> {
         if node_flags(self.node) & node_flag::TARGET != 0 {

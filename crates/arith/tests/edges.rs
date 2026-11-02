@@ -1,5 +1,5 @@
 use arinsal_arith::{self as arith, ArithError};
-use arinsal_term::{MAX_SMALL, ProcessHeap, Term, TermBuilder, VecHeap, to_owned};
+use arinsal_term::{MAX_SMALL, ProcessHeap, Term, TermBuilder, VecHeap, from_owned, to_owned};
 use num_bigint::BigInt;
 
 fn small(n: i64) -> Term {
@@ -129,4 +129,34 @@ fn bignum_float_conversion_rounds_like_otp() {
         panic!("float/1 returned a non-float");
     };
     assert_eq!(actual.to_bits(), 5_183_643_171_103_440_897);
+}
+
+#[test]
+fn multiplication_reduction_charge_matches_general_arithmetic_charge() {
+    let values = [
+        arinsal_etf::OwnedTerm::Int(-2),
+        arinsal_etf::OwnedTerm::Int(-1),
+        arinsal_etf::OwnedTerm::Int(0),
+        arinsal_etf::OwnedTerm::Int(1),
+        arinsal_etf::OwnedTerm::Int(2),
+        arinsal_etf::OwnedTerm::BigInt(BigInt::from(1_u8) << 200usize),
+        arinsal_etf::OwnedTerm::BigInt(-(BigInt::from(1_u8) << 130usize)),
+    ];
+    let mut heap = VecHeap::new();
+    let terms = values
+        .iter()
+        .map(|value| from_owned(value, &mut heap).unwrap())
+        .collect::<Vec<_>>();
+
+    for left in &terms {
+        for right in &terms {
+            similar_asserts::assert_eq!(
+                arith::mul_reduction_charge(*left, *right),
+                arith::reduction_charge("*", &[*left, *right]),
+                "{} * {}",
+                to_owned(*left).unwrap(),
+                to_owned(*right).unwrap()
+            );
+        }
+    }
 }
