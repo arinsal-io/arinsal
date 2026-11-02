@@ -2,7 +2,7 @@
 
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bits::MatchOps;
-use arinsal_term::{HeapAlloc, Term};
+use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError};
 
 use crate::beamasm_integration::ExportDispatch;
 
@@ -5230,8 +5230,17 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
             return u64::MAX;
         }
         let source = process.x[source_index];
-        match arinsal_bits::append_writer_start(source, extra_bits, unit, &mut process.heap) {
-            Ok(Some(start)) => break 'append start,
+        match TermBuilder::new(&mut process.heap)
+            .writable_append_with_address(source, extra_bits, unit)
+        {
+            Ok(Some((term, data_address, offset_bits, grew))) => {
+                break 'append arinsal_bits::AppendStart {
+                    term,
+                    data_address,
+                    offset_bits,
+                    copied_bits: if grew { offset_bits } else { 0 },
+                };
+            }
             Ok(None) => {
                 let mut fresh_request = 8_usize.saturating_add(alloc);
                 loop {
@@ -5257,10 +5266,8 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                     }
                 }
             }
-            Err(arinsal_bits::BitsError::HeapFull { need_words }) => {
-                request = need_words
-                    .saturating_add(alloc)
-                    .max(request.saturating_mul(2));
+            Err(TermError::HeapFull) => {
+                request = 5_usize.saturating_add(alloc).max(request.saturating_mul(2));
                 collect_before_append = true;
             }
             Err(_) => return 0,

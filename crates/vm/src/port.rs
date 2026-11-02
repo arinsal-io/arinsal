@@ -2488,7 +2488,7 @@ impl arinsal_drv::PortHost for DrvHost {
             target,
             arinsal_sched::Signal::Monitor {
                 reference: monitor,
-                shared: Box::new(arinsal_sched::SharedPayload(target_half.into_shared())),
+                shared: target_half.into_shared(),
             },
         );
         if sent.is_err() {

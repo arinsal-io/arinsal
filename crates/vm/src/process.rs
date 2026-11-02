@@ -5113,16 +5113,12 @@ impl Process {
                     // OTP-29.1.1: a monitor arriving after exit has begun is answered as noproc.
                     // A driver port's monitor (`ERTS_MON_TYPE_PORT`) fires at once instead
                     // (erts_proc_exit_handle_monitor).
-                    let port_origin = shared
-                        .0
-                        .downcast::<crate::proc_create::ProcessMonitorData>()
-                        .ok()
-                        .and_then(|data| {
-                            crate::proc_create::ProcessMonitorData::take_half(data, true)
-                        })
-                        .filter(|half| {
-                            half.view().kind() == crate::monitor_link::node_type::MONITOR_PORT
-                        });
+                    let port_origin = crate::proc_create::ProcessMonitorData::take_half(
+                        shared, true,
+                    )
+                    .filter(|half| {
+                        half.view().kind() == crate::monitor_link::node_type::MONITOR_PORT
+                    });
                     if let Some(half) = port_origin {
                         if let Some(runtime) = self.runtime.as_ref() {
                             crate::port::fire_port_monitor(runtime, half.view().other(), reference);
@@ -6721,6 +6717,10 @@ impl Process {
                 2
             }
             arinsal_sched::Signal::Monitor { reference, shared } => {
+                self.insert_target_monitor(reference, arinsal_sched::SharedPayload(shared));
+                2
+            }
+            arinsal_sched::Signal::MonitorOpaque { reference, shared } => {
                 self.insert_target_monitor(reference, *shared);
                 2
             }
@@ -7971,6 +7971,7 @@ fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
 }
 
 impl arinsal_sched::SignalMessage for Message {
+    type MonitorData = crate::proc_create::ProcessMonitorData;
     fn is_altact_msg(&self) -> bool {
         self.priority || self.alias != 0
     }
@@ -7991,44 +7992,41 @@ impl arinsal_sched::SignalMessage for Message {
                 payload: Payload::Signal(signal),
             })
         };
-        let (target, shared, reference) = match signal {
+        match signal {
             arinsal_sched::Signal::Monitor { reference, shared } => {
-                (true, *shared, Some(reference))
-            }
-            arinsal_sched::Signal::DemonitorOrigin(shared) => (false, shared, None),
-            signal => return allocated(signal),
-        };
-        let data = match shared
-            .0
-            .downcast::<crate::proc_create::ProcessMonitorData>()
-        {
-            Ok(data) => data,
-            Err(other) => {
-                let shared = arinsal_sched::SharedPayload(other);
-                return allocated(match reference {
-                    Some(reference) => arinsal_sched::Signal::Monitor {
+                let build = |data: Arc<crate::proc_create::ProcessMonitorData>| Event {
+                    from,
+                    payload: Payload::Signal(arinsal_sched::Signal::Monitor {
                         reference,
-                        shared: Box::new(shared),
-                    },
-                    None => arinsal_sched::Signal::DemonitorOrigin(shared),
-                });
+                        shared: data,
+                    }),
+                };
+                crate::proc_create::ProcessMonitorData::embedded_signal(shared, true, build)
+                    .unwrap_or_else(arinsal_sched::OwnedSignal::new)
             }
-        };
-        let build = |data: Arc<crate::proc_create::ProcessMonitorData>| {
-            let shared = arinsal_sched::SharedPayload(data);
-            Event {
-                from,
-                payload: Payload::Signal(match reference {
-                    Some(reference) => arinsal_sched::Signal::Monitor {
-                        reference,
-                        shared: Box::new(shared),
-                    },
-                    None => arinsal_sched::Signal::DemonitorOrigin(shared),
-                }),
+            arinsal_sched::Signal::DemonitorOrigin(shared) => {
+                let data = match shared
+                    .0
+                    .downcast::<crate::proc_create::ProcessMonitorData>()
+                {
+                    Ok(data) => data,
+                    Err(other) => {
+                        return allocated(arinsal_sched::Signal::DemonitorOrigin(
+                            arinsal_sched::SharedPayload(other),
+                        ));
+                    }
+                };
+                let build = |data: Arc<crate::proc_create::ProcessMonitorData>| Event {
+                    from,
+                    payload: Payload::Signal(arinsal_sched::Signal::DemonitorOrigin(
+                        arinsal_sched::SharedPayload(data),
+                    )),
+                };
+                crate::proc_create::ProcessMonitorData::embedded_signal(data, false, build)
+                    .unwrap_or_else(arinsal_sched::OwnedSignal::new)
             }
-        };
-        crate::proc_create::ProcessMonitorData::embedded_signal(data, target, build)
-            .unwrap_or_else(arinsal_sched::OwnedSignal::new)
+            signal => allocated(signal),
+        }
     }
 }
 
@@ -8221,8 +8219,10 @@ impl Task for Process {
         let mut literal_replies = Vec::new();
         for event in events {
             match event.payload {
-                Payload::Signal(Signal::Monitor { reference, shared }) => {
-                    // A resource monitor has no origin process to answer with `noproc`.
+                Payload::Signal(Signal::Monitor { reference, .. }) => {
+                    monitors.push((reference, event.from));
+                }
+                Payload::Signal(Signal::MonitorOpaque { reference, shared }) => {
                     if shared
                         .0
                         .downcast_ref::<arinsal_nif::ResourceMonitor>()

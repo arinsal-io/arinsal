@@ -64,8 +64,19 @@ macro_rules! binary {
     ($($name:ident => $op:literal),+ $(,)?) => {$ (
         #[inline(always)]
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-            let charge = arinsal_arith::reduction_charge($op, args);
-            let result = arinsal_arith::$name(args[0], args[1], &mut ctx.heap).map_err(map_error);
+            let (charge, result) = if $op == "*" {
+                let result = arinsal_arith::$name(args[0], args[1], &mut ctx.heap)
+                    .map_err(map_error);
+                (
+                    arinsal_arith::mul_reduction_charge(args[0], args[1]),
+                    result,
+                )
+            } else {
+                let charge = arinsal_arith::reduction_charge($op, args);
+                let result = arinsal_arith::$name(args[0], args[1], &mut ctx.heap)
+                    .map_err(map_error);
+                (charge, result)
+            };
             ctx.charge_reductions(charge as usize);
             match result { Ok(value) => value, Err(error) => ctx.fail(error) }
         }

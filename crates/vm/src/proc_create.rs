@@ -961,7 +961,7 @@ pub(crate) type NativeReturnEvents = crate::trace::PoppedNativeFrames;
 /// so they live in a separate box, as erts keeps them only in `ErtsMonitorDataExtended` /
 /// `ErtsMonitorDataTagHeap` (erl_monitor_link.h) and a plain monitor stays small.
 #[derive(Debug, Default)]
-pub(crate) struct MonitorInfo(Option<Box<MonitorExtension>>);
+pub struct MonitorInfo(Option<Box<MonitorExtension>>);
 
 #[derive(Debug)]
 struct MonitorExtension {
@@ -992,11 +992,11 @@ impl MonitorInfo {
 /// One half of a monitor this process holds: an origin entry in `ERTS_P_MONITORS` or a target
 /// entry in `ERTS_P_LT_MONITORS` (or, for a remote origin, in `ERTS_P_MONITORS`).
 /// The signal value a monitor half is sent in.
-pub(crate) type MonitorSignal = arinsal_sched::Event<crate::process::Message>;
+pub type MonitorSignal = arinsal_sched::Event<crate::process::Message>;
 pub(crate) type ProcessMonitor =
     crate::monitor_link::Monitor<MonitorInfo, OriginMonitor, MonitorSignal>;
 /// The allocation both halves of a monitor share (`ErtsMonitorData`).
-pub(crate) type ProcessMonitorData =
+pub type ProcessMonitorData =
     crate::monitor_link::MonitorData<MonitorInfo, OriginMonitor, MonitorSignal>;
 /// `ERTS_P_MONITORS`: origin halves, and target halves of remote origins, keyed by reference.
 pub(crate) type MonitorTree = crate::monitor_link::MonLnkTree<ProcessMonitor>;
@@ -1034,7 +1034,7 @@ pub(crate) fn remote_monitor_signal(
     );
     arinsal_sched::Signal::Monitor {
         reference,
-        shared: Box::new(arinsal_sched::SharedPayload(target_half.into_shared())),
+        shared: target_half.into_shared(),
     }
 }
 
@@ -1048,7 +1048,7 @@ pub(crate) fn origin_monitor(reference: u64, target: u64, state: OriginMonitor) 
 /// Alias lifecycle stored in the origin monitor entry.
 // Port of erts/emulator/beam/erl_monitor_link.h (ERTS_ML_STATE_ALIAS_*), OTP-29.1.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AliasMode {
+pub enum AliasMode {
     ExplicitUnalias,
     Demonitor,
     ReplyDemonitor,
@@ -1057,7 +1057,7 @@ pub(crate) enum AliasMode {
 /// An origin-side entry in the per-process monitor tree.
 // Port of erts/emulator/beam/erl_monitor_link.c (monitor tree origin entries), OTP-29.1.1.
 #[derive(Clone, Debug)]
-pub(crate) enum OriginMonitor {
+pub enum OriginMonitor {
     Process(OriginHalf),
     Distributed {
         alias_mode: Option<AliasMode>,
@@ -1154,7 +1154,7 @@ pub(crate) fn port_link(id: u64) -> crate::monitor_link::Link {
 /// Origin state of a local process monitor; the target is the half's `other` and the shared
 /// data is its [`MonitorInfo`].
 #[derive(Clone, Debug)]
-pub(crate) struct OriginHalf {
+pub struct OriginHalf {
     pub(crate) alias_mode: Option<AliasMode>,
 }
 

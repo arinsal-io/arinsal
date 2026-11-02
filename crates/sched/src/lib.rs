@@ -455,7 +455,7 @@ impl Eq for SharedPayload {}
 
 /// Control signals delivered in the same stream as messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Signal<M> {
+pub enum Signal<M: SignalMessage> {
     /// Link request.
     Link,
     /// Unlink request carrying its acknowledgement id.
@@ -465,7 +465,13 @@ pub enum Signal<M> {
     /// Acknowledgement for the link protocol's unlink operation.
     UnlinkAckSignal(u64),
     /// Monitor request carrying a VM reference and the monitor's shared data.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_monitor), OTP-29.1.1.
     Monitor {
+        reference: u64,
+        shared: std::sync::Arc<M::MonitorData>,
+    },
+    /// Opaque monitor request, used for NIF resources without a process monitor allocation.
+    MonitorOpaque {
         reference: u64,
         shared: Box<SharedPayload>,
     },
@@ -531,7 +537,7 @@ pub enum Signal<M> {
 
 /// The fields of [`Signal::SyncSuspend`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SyncSuspendRequest<M> {
+pub struct SyncSuspendRequest<M: SignalMessage> {
     pub requester: Pid,
     pub tag: M,
     /// Atom index of the reply when the target is suspended.
@@ -541,14 +547,14 @@ pub struct SyncSuspendRequest<M> {
 
 /// The fields of [`Signal::PortExit`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PortExitSignal<M> {
+pub struct PortExitSignal<M: SignalMessage> {
     pub port: M,
     pub reason: M,
 }
 
 /// The fields of [`Signal::LiteralAreaCopy`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LiteralAreaCopyRequest<M> {
+pub struct LiteralAreaCopyRequest<M: SignalMessage> {
     pub area_id: u64,
     pub request: M,
     pub how: LiteralCopyHow,
@@ -567,7 +573,7 @@ pub enum LiteralCopyHow {
 }
 
 /// Ordered contents of a process mailbox.
-pub enum Payload<M> {
+pub enum Payload<M: SignalMessage> {
     Message(M),
     Signal(Signal<M>),
     /// An expired `start_timer`; the VM can form `{timeout, Ref, Msg}`.
@@ -583,7 +589,7 @@ pub enum Payload<M> {
 }
 
 /// One message or signal, including its logical sender.
-pub struct Event<M> {
+pub struct Event<M: SignalMessage> {
     /// Sender used by the VM for signal semantics.
     pub from: Pid,
     /// Opaque message or typed control signal.
@@ -592,6 +598,8 @@ pub struct Event<M> {
 
 /// A message envelope as the signal queue sees it.
 pub trait SignalMessage: Send + 'static {
+    /// The concrete shared allocation used by process monitor halves.
+    type MonitorData: Send + Sync + 'static;
     /// A priority message or a message sent through an alias: erts sends it as an
     /// `ERTS_SIG_Q_OP_ALTACT_MSG` non-message signal (erl_proc_sig_queue.c, handle_altact_msg),
     /// OTP-29.1.1.
@@ -625,10 +633,18 @@ fn event_node<M: SignalMessage>(from: Pid, payload: Payload<M>) -> OwnedSignal<E
     }
 }
 
-impl SignalMessage for () {}
-impl SignalMessage for u32 {}
-impl SignalMessage for u64 {}
-impl SignalMessage for usize {}
+impl SignalMessage for () {
+    type MonitorData = ();
+}
+impl SignalMessage for u32 {
+    type MonitorData = ();
+}
+impl SignalMessage for u64 {
+    type MonitorData = ();
+}
+impl SignalMessage for usize {
+    type MonitorData = ();
+}
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.h (ERTS_SIG_IS_MSG: messages, including
 // timer timeouts, versus non-message signals), OTP-29.1.1.
@@ -715,6 +731,27 @@ struct PendingProcMonitor {
     to: Pid,
     id: u64,
     shared: SharedPayload,
+    opaque: bool,
+}
+
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_pending), OTP-29.1.1.
+fn restore_held_monitor<M: SignalMessage>(held: PendingProcMonitor) -> Signal<M> {
+    if held.opaque {
+        Signal::MonitorOpaque {
+            reference: held.id,
+            shared: Box::new(held.shared),
+        }
+    } else {
+        let data = held
+            .shared
+            .0
+            .downcast::<M::MonitorData>()
+            .unwrap_or_else(|_| panic!("held monitor payload type changed"));
+        Signal::Monitor {
+            reference: held.id,
+            shared: data,
+        }
+    }
 }
 
 thread_local! {
@@ -1651,7 +1688,7 @@ impl<T: Task> ProcessTable<T> {
     ) -> Result<ProcRef<T>, Error> {
         self.insert_init(
             |slot| slot.write(task),
-            |_| Ok::<(), std::convert::Infallible>(()),
+            |_, _| Ok::<(), std::convert::Infallible>(()),
             priority,
             bound_worker,
         )
@@ -1670,7 +1707,7 @@ impl<T: Task> ProcessTable<T> {
     fn insert_init<E>(
         &self,
         make: impl for<'slot> FnOnce(&'slot mut std::mem::MaybeUninit<T>) -> &'slot mut T,
-        init: impl FnOnce(&mut T) -> Result<(), E>,
+        init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
         priority: Priority,
         bound_worker: Option<usize>,
     ) -> Result<ProcRef<T>, SpawnInitError<E>> {
@@ -1722,11 +1759,11 @@ impl<T: Task> ProcessTable<T> {
                 },
                 cell: parking_lot::Mutex::new(TaskCell::uninit()),
             },
-            |process, _context| {
+            |process, context| {
                 // alloc_process: the task is written straight into the allocated struct.
                 let cell = process.cell.get_mut();
                 cell.init_with(make);
-                init(cell.task_mut())
+                init(context.pid, cell.task_mut())
             },
         ) else {
             return Err(SpawnInitError::Table(Error::Capacity));
@@ -2466,20 +2503,15 @@ impl<T: Task> Inner<T> {
         let Some(held) = take_held_monitor_for(to) else {
             return;
         };
-        let PendingProcMonitor {
-            from,
-            to,
-            id,
-            shared,
-        } = held;
+        let from = held.from;
+        let to = held.to;
+        let id = held.id;
+        let signal = restore_held_monitor::<T::Message>(held);
         let delivered = self.table.lookup(to).is_some_and(|process| {
             self.deliver_process(
                 &process,
                 from,
-                Payload::Signal(Signal::Monitor {
-                    reference: id,
-                    shared: Box::new(shared),
-                }),
+                Payload::Signal(signal),
                 local.as_deref_mut(),
                 false,
                 false,
@@ -5523,7 +5555,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
 /// Messages, exits, and DOWNs require the receiver to run. Link, monitor, and
 /// demonitor only update control state and are applied the next time the
 /// receiver is scheduled, including on exit.
-fn payload_wakes<M>(payload: &Payload<M>) -> bool {
+fn payload_wakes<M: SignalMessage>(payload: &Payload<M>) -> bool {
     match payload {
         Payload::Message(_) | Payload::Timer { .. } | Payload::TimerMessage { .. } => true,
         Payload::Signal(signal) => match signal {
@@ -5549,6 +5581,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             | Signal::PortUnlink(_)
             | Signal::Unlink(_)
             | Signal::Monitor { .. }
+            | Signal::MonitorOpaque { .. }
             | Signal::Demonitor(_)
             | Signal::DemonitorOrigin(_)
             | Signal::Alias(_)
@@ -5557,11 +5590,16 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
     }
 }
 
-fn take_lost_monitors<M>(events: &mut Vec<OwnedSignal<Event<M>>>) -> Vec<(Pid, u64)> {
+fn take_lost_monitors<M: SignalMessage>(
+    events: &mut Vec<OwnedSignal<Event<M>>>,
+) -> Vec<(Pid, u64)> {
     events
         .drain(..)
         .filter_map(|event| match event.payload {
-            Payload::Signal(Signal::Monitor { reference, .. }) => Some((event.from, reference)),
+            Payload::Signal(Signal::Monitor { reference, .. })
+            | Payload::Signal(Signal::MonitorOpaque { reference, .. }) => {
+                Some((event.from, reference))
+            }
             _ => None,
         })
         .collect()
@@ -5662,18 +5700,12 @@ impl<T: Task> Runner<'_, T> {
     /// Send a held process monitor now. The monitor BIF has already returned, so a dead
     /// target must bounce DOWN (erl_proc_sig_queue.c:1131-1135, `noproc`).
     fn publish_monitor(&mut self, held: PendingProcMonitor) {
-        let PendingProcMonitor {
-            from,
-            to,
-            id,
-            shared,
-        } = held;
+        let from = held.from;
+        let to = held.to;
+        let id = held.id;
         let event: Event<T::Message> = Event {
             from,
-            payload: Payload::Signal(Signal::Monitor {
-                reference: id,
-                shared: Box::new(shared),
-            }),
+            payload: Payload::Signal(restore_held_monitor::<T::Message>(held)),
         };
         let Event { from, payload } = event;
         let Some(process) = self.lookup(to) else {
@@ -5946,7 +5978,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         signal: OwnedSignal<Event<T::Message>>,
     ) -> Result<(), Error> {
         let from = signal.from;
-        let monitor = matches!(signal.payload, Payload::Signal(Signal::Monitor { .. }));
+        let monitor = matches!(
+            signal.payload,
+            Payload::Signal(Signal::Monitor { .. } | Signal::MonitorOpaque { .. })
+        );
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
         // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
         // the held one, which goes out first.
@@ -5957,7 +5992,26 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 from,
                 to,
                 id: *reference,
+                shared: SharedPayload(shared.clone()),
+                opaque: false,
+            };
+            let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
+            if let Some(previous) = previous {
+                self.publish_monitor(previous);
+            } else {
+                HELD_MONITOR_THREADS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        if let Payload::Signal(Signal::MonitorOpaque { reference, shared }) = &signal.payload
+            && matches!(current_scheduler_type(), SchedulerType::Normal)
+        {
+            let held = PendingProcMonitor {
+                from,
+                to,
+                id: *reference,
                 shared: (**shared).clone(),
+                opaque: true,
             };
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
@@ -5970,13 +6024,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // Erts sends the held monitor first when the next signal goes to its target
         // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
         let deferred = take_held_monitor_for(to).map(|held| {
-            T::Message::signal_node(
-                held.from,
-                Signal::Monitor {
-                    reference: held.id,
-                    shared: Box::new(held.shared),
-                },
-            )
+            T::Message::signal_node(held.from, restore_held_monitor::<T::Message>(held))
         });
         // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
         // reference count is taken on the receiver.
@@ -6574,7 +6622,7 @@ impl<T: Task> Scheduler<T> {
     pub fn spawn_unscheduled_init<E>(
         &self,
         make: impl for<'slot> FnOnce(&'slot mut std::mem::MaybeUninit<T>) -> &'slot mut T,
-        init: impl FnOnce(&mut T) -> Result<(), E>,
+        init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
         priority: Priority,
         scheduler_id: Option<usize>,
     ) -> Result<SpawnedProcess<T::Message>, SpawnInitError<E>> {
@@ -7561,6 +7609,7 @@ mod in_signal_tests {
 
     struct Envelope(bool);
     impl SignalMessage for Envelope {
+        type MonitorData = ();
         fn is_altact_msg(&self) -> bool {
             self.0
         }
@@ -8607,7 +8656,7 @@ fn run_process<T: Task>(
 }
 
 /// Signal operations a task's native code performs on the normal scheduler it runs on.
-trait NativeSend<M> {
+trait NativeSend<M: SignalMessage> {
     /// Deliver `msg` from `from` to `to`; a receiver woken on this scheduler's run queue is
     /// enqueued there directly. Gives the message back when the scheduler-local state is
     /// not available.

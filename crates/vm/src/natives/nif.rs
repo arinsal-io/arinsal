@@ -602,7 +602,7 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
             .signal(
                 sender,
                 target,
-                arinsal_sched::Signal::Monitor {
+                arinsal_sched::Signal::MonitorOpaque {
                     reference: id,
                     shared: Box::new(arinsal_sched::SharedPayload(monitor)),
                 },
@@ -1978,7 +1978,7 @@ fn nif_resource_monitor(
         .signal(
             hub.pid,
             pid,
-            arinsal_sched::Signal::Monitor {
+            arinsal_sched::Signal::MonitorOpaque {
                 reference: id,
                 shared: Box::new(arinsal_sched::SharedPayload(monitor)),
             },
