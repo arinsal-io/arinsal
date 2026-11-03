@@ -1968,6 +1968,19 @@ fn update_counter_object_in_place(
     Some(results)
 }
 
+// Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1: the
+// integer-Incr form is one synthesized operation at keypos + 1.
+fn update_counter_object_one_in_place(
+    object: &mut StoredTerm,
+    keypos: usize,
+    increment: i64,
+) -> Option<Term> {
+    let index = keypos;
+    let old = object.tuple_element(index)?.as_small()?;
+    let next = Term::small(old.checked_add(increment)?)?;
+    object.set_immediate_element(index, next).then_some(next)
+}
+
 fn global_true() -> Atom {
     global_atoms().intern("true").unwrap()
 }
@@ -3098,6 +3111,23 @@ impl Table {
             }
             (Storage::CATree(tree), TableType::OrderedSet) => tree.with_object_mut(key, |object| {
                 update_counter_object_in_place(object, self.options.keypos, operations)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Apply the integer increment form without materializing an operation or result vector.
+    // Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
+    pub fn update_counter_one_in_place_shared(&self, key: Term, increment: i64) -> Option<Term> {
+        match (&self.storage, self.options.table_type) {
+            (Storage::Hash(storage), TableType::Set) => storage.update_counter_one_shared(
+                key,
+                ets_hash(key),
+                self.options.keypos,
+                increment,
+            ),
+            (Storage::CATree(tree), TableType::OrderedSet) => tree.with_object_mut(key, |object| {
+                update_counter_object_one_in_place(object, self.options.keypos, increment)
             }),
             _ => None,
         }
@@ -4682,6 +4712,31 @@ impl Table {
             }
             Storage::CATree(tree) => tree.with_object_mut(key, |object| {
                 update_counter_object_in_place(object, keypos, operations)
+            }),
+        }
+    }
+
+    /// Apply the integer increment form to one tuple field in place.
+    // Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
+    pub fn update_counter_one_in_place(&mut self, key: Term, increment: i64) -> Option<Term> {
+        if !matches!(
+            self.options.table_type,
+            TableType::Set | TableType::OrderedSet
+        ) {
+            return None;
+        }
+        let keypos = self.options.keypos;
+        match &mut self.storage {
+            Storage::Hash(storage) => update_counter_object_one_in_place(
+                storage.find_mut(key, keypos)?,
+                keypos,
+                increment,
+            ),
+            Storage::Ordered(root) => {
+                update_counter_object_one_in_place(root.get_mut(key, keypos)?, keypos, increment)
+            }
+            Storage::CATree(tree) => tree.with_object_mut(key, |object| {
+                update_counter_object_one_in_place(object, keypos, increment)
             }),
         }
     }

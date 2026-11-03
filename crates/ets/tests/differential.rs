@@ -2824,6 +2824,47 @@ fn in_place_counter_update_matches_general_path() {
     );
 }
 
+#[test]
+fn single_counter_increment_matches_general_path() {
+    for kind in [TableType::Set, TableType::OrderedSet] {
+        let mut registry = Registry::new();
+        let fast_tid = registry.create(options(kind)).unwrap();
+        let slow_tid = registry.create(options(kind)).unwrap();
+        let mut input = VecHeap::new();
+        let key = from_owned(&atom("k"), &mut input).unwrap();
+        let object = from_owned(&tuple(vec![atom("k"), int(10)]), &mut input).unwrap();
+        registry
+            .get_mut(fast_tid)
+            .unwrap()
+            .insert(&[object])
+            .unwrap();
+        registry
+            .get_mut(slow_tid)
+            .unwrap()
+            .insert(&[object])
+            .unwrap();
+        let actual = registry
+            .get_mut(fast_tid)
+            .unwrap()
+            .update_counter_one_in_place(key, -2)
+            .unwrap();
+        let expected = registry
+            .get_mut(slow_tid)
+            .unwrap()
+            .update_counter(
+                key,
+                &[CounterOp {
+                    position: 2,
+                    increment: -2,
+                    threshold: None,
+                }],
+                None,
+            )
+            .unwrap()[0];
+        assert_eq!(actual, expected);
+    }
+}
+
 /// `erts_internal:ets_raw_next/2` on a tree table is `db_next_tree`: a key that is gone is not
 /// an error (checked against OTP 29.1.1: `ets_raw_next(Tree, 2)` on {1,3} gives 3).
 #[test]

@@ -4,7 +4,7 @@ use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(ets_point_ops_diff).
--export([set_ops/0, ordered_ops/0, shared_ordered_ops/0, overflow/0, errors/0,
+-export([set_ops/0, ordered_ops/0, shared_ordered_ops/0, shared_set_ops/0, overflow/0, errors/0,
          resize_list/0]).
 
 set_ops() ->
@@ -41,6 +41,14 @@ shared_ordered_ops() ->
     Many = ets:update_counter(T, k, [{2, -Inc}, {3, Inc}]),
     Default = ets:update_counter(T, absent, {2, Inc}, {absent, Big, 0}),
     {One, Many, Default, ets:lookup(T, k), ets:lookup(T, absent)}.
+
+shared_set_ops() ->
+    T = ets:new(point_shared_set,
+                [set, public, {write_concurrency, true}]),
+    true = ets:insert(T, {k, 4}),
+    One = ets:update_counter(T, k, 3),
+    Default = ets:update_counter(T, absent, 2, {absent, 0}),
+    {One, Default, ets:lookup(T, k), ets:lookup(T, absent)}.
 
 overflow() ->
     T = ets:new(point_overflow, [set, public]),
@@ -119,6 +127,16 @@ fn shared_ordered_set_bignum_counter_and_default_match_otp() {
         .unwrap();
     reference.load("ets_point_ops_diff", &beam).unwrap();
     run("shared_ordered_ops", &reference, &beam);
+}
+
+#[test]
+fn shared_set_integer_counter_and_default_match_otp() {
+    let reference = RefErl::start().expect("OTP 29.1.1 reference runtime");
+    let beam = reference
+        .compile_named("ets_point_ops_diff", SOURCE, &[])
+        .unwrap();
+    reference.load("ets_point_ops_diff", &beam).unwrap();
+    run("shared_set_ops", &reference, &beam);
 }
 
 #[test]

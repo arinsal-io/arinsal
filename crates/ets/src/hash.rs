@@ -760,6 +760,37 @@ impl HashStorage {
         })
     }
 
+    // Port of erts/emulator/beam/erl_db_hash.c (db_lookup_dbterm_hash) and
+    // erl_db.c (do_update_counter), OTP-29.1.1.
+    pub(super) fn update_counter_one_shared(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        increment: i64,
+    ) -> Option<Term> {
+        self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            let mut node = bucket.head.as_deref_mut();
+            let object = loop {
+                let current = node?;
+                if !current.prefix.pseudo_deleted()
+                    && current.prefix.hvalue() == hash >> 1
+                    && exact_key(current.key(keypos), key)
+                {
+                    break current;
+                }
+                node = current.prefix.next.as_deref_mut();
+            };
+            if !object.compressed_elements().is_empty() {
+                return None;
+            }
+            let index = keypos;
+            let old = object.tuple_element(index)?.as_small()?;
+            let next = Term::small(old.checked_add(increment)?)?;
+            object.set_immediate_element(index, next).then_some(next)
+        })
+    }
+
     // Port of erts/emulator/beam/erl_db.c (do_update_element) and :1494-1683
     // (do_update_counter), OTP-29.1.1.
     pub(super) fn update_or_insert_shared<E>(
