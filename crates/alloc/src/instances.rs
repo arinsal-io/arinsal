@@ -798,10 +798,11 @@ impl ThreadSpecificAllocators {
     }
 
     fn schedule_owner_work(&self, instance: usize) {
-        if !self.shared[instance]
-            .work_scheduled
-            .swap(true, Ordering::AcqRel)
-        {
+        // Port of erts/emulator/beam/erl_alloc_util.c (enqueue_dealloc_other_instance): erts
+        // notifies the owner only when `ddq_enqueue` found its queue idle. Test first, so a
+        // delayed free while the request is pending does not write the shared flag again.
+        let flag = &self.shared[instance].work_scheduled;
+        if !flag.load(Ordering::Acquire) && !flag.swap(true, Ordering::AcqRel) {
             notify_owner(instance);
         }
     }
@@ -1784,6 +1785,64 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc cross_thread_cycle_bench -- --ignored --nocapture"]
+    fn cross_thread_cycle_bench() {
+        // The signal node pattern: one scheduler allocates a batch, another frees it. Reports the
+        // allocating side (which also drains the frees queued for it) and the freeing side apart.
+        let _serial = registration();
+        let allocators = four_instances();
+        for fixed in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<InstanceAllocation>>();
+            let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
+            let producer = Arc::clone(&allocators);
+            let consumer = Arc::clone(&allocators);
+            let (rounds, batch) = (2_000usize, 200usize);
+            let a = thread::spawn(move || {
+                assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..rounds {
+                    let started = std::time::Instant::now();
+                    let blocks: Vec<_> = (0..batch)
+                        .map(|_| {
+                            if fixed {
+                                producer.fix_alloc_with_ptr_at(1, 0, 80).unwrap().0
+                            } else {
+                                producer.alloc(80).unwrap()
+                            }
+                        })
+                        .collect();
+                    total += started.elapsed();
+                    tx.send(blocks).unwrap();
+                    back_rx.recv().unwrap();
+                }
+                total.as_nanos() as f64 / (rounds * batch) as f64
+            });
+            let b = thread::spawn(move || {
+                assert_eq!(register_thread(ThreadKind::Scheduler(2)), Ok(2));
+                let mut total = std::time::Duration::ZERO;
+                for blocks in rx {
+                    let started = std::time::Instant::now();
+                    for handle in blocks {
+                        if fixed {
+                            consumer.fix_free_at(2, 0, handle).unwrap();
+                        } else {
+                            consumer.free(handle).unwrap();
+                        }
+                    }
+                    total += started.elapsed();
+                    back_tx.send(()).unwrap();
+                }
+                total.as_nanos() as f64 / (rounds * batch) as f64
+            });
+            let (pa, pb) = (a.join().unwrap(), b.join().unwrap());
+            eprintln!(
+                "{}: alloc side {pa:.1} ns/block, free side {pb:.1} ns/block",
+                if fixed { "fix list" } else { "general" }
+            );
+        }
     }
 
     #[test]

@@ -806,10 +806,7 @@ impl Message {
         if words + token_words == 0 {
             return Ok(Self::immediate(term));
         }
-        let mut fragment = ProcessHeap::with_words_for_type(
-            words + token_words,
-            arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG,
-        );
+        let mut fragment = arinsal_term::message::MessageHeapBlock::with_words(words + token_words);
         // Size was computed by the caller; copy_struct must not walk the term again
         // (erts_send_message: size_object then copy_struct).
         let term = if words == 0 {
@@ -820,7 +817,7 @@ impl Message {
         };
         if let Some(token) = token {
             let copy = token
-                .build_on(&mut arinsal_bifs::ProcessHeapHandle(&mut fragment))
+                .build_on(&mut fragment)
                 .map_err(|error| VmError::Unsupported(format!("message token copy: {error:?}")))?;
             *token.heap_ref_mut() = copy;
         }
@@ -924,7 +921,9 @@ impl Message {
         let target = target
             .to_term()
             .ok_or_else(|| VmError::Unsupported("invalid literal-copy target pid".into()))?;
-        let mut heap = ProcessHeap::with_words(size_object(area).saturating_add(8));
+        let mut heap = arinsal_term::message::MessageHeapBlock::with_words(
+            size_object(area).saturating_add(8),
+        );
         let area = copy_term(area, &mut heap)
             .map_err(|error| VmError::Unsupported(format!("literal-copy area: {error:?}")))?;
         let request = TermBuilder::new(&mut heap)
@@ -9295,14 +9294,18 @@ mod layout_tests {
         // `first`, `last`, the length, the non-message count and the save cursor (position and
         // node), like the inner queue of erts `ErtsSignalPrivQueues`.
         assert_eq!(std::mem::size_of::<super::MessageQueue>(), 8 * 8);
+        // Before `MessageHeapBlock`, the enum was the same size as its 240-byte ProcessHeap
+        // payload; the NodeFragment variant needed no extra discriminant space.
         // The native ABI words (erts c_p htop/stop/heap/hend/fcalls/freason) moved into the heap.
         assert!(
             std::mem::size_of::<arinsal_term::ProcessHeap>()
                 <= 128 + std::mem::size_of::<arinsal_term::NativeAbi>()
         );
         eprintln!(
-            "Process={} ProcessHeap={} VecDeque={} RunOutcome={}",
+            "Process={} ProcessHeap={} MessageHeap={} PreviousMessageHeap={} VecDeque={} RunOutcome={}",
             std::mem::size_of::<crate::Process>(),
+            std::mem::size_of::<arinsal_term::ProcessHeap>(),
+            std::mem::size_of::<arinsal_term::message::MessageHeap>(),
             std::mem::size_of::<arinsal_term::ProcessHeap>(),
             std::mem::size_of::<std::collections::VecDeque<arinsal_term::Term>>(),
             std::mem::size_of::<arinsal_sched::RunOutcome>()
