@@ -534,6 +534,46 @@ impl Copier<'_> {
         }
     }
 
+    /// Move every object of the area `start..start + words` (a heap fragment) to `n_htop` in
+    /// address order and leave move markers behind.
+    // Port of erts/emulator/beam/erl_gc.c:2459 (`move_one_area`), OTP-29.1.1.
+    fn move_one_area(&mut self, start: usize, words: usize, n_htop: &mut HeapTop) {
+        use crate::raw::{copy_words, load, store};
+        let mut at = start;
+        let end = start + words * 8;
+        // The area is a live fragment holding complete objects (`used_size`); the destination
+        // was sized for all fragment words before the copy and does not overlap it.
+        while at != end {
+            let val = load(at);
+            let destination = n_htop.at;
+            if val & 3 == 0 {
+                let object_words = if val & 63 == ARITY || val & 63 == RECORD {
+                    1 + (val >> 6) as usize
+                } else {
+                    crate::raw::boxed_words(val, at)
+                };
+                debug_assert!(n_htop.end - n_htop.at >= object_words * 8);
+                n_htop.at += object_words * 8;
+                store(destination, val);
+                copy_words(at + 8, destination + 8, object_words - 1);
+                let moved = destination as u64 | 2;
+                store(at, moved);
+                if val & 63 == SUB_BITS {
+                    self.sub_bits.push(Term(moved));
+                }
+                at += object_words * 8;
+            } else {
+                debug_assert!(n_htop.end - n_htop.at >= 16);
+                n_htop.at += 16;
+                store(destination, val);
+                store(destination + 8, load(at + 8));
+                store(at, 0);
+                store(at + 8, destination as u64 | 1);
+                at += 16;
+            }
+        }
+    }
+
     /// Sweep the objects copied to `n_htop` (or, with `INTO_OLD`, to `old_htop`) from
     /// `n_hp` until the scan catches up with the top.
     // Port of erts/emulator/beam/erl_gc.c:1728-1813 (do_minor sweep) and
@@ -554,8 +594,38 @@ impl Copier<'_> {
             // word of a completely copied object; this collector alone writes to it.
             unsafe {
                 let gval = *ptr;
+                // The common cases first, in straight-line code like the `switch` of erts'
+                // `sweep`: an immediate stays, a pointer to an already moved object is
+                // replaced by its forwarding address.
+                match gval & 3 {
+                    3 => {
+                        n_hp += 8;
+                        continue;
+                    }
+                    1 => {
+                        let target = (gval & !7) as usize;
+                        if crate::raw::load(target) == 0 {
+                            crate::raw::store(n_hp, crate::raw::load(target + 8));
+                            n_hp += 8;
+                            continue;
+                        }
+                    }
+                    2 => {
+                        let moved = crate::raw::load((gval & !7) as usize);
+                        if moved & 3 == 2 {
+                            crate::raw::store(n_hp, moved);
+                            n_hp += 8;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
                 if gval & 3 != 0 {
-                    *ptr = self.evacuate::<INTO_OLD>(gval, &mut n_htop, &mut old_htop);
+                    // erts leaves a word it does not move untouched (`n_hp++`).
+                    let moved = self.evacuate::<INTO_OLD>(gval, &mut n_htop, &mut old_htop);
+                    if moved != gval {
+                        crate::raw::store(n_hp, moved);
+                    }
                     #[cfg(debug_assertions)]
                     crate::validate::verify_copied_term_after_collection(self.to, Term(*ptr));
                     n_hp += 8;
@@ -1388,6 +1458,9 @@ impl ProcessHeap {
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
+        // Port of erl_gc.c:418-476 (`erts_gc_after_bif_call_lhf`): the fragments the BIF just
+        // allocated are known live.
+        let live_from = self.take_live_frags_from();
         let message_words = messages
             .iter()
             .filter_map(|message| message.heap.as_ref())
@@ -1565,6 +1638,20 @@ impl ProcessHeap {
         };
         let mut n_htop = copier.n_htop;
         let mut old_htop = copier.old_htop;
+        if let Some(live_from) = live_from {
+            // Port of erl_gc.c:1672-1675 and 2489 (`collect_live_heap_frags`): fragments that are
+            // completely live move into the new heap by a linear walk, garbage included,
+            // before any root is looked at.
+            for index in live_from..copier.from.fragments.len() {
+                let (start, used) = match &copier.from.fragments[index] {
+                    crate::heap::Fragment::Block { memory, used } => {
+                        (memory.as_ptr() as usize, *used)
+                    }
+                    _ => continue,
+                };
+                copier.move_one_area(start, used, &mut n_htop);
+            }
+        }
         roots.evacuate::<false>(&mut copier, &mut n_htop, &mut old_htop);
         extra.evacuate::<false>(&mut copier, &mut n_htop, &mut old_htop);
         for message in messages.iter_mut().filter(|message| message.heap.is_none()) {

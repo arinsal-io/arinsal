@@ -3744,7 +3744,7 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
     value: u64,
     descriptor: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_after_bif(header) else {
         return 0;
     };
     // The BIF's charge is in FCALLS; the sync below writes `reductions` back to it.

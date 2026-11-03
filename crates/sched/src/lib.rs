@@ -4014,14 +4014,20 @@ impl<T: Task> Inner<T> {
     // Port of erts/emulator/beam/erl_process.c:3954 (enqueue_process appends to the priority
     // queue) and :6656-6672 (select_enqueue_run_queue), OTP-29.1.1.
     fn place_runnable(&self, item: Scheduled<T>, local: Option<&mut Local<T>>) {
+        let online_schedulers;
         if let Some(local) = local
             && item.process.bound_worker().is_none()
             && self.sim.is_none()
-            && (self.online_schedulers.load(Ordering::Acquire) > 1 || local.worker_id == 0)
+            && {
+                // Keep the queue choice on one scheduler-count snapshot, as
+                // `select_enqueue_run_queue` chooses one run queue for the enqueue.
+                online_schedulers = self.online_schedulers.load(Ordering::Acquire);
+                online_schedulers > 1 || local.worker_id == 0
+            }
         {
             // With one scheduler online the target run queue is run queue 0, this one
             // (select_enqueue_run_queue returns the only online queue).
-            let scheduler = if self.online_schedulers.load(Ordering::Acquire) > 1 {
+            let scheduler = if online_schedulers > 1 {
                 self.enqueue_run_queue(&item.process)
             } else {
                 0
@@ -5957,9 +5963,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         );
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
         // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
-        // the held one, which goes out first.
+        // the held one, which goes out first. `local` is the scheduler data presence test, so
+        // this signal path does not read scheduler type from thread-local storage.
         if let Payload::Signal(Signal::Monitor { reference, shared }) = &signal.payload
-            && matches!(current_scheduler_type(), SchedulerType::Normal)
+            && self.local.is_some()
         {
             let held = PendingProcMonitor {
                 from,
@@ -5977,7 +5984,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             return Ok(());
         }
         if let Payload::Signal(Signal::MonitorOpaque { reference, shared }) = &signal.payload
-            && matches!(current_scheduler_type(), SchedulerType::Normal)
+            && self.local.is_some()
         {
             let held = PendingProcMonitor {
                 from,
@@ -8714,10 +8721,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
     ) -> Option<OnHeapSend> {
         let local = self.local.upgrade()?;
         let mut local = local.try_borrow_mut().ok()?;
-        let outcome = self.inner.table.with_live(to, |process| {
-            if !receiver_heap_stable(process) {
-                return OnHeapSend::Unavailable;
-            }
+        let outcome = self.inner.table.with_live_managed(to, |process| {
             let Some(mut cell) = process.cell.try_lock() else {
                 return OnHeapSend::Unavailable;
             };
