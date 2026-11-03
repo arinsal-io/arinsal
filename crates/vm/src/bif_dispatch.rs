@@ -202,7 +202,7 @@ impl Vm {
                 .bif_fn()
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
             let (result, reductions, deferred) =
-                calls::call_bif_metered_deferred(&mut p.heap, &mut p.header.fcalls, bif, args);
+                calls::call_bif_metered_deferred(&mut p.heap, bif, args);
             let result = match result {
                 Ok(value) => Ok(value),
                 Err(error) => {
@@ -244,7 +244,7 @@ impl Vm {
             if let Some(result) = native {
                 (result, 0, None)
             } else if let Some(bif) = bif {
-                match calls::call_bif_catch(&mut p.heap, &mut p.header.fcalls, bif, args) {
+                match calls::call_bif_catch(&mut p.heap, bif, args) {
                     Ok(Ok(value)) => (Ok(value), 0, None),
                     Ok(Err(error)) => (
                         Err(exceptions::bif_error_with_atoms(

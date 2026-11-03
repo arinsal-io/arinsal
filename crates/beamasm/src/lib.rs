@@ -37,14 +37,12 @@ use arinsal_a64::{
     enc::Gpr,
 };
 
-pub use arinsal_bifs::BifState;
 pub use dump::{DumpError, write_global_note};
 
 /// C-layout process header consumed directly by BeamAsm generated code.
 ///
-/// `BifState` owns the whole header prefix and its trailing BIF-only state, so the native ABI
-/// words remain flat at their erts offsets while BIF contexts borrow one state pointer.
-pub type ProcessHeader = BifState;
+/// Native fields live at their fixed erts offsets in the process heap.
+pub type ProcessHeader = arinsal_term::NativeAbi;
 
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, fcalls) == 0x20);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, exc) == 0x28);

@@ -34,8 +34,8 @@ fn raise_undefined_call(
         other => return Err(other),
     };
     let resumed = crate::exceptions::resume(vm, process, Some(ctx), trap)?;
-    process.header.exc.freason = 0;
-    process.header.exc.fvalue = 0;
+    process.heap.abi.exc.freason = 0;
+    process.heap.abi.exc.fvalue = 0;
     Ok(resumed)
 }
 
@@ -75,7 +75,7 @@ fn native_transfer_continues(process: &mut Process, ctx: &RunCtx<'_, Message>) -
     if !transfer || remaining == 0 {
         return false;
     }
-    process.header.fcalls = process.header.fcalls.min(remaining);
+    process.heap.abi.fcalls = process.heap.abi.fcalls.min(remaining);
     true
 }
 
@@ -1746,13 +1746,13 @@ impl Executor {
             *ran = true;
             process.native_transfer = false;
             process.set_native_pc(None);
-            if process.header.fcalls <= 0
+            if process.heap.abi.fcalls <= 0
                 && let Ok(remaining) = i32::try_from(ctx.remaining())
                 && remaining > 0
             {
-                process.header.fcalls = remaining;
+                process.heap.abi.fcalls = remaining;
             }
-            let fcalls_before = process.header.fcalls;
+            let fcalls_before = process.heap.abi.fcalls;
             if crate::code_ix::take_code_barrier() {
                 ctx.block_thread_progress(std::time::Duration::ZERO);
             }
@@ -1765,7 +1765,7 @@ impl Executor {
                 &mut self.native_registers,
                 code_ptr,
             );
-            let consumed = fcalls_before.saturating_sub(process.header.fcalls);
+            let consumed = fcalls_before.saturating_sub(process.heap.abi.fcalls);
             ctx.consume(u32::try_from(consumed).unwrap_or(0));
             // Native `timeout` has no scheduler context to send its trace event.
             if process.native_exit_kind != crate::proc_create::NativeExit::None
@@ -1785,13 +1785,13 @@ impl Executor {
                     match crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap) {
                         Err(error) => return Some(Err(error)),
                         Ok(Some(error)) => {
-                            process.header.exc.freason = 0;
-                            process.header.exc.fvalue = 0;
+                            process.heap.abi.exc.freason = 0;
+                            process.heap.abi.exc.fvalue = 0;
                             return Some(Err(error));
                         }
                         Ok(None) => {
-                            process.header.exc.freason = 0;
-                            process.header.exc.fvalue = 0;
+                            process.heap.abi.exc.freason = 0;
+                            process.heap.abi.exc.fvalue = 0;
                             if let Some(cold) = process.cold.as_mut() {
                                 cold.exit_reason = None;
                             }
@@ -2158,9 +2158,9 @@ impl Executor {
                     // the budget is used up (erts counts reductions per call).
                     // The breakpoint left native code before its call's reduction was
                     // charged.
-                    process.header.fcalls = process.header.fcalls.saturating_sub(1);
+                    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(1);
                     process.reductions_used = process.reductions_used.saturating_add(1);
-                    if !ctx.consume(1) || process.header.fcalls <= 0 {
+                    if !ctx.consume(1) || process.heap.abi.fcalls <= 0 {
                         return Ok(Flow::Break(Ok(RunState::Yield)));
                     }
                     return Ok(Flow::Continue);
@@ -2205,14 +2205,14 @@ impl Executor {
                     // The retry redoes the apply from its operands: the
                     // arguments, the fun or module and function, and apply/3's
                     // three. Registers above them are dead.
-                    let saved_live = (usize::from(process.header.arity) + 2)
+                    let saved_live = (usize::from(process.heap.abi.arity) + 2)
                         .max(3)
                         .min(process.x.len());
                     let saved_x = process.x[..saved_live].to_vec();
                     let collections_before = process.stats.gc.collections;
                     let result = match target_pc {
                         arinsal_beamasm::dispatch::CALL_FUN_UNPORTED => {
-                            let arity = usize::from(process.header.arity);
+                            let arity = usize::from(process.heap.abi.arity);
                             let fun = process.x.get(arity).copied().unwrap_or(Term::NIL);
                             self.vm.call_fun_term(process, fun, arity, true, Some(ctx))
                         }
@@ -2220,7 +2220,7 @@ impl Executor {
                             process.native_apply = true;
                             let result = match target_pc {
                                 arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED => {
-                                    let arity = usize::from(process.header.arity);
+                                    let arity = usize::from(process.heap.abi.arity);
                                     self.vm.apply_fixed(process, arity, true, 0, Some(ctx))
                                 }
                                 arinsal_beamasm::dispatch::APPLY2_UNPORTED => {
@@ -2427,12 +2427,12 @@ impl Executor {
                     if let Some(error) =
                         crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap)?
                     {
-                        process.header.exc.freason = 0;
-                        process.header.exc.fvalue = 0;
+                        process.heap.abi.exc.freason = 0;
+                        process.heap.abi.exc.fvalue = 0;
                         return Ok(Flow::Break(Err(error)));
                     }
-                    process.header.exc.freason = 0;
-                    process.header.exc.fvalue = 0;
+                    process.heap.abi.exc.freason = 0;
+                    process.heap.abi.exc.fvalue = 0;
                     if let Some(cold) = process.cold.as_mut() {
                         cold.exit_reason = None;
                     }
@@ -2586,8 +2586,8 @@ impl Executor {
                             {
                                 return Ok(Flow::Break(Err(error)));
                             }
-                            process.header.exc.freason = 0;
-                            process.header.exc.fvalue = 0;
+                            process.heap.abi.exc.freason = 0;
+                            process.heap.abi.exc.fvalue = 0;
                             return Ok(Flow::Continue);
                         }
                         Some(Err(error)) => return Err(error),
@@ -2968,8 +2968,8 @@ impl Executor {
                                 )? {
                                     return Ok(Flow::Break(Err(error)));
                                 }
-                                process.header.exc.freason = 0;
-                                process.header.exc.fvalue = 0;
+                                process.heap.abi.exc.freason = 0;
+                                process.heap.abi.exc.fvalue = 0;
                                 return Ok(Flow::Continue);
                             }
                             Err(VmError::Unsupported(message))
@@ -3250,7 +3250,7 @@ impl Executor {
         let exec_key = ctx.scheduler_key();
         let cached = exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
         if !cached {
-            process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
+            process.heap.abi.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
             process.self_pid = Some(ctx.pid());
         }
         // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
@@ -3319,15 +3319,15 @@ impl Executor {
         // enters the BIF. Leave a positive count alone in that case.
         let reds = budget.min(i32::MAX as u32) as i32;
         if process.native_pc().is_some() {
-            if reds > 1 || process.header.fcalls <= 0 {
-                process.header.fcalls = reds;
+            if reds > 1 || process.heap.abi.fcalls <= 0 {
+                process.heap.abi.fcalls = reds;
             }
-        } else if process.header.fcalls <= 0 && reds > 0 {
+        } else if process.heap.abi.fcalls <= 0 && reds > 0 {
             // Interpreted schedule-in. A trapping BIF charges FCALLS to 0 when it
             // yields; the continuation (lists:member/2) reads that counter as its
             // scan budget. Leaving it at 0 makes every resume yield without
             // scanning, and the process never reaches halt.
-            process.header.fcalls = reds;
+            process.heap.abi.fcalls = reds;
         }
         // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
         // export's code address), OTP-29.1.1: every process starts its function natively on
@@ -3419,12 +3419,7 @@ impl Executor {
                                 }
                             }
                         };
-                        let mut result = crate::calls::call_bif(
-                            &mut process.heap,
-                            &mut process.header.fcalls,
-                            bif,
-                            &args,
-                        );
+                        let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
                         crate::calls::gc_after_bif(process, &mut args, &mut result)?;
                         match result {
                             Ok(value) => break 'execution Ok(RunState::Done(value)),
@@ -3479,8 +3474,8 @@ impl Executor {
                         // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
                         // then `p->fcalls = reds`; the process's reductions are what the slice
                         // used), OTP-29.1.1: the signal handling is the process's own work.
-                        process.header.fcalls =
-                            process.header.fcalls.saturating_sub(sig_reds.max(0));
+                        process.heap.abi.fcalls =
+                            process.heap.abi.fcalls.saturating_sub(sig_reds.max(0));
                         process.reductions_used = process
                             .reductions_used
                             .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
@@ -3663,7 +3658,7 @@ impl Executor {
                                 if let Some(call_arity) =
                                     retry_call_arity(target_pc, process.x.saved_arity())
                                 {
-                                    process.header.arity = call_arity;
+                                    process.heap.abi.arity = call_arity;
                                 }
                                 if process
                                     .cold
@@ -3695,13 +3690,13 @@ impl Executor {
                                 // has reductions; refilling avoids yielding before the next
                                 // instruction (the send after a code-permission release).
                                 let native = {
-                                    if process.header.fcalls <= 0
+                                    if process.heap.abi.fcalls <= 0
                                         && let Ok(remaining) = i32::try_from(ctx.remaining())
                                         && remaining > 0
                                     {
-                                        process.header.fcalls = remaining;
+                                        process.heap.abi.fcalls = remaining;
                                     }
-                                    let fcalls_before = process.header.fcalls;
+                                    let fcalls_before = process.heap.abi.fcalls;
                                     // A code change this scheduler committed waits for thread
                                     // progress first: every other scheduler then finishes the slice it
                                     // runs with the previous code index (erts' code barrier).
@@ -3719,7 +3714,7 @@ impl Executor {
                                         code_ptr,
                                     );
                                     let consumed =
-                                        fcalls_before.saturating_sub(process.header.fcalls);
+                                        fcalls_before.saturating_sub(process.heap.abi.fcalls);
                                     ctx.consume(u32::try_from(consumed).unwrap_or(0));
                                     // Native `timeout` has no scheduler context to send its trace event.
                                     if process.native_exit_kind
@@ -3755,12 +3750,12 @@ impl Executor {
                                             Some(ctx),
                                             trap,
                                         )? {
-                                            process.header.exc.freason = 0;
-                                            process.header.exc.fvalue = 0;
+                                            process.heap.abi.exc.freason = 0;
+                                            process.heap.abi.exc.fvalue = 0;
                                             break Err(error);
                                         }
-                                        process.header.exc.freason = 0;
-                                        process.header.exc.fvalue = 0;
+                                        process.heap.abi.exc.freason = 0;
+                                        process.heap.abi.exc.fvalue = 0;
                                         if let Some(cold) = process.cold.as_mut() {
                                             cold.exit_reason = None;
                                         }
@@ -3944,7 +3939,7 @@ impl Executor {
             // the two, whichever side stated it. From here on `header.arity` is the one count
             // every reader of the saved file takes.
             let arity_set = process.native_pc().is_some() && process.native_arity_set;
-            let call_arity = usize::from(process.header.arity);
+            let call_arity = usize::from(process.heap.abi.arity);
             let mut live_x = if arity_set {
                 call_arity
             } else if process.native_pc().is_some() {
@@ -3964,7 +3959,7 @@ impl Executor {
             {
                 live_x = operands;
             }
-            process.header.arity = live_x.min(usize::from(u8::MAX)) as u8;
+            process.heap.abi.arity = live_x.min(usize::from(u8::MAX)) as u8;
             process.gc_live = live_x;
             let save_x = live_x;
             if crate::native_bridge::return_trace_enabled() && process.native_pc().is_some() {
@@ -4304,7 +4299,7 @@ impl Vm {
                         process.x[index] = *term;
                     }
                     process.gc_live = args.len();
-                    process.header.arity = args.len().min(usize::from(u8::MAX)) as u8;
+                    process.heap.abi.arity = args.len().min(usize::from(u8::MAX)) as u8;
                     (module_id, ip, false)
                 }
                 Err(_) => {
@@ -4371,7 +4366,7 @@ fn hibernate_collect(process: &mut Process) -> Result<(), VmError> {
         3
     };
     process.gc_live = live;
-    process.header.arity = live as u8;
+    process.heap.abi.arity = live as u8;
     if !process.heap.gc_enabled {
         return Ok(());
     }
@@ -6188,8 +6183,8 @@ impl Process {
             return;
         }
         let reds = (words / ERTS_MSG_COPY_WORDS_PER_REDUCTION).min(CONTEXT_REDS as usize) as i32;
-        let applied = reds.min(self.header.fcalls.max(0));
-        self.header.fcalls -= applied;
+        let applied = reds.min(self.heap.abi.fcalls.max(0));
+        self.heap.abi.fcalls -= applied;
         if self.heap.native_active() {
             return;
         }
@@ -7226,7 +7221,6 @@ impl Process {
         // process's own fields, so they are right the moment the collector returns; here the
         // ABI prefix is a copy, and every path that returns to native code after a collection
         // (success, error or trap alike) must find the new heap in it.
-        self.sync_native_heap();
         Ok(stats)
     }
 
@@ -7539,10 +7533,10 @@ impl Process {
         // are spent, and all but ERTS_ABANDON_HEAP_COST of them are not the process's own
         // work. The interpreter keeps its slice in the scheduler and never charges the rest
         // of it.
-        if self.heap.native_active() && self.header.fcalls > ABANDON_HEAP_COST {
+        if self.heap.native_active() && self.heap.abi.fcalls > ABANDON_HEAP_COST {
             self.virtual_reds = self
                 .virtual_reds
-                .saturating_add((self.header.fcalls - ABANDON_HEAP_COST) as u32);
+                .saturating_add((self.heap.abi.fcalls - ABANDON_HEAP_COST) as u32);
         }
         self.set_force_yield(true);
         true
@@ -9212,8 +9206,7 @@ mod layout_tests {
     #[test]
     fn collection_publishes_the_new_heap_to_the_native_header() {
         let mut process = Process::new();
-        process.sync_native_header();
-        let before = (process.header.heap, process.header.hend);
+        let before = (process.heap.abi.heap, process.heap.abi.hend);
         // Force a collection that grows the young heap.
         process.ensure(1 << 14, 0).unwrap();
         let (heap, hend) = process.heap.heap_bounds();
@@ -9223,23 +9216,21 @@ mod layout_tests {
             before,
             "the collection must move or grow the heap"
         );
-        assert_eq!(process.header.heap, heap);
-        assert_eq!(process.header.hend, hend);
-        assert_eq!(process.header.htop, htop);
-        assert_eq!(process.header.stop, stop);
+        assert_eq!(process.heap.abi.heap, heap);
+        assert_eq!(process.heap.abi.hend, hend);
+        assert_eq!(process.heap.abi.htop, htop);
+        assert_eq!(process.heap.abi.stop, stop);
     }
 
     #[test]
     fn partial_cursor_sync_also_publishes_heap_bounds() {
         let mut process = Process::new();
-        process.sync_native_header();
         let _ = process.heap.heap_bounds();
         process.heap.delay_collection(0);
-        process.header.heap = std::ptr::null_mut();
-        process.header.hend = std::ptr::null_mut();
-        process.sync_native_cursors();
-        assert_eq!(process.header.heap, process.heap.heap_bounds().0);
-        assert_eq!(process.header.hend, process.heap.heap_bounds().1);
+        process.heap.abi.heap = std::ptr::null_mut();
+        process.heap.abi.hend = std::ptr::null_mut();
+        assert_eq!(process.heap.abi.heap, process.heap.heap_bounds().0);
+        assert_eq!(process.heap.abi.hend, process.heap.heap_bounds().1);
     }
 
     #[test]
@@ -9311,7 +9302,11 @@ mod layout_tests {
         // `first`, `last`, the length, the non-message count and the save cursor (position and
         // node), like the inner queue of erts `ErtsSignalPrivQueues`.
         assert_eq!(std::mem::size_of::<super::MessageQueue>(), 8 * 8);
-        assert!(std::mem::size_of::<arinsal_term::ProcessHeap>() <= 128);
+        // The native ABI words (erts c_p htop/stop/heap/hend/fcalls/freason) moved into the heap.
+        assert!(
+            std::mem::size_of::<arinsal_term::ProcessHeap>()
+                <= 128 + std::mem::size_of::<arinsal_term::NativeAbi>()
+        );
         eprintln!(
             "Process={} ProcessHeap={} VecDeque={} RunOutcome={}",
             std::mem::size_of::<crate::Process>(),

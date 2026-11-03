@@ -202,7 +202,7 @@ pub(crate) fn trace_class_reason(
     class: Class,
     reason: Term,
 ) -> Result<Term, VmError> {
-    if class == Class::Throw && p.header.catches == 0 {
+    if class == Class::Throw && p.heap.abi.catches == 0 {
         let nocatch = tuple(p, &[atom("nocatch")?, reason])?;
         return tuple(p, &[class_term(Class::Error)?, nocatch]);
     }
@@ -521,12 +521,12 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
             }
             let tag = stacktrace::handler_tag(p.module, b.value() as usize)?;
             p.write(a, tag)?;
-            p.header.catches = p.header.catches.saturating_add(1);
+            p.heap.abi.catches = p.heap.abi.catches.saturating_add(1);
             p.set_ip(p.ip() + 1);
         }
         Opcode::TryEnd | Opcode::TryCase => {
             p.write(a, Term::NIL)?;
-            p.header.catches = p.header.catches.saturating_sub(1);
+            p.heap.abi.catches = p.heap.abi.catches.saturating_sub(1);
             if op == Opcode::TryCase {
                 p.x[0] = p.x[3];
             }
@@ -534,7 +534,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
         }
         Opcode::CatchEnd => {
             p.write(a, Term::NIL)?;
-            p.header.catches = p.header.catches.saturating_sub(1);
+            p.heap.abi.catches = p.heap.abi.catches.saturating_sub(1);
             if p.x[0] == Term::catch(0) {
                 let reason = p.x[1];
                 p.x[0] = match parse_class(p.x[3]) {
@@ -928,8 +928,8 @@ fn save_raw(
         stacktrace::StackTraceSave {
             class,
             depth,
-            freason: if p.header.exc.freason != 0 {
-                p.header.exc.freason
+            freason: if p.heap.abi.exc.freason != 0 {
+                p.heap.abi.exc.freason
             } else {
                 stacktrace::class_to_freason(Some(class))
             },

@@ -972,7 +972,7 @@ impl ProcessHeap {
 
     /// Words allocated on the active heap since the high-water mark (`p->htop - p->high_water`).
     pub fn words_since_high_water(&self) -> usize {
-        self.htop_index().saturating_sub(self.high_water)
+        self.htop_index().saturating_sub(self.high_water_index())
     }
 
     /// Whether a delayed collection left a young heap behind (erts `p->abandoned_heap != NULL`).
@@ -1005,7 +1005,7 @@ impl ProcessHeap {
     // get_orig_heap), OTP-29.1.1.
     fn mature_words(&self) -> usize {
         self.abandoned_heap()
-            .map_or(self.high_water, |abandoned| abandoned.high_water)
+            .map_or(self.high_water_index(), |abandoned| abandoned.high_water)
     }
 
     /// Words the young generation uses: heap, fragments and an abandoned heap.
@@ -1058,7 +1058,10 @@ impl ProcessHeap {
         if hole > 0 {
             self.words.words_mut()[used] = ((hole as u64 - 1) << 6) | crate::POS_BIG;
         }
+        // The mature boundary is an address in the block that is about to move out.
+        let old_high_water = self.high_water_index();
         let abandoned = std::mem::replace(&mut self.words, next);
+        self.refresh_native_heap_bounds();
         if self.abandoned_heap().is_some() {
             // Port of erl_gc.c:546-558: the active heap already is a fragment; it joins
             // the mbuf list.
@@ -1074,13 +1077,13 @@ impl ProcessHeap {
             self.fragments.push(crate::heap::Fragment::Abandoned {
                 block: abandoned,
                 used,
-                high_water: self.high_water,
+                high_water: old_high_water,
             });
         }
         self.set_htop_index(0);
         self.set_stop_index(next_stop);
         // Port of erl_gc.c:578-581: the high-water mark points into the current heap.
-        self.high_water = 0;
+        self.set_high_water_index(0);
     }
 
     /// Old generation capacity in words.
@@ -1111,7 +1114,8 @@ impl ProcessHeap {
                 .filter(|fragment| !matches!(fragment, crate::heap::Fragment::Abandoned { .. }))
                 .map(|fragment| fragment.len())
                 .sum(),
-            recent_size: abandoned.map_or(self.high_water, |abandoned| abandoned.high_water),
+            recent_size: abandoned
+                .map_or(self.high_water_index(), |abandoned| abandoned.high_water),
             stack_size: self.words.len() - self.stop_index(),
             old_heap_size: self.old_htop,
             heap_size: abandoned.map_or(self.htop_index(), |abandoned| abandoned.used),
@@ -1155,7 +1159,7 @@ impl ProcessHeap {
 
     /// Words allocated in the young heap at the last collection.
     pub fn recent_words(&self) -> usize {
-        self.high_water
+        self.high_water_index()
     }
 
     /// Minimum young heap size configured for this process.
@@ -1393,7 +1397,8 @@ impl ProcessHeap {
         let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
             (abandoned.start, abandoned.start + abandoned.high_water * 8)
         });
-        let mature_words = abandoned.map_or(self.high_water, |abandoned| abandoned.high_water);
+        let mature_words =
+            abandoned.map_or(self.high_water_index(), |abandoned| abandoned.high_water);
         let fragments = (self.fragment_words as usize)
             .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used))
             .saturating_add(message_words);
@@ -1474,9 +1479,10 @@ impl ProcessHeap {
             owners: std::mem::take(&mut self.owners),
             fragments: std::mem::take(&mut self.fragments),
         };
+        self.refresh_native_heap_bounds();
         self.set_htop_index(0);
         self.set_stop_index(capacity - stack);
-        self.high_water = 0;
+        self.set_high_water_index(0);
         if major {
             self.old_htop = 0;
         }
@@ -1598,7 +1604,7 @@ impl ProcessHeap {
         copier.to.old_htop = (copier.old_htop.at - old_heap) / 8;
         copier.sweep_off_heap();
         copier.finish_bits();
-        copier.to.high_water = copier.to.htop_index();
+        copier.to.set_high_water_index(copier.to.htop_index());
         let promoted = ((copier.old_htop.at - tenured_from) / 8) as u64;
         drop(copier);
         // ErlHeapFragment headers live inside the fragment block in erts; here the fragment
@@ -1949,6 +1955,7 @@ impl ProcessHeap {
     ) {
         let stack = self.stack_words();
         let htop_index = self.htop_index();
+        let high_water_index = self.high_water_index();
         debug_assert!(new_words >= htop_index.saturating_add(stack));
         let prev_len = self.words.len();
         if new_words == prev_len {
@@ -1971,6 +1978,8 @@ impl ProcessHeap {
                 .copy_within(prev_stop..prev_len, new_stop);
         }
         self.words.realloc(new_words);
+        self.refresh_native_heap_bounds();
+        self.set_high_water_index(high_water_index);
         let new_heap = self.words.as_ptr() as usize;
         // The block may have moved: the cursors are addresses, so set them again from indexes.
         self.set_htop_index(htop_index);
@@ -2448,7 +2457,7 @@ mod tests {
         let mut heap = ProcessHeap::with_words(512);
         heap.old_words = ProcessHeap::with_words(100).words;
         heap.old_htop = 25;
-        heap.high_water = 80;
+        heap.set_high_water_index(80);
 
         assert!(!heap.collection_is_major());
         assert!(heap.minor_falls_back_to_major());

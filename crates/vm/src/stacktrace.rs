@@ -715,8 +715,8 @@ pub(crate) fn note_caught_bif_frame(
                         StoredTopFrame::CurrentArgs(args_term)
                     }
                 };
-                let freason = p.header.exc.freason;
-                let fvalue = p.header.exc.fvalue;
+                let freason = p.heap.abi.exc.freason;
+                let fvalue = p.heap.abi.exc.fvalue;
                 p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
                     freason,
                     fvalue,
@@ -732,8 +732,8 @@ pub(crate) fn note_caught_bif_frame(
     let Some(top) = bif_pending_top(module, function, args, info) else {
         return;
     };
-    let freason = p.header.exc.freason;
-    let fvalue = p.header.exc.fvalue;
+    let freason = p.heap.abi.exc.freason;
+    let fvalue = p.heap.abi.exc.fvalue;
     p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
         freason,
         fvalue,
@@ -760,14 +760,14 @@ fn bif_pending_top(
 
 fn clone_matching_pending(p: &Process) -> Option<StoredTopFrame> {
     let pending = p.cold.as_ref()?.pending_trace_top.as_ref()?;
-    (pending.freason == p.header.exc.freason && pending.fvalue == p.header.exc.fvalue)
+    (pending.freason == p.heap.abi.exc.freason && pending.fvalue == p.heap.abi.exc.fvalue)
         .then(|| pending.top.clone())
 }
 
 pub(super) fn take_matching_pending_top(p: &mut Process) -> Option<StoredTopFrame> {
     let cold = p.cold.as_mut()?;
     let matches = cold.pending_trace_top.as_ref().is_some_and(|pending| {
-        pending.freason == p.header.exc.freason && pending.fvalue == p.header.exc.fvalue
+        pending.freason == p.heap.abi.exc.freason && pending.fvalue == p.heap.abi.exc.fvalue
     });
     matches
         .then(|| cold.pending_trace_top.take().map(|pending| pending.top))
@@ -978,8 +978,8 @@ fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
 }
 
 fn process_freason(p: &Process, class: Class) -> u64 {
-    if p.header.exc.freason != 0 {
-        p.header.exc.freason
+    if p.heap.abi.exc.freason != 0 {
+        p.heap.abi.exc.freason
     } else {
         class_to_freason(Some(class))
     }
@@ -1739,7 +1739,7 @@ pub(super) fn build(
     depth: usize,
 ) -> Result<Term, VmError> {
     // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
-    let trapped = p.header.i as usize == crate::bif_traps::bif_export_trap_pc();
+    let trapped = p.heap.abi.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = p.native_call_pc;
     let native_pc = if trapped {
         None
@@ -1749,7 +1749,7 @@ pub(super) fn build(
         // A process suspended inside native code: `p.module`/`p.ip()` still hold the last
         // interpreter position, so the current function comes from its native resume pc.
         p.native_pc()
-            .or_else(|| Some(p.header.i as usize).filter(|&pc| pc != 0))
+            .or_else(|| Some(p.heap.abi.i as usize).filter(|&pc| pc != 0))
             .filter(|&pc| crate::native_bridge::is_native_function_at(pc))
     };
     let mut raw = RawTrace::default();

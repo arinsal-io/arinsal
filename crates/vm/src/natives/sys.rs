@@ -374,7 +374,7 @@ fn call_bump_reductions(
         .filter(|value| *value >= 0)
         .ok_or_else(badarg)?;
     let charged = reductions.min(QUANTUM as i64) as u32;
-    process.header.fcalls -= charged as i32;
+    process.heap.abi.fcalls -= charged as i32;
     process.reductions_used = process.reductions_used.saturating_add(u64::from(charged));
     ctx.consume(charged);
     Ok(atom("true"))
@@ -498,7 +498,7 @@ fn call_values(
         let before = PersistentTermUpdate::snapshot(store);
         let result = {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let mut state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
+            let mut state = arinsal_bifs::BifState::default();
             let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
             bif(store, &mut bif_ctx, args)
         };
@@ -645,7 +645,7 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
     // OTP's BIF chunk size is `ERTS_BIF_REDS_LEFT(c_p)`, which is also how
     // `erts_debug:set_internal_state(reds_left, ...)` steers this operation.
     // Keep the scheduler quantum as an upper bound for this Rust call.
-    let budget = (process.header.fcalls.max(1) as u32).min(ctx.remaining().max(1)) as usize;
+    let budget = (process.heap.abi.fcalls.max(1) as u32).min(ctx.remaining().max(1)) as usize;
     let mut copied = 0_usize;
     loop {
         let (remaining, next_entry, tail) = process

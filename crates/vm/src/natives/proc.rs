@@ -954,7 +954,7 @@ fn process_info_aux(
                 // `- virtual_reds`: what ERTS_VBUMP_REDS took is not the process's own work.
                 u64::try_from(
                     rp.native_reds_in
-                        .saturating_sub(rp.header.fcalls)
+                        .saturating_sub(rp.heap.abi.fcalls)
                         .saturating_sub(i32::try_from(rp.virtual_reds).unwrap_or(i32::MAX)),
                 )
                 .unwrap_or(0)
@@ -2032,7 +2032,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     // `native_pc`; its position is then still in `c_p->i`, which interpreted slices clear.
     let native_position = process
         .native_pc()
-        .or_else(|| Some(process.header.i as usize).filter(|&pc| pc != 0));
+        .or_else(|| Some(process.heap.abi.i as usize).filter(|&pc| pc != 0));
     if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
         return Ok((
             function.module.to_owned(),
@@ -2110,7 +2110,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
     // Port of erts/emulator/beam/erl_process.c:14916 (erts_program_counter_info prints p->i)
     // and bif.h:322 (`p->i = beam_bif_export_trap`), OTP-29.1.1. A trapped BIF is not inside
     // the caller's native function; the PC is the export-trap entry.
-    let export_trap = process.header.i as usize == crate::bif_traps::bif_export_trap_pc();
+    let export_trap = process.heap.abi.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = process
         .native_pc()
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
@@ -2462,7 +2462,7 @@ fn process_info_single(
 /// after its values are built, so this call's bump is visible to the next `process_info`.
 fn charge_info_reductions(process: &mut Process, info_reds: i32) {
     if process.heap.native_active() {
-        process.header.fcalls = process.header.fcalls.saturating_sub(info_reds);
+        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(info_reds);
     } else {
         process.reductions_used = process
             .reductions_used
@@ -3515,7 +3515,7 @@ fn hibernate(
     process.x[1] = function;
     process.x[2] = args;
     process.gc_live = 3;
-    process.header.arity = 3;
+    process.heap.abi.arity = 3;
     process.inbox.set_save(0);
     // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
     // continuation is process state.

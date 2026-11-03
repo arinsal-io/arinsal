@@ -268,7 +268,7 @@ fn hamt_next(
     list_mode: bool,
     acc: Term,
 ) -> Result<Term, Trap> {
-    let mut elems = chunk_len(process.header.fcalls, map_size);
+    let mut elems = chunk_len(process.heap.abi.fcalls, map_size);
     let digits = path_digits(path)?;
     if digits.is_zero_small && elems > MAP_SMALL_MAP_LIMIT {
         elems = MAP_SMALL_MAP_LIMIT;
@@ -473,7 +473,7 @@ fn hamt_next(
     } else {
         chain.finish(NONE)
     };
-    process.header.fcalls -= (4 * (orig_elems as i64 - elems as i64)) as i32;
+    process.heap.abi.fcalls -= (4 * (orig_elems as i64 - elems as i64)) as i32;
     Ok(result)
 }
 
@@ -505,7 +505,8 @@ fn ordered_next(
     mut path: Term,
     map: arinsal_maps::CheckedMap,
 ) -> Result<Term, Trap> {
-    let orig_elems = (process.header.fcalls / ORDERED_ITER_FACTOR).max(1) as usize;
+    let fcalls = process.heap.abi.fcalls;
+    let orig_elems = (fcalls / ORDERED_ITER_FACTOR).max(1) as usize;
     let mut elems = orig_elems;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut region = HeapReservation::new(&mut heap, 4 * elems + 2).map_err(|_| system_limit())?;
@@ -524,19 +525,20 @@ fn ordered_next(
         path = tail;
         elems -= 1;
     }
-    if path.classify() == TermKind::List {
+    let (result, fcalls) = if path.classify() == TermKind::List {
         let next = builder.cons(path, map.term()).map_err(|_| system_limit())?;
-        process.header.fcalls = 0;
-        Ok(chain.finish(next))
+        (chain.finish(next), 0)
     } else if path == Term::NIL {
-        process.header.fcalls = process
-            .header
-            .fcalls
-            .saturating_sub(ORDERED_ITER_FACTOR * (orig_elems - elems) as i32);
-        Ok(chain.finish(NONE))
+        (
+            chain.finish(NONE),
+            fcalls.saturating_sub(ORDERED_ITER_FACTOR * (orig_elems - elems) as i32),
+        )
     } else {
-        Err(badarg())
-    }
+        return Err(badarg());
+    };
+    drop(region);
+    process.heap.abi.fcalls = fcalls;
+    Ok(result)
 }
 
 /// `erts_internal:map_next/3`.
@@ -652,13 +654,13 @@ extern "C" fn map_next_light(
 // Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3), OTP-29.1.1.
 #[inline(always)]
 fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader) -> Option<u64> {
-    let (process, registers) = crate::native_hooks::enter_runtime_no_cursors(header)?;
+    let (process, registers) = crate::native_hooks::enter_runtime(header)?;
     let (path, flat, list_mode, mode) = flatmap_step(&registers.x_reg_array[..3])?;
     let n = flat.size();
     if path.as_small().filter(|index| *index >= 0)? > n as i64 {
         return None;
     }
-    let mut top = crate::native_top_heap::NativeTopHeap::new(process)?;
+    let mut top = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let term = arinsal_maps::flatmap_next_checked(flat, n, list_mode, mode, &mut top).ok()?;
     registers.x_reg_array[0] = term;
     Some(crate::native_hooks::raw(term))

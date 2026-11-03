@@ -451,7 +451,7 @@ fn peek_xreg(
 
 fn inspect_pid(process: &Process, term: Term) -> Result<Pid, VmError> {
     let pid = Pid::from_term(term).ok_or_else(badarg)?;
-    let self_pid = process.header.self_pid;
+    let self_pid = process.heap.abi.self_pid;
     if term.tagged_word() == self_pid {
         return Err(badarg());
     }

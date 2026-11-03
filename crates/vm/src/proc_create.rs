@@ -339,16 +339,14 @@ impl std::ops::DerefMut for ArgRegs {
 /// One future schedulable process, with private registers and heap.
 #[repr(C)]
 pub struct Process {
-    /// BeamAsm ABI prefix; interpreter fields remain authoritative outside native execution.
-    pub(crate) header: ProcessHeader,
+    /// The first member of the process is the fixed native ABI prefix.
+    pub heap: ProcessHeap,
     /// X registers. Inline for the erts default of six (`def_arg_reg`).
     pub x: ArgRegs,
     /// Float registers of a process that runs outside a scheduler slice (an evaluation on its
     /// own thread). Inside a slice the float file is the scheduler's `f_reg_array`, reached
     /// through `x`, and this stays empty.
     pub fr: Box<[f64]>,
-    /// Contiguous process heap and Y stack.
-    pub heap: ProcessHeap,
     /// The erts process dictionary pointer is part of the hot process structure.
     pub(crate) dictionary: Option<Box<ProcDict>>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
@@ -499,7 +497,7 @@ pub struct Process {
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
 unsafe impl Send for Process {}
-const _: () = assert!(std::mem::offset_of!(Process, header) == 0);
+const _: () = assert!(std::mem::offset_of!(Process, heap) == 0);
 
 /// Empty chain / free-list terminator. A live slot holds a node index.
 const NIL_NODE: u32 = u32::MAX;
@@ -1601,7 +1599,7 @@ impl Process {
     /// The caller frame of the BIF the process waits in, while it is scheduled out in the
     /// export trap of an interpreter call.
     pub(crate) fn trap_return_frame(&self) -> Option<&TrapReturn> {
-        if self.header.i as usize != crate::bif_traps::bif_export_trap_pc() {
+        if self.heap.abi.i as usize != crate::bif_traps::bif_export_trap_pc() {
             return None;
         }
         self.cold.as_ref()?.trap_return.as_ref()
@@ -1726,7 +1724,7 @@ impl Process {
             self.x[index] = *arg;
         }
         self.gc_live = args.len();
-        self.header.arity = args.len().min(usize::from(u8::MAX)) as u8;
+        self.heap.abi.arity = args.len().min(usize::from(u8::MAX)) as u8;
         if let Some(saved) = self
             .cold
             .as_mut()
@@ -1740,7 +1738,7 @@ impl Process {
 
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.
     pub fn native_header(&mut self) -> &mut ProcessHeader {
-        &mut self.header
+        &mut self.heap.abi
     }
 
     /// Push a registered native return address onto the Erlang stack.
@@ -1755,7 +1753,7 @@ impl Process {
         if !self.heap.stack_set(0, continuation) {
             return Err("process stack update failed");
         }
-        self.sync_header();
+        self.clear_native_resume();
         Ok(())
     }
 
@@ -1769,7 +1767,7 @@ impl Process {
         {
             return Err("process continuation is missing");
         }
-        self.sync_header();
+        self.clear_native_resume();
         Ok(())
     }
 
@@ -1816,20 +1814,11 @@ impl Process {
         Ok(())
     }
 
-    /// Copy interpreter-owned state to the ABI prefix at native boundaries.
-    // Interpreter fields are authoritative outside native execution. This boundary copy
-    // keeps the fixed prefix authoritative while BeamAsm owns the process registers.
-    pub(crate) fn sync_header(&mut self) {
-        let (htop, stop) = self.heap.heap_cursor();
-        let (heap, hend) = self.heap.heap_bounds();
-        self.header.htop = htop;
-        self.header.stop = stop;
-        self.header.heap = heap;
-        self.header.hend = hend;
-        self.header.high_water = self.heap.high_water_ptr();
-        self.header.i = std::ptr::null();
-        self.header.arity = 0;
-        self.header.current = std::ptr::null();
+    /// Clear the resume words (`c_p->i`, `arity`, `current`) at a native entry.
+    pub(crate) fn clear_native_resume(&mut self) {
+        self.heap.abi.i = std::ptr::null();
+        self.heap.abi.arity = 0;
+        self.heap.abi.current = std::ptr::null();
     }
 
     /// Records the live X register count a native continuation resumes with.
@@ -1837,7 +1826,7 @@ impl Process {
     // a saved register file states how many registers are live, and every reader of a
     // switched-out process takes that count.
     pub(crate) fn set_native_resume_arity(&mut self, live: u8) {
-        self.header.arity = live;
+        self.heap.abi.arity = live;
         self.native_arity_set = true;
     }
 
@@ -1845,47 +1834,7 @@ impl Process {
     /// saved file.
     #[inline]
     pub(crate) fn saved_arity(&self) -> usize {
-        usize::from(self.header.arity).min(self.x.len())
-    }
-
-    /// Publishes what a runtime call that did not collect can change: the heap and stack
-    /// cursors and FCALLS. The heap bounds move only when the process collects.
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:540-601 (emit_leave_runtime with
-    // Update::eHeap | eStack | eReductions), OTP-29.1.1.
-    pub(crate) fn sync_native_cursors(&mut self) {
-        let (htop, stop) = self.heap.heap_cursor();
-        self.header.htop = htop;
-        self.header.stop = stop;
-        // A helper that collected moved the heap: the bounds go out with the cursors, or
-        // the next helper commits cursors of the new heap against the old base.
-        let (heap, hend) = self.heap.heap_bounds();
-        self.header.heap = heap;
-        self.header.hend = hend;
-    }
-
-    /// Publish only the young-heap state (cursors, bounds, high water) to the ABI prefix,
-    /// leaving FCALLS alone: the collector uses it, and it may run in a helper that has not
-    /// taken over the stored reduction counter.
-    pub(crate) fn sync_native_heap(&mut self) {
-        let (htop, stop) = self.heap.heap_cursor();
-        let (heap, hend) = self.heap.heap_bounds();
-        self.header.htop = htop;
-        self.header.stop = stop;
-        self.header.heap = heap;
-        self.header.hend = hend;
-        self.header.high_water = self.heap.high_water_ptr();
-    }
-
-    /// Publish the heap bounds and cursors to the ABI prefix before entering native code,
-    /// as the executor does at every native entry.
-    pub fn sync_native_header(&mut self) {
-        let (htop, stop) = self.heap.heap_cursor();
-        let (heap, hend) = self.heap.heap_bounds();
-        self.header.htop = htop;
-        self.header.stop = stop;
-        self.header.heap = heap;
-        self.header.hend = hend;
-        self.header.high_water = self.heap.high_water_ptr();
+        usize::from(self.heap.abi.arity).min(self.x.len())
     }
 
     /// Satisfy `need` words in a fresh heap fragment without collecting, keeping the call_memory
@@ -2260,7 +2209,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
-        process.header.arity = x_registers.min(usize::from(u8::MAX)) as u8;
+        process.heap.abi.arity = x_registers.min(usize::from(u8::MAX)) as u8;
         if !crate::beamasm_integration::enabled() {
             crate::native_bridge::push_exit_bridge(process);
         }
@@ -2308,15 +2257,13 @@ impl Process {
         let started = std::time::Instant::now();
         #[cfg(feature = "pf-mem-counters")]
         let min_heap = heap.min_heap_size_words();
+        let mut heap = heap;
+        // `c_p->fcalls` starts at a full slice; there is no separate counter to refill it.
+        heap.abi.fcalls = crate::process::CONTEXT_REDS;
         let process = slot.write(Self {
-            // `c_p->fcalls` starts at a full slice; there is no separate counter to refill it.
-            header: ProcessHeader {
-                fcalls: crate::process::CONTEXT_REDS,
-                ..ProcessHeader::default()
-            },
+            heap,
             x: ArgRegs::new(x_registers),
             fr: vec![0.0; float_registers].into_boxed_slice(),
-            heap,
             dictionary: None,
             seq_trace_token: None,
             seq_token_root: Term::NIL,
@@ -2384,7 +2331,7 @@ impl Process {
             native_error_pc: 0,
             native_exit_kind: NativeExit::None,
         });
-        process.sync_header();
+        process.clear_native_resume();
         #[cfg(feature = "pf-mem-counters")]
         if min_heap == 233 {
             PF_SPAWN_CONSTRUCTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2435,8 +2382,9 @@ impl Process {
     // (`erts_gc_after_bif_call_lhf`, `erts_garbage_collect`), OTP-29.1.1.
     pub(crate) fn bump_gc_reds(&mut self, cost: u32) {
         if self.heap.native_active() {
-            self.header.fcalls = self
-                .header
+            self.heap.abi.fcalls = self
+                .heap
+                .abi
                 .fcalls
                 .saturating_sub(cost.min(i32::MAX as u32) as i32)
                 .max(0);
@@ -2451,7 +2399,7 @@ impl Process {
     // OTP-29.1.1. The part of it that is not the process's own work is already in `virtual_reds`.
     pub(crate) fn charge_gc_stats(&mut self, stats: &arinsal_term::GcStats) {
         if stats.collections == 0 && self.heap.native_active() {
-            self.header.fcalls = 0;
+            self.heap.abi.fcalls = 0;
             return;
         }
         self.bump_gc_reds(stats.reductions);
@@ -2623,9 +2571,9 @@ impl Process {
         self.write(dst, term)
     }
     pub(crate) fn tick(&mut self) {
-        self.header.fcalls -= 1;
-        if self.header.fcalls == 0 {
-            self.header.fcalls = 4000;
+        self.heap.abi.fcalls -= 1;
+        if self.heap.abi.fcalls == 0 {
+            self.heap.abi.fcalls = 4000;
         }
     }
 }
@@ -3174,7 +3122,7 @@ mod layout_report {
     fn print_process_layout() {
         let process = Process::new();
         eprintln!("Process {}", size_of::<Process>());
-        eprintln!("  Process.header {}", size_of_val(&process.header));
+        eprintln!("  Process.heap.abi {}", size_of_val(&process.heap.abi));
         eprintln!("  Process.x {}", size_of_val(&process.x));
         eprintln!("  Process.fr {}", size_of_val(&process.fr));
         eprintln!("  Process.heap {}", size_of_val(&process.heap));
@@ -3225,7 +3173,7 @@ mod layout_report {
         );
         eprintln!(
             "  Process.reductions {}",
-            size_of_val(&process.header.fcalls)
+            size_of_val(&process.heap.abi.fcalls)
         );
         eprintln!(
             "  Process.native_reds_in {}",
