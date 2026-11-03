@@ -108,18 +108,47 @@ pub struct NativeFunction {
 #[derive(Clone, Debug, Default)]
 pub struct NativeLines {
     table: Option<Arc<[NativeLine]>>,
+    /// The module's native PCs alone, parallel to `table`: the search keys of
+    /// `lookup_loc`, so a probe touches eight bytes (erts keeps `loc_tab` compact).
+    addresses: Option<Arc<[usize]>>,
     lo: u32,
     hi: u32,
 }
 
 impl NativeLines {
-    /// The entries `lo..hi` of `table`.
-    pub fn window(table: &Arc<[NativeLine]>, lo: usize, hi: usize) -> Self {
+    /// The entries `lo..hi` of `table`; `addresses` holds their native PCs in the same order.
+    pub fn window(
+        table: &Arc<[NativeLine]>,
+        addresses: &Arc<[usize]>,
+        lo: usize,
+        hi: usize,
+    ) -> Self {
+        debug_assert_eq!(table.len(), addresses.len());
         Self {
             table: Some(Arc::clone(table)),
+            addresses: Some(Arc::clone(addresses)),
             lo: lo as u32,
             hi: hi as u32,
         }
+    }
+
+    /// The entry at the nearest preceding native PC, like erts' `lookup_loc`
+    /// (beam_ranges.c): a branching binary search over the compact PC table.
+    #[inline]
+    fn find(&self, address: usize) -> Option<&NativeLine> {
+        let keys = &self.addresses.as_deref()?[self.lo as usize..self.hi as usize];
+        let (mut low, mut high) = (0usize, keys.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let key = keys[mid];
+            if address < key {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        let index = low.checked_sub(1)?;
+        self.table.as_deref()?.get(self.lo as usize + index)
     }
 }
 
@@ -155,13 +184,9 @@ pub struct NativeLine {
 impl NativeFunction {
     /// Resolve a native return PC to the nearest preceding BEAM line marker.
     pub fn line_at(&self, address: usize) -> Option<(&str, u32)> {
-        let index = self
-            .line_table
-            .partition_point(|entry| entry.address <= address)
-            .checked_sub(1)?;
         // Line 0 marks a location erts cannot represent (LINE_INVALID_LOCATION).
         self.line_table
-            .get(index)
+            .find(address)
             .filter(|entry| entry.line != 0)
             .map(|entry| (entry.file.as_ref(), entry.line))
     }
@@ -372,14 +397,22 @@ fn find_range_with<'a>(
     if address >= mid.start && address < mid.end() {
         return Some(mid);
     }
-    let index = ranges.partition_point(|range| range.start <= address);
-    let found = index.checked_sub(1)?;
-    let range = ranges.get(found)?;
-    if address >= range.end() {
-        return None;
+    // Port of beam_ranges.c:307-327 (`find_range`), OTP-29.1.1: a branching search with the
+    // range test inside the loop, so a repeated lookup is predicted and hits `return` at once.
+    let (mut low, mut high) = (0usize, len);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let range = &ranges[mid];
+        if address < range.start {
+            high = mid;
+        } else if address < range.end() {
+            hint.store(mid, Ordering::Relaxed);
+            return Some(range);
+        } else {
+            low = mid + 1;
+        }
     }
-    hint.store(found, Ordering::Relaxed);
-    Some(range)
+    None
 }
 
 /// `erts_lookup_function_info` over the ranges published with the active code index.
@@ -396,9 +429,7 @@ fn frame_in(
     // then index its parallel location table. Filenames remain module literals.
     let loc = function
         .line_table
-        .partition_point(|entry| entry.address <= address)
-        .checked_sub(1)
-        .and_then(|index| function.line_table.get(index))
+        .find(address)
         .filter(|entry| entry.line != 0);
     let file_term = loc.as_ref().and_then(|entry| {
         entry
@@ -450,12 +481,20 @@ fn lookup_function<R>(address: usize, visit: impl FnOnce(&NativeFunction) -> R) 
 // Port of erts/emulator/beam/beam_ranges.c:262-278 (`erts_lookup_function_info`), OTP-29.1.1:
 // search the compact code-header function address table, then read metadata for the hit only.
 fn function_in(range: &ModuleRange, address: usize) -> Option<&NativeFunction> {
-    let index = range
-        .function_starts
-        .partition_point(|start| *start <= address)
-        .checked_sub(1)?;
-    let function = range.functions.get(index)?;
-    (address < function.end).then_some(function)
+    let starts = &*range.function_starts;
+    let (mut low, mut high) = (0usize, starts.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if address < starts[mid] {
+            high = mid;
+        } else if starts.get(mid + 1).is_none_or(|next| address < *next) {
+            let function = range.functions.get(mid)?;
+            return (address < function.end).then_some(function);
+        } else {
+            low = mid + 1;
+        }
+    }
+    None
 }
 
 fn native_generation() -> &'static AtomicU64 {
@@ -611,14 +650,13 @@ fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch
         return None;
     }
     let heap = &process.heap;
-    if let (Some(runtime), Some(cold)) = (process.runtime.as_ref(), process.cold.as_mut()) {
+    if let Some(runtime) = process.runtime.as_ref() {
+        // The cache lives in the cold part, which a plain raise has not needed so far.
+        let cold = process.cold.get_or_insert_with(Box::default);
         let table = runtime
             .code_indexes()
             .active_catches_cached(&mut cold.catch_cache);
         return scan_catch(heap, table, native_only);
-    }
-    if let Some(runtime) = process.runtime.as_ref() {
-        return runtime.with_active_catches(|table| scan_catch(heap, table, native_only));
     }
     crate::code_ix::for_scope(process_code_scope(process))
         .with_active_catches(|table| scan_catch(heap, table, native_only))
@@ -688,7 +726,7 @@ fn scan_catch(
                 traced,
             });
         }
-        if crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler) {
+        if raw & 63 == 0x1b && interpreter_continuation(word) {
             previous_cp = index;
             seen_cp = true;
             for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
@@ -697,6 +735,14 @@ fn scan_catch(
         }
     }
     None
+}
+
+/// Whether a catch-tagged stack word is an interpreter continuation. Out of line: the thread-local
+/// code scope it reads would otherwise be fetched on every scan.
+#[cold]
+#[inline(never)]
+fn interpreter_continuation(word: Term) -> bool {
+    crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler)
 }
 
 /// Find the nearest catch without moving the stack cursor; only native handlers resume here.
@@ -765,9 +811,12 @@ pub(crate) fn commit_catch(
     process.heap.abi.exc.fvalue = Term::NIL.tagged_word();
     process.heap.abi.exc.ftrace = 0;
     process.clear_native_failure();
-    if let Some(cold) = process.cold.as_mut() {
-        cold.pending_trace_top = None;
-        cold.explicit_raise = None;
+    if process.exc_side {
+        if let Some(cold) = process.cold.as_mut() {
+            cold.pending_trace_top = None;
+            cold.explicit_raise = None;
+        }
+        process.exc_side = false;
     }
     match found.target {
         CatchTarget::Native(handler) => {
