@@ -1773,7 +1773,7 @@ pub fn bitstring_bit_len(term: Term) -> Result<usize, BifError> {
 // Port of erts/emulator/beam/erl_iolist.c:1013-1070, OTP-29.1.1.
 pub struct IolistSizeWalk {
     current: Term,
-    tails: SmallVec<[Term; 8]>,
+    tails: arinsal_term::EStack<8>,
     size: usize,
     unit: usize,
 }
@@ -1783,7 +1783,7 @@ impl IolistSizeWalk {
     pub fn new(root: Term) -> Self {
         Self {
             current: root,
-            tails: SmallVec::new(),
+            tails: arinsal_term::EStack::new(),
             size: 0,
             unit: 8,
         }
@@ -1814,45 +1814,59 @@ impl IolistSizeWalk {
     // Port of erts/emulator/beam/erl_iolist.c (generic_iolist_size), OTP-29.1.1.
     #[inline]
     pub fn step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
+        // Port of the C locals of generic_iolist_size: cursor and accumulator live in
+        // registers and are stored back only when the walk yields or finishes. An error
+        // abandons the walk, so it needs no stored state.
         let mut consumed = 0;
+        let mut current = self.current;
+        let mut size = self.size;
         loop {
-            while self.current.classify() == TermKind::List {
+            while let Ok((head, tail)) = iolist_cons(current) {
                 if consumed + 1 >= budget {
+                    self.current = current;
+                    self.size = size;
                     return Ok((false, budget));
                 }
                 consumed += 1;
-                let (head, tail) = iolist_cons(self.current).map_err(|error| (error, consumed))?;
                 // Port of erts/emulator/beam/erl_iolist.c:158-165
                 // (generic_iolist_size): test bytes before boxed terms and sublists.
                 if let Some(byte) = head.as_small() {
                     if !(0..=255).contains(&byte) {
                         return Err((BADARG, consumed));
                     }
-                    self.size = self
-                        .size
+                    size = size
                         .checked_add(8)
                         .ok_or((BifError::SystemLimit, consumed))?;
-                    self.current = tail;
+                    current = tail;
                     continue;
                 }
                 if head.classify() == TermKind::List {
                     self.tails.push(tail);
-                    self.current = head;
+                    current = head;
                     continue;
                 }
-                self.add(head, true).map_err(|error| (error, consumed))?;
-                self.current = tail;
+                size = self
+                    .leaf_size(size, head, true)
+                    .map_err(|error| (error, consumed))?;
+                current = tail;
             }
 
             if consumed + 1 >= budget {
+                self.current = current;
+                self.size = size;
                 return Ok((false, budget));
             }
             consumed += 1;
-            self.add(self.current, false)
+            size = self
+                .leaf_size(size, current, false)
                 .map_err(|error| (error, consumed))?;
             match self.tails.pop() {
-                Some(tail) => self.current = tail,
-                None => return Ok((true, consumed)),
+                Some(tail) => current = tail,
+                None => {
+                    self.current = current;
+                    self.size = size;
+                    return Ok((true, consumed));
+                }
             }
         }
     }
@@ -1862,9 +1876,9 @@ impl IolistSizeWalk {
         std::mem::take(&mut self.size) / 8
     }
 
-    fn add(&mut self, term: Term, byte_allowed: bool) -> Result<(), BifError> {
+    fn leaf_size(&self, size: usize, term: Term, byte_allowed: bool) -> Result<usize, BifError> {
         match term.classify() {
-            TermKind::Nil => Ok(()),
+            TermKind::Nil => Ok(size),
             TermKind::Bitstring => {
                 let bits = bitstring_bit_len(term)?;
                 if !bits.is_multiple_of(self.unit) {
@@ -1872,8 +1886,7 @@ impl IolistSizeWalk {
                 }
                 // Port of erts/emulator/beam/erl_iolist.c:139-191
                 // (generic_iolist_size), OTP-29.1.1. ERTS keeps a Uint accumulator.
-                self.size = self.size.checked_add(bits).ok_or(BifError::SystemLimit)?;
-                Ok(())
+                size.checked_add(bits).ok_or(BifError::SystemLimit)
             }
             TermKind::Number if byte_allowed => {
                 if !term
@@ -1882,8 +1895,7 @@ impl IolistSizeWalk {
                 {
                     return Err(BADARG);
                 }
-                self.size = self.size.checked_add(8).ok_or(BifError::SystemLimit)?;
-                Ok(())
+                size.checked_add(8).ok_or(BifError::SystemLimit)
             }
             _ => Err(BADARG),
         }

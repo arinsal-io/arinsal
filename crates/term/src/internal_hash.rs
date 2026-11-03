@@ -1,6 +1,6 @@
 //! OTP's unsalted 64-bit HAMT hash. External node and export pointers are VM-local.
+use crate::stack::WStack;
 use crate::{FLOAT, NEG_BIG, POS_BIG, Term, TermKind};
-use smallvec::SmallVec;
 
 const C1: u64 = 0x87c3_7b91_1142_53d5;
 const C2: u64 = 0x4cf5_ad43_2745_937f;
@@ -46,7 +46,7 @@ impl State {
     }
     // Port of IHASH_PUSH_TERM in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
     #[inline(always)]
-    fn push_term(&mut self, term: Term, stack: &mut SmallVec<[u64; 16]>) {
+    fn push_term(&mut self, term: Term, stack: &mut WStack<u64, 16>) {
         if term.bits() & 3 == 3 {
             self.alpha(1);
             self.beta(term.bits());
@@ -100,7 +100,7 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
         beta: salt,
         ticks: 0,
     };
-    let mut stack: SmallVec<[u64; 16]> = SmallVec::new();
+    let mut stack: WStack<u64, 16> = WStack::new();
     let mut term = term;
 
     // Port of make_internal_hash's DECLARE_ESTACK loop and pop_next label in
