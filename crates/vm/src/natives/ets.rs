@@ -1209,6 +1209,14 @@ fn direct_update_counter_from_shared(
         {
             return None;
         }
+        if let Some(increment) = args.get(2).and_then(|operation| operation.as_small()) {
+            if let Err(error) = validate_counter_request(&table, caller, args) {
+                return Some(Err(error));
+            }
+            if let Some(value) = table.update_counter_one_in_place_shared(args[1], increment) {
+                return Some(Ok(value));
+            }
+        }
         let request = match counter_request(&table, caller, args) {
             Ok(Some(request)) => request,
             Ok(None) => return None,
@@ -1225,6 +1233,14 @@ fn direct_update_counter_from_shared(
         || table.is_busy()
     {
         return None;
+    }
+    if let Some(increment) = args.get(2).and_then(|operation| operation.as_small()) {
+        if let Err(error) = validate_counter_request(&table, caller, args) {
+            return Some(Err(error));
+        }
+        if let Some(value) = table.update_counter_one_in_place(args[1], increment) {
+            return Some(Ok(value));
+        }
     }
     let request = match counter_request(&table, caller, args) {
         Ok(Some(request)) => request,
@@ -1244,6 +1260,18 @@ fn counter_request(
     caller: Term,
     args: &[Term],
 ) -> Result<Option<CounterRequest>, VmError> {
+    validate_counter_request(table, caller, args)?;
+    let Some((operations, single)) = small_counter_ops(table.options.keypos, args[2]) else {
+        return Ok(None);
+    };
+    Ok(Some((args[1], operations, single)))
+}
+
+fn validate_counter_request(
+    table: &arinsal_ets::Table,
+    caller: Term,
+    args: &[Term],
+) -> Result<(), VmError> {
     if !allowed(table, caller, true) {
         return Err(badarg_cause("access"));
     }
@@ -1259,10 +1287,7 @@ fn counter_request(
     ) {
         return Err(badarg_cause("table_type"));
     }
-    let Some((operations, single)) = small_counter_ops(table.options.keypos, args[2]) else {
-        return Ok(None);
-    };
-    Ok(Some((args[1], operations, single)))
+    Ok(())
 }
 
 fn insert_args(
