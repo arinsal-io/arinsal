@@ -66,6 +66,17 @@ pub const ATTACHED_X_REGS: usize = 1024;
 /// `esdp->registers->f_reg_array` length.
 pub const ATTACHED_F_REGS: usize = 1024;
 
+/// Initial inline register block. A named constant is copied from read-only data; the array
+/// repeat expression compiles to a `memset_pattern16` library call, since NIL is not zero.
+const NIL_REGS: [Term; 6] = [
+    Term::NIL,
+    Term::NIL,
+    Term::NIL,
+    Term::NIL,
+    Term::NIL,
+    Term::NIL,
+];
+
 /// X registers, in one of two representations.
 ///
 /// Owned (scheduled out): the saved arguments. The first six live in the process, like
@@ -96,7 +107,7 @@ impl ArgRegs {
     pub fn new(len: usize) -> Self {
         if len <= 6 {
             Self {
-                inline: [Term::NIL; 6],
+                inline: NIL_REGS,
                 extra: Box::from([]),
                 len,
                 attached: 0,
@@ -104,7 +115,7 @@ impl ArgRegs {
             }
         } else {
             Self {
-                inline: [Term::NIL; 6],
+                inline: NIL_REGS,
                 extra: vec![Term::NIL; len].into_boxed_slice(),
                 len,
                 attached: 0,
@@ -2175,7 +2186,8 @@ impl Process {
     #[cold]
     #[inline(never)]
     fn allocate_cold(&mut self) {
-        self.cold = Some(FixAllocBox::new(ProcessCold::default()).expect("ProcessCold allocation"));
+        self.cold =
+            Some(FixAllocBox::new_with(ProcessCold::default).expect("ProcessCold allocation"));
     }
 
     /// Group leader, or `fallback` when spawn did not record one (`p->group_leader`).
@@ -2339,7 +2351,7 @@ impl Process {
             group_leader: None,
             parent: None,
             exit_cont: None,
-            apply_inline: [Term::NIL; 3],
+            apply_inline: [Term::NIL, Term::NIL, Term::NIL],
             apply_inline_len: 0,
             persistent_terms: arinsal_pterm::global_store(),
             trap_exit: false,

@@ -406,6 +406,47 @@ run() ->
     }
 
     #[test]
+    fn light_spawn_variants_match_erts() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping light spawn differential test");
+            return;
+        };
+        let source = r#"
+-module(light_spawn_probe).
+-export([run/0]).
+run() ->
+    P = self(),
+    {Pid, Ref} = spawn_opt(erlang, apply, [fun() -> receive go -> P ! went end end, []],
+                           [monitor, link, {priority, high}, {min_heap_size, 1000}]),
+    Pid ! go,
+    Went = receive went -> ok after 1000 -> timeout end,
+    Down = receive {'DOWN', Ref, process, Pid, X} -> X after 1000 -> timeout end,
+    {links, Links} = process_info(self(), links),
+    {Pid2, Ref2} = spawn_opt(fun() -> exit(boom) end, [{monitor, [{tag, tg}]}]),
+    Down2 = receive {tg, Ref2, process, Pid2, X2} -> X2 after 1000 -> timeout end,
+    Q = spawn_link(erlang, apply, [fun() -> P ! linked end, []]),
+    Linked = receive linked -> ok after 1000 -> timeout end,
+    Bad = [catch_error(fun() -> spawn(a, b, c) end),
+           catch_error(fun() -> spawn_opt(m, f, [], [bogus]) end),
+           catch_error(fun() -> spawn_link(m, 1, []) end)],
+    {Went, Down, lists:member(Pid, Links), Down2, is_pid(Q), Linked, Bad}.
+catch_error(F) -> try F() catch error:R -> R end.
+"#;
+        let beam = reference
+            .compile_named("light_spawn_probe", source, &[])
+            .unwrap();
+        reference.load("light_spawn_probe", &beam).unwrap();
+        let expected = reference.call("light_spawn_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("light_spawn_probe", "run", &[], 2, None)
+            .unwrap()
+            .term;
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual));
+    }
+
+    #[test]
     fn absolute_timer_deadline_matches_otp_monotonic_clock() {
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping absolute timer differential test");
@@ -967,22 +1008,36 @@ pub(crate) struct CreatedProcess {
 // Port of erts/emulator/beam/erl_process.c:12437 (erl_create_process), OTP-29.1.1. Every spawn
 // variant comes through here: the child starts at erlang:apply/3 with `mod`, `func` and `args`
 // in X0..X2, its links and monitors exist before it is inserted, and it is scheduled last.
-pub(crate) fn erl_create_process(
-    vm: &mut Vm,
+/// The child `erl_create_process` has built and inserted but not yet queued.
+struct UnscheduledChild {
+    spawned: arinsal_sched::SpawnedProcess<Message>,
+    seq_spawn: Option<crate::seq_trace::Token>,
+    arity: usize,
+    monitor_id: Option<u64>,
+}
+
+/// The argument count of a spawn MFA, or `None` for a bad module, function or argument list.
+// Port of erts/emulator/beam/erl_process.c (erl_create_process: erts_list_length), OTP-29.1.1.
+fn spawn_arity(mfa: (Term, Term, Term)) -> Option<usize> {
+    let (module, function, args) = mfa;
+    module.as_atom()?;
+    function.as_atom()?;
+    list_length(args).filter(|&arity| arity <= 1024)
+}
+
+/// `erl_create_process` up to the point where the child is linked and ready to be queued: the
+/// part that needs only the parent (`c_p`), shared by the executor path and the light BIF.
+// Port of erts/emulator/beam/erl_process.c:12437 (erl_create_process), OTP-29.1.1.
+fn create_child(
     parent: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    parent_pid: Pid,
     mfa: (Term, Term, Term),
-    so: ErlSpawnOpts,
-) -> Result<CreatedProcess, VmError> {
+    arity: usize,
+    so: &ErlSpawnOpts,
+) -> Result<UnscheduledChild, VmError> {
     let (module, function, args) = mfa;
     let m = module.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
     let f = function.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
-    // Port of erts/emulator/beam/erl_process.c (erl_create_process: erts_list_length),
-    // OTP-29.1.1: the argument list is only counted here.
-    let arity = list_length(args).ok_or_else(|| badarg("erlang:spawn/3"))?;
-    if arity > 1024 {
-        return Err(badarg("erlang:spawn/3"));
-    }
     // Port of erts/emulator/beam/erl_process.c (erl_create_process: erts_get_runq), OTP-29.1.1:
     // resolve the parent's run queue once and keep its non-owning runtime borrow through enqueue.
     let runtime = parent
@@ -1020,8 +1075,7 @@ pub(crate) fn erl_create_process(
         } else {
             crate::natives::sys::normalize_spawn_heap_minimum(Some(runtime), so.min_bin_vheap, true)
         };
-    let group_leader = parent.group_leader_pid(ctx.pid());
-    let parent_pid = ctx.pid();
+    let group_leader = parent.group_leader_pid(parent_pid);
     let monitor_id = so
         .monitor
         .as_ref()
@@ -1151,6 +1205,38 @@ pub(crate) fn erl_create_process(
             .links
             .insert(crate::proc_create::process_link(pid, false));
     }
+    Ok(UnscheduledChild {
+        spawned,
+        seq_spawn,
+        arity,
+        monitor_id,
+    })
+}
+
+// Port of erts/emulator/beam/erl_process.c:12437 (erl_create_process), OTP-29.1.1. Every spawn
+// variant comes through here: the child starts at erlang:apply/3 with `mod`, `func` and `args`
+// in X0..X2, its links and monitors exist before it is inserted, and it is scheduled last.
+pub(crate) fn erl_create_process(
+    vm: &mut Vm,
+    parent: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    mfa: (Term, Term, Term),
+    so: ErlSpawnOpts,
+) -> Result<CreatedProcess, VmError> {
+    let (module, function, args) = mfa;
+    let parent_pid = ctx.pid();
+    let arity = spawn_arity(mfa).ok_or_else(|| badarg("erlang:spawn/3"))?;
+    let UnscheduledChild {
+        spawned,
+        seq_spawn,
+        arity,
+        monitor_id,
+    } = create_child(parent, parent_pid, mfa, arity, &so)?;
+    let scheduler = parent
+        .runtime
+        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?
+        .scheduler()?;
+    let pid = spawned.pid();
     if crate::trace::spawn_interested(parent, parent_pid) {
         let arg_list = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
             .list_from_iter(list(args).unwrap_or_default())
@@ -1294,6 +1380,144 @@ fn spawn_mfa_with_priority(
     TermBuilder::new(&mut heap)
         .tuple(&[pid_term, ref_term])
         .map_err(|error| VmError::Unsupported(format!("spawn result: {error:?}")))
+}
+
+/// `spawn_opt/4` called directly from native code (erts `spawn_opt_4` with `c_p`). Only the
+/// untraced local case takes this path: tracing, seq_trace, a bad MFA or option list, and a
+/// thread that is not a normal scheduler return `None` before any state changes, and the
+/// executor runs the full BIF.
+// Port of erts/emulator/beam/bif.c:1027 (spawn_opt_4) and erl_process.c:12437
+// (erl_create_process), OTP-29.1.1: the child joins the calling scheduler's run queue.
+pub(crate) fn spawn_opt_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [module, function, mfa_args, options] = args else {
+        return None;
+    };
+    let mfa = (*module, *function, *mfa_args);
+    let arity = light_spawn_arity(process, mfa)?;
+    let opts = spawn_options(process.runtime, *options).ok()?;
+    let so = ErlSpawnOpts {
+        link: opts.link,
+        monitor: opts.monitor.then_some(SpawnMonitor {
+            id: None,
+            tag: opts.monitor_tag,
+            alias: opts.monitor_alias,
+            priority: false,
+        }),
+        min_heap: opts.min_heap_size,
+        min_bin_vheap: opts.tuning.min_bin_vheap,
+        fullsweep: opts.tuning.fullsweep,
+        max_heap: opts.tuning.max_heap,
+        off_heap_queue: opts.tuning.off_heap_queue,
+        scheduler: opts.scheduler,
+        priority: opts.priority,
+        opts: opts.tuning.options.unwrap_or(Term::NIL),
+        reply: None,
+    };
+    Some(spawn_light(process, mfa, arity, so))
+}
+
+/// `spawn/3` called directly from native code (erts `spawn_3`).
+// Port of erts/emulator/beam/bif.c (spawn_3), OTP-29.1.1.
+pub(crate) fn spawn_light3(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    spawn_light_default(process, args, false)
+}
+
+/// `spawn_link/3` called directly from native code (erts `spawn_link_3`).
+// Port of erts/emulator/beam/bif.c (spawn_link_3), OTP-29.1.1.
+pub(crate) fn spawn_link_light3(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    spawn_light_default(process, args, true)
+}
+
+fn spawn_light_default(
+    process: &mut Process,
+    args: &[Term],
+    link: bool,
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [module, function, mfa_args] = args else {
+        return None;
+    };
+    let mfa = (*module, *function, *mfa_args);
+    let arity = light_spawn_arity(process, mfa)?;
+    let so = ErlSpawnOpts {
+        link,
+        monitor: None,
+        min_heap: None,
+        min_bin_vheap: None,
+        fullsweep: None,
+        max_heap: None,
+        off_heap_queue: None,
+        scheduler: None,
+        priority: Priority::Normal,
+        opts: Term::NIL,
+        reply: None,
+    };
+    Some(spawn_light(process, mfa, arity, so))
+}
+
+/// The argument count when the light spawn path applies: tracing and seq_trace off, a normal
+/// scheduler thread, and a well-formed MFA. Otherwise `None`, with no state touched.
+fn light_spawn_arity(process: &Process, mfa: (Term, Term, Term)) -> Option<usize> {
+    if crate::trace::active()
+        || crate::trace::new_processes_traced()
+        || crate::seq_trace::has_token(process)
+        || !process.on_managed
+    {
+        return None;
+    }
+    process.self_pid?;
+    spawn_arity(mfa)
+}
+
+/// Create the child and queue it on the calling scheduler, returning `Pid` or `{Pid, Ref}`.
+fn spawn_light(
+    process: &mut Process,
+    mfa: (Term, Term, Term),
+    arity: usize,
+    so: ErlSpawnOpts,
+) -> Result<Term, crate::exceptions::Trap> {
+    let Some(parent_pid) = process.self_pid else {
+        return Err(crate::exceptions::Trap::error(atom("system_limit")));
+    };
+    let failure = |error: VmError| match error {
+        VmError::Trap(trap) => trap,
+        _ => crate::exceptions::Trap::error(atom("system_limit")),
+    };
+    let child = create_child(process, parent_pid, mfa, arity, &so).map_err(failure)?;
+    let pid = child.spawned.pid();
+    // erl_create_process: add2runq on the calling scheduler. Off a normal scheduler thread
+    // the child goes through the shared queue instead.
+    let queued = match arinsal_sched::native_schedule_spawned(child.spawned) {
+        Ok(queued) => queued,
+        Err(spawned) => match process.runtime.map(Runtime::scheduler) {
+            Some(Ok(scheduler)) => scheduler.schedule_unscheduled(spawned.pid()),
+            _ => Err(arinsal_sched::Error::NoProcess),
+        },
+    };
+    if queued.is_err() {
+        return Err(crate::exceptions::Trap::error(atom("system_limit")));
+    }
+    let Some(pid_term) = pid.to_term() else {
+        return Err(crate::exceptions::Trap::error(atom("system_limit")));
+    };
+    let Some(id) = child.monitor_id else {
+        return Ok(pid_term);
+    };
+    let result = reference(process, id).and_then(|ref_term| {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        TermBuilder::new(&mut heap)
+            .tuple(&[pid_term, ref_term])
+            .map_err(|error| VmError::Unsupported(format!("spawn result: {error:?}")))
+    });
+    result.map_err(failure)
 }
 
 /// `spawn_opt` GC and mailbox options that the child must carry from its first slice.

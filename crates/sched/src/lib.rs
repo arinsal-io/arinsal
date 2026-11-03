@@ -8747,6 +8747,13 @@ trait NativeSend<M: SignalMessage> {
     ) -> Option<OnHeapSend>;
     /// Whether this handle belongs to the scheduler whose shared state sits at `inner`.
     fn belongs_to(&self, inner: usize) -> bool;
+    /// Publish a child on this scheduler's own run queue. Gives the child back when the
+    /// scheduler-local state is not available.
+    #[allow(clippy::type_complexity)] // The child comes back unchanged when it was not queued.
+    fn schedule_spawned(
+        &self,
+        spawned: SpawnedProcess<M>,
+    ) -> Result<Result<(), Error>, SpawnedProcess<M>>;
     /// Start a message timer for `target` owned by `owner` on this scheduler's wheel.
     /// Gives the message back when the scheduler-local state is not available.
     fn start_timer(
@@ -8834,6 +8841,28 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         Ok(self
             .inner
             .deliver(from, to, Payload::Message(msg), Some(&mut local)))
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process: add2runq on the
+    // calling scheduler's run queue, `esdp` from the thread), OTP-29.1.1.
+    fn schedule_spawned(
+        &self,
+        spawned: SpawnedProcess<T::Message>,
+    ) -> Result<Result<(), Error>, SpawnedProcess<T::Message>> {
+        let Some(local) = self.local.upgrade() else {
+            return Err(spawned);
+        };
+        if local.try_borrow_mut().is_err() {
+            return Err(spawned);
+        }
+        let mut runner = Runner {
+            inner: &self.inner,
+            local: Some(&local),
+        };
+        Ok(<Runner<'_, T> as ContextOps<T::Message>>::schedule_spawned(
+            &mut runner,
+            spawned,
+        ))
     }
 
     fn send_node(
@@ -8945,6 +8974,24 @@ mod native_sender {
             let handle = current.as_ref()?.downcast_ref::<Rc<dyn NativeSend<M>>>()?;
             Some(f(handle))
         })
+    }
+}
+
+/// Publish a child created by a task's native code on the normal scheduler thread it runs on
+/// (`RunCtx::schedule_spawned` without the context). Gives the child back when this thread is
+/// no normal scheduler.
+#[allow(clippy::type_complexity)] // The child comes back unchanged when it was not queued.
+pub fn native_schedule_spawned<M: SignalMessage>(
+    spawned: SpawnedProcess<M>,
+) -> Result<Result<(), Error>, SpawnedProcess<M>> {
+    let mut spawned = Some(spawned);
+    let queued = native_sender::with::<M, _>(|handle| {
+        handle.schedule_spawned(spawned.take().expect("child present"))
+    });
+    match queued {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(child)) => Err(child),
+        None => Err(spawned.take().expect("child not queued")),
     }
 }
 
