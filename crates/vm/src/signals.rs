@@ -189,8 +189,8 @@ fn whereis_light_error(process: &mut Process, arg: Term, error: VmError) -> u64 
     }
     let freason = crate::stacktrace::class_to_freason(Some(trap.class));
     let fvalue = crate::native_hooks::raw(trap.reason);
-    process.header.exc.freason = freason;
-    process.header.exc.fvalue = fvalue;
+    process.heap.abi.exc.freason = freason;
+    process.heap.abi.exc.fvalue = fvalue;
     process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
@@ -212,12 +212,12 @@ pub(crate) extern "C" fn is_process_alive_light(
     _entry: u64,
     identity: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let arg = registers.x_reg_array[0]; // BIF_ARG_1
     // erts: `if (BIF_ARG_1 == BIF_P->common.id) BIF_RET(am_true)`, before any table access.
-    if arg.is_pid() && arg.tagged_word() == process.header.self_pid {
+    if arg.is_pid() && arg.tagged_word() == process.heap.abi.self_pid {
         return crate::native_hooks::raw(Term::atom(arinsal_term::atoms::TRUE));
     }
     match alive_fast(process, arg) {
@@ -263,9 +263,9 @@ fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
 #[cold]
 #[inline(never)]
 fn alive_trap(process: &mut Process, identity: u64) -> u64 {
-    process.header.i = identity as *const _;
-    process.header.arity = 1;
-    process.header.exc.freason = 1 << 10;
+    process.heap.abi.i = identity as *const _;
+    process.heap.abi.arity = 1;
+    process.heap.abi.exc.freason = 1 << 10;
     0
 }
 
@@ -657,7 +657,7 @@ fn light_monitor_self(
     if args.len() != 2 || args[0] != atom("process") {
         return None;
     }
-    let self_pid = process.header.self_pid;
+    let self_pid = process.heap.abi.self_pid;
     if self_pid == 0 || args[1].tagged_word() != self_pid {
         return None;
     }

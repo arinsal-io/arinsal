@@ -597,6 +597,9 @@ impl HeapAlloc for FragmentMut<'_> {
 
 /// The data of a message kept apart from its node: a standalone heap (a separately allocated
 /// `ErlHeapFragment`, `data.heap_frag`) or the inline fragment of the node it came in.
+// The `Heap` variant carries a whole `ProcessHeap` with its `NativeAbi`; boxing it would add an
+// allocation per message, which erts' `ErlHeapFragment` (one block) does not have.
+#[allow(clippy::large_enum_variant)]
 pub enum MessageHeap {
     Heap(crate::ProcessHeap),
     Node(NodeFragment),

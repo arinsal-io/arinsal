@@ -61,31 +61,26 @@ pub(super) fn push_continuation(
 #[inline(always)]
 pub fn call_bif(
     heap: &mut arinsal_term::ProcessHeap,
-    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> Result<arinsal_term::Term, arinsal_bifs::BifError> {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut state = arinsal_bifs::BifState::from_fcalls(*fcalls);
+    let mut state = arinsal_bifs::BifState::default();
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
-    let result = target(&mut ctx, args);
-    *fcalls = state.fcalls;
-    result
+    target(&mut ctx, args)
 }
 
 /// Invoke a BIF and return its reported work for scheduler accounting.
 pub(crate) fn call_bif_metered(
     heap: &mut arinsal_term::ProcessHeap,
-    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> (Result<arinsal_term::Term, arinsal_bifs::BifError>, u32) {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut state = arinsal_bifs::BifState::from_fcalls(*fcalls);
+    let mut state = arinsal_bifs::BifState::default();
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
     let result = target(&mut ctx, args);
     let reductions = ctx.reductions();
-    *fcalls = state.fcalls;
     (result, reductions)
 }
 
@@ -93,7 +88,6 @@ pub(crate) fn call_bif_metered(
 // Port of erts/emulator/beam/erl_bif_guard.c:210-244 (length_1), OTP-29.1.1.
 pub(crate) fn call_bif_metered_deferred(
     heap: &mut arinsal_term::ProcessHeap,
-    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> (
@@ -102,12 +96,11 @@ pub(crate) fn call_bif_metered_deferred(
     Option<Box<arinsal_bifs::DeferredTrap>>,
 ) {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut state = arinsal_bifs::BifState::from_fcalls(*fcalls);
+    let mut state = arinsal_bifs::BifState::default();
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
     let result = target(&mut ctx, args);
     let reductions = ctx.reductions();
     let deferred = ctx.take_deferred();
-    *fcalls = state.fcalls;
     (result, reductions, deferred)
 }
 
@@ -310,12 +303,11 @@ pub(crate) fn gc_after_native_parts(
 /// [`call_bif`] with the panic landing the interpreter already used.
 pub(super) fn call_bif_catch(
     heap: &mut arinsal_term::ProcessHeap,
-    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> Result<Result<arinsal_term::Term, arinsal_bifs::BifError>, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        call_bif(heap, fcalls, target, args)
+        call_bif(heap, target, args)
     }))
     .map_err(|_| ())
 }
@@ -368,9 +360,7 @@ impl Vm {
         bif: arinsal_bifs::BifFn,
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
-        let untraced = |p: &mut Process| {
-            calls::call_bif_metered(&mut p.heap, &mut p.header.fcalls, bif, &p.x[..arity])
-        };
+        let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
         if crate::trace::saves_calls(p)
             && let Some(import) = self
                 .code
@@ -415,9 +405,7 @@ impl Vm {
         bif: arinsal_bifs::BifFn,
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
-        let untraced = |p: &mut Process| {
-            calls::call_bif_metered(&mut p.heap, &mut p.header.fcalls, bif, &p.x[..arity])
-        };
+        let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
         if !crate::trace_bp::any_pattern()
             || !crate::trace_bp::selects(p, module, function, arity as u8)
         {
@@ -802,11 +790,11 @@ impl Vm {
         let value = p.gc_after_bif(value)?;
         let charge = bif_reductions.saturating_add(1);
         // The BIF body has already applied its BUMP_REDS directly to FCALLS.
-        p.header.fcalls = p.header.fcalls.saturating_sub(1);
+        p.heap.abi.fcalls = p.heap.abi.fcalls.saturating_sub(1);
         let exhausted = ctx.is_some_and(|run| !run.consume(charge));
         let outcome = self.finish_native_value(p, tail, value)?;
         if exhausted && matches!(outcome, ImportOutcome::Advanced | ImportOutcome::Jump(_)) {
-            p.header.fcalls = 4000;
+            p.heap.abi.fcalls = 4000;
             Ok(ImportOutcome::Yield)
         } else {
             Ok(outcome)

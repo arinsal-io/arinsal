@@ -249,13 +249,12 @@ pub(crate) enum NativeFn {
 /// Invoke a native body with the arguments of the function it replaces.
 pub(crate) fn call_native(
     heap: &mut arinsal_term::ProcessHeap,
-    fcalls: &mut i32,
     native: &NativeFn,
     args: &[Term],
 ) -> Result<Term, BifError> {
     match native {
-        NativeFn::Bif(function) => calls::call_bif(heap, fcalls, *function, args),
-        NativeFn::Nif(binding) => binding.call(heap, fcalls, args),
+        NativeFn::Bif(function) => calls::call_bif(heap, *function, args),
+        NativeFn::Nif(binding) => binding.call(heap, args),
     }
 }
 
@@ -270,7 +269,6 @@ impl NifBinding {
     pub(crate) fn call(
         &self,
         heap: &mut arinsal_term::ProcessHeap,
-        fcalls: &mut i32,
         args: &[Term],
     ) -> Result<Term, BifError> {
         let lib = &self.lib;
@@ -290,7 +288,7 @@ impl NifBinding {
             return Err(BifError::BADARG);
         }
         let mut fragment = ProcessHeapHandle(heap);
-        let mut state = arinsal_bifs::BifStateGuard::new(fcalls);
+        let mut state = arinsal_bifs::BifState::default();
         let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
         if self.flags != 0 {
             let trap = arinsal_nif::NifTrap {
@@ -959,9 +957,9 @@ impl PendingNif {
     pub(crate) fn run_dirty(&mut self, heap: &mut arinsal_term::ProcessHeap) {
         let current = current_class();
         let pid = thread_hub().and_then(|hub| hub.pid.to_term());
+        heap.abi.fcalls = 4_000;
         let mut fragment = ProcessHeapHandle(heap);
-        let mut fcalls = 4_000;
-        let mut state = arinsal_bifs::BifStateGuard::new(&mut fcalls);
+        let mut state = arinsal_bifs::BifState::default();
         let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
         let (lib, index, trap) = (&self.lib, self.index, &self.trap);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1070,11 +1068,10 @@ pub(crate) fn take_rescheduled() -> Option<PendingNif> {
 /// Resume a rescheduled NIF continuation on the current scheduler.
 pub(crate) fn resume_pending(
     heap: &mut arinsal_term::ProcessHeap,
-    fcalls: &mut i32,
     pending: PendingNif,
 ) -> Result<Term, BifError> {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut state = arinsal_bifs::BifStateGuard::new(fcalls);
+    let mut state = arinsal_bifs::BifState::default();
     let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
     run_nif(&mut ctx, pending)
 }
@@ -1092,7 +1089,7 @@ pub(crate) fn invoke_tracer(
     let native = specialized
         .and_then(|specialized| tracer_callback(vm, module, specialized, arity))
         .or_else(|| tracer_callback(vm, module, function, arity))?;
-    call_native(&mut process.heap, &mut process.header.fcalls, &native, args).ok()
+    call_native(&mut process.heap, &native, args).ok()
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {

@@ -68,7 +68,6 @@ fn report(process: &mut Process, failure: Failure) {
         }
         Failure::SystemLimit => {
             native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return;
         }
     };
@@ -76,12 +75,11 @@ fn report(process: &mut Process, failure: Failure) {
         .and_then(|value| crate::exceptions::tuple(process, &[crate::signals::atom(tag), value]))
     {
         Ok(reason) => {
-            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
-            process.header.exc.fvalue = native_hooks::raw(reason);
+            process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.heap.abi.exc.fvalue = native_hooks::raw(reason);
         }
         Err(_) => native_hooks::set_error(process, "system_limit"),
     }
-    process.sync_native_header();
 }
 
 /// `{{Module, Name}, Field}`.
@@ -156,10 +154,7 @@ fn create(
         external,
     );
     match result {
-        Ok(record) => {
-            process.sync_native_header();
-            native_hooks::raw(record)
-        }
+        Ok(record) => native_hooks::raw(record),
         Err(failure) => {
             report(process, failure);
             0
@@ -262,10 +257,7 @@ pub extern "C" fn arinsal_beamasm_update_record(
     };
     let result = update_record(process, native_hooks::from_raw(source), (live, count, base));
     match result {
-        Ok(record) => {
-            process.sync_native_header();
-            native_hooks::raw(record)
-        }
+        Ok(record) => native_hooks::raw(record),
         Err(failure) => {
             report(process, failure);
             0

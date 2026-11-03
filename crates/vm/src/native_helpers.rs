@@ -38,7 +38,7 @@ pub extern "C" fn arinsal_beamasm_raise_class(
         Some(arinsal_bifs::Class::Exit) => reraise | arinsal_beamasm::exc::EXTAG_EXIT,
         Some(arinsal_bifs::Class::Throw) => reraise | arinsal_beamasm::exc::EXTAG_THROWN,
         None => {
-            process.header.exc.fvalue = crate::native_hooks::raw(crate::signals::atom("badarg"));
+            process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::signals::atom("badarg"));
             arinsal_beamasm::exc::EXC_ERROR
         }
     }
@@ -57,12 +57,10 @@ pub extern "C" fn arinsal_beamasm_build_stacktrace(
     match crate::exceptions::materialize(None, process, trace) {
         Ok(value) => {
             process.x[0] = value;
-            process.sync_native_header();
             crate::native_hooks::raw(value)
         }
         Err(_) => {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             0
         }
     }
@@ -87,20 +85,14 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
             .map_err(|error| crate::VmError::Unsupported(format!("stacktrace tuple {error:?}")))
     });
     match result {
-        Ok(value) => {
-            process.sync_native_header();
-            crate::native_hooks::raw(value)
-        }
+        Ok(value) => crate::native_hooks::raw(value),
         Err(_) => {
             // The catch-end fragment stores this word and builds `{'EXIT', Word}`.
             // A zero return is not a term and the fragment loads through it.
-            let fallback =
-                arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
-                    .tuple(&[reason, arinsal_term::Term::NIL])
-                    .map(crate::native_hooks::raw)
-                    .unwrap_or_else(|_| crate::native_hooks::raw(reason));
-            process.sync_native_header();
-            fallback
+            arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+                .tuple(&[reason, arinsal_term::Term::NIL])
+                .map(crate::native_hooks::raw)
+                .unwrap_or_else(|_| crate::native_hooks::raw(reason))
         }
     }
 }
@@ -116,7 +108,6 @@ pub extern "C" fn arinsal_beamasm_big_to_float(header: *mut ProcessHeader, term_
         Ok(value) => value.to_bits(),
         Err(_) => {
             crate::native_hooks::set_error(process, "badarith");
-            process.sync_native_header();
             0
         }
     }
@@ -132,16 +123,13 @@ pub extern "C" fn arinsal_beamasm_bs_init_writable(header: *mut ProcessHeader, s
     let size = crate::native_hooks::from_raw(size).as_small();
     if process.ensure(8, 0).is_err() {
         crate::native_hooks::set_error(process, "system_limit");
-        process.sync_native_header();
         return 0;
     }
     let result = arinsal_bits::init_writable_with_size(size, &mut process.heap);
-    process.sync_native_header();
     match result {
         Ok(value) => crate::native_hooks::raw(value),
         Err(_) => {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             0
         }
     }
@@ -239,14 +227,13 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:131-176 (erts_proc_sig_receive_helper
     // call under eHeapAlloc), OTP-29.1.1: fetch messages in place and peek again.
     let fetched = process.fetch_messages_in_place();
-    process.sync_native_header();
     if fetched.is_ok()
         && let Some(message) = process.inbox.get(process.inbox.save())
     {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_receive_helper,
         // `consumed_reds += 4` per fetch), OTP-29.1.1: the call site published FCALLS
         // (Update::REDUCTIONS) and reloads it afterwards.
-        process.header.fcalls = process.header.fcalls.saturating_sub(4);
+        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(4);
         return crate::native_hooks::raw(*message);
     }
     process.delay_gc = false;
@@ -269,13 +256,12 @@ pub extern "C" fn arinsal_beamasm_remove_message(
     fcalls: i32,
     active_code_ix: usize,
 ) -> i32 {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return fcalls;
     };
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1087-1089 (beam_jit_remove_message),
     // OTP-29.1.1.
     if active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX {
-        crate::native_hooks::convert_native_cursors(process);
         crate::trace::save_call(process, crate::trace::SavedCall::Receive);
     } else {
         match process.remove_first_message() {
@@ -286,13 +272,11 @@ pub extern "C" fn arinsal_beamasm_remove_message(
                 return fcalls;
             }
         }
-        crate::native_hooks::convert_native_cursors(process);
     }
     // A message carrying a seq_trace token emits its `receive` event on the receiver's own
     // heap here (the tracer may be the receiver itself), so the native HTOP and stack
     // pointer must round-trip like in every other allocating helper.
     let result = process.remove_message(None);
-    process.sync_native_header();
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
@@ -306,7 +290,8 @@ pub extern "C" fn arinsal_beamasm_remove_message(
 /// ERTS_VBUMP_LEAVE_REDS_INTERNAL).
 fn remove_message_leave_reds(process: &mut crate::Process, fcalls: i32) -> i32 {
     const REDS_LEFT_BEFORE_GC: i32 = 5;
-    let free_words = (process.header.stop as usize).wrapping_sub(process.header.htop as usize) / 8;
+    let free_words =
+        (process.heap.abi.stop as usize).wrapping_sub(process.heap.abi.htop as usize) / 8;
     let desired = free_words < process.heap.mbuf_size() || process.heap.bin_vheap_gc_due();
     if desired && fcalls > REDS_LEFT_BEFORE_GC {
         process.virtual_reds = process
@@ -348,7 +333,7 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1222
     // (beam_jit_wait_timeout), OTP-29.1.1: timeout setup updates process wait state but does
     // not access the process heap or stack cursors.
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return 2;
     };
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
@@ -540,14 +525,14 @@ pub(crate) fn static_nif_job(
         crate::natives::tty::note_caller_native(process);
     }
     let args = process.x.get(..usize::from(arity))?.to_vec();
-    let fcalls = process.header.fcalls;
+    let fcalls = process.heap.abi.fcalls;
     let pinned_caller = (module == "zstd" || module == "zlib")
         .then(|| process.self_pid.and_then(|pid| pid.to_term()));
     Some(crate::dirty::static_nif_job(move |heap| {
-        let mut fcalls = fcalls;
+        heap.abi.fcalls = fcalls;
         let mut run = || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::calls::call_bif(heap, &mut fcalls, entry, &args)
+                crate::calls::call_bif(heap, entry, &args)
             }))
             .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))))
         };
@@ -598,14 +583,8 @@ pub(crate) fn run_static_nif(
     let result = match done {
         Some(result) => result,
         None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
-            Some(pending) => crate::natives::nif::resume_pending(
-                &mut process.heap,
-                &mut process.header.fcalls,
-                pending,
-            ),
-            None => {
-                crate::calls::call_bif(&mut process.heap, &mut process.header.fcalls, entry, &args)
-            }
+            Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
+            None => crate::calls::call_bif(&mut process.heap, entry, &args),
         }))
         .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error")))),
     };
@@ -632,7 +611,7 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
     crate::natives::nif::refresh_hub_native(process);
     let args = process.x.get(..arity).unwrap_or_default().to_vec();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::natives::nif::resume_pending(&mut process.heap, &mut process.header.fcalls, pending)
+        crate::natives::nif::resume_pending(&mut process.heap, pending)
     }))
     .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))));
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
@@ -648,7 +627,6 @@ fn leave_native_nif(
     match result {
         Ok(Ok(value)) => {
             process.x[0] = value;
-            process.sync_native_header();
             crate::native_hooks::raw(value)
         }
         Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
@@ -663,12 +641,10 @@ fn leave_native_nif(
         Ok(Err(error)) => {
             let args = process.x[..usize::from(arity)].to_vec();
             set_native_bif_error(process, module, function, &args, error);
-            process.sync_native_header();
             0
         }
         Err(_) => {
             crate::native_hooks::set_error(process, "error");
-            process.sync_native_header();
             0
         }
     }
@@ -706,7 +682,6 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::calls::call_bif(
             &mut process.heap,
-            &mut process.header.fcalls,
             nif.entry,
             &process.x[..usize::from(nif.arity)],
         )
@@ -737,7 +712,6 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::natives::nif::call_native(
             &mut process.heap,
-            &mut process.header.fcalls,
             native,
             &process.x[..usize::from(site.arity)],
         )
@@ -805,12 +779,11 @@ fn trap_to_dirty_nif(
     arity: u8,
 ) -> u64 {
     process.slice_mut().native_dirty_nif = Some((identity, 0, class));
-    process.header.arity = arity;
+    process.heap.abi.arity = arity;
     process.gc_live = usize::from(arity);
-    process.header.i =
+    process.heap.abi.i =
         arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;
-    process.header.exc.freason = 1 << 10;
-    process.sync_native_header();
+    process.heap.abi.exc.freason = 1 << 10;
     0
 }
 
@@ -1016,8 +989,8 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader
     if let Some(pid) = process.self_pid
         && let Some((saved_caller, action)) =
             crate::trace::pop_native_call_acc_frame(process, |p, words| {
-                p.heap.set_stack_pointer(p.header.stop.wrapping_add(words));
-                p.sync_native_header();
+                p.heap
+                    .set_stack_pointer(p.heap.abi.stop.wrapping_add(words));
             })
         && let Some(acc) = action.acc
     {
@@ -1026,8 +999,8 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader
     }
     let Some((frames, saved_caller)) =
         crate::trace::pop_native_trace_frames(process, |p, words| {
-            p.heap.set_stack_pointer(p.header.stop.wrapping_add(words));
-            p.sync_native_header();
+            p.heap
+                .set_stack_pointer(p.heap.abi.stop.wrapping_add(words));
         })
     else {
         return process
@@ -1092,15 +1065,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
         return 0;
     }
     // The generated code holds FCALLS in a register; a delayed collection reads what is left.
-    process.header.fcalls = fcalls;
-    // emit_enter_runtime just stored the live HTOP and E. The heap indices
-    // still describe the last runtime exit; collecting from them treats the
-    // native frames as empty and sync_native_header publishes that cursor.
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
+    process.heap.abi.fcalls = fcalls;
     // The emitter passes the full checked free-space gap, including CP and
     // S_RESERVED. Process::ensure uses that gap to decide whether to collect.
     // `process.x` is the scheduler's X register array: the live prefix is rooted and moved in
@@ -1109,7 +1074,6 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
-    process.sync_native_header();
     // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
     // returns the reductions left), OTP-29.1.1: FCALLS runs out and the process yields at
     // its next reduction check.
@@ -1128,16 +1092,16 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
 /// reductions; the part beyond what is left ends the slice.
 // Port of erts/emulator/beam/bif.h:85 (ERTS_VBUMP_REDS), OTP-29.1.1.
 fn vbump_reds(process: &mut crate::Process, reds: i32) {
-    if process.header.fcalls >= reds {
-        process.header.fcalls -= reds;
+    if process.heap.abi.fcalls >= reds {
+        process.heap.abi.fcalls -= reds;
         process.virtual_reds = process.virtual_reds.saturating_add(reds as u32);
     } else {
-        if process.header.fcalls > 0 {
+        if process.heap.abi.fcalls > 0 {
             process.virtual_reds = process
                 .virtual_reds
-                .saturating_add(process.header.fcalls as u32);
+                .saturating_add(process.heap.abi.fcalls as u32);
         }
-        process.header.fcalls = 0;
+        process.heap.abi.fcalls = 0;
     }
 }
 
@@ -1190,7 +1154,6 @@ fn dispatch_native_send(
                     crate::calls::gc_after_native_parts(process, &mut [], Some(&mut value), None);
                 if collected.is_err() {
                     crate::native_hooks::set_error(process, "system_limit");
-                    process.sync_native_header();
                     return Some(0);
                 }
             }
@@ -1207,11 +1170,9 @@ fn dispatch_native_send(
                 let Ok(value) = result else { return Some(0) };
                 let raw = crate::native_hooks::raw(value);
                 registers.x_reg_array[0] = crate::native_hooks::from_raw(raw);
-                process.sync_native_header();
                 return Some(raw);
             }
             registers.x_reg_array[0] = value;
-            process.sync_native_header();
             Some(raw)
         }
         Err(crate::VmError::Unsupported(message))
@@ -1220,16 +1181,14 @@ fn dispatch_native_send(
             if crate::trace::saves_calls(process) {
                 crate::trace::save_call(process, crate::trace::SavedCall::Send);
             }
-            process.header.arity = 2;
-            process.header.i =
+            process.heap.abi.arity = 2;
+            process.heap.abi.i =
                 arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY as *const u8 as *const _;
-            process.header.exc.freason = 1 << 10;
-            process.sync_native_header();
+            process.heap.abi.exc.freason = 1 << 10;
             None
         }
         Err(_) => {
             crate::native_hooks::set_error(process, "badarg");
-            process.sync_native_header();
             Some(0)
         }
     }
@@ -1274,7 +1233,6 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     for index in 0..live {
         if !process.heap.stack_set(index, registers.x_reg_array[index]) {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return 0;
         }
     }
@@ -1285,8 +1243,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
         Term::small(i64::from(line)).expect("debug line is a small integer"),
     ];
     registers.x_reg_array[..4].copy_from_slice(&args);
-    process.header.arity = 4;
-    process.sync_native_header();
+    process.heap.abi.arity = 4;
     export as *const arinsal_beamasm::bif::ExportEntry as usize as u64
 }
 
@@ -1308,7 +1265,6 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(header: *mut ProcessHe
         *destination = value;
         live += 1;
     }
-    process.sync_native_header();
     live as u64
 }
 
@@ -1422,7 +1378,7 @@ pub(crate) extern "C" fn self_light(
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    process.header.self_pid
+    process.heap.abi.self_pid
 }
 
 /// `erlang:send_after/3,4` (`SEND_AFTER`) and `erlang:start_timer/3,4` from the light-BIF
@@ -1456,8 +1412,6 @@ fn timer_start_native(
     let mut sink = crate::signals::NativeTimers(process.self_pid?);
     let term =
         crate::signals::start_timer_bif(process, &mut sink, &args[..arity], send_after).ok()?;
-    let top = process.heap.heap_top_index();
-    process.header.htop = native_htop(process, top);
     registers.x_reg_array[0] = term;
     Some(crate::native_hooks::raw(term))
 }
@@ -1514,8 +1468,6 @@ fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool)
     let term =
         crate::signals::timer_query_sync(process, process.self_pid?, reference, cancel, info)
             .ok()?;
-    let top = process.heap.heap_top_index();
-    process.header.htop = native_htop(process, top);
     registers.x_reg_array[0] = term;
     Some(crate::native_hooks::raw(term))
 }
@@ -1582,10 +1534,9 @@ fn park_executor(
     light_call: bool,
 ) -> u64 {
     process.native_light_bif_call = light_call;
-    process.header.arity = export.arity;
-    process.header.i = identity as *const u8 as *const _;
-    process.header.exc.freason = 1 << 10;
-    process.sync_native_header();
+    process.heap.abi.arity = export.arity;
+    process.heap.abi.i = identity as *const u8 as *const _;
+    process.heap.abi.exc.freason = 1 << 10;
     0
 }
 
@@ -1719,16 +1670,9 @@ fn atom_to_list_latin1(header: *mut ProcessHeader) -> Option<u64> {
     }
     // The fragment stored HTOP. Commit it so `HAlloc` bumps the same index,
     // then publish the new pointer for `emit_leave_runtime`.
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
     let term = arinsal_term::TermBuilder::new(&mut process.heap)
         .byte_string_list(bytes)
         .ok()?;
-    let top = process.heap.heap_top_index();
-    process.header.htop = native_htop(process, top);
     Some(crate::native_hooks::raw(term))
 }
 
@@ -1769,7 +1713,8 @@ fn binary_guard_apply(
         BinaryGuard::BinaryPart2 => {
             let (result, reductions) = {
                 let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                let mut ctx = arinsal_bifs::Ctx::new(&mut fragment, &mut process.header);
+                let mut call = arinsal_bifs::BifCall::default();
+                let mut ctx = arinsal_bifs::Ctx::new(&mut fragment, &mut call);
                 let result = arinsal_bifs::binary_part_2(&mut ctx, args);
                 (result, ctx.reductions())
             };
@@ -1827,23 +1772,16 @@ fn binary_guard_result(
     args: &[Term],
     light: bool,
 ) -> u64 {
-    let entry_top = process.heap.heap_top_index();
     let result = binary_guard_apply(process, guard, args);
-    let top = process.heap.heap_top_index();
-    if top != entry_top {
-        process.header.htop = process.heap.word_address(top);
-    }
     match result {
         Ok(value) => {
             if light {
                 registers.x_reg_array[0] = value;
-                process.sync_native_header();
             }
             crate::native_hooks::raw(value)
         }
         Err(error) => {
             set_native_bif_error(process, &export.module, &export.function, args, error);
-            process.sync_native_header();
             0
         }
     }
@@ -1994,16 +1932,10 @@ pub(crate) extern "C" fn binary_part_3_light(
         registers.x_reg_array[1],
         registers.x_reg_array[2],
     ];
-    let entry_top = process.heap.heap_top_index();
     let result = binary_part_3_apply(process, &args);
-    let top = process.heap.heap_top_index();
-    if top != entry_top {
-        process.header.htop = process.heap.word_address(top);
-    }
     match result {
         Ok(value) => {
             registers.x_reg_array[0] = value;
-            process.sync_native_header();
             crate::native_hooks::raw(value)
         }
         Err(error) => {
@@ -2011,7 +1943,6 @@ pub(crate) extern "C" fn binary_part_3_light(
                 return 0;
             };
             set_native_bif_error(process, &export.module, &export.function, &args, error);
-            process.sync_native_header();
             0
         }
     }
@@ -2036,25 +1967,19 @@ fn allocating_bif(
     // scheduler file `enter_runtime` already resolved.
     let _ = regs;
     let arg = registers.x_reg_array[0];
-    let entry_top = process.heap.heap_top_index();
     let result = {
         let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         body(&mut fragment, arg)
     };
-    let top = process.heap.heap_top_index();
     // The light fragment tests the collection after this call (instr_bif.cpp:488-523).
     if let Ok(value) = &result {
         let value = *value;
         registers.x_reg_array[0] = value;
-        if top != entry_top {
-            process.header.htop = native_htop(process, top);
-        }
         return crate::native_hooks::raw(value);
     }
     // The fragment passed `Export.info`; the descriptor is the export, so no table lookup.
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         crate::native_hooks::set_error(process, "badarg");
-        process.sync_native_header();
         return 0;
     };
     plain_bif_result(process, registers, export, arity, result)
@@ -2122,8 +2047,8 @@ fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
         let src = tuple.raw_ptr();
         let size = arity + 1;
         let process = &mut *header.cast::<crate::Process>();
-        let htop = process.header.htop;
-        let stop = process.header.stop;
+        let htop = process.heap.abi.htop;
+        let stop = process.heap.abi.stop;
         let top = htop as usize;
         let limit = (stop as usize).saturating_sub(arinsal_term::S_REDZONE * 8);
         if htop.is_null() || stop.is_null() || top.saturating_add(size.saturating_mul(8)) > limit {
@@ -2132,8 +2057,7 @@ fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
         std::ptr::copy_nonoverlapping(src, htop, size);
         htop.add(slot).write(value);
         let next = htop.add(size);
-        process.header.htop = next;
-        process.heap.note_native_alloc(size);
+        process.heap.abi.htop = next;
         Some((htop as u64) | 2)
     }
 }
@@ -2155,8 +2079,8 @@ pub(crate) extern "C" fn make_ref_light(
     // `emit_enter_runtime`. The reference cell belongs to this scheduler thread.
     unsafe {
         let process = &mut *header.cast::<crate::Process>();
-        let htop = process.header.htop;
-        let stop = process.header.stop;
+        let htop = process.heap.abi.htop;
+        let stop = process.heap.abi.stop;
         let top = htop as usize;
         let limit = (stop as usize).saturating_sub(arinsal_term::S_REDZONE * 8);
         let Some(state) = process.scheduler_ref_state else {
@@ -2172,8 +2096,7 @@ pub(crate) extern "C" fn make_ref_light(
         *htop.add(1) = ((ids[0] as u64) << 32) | 0xffff_ffff;
         *htop.add(2) = ((ids[2] as u64) << 32) | (ids[1] as u64);
         let next = htop.add(3);
-        process.header.htop = next;
-        process.heap.note_native_alloc(3);
+        process.heap.abi.htop = next;
         (htop as u64) | 2
     }
 }
@@ -2299,7 +2222,7 @@ pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
     descriptor: u64,
     identity: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
@@ -2308,7 +2231,6 @@ pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
     if let Some(raw) = nonalloc_list_fast(process, registers, export, B::call) {
         return raw;
     }
-    crate::native_hooks::convert_native_cursors(process);
     call_list_slice_bif(
         process,
         registers,
@@ -2329,13 +2251,14 @@ pub(crate) extern "C" fn list_member_entry(
     descriptor: u64,
     identity: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
     let (result, deferred) = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.header);
+        let mut call = arinsal_bifs::BifCall::default();
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut call);
         let result = arinsal_bifs::lists_member_bif(&mut ctx, &args);
         (result, ctx.take_deferred())
     };
@@ -2343,7 +2266,6 @@ pub(crate) extern "C" fn list_member_entry(
         let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
             return 0;
         };
-        crate::native_hooks::convert_native_cursors(process);
         if crate::bif_traps::install_deferred_trap(
             process,
             identity as usize,
@@ -2355,13 +2277,11 @@ pub(crate) extern "C" fn list_member_entry(
         .is_err()
         {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return 0;
         }
         debug_assert_native_heap(process);
         crate::bif_traps::arm_export_trap(process);
-        process.header.exc.freason = 1 << 10;
-        process.sync_native_header();
+        process.heap.abi.exc.freason = 1 << 10;
         return 0;
     }
     match result {
@@ -2373,7 +2293,6 @@ pub(crate) extern "C" fn list_member_entry(
             let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
                 return 0;
             };
-            crate::native_hooks::convert_native_cursors(process);
             plain_bif_result(process, registers, export, 2, Err(error))
         }
     }
@@ -2391,7 +2310,8 @@ fn nonalloc_list_fast(
     let arity = usize::from(export.arity);
     let value = {
         let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
+        let mut call = arinsal_bifs::BifCall::default();
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
         let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
         if ctx.take_deferred().is_some() {
             return None;
@@ -2465,14 +2385,9 @@ pub(crate) extern "C" fn thin_bif_light<B: crate::natives::ThinProcessBif>(
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let entry_top = process.heap.heap_top_index();
     match B::call(process, &registers.x_reg_array[..B::ARITY]) {
         Ok(value) => {
             registers.x_reg_array[0] = value;
-            let top = process.heap.heap_top_index();
-            if top != entry_top {
-                process.header.htop = native_htop(process, top);
-            }
             crate::native_hooks::raw(value)
         }
         Err(trap) => thin_bif_failed(process, registers, descriptor, *trap),
@@ -2511,10 +2426,9 @@ pub(crate) extern "C" fn direct_bif_light(
     if let Some(raw) = call_direct_bif(process, registers, export, false) {
         return raw;
     }
-    process.header.arity = export.arity;
-    process.header.i = identity as *const u8 as *const _;
-    process.header.exc.freason = 1 << 10;
-    process.sync_native_header();
+    process.heap.abi.arity = export.arity;
+    process.heap.abi.i = identity as *const u8 as *const _;
+    process.heap.abi.exc.freason = 1 << 10;
     0
 }
 
@@ -2662,24 +2576,21 @@ fn try_light_monitor(
         return None;
     }
     let arity = usize::from(export.arity);
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     let result =
         crate::signals::light_monitor_bif(process, monitor, &registers.x_reg_array[..arity])?;
     if export_call {
         charge_bif_reductions(process, 1);
     }
-    let top = process.heap.heap_top_index();
     // The light fragment tests the collection after its call (instr_bif.cpp:488-523); the
     // export trampoline has no such test and checks it here.
     if let Ok(value) = &result
         && (!export_call
-            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
+            || (process.heap.stack_index() - process.heap.heap_top_index()
+                >= process.heap.mbuf_size()
+                && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
-        if top != entry_top {
-            process.header.htop = process.heap.word_address(top);
-        }
         return Some(crate::native_hooks::raw(value));
     }
     Some(process_bif_result(process, export, arity, result))
@@ -2712,14 +2623,11 @@ fn call_trap_bif(
         // done; the arguments stay live across the reservation.
         let ensured = process.ensure(reserve, arity);
         // A collection moved the heap: publish every cursor, not just HTOP.
-        process.sync_native_header();
         if ensured.is_err() {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return Some(0);
         }
     }
-    let entry_top = process.heap.heap_top_index();
     let mut args = [Term::NIL; 4];
     args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
     let callee = (export.module_atom, export.function_atom);
@@ -2730,7 +2638,6 @@ fn call_trap_bif(
             registers,
             export,
             arity,
-            entry_top,
             export_call,
             result,
         )),
@@ -2747,30 +2654,13 @@ fn light_trap_result(
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     export: ExportDispatch,
     arity: usize,
-    entry_top: usize,
     export_call: bool,
     result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
     match result {
-        Ok(value) if !export_call => light_value_return(process, entry_top, value),
+        Ok(value) if !export_call => crate::native_hooks::raw(value),
         result => plain_bif_result(process, registers, export, arity, result),
     }
-}
-
-/// The fast return of a light BIF's value: X0, the heap top if it moved, and FCALLS.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523 (call_light_bif_shared returns X0
-// to the call site), OTP-29.1.1.
-#[inline(always)]
-pub(crate) fn light_value_return(
-    process: &mut crate::Process,
-    entry_top: usize,
-    value: Term,
-) -> u64 {
-    let top = process.heap.heap_top_index();
-    if top != entry_top {
-        process.header.htop = native_htop(process, top);
-    }
-    crate::native_hooks::raw(value)
 }
 
 /// The trap state of a light BIF that yielded (`BIF_TRAP`): the caller resumes through the
@@ -2781,8 +2671,7 @@ fn arm_light_trap(process: &mut crate::Process) -> Option<u64> {
     // BIF_TRAP sets c_p->i to beam_bif_export_trap. The fragment loads that
     // address and context-switches; schedule-in calls the continuation export.
     crate::bif_traps::arm_export_trap(process);
-    process.header.exc.freason = 1 << 10;
-    process.sync_native_header();
+    process.heap.abi.exc.freason = 1 << 10;
     None
 }
 
@@ -2843,26 +2732,22 @@ pub(crate) extern "C" fn list_reverse_entry(
     if export.light_trap_bif.is_none() {
         return park_executor(process, export, identity, false);
     }
-    let entry_top = process.heap.heap_top_index();
     let gc_was_enabled = process.heap.gc_enabled;
-    let reds = process.header.fcalls.clamp(0, 4000) as usize;
+    let reds = process.heap.abi.fcalls.clamp(0, 4000) as usize;
     let max_cells = reds
         .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
         .max(1);
     let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
     let step = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.header);
+        let mut call = arinsal_bifs::BifCall::default();
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut call);
         arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells)
     };
     let result = match step {
         Ok(arinsal_bifs::ReverseStep::Done(value)) => {
             process.set_gc_enabled(gc_was_enabled);
             registers.x_reg_array[0] = value;
-            let top = process.heap.heap_top_index();
-            if top != entry_top {
-                process.header.htop = native_htop(process, top);
-            }
             return crate::native_hooks::raw(value);
         }
         Ok(arinsal_bifs::ReverseStep::Trap(cont)) => Ok(crate::bif_traps::HandlerResult::Yield {
@@ -2883,7 +2768,7 @@ pub(crate) extern "C" fn list_reverse_entry(
         result,
     ) {
         crate::bif_traps::LightTrap::Returned(result) => {
-            light_trap_result(process, registers, export, 2, entry_top, false, result)
+            light_trap_result(process, registers, export, 2, false, result)
         }
         crate::bif_traps::LightTrap::Trapped => {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and erl_gc.c
@@ -2891,7 +2776,6 @@ pub(crate) extern "C" fn list_reverse_entry(
             // arguments as the live registers), OTP-29.1.1.
             if process.collect_bin_vheap_if_due(0).is_err() {
                 crate::native_hooks::set_error(process, "system_limit");
-                process.sync_native_header();
                 return 0;
             }
             arm_light_trap(process).unwrap_or(0)
@@ -2909,12 +2793,11 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
     descriptor: u64,
     arity: usize,
 ) -> Option<u64> {
-    let entry_top = process.heap.heap_top_index();
     // A call that needs no trap state returns its value at once.
     if registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
         && let Some(value) = T::direct(process, &registers.x_reg_array[..arity])
     {
-        return Some(light_value_return(process, entry_top, value));
+        return Some(crate::native_hooks::raw(value));
     }
     let gc_was_enabled = process.heap.gc_enabled;
     let pid = process.self_pid;
@@ -2944,7 +2827,7 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
             } else {
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1:
                 // the native shared fragment performs its inline GC check on this return.
-                Some(light_value_return(process, entry_top, value))
+                Some(crate::native_hooks::raw(value))
             }
         }
         other => trap_body_finish(
@@ -2953,7 +2836,6 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
             identity,
             descriptor,
             arity,
-            entry_top,
             gc_was_enabled,
             other,
         ),
@@ -2970,7 +2852,6 @@ pub(crate) fn trap_body_finish(
     identity: usize,
     descriptor: u64,
     arity: usize,
-    entry_top: usize,
     gc_was_enabled: bool,
     other: Result<crate::bif_traps::HandlerResult, arinsal_bifs::BifError>,
 ) -> Option<u64> {
@@ -2987,7 +2868,7 @@ pub(crate) fn trap_body_finish(
         other,
     ) {
         crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
-            process, registers, export, arity, entry_top, false, result,
+            process, registers, export, arity, false, result,
         )),
         crate::bif_traps::LightTrap::Trapped => arm_light_trap(process),
     }
@@ -3066,9 +2947,8 @@ fn invoke_dispatch_bif_slow(
     }
     if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY {
         // The breakpoint traps like a BIF so the executor delivers its trace events.
-        process.header.i = identity as *const u8 as *const _;
-        process.header.exc.freason = 1 << 10;
-        process.sync_native_header();
+        process.heap.abi.i = identity as *const u8 as *const _;
+        process.heap.abi.exc.freason = 1 << 10;
         return None;
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397 (call_light_bif_shared), OTP-29.1.1:
@@ -3098,11 +2978,10 @@ fn invoke_dispatch_bif_slow(
         if export_call {
             charge_bif_reductions(process, 1);
         }
-        process.header.arity = export.arity;
-        process.header.i = identity as *const u8 as *const _;
-        process.header.exc.freason = 1 << 10;
+        process.heap.abi.arity = export.arity;
+        process.heap.abi.i = identity as *const u8 as *const _;
+        process.heap.abi.exc.freason = 1 << 10;
         process.native_light_bif_call = !export_call;
-        process.sync_native_header();
         return None;
     }
     let bif = export.bif?;
@@ -3137,7 +3016,6 @@ fn call_direct_bif(
         registers.x_reg_array[2],
         registers.x_reg_array[3],
     ];
-    let entry_top = process.heap.heap_top_index();
     let value = direct(
         process,
         &args[..arity],
@@ -3149,7 +3027,7 @@ fn call_direct_bif(
     }
     // A direct BIF that failed has parked its exception (freason/fvalue set, as an erts
     // BIF returns THE_NON_VALUE); the call is not redone.
-    if process.header.exc.freason != 0 {
+    if process.heap.abi.exc.freason != 0 {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and erl_gc.c
         // (erts_gc_after_bif_call_lhf), OTP-29.1.1: the GC-desired test runs before the result
         // is looked at, so a failed BIF collects too, with its arguments live.
@@ -3158,7 +3036,6 @@ fn call_direct_bif(
         {
             return Some(0);
         }
-        process.sync_native_header();
         return Some(0);
     }
     registers.x_reg_array[0] = value;
@@ -3167,21 +3044,15 @@ fn call_direct_bif(
     if export_call && (process.heap.gc_desired() || process.heap.bin_vheap_gc_due()) {
         if process.collect_bin_vheap_if_due(1).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return Some(0);
         }
         raw = crate::native_hooks::raw(registers.x_reg_array[0]);
         // The collection moved the heap: publish every bound.
-        process.sync_native_header();
         return Some(raw);
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared,
     // emit_leave_runtime<eReductions | eHeap | eStack | eXRegs>), OTP-29.1.1: a BIF that did not
     // collect only moved HTOP and the reduction counter; the heap bounds and stack are unchanged.
-    let top = process.heap.heap_top_index();
-    if top != entry_top {
-        process.header.htop = native_htop(process, top);
-    }
     Some(raw)
 }
 
@@ -3197,14 +3068,12 @@ fn direct_bif_error_gc(process: &mut crate::Process, arity: usize) -> bool {
     let collected =
         crate::calls::gc_after_native_parts(process, &mut args, None, Some(&mut parked.trap));
     parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
-    process.header.exc.fvalue = parked.fvalue;
+    process.heap.abi.exc.fvalue = parked.fvalue;
     process.slice_mut().native_trap = Some(parked);
     if collected.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
-        process.sync_native_header();
         return false;
     }
-    process.sync_native_header();
     true
 }
 
@@ -3246,7 +3115,6 @@ fn make_ref_0(
     export: ExportDispatch,
     export_call: bool,
 ) -> u64 {
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     let words = arinsal_bifs::next_ref_words();
     // Common path is the young-heap bump (`HAlloc` when `HeapWordsLeft` is enough).
     // A full heap takes a fragment, as `HAlloc` calls `erts_heap_alloc`.
@@ -3254,15 +3122,7 @@ fn make_ref_0(
         Ok(term) => Ok(term),
         Err(_) => make_ref_in_fragment(process, words),
     };
-    finish_counter_bif(
-        process,
-        registers,
-        export,
-        export_call,
-        entry_top,
-        stop,
-        result,
-    )
+    finish_counter_bif(process, registers, export, export_call, result)
 }
 
 /// A full young heap: `HAlloc` falls through to `erts_heap_alloc`.
@@ -3286,7 +3146,6 @@ fn unique_integer_n(
     export_call: bool,
     args: &[Term],
 ) -> u64 {
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     let result = match arinsal_bifs::eval_unique_integer(args) {
         Ok(arinsal_bifs::UniqueInt::Small(value)) => {
             Ok(Term::small(value).expect("unique integer"))
@@ -3299,15 +3158,7 @@ fn unique_integer_n(
         }
         Err(error) => Err(error),
     };
-    finish_counter_bif(
-        process,
-        registers,
-        export,
-        export_call,
-        entry_top,
-        stop,
-        result,
-    )
+    finish_counter_bif(process, registers, export, export_call, result)
 }
 
 #[inline(always)]
@@ -3316,25 +3167,21 @@ fn finish_counter_bif(
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     export: ExportDispatch,
     export_call: bool,
-    entry_top: usize,
-    stop: usize,
     result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
     if export_call {
         charge_bif_reductions(process, 1);
     }
-    let top = process.heap.heap_top_index();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value with no collection desired goes straight
     // back to XREG0. The check is the one `call_light_bif_shared` does after the BIF.
     if let Ok(value) = &result
         && (!export_call
-            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
+            || (process.heap.stack_index() - process.heap.heap_top_index()
+                >= process.heap.mbuf_size()
+                && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
-        if top != entry_top {
-            process.header.htop = process.heap.word_address(top);
-        }
         return crate::native_hooks::raw(value);
     }
     plain_bif_result(
@@ -3361,9 +3208,9 @@ fn call_list_slice_bif(
         charge_bif_reductions(process, 1);
     }
     let arity = usize::from(export.arity);
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
+    let mut call = arinsal_bifs::BifCall::default();
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     if let Some(trap) = ctx.take_deferred() {
         let mut args = [Term::NIL; 3];
@@ -3379,25 +3226,21 @@ fn call_list_slice_bif(
         .is_err()
         {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return Some(0);
         }
         debug_assert_native_heap(process);
         crate::bif_traps::arm_export_trap(process);
-        process.header.exc.freason = 1 << 10;
-        process.sync_native_header();
+        process.heap.abi.exc.freason = 1 << 10;
         return None;
     }
-    let top = process.heap.heap_top_index();
     if let Ok(value) = &result
         && (!export_call
-            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
+            || (process.heap.stack_index() - process.heap.heap_top_index()
+                >= process.heap.mbuf_size()
+                && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
-        if top != entry_top {
-            process.header.htop = native_htop(process, top);
-        }
         return Some(crate::native_hooks::raw(value));
     }
     Some(plain_bif_result(process, registers, export, arity, result))
@@ -3430,20 +3273,19 @@ fn call_plain_bif_body(
     export_call: bool,
 ) -> u64 {
     if export_call {
-        process.header.fcalls = process.header.fcalls.saturating_sub(1);
+        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(1);
     }
     let arity = usize::from(export.arity);
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
     // OTP-29.1.1: the BIF reads its arguments from the register array (BIF_ARG_n is reg[n]).
     // A BIF leaves E alone, so only HTOP is read back after it.
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     // The result is matched where the BIF wrote it: moving it first would read it back with
     // wider loads than the BIF's stores.
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
+    let mut call = arinsal_bifs::BifCall::default();
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     let deferred = ctx.take_deferred();
-    let top = process.heap.heap_top_index();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
     // fragment installs x0 in the cached X register, so the result need not also be
@@ -3452,14 +3294,13 @@ fn call_plain_bif_body(
     if deferred.is_none()
         && let Ok(value) = &result
         && (!export_call
-            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
+            || (process.heap.stack_index() - process.heap.heap_top_index()
+                >= process.heap.mbuf_size()
+                && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         if export_call {
             registers.x_reg_array[0] = value;
-        }
-        if top != entry_top {
-            process.header.htop = native_htop(process, top);
         }
         return crate::native_hooks::raw(value);
     }
@@ -3505,15 +3346,11 @@ fn call_plain_bif_word(
     bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> u64,
 ) -> u64 {
     let arity = usize::from(export.arity);
-    let entry_top = process.heap.heap_top_addr();
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_failure(&mut fragment, &mut process.header);
+    let mut call = arinsal_bifs::BifCall::default();
+    let mut ctx = arinsal_bifs::Ctx::with_failure(&mut fragment, &mut call);
     let word = bif(&mut ctx, &registers.x_reg_array[..arity]);
     if word != arinsal_term::THE_NON_VALUE {
-        let top = process.heap.heap_top_addr();
-        if top != entry_top {
-            process.header.htop = top as *mut u64;
-        }
         return word;
     }
     let deferred = ctx.take_deferred();
@@ -3539,22 +3376,21 @@ fn plain_bif_word_slow(
     if word == arinsal_term::THE_NON_VALUE
         && deferred.is_none()
         && error.is_none()
-        && process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
-        && process.header.exc.ftrace != 0
-        && crate::native_hooks::from_raw(process.header.exc.ftrace).is_immed()
+        && process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.heap.abi.exc.ftrace != 0
+        && crate::native_hooks::from_raw(process.heap.abi.exc.ftrace).is_immed()
         && !process.heap.gc_after_bif_desired()
     {
         crate::stacktrace::clear_pending_top(process);
         if let Some(cold) = process.cold.as_mut() {
             cold.explicit_raise = None;
         }
-        process.sync_native_header();
         return 0;
     }
     // A migrated body left its failure in the process' exit words; an adapted `Result` body
     // left it in the context. Decoding clears the words, which are rewritten below.
     let error = if word == arinsal_term::THE_NON_VALUE {
-        error.or_else(|| decode_failure(&mut process.header.exc))
+        error.or_else(|| decode_failure(&mut process.heap.abi.exc))
     } else {
         error
     };
@@ -3571,14 +3407,13 @@ fn plain_bif_word_slow(
         && !process.heap.gc_after_bif_desired()
     {
         crate::stacktrace::clear_pending_top(process);
-        process.header.exc.ftrace = trace.word();
-        process.header.exc.freason =
+        process.heap.abi.exc.ftrace = trace.word();
+        process.heap.abi.exc.freason =
             crate::stacktrace::class_to_freason(Some(*class)) | arinsal_beamasm::exc::EXF_ARGLIST;
-        process.header.exc.fvalue = crate::native_hooks::raw(*reason);
+        process.heap.abi.exc.fvalue = crate::native_hooks::raw(*reason);
         if let Some(cold) = process.cold.as_mut() {
             cold.explicit_raise = None;
         }
-        process.sync_native_header();
         return 0;
     }
     let result = if word == arinsal_term::THE_NON_VALUE {
@@ -3650,25 +3485,12 @@ fn install_deferred_bif_trap(
     .is_err()
     {
         crate::native_hooks::set_error(process, "system_limit");
-        process.sync_native_header();
         return 0;
     }
     debug_assert_native_heap(process);
     crate::bif_traps::arm_export_trap(process);
-    process.header.exc.freason = 1 << 10;
-    process.sync_native_header();
+    process.heap.abi.exc.freason = 1 << 10;
     0
-}
-
-/// `c_p->htop` after a BIF advanced the young heap by `index` words.
-#[inline(always)]
-fn native_htop(process: &crate::Process, index: usize) -> *mut u64 {
-    let base = process.header.heap;
-    if base.is_null() {
-        process.heap.word_address(index)
-    } else {
-        base.wrapping_add(index)
-    }
 }
 
 /// Calls a BIF that needs its process (`c_p`) straight from native code.
@@ -3691,12 +3513,10 @@ fn call_process_bif(
     // process header on the way out (`RUNTIME_UPDATE`).
     let collects =
         (bif as usize) == (crate::natives::sys::garbage_collect_bif as *const () as usize);
-    let entry_top = process.heap.heap_top_index();
     let result = bif(process, &registers.x_reg_array[..arity])?;
     if collects {
         // The heap block moved. Heap indices from before the call belong to the
         // old block, so the post-BIF free-space check does not apply.
-        process.sync_native_header();
         return Some(match result {
             Ok(value) => {
                 registers.x_reg_array[0] = value;
@@ -3705,25 +3525,22 @@ fn call_process_bif(
                 // `call_light_bif` yields when it is exhausted.
                 // Port of erl_gc.c:588-597 (`force_reschedule`), OTP-29.1.1.
                 if process.force_yield() {
-                    process.header.fcalls = 0;
+                    process.heap.abi.fcalls = 0;
                 }
                 crate::native_hooks::raw(value)
             }
             Err(error) => process_bif_result(process, export, arity, Err(error)),
         });
     }
-    let top = process.heap.heap_top_index();
     // The light fragment tests the collection after its call (instr_bif.cpp:488-523).
     if let Ok(value) = &result
         && (!export_call
-            || (process.heap.stack_index() - top >= process.heap.mbuf_size()
+            || (process.heap.stack_index() - process.heap.heap_top_index()
+                >= process.heap.mbuf_size()
                 && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
-        if top != entry_top {
-            process.header.htop = native_htop(process, top);
-        }
         return Some(crate::native_hooks::raw(value));
     }
     Some(process_bif_result(process, export, arity, result))
@@ -3750,7 +3567,6 @@ fn process_bif_result(
         let gc = crate::calls::gc_after_native_parts(process, &mut args, value, raised);
         if gc.is_err() {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return 0;
         }
     }
@@ -3758,11 +3574,6 @@ fn process_bif_result(
         Ok(value) => {
             let value = crate::native_hooks::raw(value);
             process.x[0] = crate::native_hooks::from_raw(value);
-            if collected {
-                process.sync_native_header();
-            } else {
-                process.sync_native_cursors();
-            }
             value
         }
         Err(trap) => {
@@ -3784,7 +3595,6 @@ fn process_bif_error(
     if trap.class == arinsal_bifs::Class::Error && trap.top.is_none() && trap.trace.is_none() {
         let Ok(args) = crate::stacktrace::BifArgs::from_terms(args) else {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return 0;
         };
         trap.top = Some(crate::stacktrace::TopFrame::Bif {
@@ -3796,14 +3606,13 @@ fn process_bif_error(
     }
     let freason = crate::stacktrace::class_to_freason(Some(trap.class));
     let fvalue = crate::native_hooks::raw(trap.reason);
-    process.header.exc.freason = freason;
-    process.header.exc.fvalue = fvalue;
+    process.heap.abi.exc.freason = freason;
+    process.heap.abi.exc.fvalue = fvalue;
     process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
         fvalue,
     }));
-    process.sync_native_header();
     0
 }
 
@@ -3833,11 +3642,6 @@ fn plain_bif_result(
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif,
             // ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: one test, so at most one collection.
             process.x[0] = crate::native_hooks::from_raw(value);
-            if collected {
-                process.sync_native_header();
-            } else {
-                process.sync_native_cursors();
-            }
             value
         }
         Err(error) => plain_bif_error(process, export, error),
@@ -3868,7 +3672,6 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
     // without a collection.
     if !process.heap.gc_enabled {
         registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
-        process.sync_native_cursors();
         return value;
     }
     let arity = usize::from(export.arity);
@@ -3896,7 +3699,6 @@ fn gc_after_plain_bif(
     let collected = crate::calls::gc_after_bif(process, &mut args, result);
     if collected.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
-        process.sync_native_header();
         return false;
     }
     true
@@ -3910,15 +3712,15 @@ fn plain_bif_error(
     error: arinsal_bifs::BifError,
 ) -> u64 {
     set_native_bif_export_error(process, export, error);
-    process.sync_native_header();
     0
 }
 
 /// Charges the reductions a BIF reported against FCALLS, which the call site reloads.
 // Port of erts/emulator/beam/bif.h (BUMP_REDS), OTP-29.1.1.
 fn charge_bif_reductions(process: &mut crate::Process, reductions: u32) {
-    process.header.fcalls = process
-        .header
+    process.heap.abi.fcalls = process
+        .heap
+        .abi
         .fcalls
         .saturating_sub(reductions.min(i32::MAX as u32) as i32);
 }
@@ -3942,15 +3744,11 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
         return 0;
     };
     let args = &all_args[..usize::from(arity).min(all_args.len())];
-    let entry_top = process.heap.heap_top_index();
     // Matched where the BIF wrote it, like the light BIF path.
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
+    let mut call = arinsal_bifs::BifCall::default();
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
     let result = bif(&mut ctx, args);
-    let top = process.heap.heap_top_index();
-    if top != entry_top {
-        process.header.htop = process.heap.word_address(top);
-    }
     match result {
         Ok(value) => crate::native_hooks::raw(value),
         Err(error) => {
@@ -3964,7 +3762,6 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
                 }
                 None => set_light_bif_error(process, &error),
             }
-            process.sync_native_header();
             0
         }
     }
@@ -3976,12 +3773,11 @@ fn set_tagged_error(process: &mut crate::Process, tag: &str, value: Term) {
         .tuple(&[crate::signals::atom(tag), value]);
     match tuple {
         Ok(reason) => {
-            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
-            process.header.exc.fvalue = crate::native_hooks::raw(reason);
+            process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
         }
         Err(_) => crate::native_hooks::set_error(process, "system_limit"),
     }
-    process.sync_native_header();
 }
 
 /// Raises `{badfun,Fun}` or `{badarity,{Fun,Args}}` for a native fun call.
@@ -3998,8 +3794,8 @@ fn set_call_fun_error(process: &mut crate::Process, fun: Term, arity: u32) {
     process.x[arity] = fun;
     match crate::funs::call_error_reason(process, fun, arity) {
         Ok(reason) => {
-            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
-            process.header.exc.fvalue = crate::native_hooks::raw(reason);
+            process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
         }
         Err(_) => crate::native_hooks::set_error(process, "system_limit"),
     }
@@ -4014,7 +3810,7 @@ pub(crate) fn set_native_bif_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
+    let (freason, fvalue) = (process.heap.abi.exc.freason, process.heap.abi.exc.fvalue);
     process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Owned {
             module: module.to_owned(),
@@ -4037,7 +3833,7 @@ pub(crate) fn set_native_bif_register_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
+    let (freason, fvalue) = (process.heap.abi.exc.freason, process.heap.abi.exc.fvalue);
     process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Registers {
             module,
@@ -4059,12 +3855,12 @@ fn set_native_bif_export_error(
     set_light_bif_error(process, &error);
     // A `raise/3` with an immediate stacktrace is complete in `freason`, `fvalue` and `ftrace`,
     // as in erts: no record of the failing call is kept for it.
-    if process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
-        && process.header.exc.ftrace != 0
+    if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.heap.abi.exc.ftrace != 0
     {
         return;
     }
-    let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
+    let (freason, fvalue) = (process.heap.abi.exc.freason, process.heap.abi.exc.fvalue);
     process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
         error,
@@ -4079,7 +3875,7 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
     crate::stacktrace::clear_pending_top(process);
     // `raise/3`'s list is copied off-heap before `freason` changes, so a later
     // collection cannot move the words the catch still has to return.
-    process.header.exc.ftrace = 0;
+    process.heap.abi.exc.ftrace = 0;
     let mut in_ftrace = false;
     let explicit = match error {
         // An immediate list (`[]`) needs no copy: a collection cannot move it.
@@ -4087,7 +3883,7 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
             stacktrace: Some(trace),
             ..
         } if trace.is_immed() => {
-            process.header.exc.ftrace = trace.word();
+            process.heap.abi.exc.ftrace = trace.word();
             in_ftrace = true;
             None
         }
@@ -4114,14 +3910,14 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
         BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup")),
     };
     // `EXF_ARGLIST`: `ftrace` holds the stacktrace of a `raise/3`.
-    process.header.exc.freason = if in_ftrace {
+    process.heap.abi.exc.freason = if in_ftrace {
         freason | exc::EXF_ARGLIST
     } else {
         freason
     };
-    process.header.exc.fvalue = crate::native_hooks::raw(reason);
-    let freason = process.header.exc.freason;
-    let fvalue = process.header.exc.fvalue;
+    process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
+    let freason = process.heap.abi.exc.freason;
+    let fvalue = process.heap.abi.exc.fvalue;
     process.cold_mut().explicit_raise = explicit.map(|trace| Box::new((freason, fvalue, trace)));
 }
 
@@ -4131,11 +3927,11 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
 /// list is already a stacktrace), OTP-29.1.1. The catch's `build_stacktrace`
 /// then returns that list instead of walking native frames.
 fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
-    if process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
-        && process.header.exc.ftrace != 0
+    if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.heap.abi.exc.ftrace != 0
     {
-        let trace = crate::native_hooks::from_raw(process.header.exc.ftrace);
-        process.header.exc.ftrace = 0;
+        let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
+        process.heap.abi.exc.ftrace = 0;
         return Some(trace);
     }
     let owned = {
@@ -4144,7 +3940,7 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
             .explicit_raise
             .as_deref()
             .is_some_and(|(freason, fvalue, _)| {
-                *freason == process.header.exc.freason && *fvalue == process.header.exc.fvalue
+                *freason == process.heap.abi.exc.freason && *fvalue == process.heap.abi.exc.fvalue
             });
         if !matches {
             return None;
@@ -4173,7 +3969,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    let (freason, catches) = (process.header.exc.freason, process.header.catches);
+    let (freason, catches) = (process.heap.abi.exc.freason, process.heap.abi.catches);
     // TRAP and raw re-raises stay on the scheduler. Primary exceptions are `EXC_ERROR`,
     // `EXC_EXIT` and `EXC_THROWN`; expanded errors (`badmatch`, `function_clause`,
     // `case_clause`, ...) use erts' `(index << 10) | EXC_ERROR`.
@@ -4186,11 +3982,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // OTP-29.1.1. The shared fragment already ran `emit_enter_runtime` and stored HTOP and E
     // into `c_p`. `handle_error` runs once from that entry; it does not enter again.
     // The heap indexes are those stored cursors (`c_p->htop`, `c_p->stop`).
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
     let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) else {
         return 0;
     };
@@ -4200,13 +3991,11 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let raising_pc = registers.tmp_mem[6] as usize;
     // A function_clause list of the current function's arguments and an inline guard BIF's
     // top frame (`tmp_mem[7]`) are built by the scheduler's native exit; leave them there.
-    if process.header.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
-        process.sync_native_header();
+    if process.heap.abi.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
         return 0;
     }
     let found = crate::native_bridge::next_native_catch(process);
     let Some(found) = found else {
-        process.sync_native_header();
         return 0;
     };
     let (class, reason) = if primary {
@@ -4214,13 +4003,12 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
         (
             class,
-            crate::native_hooks::from_raw(process.header.exc.fvalue),
+            crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
         )
     } else {
         match expand_error_value(process) {
             Some(reason) => (arinsal_bifs::Class::Error, reason),
             None => {
-                process.sync_native_header();
                 return 0;
             }
         }
@@ -4246,8 +4034,8 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
                 .as_ref()
                 .and_then(|cold| cold.native_trap.as_ref())
                 .filter(|native_trap| {
-                    native_trap.freason == process.header.exc.freason
-                        && native_trap.fvalue == process.header.exc.fvalue
+                    native_trap.freason == process.heap.abi.exc.freason
+                        && native_trap.fvalue == process.heap.abi.exc.fvalue
                 })
                 .and_then(|native_trap| match native_trap.trap.top.as_ref() {
                     Some(crate::stacktrace::TopFrame::BifRegisters {
@@ -4296,7 +4084,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace, 8) {
             trace
         } else {
-            process.sync_native_header();
             return 0;
         }
     } else {
@@ -4307,7 +4094,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
             top.as_ref(),
             &registers.x_reg_array,
         ) else {
-            process.sync_native_header();
             return 0;
         };
         trace
@@ -4316,7 +4102,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let handler = match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
         crate::native_bridge::CatchHandler::Native(handler) => handler,
         crate::native_bridge::CatchHandler::Interpreted => {
-            process.sync_native_header();
             return 0;
         }
     };
@@ -4366,8 +4151,8 @@ fn note_owned_failure(process: &mut crate::Process) {
     // Only an owned record needs the move below; the record of an export failure stays put.
     if !process.slice().is_some_and(|work| {
         work.native_bif_error.as_ref().is_some_and(|failure| {
-            failure.freason == process.header.exc.freason
-                && failure.fvalue == process.header.exc.fvalue
+            failure.freason == process.heap.abi.exc.freason
+                && failure.fvalue == process.heap.abi.exc.fvalue
                 && matches!(
                     failure.call,
                     crate::proc_create::NativeBifCall::Owned { .. }
@@ -4379,8 +4164,8 @@ fn note_owned_failure(process: &mut crate::Process) {
     let Some(failure) = process.take_work(|w| w.native_bif_error.take()) else {
         return;
     };
-    if failure.freason == process.header.exc.freason
-        && failure.fvalue == process.header.exc.fvalue
+    if failure.freason == process.heap.abi.exc.freason
+        && failure.fvalue == process.heap.abi.exc.fvalue
         && let crate::proc_create::NativeBifCall::Owned {
             module,
             function,
@@ -4404,7 +4189,8 @@ fn failure_top(
     use crate::stacktrace::{BifErrorInfo, TopFrame};
     let cold = process.cold.as_ref()?;
     let failure = cold.native_bif_error.as_ref()?;
-    if failure.freason != process.header.exc.freason || failure.fvalue != process.header.exc.fvalue
+    if failure.freason != process.heap.abi.exc.freason
+        || failure.fvalue != process.heap.abi.exc.fvalue
     {
         return None;
     }
@@ -4482,8 +4268,8 @@ pub(crate) fn is_primary_freason(freason: u64) -> bool {
 
 /// Port of erts/emulator/beam/beam_common.c:742 (`expand_error_value`), OTP-29.1.1.
 pub(crate) fn expand_error_value(process: &mut crate::Process) -> Option<arinsal_term::Term> {
-    let index = process.header.exc.freason >> 10;
-    let value = crate::native_hooks::from_raw(process.header.exc.fvalue);
+    let index = process.heap.abi.exc.freason >> 10;
+    let value = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
     if index == 0 {
         return Some(value);
     }
@@ -4536,23 +4322,19 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
         Some(arinsal_term::FunRef::Local { entry, .. }) => {
             if u32::from(entry.arity) != arity {
                 set_call_fun_error(process, fun, arity);
-                process.sync_native_header();
                 return 0;
             }
             let code_ix =
                 (registers.active_code_ix as usize).min(arinsal_term::ERTS_NUM_CODE_IX - 1);
             if let Some(target) = entry.fun_code(code_ix) {
-                process.sync_native_header();
                 return target;
             }
-            process.header.arity = arity.min(u8::MAX as u32) as u8;
+            process.heap.abi.arity = arity.min(u8::MAX as u32) as u8;
             if let Some(slot) = process.x.get_mut(arity as usize) {
                 *slot = fun;
             }
-            process.sync_native_header();
             if unported == 0 {
                 set_call_fun_error(process, fun, arity);
-                process.sync_native_header();
                 return 0;
             }
             unported
@@ -4560,17 +4342,14 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
         Some(arinsal_term::FunRef::Export { entry }) => {
             if u32::from(entry.arity) != arity {
                 set_call_fun_error(process, fun, arity);
-                process.sync_native_header();
                 return 0;
             }
             let Some(_module) = arinsal_term::global_atoms().text(entry.module) else {
                 set_call_fun_error(process, fun, arity);
-                process.sync_native_header();
                 return 0;
             };
             let Some(_function) = arinsal_term::global_atoms().text(entry.function) else {
                 set_call_fun_error(process, fun, arity);
-                process.sync_native_header();
                 return 0;
             };
             let code_ix = registers.active_code_ix as usize;
@@ -4582,24 +4361,20 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
                 && let Some(target) = target
                 && target != crate::beamasm_integration::export_trampoline()
             {
-                process.sync_native_header();
                 return target;
             }
-            process.header.arity = arity.min(u8::MAX as u32) as u8;
+            process.heap.abi.arity = arity.min(u8::MAX as u32) as u8;
             if let Some(slot) = process.x.get_mut(arity as usize) {
                 *slot = fun;
             }
-            process.sync_native_header();
             if unported == 0 {
                 crate::native_hooks::set_error(process, "undef");
-                process.sync_native_header();
                 return 0;
             }
             unported
         }
         None => {
             set_call_fun_error(process, fun, arity);
-            process.sync_native_header();
             0
         }
     }
@@ -4616,7 +4391,6 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
     let fragment = crate::beamasm_integration::apply_fixed_unported_entry();
     if fragment == 0 || arity + 1 >= registers.x_reg_array.len() {
         crate::native_hooks::set_error(process, "system_limit");
-        process.sync_native_header();
         return 0;
     }
     let module = registers.x_reg_array[arity];
@@ -4633,8 +4407,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
         }
     }
     if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
-        process.header.arity = arity.min(u8::MAX as usize) as u8;
-        process.sync_native_header();
+        process.heap.abi.arity = arity.min(u8::MAX as usize) as u8;
         return fragment;
     }
     if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) {
@@ -4651,8 +4424,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
         }
     }
     // Not natively compiled (or invalid): the interpreter applies and raises errors.
-    process.header.arity = arity.min(u8::MAX as usize) as u8;
-    process.sync_native_header();
+    process.heap.abi.arity = arity.min(u8::MAX as usize) as u8;
     fragment
 }
 
@@ -4796,7 +4568,7 @@ pub extern "C" fn arinsal_beamasm_map_update_single(
 
 #[inline(always)]
 fn put_single_native(process: &mut crate::Process, key: u64, value: u64, map: u64) -> Option<u64> {
-    let mut top = crate::native_top_heap::NativeTopHeap::new(process)?;
+    let mut top = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let (key, value, map) = (
         crate::native_hooks::from_raw(key),
         crate::native_hooks::from_raw(value),
@@ -4804,10 +4576,7 @@ fn put_single_native(process: &mut crate::Process, key: u64, value: u64, map: u6
     );
     match arinsal_maps::put(map, key, value, &mut top) {
         Ok(term) => Some(crate::native_hooks::raw(term)),
-        Err(error) => {
-            top.commit();
-            put_single_failed(error)
-        }
+        Err(error) => put_single_failed(error),
     }
 }
 
@@ -4836,8 +4605,7 @@ fn map_single<const EXACT: bool>(
         let Some(process) = crate::native_hooks::process_from_header(header) else {
             return 0;
         };
-        // HAllocX on `c_p->htop`: the word-index cursors are only brought up to date when the
-        // put leaves the fast path.
+        // HAllocX on `c_p->htop`.
         if let Some(raw) = put_single_native(process, key, value, map) {
             return raw;
         }
@@ -4881,8 +4649,6 @@ fn map_single_generic<const EXACT: bool>(
     };
     match result {
         Ok(term) => {
-            // HAlloc advances HTOP; the map update leaves E unchanged.
-            process.header.htop = process.heap.heap_cursor().0;
             if exact {
                 let registers =
                     registers.expect("exact map update enters with scheduler registers");
@@ -4899,7 +4665,6 @@ fn map_single_generic<const EXACT: bool>(
         Err(arinsal_maps::MapError::Badkey(_)) if exact => {
             // `erts_maps_update` returns its zero status without setting exception fields; the
             // exact-update fragment uses the saved TMP_MEM2 key to raise BADKEY.
-            process.header.htop = process.heap.heap_cursor().0;
             0
         }
         Err(error) if !exact => put_single_failed(error),
@@ -4953,7 +4718,6 @@ fn arinsal_beamasm_map_change(
         process.x[live..base].fill(Term::NIL);
         if crate::native_hooks::collect_native(process, registers, need, source_slot + 1).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return 0;
         }
     }
@@ -4976,7 +4740,7 @@ fn map_result(
     has_fail_label: bool,
 ) -> u64 {
     // The error tuples below allocate, so the native header is published after them.
-    let raw = match result {
+    match result {
         Ok(term) => crate::native_hooks::raw(term),
         Err(arinsal_maps::MapError::Badkey(_)) if exact && has_fail_label => 0,
         Err(arinsal_maps::MapError::Badkey(key)) => {
@@ -4995,9 +4759,7 @@ fn map_result(
             crate::native_hooks::set_error(process, "badarg");
             0
         }
-    };
-    process.sync_native_header();
-    raw
+    }
 }
 
 /// Generic fallback lookup for non-flatmap keys.
@@ -5018,7 +4780,6 @@ pub extern "C" fn arinsal_beamasm_map_get(
     } else {
         arinsal_maps::get_with_hash(map, key, hash)
     };
-    process.sync_native_header();
     match result {
         Ok(Some(value)) => crate::native_hooks::raw(value),
         Ok(None) | Err(arinsal_maps::MapError::Badkey(_)) => 0,
@@ -5083,7 +4844,6 @@ pub extern "C" fn arinsal_beamasm_map_get_elements(
     if !found {
         return 0;
     }
-    process.sync_native_header();
     1
 }
 
@@ -5177,12 +4937,12 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         }
     };
     if result.is_ok() {
-        process.header.fcalls = process
-            .header
+        process.heap.abi.fcalls = process
+            .heap
+            .abi
             .fcalls
             .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32);
     }
-    process.sync_native_header();
     match result {
         Ok(term) => crate::native_hooks::raw(term),
         Err(error) => {
@@ -5227,7 +4987,6 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
     let start = 'append: loop {
         if collect_before_append && process.ensure_native_roots(request, live).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
-            process.sync_native_header();
             return u64::MAX;
         }
         let source = process.x[source_index];
@@ -5247,7 +5006,6 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                 loop {
                     if process.ensure_native_roots(fresh_request, live).is_err() {
                         crate::native_hooks::set_error(process, "system_limit");
-                        process.sync_native_header();
                         return u64::MAX;
                     }
                     let source = process.x[source_index];
@@ -5275,11 +5033,11 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
         }
     };
     registers.erl_bits_state = [start.data_address as u64, start.offset_bits as u64];
-    process.header.fcalls = process
-        .header
+    process.heap.abi.fcalls = process
+        .heap
+        .abi
         .fcalls
         .saturating_sub((start.copied_bits / (8 * 1024)).min(i32::MAX as usize) as i32);
-    process.sync_native_header();
     crate::native_hooks::raw(start.term)
 }
 
@@ -5310,11 +5068,11 @@ pub extern "C" fn arinsal_beamasm_bs_private_append_checked(
             update.old_size_bits,
             update.new_size_bits,
         );
-        process.header.fcalls = process
-            .header
+        process.heap.abi.fcalls = process
+            .heap
+            .abi
             .fcalls
             .saturating_sub((update.copied_bits / (8 * 1024)).min(i32::MAX as usize) as i32);
-        process.sync_native_header();
     }
     update.result
 }
@@ -5421,7 +5179,6 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     for (index, slot) in registers.match_staging.iter_mut().enumerate() {
         *slot = crate::native_hooks::raw(process.x[base + index]);
     }
-    process.sync_native_header();
     match result {
         Some(Ok(Some(term))) => crate::native_hooks::raw(term),
         Some(Ok(None)) => 0,
@@ -5571,8 +5328,6 @@ pub extern "C" fn arinsal_beamasm_bs_match(
         }
         _ => None,
     };
-    // HeapOnlyAlloc advances HTOP; the stack is untouched.
-    process.header.htop = process.heap.heap_cursor().0;
     result.map(crate::native_hooks::raw).unwrap_or(0)
 }
 
@@ -5600,8 +5355,6 @@ fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
     let result = crate::natives::proc::process_info_light(process, pid, item);
     // The builder allocates on the process heap. Write the cursor back on every outcome, so an
     // executor fallback re-enters from the header with the same heap.
-    let top = process.heap.heap_top_index();
-    process.header.htop = native_htop(process, top);
     match result {
         Some(Ok(term)) => {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523 (call_light_bif_shared,
@@ -5615,7 +5368,6 @@ fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
                 }
                 let Ok(term) = result else { return Some(0) };
                 registers.x_reg_array[0] = term;
-                process.sync_native_header();
                 return Some(crate::native_hooks::raw(term));
             }
             Some(crate::native_hooks::raw(term))

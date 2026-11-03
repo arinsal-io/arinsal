@@ -593,7 +593,7 @@ pub(crate) fn set_save_calls(process: &mut Process, len: usize) -> usize {
         // Port of erts/emulator/beam/bif.h:99-104 (`ERTS_VBUMP_ALL_REDS`), OTP-29.1.1.
         // BEAMASM sets `fcalls` to 0 so the light-BIF return yields and the next entry
         // loads `ERTS_SAVE_CALLS_CODE_IX`. Zeroing only `reductions` leaves `w22` live.
-        process.header.fcalls = 0;
+        process.heap.abi.fcalls = 0;
     }
     was
 }
@@ -3094,7 +3094,6 @@ pub(crate) fn push_native_trace_frame(
             Term::small(action.flags_word()).unwrap_or(Term::NIL),
         );
     }
-    process.sync_native_header();
     for action in actions {
         if crate::trace_bp::is_meta_id(action.session) && action.return_trace {
             crate::trace_bp::hold_meta_frame(process, action.session);
@@ -4305,7 +4304,7 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if flags & TIMESTAMP != 0 {
         let now = arinsal_bifs::lookup("erlang", "now", 0)?;
-        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
+        let mut state = arinsal_bifs::BifState::default();
         return now(
             &mut arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state),
             &[],

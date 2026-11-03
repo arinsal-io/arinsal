@@ -388,9 +388,28 @@ pub trait HeapAlloc {
     /// Give back the unused words `[start, end)` at the end of the latest allocation.
     // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1.
     fn release(&mut self, _end: *mut u64, _start: *mut u64) {}
+    /// The process' native ABI words (`c_p->htop`, `fcalls`, `freason`) when this allocator is
+    /// a process heap; BIF contexts reach FCALLS and the failure words through it.
+    #[inline(always)]
+    fn native_abi(&self) -> Option<&NativeAbi> {
+        None
+    }
+    /// Mutable form of [`native_abi`](Self::native_abi).
+    #[inline(always)]
+    fn native_abi_mut(&mut self) -> Option<&mut NativeAbi> {
+        None
+    }
 }
 
 impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
+    #[inline(always)]
+    fn native_abi(&self) -> Option<&NativeAbi> {
+        (**self).native_abi()
+    }
+    #[inline(always)]
+    fn native_abi_mut(&mut self) -> Option<&mut NativeAbi> {
+        (**self).native_abi_mut()
+    }
     fn allocator_identity(&self) -> usize {
         (**self).allocator_identity()
     }
@@ -1471,18 +1490,95 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
     }
 }
 
+/// The fixed process prefix read and written by generated BeamAsm code.
+///
+/// Port of erts/emulator/beam/jit/arm/beam_asm.hpp (`emit_enter_runtime` and
+/// `emit_leave_runtime`), OTP-29.1.1.
+#[repr(C)]
+pub struct NativeAbi {
+    /// Current young heap allocation pointer.
+    pub htop: *mut u64,
+    /// Erlang stack pointer, growing toward lower addresses.
+    pub stop: *mut u64,
+    /// Young heap start.
+    pub heap: *mut u64,
+    /// Young heap end.
+    pub hend: *mut u64,
+    /// Reductions remaining in the current scheduler slice.
+    pub fcalls: i32,
+    pub _fcalls_pad: u32,
+    /// `c_p->freason`, `fvalue` and `ftrace` in adjacent words.
+    pub exc: crate::exc::ExcFields,
+    /// Number of active catch tags in the process stack.
+    pub catches: usize,
+    /// Next instruction or native code pointer.
+    pub i: *const core::ffi::c_void,
+    /// Current function arity.
+    pub arity: u8,
+    pub _arity_pad: [u8; 7],
+    /// Current function metadata pointer.
+    pub current: *const core::ffi::c_void,
+    /// Process flags.
+    pub flags: u64,
+    /// Current process identifier consumed by the inline `self/0` emitter.
+    pub self_pid: u64,
+    /// First heap address safe for destructive tuple updates.
+    pub high_water: *mut u64,
+}
+
+// SAFETY: the pointers address the owning `ProcessHeap`'s own blocks and immutable code; the
+// heap moves between scheduler threads as a whole, exactly as it did when `htop`/`stop` were
+// `usize`. Nothing aliases them from another thread while the process is not running.
+unsafe impl Send for NativeAbi {}
+// SAFETY: shared references expose only copies of the words.
+unsafe impl Sync for NativeAbi {}
+
+impl Default for NativeAbi {
+    fn default() -> Self {
+        Self {
+            htop: std::ptr::null_mut(),
+            stop: std::ptr::null_mut(),
+            heap: std::ptr::null_mut(),
+            hend: std::ptr::null_mut(),
+            fcalls: 0,
+            _fcalls_pad: 0,
+            exc: crate::exc::ExcFields::default(),
+            catches: 0,
+            i: std::ptr::null(),
+            arity: 0,
+            _arity_pad: [0; 7],
+            current: std::ptr::null(),
+            flags: 0,
+            self_pid: 0,
+            high_water: std::ptr::null_mut(),
+        }
+    }
+}
+
+const _: () = assert!(std::mem::offset_of!(NativeAbi, htop) == 0x00);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, stop) == 0x08);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, heap) == 0x10);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, hend) == 0x18);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, fcalls) == 0x20);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, exc) == 0x28);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, catches) == 0x40);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, i) == 0x48);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, arity) == 0x50);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, current) == 0x58);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, flags) == 0x60);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, self_pid) == 0x68);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, high_water) == 0x70);
+
 /// A process heap with an upward bump pointer and a downward stack pointer.
+#[repr(C)]
 pub struct ProcessHeap {
+    /// The fixed native ABI fields share storage with this heap's cursors.
+    pub abi: NativeAbi,
     // Drop token owners before the heap words referenced by BinRef.val/next.
     pub(crate) owners: LazyOwners,
     pub(crate) words: WordBlock,
-    /// `HTOP` and `E`: addresses inside `words`, as erts keeps them in `Process`. A block change
-    /// (collection, resize) must set both again from their indexes taken beforehand.
-    pub(crate) htop: usize,
-    pub(crate) stop: usize,
     pub(crate) old_words: WordBlock,
     pub(crate) old_htop: usize,
-    pub(crate) high_water: usize,
     pub(crate) min_heap_size: u32,
     pub(crate) fullsweep_after: u16,
     pub(crate) minor_since_major: u16,
@@ -1698,14 +1794,19 @@ impl ProcessHeap {
 
     fn with_words_for_type_at(words: usize, allocation_type: ErtsAlcType, alloc_ix: u16) -> Self {
         let block = WordBlock::new_for(words, allocation_type, alloc_ix);
-        let base = block.as_ptr() as usize;
+        let base = block.as_ptr().cast::<u64>().cast_mut();
         Self {
+            abi: NativeAbi {
+                htop: base,
+                stop: base.wrapping_add(words),
+                heap: base,
+                hend: base.wrapping_add(words),
+                high_water: base,
+                ..NativeAbi::default()
+            },
             words: block,
-            htop: base,
-            stop: base + words * 8,
             old_words: WordBlock::default(),
             old_htop: 0,
-            high_water: 0,
             min_heap_size: 233,
             fullsweep_after: u16::MAX,
             minor_since_major: 0,
@@ -1838,13 +1939,14 @@ impl ProcessHeap {
         // subtraction and the `max(htop)` clamp of `heap_limit_words`; the words are small, so
         // the products cannot wrap, and a detached heap or a request that fails the test takes
         // the full computation out of line.
-        let top = self.htop;
+        let top = self.abi.htop as usize;
         let end = top.wrapping_add(words << 3);
         if !self.detached
             && words < (1 << 40)
-            && end.wrapping_add(crate::S_REDZONE << 3) <= self.stop + (self.bif_hidden_words << 3)
+            && end.wrapping_add(crate::S_REDZONE << 3)
+                <= self.abi.stop as usize + (self.bif_hidden_words << 3)
         {
-            self.htop = end;
+            self.abi.htop = end as *mut u64;
             return Some(top as *mut u64);
         }
         self.alloc_halloc_slow(words)
@@ -1856,12 +1958,12 @@ impl ProcessHeap {
         if self.detached {
             return self.owners.detached.as_deref_mut()?.alloc(words);
         }
-        let top = self.htop;
+        let top = self.abi.htop as usize;
         let end = top.checked_add(words.checked_mul(8)?)?;
         if end > self.words.as_ptr() as usize + (self.heap_limit_words() << 3) {
             return None;
         }
-        self.htop = end;
+        self.abi.htop = end as *mut u64;
         Some(top as *mut u64)
     }
     /// Whether generated code is running on this heap (set by the native bridge).
@@ -1905,20 +2007,28 @@ impl ProcessHeap {
     /// Return the current heap top and stack boundary for a VM-local bump cursor.
     /// The pointers remain valid until this heap collects or grows.
     pub fn heap_cursor(&self) -> (*mut u64, *mut u64) {
-        (self.htop as *mut u64, self.stop as *mut u64)
+        (self.abi.htop, self.abi.stop)
     }
     /// Return the start and end of the young heap allocation.
     pub fn heap_bounds(&self) -> (*mut u64, *mut u64) {
-        // SAFETY: The fixed word block owns this entire allocation.
-        unsafe {
-            let base = self.words.as_ptr().cast::<u64>().cast_mut();
-            (base, base.add(self.words.len()))
-        }
+        (self.abi.heap, self.abi.hend)
+    }
+    /// Refresh the native bounds after the collector replaces or resizes `words`.
+    pub(crate) fn refresh_native_heap_bounds(&mut self) {
+        self.abi.heap = self.words.as_ptr().cast::<u64>().cast_mut();
+        self.abi.hend = self.abi.heap.wrapping_add(self.words.len());
+    }
+    /// Mature boundary as an index in the current young heap.
+    pub(crate) fn high_water_index(&self) -> usize {
+        (self.abi.high_water as usize).wrapping_sub(self.abi.heap as usize) >> 3
+    }
+    /// Set the mature boundary after collection.
+    pub(crate) fn set_high_water_index(&mut self, index: usize) {
+        self.abi.high_water = self.abi.heap.wrapping_add(index);
     }
     /// Return the address of the young-heap high-water boundary.
     pub fn high_water_ptr(&self) -> *mut u64 {
-        let (heap, _) = self.heap_bounds();
-        heap.wrapping_add(self.high_water)
+        self.abi.high_water
     }
     /// Commit a VM-local cursor before collection or another heap allocator runs.
     pub fn set_heap_top(&mut self, top: *mut u64) {
@@ -1935,70 +2045,40 @@ impl ProcessHeap {
         debug_assert_eq!((address - base) % 8, 0);
         self.set_htop_index((address - base) / 8);
     }
-    /// Commit both native cursors at once when native code enters the runtime.
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime stores HTOP
-    // and E into c_p as they are), OTP-29.1.1. The young-heap base is `c_p->heap`; the
-    // indices are that base subtracted from the pointers, with no release-mode bounds check.
-    /// Record `words` just written at the native HTOP. The machine pointer and this
-    /// index stay one bump apart from the last sync.
-    #[inline(always)]
-    pub fn note_native_alloc(&mut self, words: usize) {
-        self.htop += words << 3;
-    }
-
-    #[inline(always)]
-    pub fn set_native_cursors(&mut self, htop: *mut u64, stop: *mut u64) {
-        self.commit_native_cursors(self.words.as_ptr() as usize, htop, stop);
-    }
-
-    /// Same as [`ProcessHeap::set_native_cursors`] using an already-known heap base
-    /// (`c_p->heap`). A null base falls back to the block pointer.
-    #[inline(always)]
-    pub fn set_native_cursors_at(&mut self, base: *mut u64, htop: *mut u64, stop: *mut u64) {
-        let base = if base.is_null() {
-            self.words.as_ptr() as usize
-        } else {
-            base as usize
-        };
-        self.commit_native_cursors(base, htop, stop);
-    }
-
-    #[inline(always)]
-    fn commit_native_cursors(&mut self, base: usize, htop: *mut u64, stop: *mut u64) {
-        // `HTOP` and `E` are stored as they are: the cursors are addresses, as in `Process`.
-        debug_assert!(
-            htop as usize >= base
-                && htop as usize <= stop as usize
-                && (stop as usize) <= base + self.words.len() * 8,
-            "native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}"
-        );
-        self.htop = htop as usize;
-        self.stop = stop as usize;
-    }
     /// The young heap top as a word index from the heap base.
     #[inline(always)]
     pub(crate) fn htop_index(&self) -> usize {
-        self.htop.wrapping_sub(self.words.as_ptr() as usize) >> 3
+        (self.abi.htop as usize).wrapping_sub(self.words.as_ptr() as usize) >> 3
     }
     /// Sets the young heap top from a word index.
     #[inline(always)]
     pub(crate) fn set_htop_index(&mut self, index: usize) {
-        self.htop = (self.words.as_ptr() as usize).wrapping_add(index << 3);
+        self.abi.htop = self
+            .words
+            .as_ptr()
+            .cast::<u64>()
+            .cast_mut()
+            .wrapping_add(index);
     }
     /// The stack pointer as a word index from the heap base.
     #[inline(always)]
     pub(crate) fn stop_index(&self) -> usize {
-        self.stop.wrapping_sub(self.words.as_ptr() as usize) >> 3
+        (self.abi.stop as usize).wrapping_sub(self.words.as_ptr() as usize) >> 3
     }
     /// Sets the stack pointer from a word index.
     #[inline(always)]
     pub(crate) fn set_stop_index(&mut self, index: usize) {
-        self.stop = (self.words.as_ptr() as usize).wrapping_add(index << 3);
+        self.abi.stop = self
+            .words
+            .as_ptr()
+            .cast::<u64>()
+            .cast_mut()
+            .wrapping_add(index);
     }
     /// The young heap top as an address, `c_p->htop`.
     #[inline(always)]
     pub fn heap_top_addr(&self) -> usize {
-        self.htop
+        self.abi.htop as usize
     }
     /// Young heap top as a word index.
     #[inline]
@@ -2114,8 +2194,8 @@ impl ProcessHeap {
         let used = source.htop_index();
         let block = std::mem::take(&mut source.words).into_alloc_block();
         // The block is gone: its cursors point nowhere.
-        source.htop = 0;
-        source.stop = 0;
+        source.abi.htop = std::ptr::null_mut();
+        source.abi.stop = std::ptr::null_mut();
         let used = used.min(block.len());
         self.fragments.push(Fragment::Block {
             memory: block,
@@ -2492,14 +2572,14 @@ impl ProcessHeap {
         let end = address.checked_add(bytes).ok_or(TermError::BadArg)?;
         let Self {
             words,
-            htop,
+            abi,
             fragments,
             owners,
             bin_vheap,
             ..
         } = self;
         let young_base = words.as_ptr() as usize;
-        let used_end = (*htop).max(young_base);
+        let used_end = (abi.htop as usize).max(young_base);
         let used_words = (used_end - young_base) / std::mem::size_of::<u64>();
         let young_used_end = young_base.saturating_add(used_words.saturating_mul(8));
         if address >= young_base && end <= young_used_end {

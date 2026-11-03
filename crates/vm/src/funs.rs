@@ -720,7 +720,7 @@ impl Vm {
     ) -> Result<ImportOutcome, VmError> {
         let (result, bif_reductions) = {
             let mut heap = ProcessHeapHandle(&mut p.heap);
-            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.header.fcalls);
+            let mut state = arinsal_bifs::BifState::default();
             let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 bif(&mut bif_ctx, &p.x[..arity])
@@ -738,8 +738,9 @@ impl Vm {
         p.x[0] = result;
         let charge = bif_reductions.saturating_add(1);
         p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
-        p.header.fcalls = p
-            .header
+        p.heap.abi.fcalls = p
+            .heap
+            .abi
             .fcalls
             .saturating_sub(charge.min(i32::MAX as u32) as i32);
         let exhausted = ctx.is_some_and(|run| !run.consume(charge));
@@ -751,7 +752,7 @@ impl Vm {
         }
         p.set_ip(p.ip() + 1);
         if exhausted {
-            p.header.fcalls = 4000;
+            p.heap.abi.fcalls = 4000;
             return Ok(ImportOutcome::Yield);
         }
         Ok(ImportOutcome::Advanced)

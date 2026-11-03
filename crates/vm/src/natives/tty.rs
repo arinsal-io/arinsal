@@ -465,7 +465,7 @@ fn call_values(
     note_caller(process, ctx);
     let result = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
+        let mut state = arinsal_bifs::BifState::default();
         let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
         native(&mut bif_ctx, args)
     };

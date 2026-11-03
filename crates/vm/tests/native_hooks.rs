@@ -31,7 +31,6 @@ fn run(
     })
     .unwrap();
     let module = asm.finalize().unwrap();
-    process.sync_native_header();
     let saved = process.x.saved_arity();
     // SAFETY: The code follows the BeamAsm ABI and the process plus register
     // storage remain exclusively borrowed for this synchronous native call, and

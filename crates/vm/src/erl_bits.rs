@@ -69,8 +69,9 @@ pub extern "C" fn append_binary(
         arinsal_bits::create_bin_reductions(&build(process.x[src_index], process.x[extra_index]))
             .unwrap_or(0);
     let charge = |process: &mut crate::Process| {
-        process.header.fcalls = process
-            .header
+        process.heap.abi.fcalls = process
+            .heap
+            .abi
             .fcalls
             .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32)
             .max(0);
@@ -83,7 +84,7 @@ pub extern "C" fn append_binary(
     if let Some(words) =
         arinsal_bits::concat_byte_binary_heap_words(process.x[src_index], process.x[extra_index])
             .and_then(|words| words.checked_add(alloc))
-        && let Ok(collected) = process.ensure_native_roots(words, root_live)
+        && let Ok(_) = process.ensure_native_roots(words, root_live)
         && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
             process.x[src_index],
             process.x[extra_index],
@@ -91,11 +92,6 @@ pub extern "C" fn append_binary(
         )
     {
         charge(process);
-        if collected {
-            process.sync_native_header();
-        } else {
-            process.sync_native_cursors();
-        }
         return raw(term);
     }
     let initial = build(process.x[src_index], process.x[extra_index]);
@@ -105,7 +101,6 @@ pub extern "C" fn append_binary(
     };
     let result = loop {
         if process.ensure(request, root_live).is_err() {
-            process.sync_native_header();
             set_error(process, "system_limit");
             return 0;
         }
@@ -122,7 +117,6 @@ pub extern "C" fn append_binary(
     if result.is_ok() {
         charge(process);
     }
-    process.sync_native_cursors();
     match result {
         Ok(term) => raw(term),
         Err(error) => fail(process, error),
@@ -131,7 +125,6 @@ pub extern "C" fn append_binary(
 
 fn fail(process: &mut crate::Process, error: BitsError) -> u64 {
     // An earlier collection of this helper may have moved the heap.
-    process.sync_native_header();
     let (reason, info) = crate::bits::native_error(error);
     process.cold_mut().native_error_info = info;
     set_error(process, &reason);

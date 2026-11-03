@@ -390,11 +390,11 @@ pub(crate) fn command_light(
     let reductions_used = imm.reductions_used();
     drop(imm);
     trace_immediate_process(process, caller, "in");
-    process.header.fcalls = process
-        .header
+    process.heap.abi.fcalls = process
+        .heap
+        .abi
         .fcalls
         .saturating_sub(i32::try_from(reductions_used).unwrap_or(i32::MAX));
-    process.sync_native_header();
     Some(Ok(atom("true")))
 }
 

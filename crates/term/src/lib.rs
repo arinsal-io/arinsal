@@ -74,7 +74,7 @@ pub use hash::{
 pub use heap::{
     AdoptError, BinaryRef, CP_WORDS, ConsHeapBuilder, ConsHeapChain, ConsHeapSegment,
     ConsListBuilder, FrameLayout, HeapAlloc, HeapBinaryWriter, HeapBlockBuilder, HeapReservation,
-    HeapReservationState, HeapReservationWords, HeapTermSlot, LiteralArea, MfaLocation,
+    HeapReservationState, HeapReservationWords, HeapTermSlot, LiteralArea, MfaLocation, NativeAbi,
     ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TermBuilder, Tuple3Chain, TupleBuilder, VecHeap,
     flat_key_cmp,
 };

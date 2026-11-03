@@ -679,9 +679,7 @@ fn execute_guard_bif(
         p.gc_live = live;
         let result = arith::small(import.fast, left, right)
             .map(Ok)
-            .unwrap_or_else(|| {
-                calls::call_bif(&mut p.heap, &mut p.header.fcalls, bif, &[left, right])
-            });
+            .unwrap_or_else(|| calls::call_bif(&mut p.heap, bif, &[left, right]));
         if let Ok(value) = result {
             write_fast_x(p, dst, value)?;
             p.set_ip(p.ip() + 1);
@@ -1619,7 +1617,7 @@ impl Vm {
         {
             let result = {
                 let mut heap = ProcessHeapHandle(&mut process.heap);
-                let mut state = arinsal_bifs::BifStateGuard::new(&mut process.header.fcalls);
+                let mut state = arinsal_bifs::BifState::default();
                 let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bif(&mut ctx, args)))
                     .map_err(|_| VmError::Unsupported(format!("BIF {frame} panicked")))?
@@ -1866,7 +1864,7 @@ impl Vm {
     ) -> Result<RunState, VmError> {
         self.refresh_code();
         // The interpreter is the process's position now, not the last native address.
-        p.header.i = std::ptr::null();
+        p.heap.abi.i = std::ptr::null();
         // The call site of a native call into interpreted code is only for a native call the
         // scheduler redoes. Left behind, it makes a trap of an interpreted call push a native
         // return address that erts' interpreter-free frames never have, shifting every Y.
@@ -1935,9 +1933,9 @@ impl Vm {
         // so a BIF's charge is clamped by the quantum, not by what an earlier slice left.
         let installed = i32::try_from(budget).unwrap_or(i32::MAX);
         if installed > 0 {
-            p.header.fcalls = installed;
+            p.heap.abi.fcalls = installed;
         }
-        let mut reds = p.header.fcalls;
+        let mut reds = p.heap.abi.fcalls;
         let mut consumed = 0_u32;
         let quantum = ctx.as_deref().map_or(0, |run| run.remaining());
         // A call that charged the slice itself (a driver task run in the caller) used up part
@@ -1977,7 +1975,7 @@ impl Vm {
                 let amount = $amount;
                 if amount != 0 {
                     p.reductions_used = p.reductions_used.saturating_add(u64::from(amount));
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     consumed = consumed.saturating_add(amount).min(budget);
                     if let Some(run) = ctx.as_deref_mut() {
                         run.consume(amount);
@@ -2039,7 +2037,7 @@ impl Vm {
                         );
                     }
                     sync_cursor(p, htop, &mut heap_dirty);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.heap.release_stack(1);
                     p.native_continuation_resume = true;
                     p.set_native_resume_arity(1);
@@ -2049,19 +2047,19 @@ impl Vm {
                 }
                 if depth == 0 {
                     sync_cursor(p, htop, &mut heap_dirty);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     return Ok(RunState::Done(p.x[0]));
                 }
                 if cp & 63 != 0x1b {
                     sync_cursor(p, htop, &mut heap_dirty);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     return Ok(RunState::Done(p.x[0]));
                 }
                 let Some((false, return_module, target)) =
                     p.heap.stack_get(0).and_then(crate::stacktrace::decode_tag)
                 else {
                     sync_cursor(p, htop, &mut heap_dirty);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     return Ok(RunState::Done(p.x[0]));
                 };
                 module_id = return_module;
@@ -2178,7 +2176,7 @@ impl Vm {
                 sync_cursor(p, htop, &mut heap_dirty);
                 p.module = module_id;
                 p.set_ip(offset);
-                p.header.fcalls = reds;
+                p.heap.abi.fcalls = reds;
                 return Ok(RunState::Yield);
             }
             // Port of emit_i_test_yield in erts/emulator/beam/jit/arm/instr_common.cpp:3097-3118,
@@ -2276,7 +2274,7 @@ impl Vm {
                                 p.gc_live = 3;
                                 p.module = module_id;
                                 p.set_ip(entry_ip);
-                                p.header.fcalls = reds;
+                                p.heap.abi.fcalls = reds;
                                 let breakpoint_import = module.debug_breakpoint_import as usize;
                                 let outcome = self.call_import(
                                     p,
@@ -2291,7 +2289,7 @@ impl Vm {
                                 module_handle = self.code.modules[module_id].clone();
                                 x = p.x.as_mut_ptr();
                                 fr = p.fr_ptr();
-                                reds = p.header.fcalls;
+                                reds = p.heap.abi.fcalls;
                                 depth = p.heap.stack_words();
                                 (htop, stop) = p.heap.heap_cursor();
                                 match outcome {
@@ -2501,7 +2499,7 @@ impl Vm {
                         if reds <= 0 {
                             p.module = module_id;
                             p.set_ip(offset);
-                            p.header.fcalls = reds;
+                            p.heap.abi.fcalls = reds;
                             return Ok(RunState::Yield);
                         }
                     }
@@ -2551,21 +2549,16 @@ impl Vm {
                     let charges =
                         to_dirty.is_none() && !arinsal_sched::current_scheduler_type().is_dirty();
                     if charges {
-                        p.header.fcalls = reds;
+                        p.heap.abi.fcalls = reds;
                     }
-                    let reds_before_nif = p.header.fcalls;
+                    let reds_before_nif = p.heap.abi.fcalls;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match pending {
-                            Some(pending) => natives::nif::resume_pending(
-                                &mut p.heap,
-                                &mut p.header.fcalls,
-                                pending,
-                            ),
+                            Some(pending) => natives::nif::resume_pending(&mut p.heap, pending),
                             None => match to_dirty {
                                 Some(class) => Err(arinsal_bifs::BifError::Dirty(class)),
                                 None => natives::nif::call_native(
                                     &mut p.heap,
-                                    &mut p.header.fcalls,
                                     &native,
                                     &p.x[..arity],
                                 ),
@@ -2574,7 +2567,7 @@ impl Vm {
                     }));
                     if charges {
                         charge_bif_work!(
-                            u32::try_from(reds_before_nif.saturating_sub(p.header.fcalls).max(0))
+                            u32::try_from(reds_before_nif.saturating_sub(p.heap.abi.fcalls).max(0))
                                 .unwrap_or(0)
                         );
                     }
@@ -2769,7 +2762,7 @@ impl Vm {
                     p.gc_live = 4;
                     p.module = module_id;
                     p.set_ip(offset);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     let outcome = self.call_import(
                         p,
                         import as usize,
@@ -2783,7 +2776,7 @@ impl Vm {
                     module_handle = self.code.modules[module_id].clone();
                     x = p.x.as_mut_ptr();
                     fr = p.fr_ptr();
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     match outcome {
@@ -2851,7 +2844,7 @@ impl Vm {
                     // Exception capture reads the active call site from the process.
                     p.module = module_id;
                     p.set_ip(instruction_offset(base, ip));
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     let (result, bif_reductions) =
                         if let Some(result) = call_fast_tuple_bif(p, fast_op, arity as usize) {
                             (result, 0)
@@ -2879,7 +2872,7 @@ impl Vm {
                             {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.set_native_pc(Some(resume));
-                                p.header.fcalls = reds;
+                                p.heap.abi.fcalls = reds;
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
@@ -2900,7 +2893,7 @@ impl Vm {
                             p.reductions_used = p.reductions_used.saturating_add(1);
                             // The BIF body changed the process FCALLS through Ctx. Keep the
                             // interpreter's cached value in step without charging it again.
-                            reds = p.header.fcalls;
+                            reds = p.heap.abi.fcalls;
                             consumed = consumed.saturating_add(charge).min(budget);
                             if let Some(run) = ctx.as_deref_mut() {
                                 run.consume(charge);
@@ -2940,7 +2933,7 @@ impl Vm {
                         p.set_ip(instruction_offset(base, ip));
                         // Native entry takes its reduction counter from the
                         // process, not the interpreter's cached `reds`.
-                        p.header.fcalls = reds;
+                        p.heap.abi.fcalls = reds;
                         let (result, bif_reductions) = self.call_bif_traced(
                             p,
                             ctx.as_deref_mut(),
@@ -2969,7 +2962,7 @@ impl Vm {
                                 p.reductions_used = p.reductions_used.saturating_add(1);
                                 // The BIF body changed the process FCALLS through Ctx. Keep the
                                 // interpreter's cached value in step without charging it again.
-                                reds = p.header.fcalls;
+                                reds = p.heap.abi.fcalls;
                                 consumed = consumed.saturating_add(charge).min(budget);
                                 if let Some(run) = ctx.as_deref_mut() {
                                     run.consume(charge);
@@ -2978,7 +2971,7 @@ impl Vm {
                                 {
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     p.set_native_pc(Some(resume));
-                                    p.header.fcalls = reds;
+                                    p.heap.abi.fcalls = reds;
                                     p.native_transfer = true;
                                     return Ok(RunState::Yield);
                                 }
@@ -3008,7 +3001,7 @@ impl Vm {
                     };
                     p.module = module_id;
                     p.set_ip(offset);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     let outcome = match self.call_import(
                         p,
                         import as usize,
@@ -3053,7 +3046,7 @@ impl Vm {
                             outcome @ (ImportOutcome::Advanced | ImportOutcome::Yield) => {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.set_native_pc(Some(resume));
-                                p.header.fcalls = reds;
+                                p.heap.abi.fcalls = reds;
                                 if matches!(outcome, ImportOutcome::Advanced) {
                                     p.native_transfer = true;
                                 }
@@ -3064,7 +3057,7 @@ impl Vm {
                                 // The BIF returned a value for the native caller in x[0].
                                 p.x[0] = value;
                                 p.set_native_pc(Some(resume));
-                                p.header.fcalls = reds;
+                                p.heap.abi.fcalls = reds;
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
@@ -3075,7 +3068,7 @@ impl Vm {
                     fr = p.fr_ptr();
                     module_id = p.module;
                     base = self.code.modules[module_id].code.as_ptr();
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     ip = match outcome {
@@ -3085,7 +3078,7 @@ impl Vm {
                                 p.note_tail_yield(site_module, offset, release, true);
                             }
                             sync_cursor(p, htop, &mut heap_dirty);
-                            p.header.fcalls = reds;
+                            p.heap.abi.fcalls = reds;
                             return Ok(RunState::Yield);
                         }
                         ImportOutcome::Jump(target) => target,
@@ -3101,7 +3094,7 @@ impl Vm {
                         p.set_force_yield(false);
                         p.gc_live = 1;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        p.header.fcalls = reds;
+                        p.heap.abi.fcalls = reds;
                         return Ok(RunState::Yield);
                     }
                     if let ImportOutcome::Jump(target) = outcome {
@@ -3118,7 +3111,7 @@ impl Vm {
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.module = module_id;
                             p.set_ip(target_ip);
-                            p.header.fcalls = reds;
+                            p.heap.abi.fcalls = reds;
                             p.set_native_pc(Some(native.start));
                             p.native_transfer = true;
                             return Ok(RunState::Yield);
@@ -3162,7 +3155,7 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.module = module_id;
                         p.set_ip(target as usize);
-                        p.header.fcalls = reds;
+                        p.heap.abi.fcalls = reds;
                         p.set_native_pc(Some(native.start));
                         p.native_transfer = true;
                         return Ok(RunState::Yield);
@@ -3196,7 +3189,7 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.module = module_id;
                         p.set_ip(target as usize);
-                        p.header.fcalls = reds;
+                        p.heap.abi.fcalls = reds;
                         p.set_native_pc(Some(native.start));
                         p.native_transfer = true;
                         return Ok(RunState::Yield);
@@ -3538,7 +3531,7 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.header.fcalls);
+                            let mut state = arinsal_bifs::BifState::default();
                             let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, right]);
@@ -3606,7 +3599,7 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.header.fcalls);
+                            let mut state = arinsal_bifs::BifState::default();
                             let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, right]);
@@ -3669,7 +3662,7 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.header.fcalls);
+                            let mut state = arinsal_bifs::BifState::default();
                             let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, value]);
@@ -3732,7 +3725,7 @@ impl Vm {
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
                             let mut heap = ProcessHeapHandle(&mut p.heap);
-                            let mut state = arinsal_bifs::BifStateGuard::new(&mut p.header.fcalls);
+                            let mut state = arinsal_bifs::BifState::default();
                             let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, value]);
@@ -3957,12 +3950,12 @@ impl Vm {
                     // SAFETY: The current instruction is within this module.
                     p.set_ip(unsafe { ip.offset_from(base) } as usize);
                     p.module = module_id;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     let value = match ctx.as_deref_mut() {
                         Some(ctx) => p.send_message_in(self, ctx, p.x[0], p.x[1])?,
                         None => p.send_message_with_vm(self, p.x[0], p.x[1])?,
                     };
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     sync_slice_use!();
                     // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send), OTP-29.1.1.
                     if crate::trace::saves_calls(p) {
@@ -4035,7 +4028,7 @@ impl Vm {
                     }
                     p.module = module_id;
                     p.set_ip(target as usize);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.gc_live = 0;
                     return Ok(RunState::Wait { timeout_ms: None });
                 }
@@ -4074,7 +4067,7 @@ impl Vm {
                     }
                     p.module = module_id;
                     p.set_ip(target as usize);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.gc_live = 0;
                     return Ok(RunState::Wait {
                         timeout_ms: remaining,
@@ -4130,7 +4123,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.module = module_id;
                     p.set_ip(offset);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     let fun = p.read(src)?;
                     let site_module = module_id;
                     let mut release = if tail || dealloc > 0 {
@@ -4144,7 +4137,7 @@ impl Vm {
                     x = p.x.as_mut_ptr();
                     module_id = p.module;
                     base = self.code.modules[module_id].code.as_ptr();
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     ip = match outcome {
@@ -4160,7 +4153,7 @@ impl Vm {
                                 p.note_tail_yield(site_module, offset, release, false);
                             }
                             sync_cursor(p, htop, &mut heap_dirty);
-                            p.header.fcalls = reds;
+                            p.heap.abi.fcalls = reds;
                             return Ok(RunState::Yield);
                         }
                         ImportOutcome::Jump(target) => {
@@ -4178,7 +4171,7 @@ impl Vm {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.module = module_id;
                                 p.set_ip(target_ip);
-                                p.header.fcalls = reds;
+                                p.heap.abi.fcalls = reds;
                                 p.set_native_pc(Some(native.start));
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
@@ -4202,7 +4195,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.module = module_id;
                     p.set_ip(offset);
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     let site_module = module_id;
                     let mut release = if dealloc > 0 {
                         Some(p.release_tail_frame(module_id, offset, dealloc as usize)?)
@@ -4218,7 +4211,7 @@ impl Vm {
                     )?;
                     module_id = p.module;
                     base = self.code.modules[module_id].code.as_ptr();
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     ip = match outcome {
@@ -4231,7 +4224,7 @@ impl Vm {
                                 p.note_tail_yield(site_module, offset, release, true);
                             }
                             sync_cursor(p, htop, &mut heap_dirty);
-                            p.header.fcalls = reds;
+                            p.heap.abi.fcalls = reds;
                             return Ok(RunState::Yield);
                         }
                         ImportOutcome::Jump(target) => {
@@ -4249,7 +4242,7 @@ impl Vm {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.module = module_id;
                                 p.set_ip(target_ip);
-                                p.header.fcalls = reds;
+                                p.heap.abi.fcalls = reds;
                                 p.set_native_pc(Some(native.start));
                                 p.native_transfer = true;
                                 return Ok(RunState::Yield);
@@ -4269,13 +4262,13 @@ impl Vm {
                     // SAFETY: The current instruction belongs to this module allocation.
                     p.set_ip(unsafe { ip.offset_from(base) } as usize);
                     p.module = module_id;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     exceptions::execute(self, p, op, a, b)?;
                     module_id = p.module;
                     base = self.code.modules[module_id].code.as_ptr();
                     (htop, stop) = p.heap.heap_cursor();
                     depth = p.heap.stack_words();
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     // SAFETY: The handler sets a resolved instruction index.
                     ip = unsafe { base.add(p.ip()) };
                     continue;
@@ -4368,7 +4361,7 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` refer to this module's code allocation.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.module = module_id;
                     p.set_ip(offset);
                     let op = module.generic[fallback as usize];
@@ -4377,7 +4370,7 @@ impl Vm {
                         format!("{}:{name}/{arity}", module.name)
                     };
                     bits::execute(p, module, &op, &frame)?;
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved code index.
@@ -4408,7 +4401,7 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` refer to this module allocation.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.module = module_id;
                     p.set_ip(offset);
                     let op = module.generic[fallback as usize];
@@ -4417,7 +4410,7 @@ impl Vm {
                         format!("{}:{name}/{arity}", module.name)
                     };
                     bits::execute(p, module, &op, &frame)?;
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved instruction index.
@@ -4518,14 +4511,14 @@ impl Vm {
                     // Guard failure and heap exhaustion retain the full exception path.
                     // SAFETY: `ip` and `base` refer to this module's code allocation.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.module = module_id;
                     p.set_ip(offset);
                     bits::execute_compact(p, instr, || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
                         format!("{}:{name}/{arity}", module.name)
                     })?;
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved code index.
@@ -4541,14 +4534,14 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` refer to this module's code allocation.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.module = module_id;
                     p.set_ip(offset);
                     bits::execute_compact(p, instr, || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
                         format!("{}:{name}/{arity}", module.name)
                     })?;
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved code index.
@@ -4559,7 +4552,7 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` refer to this module's code allocation.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.module = module_id;
                     p.set_ip(offset);
                     let op = module.generic[index as usize];
@@ -4581,7 +4574,7 @@ impl Vm {
                         };
                         bits::execute(p, module, &op, &frame)?;
                     }
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: Feature handlers set a resolved code index.
@@ -4592,7 +4585,7 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` belong to the current module.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    p.header.fcalls = reds;
+                    p.heap.abi.fcalls = reds;
                     p.module = module_id;
                     p.set_ip(offset);
                     let op: GenericOp = module.generic[index as usize];
@@ -4702,7 +4695,7 @@ impl Vm {
                                         p.note_tail_yield(site_module, site_ip, release, true);
                                     }
                                     sync_cursor(p, htop, &mut heap_dirty);
-                                    p.header.fcalls = reds;
+                                    p.heap.abi.fcalls = reds;
                                     return Ok(RunState::Yield);
                                 }
                                 ImportOutcome::Jump(_) => {
@@ -5134,7 +5127,7 @@ impl Vm {
                     }
                     module_id = p.module;
                     base = self.code.modules[module_id].code.as_ptr();
-                    reds = p.header.fcalls;
+                    reds = p.heap.abi.fcalls;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: Generic handlers set a resolved code index before dispatch.
@@ -5168,7 +5161,7 @@ impl Vm {
                         {
                             p.module = target_module;
                             p.set_ip(target_ip);
-                            p.header.fcalls = reds;
+                            p.heap.abi.fcalls = reds;
                             p.set_native_pc(Some(native.start));
                             p.native_transfer = true;
                             return Ok(RunState::Yield);

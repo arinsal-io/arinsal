@@ -29,12 +29,10 @@ pub extern "C" fn arinsal_beamasm_map_lookup(
         Ok(None) => 0,
         Err(MapError::Badmap(_)) => {
             set_error(process, "badmap");
-            process.sync_native_header();
             0
         }
         Err(_) => {
             set_error(process, "badarg");
-            process.sync_native_header();
             0
         }
     }
@@ -70,48 +68,19 @@ pub extern "C" fn arinsal_beamasm_bif_mfa(
         return 0;
     };
     set_error(process, "undef");
-    process.sync_native_header();
     0
 }
 
-/// The process and scheduler registers of a helper called from native code, with the heap
-/// and stack cursors committed but the X registers left in the register array, where the
-/// helper reads them.
-// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:460-540 (emit_enter_runtime stores only
-// HTOP/STOP; the runtime gets `reg`, the scheduler's x_reg_array, not a copy), OTP-29.1.1.
-/// [`enter_runtime`] without the cursor conversion: the caller must not touch heap indices
-/// until it converts them. erts keeps HTOP and STOP as pointers in the process, so a BIF that
-/// never allocates needs no conversion.
-#[track_caller]
-pub(crate) fn enter_runtime_no_cursors<'a>(
-    header: *mut ProcessHeader,
-) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
-    let process = process_from_header(header)?;
-    scheduler_registers(process)
-}
-
-/// Converts the native cursors of a process entered with [`enter_runtime_no_cursors`].
-pub(crate) fn convert_native_cursors(process: &mut Process) {
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
-}
-
+/// The process and scheduler registers of a helper called from native code; the X registers
+/// stay in the register array, where the helper reads them.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:460-540 (emit_enter_runtime stores HTOP/E/
+// FCALLS into `c_p`; the runtime gets `reg`, the scheduler's x_reg_array, not a copy), OTP-29.1.1.
+// HTOP, E and FCALLS already live in `c_p` here (`ProcessHeap::abi`), so nothing is converted.
 #[track_caller]
 pub(crate) fn enter_runtime<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let process = process_from_header(header)?;
-    // Rust helpers may allocate or publish the header again, so first commit the
-    // native heap and stack cursors that generated code flushed at the call site.
-    // `c_p->heap` is the base; converting through the block pointer is the slow path.
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
     scheduler_registers(process)
 }
 
@@ -134,14 +103,7 @@ pub(crate) fn scheduler_registers(
 // Update::eHeapAlloc publishes HTOP and E), OTP-29.1.1.
 #[track_caller]
 pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
-    let process = process_from_header(header)?;
-    // `c_p->heap` is the base; converting through the block pointer is the slow path.
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
-    Some(process)
+    process_from_header(header)
 }
 
 #[cfg(debug_assertions)]
@@ -173,7 +135,7 @@ pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a 
     #[cfg(debug_assertions)]
     {
         let location = std::panic::Location::caller();
-        let (htop, heap) = (process.header.htop, process.header.heap);
+        let (htop, heap) = (process.heap.abi.htop, process.heap.abi.heap);
         HELPER_RING.with(|ring| {
             let mut ring = ring.borrow_mut();
             if ring.len() >= 6 {
@@ -194,8 +156,8 @@ pub(crate) fn set_error(process: &mut Process, name: &str) {
     // `am_badarg` and the other built-in error atoms. Interning the reason on
     // every `persistent_term:get/1` miss took the atom-table lock.
     let term = crate::signals::atom(name);
-    process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
-    process.header.exc.fvalue = term.tagged_word();
+    process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+    process.heap.abi.exc.fvalue = term.tagged_word();
 }
 
 pub(crate) fn raw(term: Term) -> u64 {
@@ -269,12 +231,13 @@ fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bo
     .map(raw);
     let charge = arinsal_arith::mul_reduction_charge(left, right);
     // Port of erts/emulator/beam/bif.h (BUMP_REDS): the count never goes below zero.
-    process.header.fcalls = process
-        .header
+    process.heap.abi.fcalls = process
+        .heap
+        .abi
         .fcalls
         .saturating_sub(charge.min(i32::MAX as u32) as i32)
         .max(0);
-    let answer = match result {
+    match result {
         Ok(value) => value,
         Err(error) => {
             let error = match error {
@@ -294,9 +257,7 @@ fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bo
             }
             0
         }
-    };
-    process.sync_native_header();
-    answer
+    }
 }
 
 /// Arithmetic and float slow path. Returns an OTP term, except float-register
@@ -352,8 +313,9 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
         // The charge comes off FCALLS, which the scheduler adds to the process's count.
         let charge = arinsal_arith::reduction_charge(operation, args);
         // Port of erts/emulator/beam/bif.h (BUMP_REDS): the count never goes below zero.
-        process.header.fcalls = process
-            .header
+        process.heap.abi.fcalls = process
+            .heap
+            .abi
             .fcalls
             .saturating_sub(charge.min(i32::MAX as u32) as i32)
             .max(0);
@@ -445,13 +407,14 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
         _ => Err(ArithError::Badarith),
     };
     if guard_add_reductions != 0 {
-        process.header.fcalls = process
-            .header
+        process.heap.abi.fcalls = process
+            .heap
+            .abi
             .fcalls
             .saturating_sub(guard_add_reductions.min(i32::MAX as u32) as i32)
             .max(0);
     }
-    let answer = match result {
+    match result {
         Ok(value) => value,
         Err(error) => {
             let error = match error {
@@ -484,9 +447,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             }
             0
         }
-    };
-    process.sync_native_header();
-    answer
+    }
 }
 
 /// The erlang BIF behind a generic arithmetic helper op.
@@ -521,15 +482,13 @@ fn int128_to_big(process: &mut Process, low: u64, high: u64, sign: u64) -> u64 {
     }
     let built = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .int_from_bigint(&magnitude);
-    let answer = match built {
+    match built {
         Ok(term) => raw(term),
         Err(_) => {
             set_error(process, "system_limit");
             0
         }
-    };
-    process.sync_native_header();
-    answer
+    }
 }
 
 fn float_value(term: Term) -> Option<f64> {
@@ -585,7 +544,7 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
         }
         0
     };
-    let answer = match op {
+    match op {
         19 => u64::from(exact_eq(a, b)),
         20 => u64::from(!exact_eq(a, b)),
         21 => u64::from(loose_eq(a, b)),
@@ -659,7 +618,7 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
                 BifError::BADARG,
             ),
         },
-        34 => process.header.self_pid,
+        34 => process.heap.abi.self_pid,
         35 => match list_length(a).and_then(|size| Term::small(size as i64)) {
             Some(size) => raw(size),
             None => fail(process, "length", &[a], BifError::BADARG),
@@ -695,9 +654,7 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
             0
         }
         _ => 0,
-    };
-    process.sync_native_header();
-    answer
+    }
 }
 
 /// Guard helper op flag: the instruction has a failure label.
@@ -707,8 +664,8 @@ pub const QUIET_GUARD: u32 = 0x100;
 fn set_light_error(process: &mut Process, error: &BifError) {
     match error {
         BifError::Error(reason) => {
-            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
-            process.header.exc.fvalue = raw(*reason);
+            process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.heap.abi.exc.fvalue = raw(*reason);
         }
         BifError::SystemLimit => set_error(process, "system_limit"),
         BifError::Badarith => set_error(process, "badarith"),
@@ -791,17 +748,8 @@ pub unsafe extern "C" fn arinsal_beamasm_gc(
     let process = unsafe { &mut *header.cast::<Process>() };
     // SAFETY: The scheduler register pointer is live for the current native call.
     let registers = unsafe { &mut *registers };
-    // emit_enter_runtime just stored the live HTOP and E into the header. The
-    // heap indices still describe the last runtime exit, so a collection that
-    // trusted them would treat the stack as empty and sync that cursor back.
-    process.heap.set_native_cursors_at(
-        process.header.heap,
-        process.header.htop,
-        process.header.stop,
-    );
     if collect_native(process, registers, need_words, live).is_err() {
         set_error(process, "system_limit");
     }
-    process.sync_native_header();
     0
 }
