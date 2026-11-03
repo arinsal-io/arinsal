@@ -19,6 +19,7 @@ pub mod message;
 mod ops;
 mod owned;
 pub mod ptab;
+mod raw;
 mod record;
 mod record_table;
 mod region;

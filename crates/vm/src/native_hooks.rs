@@ -81,6 +81,17 @@ pub(crate) fn enter_runtime<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let process = process_from_header(header)?;
+    // erts spills `c_p->mbuf` as the BIF starts (`live_hf_end`); every native helper enters here.
+    process.heap.note_bif_entry();
+    scheduler_registers(process)
+}
+
+/// [`enter_runtime`] for the collection that follows a BIF: it must not take a new
+/// `live_hf_end`, the one spilled before the BIF is still the one that counts.
+pub(crate) fn enter_runtime_after_bif<'a>(
+    header: *mut ProcessHeader,
+) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+    let process = process_from_header(header)?;
     scheduler_registers(process)
 }
 

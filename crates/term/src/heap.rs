@@ -1606,6 +1606,14 @@ pub struct ProcessHeap {
     pub(crate) fragment_words: u32,
     /// `F_DISABLE_GC` inverted: collection may run after a BIF (`Process.gc_enabled`).
     pub gc_enabled: bool,
+    /// Whether the next collection is the epilogue of a BIF call that decided to collect
+    /// (`erts_gc_after_bif_call_lhf` with a valid `live_hf_end`).
+    live_frags_armed: std::cell::Cell<bool>,
+    /// Length of `fragments` when the last BIF epilogue found no collection due: every fragment
+    /// from this index on was allocated by the BIF that follows (erts `live_hf_end`).
+    live_frag_mark: std::cell::Cell<u32>,
+    /// Whether `live_frag_mark` was taken at the entry of the BIF whose epilogue collects.
+    live_frag_valid: std::cell::Cell<bool>,
 }
 
 /// Word kinds found while walking the live Erlang stack.
@@ -1822,6 +1830,9 @@ impl ProcessHeap {
             fragments: Vec::new(),
             fragment_words: 0,
             gc_enabled: true,
+            live_frags_armed: std::cell::Cell::new(false),
+            live_frag_mark: std::cell::Cell::new(0),
+            live_frag_valid: std::cell::Cell::new(false),
             owners: LazyOwners::default(),
         }
     }
@@ -2596,7 +2607,33 @@ impl ProcessHeap {
     // that trips both is collected once.
     #[inline(always)]
     pub fn gc_after_bif_desired(&self) -> bool {
-        self.gc_enabled & (self.gc_desired() | self.bin_vheap_gc_due())
+        let desired = self.gc_enabled & (self.gc_desired() | self.bin_vheap_gc_due());
+        if desired {
+            self.live_frags_armed.set(true);
+        } else {
+            self.live_frag_valid.set(false);
+        }
+        desired
+    }
+
+    /// Record the fragment list as a BIF starts: the fragments added after this point are
+    /// the BIF's and completely live when its epilogue collects.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:385 (`mbuf` spilled in
+    // `emit_call_light_bif_shared`), OTP-29.1.1.
+    #[inline(always)]
+    pub fn note_bif_entry(&self) {
+        self.live_frag_mark.set(self.fragments.len() as u32);
+        self.live_frag_valid.set(true);
+    }
+
+    /// The fragment index from which a collection started by a BIF epilogue may treat the
+    /// fragments as completely live (erts `live_hf_end`), consumed by the collection.
+    // Port of erts/emulator/beam/erl_gc.c (`erts_gc_after_bif_call_lhf`), OTP-29.1.1.
+    pub(crate) fn take_live_frags_from(&self) -> Option<usize> {
+        let armed = self.live_frags_armed.replace(false);
+        let valid = self.live_frag_valid.replace(false);
+        let mark = self.live_frag_mark.replace(0) as usize;
+        (armed && valid && mark <= self.fragments.len()).then_some(mark)
     }
 
     fn reservation_words_mut(
