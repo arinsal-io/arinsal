@@ -10,18 +10,16 @@
 
 use super::{Event, Incoming, Process, SignalMessage, Task};
 use crate::ptab_slot::Progress;
-use arinsal_alloc::instances::InstanceAllocation;
-use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_at, fix_free_at};
+use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_payload_at, fix_free_payload_at};
 use std::any::TypeId;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
-/// The fix_alloc block of one process: `common.refc`, the allocator handle that frees the
-/// block, and the process.
+/// The fix_alloc block of one process: `common.refc`, its owner instance, and the process.
 struct ProcessBlock<T: Task> {
     refc: AtomicUsize,
-    handle: InstanceAllocation,
+    owner_ix: usize,
     process: Process<T>,
 }
 
@@ -54,7 +52,7 @@ impl<T: Task> ProcRef<T> {
             "allocator blocks are word aligned"
         );
         let ix = arinsal_alloc::thread_alloc_ix();
-        let (handle, payload) = fix_alloc_at(
+        let payload = fix_alloc_payload_at(
             ix,
             ErtsAlcType::PROC,
             std::mem::size_of::<ProcessBlock<T>>(),
@@ -64,7 +62,12 @@ impl<T: Task> ProcRef<T> {
         let context = match prepare() {
             Some(context) => context,
             None => {
-                let _ = fix_free_at(ix, ErtsAlcType::PROC, handle);
+                let _ = fix_free_payload_at(
+                    ix,
+                    ErtsAlcType::PROC,
+                    payload,
+                    std::mem::size_of::<ProcessBlock<T>>(),
+                );
                 return None;
             }
         };
@@ -76,7 +79,7 @@ impl<T: Task> ProcRef<T> {
         let result = unsafe {
             let raw = block.as_ptr();
             (&raw mut (*raw).refc).write(AtomicUsize::new(1));
-            (&raw mut (*raw).handle).write(handle);
+            (&raw mut (*raw).owner_ix).write(ix);
             (&raw mut (*raw).process).write(build(&context));
             init(&mut (*raw).process, &context)
         };
@@ -175,11 +178,16 @@ impl<T: Task> Drop for ProcRef<T> {
             return;
         }
         fence(Ordering::Acquire);
-        let handle = self.block().handle;
+        let owner_ix = self.block().owner_ix;
         // SAFETY: the count reached zero, so this was the last reference: no other thread can
         // reach the block, and the process is dropped exactly once before its block is freed.
         unsafe { std::ptr::drop_in_place(&raw mut (*self.block.as_ptr()).process) };
-        let _ = fix_free_at(arinsal_alloc::thread_alloc_ix(), ErtsAlcType::PROC, handle);
+        let _ = fix_free_payload_at(
+            owner_ix,
+            ErtsAlcType::PROC,
+            self.block.as_ptr().cast::<u64>(),
+            std::mem::size_of::<ProcessBlock<T>>(),
+        );
     }
 }
 

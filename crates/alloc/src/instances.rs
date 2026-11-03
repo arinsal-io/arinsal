@@ -161,7 +161,7 @@ struct Instance {
 }
 
 /// Number of fixed-size allocation types (`ERTS_ALC_NO_FIXED_SIZES`) the port knows.
-pub const FIX_TYPES: usize = 2;
+pub const FIX_TYPES: usize = 4;
 
 /// Longest free list of one fixed-size type.
 ///
@@ -177,7 +177,9 @@ const FIX_MAX_LIST_SIZE: usize = 1000;
 struct FixList {
     /// `type_size`: zero until the type is first allocated.
     type_size: usize,
-    list: Vec<Allocation>,
+    /// Intrusive `fix->list` head, linked through the first payload word.
+    list: usize,
+    list_size: usize,
     min_list_size: usize,
     /// `u.cpool.shrink_list`: blocks still to give back to the carriers.
     shrink_list: usize,
@@ -375,6 +377,7 @@ pub struct ThreadSpecificAllocators {
     /// Cross-thread frees and carriers sent home. Lock-free so no foreign thread takes the owner's mutex.
     /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
     delayed: Vec<SegQueue<Delayed>>,
+    delayed_count: Vec<AtomicUsize>,
     shared: Vec<Shared>,
     /// Owner of blocks whose carrier left the instance named in their handle, by block address.
     routes: Mutex<HashMap<u64, AllocationRoute>>,
@@ -485,6 +488,7 @@ impl ThreadSpecificAllocators {
                 .collect(),
             shared,
             delayed: (0..count).map(|_| SegQueue::new()).collect(),
+            delayed_count: (0..count).map(|_| AtomicUsize::new(0)).collect(),
             routes: Mutex::new(HashMap::default()),
             routed: AtomicUsize::new(0),
             carrier_pool: Mutex::new(Vec::new()),
@@ -533,8 +537,8 @@ impl ThreadSpecificAllocators {
         let instance = self.instance_for(ix);
         debug_assert_eq!(instance, self.current_instance());
         let mut state = self.lock_instance(instance);
-        if !self.delayed[instance].is_empty() {
-            self.drain_and_publish(instance, &mut state)?;
+        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+            self.drain_delayed_and_publish(instance, &mut state)?;
         }
         debug_assert!(!state.allocator.has_pending_carriers());
         if self.pooled.load(Ordering::Acquire) != 0 && state.allocator.needs_carrier(size)? {
@@ -658,7 +662,7 @@ impl ThreadSpecificAllocators {
                 // Port of erl_alloc_util.c:6225-6230 (erts_alcu_free_thr_pref), OTP-29.1.1:
                 // a block freed by another scheduler is queued on the owning instance
                 // without taking that instance's mutex.
-                self.delayed[instance].push(Delayed::Block(handle, allocation));
+                self.enqueue_delayed(instance, Delayed::Block(handle, allocation));
                 return Ok(());
             }
             let mut state = self.lock_instance(instance);
@@ -882,8 +886,8 @@ impl ThreadSpecificAllocators {
         let instance = self.instance_for(ix);
         debug_assert_eq!(instance, self.current_instance());
         let mut state = self.lock_instance(instance);
-        if !self.delayed[instance].is_empty() {
-            self.drain_and_publish(instance, &mut state)?;
+        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+            self.drain_delayed_and_publish(instance, &mut state)?;
         }
         let fix = state
             .fix
@@ -895,8 +899,8 @@ impl ThreadSpecificAllocators {
         // erts fixes the size of each type at boot. A process that hosts schedulers of several
         // task types allocates the other sizes outside the list.
         let listed = fix.type_size == size;
-        if listed && let Some(allocation) = fix.list.pop() {
-            fix.min_list_size = fix.min_list_size.min(fix.list.len());
+        if listed && let Some(allocation) = fix_list_pop(fix) {
+            fix.min_list_size = fix.min_list_size.min(fix.list_size);
             fix.used += 1;
             fix_check_shrink(&mut state, fix_ix)?;
             return Ok((
@@ -926,6 +930,102 @@ impl ThreadSpecificAllocators {
         ))
     }
 
+    /// Allocates a fixed-size payload for its owner without constructing a routed block handle.
+    #[inline(always)]
+    pub fn fix_alloc_payload_at(
+        &self,
+        ix: usize,
+        fix_ix: usize,
+        size: usize,
+    ) -> Result<*mut u64, AllocError> {
+        let instance = self.instance_for(ix);
+        debug_assert_eq!(instance, self.current_instance());
+        let mut state = self.lock_instance(instance);
+        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+            self.drain_and_publish(instance, &mut state)?;
+        }
+        let fix = state
+            .fix
+            .get_mut(fix_ix)
+            .ok_or(AllocError::InvalidAllocation)?;
+        if fix.type_size == 0 {
+            fix.type_size = size;
+        }
+        let listed = fix.type_size == size;
+        if listed && fix.list != 0 {
+            let payload = fix_list_pop_payload(fix).expect("nonempty fix list");
+            fix.min_list_size = fix.min_list_size.min(fix.list_size);
+            fix.used += 1;
+            fix_check_shrink(&mut state, fix_ix)?;
+            return Ok(payload as *mut u64);
+        }
+        if self.pooled.load(Ordering::Acquire) != 0 && state.allocator.needs_carrier(size)? {
+            self.fetch_for_size(instance, &mut state, size)?;
+        }
+        let allocation = state.allocator.alloc(size)?;
+        let payload = state.allocator.payload_address(allocation);
+        if listed {
+            let fix = &mut state.fix[fix_ix];
+            fix.used += 1;
+            fix.allocated += 1;
+        }
+        Ok(payload)
+    }
+
+    /// Frees an owner-local payload through the intrusive fix list; foreign owners use routing.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    pub(crate) fn fix_free_payload_at(
+        &self,
+        owner_ix: usize,
+        fix_ix: usize,
+        payload: *mut u64,
+        size: usize,
+    ) -> Result<(), AllocError> {
+        let owner = self.instance_for(owner_ix);
+        let current = self.instance_for(thread_alloc_ix());
+        debug_assert_eq!(current, self.current_instance());
+        if current != owner {
+            let (instance, id, size) = crate::alloc_util::used_block_from_payload(payload as usize);
+            return self.fix_free_at(
+                thread_alloc_ix(),
+                fix_ix,
+                InstanceAllocation::from_parts(instance, id, size),
+            );
+        }
+        let mut state = self.lock_instance(owner);
+        if self.delayed_count[owner].load(Ordering::Relaxed) != 0 {
+            self.drain_delayed_and_publish(owner, &mut state)?;
+        }
+        let fix = state
+            .fix
+            .get_mut(fix_ix)
+            .ok_or(AllocError::InvalidAllocation)?;
+        if fix.type_size == 0 {
+            return Err(AllocError::InvalidAllocation);
+        }
+        if fix.type_size != size {
+            state
+                .allocator
+                .free(Allocation::from_payload(payload, size))?;
+            self.publish_transfers(owner, &mut state)?;
+            return Ok(());
+        }
+        fix.used = fix.used.saturating_sub(1);
+        if fix.shrink_list == 0 && fix.list_size < FIX_MAX_LIST_SIZE {
+            // SAFETY: this owner holds the live, word-aligned fixed-size payload exclusively.
+            unsafe { payload.write(fix.list as u64) };
+            fix.list = payload as usize;
+            fix.list_size += 1;
+            return Ok(());
+        }
+        let allocation = Allocation::from_payload(payload, size);
+        fix.allocated = fix.allocated.saturating_sub(1);
+        state.allocator.free(allocation)?;
+        fix_check_shrink(&mut state, fix_ix)?;
+        self.publish_transfers(owner, &mut state)
+    }
+
     /// Frees a block of fixed-size type `fix_ix` from the thread with allocator index `ix`: the
     /// owning instance puts it on its free list, another thread queues it for the owner.
     ///
@@ -942,7 +1042,8 @@ impl ThreadSpecificAllocators {
         loop {
             let (instance, allocation) = self.route(handle)?;
             if current != instance {
-                self.delayed[instance].push(Delayed::Fix(fix_ix, handle, allocation));
+                self.enqueue_delayed(instance, Delayed::Fix(fix_ix, handle, allocation));
+                self.schedule_owner_work(instance);
                 return Ok(());
             }
             let mut state = self.lock_instance(instance);
@@ -1082,11 +1183,27 @@ impl ThreadSpecificAllocators {
     /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
     #[inline(always)]
     fn drain_and_publish(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
-        if !self.delayed[instance].is_empty() {
-            let (_, drained) = self.drain_locked(instance, state)?;
-            self.clear_routes(drained);
+        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+            self.drain_delayed_and_publish(instance, state)?;
         }
         self.publish_transfers(instance, state)
+    }
+
+    #[inline(always)]
+    fn drain_delayed_and_publish(
+        &self,
+        instance: usize,
+        state: &mut Instance,
+    ) -> Result<(), AllocError> {
+        let (_, drained) = self.drain_locked(instance, state)?;
+        self.clear_routes(drained);
+        self.publish_transfers(instance, state)
+    }
+
+    #[inline(always)]
+    fn enqueue_delayed(&self, instance: usize, item: Delayed) {
+        self.delayed_count[instance].fetch_add(1, Ordering::Relaxed);
+        self.delayed[instance].push(item);
     }
 
     /// The instance that owns `handle`'s block now, and the block's allocation there.
@@ -1441,7 +1558,7 @@ impl ThreadSpecificAllocators {
                     .lock()
                     .expect("homecoming lock poisoned")
                     .push(HomecomingCarrier { id, transfer });
-                self.delayed[origin].push(Delayed::Homecoming(id));
+                self.enqueue_delayed(origin, Delayed::Homecoming(id));
                 sent_home.push(origin);
             }
         }
@@ -1481,22 +1598,23 @@ impl ThreadSpecificAllocators {
         while handled < limit
             && let Some(item) = queue.pop()
         {
+            self.delayed_count[instance].fetch_sub(1, Ordering::Relaxed);
             handled += 1;
             match item {
                 Delayed::Block(handle, allocation) => {
                     let allocation = match self.resolve_owned(instance, state, handle, allocation) {
                         Ok(Resolved::Owned(allocation)) => allocation,
                         Ok(Resolved::Elsewhere(owner, allocation)) => {
-                            self.delayed[owner].push(Delayed::Block(handle, allocation));
+                            self.enqueue_delayed(owner, Delayed::Block(handle, allocation));
                             continue;
                         }
                         Err(error) => {
-                            queue.push(Delayed::Block(handle, allocation));
+                            self.enqueue_delayed(instance, Delayed::Block(handle, allocation));
                             return Err(error);
                         }
                     };
                     if let Err(error) = state.allocator.free(allocation) {
-                        queue.push(Delayed::Block(handle, allocation));
+                        self.enqueue_delayed(instance, Delayed::Block(handle, allocation));
                         return Err(error);
                     }
                     freed += 1;
@@ -1508,16 +1626,19 @@ impl ThreadSpecificAllocators {
                     let allocation = match self.resolve_owned(instance, state, handle, allocation) {
                         Ok(Resolved::Owned(allocation)) => allocation,
                         Ok(Resolved::Elsewhere(owner, allocation)) => {
-                            self.delayed[owner].push(Delayed::Fix(fix_ix, handle, allocation));
+                            self.enqueue_delayed(owner, Delayed::Fix(fix_ix, handle, allocation));
                             continue;
                         }
                         Err(error) => {
-                            queue.push(Delayed::Fix(fix_ix, handle, allocation));
+                            self.enqueue_delayed(
+                                instance,
+                                Delayed::Fix(fix_ix, handle, allocation),
+                            );
                             return Err(error);
                         }
                     };
                     if let Err(error) = fix_free_owned(state, fix_ix, allocation) {
-                        queue.push(Delayed::Fix(fix_ix, handle, allocation));
+                        self.enqueue_delayed(instance, Delayed::Fix(fix_ix, handle, allocation));
                         return Err(error);
                     }
                     freed += 1;
@@ -1527,7 +1648,7 @@ impl ThreadSpecificAllocators {
                 }
                 Delayed::Homecoming(id) => {
                     if let Err(error) = self.import_homecoming(instance, state, id) {
-                        queue.push(Delayed::Homecoming(id));
+                        self.enqueue_delayed(instance, Delayed::Homecoming(id));
                         return Err(error);
                     }
                 }
@@ -1554,8 +1675,8 @@ fn fix_free_owned(
         return state.allocator.free(allocation);
     }
     fix.used = fix.used.saturating_sub(1);
-    if fix.shrink_list == 0 && fix.list.len() < FIX_MAX_LIST_SIZE {
-        fix.list.push(allocation);
+    if fix.shrink_list == 0 && fix.list_size < FIX_MAX_LIST_SIZE {
+        fix_list_push(fix, allocation);
         return Ok(());
     }
     fix.allocated = fix.allocated.saturating_sub(1);
@@ -1571,14 +1692,45 @@ fn fix_check_shrink(state: &mut Instance, fix_ix: usize) -> Result<(), AllocErro
     if fix.shrink_list == 0 {
         return Ok(());
     }
-    let Some(allocation) = fix.list.pop() else {
+    let Some(allocation) = fix_list_pop(fix) else {
         fix.shrink_list = 0;
         return Ok(());
     };
     fix.shrink_list -= 1;
-    fix.min_list_size = fix.min_list_size.min(fix.list.len());
+    fix.min_list_size = fix.min_list_size.min(fix.list_size);
     fix.allocated = fix.allocated.saturating_sub(1);
     state.allocator.free(allocation)
+}
+
+/// Links a fixed-size block through the first payload word, as `fix_cpool_free` does.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn fix_list_push(fix: &mut FixList, allocation: Allocation) {
+    let payload = allocation.payload_address();
+    // SAFETY: the live fixed-size payload is word aligned and has room for the link word.
+    unsafe { (payload as *mut u64).write(fix.list as u64) };
+    fix.list = payload;
+    fix.list_size += 1;
+}
+
+/// Pops the intrusive head and rebuilds allocator identity from its block header.
+#[inline(always)]
+fn fix_list_pop(fix: &mut FixList) -> Option<Allocation> {
+    let payload = fix_list_pop_payload(fix)?;
+    Some(Allocation::from_payload(payload as *mut u64, fix.type_size))
+}
+
+#[inline(always)]
+#[allow(unsafe_code)]
+fn fix_list_pop_payload(fix: &mut FixList) -> Option<usize> {
+    let payload = fix.list;
+    if payload == 0 {
+        return None;
+    }
+    // SAFETY: the list head names a live, word-aligned payload whose first word is its next link.
+    fix.list = unsafe { (payload as *const u64).read() as usize };
+    fix.list_size -= 1;
+    Some(payload)
 }
 
 /// Most blocks one shrink pass gives back per list.
@@ -1606,7 +1758,7 @@ fn fix_shrink_owned(state: &mut Instance, lower_limit: bool) -> Result<FixShrink
             let fix = &mut state.fix[fix_ix];
             if lower_limit {
                 fix.shrink_list = fix.min_list_size;
-                fix.min_list_size = fix.list.len();
+                fix.min_list_size = fix.list_size;
             }
         }
         for _ in 0..FIX_MAX_SHRINK_OPS {
@@ -1614,7 +1766,7 @@ fn fix_shrink_owned(state: &mut Instance, lower_limit: bool) -> Result<FixShrink
             if fix.shrink_list == 0 {
                 break;
             }
-            let Some(allocation) = fix.list.pop() else {
+            let Some(allocation) = fix_list_pop(fix) else {
                 fix.shrink_list = 0;
                 break;
             };
@@ -1623,8 +1775,8 @@ fn fix_shrink_owned(state: &mut Instance, lower_limit: bool) -> Result<FixShrink
             state.allocator.free(allocation)?;
         }
         let fix = &mut state.fix[fix_ix];
-        fix.min_list_size = fix.min_list_size.min(fix.list.len());
-        if !fix.list.is_empty() {
+        fix.min_list_size = fix.min_list_size.min(fix.list_size);
+        if fix.list_size != 0 {
             result.dealloc |= fix.shrink_list > 0;
             result.listed = true;
         }
@@ -1788,8 +1940,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing: cargo test --release -p arinsal-alloc cross_thread_cycle_bench -- --ignored --nocapture"]
-    fn cross_thread_cycle_bench() {
+    #[ignore = "timing: cargo test --release -p arinsal-alloc cross_thread_handle_bench -- --ignored --nocapture"]
+    fn cross_thread_handle_bench() {
         // The signal node pattern: one scheduler allocates a batch, another frees it. Reports the
         // allocating side (which also drains the frees queued for it) and the freeing side apart.
         let _serial = registration();
@@ -1843,6 +1995,86 @@ mod tests {
                 if fixed { "fix list" } else { "general" }
             );
         }
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc same_thread_fix_cycle_bench -- --ignored --nocapture"]
+    fn same_thread_fix_cycle_bench() {
+        let _serial = registration();
+        let allocators = four_instances();
+        thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            for _ in 0..10_000 {
+                let payload = allocators.fix_alloc_payload_at(1, 0, 80).unwrap();
+                allocators.fix_free_payload_at(1, 0, payload, 80).unwrap();
+            }
+            let cycles = 10_000_000usize;
+            let started = std::time::Instant::now();
+            for index in 0..cycles {
+                let payload = allocators.fix_alloc_payload_at(1, 0, 80).unwrap();
+                std::hint::black_box(payload);
+                allocators.fix_free_payload_at(1, 0, payload, 80).unwrap();
+                std::hint::black_box(index);
+            }
+            let work = started.elapsed().as_secs_f64() * 1e9;
+            let started = std::time::Instant::now();
+            for index in 0..cycles {
+                std::hint::black_box(index);
+            }
+            let empty = started.elapsed().as_secs_f64() * 1e9;
+            eprintln!(
+                "fix alloc+free: {:.2} ns/pair",
+                (work - empty) / cycles as f64
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc cross_thread_cycle_bench -- --ignored --nocapture"]
+    fn cross_thread_cycle_bench() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<usize>>();
+        let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
+        let producer = Arc::clone(&allocators);
+        let consumer = Arc::clone(&allocators);
+        let (rounds, batch) = (2_000usize, 200usize);
+        let allocating = thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..rounds {
+                let started = std::time::Instant::now();
+                let payloads = (0..batch)
+                    .map(|_| producer.fix_alloc_payload_at(1, 0, 80).unwrap() as usize)
+                    .collect();
+                total += started.elapsed();
+                tx.send(payloads).unwrap();
+                back_rx.recv().unwrap();
+            }
+            total.as_secs_f64() * 1e9 / (rounds * batch) as f64
+        });
+        let freeing = thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(2)), Ok(2));
+            let mut total = std::time::Duration::ZERO;
+            for payloads in rx {
+                let started = std::time::Instant::now();
+                for payload in payloads {
+                    consumer
+                        .fix_free_payload_at(1, 0, payload as *mut u64, 80)
+                        .unwrap();
+                }
+                total += started.elapsed();
+                back_tx.send(()).unwrap();
+            }
+            total.as_secs_f64() * 1e9 / (rounds * batch) as f64
+        });
+        eprintln!(
+            "cross-thread fix: alloc {:.2} ns/block, free {:.2} ns/block",
+            allocating.join().unwrap(),
+            freeing.join().unwrap()
+        );
     }
 
     #[test]
@@ -2483,10 +2715,11 @@ mod tests {
         let mut sites = Vec::new();
         let mut current = "";
         for line in production.lines() {
+            let line = line.trim_start();
             if let Some(rest) = line
-                .trim_start()
                 .strip_prefix("pub fn ")
-                .or_else(|| line.trim_start().strip_prefix("fn "))
+                .or_else(|| line.strip_prefix("pub(crate) fn "))
+                .or_else(|| line.strip_prefix("fn "))
             {
                 current = rest.split(['(', '<']).next().unwrap();
             }
@@ -2497,7 +2730,7 @@ mod tests {
                 sites.push("unowned");
             }
         }
-        assert_eq!(
+        similar_asserts::assert_eq!(
             sites,
             [
                 "alloc_with_ptr_at",
@@ -2510,6 +2743,8 @@ mod tests {
                 "unowned",
                 "unowned",
                 "fix_alloc_with_ptr_at",
+                "fix_alloc_payload_at",
+                "fix_free_payload_at",
                 "fix_free_at",
                 "fix_shrink_at",
             ]

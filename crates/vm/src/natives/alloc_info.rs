@@ -288,7 +288,7 @@ fn instance_sizes_owned(
     owned_list(sections)
 }
 
-/// The `fix_types` entry for process blocks, message references, and the BIF timer.
+/// The `fix_types` entry for process blocks, monitor data, message references, and the BIF timer.
 // Port of erts/emulator/beam/erl_alloc_util.c:4897 (`sz_info_fix`) and erl_alloc.c:2464
 // (`add_fix_values` for MSG_REF), OTP-29.1.1.
 fn fix_types_owned(instance: usize, timer_count: u64) -> OwnedTerm {
@@ -301,6 +301,9 @@ fn fix_types_owned(instance: usize, timer_count: u64) -> OwnedTerm {
     let (allocated, used) =
         arinsal_alloc::typed::fix_bytes(arinsal_alloc::typed::ErtsAlcType::PROC, instance)
             .unwrap_or((0, 0));
+    let (monitor_allocated, monitor_used) =
+        arinsal_alloc::typed::fix_bytes(arinsal_alloc::typed::ErtsAlcType::MONITOR, instance)
+            .unwrap_or((0, 0));
     let (msg_ref_allocated, msg_ref_used) =
         arinsal_alloc::typed::fix_bytes(arinsal_alloc::typed::ErtsAlcType::MSG_REF, instance)
             .unwrap_or((0, 0));
@@ -309,6 +312,11 @@ fn fix_types_owned(instance: usize, timer_count: u64) -> OwnedTerm {
             OwnedTerm::Atom("proc".into()),
             OwnedTerm::Int(allocated as i64),
             OwnedTerm::Int(used as i64),
+        ]),
+        owned_tuple(vec![
+            OwnedTerm::Atom("monitor".into()),
+            OwnedTerm::Int(monitor_allocated as i64),
+            OwnedTerm::Int(monitor_used as i64),
         ]),
         owned_tuple(vec![
             OwnedTerm::Atom("msg_ref".into()),

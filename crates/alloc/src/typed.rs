@@ -21,7 +21,7 @@ impl std::fmt::Debug for ErtsAlcType {
 
 /// Name and serving allocator (index in `ALLOCATOR_NAMES`, mapped like erl_alloc.types) of each
 /// type, indexed by the type number.
-const ALC_TYPES: [(&str, u8); 21] = [
+const ALC_TYPES: [(&str, u8); 23] = [
     ("HEAP", 4),
     ("OLD_HEAP", 4),
     ("HEAP_FRAG", 4),
@@ -43,6 +43,8 @@ const ALC_TYPES: [(&str, u8); 21] = [
     ("TMP", 0),
     ("PROC", 6),
     ("PRE_ALLOC_DATA", 3),
+    ("MONITOR", 6),
+    ("BIF_TIMER", 6),
 ];
 
 impl ErtsAlcType {
@@ -88,6 +90,10 @@ impl ErtsAlcType {
     pub const PROC: Self = Self(19);
     /// Permanent preallocation data (`ERTS_ALC_T_PRE_ALLOC_DATA`).
     pub const PRE_ALLOC_DATA: Self = Self(20);
+    /// Process monitor data (`ERTS_ALC_T_MONITOR`), a fixed-size type of fix_alloc.
+    pub const MONITOR: Self = Self(21);
+    /// BIF timer data (`ERTS_ALC_T_BIF_TIMER`), a fixed-size type of fix_alloc.
+    pub const BIF_TIMER: Self = Self(22);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {
@@ -100,6 +106,8 @@ impl ErtsAlcType {
         match self.0 {
             19 => Some(0),
             8 => Some(1),
+            21 => Some(2),
+            22 => Some(3),
             _ => None,
         }
     }
@@ -129,6 +137,484 @@ pub struct BinaryBlock {
 
 /// One ERTS message reference node from the scheduler-specific preallocator or MSG_REF fix_alloc.
 pub struct MessageRefBlock(std::ptr::NonNull<u8>);
+
+/// A fixed-size allocator object with a shared reference count stored in its payload.
+///
+/// The payload's reference count is the `refc` field used by erts objects whose lifetime crosses
+/// process and signal ownership, such as `ErtsMonitorData`.
+pub struct FixAllocArc<T: FixAllocRefCount> {
+    pointer: std::ptr::NonNull<T>,
+}
+
+/// A type-erased [`FixAllocArc`] that keeps the same allocation and reference count.
+pub struct ErasedFixAllocArc {
+    pointer: std::ptr::NonNull<()>,
+    vtable: unsafe fn(std::ptr::NonNull<()>, FixAllocArcOp) -> *const (),
+}
+
+/// A uniquely owned value allocated through a fixed-size ERTS allocation type.
+pub struct FixAllocBox<T, const TYPE: u8 = 19> {
+    pointer: std::ptr::NonNull<T>,
+    owner_ix: usize,
+}
+
+// SAFETY: the box uniquely owns T; sending it transfers that ownership, and allocator freeing
+// follows the stored block handle when the destination thread drops it.
+#[allow(unsafe_code)]
+unsafe impl<T: Send, const TYPE: u8> Send for FixAllocBox<T, TYPE> {}
+
+enum FixAllocArcOp {
+    Clone,
+    Drop,
+    Is(std::any::TypeId),
+}
+
+#[allow(unsafe_code)]
+unsafe fn erase_vtable<T: FixAllocRefCount + Send + Sync + 'static>(
+    pointer: std::ptr::NonNull<()>,
+    operation: FixAllocArcOp,
+) -> *const () {
+    match operation {
+        FixAllocArcOp::Clone => {
+            // SAFETY: this function pointer is monomorphized for T and the owner keeps it live.
+            unsafe { pointer.cast::<T>().as_ref() }
+                .reference_count()
+                .fetch_add(1, Ordering::Relaxed);
+            std::ptr::null()
+        }
+        FixAllocArcOp::Drop => {
+            // SAFETY: the erased owner carries one live reference allocated for T.
+            drop(unsafe { FixAllocArc::<T>::from_raw(pointer.cast()) });
+            std::ptr::null()
+        }
+        FixAllocArcOp::Is(type_id) => {
+            if type_id == std::any::TypeId::of::<T>() {
+                pointer.as_ptr()
+            } else {
+                std::ptr::null()
+            }
+        }
+    }
+}
+
+// SAFETY: this handle owns one reference to T; its atomic count governs access and freeing.
+#[allow(unsafe_code)]
+unsafe impl<T: FixAllocRefCount + Send + Sync> Send for FixAllocArc<T> {}
+// SAFETY: this handle owns one reference to T; T's shared state is accessed through atomics.
+#[allow(unsafe_code)]
+unsafe impl<T: FixAllocRefCount + Send + Sync> Sync for FixAllocArc<T> {}
+// SAFETY: erased owners are constructed only from `Send + Sync` fixed owners; their vtables
+// preserve that type's atomic reference count and allocator route.
+#[allow(unsafe_code)]
+unsafe impl Send for ErasedFixAllocArc {}
+// SAFETY: as above; erased access uses only the vtable operations for the original `Send + Sync` T.
+#[allow(unsafe_code)]
+unsafe impl Sync for ErasedFixAllocArc {}
+
+/// Reference count access for an object owned by [`FixAllocArc`].
+pub trait FixAllocRefCount {
+    /// The fix_alloc allocator type that owns the object.
+    const ALLOCATION_TYPE: ErtsAlcType;
+
+    /// The in-payload reference count used by this owner.
+    fn reference_count(&self) -> &std::sync::atomic::AtomicU32;
+}
+
+#[allow(unsafe_code)]
+impl<T: FixAllocRefCount> FixAllocArc<T> {
+    /// Allocates one fixed-size object with one owning reference.
+    pub fn new(value: T) -> Result<Self, AllocError> {
+        Self::allocate(value, 1)
+    }
+
+    fn allocate(value: T, references: u32) -> Result<Self, AllocError> {
+        let ix = crate::instances::thread_alloc_ix();
+        let size = std::mem::size_of::<T>();
+        if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
+            return Err(AllocError::OutOfBounds);
+        }
+        let payload = fix_alloc_payload_at(ix, T::ALLOCATION_TYPE, size)?;
+        let pointer =
+            std::ptr::NonNull::new(payload.cast::<T>()).ok_or(AllocError::InvalidAllocation)?;
+        // SAFETY: fix_alloc returned a live payload of `size_of::<T>()` bytes, aligned to a word;
+        // the alignment check above makes it valid storage for `T`.
+        unsafe { pointer.as_ptr().write(value) };
+        // Port of erts_monitor_link.c (erts_monitor_create initializes refc to the number of
+        // owning halves), OTP-29.1.1. SAFETY: `pointer` still names the live allocation above.
+        unsafe { pointer.as_ref() }
+            .reference_count()
+            .store(references, Ordering::Relaxed);
+        Ok(Self { pointer })
+    }
+
+    /// Allocates one fixed-size object with two owners, as `erts_monitor_create` does.
+    pub fn new_pair(value: T) -> Result<(Self, Self), AllocError> {
+        let first = Self::allocate(value, 2)?;
+        let second = Self {
+            pointer: first.pointer,
+        };
+        Ok((first, second))
+    }
+
+    /// Releases two owners of the same payload with one refcount operation.
+    // Port of erts/emulator/beam/erl_monitor_link.h (erts_monitor_release_both), OTP-29.1.1.
+    #[allow(unsafe_code)]
+    pub fn release_pair(first: Self, second: Self) {
+        assert_eq!(first.pointer, second.pointer);
+        let first = std::mem::ManuallyDrop::new(first);
+        let _second = std::mem::ManuallyDrop::new(second);
+        // SAFETY: both consumed handles own a reference to this live payload.
+        let old = unsafe { first.pointer.as_ref() }
+            .reference_count()
+            .fetch_sub(2, Ordering::AcqRel);
+        debug_assert!(old >= 2);
+        if old == 2 {
+            // SAFETY: these are the last two owners, so no reference to T remains.
+            unsafe { std::ptr::drop_in_place(first.pointer.as_ptr()) };
+            let _ = fix_free_payload_at(
+                first.owner_ix(),
+                T::ALLOCATION_TYPE,
+                first.pointer.as_ptr().cast(),
+                std::mem::size_of::<T>(),
+            );
+        }
+    }
+
+    /// Pointer to the allocated object, for embedded intrusive nodes.
+    pub fn as_ptr(&self) -> *const T {
+        self.pointer.as_ptr()
+    }
+
+    /// Consumes this reference into its raw pointer for an intrusive owner that stores the
+    /// reference in the pointed-to object's own lifetime.
+    pub fn into_raw(self) -> std::ptr::NonNull<T> {
+        let pointer = self.pointer;
+        std::mem::forget(self);
+        pointer
+    }
+
+    /// Reclaims one reference previously transferred by [`FixAllocArc::into_raw`].
+    ///
+    /// # Safety
+    /// `pointer` must be a live payload allocated for `T`, and the caller must own one transferred
+    /// reference that has not already been reclaimed.
+    #[allow(unsafe_code)]
+    pub unsafe fn from_raw(pointer: std::ptr::NonNull<T>) -> Self {
+        Self { pointer }
+    }
+
+    /// The allocator instance that owns the block, read from its carrier as erts does on free.
+    fn owner_ix(&self) -> usize {
+        crate::alloc_util::used_block_from_payload(self.pointer.as_ptr() as usize).0
+    }
+
+    /// Transfers this owner into a type-erased owner without allocating.
+    pub fn erase(self) -> ErasedFixAllocArc
+    where
+        T: Send + Sync + 'static,
+    {
+        let erased = ErasedFixAllocArc {
+            pointer: self.pointer.cast(),
+            vtable: erase_vtable::<T>,
+        };
+        std::mem::forget(self);
+        erased
+    }
+}
+
+impl<T, const TYPE: u8> FixAllocBox<T, TYPE> {
+    /// Allocates `value` through ERTS's process allocator.
+    // Inlined so a large `value` is built in the block, not moved into it.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    pub fn new(value: T) -> Result<Self, AllocError> {
+        if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
+            return Err(AllocError::OutOfBounds);
+        }
+        let owner_ix = crate::instances::thread_alloc_ix();
+        let bytes = std::mem::size_of::<T>();
+        let payload = fix_alloc_payload_at(owner_ix, ErtsAlcType(TYPE), bytes)?;
+        let pointer =
+            std::ptr::NonNull::new(payload.cast::<T>()).ok_or(AllocError::InvalidAllocation)?;
+        // SAFETY: fix_alloc returned a live word-aligned block large enough for T.
+        unsafe { pointer.as_ptr().write(value) };
+        Ok(Self { pointer, owner_ix })
+    }
+
+    /// Moves the value out and releases its fixed-size allocation.
+    #[allow(unsafe_code)]
+    pub fn into_inner(self) -> T {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` suppresses Drop; read moves out the initialized value exactly once.
+        let value = unsafe { this.pointer.as_ptr().read() };
+        let _ = fix_free_payload_at(
+            this.owner_ix,
+            ErtsAlcType(TYPE),
+            this.pointer.as_ptr().cast(),
+            std::mem::size_of::<T>(),
+        );
+        value
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> std::ops::Deref for FixAllocBox<T, TYPE> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: this unique owner keeps T initialized until Drop.
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> std::ops::DerefMut for FixAllocBox<T, TYPE> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the box is uniquely borrowed and no other reference to T exists.
+        unsafe { self.pointer.as_mut() }
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> Drop for FixAllocBox<T, TYPE> {
+    fn drop(&mut self) {
+        // SAFETY: the unique box owns the initialized value and no references survive its drop.
+        unsafe { std::ptr::drop_in_place(self.pointer.as_ptr()) };
+        let _ = fix_free_payload_at(
+            self.owner_ix,
+            ErtsAlcType(TYPE),
+            self.pointer.as_ptr().cast(),
+            std::mem::size_of::<T>(),
+        );
+    }
+}
+
+/// A uniquely owned value that is either an ordinary `Box` or a block of the fixed-size type
+/// `TYPE`, in one word: the low pointer bit says which (blocks are word aligned). The owning
+/// instance of a fixed-size block is read from its carrier when it is freed, as `FixAllocArc`
+/// does, so the handle needs no field for it.
+pub struct FixOrBox<T, const TYPE: u8> {
+    /// Bit 0 set: a fixed-size block.
+    tagged: std::ptr::NonNull<T>,
+}
+
+// SAFETY: the handle uniquely owns T like a `Box` or `FixAllocBox`.
+#[allow(unsafe_code)]
+unsafe impl<T: Send, const TYPE: u8> Send for FixOrBox<T, TYPE> {}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> FixOrBox<T, TYPE> {
+    /// An ordinary heap box.
+    #[inline(always)]
+    pub fn boxed(value: T) -> Self {
+        let pointer = Box::into_raw(Box::new(value));
+        debug_assert_eq!(pointer as usize & 1, 0);
+        Self {
+            // SAFETY: `Box::into_raw` never returns null.
+            tagged: unsafe { std::ptr::NonNull::new_unchecked(pointer) },
+        }
+    }
+
+    /// A block of the fixed-size type `TYPE`.
+    #[inline(always)]
+    pub fn fixed(value: T) -> Result<Self, AllocError> {
+        if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
+            return Err(AllocError::OutOfBounds);
+        }
+        let owner_ix = crate::instances::thread_alloc_ix();
+        let payload = fix_alloc_payload_at(owner_ix, ErtsAlcType(TYPE), std::mem::size_of::<T>())?;
+        let pointer =
+            std::ptr::NonNull::new(payload.cast::<T>()).ok_or(AllocError::InvalidAllocation)?;
+        // SAFETY: fix_alloc returned a live word-aligned block large enough for T.
+        unsafe { pointer.as_ptr().write(value) };
+        Ok(Self {
+            // SAFETY: the pointer is non-null and the tag bit is free (word alignment).
+            tagged: unsafe {
+                std::ptr::NonNull::new_unchecked((pointer.as_ptr() as usize | 1) as *mut T)
+            },
+        })
+    }
+
+    #[inline(always)]
+    fn pointer(&self) -> *mut T {
+        (self.tagged.as_ptr() as usize & !1) as *mut T
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> std::ops::Deref for FixOrBox<T, TYPE> {
+    type Target = T;
+
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        // SAFETY: this unique owner keeps T initialized until Drop.
+        unsafe { &*self.pointer() }
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> std::ops::DerefMut for FixOrBox<T, TYPE> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: the handle is uniquely borrowed.
+        unsafe { &mut *self.pointer() }
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T, const TYPE: u8> Drop for FixOrBox<T, TYPE> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let pointer = self.pointer();
+        if self.tagged.as_ptr() as usize & 1 == 0 {
+            // SAFETY: an untagged pointer came from `Box::into_raw` in `boxed`.
+            drop(unsafe { Box::from_raw(pointer) });
+            return;
+        }
+        // SAFETY: the unique owner holds an initialized value in a live fixed-size block.
+        unsafe { std::ptr::drop_in_place(pointer) };
+        let (owner_ix, _, _) = crate::alloc_util::used_block_from_payload(pointer as usize);
+        let _ = fix_free_payload_at(
+            owner_ix,
+            ErtsAlcType(TYPE),
+            pointer.cast(),
+            std::mem::size_of::<T>(),
+        );
+    }
+}
+
+#[allow(unsafe_code)]
+impl ErasedFixAllocArc {
+    /// Borrows the payload as `Any` while this owner is live.
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        // SAFETY: the vtable returns the payload pointer only when its concrete type id matches T.
+        let pointer =
+            unsafe { (self.vtable)(self.pointer, FixAllocArcOp::Is(std::any::TypeId::of::<T>())) };
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: the vtable returned this pointer only after confirming the concrete type.
+            Some(unsafe { &*pointer.cast::<T>() })
+        }
+    }
+
+    /// Reclaims the typed owner if its payload has type `T`.
+    pub fn downcast<T: FixAllocRefCount + Send + Sync + 'static>(
+        self,
+    ) -> Result<FixAllocArc<T>, Self> {
+        // SAFETY: this operation checks the type id and returns the pointer only on a match.
+        let pointer =
+            unsafe { (self.vtable)(self.pointer, FixAllocArcOp::Is(std::any::TypeId::of::<T>())) };
+        if pointer.is_null() {
+            return Err(self);
+        }
+        let pointer = self.pointer.cast::<T>();
+        std::mem::forget(self);
+        // SAFETY: the vtable type id matched T and this erased owner holds one live reference.
+        Ok(FixAllocArc { pointer })
+    }
+}
+
+#[allow(unsafe_code)]
+impl Clone for ErasedFixAllocArc {
+    fn clone(&self) -> Self {
+        // SAFETY: the vtable matches the live allocation and this owner keeps it alive.
+        unsafe { (self.vtable)(self.pointer, FixAllocArcOp::Clone) };
+        Self {
+            pointer: self.pointer,
+            vtable: self.vtable,
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+impl Drop for ErasedFixAllocArc {
+    fn drop(&mut self) {
+        // SAFETY: this owner represents one live reference to the vtable's allocation type.
+        unsafe { (self.vtable)(self.pointer, FixAllocArcOp::Drop) };
+    }
+}
+
+impl<T: FixAllocRefCount> Clone for FixAllocArc<T> {
+    fn clone(&self) -> Self {
+        let old = self
+            .as_ref()
+            .reference_count()
+            .fetch_add(1, Ordering::Relaxed);
+        debug_assert!(old > 0);
+        Self {
+            pointer: self.pointer,
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+impl<T: FixAllocRefCount> AsRef<T> for FixAllocArc<T> {
+    fn as_ref(&self) -> &T {
+        // SAFETY: each owner keeps the allocation live; shared mutation uses `T`'s interior
+        // mutability and the caller holds this owner for the returned borrow.
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl<T: FixAllocRefCount> std::ops::Deref for FixAllocArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl<T: FixAllocRefCount + std::fmt::Debug> std::fmt::Debug for FixAllocArc<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl<T: FixAllocRefCount + PartialEq> PartialEq for FixAllocArc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl<T: FixAllocRefCount + Eq> Eq for FixAllocArc<T> {}
+
+impl std::fmt::Debug for ErasedFixAllocArc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ErasedFixAllocArc")
+    }
+}
+
+impl PartialEq for ErasedFixAllocArc {
+    fn eq(&self, other: &Self) -> bool {
+        self.pointer == other.pointer
+    }
+}
+
+impl Eq for ErasedFixAllocArc {}
+
+#[allow(unsafe_code)]
+impl<T: FixAllocRefCount> Drop for FixAllocArc<T> {
+    fn drop(&mut self) {
+        if self
+            .as_ref()
+            .reference_count()
+            .fetch_sub(1, Ordering::AcqRel)
+            != 1
+        {
+            return;
+        }
+        let pointer = self.pointer.as_ptr();
+        // SAFETY: this was the final counted owner, so no references to `T` remain.
+        unsafe { std::ptr::drop_in_place(pointer) };
+        let _ = fix_free_payload_at(
+            self.owner_ix(),
+            T::ALLOCATION_TYPE,
+            pointer.cast(),
+            std::mem::size_of::<T>(),
+        );
+    }
+}
 
 impl MessageRefBlock {
     /// Wrap a live zero-fragment message node so its allocator route can be recovered on free.
@@ -863,6 +1349,35 @@ pub fn fix_alloc_at(
     allocator_for(allocation_type)?.fix_alloc_with_ptr_at(ix, fix_ix, bytes)
 }
 
+/// Allocates a fixed-size payload on the calling owner without materializing its allocation handle.
+// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_alloc), OTP-29.1.1.
+#[inline(always)]
+pub fn fix_alloc_payload_at(
+    ix: usize,
+    allocation_type: ErtsAlcType,
+    bytes: usize,
+) -> Result<*mut u64, AllocError> {
+    let fix_ix = allocation_type
+        .fix_index()
+        .ok_or(AllocError::InvalidAllocation)?;
+    allocator_for(allocation_type)?.fix_alloc_payload_at(ix, fix_ix, bytes)
+}
+
+/// Frees a payload allocated by [`fix_alloc_payload_at`], taking the intrusive owner fast path.
+// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_free), OTP-29.1.1.
+#[inline(always)]
+pub fn fix_free_payload_at(
+    owner_ix: usize,
+    allocation_type: ErtsAlcType,
+    payload: *mut u64,
+    bytes: usize,
+) -> Result<(), AllocError> {
+    let fix_ix = allocation_type
+        .fix_index()
+        .ok_or(AllocError::InvalidAllocation)?;
+    allocator_for(allocation_type)?.fix_free_payload_at(owner_ix, fix_ix, payload, bytes)
+}
+
 /// Frees a block from [`fix_alloc_at`] from the thread with allocator index `ix`.
 ///
 /// Port of erts/emulator/beam/erl_alloc.h (erts_free of a FIXED_SIZE type), OTP-29.1.1.
@@ -1224,7 +1739,56 @@ pub fn ets_allocation_bytes() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AllocBlock, ErtsAlcType};
+    use super::{AllocBlock, ErtsAlcType, FixAllocArc, FixAllocRefCount};
+    use std::sync::atomic::Ordering;
+
+    struct MonitorPayload {
+        references: std::sync::atomic::AtomicU32,
+        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FixAllocRefCount for MonitorPayload {
+        const ALLOCATION_TYPE: ErtsAlcType = ErtsAlcType::MONITOR;
+
+        fn reference_count(&self) -> &std::sync::atomic::AtomicU32 {
+            &self.references
+        }
+    }
+
+    impl Drop for MonitorPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn monitor_pair_uses_one_fixed_allocation_and_releases_after_last_owner() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (origin, target) = FixAllocArc::new_pair(MonitorPayload {
+            references: std::sync::atomic::AtomicU32::new(0),
+            drops: drops.clone(),
+        })
+        .unwrap();
+        similar_asserts::assert_eq!(origin.as_ptr(), target.as_ptr());
+        similar_asserts::assert_eq!(origin.reference_count().load(Ordering::Relaxed), 2);
+        let signal = origin.clone();
+        similar_asserts::assert_eq!(origin.reference_count().load(Ordering::Relaxed), 3);
+
+        drop(origin);
+        drop(target);
+        similar_asserts::assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(signal);
+        similar_asserts::assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        let (next_origin, next_target) = FixAllocArc::new_pair(MonitorPayload {
+            references: std::sync::atomic::AtomicU32::new(0),
+            drops: drops.clone(),
+        })
+        .unwrap();
+        similar_asserts::assert_eq!(next_origin.as_ptr(), next_target.as_ptr());
+        FixAllocArc::release_pair(next_origin, next_target);
+        similar_asserts::assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn typed_block_views_survive_reallocation() {

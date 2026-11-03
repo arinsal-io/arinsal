@@ -10,6 +10,7 @@
 //! queue that may move in memory: `last` points to the last node rather than to the last `next`
 //! field (`ErtsMessage **last`); an empty queue has no `last`.
 
+use crate::mailbox::non_message_signal;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
@@ -72,15 +73,17 @@ impl<T> SignalQueue<T> {
         self.non_messages
     }
 
+    /// The first signal. `None` when the queue is empty or its first node is lazy (a monitor
+    /// half queued as the signal itself, which has no value to lend before it is taken out).
     pub fn front(&self) -> Option<&T> {
-        // SAFETY: the queue owns its nodes; the borrow of the queue covers the node.
-        self.first.map(|node| unsafe { &(*node.as_ptr()).value })
+        // The queue owns its nodes; the borrow of the queue covers the node.
+        OwnedSignal::value_of(self.first?)
     }
 
+    /// [`SignalQueue::front`], mutably.
     pub fn front_mut(&mut self) -> Option<&mut T> {
-        // SAFETY: as in `front`, with the queue borrowed exclusively.
-        self.first
-            .map(|node| unsafe { &mut (*node.as_ptr()).value })
+        // As in `front`, with the queue borrowed exclusively.
+        OwnedSignal::value_mut_of(self.first?)
     }
 
     /// Unlink the first node.
@@ -130,7 +133,7 @@ impl<T> SignalQueue<T> {
 impl<T: InSignal> SignalQueue<T> {
     /// Link an allocated node at the end.
     pub fn push_back_node(&mut self, signal: OwnedSignal<T>) {
-        let non_message = !signal.is_message();
+        let non_message = non_message_signal(&signal);
         let node = signal.into_raw();
         match self.last {
             // SAFETY: `last` is a node this queue owns, and has no successor.
@@ -152,7 +155,7 @@ impl<T: InSignal> SignalQueue<T> {
         let node = self.pop_front_node()?;
         // SAFETY: the queue owned the node, which came from `OwnedSignal::into_raw`.
         let signal = unsafe { OwnedSignal::from_raw(node) };
-        self.non_messages -= usize::from(!signal.is_message());
+        self.non_messages -= usize::from(non_message_signal(&signal));
         Some(signal)
     }
 
@@ -290,7 +293,7 @@ impl<T: InSignal> MessageQueueList<T> {
             return;
         }
         let prev = self.prev_of(index);
-        let non_message = !signal.is_message();
+        let non_message = non_message_signal(&signal);
         let node = signal.into_raw();
         // SAFETY: `prev` and its successor are nodes of this list; `node` is unlinked.
         unsafe {
@@ -337,7 +340,7 @@ impl<T: InSignal> MessageQueueList<T> {
         self.cursor.set((index, prev));
         // SAFETY: the node was linked in this list, which owned it; it is unlinked now.
         let signal = unsafe { OwnedSignal::from_raw(node) };
-        self.queue.non_messages -= usize::from(!signal.is_message());
+        self.queue.non_messages -= usize::from(non_message_signal(&signal));
         Some(signal)
     }
 
@@ -363,11 +366,16 @@ impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<&'a T> {
-        let node = self.node?;
-        // SAFETY: the iterator borrows the queue, which owns the node.
-        let node = unsafe { &*node.as_ptr() };
-        self.node = node.next;
-        Some(&node.value)
+        // Lazy nodes have no value to lend and are skipped.
+        loop {
+            let node = self.node?;
+            // SAFETY: the iterator borrows the queue, which owns the node.
+            let (value, next) = unsafe { (OwnedSignal::value_of(node), (*node.as_ptr()).next) };
+            self.node = next;
+            if value.is_some() {
+                return value;
+            }
+        }
     }
 }
 
@@ -381,11 +389,16 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<&'a mut T> {
-        let node = self.node?;
-        // SAFETY: the iterator borrows the queue exclusively, and yields each node once.
-        let node = unsafe { &mut *node.as_ptr() };
-        self.node = node.next;
-        Some(&mut node.value)
+        // Lazy nodes have no value to lend and are skipped.
+        loop {
+            let node = self.node?;
+            // SAFETY: the iterator borrows the queue exclusively, and yields each node once.
+            let (value, next) = unsafe { (OwnedSignal::value_mut_of(node), (*node.as_ptr()).next) };
+            self.node = next;
+            if value.is_some() {
+                return value;
+            }
+        }
     }
 }
 

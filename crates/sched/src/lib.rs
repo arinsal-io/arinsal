@@ -468,7 +468,7 @@ pub enum Signal<M: SignalMessage> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_monitor), OTP-29.1.1.
     Monitor {
         reference: u64,
-        shared: std::sync::Arc<M::MonitorData>,
+        shared: arinsal_alloc::typed::FixAllocArc<M::MonitorData>,
     },
     /// Opaque monitor request, used for NIF resources without a process monitor allocation.
     MonitorOpaque {
@@ -500,7 +500,7 @@ pub enum Signal<M: SignalMessage> {
     /// Demonitor request carrying the origin half of the monitor itself, as erts queues the
     /// origin node (erl_proc_sig_queue.c, erts_proc_sig_send_demonitor): the target reaches
     /// its own half through the data both halves share.
-    DemonitorOrigin(SharedPayload),
+    DemonitorOrigin(arinsal_alloc::typed::ErasedFixAllocArc),
     /// Exit signal (`exit/2`) carrying an opaque reason envelope.
     Exit(Box<M>),
     /// Exit signal of a link: removes the receiver's link to the sender.
@@ -520,6 +520,10 @@ pub enum Signal<M: SignalMessage> {
     PortUnlink(u64),
     /// Monitor DOWN signal carrying an opaque reason envelope.
     MonitorDown { reference: u64, reason: Box<M> },
+    /// Monitor DOWN signal whose reason is an immediate term, carried by value.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:2836-2900 (erts_proc_sig_send_monitor_down),
+    // OTP-29.1.1: an immediate reason travels in the signal itself, with no allocation.
+    MonitorDownImmediate { reference: u64, reason: u64 },
     /// Monitor DOWN message the sender already built (a non-immediate reason, erl_proc_sig_queue.c:2836-2900).
     MonitorDownMsg { reference: u64, message: Box<M> },
     /// Alias activation.
@@ -599,7 +603,7 @@ pub struct Event<M: SignalMessage> {
 /// A message envelope as the signal queue sees it.
 pub trait SignalMessage: Send + 'static {
     /// The concrete shared allocation used by process monitor halves.
-    type MonitorData: Send + Sync + 'static;
+    type MonitorData: arinsal_alloc::typed::FixAllocRefCount + Send + Sync + 'static;
     /// A priority message or a message sent through an alias: erts sends it as an
     /// `ERTS_SIG_Q_OP_ALTACT_MSG` non-message signal (erl_proc_sig_queue.c, handle_altact_msg),
     /// OTP-29.1.1.
@@ -633,17 +637,29 @@ fn event_node<M: SignalMessage>(from: Pid, payload: Payload<M>) -> OwnedSignal<E
     }
 }
 
+/// Zero-content monitor data for scheduler tests and marker message types.
+pub struct EmptyMonitorData(std::sync::atomic::AtomicU32);
+
+impl arinsal_alloc::typed::FixAllocRefCount for EmptyMonitorData {
+    const ALLOCATION_TYPE: arinsal_alloc::typed::ErtsAlcType =
+        arinsal_alloc::typed::ErtsAlcType::MONITOR;
+
+    fn reference_count(&self) -> &std::sync::atomic::AtomicU32 {
+        &self.0
+    }
+}
+
 impl SignalMessage for () {
-    type MonitorData = ();
+    type MonitorData = EmptyMonitorData;
 }
 impl SignalMessage for u32 {
-    type MonitorData = ();
+    type MonitorData = EmptyMonitorData;
 }
 impl SignalMessage for u64 {
-    type MonitorData = ();
+    type MonitorData = EmptyMonitorData;
 }
 impl SignalMessage for usize {
-    type MonitorData = ();
+    type MonitorData = EmptyMonitorData;
 }
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.h (ERTS_SIG_IS_MSG: messages, including
@@ -726,30 +742,34 @@ impl From<DirtyKind> for SchedulerType {
 /// sending process is scheduled out. Port of erts `esdp->pending_signal`
 /// (erl_proc_sig_queue.c:1102-1125, erts_proc_sig_send_pending), OTP-29.1.1.
 #[derive(Clone)]
+enum PendingMonitorData {
+    Process(arinsal_alloc::typed::ErasedFixAllocArc),
+    Opaque(SharedPayload),
+}
+
+#[derive(Clone)]
 struct PendingProcMonitor {
     from: Pid,
     to: Pid,
     id: u64,
-    shared: SharedPayload,
-    opaque: bool,
+    shared: PendingMonitorData,
 }
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_pending), OTP-29.1.1.
 fn restore_held_monitor<M: SignalMessage>(held: PendingProcMonitor) -> Signal<M> {
-    if held.opaque {
-        Signal::MonitorOpaque {
+    match held.shared {
+        PendingMonitorData::Opaque(shared) => Signal::MonitorOpaque {
             reference: held.id,
-            shared: Box::new(held.shared),
-        }
-    } else {
-        let data = held
-            .shared
-            .0
-            .downcast::<M::MonitorData>()
-            .unwrap_or_else(|_| panic!("held monitor payload type changed"));
-        Signal::Monitor {
-            reference: held.id,
-            shared: data,
+            shared: Box::new(shared),
+        },
+        PendingMonitorData::Process(shared) => {
+            let data = shared
+                .downcast::<M::MonitorData>()
+                .unwrap_or_else(|_| panic!("held monitor payload type changed"));
+            Signal::Monitor {
+                reference: held.id,
+                shared: data,
+            }
         }
     }
 }
@@ -2785,6 +2805,9 @@ impl<T: Task> Inner<T> {
             }
             self.poll_timers(worker, Some(local), halting);
         }
+        if aux_work & AUX_WORK_ALLOCATOR_DD != 0 {
+            arinsal_alloc::typed::handle_owner_work(worker + 1);
+        }
         if aux_work & AUX_WORK_FUNC != 0 {
             self.handle_aux_work(worker);
         }
@@ -3896,7 +3919,8 @@ impl<T: Task> Inner<T> {
     ) -> Result<(), Error> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1560-1563, OTP-29.1.1.
         // Literal-copy requests are non-message signals and enter a shared run queue.
-        let force_enqueue = matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+        let force_enqueue = !signal.is_lazy()
+            && matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
         self.fanin_delivery(process, 1);
         self.deliver_process_node(process, signal, local, true, force_enqueue)?;
         Ok(())
@@ -3933,7 +3957,7 @@ impl<T: Task> Inner<T> {
         // an exited receiver is detected under the msgq lock, where its exit closed the queue.
         // No state load first: the closed in-queue rejects the signal, and the read-modify-write
         // that sets the in-queue bits returns the state word the wake decision works from.
-        let from = signal.from;
+        let from = node_from(&signal);
         let Ok(state) = process.input.push_routed_node(
             &self.progress_domain,
             || signal_buffer_slot(from),
@@ -3963,7 +3987,7 @@ impl<T: Task> Inner<T> {
         if process
             .input
             .push_block_routed(&self.progress_domain, events, |event| {
-                signal_buffer_slot(event.from)
+                signal_buffer_slot(node_from(event))
             })
             .is_err()
         {
@@ -5534,6 +5558,24 @@ impl<M: SignalMessage> RunCtx<'_, M> {
 /// Messages, exits, and DOWNs require the receiver to run. Link, monitor, and
 /// demonitor only update control state and are applied the next time the
 /// receiver is scheduled, including on exit.
+/// Set in the metadata of a lazy node that is a monitor signal, clear for a demonitor signal.
+pub const LAZY_MONITOR: u64 = 1 << 62;
+const _: () = assert!(PTAB_ID_DATA_MASK < LAZY_MONITOR);
+
+/// The metadata of a lazy node (a monitor half queued as its own signal) sent by `from`: what
+/// the delivery path needs without making the signal value.
+pub fn lazy_meta(from: Pid, monitor: bool) -> u64 {
+    from.data() | if monitor { LAZY_MONITOR } else { 0 }
+}
+
+/// The sender of a node; a lazy node knows it without a value.
+fn node_from<M: SignalMessage>(signal: &OwnedSignal<Event<M>>) -> Pid {
+    match signal.lazy_meta() {
+        Some(meta) => Pid::from_data(meta & !LAZY_MONITOR),
+        None => signal.from,
+    }
+}
+
 fn payload_wakes<M: SignalMessage>(payload: &Payload<M>) -> bool {
     match payload {
         Payload::Message(_) | Payload::Timer { .. } | Payload::TimerMessage { .. } => true,
@@ -5542,6 +5584,7 @@ fn payload_wakes<M: SignalMessage>(payload: &Payload<M>) -> bool {
             | Signal::ExitLinked(_)
             | Signal::PortExit(_)
             | Signal::MonitorDown { .. }
+            | Signal::MonitorDownImmediate { .. }
             | Signal::MonitorDownMsg { .. }
             | Signal::Suspend { .. }
             | Signal::SuspendRelease { .. }
@@ -5673,6 +5716,17 @@ impl<T: Task> Runner<'_, T> {
     fn publish_deferred_monitor_for(&mut self, to: Pid) {
         if let Some(held) = take_held_monitor_for(to) {
             self.publish_monitor(held);
+        }
+    }
+
+    /// Hold `held` as the scheduler's pending monitor; the one it replaces goes out first.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal), OTP-29.1.1.
+    fn hold_monitor(&mut self, held: PendingProcMonitor) {
+        let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
+        if let Some(previous) = previous {
+            self.publish_monitor(previous);
+        } else {
+            HELD_MONITOR_THREADS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -5956,24 +6010,42 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         to: Pid,
         signal: OwnedSignal<Event<T::Message>>,
     ) -> Result<(), Error> {
-        let from = signal.from;
-        let monitor = matches!(
-            signal.payload,
-            Payload::Signal(Signal::Monitor { .. } | Signal::MonitorOpaque { .. })
-        );
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
-        // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
-        // the held one, which goes out first. `local` is the scheduler data presence test, so
-        // this signal path does not read scheduler type from thread-local storage.
-        if let Payload::Signal(Signal::Monitor { reference, shared }) = &signal.payload
+        let from = node_from(&signal);
+        let lazy = signal.lazy_meta();
+        let monitor = match lazy {
+            Some(meta) => meta & LAZY_MONITOR != 0,
+            None => matches!(
+                signal.payload,
+                Payload::Signal(Signal::Monitor { .. } | Signal::MonitorOpaque { .. })
+            ),
+        };
+        // The held monitor takes the data out of a monitor half queued as its own signal; no
+        // node is allocated for it (the half is sent again when the held monitor goes out).
+        if lazy.is_some() && monitor && self.local.is_some() {
+            let Event {
+                payload: Payload::Signal(Signal::Monitor { reference, shared }),
+                ..
+            } = signal.into_value()
+            else {
+                unreachable!("a lazy monitor node makes a monitor signal");
+            };
+            self.hold_monitor(PendingProcMonitor {
+                from,
+                to,
+                id: reference,
+                shared: PendingMonitorData::Process(shared.erase()),
+            });
+            return Ok(());
+        }
+        if lazy.is_none()
+            && let Payload::Signal(Signal::Monitor { reference, shared }) = &signal.payload
             && self.local.is_some()
         {
             let held = PendingProcMonitor {
                 from,
                 to,
                 id: *reference,
-                shared: SharedPayload(shared.clone()),
-                opaque: false,
+                shared: PendingMonitorData::Process(shared.clone().erase()),
             };
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
@@ -5983,15 +6055,15 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             }
             return Ok(());
         }
-        if let Payload::Signal(Signal::MonitorOpaque { reference, shared }) = &signal.payload
+        if lazy.is_none()
+            && let Payload::Signal(Signal::MonitorOpaque { reference, shared }) = &signal.payload
             && self.local.is_some()
         {
             let held = PendingProcMonitor {
                 from,
                 to,
                 id: *reference,
-                shared: (**shared).clone(),
-                opaque: true,
+                shared: PendingMonitorData::Opaque((**shared).clone()),
             };
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
@@ -6012,9 +6084,11 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let managed = self.local.is_some();
         let deliver = |process: &ProcRef<T>| -> Result<(), Error> {
             let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-            let wakes = payload_wakes(&signal.payload);
+            // A lazy node is a monitor or demonitor signal: it wakes nobody and is no link.
+            let lazy = signal.is_lazy();
+            let wakes = !lazy && payload_wakes(&signal.payload);
             let force_enqueue =
-                matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+                !lazy && matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
             // A literal-copy request is never buffered: a request lost to an exiting target
             // would never be answered, so the sender must see `NoProcess` at once. Port of
             // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
@@ -6022,7 +6096,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             // already gone with a `noproc` link exit; a buffered link dropped at slice end would
             // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
             // OTP-29.1.1.
-            let link = matches!(&signal.payload, Payload::Signal(Signal::Link));
+            let link = !lazy && matches!(&signal.payload, Payload::Signal(Signal::Link));
             if waiting || monitor || link || deferred.is_some() || force_enqueue {
                 if let Some(first) = deferred {
                     // The held monitor and this signal enter the queue together.
@@ -7605,7 +7679,7 @@ mod in_signal_tests {
 
     struct Envelope(bool);
     impl SignalMessage for Envelope {
-        type MonitorData = ();
+        type MonitorData = EmptyMonitorData;
         fn is_altact_msg(&self) -> bool {
             self.0
         }
@@ -9045,12 +9119,8 @@ impl AllocOwnerWaker {
         let weak = Arc::downgrade(inner);
         let wake: OwnerWaker = Box::new(move || {
             if let Some(inner) = weak.upgrade() {
-                inner.request_aux_work_one(
-                    worker,
-                    Arc::new(move |_| {
-                        arinsal_alloc::typed::handle_owner_work(instance);
-                    }),
-                );
+                inner.aux_work_flags[worker].fetch_or(AUX_WORK_ALLOCATOR_DD, Ordering::Release);
+                inner.wake_worker(worker);
             }
         });
         ALLOC_OWNER_WAKERS
@@ -9754,6 +9824,9 @@ const AUX_WORK_STATS: u32 = 1 << 1;
 // Port of erts/emulator/beam/erl_process.c (ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP family: timer
 // requests reach the owning scheduler as aux work), OTP-29.1.1.
 const AUX_WORK_TIMER_CMDS: u32 = 1 << 2;
+/// Auxiliary work: handle the owner scheduler's delayed allocator frees.
+// Port of erts/emulator/beam/erl_process.c (ERTS_SSI_AUX_WORK_DD), OTP-29.1.1.
+const AUX_WORK_ALLOCATOR_DD: u32 = 1 << 3;
 /// First `run_queue_flags` bit of the bound-process priority queues.
 const PINNED_FLAGS_SHIFT: u32 = 8;
 

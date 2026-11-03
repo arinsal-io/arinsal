@@ -151,7 +151,7 @@ impl Process {
 
     /// Mutable view of [`Process::dirty_result_roots`], in the same order.
     pub(crate) fn dirty_result_roots_mut(&mut self) -> Vec<&mut Term> {
-        match self.cold.as_mut() {
+        match self.cold.as_deref_mut() {
             Some(cold) => {
                 dirty_result_slots(cold.dirty_bif.as_mut(), cold.static_nif_done.as_mut())
             }
@@ -250,7 +250,7 @@ impl Process {
             if let Some(Ok(value)) = slot.as_mut() {
                 roots.push(value);
             }
-            if let Some(cold) = self.cold.as_mut() {
+            if let Some(cold) = self.cold.as_deref_mut() {
                 if let Some(pending) = cold.nif_pending.as_mut() {
                     roots.extend(pending.done_slots());
                 }

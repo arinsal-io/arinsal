@@ -117,6 +117,11 @@ impl NativeArgs<'_> {
                 let values = [process.x[0], process.x[1], process.x[2]];
                 f(process, &values)
             }
+            Self::Registers(arity) if arity <= 8 => {
+                let mut values = [Term::NIL; 8];
+                values[..arity].copy_from_slice(&process.x[..arity]);
+                f(process, &values[..arity])
+            }
             Self::Registers(arity) => {
                 let mut values = Vec::with_capacity(arity);
                 values.extend_from_slice(&process.x[..arity]);
