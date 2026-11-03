@@ -5,7 +5,7 @@
 //! budget as erts and resume through the same continuations.
 
 use arinsal_term::{
-    ConsHeapChain, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq,
+    ConsHeapChain, HeapAlloc, HeapReservation, ProcessHeap, Term, TermBuilder, atoms, exact_eq,
     exact_eq_after_word_mismatch, loose_eq,
 };
 
@@ -1335,6 +1335,103 @@ pub fn lists_reverse(
     }
 }
 
+/// `lists_reverse_2` for a list that fits the free young heap and the reduction budget: the
+/// whole reversal is built in `[HEAP_TOP, HEAP_LIMIT - 2)` with raw cons writes and `HEAP_TOP`
+/// is published once. Anything else (budget or window exhausted, improper list) returns `None`
+/// with nothing committed, and the general path redoes the call.
+// Port of erts/emulator/beam/erl_bif_lists.c:1194-1262 (lists_reverse_2, lists_reverse_onheap),
+// OTP-29.1.1.
+#[inline(always)]
+pub fn reverse_onheap_direct(heap: &mut ProcessHeap, list: Term, tail: Term) -> Option<Term> {
+    if list == Term::NIL {
+        return Some(tail);
+    }
+    let reds = heap.abi.fcalls.clamp(0, 4000) as usize;
+    let window = heap.halloc_window()?;
+    // HeapWordsLeft(c_p) > 8
+    if window.len() <= 8 {
+        return None;
+    }
+    // Don't process more cells than there are reductions for, and keep HEAP_LIMIT - 2 free.
+    let max_cells = (reds * REVERSE_ONHEAP_CELLS_PER_RED).min((window.len() - 2).div_ceil(2));
+    let base = window.as_ptr() as u64;
+    let (mut cur, mut tail_bits, mut cells) = (list, tail.word(), 0usize);
+    for cell in window.as_chunks_mut::<2>().0.iter_mut().take(max_cells) {
+        let Some((car, cdr)) = cons_cell(cur) else {
+            break;
+        };
+        cell[0] = car.word();
+        cell[1] = tail_bits;
+        tail_bits = (base + (cells as u64) * 16) | 1;
+        cur = cdr;
+        cells += 1;
+    }
+    if cur != Term::NIL {
+        return None;
+    }
+    // The result is the last cell written, the first one above HEAP_TOP's new position.
+    let result = heap.window_list_term((cells - 1) * 2);
+    heap.commit_window(cells * 2);
+    // BUMP_REDS(c_p, cells / CELLS_PER_RED)
+    let reds_used = cells / REVERSE_ONHEAP_CELLS_PER_RED;
+    if reds_used != 0 {
+        heap.abi.fcalls = (heap.abi.fcalls - reds_used as i32).max(0);
+    }
+    Some(result)
+}
+
+/// `'++'/2` for a left list that fits the free young heap and the reduction budget, with a
+/// right side that is not nil: the copy is built in `[HEAP_TOP, HEAP_LIMIT - 2)`, the last CDR
+/// is the right side, and `HEAP_TOP` is published once. Nothing is committed when the window
+/// or budget runs out first (`None`).
+// Port of erts/emulator/beam/erl_bif_lists.c:211-251 (lists_append_onheap) and :273-290
+// (append), OTP-29.1.1.
+#[inline(always)]
+pub fn append_onheap_direct(heap: &mut ProcessHeap, lhs: Term, rhs: Term) -> Option<Term> {
+    if lhs == Term::NIL {
+        // `[] ++ X` is X, whatever X is.
+        return Some(rhs);
+    }
+    if rhs == Term::NIL || cons_cell(lhs).is_none() {
+        return None;
+    }
+    let reds = heap.abi.fcalls.clamp(0, 4000) as usize;
+    let window = heap.halloc_window()?;
+    // HeapWordsLeft(c_p) > 8
+    if window.len() <= 8 {
+        return None;
+    }
+    let max_cells = (reds * APPEND_ONHEAP_PER_RED).min((window.len() - 2).div_ceil(2));
+    let base = window.as_ptr() as u64;
+    let (mut cur, mut cells) = (lhs, 0usize);
+    for cell in window.as_chunks_mut::<2>().0.iter_mut().take(max_cells) {
+        let Some((car, cdr)) = cons_cell(cur) else {
+            break;
+        };
+        cell[0] = car.word();
+        // Each CDR links the following cell, except the last one: the right side. An improper
+        // left list leaves a bogus link in the unpublished window and is rejected below.
+        cell[1] = if cdr == Term::NIL {
+            rhs.word()
+        } else {
+            (base + ((cells as u64) + 1) * 16) | 1
+        };
+        cur = cdr;
+        cells += 1;
+    }
+    if cur != Term::NIL {
+        return None;
+    }
+    let result = heap.window_list_term(0);
+    heap.commit_window(cells * 2);
+    // BUMP_REDS(c_p, cells / CELLS_PER_RED)
+    let reds_used = cells / APPEND_ONHEAP_PER_RED;
+    if reds_used != 0 {
+        heap.abi.fcalls = (heap.abi.fcalls - reds_used as i32).max(0);
+    }
+    Some(result)
+}
+
 fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of `lists_reverse_2` in erts/emulator/beam/erl_bif_lists.c, OTP-29.1.1.
     let &[list, tail] = args else {
@@ -1646,6 +1743,125 @@ mod tests {
         let mut ctx = Ctx::new(&mut alloc, &mut bif_state);
         let out = crate::lookup("erlang", "++", 2).unwrap()(&mut ctx, &[list, Term::NIL]).unwrap();
         assert_eq!(out, list);
+    }
+
+    fn small_list(heap: &mut ProcessHeap, n: usize) -> Term {
+        let items: Vec<Term> = (0..n).map(|i| Term::small(i as i64).unwrap()).collect();
+        let mut alloc = ProcessHeapHandle(heap);
+        TermBuilder::new(&mut alloc)
+            .list_from_slice(&items)
+            .unwrap()
+    }
+
+    fn elements(term: Term) -> (Vec<i64>, Term) {
+        let mut out = Vec::new();
+        let mut cur = term;
+        while let Some((head, tail)) = super::cons_cell(cur) {
+            out.push(head.as_small().unwrap());
+            cur = tail;
+        }
+        (out, cur)
+    }
+
+    #[test]
+    fn reverse_onheap_direct_matches_the_general_reverse() {
+        for n in [0usize, 1, 2, 3, 10, 100] {
+            let mut heap = ProcessHeap::with_words(4096);
+            heap.abi.fcalls = 4000;
+            let list = small_list(&mut heap, n);
+            let tail = Term::small(777).unwrap();
+            let htop = heap.abi.htop;
+            let fcalls = heap.abi.fcalls;
+            let out = super::reverse_onheap_direct(&mut heap, list, tail).expect("fits");
+            let (got, end) = elements(out);
+            let mut want: Vec<i64> = (0..n as i64).collect();
+            want.reverse();
+            assert_eq!(got, want, "n = {n}");
+            assert_eq!(end, tail);
+            // Cells come from the young heap and HEAP_TOP moves by exactly 2 words per cell.
+            let moved = (heap.abi.htop as usize - htop as usize) / 8;
+            assert_eq!(moved, if n == 0 { 0 } else { 2 * n });
+            assert!(heap.abi.fcalls <= fcalls);
+        }
+    }
+
+    #[test]
+    fn reverse_onheap_direct_commits_nothing_when_it_cannot_finish() {
+        // An improper list, a non-list, and a list longer than the free window.
+        let mut heap = ProcessHeap::with_words(64);
+        heap.abi.fcalls = 4000;
+        let improper = {
+            let mut alloc = ProcessHeapHandle(&mut heap);
+            TermBuilder::new(&mut alloc)
+                .cons(Term::small(1).unwrap(), Term::small(2).unwrap())
+                .unwrap()
+        };
+        let htop = heap.abi.htop;
+        assert!(super::reverse_onheap_direct(&mut heap, improper, Term::NIL).is_none());
+        assert!(
+            super::reverse_onheap_direct(&mut heap, Term::small(5).unwrap(), Term::NIL).is_none()
+        );
+        let long = small_list(&mut heap, 20);
+        let htop_after = heap.abi.htop;
+        assert!(super::reverse_onheap_direct(&mut heap, long, Term::NIL).is_none());
+        assert_eq!(heap.abi.htop, htop_after);
+        assert!(htop <= htop_after);
+    }
+
+    #[test]
+    fn onheap_direct_paths_stop_at_the_reduction_budget() {
+        // One reduction pays for 60 cells: a longer list is left to the trapping path.
+        let mut heap = ProcessHeap::with_words(4096);
+        heap.abi.fcalls = 1;
+        let list = small_list(&mut heap, 100);
+        let htop = heap.abi.htop;
+        assert!(super::reverse_onheap_direct(&mut heap, list, Term::NIL).is_none());
+        assert!(super::append_onheap_direct(&mut heap, list, Term::small(1).unwrap()).is_none());
+        assert_eq!(heap.abi.htop, htop);
+        let short = small_list(&mut heap, 50);
+        assert!(super::reverse_onheap_direct(&mut heap, short, Term::NIL).is_some());
+    }
+
+    #[test]
+    fn append_onheap_direct_copies_the_left_list_and_shares_the_right() {
+        for n in [1usize, 2, 5, 10, 100] {
+            let mut heap = ProcessHeap::with_words(4096);
+            heap.abi.fcalls = 4000;
+            let left = small_list(&mut heap, n);
+            let right = Term::small(9).unwrap();
+            let htop = heap.abi.htop;
+            let out = super::append_onheap_direct(&mut heap, left, right).expect("fits");
+            let (got, end) = elements(out);
+            assert_eq!(got, (0..n as i64).collect::<Vec<_>>());
+            assert_eq!(
+                end, right,
+                "an improper right side is kept as the last tail"
+            );
+            assert_ne!(out, left, "the left list is copied");
+            let moved = (heap.abi.htop as usize - htop as usize) / 8;
+            assert_eq!(moved, 2 * n);
+        }
+        let mut heap = ProcessHeap::with_words(256);
+        heap.abi.fcalls = 4000;
+        let list = small_list(&mut heap, 3);
+        // `[] ++ X` is X; a nil right side and non-lists are left to the general path.
+        assert_eq!(
+            super::append_onheap_direct(&mut heap, Term::NIL, list),
+            Some(list)
+        );
+        assert!(super::append_onheap_direct(&mut heap, list, Term::NIL).is_none());
+        assert!(super::append_onheap_direct(&mut heap, Term::small(1).unwrap(), list).is_none());
+        let htop = heap.abi.htop;
+        let improper = {
+            let mut alloc = ProcessHeapHandle(&mut heap);
+            TermBuilder::new(&mut alloc)
+                .cons(Term::small(1).unwrap(), Term::small(2).unwrap())
+                .unwrap()
+        };
+        let before = heap.abi.htop;
+        assert!(super::append_onheap_direct(&mut heap, improper, list).is_none());
+        assert_eq!(heap.abi.htop, before);
+        assert!(htop <= before);
     }
 
     #[test]

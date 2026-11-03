@@ -146,6 +146,21 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
     Some(func)
 }
 
+/// The `++`/2 entry: the direct on-heap copy in front of the general list-slice entry.
+pub(crate) fn append_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
+    arinsal_bifs::visit_bif(module, function, arity, &mut AppendEntry)
+}
+
+struct AppendEntry;
+
+impl arinsal_bifs::BifTableVisitor for AppendEntry {
+    type Output = usize;
+
+    fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Self::Output {
+        crate::native_helpers::list_append_entry::<B> as *const () as usize
+    }
+}
+
 struct BinaryToListEntry;
 
 impl arinsal_bifs::BifTableVisitor for BinaryToListEntry {

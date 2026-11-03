@@ -276,6 +276,17 @@ impl BeamModuleAssembler {
             e.cmp_imm(Gpr::x(10), (4 << 6) | 0x24 | 1, false)
         })?;
         self.code.b_cond(Cond::Eq, hit)?;
+        if fail != 0 {
+            // Anything that is not a bitstring header fails here, before any GC test or
+            // runtime call; the helper is only for bitstring-shaped sources.
+            // Port of instr_bs.cpp:157-166 (mask _BITSTRING_TAG_MASK & ~_TAG_PRIMARY_MASK), OTP-29.1.1.
+            let fail_label = self.label(fail);
+            self.code.emit(|e| {
+                e.and_imm(Gpr::x(9), Gpr::x(10), 0x38)?;
+                e.cmp_imm(Gpr::x(9), 0x20, false)
+            })?;
+            self.code.b_cond(Cond::Ne, fail_label)?;
+        }
         // Plain sub-bitstrings and heap bitstrings become five-word match contexts inline.
         // Writable binaries still go through erts_bs_start_match_3.
         // Port of erts/emulator/beam/erl_bits.c:81-104 (erts_bs_start_match_3), OTP-29.1.1.

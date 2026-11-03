@@ -1283,6 +1283,18 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     // fragment calls this pointer directly, so the slice check has to be here
     // rather than only in `invoke_dispatch_bif`.
     if export.list_slice {
+        if matches!(
+            (
+                export.module.as_str(),
+                export.function.as_str(),
+                export.arity
+            ),
+            ("erlang", "++" | "append", 2)
+        ) && let Some(entry) =
+            crate::bif_table::append_entry(&export.module, &export.function, export.arity)
+        {
+            return Some(entry);
+        }
         let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
         if crate::bif_table::never_allocates(&export.module, &export.function, export.arity) {
             return Some(own.map_or(plain_bif_light as *const () as usize, |e| {
@@ -2346,6 +2358,27 @@ pub(crate) extern "C" fn list_slice_bif_entry<B: arinsal_bifs::BifBody>(
     .unwrap_or(0)
 }
 
+/// `erlang:'++'/2`: the on-heap copy runs first, straight on the young heap; everything else
+/// takes the general list BIF entry.
+pub(crate) extern "C" fn list_append_entry<B: arinsal_bifs::BifBody>(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    if let Some((process, registers)) = crate::native_hooks::enter_runtime(header)
+        && let Some(value) = arinsal_bifs::append_onheap_direct(
+            &mut process.heap,
+            registers.x_reg_array[0],
+            registers.x_reg_array[1],
+        )
+    {
+        return crate::native_hooks::raw(value);
+    }
+    list_slice_bif_entry::<B>(header, regs, i, descriptor, identity)
+}
+
 /// A process BIF (`c_p` plus the register array), chosen when the export was created.
 pub(crate) extern "C" fn process_bif_light(
     header: *mut ProcessHeader,
@@ -2717,6 +2750,29 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
 // Port of erts/emulator/beam/erl_bif_lists.c:1144-1263 (lists_reverse_2), OTP-29.1.1: the BIF
 // is one function with its own budget, and BIF_TRAP is taken only when the budget runs out.
 pub(crate) extern "C" fn list_reverse_entry(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    // lists_reverse_2: the on-heap loop runs first, straight on the young heap. The fragment
+    // installs the result in X0, so only the return value is produced.
+    if let Some((process, registers)) = crate::native_hooks::enter_runtime(header)
+        && let Some(value) = arinsal_bifs::reverse_onheap_direct(
+            &mut process.heap,
+            registers.x_reg_array[0],
+            registers.x_reg_array[1],
+        )
+    {
+        return crate::native_hooks::raw(value);
+    }
+    list_reverse_general(header, regs, i, descriptor, identity)
+}
+
+/// The rest of `lists:reverse/2`: trap, error and heap-fragment paths.
+#[inline(never)]
+fn list_reverse_general(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,

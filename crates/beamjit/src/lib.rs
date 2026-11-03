@@ -4127,7 +4127,8 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             // emitter takes them: all values, then all labels.
             let pairs = payload;
             if emitter == EmitterKind::SelectVal {
-                let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+                // The Type chunk's entry for the source lets the untagged form skip its tag test.
+                let source = typed_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190, OTP-29.1.1.
                 if GENERIC == erts_tables::GENOP_I_SELECT_VAL_LINS_3 {
                     assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
