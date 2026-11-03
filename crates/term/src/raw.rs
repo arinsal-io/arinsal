@@ -50,6 +50,84 @@ pub(crate) fn boxed_words(header: u64, address: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------------------
+// Lazy signal nodes (`message::OwnedSignal::lazy`): the queue header of a signal node
+// overlaid on another structure, and the reads of a signal node that has no value yet.
+
+use crate::message::SignalNode;
+use std::ptr::NonNull;
+
+/// The queue header of a lazy node (`ErtsSignalCommon`): `next`, a marker where
+/// `fragment_words` sits, and the function that makes the signal value, where `value` sits.
+#[repr(C)]
+struct LazyHeader<T> {
+    next: Option<NonNull<SignalNode<T>>>,
+    marker: usize,
+    materialise: unsafe fn(NonNull<u8>) -> T,
+}
+
+/// Bytes of a lazy node's header.
+pub(crate) const LAZY_HEADER_BYTES: usize = std::mem::size_of::<LazyHeader<()>>();
+
+const _: () = assert!(std::mem::offset_of!(SignalNode<()>, next) == 0);
+
+/// Writes a lazy node header at `header`.
+///
+/// Contract: `header` is word aligned and addresses [`LAZY_HEADER_BYTES`] bytes that nothing
+/// else uses until the node is taken out of its queue.
+#[inline(always)]
+pub(crate) fn lazy_header_write<T>(
+    header: NonNull<u8>,
+    marker: usize,
+    materialise: unsafe fn(NonNull<u8>) -> T,
+) {
+    // SAFETY: the contract above.
+    unsafe {
+        header.cast::<LazyHeader<T>>().as_ptr().write(LazyHeader {
+            next: None,
+            marker,
+            materialise,
+        });
+    }
+}
+
+/// The second word of a signal node: `fragment_words`, or the marker of a lazy node.
+///
+/// Contract: `node` is a live signal node of an owned handle or a queue.
+#[inline(always)]
+pub(crate) fn node_marker(node: NonNull<u8>) -> usize {
+    load(node.as_ptr() as usize + std::mem::size_of::<usize>()) as usize
+}
+
+/// Calls the function of a lazy node to make its value.
+///
+/// Contract: `node` is a lazy node whose header was written by [`lazy_header_write`] for `T`;
+/// its owner does not use it afterwards.
+#[inline(always)]
+pub(crate) fn lazy_make<T>(node: NonNull<u8>) -> T {
+    // SAFETY: the contract above; the function is valid once for this node.
+    unsafe {
+        let make = (*node.cast::<LazyHeader<T>>().as_ptr()).materialise;
+        make(node)
+    }
+}
+
+/// The value of a node that has one.
+///
+/// Contract: `node` is a live, non-lazy node, not written while the reference is in use.
+#[inline(always)]
+pub(crate) fn node_value<'a, T>(node: NonNull<SignalNode<T>>) -> &'a T {
+    // SAFETY: the contract above.
+    unsafe { &(*node.as_ptr()).value }
+}
+
+/// [`node_value`], mutably; the caller has exclusive use of the node.
+#[inline(always)]
+pub(crate) fn node_value_mut<'a, T>(node: NonNull<SignalNode<T>>) -> &'a mut T {
+    // SAFETY: the contract above.
+    unsafe { &mut (*node.as_ptr()).value }
+}
+
+// ---------------------------------------------------------------------------------------
 // View types for validated terms (plan step 7.A U4, "term kernel"). A view is constructed
 // only by a checked test (`Cons::try_from(term)`, `Tuple::try_from(term)`, ...) and is then
 // the proof that the term has that shape; its accessors read the heap with no further test,

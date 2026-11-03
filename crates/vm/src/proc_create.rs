@@ -1,6 +1,7 @@
 //! Process storage and construction.
 
 use super::*;
+use arinsal_alloc::typed::FixAllocBox;
 
 /// Why native code left for the scheduler. One byte of the process, set by the helper that
 /// requests the exit, so the exit path is one load and one match.
@@ -462,7 +463,7 @@ pub struct Process {
     /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
     /// re-read the operand (erts/emulator/beam/emu/msg_instrs.tab, wait.src).
     pub(crate) receive_infinity: bool,
-    pub(crate) cold: Option<Box<ProcessCold>>,
+    pub(crate) cold: Option<FixAllocBox<ProcessCold>>,
     /// `p->group_leader`. Kept on the process so a spawn does not allocate `ProcessCold`.
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
     /// `p->parent` (erl_process.c:12756): the spawning process, `None` (`undefined`) for the
@@ -470,7 +471,7 @@ pub struct Process {
     pub(crate) parent: Option<arinsal_sched::Pid>,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
-    exit_cont: Option<Box<ExitCont>>,
+    exit_cont: Option<FixAllocBox<ExitCont>>,
     /// Outermost `apply` operands that must stay GC roots. Nested applies spill into
     /// `ProcessCold.apply_roots`.
     pub(crate) apply_inline: [Term; 3],
@@ -1970,12 +1971,12 @@ impl Process {
         self.exit_cont.is_some()
     }
     #[inline(always)]
-    pub(crate) fn set_exit_cont(&mut self, state: Option<Box<ExitCont>>) {
+    pub(crate) fn set_exit_cont(&mut self, state: Option<FixAllocBox<ExitCont>>) {
         self.set_slow(Self::SLOW_EXIT_CONT, state.is_some());
         self.exit_cont = state;
     }
     #[inline(always)]
-    pub(crate) fn take_exit_cont(&mut self) -> Option<Box<ExitCont>> {
+    pub(crate) fn take_exit_cont(&mut self) -> Option<FixAllocBox<ExitCont>> {
         self.set_slow(Self::SLOW_EXIT_CONT, false);
         self.exit_cont.take()
     }
@@ -2174,7 +2175,7 @@ impl Process {
     #[cold]
     #[inline(never)]
     fn allocate_cold(&mut self) {
-        self.cold = Some(Box::default());
+        self.cold = Some(FixAllocBox::new(ProcessCold::default()).expect("ProcessCold allocation"));
     }
 
     /// Group leader, or `fallback` when spawn did not record one (`p->group_leader`).

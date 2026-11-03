@@ -2461,13 +2461,14 @@ pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64);
     ]
 }
 
-/// Bytes of fixed-size process and message-reference allocations, as in `erts_memory`.
-// Port of erts/emulator/beam/erl_alloc.c:2452-2469 (`add_fix_values` for PROC through MSG_REF),
+/// Bytes of fixed-size process, monitor, and message-reference allocations, as in `erts_memory`.
+// Port of erts/emulator/beam/erl_alloc.c:2452-2469 (`add_fix_values` for PROC, MONITOR, and MSG_REF),
 // OTP-29.1.1.
 pub(crate) fn fix_process_bytes() -> (u64, u64) {
     let instances = arinsal_alloc::typed::instance_count("fix_alloc").unwrap_or(0);
     [
         arinsal_alloc::typed::ErtsAlcType::PROC,
+        arinsal_alloc::typed::ErtsAlcType::MONITOR,
         arinsal_alloc::typed::ErtsAlcType::MSG_REF,
     ]
     .into_iter()

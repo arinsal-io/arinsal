@@ -652,7 +652,10 @@ fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch
     let heap = &process.heap;
     if let Some(runtime) = process.runtime.as_ref() {
         // The cache lives in the cold part, which a plain raise has not needed so far.
-        let cold = process.cold.get_or_insert_with(Box::default);
+        let cold = process.cold.get_or_insert_with(|| {
+            arinsal_alloc::typed::FixAllocBox::new(crate::proc_create::ProcessCold::default())
+                .expect("ProcessCold allocation")
+        });
         let table = runtime
             .code_indexes()
             .active_catches_cached(&mut cold.catch_cache);

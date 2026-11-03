@@ -91,7 +91,7 @@ static PF_MONITOR_DOWN: AtomicU64 = AtomicU64::new(0);
 /// destination process heap.
 pub struct Message {
     term: Term,
-    fragment: Option<Box<MessageFragment>>,
+    fragment: Option<MessageFragmentBox>,
     /// When set, the receiver inserts this into the priority section of its
     /// private message queue (OTP 28+ priority messages).
     priority: bool,
@@ -120,6 +120,19 @@ struct MessageFragment {
     /// The VM timer id a timer-sent message carries until delivery, so expiry and cancellation
     /// release its message; kept here, not in `Message`, so the common message stays small.
     timer_id: Option<u64>,
+}
+
+/// A message's fragment: an ordinary box, or for a timer message a `BIF_TIMER` fixed-size
+/// block (`ERTS_ALC_T_BIF_TIMER`) that has a fix list of its own and never shares one with the
+/// `PROC` blocks of another size. One word, so `Message` stays small.
+type MessageFragmentBox = arinsal_alloc::typed::FixOrBox<MessageFragment, 22>;
+
+fn system_fragment(fragment: MessageFragment) -> MessageFragmentBox {
+    MessageFragmentBox::boxed(fragment)
+}
+
+fn timer_fragment(fragment: MessageFragment) -> MessageFragmentBox {
+    MessageFragmentBox::fixed(fragment).expect("timer message fragment allocation")
 }
 
 type RemovedMessage = (Term, crate::seq_trace::SeqState);
@@ -171,7 +184,7 @@ fn queued_mut(event: &mut Event<Message>) -> &mut Message {
 struct QueuedMessage(MessageNode);
 
 impl QueuedMessage {
-    fn node(term: Term, fragment: Option<Box<MessageFragment>>, seq_nil: bool) -> MessageNode {
+    fn node(term: Term, fragment: Option<MessageFragmentBox>, seq_nil: bool) -> MessageNode {
         let mut message = Message::immediate(term);
         message.fragment = fragment;
         message.seq_nil = seq_nil;
@@ -265,7 +278,7 @@ impl MessageQueue {
     pub(crate) fn push_back_token(&mut self, term: Term, token: Box<crate::seq_trace::Token>) {
         self.entries.push_back(QueuedMessage::node(
             term,
-            Some(Box::new(MessageFragment {
+            Some(system_fragment(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
                 timer_id: None,
@@ -705,7 +718,7 @@ impl MessageQueue {
             if entry.fragment.is_none() && heap.is_some() {
                 // A detached inline fragment the collection did not consume stays the
                 // message's data as a fragment of its own.
-                entry.fragment = Some(Box::new(MessageFragment {
+                entry.fragment = Some(system_fragment(MessageFragment {
                     heap: None,
                     seq_token: None,
                     timer_id: None,
@@ -786,7 +799,24 @@ impl Message {
         // Literals outside the collector's purge area stay shared (copy_struct_litopt).
         let literals = arinsal_term::LiteralAreas::current();
         let words = arinsal_term::size_object_litopt(term, &literals);
-        Self::copy_counted(term, words, None, &literals)
+        Self::copy_counted(term, words, None, &literals, None)
+    }
+
+    /// Copy a timer message into a PROC-allocated timer fragment.
+    // Port of erts/emulator/beam/erl_hl_timer.c (setup_bif_timer), OTP-29.1.1.
+    pub(crate) fn copy_from_timer(term: Term, timer_id: u64) -> Result<Self, VmError> {
+        if !term.is_pointer() {
+            let mut message = Self::immediate(term);
+            message.fragment = Some(timer_fragment(MessageFragment {
+                heap: None,
+                seq_token: None,
+                timer_id: Some(timer_id),
+            }));
+            return Ok(message);
+        }
+        let literals = arinsal_term::LiteralAreas::current();
+        let words = arinsal_term::size_object_litopt(term, &literals);
+        Self::copy_counted(term, words, None, &literals, Some(timer_id))
     }
 
     /// `copy_from` when `words` is already `size_object_litopt(term, literals)`. A sequential
@@ -799,12 +829,21 @@ impl Message {
         words: usize,
         token: Option<&mut crate::seq_trace::Token>,
         literals: &arinsal_term::LiteralAreas,
+        timer_id: Option<u64>,
     ) -> Result<Self, VmError> {
         let token_words = token
             .as_deref()
             .map_or(0, crate::seq_trace::Token::heap_words);
         if words + token_words == 0 {
-            return Ok(Self::immediate(term));
+            let mut message = Self::immediate(term);
+            if let Some(timer_id) = timer_id {
+                message.fragment = Some(timer_fragment(MessageFragment {
+                    heap: None,
+                    seq_token: None,
+                    timer_id: Some(timer_id),
+                }));
+            }
+            return Ok(message);
         }
         let mut fragment = arinsal_term::message::MessageHeapBlock::with_words(words + token_words);
         // Size was computed by the caller; copy_struct must not walk the term again
@@ -823,11 +862,19 @@ impl Message {
         }
         Ok(Self {
             term,
-            fragment: Some(Box::new(MessageFragment {
-                heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
-                seq_token: None,
-                timer_id: None,
-            })),
+            fragment: Some(if let Some(timer_id) = timer_id {
+                timer_fragment(MessageFragment {
+                    heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
+                    seq_token: None,
+                    timer_id: Some(timer_id),
+                })
+            } else {
+                system_fragment(MessageFragment {
+                    heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
+                    seq_token: None,
+                    timer_id: None,
+                })
+            }),
             priority: false,
             receive_traced: false,
             seq_nil: false,
@@ -939,7 +986,7 @@ impl Message {
             .map_err(|error| VmError::Unsupported(format!("literal-copy request: {error:?}")))?;
         Ok(Self {
             term: request,
-            fragment: Some(Box::new(MessageFragment {
+            fragment: Some(system_fragment(MessageFragment {
                 heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
                 seq_token: None,
                 timer_id: None,
@@ -988,19 +1035,6 @@ impl Message {
             .and_then(|fragment| fragment.timer_id)
     }
 
-    pub(crate) fn with_timer_id(mut self, id: u64) -> Self {
-        self.fragment
-            .get_or_insert_with(|| {
-                Box::new(MessageFragment {
-                    heap: None,
-                    seq_token: None,
-                    timer_id: None,
-                })
-            })
-            .timer_id = Some(id);
-        self
-    }
-
     pub(crate) fn is_priority(&self) -> bool {
         self.priority
     }
@@ -1031,7 +1065,7 @@ impl Message {
         if let Some(fragment) = self.fragment.as_mut() {
             fragment.seq_token = Some(token);
         } else {
-            self.fragment = Some(Box::new(MessageFragment {
+            self.fragment = Some(system_fragment(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
                 timer_id: None,
@@ -1070,8 +1104,8 @@ impl Message {
             return term
                 .map_err(|error| VmError::Unsupported(format!("on-heap message copy: {error:?}")));
         }
-        if let Some(fragment) = self.fragment
-            && let Some(heap_fragment) = fragment.heap
+        if let Some(mut fragment) = self.fragment
+            && let Some(heap_fragment) = fragment.heap.take()
         {
             process
                 .heap
@@ -5020,33 +5054,29 @@ impl Process {
         reference: u64,
         shared: arinsal_sched::SharedPayload,
     ) {
-        match shared
-            .0
-            .downcast::<crate::proc_create::ProcessMonitorData>()
-        {
-            Ok(data) => {
-                let Some(target) = crate::proc_create::ProcessMonitorData::take_half(data, true)
-                else {
-                    return;
-                };
-                if target.view().kind() == crate::monitor_link::node_type::MONITOR_DIST_PROC {
-                    self.cold_mut().monitors.insert(target);
-                } else {
-                    self.cold_mut().lt_monitors.insert(target);
-                }
-            }
-            Err(other) => {
-                if let Ok(monitor) = other.downcast::<arinsal_nif::ResourceMonitor>() {
-                    self.cold_mut().resource_monitors.insert(reference, monitor);
-                }
-            }
+        if let Ok(monitor) = shared.0.downcast::<arinsal_nif::ResourceMonitor>() {
+            self.cold_mut().resource_monitors.insert(reference, monitor);
+        }
+    }
+
+    fn insert_target_process_monitor(
+        &mut self,
+        shared: arinsal_alloc::typed::FixAllocArc<crate::proc_create::ProcessMonitorData>,
+    ) {
+        let Some(target) = crate::proc_create::ProcessMonitorData::take_half(shared, true) else {
+            return;
+        };
+        if target.view().kind() == crate::monitor_link::node_type::MONITOR_DIST_PROC {
+            self.cold_mut().monitors.insert(target);
+        } else {
+            self.cold_mut().lt_monitors.insert(target);
         }
     }
 
     /// A demonitor by reference: of a remote origin (its target half is in the monitor tree) or
     /// of a NIF resource.
     fn remove_target_monitor(&mut self, reference: u64) {
-        if let Some(cold) = self.cold.as_mut() {
+        if let Some(cold) = self.cold.as_deref_mut() {
             if cold
                 .monitors
                 .get(reference)
@@ -5061,11 +5091,8 @@ impl Process {
     /// The demonitor signal of a local monitor carries its origin half; the target half is
     /// reached through the data they share (erl_proc_sig_queue.c erts_proc_sig_handle_incoming,
     /// ERTS_SIG_Q_OP_DEMONITOR): both are released.
-    fn remove_demonitored_target(&mut self, shared: arinsal_sched::SharedPayload) {
-        let Ok(data) = shared
-            .0
-            .downcast::<crate::proc_create::ProcessMonitorData>()
-        else {
+    fn remove_demonitored_target(&mut self, shared: arinsal_alloc::typed::ErasedFixAllocArc) {
+        let Ok(data) = shared.downcast::<crate::proc_create::ProcessMonitorData>() else {
             return;
         };
         let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(data, false) else {
@@ -5075,8 +5102,11 @@ impl Process {
             .cold
             .as_mut()
             .and_then(|cold| cold.lt_monitors.remove_target_of(&origin));
-        drop(target);
-        drop(origin);
+        if let Some(target) = target {
+            crate::proc_create::ProcessMonitor::release_both(origin, target);
+        } else {
+            drop(origin);
+        }
     }
 
     fn absorb_exit_signals(&mut self, ctx: &mut RunCtx<'_, Message>) {
@@ -5173,12 +5203,15 @@ impl Process {
 
     fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.exit_stage1(vm, ctx, reason);
-        self.set_exit_cont(Some(Box::new(crate::proc_create::ExitCont {
-            reason,
-            garbage: None,
-            entry_result: None,
-            code: 0,
-        })));
+        self.set_exit_cont(Some(
+            arinsal_alloc::typed::FixAllocBox::new(crate::proc_create::ExitCont {
+                reason,
+                garbage: None,
+                entry_result: None,
+                code: 0,
+            })
+            .expect("exit continuation allocation"),
+        ));
         let mut reds = isize::MAX;
         let mut garbage = None;
         self.exit_ets(ctx, &mut reds, &mut garbage);
@@ -5529,8 +5562,8 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor): the target
         // halves, of remote origins in the monitor tree and of local ones in the list.
-        let mut monitors = cold.monitors;
-        let mut targets = Vec::new();
+        let mut monitors = std::mem::take(&mut cold.monitors);
+        let mut targets: smallvec::SmallVec<[_; 4]> = smallvec::SmallVec::new();
         for monitor in monitors.drain() {
             if monitor.view().is_target() {
                 targets.push(monitor);
@@ -5541,7 +5574,7 @@ impl Process {
             // demonitor signal, so the target drops its half.
             if let Some(crate::proc_create::OriginMonitor::Process(_)) = monitor.state() {
                 let target = Pid::from_data(monitor.view().other());
-                let shared = arinsal_sched::SharedPayload(monitor.into_shared());
+                let shared = monitor.into_shared().erase();
                 let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
             }
         }
@@ -5585,6 +5618,14 @@ impl Process {
                         },
                     );
                 }
+            } else if !reason.is_pointer() {
+                let _ = ctx.signal(
+                    pid,
+                    arinsal_sched::Signal::MonitorDownImmediate {
+                        reference,
+                        reason: reason.word(),
+                    },
+                );
             } else if let Ok(message) = Message::copy_from(reason) {
                 let _ = ctx.signal(
                     pid,
@@ -6082,7 +6123,7 @@ impl Process {
                 Self::message_node(sender, envelope)
             } else if let crate::seq_trace::SeqState::Token(token) = &mut seq_token.seq {
                 let mut envelope =
-                    Message::copy_counted(value, words, Some(token.as_mut()), &literals)?;
+                    Message::copy_counted(value, words, Some(token.as_mut()), &literals, None)?;
                 if via_prio_alias {
                     envelope = envelope.with_priority();
                 }
@@ -6379,7 +6420,7 @@ impl Process {
             };
             self.sig_cont_taken += 1;
             ctx.consume_fetched();
-            if !matches!(node.payload, Payload::Signal(_)) {
+            if !node.is_lazy() && !matches!(node.payload, Payload::Signal(_)) {
                 // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
                 match self.move_message(ctx, node) {
                     Ok(()) => {
@@ -6501,7 +6542,7 @@ impl Process {
                     self.cold_mut().prio_monitors.remove(&alias);
                     let origin = entry.expect("origin half of the entry");
                     let target = Pid::from_data(origin.view().other());
-                    let shared = arinsal_sched::SharedPayload(origin.into_shared());
+                    let shared = origin.into_shared().erase();
                     let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
                 }
                 Some(crate::proc_create::OriginMonitor::Port {
@@ -6703,8 +6744,11 @@ impl Process {
                 crate::suspend::sync_reply(self, ctx, requester, tag, reply, async_, false)?;
                 2
             }
-            arinsal_sched::Signal::Monitor { reference, shared } => {
-                self.insert_target_monitor(reference, arinsal_sched::SharedPayload(shared));
+            arinsal_sched::Signal::Monitor {
+                reference: _,
+                shared,
+            } => {
+                self.insert_target_process_monitor(shared);
                 2
             }
             arinsal_sched::Signal::MonitorOpaque { reference, shared } => {
@@ -6813,6 +6857,13 @@ impl Process {
             }
             arinsal_sched::Signal::MonitorDown { reference, reason } => {
                 let reason = reason.into_receiver(self)?;
+                let queued = self.inbox.len();
+                self.deliver_monitor_down(from, reference, reason)?;
+                self.trace_new_message(ctx, queued, from);
+                8
+            }
+            arinsal_sched::Signal::MonitorDownImmediate { reference, reason } => {
+                let reason = Term::from_immed_word(reason).expect("an immediate reason");
                 let queued = self.inbox.len();
                 self.deliver_monitor_down(from, reference, reason)?;
                 self.trace_new_message(ctx, queued, from);
@@ -7392,7 +7443,7 @@ impl Process {
         }
         let inline_len = usize::from(self.apply_inline_len);
         roots.push(&mut self.apply_inline[..inline_len]);
-        if let Some(cold) = self.cold.as_mut() {
+        if let Some(cold) = self.cold.as_deref_mut() {
             if let Some(state) = cold.persistent_get_all.as_mut() {
                 roots.push_term(&mut state.result);
             }
@@ -7972,46 +8023,78 @@ impl arinsal_sched::SignalMessage for Message {
         from: Pid,
         signal: arinsal_sched::Signal<Self>,
     ) -> arinsal_sched::OwnedSignal<Event<Self>> {
-        let allocated = |signal| {
-            arinsal_sched::OwnedSignal::new(Event {
-                from,
-                payload: Payload::Signal(signal),
-            })
-        };
+        use crate::proc_create::ProcessMonitorData;
+        // A half stands for the signal only when the signal is what the half says: sent by the
+        // origin, with the monitor's own reference.
         match signal {
-            arinsal_sched::Signal::Monitor { reference, shared } => {
-                let build = |data: Arc<crate::proc_create::ProcessMonitorData>| Event {
-                    from,
-                    payload: Payload::Signal(arinsal_sched::Signal::Monitor {
-                        reference,
-                        shared: data,
+            arinsal_sched::Signal::Monitor { reference, shared }
+                if shared.origin_id() == from.data() && shared.reference() == reference =>
+            {
+                match ProcessMonitorData::half_signal(
+                    shared,
+                    true,
+                    arinsal_sched::lazy_meta(from, true),
+                ) {
+                    Ok(node) => node,
+                    Err(shared) => arinsal_sched::OwnedSignal::new(Event {
+                        from,
+                        payload: Payload::Signal(arinsal_sched::Signal::Monitor {
+                            reference,
+                            shared,
+                        }),
                     }),
-                };
-                crate::proc_create::ProcessMonitorData::embedded_signal(shared, true, build)
-                    .unwrap_or_else(arinsal_sched::OwnedSignal::new)
+                }
             }
             arinsal_sched::Signal::DemonitorOrigin(shared) => {
-                let data = match shared
-                    .0
-                    .downcast::<crate::proc_create::ProcessMonitorData>()
-                {
-                    Ok(data) => data,
-                    Err(other) => {
-                        return allocated(arinsal_sched::Signal::DemonitorOrigin(
-                            arinsal_sched::SharedPayload(other),
-                        ));
+                let shared = match shared.downcast::<ProcessMonitorData>() {
+                    Ok(data) if data.origin_id() == from.data() => {
+                        match ProcessMonitorData::half_signal(
+                            data,
+                            false,
+                            arinsal_sched::lazy_meta(from, false),
+                        ) {
+                            Ok(node) => return node,
+                            Err(data) => data.erase(),
+                        }
                     }
+                    Ok(data) => data.erase(),
+                    Err(other) => other,
                 };
-                let build = |data: Arc<crate::proc_create::ProcessMonitorData>| Event {
+                arinsal_sched::OwnedSignal::new(Event {
                     from,
-                    payload: Payload::Signal(arinsal_sched::Signal::DemonitorOrigin(
-                        arinsal_sched::SharedPayload(data),
-                    )),
-                };
-                crate::proc_create::ProcessMonitorData::embedded_signal(data, false, build)
-                    .unwrap_or_else(arinsal_sched::OwnedSignal::new)
+                    payload: Payload::Signal(arinsal_sched::Signal::DemonitorOrigin(shared)),
+                })
             }
-            signal => allocated(signal),
+            signal => arinsal_sched::OwnedSignal::new(Event {
+                from,
+                payload: Payload::Signal(signal),
+            }),
+        }
+    }
+}
+
+impl
+    crate::monitor_link::HalfSignal<
+        crate::proc_create::MonitorInfo,
+        crate::proc_create::OriginMonitor,
+    > for Event<Message>
+{
+    fn from_half(
+        data: arinsal_alloc::typed::FixAllocArc<crate::proc_create::ProcessMonitorData>,
+        target: bool,
+    ) -> Self {
+        let from = Pid::from_data(data.origin_id());
+        let signal = if target {
+            arinsal_sched::Signal::Monitor {
+                reference: data.reference(),
+                shared: data,
+            }
+        } else {
+            arinsal_sched::Signal::DemonitorOrigin(data.erase())
+        };
+        Event {
+            from,
+            payload: Payload::Signal(signal),
         }
     }
 }
@@ -8228,9 +8311,8 @@ impl Task for Process {
                     monitors.retain(|(id, _)| *id != reference);
                 }
                 Payload::Signal(Signal::DemonitorOrigin(shared)) => {
-                    if let Some(data) = shared
-                        .0
-                        .downcast_ref::<crate::proc_create::ProcessMonitorData>()
+                    if let Some(data) =
+                        shared.downcast_ref::<crate::proc_create::ProcessMonitorData>()
                     {
                         let reference = data.reference();
                         monitors.retain(|(id, _)| *id != reference);
@@ -8381,7 +8463,10 @@ impl Process {
                     &zero,
                 );
             });
-            self.set_exit_cont(Some(Box::new(state)));
+            self.set_exit_cont(Some(
+                arinsal_alloc::typed::FixAllocBox::new(state)
+                    .expect("exit continuation allocation"),
+            ));
             return RunOutcome::Yield;
         }
         let cont = state;
@@ -8435,7 +8520,7 @@ impl Process {
             // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
             // exiting process only continues its exit when scheduled in.
             let runtime = self.runtime_handle();
-            return self.continue_exit(runtime, ctx, data, true, *state);
+            return self.continue_exit(runtime, ctx, data, true, state.into_inner());
         }
         let result = self.run_executor(ctx, data, budget);
         if self.dirty_exiting() {
@@ -9313,6 +9398,17 @@ mod layout_tests {
     }
 
     #[test]
+    fn monitor_data_is_one_small_block() {
+        // Both halves of a monitor in one allocation (erts `ErtsMonitorData`); each half is
+        // queued as its own signal, so the signal nodes cost nothing. The rare tag and name are
+        // boxed separately.
+        assert_eq!(
+            std::mem::size_of::<crate::proc_create::ProcessMonitorData>(),
+            144
+        );
+    }
+
+    #[test]
     fn queued_event_stays_compact() {
         // Every message and signal crosses the in-queue and the middle queue as an `Event`, so
         // its size is copied on each send and fetch. Wide signal payloads and timer messages are
@@ -9325,13 +9421,6 @@ mod layout_tests {
         assert_eq!(
             std::mem::size_of::<arinsal_term::message::SignalNode<arinsal_sched::Event<Message>>>(),
             56
-        );
-        // Both halves of a monitor in one allocation with the nodes they are sent in (erts
-        // `ErtsMonitorDataHeap`, whose signal header shares the halves' container links); the
-        // rare tag and name are boxed separately.
-        assert_eq!(
-            std::mem::size_of::<crate::proc_create::ProcessMonitorData>(),
-            272
         );
     }
 }

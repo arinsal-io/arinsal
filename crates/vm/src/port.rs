@@ -2508,9 +2508,7 @@ impl arinsal_drv::PortHost for DrvHost {
                 let _ = handle.scheduler.signal(
                     handle.owner_pid(),
                     pid,
-                    arinsal_sched::Signal::DemonitorOrigin(arinsal_sched::SharedPayload(
-                        origin.into_shared(),
-                    )),
+                    arinsal_sched::Signal::DemonitorOrigin(origin.into_shared().erase()),
                 );
             }
         }

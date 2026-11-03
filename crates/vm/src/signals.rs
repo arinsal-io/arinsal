@@ -816,7 +816,7 @@ pub(crate) fn start_timer_bif(
     // A dead pid gets a ref but no timer entry; an unresolved name can become registered
     // before its timer expires.
     let id = rt.next_ref();
-    let message = Message::copy_from(message)?.with_timer_id(id);
+    let message = Message::copy_from_timer(message, id)?;
     // setup_bif_timer: a timer for a process that does not exist is never created.
     if let Some(pid) = pid
         && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
@@ -2461,9 +2461,7 @@ pub(crate) fn demonitor_light(
         let _ = scheduler.signal_ordered(
             me,
             pid,
-            arinsal_sched::Signal::DemonitorOrigin(arinsal_sched::SharedPayload(
-                origin.into_shared(),
-            )),
+            arinsal_sched::Signal::DemonitorOrigin(origin.into_shared().erase()),
         );
         Term::atom(arinsal_term::atoms::TRUE)
     } else {
@@ -3248,7 +3246,7 @@ fn call_resolved(
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_demonitor):
                 // the origin half itself is the demonitor signal.
                 let target = Pid::from_data(origin.view().other());
-                let shared = arinsal_sched::SharedPayload(origin.into_shared());
+                let shared = origin.into_shared().erase();
                 let _ = ctx.signal(target, Signal::DemonitorOrigin(shared));
                 was_active = true;
             }

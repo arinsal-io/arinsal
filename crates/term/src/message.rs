@@ -8,6 +8,7 @@
 //! nodes and of their inline fragments. All raw work on node memory is confined here.
 
 use std::alloc::Layout;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ pub struct SignalNode<T> {
     /// The next node of the queue holding this one (`next`).
     pub next: Option<NonNull<SignalNode<T>>>,
     /// Words of the inline heap fragment (`hfrag.alloc_size`), 0 for a node without one, or
-    /// [`EMBEDDED`] for a node inside another structure.
+    /// [`LAZY`] for a header overlaid on another structure.
     fragment_words: usize,
     /// The signal.
     pub value: T,
@@ -206,77 +207,21 @@ fn node_layout<T>(words: usize) -> (Layout, usize) {
     (layout.pad_to_align(), header_offset)
 }
 
-/// `fragment_words` of a node that lives in an [`EmbeddedSignal`] of another structure.
-const EMBEDDED: usize = usize::MAX;
+/// `fragment_words` of a node that is a header overlaid on another structure (a monitor
+/// half); its signal value is made when the node is taken out of its queue.
+const LAZY: usize = 1 << (usize::BITS - 1);
 
-/// Storage for one signal node inside another structure: erts queues a monitor's own node as
-/// the monitor and demonitor signal (erl_proc_sig_queue.c, erts_proc_sig_send_monitor), so the
-/// signal costs no allocation of its own. `busy` is set while the node is out.
-#[repr(C)]
-pub struct EmbeddedSignal<T> {
-    node: std::cell::UnsafeCell<std::mem::MaybeUninit<SignalNode<T>>>,
-    busy: std::sync::atomic::AtomicBool,
+/// Bits of a lazy node's marker word that the host structure can use for what readers need
+/// before the value exists (the sender and the kind of the signal).
+pub const LAZY_META_MASK: u64 = !(LAZY as u64);
+
+/// Whether a node's `fragment_words` word marks a lazy node.
+const fn is_lazy_word(word: usize) -> bool {
+    word & LAZY != 0
 }
 
-// SAFETY: the node is only reached through the one `OwnedSignal` that `busy` lets out at a time.
-unsafe impl<T: Send> Sync for EmbeddedSignal<T> {}
-// SAFETY: as above; the storage holds a `T` only while the node is out.
-unsafe impl<T: Send> Send for EmbeddedSignal<T> {}
-
-impl<T> Default for EmbeddedSignal<T> {
-    fn default() -> Self {
-        Self {
-            node: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
-            busy: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-impl<T> EmbeddedSignal<T> {
-    /// The node holding `value`, in this storage. Gives `value` back while the node is out.
-    ///
-    /// # Safety
-    ///
-    /// The storage outlives the returned node: dropping the node, or its value, is the last
-    /// use of the storage by it (the value typically keeps the containing structure alive).
-    pub unsafe fn fill(&self, value: T) -> Result<OwnedSignal<T>, T> {
-        if self.busy.swap(true, std::sync::atomic::Ordering::Acquire) {
-            return Err(value);
-        }
-        let node = self.node.get().cast::<SignalNode<T>>();
-        // SAFETY: `busy` was clear, so no node is out of this storage and nothing reads it;
-        // `node` points to storage of a `SignalNode<T>`.
-        unsafe {
-            node.write(SignalNode {
-                next: None,
-                fragment_words: EMBEDDED,
-                value,
-            });
-        }
-        Ok(OwnedSignal {
-            node: NonNull::new(node).expect("field pointer is not null"),
-            _value: PhantomData,
-        })
-    }
-}
-
-/// Take the value out of an embedded node and let its storage be filled again.
-///
-/// # Safety
-///
-/// `node` is a node of an [`EmbeddedSignal`] that the caller owns; it is not used afterwards.
-unsafe fn take_embedded<T>(node: NonNull<SignalNode<T>>) -> T {
-    // SAFETY: the caller owns the node; the value is read once, then `busy` (right after the
-    // node in the `#[repr(C)]` storage) is cleared, which ends the use of the storage.
-    unsafe {
-        let value = std::ptr::addr_of!((*node.as_ptr()).value).read();
-        let storage = node.as_ptr().cast::<EmbeddedSignal<T>>();
-        (*storage)
-            .busy
-            .store(false, std::sync::atomic::Ordering::Release);
-        value
-    }
-}
+/// Size of the header of a lazy node, which its host structure has to leave free in transit.
+pub const LAZY_HEADER_BYTES: usize = crate::raw::LAZY_HEADER_BYTES;
 
 /// The words of a fragment start right after its header.
 fn fragment_words_ptr(header: NonNull<HeapFragment>) -> *mut u64 {
@@ -290,7 +235,8 @@ fn fragment_words_ptr(header: NonNull<HeapFragment>) -> *mut u64 {
 /// A signal node owned outside any queue: the sender before it enqueues, or the receiver after
 /// it took the node out of a queue.
 pub struct OwnedSignal<T> {
-    node: NonNull<SignalNode<T>>,
+    /// A lazy node is replaced by an allocated one when a reader needs the value in place.
+    node: Cell<NonNull<SignalNode<T>>>,
     _value: PhantomData<T>,
 }
 
@@ -343,24 +289,89 @@ impl<T> OwnedSignal<T> {
             }
         }
         Self {
-            node,
+            node: Cell::new(node),
             _value: PhantomData,
         }
     }
 
-    fn header(&self) -> Option<NonNull<HeapFragment>> {
-        // SAFETY: the handle owns the node; the header sits where `node_layout` put it.
-        unsafe {
-            let packed = (*self.node.as_ptr()).fragment_words;
-            let words = packed;
-            if words == 0 || packed == EMBEDDED {
-                return None;
-            }
-            let (_, offset) = node_layout::<T>(words);
-            Some(NonNull::new_unchecked(
-                self.node.as_ptr().cast::<u8>().add(offset).cast(),
-            ))
+    /// A node that is the header of another structure, queued as the signal itself. `meta`
+    /// (within [`LAZY_META_MASK`]) is kept for [`OwnedSignal::lazy_meta`]. `materialise` makes
+    /// the signal value from the structure when the node is taken out of its queue, and gives up
+    /// the structure to the value; until then no value exists.
+    ///
+    /// Contract: `header` points to [`LAZY_HEADER_BYTES`] bytes, word aligned, that nothing else
+    /// uses until the node is taken out; `materialise(header)` is valid once, for that node.
+    pub fn lazy(header: NonNull<u8>, meta: u64, materialise: unsafe fn(NonNull<u8>) -> T) -> Self {
+        debug_assert_eq!(meta & !LAZY_META_MASK, 0);
+        crate::raw::lazy_header_write(header, LAZY | meta as usize, materialise);
+        Self {
+            node: Cell::new(header.cast()),
+            _value: PhantomData,
         }
+    }
+
+    fn marker(node: NonNull<SignalNode<T>>) -> usize {
+        crate::raw::node_marker(node.cast())
+    }
+
+    /// Whether the node is still the header of its structure, with no value yet: always a
+    /// non-message signal.
+    pub fn is_lazy(&self) -> bool {
+        is_lazy_word(Self::marker(self.node.get()))
+    }
+
+    /// The value of a node a queue holds; `None` for a lazy node, which has none yet.
+    ///
+    /// Contract: `node` is a live node of this type, not written while the reference is in use.
+    pub fn value_of<'a>(node: NonNull<SignalNode<T>>) -> Option<&'a T> {
+        (!is_lazy_word(Self::marker(node))).then(|| crate::raw::node_value(node))
+    }
+
+    /// [`OwnedSignal::value_of`], mutably.
+    ///
+    /// Contract: `node` is a live node of this type, not otherwise used while the reference is
+    /// in use.
+    pub fn value_mut_of<'a>(node: NonNull<SignalNode<T>>) -> Option<&'a mut T> {
+        (!is_lazy_word(Self::marker(node))).then(|| crate::raw::node_value_mut(node))
+    }
+
+    /// The `meta` a lazy node was made with, readable before the value exists.
+    pub fn lazy_meta(&self) -> Option<u64> {
+        let word = Self::marker(self.node.get());
+        is_lazy_word(word).then_some(word as u64 & LAZY_META_MASK)
+    }
+
+    /// Take the value of a lazy node out of its structure; the node is not used afterwards.
+    fn materialise(node: NonNull<SignalNode<T>>) -> T {
+        crate::raw::lazy_make(node.cast())
+    }
+
+    /// Give a lazy node the allocated storage of an ordinary one, for a reader that needs the
+    /// value in place. The structure of the lazy node now belongs to the value.
+    fn realise(&self) {
+        if !self.is_lazy() {
+            return;
+        }
+        let value = Self::materialise(self.node.get());
+        let block = Self::new(value);
+        self.node.set(block.into_raw());
+    }
+
+    fn header(&self) -> Option<NonNull<HeapFragment>> {
+        let words = Self::marker(self.node.get());
+        if words == 0 || is_lazy_word(words) {
+            return None;
+        }
+        // The header sits where `node_layout` put it, inside the handle's allocation.
+        let (_, offset) = node_layout::<T>(words);
+        NonNull::new(
+            self.node
+                .get()
+                .as_ptr()
+                .cast::<u8>()
+                .wrapping_add(offset)
+                .cast(),
+        )
     }
 
     /// The inline heap fragment, to allocate the message data in.
@@ -389,7 +400,7 @@ impl<T> OwnedSignal<T> {
     /// `node` is a live node of this type, not written while the returned words are in use.
     pub unsafe fn fragment_words_of<'a>(node: NonNull<SignalNode<T>>) -> Option<&'a [u64]> {
         let handle = std::mem::ManuallyDrop::new(Self {
-            node,
+            node: Cell::new(node),
             _value: PhantomData,
         });
         let header = handle.header()?;
@@ -426,8 +437,8 @@ impl<T> OwnedSignal<T> {
         // either moves to the returned fragment, goes back to its embedding storage, or is
         // released here.
         unsafe {
-            if (*node.as_ptr()).fragment_words == EMBEDDED {
-                return (take_embedded(node), None);
+            if is_lazy_word(Self::marker(node)) {
+                return (Self::materialise(node), None);
             }
             let value = std::ptr::addr_of!((*node.as_ptr()).value).read();
             match header {
@@ -467,7 +478,7 @@ impl<T> OwnedSignal<T> {
 
     /// Give up ownership to a queue.
     pub fn into_raw(self) -> NonNull<SignalNode<T>> {
-        let node = self.node;
+        let node = self.node.get();
         std::mem::forget(self);
         node
     }
@@ -479,7 +490,7 @@ impl<T> OwnedSignal<T> {
     /// `node` came from [`OwnedSignal::into_raw`] of this type and no other owner is left.
     pub unsafe fn from_raw(node: NonNull<SignalNode<T>>) -> Self {
         Self {
-            node,
+            node: Cell::new(node),
             _value: PhantomData,
         }
     }
@@ -489,15 +500,17 @@ impl<T> std::ops::Deref for OwnedSignal<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        self.realise();
         // SAFETY: the handle owns the node, so it is live and not borrowed elsewhere.
-        unsafe { &(*self.node.as_ptr()).value }
+        unsafe { &(*self.node.get().as_ptr()).value }
     }
 }
 
 impl<T> std::ops::DerefMut for OwnedSignal<T> {
     fn deref_mut(&mut self) -> &mut T {
+        self.realise();
         // SAFETY: as in `deref`, and the handle is borrowed exclusively.
-        unsafe { &mut (*self.node.as_ptr()).value }
+        unsafe { &mut (*self.node.get().as_ptr()).value }
     }
 }
 
@@ -508,20 +521,20 @@ impl<T> Drop for OwnedSignal<T> {
         // SAFETY: the handle owns the node; the value is dropped once, and the memory is
         // released by the fragment or here, or goes back to its embedding storage.
         unsafe {
-            if (*self.node.as_ptr()).fragment_words == EMBEDDED {
-                drop(take_embedded(self.node));
+            if is_lazy_word(Self::marker(self.node.get())) {
+                drop(Self::materialise(self.node.get()));
                 return;
             }
-            std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.node.as_ptr()).value));
+            std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.node.get().as_ptr()).value));
             if let Some(header) = header {
                 drop(NodeFragment {
-                    memory: self.node.cast(),
+                    memory: self.node.get().cast(),
                     header,
                 });
             } else {
                 // SAFETY: this node was allocated by `msg_ref_alloc` in `OwnedSignal::new`.
                 arinsal_alloc::typed::msg_ref_free(
-                    arinsal_alloc::typed::MessageRefBlock::from_node(self.node.cast()),
+                    arinsal_alloc::typed::MessageRefBlock::from_node(self.node.get().cast()),
                 );
             }
         }
@@ -822,20 +835,46 @@ mod tests {
         assert_eq!(empty.into_value(), vec![1, 2, 3]);
     }
 
+    /// A host structure whose first words are a lazy node header, with a payload word after.
+    #[repr(C)]
+    struct Host {
+        header: [u64; 3],
+        payload: u64,
+    }
+
+    unsafe fn host_value(header: NonNull<u8>) -> String {
+        // SAFETY: the test passes the start of a live `Host`.
+        let host = unsafe { header.cast::<Host>().as_ref() };
+        format!("host {}", host.payload)
+    }
+
     #[test]
-    fn an_embedded_node_is_lent_out_once_at_a_time() {
-        let storage = EmbeddedSignal::<String>::default();
-        // SAFETY: `storage` outlives every node taken from it in this test.
-        let node = unsafe { storage.fill(String::from("one")) }.expect("free storage");
-        // SAFETY: as above.
-        assert!(unsafe { storage.fill(String::from("two")) }.is_err());
-        assert_eq!(node.into_value(), "one");
-        // SAFETY: as above.
-        let node = unsafe { storage.fill(String::from("three")) }.expect("free again");
-        assert_eq!(node.as_str(), "three");
-        drop(node);
-        // SAFETY: as above.
-        assert!(unsafe { storage.fill(String::new()) }.is_ok_and(|node| node.is_empty()));
+    fn a_lazy_node_makes_its_value_when_taken_out() {
+        let mut host = Host {
+            header: [0; 3],
+            payload: 7,
+        };
+        let header = NonNull::from(&mut host).cast::<u8>();
+        let node = OwnedSignal::lazy(header, 5, host_value);
+        assert!(node.is_lazy());
+        assert_eq!(node.lazy_meta(), Some(5));
+        assert_eq!(node.into_value(), "host 7");
+    }
+
+    #[test]
+    fn a_lazy_node_read_in_place_is_replaced_by_an_allocated_one() {
+        let mut host = Host {
+            header: [0; 3],
+            payload: 9,
+        };
+        let header = NonNull::from(&mut host).cast::<u8>();
+        let mut node = OwnedSignal::lazy(header, 5, host_value);
+        assert_eq!(node.as_str(), "host 9");
+        assert!(!node.is_lazy());
+        node.push('!');
+        assert_eq!(node.into_value(), "host 9!");
+        let dropped = OwnedSignal::lazy(header, 5, host_value);
+        drop(dropped);
     }
 
     #[test]

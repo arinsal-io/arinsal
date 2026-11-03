@@ -55,6 +55,12 @@ pub trait InSignal {
     fn is_message(&self) -> bool;
 }
 
+/// Whether a node is a non-message signal. A lazy node (a monitor half queued as the signal
+/// itself) is one without its value being made.
+pub(crate) fn non_message_signal<T: InSignal>(signal: &crate::sig_queue::OwnedSignal<T>) -> bool {
+    signal.is_lazy() || !signal.is_message()
+}
+
 /// The receiver exited and closed its in-queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueClosed;
@@ -245,7 +251,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
     pub fn push(&self, value: T) {
         let signal = OwnedSignal::new(value);
-        let nmsg = usize::from(!signal.is_message());
+        let nmsg = usize::from(non_message_signal(&signal));
         let (mut queue, _) = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
@@ -286,7 +292,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(signal);
         }
-        let nmsg = usize::from(!signal.is_message());
+        let nmsg = usize::from(non_message_signal(&signal));
         queue.push_back_node(signal);
         let state = self.enqueued(1, nmsg);
         drop(queue);
@@ -330,7 +336,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
                 return None;
             }
             let signal = signal.take()?;
-            let nmsg = usize::from(!signal.is_message());
+            let nmsg = usize::from(non_message_signal(&signal));
             if buffer.queue.is_empty() {
                 // The slot becomes nonempty before the signal is in it, so a flush that
                 // clears the mask finds the signal or the slot is visited again.
@@ -516,7 +522,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         &self,
         progress: &Progress,
         values: &mut Vec<OwnedSignal<T>>,
-        sender_slot: impl Fn(&T) -> usize,
+        sender_slot: impl Fn(&OwnedSignal<T>) -> usize,
     ) -> Result<(), QueueClosed> {
         if values.is_empty() {
             return Ok(());
@@ -547,7 +553,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
                     values.extend(pending);
                     return Err(QueueClosed);
                 }
-                let nmsg = usize::from(!signal.is_message());
+                let nmsg = usize::from(non_message_signal(&signal));
                 queue.push_back_node(signal);
                 self.enqueued(1, nmsg);
             }
@@ -569,7 +575,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if self.buffers.is_occupied() {
             return Err((first, second));
         }
-        let nmsgs = usize::from(!first.is_message()) + usize::from(!second.is_message());
+        let nmsgs =
+            usize::from(non_message_signal(&first)) + usize::from(non_message_signal(&second));
         let (mut queue, contended) = self.lock_msgq();
         if self.closed.load(Ordering::Relaxed) {
             return Err((first, second));
@@ -665,7 +672,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             return None;
         }
         let signal = queue.pop_front_signal()?;
-        let nmsgs = usize::from(!signal.is_message());
+        let nmsgs = usize::from(non_message_signal(&signal));
         self.dequeued(nmsgs, queue.len());
         drop(queue);
         Some(signal.into_value())

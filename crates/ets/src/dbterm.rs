@@ -376,8 +376,7 @@ impl<P: Prefix> DbTerm<P> {
         }
     }
 
-    /// Make the block hold `nwords` words of term data, keeping the header; the words are
-    /// cleared. `erts_db_realloc` when the size changes.
+    /// Make the block hold `nwords` words of term data, keeping the header.
     // Port of erts/emulator/beam/erl_db_util.c (db_realloc_term), OTP-29.1.1.
     fn resize(&mut self, old_nwords: usize, nwords: usize) {
         if old_nwords != nwords {
@@ -389,8 +388,9 @@ impl<P: Prefix> DbTerm<P> {
             .expect("ets_alloc out of memory");
             self.ptr = NonNull::new(user.cast::<Node<P>>()).expect("ets_realloc returned null");
         }
+        // `db_store_term` writes each live tuple word after reuse or realloc, so it never clears
+        // the old payload before copying.
         self.data.meta = nwords as u64;
-        self.data.words_mut().fill(0);
     }
 }
 
@@ -401,8 +401,8 @@ pub(crate) fn new_block<P: Prefix>(nwords: usize) -> DbTerm<P> {
     debug_assert!(nwords < (1usize << TERM_WORDS_BITS));
     let head_words = DbTerm::<P>::HEAD_WORDS;
     let user = ets_alloc_words(head_words + nwords).expect("ets_alloc out of memory");
-    // SAFETY: `user` addresses `head_words + nwords` fresh words, 8-aligned: room for the
-    // header, and the term words after it are zeroed here.
+    // SAFETY: `user` addresses `head_words + nwords` fresh words, 8-aligned, with room for the
+    // initialized header. `fill_block` writes every term word before the block becomes visible.
     unsafe {
         user.cast::<Node<P>>().write(Node {
             prefix: P::empty(),
@@ -411,7 +411,6 @@ pub(crate) fn new_block<P: Prefix>(nwords: usize) -> DbTerm<P> {
                 meta: nwords as u64,
             },
         });
-        std::ptr::write_bytes(user.add(head_words), 0, nwords);
     }
     DbTerm::from_user(user)
 }

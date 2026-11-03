@@ -650,8 +650,8 @@ impl<H: NodeHandle> MonLnkTree<H> {
 
     /// The nodes in the order erts `mon_lnk_rbt_foreach` visits them (`foreach_unordered__`:
     /// both subtrees before the node).
-    fn nodes(&self) -> Vec<NodePtr> {
-        let mut nodes = Vec::new();
+    fn nodes(&self) -> smallvec::SmallVec<[NodePtr; 4]> {
+        let mut nodes = smallvec::SmallVec::new();
         let Some(mut x) = self.root else {
             return nodes;
         };
@@ -683,7 +683,7 @@ impl<H: NodeHandle> MonLnkTree<H> {
 
     /// `erts_monitor_tree_foreach_delete` / `erts_link_tree_foreach_delete`: empty the tree,
     /// handing out its nodes in foreach order.
-    pub(crate) fn drain(&mut self) -> std::vec::IntoIter<H> {
+    pub(crate) fn drain(&mut self) -> smallvec::IntoIter<[H; 4]> {
         let nodes = self.nodes();
         self.root = None;
         nodes
@@ -695,7 +695,7 @@ impl<H: NodeHandle> MonLnkTree<H> {
                     _handle: PhantomData,
                 })
             })
-            .collect::<Vec<_>>()
+            .collect::<smallvec::SmallVec<[H; 4]>>()
             .into_iter()
     }
 }
@@ -809,8 +809,8 @@ impl<I, O, S> MonitorList<I, O, S> {
         }))
     }
 
-    fn nodes(&self) -> Vec<NodePtr> {
-        let mut nodes = Vec::new();
+    fn nodes(&self) -> smallvec::SmallVec<[NodePtr; 4]> {
+        let mut nodes = smallvec::SmallVec::new();
         if let Some(first) = self.first {
             let mut node = first;
             loop {
@@ -833,7 +833,7 @@ impl<I, O, S> MonitorList<I, O, S> {
     }
 
     /// `erts_monitor_list_foreach_delete`: empty the list in list order.
-    pub(crate) fn drain(&mut self) -> std::vec::IntoIter<Monitor<I, O, S>> {
+    pub(crate) fn drain(&mut self) -> smallvec::IntoIter<[Monitor<I, O, S>; 4]> {
         let nodes = self.nodes();
         self.first = None;
         nodes
@@ -846,7 +846,7 @@ impl<I, O, S> MonitorList<I, O, S> {
                     _handle: PhantomData,
                 })
             })
-            .collect::<Vec<_>>()
+            .collect::<smallvec::SmallVec<[Monitor<I, O, S>; 4]>>()
             .into_iter()
     }
 }
@@ -855,9 +855,8 @@ impl<I, O, S> MonitorList<I, O, S> {
 /// halves and never changes; `origin_state` belongs to the origin half and is reached only
 /// through it.
 ///
-/// The allocation is an `Arc` whose strong count is erts' `refc`: each held half owns one count,
-/// and so does a half in transit as a monitor or demonitor signal (`Arc<MonitorData>` coerced
-/// into the scheduler's `SharedPayload`, so the signal costs no allocation of its own).
+/// The allocation is a `MONITOR` fix_alloc block whose in-payload strong count is erts' `refc`:
+/// each held half owns one count, as does a half in transit as a monitor or demonitor signal.
 #[repr(C)]
 pub struct MonitorData<I, O, S = ()> {
     /// The halves are written by the process that holds each of them while the other process
@@ -866,6 +865,8 @@ pub struct MonitorData<I, O, S = ()> {
     target: UnsafeCell<MonLnkNode>,
     /// `ref`: the key of both halves.
     reference: u64,
+    /// References held by both halves and any in-flight signal (`ErtsMonitorData.refc`).
+    reference_count: AtomicU32,
     /// Which halves have a [`Monitor`] handle ([`ORIGIN_HELD`], [`TARGET_HELD`]), so a half
     /// in transit becomes a handle again at most once.
     held: AtomicU32,
@@ -873,14 +874,25 @@ pub struct MonitorData<I, O, S = ()> {
     target_list: AtomicU64,
     info: I,
     origin_state: UnsafeCell<O>,
-    /// The nodes the halves are sent in: the target half as the monitor signal, the origin
-    /// half as the demonitor signal (erts queues the `ErtsMonitor` node itself).
-    target_signal: arinsal_term::message::EmbeddedSignal<S>,
-    origin_signal: arinsal_term::message::EmbeddedSignal<S>,
+    _signal: PhantomData<fn() -> S>,
 }
 
 const ORIGIN_HELD: u32 = 1;
 const TARGET_HELD: u32 = 2;
+/// A half is queued as a signal (its links are the queue header); at most once at a time.
+const ORIGIN_QUEUED: u32 = 4;
+const TARGET_QUEUED: u32 = 8;
+
+/// A signal value that a monitor half in transit stands for. The target half is the monitor
+/// signal, the origin half the demonitor signal; both are made when the receiver takes them
+/// out of its queue (erl_proc_sig_queue.c, handle_incoming reads the `ErtsMonitor` itself).
+pub(crate) trait HalfSignal<I, O>: Sized {
+    /// The signal of `data`'s `target` or origin half, which owns the in-flight reference.
+    fn from_half(
+        data: arinsal_alloc::typed::FixAllocArc<MonitorData<I, O, Self>>,
+        target: bool,
+    ) -> Self;
+}
 
 // SAFETY: each half's node and the origin state are only touched through the one handle that
 // holds that half (`held`), and the rest is atomics or the immutable `info`; so the data may be
@@ -891,12 +903,30 @@ unsafe impl<I: Send + Sync, O: Send, S: Send> Send for MonitorData<I, O, S> {}
 
 impl<I, O, S> MonitorData<I, O, S> {
     /// The data of a monitor node, borrowed for as long as one of its halves is held.
-    fn from_node<'a>(node: NodePtr) -> &'a Self {
+    fn from_node_impl<'a>(
+        node: NodePtr,
+        adopt: bool,
+    ) -> (&'a Self, Option<arinsal_alloc::typed::FixAllocArc<Self>>) {
+        let data = node_to_main(node).cast::<Self>();
         // SAFETY: monitor nodes are created only by `Monitor::create`, inside a `MonitorData`
         // of this type, with `offset` pointing back to its start. The data lives while either
-        // half is held, and the caller holds one. The fields written while it is shared (the
-        // nodes, the origin state, the atomics) are interior-mutable, and `info` is immutable.
-        unsafe { node_to_main(node).cast::<Self>().as_ref() }
+        // half is held, and the caller holds one. `adopt` is true only when a tree returns the
+        // reference transferred by `Monitor::into_node`; shared fields use interior mutability.
+        unsafe {
+            let value = data.as_ref();
+            let owner = adopt.then(|| arinsal_alloc::typed::FixAllocArc::from_raw(data));
+            (value, owner)
+        }
+    }
+
+    fn from_node<'a>(node: NodePtr) -> &'a Self {
+        Self::from_node_impl(node, false).0
+    }
+
+    fn owner_from_node(node: NodePtr) -> arinsal_alloc::typed::FixAllocArc<Self> {
+        Self::from_node_impl(node, true)
+            .1
+            .expect("a monitor tree node transfers one fix_alloc owner")
     }
 
     fn node_of(data: *const Self, target: bool) -> NodePtr {
@@ -929,45 +959,102 @@ impl<I, O, S> MonitorData<I, O, S> {
         self.reference
     }
 
-    /// The signal node of a half in transit, in this data's own storage for it: `build` gets
-    /// the reference that keeps the data alive and makes the signal value from it, so the value
-    /// owns the data its node lives in (erts sends the `ErtsMonitor` node itself). Gives the
-    /// value back when the storage is in use.
-    pub(crate) fn embedded_signal(
-        this: std::sync::Arc<Self>,
+    /// The pid (data) that originates the monitor: the `other` of the target half.
+    pub(crate) fn origin_id(&self) -> u64 {
+        // SAFETY: `other` is written when the halves are created and never changes.
+        unsafe { (*self.target.get()).other }
+    }
+
+    /// The queue node of a half in transit: the half itself, queued as its signal (erts
+    /// queues the `ErtsMonitor` node, erl_proc_sig_queue.c, erts_proc_sig_send_monitor and
+    /// erts_proc_sig_send_demonitor), so it allocates nothing. The signal value is made from the
+    /// half when the node is taken out of its queue. Gives the data back when the half is
+    /// already queued. `meta` is what the delivery path reads before the signal exists.
+    pub(crate) fn half_signal(
+        this: arinsal_alloc::typed::FixAllocArc<Self>,
         target: bool,
-        build: impl FnOnce(std::sync::Arc<Self>) -> S,
-    ) -> Result<arinsal_term::message::OwnedSignal<S>, S> {
-        let storage: *const arinsal_term::message::EmbeddedSignal<S> = if target {
-            &this.target_signal
-        } else {
-            &this.origin_signal
+        meta: u64,
+    ) -> Result<arinsal_term::message::OwnedSignal<S>, arinsal_alloc::typed::FixAllocArc<Self>>
+    where
+        S: HalfSignal<I, O>,
+    {
+        let bit = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
+        if this.held.fetch_or(bit, AtomicOrdering::AcqRel) & bit != 0 {
+            return Err(this);
+        }
+        let header = Self::node_of(this.as_ptr(), target).cast::<u8>();
+        // The signal owns this reference until `materialise` takes it back.
+        let _ = this.into_raw();
+        // A half given up for transit has no handle, so its container links, which are the
+        // first words of the node, are unused until `materialise` resets them; `bit` keeps a
+        // second signal from using them meanwhile.
+        Ok(arinsal_term::message::OwnedSignal::lazy(
+            header,
+            meta,
+            Self::materialise,
+        ))
+    }
+
+    /// The signal of a half queued by [`MonitorData::half_signal`], made when it is taken out.
+    ///
+    /// # Safety
+    ///
+    /// `header` is the node of a half queued by `half_signal` for this data type, not used again.
+    unsafe fn materialise(header: NonNull<u8>) -> S
+    where
+        S: HalfSignal<I, O>,
+    {
+        let node = header.cast::<MonLnkNode>();
+        // SAFETY: the node is the half's, in a live `MonitorData` that the signal's reference
+        // keeps; `offset` points back to its start. The container links are reset to the state
+        // a fresh half has, as the queue header overlaid them.
+        let (data, target) = unsafe {
+            let offset = usize::from((*node.as_ptr()).offset);
+            let target = (*node.as_ptr()).flags & node_flag::TARGET != 0;
+            (*node.as_ptr()).node = NodeLinks {
+                tree: TreeLinks {
+                    parent: 0,
+                    right: None,
+                    left: None,
+                },
+            };
+            let data = NonNull::new_unchecked(header.as_ptr().sub(offset).cast::<Self>());
+            (arinsal_alloc::typed::FixAllocArc::from_raw(data), target)
         };
-        let value = build(this);
-        // SAFETY: `storage` is a field of the data, and `value` holds a strong reference to that
-        // data; the node owns `value` until the value is taken out or dropped, which is the last
-        // use of the storage by the node, so the storage outlives the node.
-        unsafe { (*storage).fill(value) }
+        let bit = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
+        data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
+        S::from_half(data, target)
     }
 
     /// Turn a half in transit back into its handle. `None` when that half already has one.
-    pub(crate) fn take_half(this: std::sync::Arc<Self>, target: bool) -> Option<Monitor<I, O, S>> {
+    pub(crate) fn take_half(
+        this: arinsal_alloc::typed::FixAllocArc<Self>,
+        target: bool,
+    ) -> Option<Monitor<I, O, S>> {
         let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
         if this.held.fetch_or(bit, AtomicOrdering::AcqRel) & bit != 0 {
             return None;
         }
-        let data = std::sync::Arc::into_raw(this);
         Some(Monitor {
-            node: Self::node_of(data, target),
-            _data: PhantomData,
+            node: Self::node_of(this.as_ptr(), target),
+            _data: this,
         })
+    }
+}
+
+impl<I, O, S> arinsal_alloc::typed::FixAllocRefCount for MonitorData<I, O, S> {
+    const ALLOCATION_TYPE: arinsal_alloc::typed::ErtsAlcType =
+        arinsal_alloc::typed::ErtsAlcType::MONITOR;
+
+    fn reference_count(&self) -> &AtomicU32 {
+        &self.reference_count
     }
 }
 
 /// One half of a monitor, owned by the process that holds it (`ErtsMonitor`).
 pub(crate) struct Monitor<I, O, S = ()> {
     node: NodePtr,
-    _data: PhantomData<std::sync::Arc<MonitorData<I, O, S>>>,
+    _data: arinsal_alloc::typed::FixAllocArc<MonitorData<I, O, S>>,
 }
 
 // SAFETY: a half is moved between processes only as a whole; the data it shares with the other
@@ -986,7 +1073,7 @@ impl<I, O, S> NodeHandle for Monitor<I, O, S> {
     fn from_node(node: ContainedNode<Self>) -> Self {
         Self {
             node: node.node,
-            _data: PhantomData,
+            _data: MonitorData::owner_from_node(node.node),
         }
     }
 }
@@ -1008,39 +1095,37 @@ impl<I, O, S> Monitor<I, O, S> {
         let key_offset = offset_of!(MonitorData<I, O, S>, reference);
         let origin_offset = offset_of!(MonitorData<I, O, S>, origin);
         let target_offset = offset_of!(MonitorData<I, O, S>, target);
-        let data = std::sync::Arc::new(MonitorData {
-            origin: UnsafeCell::new(MonLnkNode::new(
-                target,
-                origin_offset,
-                key_offset - origin_offset,
-                kind | flags,
-            )),
-            target: UnsafeCell::new(MonLnkNode::new(
-                origin,
-                target_offset,
-                key_offset - target_offset,
-                kind | flags | node_flag::TARGET,
-            )),
-            reference,
-            held: AtomicU32::new(ORIGIN_HELD | TARGET_HELD),
-            target_list: AtomicU64::new(0),
-            info,
-            origin_state: UnsafeCell::new(origin_state),
-            target_signal: arinsal_term::message::EmbeddedSignal::default(),
-            origin_signal: arinsal_term::message::EmbeddedSignal::default(),
-        });
-        let data: *const MonitorData<I, O, S> = std::sync::Arc::into_raw(data);
-        // SAFETY: `data` came from `Arc::into_raw` and the allocation is live; the second count
-        // is owned by the target half.
-        unsafe { std::sync::Arc::increment_strong_count(data) };
+        let (origin_owner, target_owner) =
+            arinsal_alloc::typed::FixAllocArc::new_pair(MonitorData {
+                origin: UnsafeCell::new(MonLnkNode::new(
+                    target,
+                    origin_offset,
+                    key_offset - origin_offset,
+                    kind | flags,
+                )),
+                target: UnsafeCell::new(MonLnkNode::new(
+                    origin,
+                    target_offset,
+                    key_offset - target_offset,
+                    kind | flags | node_flag::TARGET,
+                )),
+                reference,
+                reference_count: AtomicU32::new(2),
+                held: AtomicU32::new(ORIGIN_HELD | TARGET_HELD),
+                target_list: AtomicU64::new(0),
+                info,
+                origin_state: UnsafeCell::new(origin_state),
+                _signal: PhantomData,
+            })
+            .expect("the MONITOR fixed-size allocation must be available");
         (
             Self {
-                node: MonitorData::node_of(data, false),
-                _data: PhantomData,
+                node: MonitorData::node_of(origin_owner.as_ptr(), false),
+                _data: origin_owner,
             },
             Self {
-                node: MonitorData::node_of(data, true),
-                _data: PhantomData,
+                node: MonitorData::node_of(target_owner.as_ptr(), true),
+                _data: target_owner,
             },
         )
     }
@@ -1076,25 +1161,25 @@ impl<I, O, S> Monitor<I, O, S> {
     }
 
     /// Give the half up for transit as a signal; [`MonitorData::take_half`] turns it back.
-    pub(crate) fn into_shared(self) -> std::sync::Arc<MonitorData<I, O, S>> {
+    pub(crate) fn into_shared(self) -> arinsal_alloc::typed::FixAllocArc<MonitorData<I, O, S>> {
         let target = self.view().is_target();
-        let main = node_to_main(self.node).cast::<MonitorData<I, O, S>>();
-        std::mem::forget(self);
-        // SAFETY: the handle owned one strong count of the `Arc` its data came from, which this
-        // takes over.
-        let data = unsafe { std::sync::Arc::from_raw(main.as_ptr().cast_const()) };
         let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
-        data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
-        data
+        self._data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
+        self._data
     }
-}
 
-impl<I, O, S> Drop for Monitor<I, O, S> {
-    /// `erts_monitor_release`: the data is destroyed with the last half.
-    fn drop(&mut self) {
-        let main = node_to_main(self.node).cast::<MonitorData<I, O, S>>();
-        // SAFETY: the handle owned one strong count of the `Arc` its data came from.
-        drop(unsafe { std::sync::Arc::from_raw(main.as_ptr().cast_const()) });
+    /// Releases both halves after a local demonitor removed each from its owning table.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_DEMONITOR), OTP-29.1.1.
+    pub(crate) fn release_both(origin: Self, target: Self) {
+        debug_assert!(!origin.view().is_target());
+        debug_assert!(target.view().is_target());
+        let Self {
+            _data: origin_data, ..
+        } = origin;
+        let Self {
+            _data: target_data, ..
+        } = target;
+        arinsal_alloc::typed::FixAllocArc::release_pair(origin_data, target_data);
     }
 }
 
@@ -1517,7 +1602,7 @@ mod tests {
     fn a_half_in_transit_becomes_a_handle_once() {
         let (origin, target) = TestMonitor::create(node_type::MONITOR_PROC, 5, 1, 2, 0, 7, 0);
         let shared = target.into_shared();
-        let copy = std::sync::Arc::clone(&shared);
+        let copy = shared.clone();
         let target = MonitorData::take_half(shared, true).expect("target half");
         assert!(MonitorData::take_half(copy, true).is_none());
         assert!(target.is_other_half_of(&origin));
