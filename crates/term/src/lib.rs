@@ -19,7 +19,7 @@ pub mod message;
 mod ops;
 mod owned;
 pub mod ptab;
-mod raw;
+pub mod raw;
 mod record;
 mod record_table;
 mod region;
@@ -462,11 +462,7 @@ impl Term {
     /// Read a boxed header. The term must still belong to a live, stable heap.
     #[inline]
     pub fn header(self) -> Option<u64> {
-        if self.0 & 3 != 2 {
-            return None;
-        }
-        // SAFETY: TermBuilder creates boxed terms from allocated, aligned words.
-        Some(unsafe { *self.raw_ptr() })
+        raw::boxed_header(self)
     }
     /// Return the number of 64-bit digits in a boxed bignum.
     #[inline]
@@ -537,13 +533,8 @@ impl Term {
     /// The heap must remain live and unmoved.
     #[inline]
     pub unsafe fn cons_ref(self) -> Option<(Term, Term)> {
-        if self.0 & 3 != 1 {
-            return None;
-        }
-        // SAFETY: A list pointer denotes two initialized words on a live heap.
-        let p = unsafe { self.raw_ptr() };
-        // SAFETY: See the cell invariant above.
-        Some(unsafe { (Term(*p), Term(*p.add(1))) })
+        // A list pointer denotes two initialized words on a live heap (the caller's contract).
+        raw::Cons::try_from(self).ok().map(raw::Cons::pair)
     }
     pub(crate) fn from_ptr(ptr: *mut u64, tag: u64) -> Self {
         Self((ptr as u64) | tag)

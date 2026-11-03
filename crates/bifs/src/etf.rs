@@ -6,6 +6,7 @@ use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
 use arinsal_etf::DecodedSizeWalk;
+use arinsal_term::raw::{Cons, Tuple};
 use arinsal_term::{
     Atom, AtomEncoding, BinaryOwner, BinaryRef, ConsListBuilder, ExportEntry, FunEntry, FunRef,
     HeapAlloc, HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords,
@@ -567,21 +568,35 @@ fn record_of<'a>(term: Term) -> Result<arinsal_term::RecordRef<'a>, BifError> {
 // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
 fn external_string_prefix(mut term: Term) -> (usize, bool) {
     let mut len = 0usize;
-    while is_list_term(term) {
-        let Ok((head, tail)) = crate::pure::iolist_cons(term) else {
-            return (len, false);
-        };
+    while let Ok(cell) = Cons::try_from(term) {
         // A small integer in 0..=255: the low four tag bits are 1111 and the value is above.
-        if head.word() & 15 != 15 || head.word() >> 4 > 255 {
+        let head = cell.head().word();
+        if head & 15 != 15 || head >> 4 > 255 {
             return (len, false);
         }
         len += 1;
         if len > 0xffff {
             return (len, false);
         }
-        term = tail;
+        term = cell.tail();
     }
     (len, term == Term::NIL)
+}
+
+/// Element `arity - remaining` of a tuple, with one tag and header test.
+// Port of the `ptr` walk of TERM_ARRAY_OP / ENC_LAST_ARRAY_ELEMENT in
+// erts/emulator/beam/external.c, OTP-29.1.1.
+#[inline(always)]
+fn tuple_element_from_end(container: Term, remaining: usize) -> Result<Term, BifError> {
+    let tuple = Tuple::try_from(container).map_err(|_| BifError::BADARG)?;
+    tuple
+        .get(
+            tuple
+                .arity()
+                .checked_sub(remaining)
+                .ok_or(BifError::BADARG)?,
+        )
+        .ok_or(BifError::BADARG)
 }
 
 fn bit_bytes(term: Term) -> Result<(SmallVec<[u8; 64]>, usize), BifError> {
@@ -801,7 +816,7 @@ fn push_size_array(stack: &mut WStack, container: Term, remaining: usize, kind: 
 #[inline(always)]
 fn size_array_element(kind: u64, container: Term, remaining: usize) -> Result<Term, BifError> {
     match kind {
-        ARRAY_TUPLE => crate::pure::tuple_element_from_end(container, remaining),
+        ARRAY_TUPLE => tuple_element_from_end(container, remaining),
         ARRAY_FLAT_KEYS | ARRAY_FLAT_VALUES => {
             let (key, value) = flatmap_pair(container, remaining)?;
             Ok(if kind == ARRAY_FLAT_KEYS { key } else { value })
@@ -851,7 +866,7 @@ fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
     if code == SIZE_LIST_TAIL {
         let tail = stack.pop().ok_or(BifError::BADARG)?;
         if is_list_term(tail) {
-            let (head, rest) = crate::pure::iolist_cons(tail)?;
+            let (head, rest) = Cons::try_from(tail).map_err(|_| BifError::BADARG)?.pair();
             push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
             Ok(Some(head))
         } else {
@@ -1073,20 +1088,21 @@ fn size_walk(
                     add!(3 + len);
                 } else {
                     add!(5);
-                    let (head, rest) = crate::pure::iolist_cons(obj)?;
+                    let (head, rest) = Cons::try_from(obj).map_err(|_| BifError::BADARG)?.pair();
                     push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
                     obj = head;
                     continue;
                 }
             }
             TermKind::Tuple => {
-                let arity = crate::pure::tuple_arity(obj)?;
+                let tuple = Tuple::try_from(obj).map_err(|_| BifError::BADARG)?;
+                let arity = tuple.arity();
                 add!(if arity <= 255 { 2 } else { 5 });
                 if arity > 0 {
                     if arity > 1 {
                         push_size_array(stack, obj, arity - 1, ARRAY_TUPLE);
                     }
-                    obj = crate::pure::tuple_element(obj, 0)?;
+                    obj = tuple.get(0).ok_or(BifError::BADARG)?;
                     continue;
                 }
             }
@@ -1708,7 +1724,7 @@ impl EncodeWalk {
                         key
                     } else {
                         // ENC_LAST_ARRAY_ELEMENT+N: the next tuple element.
-                        let element = crate::pure::tuple_element_from_end(container, remaining)?;
+                        let element = tuple_element_from_end(container, remaining)?;
                         if remaining > 1 {
                             push_term_task(&mut stack, stack_command(code as i64 - 8), container);
                         }
@@ -1823,11 +1839,10 @@ impl EncodeWalk {
                         out.extend_from_slice(&(len as u16).to_be_bytes());
                         let mut cursor = term;
                         for _ in 0..len {
-                            // SAFETY: external_string_prefix already walked these cons cells.
-                            let (head, tail) =
-                                unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)?;
-                            out.push(head.as_small().ok_or(BifError::BADARG)? as u8);
-                            cursor = tail;
+                            // external_string_prefix already walked these cons cells.
+                            let cell = Cons::try_from(cursor).map_err(|_| BifError::BADARG)?;
+                            out.push(cell.head().as_small().ok_or(BifError::BADARG)? as u8);
+                            cursor = cell.tail();
                         }
                         consumed += len;
                     } else {
@@ -1843,7 +1858,7 @@ impl EncodeWalk {
                     }
                 }
                 TermKind::Tuple => {
-                    let arity = crate::pure::tuple_arity(term)?;
+                    let arity = Tuple::try_from(term).map_err(|_| BifError::BADARG)?.arity();
                     if arity <= 255 {
                         out.extend_from_slice(&[104, arity as u8]);
                     } else {

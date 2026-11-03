@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use arinsal_etf::OwnedTerm;
+use arinsal_term::raw::Cons;
 use arinsal_term::{Term, TermBuilder, TermKind, atoms, global_atoms};
 use smallvec::SmallVec;
 
@@ -153,13 +154,8 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError>
     let mut cost = 0;
     let mut stack = arinsal_term::EStack::<8>::new();
     let mut current = root;
-    let mut next_cell = None;
     loop {
-        let (head, tail) = if let Some(cell) = next_cell.take() {
-            cell
-        } else if let Some(cell) = crate::lists::cons_cell(current) {
-            cell
-        } else {
+        let Ok(cell) = Cons::try_from(current) else {
             match current.classify() {
                 TermKind::Nil => {
                     if let Some(next) = stack.pop() {
@@ -182,9 +178,12 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError>
                 _ => return Err(BifError::BADARG),
             }
         };
-
-        if let Some(mut cp) = head.as_small() {
-            let mut rest = tail;
+        let head = cell.head();
+        if let Some(first) = head.as_small() {
+            // The run of small integers is the hot loop of utf8_need: one cursor, the cell
+            // proof from the tag test of the previous tail, no re-test of the cell.
+            let mut cell = cell;
+            let mut cp = first;
             loop {
                 let codepoint = cp as u64;
                 cost += 1;
@@ -197,20 +196,21 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError>
                 } else {
                     4
                 };
-                current = rest;
-                let Some((next_head, next_tail)) = crate::lists::cons_cell(rest) else {
+                let tail = cell.tail();
+                current = tail;
+                let Ok(next) = Cons::try_from(tail) else {
                     break;
                 };
-                let Some(next_cp) = next_head.as_small() else {
-                    next_cell = Some((next_head, next_tail));
+                let Some(next_cp) = next.head().as_small() else {
                     break;
                 };
+                cell = next;
                 cp = next_cp;
-                rest = next_tail;
             }
             continue;
         }
 
+        let tail = cell.tail();
         match head.classify() {
             TermKind::Nil => current = tail,
             TermKind::List => {
@@ -858,6 +858,55 @@ struct BinaryBuild {
     error: bool,
 }
 
+// Port of erts/emulator/beam/erl_unicode.c:558-603 (small integer branch of do_build_utf8),
+// OTP-29.1.1. Writes `cp` as UTF-8 at `pos` and returns its width, `None` for a value that
+// cannot be encoded. When four bytes remain the encoder writes through a fixed-size chunk,
+// so the per-byte bounds checks vanish; the tail of the buffer takes the indexed path.
+#[inline(always)]
+fn put_scalar(output: &mut [u8], pos: usize, cp: u32, latin1: bool) -> Option<usize> {
+    if latin1 && cp > 255 {
+        return None;
+    }
+    if let Some(dst) = output
+        .get_mut(pos..)
+        .and_then(|rest| rest.first_chunk_mut::<4>())
+    {
+        return encode_scalar(dst, cp);
+    }
+    let mut scratch = [0_u8; 4];
+    let width = encode_scalar(&mut scratch, cp)?;
+    output[pos..pos + width].copy_from_slice(&scratch[..width]);
+    Some(width)
+}
+
+#[inline(always)]
+fn encode_scalar(dst: &mut [u8; 4], cp: u32) -> Option<usize> {
+    if cp < 0x80 {
+        dst[0] = cp as u8;
+        Some(1)
+    } else if cp < 0x800 {
+        dst[0] = ((cp >> 6) as u8) | 0xc0;
+        dst[1] = ((cp & 0x3f) as u8) | 0x80;
+        Some(2)
+    } else if cp < 0x10000 {
+        if (0xd800..=0xdfff).contains(&cp) {
+            return None;
+        }
+        dst[0] = ((cp >> 12) as u8) | 0xe0;
+        dst[1] = (((cp >> 6) as u8) & 0x3f) | 0x80;
+        dst[2] = ((cp as u8) & 0x3f) | 0x80;
+        Some(3)
+    } else if cp < 0x110000 {
+        dst[0] = ((cp >> 18) as u8) | 0xf0;
+        dst[1] = (((cp >> 12) as u8) & 0x3f) | 0x80;
+        dst[2] = (((cp >> 6) as u8) & 0x3f) | 0x80;
+        dst[3] = ((cp as u8) & 0x3f) | 0x80;
+        Some(4)
+    } else {
+        None
+    }
+}
+
 impl BinaryBuild {
     fn new(root: Term, pos: usize, encoding: Encoding) -> Self {
         Self {
@@ -879,83 +928,56 @@ impl BinaryBuild {
         self.pos += bytes.len();
     }
 
-    // Port of erts/emulator/beam/erl_unicode.c:558-603 (small integer branch), OTP-29.1.1.
-    #[inline(always)]
-    fn append_scalar(&mut self, output: &mut [u8], cp: u32) -> bool {
-        if self.encoding == Encoding::Latin1 && cp > 255 {
-            self.error = true;
-            return false;
-        }
-        if cp < 0x80 {
-            output[self.pos] = cp as u8;
-            self.pos += 1;
-        } else if cp < 0x800 {
-            output[self.pos] = ((cp >> 6) as u8) | 0xc0;
-            output[self.pos + 1] = ((cp & 0x3f) as u8) | 0x80;
-            self.pos += 2;
-        } else if cp < 0x10000 {
-            if (0xd800..=0xdfff).contains(&cp) {
-                self.error = true;
-                return false;
-            }
-            output[self.pos] = ((cp >> 12) as u8) | 0xe0;
-            output[self.pos + 1] = (((cp >> 6) as u8) & 0x3f) | 0x80;
-            output[self.pos + 2] = ((cp as u8) & 0x3f) | 0x80;
-            self.pos += 3;
-        } else if cp < 0x110000 {
-            output[self.pos] = ((cp >> 18) as u8) | 0xf0;
-            output[self.pos + 1] = (((cp >> 12) as u8) & 0x3f) | 0x80;
-            output[self.pos + 2] = (((cp >> 6) as u8) & 0x3f) | 0x80;
-            output[self.pos + 3] = ((cp as u8) & 0x3f) | 0x80;
-            self.pos += 4;
-        } else {
-            self.error = true;
-            return false;
-        }
-        true
-    }
-
     // Port of erts/emulator/beam/erl_unicode.c:508-750 (do_build_utf8), OTP-29.1.1.
     fn fill(&mut self, output: &mut [u8], left: &mut i64) {
-        let mut next_cell = None;
+        let latin1 = self.encoding == Encoding::Latin1;
         while *left > 0 && !self.error {
-            if let Some((head, tail)) = next_cell
-                .take()
-                .or_else(|| crate::lists::cons_cell(self.current))
-            {
+            if let Ok(cell) = Cons::try_from(self.current) {
+                let head = cell.head();
                 if let Some(number) = head.as_small() {
                     if !self.leftover.is_empty() {
                         self.error = true;
                         return;
                     }
+                    // Hot loop of do_build_utf8: cursor, output position and budget live in
+                    // locals and are stored back once when the run of small integers ends.
+                    let mut cell = cell;
                     let mut cp = number as u32;
-                    let mut rest = tail;
-                    loop {
-                        if !self.append_scalar(output, cp) {
+                    let mut pos = self.pos;
+                    let mut remaining = *left;
+                    let current = loop {
+                        let Some(written) = put_scalar(output, pos, cp, latin1) else {
+                            self.pos = pos;
+                            *left = remaining;
+                            self.current = cell.term();
+                            self.error = true;
                             return;
-                        }
-                        *left -= 1;
-                        self.current = rest;
-                        if *left == 0 {
-                            break;
-                        }
-                        let Some((next_head, next_tail)) = crate::lists::cons_cell(rest) else {
-                            break;
                         };
-                        let Some(next_number) = next_head.as_small() else {
-                            next_cell = Some((next_head, next_tail));
-                            break;
+                        pos += written;
+                        remaining -= 1;
+                        let tail = cell.tail();
+                        if remaining == 0 {
+                            break tail;
+                        }
+                        let Ok(next) = Cons::try_from(tail) else {
+                            break tail;
                         };
-                        cp = next_number as u32;
-                        rest = next_tail;
-                    }
+                        let Some(next_cp) = next.head().as_small() else {
+                            break tail;
+                        };
+                        cell = next;
+                        cp = next_cp as u32;
+                    };
+                    self.pos = pos;
+                    *left = remaining;
+                    self.current = current;
                 } else if head == Term::NIL {
-                    self.current = tail;
+                    self.current = cell.tail();
                 } else if head.classify() == TermKind::List {
-                    self.ancestors.push(tail);
+                    self.ancestors.push(cell.tail());
                     self.current = head;
                 } else if head.classify() == TermKind::Bitstring {
-                    self.fill_binary(head, Some(tail), output, left);
+                    self.fill_binary(head, Some(cell.tail()), output, left);
                 } else {
                     self.error = true;
                 }
