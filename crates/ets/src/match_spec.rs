@@ -1073,6 +1073,7 @@ impl MatchProgram {
         let mut state = STATE
             .take()
             .unwrap_or_else(|| Box::new(pam::PamState::new(self.stack_need, self.num_bindings)));
+        state.prepare(self.stack_need, self.num_bindings);
         let result = self.run_program(object, dst, context, &mut state, None);
         if state.heap.used_words() != 0 {
             state.heap.reset(128);
@@ -1492,15 +1493,9 @@ fn uncons(term: &OwnedTerm) -> Option<(&OwnedTerm, OwnedTerm)> {
     Some((head, rest))
 }
 
+/// `am_true` and `am_false`: atoms are compile-time constants in erts.
 fn bool_atoms() -> (Atom, Atom) {
-    static ATOMS: std::sync::OnceLock<(Atom, Atom)> = std::sync::OnceLock::new();
-    *ATOMS.get_or_init(|| {
-        let atoms = global_atoms();
-        (
-            atoms.intern("true").unwrap(),
-            atoms.intern("false").unwrap(),
-        )
-    })
+    (arinsal_term::atoms::TRUE, arinsal_term::atoms::FALSE)
 }
 
 fn bool_term(value: bool) -> Term {

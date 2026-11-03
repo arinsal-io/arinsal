@@ -8,7 +8,7 @@ use super::dmc::{Fast, GuardBif, Op};
 use super::{MatchContext, MatchProgram, bool_term, boolean, builtin, float_bits, is_float_term};
 use super::{cons, tuple_view};
 use crate::EtsError;
-use arinsal_term::{Term, TermBuilder, TermKind, TupleRef, VecHeap, atoms, cmp, exact_eq};
+use arinsal_term::{Term, TermBuilder, TermKind, TupleRef, VecHeap, cmp, exact_eq};
 use std::cmp::Ordering;
 
 /// The `Eterm*` cursors of db_prog_match: where the next match instruction reads.
@@ -121,8 +121,9 @@ impl PamState {
         }
     }
 
-    #[inline(always)]
-    fn prepare(&mut self, stack_need: usize, num_bindings: usize) {
+    /// Size the arrays for another program, as `get_match_pseudo_process` does when the
+    /// thread's process is reused. A state made by `new` for the program needs no call.
+    pub fn prepare(&mut self, stack_need: usize, num_bindings: usize) {
         if self.esp.capacity() < stack_need {
             self.esp.reserve(stack_need);
         }
@@ -135,10 +136,10 @@ impl PamState {
     }
 }
 
-fn exit_atom() -> Term {
-    // Port of erts/emulator/beam/erl_db_util.c (db_prog_match), OTP-29.1.1:
-    // the match interpreter uses the preloaded EXIT atom directly.
-    Term::atom(atoms::EXIT_2)
+/// `am_EXIT`, the result of a failed guard BIF under `catch`. `EXIT_2` is the atom `EXIT`;
+/// the generated `EXIT` is `exit`.
+const fn exit_atom() -> Term {
+    Term::atom(arinsal_term::atoms::EXIT_2)
 }
 
 fn small_pair(a: Term, b: Term) -> Option<(i64, i64)> {
@@ -341,7 +342,6 @@ pub(super) fn db_prog_match<C: MatchContext>(
 ) -> Result<Option<Outcome>, EtsError> {
     let text = &prog.text;
     let arity = array.len();
-    state.prepare(prog.stack_need, prog.num_bindings);
     let PamState {
         heap,
         esp,

@@ -2083,7 +2083,8 @@ fn trap_exit_atom() -> Term {
 }
 
 /// `setelement/3`: one bump and a copy of the tuple.
-// Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:151-166 (emit_i_bif) and
+// erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1.
 pub(crate) extern "C" fn setelement_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
@@ -2097,7 +2098,7 @@ pub(crate) extern "C" fn setelement_light(
     }
 }
 
-/// `Some` is the new tuple. `None` means the generic BIF body must run.
+/// `Some` is the new tuple. `None` sends errors through the generic BIF body.
 fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
     if header.is_null() || regs.is_null() {
         return None;
@@ -2109,8 +2110,7 @@ fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
         let tuple = crate::native_hooks::from_raw(*regs.add(1));
         let value = *regs.add(2);
         let ix = index.as_small().filter(|ix| *ix >= 1)?;
-        let src = tuple.raw_ptr();
-        let hdr = *src;
+        let hdr = tuple.header()?;
         if hdr & 63 != 0 {
             return None;
         }
@@ -2119,6 +2119,7 @@ fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
         if slot > arity {
             return None;
         }
+        let src = tuple.raw_ptr();
         let size = arity + 1;
         let process = &mut *header.cast::<crate::Process>();
         let htop = process.header.htop;

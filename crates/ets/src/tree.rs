@@ -72,6 +72,14 @@ impl TreeRoot {
         self.nitems
     }
 
+    /// Whether the AVL root has fewer than two nodes, as checked before a CA-tree split.
+    // Port of erts/emulator/beam/erl_db_catree.c (less_than_two_elements), OTP-29.1.1.
+    pub(super) fn has_fewer_than_two_nodes(&self) -> bool {
+        self.root
+            .as_deref()
+            .is_none_or(|root| root.prefix.left.is_none() && root.prefix.right.is_none())
+    }
+
     /// `ERTS_DB_TABLE_MEM_COUNTER_ID` of a plain tree table (`erl_db.h:167`).
     pub(super) fn object_memory_words(&self) -> isize {
         self.memory_words

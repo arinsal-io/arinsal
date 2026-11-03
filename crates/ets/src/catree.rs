@@ -1065,8 +1065,10 @@ impl CATree {
         {
             return;
         }
-        if root.count() < 2 {
-            base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+        if root.has_fewer_than_two_nodes() {
+            if !self.force_split.load(AtomicOrdering::Relaxed) {
+                base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+            }
             return;
         }
         base.is_valid.store(false, AtomicOrdering::Release);
@@ -1183,8 +1185,10 @@ impl CATree {
         {
             return;
         }
-        if root.count() < 2 {
-            base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+        if root.has_fewer_than_two_nodes() {
+            if !self.force_split.load(AtomicOrdering::Relaxed) {
+                base.lock_statistics.store(0, AtomicOrdering::Relaxed);
+            }
             return;
         }
         base.is_valid.store(false, AtomicOrdering::Release);
@@ -1392,4 +1396,29 @@ fn key_object(key: Term) -> Result<crate::PlainDbTerm, EtsError> {
 
 fn copy_term_for_catree<H: HeapAlloc>(object: &StoredTerm, dst: &mut H) -> Result<Term, EtsError> {
     object.copy_out(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stale item count must not make either split caller split an empty AVL base.
+    #[test]
+    fn split_empty_base_uses_tree_shape_not_item_count() {
+        let tree = CATree::new(1, false);
+        let routes = tree.routes.load_full();
+        let base = Arc::clone(&routes[0].base);
+        *base.root.write() = TreeRoot::from_link(None, 2);
+
+        let root = base.write_no_stats();
+        tree.split_locked(&base, 0, Arc::clone(&routes), root);
+        assert!(base.is_valid.load(AtomicOrdering::Acquire));
+        assert!(base.root.read().has_fewer_than_two_nodes());
+        assert!(tree.routes.load().len() == 1);
+
+        tree.split(&base);
+        assert!(base.is_valid.load(AtomicOrdering::Acquire));
+        assert!(base.root.read().has_fewer_than_two_nodes());
+        assert!(tree.routes.load().len() == 1);
+    }
 }

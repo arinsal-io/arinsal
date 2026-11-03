@@ -2733,6 +2733,9 @@ pub(crate) struct EtsSelect {
     pub(crate) stage: SelectStage,
     /// The end of the key range an ordered table's continuation names.
     pub(crate) end: Option<arinsal_ets::SavedKey>,
+    /// Reductions a call made from native code still has to charge: the trap happens there,
+    /// the scheduler path charges them and yields once, as the BIF trap does in erts.
+    pub(crate) pending_charge: Option<isize>,
 }
 
 /// Where a trapped chunked traversal of an ordered table is.

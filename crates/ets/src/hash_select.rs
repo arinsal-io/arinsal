@@ -200,13 +200,14 @@ impl Table {
     /// iteration budget is spent at a bucket boundary.
     // Port of erts/emulator/beam/erl_db_hash.c, match_traverse and match_traverse_continue,
     // OTP-29.1.1.
+    #[inline(always)]
     pub(crate) fn hash_scan(
         &self,
         plan: &HashScanPlan,
         from: usize,
         mut iterations: isize,
-        full: &dyn Fn() -> bool,
-        visit: &mut dyn FnMut(&StoredTerm) -> Result<(), EtsError>,
+        full: impl Fn() -> bool,
+        mut visit: impl FnMut(&StoredTerm) -> Result<(), EtsError>,
     ) -> Result<HashScanEnd, EtsError> {
         let Storage::Hash(storage) = &self.storage else {
             return Err(EtsError::BadArg);
@@ -247,8 +248,8 @@ impl Table {
                 slot,
                 nlocks,
                 false,
-                visit,
-                &mut |current, visited| {
+                &mut visit,
+                |current, visited| {
                     iterations -= visited as isize;
                     let mut next = current + nlocks;
                     if next >= storage.nactive() {
@@ -329,14 +330,20 @@ impl Table {
         }
         let mut runner = program.runner();
         let mut results = Vec::new();
+        // `tb->common.compress` is tested once per table, not per object.
+        let compressed = self.options.compressed;
         let held = std::cell::Cell::new(got);
         let end = self.hash_scan(
             plan,
             from,
             HASH_SELECT_ITERATIONS,
-            &|| chunk > 0 && held.get() >= chunk,
-            &mut |object| {
-                let (term, size) = object.term_for_filter_with_size(dst)?;
+            || chunk > 0 && held.get() >= chunk,
+            |object| {
+                let (term, size) = if compressed {
+                    object.term_for_filter_with_size(dst)?
+                } else {
+                    object.term_uncompressed_with_size()
+                };
                 if let Some(result) = runner.run_sized(term, dst, size)? {
                     results.push(result);
                     held.set(held.get() + 1);
@@ -363,8 +370,8 @@ impl Table {
             plan,
             from,
             HASH_SELECT_ITERATIONS,
-            &|| false,
-            &mut |object| {
+            || false,
+            |object| {
                 let term = object.term_for_filter(&mut scratch)?;
                 if program
                     .run(term, &mut scratch)?

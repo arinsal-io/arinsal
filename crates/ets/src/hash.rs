@@ -155,17 +155,6 @@ impl SegmentedBuckets {
             bucket.head = None;
         }
     }
-
-    fn for_each_mut(&mut self, mut visit: impl FnMut(&mut HashBucket)) {
-        for bucket in &mut self.first {
-            visit(bucket);
-        }
-        for segment in &mut self.ext {
-            for bucket in segment {
-                visit(bucket);
-            }
-        }
-    }
 }
 
 impl std::ops::Index<usize> for SegmentedBuckets {
@@ -359,6 +348,9 @@ pub(super) struct HashStorage {
     /// erts `tb->is_resizing`: at most one thread grows or shrinks the table at a time, and a
     /// thread that finds it set does not wait.
     is_resizing: AtomicBool,
+    /// erts `tb->fixdel`: the buckets that hold pseudo-deleted nodes, so the last unfix purges
+    /// those buckets instead of walking the whole table.
+    fixdel: parking_lot::Mutex<Vec<usize>>,
 }
 
 /// Holds `is_resizing` until dropped (erts `done_resizing`).
@@ -423,6 +415,7 @@ impl HashStorage {
             auto_lock_count: AtomicUsize::new(locks),
             decentralized_counters,
             is_resizing: AtomicBool::new(false),
+            fixdel: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -672,8 +665,12 @@ impl HashStorage {
 
     /// Delete all objects at a key while holding its write stripe.
     pub(super) fn delete_key_shared(&self, key: Term, hash: u64, keypos: usize, fixed: bool) {
-        let (count, memory_delta) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
-            erase_in_bucket(bucket, hash >> 1, keypos, key, fixed)
+        let (count, memory_delta) = self.with_hash_bucket_mut(hash >> 1, |slot, bucket| {
+            let erased = erase_in_bucket(bucket, hash >> 1, keypos, key, fixed);
+            if fixed && erased.0 != 0 {
+                self.add_fixed_deletion(slot);
+            }
+            erased
         });
         self.add_object_memory(hash >> 1, memory_delta);
         if count != 0 {
@@ -695,6 +692,9 @@ impl HashStorage {
         let slot = self.slot_index(hash >> 1);
         let (count, memory_delta) =
             erase_in_bucket(self.segment_bucket_mut(slot), hash >> 1, keypos, key, fixed);
+        if fixed && count != 0 {
+            self.add_fixed_deletion(slot);
+        }
         self.add_object_memory(hash >> 1, memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
@@ -897,8 +897,13 @@ impl HashStorage {
         table_type: TableType,
         fixed: bool,
     ) {
-        let (count, memory_delta) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
-            erase_object_in_bucket(bucket, hash >> 1, keypos, key, object, table_type, fixed)
+        let (count, memory_delta) = self.with_hash_bucket_mut(hash >> 1, |slot, bucket| {
+            let erased =
+                erase_object_in_bucket(bucket, hash >> 1, keypos, key, object, table_type, fixed);
+            if fixed && erased.0 != 0 {
+                self.add_fixed_deletion(slot);
+            }
+            erased
         });
         self.add_object_memory(hash >> 1, memory_delta);
         if count != 0 {
@@ -929,6 +934,9 @@ impl HashStorage {
             table_type,
             fixed,
         );
+        if fixed && count != 0 {
+            self.add_fixed_deletion(slot);
+        }
         self.add_object_memory(hash >> 1, memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
@@ -947,9 +955,13 @@ impl HashStorage {
         fixed: bool,
         dst: &mut H,
     ) -> Result<Vec<Term>, EtsError> {
-        let (values, count, memory_delta) = self
-            .with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
-                take_in_bucket(bucket, hash >> 1, keypos, key, table_type, fixed, dst)
+        let (values, count, memory_delta) =
+            self.with_hash_bucket_mut(hash >> 1, |slot, bucket| {
+                let taken = take_in_bucket(bucket, hash >> 1, keypos, key, table_type, fixed, dst)?;
+                if fixed && taken.1 != 0 {
+                    self.add_fixed_deletion(slot);
+                }
+                Ok::<_, EtsError>(taken)
             })?;
         self.add_object_memory(hash >> 1, memory_delta);
         if count != 0 {
@@ -981,6 +993,9 @@ impl HashStorage {
             fixed,
             dst,
         )?;
+        if fixed && count != 0 {
+            self.add_fixed_deletion(slot);
+        }
         self.add_object_memory(hash >> 1, memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
@@ -1365,9 +1380,13 @@ impl HashStorage {
     pub(super) fn mark_deleted_from(&mut self, mut slot: usize, loops: &mut isize) -> usize {
         loop {
             let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
+            let marked = node.is_some();
             while let Some(current) = node {
                 current.prefix.set_pseudo_deleted(true);
                 node = current.prefix.next.as_deref_mut();
+            }
+            if marked {
+                self.fixdel.get_mut().push(slot);
             }
             slot += 1;
             *loops -= 1;
@@ -1381,9 +1400,13 @@ impl HashStorage {
     pub(super) fn mark_all_deleted(&mut self) {
         for slot in 0..self.nactive() {
             let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
+            let marked = node.is_some();
             while let Some(current) = node {
                 current.prefix.set_pseudo_deleted(true);
                 node = current.prefix.next.as_deref_mut();
+            }
+            if marked {
+                self.fixdel.get_mut().push(slot);
             }
         }
     }
@@ -1392,6 +1415,7 @@ impl HashStorage {
     // Port of erts/emulator/beam/erl_db_hash.c (db_delete_all_objects_hash:
     // db_free_table_continue_hash + db_create_hash), OTP-29.1.1.
     pub(super) fn clear_buckets(&mut self) {
+        self.fixdel.get_mut().clear();
         for stripe in self.stripes.iter_mut() {
             stripe.buckets.get_mut().reset();
             stripe.nitems.store(0, Ordering::Relaxed);
@@ -1405,11 +1429,22 @@ impl HashStorage {
     /// Remove pseudo-deleted nodes once the last table fixation ends.
     // Port of erts/emulator/beam/erl_db_hash.c (db_unfix_table_hash), OTP-29.1.1.
     pub(super) fn unfix(&mut self) {
-        for stripe in &mut self.stripes {
-            stripe.buckets.get_mut().for_each_mut(|bucket| {
+        let mut slots = std::mem::take(self.fixdel.get_mut());
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            // A slot beyond `nactive` was joined and purged by a shrink.
+            if slot < self.nactive() {
+                let bucket = self.segment_bucket_mut(slot);
                 bucket.head = purge_pseudo_deleted(bucket.head.take());
-            });
+            }
         }
+    }
+
+    /// Note that a fixed table's bucket holds a pseudo-deleted node.
+    // Port of erts/emulator/beam/erl_db_hash.c (add_fixed_deletion), OTP-29.1.1.
+    fn add_fixed_deletion(&self, slot: usize) {
+        self.fixdel.lock().push(slot);
     }
 
     /// Detach all buckets (and, for a table being deleted, the pseudo-deleted list) so they can
@@ -1581,13 +1616,14 @@ impl HashStorage {
     /// Visit consecutive buckets assigned to one lock, keeping its read guard until the
     /// traversal leaves that stripe or stops at a bucket boundary.
     // Port of erts/emulator/beam/erl_db_hash.c (match_traverse, next_slot), OTP-29.1.1.
+    #[inline(always)]
     pub(super) fn try_with_ordered_stripe<E>(
         &self,
         from: usize,
         stride: usize,
         with_deleted: bool,
-        visit: &mut dyn FnMut(&StoredTerm) -> Result<(), E>,
-        after_bucket: &mut dyn FnMut(usize, usize) -> Result<bool, E>,
+        mut visit: impl FnMut(&StoredTerm) -> Result<(), E>,
+        mut after_bucket: impl FnMut(usize, usize) -> Result<bool, E>,
     ) -> Result<(usize, bool), E> {
         debug_assert!(stride > 0);
         let active = self.nactive();
