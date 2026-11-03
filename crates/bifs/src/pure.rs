@@ -458,20 +458,6 @@ fn for_each_cons(
     }
 }
 
-// Port of erts_list_length in erts/emulator/beam/utils.c:345-354, OTP-29.1.1.
-fn proper_list_length(mut list: Term) -> Result<usize, BifError> {
-    let mut len = 0usize;
-    while let Some((_, tail)) = next_cons(list) {
-        len += 1;
-        list = tail;
-    }
-    if list == Term::NIL {
-        Ok(len)
-    } else {
-        Err(BADARG)
-    }
-}
-
 const MAX_TUPLE_SIZE: usize = (1 << 24) - 1;
 
 fn check_tuple_arity(size: usize) -> Result<(), BifError> {
@@ -969,10 +955,10 @@ fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         return Term::NIL;
     }
     // The element words are copied straight into the cons cells, last to first, like the
-    // `CONS(hp, tup[n], res)` loop of tuple_to_list_1, with no per-element bounds check.
+    // paired `CONS(hp, tup[n], res)` loop of tuple_to_list_1, with no per-element bounds check.
     let built = TermBuilder::new(&mut Heap(&mut ctx.heap))
         .reserve_cons_list(len)
-        .and_then(|list| list.prepend_exact_words_with_tail(values.words(), Term::NIL));
+        .and_then(|list| list.prepend_tuple_words_with_tail(values.words(), Term::NIL));
     match built {
         Ok(list) => list,
         Err(_) => ctx.system_limit(),
@@ -980,21 +966,10 @@ fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 }
 fn list_to_tuple_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
-    let len = proper_list_length(args[0])?;
+    let list = arinsal_term::raw::ProperList::try_from(args[0]).map_err(|_| BADARG)?;
+    let len = list.len();
     check_tuple_arity(len)?;
-    if len == 0 {
-        return Ok(TermBuilder::new(&mut ctx.heap)
-            .tuple_from_fn(0, |_, _| unreachable!())
-            .expect("empty tuple is static"));
-    }
-    // The list was walked above, so every cell is there: the tuple is filled in one pass.
-    let mut tail = args[0];
-    TermBuilder::new(&mut ctx.heap)
-        .tuple_from_fn(len, |_, _| {
-            let (head, next) = next_cons(tail).expect("validated list");
-            tail = next;
-            head
-        })
+    list.to_tuple(&mut ctx.heap)
         .map_err(|_| BifError::SystemLimit)
 }
 fn make_tuple_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

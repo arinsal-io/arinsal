@@ -4916,6 +4916,42 @@ impl ConsListBuilder {
         Ok(head)
     }
 
+    /// Build a tuple's list from element pairs, in the same order as `tuple_to_list_1`.
+    ///
+    /// OTP's optimized `while (n--)` copy handles two tuple elements per loop branch.
+    // Port of erts/emulator/beam/bif.c:3762-3777 (tuple_to_list_1), OTP-29.1.1.
+    #[inline(always)]
+    pub fn prepend_tuple_words_with_tail(
+        self,
+        values: &[u64],
+        tail: Term,
+    ) -> Result<Term, TermError> {
+        if self.written != 0 || values.len() != self.len {
+            return Err(TermError::BadArg);
+        }
+        let mut head = tail;
+        let mut cell = self.start as *mut u64;
+        let (pairs, remainder) = values.as_chunks::<2>();
+        if let Some(&value) = remainder.first() {
+            store(cell, value);
+            store(cell.wrapping_add(1), head.bits());
+            head = Term((cell as u64).wrapping_add(1));
+            cell = cell.wrapping_add(2);
+        }
+        for pair in pairs.iter().rev() {
+            store(cell, pair[1]);
+            store(cell.wrapping_add(1), head.bits());
+            head = Term((cell as u64).wrapping_add(1));
+            cell = cell.wrapping_add(2);
+
+            store(cell, pair[0]);
+            store(cell.wrapping_add(1), head.bits());
+            head = Term((cell as u64).wrapping_add(1));
+            cell = cell.wrapping_add(2);
+        }
+        Ok(head)
+    }
+
     /// Fill the next reserved cons cell as an independent pair and return its term.
     /// Port of `CONS(hp, key, value)` in `erts/emulator/beam/erl_map.c:521`, OTP-29.1.1.
     #[inline(always)]
@@ -5076,14 +5112,17 @@ impl ConsListBuilder {
         }
         let mut head = self.head;
         if bitoffs == 0 {
-            let mut remaining = count;
+            // The pre-sized source slice makes the down-counter bounds provable
+            // while matching OTP's single backward induction variable.
+            let source = &bytes[start..end];
+            let mut remaining = source.len();
             while remaining != 0 {
                 remaining -= 1;
-                let value = Term::small(i64::from(bytes[start + remaining]))
-                    .expect("byte fits small integer");
+                let byte = source[remaining];
+                let value = Term::small(i64::from(byte)).expect("byte fits small integer");
                 store(cell, value.bits());
                 store(cell.wrapping_add(1), head.bits());
-                head = Term::from_ptr(cell, 1);
+                head = Term((cell as u64).wrapping_add(1));
                 cell = cell.wrapping_add(2);
             }
         } else {
@@ -5097,7 +5136,7 @@ impl ConsListBuilder {
                 let value = Term::small(i64::from(byte)).expect("byte fits small integer");
                 store(cell, value.bits());
                 store(cell.wrapping_add(1), head.bits());
-                head = Term::from_ptr(cell, 1);
+                head = Term((cell as u64).wrapping_add(1));
                 cell = cell.wrapping_add(2);
             }
         }

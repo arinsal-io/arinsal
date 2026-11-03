@@ -174,23 +174,31 @@ fn is_atom_bits(word: u64) -> bool {
     word & 0x3f == ATOM_TAG
 }
 
-// Port of erts/emulator/beam/erl_utils.h:267-271 (erts_cmp_flatmap_keys), OTP-29.1.1:
-// two atoms compare by index; every other pair is `erts_cmp(..., exact=1)`, whose
-// small-integer path is a register compare.
+// Port of erts/emulator/beam/erl_utils.h:267-271 (erts_cmp_flatmap_keys) and
+// :238-260 (erts_cmp immediate fast paths), OTP-29.1.1.
 #[inline(always)]
 fn key_cmp(a: Term, b: Term) -> Ordering {
-    if is_atom_bits(bits(a)) && is_atom_bits(bits(b)) {
-        return bits(a).cmp(&bits(b));
+    let a_word = a.tagged_word();
+    let b_word = b.tagged_word();
+    if a_word & 0x0f == 0x0f && b_word & 0x0f == 0x0f {
+        return (a_word as i64).cmp(&(b_word as i64));
     }
-    if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
-        return a.cmp(&b);
+    if is_atom_bits(a_word) && is_atom_bits(b_word) {
+        return a_word.cmp(&b_word);
     }
-    // erts_cmp_compound resolves immediates of different types by the term order
-    // number < atom without touching the heap; do the same for the common small/atom mix.
-    match (a.as_small().is_some(), b.as_small().is_some()) {
-        (true, false) if b.as_atom().is_some() => return Ordering::Less,
-        (false, true) if a.as_atom().is_some() => return Ordering::Greater,
-        _ => {}
+    if a.is_immed() && b.is_immed() {
+        let a_kind = a.classify();
+        let b_kind = b.classify();
+        let kind_order = a_kind.cmp(&b_kind);
+        if kind_order != Ordering::Equal {
+            return kind_order;
+        }
+        return match a_kind {
+            TermKind::Number | TermKind::Atom => unreachable!("simple immediates use word paths"),
+            // Ports and pids compare their immediate identities; this path never
+            // dereferences a boxed header.
+            _ => cmp_exact(a, b),
+        };
     }
     cmp_exact(a, b)
 }
@@ -2191,11 +2199,16 @@ mod key_order_tests {
 
     #[test]
     fn small_sorts_before_atom_like_erts_term_order() {
+        let negative = Term::small(-7).unwrap();
+        let zero = Term::small(0).unwrap();
         let small = Term::small(7).unwrap();
         let atom = Term::atom(arinsal_term::atoms::OK);
+        assert_eq!(key_cmp(negative, zero), Ordering::Less);
+        assert_eq!(key_cmp(negative, small), Ordering::Less);
         assert_eq!(key_cmp(small, atom), Ordering::Less);
         assert_eq!(key_cmp(atom, small), Ordering::Greater);
         assert_eq!(key_cmp(small, Term::small(9).unwrap()), Ordering::Less);
+        assert_eq!(key_cmp(atom, Term::NIL), Ordering::Less);
     }
 
     #[test]
