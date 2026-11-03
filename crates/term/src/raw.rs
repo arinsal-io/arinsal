@@ -6,7 +6,7 @@
 //! [`Tuple`], [`boxed_header`]); it is public so that BIF loops outside this crate can walk
 //! lists and tuples with erts-shaped code while staying in safe Rust.
 
-use crate::{ARITY, Term};
+use crate::{ARITY, EMPTY_TUPLE, HeapAlloc, Term, TermError};
 
 /// Reads the word at `address`.
 ///
@@ -133,6 +133,84 @@ impl Cons<'_> {
     }
 }
 
+/// A proper list whose length and terminator were checked in one pass.
+#[derive(Clone, Copy)]
+pub struct ProperList<'h> {
+    term: Term,
+    len: usize,
+    heap: PhantomData<&'h ()>,
+}
+
+impl TryFrom<Term> for ProperList<'_> {
+    type Error = WrongShape;
+
+    /// Checks every cons tag and the final `[]`, like `erts_list_length`.
+    // Port of erts/emulator/beam/utils.c:345-354 (erts_list_length), OTP-29.1.1.
+    #[inline(always)]
+    fn try_from(term: Term) -> Result<Self, WrongShape> {
+        let len = proper_list_len(term);
+        if len < 0 {
+            return Err(WrongShape);
+        }
+        Ok(Self {
+            term,
+            len: len as usize,
+            heap: PhantomData,
+        })
+    }
+}
+
+#[inline(never)]
+fn proper_list_len(mut current: Term) -> isize {
+    let mut len = 0isize;
+    while current.0 & 2 == 0 {
+        len = len.wrapping_add(1);
+        current = Term(read_tagged(current.0, 7));
+    }
+    if current == Term::NIL { len } else { -1 }
+}
+
+impl ProperList<'_> {
+    /// Number of cons cells.
+    #[inline(always)]
+    pub fn len(self) -> usize {
+        self.len
+    }
+
+    /// Whether the list is empty.
+    #[inline(always)]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Copies the validated list into a tuple using its list terminator as the loop condition.
+    ///
+    /// The list's heap area must remain live and unmoved through the allocation and copy.
+    // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
+    #[inline(always)]
+    pub fn to_tuple<H: HeapAlloc + ?Sized>(self, heap: &mut H) -> Result<Term, TermError> {
+        if self.len == 0 {
+            return Ok(Term::from_ptr((&EMPTY_TUPLE as *const u64).cast_mut(), 2));
+        }
+        if self.len > (1 << 24) - 1 {
+            return Err(TermError::SystemLimit);
+        }
+        let start = heap.alloc(self.len + 1).ok_or(TermError::HeapFull)?;
+        store(start as usize, (self.len as u64) << 6 | ARITY);
+        let mut source = self.term;
+        let mut dst = start.wrapping_add(1) as usize;
+        // The proof guarantees every value in this chain is a list cell or the final nil;
+        // erts tests only the list tag bit in its copy loop.
+        while source.0 & 2 == 0 {
+            store(dst, read_tagged(source.0, -1));
+            dst = dst.wrapping_add(8);
+            source = Term(read_tagged(source.0, 7));
+        }
+        debug_assert_eq!(source, Term::NIL);
+        Ok(Term::from_ptr(start, 2))
+    }
+}
+
 /// A tuple: a boxed term whose header is an arity word.
 ///
 /// Port of erts/emulator/beam/erl_term.h (`is_tuple`, `tuple_val`, `arityval`), OTP-29.1.1.
@@ -190,6 +268,169 @@ impl Tuple<'_> {
             at: self.word.wrapping_add(6),
             end: self.word.wrapping_add(6 + 8 * self.arity as u64),
         }
+    }
+}
+
+/// A validated two-tuple whose pair can be loaded without another header or arity test.
+///
+/// Port of `tuple_val`/`arityval` followed by tuple element reads in
+/// erts/emulator/beam/erl_map.c:367-472, OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub struct Tuple2<'h> {
+    word: u64,
+    heap: PhantomData<&'h ()>,
+}
+
+impl TryFrom<Term> for Tuple2<'_> {
+    type Error = WrongShape;
+
+    /// Checks the boxed tuple header and arity once.
+    #[inline(always)]
+    fn try_from(term: Term) -> Result<Self, WrongShape> {
+        let tuple = Tuple::try_from(term)?;
+        if tuple.arity() != 2 {
+            return Err(WrongShape);
+        }
+        Ok(Tuple2 {
+            word: tuple.word,
+            heap: PhantomData,
+        })
+    }
+}
+
+impl Tuple2<'_> {
+    /// The validated tuple term.
+    #[inline(always)]
+    pub fn term(self) -> Term {
+        Term(self.word)
+    }
+
+    /// Loads the first two tuple elements without further tag, header, or arity checks.
+    #[inline(always)]
+    pub fn pair(self) -> (Term, Term) {
+        (
+            Term(read_tagged(self.word, 6)),
+            Term(read_tagged(self.word, 14)),
+        )
+    }
+}
+
+/// Incremental shape validation for a proper list of two-tuples.
+///
+/// The caller keeps the source heap live and unmoved while validation and the resulting
+/// [`ValidatedMapList`] are in use.
+///
+/// Port of `maps_from_list_1_helper` in erts/emulator/beam/erl_map.c:321-366, OTP-29.1.1.
+pub struct MapListValidator<'h> {
+    root: Term,
+    cursor: Term,
+    pending: Option<Cons<'h>>,
+    heap: PhantomData<&'h ()>,
+}
+
+impl<'h> MapListValidator<'h> {
+    /// Start validating `maps:from_list/1` input.
+    #[inline(always)]
+    pub fn new(list: Term) -> Self {
+        Self {
+            root: list,
+            cursor: list,
+            pending: None,
+            heap: PhantomData,
+        }
+    }
+
+    /// The current cons cell, or `None` at nil; an improper tail is an error.
+    ///
+    /// Port of the `is_list` validation in `maps_from_list_1_helper`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn current(&mut self) -> Result<Option<Cons<'h>>, WrongShape> {
+        if let Some(cons) = self.pending {
+            return Ok(Some(cons));
+        }
+        if self.cursor == Term::NIL {
+            Ok(None)
+        } else {
+            let cons = Cons::try_from(self.cursor)?;
+            self.pending = Some(cons);
+            Ok(Some(cons))
+        }
+    }
+
+    /// Validate the current cell's head as a two-tuple and advance the list cursor.
+    ///
+    /// Port of the tuple validation in `maps_from_list_1_helper`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn advance(&mut self) -> Result<(), WrongShape> {
+        let cons = self.pending.take().ok_or(WrongShape)?;
+        let _tuple = Tuple2::try_from(cons.head())?;
+        self.cursor = cons.tail();
+        Ok(())
+    }
+
+    /// Finish after the cursor reaches nil.
+    ///
+    /// Port of the validated-list handoff to `flatmap_from_validated_list`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn finish(self) -> Result<ValidatedMapList<'h>, WrongShape> {
+        if self.cursor != Term::NIL || self.pending.is_some() {
+            return Err(WrongShape);
+        }
+        Ok(ValidatedMapList {
+            root: self.root,
+            heap: PhantomData,
+        })
+    }
+}
+
+/// A proper list whose every head has already been validated as a two-tuple.
+#[derive(Clone, Copy)]
+pub struct ValidatedMapList<'h> {
+    root: Term,
+    heap: PhantomData<&'h ()>,
+}
+
+impl<'h> ValidatedMapList<'h> {
+    /// Rewalk the validated list with erts-shaped CAR/CDR and tuple element loads.
+    ///
+    /// Port of the second pass in `flatmap_from_validated_list`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn pairs(self) -> ValidatedMapPairs<'h> {
+        ValidatedMapPairs {
+            cursor: self.root,
+            heap: PhantomData,
+        }
+    }
+}
+
+/// Iterator over a [`ValidatedMapList`], with no per-cell or per-tuple shape checks.
+pub struct ValidatedMapPairs<'h> {
+    cursor: Term,
+    heap: PhantomData<&'h ()>,
+}
+
+impl Iterator for ValidatedMapPairs<'_> {
+    type Item = (Term, Term);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor == Term::NIL {
+            return None;
+        }
+        let cons = Cons {
+            word: self.cursor.0,
+            heap: PhantomData,
+        };
+        let tuple = Tuple2 {
+            word: cons.head().0,
+            heap: PhantomData,
+        };
+        self.cursor = cons.tail();
+        Some(tuple.pair())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
     }
 }
 

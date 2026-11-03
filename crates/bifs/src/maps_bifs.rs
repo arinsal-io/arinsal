@@ -1,7 +1,10 @@
 //! Map BIF adapters over flatmaps and HAMTs.
 
 use arinsal_maps::{self, MapError, MapResult};
-use arinsal_term::{Term, atoms};
+use arinsal_term::{
+    Term, atoms,
+    raw::{Cons, MapListValidator, Tuple, ValidatedMapPairs},
+};
 
 use crate::pure::{bool_term, integer};
 use crate::{BifError, Ctx};
@@ -266,6 +269,9 @@ pub struct MapsBuildWalk {
     phase: BuildPhase,
     cursor: Term,
     size: usize,
+    /// Incremental validation and the no-recheck iterator for `maps:from_list/1`.
+    validator: Option<MapListValidator<'static>>,
+    pairs: Option<ValidatedMapPairs<'static>>,
     leaves_written: usize,
     build: Option<arinsal_maps::HashmapFromPairs>,
 }
@@ -282,20 +288,18 @@ impl MapsBuildWalk {
     }
 
     fn new(list: Term, fill: Option<Term>) -> Self {
+        let validator = fill.is_none().then(|| MapListValidator::new(list));
         Self {
             list,
             fill,
             phase: BuildPhase::Validate,
             cursor: list,
             size: 0,
+            validator,
+            pairs: None,
             leaves_written: 0,
             build: None,
         }
-    }
-
-    /// The key and value of a list element (`from_list` elements must be 2-tuples).
-    fn element(&self, item: Term) -> Result<(Term, Term), BifError> {
-        Self::element_of(self.fill, item, true)
     }
 
     fn element_after_validation(&self, item: Term) -> Result<(Term, Term), BifError> {
@@ -310,21 +314,22 @@ impl MapsBuildWalk {
         if let Some(value) = fill {
             return Ok((item, value));
         }
-        // SAFETY: the input list stays live while the call is trapped (GC is disabled).
-        let tuple = unsafe { item.tuple_ref() }.ok_or(BifError::BADARG)?;
-        if check_arity && tuple.len() != 2 {
+        let tuple = Tuple::try_from(item).map_err(|_| BifError::BADARG)?;
+        if check_arity && tuple.arity() != 2 {
             return Err(BifError::BADARG);
         }
+        let mut elements = tuple.elements();
         Ok((
-            tuple.get(0).ok_or(BifError::BADARG)?,
-            tuple.get(1).ok_or(BifError::BADARG)?,
+            elements.next().ok_or(BifError::BADARG)?,
+            elements.next().ok_or(BifError::BADARG)?,
         ))
     }
 
     /// One cell of the input list.
     fn cell(cursor: Term) -> Result<(Term, Term), BifError> {
-        // SAFETY: the input list stays live while the call is trapped (GC is disabled).
-        unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)
+        Cons::try_from(cursor)
+            .map(Cons::pair)
+            .map_err(|_| BifError::BADARG)
     }
 
     /// Run with `reds` reductions of budget (the YCF counter); the finished map, or `None`
@@ -338,46 +343,79 @@ impl MapsBuildWalk {
                 // when YCF yields after consuming a reduction and before the loop body.
                 if self.fill.is_some() {
                     // Port of `maps_from_keys_2_helper`: count cells without inspecting heads.
-                    while self.cursor.tagged_word() & 3 == 1 {
+                    while let Ok(cons) = Cons::try_from(self.cursor) {
                         *reds -= 1;
                         if *reds <= 0 {
                             self.phase = BuildPhase::ValidateBody;
                             return Ok(None);
                         }
-                        let (_, tail) = Self::cell(self.cursor)?;
+                        let tail = cons.tail();
                         self.size += 1;
                         self.cursor = tail;
                     }
                 } else {
-                    while self.cursor.tagged_word() & 3 == 1 {
+                    loop {
+                        let cons = self
+                            .validator
+                            .as_mut()
+                            .expect("from_list validation state")
+                            .current()
+                            .map_err(|_| BifError::BADARG)?;
+                        let Some(_) = cons else {
+                            break;
+                        };
                         *reds -= 1;
                         if *reds <= 0 {
                             self.phase = BuildPhase::ValidateBody;
                             return Ok(None);
                         }
-                        let (head, tail) = Self::cell(self.cursor)?;
-                        self.element(head)?;
+                        self.validator
+                            .as_mut()
+                            .expect("from_list validation state")
+                            .advance()
+                            .map_err(|_| BifError::BADARG)?;
                         self.size += 1;
-                        self.cursor = tail;
                     }
                 }
-                if self.cursor != Term::NIL {
-                    return Err(BifError::BADARG);
-                }
+                let validated = if self.fill.is_none() {
+                    Some(
+                        self.validator
+                            .take()
+                            .expect("from_list validation state")
+                            .finish()
+                            .map_err(|_| BifError::BADARG)?,
+                    )
+                } else {
+                    if self.cursor != Term::NIL {
+                        return Err(BifError::BADARG);
+                    }
+                    None
+                };
                 if self.size <= MAP_SMALL_MAP_LIMIT {
                     // No yielding while constructing a flatmap: the list is short. The
                     // list was validated above, so every cell is a well-formed element.
-                    let fill = self.fill;
-                    let mut cursor = self.list;
-                    let pairs = std::iter::from_fn(|| {
-                        let (head, tail) = Self::cell(cursor).ok()?;
-                        cursor = tail;
-                        Self::element_of(fill, head, false).ok()
-                    });
-                    let result = arinsal_maps::from_small_pairs(self.size, pairs, &mut ctx.heap);
+                    let result = if self.fill.is_none() {
+                        arinsal_maps::from_small_pairs(
+                            self.size,
+                            validated.expect("validated from_list").pairs(),
+                            &mut ctx.heap,
+                        )
+                    } else {
+                        let fill = self.fill;
+                        let mut cursor = self.list;
+                        let pairs = std::iter::from_fn(|| {
+                            let (head, tail) = Self::cell(cursor).ok()?;
+                            cursor = tail;
+                            Self::element_of(fill, head, false).ok()
+                        });
+                        arinsal_maps::from_small_pairs(self.size, pairs, &mut ctx.heap)
+                    };
                     return mapped(ctx, result).map(Some);
                 }
                 self.cursor = self.list;
+                if let Some(validated) = validated {
+                    self.pairs = Some(validated.pairs());
+                }
                 let build = arinsal_maps::HashmapFromPairs::new(self.size, &mut ctx.heap);
                 self.build = Some(mapped(ctx, build)?);
                 self.phase = BuildPhase::Leaves;
@@ -385,19 +423,54 @@ impl MapsBuildWalk {
             match self.phase {
                 BuildPhase::Validate => unreachable!("validation loop handles this phase"),
                 BuildPhase::ValidateBody => {
-                    let tail = if self.fill.is_some() {
-                        Self::cell(self.cursor)?.1
+                    if self.fill.is_some() {
+                        self.cursor = Self::cell(self.cursor)?.1;
                     } else {
-                        let (head, tail) = Self::cell(self.cursor)?;
-                        self.element(head)?;
-                        tail
-                    };
+                        self.validator
+                            .as_mut()
+                            .expect("from_list validation state")
+                            .advance()
+                            .map_err(|_| BifError::BADARG)?;
+                    }
                     self.size += 1;
-                    self.cursor = tail;
                     self.phase = BuildPhase::Validate;
                 }
                 BuildPhase::Leaves => {
-                    if self.cursor.tagged_word() & 3 == 1 {
+                    if self.fill.is_none() {
+                        if self.leaves_written < self.size {
+                            self.phase = BuildPhase::LeavesBody;
+                            *reds -= 1;
+                            if *reds <= 0 {
+                                return Ok(None);
+                            }
+                            let remaining = self.size - self.leaves_written;
+                            let count = remaining.min(*reds as usize);
+                            self.build
+                                .as_mut()
+                                .expect("hashmap leaf builder")
+                                .push_chunk(
+                                    count,
+                                    self.pairs
+                                        .as_mut()
+                                        .expect("validated map pair iterator")
+                                        .by_ref()
+                                        .take(count),
+                                )
+                                .map_err(|error| map_error(ctx, error))?;
+                            self.leaves_written += count;
+                            *reds -= count.saturating_sub(1) as i64;
+                            self.phase = BuildPhase::Leaves;
+                            continue;
+                        }
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .finish_leaves();
+                        self.pairs = None;
+                        self.phase = BuildPhase::Build;
+                        continue;
+                    }
+                    if let Ok(cons) = Cons::try_from(self.cursor) {
                         self.phase = BuildPhase::LeavesBody;
                         *reds -= 1;
                         if *reds <= 0 {
@@ -408,13 +481,14 @@ impl MapsBuildWalk {
                         let remaining = self.size - self.leaves_written;
                         let count = remaining.min(*reds as usize);
                         let fill = self.fill;
-                        let mut cursor = self.cursor;
-                        let pairs = std::iter::from_fn(|| {
+                        let (head, mut cursor) = cons.pair();
+                        let first = Self::element_of(fill, head, false)?;
+                        let rest = std::iter::from_fn(|| {
                             let (head, tail) = Self::cell(cursor).ok()?;
                             cursor = tail;
                             Self::element_of(fill, head, false).ok()
-                        })
-                        .take(count);
+                        });
+                        let pairs = std::iter::once(first).chain(rest).take(count);
                         self.build
                             .as_mut()
                             .expect("hashmap leaf builder")
@@ -433,6 +507,22 @@ impl MapsBuildWalk {
                     self.phase = BuildPhase::Build;
                 }
                 BuildPhase::LeavesBody => {
+                    if self.fill.is_none() {
+                        let (key, value) = self
+                            .pairs
+                            .as_mut()
+                            .expect("validated map pair iterator")
+                            .next()
+                            .expect("remaining validated map pair");
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .push(key, value)
+                            .map_err(|error| map_error(ctx, error))?;
+                        self.leaves_written += 1;
+                        self.phase = BuildPhase::Leaves;
+                        continue;
+                    }
                     let (head, tail) = Self::cell(self.cursor)?;
                     let (key, value) = self.element_after_validation(head)?;
                     self.build

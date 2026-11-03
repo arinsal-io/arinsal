@@ -361,8 +361,15 @@ pub fn lists_append(
             let mut reserved =
                 HeapReservation::new(&mut ctx.heap, words).expect("infallible BIF heap");
             let mut alloc_top = reserved.cursor();
-            let alloc_end = reserved.limit().wrapping_sub(1);
-            while alloc_top < alloc_end && is_list_bits(list_bits) && built_onheap < onheap_cells {
+            // erts folds the reduction budget and heap limit into alloc_end before the copy loop.
+            let available_words = words - 1;
+            let alloc_words = if onheap_cells == usize::MAX {
+                available_words
+            } else {
+                onheap_cells.saturating_mul(2).min(available_words)
+            };
+            let alloc_end = alloc_top.wrapping_add(alloc_words);
+            while alloc_top < alloc_end && is_list_bits(list_bits) {
                 let (car, next) = car_cdr!(list_bits);
                 let cell = (alloc_top as u64) | 1;
                 if last_cdr.is_null() {
@@ -1354,21 +1361,22 @@ pub fn reverse_onheap_direct(heap: &mut ProcessHeap, list: Term, tail: Term) -> 
     }
     // Don't process more cells than there are reductions for, and keep HEAP_LIMIT - 2 free.
     let max_cells = (reds * REVERSE_ONHEAP_CELLS_PER_RED).min((window.len() - 2).div_ceil(2));
-    let base = window.as_ptr() as u64;
-    let (mut cur, mut tail_bits, mut cells) = (list, tail.word(), 0usize);
-    for cell in window.as_chunks_mut::<2>().0.iter_mut().take(max_cells) {
+    let (mut cur, mut tail_bits) = (list, tail.word());
+    let window_cells = window.as_chunks_mut::<2>().0.get_mut(..max_cells)?;
+    let base = window_cells.as_ptr() as usize;
+    for cell in window_cells.iter_mut() {
         let Some((car, cdr)) = cons_cell(cur) else {
             break;
         };
         cell[0] = car.word();
         cell[1] = tail_bits;
-        tail_bits = (base + (cells as u64) * 16) | 1;
+        tail_bits = (cell.as_mut_ptr() as u64) | 1;
         cur = cdr;
-        cells += 1;
     }
     if cur != Term::NIL {
         return None;
     }
+    let cells = (((tail_bits as usize) & !7) - base) / 16 + 1;
     // The result is the last cell written, the first one above HEAP_TOP's new position.
     let result = heap.window_list_term((cells - 1) * 2);
     heap.commit_window(cells * 2);
