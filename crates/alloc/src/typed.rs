@@ -341,6 +341,26 @@ impl<T, const TYPE: u8> FixAllocBox<T, TYPE> {
         Ok(Self { pointer, owner_ix })
     }
 
+    /// [`Self::new`] for a large value: the block is allocated first and `init` builds the value
+    /// straight into it, as erts initializes the fields of a freshly `erts_alloc`ed struct.
+    /// `new` receives its value already built on the caller's stack and copies it.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    pub fn new_with(init: impl FnOnce() -> T) -> Result<Self, AllocError> {
+        if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
+            return Err(AllocError::OutOfBounds);
+        }
+        let owner_ix = crate::instances::thread_alloc_ix();
+        let bytes = std::mem::size_of::<T>();
+        let payload = fix_alloc_payload_at(owner_ix, ErtsAlcType(TYPE), bytes)?;
+        let pointer =
+            std::ptr::NonNull::new(payload.cast::<T>()).ok_or(AllocError::InvalidAllocation)?;
+        // SAFETY: fix_alloc returned a live word-aligned block large enough for T. `init` cannot
+        // observe the block, so a panic in it leaks the block and nothing else.
+        unsafe { pointer.as_ptr().write(init()) };
+        Ok(Self { pointer, owner_ix })
+    }
+
     /// Moves the value out and releases its fixed-size allocation.
     #[allow(unsafe_code)]
     pub fn into_inner(self) -> T {
@@ -1759,6 +1779,23 @@ mod tests {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn new_with_builds_the_value_in_the_block_and_drops_it_once() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = drops.clone();
+        struct Counted([u64; 64], std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let boxed = super::FixAllocBox::<Counted>::new_with(|| Counted([7; 64], counter)).unwrap();
+        similar_asserts::assert_eq!(boxed.0.iter().sum::<u64>(), 7 * 64);
+        similar_asserts::assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(boxed);
+        similar_asserts::assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]

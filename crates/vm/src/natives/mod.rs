@@ -459,6 +459,15 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erts_internal" && function == "port_control" && arity == 3 {
         return Some(crate::port::port_control_light);
     }
+    if module == "erlang" && function == "spawn" && arity == 3 {
+        return Some(crate::signals::spawn_light3);
+    }
+    if module == "erlang" && function == "spawn_link" && arity == 3 {
+        return Some(crate::signals::spawn_link_light3);
+    }
+    if module == "erlang" && function == "spawn_opt" && arity == 4 {
+        return Some(crate::signals::spawn_opt_light);
+    }
     if module == "erlang" && function == "monitor" && (arity == 2 || arity == 3) {
         return Some(crate::signals::monitor_light);
     }

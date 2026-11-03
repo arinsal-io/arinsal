@@ -826,6 +826,18 @@ pub struct HeapTermSlot {
 }
 
 impl HeapTermSlot {
+    /// The slot at word `index` of a reservation slice.
+    #[inline(always)]
+    pub fn from_index(index: usize) -> Self {
+        Self::index(index)
+    }
+
+    /// The word index of an indexed slot, `None` for an address slot.
+    #[inline(always)]
+    pub fn word_index(self) -> Option<usize> {
+        self.indexed.then_some(self.value)
+    }
+
     #[inline]
     fn address(value: usize) -> Self {
         Self {
@@ -1133,6 +1145,12 @@ pub struct HeapReservationWords<'a> {
 }
 
 impl HeapReservationWords<'_> {
+    /// Return the reserved words and the `hp` cursor for inline heap block construction.
+    #[inline(always)]
+    pub fn words_and_cursor(&mut self) -> (&mut [u64], &mut usize) {
+        (&mut *self.words, &mut self.cursor)
+    }
+
     /// Return the words already reserved by `HAlloc`.
     #[inline]
     pub fn as_mut_words(&mut self) -> &mut [u64] {
@@ -1185,6 +1203,18 @@ impl HeapReservationWords<'_> {
         Ok(Term::from_ptr(
             self.words.as_ptr().wrapping_add(slot.value).cast_mut(),
             1,
+        ))
+    }
+
+    /// Return a tuple term over an initialized header at a reserved word index.
+    #[inline(always)]
+    pub fn boxed_term_at(&self, slot: HeapTermSlot) -> Result<Term, TermError> {
+        if !slot.indexed || slot.value >= self.words.len() {
+            return Err(TermError::BadArg);
+        }
+        Ok(Term::from_ptr(
+            self.words.as_ptr().wrapping_add(slot.value).cast_mut(),
+            2,
         ))
     }
 

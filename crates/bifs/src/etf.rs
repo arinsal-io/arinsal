@@ -3457,223 +3457,489 @@ fn decode_direct_step(
     budget: usize,
 ) -> Result<(Option<(Term, usize)>, usize), BifError> {
     let mut work = 0;
-    while !*root_started || work < budget {
-        if pending.is_some() {
-            if pending
-                .as_ref()
-                .is_some_and(|item| matches!(item, DecodePending::Tuple { .. }))
-            {
-                let Some(DecodePending::Tuple {
+    if pending.is_some() {
+        if pending
+            .as_ref()
+            .is_some_and(|item| matches!(item, DecodePending::Tuple { .. }))
+        {
+            let Some(DecodePending::Tuple {
+                block,
+                arity,
+                mut next_index,
+                continuation,
+            }) = pending.take()
+            else {
+                unreachable!();
+            };
+            let count = next_index.min(budget.saturating_sub(work));
+            if count > 0 {
+                let first = next_index - count + 1;
+                let terminal = if next_index == arity {
+                    continuation
+                } else {
+                    Some(
+                        block
+                            .term_slot(next_index + 1)
+                            .map_err(map_term_build_error)?,
+                    )
+                };
+                block
+                    .write_next_chain(first, count, terminal)
+                    .map_err(map_term_build_error)?;
+                next_index -= count;
+            }
+            work += count;
+            if next_index != 0 {
+                *pending = Some(DecodePending::Tuple {
                     block,
                     arity,
-                    mut next_index,
+                    next_index,
                     continuation,
-                }) = pending.take()
-                else {
-                    unreachable!();
-                };
-                let count = next_index.min(budget.saturating_sub(work));
-                if count > 0 {
-                    let first = next_index - count + 1;
-                    let terminal = if next_index == arity {
-                        continuation
-                    } else {
-                        Some(
-                            block
-                                .term_slot(next_index + 1)
-                                .map_err(map_term_build_error)?,
-                        )
-                    };
-                    block
-                        .write_next_chain(first, count, terminal)
-                        .map_err(map_term_build_error)?;
-                    next_index -= count;
-                }
-                work += count;
-                if next_index != 0 {
-                    *pending = Some(DecodePending::Tuple {
-                        block,
-                        arity,
-                        next_index,
-                        continuation,
-                    });
-                    return Ok((None, work));
-                }
-                *next = Some(block.term_slot(1).map_err(map_term_build_error)?);
+                });
+                return Ok((None, work));
             }
-            if pending
-                .as_ref()
-                .is_some_and(|item| matches!(item, DecodePending::List { .. }))
-            {
-                let Some(DecodePending::List {
+            *next = Some(block.term_slot(1).map_err(map_term_build_error)?);
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|item| matches!(item, DecodePending::List { .. }))
+        {
+            let Some(DecodePending::List {
+                block,
+                size,
+                mut next_index,
+                mut chain,
+                continuation,
+            }) = pending.take()
+            else {
+                unreachable!();
+            };
+            let count = next_index.min(budget.saturating_sub(work));
+            if count > 0 {
+                chain = Some(
+                    block
+                        .write_list_chain(next_index - count, count, chain.ok_or(BifError::BADARG)?)
+                        .map_err(map_term_build_error)?,
+                );
+                next_index -= count;
+            }
+            work += count;
+            if next_index != 0 {
+                *pending = Some(DecodePending::List {
                     block,
                     size,
-                    mut next_index,
-                    mut chain,
+                    next_index,
+                    chain,
                     continuation,
-                }) = pending.take()
-                else {
-                    unreachable!();
-                };
-                let count = next_index.min(budget.saturating_sub(work));
-                if count > 0 {
-                    chain = Some(
-                        block
-                            .write_list_chain(
-                                next_index - count,
-                                count,
-                                chain.ok_or(BifError::BADARG)?,
-                            )
-                            .map_err(map_term_build_error)?,
-                    );
-                    next_index -= count;
-                }
-                work += count;
-                if next_index != 0 {
-                    *pending = Some(DecodePending::List {
-                        block,
-                        size,
-                        next_index,
-                        chain,
-                        continuation,
-                    });
-                    return Ok((None, work));
-                }
-                *next = chain;
+                });
+                return Ok((None, work));
             }
-            if pending
-                .as_ref()
-                .is_some_and(|item| matches!(item, DecodePending::String { .. }))
-            {
-                let Some(DecodePending::String {
+            *next = chain;
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|item| matches!(item, DecodePending::String { .. }))
+        {
+            let Some(DecodePending::String {
+                target,
+                continuation,
+                mut builder,
+                source_at,
+                size,
+                mut written,
+            }) = pending.take()
+            else {
+                unreachable!();
+            };
+            let count = (size - written).min(budget.saturating_sub(work));
+            let source = r
+                .bytes
+                .get(source_at + written..source_at + written + count)
+                .ok_or(BifError::BADARG)?;
+            for byte in source {
+                builder
+                    .append(Term::small(i64::from(*byte)).ok_or(BifError::BADARG)?)
+                    .map_err(map_term_build_error)?;
+            }
+            written += count;
+            work += count;
+            if written != size {
+                *pending = Some(DecodePending::String {
                     target,
                     continuation,
-                    mut builder,
+                    builder,
                     source_at,
                     size,
-                    mut written,
-                }) = pending.take()
-                else {
-                    unreachable!();
-                };
-                let count = (size - written).min(budget.saturating_sub(work));
-                let source = r
-                    .bytes
-                    .get(source_at + written..source_at + written + count)
-                    .ok_or(BifError::BADARG)?;
-                for byte in source {
-                    builder
-                        .append(Term::small(i64::from(*byte)).ok_or(BifError::BADARG)?)
-                        .map_err(map_term_build_error)?;
-                }
-                written += count;
-                work += count;
-                if written != size {
-                    *pending = Some(DecodePending::String {
-                        target,
-                        continuation,
-                        builder,
-                        source_at,
-                        size,
-                        written,
-                    });
-                    return Ok((None, work));
-                }
-                let term = builder.finish(Term::NIL).map_err(map_term_build_error)?;
-                write_decode_target(ctx, target, root, term)?;
-                *root_started = true;
-                *next = continuation;
+                    written,
+                });
+                return Ok((None, work));
             }
-            if pending
-                .as_ref()
-                .is_some_and(|item| matches!(item, DecodePending::Binary { .. }))
-            {
-                let Some(DecodePending::Binary {
+            let term = builder.finish(Term::NIL).map_err(map_term_build_error)?;
+            write_decode_target(ctx, target, root, term)?;
+            *root_started = true;
+            *next = continuation;
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|item| matches!(item, DecodePending::Binary { .. }))
+        {
+            let Some(DecodePending::Binary {
+                target,
+                continuation,
+                mut binary,
+                mut remaining,
+                bit_len,
+            }) = pending.take()
+            else {
+                unreachable!();
+            };
+            let copy_limit = budget
+                .saturating_sub(work)
+                .saturating_mul(B2T_MEMCPY_FACTOR);
+            let copy_len = remaining.min(copy_limit);
+            let source = r.take(copy_len)?;
+            let destination_at = binary
+                .len()
+                .checked_sub(remaining)
+                .ok_or(BifError::BADARG)?;
+            let destination = binary.bytes_mut_unique().ok_or(BifError::BADARG)?;
+            let destination_end = destination_at
+                .checked_add(copy_len)
+                .ok_or(BifError::BADARG)?;
+            destination
+                .get_mut(destination_at..destination_end)
+                .ok_or(BifError::BADARG)?
+                .copy_from_slice(source);
+            remaining -= copy_len;
+            if remaining != 0 {
+                *pending = Some(DecodePending::Binary {
                     target,
                     continuation,
-                    mut binary,
-                    mut remaining,
+                    binary,
+                    remaining,
                     bit_len,
-                }) = pending.take()
-                else {
-                    unreachable!();
-                };
-                let copy_limit = budget
-                    .saturating_sub(work)
-                    .saturating_mul(B2T_MEMCPY_FACTOR);
-                let copy_len = remaining.min(copy_limit);
-                let source = r.take(copy_len)?;
-                let destination_at = binary
-                    .len()
-                    .checked_sub(remaining)
-                    .ok_or(BifError::BADARG)?;
-                let destination = binary.bytes_mut_unique().ok_or(BifError::BADARG)?;
-                let destination_end = destination_at
-                    .checked_add(copy_len)
-                    .ok_or(BifError::BADARG)?;
-                destination
-                    .get_mut(destination_at..destination_end)
-                    .ok_or(BifError::BADARG)?
-                    .copy_from_slice(source);
-                remaining -= copy_len;
-                if remaining != 0 {
-                    *pending = Some(DecodePending::Binary {
-                        target,
-                        continuation,
-                        binary,
-                        remaining,
-                        bit_len,
-                    });
-                    return Ok((None, work + copy_len / B2T_MEMCPY_FACTOR));
-                }
-                let term = TermBuilder::new(&mut ctx.heap)
-                    .refc_binary(binary, bit_len)
-                    .map_err(map_term_build_error)?;
-                write_decode_target(ctx, target, root, term)?;
-                *root_started = true;
-                *next = continuation;
-                work += copy_len / B2T_MEMCPY_FACTOR;
-                continue;
+                });
+                return Ok((None, work + copy_len / B2T_MEMCPY_FACTOR));
             }
+            let term = TermBuilder::new(&mut ctx.heap)
+                .refc_binary(binary, bit_len)
+                .map_err(map_term_build_error)?;
+            write_decode_target(ctx, target, root, term)?;
+            *root_started = true;
+            *next = continuation;
+            work += copy_len / B2T_MEMCPY_FACTOR;
         }
-        if *root_started && next.is_none() {
+    }
+    let mut hp = {
+        let (_, cursor) = ctx.heap.words_and_cursor();
+        *cursor
+    };
+    let mut cur = next.and_then(HeapTermSlot::word_index);
+    while !*root_started || work < budget {
+        if *root_started && cur.is_none() {
+            *next = None;
             return Ok((Some((*root, r.at)), work));
         }
         let target = if *root_started {
-            DecodeTarget::Heap(next.take().ok_or(BifError::BADARG)?)
+            DecodeTarget::Heap(HeapTermSlot::from_index(
+                cur.take().ok_or(BifError::BADARG)?,
+            ))
         } else {
             DecodeTarget::Root
-        };
-        let continuation = match target {
-            DecodeTarget::Root => None,
-            DecodeTarget::Heap(slot) => ctx
-                .heap
-                .take_next_slot(slot)
-                .map_err(map_term_build_error)?,
         };
         let mut next_was_set = false;
         let mut defer_output = false;
         let mut reprocess_target = false;
+        let mut yield_after_write = false;
         let tag_start = r.at;
-        let tag = loop {
-            let tag = r.u8()?;
-            if tag == 121 {
-                r.take(4)?;
-                *internal_nc = true;
+        let (tag, continuation, direct, cursor_hp) = {
+            let (words, cursor) = ctx.heap.words_and_cursor();
+            *cursor = hp;
+            let len = words.len();
+            let base = words.as_ptr() as usize as u64;
+            let slot_index = match target {
+                DecodeTarget::Root => None,
+                DecodeTarget::Heap(slot) => Some(slot.word_index().ok_or(BifError::BADARG)?),
+            };
+            let chain = if let Some(index) = slot_index {
+                let chain = *words.get(index).ok_or(BifError::BADARG)? as usize;
+                if chain > len {
+                    return Err(BifError::BADARG);
+                }
+                words[index] = 0;
+                chain
             } else {
-                break tag;
+                0
+            };
+            let continuation = if chain == 0 {
+                None
+            } else {
+                Some(HeapTermSlot::from_index(chain - 1))
+            };
+            let tag = loop {
+                let tag = r.u8()?;
+                if tag == 121 {
+                    r.take(4)?;
+                    *internal_nc = true;
+                } else {
+                    break tag;
+                }
+            };
+            let payload_at = r.at;
+            let mut root_term = None;
+            let mut root_block = None;
+            let mut direct_next = continuation;
+            let direct_work = match tag {
+                97 => {
+                    let term = Term::small(i64::from(r.u8()?)).ok_or(BifError::BADARG)?;
+                    if let Some(index) = slot_index {
+                        words[index] = term.word();
+                    } else {
+                        root_term = Some(term);
+                    }
+                    Some(1)
+                }
+                98 => {
+                    let term = Term::small(i64::from(r.u32()? as i32)).ok_or(BifError::BADARG)?;
+                    if let Some(index) = slot_index {
+                        words[index] = term.word();
+                    } else {
+                        root_term = Some(term);
+                    }
+                    Some(1)
+                }
+                106 => {
+                    if let Some(index) = slot_index {
+                        words[index] = Term::NIL.word();
+                    } else {
+                        root_term = Some(Term::NIL);
+                    }
+                    Some(1)
+                }
+                100 | 115 | 118 | 119 => {
+                    r.at = payload_at - 1;
+                    let (term, _) = r.atom(safe, true)?;
+                    if let Some(index) = slot_index {
+                        words[index] = term.word();
+                    } else {
+                        root_term = Some(term);
+                    }
+                    Some(1)
+                }
+                104 | 105 => {
+                    let arity = if tag == 104 {
+                        r.u8()? as usize
+                    } else {
+                        r.u32()? as usize
+                    };
+                    let end = hp.checked_add(arity + 1).ok_or(BifError::BADARG)?;
+                    if arity == 0 {
+                        if let Some(index) = slot_index {
+                            words[index] = arinsal_term::global_empty_tuple().word();
+                        } else {
+                            root_term = Some(arinsal_term::global_empty_tuple());
+                        }
+                        Some(1)
+                    } else if arity < (1 << 24)
+                        && arity <= budget.saturating_sub(work + 1)
+                        && end <= len
+                    {
+                        let block = words.get_mut(hp..end).ok_or(BifError::BADARG)?;
+                        block[0] = (arity as u64) << 6;
+                        for (offset, word) in block[1..arity].iter_mut().enumerate() {
+                            *word = (hp + offset + 3) as u64;
+                        }
+                        block[arity] = chain as u64;
+                        let term_word = base.wrapping_add((hp * 8) as u64) | 2;
+                        if let Some(index) = slot_index {
+                            words[index] = term_word;
+                        } else {
+                            root_block = Some((hp, 2));
+                        }
+                        *cursor = end;
+                        direct_next = Some(HeapTermSlot::from_index(hp + 1));
+                        let extra = arity + 1;
+                        hp = end;
+                        Some(extra)
+                    } else {
+                        r.at = payload_at;
+                        None
+                    }
+                }
+                107 => {
+                    let size = r.u16()? as usize;
+                    let bytes_at = r.at;
+                    let Some(bytes) = r.bytes.get(bytes_at..bytes_at.saturating_add(size)) else {
+                        return Err(BifError::BADARG);
+                    };
+                    if size == 0 {
+                        if let Some(index) = slot_index {
+                            words[index] = Term::NIL.word();
+                        } else {
+                            root_term = Some(Term::NIL);
+                        }
+                        r.at += size;
+                        Some(1)
+                    } else if size <= budget.saturating_sub(work + 1)
+                        && hp
+                            .checked_add(size.checked_mul(2).ok_or(BifError::BADARG)?)
+                            .is_some_and(|end| end <= len)
+                    {
+                        let end = hp + size * 2;
+                        for (index, byte) in bytes.iter().copied().enumerate() {
+                            let car = hp + index * 2;
+                            words[car] =
+                                Term::small(i64::from(byte)).ok_or(BifError::BADARG)?.word();
+                            words[car + 1] = if index + 1 == size {
+                                Term::NIL.word()
+                            } else {
+                                base.wrapping_add(((car + 2) * 8) as u64) | 1
+                            };
+                        }
+                        let term_word = base.wrapping_add((hp * 8) as u64) | 1;
+                        if let Some(index) = slot_index {
+                            words[index] = term_word;
+                        } else {
+                            root_block = Some((hp, 1));
+                        }
+                        r.at += size;
+                        *cursor = end;
+                        hp = end;
+                        Some(size + 1)
+                    } else {
+                        r.at = payload_at;
+                        None
+                    }
+                }
+                108 => {
+                    let size = r.u32()? as usize;
+                    if size == 0 {
+                        r.at = payload_at;
+                        None
+                    } else if size - 1 <= budget.saturating_sub(work + 1)
+                        && hp
+                            .checked_add(size.checked_mul(2).ok_or(BifError::BADARG)?)
+                            .is_some_and(|end| end <= len)
+                    {
+                        let end = hp + size * 2;
+                        let tail = continuation
+                            .map(|slot| {
+                                slot.word_index()
+                                    .and_then(|index| index.checked_add(1))
+                                    .ok_or(BifError::BADARG)
+                            })
+                            .transpose()?
+                            .unwrap_or(0) as u64;
+                        for index in 0..size {
+                            let car = hp + index * 2;
+                            words[car] = if index + 1 == size {
+                                (car + 2) as u64
+                            } else {
+                                (car + 3) as u64
+                            };
+                            words[car + 1] = if index + 1 == size {
+                                tail
+                            } else {
+                                base.wrapping_add(((car + 2) * 8) as u64) | 1
+                            };
+                        }
+                        let term_word = base.wrapping_add((hp * 8) as u64) | 1;
+                        if let Some(index) = slot_index {
+                            words[index] = term_word;
+                        } else {
+                            root_block = Some((hp, 1));
+                        }
+                        *cursor = end;
+                        direct_next = Some(HeapTermSlot::from_index(hp));
+                        hp = end;
+                        Some(size)
+                    } else {
+                        r.at = payload_at;
+                        None
+                    }
+                }
+                109 | 77 => {
+                    let size = r.u32()? as usize;
+                    let bits = if tag == 77 { r.u8()? as usize } else { 8 };
+                    if tag == 77 && (size == 0 || !(1..=8).contains(&bits)) {
+                        return Err(BifError::BADARG);
+                    }
+                    if size > 64 {
+                        r.at = payload_at;
+                        None
+                    } else {
+                        let bit_len = if tag == 109 {
+                            size.checked_mul(8)
+                        } else {
+                            size.checked_sub(1)
+                                .and_then(|n| n.checked_mul(8))
+                                .and_then(|n| n.checked_add(bits))
+                        }
+                        .ok_or(BifError::BADARG)?;
+                        let bytes = r.take(size)?;
+                        let payload_words = size.div_ceil(8);
+                        let words_needed = 2 + payload_words;
+                        let end = hp.checked_add(words_needed).ok_or(BifError::BADARG)?;
+                        if end > len {
+                            return Err(BifError::BADARG);
+                        }
+                        words[hp] = (((words_needed - 1) as u64) << 6) | 0x20;
+                        words[hp + 1] = bit_len as u64;
+                        for (index, chunk) in bytes.chunks(8).enumerate() {
+                            let mut word = [0; 8];
+                            word[..chunk.len()].copy_from_slice(chunk);
+                            if index + 1 == payload_words && !bit_len.is_multiple_of(8) {
+                                let used = bit_len % 8;
+                                word[chunk.len() - 1] &= 0xff << (8 - used);
+                            }
+                            words[hp + 2 + index] = u64::from_ne_bytes(word);
+                        }
+                        let term_word = base.wrapping_add((hp * 8) as u64) | 2;
+                        if let Some(index) = slot_index {
+                            words[index] = term_word;
+                        } else {
+                            root_block = Some((hp, 2));
+                        }
+                        *cursor = end;
+                        hp = end;
+                        Some(1 + (budget.saturating_sub(work).min(size / B2T_MEMCPY_FACTOR)))
+                    }
+                }
+                _ => None,
+            };
+            if direct_work.is_none()
+                && let Some(index) = slot_index
+            {
+                words[index] = chain as u64;
             }
+            let direct = direct_work.map(|amount| (root_term, root_block, direct_next, amount));
+            (tag, continuation, direct, *cursor)
         };
+        if let Some((root_term, root_block, direct_next, direct_work)) = direct {
+            if let Some(term) = root_term {
+                *root = term;
+            } else if let Some((index, tag)) = root_block {
+                *root = if tag == 1 {
+                    ctx.heap
+                        .list_term_at(HeapTermSlot::from_index(index))
+                        .map_err(map_term_build_error)?
+                } else {
+                    ctx.heap
+                        .boxed_term_at(HeapTermSlot::from_index(index))
+                        .map_err(map_term_build_error)?
+                };
+            }
+            *root_started = true;
+            *next = direct_next;
+            cur = direct_next.and_then(HeapTermSlot::word_index);
+            hp = cursor_hp;
+            work = work.saturating_add(direct_work);
+            continue;
+        }
+        *next = None;
 
         let term = match tag {
-            97 | 98 => {
-                let number = if tag == 97 {
-                    r.u8()? as i64
-                } else {
-                    r.u32()? as i32 as i64
-                };
-                Some(Term::small(number).ok_or(BifError::BADARG)?)
-            }
+            97 | 98 | 106 => unreachable!("hot immediate tags are decoded in the loop"),
             110 | 111 => {
                 let length = if tag == 110 {
                     r.u8()? as usize
@@ -3728,7 +3994,6 @@ fn decode_direct_step(
                 }
                 Some(Term::atom(atom))
             }
-            106 => Some(Term::NIL),
             104 | 105 => {
                 let arity = if tag == 104 {
                     r.u8()? as usize
@@ -3753,6 +4018,7 @@ fn decode_direct_step(
                         continuation,
                     });
                     next_was_set = true;
+                    yield_after_write = true;
                     Some(term)
                 }
             }
@@ -3775,6 +4041,7 @@ fn decode_direct_step(
                         written: 0,
                     });
                     defer_output = true;
+                    yield_after_write = true;
                     None
                 }
             }
@@ -3806,6 +4073,7 @@ fn decode_direct_step(
                         continuation,
                     });
                     next_was_set = true;
+                    yield_after_write = true;
                     Some(term)
                 }
             }
@@ -4098,20 +4366,66 @@ fn decode_direct_step(
                 }
                 .ok_or(BifError::BADARG)?;
                 if size > 64 {
-                    *pending = Some(DecodePending::Binary {
-                        target,
-                        continuation,
-                        binary: RefcBinary::new_zeroed(size).map_err(map_term_build_error)?,
-                        remaining: size,
-                        bit_len,
-                    });
-                    None
+                    let copy_limit = budget
+                        .saturating_sub(work)
+                        .saturating_mul(B2T_MEMCPY_FACTOR);
+                    let copy_len = size.min(copy_limit);
+                    let source = r.take(copy_len)?;
+                    let mut binary = RefcBinary::new_zeroed(size).map_err(map_term_build_error)?;
+                    binary
+                        .bytes_mut_unique()
+                        .ok_or(BifError::BADARG)?
+                        .get_mut(..copy_len)
+                        .ok_or(BifError::BADARG)?
+                        .copy_from_slice(source);
+                    work += copy_len / B2T_MEMCPY_FACTOR;
+                    if copy_len != size {
+                        *pending = Some(DecodePending::Binary {
+                            target,
+                            continuation,
+                            binary,
+                            remaining: size - copy_len,
+                            bit_len,
+                        });
+                        yield_after_write = true;
+                        None
+                    } else {
+                        Some(
+                            TermBuilder::new(&mut ctx.heap)
+                                .refc_binary(binary, bit_len)
+                                .map_err(map_term_build_error)?,
+                        )
+                    }
                 } else {
                     let bytes = r.take(size)?;
+                    let start = {
+                        let (words, cursor) = ctx.heap.words_and_cursor();
+                        let start = hp;
+                        let payload_words = size.div_ceil(8);
+                        let words_needed = 2 + payload_words;
+                        let end = start.checked_add(words_needed).ok_or(BifError::BADARG)?;
+                        if end > words.len() {
+                            return Err(BifError::BADARG);
+                        }
+                        words[start] = (((words_needed - 1) as u64) << 6) | 0x20;
+                        words[start + 1] = bit_len as u64;
+                        for (index, chunk) in bytes.chunks(8).enumerate() {
+                            let mut word = [0; 8];
+                            word[..chunk.len()].copy_from_slice(chunk);
+                            if index + 1 == payload_words && !bit_len.is_multiple_of(8) {
+                                let used = bit_len % 8;
+                                word[chunk.len() - 1] &= 0xff << (8 - used);
+                            }
+                            words[start + 2 + index] = u64::from_ne_bytes(word);
+                        }
+                        *cursor = end;
+                        start
+                    };
+                    hp += 2 + size.div_ceil(8);
                     work += budget.saturating_sub(work).min(size / B2T_MEMCPY_FACTOR);
                     Some(
-                        TermBuilder::new(&mut ctx.heap)
-                            .bitstring(bytes, bit_len)
+                        ctx.heap
+                            .boxed_term_at(HeapTermSlot::from_index(start))
                             .map_err(map_term_build_error)?,
                     )
                 }
@@ -4150,10 +4464,21 @@ fn decode_direct_step(
             *root_started = true;
         }
         work = work.saturating_add(1);
+        cur = next.and_then(HeapTermSlot::word_index);
+        if !matches!(tag, 97 | 98 | 104 | 105 | 106 | 107 | 108) {
+            let (_, cursor) = ctx.heap.words_and_cursor();
+            hp = *cursor;
+        }
+        if yield_after_write {
+            return Ok((None, work));
+        }
     }
-    if pending.is_none() && *root_started && next.is_none() {
+    if pending.is_none() && *root_started && cur.is_none() {
         Ok((Some((*root, r.at)), work))
     } else {
+        // `cur` is the next unfilled slot after the local dec_term-style walk.
+        // Publish it only when the reduction budget stops this invocation.
+        *next = cur.map(HeapTermSlot::from_index);
         Ok((None, work))
     }
 }

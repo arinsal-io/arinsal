@@ -506,6 +506,13 @@ fn sensitive_set() -> &'static Mutex<std::collections::HashSet<(usize, Pid)>> {
 
 static SENSITIVE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static RUNNING_PROCS_ENABLED: AtomicBool = AtomicBool::new(false);
+static NEW_PROCS_TRACED: AtomicBool = AtomicBool::new(false);
+
+/// Whether any session sets trace flags on new processes (`erlang:trace(new, ...)`), which
+/// `erl_create_process` applies to every child.
+pub(crate) fn new_processes_traced() -> bool {
+    NEW_PROCS_TRACED.load(Ordering::Relaxed)
+}
 
 /// Whether any trace session requests process scheduler transitions.
 pub(crate) fn running_procs_enabled() -> bool {
@@ -518,11 +525,10 @@ fn refresh_running_procs_enabled() {
         .values()
         .any(|entry| entry.flags & RUNNING_PROCS != 0);
     drop(process_entries);
-    let future_active = new_process_tracing()
-        .lock()
-        .unwrap()
-        .values()
-        .any(|(flags, _)| flags & RUNNING_PROCS != 0);
+    let future = new_process_tracing().lock().unwrap();
+    NEW_PROCS_TRACED.store(!future.is_empty(), Ordering::Relaxed);
+    let future_active = future.values().any(|(flags, _)| flags & RUNNING_PROCS != 0);
+    drop(future);
     RUNNING_PROCS_ENABLED.store(process_active || future_active, Ordering::Relaxed);
 }
 

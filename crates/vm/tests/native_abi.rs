@@ -958,6 +958,30 @@ fn compressed_etf_decode_resumes_across_output_chunks() {
 }
 
 #[test]
+fn large_nested_list_etf_decode_resumes_with_one_reduction() {
+    const MODULE: &str = "large_nested_list_etf_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(large_nested_list_etf_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            Value = [{N, {N, [N]}} || N <- lists:seq(1, 100000)],
+            Encoded = term_to_binary(Value),
+            binary_to_term(Encoded) =:= Value.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    similar_asserts::assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("true"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    similar_asserts::assert_eq!(actual.term, OwnedTerm::atom("true"));
+}
+
+#[test]
 fn nested_map_etf_decode_resumes_after_low_reductions() {
     const MODULE: &str = "nested_map_etf_trap_vm_test";
     let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
