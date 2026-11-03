@@ -7,11 +7,12 @@ use std::sync::{Arc, OnceLock};
 
 use arinsal_etf::DecodedSizeWalk;
 use arinsal_term::{
-    Atom, AtomEncoding, BinaryOwner, ConsListBuilder, ExportEntry, FunEntry, FunRef, HeapAlloc,
-    HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords, HeapTermSlot,
-    HxNode, Identity, Node, OwnedBinaryRef, ProcessHeap, RefcBinary, Term, TermBuilder, TermKind,
-    atoms, binary_owner, cmp_exact, flat_key_cmp, global_atoms, hashmap_from_ks_and_vs_extra,
-    hashmap_from_unsorted_array, hashmap_key_hash, writable_finalize, writable_resize_private,
+    Atom, AtomEncoding, BinaryOwner, BinaryRef, ConsListBuilder, ExportEntry, FunEntry, FunRef,
+    HeapAlloc, HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords,
+    HeapTermSlot, HxNode, Identity, Node, OwnedBinaryRef, ProcessHeap, RefcBinary, Term,
+    TermBuilder, TermKind, atoms, binary_owner, cmp_exact, flat_key_cmp, global_atoms,
+    hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array, hashmap_key_hash, writable_finalize,
+    writable_resize_private,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
@@ -2401,6 +2402,13 @@ enum DecodeInput<'a> {
     },
 }
 
+fn decode_binary_view(args: &[Term]) -> Result<(Term, BinaryRef<'_>), BifError> {
+    let term = *args.first().ok_or(BifError::BADARG)?;
+    // SAFETY: the input binary owner is live and stable during the BIF call.
+    let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
+    Ok((term, view))
+}
+
 impl DecodeInput<'_> {
     fn bytes(&self) -> &[u8] {
         match self {
@@ -2410,6 +2418,28 @@ impl DecodeInput<'_> {
                 .payload(*offset, *len)
                 .expect("retained ETF bytes remain within the Binary allocation"),
         }
+    }
+}
+
+fn decode_input(args: &[Term]) -> Result<DecodeInput<'_>, BifError> {
+    let (term, view) = decode_binary_view(args)?;
+    if !view.bit_len().is_multiple_of(8) {
+        return Err(BifError::BADARG);
+    }
+    let can_borrow = view.is_refc()
+        && view.start_bit().is_multiple_of(8)
+        && !arinsal_term::is_writable_binary(term);
+    if can_borrow {
+        let offset = view.start_bit() / 8;
+        let len = view.bit_len() / 8;
+        Ok(DecodeInput::Borrowed {
+            bytes: &view.bytes()[offset..offset + len],
+            term,
+            offset,
+            len,
+        })
+    } else {
+        Ok(DecodeInput::Inline(bit_bytes(term)?.0))
     }
 }
 
@@ -4143,32 +4173,14 @@ pub struct DecodeWalk<'a> {
     reservation: Option<HeapReservationState>,
     size_done: bool,
     decode_started: bool,
+    initial_work: usize,
 }
 
 impl<'a> DecodeWalk<'a> {
     /// Start decoding an ETF binary while borrowing a reference-counted input payload.
     pub fn new(args: &'a [Term]) -> Result<Self, BifError> {
         let opts = decode_options(args.get(1).copied())?;
-        // SAFETY: the input binary owner is live and stable during the BIF call.
-        let view = unsafe { args[0].binary_ref() }.ok_or(BifError::BADARG)?;
-        if !view.bit_len().is_multiple_of(8) {
-            return Err(BifError::BADARG);
-        }
-        let can_borrow = view.is_refc()
-            && view.start_bit().is_multiple_of(8)
-            && !arinsal_term::is_writable_binary(args[0]);
-        let input = if can_borrow {
-            let offset = view.start_bit() / 8;
-            let len = view.bit_len() / 8;
-            DecodeInput::Borrowed {
-                bytes: &view.bytes()[offset..offset + len],
-                term: args[0],
-                offset,
-                len,
-            }
-        } else {
-            DecodeInput::Inline(bit_bytes(args[0])?.0)
-        };
+        let input = decode_input(args)?;
         let bytes = input.bytes();
         if bytes.first() != Some(&131) {
             return Err(BifError::BADARG);
@@ -4222,7 +4234,133 @@ impl<'a> DecodeWalk<'a> {
             reservation: None,
             size_done: false,
             decode_started: false,
+            initial_work: 0,
         })
+    }
+
+    /// Decode an uncompressed input synchronously when its body fits the current BIF budget.
+    ///
+    /// Port of erts/emulator/beam/external.c:2027-2058 (`B2TSize`/`B2TDecodeInit`), OTP-29.1.1.
+    pub fn decode_small(
+        args: &'a [Term],
+        heap: &mut ProcessHeap,
+        local_node: Option<(Atom, u32)>,
+        byte_budget: usize,
+        trap_context: &mut Option<DecodeWalk<'a>>,
+    ) -> Result<Option<(Term, usize)>, (BifError, usize)> {
+        let opts = decode_options(args.get(1).copied()).map_err(|error| (error, 0))?;
+        let (_, view) = decode_binary_view(args).map_err(|error| (error, 0))?;
+        if !view.bit_len().is_multiple_of(8) {
+            return Err((BifError::BADARG, 0));
+        }
+        if !view.start_bit().is_multiple_of(8) {
+            return Ok(None);
+        }
+        let start = view.start_bit() / 8;
+        let len = view.bit_len() / 8;
+        let bytes = view
+            .bytes()
+            .get(start..start + len)
+            .ok_or((BifError::BADARG, 0))?;
+        if bytes.first() != Some(&131) {
+            return Err((BifError::BADARG, 0));
+        }
+        if bytes.get(1) == Some(&80) {
+            return Ok(None);
+        }
+        let body = &bytes[1..];
+
+        let mut sizing = DecodedSizeWalk::new();
+        let (size, size_work) = sizing
+            .step(body, byte_budget, true, local_term_hash)
+            .map_err(|_| (BifError::BADARG, 0))?;
+        let Some((heap_words, checked)) = size else {
+            *trap_context = Some(Self::after_sizing(
+                args, local_node, sizing, None, false, size_work,
+            )?);
+            return Ok(None);
+        };
+        let remaining_reds = byte_budget.saturating_sub(size_work);
+        if body.len() > remaining_reds {
+            *trap_context = Some(Self::after_sizing(
+                args,
+                local_node,
+                sizing,
+                Some(heap_words),
+                true,
+                size_work,
+            )?);
+            return Ok(None);
+        }
+        let mut reservation = HeapReservation::new(heap, heap_words)
+            .map_err(|error| (map_term_build_error(error), size_work))?;
+        let mut next = None;
+        let mut root = Term::NIL;
+        let mut root_started = false;
+        let mut maps = SmallVec::<[DecodeMap; 10]>::new();
+        let mut pending = None;
+        let mut internal_nc = false;
+        let ((parsed, decode_work), _bytes_read) = reservation
+            .with_words(|reserved_words| {
+                let mut state = crate::BifState::default();
+                let mut decode_ctx = Ctx::with_allocator(reserved_words, &mut state);
+                let mut reader = Reader { bytes: body, at: 0 };
+                let parsed = decode_direct_step(
+                    &mut reader,
+                    &mut next,
+                    &mut root,
+                    &mut root_started,
+                    &mut maps,
+                    &mut pending,
+                    &mut internal_nc,
+                    opts.safe,
+                    local_node,
+                    &mut decode_ctx,
+                    usize::MAX,
+                )?;
+                Ok::<_, BifError>((parsed, reader.at))
+            })
+            .map_err(|error| (map_term_build_error(error), size_work))?
+            .map_err(|error| (error, size_work))?;
+        let Some((_term, decoded_bytes)) = parsed else {
+            return Err((BifError::BADARG, size_work + decode_work));
+        };
+        if decoded_bytes != checked {
+            return Err((BifError::BADARG, size_work + decode_work));
+        }
+        finish_decode_maps(&mut reservation, &mut maps, &mut root)
+            .map_err(|error| (error, size_work + decode_work))?;
+        drop(reservation);
+
+        let value = if opts.used {
+            let mut state = crate::BifState::default();
+            let handle = crate::ProcessHeapHandle(heap);
+            let mut result_ctx = Ctx::with_allocator(handle, &mut state);
+            let used = integer(&mut result_ctx, 1 + checked)
+                .map_err(|error| (error, size_work + decode_work))?;
+            tuple_build(&mut result_ctx, &[root, used])
+        } else {
+            root
+        };
+        Ok(Some((value, size_work + decode_work)))
+    }
+
+    fn after_sizing(
+        args: &'a [Term],
+        local_node: Option<(Atom, u32)>,
+        sizing: DecodedSizeWalk,
+        heap_words: Option<usize>,
+        size_done: bool,
+        size_work: usize,
+    ) -> Result<Self, (BifError, usize)> {
+        // Port of external.c B2TSize -> B2TDecodeInit state transfer, OTP-29.1.1.
+        let mut decoder = Self::new(args).map_err(|error| (error, size_work))?;
+        decoder.local_node = local_node;
+        decoder.sizing = sizing;
+        decoder.heap_words = heap_words;
+        decoder.size_done = size_done;
+        decoder.initial_work = size_work;
+        Ok(decoder)
     }
 
     /// Configure this node's identity for external pid, port, and reference terms.
@@ -4260,6 +4398,7 @@ impl<'a> DecodeWalk<'a> {
             reservation,
             size_done,
             decode_started,
+            initial_work,
         } = self;
         let input = match input {
             DecodeInput::Inline(bytes) => DecodeInput::Inline(bytes),
@@ -4302,6 +4441,7 @@ impl<'a> DecodeWalk<'a> {
             reservation,
             size_done,
             decode_started,
+            initial_work,
         })
     }
 
@@ -4450,9 +4590,13 @@ impl<'a> DecodeWalk<'a> {
         byte_budget: usize,
         ctx: &mut Ctx<'_>,
     ) -> Result<(Option<Term>, usize), (BifError, usize)> {
-        let mut consumed = 0;
+        let mut consumed = std::mem::take(&mut self.initial_work);
+        if consumed >= byte_budget.max(1) {
+            return Ok((None, consumed));
+        }
         if !self.size_done {
-            let (checked, size_work) = self.size_step(byte_budget.max(1))?;
+            let size_budget = byte_budget.max(1).saturating_sub(consumed).max(1);
+            let (checked, size_work) = self.size_step(size_budget)?;
             consumed += size_work;
             let Some(_) = checked else {
                 return Ok((None, consumed));
