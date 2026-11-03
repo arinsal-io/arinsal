@@ -378,6 +378,37 @@ impl DispatchFragments {
         let mut memory = CodeMemory::new(bytes.len().max(4))?;
         let offset = memory.alloc(bytes.len().max(4))?;
         memory.write_bytes(offset, &bytes)?;
+        // `ARINSAL_BEAMASM_DUMP`: the shared fragments' code image and entry offsets, so the
+        // fragments a profile samples can be listed like a module's code.
+        if let Some(directory) = crate::dump_directory() {
+            let directory = std::path::Path::new(directory);
+            let entries = [
+                ("export", export),
+                ("call_light_bif", light_bif),
+                ("call_light_bif_helper", light_bif_without_pointer),
+                ("breakpoint", breakpoint),
+                ("apply_fixed", apply_fixed),
+                ("apply2", apply2),
+                ("apply3", apply3),
+                ("apply_fun", apply_fun),
+                ("raise_exception", raise_exception),
+                ("bif_is_eq_exact", bif_is_eq_exact),
+                ("bif_is_ne_exact", bif_is_ne_exact),
+                ("arith_compare", arith_compare),
+                ("bif_element_guard", bif_element_guard),
+            ];
+            let map = entries
+                .iter()
+                .map(|(name, label)| format!("{name} {}\n", labels[label]))
+                .collect::<String>();
+            let _ = std::fs::create_dir_all(directory);
+            let _ = std::fs::write(directory.join("fragments.bin"), &bytes);
+            let _ = std::fs::write(
+                directory.join("fragments.base"),
+                format!("{:x}", memory.ptr_at(0) as usize),
+            );
+            let _ = std::fs::write(directory.join("fragments.map"), map);
+        }
         Ok(Self {
             memory,
             export_offset: labels[&export],
@@ -1049,6 +1080,25 @@ fn emit_raise_exception_fragment(
     })
 }
 
+/// `emit_leave_runtime<eReductions | eHeapAlloc | eXRegs>` after a light BIF, with HTOP and E
+/// reloaded by two word loads instead of one `ldp`. A BIF publishes HTOP with a single word
+/// store; a 16-byte pair load that spans that fresh store and the stack word cannot be
+/// forwarded from the store queue and waits for it to drain, which a short BIF (a three-cell
+/// list reversal) exposes as a stall on the first instruction after the call.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:539-601 (emit_leave_runtime), OTP-29.1.1,
+// with the heap/stack reload split for the Apple core's store-to-load forwarding.
+fn emit_leave_light_bif(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
+        encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)
+    })?;
+    emit_leave_runtime(
+        code,
+        MAX_BIF_ARITY,
+        Update::REDUCTIONS.union(Update::X_REGS),
+    )
+}
+
 /// Shared body of every `call_light_bif`.
 ///
 /// On entry ARG3 (`x2`) is the call's entry address, ARG4 (`x3`) is the export and ARG8
@@ -1128,7 +1178,7 @@ fn emit_call_light_bif_shared(
         })?;
     }
     code.bind(after_bif)?;
-    emit_leave_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
+    emit_leave_light_bif(code)?;
     code.cbnz(Gpr::x(0), success)?;
     code.bind(not_value)?;
     code.emit(|encoder| {

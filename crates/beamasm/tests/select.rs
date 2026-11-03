@@ -303,3 +303,122 @@ fn native_i_select_tuple_arity2() {
         101
     );
 }
+
+fn tagged_atom(index: u64) -> u64 {
+    (index << 6) | 0xb
+}
+
+/// Atom indexes far above the 12-bit immediate force the untag + rebase plan: the value is
+/// tag-tested once, shifted and rebased, and the compares become immediates.
+#[test]
+fn native_select_val_lins_untags_atoms() {
+    let indexes: Vec<u64> = (0..14).map(|i| 20_000 + i * 3).collect();
+    let mut args: Vec<ArgVal> = indexes
+        .iter()
+        .map(|i| ArgVal::Immediate(tagged_atom(*i)))
+        .collect();
+    args.extend(TARGETS[..14].iter().copied().map(ArgVal::Label));
+    for (n, index) in indexes.iter().enumerate() {
+        assert_eq!(
+            run(
+                |m| m.emit_i_select_val_lins(ArgVal::X(0), ArgVal::Label(99), 28, &args),
+                tagged_atom(*index),
+                None,
+            ),
+            100 + n as u64
+        );
+    }
+    // Between two values, below and above the range, another atom tag, and a small.
+    for miss in [
+        tagged_atom(20_001),
+        tagged_atom(19_999),
+        tagged_atom(20_100),
+        tagged_atom(0),
+        tagged_small(20_000),
+        0x3b,
+    ] {
+        assert_eq!(
+            run(
+                |m| m.emit_i_select_val_lins(ArgVal::X(0), ArgVal::Label(99), 28, &args),
+                miss,
+                None,
+            ),
+            999,
+            "source {miss:#x}"
+        );
+    }
+}
+
+#[test]
+fn native_select_val_bins_untags_atoms_and_negative_smalls() {
+    let atoms: Vec<u64> = (0..24).map(|i| tagged_atom(50_000 + i * 2)).collect();
+    let smalls: Vec<u64> = (0..24).map(|i| tagged_small(-12 + i)).collect();
+    for values in [atoms, smalls] {
+        let mut args: Vec<ArgVal> = values.iter().map(|v| ArgVal::Immediate(*v)).collect();
+        args.extend((0..24).map(|i| ArgVal::Label(TARGETS[i % 16])));
+        for (n, value) in values.iter().enumerate() {
+            assert_eq!(
+                run(
+                    |m| m.emit_i_select_val_bins_untagged(
+                        ArgVal::X(0),
+                        ArgVal::Label(99),
+                        48,
+                        &args
+                    ),
+                    *value,
+                    None,
+                ),
+                100 + (n % 16) as u64,
+                "value {value:#x}"
+            );
+        }
+        for miss in [
+            tagged_atom(49_999),
+            tagged_atom(50_001),
+            tagged_atom(60_000),
+            tagged_small(1000),
+            tagged_small(-1000),
+            0x3b,
+        ] {
+            let in_set = values.contains(&miss);
+            let got = run(
+                |m| m.emit_i_select_val_bins_untagged(ArgVal::X(0), ArgVal::Label(99), 48, &args),
+                miss,
+                None,
+            );
+            assert!(in_set || got == 999, "source {miss:#x} matched {got}");
+        }
+    }
+}
+
+#[test]
+fn native_select_val_bins_full_word_compares_for_atoms() {
+    let atoms: Vec<u64> = (0..24).map(|i| tagged_atom(50_000 + i * 2)).collect();
+    let mut args: Vec<ArgVal> = atoms.iter().map(|v| ArgVal::Immediate(*v)).collect();
+    args.extend((0..24).map(|i| ArgVal::Label(TARGETS[i % 16])));
+    for (n, value) in atoms.iter().enumerate() {
+        assert_eq!(
+            run(
+                |m| m.emit_i_select_val_bins(ArgVal::X(0), ArgVal::Label(99), 48, &args),
+                *value,
+                None,
+            ),
+            100 + (n % 16) as u64
+        );
+    }
+    for miss in [
+        tagged_atom(49_999),
+        tagged_atom(50_001),
+        tagged_small(5),
+        0x3b,
+    ] {
+        assert_eq!(
+            run(
+                |m| m.emit_i_select_val_bins(ArgVal::X(0), ArgVal::Label(99), 48, &args),
+                miss,
+                None,
+            ),
+            999
+        );
+    }
+}

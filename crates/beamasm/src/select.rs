@@ -6,11 +6,16 @@ use arinsal_a64::{
 };
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::types::{TypedArg, type_id};
 
 const TMP0: Gpr = Gpr::x(8);
 const TMP1: Gpr = Gpr::x(9);
 const TMP2: Gpr = Gpr::x(10);
 const TMP3: Gpr = Gpr::x(11);
+const ARG1: Gpr = Gpr::x(0);
+/// Whether `i_select_val_bins` untags and rebases its values, as erts does
+/// (instr_select.cpp `emit_i_select_val_bins`).
+const BINS_UNTAG: bool = true;
 const SMALL_TAG: u64 = 0x0f;
 const SMALL_MASK: u64 = 0x0f;
 const SMALL_SHIFT: u8 = 4;
@@ -21,6 +26,12 @@ impl BeamModuleAssembler {
             ArgVal::Immediate(value) | ArgVal::Literal(value) => {
                 if value <= 4095 {
                     self.code.emit(|e| e.cmp_imm(reg, value as u16, false))?;
+                } else if value.wrapping_neg() <= 4095 {
+                    // Rebased values below the base wrap around; `cmn` keeps the unsigned
+                    // `hs`/`lo` meaning of `cmp`.
+                    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (cmp_arg/cmp), OTP-29.1.1.
+                    self.code
+                        .emit(|e| e.cmn_imm(reg, value.wrapping_neg() as u16, false))?;
                 } else {
                     self.code.emit(|e| e.mov_const(TMP3, value))?;
                     self.code.emit(|e| e.cmp_reg(reg, TMP3, Shift::Lsl, 0))?;
@@ -66,22 +77,140 @@ impl BeamModuleAssembler {
     }
 
     /// Emits BeamAsm's linear search, including its contiguous run and two-way shortcuts.
-    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:199-255, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp (emit_i_select_val_lins), OTP-29.1.1
     pub fn emit_i_select_val_lins(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         fail: ArgVal,
         size: usize,
         args: &[ArgVal],
     ) -> Result<(), ModuleError> {
+        let src = src.into();
         let count = Self::validate_pairs(size, args)?;
         if count >= 128 {
             return Err(ModuleError::InvalidOperand(
                 "linear select has 128 or more values",
             ));
         }
-        let reg = self.source_reg(src)?;
-        let done = self.code.new_label();
+        // With a nil fail the search falls through; `next` follows the search so the tag
+        // test of the untagged form can skip it.
+        let (fail_label, next) = match fail {
+            ArgVal::Label(id) => {
+                let label = self.label(id);
+                (Some(label), label)
+            }
+            _ => {
+                let label = self.code.new_label();
+                self.branch_fail_check(fail)?;
+                (None, label)
+            }
+        };
+        let reg = self.source_reg_into(src.val, ARG1)?;
+        let (base, shift) = plan_untag(&select_values(&args[..count]));
+        if base == 0 && shift == 0 {
+            self.emit_linear_search(reg, fail_label, args)?;
+        } else {
+            let untagged =
+                self.emit_select_untag(reg, &src, &args[..count], args, next, base, shift)?;
+            self.emit_linear_search(ARG1, fail_label, &untagged)?;
+        }
+        if fail_label.is_none() {
+            self.code.bind(next)?;
+        }
+        Ok(())
+    }
+
+    fn branch_fail_check(&self, fail: ArgVal) -> Result<(), ModuleError> {
+        if is_nil(fail) {
+            Ok(())
+        } else {
+            Err(ModuleError::InvalidOperand(
+                "select fail must be label or nil",
+            ))
+        }
+    }
+
+    /// Emits the type test and rebasing of `emit_select_untag` and returns the rewritten
+    /// value and label vector (values sorted again when a base is applied).
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp (emit_select_untag), OTP-29.1.1
+    #[allow(clippy::too_many_arguments)]
+    fn emit_select_untag(
+        &mut self,
+        comparand: Gpr,
+        src: &TypedArg,
+        values: &[ArgVal],
+        args: &[ArgVal],
+        fail: Label,
+        base: u64,
+        shift: u32,
+    ) -> Result<Vec<ArgVal>, ModuleError> {
+        let count = values.len();
+        let first = select_values(values)[0];
+        let (mask, tag) = if first & 0xf == 0xf {
+            (0xfu64, 0xfu16)
+        } else {
+            (0x3f, 0xb)
+        };
+        // The compiler's type for the source can prove the tag already.
+        let known = if tag == 0xf {
+            src.always_small()
+        } else {
+            src.exact_type(type_id::ATOM)
+        };
+        if !known {
+            self.code.emit(|e| e.and_imm(TMP1, comparand, mask))?;
+            self.code.emit(|e| e.cmp_imm(TMP1, tag, false))?;
+            self.code.b_cond(Cond::Ne, fail)?;
+        }
+        let mut comparand = comparand;
+        let mut base = base;
+        if shift != 0 {
+            self.code
+                .emit(|e| e.lsr_imm(ARG1, comparand, shift as u8))?;
+            base >>= shift;
+            comparand = ARG1;
+        }
+        let raw = select_values(values);
+        let mut entries: Vec<(u64, ArgVal)> = (0..count)
+            .map(|i| ((raw[i] >> shift).wrapping_sub(base), args[i + count]))
+            .collect();
+        if base != 0 {
+            if base <= 4095 {
+                self.code
+                    .emit(|e| e.sub_imm(ARG1, comparand, base as u16, false))?;
+            } else if base < (1 << 24) {
+                // erts' `sub(ARG1, comparand, base)`: two immediate subtractions.
+                let (low, high) = ((base & 0xfff) as u16, (base >> 12) as u16);
+                let mut from = comparand;
+                if low != 0 {
+                    self.code.emit(|e| e.sub_imm(ARG1, from, low, false))?;
+                    from = ARG1;
+                }
+                self.code.emit(|e| e.sub_imm(ARG1, from, high, true))?;
+            } else {
+                self.code.emit(|e| e.mov_const(TMP0, base))?;
+                self.code
+                    .emit(|e| e.sub_reg(ARG1, comparand, TMP0, Shift::Lsl, 0))?;
+            }
+            // The order changes after rebasing: values below the base wrap to large words.
+            entries.sort_by_key(|(value, _)| *value);
+        }
+        let mut result = Vec::with_capacity(count * 2);
+        result.extend(entries.iter().map(|(value, _)| ArgVal::Immediate(*value)));
+        result.extend(entries.iter().map(|(_, label)| *label));
+        Ok(result)
+    }
+
+    /// Linear search over `args` (values then labels). `fail` is the branch after the
+    /// last test; `None` falls through.
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp (emit_linear_search), OTP-29.1.1
+    fn emit_linear_search(
+        &mut self,
+        reg: Gpr,
+        fail: Option<Label>,
+        args: &[ArgVal],
+    ) -> Result<(), ModuleError> {
+        let count = args.len() / 2;
         let mut i = 0;
         while i < count {
             let value = args[i];
@@ -138,8 +267,9 @@ impl BeamModuleAssembler {
                 i += 1;
             }
         }
-        self.branch_fail(fail, done)?;
-        self.code.bind(done)?;
+        if let Some(fail) = fail {
+            self.code.b(fail)?;
+        }
         Ok(())
     }
 
@@ -211,13 +341,36 @@ impl BeamModuleAssembler {
     }
 
     /// Emits the binary search tree, switching to linear search at ten entries.
-    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:386-437, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp (emit_i_select_val_bins,
+    // emit_binsearch_nodes), OTP-29.1.1
     pub fn emit_i_select_val_bins(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         fail: ArgVal,
         size: usize,
         args: &[ArgVal],
+    ) -> Result<(), ModuleError> {
+        self.select_val_bins(src.into(), fail, size, args, BINS_UNTAG)
+    }
+
+    /// [`Self::emit_i_select_val_bins`] with the untag + rebase plan forced on.
+    pub fn emit_i_select_val_bins_untagged(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: ArgVal,
+        size: usize,
+        args: &[ArgVal],
+    ) -> Result<(), ModuleError> {
+        self.select_val_bins(src.into(), fail, size, args, true)
+    }
+
+    fn select_val_bins(
+        &mut self,
+        src: TypedArg,
+        fail: ArgVal,
+        size: usize,
+        args: &[ArgVal],
+        untag: bool,
     ) -> Result<(), ModuleError> {
         let count = Self::validate_pairs(size, args)?;
         if count == 0 {
@@ -226,10 +379,28 @@ impl BeamModuleAssembler {
             self.code.bind(done)?;
             return Ok(());
         }
-        let reg = self.source_reg(src)?;
+        let reg = self.source_reg_into(src.val, ARG1)?;
         let fail_label = self.fail_label(fail)?;
         let sorted = sorted_select_pairs(count, args)?;
-        self.binsearch(reg, 0, count, &sorted, fail_label)?;
+        let (base, shift) = if untag {
+            plan_untag(&select_values(&sorted[..count]))
+        } else {
+            (0, 0)
+        };
+        if base == 0 && shift == 0 {
+            self.binsearch(reg, 0, count, &sorted, fail_label)?;
+        } else {
+            let untagged = self.emit_select_untag(
+                reg,
+                &src,
+                &sorted[..count],
+                &sorted,
+                fail_label,
+                base,
+                shift,
+            )?;
+            self.binsearch(ARG1, 0, count, &untagged, fail_label)?;
+        }
         if is_nil(fail) {
             self.code.bind(fail_label)?;
         }
@@ -254,21 +425,15 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
         fail: Label,
     ) -> Result<(), ModuleError> {
-        // Port of erts/emulator/beam/jit/arm/instr_select.cpp:386-437, OTP-29.1.1
+        // Port of erts/emulator/beam/jit/arm/instr_select.cpp (emit_binsearch_nodes), OTP-29.1.1
         let count = args.len() / 2;
         let remaining = right - left;
         if remaining <= 10 {
-            for i in left..right {
-                let ArgVal::Label(target) = args[i + count] else {
-                    return Err(ModuleError::InvalidOperand(
-                        "select destinations must be labels",
-                    ));
-                };
-                self.emit_compare(reg, args[i])?;
-                self.branch_cond(Cond::Eq, target)?;
-            }
-            self.code.b(fail)?;
-            return Ok(());
+            // The leaf is a linear search with the run and two-way shortcuts.
+            let mut shrunk = Vec::with_capacity(remaining * 2);
+            shrunk.extend_from_slice(&args[left..right]);
+            shrunk.extend_from_slice(&args[left + count..right + count]);
+            return self.emit_linear_search(reg, Some(fail), &shrunk);
         }
         let mid = (left + right) / 2;
         let ArgVal::Label(target) = args[mid + count] else {
@@ -464,6 +629,80 @@ impl BeamModuleAssembler {
         }
         Ok(())
     }
+}
+
+/// Raw words of a value vector; non-word operands map to a value that disables untagging.
+fn select_values(values: &[ArgVal]) -> Vec<u64> {
+    values
+        .iter()
+        .map(|value| match value {
+            ArgVal::Immediate(v) | ArgVal::Literal(v) => *v,
+            _ => 0,
+        })
+        .collect()
+}
+
+/// `isInt13`: fits the 12-bit immediate of `cmp` or, negated, of `cmn`.
+fn is_int13(value: u64) -> bool {
+    value < 4096 || (value as i64).wrapping_neg() as u64 <= 4095
+}
+
+/// Finds the base and shift that let the most comparisons use immediate operands, or
+/// `(0, 0)` when untagging does not pay off.
+// Port of erts/emulator/beam/jit/arm/instr_select.cpp (plan_untag), OTP-29.1.1
+fn plan_untag(values: &[u64]) -> (u64, u32) {
+    let count = values.len();
+    if count == 0 {
+        return (0, 0);
+    }
+    let shift = if values[0] & 0xf == 0xf {
+        4
+    } else if values[0] & 0x3f == 0xb {
+        6
+    } else {
+        return (0, 0);
+    };
+    let tag_ok = |v: u64| {
+        if shift == 4 {
+            v & 0xf == 0xf
+        } else {
+            v & 0x3f == 0xb
+        }
+    };
+    if !values.iter().all(|v| tag_ok(*v)) {
+        return (0, 0);
+    }
+    let (mut left, mut right) = (0usize, 0usize);
+    let (mut best_left, mut best_right) = (0usize, 0usize);
+    while right < count {
+        let distance = right - left;
+        let left_value = values[left] >> shift;
+        let mid_value = values[left + distance / 2] >> shift;
+        let right_value = values[right] >> shift;
+        if is_int13(left_value.wrapping_sub(mid_value))
+            && is_int13(right_value.wrapping_sub(mid_value))
+        {
+            if distance > best_right - best_left {
+                best_right = right;
+                best_left = left;
+            }
+            right += 1;
+        } else {
+            left += 1;
+        }
+    }
+    let distance = best_right - best_left;
+    // A short run does not pay for the untagging.
+    if distance <= 6 {
+        return (0, 0);
+    }
+    if is_int13(values[best_left]) && is_int13(values[best_right]) {
+        return (0, 0);
+    }
+    if is_int13(values[best_left] >> shift) && is_int13(values[best_right] >> shift) {
+        return (0, shift);
+    }
+    (values[best_left + distance / 2], shift)
 }
 
 fn sorted_select_pairs(count: usize, args: &[ArgVal]) -> Result<Vec<ArgVal>, ModuleError> {

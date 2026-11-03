@@ -1925,6 +1925,36 @@ impl ProcessHeap {
     pub fn set_bif_hidden_words(&mut self, words: usize) {
         self.bif_hidden_words = words;
     }
+    /// The free young-heap window `[HEAP_TOP, HEAP_LIMIT)` of the process as a slice, for BIF
+    /// loops that fill cells by index and then publish `HEAP_TOP` once with
+    /// [`ProcessHeap::commit_window`]. `None` for a detached heap, whose allocations never touch
+    /// the young heap.
+    // Port of erts/emulator/beam/erl_process.h:990-998 (HEAP_LIMIT), OTP-29.1.1.
+    #[inline(always)]
+    pub fn halloc_window(&mut self) -> Option<&mut [u64]> {
+        if self.detached {
+            return None;
+        }
+        let base = self.words.as_ptr() as usize;
+        let top = self.abi.htop as usize;
+        let limit = (self.abi.stop as usize)
+            .wrapping_add(self.bif_hidden_words << 3)
+            .wrapping_sub(crate::S_REDZONE << 3)
+            .max(top);
+        let (lo, hi) = (top.wrapping_sub(base) >> 3, limit.wrapping_sub(base) >> 3);
+        self.words.words_mut().get_mut(lo..hi)
+    }
+    /// Publish `words` window words as allocated: `HEAP_TOP += words`.
+    #[inline(always)]
+    pub fn commit_window(&mut self, words: usize) {
+        self.abi.htop = self.abi.htop.wrapping_add(words);
+    }
+    /// The list term of the cons cell `word_offset` words above the current `HEAP_TOP`; it
+    /// designates window cells that the caller has written (and commits before use).
+    #[inline(always)]
+    pub fn window_list_term(&self, word_offset: usize) -> Term {
+        Term((self.abi.htop as u64).wrapping_add((word_offset as u64) << 3) | 1)
+    }
     /// Young-heap words available to `HAlloc` before it uses a fragment.
     // Port of erts/emulator/beam/erl_vm.h:150-175 (HAllocX/HeapWordsLeft), OTP-29.1.1.
     pub fn halloc_words_left(&self) -> Option<usize> {
