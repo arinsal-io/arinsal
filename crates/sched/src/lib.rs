@@ -1176,7 +1176,6 @@ impl<M: SignalMessage> SignalProbe<M> {
         self.input()
             .push_routed_node(self.progress(), || signal_buffer_slot(pid), signal)
             .map_err(|_| Error::NoProcess)?;
-        self.input().backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2227,7 +2226,6 @@ struct Inner<T: Task> {
     sleepers: Arc<[OnceLock<thread::Thread>]>,
     fanin_stats: bool,
     fanin_delivered: AtomicU64,
-    fanin_peak_backlog: AtomicUsize,
     /// erts thread progress (erl_thr_progress.c) of the normal scheduler threads.
     progress: Arc<thr_progress::ThrProgress>,
     /// `progress` as the domain handle the signal buffer pointer is read and freed through.
@@ -2812,13 +2810,10 @@ impl<T: Task> Inner<T> {
         true
     }
 
-    fn fanin_delivery(&self, process: &Process<T>, count: usize) {
+    fn fanin_delivery(&self, _process: &Process<T>, count: usize) {
         if !self.fanin_stats {
             return;
         }
-        let backlog = process.input.backlog.load(Ordering::Relaxed);
-        self.fanin_peak_backlog
-            .fetch_max(backlog, Ordering::Relaxed);
         let delivered = self
             .fanin_delivered
             .fetch_add(count as u64, Ordering::Relaxed)
@@ -2827,9 +2822,8 @@ impl<T: Task> Inner<T> {
             || delivered / 250_000 > (delivered - count as u64) / 250_000
         {
             eprintln!(
-                "ARINSAL_SCHED_STATS delivered={delivered} live={} target_backlog={backlog} peak_backlog={} process_peak_rss_mib={}",
+                "ARINSAL_SCHED_STATS delivered={delivered} live={} process_peak_rss_mib={}",
                 self.table.live_count(),
-                self.fanin_peak_backlog.load(Ordering::Relaxed),
                 process_peak_rss_bytes().map_or_else(
                     || "unavailable".to_owned(),
                     |bytes| format!("{:.1}", bytes as f64 / 1_048_576.0)
@@ -3904,14 +3898,7 @@ impl<T: Task> Inner<T> {
         // Literal-copy requests are non-message signals and enter a shared run queue.
         let force_enqueue = matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
         self.fanin_delivery(process, 1);
-        // The send pressure counts only a receiver that was not waiting. The state word comes
-        // back from the enqueue's own read-modify-write, so the shared word is touched once;
-        // the receiver tolerates a count that lags (it only decrements a non-zero backlog).
-        let state = self.deliver_process_node(process, signal, local, true, force_enqueue)?;
-        let state = run_state_of(state);
-        if state != WAITING && state != UNSCHEDULED {
-            process.input.backlog.fetch_add(1, Ordering::Relaxed);
-        }
+        self.deliver_process_node(process, signal, local, true, force_enqueue)?;
         Ok(())
     }
 
@@ -3972,7 +3959,6 @@ impl<T: Task> Inner<T> {
             return Err(Error::NoProcess);
         }
         let count = events.len();
-        process.input.backlog.fetch_add(count, Ordering::Relaxed);
         self.fanin_delivery(process, count);
         if process
             .input
@@ -3981,10 +3967,6 @@ impl<T: Task> Inner<T> {
             })
             .is_err()
         {
-            process
-                .input
-                .backlog
-                .fetch_sub(events.len(), Ordering::Relaxed);
             return Err(Error::NoProcess);
         }
         if wake {
@@ -4000,7 +3982,6 @@ impl<T: Task> Inner<T> {
         force_enqueue: bool,
         state: Option<u32>,
     ) {
-        let wait_timer = process.wait_timer.load(Ordering::Acquire);
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message),
         // OTP-29.1.1: read the state and schedule only a process that is not active. The
         // SeqCst load orders after the SeqCst enqueue (see the wake protocol above).
@@ -4011,6 +3992,9 @@ impl<T: Task> Inner<T> {
                 self.notify_dirty_signal_handler(process, None);
             }
         } else {
+            // Read only for a receiver that is scheduled: its wait started before it published
+            // WAITING, and the state word's read-modify-write orders this load after that store.
+            let wait_timer = process.wait_timer.load(Ordering::Acquire);
             if wait_timer != 0 {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
                 self.cancel_wait_timer(process, wait_timer);
@@ -5090,11 +5074,7 @@ trait ContextOps<M: SignalMessage> {
 }
 
 impl<M: SignalMessage> RunCtx<'_, M> {
-    fn consumed_event(&self) {
-        if self.proc.input.backlog.load(Ordering::Relaxed) != 0 {
-            self.proc.input.backlog.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
+    fn consumed_event(&self) {}
     /// Pid of the running task.
     pub fn pid(&self) -> Pid {
         self.proc.pid
@@ -5414,13 +5394,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Account `count` events taken from [`Self::fetch_signals`] at once.
     pub fn consume_fetched_many(&self, count: usize) {
-        let backlog = self.proc.input.backlog.load(Ordering::Relaxed);
-        if backlog != 0 {
-            self.proc
-                .input
-                .backlog
-                .fetch_sub(backlog.min(count), Ordering::Relaxed);
-        }
+        let _ = count;
     }
     /// Record whether this slice ends active (runnable) or waiting.
     // Port of erts/emulator/beam/erl_process.c (ERTS_PSFLG_ACTIVE in the process state
@@ -5455,7 +5429,6 @@ impl<M: SignalMessage> RunCtx<'_, M> {
                 signal,
             )
             .map_err(|_| Error::NoProcess)?;
-        self.proc.input.backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     /// Set this process's user priority; it takes effect when the process is next queued.
@@ -6029,33 +6002,31 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
         // reference count is taken on the receiver.
         let inner = self.inner;
-        inner
-            .table
-            .with_live(to, |process| -> Result<(), Error> {
-                let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-                let wakes = payload_wakes(&signal.payload);
-                let force_enqueue =
-                    matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
-                // A literal-copy request is never buffered: a request lost to an exiting target
-                // would never be answered, so the sender must see `NoProcess` at once. Port of
-                // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
-                // Neither is a link: erts enqueues it at once and `link/1` answers a target that is
-                // already gone with a `noproc` link exit; a buffered link dropped at slice end would
-                // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
-                // OTP-29.1.1.
-                let link = matches!(&signal.payload, Payload::Signal(Signal::Link));
-                if waiting || monitor || link || deferred.is_some() || force_enqueue {
-                    if let Some(first) = deferred {
-                        // The held monitor and this signal enter the queue together.
-                        let second = signal;
-                        let (first, second) = match process.input.push_pair(
-                            &self.inner.progress_domain,
-                            first,
-                            second,
-                        ) {
+        let managed = self.local.is_some();
+        let deliver = |process: &ProcRef<T>| -> Result<(), Error> {
+            let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
+            let wakes = payload_wakes(&signal.payload);
+            let force_enqueue =
+                matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+            // A literal-copy request is never buffered: a request lost to an exiting target
+            // would never be answered, so the sender must see `NoProcess` at once. Port of
+            // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
+            // Neither is a link: erts enqueues it at once and `link/1` answers a target that is
+            // already gone with a `noproc` link exit; a buffered link dropped at slice end would
+            // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
+            // OTP-29.1.1.
+            let link = matches!(&signal.payload, Payload::Signal(Signal::Link));
+            if waiting || monitor || link || deferred.is_some() || force_enqueue {
+                if let Some(first) = deferred {
+                    // The held monitor and this signal enter the queue together.
+                    let second = signal;
+                    let (first, second) =
+                        match process
+                            .input
+                            .push_pair(&self.inner.progress_domain, first, second)
+                        {
                             Ok(()) => {
                                 self.inner.fanin_delivery(process, 2);
-                                process.input.backlog.fetch_add(2, Ordering::Relaxed);
                                 if wakes {
                                     self.inner.wake_after_publish(
                                         process,
@@ -6068,61 +6039,69 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                             }
                             Err(pair) => pair,
                         };
-                        let mut events = self
-                            .local
-                            .map(RefCell::borrow_mut)
-                            .as_deref_mut()
-                            .and_then(|local| local.message_slabs.pop())
-                            .unwrap_or_else(|| Vec::with_capacity(2));
-                        events.push(first);
-                        events.push(second);
-                        let delivered = self.inner.deliver_block(
-                            process,
-                            &mut events,
-                            self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                            wakes,
-                            force_enqueue,
-                        );
-                        let lost = if delivered.is_err() {
-                            take_lost_monitors(&mut events)
-                        } else {
-                            Vec::new()
-                        };
-                        events.clear();
-                        if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut()
-                            && local.message_slabs.len() < 64
-                        {
-                            local.message_slabs.push(events);
-                        }
-                        if delivered.is_err() {
-                            self.bounce_monitors(to, lost);
-                            return Err(Error::NoProcess);
-                        }
+                    let mut events = self
+                        .local
+                        .map(RefCell::borrow_mut)
+                        .as_deref_mut()
+                        .and_then(|local| local.message_slabs.pop())
+                        .unwrap_or_else(|| Vec::with_capacity(2));
+                    events.push(first);
+                    events.push(second);
+                    let delivered = self.inner.deliver_block(
+                        process,
+                        &mut events,
+                        self.local.map(RefCell::borrow_mut).as_deref_mut(),
+                        wakes,
+                        force_enqueue,
+                    );
+                    let lost = if delivered.is_err() {
+                        take_lost_monitors(&mut events)
                     } else {
-                        self.inner.deliver_process_node(
-                            process,
-                            signal,
-                            self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                            wakes,
-                            force_enqueue,
-                        )?;
+                        Vec::new()
+                    };
+                    events.clear();
+                    if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut()
+                        && local.message_slabs.len() < 64
+                    {
+                        local.message_slabs.push(events);
                     }
-                    // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
-                    // Message queue depth does not create a scheduler event for the sender.
-                    return Ok(());
+                    if delivered.is_err() {
+                        self.bounce_monitors(to, lost);
+                        return Err(Error::NoProcess);
+                    }
+                } else {
+                    self.inner.deliver_process_node(
+                        process,
+                        signal,
+                        self.local.map(RefCell::borrow_mut).as_deref_mut(),
+                        wakes,
+                        force_enqueue,
+                    )?;
                 }
-                // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message) and
-                // erl_proc_sig_queue.c:712 (enqueue_signals), OTP-29.1.1: the signal is appended to
-                // the receiver's in-queue now; erts keeps no per-sender buffer to publish later. A
-                // receiver that is already gone drops it, as erts does for a dead receiver.
-                let _ = self.inner.deliver_live_node(
-                    process,
-                    signal,
-                    self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                );
-                Ok(())
-            })
-            .ok_or(Error::NoProcess)?
+                // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
+                // Message queue depth does not create a scheduler event for the sender.
+                return Ok(());
+            }
+            // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message) and
+            // erl_proc_sig_queue.c:712 (enqueue_signals), OTP-29.1.1: the signal is appended to
+            // the receiver's in-queue now; erts keeps no per-sender buffer to publish later. A
+            // receiver that is already gone drops it, as erts does for a dead receiver.
+            let _ = self.inner.deliver_live_node(
+                process,
+                signal,
+                self.local.map(RefCell::borrow_mut).as_deref_mut(),
+            );
+            Ok(())
+        };
+        // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: a normal
+        // scheduler is a managed thread of thread progress, so its lookup is the slot read alone;
+        // only another thread delays progress for the lookup.
+        let delivered = if managed {
+            inner.table.with_live_managed(to, deliver)
+        } else {
+            inner.table.with_live(to, deliver)
+        };
+        delivered.ok_or(Error::NoProcess)?
     }
     fn flush(&mut self) {
         self.publish_deferred_monitor();
@@ -6466,7 +6445,6 @@ impl<T: Task> Scheduler<T> {
             sleepers: Arc::clone(&sleepers),
             fanin_stats: std::env::var_os("ARINSAL_FANIN_STATS").is_some(),
             fanin_delivered: AtomicU64::new(0),
-            fanin_peak_backlog: AtomicUsize::new(0),
             progress_domain: Progress(Arc::clone(&progress)),
             progress,
             dirty: [
@@ -6911,6 +6889,17 @@ impl<T: Task> Scheduler<T> {
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
         self.inner.table.with_live(pid, |_| ()).is_some()
+    }
+
+    /// [`Scheduler::lookup`] for a caller running on a managed (normal) scheduler thread of this
+    /// scheduler when `managed`: it skips the thread-progress delay.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1.
+    pub fn lookup_from(&self, pid: Pid, managed: bool) -> bool {
+        if managed {
+            self.inner.table.with_live_managed(pid, |_| ()).is_some()
+        } else {
+            self.lookup(pid)
+        }
     }
     /// The process table interval the live task with this pid started in.
     /// Port of erts/emulator/beam/erl_db.c (heir_started_interval), OTP-29.1.1.
@@ -7739,7 +7728,6 @@ mod msgq_stage_microbench {
             inner: &scheduler.inner,
             local: None,
         };
-        input.backlog.store(N, Ordering::Relaxed);
         let consts = SliceConsts {
             worker: None,
             worker_count: scheduler.inner.config.workers,
@@ -7798,7 +7786,6 @@ mod msgq_stage_microbench {
         let to = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(to).unwrap();
         process.run_state().store(RUNNING, Ordering::Relaxed);
-        process.input.backlog.store(257, Ordering::Relaxed);
         let mut runner = Runner {
             inner: &scheduler.inner,
             local: None,

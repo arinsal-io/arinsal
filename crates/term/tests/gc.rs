@@ -134,7 +134,7 @@ fn a_received_node_fragment_is_collected_with_the_process() {
 
 #[test]
 fn gc_rebases_message_binary_chains_before_releasing_fragments() {
-    let mut message_heap = ProcessHeap::with_words(128);
+    let mut message_heap = arinsal_term::message::MessageHeapBlock::with_words(128);
     let payload = vec![0x5a; 100];
     let binary = TermBuilder::new(&mut message_heap)
         .binary(&payload)

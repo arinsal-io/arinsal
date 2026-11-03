@@ -2208,22 +2208,16 @@ impl ProcessHeap {
         {
             return Err(AdoptError::NotStandalone);
         }
-        // The block moves with its terms; no word is copied. Only the used words count towards
-        // the garbage collection test, not the block capacity.
-        // Port of erts/emulator/beam/erl_nfunc_sched.h (erts_flush_dirty_shadow_proc) and
-        // erts/emulator/beam/utils.c (erts_heap_alloc, MBUF_SIZE adds the requested words only),
-        // OTP-29.1.1.
+        // Dirty-shadow process heaps retain their separate ABI object until ownership moves.
+        // Port of erts_flush_dirty_shadow_proc and erts_heap_alloc, OTP-29.1.1.
         let adopted_words = source
             .htop_index()
             .saturating_add(source.fragment_words as usize);
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
-        // Only the words below the heap top hold objects; the rest of the block is not cleared.
-        // Port of erts/emulator/beam/erl_message.h:72-78 (ErlHeapFragment `used_size`), OTP-29.1.1.
         let used = source.htop_index();
         let block = std::mem::take(&mut source.words).into_alloc_block();
-        // The block is gone: its cursors point nowhere.
         source.abi.htop = std::ptr::null_mut();
         source.abi.stop = std::ptr::null_mut();
         let used = used.min(block.len());
@@ -2235,6 +2229,21 @@ impl ProcessHeap {
         self.abandoned |= source.abandoned;
         self.absorb_fragment_owners(&mut source);
         Ok(())
+    }
+
+    /// Adopt a standalone `ErlHeapFragment` without copying its term words.
+    // Port of erts_save_message_in_proc, OTP-29.1.1.
+    pub fn adopt_message_heap_block(&mut self, source: crate::message::MessageHeapBlock) {
+        let (block, used, off_heap, bin_vheap) = source.into_parts();
+        self.fragment_words = self
+            .fragment_words
+            .saturating_add(u32::try_from(used).unwrap_or(u32::MAX));
+        let used = used.min(block.len());
+        self.fragments.push(Fragment::Block {
+            memory: block,
+            used,
+        });
+        self.absorb_off_heap(off_heap, bin_vheap);
     }
 
     /// Keep the inline heap fragment of a received message as a fragment of this process,
@@ -2256,7 +2265,10 @@ impl ProcessHeap {
         data: crate::message::MessageHeap,
     ) -> Result<(), AdoptError> {
         match data {
-            crate::message::MessageHeap::Heap(heap) => self.adopt_message_fragment(heap),
+            crate::message::MessageHeap::Heap(heap) => {
+                self.adopt_message_heap_block(heap);
+                Ok(())
+            }
             crate::message::MessageHeap::Node(fragment) => {
                 self.adopt_message_node(fragment);
                 Ok(())

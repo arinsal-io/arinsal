@@ -13,8 +13,11 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::bits::{ExternalBinary, RefcBinary, WritableBinary};
-use crate::heap::{HeapAlloc, link_external_bin_ref, link_magic_thing, link_node_thing};
+use crate::heap::{
+    HeapAlloc, OffHeapLists, link_external_bin_ref, link_magic_thing, link_node_thing, store,
+};
 use crate::{Node, Term, TermError};
+use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 
 /// One signal (`ErtsSignalCommon`): the queue link, then the signal value. A message node may
 /// be followed in the same allocation by a heap fragment (`ERTS_MSG_COMBINED_HFRAG`).
@@ -37,6 +40,154 @@ pub(crate) struct HeapFragment {
     pub(crate) bin_vheap: u64,
     alloc_size: usize,
     used_size: usize,
+}
+
+/// A standalone message heap fragment with its terms and linked off-heap owners.
+/// Port of `ErlHeapFragment` in erts/emulator/beam/erl_message.h, OTP-29.1.1.
+pub struct MessageHeapBlock {
+    pub(crate) off_heap: OffHeapLists,
+    pub(crate) bin_vheap: u64,
+    memory: AllocBlock,
+    used: usize,
+}
+
+impl MessageHeapBlock {
+    /// Allocate one message fragment with room for `words` terms.
+    pub fn with_words(words: usize) -> Self {
+        let memory = AllocBlock::new(ErtsAlcType::HEAP_FRAG, words)
+            .expect("message heap fragment allocation size is valid");
+        Self {
+            off_heap: OffHeapLists::default(),
+            bin_vheap: 0,
+            memory,
+            used: 0,
+        }
+    }
+
+    /// Number of initialized message words.
+    pub fn len(&self) -> usize {
+        self.used
+    }
+
+    /// Whether the fragment contains no message words.
+    pub fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+
+    /// The initialized message words.
+    pub fn words(&self) -> &[u64] {
+        &self.memory.as_slice()[..self.used]
+    }
+
+    pub(crate) fn into_parts(self) -> (AllocBlock, usize, OffHeapLists, u64) {
+        (self.memory, self.used, self.off_heap, self.bin_vheap)
+    }
+}
+
+impl HeapAlloc for MessageHeapBlock {
+    fn allocator_identity(&self) -> usize {
+        self.memory.as_ptr() as usize
+    }
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        let end = self.used.checked_add(words)?;
+        if end > self.memory.len() {
+            return None;
+        }
+        let ptr = self.memory.as_mut_slice()[self.used..].as_mut_ptr();
+        self.used = end;
+        Some(ptr)
+    }
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        if self.used.checked_add(words)?.checked_add(extra)? > self.memory.len() {
+            return None;
+        }
+        self.alloc(words)
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        let base = self.memory.as_ptr() as usize;
+        let used_end = base.saturating_add(self.used.saturating_mul(8));
+        let start = start as usize;
+        if start >= base
+            && start <= used_end
+            && end as usize == used_end
+            && (start - base).is_multiple_of(8)
+        {
+            self.used = (start - base) / 8;
+        }
+    }
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        self.bin_vheap = self.bin_vheap.saturating_add((binary.len() / 8) as u64);
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let head = if writable {
+            &mut self.off_heap.wrt_bins
+        } else {
+            &mut self.off_heap.off_heap_first
+        };
+        store(bin_ref.wrapping_add(2), *head as u64);
+        *head = bin_ref as usize;
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        self.off_heap.overhead = self.off_heap.overhead.saturating_add(overhead_words);
+        Ok(())
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        self.bin_vheap = self.bin_vheap.saturating_add(words);
+    }
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        self.bin_vheap = self
+            .bin_vheap
+            .saturating_add((binary.capacity() / 8) as u64);
+        Ok(())
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        _binary: Arc<WritableBinary>,
+        bits: usize,
+    ) -> Result<(), TermError> {
+        self.bin_vheap = self.bin_vheap.saturating_add((bits.div_ceil(8) / 8) as u64);
+        Ok(())
+    }
+    fn supports_writable_binary(&self) -> bool {
+        true
+    }
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        link_external_bin_ref(&mut self.off_heap.off_heap_first, bin_ref, binary);
+        Ok(())
+    }
+    fn supports_external_binary(&self) -> bool {
+        true
+    }
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        link_node_thing(&mut self.off_heap.off_heap_first, thing, node);
+    }
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        link_magic_thing(
+            &mut self.off_heap.off_heap_first,
+            &mut self.off_heap.overhead,
+            thing,
+            owner,
+        );
+        Ok(())
+    }
+    fn supports_magic(&self) -> bool {
+        true
+    }
 }
 
 /// The layout of a node of `T` with an inline fragment of `words`, and the offset of the
@@ -597,11 +748,8 @@ impl HeapAlloc for FragmentMut<'_> {
 
 /// The data of a message kept apart from its node: a standalone heap (a separately allocated
 /// `ErlHeapFragment`, `data.heap_frag`) or the inline fragment of the node it came in.
-// The `Heap` variant carries a whole `ProcessHeap` with its `NativeAbi`; boxing it would add an
-// allocation per message, which erts' `ErlHeapFragment` (one block) does not have.
-#[allow(clippy::large_enum_variant)]
 pub enum MessageHeap {
-    Heap(crate::ProcessHeap),
+    Heap(MessageHeapBlock),
     Node(NodeFragment),
 }
 
@@ -615,7 +763,7 @@ impl MessageHeap {
     /// Words of the message data (`erts_msg_attached_data_size`).
     pub fn message_data_size(&self) -> usize {
         match self {
-            Self::Heap(heap) => heap.message_data_size(),
+            Self::Heap(heap) => heap.len(),
             Self::Node(fragment) => fragment.len(),
         }
     }
@@ -623,7 +771,7 @@ impl MessageHeap {
     /// Words a literal-area check inspects.
     pub fn literal_scan_words(&self) -> usize {
         match self {
-            Self::Heap(heap) => heap.literal_scan_words(),
+            Self::Heap(heap) => heap.len(),
             Self::Node(fragment) => fragment.len(),
         }
     }
@@ -631,7 +779,9 @@ impl MessageHeap {
     /// Whether the data holds a direct pointer that `is_area_pointer` accepts.
     pub fn has_heap_reference(&self, is_area_pointer: impl FnMut(Term) -> bool) -> bool {
         match self {
-            Self::Heap(heap) => heap.has_heap_reference(is_area_pointer),
+            Self::Heap(heap) => {
+                crate::ProcessHeap::words_have_heap_reference(heap.words(), is_area_pointer)
+            }
             Self::Node(fragment) => {
                 crate::ProcessHeap::words_have_heap_reference(fragment.words(), is_area_pointer)
             }

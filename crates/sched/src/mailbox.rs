@@ -115,8 +115,6 @@ pub struct Incoming<T: Send + 'static> {
     /// MSG_SIG_IN_Q/NMSG_SIG_IN_Q bits of the signals still queued (erts re-sets them from
     /// `msgs_in_slots`/`nonmsgs_in_slots` after racing buffer inserts, erl_proc_sig_queue.c:1450).
     nmsgs: AtomicUsize,
-    /// Signals delivered but not yet consumed by the receiver (send pressure).
-    pub(crate) backlog: AtomicUsize,
     buffering_allowed: AtomicBool,
     /// `p->sig_inq_buffers`: null while the buffers are not installed.
     buffers: ProgressSlot<SignalBuffers<T>>,
@@ -134,7 +132,6 @@ impl<T: Send + 'static> Default for Incoming<T> {
             state: AtomicU32::new(0),
             nmsgs: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
-            backlog: AtomicUsize::new(0),
             buffering_allowed: AtomicBool::new(false),
             buffers: ProgressSlot::new(),
             contention_count: AtomicUsize::new(0),
@@ -651,11 +648,6 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         // `accept` took only messages.
         self.dequeued(0, 0);
         drop(queue);
-        let backlog = self.backlog.load(Ordering::Relaxed);
-        if backlog != 0 {
-            self.backlog
-                .fetch_sub(backlog.min(count), Ordering::Relaxed);
-        }
         count
     }
 
@@ -676,9 +668,6 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         let nmsgs = usize::from(!signal.is_message());
         self.dequeued(nmsgs, queue.len());
         drop(queue);
-        if self.backlog.load(Ordering::Relaxed) != 0 {
-            self.backlog.fetch_sub(1, Ordering::Relaxed);
-        }
         Some(signal.into_value())
     }
 }

@@ -2168,7 +2168,11 @@ pub(crate) fn monitor_light(
         return None;
     }
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    if !rt_ref(process)?.scheduler().ok()?.lookup(pid) {
+    if !rt_ref(process)?
+        .scheduler()
+        .ok()?
+        .lookup_from(pid, process.on_managed)
+    {
         return None;
     }
     let id = rt_ref(process)?.next_ref();
@@ -2534,7 +2538,11 @@ pub(crate) fn link_light(
         return None;
     }
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    if !rt_ref(process)?.scheduler().ok()?.lookup(pid) {
+    if !rt_ref(process)?
+        .scheduler()
+        .ok()?
+        .lookup_from(pid, process.on_managed)
+    {
         return None;
     }
     // Port of erts/emulator/beam/bif.c:165-183 (link_opt): a link that exists and is not

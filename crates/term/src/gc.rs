@@ -1869,12 +1869,7 @@ impl ProcessHeap {
             let mut blocks: Vec<&[u64]> = Vec::new();
             match &data {
                 crate::message::MessageHeap::Heap(fragment) => {
-                    blocks.push(&fragment.words.words()[..fragment.htop_index()]);
-                    for block in &fragment.fragments {
-                        if let crate::heap::Fragment::Block { memory, used } = block {
-                            blocks.push(&memory.as_slice()[..*used]);
-                        }
-                    }
+                    blocks.push(fragment.words());
                 }
                 crate::message::MessageHeap::Node(fragment) => blocks.push(fragment.words()),
             }
@@ -1913,14 +1908,15 @@ impl ProcessHeap {
             // the copied blocks too, so move both intrusive lists before adopting them.
             match &mut data {
                 crate::message::MessageHeap::Heap(fragment) => {
-                    if let Some(owners) = fragment.owners.as_mut() {
-                        rebase_binref_chains_to_ranges(
-                            &mut owners.off_heap_first,
-                            &mut owners.wrt_bins,
-                            &ranges,
-                        );
-                    }
-                    self.absorb_fragment_owners(fragment);
+                    rebase_binref_chains_to_ranges(
+                        &mut fragment.off_heap.off_heap_first,
+                        &mut fragment.off_heap.wrt_bins,
+                        &ranges,
+                    );
+                    self.absorb_off_heap(
+                        std::mem::take(&mut fragment.off_heap),
+                        fragment.bin_vheap,
+                    );
                 }
                 crate::message::MessageHeap::Node(fragment) => {
                     let lists = fragment.owners_mut();
