@@ -2421,6 +2421,8 @@ pub(crate) fn compile(
             }
         })
         .collect();
+    let location_addresses: Arc<[usize]> =
+        location_table.iter().map(|entry| entry.address).collect();
     for function in &compiled.functions {
         let Some(start) = compiled
             .native
@@ -2459,7 +2461,7 @@ pub(crate) fn compile(
                 let last = location_table
                     .partition_point(|entry| entry.address < end)
                     .max(first);
-                crate::NativeLines::window(&location_table, first, last)
+                crate::NativeLines::window(&location_table, &location_addresses, first, last)
             },
             file_term: None,
         });

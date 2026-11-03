@@ -1545,13 +1545,6 @@ impl Runtime {
         &self.code
     }
 
-    pub(crate) fn with_active_catches<R>(
-        &self,
-        read: impl FnOnce(&[Option<crate::native_bridge::CatchTarget>]) -> R,
-    ) -> R {
-        self.code.with_active_catches(read)
-    }
-
     /// Address of an export in the requested active code index.
     // Port of erts/emulator/beam/beam_common.c:1520-1530 (apply export dispatch), OTP-29.1.1.
     pub(crate) fn export_address(

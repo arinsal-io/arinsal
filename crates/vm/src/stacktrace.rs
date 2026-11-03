@@ -717,7 +717,7 @@ pub(crate) fn note_caught_bif_frame(
                 };
                 let freason = p.heap.abi.exc.freason;
                 let fvalue = p.heap.abi.exc.fvalue;
-                p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
+                p.cold_exc_mut().pending_trace_top = Some(Box::new(PendingTop {
                     freason,
                     fvalue,
                     top,
@@ -734,7 +734,7 @@ pub(crate) fn note_caught_bif_frame(
     };
     let freason = p.heap.abi.exc.freason;
     let fvalue = p.heap.abi.exc.fvalue;
-    p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
+    p.cold_exc_mut().pending_trace_top = Some(Box::new(PendingTop {
         freason,
         fvalue,
         top,
@@ -759,6 +759,9 @@ fn bif_pending_top(
 }
 
 fn clone_matching_pending(p: &Process) -> Option<StoredTopFrame> {
+    if !p.exc_side {
+        return None;
+    }
     let pending = p.cold.as_ref()?.pending_trace_top.as_ref()?;
     (pending.freason == p.heap.abi.exc.freason && pending.fvalue == p.heap.abi.exc.fvalue)
         .then(|| pending.top.clone())

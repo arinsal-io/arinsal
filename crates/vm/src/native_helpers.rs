@@ -3387,6 +3387,33 @@ fn plain_bif_word_slow(
         }
         return 0;
     }
+    // Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1: `BIF_ERROR(p, EXC_*)` after
+    // `p->fvalue = reason`) and beam_common.c (save_stacktrace: these three BIFs take the
+    // `non_bif_stacktrace` branch, so no BIF frame is recorded), OTP-29.1.1. The failure words
+    // are complete, so nothing is decoded and no record of the failing call is kept.
+    if word == arinsal_term::THE_NON_VALUE
+        && deferred.is_none()
+        && error.is_none()
+        && export.arity == 1
+        && export.module_atom == arinsal_term::atoms::ERLANG
+        && matches!(
+            export.function_atom,
+            arinsal_term::atoms::ERROR | arinsal_term::atoms::EXIT | arinsal_term::atoms::THROW
+        )
+        && process.heap.abi.exc.ftrace == 0
+        && process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && !process.heap.gc_after_bif_desired()
+    {
+        process.heap.abi.exc.freason &= !arinsal_beamasm::exc::EXF_ARGLIST;
+        process.clear_native_failure();
+        if process.exc_side {
+            crate::stacktrace::clear_pending_top(process);
+            if let Some(cold) = process.cold.as_mut() {
+                cold.explicit_raise = None;
+            }
+        }
+        return 0;
+    }
     // A migrated body left its failure in the process' exit words; an adapted `Result` body
     // left it in the context. Decoding clears the words, which are rewritten below.
     let error = if word == arinsal_term::THE_NON_VALUE {
@@ -3918,7 +3945,16 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
     process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
     let freason = process.heap.abi.exc.freason;
     let fvalue = process.heap.abi.exc.fvalue;
-    process.cold_mut().explicit_raise = explicit.map(|trace| Box::new((freason, fvalue, trace)));
+    match explicit {
+        Some(trace) => {
+            process.cold_exc_mut().explicit_raise = Some(Box::new((freason, fvalue, trace)));
+        }
+        None => {
+            if let Some(cold) = process.cold.as_mut() {
+                cold.explicit_raise = None;
+            }
+        }
+    }
 }
 
 /// The `raise/3` list for this failure, copied back onto the heap.
@@ -3933,6 +3969,10 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
         let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
         process.heap.abi.exc.ftrace = 0;
         return Some(trace);
+    }
+    // Only `set_light_bif_error` parks a trace in the cold part, and it flags the process.
+    if !process.exc_side {
+        return None;
     }
     let owned = {
         let cold = process.cold.as_mut()?;
@@ -4019,10 +4059,16 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
     // `build_stacktrace` resolves it against the active code ranges when the trace is requested.
     let native_pc = (raising_pc != 0).then_some(raising_pc);
+    // `exc_side_pending` is false for a plain `error/1`, `exit/1` or `throw/1` and for a raise
+    // from compiled code: nothing is parked in the cold part, so erts' two inputs to
+    // `save_stacktrace` (pc and registers) are all there is.
+    let side = process.exc_side_pending();
     // A `raise/3` carries the trace the catch must see, so no top frame is looked for.
     let explicit = take_explicit_raise(process);
     let top = if explicit.is_some() {
         None
+    } else if !side {
+        inline_bif_top(registers.tmp_mem[7])
     } else {
         // An inline guard BIF (`element/2`, `hd/1`, ...) names itself as the top frame, with its
         // arguments in X0.. Port of beam_asm_global.cpp (emit_raise_badarg passes the BIF's
@@ -4105,9 +4151,11 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
             return 0;
         }
     };
-    crate::stacktrace::clear_pending_top(process);
-    if let Some(cold) = process.cold.as_mut() {
-        cold.native_error_info = None;
+    if side {
+        crate::stacktrace::clear_pending_top(process);
+        if let Some(cold) = process.cold.as_mut() {
+            cold.native_error_info = None;
+        }
     }
     // The branch below resumes the handler. The scheduler must not treat
     // the next native exit as a continuation resume.
@@ -4898,7 +4946,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         Err(error) => {
             let (reason, info) = crate::bits::native_error(error);
             if !has_fail_label {
-                process.cold_mut().native_error_info = info;
+                process.cold_exc_mut().native_error_info = info;
             }
             crate::native_hooks::set_error(process, &reason);
             return 0;
@@ -4909,7 +4957,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         Err(error) => {
             let (reason, info) = crate::bits::native_error(error);
             if !has_fail_label {
-                process.cold_mut().native_error_info = info;
+                process.cold_exc_mut().native_error_info = info;
             }
             crate::native_hooks::set_error(process, &reason);
             return 0;
@@ -4949,7 +4997,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
             // Port of erts/emulator/beam/erl_bits.c (bs_create_bin error_info), OTP-29.1.1.
             let (reason, info) = crate::bits::native_error(error);
             if !has_fail_label {
-                process.cold_mut().native_error_info = info;
+                process.cold_exc_mut().native_error_info = info;
             }
             crate::native_hooks::set_error(process, &reason);
             0

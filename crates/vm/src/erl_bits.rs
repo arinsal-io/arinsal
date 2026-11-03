@@ -126,7 +126,7 @@ pub extern "C" fn append_binary(
 fn fail(process: &mut crate::Process, error: BitsError) -> u64 {
     // An earlier collection of this helper may have moved the heap.
     let (reason, info) = crate::bits::native_error(error);
-    process.cold_mut().native_error_info = info;
+    process.cold_exc_mut().native_error_info = info;
     set_error(process, &reason);
     0
 }

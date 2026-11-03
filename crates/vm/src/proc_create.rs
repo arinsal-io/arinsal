@@ -375,6 +375,10 @@ pub struct Process {
     // Port of erts/emulator/beam/erl_process.h (`p->state` and `p->flags` as the one word
     // erts_schedule reads), OTP-29.1.1.
     slow: u32,
+    /// `cold` may hold exception side state (`explicit_raise`, `pending_trace_top`,
+    /// `native_error_info`). Set by every writer, cleared once an exception reaches its handler;
+    /// while clear, `handle_error` reads none of them. erts keeps no such state.
+    pub(crate) exc_side: bool,
     /// The entry process has been scheduled once (its native start is decided then).
     entry_started: bool,
     // Last BEAM live operand or call arity for allocation instructions without one.
@@ -2145,6 +2149,20 @@ impl Process {
         SliceWorkMut(self)
     }
 
+    /// The cold part for a write of exception side state (see `exc_side`).
+    #[inline]
+    pub(crate) fn cold_exc_mut(&mut self) -> &mut ProcessCold {
+        self.exc_side = true;
+        self.cold_mut()
+    }
+
+    /// Whether `handle_error` has to look at the cold part: exception side state or pending
+    /// slice work (`native_bif_error`, `native_trap`).
+    #[inline(always)]
+    pub(crate) fn exc_side_pending(&self) -> bool {
+        self.exc_side || self.slow & Self::SLOW_COLD != 0
+    }
+
     #[inline]
     pub(crate) fn cold_mut(&mut self) -> &mut ProcessCold {
         if self.cold.is_none() {
@@ -2277,6 +2295,7 @@ impl Process {
             initial_mfa: None,
             native_pc: None,
             slow: Self::SLOW_NOT_STARTED | Self::SLOW_NO_NATIVE_PC | Self::SLOW_NO_PROBE,
+            exc_side: false,
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
