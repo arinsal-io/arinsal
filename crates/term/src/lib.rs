@@ -23,6 +23,7 @@ mod record;
 mod record_table;
 mod region;
 mod rwmutex;
+pub mod stack;
 pub mod validate;
 mod views;
 
@@ -106,6 +107,7 @@ pub use rwmutex::{
     FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, current_reader_group,
     is_scheduler_thread, reader_group_slots, set_reader_group, set_reader_groups,
 };
+pub use stack::{EStack, WStack};
 pub use views::{BigRef, FlatMapRef, FloatRef, ListIter};
 
 use std::fmt;

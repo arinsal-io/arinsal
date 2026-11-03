@@ -1,145 +1,15 @@
 //! Iterative comparison and object sizing.
 use crate::FunRef;
 use crate::identity::node_order;
+use crate::stack::{EStack, WStack};
 use crate::{
     ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FLOAT, FUN, HEAP_BITS,
     Identity, MAP, NEG_BIG, POS_BIG, RECORD, REF, SUB_BITS, Term, TermKind, global_atoms,
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
-use std::ops::{Index, IndexMut};
 
 const SIZE_WSTACK_INLINE: usize = 16;
-
-// Port of DECLARE_WSTACK / WSTACK_PUSH / WSTACK_POP in erts global.h, OTP-29.1.1.
-struct SizeWStack {
-    inline: arrayvec::ArrayVec<u64, SIZE_WSTACK_INLINE>,
-    spill: Vec<u64>,
-}
-
-impl SizeWStack {
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            inline: arrayvec::ArrayVec::new(),
-            spill: Vec::new(),
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, word: u64) {
-        if self.inline.len() < SIZE_WSTACK_INLINE && self.spill.is_empty() {
-            self.inline.push(word);
-        } else {
-            if self.spill.capacity() == 0 {
-                self.spill.reserve(256);
-            }
-            self.spill.push(word);
-        }
-    }
-
-    #[inline(always)]
-    fn pop(&mut self) -> Option<u64> {
-        self.spill.pop().or_else(|| self.inline.pop())
-    }
-}
-
-// erts' WSTACK and PSTACK use an uninitialised inline array and allocate only
-// after it fills. ArrayVec provides the same initialized-prefix representation safely.
-struct WorkStack<T, const N: usize> {
-    inline: arrayvec::ArrayVec<T, N>,
-    overflow: Vec<T>,
-}
-
-impl<T, const N: usize> WorkStack<T, N> {
-    // Port of WSTACK_DECLARE/PSTACK_DECLARE in erts/emulator/beam/global.h:493-517,
-    // OTP-29.1.1. ArrayVec tracks the initialized prefix without clearing its backing array.
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            inline: arrayvec::ArrayVec::new(),
-            overflow: Vec::new(),
-        }
-    }
-
-    // Port of WSTACK_PUSH and PSTACK_PUSH in global.h:630-635, OTP-29.1.1.
-    #[inline(always)]
-    fn push(&mut self, value: T) {
-        if self.inline.len() < N && self.overflow.is_empty() {
-            self.inline.push(value);
-        } else {
-            self.overflow.push(value);
-        }
-    }
-
-    // Port of WSTACK_POP and PSTACK_POP in global.h:690, OTP-29.1.1.
-    #[inline(always)]
-    fn pop(&mut self) -> Option<T> {
-        self.overflow.pop().or_else(|| self.inline.pop())
-    }
-
-    // Port of WSTACK_COUNT in global.h:482-490, OTP-29.1.1.
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.inline.len() + self.overflow.len()
-    }
-
-    #[inline(always)]
-    fn get(&self, index: usize) -> Option<&T> {
-        if index < self.inline.len() {
-            self.inline.get(index)
-        } else {
-            self.overflow.get(index - self.inline.len())
-        }
-    }
-
-    #[inline(always)]
-    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        let inline_len = self.inline.len();
-        if index < inline_len {
-            self.inline.get_mut(index)
-        } else {
-            self.overflow.get_mut(index - inline_len)
-        }
-    }
-
-    #[inline(always)]
-    fn last(&self) -> Option<&T> {
-        self.overflow.last().or_else(|| self.inline.last())
-    }
-
-    #[inline(always)]
-    fn last_mut(&mut self) -> Option<&mut T> {
-        self.overflow.last_mut().or_else(|| self.inline.last_mut())
-    }
-
-    // Port of WSTACK_ROLLBACK in global.h:692-693, OTP-29.1.1. Overflow capacity is retained.
-    #[inline(always)]
-    fn truncate(&mut self, len: usize) {
-        if len >= N {
-            self.overflow.truncate(len - N);
-        } else {
-            self.overflow.clear();
-            self.inline.truncate(len);
-        }
-    }
-}
-
-impl<T, const N: usize> Index<usize> for WorkStack<T, N> {
-    type Output = T;
-
-    #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        self.get(index).expect("stack index is in range")
-    }
-}
-
-impl<T, const N: usize> IndexMut<usize> for WorkStack<T, N> {
-    #[inline]
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        self.get_mut(index).expect("stack index is in range")
-    }
-}
 
 /// Add two small integers, preserving their tag and detecting 60-bit overflow.
 #[inline]
@@ -539,7 +409,7 @@ pub fn size_object_litopt(root: Term, literals: &crate::LiteralAreas) -> usize {
 /// Port of erts/emulator/beam/copy.c:88 (`size_object_x`), OTP-29.1.1.
 pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>) -> usize {
     // `DECLARE_ESTACK` starts at DEF_ESTACK_SIZE (global.h:322).
-    let mut stack = SizeWStack::new();
+    let mut stack = WStack::new();
     let mut sum = 0usize;
     // SAFETY: `obj` and every child pushed below are live terms owned by the caller.
     // Each raw read is the word `size_object_x` reads for that primary tag or header.
@@ -708,7 +578,7 @@ fn lit_kept(litopt: Option<&crate::LiteralAreas>, ptr: *const u64) -> bool {
 }
 
 #[inline]
-fn pop_size(stack: &mut SizeWStack, obj: &mut Term) {
+fn pop_size(stack: &mut WStack<u64, SIZE_WSTACK_INLINE>, obj: &mut Term) {
     match stack.pop() {
         Some(next) => *obj = Term(next),
         None => *obj = Term(u64::MAX),
@@ -820,7 +690,7 @@ pub(crate) fn size_object_with_prior(
     let seen_before = |address: u64| prior.is_some_and(|p| p.contains_key(&address));
     let mut size = 0;
     // Most copied terms (table rows, small messages) fit inline: no allocation per call.
-    let mut stack: SmallVec<[Term; 32]> = SmallVec::new();
+    let mut stack: EStack<32> = EStack::new();
     let mut current = Some(root);
     while let Some(mut term) = current.take().or_else(|| stack.pop()) {
         while term.bits() & 3 == 1 {
@@ -1376,8 +1246,8 @@ enum CmpAction {
 // one WSTACK; map iterator frames stay in the separate PSTACK.
 // Port of WSTACK_DECLARE/PSTACK_DECLARE in global.h:493-517, OTP-29.1.1.
 struct CmpStack<'a> {
-    work: WorkStack<CmpWork<'a>, 16>,
-    map_frames: WorkStack<CmpMapFrame, 1>,
+    work: WStack<CmpWork<'a>, 16>,
+    map_frames: WStack<CmpMapFrame, 1>,
 }
 
 const WORK_OP_MASK: u64 = 0xF;
@@ -1397,8 +1267,8 @@ const CMP_HASHMAP_PHASE2_MIN_RIGHT_OP: u64 = 13;
 impl<'a> CmpStack<'a> {
     fn new() -> Self {
         Self {
-            work: WorkStack::new(),
-            map_frames: WorkStack::new(),
+            work: WStack::new(),
+            map_frames: WStack::new(),
         }
     }
 
@@ -2396,9 +2266,9 @@ struct EqHashmapIterPair {
 }
 
 struct EqStack<'a> {
-    work: WorkStack<EqWork<'a>, 16>,
+    work: WStack<EqWork<'a>, 16>,
     // PSTACK of one entry in erts: a hashmap comparison is rare and walks a whole HAMT.
-    hashmaps: WorkStack<EqHashmapIterPair, 1>,
+    hashmaps: WStack<EqHashmapIterPair, 1>,
 }
 
 enum EqWork<'a> {
@@ -2426,8 +2296,8 @@ impl<'a> EqStack<'a> {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            work: WorkStack::new(),
-            hashmaps: WorkStack::new(),
+            work: WStack::new(),
+            hashmaps: WStack::new(),
         }
     }
 

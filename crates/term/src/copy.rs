@@ -783,7 +783,7 @@ fn validate_destination<H: HeapAlloc + ?Sized>(root: Term, dst: &H) -> Result<()
     if dst.supports_writable_binary() {
         return Ok(());
     }
-    let mut stack: smallvec::SmallVec<[Term; 32]> = smallvec::SmallVec::new();
+    let mut stack: crate::stack::EStack<32> = crate::stack::EStack::new();
     stack.push(root);
     while let Some(term) = stack.pop() {
         if crate::bits::binary_owner_is_writable(term) {

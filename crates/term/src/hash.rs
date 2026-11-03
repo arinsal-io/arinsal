@@ -171,14 +171,14 @@ pub enum Hash2Progress {
 pub struct Hash2Run {
     hash: u32,
     term: Term,
-    stack: smallvec::SmallVec<[Term; 16]>,
+    stack: crate::stack::EStack<16>,
     hash_xor_pairs: u32,
     resume: Option<Hash2Resume>,
     simple: Option<u32>,
 }
 
 struct Hash2Walk<'a> {
-    stack: &'a mut smallvec::SmallVec<[Term; 16]>,
+    stack: &'a mut crate::stack::EStack<16>,
     left: &'a mut i64,
     can_trap: bool,
 }
@@ -429,7 +429,7 @@ impl Hash2Run {
     // Port of flatmap and HAMT child pushes in make_hash2_helper,
     // erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
     #[inline(always)]
-    fn push_map_child(child: Term, stack: &mut smallvec::SmallVec<[Term; 16]>) {
+    fn push_map_child(child: Term, stack: &mut crate::stack::EStack<16>) {
         if child.bits() & 3 == 1 {
             let mut pair = crate::ops::children(child);
             let key = pair.next().unwrap();
@@ -499,7 +499,7 @@ impl Hash2Run {
         Self {
             hash: 0,
             term,
-            stack: smallvec::SmallVec::new(),
+            stack: crate::stack::EStack::new(),
             hash_xor_pairs: 0,
             resume: None,
             simple,
@@ -514,7 +514,7 @@ impl Hash2Run {
         Self {
             hash: 0,
             term,
-            stack: smallvec::SmallVec::new(),
+            stack: crate::stack::EStack::new(),
             hash_xor_pairs: 0,
             resume: None,
             simple: None,

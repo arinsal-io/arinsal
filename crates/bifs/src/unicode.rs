@@ -151,7 +151,7 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError>
     }
     let mut need = 0_usize;
     let mut cost = 0;
-    let mut stack = SmallVec::<[Term; 8]>::new();
+    let mut stack = arinsal_term::EStack::<8>::new();
     let mut current = root;
     let mut next_cell = None;
     loop {
@@ -374,8 +374,12 @@ impl Output {
     }
 }
 
-fn wrap(ctx: &mut Ctx<'_>, mut rest: Term, ancestors: &[Term]) -> Term {
-    for &tail in ancestors.iter().rev() {
+fn wrap<'a>(
+    ctx: &mut Ctx<'_>,
+    mut rest: Term,
+    ancestors: impl DoubleEndedIterator<Item = &'a Term>,
+) -> Term {
+    for &tail in ancestors.rev() {
         rest = cons(ctx, rest, tail);
     }
     rest
@@ -660,7 +664,7 @@ fn convert(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, 
     } else {
         Output::Binary(Vec::with_capacity(need))
     };
-    let mut ancestors = Vec::<Term>::new();
+    let mut ancestors = arinsal_term::EStack::<8>::new();
     let mut current = root;
     let mut leftover = Vec::<u8>::new();
     loop {
@@ -698,18 +702,18 @@ fn convert(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, 
                     }
                 } else if head.classify() == TermKind::Number && !leftover.is_empty() {
                     let prior = binary(ctx, &leftover);
-                    let rest = wrap(ctx, current, &ancestors);
+                    let rest = wrap(ctx, current, ancestors.iter());
                     let rest = cons(ctx, rest, Term::NIL);
                     let rest = cons(ctx, prior, rest);
                     return Ok(make_failure(ctx, output, "error", rest));
                 } else if let Some(cp) = head.as_small().and_then(|n| u32::try_from(n).ok()) {
                     if !valid_cp(cp) || (encoding == Encoding::Latin1 && cp > 255) {
-                        let rest = wrap(ctx, current, &ancestors);
+                        let rest = wrap(ctx, current, ancestors.iter());
                         return Ok(make_failure(ctx, output, "error", rest));
                     }
                     output.push(cp);
                 } else if head.classify() == TermKind::Number {
-                    let rest = wrap(ctx, current, &ancestors);
+                    let rest = wrap(ctx, current, ancestors.iter());
                     return Ok(make_failure(ctx, output, "error", rest));
                 } else {
                     return Err(BifError::BADARG);
@@ -749,7 +753,7 @@ fn process_binary(
     ctx: &mut Ctx<'_>,
     term: Term,
     tail: Option<Term>,
-    ancestors: &[Term],
+    ancestors: &arinsal_term::EStack<8>,
     encoding: Encoding,
     leftover: &mut Vec<u8>,
     output: &mut Output,
@@ -777,7 +781,7 @@ fn process_binary(
                 } else {
                     term
                 };
-                let rest = wrap(ctx, rest, ancestors);
+                let rest = wrap(ctx, rest, ancestors.iter());
                 let rest = cons(ctx, rest, Term::NIL);
                 let rest = cons(ctx, previous, rest);
                 return Ok(Some(make_failure(
@@ -812,7 +816,7 @@ fn process_binary(
                 } else {
                     suffix
                 };
-                let rest = wrap(ctx, rest, ancestors);
+                let rest = wrap(ctx, rest, ancestors.iter());
                 let old = std::mem::replace(output, Output::Binary(Vec::new()));
                 return Ok(Some(make_failure(ctx, old, "error", rest)));
             }
@@ -846,7 +850,7 @@ fn characters_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term,
 /// The local estack and cursors of one `do_build_utf8` invocation.
 struct BinaryBuild {
     current: Term,
-    ancestors: SmallVec<[Term; 8]>,
+    ancestors: arinsal_term::EStack<8>,
     source_rest: Option<(Term, usize, Option<Term>)>,
     leftover: SmallVec<[u8; 4]>,
     pos: usize,
@@ -858,7 +862,7 @@ impl BinaryBuild {
     fn new(root: Term, pos: usize, encoding: Encoding) -> Self {
         Self {
             current: root,
-            ancestors: SmallVec::new(),
+            ancestors: arinsal_term::EStack::new(),
             source_rest: None,
             leftover: SmallVec::new(),
             pos,
@@ -1064,7 +1068,7 @@ impl BinaryBuild {
         } else {
             self.current
         };
-        wrap(ctx, rest, &self.ancestors)
+        wrap(ctx, rest, self.ancestors.iter())
     }
 }
 

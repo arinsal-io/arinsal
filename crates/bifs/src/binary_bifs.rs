@@ -364,7 +364,7 @@ fn direct_iolist_size_only(root: Term, budget: usize) -> Option<(usize, usize)> 
     let mut yield_count = i64::try_from(budget).ok()?;
     let mut size_bits = 0_usize;
     let mut work = 0_usize;
-    let mut pending = SmallVec::<[Term; 8]>::new();
+    let mut pending = arinsal_term::EStack::<8>::new();
     let mut current = root;
     loop {
         while let Ok((head, tail)) = iolist_cons(current) {
@@ -414,7 +414,7 @@ fn direct_iolist_size_only(root: Term, budget: usize) -> Option<(usize, usize)> 
 #[inline(always)]
 fn direct_iolist_copy(root: Term, output: &mut [u8], mut yield_count: i64) -> Result<(), BifError> {
     let mut offset = 0_usize;
-    let mut pending = SmallVec::<[Term; 8]>::new();
+    let mut pending = arinsal_term::EStack::<8>::new();
     let mut current = root;
     loop {
         while let Ok((head, tail)) = iolist_cons(current) {
@@ -546,7 +546,7 @@ enum VecSegment {
 pub struct IolistVecWalk {
     root: Term,
     obj: Term,
-    stack: SmallVec<[Term; 8]>,
+    stack: arinsal_term::EStack<8>,
     size: usize,
     sized: bool,
     copied: Vec<u8>,
@@ -561,7 +561,7 @@ impl IolistVecWalk {
         Self {
             root,
             obj: root,
-            stack: SmallVec::new(),
+            stack: arinsal_term::EStack::new(),
             size: 0,
             sized: false,
             copied: Vec::new(),
@@ -860,7 +860,7 @@ fn walk_iolist(
     root: Term,
     mut visit: impl FnMut(Term, bool) -> Result<(), BifError>,
 ) -> Result<(), BifError> {
-    let mut pending = SmallVec::<[Term; 8]>::new();
+    let mut pending = arinsal_term::EStack::<8>::new();
     let mut current = root;
     loop {
         while current.classify() == TermKind::List {
@@ -921,7 +921,7 @@ fn copy_iolist(root: Term, output: &mut [u8]) -> Result<(), BifError> {
 // Port of erts/emulator/beam/erl_iolist.c:294-620 (generic_iolist_copy), OTP-29.1.1.
 pub struct IolistCopyWalk {
     current: Term,
-    tails: SmallVec<[Term; 8]>,
+    tails: arinsal_term::EStack<8>,
     source: Option<CopySource>,
     offset: usize,
     done_after_source: bool,
@@ -940,7 +940,7 @@ impl IolistCopyWalk {
     pub fn new(root: Term) -> Self {
         Self {
             current: root,
-            tails: SmallVec::new(),
+            tails: arinsal_term::EStack::new(),
             source: None,
             offset: 0,
             done_after_source: false,
@@ -1009,13 +1009,17 @@ impl IolistCopyWalk {
                 continue;
             }
 
-            while self.current.classify() == TermKind::List {
+            // Port of the C locals of generic_iolist_copy: cursor and output offset stay in
+            // registers and are stored back only when the walk leaves this loop.
+            let mut current = self.current;
+            let mut offset = self.offset;
+            while let Ok((head, tail)) = iolist_cons(current) {
                 if remaining <= 1 {
+                    self.current = current;
+                    self.offset = offset;
                     return Ok((false, yield_count));
                 }
                 remaining -= 1;
-                let (head, tail) = iolist_cons(self.current)
-                    .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
                 // Port of erts/emulator/beam/erl_iolist.c:479-514
                 // (generic_iolist_copy): the byte case precedes boxed terms and sublists.
                 if let Some(number) = head.as_small() {
@@ -1027,19 +1031,19 @@ impl IolistCopyWalk {
                         self.to_bit += 8;
                     } else {
                         *output
-                            .get_mut(self.offset)
+                            .get_mut(offset)
                             .ok_or((BifError::SystemLimit, yield_count - remaining))? = byte;
-                        self.offset += 1;
+                        offset += 1;
                     }
-                    self.current = tail;
+                    current = tail;
                     continue;
                 }
                 if head.classify() == TermKind::List {
                     self.tails.push(tail);
-                    self.current = head;
+                    current = head;
                     continue;
                 }
-                self.current = tail;
+                current = tail;
                 match head.classify() {
                     TermKind::Nil => {}
                     TermKind::Bitstring => {
@@ -1066,18 +1070,17 @@ impl IolistCopyWalk {
                             self.to_bit += 8;
                         } else {
                             let slot = output
-                                .get_mut(self.offset)
+                                .get_mut(offset)
                                 .ok_or((BifError::SystemLimit, yield_count - remaining))?;
                             *slot = byte;
-                            self.offset += 1;
+                            offset += 1;
                         }
                     }
                     _ => return Err((BifError::BADARG, yield_count - remaining)),
                 }
-                if self.source.is_some() {
-                    break;
-                }
             }
+            self.current = current;
+            self.offset = offset;
 
             if self.source.is_some() {
                 continue;
