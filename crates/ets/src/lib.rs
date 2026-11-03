@@ -1624,15 +1624,22 @@ impl StoredTerm {
         scratch: &mut H,
     ) -> Result<(Term, Option<match_spec::KnownObject<'_>>), EtsError> {
         if !self.compressed_elements().iter().any(Option::is_some) {
-            return Ok((
-                self.term(),
-                Some(match_spec::KnownObject {
-                    size: self.term_size_words(),
-                    block: self.shallow().then(|| self.words()),
-                }),
-            ));
+            return Ok(self.term_uncompressed_with_size());
         }
         Ok((self.term_for_match(scratch)?, None))
+    }
+
+    /// The object of a table without `compressed`, as `match_traverse` hands it to
+    /// `db_match_dbterm_uncompressed` without testing the object.
+    #[inline(always)]
+    fn term_uncompressed_with_size(&self) -> (Term, Option<match_spec::KnownObject<'_>>) {
+        (
+            self.term(),
+            Some(match_spec::KnownObject {
+                size: self.term_size_words(),
+                block: self.shallow().then(|| self.words()),
+            }),
+        )
     }
 }
 
@@ -7001,6 +7008,55 @@ mod registry_tests {
         registry.delete(first).unwrap();
         assert!(index.lookup(renamed_name).is_none());
         assert!(index.lookup(second_name).is_some());
+    }
+
+    /// The last unfix purges the buckets that `fixdel` names and no others
+    /// (db_unfix_table_hash): deleting under a fixation leaves pseudo-deleted nodes, which
+    /// stay until the fixation ends.
+    #[test]
+    fn unfix_purges_the_pseudo_deleted_nodes_of_fixdel_buckets() {
+        let pid = Term::pid(3, 0).unwrap();
+        let mut registry = Registry::new();
+        let tid = registry
+            .create(TableOptions {
+                owner: pid,
+                ..options()
+            })
+            .unwrap();
+        let mut table = registry.get_mut(tid).unwrap();
+        let mut heap = VecHeap::new();
+        for key in 1..=100 {
+            let object = TermBuilder::new(&mut heap)
+                .tuple(&[Term::small(key).unwrap(), Term::small(key).unwrap()])
+                .unwrap();
+            table.insert(&[object]).unwrap();
+        }
+        let nodes = |table: &Table| {
+            let Storage::Hash(storage) = &table.storage else {
+                unreachable!("a set is a hash table");
+            };
+            let mut count = 0;
+            for slot in 0..storage.nactive() {
+                storage
+                    .try_with_slot_ordered(slot, true, |_, _| {
+                        count += 1;
+                        Ok::<_, EtsError>(())
+                    })
+                    .unwrap();
+            }
+            count
+        };
+        table.safe_fixtable_for(pid, true).unwrap();
+        for key in 1..=40 {
+            table.delete_key(Term::small(key).unwrap());
+        }
+        assert_eq!(table.len(), 60);
+        assert_eq!(nodes(&table), 100, "pseudo-deleted nodes stay while fixed");
+        table.safe_fixtable_for(pid, false).unwrap();
+        assert_eq!(nodes(&table), 60, "the unfix purges them");
+        table.safe_fixtable_for(pid, true).unwrap();
+        table.safe_fixtable_for(pid, false).unwrap();
+        assert_eq!(nodes(&table), 60);
     }
 }
 

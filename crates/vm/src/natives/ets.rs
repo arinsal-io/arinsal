@@ -2139,10 +2139,19 @@ fn hash_select(
     {
         return Err(VmError::Yield);
     }
-    let resumed = process
+    let mut resumed = process
         .cold
         .as_mut()
         .and_then(|cold| cold.ets_select.take().map(|boxed| *boxed));
+    if let Some(ctx) = ctx.as_deref_mut()
+        && let Some(state) = resumed.as_mut()
+        && let Some(charged) = state.pending_charge.take()
+    {
+        // The traversal trapped in a call made from native code: charge it and yield once.
+        bump_reds(process, ctx, charged);
+        process.cold_mut().ets_select = resumed.take().map(Box::new);
+        return Err(VmError::Yield);
+    }
     if resumed
         .as_ref()
         .is_some_and(|state| matches!(state.stage, SelectStage::Reverse { .. }))
@@ -2369,9 +2378,6 @@ fn hash_select(
     if !matches!(next, Next::Return) && !was_resumed {
         // Port of erts/emulator/beam/erl_db.c (ets_select2, ets_select3), OTP-29.1.1:
         // fix immediately after the first trap; the traversal is not replayed.
-        if ctx.is_none() {
-            return Err(VmError::Yield);
-        }
         if hash && safety != IterSafety::Safe {
             let registry = rt.ets.read().unwrap();
             let mut table = registry.get_mut(tid).map_err(err)?;
@@ -2407,11 +2413,16 @@ fn hash_select(
                 program_owner,
                 stage: SelectStage::Scan,
                 end: None,
+                pending_charge: None,
             }));
-            let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
-            // A hash traversal charges all the reductions it has left, an ordered one the
-            // objects it visited.
-            bump_reds(process, ctx, if tree { used } else { isize::MAX });
+            // A hash traversal charges all the reductions it has left (BUMP_ALL_REDS), an
+            // ordered one the objects it visited. A call made from native code leaves the
+            // continuation in the process and declines; the scheduler path resumes it.
+            let charged = if tree { used } else { isize::MAX };
+            let pending_charge = trap_charge(process, ctx.as_deref_mut(), charged);
+            if let Some(state) = process.cold_mut().ets_select.as_mut() {
+                state.pending_charge = pending_charge;
+            }
             return Err(VmError::Yield);
         }
         Next::Reverse(key) => {
@@ -2440,9 +2451,12 @@ fn hash_select(
                 program_owner,
                 stage: SelectStage::Reverse { done: 0, eot },
                 end,
+                pending_charge: None,
             }));
-            let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
-            bump_reds(process, ctx, used);
+            let pending_charge = trap_charge(process, ctx.as_deref_mut(), used);
+            if let Some(state) = process.cold_mut().ets_select.as_mut() {
+                state.pending_charge = pending_charge;
+            }
             return Err(VmError::Yield);
         }
         Next::Return => {}
@@ -2553,6 +2567,23 @@ fn reverse_trap(
                 .tuple(&[list, continuation])
                 .map_err(|_| badarg())
         }
+    }
+}
+
+/// Charge the reductions of a traversal that trapped. The scheduler path charges them now; a
+/// call made from native code leaves them to the scheduler path that resumes the trap, which
+/// yields then (erts charges at the trap and reschedules at the trap target's entry).
+fn trap_charge(
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
+    charged: isize,
+) -> Option<isize> {
+    match ctx {
+        Some(ctx) => {
+            bump_reds(process, ctx, charged);
+            None
+        }
+        None => Some(charged),
     }
 }
 

@@ -19,6 +19,8 @@ f1(X, Y) when is_integer(X), is_integer(Y) -> X / Y.
 f2(X, Y) -> X / Y.
 f3(X, Y) -> X * Y * 1.0e300.
 
+setelement_call(I, T, V) -> setelement(I, T, V).
+
 %% Fused div/rem.
 r1(X, Y) -> R = X rem Y, Q = X div Y, {R, Q}.
 r2(X, Y) -> Q = X div Y, R = X rem Y, {Q, R}.
@@ -69,6 +71,9 @@ run() ->
              ?V(f1(1 bsl 1030, 1)), ?V(f1(1, 0))]),
     out(f2, [?V(f2(A, 1)), ?V(f2(1, A)), ?V(f2(1.5, 0)), ?V(f2(1.0e300, 1.0e-300))]),
     out(f3, [?V(f3(1.0e10, 1.0e10)), ?V(f3(2, 3))]),
+    out(setelement, [?V(setelement_call(1, {a}, x)), ?V(setelement_call(0, {a}, x)),
+                     ?V(setelement_call(2, {a}, x)), ?V(setelement_call(1, not_a_tuple, x)),
+                     ?V(setelement_call(index, {a}, x))]),
     [out(r, [?V(r1(X, Y)), ?V(r2(X, Y))]) || {X, Y} <- [{7, 2}, {-7, 2}, {7, -2}, {Big, 3}, {5, Z}, {A, 1}]],
     out(b1, [b1(<<"héé"/utf8, 1>>), b1(<<255, 1>>), b1(<<>>)]),
     out(b2, [b2(<<"hé"/utf16, 1>>), b2(<<0, 216>>), b2(<<>>)]),
