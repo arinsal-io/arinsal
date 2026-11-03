@@ -4041,10 +4041,43 @@ fn binary_to_term(
         };
     }
 
-    let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
-    // Port of erts/emulator/beam/external.c:3123 (`dec_is_this_node`), OTP-29.1.1.
-    let (node, creation) = arinsal_term::this_node();
-    decoder.set_local_node(node, creation);
+    // Port of erts/emulator/beam/external.c:2027-2058 (`B2TSize`/`B2TDecodeInit`), OTP-29.1.1:
+    // keep the context on the BIF stack when the input fits, then carry B2TSize state if it traps.
+    let local_node = arinsal_term::this_node();
+    let mut prepared = None;
+    match arinsal_bifs::DecodeWalk::decode_small(
+        args,
+        &mut process.heap,
+        Some(local_node),
+        chunk_bytes,
+        &mut prepared,
+    ) {
+        Ok(Some((value, consumed))) => {
+            process.set_gc_enabled(restore_gc);
+            return Ok(HandlerResult::Done {
+                value,
+                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+            });
+        }
+        Ok(None) => {}
+        Err((error, consumed)) => {
+            process.set_gc_enabled(restore_gc);
+            return Ok(HandlerResult::Failed {
+                error: decode_trap_error(error),
+                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+            });
+        }
+    }
+
+    let mut decoder = match prepared {
+        Some(decoder) => decoder,
+        None => {
+            let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
+            // Port of erts/emulator/beam/external.c:3123 (`dec_is_this_node`), OTP-29.1.1.
+            decoder.set_local_node(local_node.0, local_node.1);
+            decoder
+        }
+    };
     match decode_step(process, &mut decoder, chunk_bytes) {
         Ok((None, consumed)) => {
             let decoder = decoder.into_owned()?;
