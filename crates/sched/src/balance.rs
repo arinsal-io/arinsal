@@ -44,6 +44,8 @@ pub(crate) const EVACUATE_QMASK: u32 = QMASK << EVACUATE_SHFT;
 pub(crate) const FLG_OUT_OF_WORK: u32 = 1 << FLG_BASE2;
 pub(crate) const FLG_HALFTIME_OUT_OF_WORK: u32 = 1 << (FLG_BASE2 + 1);
 pub(crate) const FLG_INACTIVE: u32 = 1 << (FLG_BASE2 + 4);
+/// The scheduler of the run queue has not declared itself out of work (`ERTS_RUNQ_FLG_NONEMPTY`).
+pub(crate) const FLG_NONEMPTY: u32 = 1 << (FLG_BASE2 + 5);
 const MIGRATION_QMASKS: u32 = EMIGRATE_QMASK | IMMIGRATE_QMASK | EVACUATE_QMASK;
 const MIGRATION_INFO: u32 =
     MIGRATION_QMASKS | FLG_INACTIVE | FLG_OUT_OF_WORK | FLG_HALFTIME_OUT_OF_WORK;
@@ -84,7 +86,7 @@ impl RunQueueBalance {
             reds: std::array::from_fn(|_| AtomicI64::new(0)),
             total_len: AtomicI32::new(0),
             total_max_len: AtomicI32::new(0),
-            flags: AtomicU32::new(0),
+            flags: AtomicU32::new(FLG_NONEMPTY),
             check_balance_reds: AtomicI64::new(CALL_CHECK_BALANCE_REDS),
             waiting: AtomicBool::new(false),
         }
@@ -281,6 +283,8 @@ pub(crate) struct Balance {
     /// `paths[ix].flags`, readable without taking the paths lock.
     path_flags: Vec<AtomicU32>,
     compact_load: bool,
+    /// Run queues whose scheduler declared itself out of work (`no_empty_run_queues`).
+    no_empty_run_queues: AtomicI32,
 }
 
 impl Balance {
@@ -304,7 +308,34 @@ impl Balance {
             paths: arc_swap::ArcSwap::from_pointee(vec![MigrationPath::NONE; schedulers]),
             path_flags: (0..schedulers).map(|_| AtomicU32::new(0)).collect(),
             compact_load,
+            no_empty_run_queues: AtomicI32::new(0),
         }
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:2977 (empty_runq / empty_runq_aux), OTP-29.1.1:
+    /// the scheduler of run queue `ix` declares itself out of work. Returns the old flags.
+    pub(crate) fn empty_runq(&self, ix: usize) -> u32 {
+        let old = self.rq(ix).flags.fetch_and(!FLG_NONEMPTY, Ordering::AcqRel);
+        if old & FLG_NONEMPTY != 0 {
+            self.no_empty_run_queues.fetch_add(1, Ordering::AcqRel);
+        }
+        old
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:2993 (non_empty_runq), OTP-29.1.1.
+    pub(crate) fn non_empty_runq(&self, ix: usize) {
+        if self.rq(ix).flags.load(Ordering::Relaxed) & FLG_NONEMPTY != 0 {
+            return;
+        }
+        let old = self.rq(ix).flags.fetch_or(FLG_NONEMPTY, Ordering::AcqRel);
+        if old & FLG_NONEMPTY == 0 {
+            self.no_empty_run_queues.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// `erts_atomic32_read_acqb(&no_empty_run_queues)`.
+    pub(crate) fn no_empty_run_queues(&self) -> i32 {
+        self.no_empty_run_queues.load(Ordering::Acquire)
     }
 
     /// Number of completed balance checks (`erts_debug:get_internal_state(nbalance)`).

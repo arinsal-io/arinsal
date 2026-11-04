@@ -812,17 +812,34 @@ pub(crate) fn run_remaining_later_ops(progress: &ThrProgress) {
 /// later operations that became ready.
 // Port of erl_process.c:9857-9866 (schedule: erts_thr_progress_update and
 // erts_thr_progress_leader_update) and :2281 (handle_thr_prgr_later_op), OTP-29.1.1.
-pub(crate) fn scheduler_progress(managed: &ManagedThread) {
+///
+/// `run_queue_held` is the scheduler's run queue lock analogue. Port of
+/// erts/emulator/beam/erl_process.c:9857-9866 (schedule), OTP-29.1.1: `erts_thr_progress_update`
+/// runs with the run queue locked; `erts_thr_progress_leader_update`, which can block the thread
+/// for a thread progress blocker, and the aux work run with it unlocked, so a thief retrying this
+/// victim cannot keep the blocker waiting.
+pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue_held: &AtomicBool) {
+    let held = run_queue_held.load(Ordering::Relaxed);
+    let mut released = false;
     {
         let tpd = &mut *managed.0.borrow_mut();
         if update(tpd) {
+            run_queue_held.store(false, Ordering::Release);
+            released = true;
             leader_update(tpd);
         }
     }
     // Each operation runs with the thread data released: releasing a process can schedule
     // another later operation.
     while let Some(op) = next_ready_later_op(&mut managed.0.borrow_mut()) {
+        if !released {
+            run_queue_held.store(false, Ordering::Release);
+            released = true;
+        }
         op.run();
+    }
+    if released && held {
+        run_queue_held.store(true, Ordering::Release);
     }
 }
 
@@ -1061,7 +1078,7 @@ mod tests {
                     LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
                 );
                 for _ in 0..8 {
-                    scheduler_progress(&managed);
+                    scheduler_progress(&managed, &AtomicBool::new(false));
                 }
                 assert!(ran.load(Ordering::SeqCst));
                 assert!(reached(&progress, 2));
@@ -1087,7 +1104,7 @@ mod tests {
                     LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
                 );
                 for _ in 0..8 {
-                    scheduler_progress(&managed);
+                    scheduler_progress(&managed, &AtomicBool::new(false));
                 }
                 assert!(
                     !ran.load(Ordering::SeqCst),
@@ -1095,7 +1112,7 @@ mod tests {
                 );
                 unmanaged_continue(&progress, delay);
                 for _ in 0..8 {
-                    scheduler_progress(&managed);
+                    scheduler_progress(&managed, &AtomicBool::new(false));
                 }
                 assert!(ran.load(Ordering::SeqCst));
                 unregister_managed_thread();
@@ -1145,7 +1162,7 @@ mod tests {
                     progress.sleepers[id].set(std::thread::current()).unwrap();
                     let managed = register_managed_thread(&progress, id);
                     while !stop.load(Ordering::SeqCst) {
-                        scheduler_progress(&managed);
+                        scheduler_progress(&managed, &AtomicBool::new(false));
                         passes.fetch_add(1, Ordering::SeqCst);
                     }
                     scheduler_prepare_wait();

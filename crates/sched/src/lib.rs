@@ -3131,15 +3131,22 @@ impl<T: Task> Inner<T> {
             .min(self.online_schedulers.load(Ordering::Acquire))
             .clamp(1, self.stealers.len());
         let active = active.min(used);
+        // Port of erts/emulator/beam/erl_process.c:4658, OTP-29.1.1: no victim when every
+        // run queue is out of work.
+        if self.balance.no_empty_run_queues() >= used as i32 {
+            return None;
+        }
         if id >= active {
             return None;
         }
+        // Victims skipped because their scheduler was in schedule() (erts: trylock EBUSY).
+        let mut contended: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         if active < used {
             let no = used - active;
             let stop = active + id % no;
             let mut vix = stop;
             loop {
-                if let Some(found) = self.try_steal_task_from_victim(local, vix) {
+                if let Some(found) = self.try_steal_task_from_victim(local, vix, &mut contended) {
                     return Some(found);
                 }
                 vix += 1;
@@ -3160,7 +3167,16 @@ impl<T: Task> Inner<T> {
             if vix == id {
                 break;
             }
-            if let Some(found) = self.try_steal_task_from_victim(local, vix) {
+            if let Some(found) = self.try_steal_task_from_victim(local, vix, &mut contended) {
+                return Some(found);
+            }
+        }
+        // Finally retry the victims that were contended, while some run queue has work.
+        while self.balance.no_empty_run_queues() < used as i32 {
+            let Some(vix) = contended.pop_front() else {
+                break;
+            };
+            if let Some(found) = self.try_steal_task_from_victim(local, vix, &mut contended) {
                 return Some(found);
             }
         }
@@ -3171,18 +3187,33 @@ impl<T: Task> Inner<T> {
     /// OTP-29.1.1: steal half of the highest priority queue of the victim, at least one
     /// and at most 100 processes, run the first and queue the rest here. A victim without
     /// processes gives up its first runnable port instead.
-    fn try_steal_task_from_victim(&self, local: &mut Local<T>, vix: usize) -> Option<Stolen<T>> {
-        // Port of erts/emulator/beam/erl_process.c:4631 (check_possible_steal_victim
-        // trylock EBUSY), OTP-29.1.1: skip a victim that is in schedule().
+    fn try_steal_task_from_victim(
+        &self,
+        local: &mut Local<T>,
+        vix: usize,
+        contended: &mut std::collections::VecDeque<usize>,
+    ) -> Option<Stolen<T>> {
+        let id = local.worker_id;
+        let rq = &self.balance.rqs[vix];
+        // Port of erts/emulator/beam/erl_process.c:4623 (check_possible_steal_victim),
+        // OTP-29.1.1: a victim without work is not tried; one that is in schedule() (trylock
+        // EBUSY) is put on the contended list for a retry at the end of try_steal_task.
+        let has_work = (0..PROC_QUEUES).any(|queue| {
+            rq.len(queue) > 0
+                || !self.stealers[vix][queue].is_empty()
+                || !self.run_queues[vix][queue].is_empty()
+        }) || rq.len(balance::PORT_PRIO_LEVEL) > 0;
+        if !has_work {
+            return None;
+        }
         if self
             .in_schedule
             .get(vix)
             .is_some_and(|flag| flag.load(Ordering::Acquire))
         {
+            contended.push_back(vix);
             return None;
         }
-        let id = local.worker_id;
-        let rq = &self.balance.rqs[vix];
         for queue in 0..PROC_QUEUES {
             let mut len = rq.len(queue);
             if queue == balance::PRIORITY_NORMAL {
@@ -9395,6 +9426,9 @@ fn schedule_next<T: Task>(
 ) -> Option<(Scheduled<T>, u64)> {
     let mut local_guard = local_cell.borrow_mut();
     let local = &mut *local_guard;
+    // Port of erts/emulator/beam/erl_process.c:9943 (schedule: non_empty_runq after
+    // scheduler_wait), OTP-29.1.1.
+    inner.balance.non_empty_runq(id);
     // The schedule-out half of the slice that just ran comes first and shares this borrow
     // (erts_schedule: schedule_out_process, then check_activities_to_run and the dequeue).
     // Every `None` below happens after it.
@@ -9410,7 +9444,7 @@ fn schedule_next<T: Task>(
     }
     // Port of erts/emulator/beam/erl_process.c:9857-9866 (schedule: the progress point
     // between two scheduled processes), OTP-29.1.1.
-    thr_progress::scheduler_progress(managed_thread);
+    thr_progress::scheduler_progress(managed_thread, &inner.in_schedule[id]);
     if halting() {
         inner.in_schedule[id].store(false, Ordering::Release);
         // The halting scheduler terminates the OS process; the others stay idle.
@@ -9453,6 +9487,7 @@ fn schedule_next<T: Task>(
             return None;
         }
         let observed = inner.work_epochs[id].load(Ordering::SeqCst);
+        inner.balance.empty_runq(id);
         inner.parked[id].store(true, Ordering::SeqCst);
         local.set_msacc_state(MsaccState::Aux);
         inner.poll_timers(id, Some(&mut *local), true);
@@ -9505,6 +9540,7 @@ fn schedule_next<T: Task>(
         // Sleeping without this look loses the enqueue: the scheduler parks
         // with work on its queue, and a later SIGTERM notify never runs.
         let observed = inner.work_epochs[id].load(Ordering::SeqCst);
+        inner.balance.empty_runq(id);
         inner.parked[id].store(true, Ordering::SeqCst);
         let still_suspended = id >= inner.online_schedulers.load(Ordering::Acquire)
             || (inner.scheduling_blocked.load(Ordering::Acquire)
@@ -9578,12 +9614,16 @@ fn schedule_next<T: Task>(
     inner.flush_local_metrics(&mut *local);
     // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:
     // check_balance and immigrate), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_process.c:9805 (check_balance unlocks the run queue
+    // while it computes), OTP-29.1.1.
     if inner.balance.rqs[id]
         .check_balance_reds
         .load(Ordering::Relaxed)
         <= 0
     {
+        inner.in_schedule[id].store(false, Ordering::Release);
         inner.balance.check_balance(id);
+        inner.in_schedule[id].store(true, Ordering::Release);
     }
     if inner.balance.path_flags(id) & balance::IMMIGRATE_QMASK != 0 {
         inner.immigrate(&mut *local);
@@ -9596,10 +9636,14 @@ fn schedule_next<T: Task>(
     if FUNCTION_CALLS.load(Ordering::Relaxed) > 2 * CONTEXT_REDS_SYS
         && let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll))
     {
+        // Port of erts/emulator/beam/erl_process.c:9953-9971 (erts_runq_unlock around
+        // erts_check_io), OTP-29.1.1.
+        inner.in_schedule[id].store(false, Ordering::Release);
         local.set_msacc_state(MsaccState::CheckIo);
         poll.poll(Some(Duration::ZERO));
         local.set_msacc_state(MsaccState::Other);
         clear_sys_scheduling();
+        inner.in_schedule[id].store(true, Ordering::Release);
     }
     // Hold the run-queue lock across the wakeup check. A scheduler woken here
     // must not steal the process this scheduler is about to run.
@@ -9697,6 +9741,11 @@ fn schedule_next<T: Task>(
     local.pinned_turn = item.is_some();
     if item.is_none() {
         item = local.pop();
+    }
+    if item.is_none() {
+        // Port of erts/emulator/beam/erl_process.c:4646 (try_steal_task:
+        // empty_runq_get_old_flags), OTP-29.1.1.
+        inner.balance.empty_runq(id);
     }
     if item.is_none() && *steal_armed {
         // Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1.
