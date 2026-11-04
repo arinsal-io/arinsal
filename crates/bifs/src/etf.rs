@@ -6,7 +6,7 @@ use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
 use arinsal_etf::DecodedSizeWalk;
-use arinsal_term::raw::{Cons, Tuple};
+use arinsal_term::raw::{Cons, Tuple, term_at_pointer, term_from_bits};
 use arinsal_term::{
     Atom, AtomEncoding, BinaryOwner, BinaryRef, ConsListBuilder, ExportEntry, FunEntry, FunRef,
     HeapAlloc, HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords,
@@ -491,16 +491,15 @@ fn resolve_local_node(opts: &mut EncodeOpts, source: Option<fn() -> (Atom, u32)>
 fn encode_one_cons(
     stack: &mut WStack,
     out: &mut impl ByteOutput,
-    cons: Term,
+    cons: Cons<'static>,
 ) -> Result<Term, BifError> {
-    let len_cnt = pop_stack_small(stack)?;
-    // SAFETY: the source cons stays live while this BIF is suspended.
-    let (head, tail) = unsafe { cons.cons_ref() }.ok_or(BifError::BADARG)?;
+    let len_cnt = pop_stack_small(stack);
+    let (head, tail) = cons.pair();
     if is_list_term(tail) {
         stack.push(stack_small(len_cnt + 1)?);
         push_term_task(stack, ENC_ONE_CONS, tail);
     } else {
-        let len_at = pop_stack_small(stack)?;
+        let len_at = pop_stack_small(stack);
         out.patch(
             len_at,
             &u32::try_from(len_cnt)
@@ -566,9 +565,17 @@ fn record_of<'a>(term: Term) -> Result<arinsal_term::RecordRef<'a>, BifError> {
 
 /// Leading byte-valued elements of a list and whether the whole list is a string.
 // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
-fn external_string_prefix(mut term: Term) -> (usize, bool) {
+fn external_string_prefix(mut term: Term, first: Cons<'static>) -> (usize, bool) {
     let mut len = 0usize;
-    while let Ok(cell) = Cons::try_from(term) {
+    let mut first = Some(first);
+    loop {
+        let cell = match first.take() {
+            Some(cell) => cell,
+            None => match Cons::try_from(term) {
+                Ok(cell) => cell,
+                Err(_) => return (len, term == Term::NIL),
+            },
+        };
         // A small integer in 0..=255: the low four tag bits are 1111 and the value is above.
         let head = cell.head().word();
         if head & 15 != 15 || head >> 4 > 255 {
@@ -580,25 +587,9 @@ fn external_string_prefix(mut term: Term) -> (usize, bool) {
         }
         term = cell.tail();
     }
-    (len, term == Term::NIL)
 }
 
-/// Element `arity - remaining` of a tuple, with one tag and header test.
-// Port of the `ptr` walk of TERM_ARRAY_OP / ENC_LAST_ARRAY_ELEMENT in
-// erts/emulator/beam/external.c, OTP-29.1.1.
 #[inline(always)]
-fn tuple_element_from_end(container: Term, remaining: usize) -> Result<Term, BifError> {
-    let tuple = Tuple::try_from(container).map_err(|_| BifError::BADARG)?;
-    tuple
-        .get(
-            tuple
-                .arity()
-                .checked_sub(remaining)
-                .ok_or(BifError::BADARG)?,
-        )
-        .ok_or(BifError::BADARG)
-}
-
 fn bit_bytes(term: Term) -> Result<(SmallVec<[u8; 64]>, usize), BifError> {
     // SAFETY: the process owns the binary; no writable append occurs in this BIF.
     let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
@@ -628,6 +619,39 @@ fn exact_key_cmp(left: Term, right: Term) -> Ordering {
     cmp_exact(left, right)
 }
 
+enum FastEncodeKind<'h> {
+    Small(i64),
+    Atom(Atom),
+    Nil,
+    List(Cons<'h>),
+    Tuple(Tuple<'h>),
+    Rare(TermKind),
+}
+
+#[inline(always)]
+// Port of tag_val_def dispatch in erts/emulator/beam/external.c
+// (encode_size_struct_int / enc_term_int), OTP-29.1.1.
+fn fast_encode_kind<'h>(term: Term) -> FastEncodeKind<'h> {
+    let bits = term.word();
+    match bits & 3 {
+        1 => match Cons::try_from(term) {
+            Ok(cons) => FastEncodeKind::List(cons),
+            Err(_) => FastEncodeKind::Rare(term.classify()),
+        },
+        2 => match Tuple::try_from(term) {
+            Ok(tuple) => FastEncodeKind::Tuple(tuple),
+            Err(_) => FastEncodeKind::Rare(term.classify()),
+        },
+        3 if bits & 15 == 15 => FastEncodeKind::Small((bits as i64) >> 4),
+        3 => match bits & 63 {
+            11 => FastEncodeKind::Atom(Atom((bits >> 6) as u32)),
+            0x3b => FastEncodeKind::Nil,
+            _ => FastEncodeKind::Rare(term.classify()),
+        },
+        _ => FastEncodeKind::Rare(term.classify()),
+    }
+}
+
 const WSTACK_INLINE: usize = 32;
 
 /// The work stack of the encoder passes.
@@ -637,8 +661,8 @@ const WSTACK_INLINE: usize = 32;
 // context (`EncodeWalk::work`) when the pass yields.
 struct WStack {
     len: usize,
-    inline: [Term; WSTACK_INLINE],
-    spill: Vec<Term>,
+    inline: [u64; WSTACK_INLINE],
+    spill: Vec<u64>,
 }
 
 impl WStack {
@@ -646,27 +670,27 @@ impl WStack {
     fn new() -> Self {
         Self {
             len: 0,
-            inline: [Term::NON_VALUE; WSTACK_INLINE],
+            inline: [0; WSTACK_INLINE],
             spill: Vec::new(),
         }
     }
 
     /// `WSTACK_RESTORE`: take the words of a saved context.
     #[inline(always)]
-    fn restore(&mut self, saved: &mut Vec<Term>) {
+    fn restore(&mut self, saved: &mut Vec<u64>) {
         if !saved.is_empty() {
-            for term in saved.drain(..) {
-                self.push(term);
+            for word in saved.drain(..) {
+                self.push(word);
             }
         }
     }
 
     #[inline(always)]
-    fn push(&mut self, term: Term) {
+    fn push(&mut self, word: u64) {
         if self.len < WSTACK_INLINE {
-            self.inline[self.len] = term;
+            self.inline[self.len] = word;
         } else {
-            self.push_spilled(term);
+            self.push_spilled(word);
         }
         self.len += 1;
     }
@@ -674,15 +698,15 @@ impl WStack {
     // `WSTACK_EXPAND`: the overflow area grows by doubling from a first block.
     #[cold]
     #[inline(never)]
-    fn push_spilled(&mut self, term: Term) {
+    fn push_spilled(&mut self, word: u64) {
         if self.spill.capacity() == 0 {
             self.spill.reserve(256);
         }
-        self.spill.push(term);
+        self.spill.push(word);
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Option<Term> {
+    fn pop(&mut self) -> Option<u64> {
         if self.len == 0 {
             return None;
         }
@@ -695,11 +719,13 @@ impl WStack {
     }
 
     #[inline(always)]
-    fn last(&self) -> Option<Term> {
-        match self.len {
-            0 => None,
-            len if len <= WSTACK_INLINE => Some(self.inline[len - 1]),
-            _ => self.spill.last().copied(),
+    fn pop_word(&mut self) -> u64 {
+        debug_assert_ne!(self.len, 0);
+        self.len -= 1;
+        if self.len < WSTACK_INLINE {
+            self.inline[self.len]
+        } else {
+            self.spill.pop().expect("WSTACK spill is nonempty")
         }
     }
 
@@ -709,7 +735,7 @@ impl WStack {
     }
 
     /// `WSTACK_SAVE`: move the contents, bottom first, into `saved`.
-    fn save(&mut self, saved: &mut Vec<Term>) {
+    fn save(&mut self, saved: &mut Vec<u64>) {
         if self.len == 0 {
             return;
         }
@@ -728,40 +754,38 @@ const SIZE_LIST_TAIL: u64 = 0;
 const SIZE_HASHMAP_NODE: u64 = 1;
 const SIZE_ARRAY: u64 = 2;
 
-// Array kinds of TERM_ARRAY_OP: erts stores `Eterm*` plus the element count; here the
-// container term replaces the pointer and the kind says how to index into it.
+// Array kinds of TERM_ARRAY_OP: tuple tasks carry an Eterm* cursor plus a count like erts;
+// other Rust arrays retain their container term and kind with the count.
 const ARRAY_TUPLE: u64 = 0;
 const ARRAY_FLAT_KEYS: u64 = 1;
 const ARRAY_FLAT_VALUES: u64 = 2;
 const ARRAY_FUN_ENV: u64 = 3;
 const ARRAY_RECORD: u64 = 4;
 
-const fn size_op(code: u64) -> Term {
-    Term::catch(code)
+const fn size_op(code: u64) -> u64 {
+    Term::catch(code).word()
 }
 
-// Encode pass commands are small-integer terms below the term entry they belong to
-// (`WSTACK_PUSH2(s, obj, ENC_...)`). Codes from ENC_ARRAY up are
-// ENC_LAST_ARRAY_ELEMENT+N (tuple elements) and ENC_MAP_PAIR with the pairs left.
+// Encode pass commands are the raw operation values used by enc_term_int.
 const ENC_TERM_CODE: u64 = 0;
 const ENC_ONE_CONS_CODE: u64 = 1;
 const ENC_PATCH_FUN_SIZE_CODE: u64 = 2;
 const ENC_BIN_COPY_CODE: u64 = 3;
+const ENC_MAP_PAIR_CODE: u64 = 4;
 const ENC_HASHMAP_NODE_CODE: u64 = 5;
 const ENC_START_SORTING_MAP_CODE: u64 = 7;
-const ENC_ARRAY: u64 = 16;
-const ENC_PAIR_KIND: u64 = 1;
+const ENC_LAST_ARRAY_ELEMENT: u64 = 10;
 
-const ENC_TERM: Term = stack_command(ENC_TERM_CODE as i64);
-const ENC_ONE_CONS: Term = stack_command(ENC_ONE_CONS_CODE as i64);
-const ENC_PATCH_FUN_SIZE: Term = stack_command(ENC_PATCH_FUN_SIZE_CODE as i64);
-const ENC_BIN_COPY: Term = stack_command(ENC_BIN_COPY_CODE as i64);
-const ENC_HASHMAP_NODE: Term = stack_command(ENC_HASHMAP_NODE_CODE as i64);
-const ENC_START_SORTING_MAP: Term = stack_command(ENC_START_SORTING_MAP_CODE as i64);
+const ENC_TERM: u64 = stack_command(ENC_TERM_CODE as i64);
+const ENC_ONE_CONS: u64 = stack_command(ENC_ONE_CONS_CODE as i64);
+const ENC_PATCH_FUN_SIZE: u64 = stack_command(ENC_PATCH_FUN_SIZE_CODE as i64);
+const ENC_BIN_COPY: u64 = stack_command(ENC_BIN_COPY_CODE as i64);
+const ENC_HASHMAP_NODE: u64 = stack_command(ENC_HASHMAP_NODE_CODE as i64);
+const ENC_START_SORTING_MAP: u64 = stack_command(ENC_START_SORTING_MAP_CODE as i64);
 
-const fn stack_command(code: i64) -> Term {
+const fn stack_command(code: i64) -> u64 {
     match Term::small(code) {
-        Some(term) => term,
+        Some(term) => term.word(),
         None => panic!("ETF stack command must fit a small integer"),
     }
 }
@@ -773,50 +797,82 @@ fn is_list_term(term: Term) -> bool {
 
 // Port of WSTACK_PUSH2 in erts/emulator/beam/external.c, OTP-29.1.1.
 #[inline(always)]
-fn push_term_task(stack: &mut WStack, command: Term, term: Term) {
-    stack.push(term);
-    stack.push(command);
-}
-
-// Port of the `WSTACK_PUSH` calls that push a node without an operation word.
-#[inline(always)]
-fn push_task(stack: &mut WStack, command: Option<Term>, term: Term) {
-    stack.push(term);
-    if let Some(command) = command {
+fn push_term_task(stack: &mut WStack, command: u64, term: Term) {
+    if command & 63 == 0x1b {
+        stack.push(term.word());
         stack.push(command);
+    } else {
+        stack.push(command);
+        stack.push(term.word());
     }
 }
 
 #[inline(always)]
-fn stack_small(value: usize) -> Result<Term, BifError> {
-    Term::small(i64::try_from(value).map_err(|_| BifError::SystemLimit)?)
-        .ok_or(BifError::SystemLimit)
+// Port of WSTACK_PUSH2 in erts/emulator/beam/external.c (enc_term_int tuple array), OTP-29.1.1.
+fn push_tuple_pointer_task(stack: &mut WStack, command: u64, pointer: u64) {
+    stack.push(command);
+    stack.push(pointer);
 }
 
 #[inline(always)]
-fn pop_stack_small(stack: &mut WStack) -> Result<usize, BifError> {
-    usize::try_from(
-        stack
-            .pop()
-            .and_then(Term::as_small)
-            .ok_or(BifError::BADARG)?,
-    )
-    .map_err(|_| BifError::BADARG)
+fn push_flatmap_task(
+    stack: &mut WStack,
+    container: Term,
+    remaining: usize,
+) -> Result<(), BifError> {
+    stack.push(container.word());
+    stack.push(stack_command(ENC_MAP_PAIR_CODE as i64));
+    stack.push(stack_small(remaining)?);
+    Ok(())
+}
+
+// Port of the `WSTACK_PUSH` calls that push a node without an operation word.
+#[inline(always)]
+fn push_task(stack: &mut WStack, command: Option<u64>, term: Term) {
+    if let Some(command) = command {
+        if command & 63 == 0x1b {
+            stack.push(term.word());
+            stack.push(command);
+        } else {
+            stack.push(command);
+            stack.push(term.word());
+        }
+    } else {
+        stack.push(term.word());
+    }
+}
+
+#[inline(always)]
+fn stack_small(value: usize) -> Result<u64, BifError> {
+    u64::try_from(value).map_err(|_| BifError::SystemLimit)
+}
+
+// Port of the saved integer WSTACK words in erts/emulator/beam/external.c (enc_term_int).
+#[inline(always)]
+fn pop_stack_small(stack: &mut WStack) -> usize {
+    usize::try_from(stack.pop_word()).expect("WSTACK integer fits usize")
 }
 
 // Port of TERM_ARRAY_OP(N) pushes in erts/emulator/beam/external.c
 // (encode_size_struct_int), OTP-29.1.1: `remaining` elements still to read.
 #[inline(always)]
 fn push_size_array(stack: &mut WStack, container: Term, remaining: usize, kind: u64) {
-    stack.push(container);
+    stack.push(container.word());
     stack.push(size_op(SIZE_ARRAY + (((remaining as u64) << 3) | kind)));
+}
+
+#[inline(always)]
+fn push_size_tuple_array(stack: &mut WStack, pointer: u64, remaining: usize) {
+    stack.push(pointer);
+    stack.push(size_op(
+        SIZE_ARRAY + ((remaining as u64) << 3) + ARRAY_TUPLE,
+    ));
 }
 
 /// Element `len - remaining` of the array a TERM_ARRAY_OP walks.
 #[inline(always)]
 fn size_array_element(kind: u64, container: Term, remaining: usize) -> Result<Term, BifError> {
     match kind {
-        ARRAY_TUPLE => tuple_element_from_end(container, remaining),
         ARRAY_FLAT_KEYS | ARRAY_FLAT_VALUES => {
             let (key, value) = flatmap_pair(container, remaining)?;
             Ok(if kind == ARRAY_FLAT_KEYS { key } else { value })
@@ -859,12 +915,12 @@ fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
     let Some(word) = stack.pop() else {
         return Ok(None);
     };
-    if word.word() & 63 != 0x1b {
-        return Ok(Some(word));
+    if word & 63 != 0x1b {
+        return Ok(Some(term_from_bits(word)));
     }
-    let code = word.word() >> 6;
+    let code = word >> 6;
     if code == SIZE_LIST_TAIL {
-        let tail = stack.pop().ok_or(BifError::BADARG)?;
+        let tail = term_from_bits(stack.pop_word());
         if is_list_term(tail) {
             let (head, rest) = Cons::try_from(tail).map_err(|_| BifError::BADARG)?.pair();
             push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
@@ -873,7 +929,7 @@ fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
             Ok(Some(tail))
         }
     } else if code == SIZE_HASHMAP_NODE {
-        let node = stack.pop().ok_or(BifError::BADARG)?;
+        let node = term_from_bits(stack.pop_word());
         Ok(Some(push_hashmap_node_tasks(
             stack,
             node,
@@ -883,11 +939,21 @@ fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
     } else {
         let spec = code - SIZE_ARRAY;
         let remaining = (spec >> 3) as usize;
-        let container = stack.pop().ok_or(BifError::BADARG)?;
-        let obj = size_array_element(spec & 7, container, remaining)?;
-        if remaining > 1 {
-            push_term_task(stack, size_op(code - 8), container);
-        }
+        let obj = if spec & 7 == ARRAY_TUPLE {
+            let pointer = stack.pop_word();
+            let obj = term_at_pointer(pointer);
+            if remaining > 1 {
+                push_size_tuple_array(stack, pointer + 8, remaining - 1);
+            }
+            obj
+        } else {
+            let container = term_from_bits(stack.pop_word());
+            let obj = size_array_element(spec & 7, container, remaining)?;
+            if remaining > 1 {
+                push_term_task(stack, size_op(code - 8), container);
+            }
+            obj
+        };
         Ok(Some(obj))
     }
 }
@@ -897,8 +963,8 @@ fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
 fn push_hashmap_root_tasks(
     stack: &mut WStack,
     map: Term,
-    node_command: Term,
-    term_command: Option<Term>,
+    node_command: u64,
+    term_command: Option<u64>,
 ) -> Result<(), BifError> {
     let children = arinsal_term::MapNodeChildren::new(map).ok_or(BifError::BADARG)?;
     for child in children.rev() {
@@ -917,8 +983,8 @@ fn push_hashmap_root_tasks(
 fn push_hashmap_node_tasks(
     stack: &mut WStack,
     node: Term,
-    node_command: Option<Term>,
-    value_command: Option<Term>,
+    node_command: Option<u64>,
+    value_command: Option<u64>,
 ) -> Result<Term, BifError> {
     if node.classify() == TermKind::List {
         let (key, value) = arinsal_term::hashmap_leaf_pair(node).ok_or(BifError::BADARG)?;
@@ -1063,50 +1129,44 @@ fn size_walk(
             return Ok(Some(obj));
         }
         work += 1;
-        match obj.classify() {
-            TermKind::Number => {
-                if let Some(value) = obj.as_small() {
-                    add!(small_size(value));
-                } else if obj.header().is_some_and(|header| header & 63 == 0x18) {
-                    add!(if minor == 0 { 32 } else { 9 });
-                } else {
-                    add!(bignum_size(obj)?);
-                }
-            }
-            TermKind::Atom => add!(atom_size_in(
-                table,
-                obj.as_atom().ok_or(BifError::BADARG)?,
-                minor
-            )?),
-            TermKind::Nil => add!(1),
-            TermKind::List => {
-                // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1:
-                // one scan returns both the string length and the work count.
-                let (len, is_string) = external_string_prefix(obj);
+        match fast_encode_kind(obj) {
+            FastEncodeKind::Small(value) => add!(small_size(value)),
+            FastEncodeKind::Atom(atom) => add!(atom_size_in(table, atom, minor)?),
+            FastEncodeKind::Nil => add!(1),
+            FastEncodeKind::List(cons) => {
+                // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
+                let (len, is_string) = external_string_prefix(obj, cons);
                 work += len / 2;
                 if is_string {
                     add!(3 + len);
                 } else {
                     add!(5);
-                    let (head, rest) = Cons::try_from(obj).map_err(|_| BifError::BADARG)?.pair();
+                    let (head, rest) = cons.pair();
                     push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
                     obj = head;
                     continue;
                 }
             }
-            TermKind::Tuple => {
-                let tuple = Tuple::try_from(obj).map_err(|_| BifError::BADARG)?;
+            FastEncodeKind::Tuple(tuple) => {
                 let arity = tuple.arity();
                 add!(if arity <= 255 { 2 } else { 5 });
                 if arity > 0 {
                     if arity > 1 {
-                        push_size_array(stack, obj, arity - 1, ARRAY_TUPLE);
+                        let pointer = tuple.element_pointer(1).ok_or(BifError::BADARG)?;
+                        push_size_tuple_array(stack, pointer, arity - 1);
                     }
                     obj = tuple.get(0).ok_or(BifError::BADARG)?;
                     continue;
                 }
             }
-            TermKind::Map => {
+            FastEncodeKind::Rare(TermKind::Number) => {
+                if obj.header().is_some_and(|header| header & 63 == 0x18) {
+                    add!(if minor == 0 { 32 } else { 9 });
+                } else {
+                    add!(bignum_size(obj)?);
+                }
+            }
+            FastEncodeKind::Rare(TermKind::Map) => {
                 let checked = arinsal_maps::checked_map(obj).map_err(|_| BifError::BADARG)?;
                 match checked.kind() {
                     arinsal_maps::CheckedMapKind::Flatmap(_) => {
@@ -1127,13 +1187,13 @@ fn size_walk(
                     }
                 }
             }
-            TermKind::Bitstring => {
+            FastEncodeKind::Rare(TermKind::Bitstring) => {
                 let bits = crate::pure::bitstring_bit_len(obj)?;
                 let len = bits.div_ceil(8);
                 let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
                 add!(header.checked_add(len).ok_or(BifError::SystemLimit)?);
             }
-            TermKind::Pid | TermKind::Port | TermKind::Ref => {
+            FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
                 // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
                 resolve_local_node(opts, node_source);
                 let identity = obj.identity().ok_or(BifError::BADARG)?;
@@ -1158,7 +1218,7 @@ fn size_walk(
                 };
                 add!(size);
             }
-            TermKind::Fun => {
+            FastEncodeKind::Rare(TermKind::Fun) => {
                 let fun = fun_of(obj)?;
                 match &fun {
                     FunRef::Export { entry } => {
@@ -1179,7 +1239,7 @@ fn size_walk(
                                 + small_size(i64::from(entry.old_index))
                                 + small_size(i64::from(entry.old_uniq))
                         );
-                        stack.push(entry.pid);
+                        stack.push(entry.pid.word());
                         let free = fun.num_free();
                         if free > 1 {
                             push_size_array(stack, obj, free - 1, ARRAY_FUN_ENV);
@@ -1191,7 +1251,7 @@ fn size_walk(
                     }
                 }
             }
-            TermKind::Record => {
+            FastEncodeKind::Rare(TermKind::Record) => {
                 let record = record_of(obj)?;
                 let mut size = 1
                     + 4
@@ -1218,7 +1278,7 @@ fn size_walk(
                     continue;
                 }
             }
-            _ => return Err(BifError::Unsupported("ETF representation")),
+            FastEncodeKind::Rare(_) => return Err(BifError::Unsupported("ETF representation")),
         }
         match size_pop(stack)? {
             Some(next) => obj = next,
@@ -1257,7 +1317,7 @@ pub enum RefcEncoded {
 pub struct EncodeWalk {
     opts: EncodeOpts,
     /// The saved work stack of whichever pass is running (`ctx->wstack`).
-    work: Vec<Term>,
+    work: Vec<u64>,
     current_term: Option<Term>,
     size_current: Option<Term>,
     encoded_size: usize,
@@ -1684,68 +1744,69 @@ impl EncodeWalk {
         let mut cur = self.current_term.take();
         let mut free_first = self.free_first;
         loop {
-            if consumed + 1 >= budget
-                && !(free_first
-                    && (cur.is_some()
-                        || stack.last().is_some_and(|command| {
-                            let code = command.word() >> 4;
-                            code == ENC_TERM_CODE
-                                || code == ENC_ONE_CONS_CODE
-                                || code == ENC_HASHMAP_NODE_CODE
-                                || code >= ENC_ARRAY
-                        })))
-            {
+            if consumed + 1 >= budget && !(free_first && (cur.is_some() || !stack.is_empty())) {
                 break;
             }
             let term = if let Some(term) = cur.take() {
                 term
             } else {
                 // outer_loop
-                let Some(command) = stack.pop() else {
+                let Some(object_word) = stack.pop() else {
                     break;
                 };
-                let code = command.word() >> 4;
+                let command = stack.pop_word();
+                let code = command >> 4;
                 if code == ENC_TERM_CODE {
-                    stack.pop().ok_or(BifError::BADARG)?
+                    term_from_bits(object_word)
                 } else if code == ENC_ONE_CONS_CODE {
-                    let list = stack.pop().ok_or(BifError::BADARG)?;
-                    encode_one_cons(&mut stack, out, list)?
-                } else if code >= ENC_ARRAY {
-                    let spec = code - ENC_ARRAY;
-                    let remaining = (spec >> 3) as usize;
-                    let container = stack.pop().ok_or(BifError::BADARG)?;
-                    if spec & 7 == ENC_PAIR_KIND {
-                        // ENC_MAP_PAIR: one key/value pair of a flatmap.
-                        let (key, value) = flatmap_pair(container, remaining)?;
-                        if remaining > 1 {
-                            push_term_task(&mut stack, stack_command(code as i64 - 8), container);
-                        }
-                        push_term_task(&mut stack, ENC_TERM, value);
-                        key
-                    } else {
-                        // ENC_LAST_ARRAY_ELEMENT+N: the next tuple element.
-                        let element = tuple_element_from_end(container, remaining)?;
-                        if remaining > 1 {
-                            push_term_task(&mut stack, stack_command(code as i64 - 8), container);
-                        }
-                        element
+                    let list = term_from_bits(object_word);
+                    let cons = Cons::try_from(list).map_err(|_| BifError::BADARG)?;
+                    encode_one_cons(&mut stack, out, cons)?
+                } else if code == ENC_MAP_PAIR_CODE {
+                    let remaining = usize::try_from(object_word).map_err(|_| BifError::BADARG)?;
+                    let container = term_from_bits(stack.pop_word());
+                    let (key, value) = flatmap_pair(container, remaining)?;
+                    if remaining > 1 {
+                        push_flatmap_task(&mut stack, container, remaining - 1)?;
                     }
+                    push_term_task(&mut stack, ENC_TERM, value);
+                    key
+                } else if code >= ENC_LAST_ARRAY_ELEMENT {
+                    // ENC_LAST_ARRAY_ELEMENT+N: a tuple element pointer and count.
+                    let remaining = code - ENC_LAST_ARRAY_ELEMENT + 1;
+                    let pointer = object_word;
+                    let element = term_at_pointer(pointer);
+                    if remaining > 1 {
+                        push_tuple_pointer_task(
+                            &mut stack,
+                            stack_command((code - 1) as i64),
+                            pointer + 8,
+                        );
+                    }
+                    element
                 } else if code == ENC_PATCH_FUN_SIZE_CODE {
                     consumed += 1;
-                    let at = pop_stack_small(&mut stack)?;
+                    let at = usize::try_from(object_word).map_err(|_| BifError::BADARG)?;
                     let size = u32::try_from(out.len() - at).map_err(|_| BifError::SystemLimit)?;
                     out.patch(at, &size.to_be_bytes());
                     continue;
                 } else if code == ENC_BIN_COPY_CODE {
-                    let term = stack.pop().ok_or(BifError::BADARG)?;
-                    let bits = pop_stack_small(&mut stack)?;
-                    let copied = pop_stack_small(&mut stack)?;
-                    let start = pop_stack_small(&mut stack)?;
+                    let term = term_from_bits(object_word);
+                    let bits = pop_stack_small(&mut stack);
+                    let copied = pop_stack_small(&mut stack);
+                    let start = pop_stack_small(&mut stack);
                     // Port of erts/emulator/beam/external.c:3368 (ENC_BIN_COPY), OTP-29.1.1.
                     let len = bits.div_ceil(8);
-                    let amount = len
-                        .saturating_sub(copied)
-                        .min(budget.saturating_sub(consumed).max(1));
+                    let available = budget.saturating_sub(consumed);
+                    if available == 0 {
+                        stack.push(stack_small(start)?);
+                        stack.push(stack_small(copied)?);
+                        stack.push(stack_small(bits)?);
+                        stack.push(ENC_BIN_COPY);
+                        stack.push(term.word());
+                        break;
+                    }
+                    let amount = len.saturating_sub(copied).min(available);
                     let bit_count = (amount * 8).min(bits.saturating_sub(copied * 8));
                     out.write_bitstring(term, copied * 8, bit_count)?;
                     consumed += amount;
@@ -1753,10 +1814,10 @@ impl EncodeWalk {
                         stack.push(stack_small(start)?);
                         stack.push(stack_small(copied + amount)?);
                         stack.push(stack_small(bits)?);
-                        stack.push(term);
                         stack.push(ENC_BIN_COPY);
+                        stack.push(term.word());
                     } else {
-                        if bits % 8 != 0 {
+                        if !bits.is_multiple_of(8) {
                             out.mask_last(0xff << (8 - bits % 8));
                         }
                         if len > 64 && record_splits {
@@ -1765,7 +1826,7 @@ impl EncodeWalk {
                     }
                     continue;
                 } else if code == ENC_HASHMAP_NODE_CODE {
-                    let node = stack.pop().ok_or(BifError::BADARG)?;
+                    let node = term_from_bits(object_word);
                     cur = Some(push_hashmap_node_tasks(
                         &mut stack,
                         node,
@@ -1774,6 +1835,7 @@ impl EncodeWalk {
                     )?);
                     continue;
                 } else if code == ENC_START_SORTING_MAP_CODE {
+                    debug_assert_eq!(object_word, Term::NON_VALUE.word());
                     let mut sorting = self.cold().map_sort.take().ok_or(BifError::BADARG)?;
                     let work_budget = budget.saturating_sub(consumed).max(1);
                     consumed += sorting.step(work_budget);
@@ -1782,6 +1844,7 @@ impl EncodeWalk {
                     } else {
                         self.cold().map_sort = Some(sorting);
                         stack.push(ENC_START_SORTING_MAP);
+                        stack.push(Term::NON_VALUE.word());
                     }
                     continue;
                 } else {
@@ -1791,11 +1854,14 @@ impl EncodeWalk {
             if !std::mem::take(&mut free_first) {
                 consumed += 1;
             }
-            match term.classify() {
-                TermKind::Number => {
-                    if let Some(n) = term.as_small() {
-                        write_small(out, n);
-                    } else if let Some(header) = term.header() {
+            match fast_encode_kind(term) {
+                FastEncodeKind::Small(n) => write_small(out, n),
+                FastEncodeKind::Atom(atom) => {
+                    atom_bytes_in(table, out, atom, opts.minor)?;
+                }
+                FastEncodeKind::Nil => out.push(106),
+                FastEncodeKind::Rare(TermKind::Number) => {
+                    if let Some(header) = term.header() {
                         if header & 63 == 0x18 {
                             // SAFETY: a live boxed FLOAT has one initialized data word.
                             let f = unsafe { term.float_ref() }.ok_or(BifError::BADARG)?.get();
@@ -1824,21 +1890,16 @@ impl EncodeWalk {
                         }
                     }
                 }
-                TermKind::Atom => atom_bytes_in(
-                    table,
-                    out,
-                    term.as_atom().ok_or(BifError::BADARG)?,
-                    opts.minor,
-                )?,
-                TermKind::Nil => out.push(106),
-                TermKind::List => {
+                FastEncodeKind::List(cons) => {
                     // Port of erts/emulator/beam/external.c:3703 (LIST_DEF), OTP-29.1.1.
-                    let (len, is_string) = external_string_prefix(term);
+                    let (len, is_string) = external_string_prefix(term, cons);
                     if is_string {
                         out.push(107);
                         out.extend_from_slice(&(len as u16).to_be_bytes());
-                        let mut cursor = term;
-                        for _ in 0..len {
+                        let first = cons.head().as_small().ok_or(BifError::BADARG)?;
+                        out.push(first as u8);
+                        let mut cursor = cons.tail();
+                        for _ in 1..len {
                             // external_string_prefix already walked these cons cells.
                             let cell = Cons::try_from(cursor).map_err(|_| BifError::BADARG)?;
                             out.push(cell.head().as_small().ok_or(BifError::BADARG)? as u8);
@@ -1854,11 +1915,11 @@ impl EncodeWalk {
                         // `WSTACK_PUSH2(s, ep, 1)` then `goto encode_one_cons`.
                         stack.push(stack_small(len_at)?);
                         stack.push(stack_small(1)?);
-                        cur = Some(encode_one_cons(&mut stack, out, term)?);
+                        cur = Some(encode_one_cons(&mut stack, out, cons)?);
                     }
                 }
-                TermKind::Tuple => {
-                    let arity = Tuple::try_from(term).map_err(|_| BifError::BADARG)?.arity();
+                FastEncodeKind::Tuple(tuple) => {
+                    let arity = tuple.arity();
                     if arity <= 255 {
                         out.extend_from_slice(&[104, arity as u8]);
                     } else {
@@ -1867,14 +1928,15 @@ impl EncodeWalk {
                     }
                     if arity > 0 {
                         // WSTACK_PUSH2(s, ENC_LAST_ARRAY_ELEMENT+i-1, ptr)
-                        push_term_task(
+                        let pointer = tuple.element_pointer(0).ok_or(BifError::BADARG)?;
+                        push_tuple_pointer_task(
                             &mut stack,
-                            stack_command((ENC_ARRAY + ((arity as u64) << 3)) as i64),
-                            term,
+                            stack_command((ENC_LAST_ARRAY_ELEMENT + arity as u64 - 1) as i64),
+                            pointer,
                         );
                     }
                 }
-                TermKind::Map => {
+                FastEncodeKind::Rare(TermKind::Map) => {
                     let checked = arinsal_maps::checked_map(term).map_err(|_| BifError::BADARG)?;
                     match checked.kind() {
                         arinsal_maps::CheckedMapKind::Flatmap(_) => {
@@ -1890,15 +1952,10 @@ impl EncodeWalk {
                                     .map_err(|_| BifError::BADARG)?;
                                 self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
                                 stack.push(ENC_START_SORTING_MAP);
+                                stack.push(Term::NON_VALUE.word());
                             } else if len > 0 {
                                 // WSTACK_PUSH4(s, kptr, vptr, ENC_MAP_PAIR, size)
-                                push_term_task(
-                                    &mut stack,
-                                    stack_command(
-                                        (ENC_ARRAY + (((len as u64) << 3) | ENC_PAIR_KIND)) as i64,
-                                    ),
-                                    term,
-                                );
+                                push_flatmap_task(&mut stack, term, len)?;
                             }
                         }
                         arinsal_maps::CheckedMapKind::Hashmap(_) => {
@@ -1917,6 +1974,7 @@ impl EncodeWalk {
                                         .map_err(|_| BifError::BADARG)?;
                                     self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
                                     stack.push(ENC_START_SORTING_MAP);
+                                    stack.push(Term::NON_VALUE.word());
                                 } else {
                                     push_hashmap_root_tasks(
                                         &mut stack,
@@ -1936,7 +1994,7 @@ impl EncodeWalk {
                         }
                     }
                 }
-                TermKind::Bitstring => {
+                FastEncodeKind::Rare(TermKind::Bitstring) => {
                     // SAFETY: the binary owner remains live and no append runs during encoding.
                     let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
                     let bits = view.bit_len();
@@ -1959,8 +2017,8 @@ impl EncodeWalk {
                             stack.push(stack_small(start)?);
                             stack.push(stack_small(0)?);
                             stack.push(stack_small(bits)?);
-                            stack.push(term);
                             stack.push(ENC_BIN_COPY);
+                            stack.push(term.word());
                         } else {
                             if aligned && bits.is_multiple_of(8) {
                                 // copy_binary_to_buffer: one memcpy of the payload.
@@ -1980,7 +2038,7 @@ impl EncodeWalk {
                         }
                     }
                 }
-                TermKind::Pid | TermKind::Port | TermKind::Ref => {
+                FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
                     resolve_local_node(&mut opts, node_source);
                     let identity =
                         local_identity(term.identity().ok_or(BifError::BADARG)?, opts.local_node);
@@ -2022,7 +2080,7 @@ impl EncodeWalk {
                         }
                     }
                 }
-                TermKind::Fun => match fun_of(term)? {
+                FastEncodeKind::Rare(TermKind::Fun) => match fun_of(term)? {
                     FunRef::Export { entry } => {
                         out.push(113);
                         atom_bytes_in(table, out, entry.module, opts.minor)?;
@@ -2040,8 +2098,8 @@ impl EncodeWalk {
                         atom_bytes_in(table, out, entry.module, opts.minor)?;
                         write_small(out, i64::from(entry.old_index));
                         write_small(out, i64::from(entry.old_uniq));
-                        stack.push(stack_small(at)?);
                         stack.push(ENC_PATCH_FUN_SIZE);
+                        stack.push(stack_small(at)?);
                         let view = fun_of(term)?;
                         for i in (0..view.num_free()).rev() {
                             push_term_task(
@@ -2053,7 +2111,7 @@ impl EncodeWalk {
                         push_term_task(&mut stack, ENC_TERM, entry.pid);
                     }
                 },
-                TermKind::Record => {
+                FastEncodeKind::Rare(TermKind::Record) => {
                     // Port of erts/emulator/beam/external.c:4010-4031, OTP-29.1.1.
                     let record = record_of(term)?;
                     out.push(67);
@@ -2079,7 +2137,9 @@ impl EncodeWalk {
                         );
                     }
                 }
-                _ => return Err(BifError::Unsupported("ETF representation")),
+                FastEncodeKind::Rare(_) => {
+                    return Err(BifError::Unsupported("ETF representation"));
+                }
             }
         }
         let done = stack.is_empty()
@@ -3383,7 +3443,7 @@ fn finish_decode_maps(
     Ok(())
 }
 
-// Port of erts/emulator/beam/external.c:4452-4505 (integer tags), OTP-29.1.1.
+// Port of erts/emulator/beam/external.c:4325-5445 (`dec_term`), OTP-29.1.1.
 fn read_small_integer(r: &mut Reader<'_>) -> Result<i64, BifError> {
     let tag = r.u8()?;
     let number = match tag {
@@ -3937,7 +3997,6 @@ fn decode_direct_step(
             continue;
         }
         *next = None;
-
         let term = match tag {
             97 | 98 | 106 => unreachable!("hot immediate tags are decoded in the loop"),
             110 | 111 => {
@@ -5013,7 +5072,8 @@ impl<'a> DecodeWalk<'a> {
             }
             Ok((None, decode_work)) => {
                 self.reservation = Some(reservation.suspend());
-                Ok((None, consumed + decode_work))
+                let consumed = consumed + decode_work;
+                Ok((None, consumed))
             }
             Err(error) => {
                 drop(reservation);
