@@ -935,19 +935,17 @@ fn spawn_mfa(
     monitor_alias: Option<crate::proc_create::AliasMode>,
     scheduler_id: Option<usize>,
 ) -> Result<Term, VmError> {
-    spawn_mfa_with_priority(
-        vm,
-        parent,
-        ctx,
-        mfa,
-        linked,
-        monitored,
-        min_heap_size,
-        monitor_tag,
-        monitor_alias,
-        scheduler_id,
-        Priority::Normal,
-    )
+    let mut opts = default_spawn_options(Term::NIL);
+    opts.link = linked;
+    opts.monitor = monitored.then_some(SpawnMonitor {
+        id: None,
+        tag: monitor_tag,
+        alias: monitor_alias,
+        priority: false,
+    });
+    opts.min_heap = min_heap_size;
+    opts.scheduler = scheduler_id;
+    spawn_mfa_with_priority(vm, parent, ctx, mfa, opts)
 }
 
 /// Whether `module:function/arity` is a BIF export.
@@ -977,8 +975,6 @@ fn is_bif_export(module: arinsal_term::Atom, function: arinsal_term::Atom, arity
         .contains(&(module, function, arity))
 }
 
-#[allow(clippy::too_many_arguments)]
-// spawn_opt flags stay positional; packing them hides the monitor race.
 // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1.
 /// Spawn options of `erl_create_process` (erl_process.c:12437, `ErlSpawnOpts`).
 pub(crate) struct ErlSpawnOpts {
@@ -1066,12 +1062,8 @@ fn create_child(
     // heap holds the copied arguments and the reserved words, rounded up to a heap size, is
     // never smaller than the process's minimum heap, and is allocated once.
     let literals = arinsal_term::LiteralAreas::current();
-    let arg_size = arinsal_term::size_object_litopt(args, &literals);
-    let heap_need = arg_size.saturating_add(arinsal_term::S_RESERVED);
-    let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
-        .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
-    let mut heap = arinsal_term::ProcessHeap::with_words_at(heap_words, parent.heap.alloc_ix());
-    heap.set_min_heap_size(min_heap);
+    let arg_size = std::cell::Cell::new(0);
+    let parent_alloc_ix = parent.heap.alloc_ix();
     let initial_bif = if let Ok(arity) = u8::try_from(arity)
         && is_bif_export(m, f, arity)
         && let (Some(m_name), Some(f_name)) = (atom_name(module), atom_name(function))
@@ -1142,7 +1134,7 @@ fn create_child(
         let copied_args = {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
             // copy_struct_litopt with the size computed above, as erts does.
-            arinsal_term::copy_struct_litopt(args, &mut heap, arg_size, &literals)
+            arinsal_term::copy_struct_litopt(args, &mut heap, arg_size.get(), &literals)
                 .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
         };
         if let Some((_, _, arity)) = initial_bif {
@@ -1189,9 +1181,19 @@ fn create_child(
         Ok(())
     };
     let spawned = scheduler
-        .spawn_unscheduled_init(
-            |slot: &mut std::mem::MaybeUninit<Process>| {
-                Process::write_spawn_registers_heap(slot, 3, 0, heap)
+        .spawn_unscheduled_try_init(
+            || {
+                // erts allocates the Process before sizing the copied argument graph and
+                // allocating its initial heap.
+                let size = arinsal_term::size_object_litopt(args, &literals);
+                arg_size.set(size);
+                let heap_need = size.saturating_add(arinsal_term::S_RESERVED);
+                let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
+                    .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
+                let mut heap =
+                    arinsal_term::ProcessHeap::with_words_at(heap_words, parent_alloc_ix);
+                heap.set_min_heap_size(min_heap);
+                Ok(Process::spawn_registers_and_heap(3, 0, heap))
             },
             init_child,
             so.priority,
@@ -1347,41 +1349,9 @@ fn spawn_mfa_with_priority(
     parent: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     mfa: (Term, Term, Term),
-    linked: bool,
-    monitored: bool,
-    min_heap_size: Option<usize>,
-    monitor_tag: Option<arinsal_etf::OwnedTerm>,
-    monitor_alias: Option<crate::proc_create::AliasMode>,
-    scheduler_id: Option<usize>,
-    priority: Priority,
+    opts: ErlSpawnOpts,
 ) -> Result<Term, VmError> {
-    // Spawn options reach the child set-up through the thread-local tuning, as erts passes
-    // `ErlSpawnOpts` down; `take` clears it on every path.
-    let tuning = SpawnTuning::take();
-    let created = erl_create_process(
-        vm,
-        parent,
-        ctx,
-        mfa,
-        ErlSpawnOpts {
-            link: linked,
-            monitor: monitored.then_some(SpawnMonitor {
-                id: None,
-                tag: monitor_tag,
-                alias: monitor_alias,
-                priority: false,
-            }),
-            min_heap: min_heap_size,
-            min_bin_vheap: tuning.min_bin_vheap,
-            fullsweep: tuning.fullsweep,
-            max_heap: tuning.max_heap,
-            off_heap_queue: tuning.off_heap_queue,
-            scheduler: scheduler_id,
-            priority,
-            opts: tuning.options.unwrap_or(Term::NIL),
-            reply: None,
-        },
-    )?;
+    let created = erl_create_process(vm, parent, ctx, mfa, opts)?;
     let pid_term = created
         .pid
         .to_term()
@@ -1412,25 +1382,7 @@ pub(crate) fn spawn_opt_light(
     let mfa = (*module, *function, *mfa_args);
     let arity = light_spawn_arity(process, mfa)?;
     let opts = spawn_options(process.runtime, *options).ok()?;
-    let so = ErlSpawnOpts {
-        link: opts.link,
-        monitor: opts.monitor.then_some(SpawnMonitor {
-            id: None,
-            tag: opts.monitor_tag,
-            alias: opts.monitor_alias,
-            priority: false,
-        }),
-        min_heap: opts.min_heap_size,
-        min_bin_vheap: opts.tuning.min_bin_vheap,
-        fullsweep: opts.tuning.fullsweep,
-        max_heap: opts.tuning.max_heap,
-        off_heap_queue: opts.tuning.off_heap_queue,
-        scheduler: opts.scheduler,
-        priority: opts.priority,
-        opts: opts.tuning.options.unwrap_or(Term::NIL),
-        reply: None,
-    };
-    Some(spawn_light(process, mfa, arity, so))
+    Some(spawn_light(process, mfa, arity, opts))
 }
 
 /// `spawn/3` called directly from native code (erts `spawn_3`).
@@ -1537,46 +1489,22 @@ fn spawn_light(
     result.map_err(failure)
 }
 
-/// `spawn_opt` GC and mailbox options that the child must carry from its first slice.
-///
-/// Port of erts/emulator/beam/erl_process.c:12222 (`erts_parse_spawn_opts`), OTP-29.1.1.
-/// The spawn helpers take it through a thread-local so their positional flag lists stay frozen.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct SpawnTuning {
-    options: Option<Term>,
-    max_heap: Option<crate::process::MaxHeap>,
-    fullsweep: Option<u16>,
-    min_bin_vheap: Option<usize>,
-    off_heap_queue: Option<bool>,
-}
-
-thread_local! {
-    static SPAWN_TUNING: std::cell::Cell<SpawnTuning> = std::cell::Cell::new(SpawnTuning::default());
-}
-
-impl SpawnTuning {
-    /// Run `spawn` with this tuning visible to the child set-up, clearing it on every exit path.
-    fn around<T>(self, spawn: impl FnOnce() -> T) -> T {
-        SPAWN_TUNING.with(|cell| cell.set(self));
-        let result = spawn();
-        SPAWN_TUNING.with(|cell| cell.set(SpawnTuning::default()));
-        result
+// Port of erts/emulator/beam/erl_process.c:12222 (`erts_parse_spawn_opts`), OTP-29.1.1.
+/// Defaults that `erts_parse_spawn_opts` establishes before walking an option list.
+fn default_spawn_options(options: Term) -> ErlSpawnOpts {
+    ErlSpawnOpts {
+        link: false,
+        monitor: None,
+        min_heap: None,
+        min_bin_vheap: None,
+        fullsweep: None,
+        max_heap: None,
+        off_heap_queue: None,
+        scheduler: None,
+        priority: Priority::Normal,
+        opts: options,
+        reply: None,
     }
-
-    fn take() -> SpawnTuning {
-        SPAWN_TUNING.with(std::cell::Cell::take)
-    }
-}
-
-struct SpawnOpts {
-    tuning: SpawnTuning,
-    link: bool,
-    monitor: bool,
-    monitor_tag: Option<arinsal_etf::OwnedTerm>,
-    monitor_alias: Option<crate::proc_create::AliasMode>,
-    min_heap_size: Option<usize>,
-    scheduler: Option<usize>,
-    priority: Priority,
 }
 
 // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1.
@@ -1589,13 +1517,18 @@ fn link_atom() -> Term {
 /// One `spawn_opt` option into `opts`.
 fn parse_spawn_option(
     runtime: Option<&Runtime>,
-    opts: &mut SpawnOpts,
+    opts: &mut ErlSpawnOpts,
     option: Term,
 ) -> Result<(), VmError> {
     if option == link_atom() {
         opts.link = true;
     } else if option == Term::atom(arinsal_term::atoms::MONITOR) {
-        opts.monitor = true;
+        opts.monitor.get_or_insert(SpawnMonitor {
+            id: None,
+            tag: None,
+            alias: None,
+            priority: false,
+        });
     } else if option.classify() == TermKind::Tuple {
         // SAFETY: The option term remains in the caller's live heap.
         let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("erlang:spawn_opt"))?;
@@ -1606,12 +1539,17 @@ fn parse_spawn_option(
                 .and_then(Term::as_small)
                 .filter(|&words| words >= 0)
                 .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-            opts.min_heap_size = Some(words as usize);
+            opts.min_heap = Some(words as usize);
         } else if tuple.len() == 2 && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MONITOR))
         {
             // code_server:spawn_opt(Fun, [{monitor, [{tag, {'ON_LOAD_DOWN', Mod}}]}]).
             // Port of erl_process.c spawn option `{monitor, MonitorOpts}`, OTP-29.1.1.
-            opts.monitor = true;
+            let monitor = opts.monitor.get_or_insert(SpawnMonitor {
+                id: None,
+                tag: None,
+                alias: None,
+                priority: false,
+            });
             let items = list(tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?)
                 .ok_or_else(|| badarg("erlang:spawn_opt"))?;
             for item in items {
@@ -1622,13 +1560,12 @@ fn parse_spawn_option(
                 }
                 match (item.get(0), item.get(1)) {
                     (Some(key), Some(value)) if key == Term::atom(arinsal_term::atoms::TAG) => {
-                        opts.monitor_tag =
-                            Some(arinsal_term::to_owned(value).map_err(|error| {
-                                VmError::Unsupported(format!("monitor tag: {error:?}"))
-                            })?);
+                        monitor.tag = Some(arinsal_term::to_owned(value).map_err(|error| {
+                            VmError::Unsupported(format!("monitor tag: {error:?}"))
+                        })?);
                     }
                     (Some(key), Some(value)) if key == Term::atom(arinsal_term::atoms::ALIAS) => {
-                        opts.monitor_alias = Some(
+                        monitor.alias = Some(
                             parse_alias_mode(value).ok_or_else(|| badarg("erlang:spawn_opt"))?,
                         );
                     }
@@ -1650,7 +1587,7 @@ fn parse_spawn_option(
         } else if tuple.len() == 2
             && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MAX_HEAP_SIZE))
         {
-            opts.tuning.max_heap = Some(
+            opts.max_heap = Some(
                 crate::natives::proc::parse_max_heap_from(
                     tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?,
                     crate::natives::sys::gc_spawn_defaults(runtime).max_heap_size,
@@ -1665,7 +1602,7 @@ fn parse_spawn_option(
                 .and_then(Term::as_small)
                 .filter(|&value| value >= 0)
                 .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-            opts.tuning.fullsweep = Some(value.min(i64::from(u16::MAX)) as u16);
+            opts.fullsweep = Some(value.min(i64::from(u16::MAX)) as u16);
         } else if tuple.len() == 2
             && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MIN_BIN_VHEAP_SIZE))
         {
@@ -1674,16 +1611,16 @@ fn parse_spawn_option(
                 .and_then(Term::as_small)
                 .filter(|&value| value >= 0)
                 .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-            opts.tuning.min_bin_vheap = Some(value as usize);
+            opts.min_bin_vheap = Some(value as usize);
         } else if tuple.len() == 2
             && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MESSAGE_QUEUE_DATA))
         {
             match tuple.get(1) {
                 Some(value) if value == Term::atom(arinsal_term::atoms::OFF_HEAP) => {
-                    opts.tuning.off_heap_queue = Some(true);
+                    opts.off_heap_queue = Some(true);
                 }
                 Some(value) if value == Term::atom(arinsal_term::atoms::ON_HEAP) => {
-                    opts.tuning.off_heap_queue = Some(false);
+                    opts.off_heap_queue = Some(false);
                 }
                 _ => return Err(badarg("erlang:spawn_opt")),
             }
@@ -1716,20 +1653,8 @@ fn parse_spawn_option(
     Ok(())
 }
 
-fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmError> {
-    let mut opts = SpawnOpts {
-        tuning: SpawnTuning {
-            options: Some(term),
-            ..SpawnTuning::default()
-        },
-        link: false,
-        monitor: false,
-        monitor_tag: None,
-        monitor_alias: None,
-        min_heap_size: None,
-        scheduler: None,
-        priority: Priority::Normal,
-    };
+fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<ErlSpawnOpts, VmError> {
+    let mut opts = default_spawn_options(term);
     // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1: the option
     // list is walked in place and each option compared with its atom.
     let mut failure = None;
@@ -1748,13 +1673,11 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
     }
     // The child keeps the system default virtual binary heap minimum unless `min_heap_size` or
     // `max_heap_size` is also given (verified against `erl` 29.1.1).
-    if opts.min_heap_size.is_none() && opts.tuning.max_heap.is_none() {
-        opts.tuning.min_bin_vheap = None;
+    if opts.min_heap.is_none() && opts.max_heap.is_none() {
+        opts.min_bin_vheap = None;
     }
-    let min_heap =
-        crate::natives::sys::normalize_spawn_heap_minimum(runtime, opts.min_heap_size, false);
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(runtime, opts.min_heap, false);
     if opts
-        .tuning
         .max_heap
         .is_some_and(|limit| limit.size != 0 && limit.size < min_heap as u64)
     {
@@ -3230,21 +3153,7 @@ fn call_resolved(
         ),
         (SignalBif::SpawnOpt4, [module, function, args, options]) => {
             spawn_options(process.runtime, *options).and_then(|opts| {
-                opts.tuning.around(|| {
-                    spawn_mfa_with_priority(
-                        vm,
-                        process,
-                        ctx,
-                        (*module, *function, *args),
-                        opts.link,
-                        opts.monitor,
-                        opts.min_heap_size,
-                        opts.monitor_tag,
-                        opts.monitor_alias,
-                        opts.scheduler,
-                        opts.priority,
-                    )
-                })
+                spawn_mfa_with_priority(vm, process, ctx, (*module, *function, *args), opts)
             })
         }
         (SignalBif::Register2, [name, id]) => {

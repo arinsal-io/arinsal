@@ -1705,8 +1705,8 @@ impl<T: Task> ProcessTable<T> {
         priority: Priority,
         bound_worker: Option<usize>,
     ) -> Result<ProcRef<T>, Error> {
-        self.insert_init(
-            |slot| slot.write(task),
+        self.insert_try_init(
+            || Ok(task),
             |_, _| Ok::<(), std::convert::Infallible>(()),
             priority,
             bound_worker,
@@ -1723,9 +1723,10 @@ impl<T: Task> ProcessTable<T> {
     /// Port of erts/emulator/beam/erl_process.c (erl_create_process: alloc_process takes the
     /// struct and its table entry, then the fields are initialized in place) and erl_ptab.c
     /// (erts_ptab_new_element), OTP-29.1.1. A failing `init` gives the identifier back.
-    fn insert_init<E>(
+    #[inline(always)]
+    fn insert_try_init<E>(
         &self,
-        make: impl for<'slot> FnOnce(&'slot mut std::mem::MaybeUninit<T>) -> &'slot mut T,
+        make: impl FnOnce() -> Result<T, E>,
         init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
         priority: Priority,
         bound_worker: Option<usize>,
@@ -1781,7 +1782,7 @@ impl<T: Task> ProcessTable<T> {
             |process, context| {
                 // alloc_process: the task is written straight into the allocated struct.
                 let cell = process.cell.get_mut();
-                cell.init_with(make);
+                cell.init_with(make)?;
                 init(context.pid, cell.task_mut())
             },
         ) else {
@@ -2568,7 +2569,7 @@ impl<T: Task> Inner<T> {
                 from,
                 Payload::Signal(signal),
                 local.as_deref_mut(),
-                false,
+                true,
                 false,
             )
             .is_ok()
@@ -5654,42 +5655,6 @@ fn node_from<M: SignalMessage>(signal: &OwnedSignal<Event<M>>) -> Pid {
     }
 }
 
-fn payload_wakes<M: SignalMessage>(payload: &Payload<M>) -> bool {
-    match payload {
-        Payload::Message(_) | Payload::Timer { .. } | Payload::TimerMessage { .. } => true,
-        Payload::Signal(signal) => match signal {
-            Signal::Exit(_)
-            | Signal::ExitLinked(_)
-            | Signal::PortExit(_)
-            | Signal::MonitorDown { .. }
-            | Signal::MonitorDownImmediate { .. }
-            | Signal::MonitorDownMsg { .. }
-            | Signal::Suspend { .. }
-            | Signal::SuspendRelease { .. }
-            | Signal::SuspendDown { .. }
-            | Signal::SuspendResume
-            | Signal::SuspendInternal
-            | Signal::SyncSuspend(_)
-            | Signal::MonitorNoproc(_)
-            | Signal::GarbageCollect
-            | Signal::LiteralAreaCopy(_)
-            | Signal::ProcSigBlock(_) => true,
-            Signal::UnlinkAck(id) => *id != 0,
-            Signal::UnlinkAckSignal(_) => true,
-            Signal::Link
-            | Signal::PortLink(_)
-            | Signal::PortUnlink(_)
-            | Signal::Unlink(_)
-            | Signal::Monitor { .. }
-            | Signal::MonitorOpaque { .. }
-            | Signal::Demonitor(_)
-            | Signal::DemonitorOrigin(_)
-            | Signal::Alias(_)
-            | Signal::Unalias(_) => false,
-        },
-    }
-}
-
 fn take_lost_monitors<M: SignalMessage>(
     events: &mut Vec<OwnedSignal<Event<M>>>,
 ) -> Vec<(Pid, u64)> {
@@ -5834,7 +5799,7 @@ impl<T: Task> Runner<'_, T> {
                 from,
                 payload,
                 self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                false,
+                true,
                 false,
             )
             .is_err()
@@ -6166,9 +6131,13 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let managed = self.managed;
         let deliver = |process: &ProcRef<T>| -> Result<(), Error> {
             let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-            // A lazy node is a monitor or demonitor signal: it wakes nobody and is no link.
+            // A lazy node is a monitor or demonitor signal and is no link.
             let lazy = signal.is_lazy();
-            let wakes = !lazy && payload_wakes(&signal.payload);
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c (proc_queue_signal) and
+            // erl_proc_sig_queue.h (erts_proc_notify_new_sig), OTP-29.1.1: every signal schedules
+            // a receiver that is not active, links, monitors, demonitors and aliases included, so
+            // a waiting target handles them as they arrive instead of in one burst at its end.
+            let wakes = true;
             let force_enqueue =
                 !lazy && matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
             // A literal-copy request is never buffered: a request lost to an exiting target
@@ -6760,9 +6729,23 @@ impl<T: Task> Scheduler<T> {
     ///
     /// Port of erts/emulator/beam/erl_process.c (erl_create_process: alloc_process, then the
     /// fields initialized in place), OTP-29.1.1.
+    #[inline(always)]
     pub fn spawn_unscheduled_init<E>(
         &self,
-        make: impl for<'slot> FnOnce(&'slot mut std::mem::MaybeUninit<T>) -> &'slot mut T,
+        make: impl FnOnce() -> T,
+        init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
+        priority: Priority,
+        scheduler_id: Option<usize>,
+    ) -> Result<SpawnedProcess<T::Message>, SpawnInitError<E>> {
+        self.spawn_unscheduled_try_init(|| Ok(make()), init, priority, scheduler_id)
+    }
+
+    /// Like [`Self::spawn_unscheduled_init`], but lets task construction fail after the process
+    /// slot is allocated and before it becomes visible in the process table.
+    #[inline(always)]
+    pub fn spawn_unscheduled_try_init<E>(
+        &self,
+        make: impl FnOnce() -> Result<T, E>,
         init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
         priority: Priority,
         scheduler_id: Option<usize>,
@@ -6777,7 +6760,10 @@ impl<T: Task> Scheduler<T> {
             }
             None => None,
         };
-        let process = self.inner.table.insert_init(make, init, priority, bound)?;
+        let process = self
+            .inner
+            .table
+            .insert_try_init(make, init, priority, bound)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(SpawnedProcess {
             pid: process.pid,
@@ -9414,6 +9400,11 @@ fn schedule_next<T: Task>(
     // Every `None` below happens after it.
     if let Some(end) = previous {
         let reductions_before = end.reductions_before;
+        // Port of erts/emulator/beam/erl_process.c:9744 (schedule: schedule_out_process
+        // "returns with rq locked"), OTP-29.1.1: the run queue lock covers the enqueue of the
+        // slice that just ended up to the dequeue, so a thief (trylock EBUSY) cannot take
+        // the process between the two.
+        inner.in_schedule[id].store(true, Ordering::Release);
         schedule_out(inner, Some(&mut *local), end, Some(id), None);
         local.wakeup_other_reds += (local.reductions - reductions_before) as i64;
     }
@@ -9421,6 +9412,7 @@ fn schedule_next<T: Task>(
     // between two scheduled processes), OTP-29.1.1.
     thr_progress::scheduler_progress(managed_thread);
     if halting() {
+        inner.in_schedule[id].store(false, Ordering::Release);
         // The halting scheduler terminates the OS process; the others stay idle.
         thr_progress::scheduler_prepare_wait();
         thread::park();
@@ -9842,7 +9834,6 @@ fn schedule_next<T: Task>(
         ns.saturating_sub(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
     });
     if !inner.parked[id].load(Ordering::SeqCst) {
-        // Woken while spinning.
     } else {
         // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
         // wraps only the blocking wait, the spin above counts as `other`.

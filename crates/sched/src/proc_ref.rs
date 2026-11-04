@@ -345,20 +345,13 @@ impl<T: Task> TaskCell<T> {
         }
     }
 
-    /// Let `make` write the task into the cell. `make` proves the write by returning the
-    /// reference `MaybeUninit::write` gave it for this slot.
-    pub(crate) fn init_with(
-        &mut self,
-        make: impl for<'slot> FnOnce(&'slot mut MaybeUninit<T>) -> &'slot mut T,
-    ) {
+    /// Build the task after slot allocation and write it into its final storage once.
+    #[inline(always)]
+    pub(crate) fn init_with<E>(&mut self, init: impl FnOnce() -> Result<T, E>) -> Result<(), E> {
         assert!(!self.initialized, "a task is written once");
-        let slot = self.task.as_ptr();
-        let written: *const T = make(&mut self.task);
-        assert!(
-            std::ptr::eq(written, slot),
-            "the task must be written into its own slot"
-        );
+        self.task.write(init()?);
         self.initialized = true;
+        Ok(())
     }
 
     pub(crate) fn task(&self) -> &T {

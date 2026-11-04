@@ -2243,26 +2243,22 @@ impl Process {
         float_registers: usize,
         heap: ProcessHeap,
     ) -> Self {
-        let mut slot = std::mem::MaybeUninit::uninit();
-        Self::write_spawn_registers_heap(&mut slot, x_registers, float_registers, heap);
-        // SAFETY: `write_spawn_registers_heap` initialized the slot.
-        unsafe { slot.assume_init() }
+        Self::spawn_registers_and_heap(x_registers, float_registers, heap)
     }
-    /// [`Self::with_spawn_registers_heap`] written straight into `slot`, the task slot of the
-    /// allocated process struct (erl_create_process initializes the fields in place).
-    pub(crate) fn write_spawn_registers_heap(
-        slot: &mut std::mem::MaybeUninit<Self>,
+    /// Build a spawned process after its process slot has been allocated.
+    #[inline(always)]
+    pub(crate) fn spawn_registers_and_heap(
         x_registers: usize,
         float_registers: usize,
         heap: ProcessHeap,
-    ) -> &mut Self {
-        let process = Self::write_registers_and_heap(slot, x_registers, float_registers, heap);
+    ) -> Self {
+        let mut process = Self::write_registers_and_heap(x_registers, float_registers, heap);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
         process.heap.abi.arity = x_registers.min(usize::from(u8::MAX)) as u8;
         if !crate::beamasm_integration::enabled() {
-            crate::native_bridge::push_exit_bridge(process);
+            crate::native_bridge::push_exit_bridge(&mut process);
         }
         process
     }
@@ -2293,17 +2289,14 @@ impl Process {
         float_registers: usize,
         heap: ProcessHeap,
     ) -> Self {
-        let mut slot = std::mem::MaybeUninit::uninit();
-        Self::write_registers_and_heap(&mut slot, x_registers, float_registers, heap);
-        // SAFETY: `write_registers_and_heap` initialized the slot.
-        unsafe { slot.assume_init() }
+        Self::write_registers_and_heap(x_registers, float_registers, heap)
     }
+    #[inline(always)]
     fn write_registers_and_heap(
-        slot: &mut std::mem::MaybeUninit<Self>,
         x_registers: usize,
         float_registers: usize,
         heap: ProcessHeap,
-    ) -> &mut Self {
+    ) -> Self {
         #[cfg(feature = "pf-mem-counters")]
         let started = std::time::Instant::now();
         #[cfg(feature = "pf-mem-counters")]
@@ -2311,7 +2304,7 @@ impl Process {
         let mut heap = heap;
         // `c_p->fcalls` starts at a full slice; there is no separate counter to refill it.
         heap.abi.fcalls = crate::process::CONTEXT_REDS;
-        let process = slot.write(Self {
+        let mut process = Self {
             heap,
             x: ArgRegs::new(x_registers),
             fr: vec![0.0; float_registers].into_boxed_slice(),
@@ -2383,7 +2376,7 @@ impl Process {
             native_arity_set: false,
             native_error_pc: 0,
             native_exit_kind: NativeExit::None,
-        });
+        };
         process.clear_native_resume();
         #[cfg(feature = "pf-mem-counters")]
         if min_heap == 233 {
