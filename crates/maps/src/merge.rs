@@ -5,7 +5,7 @@
 use super::{
     LIMIT, MAP, MAP_HEADER_FLATMAP, MapError, MapResult, bits, boxed, exact_cmp, key_cmp, term,
 };
-use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError, exact_eq};
+use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError, WStack, exact_eq};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
@@ -444,7 +444,7 @@ impl Src {
 pub struct HashmapMergeContext {
     size: usize,
     lvl: usize,
-    stack: Vec<Frame>,
+    stack: WStack<Frame, 4>,
     depth: usize,
     root_pending: bool,
     started: bool,
@@ -467,7 +467,8 @@ impl HashmapMergeContext {
         } else {
             (map_a, map_b)
         };
-        let stack = vec![Frame::new(src_a, src_b, Src::empty(), Src::empty())];
+        let mut stack = WStack::new();
+        stack.push(Frame::new(src_a, src_b, Src::empty(), Src::empty()));
         Self {
             size: hashmap_size(map_a) + hashmap_size(map_b),
             lvl: 0,

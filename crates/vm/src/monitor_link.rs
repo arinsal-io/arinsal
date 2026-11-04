@@ -1103,7 +1103,33 @@ impl<I, O, S> NodeHandle for Monitor<I, O, S> {
 impl<I, O, S> Monitor<I, O, S> {
     /// `erts_monitor_create`: both halves of a new monitor. The origin half's `other` is the
     /// target, the target half's `other` the origin.
+    #[cfg(test)]
     pub(crate) fn create(
+        kind: u32,
+        reference: u64,
+        origin: u64,
+        target: u64,
+        flags: u32,
+        info: I,
+        origin_state: O,
+    ) -> (Self, Self) {
+        Self::create_at(
+            None,
+            kind,
+            reference,
+            origin,
+            target,
+            flags,
+            info,
+            origin_state,
+        )
+    }
+
+    /// [`Monitor::create`] allocating on the creating scheduler's allocator index `ix`
+    /// (`esdp->no`) when the caller has it, else on the thread's.
+    #[allow(clippy::too_many_arguments)] // `erts_monitor_create` takes the same set.
+    pub(crate) fn create_at(
+        ix: Option<usize>,
         kind: u32,
         reference: u64,
         origin: u64,
@@ -1117,29 +1143,32 @@ impl<I, O, S> Monitor<I, O, S> {
         let key_offset = offset_of!(MonitorData<I, O, S>, reference);
         let origin_offset = offset_of!(MonitorData<I, O, S>, origin);
         let target_offset = offset_of!(MonitorData<I, O, S>, target);
-        let (origin_owner, target_owner) =
-            arinsal_alloc::typed::FixAllocArc::new_pair(MonitorData {
-                origin: UnsafeCell::new(MonLnkNode::new(
-                    target,
-                    origin_offset,
-                    key_offset - origin_offset,
-                    kind | flags,
-                )),
-                target: UnsafeCell::new(MonLnkNode::new(
-                    origin,
-                    target_offset,
-                    key_offset - target_offset,
-                    kind | flags | node_flag::TARGET,
-                )),
-                reference,
-                reference_count: AtomicU32::new(2),
-                held: AtomicU32::new(ORIGIN_HELD | TARGET_HELD),
-                target_list: AtomicU64::new(0),
-                info,
-                origin_state: UnsafeCell::new(origin_state),
-                _signal: PhantomData,
-            })
-            .expect("the MONITOR fixed-size allocation must be available");
+        let data = MonitorData {
+            origin: UnsafeCell::new(MonLnkNode::new(
+                target,
+                origin_offset,
+                key_offset - origin_offset,
+                kind | flags,
+            )),
+            target: UnsafeCell::new(MonLnkNode::new(
+                origin,
+                target_offset,
+                key_offset - target_offset,
+                kind | flags | node_flag::TARGET,
+            )),
+            reference,
+            reference_count: AtomicU32::new(2),
+            held: AtomicU32::new(ORIGIN_HELD | TARGET_HELD),
+            target_list: AtomicU64::new(0),
+            info,
+            origin_state: UnsafeCell::new(origin_state),
+            _signal: PhantomData,
+        };
+        let (origin_owner, target_owner) = match ix {
+            Some(ix) => arinsal_alloc::typed::FixAllocArc::new_pair_at(ix, data),
+            None => arinsal_alloc::typed::FixAllocArc::new_pair(data),
+        }
+        .expect("the MONITOR fixed-size allocation must be available");
         (
             Self {
                 node: MonitorData::node_of(origin_owner.as_ptr(), false),

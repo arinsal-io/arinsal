@@ -796,7 +796,10 @@ impl TimerSink for RunCtx<'_, Message> {
 }
 
 /// The calling normal scheduler's timer wheel, reached from native code without a `RunCtx`.
-pub(crate) struct NativeTimers(pub(crate) Pid);
+pub(crate) struct NativeTimers(
+    pub(crate) Pid,
+    pub(crate) Option<arinsal_sched::NativeHandle<Message>>,
+);
 
 impl TimerSink for NativeTimers {
     fn schedule_timer(
@@ -806,7 +809,10 @@ impl TimerSink for NativeTimers {
         message: Message,
         wrapped: bool,
     ) -> Result<arinsal_sched::TimerRef, String> {
-        match arinsal_sched::native_start_timer(self.0, target, ms, message, wrapped) {
+        let Some(handle) = &self.1 else {
+            return Err("no native scheduler".into());
+        };
+        match handle.start_timer(self.0, target, ms, message, wrapped) {
             Ok(result) => result.map_err(|e| e.to_string()),
             Err(_) => Err("no native scheduler".into()),
         }
@@ -818,7 +824,10 @@ impl TimerSink for NativeTimers {
         wrapped: bool,
         resolve: std::sync::Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
     ) -> Result<arinsal_sched::TimerRef, String> {
-        match arinsal_sched::native_start_resolved_timer(self.0, ms, resolve, message, wrapped) {
+        let Some(handle) = &self.1 else {
+            return Err("no native scheduler".into());
+        };
+        match handle.start_resolved_timer(self.0, ms, resolve, message, wrapped) {
             Ok(result) => result.map_err(|e| e.to_string()),
             Err(_) => Err("no native scheduler".into()),
         }
@@ -856,11 +865,13 @@ pub(crate) fn start_timer_bif(
     let rt = process.runtime.ok_or_else(|| badarg("timer/3"))?;
     // A dead pid gets a ref but no timer entry; an unresolved name can become registered
     // before its timer expires.
-    let id = rt.next_ref();
-    let message = Message::copy_from_timer(message, id)?;
+    let id = process.next_ref();
+    let message = Message::copy_from_timer(message, id, process.heap.alloc_ix())?;
     // setup_bif_timer: a timer for a process that does not exist is never created.
     if let Some(pid) = pid
-        && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
+        && !rt
+            .scheduler()
+            .is_ok_and(|scheduler| scheduler.lookup_from(pid, process.on_managed))
     {
         return reference(process, id);
     }
@@ -882,7 +893,9 @@ pub(crate) fn start_timer_bif(
     // process, linked to it through that process' bif-timer word (erl_hl_timer.c:1832), so exit
     // cancels it without any table of timers.
     if let Some(pid) = pid
-        && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
+        && !rt
+            .scheduler()
+            .is_ok_and(|scheduler| scheduler.lookup_from(pid, process.on_managed))
         && let Ok(scheduler) = rt.scheduler()
     {
         // The receiver exited meanwhile; its exit may already have swept its timers.
@@ -1057,7 +1070,7 @@ fn create_child(
     let heap_need = arg_size.saturating_add(arinsal_term::S_RESERVED);
     let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
         .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
-    let mut heap = arinsal_term::ProcessHeap::with_words(heap_words);
+    let mut heap = arinsal_term::ProcessHeap::with_words_at(heap_words, parent.heap.alloc_ix());
     heap.set_min_heap_size(min_heap);
     let initial_bif = if let Ok(arity) = u8::try_from(arity)
         && is_bif_export(m, f, arity)
@@ -1079,7 +1092,7 @@ fn create_child(
     let monitor_id = so
         .monitor
         .as_ref()
-        .map(|monitor| monitor.id.unwrap_or_else(arinsal_bifs::next_ref_id));
+        .map(|monitor| monitor.id.unwrap_or_else(|| parent.next_ref()));
     // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: alloc_process
     // takes the process struct and its table entry first, and the fields are then initialized
     // in place.
@@ -1152,7 +1165,8 @@ fn create_child(
         if let (Some(id), Some(monitor)) = (monitor_id, so.monitor.as_ref()) {
             // Port of erts/emulator/beam/erl_process.c:12932-12942 (erl_create_process):
             // the child has a pid and remains locked while both monitor halves are installed.
-            let (origin, target) = crate::proc_create::create_monitor(
+            let (origin, target) = crate::proc_create::create_monitor_at(
+                parent.heap.alloc_ix(),
                 id,
                 parent_pid.data(),
                 child_pid.data(),
@@ -1495,7 +1509,10 @@ fn spawn_light(
     let pid = child.spawned.pid();
     // erl_create_process: add2runq on the calling scheduler. Off a normal scheduler thread
     // the child goes through the shared queue instead.
-    let queued = match arinsal_sched::native_schedule_spawned(child.spawned) {
+    let queued = match match process.native_handle() {
+        Some(handle) => handle.schedule_spawned(child.spawned),
+        None => Err(child.spawned),
+    } {
         Ok(queued) => queued,
         Err(spawned) => match process.runtime.map(Runtime::scheduler) {
             Some(Ok(scheduler)) => scheduler.schedule_unscheduled(spawned.pid()),
@@ -1912,7 +1929,7 @@ fn access_timer_sync(
             .unwrap_or_else(|| atom("false"));
         return Ok(if info { value } else { atom("ok") });
     }
-    let id = rt.next_ref();
+    let id = process.next_ref();
     // The reply reference shares node and creation with the (local) timer reference.
     // Nothing is allocated on the caller's heap: the BIF is retried once the reply is in.
     let reply = match to_owned(timer_reference) {
@@ -2399,12 +2416,13 @@ pub(crate) fn monitor_light(
     {
         return None;
     }
-    let id = rt_ref(process)?.next_ref();
+    let id = process.next_ref();
     let ref_term = reference(process, id).ok()?;
     // Port of erts/emulator/beam/bif.c (monitor_2, ERTS_MON_TYPE_PROC): one
     // `erts_monitor_create` for both halves; the origin goes into the tree, the target half is
     // the monitor signal.
-    let (origin, target) = crate::proc_create::create_monitor(
+    let (origin, target) = crate::proc_create::create_monitor_at(
+        process.heap.alloc_ix(),
         id,
         me.data(),
         pid.data(),
@@ -2419,13 +2437,14 @@ pub(crate) fn monitor_light(
     if rt_ref(process)?
         .scheduler()
         .ok()?
-        .signal_ordered(
+        .signal_ordered_from(
             me,
             pid,
             arinsal_sched::Signal::Monitor {
                 reference: id,
                 shared: target.into_shared(),
             },
+            process.on_managed,
         )
         .is_err()
     {
@@ -2468,7 +2487,7 @@ pub(crate) fn alias_light(
     }
     let me = process.self_pid?;
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let id = rt_ref(process)?.next_ref();
+    let id = process.next_ref();
     let reference = reference(process, id).ok()?;
     rt_ref(process)?.alias_bind_prio(id, Some(me), priority);
     process
@@ -2702,10 +2721,11 @@ pub(crate) fn demonitor_light(
         // Port of erts/emulator/beam/bif.c:521 (demonitor, ERTS_MON_TYPE_PROC): the demonitor
         // always goes through proc_queue_signal, which sends a held monitor first; the signal is
         // the origin half itself (erts_proc_sig_send_demonitor).
-        let _ = scheduler.signal_ordered(
+        let _ = scheduler.signal_ordered_from(
             me,
             pid,
             arinsal_sched::Signal::DemonitorOrigin(origin.into_shared()),
+            process.on_managed,
         );
         Term::atom(arinsal_term::atoms::TRUE)
     } else {
@@ -2755,11 +2775,16 @@ pub(crate) fn unlink_light(
     {
         return Some(Ok(atom("true")));
     }
-    let id = rt_ref(process)?.next_ref();
+    let id = process.next_ref();
     let sent = rt_ref(process)?
         .scheduler()
         .ok()?
-        .signal_ordered(me, pid, arinsal_sched::Signal::Unlink(id))
+        .signal_ordered_from(
+            me,
+            pid,
+            arinsal_sched::Signal::Unlink(id),
+            process.on_managed,
+        )
         .is_ok();
     unlink_mark(process, pid, id, sent);
     Some(Ok(atom("true")))
@@ -2812,7 +2837,7 @@ pub(crate) fn link_light(
     rt_ref(process)?
         .scheduler()
         .ok()?
-        .signal_ordered(me, pid, arinsal_sched::Signal::Link)
+        .signal_ordered_from(me, pid, arinsal_sched::Signal::Link, process.on_managed)
         .ok()?;
     link_node_create(process.cold_mut(), pid, false);
     Some(Ok(atom("true")))
@@ -2870,10 +2895,11 @@ pub(crate) fn exit2_light(
     }
     let message = Message::copy_from(*reason).ok()?;
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered(
+    let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered_from(
         me,
         pid,
         arinsal_sched::Signal::Exit(Box::new(message)),
+        process.on_managed,
     );
     Some(Ok(atom("true")))
 }
@@ -3050,7 +3076,7 @@ fn monitor_port(
     alias_mode: Option<crate::proc_create::AliasMode>,
 ) -> Result<Term, VmError> {
     let runtime = process.runtime.ok_or_else(|| badarg("monitor/2"))?;
-    let reference_id = runtime.next_ref();
+    let reference_id = process.next_ref();
     let reference_term = reference(process, reference_id)?;
     if alias_mode.is_some() {
         runtime.alias_bind_prio(reference_id, Some(me), false);
@@ -3405,7 +3431,7 @@ fn call_resolved(
             } else {
                 return Err(badarg("monitor/2"));
             };
-            let id = rt.next_ref();
+            let id = process.next_ref();
             let ref_term = reference(process, id)?;
             // Port of erts/emulator/beam/bif.c:782-784 (monitor), OTP-29.1.1.
             // Monitoring oneself creates no monitor and sends no signal.
@@ -3477,8 +3503,8 @@ fn call_resolved(
             if *target != Term::atom(arinsal_term::atoms::CLOCK_SERVICE) {
                 return Err(badarg("monitor/2"));
             }
-            let runtime = process.runtime.ok_or_else(|| badarg("monitor/2"))?;
-            let id = runtime.next_ref();
+            process.runtime.ok_or_else(|| badarg("monitor/2"))?;
+            let id = process.next_ref();
             reference(process, id)
         }
         (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
@@ -4032,7 +4058,7 @@ pub(crate) fn submit(
     op: RemoteOp,
     wait: Option<WaitKind>,
 ) -> Result<Submit, VmError> {
-    let id = runtime(process)?.next_ref();
+    let id = process.next_ref();
     submit_id(process, ctx, target, id, op, wait)
 }
 
@@ -4073,11 +4099,7 @@ fn submit_from(
     wait: Option<WaitKind>,
     priority: Option<Priority>,
 ) -> Result<Submit, VmError> {
-    let id = if id == 0 {
-        runtime(process)?.next_ref()
-    } else {
-        id
-    };
+    let id = if id == 0 { process.next_ref() } else { id };
     let slot_of = scope(process);
     let elevates = matches!(
         op,
@@ -4179,7 +4201,7 @@ fn elevate_sig_handling_prio(
         Some(other) if sys_index(other) > sys_index(min_prio) => {}
         _ => return Ok(()),
     }
-    let id = runtime(process)?.next_ref();
+    let id = process.next_ref();
     {
         let mut tables = tables().lock().unwrap();
         if proc_is_exiting(process, target) {
@@ -4981,7 +5003,7 @@ fn trace_delivered(
     if target != atom("all") && Pid::from_term(target).is_none() {
         return Err(badarg("trace_delivered/1"));
     }
-    let id = runtime(process)?.next_ref();
+    let id = process.next_ref();
     let reference = reference(process, id)?;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let message = TermBuilder::new(&mut heap)

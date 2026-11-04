@@ -109,7 +109,7 @@ fn send_signal(
         .ok_or(arinsal_sched::Error::NoProcess)?
         .scheduler()
         .map_err(|_| arinsal_sched::Error::NoProcess)?;
-    scheduler.signal_ordered(me, to, signal)
+    scheduler.signal_ordered_from(me, to, signal, process.on_managed)
 }
 
 /// What `erts_internal_suspend_process_2` decided (erl_process.c:9013-9163).

@@ -1825,6 +1825,18 @@ impl ProcessHeap {
         Self::with_words_for_type(words, ErtsAlcType::HEAP)
     }
 
+    /// [`ProcessHeap::with_words`] allocating on allocator index `ix` (the creating scheduler's
+    /// `esdp->no`, which must be the calling thread's). The heap does not keep the index: it is
+    /// set on each run, since the new process may first run on another scheduler.
+    pub fn with_words_at(words: usize, ix: Option<usize>) -> Self {
+        let words_ix = ix.map_or(NO_ALLOC_IX, |ix| {
+            u16::try_from(ix).map_or(NO_ALLOC_IX, |ix| ix.min(NO_ALLOC_IX - 1))
+        });
+        let mut heap = Self::with_words_for_type_at(words, ErtsAlcType::HEAP, words_ix);
+        heap.alloc_ix = NO_ALLOC_IX;
+        heap
+    }
+
     /// Create a heap fragment block with the requested typed allocator.
     pub fn with_words_for_type(words: usize, allocation_type: ErtsAlcType) -> Self {
         Self::with_words_for_type_at(words, allocation_type, NO_ALLOC_IX)
@@ -1877,6 +1889,13 @@ impl ProcessHeap {
         self.alloc_ix = ix.map_or(NO_ALLOC_IX, |ix| {
             u16::try_from(ix).map_or(NO_ALLOC_IX, |ix| ix.min(NO_ALLOC_IX - 1))
         });
+    }
+
+    /// The allocator index set by [`ProcessHeap::set_alloc_ix`], `None` while the process is
+    /// not running.
+    #[inline]
+    pub fn alloc_ix(&self) -> Option<usize> {
+        (self.alloc_ix != NO_ALLOC_IX).then_some(usize::from(self.alloc_ix))
     }
 
     /// A word block of `allocation_type` for this heap's scheduler thread.
@@ -3671,6 +3690,33 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     ) -> Result<Term, TermError> {
         let values: Vec<Term> = values.into_iter().collect();
         self.list_from_slice(&values)
+    }
+    /// Build a list from a reverse-scannable iterator with one heap reservation.
+    ///
+    /// Port of `erts_make_list_from_utf8_buf` in erts/emulator/beam/erl_unicode.c,
+    /// OTP-29.1.1.
+    pub fn list_from_reverse_iter(
+        &mut self,
+        len: usize,
+        mut values: impl DoubleEndedIterator<Item = Term>,
+    ) -> Result<Term, TermError> {
+        if len == 0 {
+            return Ok(Term::NIL);
+        }
+        let words = len.checked_mul(2).ok_or(TermError::SystemLimit)?;
+        let run = self.words(words)?;
+        let mut tail = Term::NIL;
+        for index in 0..len {
+            let value = values.next_back().ok_or(TermError::BadArg)?;
+            let cell = run.wrapping_add(2 * index);
+            store(cell, value.bits());
+            store(cell.wrapping_add(1), tail.bits());
+            tail = Term::from_ptr(cell, 1);
+        }
+        if values.next_back().is_some() {
+            return Err(TermError::BadArg);
+        }
+        Ok(tail)
     }
     /// Build a list from a slice with one reservation of `2 * n` words.
     pub fn list_from_slice(&mut self, values: &[Term]) -> Result<Term, TermError> {

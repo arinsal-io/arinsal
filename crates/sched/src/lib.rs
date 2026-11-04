@@ -1818,6 +1818,9 @@ impl<T: Task> ProcessTable<T> {
 
     /// Scan one range while delaying thread progress once for the whole chunk.
     // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+    // Out of line: inlined next to a `managed` branch, LLVM hoists the thread-local address of
+    // `is_managed_thread_of` above the branch and a managed caller still pays the lookup.
+    #[inline(never)]
     fn with_slot_range(&self, first: u32, limit: u32, mut f: impl FnMut(&ProcRef<T>)) {
         let delay = thr_progress::unmanaged_delay(&self.progress);
         let limit = limit.min(self.ids.process_slot_count());
@@ -1902,6 +1905,39 @@ impl<T: Task> ProcessTable<T> {
     fn lookup(&self, pid: Pid) -> Option<ProcRef<T>> {
         self.load_slot(self.index(pid))
             .filter(|process| process.pid == pid)
+    }
+
+    /// [`ProcessTable::lookup`] for a managed thread of this scheduler: the slot read and the
+    /// reference increment, with no thread-progress delay and so no thread-local read.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw + erts_proc_inc_refc),
+    // OTP-29.1.1.
+    fn lookup_managed(&self, pid: Pid) -> Option<ProcRef<T>> {
+        self.with_live_managed(pid, ProcRef::clone)
+    }
+
+    /// [`ProcessTable::lookup`], or [`ProcessTable::lookup_managed`] when `managed`.
+    #[inline]
+    fn lookup_from(&self, pid: Pid, managed: bool) -> Option<ProcRef<T>> {
+        if managed {
+            self.lookup_managed(pid)
+        } else {
+            self.lookup(pid)
+        }
+    }
+
+    /// [`ProcessTable::with_live`], or [`ProcessTable::with_live_managed`] when `managed`.
+    #[inline]
+    fn with_live_from<R>(
+        &self,
+        pid: Pid,
+        managed: bool,
+        f: impl FnOnce(&ProcRef<T>) -> R,
+    ) -> Option<R> {
+        if managed {
+            self.with_live_managed(pid, f)
+        } else {
+            self.with_live(pid, f)
+        }
     }
 
     /// Run `f` on a live process without touching its reference count.
@@ -3654,12 +3690,14 @@ impl<T: Task> Inner<T> {
     #[inline]
     fn apply_link_events(&self, wheel: &mut Wheel<T::Message>) {
         if wheel.has_link_events() {
-            self.drain_link_events(wheel);
+            // A real wheel belongs to its scheduler thread (a managed thread of thread
+            // progress); only the simulated scheduler's shared wheels are touched by any thread.
+            self.drain_link_events(wheel, self.sim_timers.is_none());
         }
     }
 
     #[inline(never)]
-    fn drain_link_events(&self, wheel: &mut Wheel<T::Message>) {
+    fn drain_link_events(&self, wheel: &mut Wheel<T::Message>, managed: bool) {
         let worker = wheel.worker();
         // Applying an event can record more (a timer created for a paused receiver is
         // canceled again), so run until the wheel has none.
@@ -3667,7 +3705,7 @@ impl<T: Task> Inner<T> {
             {
                 match event {
                     LinkEvent::Link(pid, id) => {
-                        let stashed = self.table.with_live(pid, |process| {
+                        let stashed = self.table.with_live_from(pid, managed, |process| {
                             // Port of erts/emulator/beam/erl_hl_timer.c:1838 (setup_bif_timer):
                             // a timer for a process whose timers are paused is created paused.
                             // The paused check and the link are one step under the paused lock,
@@ -3687,7 +3725,7 @@ impl<T: Task> Inner<T> {
                         }
                     }
                     LinkEvent::Unlink(pid, id) => {
-                        self.table.with_live(pid, |process| {
+                        self.table.with_live_from(pid, managed, |process| {
                             process.btm.lock().tree.remove(&id);
                         });
                     }
@@ -4482,7 +4520,10 @@ impl<T: Task> Inner<T> {
         local: Option<&mut Local<T>>,
         owner: Option<usize>,
     ) -> Result<TimerRef, Error> {
-        let Some(process) = self.table.lookup(pid) else {
+        // A caller with scheduler-local state runs on a managed thread: its lookups read the
+        // slot alone, as `erts_proc_lookup_raw` does in `setup_bif_timer`.
+        let managed = local.is_some();
+        let Some(process) = self.table.lookup_from(pid, managed) else {
             return Err(Error::NoProcess);
         };
         let fallback = pid.number() as usize % self.timer_commands.len();
@@ -4508,7 +4549,7 @@ impl<T: Task> Inner<T> {
             let receiver = if *target == pid {
                 Some(process)
             } else {
-                self.table.lookup(*target)
+                self.table.lookup_from(*target, managed)
             };
             if let Some(receiver) = receiver {
                 receiver
@@ -4896,7 +4937,9 @@ impl<T: Task> Local<T> {
         // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_lookup / pix to slot).
         // A side cache of Arcs kept exited processes alive until a later spawn
         // reused the slot, so delete_process ran on the spawner.
-        table.lookup(pid)
+        // `Local` is the state of a normal scheduler thread, a managed thread of thread
+        // progress: the lookup reads the slot alone, as `erts_proc_lookup_raw` does.
+        table.lookup_managed(pid)
     }
     /// Highest priority (lowest index) with runnable local work.
     fn best_priority(&self) -> Option<usize> {
@@ -5683,6 +5726,10 @@ fn process_peak_rss_bytes() -> Option<u64> {
 struct Runner<'a, T: Task> {
     inner: &'a Inner<T>,
     local: Option<&'a RefCell<Local<T>>>,
+    /// The caller is a managed thread of the scheduler's thread progress (a normal scheduler):
+    /// process lookups read the slot alone. Always true with `local`; a caller without
+    /// scheduler-local state may still run on a normal scheduler (`erts_proc_lookup_raw`).
+    managed: bool,
 }
 
 impl<T: Task> Runner<'_, T> {
@@ -6116,7 +6163,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
         // reference count is taken on the receiver.
         let inner = self.inner;
-        let managed = self.local.is_some();
+        let managed = self.managed;
         let deliver = |process: &ProcRef<T>| -> Result<(), Error> {
             let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
             // A lazy node is a monitor or demonitor signal: it wakes nobody and is no link.
@@ -6904,9 +6951,22 @@ impl<T: Task> Scheduler<T> {
         to: Pid,
         signal: Signal<T::Message>,
     ) -> Result<(), Error> {
+        self.signal_ordered_from(from, to, signal, false)
+    }
+    /// [`Scheduler::signal_ordered`] for a caller that is a process running on a normal
+    /// scheduler (`managed`): the receiver lookup reads the slot alone and delays no thread
+    /// progress, as `erts_proc_lookup_raw` does for the sending scheduler.
+    pub fn signal_ordered_from(
+        &self,
+        from: Pid,
+        to: Pid,
+        signal: Signal<T::Message>,
+        managed: bool,
+    ) -> Result<(), Error> {
         let mut runner = Runner {
             inner: &self.inner,
             local: None,
+            managed,
         };
         <Runner<'_, T> as ContextOps<T::Message>>::deliver(
             &mut runner,
@@ -7843,6 +7903,7 @@ mod msgq_stage_microbench {
         let mut receive_runner = Runner {
             inner: &scheduler.inner,
             local: None,
+            managed: false,
         };
         let consts = SliceConsts {
             worker: None,
@@ -7905,6 +7966,7 @@ mod msgq_stage_microbench {
         let mut runner = Runner {
             inner: &scheduler.inner,
             local: None,
+            managed: false,
         };
         let started = Instant::now();
         for message in 0..N {
@@ -7930,6 +7992,7 @@ mod msgq_stage_microbench {
             let mut runner = Runner {
                 inner: &scheduler.inner,
                 local: None,
+                managed: false,
             };
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
                 &mut runner,
@@ -7968,6 +8031,7 @@ mod msgq_stage_microbench {
         let mut runner = Runner {
             inner: &scheduler.inner,
             local: None,
+            managed: false,
         };
         for value in 1..=3 {
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
@@ -8597,7 +8661,11 @@ fn run_slice<T: Task>(
         simulated: inner.sim.is_some(),
     };
     let (outcome, remaining, active_ns) = {
-        let mut runner = Runner { inner, local: None };
+        let mut runner = Runner {
+            inner,
+            local: None,
+            managed: false,
+        };
         let result = {
             let task = cell.task_mut();
             let mut ctx = RunCtx {
@@ -8710,6 +8778,7 @@ fn run_process<T: Task>(
     let mut runner = Runner {
         inner,
         local: Some(local_cell),
+        managed: true,
     };
     let (outcome, remaining, active_ns) = {
         let task = cell.task_mut();
@@ -8893,6 +8962,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         let mut runner = Runner {
             inner: &self.inner,
             local: Some(&local),
+            managed: true,
         };
         Ok(<Runner<'_, T> as ContextOps<T::Message>>::schedule_spawned(
             &mut runner,
@@ -8986,7 +9056,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
 // the calling scheduler thread, which BIFs called from JIT code reach through `esdp`),
 // OTP-29.1.1.
 mod native_sender {
-    use super::NativeSend;
+    use super::{NativeSend, NativeSlot, SignalMessage};
     use std::any::Any;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -8995,21 +9065,41 @@ mod native_sender {
         static CURRENT: RefCell<Option<Box<dyn Any>>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn install<M: 'static>(handle: Rc<dyn NativeSend<M>>) {
-        CURRENT.with(|current| *current.borrow_mut() = Some(Box::new(handle)));
+    pub(super) fn install<M: SignalMessage>(handle: Rc<dyn NativeSend<M>>) {
+        let slot = Rc::new(NativeSlot { send: handle });
+        CURRENT.with(|current| *current.borrow_mut() = Some(Box::new(slot)));
     }
 
     pub(super) fn clear() {
         CURRENT.with(|current| current.borrow_mut().take());
     }
 
-    pub(super) fn with<M: 'static, R>(f: impl FnOnce(&Rc<dyn NativeSend<M>>) -> R) -> Option<R> {
+    pub(super) fn with<M: SignalMessage, R>(
+        f: impl FnOnce(&Rc<dyn NativeSend<M>>) -> R,
+    ) -> Option<R> {
         CURRENT.with(|current| {
             let current = current.try_borrow().ok()?;
-            let handle = current.as_ref()?.downcast_ref::<Rc<dyn NativeSend<M>>>()?;
-            Some(f(handle))
+            let slot = current.as_ref()?.downcast_ref::<Rc<NativeSlot<M>>>()?;
+            Some(f(&slot.send))
         })
     }
+
+    /// The thread's slot itself, for a caller that keeps it across several operations.
+    pub(super) fn slot<M: SignalMessage>() -> Option<Rc<NativeSlot<M>>> {
+        CURRENT.with(|current| {
+            let current = current.try_borrow().ok()?;
+            current
+                .as_ref()?
+                .downcast_ref::<Rc<NativeSlot<M>>>()
+                .cloned()
+        })
+    }
+}
+
+/// The scheduler thread's native sender behind one thin pointer, so a handle fits a word of
+/// the process struct (erts keeps `scheduler_data` there).
+pub struct NativeSlot<M: SignalMessage> {
+    send: std::rc::Rc<dyn NativeSend<M>>,
 }
 
 /// Publish a child created by a task's native code on the normal scheduler thread it runs on
@@ -9027,6 +9117,87 @@ pub fn native_schedule_spawned<M: SignalMessage>(
         Some(Ok(result)) => Ok(result),
         Some(Err(child)) => Err(child),
         None => Err(spawned.take().expect("child not queued")),
+    }
+}
+
+/// The calling normal scheduler thread's [`NativeSend`] handle, taken once for the several
+/// native operations one BIF performs.
+///
+/// Port of erts/emulator/beam/erl_process.h (erts_get_scheduler_data): erts reads `esdp` once
+/// per BIF and uses it for every step, so one thread-local read serves a send that first tries
+/// the receiver's heap and then queues a node.
+pub struct NativeHandle<M: SignalMessage>(std::rc::Rc<NativeSlot<M>>);
+
+/// The handle of the calling normal scheduler thread, `None` on any other thread.
+pub fn native_handle<M: SignalMessage>() -> Option<NativeHandle<M>> {
+    native_sender::slot::<M>().map(NativeHandle)
+}
+
+impl<M: SignalMessage> Clone for NativeHandle<M> {
+    fn clone(&self) -> Self {
+        Self(std::rc::Rc::clone(&self.0))
+    }
+}
+
+impl<M: SignalMessage> NativeHandle<M> {
+    /// [`native_try_send_on_heap`] through this handle.
+    pub fn try_send_on_heap(
+        &self,
+        from: Pid,
+        to: Pid,
+        prepare: &mut dyn FnMut(&mut dyn std::any::Any) -> Option<M>,
+    ) -> Option<OnHeapSend> {
+        self.0.send.send_on_heap(from, to, prepare)
+    }
+
+    /// [`native_send_node`] through this handle.
+    #[allow(clippy::type_complexity)] // The node comes back unchanged when it was not sent.
+    pub fn send_node(
+        &self,
+        to: Pid,
+        signal: OwnedSignal<Event<M>>,
+    ) -> Result<Result<(), Error>, OwnedSignal<Event<M>>> {
+        self.0.send.send_node(to, signal)
+    }
+
+    /// [`native_schedule_spawned`] through this handle.
+    #[allow(clippy::type_complexity)] // The child comes back unchanged when it was not queued.
+    pub fn schedule_spawned(
+        &self,
+        spawned: SpawnedProcess<M>,
+    ) -> Result<Result<(), Error>, SpawnedProcess<M>> {
+        self.0.send.schedule_spawned(spawned)
+    }
+
+    /// [`native_start_timer`] through this handle.
+    pub fn start_timer(
+        &self,
+        owner: Pid,
+        target: Pid,
+        ms: u64,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<Result<TimerRef, Error>, M> {
+        self.0.send.start_timer(owner, target, ms, msg, wrapped)
+    }
+
+    /// [`native_start_resolved_timer`] through this handle.
+    pub fn start_resolved_timer(
+        &self,
+        owner: Pid,
+        ms: u64,
+        resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<Result<TimerRef, Error>, M> {
+        self.0
+            .send
+            .start_resolved_timer(owner, ms, resolve, msg, wrapped)
+    }
+
+    /// [`native_access_timer`] through this handle.
+    pub fn access_timer(&self, key: u64, cancel: bool) -> Option<Option<u64>> {
+        self.0.send.access_bif_timer(key, cancel)
     }
 }
 

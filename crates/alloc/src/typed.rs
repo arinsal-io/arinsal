@@ -228,7 +228,10 @@ impl<T: FixAllocRefCount> FixAllocArc<T> {
     }
 
     fn allocate(value: T, references: u32) -> Result<Self, AllocError> {
-        let ix = crate::instances::thread_alloc_ix();
+        Self::allocate_at(crate::instances::thread_alloc_ix(), value, references)
+    }
+
+    fn allocate_at(ix: usize, value: T, references: u32) -> Result<Self, AllocError> {
         let size = std::mem::size_of::<T>();
         if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
             return Err(AllocError::OutOfBounds);
@@ -248,8 +251,15 @@ impl<T: FixAllocRefCount> FixAllocArc<T> {
     }
 
     /// Allocates one fixed-size object with two owners, as `erts_monitor_create` does.
+    #[inline(never)] // The thread lookup stays off the path of callers that hold the index.
     pub fn new_pair(value: T) -> Result<(Self, Self), AllocError> {
-        let first = Self::allocate(value, 2)?;
+        Self::new_pair_at(crate::instances::thread_alloc_ix(), value)
+    }
+
+    /// [`Self::new_pair`] on allocator index `ix`, the calling thread's index as its scheduler
+    /// knows it (`esdp->no`).
+    pub fn new_pair_at(ix: usize, value: T) -> Result<(Self, Self), AllocError> {
+        let first = Self::allocate_at(ix, value, 2)?;
         let second = Self {
             pointer: first.pointer,
         };
@@ -347,10 +357,17 @@ impl<T, const TYPE: u8> FixAllocBox<T, TYPE> {
     #[allow(unsafe_code)]
     #[inline(always)]
     pub fn new_with(init: impl FnOnce() -> T) -> Result<Self, AllocError> {
+        Self::new_with_at(crate::instances::thread_alloc_ix(), init)
+    }
+
+    /// [`Self::new_with`] on allocator index `owner_ix`, the calling thread's index as its
+    /// scheduler knows it (`esdp->no`).
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    pub fn new_with_at(owner_ix: usize, init: impl FnOnce() -> T) -> Result<Self, AllocError> {
         if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
             return Err(AllocError::OutOfBounds);
         }
-        let owner_ix = crate::instances::thread_alloc_ix();
         let bytes = std::mem::size_of::<T>();
         let payload = fix_alloc_payload_at(owner_ix, ErtsAlcType(TYPE), bytes)?;
         let pointer =
@@ -438,10 +455,16 @@ impl<T, const TYPE: u8> FixOrBox<T, TYPE> {
     /// A block of the fixed-size type `TYPE`.
     #[inline(always)]
     pub fn fixed(value: T) -> Result<Self, AllocError> {
+        Self::fixed_at(crate::instances::thread_alloc_ix(), value)
+    }
+
+    /// [`Self::fixed`] on allocator index `owner_ix`, which the caller got from its scheduler
+    /// (`esdp->no`) instead of a thread lookup. It must be the calling thread's index.
+    #[inline(always)]
+    pub fn fixed_at(owner_ix: usize, value: T) -> Result<Self, AllocError> {
         if std::mem::align_of::<T>() > std::mem::align_of::<u64>() {
             return Err(AllocError::OutOfBounds);
         }
-        let owner_ix = crate::instances::thread_alloc_ix();
         let payload = fix_alloc_payload_at(owner_ix, ErtsAlcType(TYPE), std::mem::size_of::<T>())?;
         let pointer =
             std::ptr::NonNull::new(payload.cast::<T>()).ok_or(AllocError::InvalidAllocation)?;
@@ -1053,6 +1076,10 @@ impl AllocBlock {
         allocation_type: ErtsAlcType,
         user_words: usize,
     ) -> Result<*mut u64, AllocError> {
+        // erts_alloc of size 0 is never reached for an empty heap: no thread lookup either.
+        if user_words == 0 {
+            return Ok(std::ptr::null_mut());
+        }
         Self::detach_heap_at(
             crate::instances::thread_alloc_ix(),
             allocation_type,
@@ -1092,6 +1119,10 @@ impl AllocBlock {
 
     /// Frees a block produced by [`AllocBlock::detach_heap`].
     pub fn free_detached_heap(user: *mut u64) {
+        // An absent heap (erts leaves OLD_HEAP null) frees nothing and needs no thread index.
+        if user.is_null() {
+            return;
+        }
         Self::free_detached_heap_at(crate::instances::thread_alloc_ix(), user);
     }
 
