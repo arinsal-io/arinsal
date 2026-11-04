@@ -164,7 +164,7 @@ struct Instance {
 }
 
 /// Number of fixed-size allocation types (`ERTS_ALC_NO_FIXED_SIZES`) the port knows.
-pub const FIX_TYPES: usize = 4;
+pub const FIX_TYPES: usize = 5;
 
 /// Longest free list of one fixed-size type.
 ///
@@ -1761,13 +1761,18 @@ fn fix_free_owned(
     fix_ix: usize,
     allocation: Allocation,
 ) -> Result<(), AllocError> {
-    let fix = state
+    let type_size = state
         .fix
-        .get_mut(fix_ix)
-        .ok_or(AllocError::InvalidAllocation)?;
-    if allocation.size() != fix.type_size {
+        .get(fix_ix)
+        .ok_or(AllocError::InvalidAllocation)?
+        .type_size;
+    // The size read back from the block header is the payload capacity of its block, which
+    // exceeds the type size for a type smaller than the minimum block (erts compares nothing:
+    // the free list is selected by the type).
+    if allocation.size() != state.allocator.payload_capacity(type_size) {
         return state.allocator.free(allocation);
     }
+    let fix = &mut state.fix[fix_ix];
     fix.used = fix.used.saturating_sub(1);
     if fix.shrink_list == 0 && fix.list_size < FIX_MAX_LIST_SIZE {
         fix_list_push(fix, allocation);

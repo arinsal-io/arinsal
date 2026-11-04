@@ -154,9 +154,13 @@ fn heap_contains(heap: &ProcessHeap, addr: usize) -> bool {
     if in_span(heap.old_words.as_ptr() as usize, old, addr) {
         return true;
     }
-    heap.fragments
-        .iter()
-        .any(|fragment| in_span(fragment.as_ptr() as usize, fragment.len() * 8, addr))
+    heap.fragments.iter().enumerate().any(|(index, fragment)| {
+        in_span(
+            fragment.as_ptr() as usize,
+            heap.fragment_used_words(index, fragment) * 8,
+            addr,
+        )
+    })
 }
 
 fn is_static_empty_tuple(addr: usize) -> bool {
@@ -304,9 +308,10 @@ fn describe(heap: &ProcessHeap) -> String {
     } else {
         heap.fragments
             .iter()
-            .map(|fragment| {
+            .enumerate()
+            .map(|(index, fragment)| {
                 let start = fragment.as_ptr() as usize;
-                let end = start + fragment.len() * 8;
+                let end = start + heap.fragment_used_words(index, fragment) * 8;
                 format!("{start:#x}..{end:#x}")
             })
             .collect::<Vec<_>>()

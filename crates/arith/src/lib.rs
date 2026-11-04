@@ -128,9 +128,6 @@ pub fn reduction_charge(operation: &str, args: &[Term]) -> u32 {
 /// Port of `bump_reds_quadratic` in `erts/emulator/beam/erl_arith.c`, OTP-29.1.1. The direct
 /// form keeps the operand sizes gathered once, as `erts_mixed_times` does before `big_times`.
 pub fn mul_reduction_charge(left: Term, right: Term) -> u32 {
-    const WORDS_PER_REDUCTION: usize = 16;
-    const MAX_REDUCTIONS: usize = 4_000;
-
     let left_small = left.as_small();
     let right_small = right.as_small();
     if matches!(left_small, Some(0 | 1)) || matches!(right_small, Some(0 | 1)) {
@@ -148,12 +145,20 @@ pub fn mul_reduction_charge(left: Term, right: Term) -> u32 {
         return 0;
     }
 
-    if left_words >= MAX_REDUCTIONS * WORDS_PER_REDUCTION
-        || right_words >= MAX_REDUCTIONS * WORDS_PER_REDUCTION
-    {
-        MAX_REDUCTIONS as u32
+    mul_reduction_charge_words(left_words, right_words)
+}
+
+/// Charge `bump_reds_quadratic` from sizes already gathered by the multiply dispatch.
+///
+/// Port of `bump_reds_quadratic` in `erts/emulator/beam/erl_arith.c:74-84`, OTP-29.1.1.
+#[inline(always)]
+pub fn mul_reduction_charge_words(left_words: usize, right_words: usize) -> u32 {
+    const MAX_REDUCTIONS: u32 = 4_000;
+    const MAX_SIZE: usize = 4_000 * 16;
+    if left_words >= MAX_SIZE || right_words >= MAX_SIZE {
+        MAX_REDUCTIONS
     } else {
-        (left_words.saturating_mul(right_words) / WORDS_PER_REDUCTION + 1) as u32
+        (left_words * right_words / 16 + 1) as u32
     }
 }
 
@@ -168,6 +173,10 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     }
     fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc_fragment_only(words)
+    }
+    #[inline(always)]
+    fn shrink_fragment_tail(&mut self, start: *mut u64, allocated: usize, used: usize) {
+        self.0.shrink_fragment_tail(start, allocated, used)
     }
     fn words_left(&self) -> Option<usize> {
         self.0.words_left()
@@ -434,26 +443,48 @@ pub fn sub<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H) -> ArithResult
 }
 /// `A * B`.
 pub fn mul<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H) -> ArithResult {
-    if as_float(a).is_some() || as_float(b).is_some() {
-        // Port of erts/emulator/beam/erl_arith.c:716 (erts_mixed_times), OTP-29.1.1.
-        return binary_arith(a, b, heap, |x, y| x * y, |x, y| x * y);
-    }
-    if let (Some(x), Some(y)) = (a.as_small(), b.as_small()) {
+    mul_with_charge(a, b, heap).0
+}
+
+/// Multiply and return the effort charge from the sizes used by tag dispatch.
+///
+/// Port of `erts_mixed_times` and `bump_reds_quadratic` in `erl_arith.c`, OTP-29.1.1.
+#[inline(always)]
+pub fn mul_with_charge<H: HeapAlloc + ?Sized>(
+    a: Term,
+    b: Term,
+    heap: &mut H,
+) -> (ArithResult, u32) {
+    let a_small = a.as_small();
+    let b_small = b.as_small();
+    if let (Some(x), Some(y)) = (a_small, b_small) {
         let need_words = small_product_heap_words(x, y);
-        return TermBuilder::new(&mut HeapProxy(heap))
+        let result = TermBuilder::new(heap)
             .small_times(x, y)
             .map_err(|error| construction_error(error, need_words));
+        return (result, 0);
     }
     // Port of erts/emulator/beam/erl_arith.c:716 (erts_mixed_times), OTP-29.1.1.
-    // Let the tag dispatch decode boxed headers once inside the direct digit path.
-    match TermBuilder::new(&mut HeapProxy(heap)).bignum_times(a, b) {
+    let mut operand_sizes = [0; 2];
+    let result =
+        TermBuilder::new(heap).bignum_times_with_sizes(a, b, a_small, b_small, &mut operand_sizes);
+    let charge = if operand_sizes[0] == 0 || operand_sizes[1] == 0 {
+        0
+    } else {
+        mul_reduction_charge_words(operand_sizes[0], operand_sizes[1])
+    };
+    let result = match result {
         Ok(result) => Ok(result),
+        Err(TermError::BadArg) if as_float(a).is_some() || as_float(b).is_some() => {
+            return (binary_arith(a, b, heap, |x, y| x * y, |x, y| x * y), 0);
+        }
         Err(TermError::HeapFull) => Err(ArithError::HeapFull {
             need_words: bignum_product_heap_words(a, b),
         }),
         Err(TermError::BadArg) => Err(ArithError::Badarith),
         Err(error) => Err(construction_error(error, 0)),
-    }
+    };
+    (result, charge)
 }
 /// `A / B`, always a float.
 pub fn fdiv<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H) -> ArithResult {

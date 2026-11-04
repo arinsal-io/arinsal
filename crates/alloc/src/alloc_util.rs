@@ -1074,6 +1074,13 @@ impl AllocUtil {
         self.class_stats[0].blocks.current + self.class_stats[1].blocks.current
     }
 
+    /// Payload bytes of the block an allocation of `size` bytes gets: the block is at least
+    /// `min_block_size` (a free block must hold its tree node), so a small fixed-size type's
+    /// block reports more than was asked for when it is read back from its header.
+    pub(crate) fn payload_capacity(&self, size: usize) -> usize {
+        block_size(size, self.strategy).map_or(size, |block| block - BLOCK_HEADER)
+    }
+
     /// Allocates a payload of `size` bytes.
     /// Port of `erts_alcu_alloc`, `erl_alloc_util.c:2377`, OTP-29.1.1.
     #[inline]

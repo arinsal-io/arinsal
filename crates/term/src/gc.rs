@@ -836,7 +836,13 @@ impl ProcessHeap {
         self.htop_index()
             .saturating_add(self.stack_words())
             .saturating_add(self.old_htop)
-            .saturating_add(self.fragments.iter().map(|f| f.len()).sum::<usize>())
+            .saturating_add(
+                self.fragments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fragment)| self.fragment_used_words(index, fragment))
+                    .sum::<usize>(),
+            )
     }
 
     /// Return whether initialized process storage contains a direct pointer into an area.
@@ -871,11 +877,11 @@ impl ProcessHeap {
         ) {
             return true;
         }
-        self.fragments.iter().any(|fragment| {
+        self.fragments.iter().enumerate().any(|(index, fragment)| {
             Self::any_heap_reference_words(
                 fragment.as_ptr(),
                 0,
-                fragment.len(),
+                self.fragment_used_words(index, fragment),
                 true,
                 &mut is_area_pointer,
             )
@@ -950,9 +956,9 @@ impl ProcessHeap {
         let last = first + (words - 1) * 8;
         let young = self.words.as_ptr() as usize;
         let in_young = first >= young && last < young + self.words.len() * 8;
-        let in_fragment = self.fragments.iter().any(|fragment| {
+        let in_fragment = self.fragments.iter().enumerate().any(|(index, fragment)| {
             let start = fragment.as_ptr() as usize;
-            first >= start && last < start + fragment.len() * 8
+            first >= start && last < start + self.fragment_used_words(index, fragment) * 8
         });
         assert!(
             in_young || in_fragment || self.detached,
@@ -969,9 +975,10 @@ impl ProcessHeap {
         let address = (term.bits() & !7) as usize;
         self.words.contains_initialized(address, self.htop_index())
             || self.old_words.contains_initialized(address, self.old_htop)
-            || self.fragments.iter().any(|fragment| {
+            || self.fragments.iter().enumerate().any(|(index, fragment)| {
                 let start = fragment.as_ptr() as usize;
-                address >= start && address < start.saturating_add(fragment.len() * 8)
+                address >= start
+                    && address < start.saturating_add(self.fragment_used_words(index, fragment) * 8)
             })
     }
 
@@ -988,7 +995,7 @@ impl ProcessHeap {
         {
             return true;
         }
-        index.sync(&self.fragments);
+        index.sync(self);
         index
             .ranges
             .range(..=address)
@@ -1008,6 +1015,8 @@ impl ProcessHeap {
     /// target's young heap, fragments and off-heap lists never see it. Terms built meanwhile
     /// live only until `end_detached`.
     pub fn begin_detached(&mut self) {
+        self.sync_mbuf_fast();
+        self.mbuf_fast = crate::heap::MbufFast::default();
         self.owners.detached = Some(Box::new(VecHeap::new()));
         self.detached = true;
     }
@@ -1021,6 +1030,7 @@ impl ProcessHeap {
     pub fn end_detached(&mut self) {
         self.detached = false;
         self.owners.detached = None;
+        self.rebuild_mbuf_fast();
     }
 
     /// Total words in the contiguous young heap and stack allocation.
@@ -1037,7 +1047,7 @@ impl ProcessHeap {
 
     /// Young heap, old heap, and fragment capacity in words.
     pub fn total_heap_size_words(&self) -> usize {
-        self.heap_size_words() + self.old_words.len() + self.fragment_words as usize
+        self.heap_size_words() + self.old_words.len() + self.fragment_words
     }
 
     /// Words allocated on the active heap since the high-water mark (`p->htop - p->high_water`).
@@ -1083,7 +1093,7 @@ impl ProcessHeap {
     pub fn young_gen_usage(&self) -> usize {
         let abandoned = self.abandoned_heap().map_or(0, |abandoned| abandoned.used);
         self.htop_index()
-            .saturating_add(self.fragment_words as usize)
+            .saturating_add(self.fragment_words)
             .saturating_add(abandoned)
     }
 
@@ -1135,13 +1145,12 @@ impl ProcessHeap {
         if self.abandoned_heap().is_some() {
             // Port of erl_gc.c:546-558: the active heap already is a fragment; it joins
             // the mbuf list.
-            self.fragment_words = self
-                .fragment_words
-                .saturating_add(u32::try_from(used).unwrap_or(u32::MAX));
-            self.fragments.push(crate::heap::Fragment::Block {
-                memory: abandoned.into_alloc_block(),
-                used,
-            });
+            self.fragment_words += used;
+            let memory = abandoned.into_alloc_block();
+            let index = self.fragments.len();
+            self.fragments
+                .push(crate::heap::Fragment::Block { memory, used });
+            self.set_mbuf_fast(index);
         } else {
             self.abandoned = true;
             self.fragments.push(crate::heap::Fragment::Abandoned {
@@ -1168,7 +1177,7 @@ impl ProcessHeap {
 
     /// Words held in heap fragments.
     pub fn fragment_words(&self) -> usize {
-        self.fragments.iter().map(|fragment| fragment.len()).sum()
+        self.fragment_words
     }
 
     /// Allocated and block sizes behind `process_info(garbage_collection_info)`.
@@ -1181,8 +1190,11 @@ impl ProcessHeap {
             mbuf_size: self
                 .fragments
                 .iter()
-                .filter(|fragment| !matches!(fragment, crate::heap::Fragment::Abandoned { .. }))
-                .map(|fragment| fragment.len())
+                .enumerate()
+                .filter(|(_, fragment)| {
+                    !matches!(fragment, crate::heap::Fragment::Abandoned { .. })
+                })
+                .map(|(index, fragment)| self.fragment_used_words(index, fragment))
                 .sum(),
             recent_size: abandoned
                 .map_or(self.high_water_index(), |abandoned| abandoned.high_water),
@@ -1277,7 +1289,7 @@ impl ProcessHeap {
     /// Port of erl_gc.h:132-139 (`ERTS_IS_GC_DESIRED`), OTP-29.1.1.
     #[inline(always)]
     pub fn gc_desired(&self) -> bool {
-        self.bif_free_words() < self.fragment_words as usize
+        self.bif_free_words() < self.fragment_words
     }
 
     /// Whether a term points into the old generation.
@@ -1312,10 +1324,17 @@ impl ProcessHeap {
                 if word & 3 == 1 || word & 3 == 2 {
                     let address = (word & !7) as usize;
                     if address >= young_start && address < young_end
-                        || self.fragments.iter().any(|fragment| {
-                            let start = fragment.as_ptr() as usize;
-                            address >= start && address < start + fragment.len() * 8
-                        })
+                        || self
+                            .fragments
+                            .iter()
+                            .enumerate()
+                            .any(|(fragment_index, fragment)| {
+                                let start = fragment.as_ptr() as usize;
+                                address >= start
+                                    && address
+                                        < start
+                                            + self.fragment_used_words(fragment_index, fragment) * 8
+                            })
                     {
                         return false;
                     }
@@ -1455,6 +1474,7 @@ impl ProcessHeap {
         min_free: usize,
         messages: &mut [GcMessageRoot<'_>],
     ) -> Result<GcStats, TermError> {
+        self.sync_mbuf_fast();
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
@@ -1472,7 +1492,8 @@ impl ProcessHeap {
         });
         let mature_words =
             abandoned.map_or(self.high_water_index(), |abandoned| abandoned.high_water);
-        let fragments = (self.fragment_words as usize)
+        let fragments = self
+            .fragment_words
             .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used))
             .saturating_add(message_words);
         #[cfg(debug_assertions)]
@@ -1480,9 +1501,10 @@ impl ProcessHeap {
             let mut ranges = self
                 .fragments
                 .iter()
-                .map(|fragment| {
+                .enumerate()
+                .map(|(index, fragment)| {
                     let start = fragment.as_ptr() as usize;
-                    (start, start + fragment.len() * 8)
+                    (start, start + self.fragment_used_words(index, fragment) * 8)
                 })
                 .collect::<Vec<_>>();
             ranges.sort_unstable_by_key(|&(start, _)| start);
@@ -1552,6 +1574,7 @@ impl ProcessHeap {
             owners: std::mem::take(&mut self.owners),
             fragments: std::mem::take(&mut self.fragments),
         };
+        self.mbuf_fast = crate::heap::MbufFast::default();
         self.refresh_native_heap_bounds();
         self.set_htop_index(0);
         self.set_stop_index(capacity - stack);
@@ -1759,6 +1782,7 @@ impl ProcessHeap {
         }
         self.bin_vheap_size =
             next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
+        self.rebuild_mbuf_fast();
         Ok(stats)
     }
 
@@ -1863,6 +1887,7 @@ impl ProcessHeap {
         self.request_full_sweep();
         let stats = self.collect_with_root_slots(roots, extra, 0, &mut [])?;
         self.fragments.clear();
+        self.mbuf_fast = crate::heap::MbufFast::default();
         self.abandoned = false;
         self.fragment_words = 0;
         let exact = self
@@ -2583,16 +2608,27 @@ pub struct FragmentIndex {
 impl FragmentIndex {
     /// Fragments are only ever appended between collections; a shorter list
     /// means a collection ran and the index is rebuilt.
-    fn sync(&mut self, fragments: &[crate::heap::Fragment]) {
-        if fragments.len() < self.synced {
+    fn sync(&mut self, heap: &ProcessHeap) {
+        if heap.fragments.len() < self.synced {
             self.synced = 0;
             self.ranges.clear();
         }
-        for fragment in &fragments[self.synced..] {
+        for (index, fragment) in heap.fragments.iter().enumerate().skip(self.synced) {
             let start = fragment.as_ptr() as usize;
-            self.ranges
-                .insert(start, start.saturating_add(fragment.len() * 8));
+            self.ranges.insert(
+                start,
+                start.saturating_add(heap.fragment_used_words(index, fragment) * 8),
+            );
         }
-        self.synced = fragments.len();
+        if heap.mbuf_fast.base != 0 && heap.mbuf_fast.fragment_index < self.synced {
+            let index = heap.mbuf_fast.fragment_index;
+            let fragment = &heap.fragments[index];
+            let start = fragment.as_ptr() as usize;
+            self.ranges.insert(
+                start,
+                start.saturating_add(heap.fragment_used_words(index, fragment) * 8),
+            );
+        }
+        self.synced = heap.fragments.len();
     }
 }

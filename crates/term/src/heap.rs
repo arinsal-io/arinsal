@@ -54,6 +54,14 @@ pub(crate) enum Fragment {
     Node(crate::message::NodeFragment),
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MbufFast {
+    pub(crate) base: usize,
+    alloc_size: usize,
+    pub(crate) used_size: usize,
+    pub(crate) fragment_index: usize,
+}
+
 impl Fragment {
     pub(crate) fn as_ptr(&self) -> *const u64 {
         match self {
@@ -388,6 +396,13 @@ pub trait HeapAlloc {
     /// Give back the unused words `[start, end)` at the end of the latest allocation.
     // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1.
     fn release(&mut self, _end: *mut u64, _start: *mut u64) {}
+    /// Trim a result built in the most recent fragment-only allocation.
+    ///
+    /// Port of `maybe_shrink` in `erts/emulator/beam/erl_arith.c:43-49`, OTP-29.1.1.
+    #[inline(always)]
+    fn shrink_fragment_tail(&mut self, start: *mut u64, allocated: usize, used: usize) {
+        self.release(start.wrapping_add(allocated), start.wrapping_add(used));
+    }
     /// The process' native ABI words (`c_p->htop`, `fcalls`, `freason`) when this allocator is
     /// a process heap; BIF contexts reach FCALLS and the failure words through it.
     #[inline(always)]
@@ -424,6 +439,10 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     }
     fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
         (**self).alloc_fragment_only(words)
+    }
+    #[inline(always)]
+    fn shrink_fragment_tail(&mut self, start: *mut u64, allocated: usize, used: usize) {
+        (**self).shrink_fragment_tail(start, allocated, used)
     }
     fn words_left(&self) -> Option<usize> {
         (**self).words_left()
@@ -1631,9 +1650,10 @@ pub struct ProcessHeap {
     /// so the frequent "is there one" question does not walk the fragment list.
     pub(crate) abandoned: bool,
     pub(crate) fragments: Vec<Fragment>,
-    /// Total word capacity in process heap fragments (`mbuf_sz` in erts).
-    /// Words in heap fragments (u32 keeps the hot heap struct within 128 bytes).
-    pub(crate) fragment_words: u32,
+    /// Cached current `p->mbuf` cursor, kept out of the fragment vector for its allocation path.
+    pub(crate) mbuf_fast: MbufFast,
+    /// Sum of used words in process heap fragments (`mbuf_sz` in erts).
+    pub(crate) fragment_words: usize,
     /// `F_DISABLE_GC` inverted: collection may run after a BIF (`Process.gc_enabled`).
     pub gc_enabled: bool,
     /// Whether the next collection is the epilogue of a BIF call that decided to collect
@@ -1870,6 +1890,7 @@ impl ProcessHeap {
             detached: false,
             abandoned: false,
             fragments: Vec::new(),
+            mbuf_fast: MbufFast::default(),
             fragment_words: 0,
             gc_enabled: true,
             live_frags_armed: std::cell::Cell::new(false),
@@ -2184,7 +2205,7 @@ impl ProcessHeap {
     /// compares it.
     #[inline]
     pub fn mbuf_size(&self) -> usize {
-        self.fragment_words as usize
+        self.fragment_words
     }
     /// Address of the word at `index` in the young heap block.
     #[inline]
@@ -2213,10 +2234,69 @@ impl ProcessHeap {
     pub fn heap_fragment(&mut self, words: usize) -> *mut u64 {
         self.heap_fragment_with_extra(words, 0)
     }
+
+    /// Publish the cached `mbuf` used size to the corresponding fragment before a slow walk.
+    pub(crate) fn sync_mbuf_fast(&mut self) {
+        let mbuf = self.mbuf_fast;
+        if mbuf.base == 0 {
+            return;
+        }
+        if let Some(Fragment::Block { memory, used }) = self.fragments.get_mut(mbuf.fragment_index)
+        {
+            debug_assert_eq!(memory.as_ptr() as usize, mbuf.base);
+            *used = mbuf.used_size;
+        }
+    }
+
+    pub(crate) fn set_mbuf_fast(&mut self, index: usize) {
+        self.sync_mbuf_fast();
+        self.mbuf_fast = match self.fragments.get(index) {
+            Some(Fragment::Block { memory, used }) => MbufFast {
+                base: memory.as_ptr() as usize,
+                alloc_size: memory.len(),
+                used_size: *used,
+                fragment_index: index,
+            },
+            _ => MbufFast::default(),
+        };
+    }
+
+    /// Rebuild the fast cursor after an operation replaces or adopts the fragment list.
+    pub(crate) fn rebuild_mbuf_fast(&mut self) {
+        let index = self
+            .fragments
+            .iter()
+            .rposition(|fragment| matches!(fragment, Fragment::Block { .. }));
+        if let Some(index) = index {
+            self.set_mbuf_fast(index);
+        } else {
+            self.mbuf_fast = MbufFast::default();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fragment_used_words(&self, index: usize, fragment: &Fragment) -> usize {
+        if self.mbuf_fast.base != 0
+            && self.mbuf_fast.fragment_index == index
+            && let Fragment::Block { .. } = fragment
+        {
+            return self.mbuf_fast.used_size;
+        }
+        fragment.len()
+    }
+
     /// Allocate a side fragment with spare capacity for subsequent BIF allocations.
     ///
     /// Port of erts/emulator/beam/utils.c:135-189 (`erts_heap_alloc`), OTP-29.1.1.
     pub fn heap_fragment_with_extra(&mut self, words: usize, extra: usize) -> *mut u64 {
+        // Port of the MBUF fast path in erts/emulator/beam/utils.c:148-154, OTP-29.1.1.
+        let mbuf = &mut self.mbuf_fast;
+        if mbuf.base != 0 && words <= mbuf.alloc_size - mbuf.used_size {
+            let ret = (mbuf.base as *mut u64).wrapping_add(mbuf.used_size);
+            mbuf.used_size += words;
+            self.fragment_words += words;
+            return ret;
+        }
         if self.detached
             && let Some(ptr) = self
                 .owners
@@ -2225,17 +2305,6 @@ impl ProcessHeap {
                 .and_then(|heap| heap.alloc_with_extra(words, extra))
         {
             return ptr;
-        }
-        // ERTS reuses the newest fragment before allocating another one.
-        self.fragment_words = self
-            .fragment_words
-            .saturating_add(u32::try_from(words).unwrap_or(u32::MAX));
-        if let Some(Fragment::Block { memory, used }) = self.fragments.last_mut()
-            && words <= memory.len() - *used
-        {
-            let at = *used;
-            *used += words;
-            return memory.as_mut_slice()[at..].as_mut_ptr();
         }
         let block_words = words.checked_add(extra).unwrap_or(words);
         // Port of erts/emulator/beam/utils.c:173-186 (`erts_heap_alloc`), OTP-29.1.1.
@@ -2251,10 +2320,20 @@ impl ProcessHeap {
         }
         .expect("heap fragment allocation size is valid");
         let ptr = memory.as_mut_ptr();
+        let alloc_size = memory.len();
+        self.sync_mbuf_fast();
+        let fragment_index = self.fragments.len();
         self.fragments.push(Fragment::Block {
             memory,
             used: words,
         });
+        self.mbuf_fast = MbufFast {
+            base: ptr as usize,
+            alloc_size,
+            used_size: words,
+            fragment_index,
+        };
+        self.fragment_words += words;
         ptr
     }
     /// Move a standalone message heap into this process without copying its terms.
@@ -2270,12 +2349,10 @@ impl ProcessHeap {
         }
         // Dirty-shadow process heaps retain their separate ABI object until ownership moves.
         // Port of erts_flush_dirty_shadow_proc and erts_heap_alloc, OTP-29.1.1.
-        let adopted_words = source
-            .htop_index()
-            .saturating_add(source.fragment_words as usize);
-        self.fragment_words = self
-            .fragment_words
-            .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
+        source.sync_mbuf_fast();
+        self.sync_mbuf_fast();
+        let adopted_words = source.htop_index() + source.fragment_words;
+        self.fragment_words += adopted_words;
         let used = source.htop_index();
         let block = std::mem::take(&mut source.words).into_alloc_block();
         source.abi.htop = std::ptr::null_mut();
@@ -2286,6 +2363,7 @@ impl ProcessHeap {
             used,
         });
         self.fragments.append(&mut source.fragments);
+        self.rebuild_mbuf_fast();
         self.abandoned |= source.abandoned;
         self.absorb_fragment_owners(&mut source);
         Ok(())
@@ -2295,14 +2373,15 @@ impl ProcessHeap {
     // Port of erts_save_message_in_proc, OTP-29.1.1.
     pub fn adopt_message_heap_block(&mut self, source: crate::message::MessageHeapBlock) {
         let (block, used, off_heap, bin_vheap) = source.into_parts();
-        self.fragment_words = self
-            .fragment_words
-            .saturating_add(u32::try_from(used).unwrap_or(u32::MAX));
+        self.sync_mbuf_fast();
+        self.fragment_words += used;
         let used = used.min(block.len());
+        let fragment_index = self.fragments.len();
         self.fragments.push(Fragment::Block {
             memory: block,
             used,
         });
+        self.set_mbuf_fast(fragment_index);
         self.absorb_off_heap(off_heap, bin_vheap);
     }
 
@@ -2313,9 +2392,7 @@ impl ProcessHeap {
     pub fn adopt_message_node(&mut self, mut fragment: crate::message::NodeFragment) {
         let (off_heap, bin_vheap) = fragment.take_owners();
         self.absorb_off_heap(off_heap, bin_vheap);
-        self.fragment_words = self
-            .fragment_words
-            .saturating_add(u32::try_from(fragment.len()).unwrap_or(u32::MAX));
+        self.fragment_words += fragment.len();
         self.fragments.push(Fragment::Node(fragment));
     }
 
@@ -2466,8 +2543,9 @@ impl ProcessHeap {
     pub fn message_data_size(&self) -> usize {
         self.fragments
             .iter()
-            .filter_map(|fragment| match fragment {
-                Fragment::Block { used, .. } => Some(*used),
+            .enumerate()
+            .filter_map(|(index, fragment)| match fragment {
+                Fragment::Block { .. } => Some(self.fragment_used_words(index, fragment)),
                 Fragment::Node(fragment) => Some(fragment.len()),
                 Fragment::Abandoned { .. } => None,
             })
@@ -2690,6 +2768,7 @@ impl ProcessHeap {
         start: *mut u64,
         count: usize,
     ) -> Result<(&mut [u64], &mut LazyOwners, &mut u64), TermError> {
+        self.sync_mbuf_fast();
         if self.detached {
             return Err(TermError::Unsupported("detached heap decode slice"));
         }
@@ -2762,6 +2841,19 @@ impl HeapAlloc for ProcessHeap {
             }
             return;
         }
+        let mbuf = &mut self.mbuf_fast;
+        let mbuf_end = mbuf.base + mbuf.used_size * std::mem::size_of::<u64>();
+        if mbuf.base != 0
+            && end as usize == mbuf_end
+            && (start as usize) >= mbuf.base
+            && (start as usize) <= mbuf_end
+        {
+            let new_used = (start as usize - mbuf.base) / std::mem::size_of::<u64>();
+            let released = mbuf.used_size - new_used;
+            mbuf.used_size = new_used;
+            self.fragment_words -= released;
+            return;
+        }
         let base = self.words.as_ptr() as usize;
         let top = base + self.htop_index() * 8;
         let address = start as usize;
@@ -2780,9 +2872,7 @@ impl HeapAlloc for ProcessHeap {
             && (address - fragment_start).is_multiple_of(8)
         {
             let new_used = (address - fragment_start) / 8;
-            self.fragment_words = self
-                .fragment_words
-                .saturating_sub(u32::try_from(*used - new_used).unwrap_or(u32::MAX));
+            self.fragment_words -= *used - new_used;
             *used = new_used;
         }
     }
@@ -2828,6 +2918,18 @@ impl HeapAlloc for ProcessHeap {
     fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
         // HeapFragOnlyAlloc reserves 512 extra words outside Valgrind builds.
         Some(self.heap_fragment_with_extra(words, 512))
+    }
+    #[inline(always)]
+    fn shrink_fragment_tail(&mut self, start: *mut u64, allocated: usize, used: usize) {
+        if self.detached {
+            if let Some(heap) = self.owners.detached.as_deref_mut() {
+                heap.shrink_fragment_tail(start, allocated, used);
+            }
+            return;
+        }
+        let released = allocated - used;
+        self.mbuf_fast.used_size -= released;
+        self.fragment_words -= released;
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         if self.detached
@@ -3834,9 +3936,27 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     ///
     /// Port of `erts_mixed_times` in erts/emulator/beam/erl_arith.c and `big_times` in
     /// erts/emulator/beam/big.c, OTP-29.1.1.
+    #[inline(always)]
     pub fn bignum_times(&mut self, a: Term, b: Term) -> Result<Term, TermError> {
-        if let Some(small) = a.as_small() {
-            return b
+        let mut operand_sizes = [0; 2];
+        self.bignum_times_with_sizes(a, b, a.as_small(), b.as_small(), &mut operand_sizes)
+    }
+
+    /// Multiply and return the operand sizes already read by the tag dispatch.
+    ///
+    /// Port of `erts_mixed_times` and `big_times` in `erl_arith.c` and `big.c`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn bignum_times_with_sizes(
+        &mut self,
+        a: Term,
+        b: Term,
+        a_small: Option<i64>,
+        b_small: Option<i64>,
+        operand_sizes: &mut [usize; 2],
+    ) -> Result<Term, TermError> {
+        *operand_sizes = [0; 2];
+        match (a_small, b_small) {
+            (Some(small), None) => b
                 .with_bignum_parts_mut(|digits, negative| {
                     if small == 0 {
                         return Ok(Term::small(0).unwrap());
@@ -3844,19 +3964,19 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                     if small == 1 {
                         return Ok(b);
                     }
+                    let digit_count = digits.len();
+                    operand_sizes[0] = 1;
+                    operand_sizes[1] = digit_count;
                     let temporary = small_to_big_words(small);
                     self.bignum_product(
                         &temporary[1..],
                         digits,
                         (small < 0) != negative,
-                        digits.len() + 3,
+                        digit_count + 3,
                     )
                 })
-                .ok_or(TermError::BadArg)?;
-        }
-
-        if let Some(small) = b.as_small() {
-            return a
+                .ok_or(TermError::BadArg)?,
+            (None, Some(small)) => a
                 .with_bignum_parts_mut(|digits, negative| {
                     if small == 0 {
                         return Ok(Term::small(0).unwrap());
@@ -3864,32 +3984,30 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                     if small == 1 {
                         return Ok(a);
                     }
+                    let digit_count = digits.len();
+                    operand_sizes[0] = digit_count;
+                    operand_sizes[1] = 1;
                     let temporary = small_to_big_words(small);
                     self.bignum_product(
                         digits,
                         &temporary[1..],
                         negative != (small < 0),
-                        digits.len() + 3,
+                        digit_count + 3,
                     )
                 })
-                .ok_or(TermError::BadArg)?;
-        }
-
-        if a.bits() == b.bits() {
-            return a
-                .with_bignum_parts_mut(|digits, _negative| {
-                    self.bignum_product(digits, digits, false, digits.len() * 2 + 1)
+                .ok_or(TermError::BadArg)?,
+            (None, None) => a
+                .with_bignum_parts_mut(|x, x_negative| {
+                    b.with_bignum_parts_mut(|y, y_negative| {
+                        operand_sizes[0] = x.len();
+                        operand_sizes[1] = y.len();
+                        self.bignum_product(x, y, x_negative != y_negative, x.len() + y.len() + 1)
+                    })
+                    .ok_or(TermError::BadArg)?
                 })
-                .ok_or(TermError::BadArg)?;
+                .ok_or(TermError::BadArg)?,
+            (Some(_), Some(_)) => Err(TermError::BadArg),
         }
-
-        a.with_bignum_parts_mut(|x, x_negative| {
-            b.with_bignum_parts_mut(|y, y_negative| {
-                self.bignum_product(x, y, x_negative != y_negative, x.len() + y.len() + 1)
-            })
-        })
-        .ok_or(TermError::BadArg)?
-        .ok_or(TermError::BadArg)?
     }
 
     fn bignum_product(
@@ -3899,12 +4017,9 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         negative: bool,
         allocated_words: usize,
     ) -> Result<Term, TermError> {
-        let result_words = x
-            .len()
-            .checked_add(y.len())
-            .and_then(|digits| digits.checked_add(1))
-            .ok_or(TermError::SystemLimit)?;
-        let allocated_words = allocated_words.max(result_words);
+        // Port of erl_arith.c:43-49 (`maybe_shrink`) and big.c:3827 (`big_times`), OTP-29.1.1.
+        // The caller has already computed BIG_NEED_SIZE from the operand sizes.
+        // Keep that exact reservation and trim only after big_norm reports the result arity.
         let p = self
             .heap
             .alloc_fragment_only(allocated_words)
@@ -3920,7 +4035,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                 MAX_SMALL as u64
             };
             if magnitude <= small_magnitude {
-                self.heap.release(p.wrapping_add(allocated_words), p);
+                self.heap.shrink_fragment_tail(p, allocated_words, 0);
                 let value = if negative {
                     -(magnitude as i64)
                 } else {
@@ -3931,7 +4046,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
 
         if result_digits > 65_535 {
-            self.heap.release(p.wrapping_add(allocated_words), p);
+            self.heap.shrink_fragment_tail(p, allocated_words, 0);
             return Err(TermError::SystemLimit);
         }
 
@@ -3942,7 +4057,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         let used_words = result_digits + 1;
         if used_words < allocated_words {
             self.heap
-                .release(p.wrapping_add(allocated_words), p.wrapping_add(used_words));
+                .shrink_fragment_tail(p, allocated_words, used_words);
         }
         Ok(Term::from_ptr(p, 2))
     }
@@ -5401,7 +5516,8 @@ impl Term {
 #[cfg(test)]
 mod heap_block_tests {
     use super::{
-        HeapAlloc, HeapReservation, ProcessHeap, Term, TermBuilder, TermError, TermKind, VecHeap,
+        HeapAlloc, HeapReservation, MbufFast, ProcessHeap, Term, TermBuilder, TermError, TermKind,
+        VecHeap,
     };
 
     #[test]
@@ -5450,6 +5566,7 @@ mod heap_block_tests {
                         std::hint::black_box(heap.heap_fragment(1 + (next() % 12) as usize));
                     }
                     let mut fragments = std::mem::take(&mut heap.fragments);
+                    heap.mbuf_fast = MbufFast::default();
                     heap.release_fragments(&mut fragments);
                     heap.fragments = fragments;
                     heap.fragment_words = 0;
