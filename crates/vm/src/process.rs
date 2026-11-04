@@ -5349,37 +5349,10 @@ impl Process {
         }
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
-        if let Some(runtime) = self.runtime {
-            // Node monitors live in the process monitor tree; the global table is
-            // consulted only when this process registered one (dist.c:6732).
-            if resources & proc_flags::NODE_MON != 0 {
-                crate::node_tables::lock().forget_node_monitors(ctx.pid());
-            }
-            // Every suspend this process holds is released at its target (erl_process.c:13894).
-            crate::suspend::release_on_exit(self, ctx);
-            crate::suspend::down_on_exit(self, ctx);
-            if let Ok(scheduler) = runtime.scheduler() {
-                // Port of erts/emulator/beam/erl_process.c:14068 (erts_proc_exit_handle_link): the
-                // exit walks the process's own links, the port ones go to `erts_port_exit`.
-                let port_links: Vec<u64> = self
-                    .cold
-                    .as_ref()
-                    .map(|cold| {
-                        cold.links
-                            .iter()
-                            .filter(|link| link.kind() == crate::monitor_link::node_type::LINK_PORT)
-                            .map(|link| crate::proc_create::port_of_link_key(link.other()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !port_links.is_empty() {
-                    crate::port::owner_exit(runtime, scheduler, ctx.pid(), reason, &port_links);
-                }
-                // Port of erts/emulator/beam/erl_process.c:14415-14417 (F_USING_DDLL).
-                if resources & proc_flags::DDLL != 0 {
-                    crate::ddll::proc_dead(scheduler, ctx.pid());
-                }
-            }
+        // Node monitors live in the process monitor tree; the global table is
+        // consulted only when this process registered one (dist.c:6732).
+        if resources & proc_flags::NODE_MON != 0 {
+            crate::node_tables::lock().forget_node_monitors(ctx.pid());
         }
     }
 
@@ -5520,7 +5493,15 @@ impl Process {
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0 {
             crate::trace::clear(self, ctx.pid());
         }
-        crate::trace::clear_save_calls(self);
+        let resources = proc_flags::resources_to_clean(ctx.exit_flags());
+        if resources & proc_flags::DDLL != 0
+            && let Some(runtime) = self.runtime
+            && let Ok(scheduler) = runtime.scheduler()
+        {
+            // Port of erts/emulator/beam/erl_process.c:14415-14417
+            // (ERTS_CONTINUE_EXIT_FREE), OTP-29.1.1.
+            crate::ddll::proc_dead(scheduler, ctx.pid());
+        }
         // ERTS_CONTINUE_EXIT_FREE releases the registered name before removing the pid from
         // the process table. The name index is stored on the process-table entry.
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::REG != 0
@@ -5547,24 +5528,26 @@ impl Process {
         // Further publishes fail with `NoProcess` and the watcher synthesizes DOWN.
         // Signals already queued are installed before we notify.
         self.absorb_exit_signals(ctx);
-        let Some(mut cold) = self.cold.take() else {
+        let Some(cold) = self.cold.as_mut() else {
             return;
         };
-        // Port of erts/emulator/beam/erl_process.c:13918 (origin ERTS_MON_TYPE_PORT),
-        // OTP-29.1.1: exit demonitors each port the process was watching.
-        for monitor in cold.monitors.iter() {
-            if let Some(crate::proc_create::OriginMonitor::Port {
-                port_id: Some(port_id),
-                ..
-            }) = monitor.origin_state()
-            {
-                crate::port::demonitor_port(self, ctx.pid(), *port_id, monitor.reference());
+        let links = cold.links.drain();
+        for node in links {
+            if node.view().unlinking() != 0 {
+                continue;
             }
-        }
-        for node in cold.links.drain() {
-            if node.view().unlinking() != 0
-                || node.view().kind() == crate::monitor_link::node_type::LINK_PORT
-            {
+            if node.view().kind() == crate::monitor_link::node_type::LINK_PORT {
+                if let Some(runtime) = self.runtime
+                    && let Ok(scheduler) = runtime.scheduler()
+                {
+                    crate::port::owner_exit(
+                        runtime,
+                        scheduler,
+                        ctx.pid(),
+                        reason,
+                        &[crate::proc_create::port_of_link_key(node.view().other())],
+                    );
+                }
                 continue;
             }
             let pid = Pid::from_data(node.view().other());
@@ -5585,10 +5568,14 @@ impl Process {
                 let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(Box::new(message)));
             }
         }
+        // Suspend monitors are handled with the process monitor phase, after links.
+        crate::suspend::release_on_exit(self, ctx);
+        crate::suspend::down_on_exit(self, ctx);
         // Port of erts/emulator/beam/erl_process.c:13829 (erts_proc_exit_handle_monitor,
         // ERTS_MON_TYPE_RESOURCE): erts_fire_nif_monitor.
-        if !cold.resource_monitors.is_empty()
-            && let Some(exiting) = ctx.pid().to_term()
+        if let Some(exiting) = ctx.pid().to_term()
+            && let Some(cold) = self.cold.as_ref()
+            && !cold.resource_monitors.is_empty()
         {
             for monitor in cold.resource_monitors.values() {
                 monitor.fire(exiting);
@@ -5596,29 +5583,86 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor): the target
         // halves, of remote origins in the monitor tree and of local ones in the list.
-        let mut monitors = std::mem::take(&mut cold.monitors);
-        let mut targets: smallvec::SmallVec<[_; 4]> = smallvec::SmallVec::new();
-        for monitor in monitors.drain() {
+        let monitors = self
+            .cold
+            .as_mut()
+            .expect("process cold part")
+            .monitors
+            .drain();
+        for monitor in monitors {
             if monitor.view().is_target() {
-                targets.push(monitor);
+                let half = monitor.view();
+                let reference = half.reference();
+                if half.kind() == crate::monitor_link::node_type::MONITOR_PORT {
+                    if let Some(runtime) = self.runtime.as_ref() {
+                        crate::port::fire_port_monitor(runtime, half.other(), reference);
+                    }
+                    continue;
+                }
+                let pid = Pid::from_data(half.other());
+                if let Some(runtime) = self.runtime.as_ref()
+                    && crate::dist::forward_monitor_down_if_proxy(
+                        runtime,
+                        pid,
+                        ctx.pid(),
+                        reference,
+                        reason,
+                    )
+                {
+                    continue;
+                }
+                if reason.is_pointer() {
+                    if let Ok(message) =
+                        down_message_on_sender(self, reference, half.info(), ctx.pid(), reason)
+                    {
+                        let _ = ctx.signal(
+                            pid,
+                            arinsal_sched::Signal::MonitorDownMsg {
+                                reference,
+                                message: Box::new(message),
+                            },
+                        );
+                    }
+                } else {
+                    let _ = ctx.signal(
+                        pid,
+                        arinsal_sched::Signal::MonitorDownImmediate {
+                            reference,
+                            reason: reason.word(),
+                        },
+                    );
+                }
                 continue;
             }
-            // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor, origin
-            // ERTS_MON_TYPE_PROC), OTP-29.1.1: the origin half goes to the target as a
-            // demonitor signal, so the target drops its half.
-            if let Some(crate::proc_create::OriginMonitor::Process(_)) = monitor.state() {
-                let target = Pid::from_data(monitor.view().other());
-                let shared = monitor.into_shared();
-                let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
+            match monitor.state() {
+                Some(crate::proc_create::OriginMonitor::Process(_)) => {
+                    let target = Pid::from_data(monitor.view().other());
+                    let shared = monitor.into_shared();
+                    let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
+                }
+                Some(crate::proc_create::OriginMonitor::Port {
+                    port_id: Some(port_id),
+                    ..
+                }) => {
+                    crate::port::demonitor_port(
+                        self,
+                        ctx.pid(),
+                        *port_id,
+                        monitor.view().reference(),
+                    );
+                }
+                _ => {}
             }
         }
-        targets.extend(cold.lt_monitors.drain());
-        for target in targets {
+        let lt_monitors = self
+            .cold
+            .as_mut()
+            .expect("process cold part")
+            .lt_monitors
+            .drain();
+        for target in lt_monitors {
             let half = target.view();
             let reference = half.reference();
-            // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor, target
-            // ERTS_MON_TYPE_PORT): a port that monitors the exiting process runs its driver's
-            // `process_exit` callback.
             if half.kind() == crate::monitor_link::node_type::MONITOR_PORT {
                 if let Some(runtime) = self.runtime.as_ref() {
                     crate::port::fire_port_monitor(runtime, half.other(), reference);
@@ -5637,9 +5681,6 @@ impl Process {
             {
                 continue;
             }
-            // Port of erts/emulator/beam/erl_proc_sig_queue.c:2836-2900 (erts_proc_sig_send_monitor_down),
-            // OTP-29.1.1: an immediate reason travels in the signal and the origin builds the DOWN
-            // message; any other reason is copied into a DOWN message built here, on the sender.
             if reason.is_pointer() {
                 if let Ok(message) =
                     down_message_on_sender(self, reference, half.info(), ctx.pid(), reason)
@@ -5652,20 +5693,12 @@ impl Process {
                         },
                     );
                 }
-            } else if !reason.is_pointer() {
+            } else {
                 let _ = ctx.signal(
                     pid,
                     arinsal_sched::Signal::MonitorDownImmediate {
                         reference,
                         reason: reason.word(),
-                    },
-                );
-            } else if let Ok(message) = Message::copy_from(reason) {
-                let _ = ctx.signal(
-                    pid,
-                    arinsal_sched::Signal::MonitorDown {
-                        reference,
-                        reason: Box::new(message),
                     },
                 );
             }
@@ -8333,6 +8366,7 @@ impl Task for Process {
     // off-heap list, message queue, dictionary and the link and monitor state are freed by
     // the exiting scheduler, not when the last reference to the struct goes.
     fn delete_process(&mut self) {
+        crate::trace::clear_save_calls(self);
         self.heap = arinsal_term::ProcessHeap::with_words(0);
         self.cold = None;
         // The probe keeps a reference to this process; holding it past exit leaks the struct.
