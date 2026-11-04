@@ -71,7 +71,7 @@ pub struct LineBreakpointHelpers {
 /// collection test reads (`ERTS_IS_GC_DESIRED_INTERNAL`, instr_bif.cpp:488-523).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LightGcOffsets {
-    /// `Process.heap.fragment_words` (`mbuf_sz`), a 32-bit count of words.
+    /// `Process.heap.fragment_words` (`mbuf_sz`), a native-word count of words.
     pub fragment_words: u32,
     /// `Process.heap.owners`, an optional pointer to off-heap counters.
     pub owners_pointer: u32,
@@ -1252,7 +1252,7 @@ fn emit_call_light_bif_shared(
             encoder.ccmp_reg(Gpr::x(12), Gpr::x(13), NZCV_CF, Cond::Eq)?;
             encoder.sub_reg(Gpr::x(9), Gpr::x(20), Gpr::x(23), Shift::Lsl, 0)?;
             encoder.asr_imm(Gpr::x(9), Gpr::x(9), 3)?;
-            encoder.ldr_uoff(Gpr::w(11), Gpr::x(21), gc.fragment_words)?;
+            encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), gc.fragment_words)?;
             // Unless the binary test said "no collection" (LS), the flags force `lt`.
             encoder.ccmp_reg(Gpr::x(9), Gpr::x(11), NZCV_VF, Cond::Ls)
         })?;

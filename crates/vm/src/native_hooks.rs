@@ -236,11 +236,9 @@ fn with_fragment_alloc(
 fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bool) -> u64 {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:526-530 and
     // erts/emulator/beam/erl_arith.c:716-858 (emit_mul_body_shared, erts_mixed_times).
-    let result = with_fragment_alloc(process, left, right, |a, b, heap| {
-        arinsal_arith::mul(a, b, heap)
-    })
-    .map(raw);
-    let charge = arinsal_arith::mul_reduction_charge(left, right);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let (result, charge) = arinsal_arith::mul_with_charge(left, right, &mut heap);
+    let result = result.map(raw);
     // Port of erts/emulator/beam/bif.h (BUMP_REDS): the count never goes below zero.
     process.heap.abi.fcalls = process
         .heap

@@ -812,6 +812,10 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn release(&mut self, end: *mut u64, start: *mut u64) {
         HeapAlloc::release(self.0, end, start)
     }
+    #[inline(always)]
+    fn shrink_fragment_tail(&mut self, start: *mut u64, allocated: usize, used: usize) {
+        HeapAlloc::shrink_fragment_tail(self.0, start, allocated, used)
+    }
     fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
         HeapAlloc::release_needs_filler(self.0, end, start)
     }

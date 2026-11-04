@@ -238,13 +238,19 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         bits
     }
 
-    /// Take the msgq lock; a busy lock counts as contention like erts' failed trylock.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694, OTP-29.1.1.
-    fn lock_msgq(&self) -> (parking_lot::MutexGuard<'_, SignalQueue<T>>, usize) {
-        match self.msgq.try_lock() {
-            Some(queue) => (queue, 0),
-            None => (self.msgq.lock(), 1),
+    /// Take the msgq lock like `erts_proc_sig_queue_lock`: a busy lock counts as contention, a
+    /// free one cancels one. The contention counter lives under the lock.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10240 (erts_proc_sig_queue_lock), OTP-29.1.1.
+    fn lock_msgq(&self) -> parking_lot::MutexGuard<'_, SignalQueue<T>> {
+        if let Some(queue) = self.msgq.try_lock() {
+            if self.contention_count.load(Ordering::Relaxed) > 0 {
+                self.contention_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            return queue;
         }
+        let queue = self.msgq.lock();
+        self.contention_count.fetch_add(1, Ordering::Relaxed);
+        queue
     }
 
     /// Append an event, flushing the sender buffers first so it cannot overtake them.
@@ -252,7 +258,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     pub fn push(&self, value: T) {
         let signal = OwnedSignal::new(value);
         let nmsg = usize::from(non_message_signal(&signal));
-        let (mut queue, _) = self.lock_msgq();
+        let mut queue = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
@@ -288,7 +294,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             Ok(state) => return Ok(state),
             Err(signal) => signal,
         };
-        let (mut queue, contended) = self.lock_msgq();
+        let mut queue = self.lock_msgq();
+        self.maybe_install_buffers_locked(progress);
         if self.closed.load(Ordering::Relaxed) {
             return Err(signal);
         }
@@ -296,7 +303,6 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         queue.push_back_node(signal);
         let state = self.enqueued(1, nmsg);
         drop(queue);
-        self.note_contention(contended, progress);
         Ok(state)
     }
 
@@ -378,17 +384,16 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         self.install_buffers_locked(progress);
     }
 
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694, OTP-29.1.1.
-    fn note_contention(&self, retries: usize, progress: &Progress) {
-        if retries == 0 || !self.buffering_allowed.load(Ordering::Acquire) {
-            return;
-        }
-        let count = self.contention_count.fetch_add(retries, Ordering::AcqRel) + retries;
-        if count > BUFFER_CONTENTION_INSTALL_LIMIT {
-            let _queue = self.msgq.lock();
-            if self.buffering_allowed.load(Ordering::Acquire) && !self.buffers.is_occupied() {
-                self.install_buffers_locked(progress);
-            }
+    /// Install buffers once enough contention was counted; the caller holds the msgq lock.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10658 (erts_proc_sig_queue_maybe_install_buffers),
+    // OTP-29.1.1: the off-heap queue flag is `buffering_allowed`; the counter limit is checked
+    // right after the lock is taken, before the signal is enqueued.
+    fn maybe_install_buffers_locked(&self, progress: &Progress) {
+        if self.buffering_allowed.load(Ordering::Acquire)
+            && !self.buffers.is_occupied()
+            && self.contention_count.load(Ordering::Relaxed) > BUFFER_CONTENTION_INSTALL_LIMIT
+        {
+            self.install_buffers_locked(progress);
         }
     }
 
@@ -507,7 +512,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             block.push_back(value);
         }
         let (count, nmsgs) = (block.len(), block.non_messages());
-        let (mut queue, _) = self.lock_msgq();
+        let mut queue = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
@@ -529,7 +534,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         }
         if !self.buffers.is_occupied() {
             let mut block = SignalQueue::default();
-            let (mut queue, contended) = self.lock_msgq();
+            let mut queue = self.lock_msgq();
+            self.maybe_install_buffers_locked(progress);
             if self.closed.load(Ordering::Relaxed) {
                 return Err(QueueClosed);
             }
@@ -540,14 +546,13 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             queue.append(&mut block);
             self.enqueued(count, nmsgs);
             drop(queue);
-            self.note_contention(contended, progress);
             return Ok(());
         }
         let mut pending = std::mem::take(values).into_iter();
         while let Some(signal) = pending.next() {
             let slot = sender_slot(&signal);
             if let Err(signal) = self.try_push_buffer(progress, || slot, signal) {
-                let (mut queue, _) = self.lock_msgq();
+                let mut queue = self.lock_msgq();
                 if self.closed.load(Ordering::Relaxed) {
                     values.push(signal);
                     values.extend(pending);
@@ -577,7 +582,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         }
         let nmsgs =
             usize::from(non_message_signal(&first)) + usize::from(non_message_signal(&second));
-        let (mut queue, contended) = self.lock_msgq();
+        let mut queue = self.lock_msgq();
+        self.maybe_install_buffers_locked(progress);
         if self.closed.load(Ordering::Relaxed) {
             return Err((first, second));
         }
@@ -585,7 +591,6 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         queue.push_back_node(second);
         self.enqueued(2, nmsgs);
         drop(queue);
-        self.note_contention(contended, progress);
         Ok(())
     }
 
@@ -626,7 +631,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if !self.has_pending() {
             return;
         }
-        let mut queue = self.msgq.lock();
+        let mut queue = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
@@ -643,7 +648,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if !self.has_pending() {
             return 0;
         }
-        let mut queue = self.msgq.lock();
+        let mut queue = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
@@ -664,7 +669,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
     // OTP-29.1.1.
     pub fn fetch_first_if(&self, accept: impl FnOnce(&T) -> bool) -> Option<T> {
-        let mut queue = self.msgq.lock();
+        let mut queue = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
