@@ -648,6 +648,28 @@ impl<H: NodeHandle> MonLnkTree<H> {
         }))
     }
 
+    /// Port of erts/emulator/beam/erl_monitor_link.c (`erts_monitor_tree_lookup`,
+    /// `erts_monitor_tree_delete`), OTP-29.1.1: delete the node found by the reference lookup.
+    pub(crate) fn remove_if(
+        &mut self,
+        key: u64,
+        predicate: impl FnOnce(u32) -> bool,
+    ) -> Result<Option<H>, u32> {
+        let Some(node) = self.lookup_node(key) else {
+            return Ok(None);
+        };
+        let flags = node_flags(node);
+        if !predicate(flags) {
+            return Err(flags);
+        }
+        self.delete_node(node);
+        set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
+        Ok(Some(H::from_node(ContainedNode {
+            node,
+            _handle: PhantomData,
+        })))
+    }
+
     /// The nodes in the order erts `mon_lnk_rbt_foreach` visits them (`foreach_unordered__`:
     /// both subtrees before the node).
     fn nodes(&self) -> smallvec::SmallVec<[NodePtr; 4]> {

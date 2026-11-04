@@ -140,8 +140,13 @@ pub(crate) struct ThrProgress {
     umrefc_waiting: std::sync::atomic::AtomicI32,
 }
 
-/// Give the allocator pool access to this runtime's existing thread-progress operations.
-pub(crate) fn install_sspa_progress(_: Arc<ThrProgress>) {
+/// The thread progress of the latest runtime, for threads that are not managed threads of it.
+static GLOBAL_PROGRESS: Mutex<Option<Arc<ThrProgress>>> = Mutex::new(None);
+
+/// Give the allocator pool and the delayed-dealloc queues access to this runtime's existing
+/// thread-progress operations.
+pub(crate) fn install_sspa_progress(progress: Arc<ThrProgress>) {
+    *GLOBAL_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(progress);
     let _ = arinsal_alloc::sspa::install_progress_ops(arinsal_alloc::sspa::ProgressOps {
         current: sspa_current,
         has_reached: sspa_has_reached,
@@ -149,13 +154,23 @@ pub(crate) fn install_sspa_progress(_: Arc<ThrProgress>) {
     });
 }
 
+// Port of erl_thr_progress.h (erts_thr_progress_current): the global value, which an unmanaged
+// thread (the owner of a locked allocator instance) reads like a managed one.
 fn sspa_current(_: usize) -> u64 {
-    SSPA_PROGRESS.with(|progress| {
-        progress
-            .borrow()
-            .as_ref()
-            .map_or(0, |progress| progress.current.load(Ordering::Acquire))
-    })
+    SSPA_PROGRESS
+        .with(|progress| {
+            progress
+                .borrow()
+                .as_ref()
+                .map(|progress| progress.current.load(Ordering::Acquire))
+        })
+        .unwrap_or_else(|| {
+            GLOBAL_PROGRESS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(0, |progress| progress.current.load(Ordering::Acquire))
+        })
 }
 
 fn sspa_has_reached(scheduler: usize, value: u64) -> bool {
@@ -369,7 +384,7 @@ fn leader_update(tpd: &mut ThrPrgrData) -> bool {
         if ix == my_ix {
             continue;
         }
-        let tmp = progress.thr[ix].0.load(Ordering::Acquire);
+        let tmp = progress.thr[ix].0.load(Ordering::Relaxed);
         if tmp != next && tmp != VAL_WAITING {
             tpd.chk_next_ix = ix;
             caught_up = false;

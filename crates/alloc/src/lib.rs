@@ -3,6 +3,8 @@
 pub mod alloc_util;
 pub mod allocator;
 pub mod cpuinfo;
+#[allow(unsafe_code)]
+pub(crate) mod ddq;
 pub mod instances;
 pub mod mmap;
 pub mod mseg;
@@ -13,6 +15,7 @@ pub mod sspa;
 pub mod typed;
 pub mod types;
 
+pub use ddq::DdStatus;
 pub use instances::{
     RegisterError, ThreadKind, notify_owner, register_thread, set_owner_notifier, thread_alloc_ix,
 };

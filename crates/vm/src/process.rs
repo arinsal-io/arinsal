@@ -3371,6 +3371,12 @@ impl Executor {
                     process.module = module_id;
                     process.set_entry_ip(entry);
                     process.set_native_pc(Some(start));
+                    // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->i =
+                    // beam_run_process; p->arity = 3`), OTP-29.1.1: the process starts like any
+                    // switched-out one, resuming at `c_p->i` with `c_p->arity` live registers.
+                    // The entry needs no registry lookup for the stub's arity.
+                    process.native_continuation_resume = true;
+                    process.set_native_resume_arity(3);
                 }
                 None => {
                     self.vm.resolve_run_process(process)?;
@@ -3734,7 +3740,7 @@ impl Executor {
                                         .code_ix
                                         .process_code_ix(crate::trace::saves_calls(process))
                                         as u64;
-                                    let native = crate::run_native(
+                                    let native = crate::native_bridge::run_native_resume(
                                         process,
                                         &mut self.native_registers,
                                         code_ptr,
@@ -5091,10 +5097,10 @@ impl Process {
     /// The demonitor signal of a local monitor carries its origin half; the target half is
     /// reached through the data they share (erl_proc_sig_queue.c erts_proc_sig_handle_incoming,
     /// ERTS_SIG_Q_OP_DEMONITOR): both are released.
-    fn remove_demonitored_target(&mut self, shared: arinsal_alloc::typed::ErasedFixAllocArc) {
-        let Ok(data) = shared.downcast::<crate::proc_create::ProcessMonitorData>() else {
-            return;
-        };
+    fn remove_demonitored_target(
+        &mut self,
+        data: arinsal_alloc::typed::FixAllocArc<crate::proc_create::ProcessMonitorData>,
+    ) {
         let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(data, false) else {
             return;
         };
@@ -5574,7 +5580,7 @@ impl Process {
             // demonitor signal, so the target drops its half.
             if let Some(crate::proc_create::OriginMonitor::Process(_)) = monitor.state() {
                 let target = Pid::from_data(monitor.view().other());
-                let shared = monitor.into_shared().erase();
+                let shared = monitor.into_shared();
                 let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
             }
         }
@@ -6542,7 +6548,7 @@ impl Process {
                     self.cold_mut().prio_monitors.remove(&alias);
                     let origin = entry.expect("origin half of the entry");
                     let target = Pid::from_data(origin.view().other());
-                    let shared = origin.into_shared().erase();
+                    let shared = origin.into_shared();
                     let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
                 }
                 Some(crate::proc_create::OriginMonitor::Port {
@@ -8046,19 +8052,17 @@ impl arinsal_sched::SignalMessage for Message {
                 }
             }
             arinsal_sched::Signal::DemonitorOrigin(shared) => {
-                let shared = match shared.downcast::<ProcessMonitorData>() {
-                    Ok(data) if data.origin_id() == from.data() => {
-                        match ProcessMonitorData::half_signal(
-                            data,
-                            false,
-                            arinsal_sched::lazy_meta(from, false),
-                        ) {
-                            Ok(node) => return node,
-                            Err(data) => data.erase(),
-                        }
+                let shared = if shared.origin_id() == from.data() {
+                    match ProcessMonitorData::half_signal(
+                        shared,
+                        false,
+                        arinsal_sched::lazy_meta(from, false),
+                    ) {
+                        Ok(node) => return node,
+                        Err(shared) => shared,
                     }
-                    Ok(data) => data.erase(),
-                    Err(other) => other,
+                } else {
+                    shared
                 };
                 arinsal_sched::OwnedSignal::new(Event {
                     from,
@@ -8090,7 +8094,7 @@ impl
                 shared: data,
             }
         } else {
-            arinsal_sched::Signal::DemonitorOrigin(data.erase())
+            arinsal_sched::Signal::DemonitorOrigin(data)
         };
         Event {
             from,
@@ -8311,12 +8315,8 @@ impl Task for Process {
                     monitors.retain(|(id, _)| *id != reference);
                 }
                 Payload::Signal(Signal::DemonitorOrigin(shared)) => {
-                    if let Some(data) =
-                        shared.downcast_ref::<crate::proc_create::ProcessMonitorData>()
-                    {
-                        let reference = data.reference();
-                        monitors.retain(|(id, _)| *id != reference);
-                    }
+                    let reference = shared.reference();
+                    monitors.retain(|(id, _)| *id != reference);
                 }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: an exiting process still answers a queued literal-copy request.

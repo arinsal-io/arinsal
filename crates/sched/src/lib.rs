@@ -500,7 +500,7 @@ pub enum Signal<M: SignalMessage> {
     /// Demonitor request carrying the origin half of the monitor itself, as erts queues the
     /// origin node (erl_proc_sig_queue.c, erts_proc_sig_send_demonitor): the target reaches
     /// its own half through the data both halves share.
-    DemonitorOrigin(arinsal_alloc::typed::ErasedFixAllocArc),
+    DemonitorOrigin(arinsal_alloc::typed::FixAllocArc<M::MonitorData>),
     /// Exit signal (`exit/2`) carrying an opaque reason envelope.
     Exit(Box<M>),
     /// Exit signal of a link: removes the receiver's link to the sender.
@@ -2133,6 +2133,7 @@ impl<T: Task> LocalInit<T> {
             last_monotonic_ms: self.last_monotonic_ms,
             fix_shrink_due_ms: 0,
             fix_shrink_dealloc: false,
+            dd_thr_prgr_pending: Arc::new(AtomicBool::new(false)),
             profile_active: self.profile_active,
             last_process: self.last_process,
             metric_deltas: self.metric_deltas,
@@ -2806,7 +2807,23 @@ impl<T: Task> Inner<T> {
             self.poll_timers(worker, Some(local), halting);
         }
         if aux_work & AUX_WORK_ALLOCATOR_DD != 0 {
-            arinsal_alloc::typed::handle_owner_work(worker + 1);
+            let status = arinsal_alloc::typed::handle_owner_work(worker + 1);
+            // Port of handle_delayed_dealloc (erl_process.c, OTP-29.1.1): queued blocks that
+            // wait for thread progress set ERTS_SSI_AUX_WORK_DD_THR_PRGR and a wakeup at the
+            // progress value; here a later operation raises the DD work again.
+            if status.need_thr_progress
+                && !status.more_work
+                && !local.dd_thr_prgr_pending.swap(true, Ordering::AcqRel)
+            {
+                let pending = Arc::clone(&local.dd_thr_prgr_pending);
+                thr_progress::schedule_later_op(
+                    &self.progress,
+                    LaterOp::Boxed(Box::new(move || {
+                        pending.store(false, Ordering::Release);
+                        arinsal_alloc::notify_owner(worker + 1);
+                    })),
+                );
+            }
         }
         if aux_work & AUX_WORK_FUNC != 0 {
             self.handle_aux_work(worker);
@@ -3890,13 +3907,28 @@ impl<T: Task> Inner<T> {
     ) -> Result<(), Error> {
         // A scheduler worker already participates in thread progress, so its send mirrors
         // erts_proc_lookup_raw without adding an unmanaged delay point per message.
-        let delivered = if let Some(local) = local {
-            self.table.with_live_managed(to, |process| {
-                self.deliver_live_node(process, signal, Some(local))
-            })
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1076-1170 (proc_queue_signal),
+        // OTP-29.1.1: lookup, enqueue, then make one notification decision.
+        let force_enqueue = !signal.is_lazy()
+            && matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+        let managed = local.is_some();
+        let enqueue = |process: &ProcRef<T>| {
+            self.fanin_delivery(process, 1);
+            let from = node_from(&signal);
+            let Ok(state) = process.input.push_routed_node(
+                &self.progress_domain,
+                || signal_buffer_slot(from),
+                signal,
+            ) else {
+                return Err(Error::NoProcess);
+            };
+            self.wake_after_publish(process, local, force_enqueue, Some(state));
+            Ok(())
+        };
+        let delivered = if managed {
+            self.table.with_live_managed(to, enqueue)
         } else {
-            self.table
-                .with_live(to, |process| self.deliver_live_node(process, signal, None))
+            self.table.with_live(to, enqueue)
         };
         delivered.ok_or(Error::NoProcess)?
     }
@@ -4712,6 +4744,9 @@ struct Local<T: Task> {
     fix_shrink_due_ms: u64,
     /// The last shrink pass left blocks to give back (`ERTS_SSI_AUX_WORK_FIX_ALLOC_DEALLOC`).
     fix_shrink_dealloc: bool,
+    /// A later operation waits that sets the allocator DD aux work again once thread progress
+    /// reached the point the delayed-dealloc queues wait for (`ERTS_SSI_AUX_WORK_DD_THR_PRGR`).
+    dd_thr_prgr_pending: Arc<AtomicBool>,
     profile_active: bool,
     last_process: Option<Pid>,
     metric_deltas: Vec<i64>,
