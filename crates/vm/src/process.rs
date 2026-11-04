@@ -9124,6 +9124,17 @@ impl Vm {
                     .scheduler
                     .set(scheduler)
                     .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
+                // Port of code_ix.c:142-171 and beam_common.c (erts_schedule_code_barrier),
+                // OTP-29.1.1: code-table owners retire through this scheduler's progress queue.
+                let scheduler = Arc::downgrade(runtime.scheduler()?);
+                runtime.code.set_retire_hook(move |retired| {
+                    if let Some(scheduler) = scheduler.upgrade() {
+                        scheduler.thread_progress_later(move || retired.release());
+                    } else {
+                        // The scheduler is gone only after shutdown joined its workers.
+                        retired.release();
+                    }
+                });
                 if module == "erl_init" && function == "start" && simulation_seed.is_none() {
                     crate::natives::env::install_boot_signals(runtime)?;
                 }

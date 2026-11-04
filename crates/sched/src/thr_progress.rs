@@ -209,9 +209,6 @@ thread_local! {
     static SSPA_PROGRESS: RefCell<Option<Arc<ThrProgress>>> = const { RefCell::new(None) };
     /// Block nesting of an unmanaged thread (erts temporary `ErtsThrPrgrData`).
     static UNMANAGED_BLOCKING: Cell<u32> = const { Cell::new(0) };
-    /// Later operations of a runtime without managed threads (the simulated scheduler):
-    /// no thread can be in the middle of a slice, so they run after the current one.
-    static LATER_READY: RefCell<Vec<LaterOp>> = const { RefCell::new(Vec::new()) };
     /// The thread progress this thread is a managed thread of, compared by address only
     /// (erts_thr_progress_is_managed_thread).
     static MANAGED_OF: Cell<usize> = const { Cell::new(0) };
@@ -831,7 +828,11 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue_held: &Atomi
     }
     // Each operation runs with the thread data released: releasing a process can schedule
     // another later operation.
-    while let Some(op) = next_ready_later_op(&mut managed.0.borrow_mut()) {
+    loop {
+        let op = next_ready_later_op(&mut managed.0.borrow_mut());
+        let Some(op) = op else {
+            break;
+        };
         if !released {
             run_queue_held.store(false, Ordering::Release);
             released = true;
@@ -933,10 +934,14 @@ pub(crate) fn unblock(progress: &ThrProgress) {
 // haw_thr_prgr_wakeup) and erl_thr_progress.h (erts_thr_progress_later), OTP-29.1.1.
 pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
     if progress.managed_no() == 0 {
-        LATER_READY.with(|later| later.borrow_mut().push(op));
+        let mut shared = progress.unmanaged_later.lock().unwrap();
+        shared.push_back((0, op));
+        progress
+            .unmanaged_later_len
+            .store(shared.len(), Ordering::Release);
         return;
     }
-    let op = with_tpd(|tpd| {
+    let fallback = with_tpd(|tpd| {
         let Some(tpd) = tpd.filter(|tpd| std::ptr::eq(Arc::as_ptr(&tpd.progress), progress)) else {
             return Some(op);
         };
@@ -953,7 +958,7 @@ pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
         }
         None
     });
-    if let Some(op) = op {
+    if let Some(op) = fallback {
         // An unmanaged thread: any managed thread runs it once progress reaches it.
         let later = current_to_later(progress.current.load(Ordering::SeqCst));
         let mut shared = progress.unmanaged_later.lock().unwrap();
@@ -967,9 +972,20 @@ pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
 }
 
 /// Run the later operations of a runtime without managed threads.
-pub(crate) fn run_unmanaged_later_ops() {
+pub(crate) fn run_unmanaged_later_ops(progress: &ThrProgress) {
     loop {
-        let ready = LATER_READY.with(|later| std::mem::take(&mut *later.borrow_mut()));
+        let mut ready = Vec::new();
+        if progress
+            .umrefc
+            .iter()
+            .any(|refc| refc.load(Ordering::Acquire) != 0)
+        {
+            return;
+        }
+        let mut shared = progress.unmanaged_later.lock().unwrap();
+        progress.unmanaged_later_len.store(0, Ordering::Release);
+        ready.extend(shared.drain(..).map(|(_, op)| op));
+        drop(shared);
         if ready.is_empty() {
             return;
         }

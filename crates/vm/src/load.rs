@@ -1312,9 +1312,9 @@ impl Vm {
             })
     }
 
-    /// Makes this VM read the tables of `erts_active_code_ix()`. A VM keeps the tables it
-    /// looked at last until its next code access point, like erts' processes keep the code
-    /// index they were scheduled in with.
+    /// Makes this VM read the tables of `erts_active_code_ix()`. This owned snapshot is checked
+    /// at schedule-in and before code-sensitive access; raw slot borrows themselves end inside
+    /// their lookup closure before the scheduler reaches a thread-progress point.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247 and code_ix.h
     // (erts_active_code_ix), OTP-29.1.1: with the code index unchanged this is one load and a
     // compare.

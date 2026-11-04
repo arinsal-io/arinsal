@@ -6717,6 +6717,12 @@ impl<T: Task> Scheduler<T> {
                     == 0
         })
     }
+    /// Run `op` after every managed thread of this scheduler passed a thread-progress point.
+    /// Calls from non-managed threads join the same later-operation queue.
+    // Port of erl_process.c:2351 (erts_schedule_thr_prgr_later_op), OTP-29.1.1.
+    pub fn thread_progress_later(&self, op: impl FnOnce() + Send + 'static) {
+        thr_progress::schedule_later_op(&self.inner.progress, LaterOp::Boxed(Box::new(op)));
+    }
     /// The thread progress domain of this scheduler, for tables whose elements are freed after
     /// thread progress ([`ProgressSlot`]).
     pub fn progress(&self) -> Progress {
@@ -8142,6 +8148,28 @@ mod dirty_state_tests {
     }
 
     #[test]
+    fn non_managed_later_operation_uses_the_simulated_scheduler_progress_queue() {
+        let scheduler = Scheduler::simulation(Config::default(), 1);
+        let ran = Arc::new(AtomicBool::new(false));
+        let scheduled = Arc::clone(&ran);
+        let progress_scheduler = Arc::new(scheduler);
+        let external = Arc::clone(&progress_scheduler);
+        let nested_scheduler = Arc::downgrade(&progress_scheduler);
+        let thread = thread::spawn(move || {
+            external.thread_progress_later(move || {
+                nested_scheduler
+                    .upgrade()
+                    .unwrap()
+                    .thread_progress_later(move || scheduled.store(true, Ordering::Release));
+            });
+        });
+        thread.join().unwrap();
+        progress_scheduler.spawn(Idle).unwrap();
+        assert!(progress_scheduler.step());
+        assert!(ran.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn dirty_wake_takes_the_most_recent_eligible_sleeper() {
         let pool = DirtyPool::<Idle>::new(4, 0);
         pool.online.store(3, Ordering::Release);
@@ -8345,7 +8373,7 @@ fn run_one<T: Task>(
 ) {
     run_slice(inner, item, data, worker, dirty);
     // A runtime without managed threads runs later operations after the slice.
-    thr_progress::run_unmanaged_later_ops();
+    thr_progress::run_unmanaged_later_ops(&inner.progress);
 }
 
 /// What a finished slice leaves for the schedule-out half of `erts_schedule`.
