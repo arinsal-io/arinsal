@@ -1708,18 +1708,21 @@ pub fn drain_owned_deallocations(instance: usize) -> usize {
 }
 
 /// Runs the owner work of scheduler instance `instance` for every allocator: queued requests and
-/// a bounded number of delayed frees. True while any allocator still has frees queued.
+/// a bounded number of delayed frees. The result says whether any allocator still has frees queued
+/// behind the limit, and whether any waits for thread progress.
 ///
 /// Port of `erts_alloc_handle_delayed_dealloc`, OTP-29.1.1, as run by the owner's aux work after
 /// [`notify_owner`](crate::notify_owner).
-pub fn handle_owner_work(instance: usize) -> bool {
-    let mut more = false;
+pub fn handle_owner_work(instance: usize) -> crate::DdStatus {
+    let mut total = crate::DdStatus::default();
     for_each_allocator(|allocators| {
         if instance < allocators.instance_count() {
-            more |= allocators.handle_owner_work(instance).unwrap_or(false);
+            let status = allocators.handle_owner_work(instance).unwrap_or_default();
+            total.more_work |= status.more_work;
+            total.need_thr_progress |= status.need_thr_progress;
         }
     });
-    more
+    total
 }
 
 /// Runs only the queued requests of scheduler instance `instance` for every allocator.

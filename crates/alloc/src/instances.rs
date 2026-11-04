@@ -5,6 +5,7 @@ use crate::alloc_util::{
     AllocError, AllocUtil, AllocUtilOptions, Allocation, AllocatorInfo, CarrierPoolStats,
     CarrierTransfer, Strategy, set_dyn_sbct,
 };
+use crate::ddq::{DdHead, DdStatus, DdTail, node_info};
 use crate::raw::WordView;
 use crossbeam_queue::SegQueue;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -158,6 +159,8 @@ struct Instance {
     allocator: AllocUtil,
     /// `allctr->fix`: the free lists of the fixed-size types this instance serves.
     fix: Vec<FixList>,
+    /// The dequeue side of the instance's delayed-dealloc queue (`ddq->head`).
+    ddq: DdHead,
 }
 
 /// Number of fixed-size allocation types (`ERTS_ALC_NO_FIXED_SIZES`) the port knows.
@@ -192,8 +195,20 @@ type OwnerRequest = Box<dyn FnOnce(&ThreadSpecificAllocators, &mut Instance) + S
 
 /// Delayed frees handled per owner-work pass.
 ///
-/// Port of `ERTS_ALCU_DD_OPS_LIM_HIGH` in erl_alloc_util.h, OTP-29.1.1.
+/// Port of `ERTS_ALCU_DD_OPS_LIM_HIGH` in erl_alloc_util.c, OTP-29.1.1.
 const OWNER_WORK_DD_LIMIT: usize = 20;
+
+/// Delayed frees handled by an allocation or free on the owner (`ERTS_ALCU_HANDLE_DD_IN_OP`).
+///
+/// Port of `ERTS_ALCU_DD_OPS_LIM_LOW` in erl_alloc_util.c, OTP-29.1.1.
+const DD_OPS_LIM_LOW: usize = 2;
+
+/// Bit of a queued fixed-size block's info word where its size starts; below it is its type.
+const FIX_INFO_SHIFT: usize = 8;
+
+/// Passes of an explicit full drain: a queue of fixed-size blocks needs three to hand out its
+/// last block (`unref_end` moves, the marker is appended, `unref_end` moves again).
+const DRAIN_PASSES: usize = 3;
 
 /// How long a requester waits for its owner before it asks the owner again.
 const OWNER_WAIT_SLICE: Duration = Duration::from_micros(200);
@@ -339,8 +354,6 @@ enum AllocationRoute {
 /// that was sent back to its origin.
 enum Delayed {
     Block(InstanceAllocation, Allocation),
-    /// A block of fixed-size type `usize` (its index), which goes back to the owner's free list.
-    Fix(usize, InstanceAllocation, Allocation),
     Homecoming(u64),
 }
 
@@ -378,6 +391,10 @@ pub struct ThreadSpecificAllocators {
     /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
     delayed: Vec<SegQueue<Delayed>>,
     delayed_count: Vec<AtomicUsize>,
+    /// The enqueue side of each instance's delayed-dealloc queue of fixed-size blocks, whose
+    /// nodes are the freed blocks (`allctr->dd.q`); the dequeue side is in the instance.
+    /// Never resized: a queue's marker address is its empty value.
+    ddq: Vec<DdTail>,
     shared: Vec<Shared>,
     /// Owner of blocks whose carrier left the instance named in their handle, by block address.
     routes: Mutex<HashMap<u64, AllocationRoute>>,
@@ -467,6 +484,11 @@ impl ThreadSpecificAllocators {
                 work_scheduled: AtomicBool::new(false),
             })
             .collect();
+        let ddq: Vec<DdTail> = (0..count).map(|_| DdTail::new()).collect();
+        for tail in &ddq {
+            tail.init();
+        }
+        let progress = crate::sspa::progress_ops();
         Self {
             scheduler_instances: if thread_specific {
                 crate::typed::configured()
@@ -477,18 +499,21 @@ impl ThreadSpecificAllocators {
             },
             instances: allocators
                 .into_iter()
-                .map(|allocator| Slot {
+                .enumerate()
+                .map(|(instance, allocator)| Slot {
                     blocks_size: AtomicUsize::new(0),
                     lock: parking_lot::Mutex::new(()),
                     state: OwnerCell(UnsafeCell::new(Instance {
                         allocator,
                         fix: (0..FIX_TYPES).map(|_| FixList::default()).collect(),
+                        ddq: DdHead::new(&ddq[instance], progress),
                     })),
                 })
                 .collect(),
             shared,
             delayed: (0..count).map(|_| SegQueue::new()).collect(),
             delayed_count: (0..count).map(|_| AtomicUsize::new(0)).collect(),
+            ddq,
             routes: Mutex::new(HashMap::default()),
             routed: AtomicUsize::new(0),
             carrier_pool: Mutex::new(Vec::new()),
@@ -537,7 +562,7 @@ impl ThreadSpecificAllocators {
         let instance = self.instance_for(ix);
         debug_assert_eq!(instance, self.current_instance());
         let mut state = self.lock_instance(instance);
-        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+        if self.has_delayed(instance, &state) {
             self.drain_delayed_and_publish(instance, &mut state)?;
         }
         debug_assert!(!state.allocator.has_pending_carriers());
@@ -748,38 +773,46 @@ impl ThreadSpecificAllocators {
     /// queues the drain on the owner and waits for it.
     pub fn drain_deallocations(&self, instance: usize) -> Result<usize, AllocError> {
         self.on_owner(instance, move |this, state| {
-            let (count, drained) = this.drain_locked(instance, state)?;
-            this.clear_routes(drained);
+            // One erts pass moves the queue one step along its protocol; run passes until one
+            // changes nothing, which a runtime waiting for thread progress reaches at once.
+            let mut count = 0;
+            for _ in 0..DRAIN_PASSES {
+                let (freed, drained, _) = this.drain_locked(instance, state)?;
+                this.clear_routes(drained);
+                count += freed;
+            }
             this.publish_transfers(instance, state)?;
             Ok(count)
         })
     }
 
     /// Runs the requests other threads queued for `instance` and up to
-    /// [`OWNER_WORK_DD_LIMIT`] delayed frees; true when more frees remain.
+    /// [`OWNER_WORK_DD_LIMIT`] delayed frees; the result tells whether frees remain behind the
+    /// limit and whether queued blocks wait for thread progress.
     ///
     /// Port of the `ERTS_SSI_AUX_WORK_DD` handler (`erts_alloc_handle_delayed_dealloc`,
     /// erl_alloc.c) and of `erts_alloc_notify_delayed_dealloc`, OTP-29.1.1: the owner calls this
     /// from its aux work and is notified again while queued frees remain. A thread that does not
     /// own a scheduler instance does nothing.
-    pub fn handle_owner_work(&self, instance: usize) -> Result<bool, AllocError> {
+    pub fn handle_owner_work(&self, instance: usize) -> Result<DdStatus, AllocError> {
         if self.lock_free(instance) && thread_alloc_ix() != instance {
-            return Ok(false);
+            return Ok(DdStatus::default());
         }
         self.shared[instance]
             .work_scheduled
             .store(false, Ordering::Release);
         let mut state = self.lock_instance(instance);
         self.run_requests_on(instance, &mut state);
-        let (_, drained) = self.drain_limited(instance, &mut state, OWNER_WORK_DD_LIMIT)?;
+        let (_, drained, mut status) =
+            self.drain_limited(instance, &mut state, OWNER_WORK_DD_LIMIT, true)?;
         self.clear_routes(drained);
         self.publish_transfers(instance, &mut state)?;
         drop(state);
-        let more = !self.delayed[instance].is_empty();
-        if more {
+        status.more_work |= !self.delayed[instance].is_empty();
+        if status.more_work {
             self.schedule_owner_work(instance);
         }
-        Ok(more)
+        Ok(status)
     }
 
     /// Runs the requests other threads queued for `instance`, without handling delayed frees.
@@ -886,7 +919,7 @@ impl ThreadSpecificAllocators {
         let instance = self.instance_for(ix);
         debug_assert_eq!(instance, self.current_instance());
         let mut state = self.lock_instance(instance);
-        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+        if self.has_delayed(instance, &state) {
             self.drain_delayed_and_publish(instance, &mut state)?;
         }
         let fix = state
@@ -941,7 +974,7 @@ impl ThreadSpecificAllocators {
         let instance = self.instance_for(ix);
         debug_assert_eq!(instance, self.current_instance());
         let mut state = self.lock_instance(instance);
-        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+        if self.has_delayed(instance, &state) {
             self.drain_and_publish(instance, &mut state)?;
         }
         let fix = state
@@ -994,7 +1027,7 @@ impl ThreadSpecificAllocators {
             );
         }
         let mut state = self.lock_instance(owner);
-        if self.delayed_count[owner].load(Ordering::Relaxed) != 0 {
+        if self.has_delayed(owner, &state) {
             self.drain_delayed_and_publish(owner, &mut state)?;
         }
         let fix = state
@@ -1042,8 +1075,7 @@ impl ThreadSpecificAllocators {
         loop {
             let (instance, allocation) = self.route(handle)?;
             if current != instance {
-                self.enqueue_delayed(instance, Delayed::Fix(fix_ix, handle, allocation));
-                self.schedule_owner_work(instance);
+                self.enqueue_fix(instance, current, fix_ix, allocation);
                 return Ok(());
             }
             let mut state = self.lock_instance(instance);
@@ -1091,9 +1123,10 @@ impl ThreadSpecificAllocators {
         })
     }
 
-    /// Returns the number of frees waiting for the instance.
+    /// Returns the number of frees waiting for the instance, fixed-size blocks included.
+    #[cfg(test)]
     pub fn pending_deallocations(&self, instance: usize) -> usize {
-        self.delayed[instance].len()
+        self.delayed[instance].len() + self.ddq[instance].queued()
     }
 
     #[cfg(test)]
@@ -1183,10 +1216,18 @@ impl ThreadSpecificAllocators {
     /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
     #[inline(always)]
     fn drain_and_publish(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
-        if self.delayed_count[instance].load(Ordering::Relaxed) != 0 {
+        if self.has_delayed(instance, state) {
             self.drain_delayed_and_publish(instance, state)?;
         }
         self.publish_transfers(instance, state)
+    }
+
+    /// Whether `instance` has queued frees to look at: blocks of the plain queue, or the
+    /// delayed-dealloc queue of fixed-size blocks is not idle (`ddq_check_incoming` has a use).
+    #[inline(always)]
+    fn has_delayed(&self, instance: usize, state: &Instance) -> bool {
+        self.delayed_count[instance].load(Ordering::Relaxed) != 0
+            || self.ddq[instance].pending(&state.ddq)
     }
 
     #[inline(always)]
@@ -1195,9 +1236,29 @@ impl ThreadSpecificAllocators {
         instance: usize,
         state: &mut Instance,
     ) -> Result<(), AllocError> {
-        let (_, drained) = self.drain_locked(instance, state)?;
+        let (_, drained, _) = self.drain_limited(instance, state, DD_OPS_LIM_LOW, false)?;
         self.clear_routes(drained);
         self.publish_transfers(instance, state)
+    }
+
+    /// Queues a freed block of fixed-size type `fix_ix` on the instance that owns it, using the
+    /// block as the queue node, and wakes the owner when the block went to the end of the queue.
+    ///
+    /// Port of `enqueue_dealloc_other_instance` and `erts_alcu_free_thr_pref`
+    /// (erl_alloc_util.c, OTP-29.1.1): `cinit` is the difference of the two instance numbers
+    /// (`used_allctr->dd.ix - pref_allctr->dd.ix`) that spreads racing enqueuers.
+    #[inline(always)]
+    fn enqueue_fix(&self, instance: usize, current: usize, fix_ix: usize, allocation: Allocation) {
+        debug_assert!(fix_ix < 1 << FIX_INFO_SHIFT);
+        let info = fix_ix | (allocation.size() << FIX_INFO_SHIFT);
+        if self.ddq[instance].enqueue(
+            allocation.payload_address(),
+            info,
+            instance.wrapping_sub(current),
+            crate::sspa::progress_ops(),
+        ) {
+            self.schedule_owner_work(instance);
+        }
     }
 
     #[inline(always)]
@@ -1574,32 +1635,89 @@ impl ThreadSpecificAllocators {
         &self,
         instance: usize,
         state: &mut Instance,
-    ) -> Result<(usize, Vec<InstanceAllocation>), AllocError> {
-        self.drain_limited(instance, state, usize::MAX)
+    ) -> Result<(usize, Vec<InstanceAllocation>, DdStatus), AllocError> {
+        self.drain_limited(instance, state, usize::MAX, false)
     }
 
-    /// Handles up to `limit` queue entries of `instance`; returns the handles of the blocks freed.
+    /// Handles up to `limit` queue entries of `instance`; returns the number and the handles of
+    /// the blocks freed and what the owner's aux work has left to do.
     ///
     /// Port of `handle_delayed_dealloc` (erl_alloc_util.c, OTP-29.1.1): a block is freed here, or
     /// redirected to the instance that owns its carrier now; a homecoming marker takes the
     /// carrier back. A block of a pooled or homecoming carrier takes the carrier back first.
+    /// `want_progress` is `need_thr_progress != NULL`. Blocks of fixed-size types come from the
+    /// instance's `ddq` (`ddq_dequeue`, then `ddq_check_incoming` once the queue runs dry); the
+    /// others and the homecoming markers from the plain queue.
     fn drain_limited(
         &self,
         instance: usize,
         state: &mut Instance,
         limit: usize,
-    ) -> Result<(usize, Vec<InstanceAllocation>), AllocError> {
+        want_progress: bool,
+    ) -> Result<(usize, Vec<InstanceAllocation>, DdStatus), AllocError> {
         // The handles of freed blocks are kept only while some block has a route to clear: the
         // common case allocates nothing per drain.
         let mut drained = Vec::new();
         let mut freed = 0;
+        let mut status = DdStatus::default();
+        let progress = crate::sspa::progress_ops();
+        let tail = &self.ddq[instance];
+        let mut ops = 0usize;
+        let mut have_checked_incoming = false;
+        loop {
+            ops = ops.saturating_add(1);
+            if ops > limit {
+                if state.ddq.has_dequeueable() {
+                    status.more_work = true;
+                }
+                break;
+            }
+            let Some(node) = state.ddq.dequeue(tail) else {
+                if have_checked_incoming {
+                    break;
+                }
+                let need = state.ddq.check_incoming(tail, progress);
+                status.need_thr_progress |= need && want_progress;
+                have_checked_incoming = true;
+                // `goto dequeue`: the check does not count as an operation.
+                ops -= 1;
+                continue;
+            };
+            let info = node_info(node);
+            let fix_ix = info & ((1 << FIX_INFO_SHIFT) - 1);
+            let size = info >> FIX_INFO_SHIFT;
+            let allocation = Allocation::from_payload(node as *mut u64, size);
+            let handle = InstanceAllocation::from_parts(instance, allocation.id(), size);
+            let allocation = match self.resolve_owned(instance, state, handle, allocation) {
+                Ok(Resolved::Owned(allocation)) => allocation,
+                Ok(Resolved::Elsewhere(owner, allocation)) => {
+                    self.enqueue_fix(owner, instance, fix_ix, allocation);
+                    continue;
+                }
+                Err(error) => {
+                    self.enqueue_fix(instance, instance, fix_ix, allocation);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = fix_free_owned(state, fix_ix, allocation) {
+                self.enqueue_fix(instance, instance, fix_ix, allocation);
+                return Err(error);
+            }
+            freed += 1;
+            if self.routed.load(Ordering::Acquire) != 0 {
+                drained.push(handle);
+            }
+        }
+        if want_progress && !status.need_thr_progress && !status.more_work {
+            let need = state.ddq.check_incoming(tail, progress);
+            status.need_thr_progress |= need;
+        }
         let queue = &self.delayed[instance];
-        let mut handled = 0;
-        while handled < limit
+        while ops <= limit
             && let Some(item) = queue.pop()
         {
             self.delayed_count[instance].fetch_sub(1, Ordering::Relaxed);
-            handled += 1;
+            ops = ops.saturating_add(1);
             match item {
                 Delayed::Block(handle, allocation) => {
                     let allocation = match self.resolve_owned(instance, state, handle, allocation) {
@@ -1622,30 +1740,6 @@ impl ThreadSpecificAllocators {
                         drained.push(handle);
                     }
                 }
-                Delayed::Fix(fix_ix, handle, allocation) => {
-                    let allocation = match self.resolve_owned(instance, state, handle, allocation) {
-                        Ok(Resolved::Owned(allocation)) => allocation,
-                        Ok(Resolved::Elsewhere(owner, allocation)) => {
-                            self.enqueue_delayed(owner, Delayed::Fix(fix_ix, handle, allocation));
-                            continue;
-                        }
-                        Err(error) => {
-                            self.enqueue_delayed(
-                                instance,
-                                Delayed::Fix(fix_ix, handle, allocation),
-                            );
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = fix_free_owned(state, fix_ix, allocation) {
-                        self.enqueue_delayed(instance, Delayed::Fix(fix_ix, handle, allocation));
-                        return Err(error);
-                    }
-                    freed += 1;
-                    if self.routed.load(Ordering::Acquire) != 0 {
-                        drained.push(handle);
-                    }
-                }
                 Delayed::Homecoming(id) => {
                     if let Err(error) = self.import_homecoming(instance, state, id) {
                         self.enqueue_delayed(instance, Delayed::Homecoming(id));
@@ -1654,7 +1748,7 @@ impl ThreadSpecificAllocators {
                 }
             }
         }
-        Ok((freed, drained))
+        Ok((freed, drained, status))
     }
 }
 
@@ -2316,6 +2410,66 @@ mod tests {
     }
 
     #[test]
+    fn fixed_size_frees_from_many_threads_all_reach_the_owner() {
+        // Two scheduler threads and an unmanaged thread free fixed-size blocks of instance 1
+        // at once; the owner finds every one back on its free list through the ddq protocol.
+        let _serial = registration();
+        let allocators = four_instances();
+        let per_thread = 3_000usize;
+        let (ready_sender, ready) = mpsc::channel::<Vec<Vec<InstanceAllocation>>>();
+        let (go_sender, go) = mpsc::channel::<()>();
+        let owner = {
+            let allocators = Arc::clone(&allocators);
+            thread::spawn(move || {
+                assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+                let mut parts = vec![Vec::new(), Vec::new(), Vec::new()];
+                for part in &mut parts {
+                    for _ in 0..per_thread {
+                        part.push(allocators.fix_alloc_with_ptr_at(1, 0, 80).unwrap().0);
+                    }
+                }
+                ready_sender.send(parts).unwrap();
+                go.recv().unwrap();
+                let mut rounds = 0;
+                while allocators.fix_bytes(1, 0).1 != 0 {
+                    allocators.handle_owner_work(1).unwrap();
+                    allocators.drain_deallocations(1).unwrap();
+                    rounds += 1;
+                    assert!(rounds < 1_000, "queued blocks never reach the owner");
+                }
+                allocators.fix_bytes(1, 0)
+            })
+        };
+        let mut parts = ready.recv().unwrap();
+        let senders: Vec<_> = (0..3)
+            .map(|index| {
+                let allocators = Arc::clone(&allocators);
+                let blocks = parts.remove(0);
+                thread::spawn(move || {
+                    // The third thread never registers: an unmanaged enqueuer on instance 0.
+                    let ix = if index < 2 {
+                        register_thread(ThreadKind::Scheduler(index + 2)).unwrap()
+                    } else {
+                        0
+                    };
+                    for handle in blocks {
+                        allocators.fix_free_at(ix, 0, handle).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for sender in senders {
+            sender.join().unwrap();
+        }
+        go_sender.send(()).unwrap();
+        let (allocated, used) = owner.join().unwrap();
+        assert_eq!(used, 0);
+        // The free list keeps at most FIX_MAX_LIST_SIZE blocks; the others went back to the carrier.
+        assert_eq!(allocated, 80 * FIX_MAX_LIST_SIZE);
+        assert_eq!(allocators.pending_deallocations(1), 0);
+    }
+
+    #[test]
     fn passed_index_allocates_on_the_owner_and_queues_a_foreign_free() {
         let _serial = registration();
         let allocators = four_instances();
@@ -2481,9 +2635,9 @@ mod tests {
                 let handles: Vec<_> = (0..25).map(|_| allocators.alloc(24).unwrap()).collect();
                 ready_sender.send(handles).unwrap();
                 done.recv().unwrap();
-                let first = allocators.handle_owner_work(1).unwrap();
+                let first = allocators.handle_owner_work(1).unwrap().more_work;
                 let left = allocators.pending_deallocations(1);
-                let second = allocators.handle_owner_work(1).unwrap();
+                let second = allocators.handle_owner_work(1).unwrap().more_work;
                 (first, left, second, allocators.pending_deallocations(1))
             })
         };

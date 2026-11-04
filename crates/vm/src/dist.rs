@@ -3138,6 +3138,10 @@ pub(crate) fn local_reg_name(target: Term) -> Result<Option<Term>, VmError> {
 }
 
 pub(crate) fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, VmError> {
+    // do_send: a pid or an atom target never builds anything here.
+    if arinsal_term::raw::Tuple2::try_from(target).is_err() {
+        return Ok(None);
+    }
     let owned = owned(target)?;
     let OwnedTerm::Tuple(ref parts) = owned else {
         return Ok(None);

@@ -11,7 +11,7 @@ const CACHE_LINE: usize = 64;
 const FORCE_PROGRESS: i32 = 10;
 const MAX_REMOTE: i32 = 5;
 
-fn progress_later(value: u64) -> u64 {
+pub(crate) fn progress_later(value: u64) -> u64 {
     if value == u64::MAX - 2 {
         0
     } else if value == u64::MAX - 1 {
@@ -33,6 +33,20 @@ pub struct ProgressOps {
 }
 
 static PROGRESS_OPS: OnceLock<ProgressOps> = OnceLock::new();
+
+/// The thread progress operations of a runtime without managed threads: every thread is
+/// unmanaged, so the reference counters of the delayed-dealloc queues alone protect its nodes,
+/// and progress is always reached.
+static UNMANAGED_OPS: ProgressOps = ProgressOps {
+    current: |_| 0,
+    has_reached: |_, _| true,
+    is_managed: || false,
+};
+
+/// The installed thread progress bridge, or the one of a process with no managed threads.
+pub(crate) fn progress_ops() -> &'static ProgressOps {
+    PROGRESS_OPS.get().unwrap_or(&UNMANAGED_OPS)
+}
 
 /// Install the scheduler's thread-progress bridge before creating the message-ref pool.
 pub fn install_progress_ops(ops: ProgressOps) -> Result<(), ProgressOps> {
