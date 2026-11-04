@@ -706,6 +706,9 @@ impl<H: NodeHandle> MonLnkTree<H> {
     /// `erts_monitor_tree_foreach_delete` / `erts_link_tree_foreach_delete`: empty the tree,
     /// handing out its nodes in foreach order.
     pub(crate) fn drain(&mut self) -> smallvec::IntoIter<[H; 4]> {
+        if self.root.is_none() {
+            return smallvec::SmallVec::<[H; 4]>::new().into_iter();
+        }
         let nodes = self.nodes();
         self.root = None;
         nodes

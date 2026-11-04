@@ -277,11 +277,13 @@ pub(crate) fn resume_remote(process: &mut Process, me: Pid, target: Pid) -> Opti
 
 /// Exit of a suspender (erl_process.c:13894): every suspend it holds is released at its target.
 pub(crate) fn release_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
-    let monitors = process
-        .cold
-        .as_mut()
-        .map(|cold| std::mem::take(&mut cold.suspend_monitors))
-        .unwrap_or_default();
+    let Some(cold) = process.cold.as_mut() else {
+        return;
+    };
+    if cold.suspend_monitors.is_empty() {
+        return;
+    }
+    let monitors = std::mem::take(&mut cold.suspend_monitors);
     for (target, monitor) in monitors {
         let _ = ctx.signal(
             target,
@@ -294,11 +296,13 @@ pub(crate) fn release_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, Messag
 
 /// Exit of a suspendee (erl_process.c:13809): every suspender drops its half of the monitor.
 pub(crate) fn down_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
-    let monitors = process
-        .cold
-        .as_mut()
-        .map(|cold| std::mem::take(&mut cold.suspended_by))
-        .unwrap_or_default();
+    let Some(cold) = process.cold.as_mut() else {
+        return;
+    };
+    if cold.suspended_by.is_empty() {
+        return;
+    }
+    let monitors = std::mem::take(&mut cold.suspended_by);
     for (origin, monitor) in monitors {
         monitor.set_active(false);
         let _ = ctx.signal(
