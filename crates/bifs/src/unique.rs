@@ -28,42 +28,53 @@ const MAX_SMALL: u64 = (1 << 59) - 1;
 
 /// `ErtsSchedulerData` fields `thr_id`, `ref` and `unique` (erl_process.h:718-720).
 ///
-/// One copy per thread, like `erts_get_scheduler_data`. The counters are plain
-/// cells: only that scheduler thread writes them (`esdp->ref++`), so they are
-/// not atomics.
+/// One per scheduler thread, created when the thread first binds and never freed (a thread
+/// binds once, and there are as many as schedulers). Only that thread writes the counters
+/// (`esdp->ref++`), so they are loaded and stored, not incremented atomically; the atomic type
+/// lets a process hold the reference without thread-local access, as `c_p->scheduler_data` does.
+// 128-byte alignment keeps two schedulers' counters off one cache line.
+#[repr(align(128))]
 struct Esdp {
-    thr_id: Cell<u32>,
-    bound: Cell<bool>,
+    thr_id: u32,
     /// `esdp->ref`, initialized to `ref_init_value`.
-    ref_n: Cell<u64>,
+    ref_n: AtomicU64,
     /// `esdp->unique`.
-    unique_n: Cell<u64>,
+    unique_n: AtomicU64,
 }
 
 thread_local! {
-    static ESDP: Esdp = const {
-        Esdp {
-            thr_id: Cell::new(0),
-            bound: Cell::new(false),
-            ref_n: Cell::new(0),
-            unique_n: Cell::new(0),
-        }
-    };
+    /// `erts_get_scheduler_data()` for the counters: `None` on a thread that never bound.
+    static ESDP: Cell<Option<&'static Esdp>> = const { Cell::new(None) };
 }
 
-/// Thread id of the scheduler whose counters this process turn uses.
-///
-/// The counters themselves stay in [`ESDP`]; this is only the id `run` compares
-/// when the process moves to another scheduler.
+impl Esdp {
+    #[inline(always)]
+    fn bump_ref_words(&self) -> [u32; 3] {
+        let value = self.ref_n.load(Ordering::Relaxed);
+        self.ref_n.store(value.wrapping_add(1), Ordering::Relaxed);
+        set_ref_numbers(self.thr_id, value)
+    }
+
+    #[inline(always)]
+    fn bump_unique(&self, positive: bool) -> UniqueInt {
+        let unique = self.unique_n.load(Ordering::Relaxed);
+        self.unique_n
+            .store(unique.wrapping_add(1), Ordering::Relaxed);
+        combine_unique(u64::from(self.thr_id), unique, positive, unique_layout())
+    }
+}
+
+/// The scheduler whose counters a process turn uses, held by the process like
+/// `c_p->scheduler_data` so that making a reference reads no thread-local.
 #[derive(Clone, Copy)]
 pub struct SchedulerRefState {
-    thr_id: u32,
+    esdp: &'static Esdp,
 }
 
 impl SchedulerRefState {
     /// Scheduler thread id mixed into reference numbers.
     pub fn thr_id(&self) -> u32 {
-        self.thr_id
+        self.esdp.thr_id
     }
 
     /// Next ordinary-reference id. The pre-increment value is the one published,
@@ -72,22 +83,19 @@ impl SchedulerRefState {
         ordinary_ref_key(self.bump_ref_words())
     }
 
-    /// Three reference words from `esdp->ref++`. No atomic: the cell belongs to
-    /// this scheduler thread.
+    /// Three reference words from `esdp->ref++`. No atomic read-modify-write: the counter
+    /// belongs to this scheduler thread, which is the thread running the process.
     // Port of erts/emulator/beam/erl_bif_unique.h:170-177 (erts_sched_make_ref_in_array),
-    // OTP-29.1.1. The counter stays in this thread's `Esdp`; `next_ref_words`
-    // reads it there, the same way `bump_ref` does.
+    // OTP-29.1.1.
     #[inline(always)]
     pub fn bump_ref_words(&self) -> [u32; 3] {
-        debug_assert!(ESDP.with(|esdp| !esdp.bound.get() || esdp.thr_id.get() == self.thr_id));
-        next_ref_words()
+        self.esdp.bump_ref_words()
     }
 
     /// Next non-monotonic `unique_integer` on this scheduler.
     // Port of erts/emulator/beam/erl_bif_unique.c:565-578 (`unique_integer_bif`), OTP-29.1.1.
     pub fn bump_unique(&self, positive: bool) -> UniqueInt {
-        debug_assert!(ESDP.with(|esdp| !esdp.bound.get() || esdp.thr_id.get() == self.thr_id));
-        next_unique_integer(positive)
+        self.esdp.bump_unique(positive)
     }
 }
 
@@ -95,17 +103,18 @@ impl SchedulerRefState {
 /// return the counters created for the first `thr_id`.
 // Port of erts/emulator/beam/erl_bif_unique.c:809-814 (erts_sched_bif_unique_init), OTP-29.1.1.
 pub fn bind_scheduler_ref_state(thr_id: u32) -> SchedulerRefState {
-    ESDP.with(|esdp| {
-        if !esdp.bound.get() {
-            esdp.thr_id.set(thr_id & THR_ID_MASK);
+    ESDP.with(|slot| {
+        let esdp = slot.get().unwrap_or_else(|| {
             // `esdp->ref = ref_init_value`, not an offset added on every bump.
-            esdp.ref_n.set(initial_ref());
-            esdp.unique_n.set(0);
-            esdp.bound.set(true);
-        }
-        SchedulerRefState {
-            thr_id: esdp.thr_id.get(),
-        }
+            let esdp: &'static Esdp = Box::leak(Box::new(Esdp {
+                thr_id: thr_id & THR_ID_MASK,
+                ref_n: AtomicU64::new(initial_ref()),
+                unique_n: AtomicU64::new(0),
+            }));
+            slot.set(Some(esdp));
+            esdp
+        });
+        SchedulerRefState { esdp }
     })
 }
 
@@ -189,14 +198,9 @@ fn ref_numbers_value(ids: [u32; 3]) -> u64 {
 // erl_bif_unique.h:170-177 (`erts_sched_make_ref_in_array`), OTP-29.1.1.
 #[inline]
 pub fn next_ref_words() -> [u32; 3] {
-    ESDP.with(|esdp| {
-        if esdp.bound.get() {
-            let value = esdp.ref_n.get();
-            esdp.ref_n.set(value.wrapping_add(1));
-            set_ref_numbers(esdp.thr_id.get(), value)
-        } else {
-            global_ref_words()
-        }
+    ESDP.with(|slot| match slot.get() {
+        Some(esdp) => esdp.bump_ref_words(),
+        None => global_ref_words(),
     })
 }
 
@@ -273,15 +277,9 @@ pub enum UniqueInt {
 #[inline]
 pub fn next_unique_integer(positive: bool) -> UniqueInt {
     // `unique_data.r.o` is process-wide, computed once in `init_unique_integer`.
-    let layout = unique_layout();
-    ESDP.with(|esdp| {
-        if esdp.bound.get() {
-            let unique = esdp.unique_n.get();
-            esdp.unique_n.set(unique.wrapping_add(1));
-            combine_unique(u64::from(esdp.thr_id.get()), unique, positive, layout)
-        } else {
-            global_unique(positive)
-        }
+    ESDP.with(|slot| match slot.get() {
+        Some(esdp) => esdp.bump_unique(positive),
+        None => global_unique(positive),
     })
 }
 

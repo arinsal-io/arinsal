@@ -1421,7 +1421,7 @@ fn timer_start_native(
     let arity = usize::from(export.arity);
     let mut args = [Term::NIL; 4];
     args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-    let mut sink = crate::signals::NativeTimers(process.self_pid?);
+    let mut sink = crate::signals::NativeTimers(process.self_pid?, process.native_handle());
     let term =
         crate::signals::start_timer_bif(process, &mut sink, &args[..arity], send_after).ok()?;
     registers.x_reg_array[0] = term;
@@ -1464,8 +1464,9 @@ fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool)
     // this scheduler names a timer on its own wheel, which answers without any request.
     if process.pending_signal_waiter().is_none()
         && let Some(key) = crate::signals::ref_id(reference)
-        && let Some(remaining) =
-            arinsal_sched::native_access_timer::<crate::process::Message>(key, cancel)
+        && let Some(remaining) = process
+            .native_handle()
+            .and_then(|handle| handle.access_timer(key, cancel))
     {
         let term = if !info {
             crate::signals::atom("ok")

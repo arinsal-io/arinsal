@@ -131,8 +131,12 @@ fn system_fragment(fragment: MessageFragment) -> MessageFragmentBox {
     MessageFragmentBox::boxed(fragment)
 }
 
-fn timer_fragment(fragment: MessageFragment) -> MessageFragmentBox {
-    MessageFragmentBox::fixed(fragment).expect("timer message fragment allocation")
+fn timer_fragment(fragment: MessageFragment, alloc_ix: Option<usize>) -> MessageFragmentBox {
+    match alloc_ix {
+        Some(ix) => MessageFragmentBox::fixed_at(ix, fragment),
+        None => MessageFragmentBox::fixed(fragment),
+    }
+    .expect("timer message fragment allocation")
 }
 
 type RemovedMessage = (Term, crate::seq_trace::SeqState);
@@ -804,19 +808,26 @@ impl Message {
 
     /// Copy a timer message into a PROC-allocated timer fragment.
     // Port of erts/emulator/beam/erl_hl_timer.c (setup_bif_timer), OTP-29.1.1.
-    pub(crate) fn copy_from_timer(term: Term, timer_id: u64) -> Result<Self, VmError> {
+    pub(crate) fn copy_from_timer(
+        term: Term,
+        timer_id: u64,
+        alloc_ix: Option<usize>,
+    ) -> Result<Self, VmError> {
         if !term.is_pointer() {
             let mut message = Self::immediate(term);
-            message.fragment = Some(timer_fragment(MessageFragment {
-                heap: None,
-                seq_token: None,
-                timer_id: Some(timer_id),
-            }));
+            message.fragment = Some(timer_fragment(
+                MessageFragment {
+                    heap: None,
+                    seq_token: None,
+                    timer_id: Some(timer_id),
+                },
+                alloc_ix,
+            ));
             return Ok(message);
         }
         let literals = arinsal_term::LiteralAreas::current();
         let words = arinsal_term::size_object_litopt(term, &literals);
-        Self::copy_counted(term, words, None, &literals, Some(timer_id))
+        Self::copy_counted(term, words, None, &literals, Some((timer_id, alloc_ix)))
     }
 
     /// `copy_from` when `words` is already `size_object_litopt(term, literals)`. A sequential
@@ -829,19 +840,22 @@ impl Message {
         words: usize,
         token: Option<&mut crate::seq_trace::Token>,
         literals: &arinsal_term::LiteralAreas,
-        timer_id: Option<u64>,
+        timer_id: Option<(u64, Option<usize>)>,
     ) -> Result<Self, VmError> {
         let token_words = token
             .as_deref()
             .map_or(0, crate::seq_trace::Token::heap_words);
         if words + token_words == 0 {
             let mut message = Self::immediate(term);
-            if let Some(timer_id) = timer_id {
-                message.fragment = Some(timer_fragment(MessageFragment {
-                    heap: None,
-                    seq_token: None,
-                    timer_id: Some(timer_id),
-                }));
+            if let Some((timer_id, alloc_ix)) = timer_id {
+                message.fragment = Some(timer_fragment(
+                    MessageFragment {
+                        heap: None,
+                        seq_token: None,
+                        timer_id: Some(timer_id),
+                    },
+                    alloc_ix,
+                ));
             }
             return Ok(message);
         }
@@ -862,12 +876,15 @@ impl Message {
         }
         Ok(Self {
             term,
-            fragment: Some(if let Some(timer_id) = timer_id {
-                timer_fragment(MessageFragment {
-                    heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
-                    seq_token: None,
-                    timer_id: Some(timer_id),
-                })
+            fragment: Some(if let Some((timer_id, alloc_ix)) = timer_id {
+                timer_fragment(
+                    MessageFragment {
+                        heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
+                        seq_token: None,
+                        timer_id: Some(timer_id),
+                    },
+                    alloc_ix,
+                )
             } else {
                 system_fragment(MessageFragment {
                     heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
@@ -1680,6 +1697,9 @@ struct Executor {
     current_process: crate::natives::nif::CurrentProcess,
     /// The scheduler thread's hub is bound to `current_process`.
     hub_bound: bool,
+    /// The reference and unique-integer counters of this scheduler, bound on its first turn
+    /// (`esdp->ref`, `esdp->unique`): a process scheduled in takes them from here.
+    ref_state: Option<arinsal_bifs::SchedulerRefState>,
     vm: Vm,
     /// Native register backing is scheduler-local, as required by x19.
     native_registers: SchedulerRegisters,
@@ -3302,7 +3322,15 @@ impl Executor {
                 .as_ref()
                 .is_none_or(|state| state.thr_id() != thr)
             {
-                process.scheduler_ref_state = Some(arinsal_bifs::bind_scheduler_ref_state(thr));
+                let state = match self.ref_state {
+                    Some(state) if state.thr_id() == thr => state,
+                    _ => {
+                        let state = arinsal_bifs::bind_scheduler_ref_state(thr);
+                        self.ref_state = Some(state);
+                        state
+                    }
+                };
+                process.scheduler_ref_state = Some(state);
             }
             process.exec_key = exec_key;
         }
@@ -5649,6 +5677,7 @@ impl Process {
     /// Port of erts/emulator/beam/erl_message.c:621 (`erts_try_alloc_message_on_heap`)
     /// and erl_process.h:2878 (`erts_alloc_message_heap_state`), OTP-29.1.1.
     /// `Ok(false)` keeps the existing heap-fragment copy.
+    #[allow(clippy::too_many_arguments)] // erts passes the scheduler data as one more.
     fn try_send_on_receiver_heap(
         &self,
         ctx: Option<&mut RunCtx<'_, Message>>,
@@ -5657,26 +5686,25 @@ impl Process {
         counted: CountedSend<'_>,
         priority: bool,
         seq_token: &mut SendMeta,
+        handle: Option<&arinsal_sched::NativeHandle<Message>>,
     ) -> Result<bool, VmError> {
         if counted.words + counted.token_words == 0 {
             return Ok(false);
         }
-        if ctx.is_none() {
+        if ctx.is_none()
+            && let Some(handle) = handle
+        {
             let mut failure = None;
-            let native = arinsal_sched::native_try_send_on_heap::<Message>(
-                from,
-                to,
-                &mut |task: &mut dyn std::any::Any| {
-                    let receiver = task.downcast_mut::<Process>()?;
-                    match message_on_receiver_heap(receiver, counted, priority, seq_token) {
-                        Ok(envelope) => envelope,
-                        Err(error) => {
-                            failure = Some(error);
-                            None
-                        }
+            let native = handle.try_send_on_heap(from, to, &mut |task: &mut dyn std::any::Any| {
+                let receiver = task.downcast_mut::<Process>()?;
+                match message_on_receiver_heap(receiver, counted, priority, seq_token) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        failure = Some(error);
+                        None
                     }
-                },
-            );
+                }
+            });
             if let Some(error) = failure {
                 return Err(error);
             }
@@ -6079,6 +6107,13 @@ impl Process {
             && matches!(seq_token.seq, crate::seq_trace::SeqState::Nil)
             && self.message_queue_data() == MessageQueueData::OnHeap;
         let mut on_own_heap = shares_own_term;
+        // Port of erts/emulator/beam/erl_process.h (erts_get_scheduler_data), OTP-29.1.1: the
+        // scheduler data is read once per send and serves both the heap attempt and the node.
+        let native = if ctx.is_none() && pid != sender {
+            self.native_handle()
+        } else {
+            None
+        };
         let (envelope, words) = if shares_own_term {
             let mut envelope = Message::immediate(value);
             if via_prio_alias {
@@ -6121,6 +6156,7 @@ impl Process {
                 counted,
                 via_prio_alias,
                 &mut seq_token,
+                native.as_ref(),
             )? {
                 self.bump_send_reds(ctx.as_deref_mut(), pid == sender, words);
                 return Ok(value);
@@ -6175,10 +6211,9 @@ impl Process {
                 {
                     probe.send_self_node(pid, node)
                 } else {
-                    match if pid == sender {
-                        Err(node)
-                    } else {
-                        arinsal_sched::native_send_node(pid, node)
+                    match match (&native, pid == sender) {
+                        (Some(handle), false) => handle.send_node(pid, node),
+                        _ => Err(node),
                     } {
                         Ok(delivered) => delivered,
                         Err(node) => self
@@ -6206,6 +6241,29 @@ impl Process {
     /// at most one slice. A process sending to itself with an on-heap queue copies nothing.
     // Port of erts/emulator/beam/erl_message.c (erts_send_message, the `BUMP_REDS` after
     // `erts_queue_proc_message`), OTP-29.1.1.
+    /// A new reference id from the running scheduler's counter, through the process.
+    // Port of erts/emulator/beam/erl_bif_unique.h:170-177 (erts_sched_make_ref_in_array with
+    // `esdp = erts_proc_sched_data(c_p)`), OTP-29.1.1: no thread lookup. A process that has not
+    // been scheduled yet falls back to the thread's counters.
+    #[inline]
+    pub(crate) fn next_ref(&self) -> u64 {
+        match self.scheduler_ref_state {
+            Some(state) => state.bump_ref(),
+            None => arinsal_bifs::next_ref_id(),
+        }
+    }
+
+    /// The running scheduler's native sender: one thread-local read for the first use in a run,
+    /// none after.
+    // Port of erts/emulator/beam/erl_process.h (ERTS_PROC_GET_SCHDATA: `c_p->scheduler_data`),
+    // OTP-29.1.1: a BIF reaches the scheduler through its process, not through the thread.
+    pub(crate) fn native_handle(&mut self) -> Option<arinsal_sched::NativeHandle<Message>> {
+        if self.native.is_none() {
+            self.native = arinsal_sched::native_handle::<Message>();
+        }
+        self.native.clone()
+    }
+
     fn bump_send_reds(
         &mut self,
         ctx: Option<&mut RunCtx<'_, Message>>,
@@ -8002,6 +8060,7 @@ fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
     Box::new(Executor {
         current_process: Default::default(),
         hub_bound: false,
+        ref_state: None,
         vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
         native_registers: {
             let mut registers = SchedulerRegisters::default();
@@ -8207,6 +8266,7 @@ impl Task for Process {
         self.on_managed = !ctx.scheduler_type().is_dirty() && !ctx.simulated();
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
         self.heap.set_alloc_ix(None);
+        self.native = None;
         if matches!(outcome, RunOutcome::Exit(_)) {
             // erts finishes a suspended updater's table_updater even when the process is
             // killed, which releases the permission; the update is already published here.

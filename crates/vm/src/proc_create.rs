@@ -421,6 +421,9 @@ pub struct Process {
     /// The running turn is on a managed (normal) scheduler thread, so table lookups need no
     /// thread-progress delay. Set at the start of every run.
     pub(crate) on_managed: bool,
+    /// The running scheduler's native sender (`c_p->scheduler_data` of erts), fetched on first
+    /// use in a run and dropped when the run ends.
+    pub(crate) native: Option<arinsal_sched::NativeHandle<process::Message>>,
     /// Saved continuation data for the process's pending `erts_await_result` BIF.
     // Port of erts/emulator/beam/erl_bif_info.c:1480-1500, OTP-29.1.1.
     pending_signal_waiter: Option<crate::signals::Waiter>,
@@ -1027,8 +1030,20 @@ pub(crate) fn create_monitor(
     info: MonitorInfo,
     state: OriginMonitor,
 ) -> (ProcessMonitor, ProcessMonitor) {
+    create_monitor_at(None, reference, origin, target, info, state)
+}
+
+/// [`create_monitor`] on the creating scheduler's allocator index `ix` when the caller has it.
+pub(crate) fn create_monitor_at(
+    ix: Option<usize>,
+    reference: u64,
+    origin: u64,
+    target: u64,
+    info: MonitorInfo,
+    state: OriginMonitor,
+) -> (ProcessMonitor, ProcessMonitor) {
     let kind = state.kind();
-    crate::monitor_link::Monitor::create(kind, reference, origin, target, 0, info, state)
+    crate::monitor_link::Monitor::create_at(ix, kind, reference, origin, target, 0, info, state)
 }
 
 /// The monitor signal of a remote process monitoring local `target` (erts
@@ -2186,8 +2201,13 @@ impl Process {
     #[cold]
     #[inline(never)]
     fn allocate_cold(&mut self) {
-        self.cold =
-            Some(FixAllocBox::new_with(ProcessCold::default).expect("ProcessCold allocation"));
+        self.cold = Some(
+            match self.heap.alloc_ix() {
+                Some(ix) => FixAllocBox::new_with_at(ix, ProcessCold::default),
+                None => FixAllocBox::new_with(ProcessCold::default),
+            }
+            .expect("ProcessCold allocation"),
+        );
     }
 
     /// Group leader, or `fallback` when spawn did not record one (`p->group_leader`).
@@ -2324,6 +2344,7 @@ impl Process {
             runtime: None,
             self_pid: None,
             on_managed: false,
+            native: None,
             pending_signal_waiter: None,
             scheduler_id: 0,
             scheduler_ref_state: None,

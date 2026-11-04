@@ -152,7 +152,7 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError>
     }
     let mut need = 0_usize;
     let mut cost = 0;
-    let mut stack = arinsal_term::EStack::<8>::new();
+    let mut stack = arinsal_term::EStack::<16>::new();
     let mut current = root;
     loop {
         let Ok(cell) = Cons::try_from(current) else {
@@ -336,39 +336,44 @@ fn valid_incomplete_utf8(bytes: &[u8]) -> bool {
     }
 }
 
+// Port of erts/emulator/beam/erl_unicode.c:1342 (do_utf8_to_list): keep the
+// converted UTF-8 scratch bytes, then reserve the final list directly on the heap.
 enum Output {
     Binary(Vec<u8>),
-    List(Vec<u32>),
+    List {
+        bytes: SmallVec<[u8; 64]>,
+        characters: usize,
+    },
 }
 
 impl Output {
     fn push(&mut self, cp: u32) {
+        let mut buffer = [0; 4];
+        let encoded = char::from_u32(cp)
+            .unwrap()
+            .encode_utf8(&mut buffer)
+            .as_bytes();
         match self {
-            Self::Binary(bytes) => {
-                let mut buffer = [0; 4];
-                bytes.extend_from_slice(
-                    char::from_u32(cp)
-                        .unwrap()
-                        .encode_utf8(&mut buffer)
-                        .as_bytes(),
-                );
+            Self::Binary(bytes) => bytes.extend_from_slice(encoded),
+            Self::List { bytes, characters } => {
+                bytes.extend_from_slice(encoded);
+                *characters += 1;
             }
-            Self::List(points) => points.push(cp),
         }
     }
     fn term(self, ctx: &mut Ctx<'_>) -> Term {
         match self {
             Self::Binary(bytes) => binary(ctx, &bytes),
-            Self::List(points) => {
-                let mut heap = Heap(&mut ctx.heap);
-                let mut builder = TermBuilder::new(&mut heap);
-                let mut tail = Term::NIL;
-                for cp in points.into_iter().rev() {
-                    tail = builder
-                        .cons(Term::small(i64::from(cp)).unwrap(), tail)
-                        .expect("infallible BIF heap");
-                }
-                tail
+            Self::List { bytes, characters } => {
+                let points = std::str::from_utf8(&bytes).expect("Unicode output is valid UTF-8");
+                TermBuilder::new(&mut Heap(&mut ctx.heap))
+                    .list_from_reverse_iter(
+                        characters,
+                        points
+                            .chars()
+                            .map(|c| Term::small(i64::from(c as u32)).unwrap()),
+                    )
+                    .expect("infallible BIF heap")
             }
         }
     }
@@ -438,7 +443,11 @@ fn missing_bytes(encoding: Encoding, bytes: &[u8]) -> Option<usize> {
     }
 }
 
-fn decode_binary_part(data: &[u8], encoding: Encoding, points: &mut Vec<u32>) -> BinaryResult {
+fn decode_binary_part(
+    data: &[u8],
+    encoding: Encoding,
+    points: &mut SmallVec<[u32; 64]>,
+) -> BinaryResult {
     let mut pos = 0;
     while pos < data.len() {
         match decode(&data[pos..], encoding) {
@@ -465,7 +474,7 @@ enum MapResult {
 }
 
 struct MapState {
-    points: Vec<u32>,
+    points: SmallVec<[u32; 64]>,
     pending: Option<(Vec<u8>, usize)>,
 }
 
@@ -611,12 +620,19 @@ fn wrapper_convert(
     encoding: Encoding,
 ) -> Result<Term, BifError> {
     let mut state = MapState {
-        points: Vec::new(),
+        points: SmallVec::new(),
         pending: None,
     };
     let result = map_chardata(ctx, args[0], encoding, &mut state)?;
     let output = if list_output {
-        Output::List(state.points)
+        let mut output = Output::List {
+            bytes: SmallVec::new(),
+            characters: 0,
+        };
+        for cp in state.points {
+            output.push(cp);
+        }
+        output
     } else {
         let mut bytes = Vec::new();
         for cp in state.points {
@@ -660,7 +676,10 @@ fn convert(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, 
         check_structure(root, encoding)?.bytes
     };
     let mut output = if list_output {
-        Output::List(Vec::with_capacity(need))
+        Output::List {
+            bytes: SmallVec::with_capacity(need),
+            characters: 0,
+        }
     } else {
         Output::Binary(Vec::with_capacity(need))
     };
@@ -1443,7 +1462,8 @@ struct Measure {
 // Port of erts/emulator/beam/erl_unicode.c:342 (utf8_need), OTP-29.1.1, for its cost.
 fn measure(root: Term, latin1: bool) -> Measure {
     let mut measure = Measure { cost: 0, units: 0 };
-    let mut stack = vec![root];
+    let mut stack = arinsal_term::EStack::<16>::new();
+    stack.push(root);
     let binary_work = |measure: &mut Measure, term: Term| -> bool {
         let Ok(data) = bytes(term) else {
             return false;
@@ -1785,8 +1805,14 @@ fn internal_name2native_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term,
     Ok(binary(ctx, &data))
 }
 
-fn codepoint_list(ctx: &mut Ctx<'_>, points: impl IntoIterator<Item = u32>) -> Term {
-    Output::List(points.into_iter().collect()).term(ctx)
+fn codepoint_list(
+    ctx: &mut Ctx<'_>,
+    points: impl ExactSizeIterator<Item = u32> + DoubleEndedIterator,
+) -> Term {
+    let len = points.len();
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .list_from_reverse_iter(len, points.map(|cp| Term::small(i64::from(cp)).unwrap()))
+        .expect("infallible BIF heap")
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2735 (prim_file_internal_native2name_1), OTP-29.1.1.
@@ -1814,7 +1840,7 @@ fn internal_native2name_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term,
             } else {
                 points
             };
-            Ok(codepoint_list(ctx, points))
+            Ok(codepoint_list(ctx, points.into_iter()))
         }
         Err(_) => Ok(tuple_build(ctx, &[atom("error"), atom("warning")])),
     }
@@ -1832,7 +1858,7 @@ fn internal_normalize_utf8_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Te
     let data = bytes(args[0])?;
     let text = std::str::from_utf8(&data).map_err(|_| BifError::BADARG)?;
     let points = text.chars().map(|c| c as u32).collect::<Vec<_>>();
-    Ok(codepoint_list(ctx, normalize_filename(points)))
+    Ok(codepoint_list(ctx, normalize_filename(points).into_iter()))
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2855 (prim_file_is_translatable_1), OTP-29.1.1.

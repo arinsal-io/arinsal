@@ -3778,10 +3778,10 @@ fn spawn_request(
     let Some(parsed) = parse_spawn_options(process.runtime, options) else {
         return Ok(atom("badopt"));
     };
-    let runtime = process
+    process
         .runtime
         .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
-    let id = runtime.next_ref();
+    let id = process.next_ref();
     let reference = crate::signals::reference(process, id)?;
     if parsed.bad {
         if parsed.reply_error {
@@ -3887,10 +3887,10 @@ fn dist_spawn_request(
             }
         }
     }
-    let runtime = process
+    process
         .runtime
         .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
-    let id = runtime.next_ref();
+    let id = process.next_ref();
     let reference = crate::signals::reference(process, id)?;
     let reason = atom(if bad { "badopt" } else { "noconnection" });
     if reply_error {
@@ -4263,7 +4263,7 @@ fn create_alias(
             mode = crate::proc_create::AliasMode::ExplicitUnalias;
         }
     }
-    let id = process.runtime.as_ref().ok_or_else(badarg)?.next_ref();
+    let id = process.next_ref();
     let reference = crate::signals::reference(process, id)?;
     let pid = ctx.pid();
     process
