@@ -360,7 +360,7 @@ fn publish_native_module_range(scope: u64, range: ModuleRange) {
     insert_module_range(&mut seed, range.clone());
     scope0_ranges().store(Arc::new(seed));
     crate::code_ix::with_all_scopes(|indexes| {
-        let mut ranges = indexes.code_ranges().as_ref().clone();
+        let mut ranges = indexes.with_code_ranges(<[_]>::to_vec);
         insert_module_range(&mut ranges, range.clone());
         indexes.store_code_ranges(Arc::new(ranges));
     });
@@ -656,10 +656,11 @@ fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch
             arinsal_alloc::typed::FixAllocBox::new(crate::proc_create::ProcessCold::default())
                 .expect("ProcessCold allocation")
         });
-        let table = runtime
+        return runtime
             .code_indexes()
-            .active_catches_cached(&mut cold.catch_cache);
-        return scan_catch(heap, table, native_only);
+            .with_active_catches_cached(&mut cold.catch_cache, |table| {
+                scan_catch(heap, table, native_only)
+            });
     }
     crate::code_ix::for_scope(process_code_scope(process))
         .with_active_catches(|table| scan_catch(heap, table, native_only))
@@ -972,13 +973,14 @@ pub(crate) fn unregister_native_scope(scope: u64) {
         return;
     }
     let module_ranges = crate::code_ix::existing_scope(scope)
-        .map(|indexes| indexes.code_ranges())
-        .map(|ranges| {
-            ranges
-                .iter()
-                .filter(|range| range.scope == scope && range.end() > range.start)
-                .map(|range| (range.start, range.end()))
-                .collect::<Vec<_>>()
+        .map(|indexes| {
+            indexes.with_code_ranges(|ranges| {
+                ranges
+                    .iter()
+                    .filter(|range| range.scope == scope && range.end() > range.start)
+                    .map(|range| (range.start, range.end()))
+                    .collect::<Vec<_>>()
+            })
         })
         .unwrap_or_default();
     let removed = remove_global_ranges(|range| range.scope == scope);
@@ -1908,9 +1910,10 @@ mod version_selection_tests {
             indexes.add_staging_code_range(range());
             drop(staging);
 
-            let ranges = indexes.code_ranges();
-            similar_asserts::assert_eq!(ranges.len(), 1);
-            similar_asserts::assert_eq!((ranges[0].start(), ranges[0].end()), (start, end));
+            indexes.with_code_ranges(|ranges| {
+                similar_asserts::assert_eq!(ranges.len(), 1);
+                similar_asserts::assert_eq!((ranges[0].start(), ranges[0].end()), (start, end));
+            });
         }
 
         crate::beamasm_integration::release_code_scope(scope);
