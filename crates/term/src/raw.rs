@@ -8,6 +8,18 @@
 
 use crate::{ARITY, EMPTY_TUPLE, HeapAlloc, Term, TermError};
 
+/// Rebuilds a term from its tagged word after it has been held by the ETF work stack.
+///
+/// # Safety contract
+/// `bits` must come from [`Term::word`] for a live term in the same encode walk. The walk must
+/// not run GC or release a heap fragment between saving and restoring the word.
+#[inline(always)]
+pub fn term_from_bits(bits: u64) -> Term {
+    // SAFETY: callers only restore tagged words previously obtained from a live `Term` in
+    // the same walk, which keeps the owning heap stable until the word is consumed.
+    unsafe { Term::from_raw_bits(bits) }
+}
+
 /// Reads the word at `address`.
 ///
 /// Contract: `address` is word-aligned and names an initialized word of a live heap block,
@@ -339,6 +351,12 @@ impl Tuple<'_> {
         (index < self.arity).then(|| Term(read_tagged(self.word, 6 + 8 * index as i64)))
     }
 
+    /// Address of element `index` for a tuple array task.
+    #[inline(always)]
+    pub fn element_pointer(self, index: usize) -> Option<u64> {
+        (index < self.arity).then(|| self.word.wrapping_add(6 + 8 * index as u64))
+    }
+
     /// Elements in order: one cursor and one end address, no per-element index check.
     #[inline(always)]
     pub fn elements(self) -> TupleElements {
@@ -512,6 +530,16 @@ impl Iterator for ValidatedMapPairs<'_> {
     }
 }
 
+/// Reads a tuple element at an address produced by [`Tuple::element_pointer`].
+///
+/// The pointer must still refer to the same live tuple element. ETF encode walks retain
+/// source terms and do not run GC while their WSTACK tasks are saved or restored.
+#[inline(always)]
+pub fn term_at_pointer(pointer: u64) -> Term {
+    // SAFETY: callers only pass a pointer previously produced by a validated tuple view and
+    // preserved in the same walk; no GC or heap-fragment release occurs during that walk.
+    unsafe { Term::from_raw_bits(*(pointer as *const u64)) }
+}
 /// Element cursor of a [`Tuple`].
 #[derive(Clone, Copy)]
 pub struct TupleElements {

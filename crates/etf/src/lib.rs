@@ -316,6 +316,8 @@ pub struct DistributionPacket {
     pub payload: Vec<u8>,
 }
 
+#[cold]
+#[inline(never)]
 fn invalid(offset: usize, msg: &str) -> DecodeError {
     DecodeError::Invalid {
         offset,
@@ -329,13 +331,13 @@ struct Reader<'a> {
 }
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self.at.checked_add(n).ok_or(DecodeError::Eof(self.at))?;
-        let result = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(DecodeError::Eof(self.at))?;
+        if n > self.bytes.len() - self.at {
+            return Err(DecodeError::Eof(self.at));
+        }
+        let start = self.at;
+        let end = start + n;
         self.at = end;
-        Ok(result)
+        Ok(&self.bytes[start..end])
     }
     fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
@@ -378,6 +380,40 @@ impl<'a> Reader<'a> {
             return Err(invalid(offset, "atom exceeds 255 characters"));
         }
         Ok(s)
+    }
+}
+
+// Port of CHKSIZE/SKIP cursor state in erts/emulator/beam/external.c (decoded_size), OTP-29.1.1.
+struct SizeReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    end: usize,
+}
+
+impl<'a> SizeReader<'a> {
+    #[inline(always)]
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if n > self.end - self.at {
+            return Err(DecodeError::Eof(self.at));
+        }
+        let start = self.at;
+        self.at += n;
+        Ok(&self.bytes[start..self.at])
+    }
+
+    #[inline(always)]
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    #[inline(always)]
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    #[inline(always)]
+    fn u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 }
 
@@ -658,21 +694,22 @@ impl DecodedSizeWalk {
             return Ok((Some((self.heap_words, self.at)), 0));
         }
         let budget = work_budget.max(1);
+        let input_len = bytes.len();
         if input_complete && budget >= bytes.len() {
             return self.step_complete(bytes, local_hash);
         }
         let mut work = 0;
-        while self.terms != 0 && self.at < bytes.len() && work < budget {
+        while self.terms != 0 && self.at < input_len && work < budget {
             // Complete input has no refill boundary to roll back across. Avoid copying
             // the scanner state in the synchronous binary_to_term path.
             let checkpoint = if input_complete { None } else { Some(*self) };
-            let mut r = Reader { bytes, at: self.at };
-            let tag = match r.u8() {
-                Ok(tag) => tag,
-                Err(error) => {
-                    return self.incomplete(checkpoint, error, input_complete, work);
-                }
+            let mut r = SizeReader {
+                bytes,
+                at: self.at,
+                end: input_len,
             };
+            let tag = bytes[r.at];
+            r.at += 1;
             let scanned = scan_decoded_size_tag(
                 &mut self.terms,
                 &mut self.heap_words,
@@ -705,7 +742,7 @@ impl DecodedSizeWalk {
         if self.terms == 0 {
             self.done = true;
             Ok((Some((self.heap_words, self.at)), work))
-        } else if input_complete && self.at == bytes.len() {
+        } else if input_complete && self.at == input_len {
             Err(DecodeError::Eof(self.at))
         } else {
             Ok((None, work))
@@ -725,9 +762,15 @@ impl DecodedSizeWalk {
         let mut local_hash_state = self.local_hash;
         let mut local_term_end = self.local_term_end;
         let mut work = 0;
-        while terms != 0 && at < bytes.len() {
-            let mut r = Reader { bytes, at };
-            let tag = r.u8()?;
+        let input_len = bytes.len();
+        while terms != 0 && at < input_len {
+            let mut r = SizeReader {
+                bytes,
+                at,
+                end: input_len,
+            };
+            let tag = bytes[r.at];
+            r.at += 1;
             scan_decoded_size_tag(
                 &mut terms,
                 &mut heap_words,
@@ -788,6 +831,33 @@ impl Default for DecodedSizeWalk {
 }
 
 // Port of erts/emulator/beam/external.c:6169-6461 (`decoded_size` tag cases), OTP-29.1.1.
+struct SizeTotals<'a> {
+    terms: &'a mut u32,
+    heap_words: &'a mut usize,
+    at: usize,
+}
+
+impl SizeTotals<'_> {
+    #[inline(always)]
+    fn words(&mut self, words: usize) -> Result<(), DecodeError> {
+        *self.heap_words = self
+            .heap_words
+            .checked_add(words)
+            .ok_or_else(|| invalid(self.at, "heap size overflow"))?;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn terms(&mut self, count: usize) -> Result<(), DecodeError> {
+        let count = u32::try_from(count).map_err(|_| invalid(self.at, "too many subterms"))?;
+        *self.terms = self
+            .terms
+            .checked_add(count)
+            .ok_or_else(|| invalid(self.at, "too many subterms"))?;
+        Ok(())
+    }
+}
+
 #[inline(always)]
 fn scan_decoded_size_tag(
     terms: &mut u32,
@@ -795,25 +865,17 @@ fn scan_decoded_size_tag(
     atom_extra_skip: &mut usize,
     local_hash: &mut Option<(u32, usize)>,
     local_term_end: &mut u32,
-    r: &mut Reader<'_>,
+    r: &mut SizeReader<'_>,
     tag: u8,
 ) -> Result<(), DecodeError> {
     const SMALL_MAP_LIMIT: usize = 32;
     const ON_HEAP_BINARY_LIMIT: usize = 64;
     const EXTERNAL_THING_HEAD_SIZE: usize = 3;
     let at = r.at - 1;
-    let add_words = |heap_words: &mut usize, words: usize| {
-        *heap_words = (*heap_words)
-            .checked_add(words)
-            .ok_or_else(|| invalid(at, "heap size overflow"))?;
-        Ok::<(), DecodeError>(())
-    };
-    let add_terms = |remaining: &mut u32, count: usize| {
-        let count = u32::try_from(count).map_err(|_| invalid(at, "too many subterms"))?;
-        *remaining = (*remaining)
-            .checked_add(count)
-            .ok_or_else(|| invalid(at, "too many subterms"))?;
-        Ok::<(), DecodeError>(())
+    let mut totals = SizeTotals {
+        terms,
+        heap_words,
+        at,
     };
     match tag {
         97 => {
@@ -828,7 +890,7 @@ fn scan_decoded_size_tag(
                 n.checked_add(1)
                     .ok_or_else(|| invalid(at, "bignum too large"))?,
             )?;
-            add_words(heap_words, 1 + n.div_ceil(8))?;
+            totals.words(1 + n.div_ceil(8))?;
         }
         111 => {
             let n = r.u32()? as usize;
@@ -839,7 +901,7 @@ fn scan_decoded_size_tag(
                 n.checked_add(1)
                     .ok_or_else(|| invalid(at, "bignum too large"))?,
             )?;
-            add_words(heap_words, 2 + n.div_ceil(8))?;
+            totals.words(2 + n.div_ceil(8))?;
         }
         100 | 115 | 118 | 119 => {
             let (n, utf8) = match tag {
@@ -876,8 +938,8 @@ fn scan_decoded_size_tag(
         }
         103 | 88 => {
             *atom_extra_skip = if tag == 103 { 9 } else { 12 };
-            add_terms(terms, 1)?;
-            add_words(heap_words, 4)?;
+            totals.terms(1)?;
+            totals.words(4)?;
         }
         102 | 89 | 120 => {
             *atom_extra_skip = match tag {
@@ -885,8 +947,8 @@ fn scan_decoded_size_tag(
                 89 => 8,
                 _ => 12,
             };
-            add_terms(terms, 1)?;
-            add_words(heap_words, 4)?;
+            totals.terms(1)?;
+            totals.words(4)?;
         }
         101 | 114 | 90 => {
             let (id_words, extra) = if tag == 101 {
@@ -913,8 +975,8 @@ fn scan_decoded_size_tag(
                 }
             };
             *atom_extra_skip = extra;
-            add_words(heap_words, EXTERNAL_THING_HEAD_SIZE + id_words / 2 + 1)?;
-            add_terms(terms, 1)?;
+            totals.words(EXTERNAL_THING_HEAD_SIZE + id_words / 2 + 1)?;
+            totals.terms(1)?;
         }
         106 => {
             if *atom_extra_skip != 0 {
@@ -927,15 +989,12 @@ fn scan_decoded_size_tag(
         }
         108 => {
             let n = r.u32()? as usize;
-            if n.checked_add(1)
-                .is_none_or(|count| count > r.bytes.len().saturating_sub(r.at))
-            {
+            if n.checked_add(1).is_none_or(|count| count > r.end - r.at) {
                 return Err(DecodeError::Eof(r.at));
             }
-            add_terms(terms, n)?;
-            add_terms(terms, 1)?;
-            add_words(
-                heap_words,
+            totals.terms(n)?;
+            totals.terms(1)?;
+            totals.words(
                 n.checked_mul(2)
                     .ok_or_else(|| invalid(at, "list too large"))?,
             )?;
@@ -949,12 +1008,12 @@ fn scan_decoded_size_tag(
             if n > (1 << 24) - 1 {
                 return Err(invalid(at, "tuple too large"));
             }
-            if n > r.bytes.len().saturating_sub(r.at) {
+            if n > r.end - r.at {
                 return Err(DecodeError::Eof(r.at));
             }
-            add_terms(terms, n)?;
+            totals.terms(n)?;
             if n > 0 {
-                add_words(heap_words, n + 1)?;
+                totals.words(n + 1)?;
             }
         }
         116 => {
@@ -965,81 +1024,73 @@ fn scan_decoded_size_tag(
             let children = n
                 .checked_mul(2)
                 .ok_or_else(|| invalid(at, "map too large"))?;
-            if children > r.bytes.len().saturating_sub(r.at) {
+            if children > r.end - r.at {
                 return Err(DecodeError::Eof(r.at));
             }
             if n <= SMALL_MAP_LIMIT {
-                add_words(heap_words, 3 + n + usize::from(n > 0) * (1 + n))?;
+                totals.words(3 + n + usize::from(n > 0) * (1 + n))?;
             } else {
                 let words = n
                     .checked_mul(3)
                     .and_then(|base| base.checked_add(n.saturating_mul(8) / 10))
                     .ok_or_else(|| invalid(at, "map too large"))?;
-                add_words(heap_words, words)?;
+                totals.words(words)?;
             }
-            add_terms(terms, children)?;
+            totals.terms(children)?;
         }
         107 => {
             let n = r.u16()? as usize;
             r.take(n)?;
-            add_words(
-                heap_words,
+            totals.words(
                 n.checked_mul(2)
                     .ok_or_else(|| invalid(at, "string too large"))?,
             )?;
         }
         99 => {
             r.take(31)?;
-            add_words(heap_words, 3)?;
+            totals.words(3)?;
         }
         70 => {
             r.take(8)?;
-            add_words(heap_words, 3)?;
+            totals.words(3)?;
         }
         109 => {
             let n = r.u32()? as usize;
             r.take(n)?;
-            add_words(
-                heap_words,
-                if n <= ON_HEAP_BINARY_LIMIT {
-                    2 + n.div_ceil(8)
-                } else {
-                    8
-                },
-            )?;
+            totals.words(if n <= ON_HEAP_BINARY_LIMIT {
+                2 + n.div_ceil(8)
+            } else {
+                8
+            })?;
         }
         77 => {
-            let n = r.u32()? as usize;
-            let bits = r.u8()?;
+            let header = r.take(5)?;
+            let n = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let bits = header[4];
             if !(1..=8).contains(&bits) || n == 0 {
                 return Err(invalid(at, "invalid final bit count"));
             }
             r.take(n)?;
-            add_words(
-                heap_words,
-                if n <= ON_HEAP_BINARY_LIMIT {
-                    2 + n.div_ceil(8)
-                } else {
-                    8
-                },
-            )?;
+            totals.words(if n <= ON_HEAP_BINARY_LIMIT {
+                2 + n.div_ceil(8)
+            } else {
+                8
+            })?;
         }
-        113 => add_terms(terms, 3)?,
+        113 => totals.terms(3)?,
         112 => {
             // The Size field is ignored by dec_term; it has historical OTP bugs.
-            r.take(4 + 1 + 16 + 4)?;
-            let free = r.u32()? as usize;
+            let header = r.take(4 + 1 + 16 + 4 + 4)?;
+            let free = u32::from_be_bytes(header[25..29].try_into().unwrap()) as usize;
             if free > 255 {
                 return Err(invalid(at, "fun environment too large"));
             }
-            add_terms(
-                terms,
+            totals.terms(
                 4usize
                     .checked_add(free)
                     .ok_or_else(|| invalid(at, "fun too large"))?,
             )?;
-            add_words(
-                heap_words,
+            totals.words(
                 2usize
                     .checked_add(free)
                     .ok_or_else(|| invalid(at, "fun too large"))?,
@@ -1053,10 +1104,10 @@ fn scan_decoded_size_tag(
                 return Err(invalid(at, "nested LOCAL_EXT"));
             }
             *local_hash = Some((hash, term_start));
-            *local_term_end = (*terms)
+            *local_term_end = (*totals.terms)
                 .checked_sub(1)
                 .ok_or_else(|| invalid(at, "term counter underflow"))?;
-            add_terms(terms, 1)?;
+            totals.terms(1)?;
         }
         67 => {
             let n = r.u32()? as usize;
@@ -1065,13 +1116,13 @@ fn scan_decoded_size_tag(
                 .and_then(|fields| fields.checked_add(8))
                 .ok_or_else(|| invalid(at, "record too large"))?;
             r.take(1)?;
-            add_words(heap_words, words)?;
+            totals.words(words)?;
             if n > 0 {
-                add_words(heap_words, n + 1)?;
+                totals.words(n + 1)?;
             }
-            add_terms(terms, 2)?;
-            add_terms(terms, n)?;
-            add_terms(terms, n)?;
+            totals.terms(2)?;
+            totals.terms(n)?;
+            totals.terms(n)?;
         }
         _ => return Err(DecodeError::UnknownTag { tag, offset: at }),
     }
