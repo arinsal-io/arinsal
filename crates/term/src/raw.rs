@@ -112,8 +112,8 @@ impl<const N: usize> Default for UninitTermArray<N> {
 
 /// Reads the word at `address`.
 ///
-/// Contract: `address` is word-aligned and names an initialized word of a live heap block,
-/// heap fragment or reserved destination that the calling collection owns.
+/// Contract: `address` is word-aligned and names an initialized word in a live allocation,
+/// heap fragment or reserved destination that the caller owns or may read immutably.
 #[inline(always)]
 pub(crate) fn load(address: usize) -> u64 {
     // SAFETY: the contract above; the collector has exclusive access to the process heap.

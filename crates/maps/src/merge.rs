@@ -1092,6 +1092,7 @@ impl HashmapFromPairs {
     /// Fill several leaves while the caller's validated input cursor advances.
     /// Port of the `while (is_list(item))` leaf loop at erl_map.c:513-531,
     /// OTP-29.1.1.
+    #[inline(always)]
     pub fn push_chunk(
         &mut self,
         count: usize,
