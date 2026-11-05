@@ -4846,6 +4846,24 @@ pub struct HeapBlockBuilder {
 }
 
 impl HeapBlockBuilder {
+    /// Append consecutive header and term words after one reservation check.
+    #[inline(always)]
+    pub(crate) fn write_words(&mut self, values: &[u64]) -> Result<(), TermError> {
+        let end = self
+            .written
+            .checked_add(values.len())
+            .filter(|end| *end <= self.words)
+            .ok_or(TermError::BadArg)?;
+        for (offset, value) in values.iter().copied().enumerate() {
+            crate::raw::store(
+                self.start + (self.written + offset) * std::mem::size_of::<u64>(),
+                value,
+            );
+        }
+        self.written = end;
+        Ok(())
+    }
+
     /// Append a non-term header word to the reserved object.
     #[inline(always)]
     pub fn write_header(&mut self, value: u64) -> Result<(), TermError> {
@@ -4862,6 +4880,24 @@ impl HeapBlockBuilder {
     #[inline(always)]
     pub fn write_term_bits(&mut self, value: u64) -> Result<(), TermError> {
         self.write_word(value)
+    }
+
+    /// Append reserved words from last to first, as the HAMT builder's stack pop loop does.
+    #[inline(always)]
+    pub fn write_term_bits_reversed(&mut self, values: &[u64]) -> Result<(), TermError> {
+        let end = self
+            .written
+            .checked_add(values.len())
+            .filter(|end| *end <= self.words)
+            .ok_or(TermError::BadArg)?;
+        for (offset, value) in values.iter().rev().enumerate() {
+            crate::raw::store(
+                self.start + (self.written + offset) * std::mem::size_of::<u64>(),
+                *value,
+            );
+        }
+        self.written = end;
+        Ok(())
     }
 
     /// A boxed term at a previously initialized word offset in the reservation.
@@ -5201,7 +5237,7 @@ impl ConsListBuilder {
     /// repeated destination-capacity check while remaining bounded by the reservation.
     /// Port of leaf construction in erts/emulator/beam/erl_map.c:513-531 and :732-739,
     /// OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     pub fn fill_cons_cells_with(
         &mut self,
         count: usize,

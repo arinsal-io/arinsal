@@ -81,20 +81,26 @@ enum SortKey {
     /// `hxnodecmpkey`: `CMP_TERM` order of the leaf keys.
     Key,
 }
-type NodeCompare = fn(&HxNode, &HxNode) -> i32;
+type NodeCompare = fn(*const HxNode, *const HxNode) -> i32;
 
 // Port of erts/emulator/beam/erl_map.c:1160-1186 (hxnodecmp), OTP-29.1.1.
-fn node_cmp_hash(a: &HxNode, b: &HxNode) -> i32 {
-    match a.hx.cmp(&b.hx) {
-        Ordering::Less => 1,
-        Ordering::Equal => 0,
-        Ordering::Greater => -1,
+fn node_cmp_hash(a: *const HxNode, b: *const HxNode) -> i32 {
+    let a_hx = crate::raw::load(a as usize);
+    let b_hx = crate::raw::load(b as usize);
+    if a_hx < b_hx {
+        1
+    } else if a_hx == b_hx {
+        0
+    } else {
+        -1
     }
 }
 
 // Port of erts/emulator/beam/erl_map.c:1160-1186 (hxnodecmpkey), OTP-29.1.1.
-fn node_cmp_key(a: &HxNode, b: &HxNode) -> i32 {
-    match crate::heap::exact_flat_key_cmp(leaf_key(a.val), leaf_key(b.val), false) {
+fn node_cmp_key(a: *const HxNode, b: *const HxNode) -> i32 {
+    let a_val = Term(crate::raw::load(a.cast::<u64>().wrapping_add(3) as usize));
+    let b_val = Term(crate::raw::load(b.cast::<u64>().wrapping_add(3) as usize));
+    match crate::heap::exact_flat_key_cmp(leaf_key(a_val), leaf_key(b_val), false) {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,
@@ -112,12 +118,11 @@ struct Frame {
 #[derive(Clone, Copy)]
 enum PartPhase {
     FastTest,
-    FastBody,
     SlowTest,
-    SlowBody,
 }
 
 /// `erts_qsort_partion_array` in flight.
+#[derive(Clone, Copy)]
 struct Partition {
     frame: Frame,
     /// Absolute index of the first item of the greater-than-pivot part.
@@ -127,11 +132,6 @@ struct Partition {
     pivot_part_end: usize,
     last_part_start: usize,
     ph: PartPhase,
-}
-
-enum PartitionOut {
-    Yield(Partition),
-    Done(Frame, usize, usize),
 }
 
 /// Yielding `erts_qsort` over the hash records.
@@ -166,27 +166,27 @@ impl Qsort {
     /// Run until sorted (`true`) or out of reductions (`false`).
     fn step(&mut self, nodes: &mut [HxNode], reds: &mut i64) -> bool {
         loop {
-            if let Some(part) = self.part.take() {
-                match Self::partition_step(self.compare, part, nodes, reds) {
-                    PartitionOut::Yield(part) => {
-                        self.part = Some(part);
-                        return false;
-                    }
-                    PartitionOut::Done(frame, start, end) => {
-                        let first = Frame {
-                            base: frame.base,
-                            n: start - frame.base,
-                            seed: frame.seed.wrapping_add(1),
-                        };
-                        let second = Frame {
-                            base: end,
-                            n: frame.base + frame.n - end,
-                            seed: frame.seed.wrapping_add(1),
-                        };
-                        // The first recursive call runs first.
-                        self.stack.push(second);
-                        self.stack.push(first);
-                    }
+            if let Some(mut part) = self.part {
+                self.part = None;
+                if let Some((start, end)) =
+                    Self::partition_step(self.compare, &mut part, nodes, reds)
+                {
+                    let first = Frame {
+                        base: part.frame.base,
+                        n: start - part.frame.base,
+                        seed: part.frame.seed.wrapping_add(1),
+                    };
+                    let second = Frame {
+                        base: end,
+                        n: part.frame.base + part.frame.n - end,
+                        seed: part.frame.seed.wrapping_add(1),
+                    };
+                    // The first recursive call runs first.
+                    self.stack.push(second);
+                    self.stack.push(first);
+                } else {
+                    self.part = Some(part);
+                    return false;
                 }
                 continue;
             }
@@ -218,7 +218,7 @@ impl Qsort {
                 .wrapping_sub(frame.n as u64),
         ) as usize)
             % frame.n;
-        swap(nodes, frame.base, frame.base + pivot_index);
+        swap_nodes(nodes.as_mut_ptr(), frame.base, frame.base + pivot_index);
         Partition {
             frame,
             second_part_start: frame.base + frame.n,
@@ -231,72 +231,91 @@ impl Qsort {
     }
 
     // Port of erts/emulator/beam/utils.c:3495-3587 (erts_qsort_partion_array), OTP-29.1.1.
+    #[inline(never)]
     fn partition_step(
         compare: NodeCompare,
-        mut p: Partition,
+        p: &mut Partition,
         nodes: &mut [HxNode],
         reds: &mut i64,
-    ) -> PartitionOut {
+    ) -> Option<(usize, usize)> {
         let base = p.frame.base;
+        let mut curr = p.curr;
+        let mut second_part_start = p.second_part_start;
+        let mut pivot_part_start = p.pivot_part_start;
+        let mut pivot_part_end = p.pivot_part_end;
+        let mut last_part_start = p.last_part_start;
+        let mut remaining_reds = *reds;
+
+        if matches!(p.ph, PartPhase::FastTest) {
+            loop {
+                if curr == second_part_start {
+                    // Port of the successful fast path in utils.c:3521-3527.
+                    let start = second_part_start - 1;
+                    swap_nodes(nodes.as_mut_ptr(), base, start);
+                    *reds = remaining_reds;
+                    return Some((start, second_part_start));
+                }
+                remaining_reds -= 1;
+                if remaining_reds <= 0 {
+                    *reds = remaining_reds;
+                    p.curr = curr;
+                    p.second_part_start = second_part_start;
+                    p.ph = PartPhase::FastTest;
+                    return None;
+                }
+
+                // Port of the fast loop in utils.c:3511-3520. Keep the indices local
+                // until a yield, as the C function does across its reduction check.
+                let c = compare(
+                    nodes.as_ptr().wrapping_add(curr),
+                    nodes.as_ptr().wrapping_add(base),
+                );
+                if c < 0 {
+                    curr += 1;
+                } else if c == 0 {
+                    pivot_part_start = curr - 1;
+                    pivot_part_end = curr + 1;
+                    last_part_start = second_part_start;
+                    swap_nodes(nodes.as_mut_ptr(), base, pivot_part_start);
+                    break;
+                } else {
+                    second_part_start -= 1;
+                    swap_nodes(nodes.as_mut_ptr(), curr, second_part_start);
+                }
+            }
+        }
+
         loop {
-            match p.ph {
-                PartPhase::FastTest => {
-                    if p.curr != p.second_part_start {
-                        p.ph = PartPhase::FastBody;
-                        *reds -= 1;
-                        if *reds <= 0 {
-                            return PartitionOut::Yield(p);
-                        }
-                    } else {
-                        // Fast path succeeded: no item equals the pivot.
-                        let start = p.second_part_start - 1;
-                        swap(nodes, base, start);
-                        return PartitionOut::Done(p.frame, start, p.second_part_start);
-                    }
-                }
-                PartPhase::FastBody => {
-                    let c = compare(&nodes[p.curr], &nodes[base]);
-                    if c < 0 {
-                        p.curr += 1;
-                        p.ph = PartPhase::FastTest;
-                    } else if c == 0 {
-                        // More than one pivot item: slow path (utils.c:3556).
-                        p.pivot_part_start = p.curr - 1;
-                        p.pivot_part_end = p.curr + 1;
-                        p.last_part_start = p.second_part_start;
-                        swap(nodes, base, p.pivot_part_start);
-                        p.ph = PartPhase::SlowTest;
-                    } else {
-                        p.second_part_start -= 1;
-                        swap(nodes, p.curr, p.second_part_start);
-                        p.ph = PartPhase::FastTest;
-                    }
-                }
-                PartPhase::SlowTest => {
-                    if p.pivot_part_end != p.last_part_start {
-                        p.ph = PartPhase::SlowBody;
-                        *reds -= 1;
-                        if *reds <= 0 {
-                            return PartitionOut::Yield(p);
-                        }
-                    } else {
-                        return PartitionOut::Done(p.frame, p.pivot_part_start, p.pivot_part_end);
-                    }
-                }
-                PartPhase::SlowBody => {
-                    let c = compare(&nodes[p.pivot_part_end], &nodes[p.pivot_part_end - 1]);
-                    if c == 0 {
-                        p.pivot_part_end += 1;
-                    } else if c < 0 {
-                        swap(nodes, p.pivot_part_start, p.pivot_part_end);
-                        p.pivot_part_start += 1;
-                        p.pivot_part_end += 1;
-                    } else {
-                        p.last_part_start -= 1;
-                        swap(nodes, p.pivot_part_end, p.last_part_start);
-                    }
-                    p.ph = PartPhase::SlowTest;
-                }
+            if pivot_part_end == last_part_start {
+                *reds = remaining_reds;
+                return Some((pivot_part_start, pivot_part_end));
+            }
+            remaining_reds -= 1;
+            if remaining_reds <= 0 {
+                *reds = remaining_reds;
+                p.curr = curr;
+                p.second_part_start = second_part_start;
+                p.pivot_part_start = pivot_part_start;
+                p.pivot_part_end = pivot_part_end;
+                p.last_part_start = last_part_start;
+                p.ph = PartPhase::SlowTest;
+                return None;
+            }
+
+            // Port of the duplicate-pivot loop in utils.c:3555-3572.
+            let c = compare(
+                nodes.as_ptr().wrapping_add(pivot_part_end),
+                nodes.as_ptr().wrapping_add(pivot_part_end - 1),
+            );
+            if c == 0 {
+                pivot_part_end += 1;
+            } else if c < 0 {
+                swap_nodes(nodes.as_mut_ptr(), pivot_part_start, pivot_part_end);
+                pivot_part_start += 1;
+                pivot_part_end += 1;
+            } else {
+                last_part_start -= 1;
+                swap_nodes(nodes.as_mut_ptr(), pivot_part_end, last_part_start);
             }
         }
     }
@@ -350,29 +369,32 @@ fn partition_array(nodes: &mut [HxNode], compare: NodeCompare, extra_seed: u32) 
             .wrapping_sub(n as u64),
     ) as usize
         % n;
-    swap(nodes, 0, pivot_index);
+    swap_nodes(nodes.as_mut_ptr(), 0, pivot_index);
 
     let mut second_part_start = n;
     let mut curr = 1;
     while curr != second_part_start {
-        match compare(&nodes[curr], &nodes[0]) {
+        match compare(nodes.as_ptr().wrapping_add(curr), nodes.as_ptr()) {
             value if value < 0 => curr += 1,
             0 => {
                 let mut pivot_part_start = curr - 1;
                 let mut pivot_part_end = curr + 1;
                 let mut last_part_start = second_part_start;
-                swap(nodes, 0, pivot_part_start);
+                swap_nodes(nodes.as_mut_ptr(), 0, pivot_part_start);
                 while pivot_part_end != last_part_start {
-                    match compare(&nodes[pivot_part_end], &nodes[pivot_part_end - 1]) {
+                    match compare(
+                        nodes.as_ptr().wrapping_add(pivot_part_end),
+                        nodes.as_ptr().wrapping_add(pivot_part_end - 1),
+                    ) {
                         0 => pivot_part_end += 1,
                         value if value < 0 => {
-                            swap(nodes, pivot_part_start, pivot_part_end);
+                            swap_nodes(nodes.as_mut_ptr(), pivot_part_start, pivot_part_end);
                             pivot_part_start += 1;
                             pivot_part_end += 1;
                         }
                         _ => {
                             last_part_start -= 1;
-                            swap(nodes, pivot_part_end, last_part_start);
+                            swap_nodes(nodes.as_mut_ptr(), pivot_part_end, last_part_start);
                         }
                     }
                 }
@@ -380,19 +402,28 @@ fn partition_array(nodes: &mut [HxNode], compare: NodeCompare, extra_seed: u32) 
             }
             _ => {
                 second_part_start -= 1;
-                swap(nodes, curr, second_part_start);
+                swap_nodes(nodes.as_mut_ptr(), curr, second_part_start);
             }
         }
     }
     let pivot_part_start = second_part_start - 1;
-    swap(nodes, 0, pivot_part_start);
+    swap_nodes(nodes.as_mut_ptr(), 0, pivot_part_start);
     (pivot_part_start, second_part_start)
 }
 
 // Port of erts/emulator/beam/utils.c:3466-3484 (erts_qsort_swap), OTP-29.1.1.
-fn swap(nodes: &mut [HxNode], i: usize, j: usize) {
-    if i != j {
-        nodes.swap(i, j);
+fn swap_nodes(base: *mut HxNode, i: usize, j: usize) {
+    if i == j {
+        return;
+    }
+    let base = base.cast::<u64>();
+    let words_per_node = std::mem::size_of::<HxNode>() / std::mem::size_of::<u64>();
+    for word in 0..words_per_node {
+        let left = base.wrapping_add(i * words_per_node + word) as usize;
+        let right = base.wrapping_add(j * words_per_node + word) as usize;
+        let value = crate::raw::load(left);
+        crate::raw::store(left, crate::raw::load(right));
+        crate::raw::store(right, value);
     }
 }
 
@@ -407,13 +438,17 @@ fn insertion_sort(compare: NodeCompare, nodes: &mut [HxNode]) {
         let mut smallest_so_far = unsorted_start;
         let mut curr = smallest_so_far + 1;
         while curr <= end {
-            if compare(&nodes[curr], &nodes[smallest_so_far]) < 0 {
+            if compare(
+                nodes.as_ptr().wrapping_add(curr),
+                nodes.as_ptr().wrapping_add(smallest_so_far),
+            ) < 0
+            {
                 smallest_so_far = curr;
             }
             curr += 1;
         }
         if smallest_so_far != unsorted_start {
-            swap(nodes, unsorted_start, smallest_so_far);
+            swap_nodes(nodes.as_mut_ptr(), unsorted_start, smallest_so_far);
         }
         unsorted_start += 1;
     }
@@ -734,6 +769,13 @@ enum ChunkPhase {
     RootEnd,
 }
 
+// The index comes from the sorted HxNode run and its skip counts, as in hashmap_from_chunked_array.
+#[inline(always)]
+fn hxnode_word(hxns: &[HxNode], index: usize, word_offset: usize) -> u64 {
+    let node = hxns.as_ptr().wrapping_add(index) as usize;
+    crate::raw::load(node.wrapping_add(word_offset * std::mem::size_of::<u64>()))
+}
+
 /// `hashmap_from_chunked_array`: builds the trie bottom-up on an explicit stack.
 ///
 /// Port of erts/emulator/beam/erl_map.c:919-1158, OTP-29.1.1. Where C allocates a node and then
@@ -758,8 +800,110 @@ struct Chunked {
     sz: usize,
     elems: usize,
     res: Term,
-    stack: SmallVec<[u64; 16]>,
+    stack: ErtsEStack,
     pending: Option<HeapBlockBuilder>,
+}
+
+/// The default-array and growth behavior of erts `ErtsEStack`.
+///
+/// Port of erts/emulator/beam/global.h:306-445 and utils.c:212-237, OTP-29.1.1.
+struct ErtsEStack {
+    inline: [u64; 16],
+    len: usize,
+    spill: Option<Vec<u64>>,
+}
+
+impl ErtsEStack {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: [0; 16],
+            len: 0,
+            spill: None,
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.spill.as_ref().map_or(self.len, Vec::len)
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u64] {
+        self.spill.as_deref().unwrap_or(&self.inline[..self.len])
+    }
+
+    #[inline(always)]
+    fn reserve(&mut self, need: usize) {
+        if let Some(spill) = &mut self.spill {
+            let old_size = spill.capacity();
+            if old_size - spill.len() < need {
+                let new_size = if need < old_size {
+                    2 * old_size
+                } else {
+                    (need / old_size + 2) * old_size
+                };
+                let mut grown = Vec::with_capacity(new_size);
+                grown.extend_from_slice(spill);
+                *spill = grown;
+            }
+        } else if 16 - self.len < need {
+            let new_size = if need < 16 { 32 } else { (need / 16 + 2) * 16 };
+            let mut spill = Vec::with_capacity(new_size);
+            spill.extend_from_slice(&self.inline[..self.len]);
+            self.spill = Some(spill);
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: u64) {
+        self.reserve(1);
+        if let Some(spill) = &mut self.spill {
+            spill.push(value);
+        } else {
+            self.inline[self.len] = value;
+            self.len += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn push2(&mut self, first: u64, second: u64) {
+        self.reserve(2);
+        if let Some(spill) = &mut self.spill {
+            spill.push(first);
+            spill.push(second);
+        } else {
+            self.inline[self.len] = first;
+            self.inline[self.len + 1] = second;
+            self.len += 2;
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<u64> {
+        if let Some(spill) = &mut self.spill {
+            spill.pop()
+        } else if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            Some(self.inline[self.len])
+        }
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, len: usize) {
+        if let Some(spill) = &mut self.spill {
+            spill.truncate(len);
+        } else {
+            self.len = len;
+        }
+    }
 }
 
 impl Chunked {
@@ -781,7 +925,7 @@ impl Chunked {
             sz: 0,
             elems: 0,
             res: Term::NIL,
-            stack: SmallVec::new(),
+            stack: ErtsEStack::new(),
             pending: None,
         }
     }
@@ -793,13 +937,90 @@ impl Chunked {
         res: Term,
     ) -> Result<Term, TermError> {
         let mut builder = TermBuilder::new(heap).reserve_boxed_words(2, HALLOC_EXTRA)?;
-        builder.write_header(node_bitmap_header(1 << maskval(level_hash, dc)))?;
-        builder.write_term(res)?;
+        builder.write_words(&[node_bitmap_header(1 << maskval(level_hash, dc)), res.bits()])?;
         builder.finish()
     }
 
     fn pop(&mut self) -> u64 {
         self.stack.pop().expect("HAMT build stack")
+    }
+
+    #[inline(always)]
+    fn push2(&mut self, first: u64, second: u64) {
+        self.stack.push2(first, second);
+    }
+
+    #[inline(always)]
+    fn run_simple_elements(&mut self, hxns: &[HxNode], reds: &mut i64, paid_first: bool) {
+        let mut elems = self.elems;
+        let mut ix = self.ix;
+        let mut d = self.d;
+        let mut vp = self.vp;
+        let mut v = self.v;
+        let mut remaining_reds = *reds;
+        let mut paid = paid_first;
+        loop {
+            if !paid {
+                if elems == 0 {
+                    self.elems = 0;
+                    self.ix = ix;
+                    self.d = d;
+                    self.vp = vp;
+                    self.v = v;
+                    self.ph = ChunkPhase::AfterElems;
+                    *reds = remaining_reds;
+                    return;
+                }
+                elems -= 1;
+                remaining_reds -= 1;
+                if remaining_reds <= 0 {
+                    self.elems = elems;
+                    self.ix = ix;
+                    self.d = d;
+                    self.vp = vp;
+                    self.v = v;
+                    self.ph = ChunkPhase::ElemsBody;
+                    *reds = remaining_reds;
+                    return;
+                }
+            }
+            paid = false;
+
+            let hdr = self.pop();
+            ix += hxnode_word(hxns, ix, 1) as usize;
+            let skip = hxnode_word(hxns, ix, 1) as usize;
+            let vn = hxnode_word(hxns, ix + skip, 0);
+            let dn = cdepth(v, vn);
+            debug_assert!(v > vn);
+            let res = Term(hxnode_word(hxns, ix, 3));
+            if skip > 1 || d != dn {
+                self.elems = elems;
+                self.ix = ix;
+                self.d = d;
+                self.dn = dn;
+                self.vp = vp;
+                self.v = v;
+                self.vn = vn;
+                self.hdr = hdr;
+                self.res = res;
+                if skip > 1 {
+                    self.wat = d.max(dn);
+                    self.dc = HAMT_MAX_LEVEL - 1;
+                    self.ph = ChunkPhase::L4Test;
+                } else if d < dn {
+                    self.ph = ChunkPhase::L5Test;
+                } else {
+                    self.ph = ChunkPhase::L6Test;
+                }
+                *reds = remaining_reds;
+                return;
+            }
+            let bp = 1 << maskval(v, d);
+            self.push2(res.bits(), hdr | bp);
+            vp = v;
+            v = vn;
+            d = dn;
+        }
     }
 
     fn step<H: HeapAlloc + ?Sized>(
@@ -810,28 +1031,42 @@ impl Chunked {
     ) -> Result<Option<Term>, TermError> {
         use ChunkPhase as C;
         let max_level = HAMT_MAX_LEVEL;
+        let mut phase = self.ph;
+        let mut remaining_reds = *reds;
+        macro_rules! chunk_tick {
+            ($n:expr, $next:expr) => {{
+                phase = $next;
+                remaining_reds -= $n as i64;
+                if remaining_reds <= 0 {
+                    self.ph = phase;
+                    *reds = remaining_reds;
+                    return Ok(None);
+                }
+                continue;
+            }};
+        }
         loop {
-            match self.ph {
+            match phase {
                 C::Init => {
                     if self.n == 1 {
                         // Every key shares all HAMT_MAX_LEVEL hash slots.
-                        self.res = hxns[0].val;
-                        self.v = hxns[0].hx;
+                        self.res = Term(hxnode_word(hxns, 0, 3));
+                        self.v = hxnode_word(hxns, 0, 0);
                         self.d = max_level - 1;
-                        self.ph = C::OneTest;
+                        phase = C::OneTest;
                     } else {
                         self.ix = 0;
                         self.d = 0;
-                        self.vp = hxns[0].hx;
-                        self.v = hxns[hxns[0].skip].hx;
+                        self.vp = hxnode_word(hxns, 0, 0);
+                        self.v = hxnode_word(hxns, hxnode_word(hxns, 0, 1) as usize, 0);
                         debug_assert!(self.vp > self.v);
                         self.slot = maskval(self.vp, self.d);
-                        self.ph = C::L1Test;
+                        phase = C::L1Test;
                     }
                 }
                 C::OneTest => {
                     if self.d > 0 {
-                        tick!(self, reds, 1, C::OneBody);
+                        chunk_tick!(1, C::OneBody);
                     }
                     let slot = maskval(self.v, 0);
                     let root = produce_words(
@@ -842,124 +1077,106 @@ impl Chunked {
                             self.res.bits(),
                         ],
                     )?;
+                    *reds = remaining_reds;
                     return Ok(Some(root));
                 }
                 C::OneBody => {
                     self.res = Self::collision_node(heap, self.v, self.d, self.res)?;
                     self.d -= 1;
-                    self.ph = C::OneTest;
+                    phase = C::OneTest;
                 }
                 C::L1Test => {
                     if self.slot == maskval(self.v, self.d) {
-                        tick!(self, reds, 1, C::L1Body);
+                        chunk_tick!(1, C::L1Body);
                     }
-                    self.ph = C::AfterL1;
+                    phase = C::AfterL1;
                 }
                 C::L1Body => {
                     self.stack.push(1 << self.slot);
                     self.d += 1;
                     self.slot = maskval(self.vp, self.d);
-                    self.ph = C::L1Test;
+                    phase = C::L1Test;
                 }
                 C::AfterL1 => {
-                    self.res = hxns[self.ix].val;
-                    if hxns[self.ix].skip > 1 {
+                    self.res = Term(hxnode_word(hxns, self.ix, 3));
+                    if hxnode_word(hxns, self.ix, 1) > 1 {
                         self.dc = max_level - 1;
-                        self.ph = C::L2Test;
+                        phase = C::L2Test;
                     } else {
-                        self.ph = C::PushFirst;
+                        phase = C::PushFirst;
                     }
                 }
                 C::L2Test => {
                     if self.dc > self.d {
-                        tick!(self, reds, 1, C::L2Body);
+                        chunk_tick!(1, C::L2Body);
                     }
-                    self.ph = C::PushFirst;
+                    phase = C::PushFirst;
                 }
                 C::L2Body => {
                     self.res = Self::collision_node(heap, self.vp, self.dc, self.res)?;
                     self.dc -= 1;
-                    self.ph = C::L2Test;
+                    phase = C::L2Test;
                 }
                 C::PushFirst => {
-                    self.stack.push(self.res.bits());
-                    self.stack.push(1 << self.slot);
+                    self.push2(self.res.bits(), 1 << self.slot);
                     // Remove first and last elements.
                     self.elems = self.n - 2;
-                    self.ph = C::ElemsTest;
+                    phase = C::ElemsTest;
                 }
                 C::ElemsTest => {
-                    if self.elems != 0 {
-                        self.elems -= 1;
-                        tick!(self, reds, 1, C::ElemsBody);
-                    }
-                    self.ph = C::AfterElems;
+                    self.run_simple_elements(hxns, &mut remaining_reds, false);
+                    phase = self.ph;
                 }
                 C::ElemsBody => {
-                    self.hdr = self.pop();
-                    self.ix += hxns[self.ix].skip;
-                    // Look at the next value to decide whether a node or subtree is built.
-                    self.vn = hxns[self.ix + hxns[self.ix].skip].hx;
-                    self.dn = cdepth(self.v, self.vn);
-                    debug_assert!(self.v > self.vn);
-                    self.res = hxns[self.ix].val;
-                    if hxns[self.ix].skip > 1 {
-                        self.wat = self.d.max(self.dn);
-                        self.dc = max_level - 1;
-                        self.ph = C::L4Test;
-                    } else {
-                        self.ph = C::Branch;
-                    }
+                    self.run_simple_elements(hxns, &mut remaining_reds, true);
+                    phase = self.ph;
                 }
                 C::L4Test => {
                     if self.dc > self.wat {
-                        tick!(self, reds, 1, C::L4Body);
+                        chunk_tick!(1, C::L4Body);
                     }
-                    self.ph = C::Branch;
+                    phase = C::Branch;
                 }
                 C::L4Body => {
                     self.res = Self::collision_node(heap, self.v, self.dc, self.res)?;
                     self.dc -= 1;
-                    self.ph = C::L4Test;
+                    phase = C::L4Test;
                 }
                 C::Branch => {
                     if self.d < self.dn {
                         // Next depth is higher (implies collision).
-                        self.ph = C::L5Test;
+                        phase = C::L5Test;
                     } else if self.d == self.dn {
                         // No collisions at all.
                         let bp = 1 << maskval(self.v, self.d);
-                        self.stack.push(self.res.bits());
-                        self.stack.push(self.hdr | bp);
-                        self.ph = C::ElemEnd;
+                        self.push2(self.res.bits(), self.hdr | bp);
+                        phase = C::ElemEnd;
                     } else {
                         // A drop: build nodes and subtree.
-                        self.ph = C::L6Test;
+                        phase = C::L6Test;
                     }
                 }
                 C::L5Test => {
                     if self.d < self.dn {
-                        tick!(self, reds, 1, C::L5Body);
+                        chunk_tick!(1, C::L5Body);
                     }
                     self.slot = maskval(self.v, self.d);
-                    self.stack.push(self.res.bits());
-                    self.stack.push(1 << self.slot);
-                    self.ph = C::ElemEnd;
+                    self.push2(self.res.bits(), 1 << self.slot);
+                    phase = C::ElemEnd;
                 }
                 C::L5Body => {
                     self.slot = maskval(self.v, self.d);
                     self.stack.push(self.hdr | (1 << self.slot));
                     self.d += 1;
                     self.hdr = 0;
-                    self.ph = C::L5Test;
+                    phase = C::L5Test;
                 }
                 C::L6Test => {
                     if self.dn != self.d {
-                        tick!(self, reds, 1, C::L6Body);
+                        chunk_tick!(1, C::L6Body);
                     }
-                    self.stack.push(self.res.bits());
-                    self.stack.push(self.hdr);
-                    self.ph = C::ElemEnd;
+                    self.push2(self.res.bits(), self.hdr);
+                    phase = C::ElemEnd;
                 }
                 C::L6Body => {
                     self.slot = maskval(self.v, self.d);
@@ -969,18 +1186,33 @@ impl Chunked {
                     self.sz = (self.hdr as u16).count_ones() as usize;
                     let mut builder =
                         TermBuilder::new(heap).reserve_boxed_words(self.sz + 1, HALLOC_EXTRA)?;
-                    builder.write_header(node_bitmap_header(self.hdr))?;
-                    builder.write_term(self.res)?;
+                    builder.write_words(&[node_bitmap_header(self.hdr), self.res.bits()])?;
                     self.pending = Some(builder);
                     self.sz -= 1;
-                    self.ph = C::L7Test;
+                    phase = C::L7Test;
                 }
                 C::L7Test => {
-                    if self.sz != 0 {
-                        self.sz -= 1;
-                        tick!(self, reds, 1, C::L7Body);
+                    if self.sz != 0 && remaining_reds > 1 {
+                        let count = self.sz.min((remaining_reds - 1) as usize);
+                        let stack_start = self.stack.len() - count;
+                        self.pending
+                            .as_mut()
+                            .expect("bitmap node allocation")
+                            .write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
+                        self.stack.truncate(stack_start);
+                        self.sz -= count;
+                        remaining_reds -= count as i64;
                     }
-                    self.ph = C::L6End;
+                    if self.sz != 0 {
+                        // YCF consumes the reduction before popping the next stack word.
+                        self.sz -= 1;
+                        remaining_reds -= 1;
+                        phase = C::L7Body;
+                        self.ph = phase;
+                        *reds = remaining_reds;
+                        return Ok(None);
+                    }
+                    phase = C::L6End;
                 }
                 C::L7Body => {
                     let word = self.pop();
@@ -988,7 +1220,7 @@ impl Chunked {
                         .as_mut()
                         .expect("bitmap node allocation")
                         .write_term_bits(word)?;
-                    self.ph = C::L7Test;
+                    phase = C::L7Test;
                 }
                 C::L6End => {
                     self.res = self
@@ -999,45 +1231,45 @@ impl Chunked {
                     // Pop the next hdr; it is pushed back if it is not needed.
                     self.hdr = self.pop();
                     self.d -= 1;
-                    self.ph = C::L6Test;
+                    phase = C::L6Test;
                 }
                 C::ElemEnd => {
                     self.vp = self.v;
                     self.v = self.vn;
                     self.d = self.dn;
-                    self.ph = C::ElemsTest;
+                    phase = C::ElemsTest;
                 }
                 C::AfterElems => {
                     self.dn = cdepth(self.vp, self.v);
-                    self.ix += hxns[self.ix].skip;
-                    self.res = hxns[self.ix].val;
-                    if hxns[self.ix].skip > 1 {
+                    self.ix += hxnode_word(hxns, self.ix, 1) as usize;
+                    self.res = Term(hxnode_word(hxns, self.ix, 3));
+                    if hxnode_word(hxns, self.ix, 1) > 1 {
                         self.dc = max_level - 1;
-                        self.ph = C::L8Test;
+                        phase = C::L8Test;
                     } else {
-                        self.ph = C::AfterL8;
+                        phase = C::AfterL8;
                     }
                 }
                 C::L8Test => {
                     if self.dc > self.dn {
-                        tick!(self, reds, 1, C::L8Body);
+                        chunk_tick!(1, C::L8Body);
                     }
-                    self.ph = C::AfterL8;
+                    phase = C::AfterL8;
                 }
                 C::L8Body => {
                     self.res = Self::collision_node(heap, self.v, self.dc, self.res)?;
                     self.dc -= 1;
-                    self.ph = C::L8Test;
+                    phase = C::L8Test;
                 }
                 C::AfterL8 => {
                     self.hdr = self.pop();
-                    self.ph = C::L9Test;
+                    phase = C::L9Test;
                 }
                 C::L9Test => {
                     if self.dn != 0 {
-                        tick!(self, reds, 1, C::L9Body);
+                        chunk_tick!(1, C::L9Body);
                     }
-                    self.ph = C::RootStart;
+                    phase = C::RootStart;
                 }
                 C::L9Body => {
                     self.slot = maskval(self.v, self.dn);
@@ -1045,18 +1277,32 @@ impl Chunked {
                     self.sz = (self.hdr as u16).count_ones() as usize;
                     let mut builder =
                         TermBuilder::new(heap).reserve_boxed_words(self.sz + 1, HALLOC_EXTRA)?;
-                    builder.write_header(node_bitmap_header(self.hdr))?;
-                    builder.write_term(self.res)?;
+                    builder.write_words(&[node_bitmap_header(self.hdr), self.res.bits()])?;
                     self.pending = Some(builder);
                     self.sz -= 1;
-                    self.ph = C::L10Test;
+                    phase = C::L10Test;
                 }
                 C::L10Test => {
+                    if self.sz != 0 && remaining_reds > 1 {
+                        let count = self.sz.min((remaining_reds - 1) as usize);
+                        let stack_start = self.stack.len() - count;
+                        self.pending
+                            .as_mut()
+                            .expect("bitmap node allocation")
+                            .write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
+                        self.stack.truncate(stack_start);
+                        self.sz -= count;
+                        remaining_reds -= count as i64;
+                    }
                     if self.sz != 0 {
                         self.sz -= 1;
-                        tick!(self, reds, 1, C::L10Body);
+                        remaining_reds -= 1;
+                        phase = C::L10Body;
+                        self.ph = phase;
+                        *reds = remaining_reds;
+                        return Ok(None);
                     }
-                    self.ph = C::L9End;
+                    phase = C::L9End;
                 }
                 C::L10Body => {
                     let word = self.pop();
@@ -1064,7 +1310,7 @@ impl Chunked {
                         .as_mut()
                         .expect("bitmap node allocation")
                         .write_term_bits(word)?;
-                    self.ph = C::L10Test;
+                    phase = C::L10Test;
                 }
                 C::L9End => {
                     self.res = self
@@ -1074,7 +1320,7 @@ impl Chunked {
                         .finish()?;
                     self.hdr = self.pop();
                     self.dn -= 1;
-                    self.ph = C::L9Test;
+                    phase = C::L9Test;
                 }
                 C::RootStart => {
                     // And finally the root.
@@ -1082,23 +1328,40 @@ impl Chunked {
                     self.hdr |= 1 << self.slot;
                     self.sz = (self.hdr as u16).count_ones() as usize;
                     let mut builder = TermBuilder::new(heap).reserve_boxed_words(self.sz + 2, 0)?;
-                    builder.write_header(if self.hdr == 0xffff {
-                        HEAD_ARRAY_HEADER
-                    } else {
-                        head_bitmap_header(self.hdr)
-                    })?;
-                    builder.write_header(self.size as u64)?;
-                    builder.write_term(self.res)?;
+                    builder.write_words(&[
+                        if self.hdr == 0xffff {
+                            HEAD_ARRAY_HEADER
+                        } else {
+                            head_bitmap_header(self.hdr)
+                        },
+                        self.size as u64,
+                        self.res.bits(),
+                    ])?;
                     self.pending = Some(builder);
                     self.sz -= 1;
-                    self.ph = C::L11Test;
+                    phase = C::L11Test;
                 }
                 C::L11Test => {
+                    if self.sz != 0 && remaining_reds > 1 {
+                        let count = self.sz.min((remaining_reds - 1) as usize);
+                        let stack_start = self.stack.len() - count;
+                        self.pending
+                            .as_mut()
+                            .expect("map head allocation")
+                            .write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
+                        self.stack.truncate(stack_start);
+                        self.sz -= count;
+                        remaining_reds -= count as i64;
+                    }
                     if self.sz != 0 {
                         self.sz -= 1;
-                        tick!(self, reds, 1, C::L11Body);
+                        remaining_reds -= 1;
+                        phase = C::L11Body;
+                        self.ph = phase;
+                        *reds = remaining_reds;
+                        return Ok(None);
                     }
-                    self.ph = C::RootEnd;
+                    phase = C::RootEnd;
                 }
                 C::L11Body => {
                     let word = self.pop();
@@ -1106,11 +1369,12 @@ impl Chunked {
                         .as_mut()
                         .expect("map head allocation")
                         .write_term_bits(word)?;
-                    self.ph = C::L11Test;
+                    phase = C::L11Test;
                 }
                 C::RootEnd => {
                     let root = self.pending.take().expect("map head allocation").finish()?;
                     debug_assert!(self.stack.is_empty());
+                    *reds = remaining_reds;
                     return Ok(Some(root));
                 }
             }

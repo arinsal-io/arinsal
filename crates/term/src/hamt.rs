@@ -309,6 +309,7 @@ pub struct HxNode {
 }
 impl HxNode {
     /// Record for the leaf `val` (a `[Key | Value]` cons) at input position `i`.
+    #[inline(always)]
     pub fn new(key: Term, val: Term, i: usize) -> Self {
         Self {
             hx: swizzle_map_hash(internal_hash(key)),
