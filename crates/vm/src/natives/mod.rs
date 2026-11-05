@@ -411,6 +411,24 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "process_flag" && arity == 2 {
         return Some(proc::process_flag_save_calls_bif);
     }
+    if module == "erlang" && function == "system_info" && arity == 1 {
+        return Some(sys::system_info_light);
+    }
+    if module == "erlang" && function == "nodes" && arity == 0 {
+        return Some(node::nodes0_bif);
+    }
+    if module == "erlang" && function == "registered" && arity == 0 {
+        return Some(crate::signals::registered_light);
+    }
+    if module == "erlang" && function == "list_to_pid" && arity == 1 {
+        return Some(proc::list_to_pid_light);
+    }
+    if module == "erlang" && function == "process_info" && arity == 1 {
+        return Some(proc::process_info_1_light);
+    }
+    if module == "erlang" && function == "fun_info" && arity == 2 {
+        return Some(proc::fun_info_arity_light);
+    }
     if module == "erlang"
         && let Some(bif) = proc::dictionary_bif(function, arity)
     {
@@ -506,6 +524,7 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
             ("statistics", 1) => return Some(sys::statistics_light),
             ("module_loaded", 1) => return Some(code::module_loaded_light),
             ("function_exported", 3) => return Some(code::function_exported_light),
+            ("make_fun", 3) => return Some(crate::Vm::make_fun_light),
             _ => {}
         }
     }

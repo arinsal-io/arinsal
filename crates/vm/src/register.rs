@@ -247,18 +247,43 @@ impl ProcessReg {
     /// `registered/0`. Each name is consed onto the front, so the list is the
     /// reverse of the bucket walk.
     // Port of erts/emulator/beam/register.c:567 (registered_foreach), OTP-29.1.1.
+    #[cfg(test)]
     pub(crate) fn registered_atoms(&self) -> Vec<Atom> {
-        let mut names = Vec::with_capacity(self.nobjs.max(0) as usize);
+        let mut names = Vec::with_capacity(self.registered_count());
+        self.for_each_registered_atom(|name| names.push(name));
+        names.reverse();
+        names
+    }
+
+    pub(crate) fn registered_count(&self) -> usize {
+        self.nobjs.max(0) as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_each_registered_atom(&self, mut visit: impl FnMut(Atom)) {
         for head in &self.buckets {
             let mut link = *head;
             while let Some(index) = link {
                 let entry = &self.entries[index as usize];
-                names.push(entry.name);
+                visit(entry.name);
                 link = entry.next;
             }
         }
-        names.reverse();
-        names
+    }
+
+    pub(crate) fn try_for_each_registered_atom<E>(
+        &self,
+        mut visit: impl FnMut(Atom) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for head in &self.buckets {
+            let mut link = *head;
+            while let Some(index) = link {
+                let entry = &self.entries[index as usize];
+                visit(entry.name)?;
+                link = entry.next;
+            }
+        }
+        Ok(())
     }
 
     // Port of erts/emulator/beam/hash.c:187 (rehash), OTP-29.1.1.

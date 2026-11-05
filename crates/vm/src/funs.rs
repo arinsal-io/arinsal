@@ -1324,6 +1324,27 @@ impl Vm {
         result
     }
 
+    /// `erlang:make_fun/3` as a light BIF. A call that is not a plain `{Module, Function,
+    /// Arity}` of atoms and a byte-sized arity is declined for the executor to raise.
+    // Port of erts/emulator/beam/bif.c:4467 (make_fun_3), OTP-29.1.1.
+    pub(crate) fn make_fun_light(
+        process: &mut Process,
+        args: &[Term],
+    ) -> Option<Result<Term, exceptions::Trap>> {
+        let [module, function, arity] = args else {
+            return None;
+        };
+        let (module, function) = (module.as_atom()?, function.as_atom()?);
+        let arity = u8::try_from(arity.as_small()?).ok()?;
+        let scope = process.runtime?.code_scope;
+        let entry =
+            crate::beamasm_integration::export_get_or_make_stub(scope, (module, function, arity))?;
+        TermBuilder::new(&mut process.heap)
+            .export_fun(entry)
+            .ok()
+            .map(Ok)
+    }
+
     pub(super) fn make_export_fun(
         &mut self,
         p: &mut Process,

@@ -331,9 +331,7 @@ fn call_term_to_string(
     term_to_string(process, args)
 }
 
-/// `erlang:statistics/1` for the items that need no scheduler context, called from native code.
-/// The others (reductions, run queues, scheduler wall time, microstate accounting) read the
-/// scheduler's counters through the executor.
+/// `erlang:statistics/1` selectors that read process or atomic scheduler state from native code.
 // Port of erts/emulator/beam/erl_bif_info.c (statistics_1, `runtime`, `wall_clock`,
 // `garbage_collection`, `io`), OTP-29.1.1.
 pub(crate) fn statistics_light(
@@ -343,13 +341,79 @@ pub(crate) fn statistics_light(
     let [key] = args else {
         return None;
     };
-    if !matches!(
-        atom_name(*key)?,
-        "runtime" | "wall_clock" | "garbage_collection" | "io"
-    ) {
+    match atom_name(*key)? {
+        "runtime" | "wall_clock" | "garbage_collection" | "io" => {
+            statistics(process, None, *key).ok().map(Ok)
+        }
+        "exact_reductions" => {
+            let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
+            let total = scheduler.exact_total_reductions();
+            let flags = runtime_state(process);
+            let (total, delta) = since(total, &flags.last_exact_reductions);
+            Some(pair(process, total, delta).map_err(|error| match error {
+                VmError::Trap(trap) => trap,
+                _ => crate::exceptions::Trap::error(atom("system_limit")),
+            }))
+        }
+        "reductions" | "context_switches" | "run_queue" => {
+            let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
+            let (run_queue, reductions, context_switches) = scheduler.statistics_counters();
+            let result = match atom_name(*key)? {
+                "reductions" => {
+                    let flags = runtime_state(process);
+                    // The run-queue totals include scheduled-out slices. erts also includes the
+                    // caller's live reduction count in this BIF's snapshot.
+                    let total = reductions.saturating_add(current_reductions(process));
+                    let (total, delta) = since(total, &flags.last_reductions);
+                    pair(process, total, delta)
+                }
+                "context_switches" => {
+                    // Port of erts/emulator/beam/erl_bif_info.c:4230, OTP-29.1.1.
+                    // `statistics(context_switches)` reports the cumulative count and zero.
+                    pair(process, context_switches, 0)
+                }
+                "run_queue" => non_neg(process, run_queue),
+                _ => unreachable!(),
+            };
+            Some(result.map_err(|error| match error {
+                VmError::Trap(trap) => trap,
+                _ => crate::exceptions::Trap::error(atom("system_limit")),
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn current_reductions(process: &Process) -> u64 {
+    if !process.heap.native_active() {
+        return 0;
+    }
+    u64::try_from(
+        process
+            .native_reds_in
+            .saturating_sub(process.heap.abi.fcalls)
+            .saturating_sub(i32::try_from(process.virtual_reds).unwrap_or(i32::MAX)),
+    )
+    .unwrap_or(0)
+}
+
+/// `system_info(process_count)` needs only the process table's live count.
+// Port of erts/emulator/beam/erl_bif_info.c:2942 (system_info process_count), OTP-29.1.1.
+pub(crate) fn system_info_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [selector] = args else {
+        return None;
+    };
+    if atom_name(*selector)? != "process_count" {
         return None;
     }
-    statistics(process, None, *key).ok().map(Ok)
+    let count = process_count(process) as u64;
+    Some(non_neg(process, count).map_err(|error| match error {
+        VmError::Trap(trap) => trap,
+        _ => crate::exceptions::Trap::error(atom("system_limit")),
+    }))
 }
 
 fn call_statistics(
@@ -556,6 +620,12 @@ fn call_values(
             TermKind::Pid => Ok(atom("false")),
             _ => Err(badarg()),
         }),
+        ("erlang", "system_info", 1) if atom_name(args[0]) == Some("process_count") => {
+            // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
+            // This selector is an atomic process-table count; avoid the generic tuple/allocator
+            // selector conversion before reaching that branch.
+            Some(non_neg(process, process_count(process) as u64))
+        }
         ("erlang", "system_info", 1) => alloc_info::system_info(vm, process, ctx, args[0])
             .or_else(|| system_info(vm, process, Some(ctx), args[0])),
         _ => None,
@@ -980,6 +1050,16 @@ fn system_info(
     ctx: Option<&RunCtx<'_, Message>>,
     selector: Term,
 ) -> Option<Result<Term, VmError>> {
+    // `system_info(process_count)` is a direct process-table count in erts; handle its atom
+    // before constructing the owned selector used by tuple and allocator selectors below.
+    // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
+    if selector
+        .as_atom()
+        .and_then(|atom| global_atoms().text(atom))
+        == Some("process_count")
+    {
+        return Some(non_neg(process, process_count(process) as u64));
+    }
     let owned_selector = arinsal_term::to_owned(selector).ok();
     if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
         && let [
@@ -2524,18 +2604,15 @@ fn statistics(
         }
         "exact_reductions" => {
             let flags = runtime_state(process);
-            let (total, delta) = since(
-                reduction_total(ctx.as_deref()),
-                &flags.last_exact_reductions,
-            );
+            let total = ctx.map_or(0, |ctx| ctx.exact_total_reductions());
+            let (total, delta) = since(total, &flags.last_exact_reductions);
             pair(process, total, delta)
         }
         "context_switches" => {
             let total =
                 scheduler_stats(process, ctx.as_deref()).map_or(0, |stats| stats.context_switches);
-            let flags = runtime_state(process);
-            let (_, delta) = since(total, &flags.last_context_switches);
-            pair(process, total, delta)
+            // Port of erts/emulator/beam/erl_bif_info.c:4230, OTP-29.1.1.
+            pair(process, total, 0)
         }
         "garbage_collection" => triple(
             process,
@@ -3633,7 +3710,6 @@ fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
 pub(crate) struct StatisticsState {
     pub(crate) last_reductions: AtomicU64,
     pub(crate) last_exact_reductions: AtomicU64,
-    pub(crate) last_context_switches: AtomicU64,
     pub(crate) gc_count: AtomicU64,
     pub(crate) gc_words: AtomicU64,
     last_runtime_ms: AtomicU64,
@@ -3666,7 +3742,6 @@ impl StatisticsState {
         Self {
             last_reductions: AtomicU64::new(0),
             last_exact_reductions: AtomicU64::new(0),
-            last_context_switches: AtomicU64::new(0),
             gc_count: AtomicU64::new(0),
             gc_words: AtomicU64::new(0),
             last_runtime_ms: AtomicU64::new(0),

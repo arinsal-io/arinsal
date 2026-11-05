@@ -83,6 +83,23 @@ fn call_nodes0(
     nodes(process, atom("visible"), None)
 }
 
+/// The `nodes/0` light BIF uses the same node-table scan as the executor body.
+// Port of erts/emulator/beam/dist.c:6279 (nodes/0), OTP-29.1.1.
+pub(crate) fn nodes0_bif(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    if !args.is_empty() {
+        return None;
+    }
+    Some(
+        nodes(process, atom("visible"), None).map_err(|error| match error {
+            VmError::Trap(trap) => trap,
+            _ => crate::exceptions::Trap::error(atom("system_limit")),
+        }),
+    )
+}
+
 fn call_nodes1(
     _vm: &mut Vm,
     process: &mut Process,
@@ -176,33 +193,11 @@ pub(crate) fn node(term: Term) -> Result<Term, VmError> {
 
 fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:6279 (nodes), OTP-29.1.1.
-    let types = owned(types)?;
-    let type_names = match &types {
-        OwnedTerm::Nil => Some(Vec::new()),
-        OwnedTerm::Atom(name) => Some(vec![name.as_str()]),
-        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems
-            .iter()
-            .map(|term| match term {
-                OwnedTerm::Atom(name) => Some(name.as_str()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>(),
-        _ => None,
-    };
-    let Some(type_names) = type_names else {
-        return Err(badarg());
-    };
-    if type_names
-        .iter()
-        .any(|name| !matches!(*name, "visible" | "hidden" | "known" | "connected" | "this"))
-    {
-        return Err(badarg());
-    }
     let mut want_visible = false;
     let mut want_hidden = false;
     let mut want_known = false;
     let mut want_this = false;
-    for name in type_names {
+    let mut add_type = |name: &str| -> Result<(), VmError> {
         match name {
             "visible" => want_visible = true,
             "hidden" => want_hidden = true,
@@ -212,7 +207,19 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
                 want_hidden = true;
             }
             "this" => want_this = true,
-            _ => unreachable!(),
+            _ => return Err(badarg()),
+        }
+        Ok(())
+    };
+    if let Some(atom) = types.as_atom() {
+        add_type(global_atoms().text(atom).ok_or_else(badarg)?)?;
+    } else {
+        let mut list = types;
+        while list != Term::NIL {
+            let cell = arinsal_term::raw::Cons::try_from(list).map_err(|_| badarg())?;
+            let atom = cell.head().as_atom().ok_or_else(badarg)?;
+            add_type(global_atoms().text(atom).ok_or_else(badarg)?)?;
+            list = cell.tail();
         }
     }
     if want_known {
@@ -244,7 +251,10 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
         }
     }
     let tables = node_tables::lock();
-    let mut entries = Vec::new();
+    // erts allocates one temporary ErtsNodeInfo array after counting the matching entries.
+    // The local node table does not keep per-kind counters, so reserve its maximum scan size
+    // before the single pass instead of growing the temporary array as matches are found.
+    let mut entries = Vec::with_capacity(tables.entries.len() + usize::from(want_this));
     if want_this {
         entries.push((tables.local_name.clone(), node_tables::NodeKind::This, None));
     }

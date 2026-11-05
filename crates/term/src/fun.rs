@@ -379,10 +379,12 @@ impl ExportEntry {
 /// Build and retain `Export.lambda` in the global literal area.
 // Port of erts/emulator/beam/export.c:44-56 (create_shared_lambda), OTP-29.1.1.
 pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> {
-    make_export_entry_permanent(&entry);
+    // The lambda is published only after the entry is permanent, so a set lambda needs no
+    // table lock (erts: `ep->lambda` is read directly, export.c).
     if let Some(lambda) = entry.lambda() {
         return Ok(lambda);
     }
+    make_export_entry_permanent(&entry);
     static LITERALS: OnceLock<Mutex<LiteralArea>> = OnceLock::new();
     let literals = LITERALS.get_or_init(|| Mutex::new(LiteralArea::new()));
     let mut literals = literals

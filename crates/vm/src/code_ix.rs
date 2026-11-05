@@ -241,6 +241,15 @@ impl CodeIndexes {
             .read(|ranges| self.tables[index].read(|tables| read(ranges.as_slice(), tables)))
     }
 
+    /// Read the active export table without loading the unrelated module-range table.
+    // Port of erts/emulator/beam/code_ix.h (`erts_active_code_ix`) and export.c
+    // (`erts_find_export_entry` reads only the active export table), OTP-29.1.1.
+    #[inline(always)]
+    pub(crate) fn with_active_tables<R>(&self, read: impl FnOnce(&CodeTables) -> R) -> R {
+        let index = self.active();
+        self.tables[index].read(read)
+    }
+
     /// Publishes `ranges` on every code index. The active index is what readers load;
     /// the other slots must already hold it when a commit rotates `erts_active_code_ix`.
     pub(crate) fn store_code_ranges(&self, ranges: Arc<Vec<crate::native_bridge::ModuleRange>>) {

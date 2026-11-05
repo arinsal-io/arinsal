@@ -3490,6 +3490,43 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(start, 2))
     }
 
+    /// Build a list of 2-tuples by consing each pair from one `5 * len` word reservation.
+    ///
+    /// Port of `pd_hash_get_all` in erts/emulator/beam/erl_process_dict.c, OTP-29.1.1.
+    /// The caller supplies pairs in bucket scan order; the returned list is reversed as each
+    /// tuple is consed onto the head.
+    pub fn tuple2_list_from_iter_reversed(
+        &mut self,
+        len: usize,
+        pairs: impl IntoIterator<Item = (Term, Term)>,
+    ) -> Result<Term, TermError> {
+        if len == 0 {
+            return Ok(Term::NIL);
+        }
+        let words = len.checked_mul(5).ok_or(TermError::SystemLimit)?;
+        let start = self.words(words)?;
+        let mut result = Term::NIL;
+        let mut count = 0;
+        for (index, (key, value)) in pairs.into_iter().enumerate() {
+            if index >= len {
+                return Err(TermError::BadArg);
+            }
+            let tuple = start.wrapping_add(index * 5);
+            store(tuple, (2 << 6) | ARITY);
+            store(tuple.wrapping_add(1), key.bits());
+            store(tuple.wrapping_add(2), value.bits());
+            let cons = tuple.wrapping_add(3);
+            store(cons, Term::from_ptr(tuple, 2).bits());
+            store(cons.wrapping_add(1), result.bits());
+            result = Term::from_ptr(cons, 1);
+            count += 1;
+        }
+        if count != len {
+            return Err(TermError::BadArg);
+        }
+        Ok(result)
+    }
+
     /// Reserve and initialize a nonempty tuple so a BIF can apply indexed updates in place.
     /// Port of the `HAlloc` and element stores in `make_tuple_3`,
     /// erts/emulator/beam/bif.c:3033-3074, OTP-29.1.1.

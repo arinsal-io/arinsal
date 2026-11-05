@@ -77,18 +77,25 @@ fn floor_div(numerator: BigInt, denominator: BigInt) -> BigInt {
     }
 }
 
+/// Ticks per second of a named time unit.
+fn standard_unit(name: &str) -> Option<i128> {
+    Some(match name {
+        "native" | "nanosecond" | "nano_seconds" => NATIVE,
+        // The OTP 29.1.1 macOS perf counter is nanosecond-resolution.
+        "perf_counter" => NATIVE,
+        "microsecond" | "micro_seconds" => 1_000_000,
+        "millisecond" | "milli_seconds" => 1_000,
+        "second" | "seconds" => 1,
+        _ => return None,
+    })
+}
+
 fn unit(value: Term) -> Result<BigInt, BifError> {
     if let Some(name) = atom_name(value) {
         // Port of erts/emulator/beam/erl_time_sup.c:2607 (perf_counter_unit), OTP-29.1.1.
-        return Ok(BigInt::from(match name {
-            "native" | "nanosecond" | "nano_seconds" => NATIVE,
-            // The OTP 29.1.1 macOS perf counter is nanosecond-resolution.
-            "perf_counter" => NATIVE,
-            "microsecond" | "micro_seconds" => 1_000_000,
-            "millisecond" | "milli_seconds" => 1_000,
-            "second" | "seconds" => 1,
-            _ => return Err(BifError::BADARG),
-        }));
+        return standard_unit(name)
+            .map(BigInt::from)
+            .ok_or(BifError::BADARG);
     }
     let value = bigint(value)?;
     if value.sign() != Sign::Plus {
@@ -107,6 +114,20 @@ fn scaled(ctx: &mut Ctx<'_>, value: i128, args: &[Term]) -> Result<Term, BifErro
         && let Some(term) = Term::small(small)
     {
         return Ok(term);
+    }
+    // Port of erts/emulator/beam/erl_time_sup.c (time_unit_conversion, OTP-29.1.1): the
+    // standard units convert with machine arithmetic; only an integer unit may need a bignum.
+    if let Some(unit_term) = args.first()
+        && let Some(factor) = atom_name(*unit_term).and_then(standard_unit)
+    {
+        // `value` is a 64-bit clock reading or offset, `factor` <= 10^9: no overflow.
+        let result = (value * factor).div_euclid(NATIVE);
+        return match i64::try_from(result).ok().and_then(Term::small) {
+            Some(term) => Ok(term),
+            None => TermBuilder::new(&mut Heap(&mut ctx.heap))
+                .int_from_bigint(&BigInt::from(result))
+                .map_err(|_| BifError::SystemLimit),
+        };
     }
     let units = if let Some(unit_term) = args.first() {
         unit(*unit_term)?
@@ -211,8 +232,17 @@ fn timestamp_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // `timestamp/0` must use the same monotonic sample and offset as
     // `system_time/0`; sampling the wall clock independently can disagree with
     // a monotonic-time conversion by more than the permitted midpoint window.
-    let micros = (mono_nanos() + time_offset_nanos()?) / 1_000;
-    Ok(timestamp_tuple(ctx, micros))
+    let micros = i64::try_from((mono_nanos() + time_offset_nanos()?) / 1_000)
+        .map_err(|_| BifError::SystemLimit)?;
+    Ok(timestamp_tuple_i64(ctx, micros))
+}
+fn timestamp_tuple_i64(ctx: &mut Ctx<'_>, micros: i64) -> Term {
+    // Port of erts/emulator/beam/erl_time_sup.c:1907-1924 (make_timestamp_value), OTP-29.1.1.
+    // ERTS keeps the timestamp arithmetic in its native 64-bit time type.
+    let mega = micros / 1_000_000_000_000;
+    let seconds = (micros / 1_000_000) % 1_000_000;
+    let micro = micros % 1_000_000;
+    tuple_build(ctx, &[small(mega), small(seconds), small(micro)])
 }
 fn timestamp_tuple(ctx: &mut Ctx<'_>, micros: i128) -> Term {
     let mega = micros / 1_000_000_000_000;
