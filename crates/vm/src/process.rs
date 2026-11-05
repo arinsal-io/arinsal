@@ -308,6 +308,16 @@ impl MessageQueue {
         prio_len + 1
     }
 
+    /// The queue the outer queue is spliced onto by `erts_proc_sig_fetch__`.
+    pub(crate) fn fetch_target(&mut self) -> &mut arinsal_sched::SignalQueue<Event<Message>> {
+        self.entries.queue_mut()
+    }
+
+    /// After a splice onto the end that began at position `old_len`.
+    pub(crate) fn spliced_at(&mut self, old_len: usize) {
+        self.structure_changed_at(old_len);
+    }
+
     /// Link a message node at the end of the queue, or after the last priority message.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_incoming: a
     // message signal is moved onto the message queue as it is), OTP-29.1.1.
@@ -7278,6 +7288,24 @@ impl Process {
         }
         if self.slice().is_some_and(|work| !work.delayed_gc.is_empty()) {
             return Ok(0);
+        }
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__): the outer
+        // queue, messages only, is spliced onto the message queue as a whole.
+        let traced_words = self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.call_memory.is_empty());
+        if !traced_words {
+            let old_len = self.inbox.len();
+            let Some(fetched) = self.probe_fetch_messages_into_inbox() else {
+                return Ok(0);
+            };
+            if fetched != 0 {
+                self.sig_cont_taken += fetched as u64;
+                self.inbox.spliced_at(old_len);
+                crate::natives::erts_debug::after_message_queue_change(self);
+            }
+            return Ok(fetched);
         }
         let Some(fetched) = self.probe_fetch_messages() else {
             return Ok(0);
