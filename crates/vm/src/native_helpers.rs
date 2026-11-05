@@ -1091,7 +1091,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
 /// `ERTS_VBUMP_REDS`: take `reds` from the slice without counting them in the process's own
 /// reductions; the part beyond what is left ends the slice.
 // Port of erts/emulator/beam/bif.h:85 (ERTS_VBUMP_REDS), OTP-29.1.1.
-fn vbump_reds(process: &mut crate::Process, reds: i32) {
+pub(crate) fn vbump_reds(process: &mut crate::Process, reds: i32) {
     if process.heap.abi.fcalls >= reds {
         process.heap.abi.fcalls -= reds;
         process.virtual_reds = process.virtual_reds.saturating_add(reds as u32);

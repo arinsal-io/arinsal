@@ -7,6 +7,7 @@
 //! lists and tuples with erts-shaped code while staying in safe Rust.
 
 use crate::{ARITY, EMPTY_TUPLE, HeapAlloc, Term, TermError};
+use std::mem::MaybeUninit;
 
 /// Rebuilds a term from its tagged word after it has been held by the ETF work stack.
 ///
@@ -18,6 +19,95 @@ pub fn term_from_bits(bits: u64) -> Term {
     // SAFETY: callers only restore tagged words previously obtained from a live `Term` in
     // the same walk, which keeps the owning heap stable until the word is consumed.
     unsafe { Term::from_raw_bits(bits) }
+}
+
+/// Fixed-capacity stack storage for terms whose populated prefix is known at runtime.
+///
+/// The backing array has no capacity field and does not initialize unused slots.
+pub struct UninitTermArray<const N: usize> {
+    words: [MaybeUninit<Term>; N],
+    len: usize,
+}
+
+impl<const N: usize> UninitTermArray<N> {
+    /// Creates empty storage without initializing its term slots.
+    #[inline(always)]
+    pub fn new() -> Self {
+        // SAFETY: an array of `MaybeUninit<Term>` is valid with every slot uninitialized.
+        let words = unsafe { MaybeUninit::<[MaybeUninit<Term>; N]>::uninit().assume_init() };
+        Self { words, len: 0 }
+    }
+
+    /// Fills `count` slots from a callback, checking the fixed bound once.
+    #[inline(always)]
+    pub fn fill_with(&mut self, count: usize, mut next: impl FnMut() -> Option<Term>) -> bool {
+        assert!(count <= N - self.len);
+        for _ in 0..count {
+            let Some(value) = next() else {
+                return false;
+            };
+            // SAFETY: the upfront count check bounds every slot written in this loop.
+            unsafe { self.words.get_unchecked_mut(self.len).write(value) };
+            self.len += 1;
+        }
+        true
+    }
+
+    /// Returns a copied term from the populated prefix.
+    #[inline(always)]
+    pub fn get(&self, index: usize) -> Term {
+        assert!(index < self.len);
+        // SAFETY: `push` initializes every slot below `len`, and `index < len`.
+        unsafe { self.words[index].assume_init_read() }
+    }
+
+    /// Replaces one initialized term in the populated prefix.
+    #[inline(always)]
+    pub fn set(&mut self, index: usize, value: Term) {
+        assert!(index < self.len);
+        self.words[index].write(value);
+    }
+
+    /// Number of terms in the initialized prefix.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the initialized prefix is empty.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the initialized prefix as a slice.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Term] {
+        // SAFETY: `push` initializes every slot below `len`; the backing array is aligned
+        // for `Term` and remains borrowed for the returned slice lifetime.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<Term>(), self.len) }
+    }
+
+    /// Removes one initialized entry while preserving the order of the remaining prefix.
+    #[inline(always)]
+    pub fn shift_down(&mut self, index: usize) {
+        assert!(index < self.len);
+        // SAFETY: both ranges are within the initialized prefix and `ptr::copy` permits overlap.
+        unsafe {
+            std::ptr::copy(
+                self.words.as_ptr().add(index + 1).cast::<Term>(),
+                self.words.as_mut_ptr().add(index).cast::<Term>(),
+                self.len - index - 1,
+            );
+        }
+        self.len -= 1;
+    }
+}
+
+impl<const N: usize> Default for UninitTermArray<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Reads the word at `address`.

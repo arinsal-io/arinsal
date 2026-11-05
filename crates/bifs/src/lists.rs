@@ -4,6 +4,7 @@
 //! (and keymember/keysearch), and `lists:reverse/2` stop on the same reduction
 //! budget as erts and resume through the same continuations.
 
+use arinsal_term::raw::UninitTermArray;
 use arinsal_term::{
     ConsHeapChain, HeapAlloc, HeapReservation, ProcessHeap, Term, TermBuilder, atoms, exact_eq,
     exact_eq_after_word_mismatch, loose_eq,
@@ -807,9 +808,18 @@ enum SubtractStage {
 
 enum SubtractScratch {
     Empty,
-    Lhs([Term; 16]),
-    Rhs([Term; 16]),
+    Lhs(UninitTermArray<16>),
+    Rhs(UninitTermArray<16>),
     Set(RbTree),
+}
+
+enum SubtractNaiveLhsResult {
+    Complete(Term),
+    Trapped {
+        elements: UninitTermArray<16>,
+        iterator: Term,
+        remaining: usize,
+    },
 }
 
 impl SubtractWalk {
@@ -864,16 +874,30 @@ impl SubtractWalk {
                         && self.lhs_remaining <= 16
                         && self.rhs.classify() == arinsal_term::TermKind::List
                     {
-                        let mut elements = [Term::NIL; 16];
+                        let mut elements = UninitTermArray::new();
                         let mut iterator = self.lhs;
-                        for element in elements.iter_mut().take(self.lhs_remaining) {
-                            let (head, tail) = cons_cell(iterator).ok_or(BADARG)?;
-                            *element = head;
+                        if !elements.fill_with(self.lhs_remaining, || {
+                            let (head, tail) = cons_cell(iterator)?;
                             iterator = tail;
+                            Some(head)
+                        }) {
+                            return Err(BADARG);
                         }
-                        self.iterator = self.rhs;
-                        self.scratch = SubtractScratch::Lhs(elements);
-                        self.stage = SubtractStage::NaiveLhs;
+                        let budget = subtract_budget(ctx, reductions_left, 16);
+                        match subtract_naive_lhs_step(ctx, elements, self.rhs, budget)? {
+                            SubtractNaiveLhsResult::Complete(result) => return Ok(Some(result)),
+                            SubtractNaiveLhsResult::Trapped {
+                                elements,
+                                iterator,
+                                remaining,
+                            } => {
+                                self.iterator = iterator;
+                                self.lhs_remaining = remaining;
+                                self.scratch = SubtractScratch::Lhs(elements);
+                                self.stage = SubtractStage::NaiveLhs;
+                                return Ok(None);
+                            }
+                        }
                     } else {
                         self.iterator = self.rhs;
                         self.stage = SubtractStage::LenRhs;
@@ -881,43 +905,24 @@ impl SubtractWalk {
                 }
                 SubtractStage::NaiveLhs => {
                     let budget = subtract_budget(ctx, reductions_left, 16);
-                    let SubtractScratch::Lhs(elements) = &mut self.scratch else {
+                    let SubtractScratch::Lhs(elements) =
+                        std::mem::replace(&mut self.scratch, SubtractScratch::Empty)
+                    else {
                         unreachable!("naive LHS stage owns its fixed array")
                     };
-                    let mut checks = 0usize;
-                    while checks < budget {
-                        let Some((value, next)) = cons_cell(self.iterator) else {
-                            break;
-                        };
-                        let mut found_at = None;
-                        for (index, element) in elements.iter().take(self.lhs_remaining).enumerate()
-                        {
-                            if exact_eq(value, *element) {
-                                found_at = Some(index);
-                                break;
-                            }
+                    match subtract_naive_lhs_step(ctx, elements, self.iterator, budget)? {
+                        SubtractNaiveLhsResult::Complete(result) => return Ok(Some(result)),
+                        SubtractNaiveLhsResult::Trapped {
+                            elements,
+                            iterator,
+                            remaining,
+                        } => {
+                            self.iterator = iterator;
+                            self.lhs_remaining = remaining;
+                            self.scratch = SubtractScratch::Lhs(elements);
+                            return Ok(None);
                         }
-                        if let Some(found_at) = found_at {
-                            let old_remaining = self.lhs_remaining;
-                            self.lhs_remaining -= 1;
-                            elements.copy_within(found_at + 1..old_remaining, found_at);
-                        }
-                        checks = checks.saturating_add(self.lhs_remaining.max(1));
-                        self.iterator = next;
                     }
-                    ctx.charge_reductions(checks.min(budget) / 16);
-                    if self.iterator != Term::NIL {
-                        if self.iterator.classify() != arinsal_term::TermKind::List {
-                            return Err(BADARG);
-                        }
-                        return Ok(None);
-                    }
-                    return subtract_list_from_slice(
-                        ctx,
-                        &elements[..self.lhs_remaining],
-                        Term::NIL,
-                    )
-                    .map(Some);
                 }
                 SubtractStage::LenRhs => {
                     let budget = subtract_budget(ctx, reductions_left, 32);
@@ -936,12 +941,14 @@ impl SubtractWalk {
                         return Ok(Some(self.lhs));
                     }
                     if self.rhs_remaining <= 16 {
-                        let mut elements = [Term::NIL; 16];
+                        let mut elements = UninitTermArray::new();
                         let mut iterator = self.rhs;
-                        for element in elements.iter_mut().take(self.rhs_remaining) {
-                            let (head, tail) = cons_cell(iterator).ok_or(BADARG)?;
-                            *element = head;
+                        if !elements.fill_with(self.rhs_remaining, || {
+                            let (head, tail) = cons_cell(iterator)?;
                             iterator = tail;
+                            Some(head)
+                        }) {
+                            return Err(BADARG);
                         }
                         self.iterator = self.lhs;
                         self.result = Some(ConsHeapChain::new());
@@ -982,7 +989,7 @@ impl SubtractWalk {
             };
             let found_at = (0..self.rhs_remaining)
                 .rev()
-                .find(|&i| exact_eq(value, elements[i]));
+                .find(|&i| exact_eq(value, elements.get(i)));
             if let Some(found_at) = found_at {
                 if self.rhs_remaining == 1 {
                     ctx.charge_reductions(checks.min(budget) / 16);
@@ -994,7 +1001,7 @@ impl SubtractWalk {
                     ));
                 }
                 self.rhs_remaining -= 1;
-                elements[found_at] = elements[self.rhs_remaining];
+                elements.set(found_at, elements.get(self.rhs_remaining));
             } else {
                 self.result
                     .as_mut()
@@ -1118,6 +1125,54 @@ fn subtract_budget(ctx: &Ctx<'_>, reductions_left: usize, units_per_red: usize) 
         .saturating_mul(units_per_red)
 }
 
+/// Runs the short-LHS scan with its working values held in stack locals.
+///
+/// Port of `subtract_naive_lhs` in `erl_bif_lists.c:632-684`, OTP-29.1.1.
+#[inline(always)]
+fn subtract_naive_lhs_step(
+    ctx: &mut Ctx<'_>,
+    mut elements: UninitTermArray<16>,
+    mut iterator: Term,
+    budget: usize,
+) -> Result<SubtractNaiveLhsResult, BifError> {
+    let mut checks = 0usize;
+    while checks < budget {
+        let Some((value, next)) = cons_cell(iterator) else {
+            break;
+        };
+        let found_at = elements
+            .as_slice()
+            .iter()
+            .position(|&element| subtract_term_eq(value, element));
+        if let Some(index) = found_at {
+            elements.shift_down(index);
+        }
+        checks += elements.len().max(1);
+        iterator = next;
+    }
+    ctx.charge_reductions(checks.min(budget) / 16);
+    if iterator != Term::NIL {
+        if iterator.classify() != arinsal_term::TermKind::List {
+            return Err(BADARG);
+        }
+        let remaining = elements.len();
+        return Ok(SubtractNaiveLhsResult::Trapped {
+            elements,
+            iterator,
+            remaining,
+        });
+    }
+    subtract_list_from_slice(ctx, elements.as_slice(), Term::NIL)
+        .map(SubtractNaiveLhsResult::Complete)
+}
+
+/// Mirrors erts `EQ`: equal words match directly; non-identical immediates cannot match.
+#[inline(always)]
+fn subtract_term_eq(left: Term, right: Term) -> bool {
+    left == right
+        || (!(left.is_immed() && right.is_immed()) && exact_eq_after_word_mismatch(left, right))
+}
+
 /// Append retained cells in input order with `HAllocX` fragment slack.
 /// Port of `erl_bif_lists.c:748-770` and `:881-916`, OTP-29.1.1.
 struct SubtractResultBuilder<'a, H: HeapAlloc + ?Sized> {
@@ -1146,6 +1201,7 @@ impl<'a, H: HeapAlloc + ?Sized> SubtractResultBuilder<'a, H> {
 
 /// Build the small-LHS result backwards in one reserved heap block.
 /// Port of `erl_bif_lists.c:665-684` (`subtract_naive_lhs`), OTP-29.1.1.
+#[inline(always)]
 fn subtract_list_from_slice(
     ctx: &mut Ctx<'_>,
     items: &[Term],
