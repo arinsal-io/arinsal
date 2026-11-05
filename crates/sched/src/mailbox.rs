@@ -61,6 +61,32 @@ pub(crate) fn non_message_signal<T: InSignal>(signal: &crate::sig_queue::OwnedSi
     signal.is_lazy() || !signal.is_message()
 }
 
+const LOCK_SPIN_UNTIL_YIELD: u32 = 25;
+const LOCK_SPIN_COUNT_BASE: u32 = 1000;
+const LOCK_SPIN_COUNT_SCHED_INC: u32 = 32;
+const LOCK_SPIN_COUNT_MAX: u32 = 2000;
+
+static LOCK_SPIN_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(LOCK_SPIN_COUNT_BASE);
+
+/// Set the message queue lock spin count for `schedulers` normal schedulers.
+// Port of erts/emulator/beam/erl_process_lock.c (erts_init_proc_lock: proc_lock_spin_count),
+// OTP-29.1.1; a machine with one cpu does not spin.
+pub fn set_lock_spin_count(schedulers: usize) {
+    let cpus = std::thread::available_parallelism().map_or(2, usize::from);
+    let count = if cpus == 1 {
+        0
+    } else {
+        (LOCK_SPIN_COUNT_BASE + LOCK_SPIN_COUNT_SCHED_INC * schedulers as u32)
+            .min(LOCK_SPIN_COUNT_MAX)
+    };
+    LOCK_SPIN_COUNT.store(count, Ordering::Relaxed);
+}
+
+fn lock_spin_count() -> u32 {
+    LOCK_SPIN_COUNT.load(Ordering::Relaxed)
+}
+
 /// The receiver exited and closed its in-queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueClosed;
@@ -277,9 +303,38 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             }
             return queue;
         }
-        let queue = self.msgq.lock();
+        let queue = self.lock_msgq_failed();
         self.contention_count.fetch_add(1, Ordering::Relaxed);
         queue
+    }
+
+    /// Spin on the lock word, yielding every `LOCK_SPIN_UNTIL_YIELD` rounds, and sleep for the
+    /// lock when the spin count runs out.
+    // Port of erts/emulator/beam/erl_process_lock.c (erts_proc_lock_failed), OTP-29.1.1: a normal
+    // scheduler spins `ERTS_PROC_LOCK_SPIN_COUNT_BASE + 32 * schedulers` (at most 2000) rounds
+    // of a pause, a thread yield every 25th, and takes the lock with a compare-exchange once the
+    // word shows it free. `parking_lot` alone would yield after a handful of pauses.
+    #[cold]
+    fn lock_msgq_failed(&self) -> parking_lot::MutexGuard<'_, SignalQueue<T>> {
+        let mut spin_count = lock_spin_count();
+        let mut until_yield = LOCK_SPIN_UNTIL_YIELD;
+        loop {
+            if spin_count == 0 {
+                return self.msgq.lock();
+            }
+            spin_count -= 1;
+            std::hint::spin_loop();
+            until_yield -= 1;
+            if until_yield == 0 {
+                until_yield = LOCK_SPIN_UNTIL_YIELD;
+                std::thread::yield_now();
+            }
+            if !self.msgq.is_locked()
+                && let Some(queue) = self.msgq.try_lock()
+            {
+                return queue;
+            }
+        }
     }
 
     /// Append an event, flushing the sender buffers first so it cannot overtake them.
@@ -678,7 +733,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// Returns the number of signals taken.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__: an outer
     // queue without non-message signals is spliced onto the message queue), OTP-29.1.1.
-    pub fn take_all_if(&self, accept: impl Fn(&T) -> bool, into: &mut SignalQueue<T>) -> usize {
+    pub fn take_all_if(&self, _accept: impl Fn(&T) -> bool, into: &mut SignalQueue<T>) -> usize {
         if !self.has_pending() {
             return 0;
         }
@@ -686,7 +741,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
-        if queue.non_messages() != 0 || !queue.iter().all(accept) {
+        if queue.non_messages() != 0 {
             return 0;
         }
         let count = queue.len();

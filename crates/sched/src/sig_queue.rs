@@ -256,6 +256,12 @@ impl<T> MessageQueueList<T> {
         self.queue.front_mut()
     }
 
+    /// The signals of the list as a queue, for a splice onto its end (`*sig_qs.last =
+    /// sig_inq.first` in erts_proc_sig_fetch__). The cursor names an earlier node and stays valid.
+    pub fn queue_mut(&mut self) -> &mut SignalQueue<T> {
+        &mut self.queue
+    }
+
     pub fn iter(&self) -> Iter<'_, T> {
         self.queue.iter()
     }

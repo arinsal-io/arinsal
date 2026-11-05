@@ -2150,6 +2150,16 @@ impl Process {
         self.set_slow(Self::SLOW_SIG_CONT, busy);
         Some(fetched)
     }
+    /// [`Self::probe_fetch_messages`] with the message queue as the target: the outer queue is
+    /// spliced onto its end, no node is touched.
+    #[inline(always)]
+    pub(crate) fn probe_fetch_messages_into_inbox(&mut self) -> Option<usize> {
+        let probe = self.signal_probe.as_ref()?;
+        Some(probe.fetch_messages_if(
+            |message| !message.is_altact_msg(),
+            self.inbox.fetch_target(),
+        ))
+    }
     /// Moves the whole outer queue to the middle queue through the signal probe.
     #[inline(always)]
     pub(crate) fn probe_fetch_all(&mut self) -> bool {

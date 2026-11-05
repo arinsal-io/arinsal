@@ -7,7 +7,7 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(native_sig_fetch).
 -export([self_after0/0, other_after0/0, selective_after_n/0, exit_pending/0,
-         link_monitor_flood/0, trapped_exits/0, mixed_flood/0]).
+         link_monitor_flood/0, trapped_exits/0, mixed_flood/0, timer_alone/0, timer_mixed/0]).
 
 self_after0() -> r2(hello, 0).
 
@@ -117,6 +117,33 @@ mixed_flood() ->
     spin(A, N),
     self() ! last,
     receive last -> got after 0 -> timeout end.
+
+%% A fired timer message is an ordinary message: a receive with `after 0` sees it, and it
+%% keeps its place in the message queue order.
+fired(_Ref) ->
+    receive after 5 -> ok end.
+
+timer_alone() ->
+    Ref = erlang:send_after(1, self(), tick),
+    fired(Ref),
+    Got = receive tick -> got after 0 -> timeout end,
+    Ref2 = erlang:start_timer(1, self(), tock),
+    fired(Ref2),
+    {Got, receive {timeout, Ref2, tock} -> got2 after 0 -> timeout end}.
+
+timer_mixed() ->
+    Self = self(),
+    A = atomics:new(1, []),
+    self() ! first,
+    Ref = erlang:send_after(1, self(), tick),
+    fired(Ref),
+    Ref2 = erlang:start_timer(1, self(), tock),
+    fired(Ref2),
+    spawn(fun() -> Self ! last, atomics:add(A, 1, 1) end),
+    spin(A, 1),
+    Len = element(2, process_info(self(), message_queue_len)),
+    L = drain0([]),
+    {Len, lists:reverse(L) =:= [first, tick, {timeout, Ref2, tock}, last]}.
 "#;
 
 fn compare(function: &str) {
@@ -170,4 +197,14 @@ fn native_sig_fetch_trapped_exits() {
 #[test]
 fn native_sig_fetch_mixed_signal_flood() {
     compare("mixed_flood");
+}
+
+#[test]
+fn native_sig_fetch_timer_alone() {
+    compare("timer_alone");
+}
+
+#[test]
+fn native_sig_fetch_timer_mixed() {
+    compare("timer_mixed");
 }

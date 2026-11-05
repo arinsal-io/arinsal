@@ -668,8 +668,9 @@ impl<M: SignalMessage> InSignal for Event<M> {
     fn is_message(&self) -> bool {
         match &self.payload {
             Payload::Message(message) => !message.is_altact_msg(),
-            Payload::TimerMessage { message, .. } => !message.is_altact_msg(),
-            Payload::Timer { .. } => true,
+            // Timer payloads need the scheduler's timer bookkeeping: counted as non-message
+            // signals they stop the splice in `take_all_if` without a walk under the msgq lock.
+            Payload::TimerMessage { .. } | Payload::Timer { .. } => false,
             Payload::Signal(_) => false,
         }
     }
@@ -6570,6 +6571,7 @@ impl<T: Task> Scheduler<T> {
     /// Start real worker threads.
     pub fn new(config: Config) -> Self {
         arinsal_term::set_reader_groups(config.workers);
+        mailbox::set_lock_spin_count(config.workers);
         // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_init sizes the instances from
         // erts_no_schedulers), OTP-29.1.1. A launcher that already configured the allocators
         // (with `+Mdai`) or an earlier runtime in this process keeps its counts.
