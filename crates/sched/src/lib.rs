@@ -2163,6 +2163,7 @@ impl<T: Task> LocalInit<T> {
             balance: self.balance,
             timer_service: Rc::new(RefCell::new(self.timer_service)),
             queues: self.queues,
+            proc_qmask: 0,
             pinned_turn: false,
             message_slabs: self.message_slabs,
             pending_waits: self.pending_waits,
@@ -3021,7 +3022,7 @@ impl<T: Task> Inner<T> {
             if Self::is_current_entry(&item) {
                 local.migrate_queued(&item.process, id);
             }
-            local.queues[queue].push(item);
+            local.push_queued(item);
         }
     }
 
@@ -3237,7 +3238,7 @@ impl<T: Task> Inner<T> {
                     if Self::is_current_entry(&found) {
                         local.migrate_queued(&found.process, id);
                     }
-                    local.queues[queue].push(found);
+                    local.push_queued(found);
                 }
             }
             if let Some(first) = first {
@@ -3290,7 +3291,7 @@ impl<T: Task> Inner<T> {
         for priority in 0..local.queues.len() {
             if flags & (1 << priority) != 0 {
                 while let Some(found) = self.run_queues[id][priority].pop() {
-                    local.queues[priority].push(found);
+                    local.push_queued(found);
                 }
             }
         }
@@ -3417,6 +3418,7 @@ impl<T: Task> Inner<T> {
                 moved.push(item);
             }
         }
+        local.proc_qmask = 0;
         if target != worker {
             // Bound entries sit in the pinned injectors, not the ordinary run queue.
             // Leave them there and the blocked scheduler parks with the only copy of
@@ -4160,7 +4162,7 @@ impl<T: Task> Inner<T> {
             };
             if scheduler == local.worker_id {
                 local.record_queued(&item.process, local.worker_id, false);
-                local.queues[item.queue()].push(item);
+                local.push_queued(item);
             } else {
                 self.push_run_queue(scheduler, item, false);
             }
@@ -4803,6 +4805,8 @@ struct Local<T: Task> {
     balance: Arc<balance::Balance>,
     timer_service: Rc<RefCell<TimerService<T::Message>>>,
     queues: [Worker<Scheduled<T>>; 4],
+    /// Process priority bits corresponding to `rq->flags`' non-empty queue mask.
+    proc_qmask: u32,
     /// The previous pick took a bound process ahead of equal-priority shared work.
     pinned_turn: bool,
     message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
@@ -4840,6 +4844,12 @@ struct Local<T: Task> {
     wakeup_other_reds: i64,
 }
 impl<T: Task> Local<T> {
+    fn push_queued(&mut self, item: Scheduled<T>) {
+        let queue = item.queue();
+        self.queues[queue].push(item);
+        self.proc_qmask |= 1 << queue;
+    }
+
     fn set_wall_enabled(&mut self, enabled: bool) {
         self.set_wall_enabled_at(enabled, None);
     }
@@ -4978,20 +4988,58 @@ impl<T: Task> Local<T> {
         (0..self.queues.len()).find(|&priority| !self.queues[priority].is_empty())
     }
     fn pop(&mut self) -> Option<Scheduled<T>> {
-        for priority in 0..PROC_QUEUES {
+        loop {
+            // Port of erl_process.c:9988-10020 (erts_schedule pick_next_process), OTP-29.1.1:
+            // rq->flags stores one bit per non-empty priority queue; select its least bit.
+            let (priority, qbit) = first_process_queue(self.proc_qmask)?;
             let queue = &self.queues[priority];
             if let Some(item) =
                 pop_requeue(|| queue.pop(), |item| queue.push(item), || queue.is_empty())
             {
+                if queue.is_empty() {
+                    self.proc_qmask &= !qbit;
+                }
                 return Some(item);
             }
+            // A concurrent thief may remove the final item after the mask was read.
+            self.proc_qmask &= !qbit;
         }
-        None
     }
 }
 
 /// Process priority queues of a run queue: max, high and normal (shared with low).
 const PROC_QUEUES: usize = balance::PRIORITY_NORMAL + 1;
+
+/// Select the least significant non-empty process-priority bit.
+// Port of erts/emulator/beam/erl_process.c:9988-10020 (erts_schedule pick_next_process), OTP-29.1.1.
+#[inline(always)]
+fn first_process_queue(queue_mask: u32) -> Option<(usize, u32)> {
+    let queue_mask = queue_mask & ((1 << PROC_QUEUES) - 1);
+    if queue_mask == 0 {
+        return None;
+    }
+    let queue_bit = queue_mask.isolate_lowest_one();
+    Some((queue_bit.trailing_zeros() as usize, queue_bit))
+}
+
+#[cfg(test)]
+mod process_queue_mask_tests {
+    use super::first_process_queue;
+
+    #[test]
+    fn selects_the_highest_nonempty_priority_and_ignores_nonprocess_bits() {
+        assert!(
+            first_process_queue(0b110)
+                .is_some_and(|(priority, bit)| { priority == 1 && bit == 0b010 })
+        );
+        assert!(
+            first_process_queue(0b100)
+                .is_some_and(|(priority, bit)| { priority == 2 && bit == 0b100 })
+        );
+        assert!(first_process_queue(0b1000).is_none());
+        assert!(first_process_queue(0).is_none());
+    }
+}
 
 /// Take the next entry of a priority queue.
 ///
@@ -5761,7 +5809,7 @@ impl<T: Task> Runner<'_, T> {
             // it runs before a process the parent wakes afterwards.
             if self.inner.sim.is_none() {
                 local.record_queued(&item.process, local.worker_id, false);
-                local.queues[item.queue()].push(item);
+                local.push_queued(item);
             } else {
                 self.inner.push_run_queue(local.worker_id, item, false);
             }
@@ -8530,7 +8578,7 @@ fn schedule_out<T: Task>(
                     // so they join the local deques ahead of it.
                     inner.take_injected(local);
                     local.record_queued(&next.process, local.worker_id, true);
-                    local.queues[next.queue()].push(next);
+                    local.push_queued(next);
                 }
             } else {
                 inner.enqueue(next, true);

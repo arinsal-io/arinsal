@@ -117,10 +117,12 @@ pub struct Incoming<T: Send + 'static> {
     /// structure.
     // Port of erts/emulator/beam/erl_process.h:1231-1340 (ERTS_PSFLG_*), OTP-29.1.1.
     state: AtomicU32,
-    /// Non-message signals in the queue and the buffers; with it a fetch leaves exactly the
+    /// Non-message signals in the sender buffers, counted under each buffer's lock; those in
+    /// the msgq queue are counted by the queue under the msgq lock (erts keeps `nmsigs` as
+    /// plain fields under the lock). With both a fetch leaves exactly the
     /// MSG_SIG_IN_Q/NMSG_SIG_IN_Q bits of the signals still queued (erts re-sets them from
     /// `msgs_in_slots`/`nonmsgs_in_slots` after racing buffer inserts, erl_proc_sig_queue.c:1450).
-    nmsgs: AtomicUsize,
+    buffered_nmsgs: AtomicUsize,
     buffering_allowed: AtomicBool,
     /// `p->sig_inq_buffers`: null while the buffers are not installed.
     buffers: ProgressSlot<SignalBuffers<T>>,
@@ -136,7 +138,7 @@ impl<T: Send + 'static> Default for Incoming<T> {
             msgq: Mutex::new(SignalQueue::default()),
             buffered: AtomicUsize::new(0),
             state: AtomicU32::new(0),
-            nmsgs: AtomicUsize::new(0),
+            buffered_nmsgs: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffering_allowed: AtomicBool::new(false),
             buffers: ProgressSlot::new(),
@@ -169,17 +171,8 @@ impl<T: Send + 'static> Incoming<T> {
 }
 
 impl<T: InSignal + Send + 'static> Incoming<T> {
-    /// Account `count` enqueued signals, `nmsgs` of them non-message signals, and set the
-    /// matching in-queue state bits.
-    /// Returns the state word with the in-queue bits set. The one read-modify-write both sets
-    /// the bits and tells the sender whether the receiver was active, so the wake decision
-    /// needs no further load of the word.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:911-935 and erl_proc_sig_queue.h:2080
-    // (erts_proc_notify_new_message works from the state returned by the bor), OTP-29.1.1.
-    fn enqueued(&self, count: usize, nmsgs: usize) -> u32 {
-        if nmsgs != 0 {
-            self.nmsgs.fetch_add(nmsgs, Ordering::SeqCst);
-        }
+    /// The in-queue state bits for `count` signals, `nmsgs` of them non-message.
+    fn in_queue_flags(count: usize, nmsgs: usize) -> u32 {
         let mut set = 0;
         if count > nmsgs {
             set |= psflg::MSG_SIG_IN_Q;
@@ -187,15 +180,54 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if nmsgs != 0 {
             set |= psflg::NMSG_SIG_IN_Q;
         }
-        // `erts_atomic32_read_bor_nob`. Every change of the word is a read-modify-write, so
-        // this one and the receiver's transition to WAITING are totally ordered by the
-        // modification order of that one location: either the returned word is not active and
-        // the sender wakes the receiver, or the receiver's transition returns the bit set here
-        // and its later loads of the word see it (the wake protocol in lib.rs). No second
-        // location takes part on the queue path, so it needs no ordering across locations. A sender
-        // buffer insert counts itself first, so `dequeued` re-checks the counters after it clears.
-        // SeqCst on an RMW is the same instruction as AcqRel and publishes what the sender
-        // wrote before the bor to a probe that reads the bit.
+        set
+    }
+
+    /// Set the in-queue bits for `count` signals appended to the msgq queue, `nmsgs` of them
+    /// non-message; the caller holds the msgq lock. Returns the state word with the bits set.
+    ///
+    /// Like erts, the sender writes the state word only when a bit is missing: `state` is
+    /// read under the msgq lock and the bor runs only `if ((state & set_flags) != set_flags)`.
+    /// The in-queue bits are cleared only by a fetch under the msgq lock, so bits seen set here
+    /// belong to signals of the current queue and the fetch that clears them takes this
+    /// signal too. Wake protocol, against the receiver `R` (lib.rs):
+    /// 1. Bits missing: the bor is a read-modify-write of the one word `R`'s transition to
+    ///    WAITING (`store_from_running`, an RMW as well) also modifies, so they are totally
+    ///    ordered. Either the bor returns an inactive word and this sender wakes `R`, or `R`'s
+    ///    transition returns the bit set here and its probe sees it.
+    /// 2. Bits already set by an earlier signal `S1` (still unfetched, because the fetch that
+    ///    clears them needs the lock this sender holds): this sender's load of the word
+    ///    returns an active or inactive word. If `R` is inactive at that load, `R` already
+    ///    probed (its transition returned, then it loads the bits `S1` set, which stay set)
+    ///    and claims itself, or this sender's claim (`schedule_waiting`) wins the CAS: one of
+    ///    the two schedules it. If `R` is active at the load, `R`'s later transition to
+    ///    WAITING is followed by its probe, which sees `S1`'s bits still set, or a fetch
+    ///    between has taken this signal along with `S1` (the fetch needs the lock, so it is
+    ///    after this enqueue). erts relies on the same lock: `wait` clears ACTIVE under the
+    ///    msgq lock after a failed fetch (emu/msg_instrs.tab, beam_common.c:1596), and
+    ///    `enqueue_signals` reads the state under that lock.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:936-937 (enqueue_signals: conditional
+    // erts_atomic32_read_bor_nob) and erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message
+    // works from the state read), OTP-29.1.1.
+    fn enqueued_locked(&self, count: usize, nmsgs: usize) -> u32 {
+        let set = Self::in_queue_flags(count, nmsgs);
+        let state = self.state.load(Ordering::SeqCst);
+        if state & set == set {
+            return state;
+        }
+        // `erts_atomic32_read_bor_nob`. SeqCst on an RMW is the same instruction as AcqRel
+        // and publishes what the sender wrote before the bor to a probe that reads the bit.
+        self.state.fetch_or(set, Ordering::SeqCst) | set
+    }
+
+    /// Account one signal published into a sender buffer, `nmsgs` 0 or 1 non-message; the
+    /// caller holds the buffer's lock, not the msgq lock, so the bits are set with an RMW.
+    /// A sender buffer insert counts itself first, so `dequeued` re-checks the counters after
+    /// it clears.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10369 (enqueue_signals with
+    // is_to_buffer), OTP-29.1.1.
+    fn enqueued_buffered(&self, nmsgs: usize) -> u32 {
+        let set = Self::in_queue_flags(1, nmsgs);
         self.state.fetch_or(set, Ordering::SeqCst) | set
     }
 
@@ -203,11 +235,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// queued (signals racing into the buffers).
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1336-1495 (erts_proc_sig_fetch__
     // clear_flags, then re-set for racing buffer inserts), OTP-29.1.1.
-    fn dequeued(&self, nmsgs: usize, queued: usize) {
-        if nmsgs != 0 {
-            self.nmsgs.fetch_sub(nmsgs, Ordering::SeqCst);
-        }
-        let keep = self.in_queue_bits(queued);
+    fn dequeued(&self, queue: &SignalQueue<T>) {
+        let keep = self.in_queue_bits(queue);
         let clear = psflg::SIG_IN_Q & !keep;
         // `erts_atomic32_read_band_nob`.
         // No read first: the word was just written by a sender, so a load would cost a second
@@ -217,17 +246,17 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             // A sender buffer insert that counted itself after the counters were read above
             // sets its bits after the clear, so only one that counted before the read can
             // have lost them: set those again.
-            let again = self.in_queue_bits(queued) & clear;
+            let again = self.in_queue_bits(queue) & clear;
             if again != 0 {
                 self.state.fetch_or(again, Ordering::SeqCst);
             }
         }
     }
 
-    /// The in-queue state bits for `queued` signals in the msgq queue plus the buffered ones.
-    fn in_queue_bits(&self, queued: usize) -> u32 {
-        let left_nmsgs = self.nmsgs.load(Ordering::SeqCst);
-        let left = queued + self.buffered.load(Ordering::SeqCst);
+    /// The in-queue state bits for the signals left in the msgq queue plus the buffered ones.
+    fn in_queue_bits(&self, queue: &SignalQueue<T>) -> u32 {
+        let left_nmsgs = queue.non_messages() + self.buffered_nmsgs.load(Ordering::SeqCst);
+        let left = queue.len() + self.buffered.load(Ordering::SeqCst);
         let mut bits = 0;
         if left > left_nmsgs {
             bits |= psflg::MSG_SIG_IN_Q;
@@ -263,7 +292,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             self.flush_buffers_locked(&mut queue, true);
         }
         queue.push_back_node(signal);
-        self.enqueued(1, nmsg);
+        self.enqueued_locked(1, nmsg);
     }
 
     /// Publish a signal through its sender's parallel buffer when buffering is enabled.
@@ -301,7 +330,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         }
         let nmsg = usize::from(non_message_signal(&signal));
         queue.push_back_node(signal);
-        let state = self.enqueued(1, nmsg);
+        let state = self.enqueued_locked(1, nmsg);
         drop(queue);
         Ok(state)
     }
@@ -350,7 +379,10 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             }
             buffer.queue.push_back_node(signal);
             self.buffered.fetch_add(1, Ordering::SeqCst);
-            let state = self.enqueued(1, nmsg);
+            if nmsg != 0 {
+                self.buffered_nmsgs.fetch_add(nmsg, Ordering::SeqCst);
+            }
+            let state = self.enqueued_buffered(nmsg);
             self.buffer_enqueues.fetch_add(1, Ordering::Relaxed);
             Some(state)
         });
@@ -458,8 +490,12 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     fn take_buffered(&self, buffer: &mut SignalBuffer<T>, queue: &mut SignalQueue<T>) {
         let count = buffer.queue.len();
         if count != 0 {
+            let nmsgs = buffer.queue.non_messages();
             queue.append(&mut buffer.queue);
             self.buffered.fetch_sub(count, Ordering::Relaxed);
+            if nmsgs != 0 {
+                self.buffered_nmsgs.fetch_sub(nmsgs, Ordering::Relaxed);
+            }
         }
     }
 
@@ -517,7 +553,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             self.flush_buffers_locked(&mut queue, true);
         }
         queue.append(&mut block);
-        self.enqueued(count, nmsgs);
+        self.enqueued_locked(count, nmsgs);
     }
 
     /// Publish a sender ordered block through the matching per sender buffers.
@@ -544,7 +580,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             }
             let (count, nmsgs) = (block.len(), block.non_messages());
             queue.append(&mut block);
-            self.enqueued(count, nmsgs);
+            self.enqueued_locked(count, nmsgs);
             drop(queue);
             return Ok(());
         }
@@ -560,7 +596,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
                 }
                 let nmsg = usize::from(non_message_signal(&signal));
                 queue.push_back_node(signal);
-                self.enqueued(1, nmsg);
+                self.enqueued_locked(1, nmsg);
             }
         }
         Ok(())
@@ -589,7 +625,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         }
         queue.push_back_node(first);
         queue.push_back_node(second);
-        self.enqueued(2, nmsgs);
+        self.enqueued_locked(2, nmsgs);
         drop(queue);
         Ok(())
     }
@@ -604,9 +640,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         self.uninstall_buffers_locked(&mut queue);
         let count = queue.len();
         if count != 0 {
-            let nmsgs = queue.non_messages();
             into.append(&mut queue);
-            self.dequeued(nmsgs, 0);
+            self.dequeued(&queue);
         }
         count
     }
@@ -620,7 +655,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// Whether a non-message signal waits in the in-queue or its buffers.
     // Port of erts/emulator/beam/erl_process.h (ERTS_PSFLG_NMSG_SIG_IN_Q), OTP-29.1.1.
     pub fn has_pending_nmsg(&self) -> bool {
-        self.nmsgs.load(Ordering::SeqCst) != 0
+        self.state.load(Ordering::SeqCst) & psflg::NMSG_SIG_IN_Q != 0
     }
 
     /// Take the whole in-queue, in order, for the receiver's inner queue: the
@@ -635,9 +670,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
-        let nmsgs = queue.non_messages();
         into.append(&mut queue);
-        self.dequeued(nmsgs, 0);
+        self.dequeued(&queue);
     }
 
     /// Take the whole in-queue when `accept` takes every queued signal; otherwise leave it.
@@ -658,7 +692,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         let count = queue.len();
         into.append(&mut queue);
         // `accept` took only messages.
-        self.dequeued(0, 0);
+        self.dequeued(&queue);
         drop(queue);
         count
     }
@@ -677,8 +711,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             return None;
         }
         let signal = queue.pop_front_signal()?;
-        let nmsgs = usize::from(non_message_signal(&signal));
-        self.dequeued(nmsgs, queue.len());
+        self.dequeued(&queue);
         drop(queue);
         Some(signal.into_value())
     }

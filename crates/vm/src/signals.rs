@@ -2793,12 +2793,53 @@ pub(crate) fn send3_light(
     if !plain {
         return None;
     }
-    Some(
-        process
-            .send_to_pid_idle(pid, *message)
-            .map(|_| atom("ok"))
-            .map_err(|_| crate::exceptions::Trap::error(atom("badarg"))),
-    )
+    // Port of erts/emulator/beam/bif.c:2742 (send_3: ERTS_VBUMP_REDS(p, 4) after a completed
+    // send), OTP-29.1.1.
+    Some(match process.send_to_pid_idle(pid, *message) {
+        Ok(_) => {
+            crate::native_helpers::vbump_reds(process, 4);
+            Ok(atom("ok"))
+        }
+        Err(_) => Err(crate::exceptions::Trap::error(atom("badarg"))),
+    })
+}
+
+/// `erlang:send(Dest, Msg)` called directly from native code for a local pid and a sender with
+/// no trace or seq-trace hooks. A name, a port, a remote destination and every hook decline
+/// before any state changes and take the executor.
+// Port of erts/emulator/beam/bif.c:2862 (erl_send: ERTS_VBUMP_REDS after a completed send) and
+// bif.c:2458 (do_send), OTP-29.1.1.
+pub(crate) fn send2_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target, message] = args else {
+        return None;
+    };
+    let pid = Pid::from_term(*target)?;
+    if !crate::trace::send_hooks_idle(process) {
+        return None;
+    }
+    Some(match process.send_to_pid_idle(pid, *message) {
+        Ok(value) => {
+            crate::native_helpers::vbump_reds(process, 4);
+            Ok(value)
+        }
+        Err(_) => Err(crate::exceptions::Trap::error(atom("badarg"))),
+    })
+}
+
+/// `exit(Reason)` called directly from native code: the reason travels in the exception, as
+/// erts `exit_1` leaves it in `c_p->fvalue` (`BIF_ERROR(BIF_P, EXC_EXIT)`).
+// Port of erts/emulator/beam/bif.c:1536 (exit_1), OTP-29.1.1.
+pub(crate) fn exit1_light(
+    _process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [reason] = args else {
+        return None;
+    };
+    Some(Err(crate::exceptions::Trap::exit(*reason)))
 }
 
 /// `exit(Pid, Reason)` called directly from native code (erts bif.c:1721 send_exit_signal_bif)
