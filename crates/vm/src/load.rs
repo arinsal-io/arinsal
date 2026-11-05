@@ -370,6 +370,12 @@ pub(crate) struct ExportIndex {
 #[derive(Clone, Copy, Default)]
 struct ExportIndexEntry {
     dispatch: Option<&'static arinsal_beamasm::bif::ExportEntry>,
+    /// Module exports in the current version; imported error-handler stubs do not set this.
+    // Port of `erts_find_function`'s active export/trampoline check, export.c:154-180.
+    current_module_export: bool,
+    /// `Export.bif_number != -1`, used by `erts_is_builtin` even without module code.
+    // Port of erts/emulator/beam/beam_common.c:2359-2381, OTP-29.1.1.
+    builtin: bool,
 }
 
 impl ExportIndex {
@@ -381,7 +387,7 @@ impl ExportIndex {
         };
         for line in include_str!("../../../spec/otp-29.1.1/bif.tab").lines() {
             if let Some((module, function, arity)) = parse_bif_mfa(line) {
-                index.put(&module, &function, arity);
+                index.put_builtin(&module, &function, arity);
             }
         }
         // Port of erts/emulator/beam/erl_bif_re.c:222 (erts_init_bif_re) and
@@ -420,6 +426,44 @@ impl ExportIndex {
         if self.seen.insert((module, function, arity)) {
             self.order.push((module, function, arity));
         }
+    }
+
+    // Port of `erts_is_builtin`'s BIF entry marker, populated from bif.tab at initialization.
+    fn put_builtin(&mut self, module: &str, function: &str, arity: u8) {
+        let (Ok(module), Ok(function)) = (
+            global_atoms().intern(module),
+            global_atoms().intern(function),
+        ) else {
+            return;
+        };
+        self.put_atoms(module, function, arity);
+        self.entries
+            .get_mut(&(module, function, arity))
+            .expect("builtin export was inserted")
+            .builtin = true;
+    }
+
+    /// Marks the exports of the current module version in this code index.
+    // Port of erts/emulator/beam/module.c (`Module.curr`) and export.c:154-180
+    // (`erts_find_function`), OTP-29.1.1. Arinsal interpreted exports share the trampoline,
+    // so this index marker carries the loaded-export distinction that erts gets from dispatch.
+    pub(crate) fn set_current_module(&mut self, module: &Module, current: bool) {
+        for export in &module.exports {
+            let key = (module.name_atom, export.function_atom, export.arity);
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.current_module_export = current;
+            }
+        }
+    }
+
+    /// Tests the active MFA entry as `erts_find_function` followed by `erts_is_builtin` does.
+    // Port of erts/emulator/beam/export.c:154-180 (`erts_find_function`) and
+    // beam_common.c:2359-2381 (`erts_is_builtin`), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn function_exported(&self, key: (Atom, Atom, u8)) -> bool {
+        self.entries
+            .get(&key)
+            .is_some_and(|entry| entry.current_module_export || entry.builtin)
     }
 
     fn note_module(&mut self, module: &Module) {
@@ -670,6 +714,11 @@ impl CodeTables {
     /// Makes instance `id` the current code of `name` and returns the instance it replaces.
     pub(crate) fn make_current(&mut self, name: &str, id: usize) -> Option<usize> {
         let previous = self.loaded.insert(name, id);
+        if let Some(previous) = previous {
+            self.exports
+                .set_current_module(&self.modules[previous], false);
+        }
+        self.exports.set_current_module(&self.modules[id], true);
         activate_module_records(self.code_scope, &self.modules[id]);
         self.deleted.remove(name);
         self.known_modules.insert(name.to_owned());

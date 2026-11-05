@@ -1,10 +1,10 @@
 //! Process-aware BIFs. These use the running process and scheduler context.
 
 use crate::process::{Message, Runtime};
-use crate::{Process, Vm, VmError};
+use crate::{Process, ProcessHeapHandle, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{Atom, Term, TermBuilder, TermKind, global_atoms, to_owned};
+use arinsal_term::{Atom, HeapReservation, Term, TermBuilder, TermKind, global_atoms, to_owned};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
@@ -3297,22 +3297,7 @@ fn call_resolved(
             }
         }
         (SignalBif::Whereis1, [name]) => whereis_1(process, *name),
-        (SignalBif::Registered0, []) => {
-            let rt = runtime(process)?;
-            // Snapshot under the read lock, then build the list. Order is the
-            // reverse bucket walk from register.c:567.
-            let names: Vec<Term> = rt
-                .reg
-                .read()
-                .registered_atoms()
-                .into_iter()
-                .map(Term::atom)
-                .collect();
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            TermBuilder::new(&mut heap)
-                .list_from_iter(names)
-                .map_err(|error| VmError::Unsupported(format!("registered list: {error:?}")))
-        }
+        (SignalBif::Registered0, []) => registered_names(process),
         (SignalBif::Link1, [target]) => link_opt(vm, process, ctx, *target, Term::NIL),
         (SignalBif::Link2, [target, opts]) => link_opt(vm, process, ctx, *target, *opts),
         (SignalBif::Unlink1, [port]) if port.as_port().is_some() => {
@@ -3697,6 +3682,49 @@ fn call_resolved(
         }
         _ => Err(VmError::Unsupported("resolved signal BIF arity".into())),
     }
+}
+
+fn registered_names(process: &mut Process) -> Result<Term, VmError> {
+    let rt = process
+        .runtime
+        .ok_or_else(|| VmError::Unsupported("process BIF requires a scheduler".into()))?;
+    // Port of erts/emulator/beam/register.c:585-599, OTP-29.1.1: count while locked, reserve
+    // the exact young-heap space, then prepend each bucket entry before releasing the read lock.
+    let registry = rt.reg.read();
+    let count = registry.registered_count();
+    if count == 0 {
+        return Ok(Term::NIL);
+    }
+    let words = count
+        .checked_mul(2)
+        .ok_or_else(|| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))?;
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    let mut block = HeapReservation::with_extra(&mut heap, words, 0)
+        .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))?;
+    let mut builder = TermBuilder::new(&mut block);
+    let mut tail = Term::NIL;
+    registry
+        .try_for_each_registered_atom(|name| {
+            tail = builder.cons(Term::atom(name), tail)?;
+            Ok::<_, arinsal_term::TermError>(())
+        })
+        .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))?;
+    Ok(tail)
+}
+
+/// `registered/0` only snapshots the process registry and builds the resulting list.
+// Port of erts/emulator/beam/register.c:567 (`registered_atoms`), OTP-29.1.1.
+pub(crate) fn registered_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    if !args.is_empty() {
+        return None;
+    }
+    Some(registered_names(process).map_err(|error| match error {
+        VmError::Trap(trap) => trap,
+        _ => crate::exceptions::Trap::error(atom("system_limit")),
+    }))
 }
 
 /// Work a target process runs when it next handles signals.

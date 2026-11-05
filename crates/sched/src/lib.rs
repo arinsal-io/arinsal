@@ -3597,6 +3597,62 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    /// Read the counters used by the constant time `statistics/1` selectors.
+    // Port of erts/emulator/beam/erl_process.c:erts_get_total_context_switches,
+    // erts_get_total_reductions, and run_queues_len_aux, OTP-29.1.1.
+    fn statistics_counters(&self) -> (u64, u64, u64) {
+        if self.sim.is_some() {
+            let stats = self.simulation_stats();
+            return (
+                stats.run_queue_lengths.iter().sum(),
+                stats.reductions,
+                stats.context_switches,
+            );
+        }
+        let reductions = self
+            .worker_stats
+            .iter()
+            .map(|worker| worker.reductions.load(Ordering::Relaxed))
+            .sum();
+        let context_switches = self
+            .worker_stats
+            .iter()
+            .map(|worker| worker.context_switches.load(Ordering::Relaxed))
+            .sum();
+        let run_queue = self
+            .worker_counts
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let queued = value.0.load(Ordering::Relaxed) >> QUEUE_COUNT_SHIFT;
+                let ports = self
+                    .balance
+                    .rqs
+                    .get(index)
+                    .map_or(0, |rq| rq.len(balance::PORT_PRIO_LEVEL).max(0) as u64);
+                queued + ports
+            })
+            .sum();
+        (run_queue, reductions, context_switches)
+    }
+
+    /// Read the exact reductions total while every other managed scheduler is at a progress
+    /// point.
+    // Port of erts/emulator/beam/erl_process.c:erts_get_exact_total_reductions, OTP-29.1.1.
+    fn exact_total_reductions(&self) -> u64 {
+        if self.sim.is_some() {
+            return self.simulation_stats().reductions;
+        }
+        thr_progress::block(&self.progress);
+        let total = self
+            .worker_stats
+            .iter()
+            .map(|worker| worker.reductions.load(Ordering::Relaxed))
+            .sum();
+        thr_progress::unblock(&self.progress);
+        total
+    }
+
     /// Port of erts/emulator/beam/erl_process.c:3729 (wake_scheduler), OTP-29.1.1: `ssi_wake`
     /// only wakes a scheduler that sleeps; a running one finds the work on its next loop.
     fn wake_scheduler(&self, worker: usize) {
@@ -5194,6 +5250,7 @@ trait ContextOps<M: SignalMessage> {
     fn block_thread_progress(&self, duration: Duration);
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<M>>;
     fn total_reductions(&self) -> u64;
+    fn exact_total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
     fn set_msacc_enabled(&mut self, enabled: bool);
     fn set_msacc_state(&mut self, state: MsaccState);
@@ -5506,6 +5563,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Scheduler-wide reductions committed before this process turn.
     pub fn total_reductions(&self) -> u64 {
         self.inner.total_reductions()
+    }
+    /// Read exact reductions while all other managed schedulers are paused at a progress point.
+    pub fn exact_total_reductions(&self) -> u64 {
+        self.inner.exact_total_reductions()
     }
     /// Scheduler-owned task and timing snapshot including this turn's pending changes.
     pub fn scheduler_stats(&self) -> SchedulerStats {
@@ -6331,6 +6392,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         self.inner
             .scheduler_stats(self.local.map(RefCell::borrow).as_deref(), 0)
             .reductions
+    }
+    fn exact_total_reductions(&self) -> u64 {
+        self.inner.exact_total_reductions()
     }
     fn scheduler_stats(&self) -> SchedulerStats {
         self.inner
@@ -7347,6 +7411,17 @@ impl<T: Task> Scheduler<T> {
     /// Return scheduler-owned task counts and cumulative execution counters.
     pub fn stats(&self) -> SchedulerStats {
         self.inner.scheduler_stats(None, 0)
+    }
+
+    /// Read the counters used by the cheap `statistics/1` selectors without requesting worker
+    /// snapshots.
+    pub fn statistics_counters(&self) -> (u64, u64, u64) {
+        self.inner.statistics_counters()
+    }
+
+    /// Read reductions after all other managed schedulers have reached a progress point.
+    pub fn exact_total_reductions(&self) -> u64 {
+        self.inner.exact_total_reductions()
     }
 
     /// Enable or disable per worker execution time accounting.
@@ -8494,6 +8569,11 @@ fn schedule_out<T: Task>(
         // Dirty schedulers keep no reduction or normal run queue counters.
     } else if let Some(local) = local.as_deref_mut() {
         local.reductions += consumed;
+        if inner.sim.is_none() {
+            inner.worker_stats[local.worker_id]
+                .reductions
+                .fetch_add(consumed, Ordering::Relaxed);
+        }
         if SCHED_POLL.get().is_some() {
             FUNCTION_CALLS.fetch_add(
                 u32::try_from(consumed).unwrap_or(u32::MAX),
@@ -8861,6 +8941,11 @@ fn run_process<T: Task>(
         let mut local = local_cell.borrow_mut();
         local.record_running(&process, id);
         local.context_switches += 1;
+        if inner.sim.is_none() {
+            inner.worker_stats[local.worker_id]
+                .context_switches
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     let budget = inner.config.reductions;
     // `schedule_next` has synchronized the scheduler's accounting state with these flags.

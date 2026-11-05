@@ -567,7 +567,7 @@ pub(crate) fn module_loaded_light(
 }
 
 /// `erlang:function_exported/3` called directly from native code.
-// Port of erts/emulator/beam/beam_bif_load.c:2574 (function_exported_3), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:4402 (function_exported_3), OTP-29.1.1.
 pub(crate) fn function_exported_light(
     process: &mut Process,
     args: &[Term],
@@ -577,16 +577,17 @@ pub(crate) fn function_exported_light(
     };
     let module = module.as_atom()?;
     let function = function.as_atom()?;
-    let module_name = global_atoms().text(module)?;
-    let function_name = global_atoms().text(function)?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
-    let exported = process.runtime.as_ref()?.with_active_code(|_, tables| {
-        tables.loaded.get(module_name).is_some_and(|id| {
-            tables.modules[*id]
-                .export_slot(function_name, arity)
-                .is_some()
-        })
-    });
+    let exported = process
+        .runtime
+        .as_ref()?
+        .code_indexes()
+        .with_active_tables(|tables| {
+            tables.exports.function_exported((module, function, arity))
+                || (module == atoms::ERLANG
+                    && ((function == atoms::APPLY && matches!(arity, 2 | 3))
+                        || (function == atoms::YIELD && arity == 0)))
+        });
     Some(Ok(Term::atom(if exported {
         atoms::TRUE
     } else {
@@ -1153,6 +1154,9 @@ fn delete(
             return Outcome::NotPurged;
         }
         if let Some(current) = tables.loaded.remove(name) {
+            tables
+                .exports
+                .set_current_module(&tables.modules[current], false);
             tables.old.insert(name.to_owned(), current);
             crate::load::retract_module_records(tables.code_scope, name);
             tables.deleted.insert(name.to_owned());

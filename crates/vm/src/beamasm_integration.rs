@@ -319,7 +319,11 @@ impl DispatchRegistry {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
             // OTP-29.1.1: erts calls every BIF from the generated code with `c_p`, so a native
             // that needs only its process is called the same way.
-            leaked.light_process_bif = if leaked.class == arinsal_loader::ImportClass::Native
+            leaked.light_process_bif = if (leaked.class == arinsal_loader::ImportClass::Native
+                || (leaked.class == arinsal_loader::ImportClass::Fun
+                    && leaked.module == "erlang"
+                    && ((leaked.function == "fun_info" && leaked.arity == 2)
+                        || (leaked.function == "make_fun" && leaked.arity == 3))))
                 && !leaked.trap_entry
                 && leaked.direct_ets.is_none()
             {

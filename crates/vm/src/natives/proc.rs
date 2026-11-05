@@ -1671,7 +1671,9 @@ fn port_to_list(term: Term) -> Result<String, VmError> {
 
 /// Latin-1 integer list to bytes; `None` when longer than `max` or not a proper list.
 fn intlist_to_buf(term: Term, max: usize) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
+    // Port of erts/emulator/beam/bif.c:4525 (list_to_pid_1), OTP-29.1.1:
+    // erts allocates its fixed 65-byte temporary buffer before walking the list.
+    let mut buf = Vec::with_capacity(max + 1);
     let mut current = term;
     while current.classify() == TermKind::List {
         if buf.len() >= max {
@@ -1692,9 +1694,10 @@ fn parse_uint(bytes: &[u8], i: &mut usize) -> Option<u64> {
     }
     let mut value = 0u64;
     while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+        // erts parses into Uint, so decimal overflow wraps at the machine-word width.
         value = value
-            .checked_mul(10)?
-            .checked_add(u64::from(bytes[*i] - b'0'))?;
+            .wrapping_mul(10)
+            .wrapping_add(u64::from(bytes[*i] - b'0'));
         *i += 1;
     }
     Some(value)
@@ -1730,6 +1733,51 @@ fn list_to_pid(_process: &mut Process, chars: Term) -> Result<Term, VmError> {
         return Err(badarg());
     }
     Term::pid(b as u32, c as u32).ok_or_else(badarg)
+}
+
+/// `list_to_pid/1` parses a pid from the caller's character list without VM access.
+// Port of erts/emulator/beam/bif.c:4525 (list_to_pid_1), OTP-29.1.1.
+pub(crate) fn list_to_pid_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [chars] = args else {
+        return None;
+    };
+    // A failure declines: the executor raises it with the argument list in the frame.
+    list_to_pid(process, *chars).ok().map(Ok)
+}
+
+/// Handle `fun_info(Fun, arity)` from the process/register BIF entry.
+// Port of erts/emulator/beam/erl_bif_info.c:3912 (`fun_info_2`), OTP-29.1.1.
+pub(crate) fn fun_info_arity_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [fun, what] = args else {
+        return None;
+    };
+    if *what != Term::atom(arinsal_term::atoms::ARITY) {
+        return None;
+    }
+    let arity = {
+        let view = arinsal_beamasm::rt::fun_ref(*fun)?;
+        match view {
+            arinsal_term::FunRef::Local { entry, .. } => entry.arity,
+            arinsal_term::FunRef::Export { entry } => entry.arity,
+        }
+    };
+    // Port of erts/emulator/beam/erl_bif_info.c:3976 (`HAlloc(p, 3)`), OTP-29.1.1:
+    // release the inspected fun before a possible collection and reserve the result tuple.
+    if let Err(error) = process.ensure_entry(3, 0) {
+        return Some(Err(match error {
+            VmError::Trap(trap) => trap,
+            _ => crate::exceptions::Trap::error(atom("system_limit")),
+        }));
+    }
+    let arity = Term::small(i64::from(arity)).expect("fun arity fits a small integer");
+    let result = TermBuilder::new(&mut process.heap).tuple(&[*what, arity]);
+    Some(result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit"))))
 }
 
 // Port of erts/emulator/beam/bif.c:4608 (list_to_port_1), OTP-29.1.1.
@@ -2352,6 +2400,53 @@ pub(crate) fn process_info_light(
         Err(arinsal_sched::SignalFreeError::NoProcess) => Some(Ok(atom("undefined"))),
         Err(arinsal_sched::SignalFreeError::Busy) => None,
     }
+}
+
+/// Handle the self case of `process_info/1` from native process/register state.
+// Port of erts/emulator/beam/erl_bif_info.c:1562 (`process_info_1`), OTP-29.1.1.
+pub(crate) fn process_info_1_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target] = args else {
+        return None;
+    };
+    let own = process.self_pid?;
+    if Pid::from_term(*target) != Some(own) || !process.sig_cont_empty() {
+        return None;
+    }
+    let runtime = process.runtime.as_ref()?;
+    let busy = match process.signal_probe() {
+        Some(probe) => {
+            probe.has_pending()
+                || probe
+                    .proc_flags()
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    & arinsal_sched::proc_flags::SUSPENDED
+                    != 0
+        }
+        None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
+    };
+    if busy {
+        return None;
+    }
+    let args = ProcessInfoArgs::parse(None).ok()?;
+    Some(
+        process_info(
+            None,
+            InfoSource::Caller,
+            process,
+            own,
+            None,
+            &args,
+            Term::atom(arinsal_term::atoms::RUNNING),
+            true,
+        )
+        .map_err(|error| match error {
+            VmError::Trap(trap) => trap,
+            _ => crate::exceptions::Trap::error(atom("system_limit")),
+        }),
+    )
 }
 
 fn process_info_light_single(
@@ -3395,15 +3490,18 @@ fn dictionary_get0(
     process: &mut Process,
     _args: &[Term],
 ) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let raw = process
-        .dictionary
-        .as_ref()
-        .map_or_else(Vec::new, |dictionary| dictionary.entries_reversed());
-    let entries = raw
-        .into_iter()
-        .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
-        .collect::<Result<Vec<_>, _>>();
-    Some(entries.and_then(|entries| dictionary_alloc(make_list(process, entries))))
+    // Port of erts/emulator/beam/erl_process_dict.c:315 (`get_0`), OTP-29.1.1.
+    let Some(dictionary) = process.dictionary.as_ref() else {
+        return Some(Ok(Term::NIL));
+    };
+    let len = dictionary.len();
+    if len == 0 {
+        return Some(Ok(Term::NIL));
+    }
+    let entries = dictionary.entries();
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let result = TermBuilder::new(&mut heap).tuple2_list_from_iter_reversed(len, entries);
+    Some(result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn dictionary_get1(
