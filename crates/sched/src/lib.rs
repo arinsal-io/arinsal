@@ -2195,7 +2195,7 @@ struct TimerService<M> {
 
 struct LocalInit<T: Task> {
     worker_id: usize,
-    balance: Arc<balance::Balance>,
+    balance: Arc<balance::Balance<T>>,
     timer_service: TimerService<T::Message>,
     message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     pending_waits: Vec<PendingWait<T>>,
@@ -2292,7 +2292,7 @@ struct Inner<T: Task> {
     table: ProcessTable<T>,
     /// Process queues of each normal run queue (`rq->procs`); the owner dequeues from its own,
     /// other schedulers enqueue to it and steal from it.
-    run_queues: Vec<run_queue::ProcQueues<T>>,
+    run_queues: Arc<[run_queue::ProcQueues<T>]>,
     sim_timers: Option<Vec<Mutex<Wheel<T::Message>>>>,
     timer_commands: Vec<Arc<thr_queue::ThrQueue<TimerCommand<T::Message>>>>,
     canceled_timers: Vec<Arc<thr_queue::ThrQueue<CanceledTimer>>>,
@@ -2352,7 +2352,7 @@ struct Inner<T: Task> {
     /// The `erts_dirty_process_signal_handler` processes and their notification message.
     dirty_signal_handlers: OnceLock<DirtySignalHandlers<T::Message>>,
     /// Run queue balancing statistics and migration paths.
-    balance: Arc<balance::Balance>,
+    balance: Arc<balance::Balance<T>>,
     /// `rq->ports` of each normal run queue.
     port_queues: Vec<ports::PortQueue>,
 }
@@ -3684,13 +3684,21 @@ impl<T: Task> Inner<T> {
         if current == ix {
             return false;
         }
-        if activate && self.balance.try_inc_no_active_runqs(ix + 1) {
+        // `ERTS_RUNQ_FLG_SUSPENDED`: an offline scheduler, or one stopped by blocked
+        // multi-scheduling.
+        let suspended = ix >= self.online_schedulers.load(Ordering::Acquire)
+            || (self.scheduling_blocked.load(Ordering::Acquire)
+                && ix != self.scheduling_blocker.load(Ordering::Acquire));
+        let flags = self.balance.rqs[ix].flags.load(Ordering::Acquire);
+        if activate && !suspended && self.balance.try_inc_no_active_runqs(ix + 1) {
             self.balance.rqs[ix]
                 .flags
                 .fetch_and(!balance::FLG_INACTIVE, Ordering::AcqRel);
         }
-        if self.parked[ix].load(Ordering::SeqCst) && self.run_queues[ix].is_empty() {
-            self.wake_worker(ix);
+        // A run queue whose scheduler declared itself out of work counts as woken even when
+        // that scheduler is still spinning: `ssi_wake` only acts on a sleeping one.
+        if !suspended && flags & balance::FLG_NONEMPTY == 0 {
+            self.wake_scheduler(ix);
             return true;
         }
         false
@@ -4859,7 +4867,7 @@ struct PendingWait<T: Task> {
 
 struct Local<T: Task> {
     worker_id: usize,
-    balance: Arc<balance::Balance>,
+    balance: Arc<balance::Balance<T>>,
     timer_service: Rc<RefCell<TimerService<T::Message>>>,
     message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     /// Receive timeouts not yet published to the wheel.
@@ -6632,7 +6640,7 @@ impl<T: Task> Scheduler<T> {
         let inner = Arc::new(Inner {
             table: ProcessTable::new(config.max_processes, Arc::clone(&progress)),
             config,
-            run_queues: (0..workers).map(|_| run_queue::ProcQueues::new()).collect(),
+            run_queues: Arc::clone(&balance.rqs),
             sim_timers: simulated.then(|| {
                 (0..workers)
                     .map(|worker| Mutex::new(Wheel::new(now).for_worker(worker)))
@@ -7584,7 +7592,7 @@ impl<T: Task> Scheduler<T> {
             self.inner.online_schedulers.load(Ordering::Acquire)
         });
         if !blocked {
-            for rq in &self.inner.balance.rqs {
+            for rq in self.inner.balance.rqs.iter() {
                 rq.reset_statistics();
             }
             self.wake_all_workers();
