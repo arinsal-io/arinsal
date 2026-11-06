@@ -1466,15 +1466,15 @@ fn process_info_item_garbage_collection(
     let minor_gcs = Term::small(i64::from(minor_gcs)).unwrap();
     info_produce(process, reserve, 5 * (3 + 2), |block| {
         let mut rows = [Term::NIL; 5];
-        for (row, (name, value)) in rows.iter_mut().zip([
-            ("max_heap_size", limit),
-            ("min_bin_vheap_size", min_bin_vheap_size),
-            ("min_heap_size", min_heap_size),
-            ("fullsweep_after", fullsweep_after),
-            ("minor_gcs", minor_gcs),
+        for (row, (key, value)) in rows.iter_mut().zip([
+            (arinsal_term::atoms::MAX_HEAP_SIZE, limit),
+            (arinsal_term::atoms::MIN_BIN_VHEAP_SIZE, min_bin_vheap_size),
+            (arinsal_term::atoms::MIN_HEAP_SIZE, min_heap_size),
+            (arinsal_term::atoms::FULLSWEEP_AFTER, fullsweep_after),
         ]) {
-            *row = block.tuple(&[atom(name), value])?;
+            *row = block.tuple(&[Term::atom(key), value])?;
         }
+        rows[4] = block.tuple(&[atom("minor_gcs"), minor_gcs])?;
         block.list_from_slice(&rows)
     })
 }
@@ -1517,10 +1517,29 @@ fn process_info_item_garbage_collection_info(
         let mut rows = [Term::NIL; 11];
         for (row, (name, value)) in rows.iter_mut().zip(entries) {
             let value = block.int_from_u64(value as u64)?;
-            *row = block.tuple(&[atom(name), value])?;
+            *row = block.tuple(&[gc_info_atom(name), value])?;
         }
         block.list_from_slice(&rows)
     })
+}
+
+/// Seven `erts_process_gc_info` tags are globals; its four `ERTS_DECL_AM` tags are interned per call.
+// Port of erts/emulator/beam/erl_gc.c:3652-3671 (`erts_process_gc_info`), OTP-29.1.1.
+fn gc_info_atom(name: &'static str) -> Term {
+    match name {
+        "old_heap_block_size" => Term::atom(arinsal_term::atoms::OLD_HEAP_BLOCK_SIZE),
+        "heap_block_size" => Term::atom(arinsal_term::atoms::HEAP_BLOCK_SIZE),
+        "mbuf_size" => Term::atom(arinsal_term::atoms::MBUF_SIZE),
+        "recent_size" => Term::atom(arinsal_term::atoms::RECENT_SIZE),
+        "stack_size" => Term::atom(arinsal_term::atoms::STACK_SIZE),
+        "old_heap_size" => Term::atom(arinsal_term::atoms::OLD_HEAP_SIZE),
+        "heap_size" => Term::atom(arinsal_term::atoms::HEAP_SIZE),
+        "bin_vheap_size"
+        | "bin_vheap_block_size"
+        | "bin_old_vheap_size"
+        | "bin_old_vheap_block_size" => atom(name),
+        _ => unreachable!("unknown process GC info key"),
+    }
 }
 
 fn uint_words(value: usize) -> usize {
@@ -1744,7 +1763,7 @@ pub(crate) fn fun_info_arity_light(
         }));
     }
     let arity = Term::small(i64::from(arity)).expect("fun arity fits a small integer");
-    let result = TermBuilder::new(&mut process.heap).tuple(&[*what, arity]);
+    let result = TermBuilder::new(&mut process.heap).tuple2(*what, arity);
     Some(result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit"))))
 }
 
@@ -4223,22 +4242,30 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
     let size = Term::small(i64::try_from(limit.size).map_err(|_| badarg())?).ok_or_else(badarg)?;
     let pairs = [
         (
-            atom("error_logger"),
-            atom(if limit.log { "true" } else { "false" }),
-        ),
-        (
-            atom("include_shared_binaries"),
-            atom(if limit.include_shared_binaries {
-                "true"
+            Term::atom(arinsal_term::atoms::ERROR_LOGGER),
+            Term::atom(if limit.log {
+                arinsal_term::atoms::TRUE
             } else {
-                "false"
+                arinsal_term::atoms::FALSE
             }),
         ),
         (
-            atom("kill"),
-            atom(if limit.kill { "true" } else { "false" }),
+            Term::atom(arinsal_term::atoms::INCLUDE_SHARED_BINARIES),
+            Term::atom(if limit.include_shared_binaries {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }),
         ),
-        (atom("size"), size),
+        (
+            Term::atom(arinsal_term::atoms::KILL),
+            Term::atom(if limit.kill {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }),
+        ),
+        (Term::atom(arinsal_term::atoms::SIZE), size),
     ];
     // Port of `erts_map_from_ks_and_vs` (erts/emulator/beam/erl_map.c), OTP-29.1.1: the key
     // tuple and the map are one factory allocation of `1 + 3 + 2 * n` words.

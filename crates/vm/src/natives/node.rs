@@ -80,7 +80,7 @@ fn call_nodes0(
     _args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:6279 (nodes/0 → visible), OTP-29.1.1.
-    nodes(process, atom("visible"), None)
+    nodes(process, Term::atom(arinsal_term::atoms::VISIBLE), None)
 }
 
 /// The `nodes/0` light BIF uses the same node-table scan as the executor body.
@@ -93,10 +93,12 @@ pub(crate) fn nodes0_bif(
         return None;
     }
     Some(
-        nodes(process, atom("visible"), None).map_err(|error| match error {
-            VmError::Trap(trap) => trap,
-            _ => crate::exceptions::Trap::error(atom("system_limit")),
-        }),
+        nodes(process, Term::atom(arinsal_term::atoms::VISIBLE), None).map_err(
+            |error| match error {
+                VmError::Trap(trap) => trap,
+                _ => crate::exceptions::Trap::error(atom("system_limit")),
+            },
+        ),
     )
 }
 

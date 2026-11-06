@@ -4958,7 +4958,7 @@ fn processes(
         snapshot: None,
         scheduler,
         pids: Vec::new(),
-        chunk_intervals: Vec::new(),
+        chunk_intervals: Vec::with_capacity(table_max.div_ceil(1000) as usize),
         next_index: 0,
         deleted_done: false,
     };
@@ -4996,6 +4996,9 @@ fn scan_process_table(list: &mut PtabListState, table_max: u32, reds_left: u32) 
     const CHUNK_SIZE: u32 = 1000;
     if list.snapshot.is_none() {
         list.snapshot = Some(list.scheduler.begin_ptab_list());
+        let count = list.snapshot.as_ref().unwrap().count();
+        list.pids
+            .reserve_exact(count.saturating_sub(list.pids.capacity()));
     }
     let mut spent = 0_u32;
     let mut first_chunk = true;
@@ -5006,9 +5009,15 @@ fn scan_process_table(list: &mut PtabListState, table_max: u32, reds_left: u32) 
         if !first_chunk && (spent >= reds_left || chunk_reds > reds_left - spent) {
             break;
         }
-        let (pids, interval) = list.snapshot.as_ref().unwrap().scan_chunk(first, end);
-        list.pids
-            .extend(pids.into_iter().filter_map(|pid| pid.to_term()));
+        let interval = list
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .scan_chunk_with(first, end, |pid| {
+                if let Some(pid) = pid.to_term() {
+                    list.pids.push(pid);
+                }
+            });
         list.chunk_intervals.push(interval);
         let indices = end - first;
         list.next_index = end;
@@ -5033,13 +5042,15 @@ fn run_process_list(
     }
     if !list.deleted_done {
         let max_deleted_reds = reds_left.saturating_sub(spent).min(40);
-        let (deleted, deleted_reds, done) = list
+        let (deleted_reds, done) = list
             .snapshot
             .as_mut()
             .expect("table scan initialized its snapshot")
-            .inspect_deleted(&list.chunk_intervals, max_deleted_reds);
-        list.pids
-            .extend(deleted.into_iter().filter_map(|pid| pid.to_term()));
+            .inspect_deleted_with(&list.chunk_intervals, max_deleted_reds, |pid| {
+                if let Some(pid) = pid.to_term() {
+                    list.pids.push(pid);
+                }
+            });
         list.deleted_done = done;
         spent += deleted_reds;
         if !done {
@@ -5173,11 +5184,12 @@ fn ports(
             });
         }
         let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
+        let ids = vec![Term::port(0).ok_or(BifError::SystemLimit)?];
         let list = PortPtabListState {
             snapshot: None,
             runtime,
-            ids: vec![Term::port(0).ok_or(BifError::SystemLimit)?],
-            chunk_intervals: Vec::new(),
+            ids,
+            chunk_intervals: Vec::with_capacity(table_max.div_ceil(1000) as usize),
             next_index: 0,
             deleted_done: false,
         };
@@ -5263,17 +5275,17 @@ fn run_port_list(
     }
     if !list.deleted_done {
         let max_deleted_reds = reds_left.saturating_sub(spent).min(40);
-        let (deleted, deleted_reds, done) = list
+        let (deleted_reds, done) = list
             .snapshot
             .as_mut()
             .expect("table scan initialized its snapshot")
-            .inspect_deleted(&list.chunk_intervals, max_deleted_reds);
-        list.ids.extend(
-            deleted
-                .into_iter()
-                .filter(|id| *id != 0)
-                .filter_map(Term::port),
-        );
+            .inspect_deleted_with(&list.chunk_intervals, max_deleted_reds, |id| {
+                if id != 0
+                    && let Some(id) = Term::port(id)
+                {
+                    list.ids.push(id);
+                }
+            });
         list.deleted_done = done;
         spent += deleted_reds;
         if !done {
@@ -5295,6 +5307,9 @@ fn scan_port_table(list: &mut PortPtabListState, table_max: u32, reds_left: u32)
     const CHUNK_SIZE: u32 = 1000;
     if list.snapshot.is_none() {
         list.snapshot = Some(list.runtime.ports.begin_ptab_list());
+        let count = list.snapshot.as_ref().unwrap().count();
+        list.ids
+            .reserve_exact(count.saturating_sub(list.ids.capacity()));
     }
     let mut spent = 0_u32;
     let mut first_chunk = true;
@@ -5305,9 +5320,17 @@ fn scan_port_table(list: &mut PortPtabListState, table_max: u32, reds_left: u32)
         if !first_chunk && (spent >= reds_left || chunk_reds > reds_left - spent) {
             break;
         }
-        let (ids, interval) = list.snapshot.as_ref().unwrap().scan_chunk(first, end);
-        list.ids
-            .extend(ids.into_iter().filter(|id| *id != 0).filter_map(Term::port));
+        let interval = list
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .scan_chunk_with(first, end, |id| {
+                if id != 0
+                    && let Some(id) = Term::port(id)
+                {
+                    list.ids.push(id);
+                }
+            });
         list.chunk_intervals.push(interval);
         list.next_index = end;
         spent += (end - first) / 25;

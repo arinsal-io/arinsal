@@ -8540,6 +8540,10 @@ impl Process {
             entry_result,
             code,
         };
+        // Port of erts/emulator/beam/erl_process.c:14229 (erts_do_exit_process:
+        // `BUMP_REDS(p, 100)`), OTP-29.1.1: the rest of the exit runs on what is left, and the
+        // schedulers' wakeup_other, check_balance and check_time counters see this cost.
+        ctx.consume(100);
         self.continue_exit(runtime, ctx, data, false, state)
     }
 

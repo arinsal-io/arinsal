@@ -339,7 +339,6 @@ impl DispatchRegistry {
                     && ((leaked.function == "fun_info" && leaked.arity == 2)
                         || (leaked.function == "make_fun" && leaked.arity == 3))))
                 && !leaked.trap_entry
-                && leaked.direct_ets.is_none()
             {
                 crate::natives::process_bif(&leaked.module, &leaked.function, leaked.arity)
             } else {
