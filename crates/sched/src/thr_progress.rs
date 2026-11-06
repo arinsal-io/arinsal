@@ -815,13 +815,13 @@ pub(crate) fn run_remaining_later_ops(progress: &ThrProgress) {
 /// runs with the run queue locked; `erts_thr_progress_leader_update`, which can block the thread
 /// for a thread progress blocker, and the aux work run with it unlocked, so a thief retrying this
 /// victim cannot keep the blocker waiting.
-pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue_held: &AtomicBool) {
-    let held = run_queue_held.load(Ordering::Relaxed);
+pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue: &mut dyn RunQueueHold) {
+    let held = run_queue.is_held();
     let mut released = false;
     {
         let tpd = &mut *managed.0.borrow_mut();
         if update(tpd) {
-            run_queue_held.store(false, Ordering::Release);
+            run_queue.release();
             released = true;
             leader_update(tpd);
         }
@@ -834,14 +834,33 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue_held: &Atomi
             break;
         };
         if !released {
-            run_queue_held.store(false, Ordering::Release);
+            run_queue.release();
             released = true;
         }
         op.run();
     }
     if released && held {
-        run_queue_held.store(true, Ordering::Release);
+        run_queue.reacquire();
     }
+}
+
+/// The scheduler's hold on its run queue lock across `erts_schedule`.
+pub(crate) trait RunQueueHold {
+    /// The scheduler holds the run queue lock now.
+    fn is_held(&self) -> bool;
+    /// `erts_runq_unlock`.
+    fn release(&mut self);
+    /// `erts_runq_lock`.
+    fn reacquire(&mut self);
+}
+
+/// A thread without a run queue (tests, unmanaged callers).
+impl RunQueueHold for () {
+    fn is_held(&self) -> bool {
+        false
+    }
+    fn release(&mut self) {}
+    fn reacquire(&mut self) {}
 }
 
 /// The next later operation of this thread, or of an unmanaged thread, that thread progress
@@ -1094,7 +1113,7 @@ mod tests {
                     LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
                 );
                 for _ in 0..8 {
-                    scheduler_progress(&managed, &AtomicBool::new(false));
+                    scheduler_progress(&managed, &mut ());
                 }
                 assert!(ran.load(Ordering::SeqCst));
                 assert!(reached(&progress, 2));
@@ -1120,7 +1139,7 @@ mod tests {
                     LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
                 );
                 for _ in 0..8 {
-                    scheduler_progress(&managed, &AtomicBool::new(false));
+                    scheduler_progress(&managed, &mut ());
                 }
                 assert!(
                     !ran.load(Ordering::SeqCst),
@@ -1128,7 +1147,7 @@ mod tests {
                 );
                 unmanaged_continue(&progress, delay);
                 for _ in 0..8 {
-                    scheduler_progress(&managed, &AtomicBool::new(false));
+                    scheduler_progress(&managed, &mut ());
                 }
                 assert!(ran.load(Ordering::SeqCst));
                 unregister_managed_thread();
@@ -1178,7 +1197,7 @@ mod tests {
                     progress.sleepers[id].set(std::thread::current()).unwrap();
                     let managed = register_managed_thread(&progress, id);
                     while !stop.load(Ordering::SeqCst) {
-                        scheduler_progress(&managed, &AtomicBool::new(false));
+                        scheduler_progress(&managed, &mut ());
                         passes.fetch_add(1, Ordering::SeqCst);
                     }
                     scheduler_prepare_wait();
