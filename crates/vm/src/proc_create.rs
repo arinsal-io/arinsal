@@ -3,6 +3,8 @@
 use super::*;
 use arinsal_alloc::typed::FixAllocBox;
 
+pub(crate) mod raw;
+
 /// Why native code left for the scheduler. One byte of the process, set by the helper that
 /// requests the exit, so the exit path is one load and one match.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

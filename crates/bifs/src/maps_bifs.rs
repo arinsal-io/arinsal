@@ -469,8 +469,7 @@ impl MapsBuildWalk {
                                     self.pairs
                                         .as_mut()
                                         .expect("validated map pair iterator")
-                                        .by_ref()
-                                        .take(count),
+                                        .by_ref(),
                                 )
                                 .map_err(|error| map_error(ctx, error))?;
                             self.leaves_written += count;
@@ -518,7 +517,7 @@ impl MapsBuildWalk {
                             cursor = tail;
                             Self::element_of(fill, head, false).ok()
                         });
-                        let pairs = std::iter::once(first).chain(rest).take(count);
+                        let pairs = std::iter::once(first).chain(rest);
                         self.build
                             .as_mut()
                             .expect("hashmap leaf builder")

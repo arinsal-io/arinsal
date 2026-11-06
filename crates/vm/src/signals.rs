@@ -1102,6 +1102,9 @@ fn create_child(
     // takes the process struct and its table entry first, and the fields are then initialized
     // in place.
     let init_child = |child_pid: Pid, child: &mut Process| -> Result<(), VmError> {
+        if !crate::beamasm_integration::enabled() {
+            crate::native_bridge::push_exit_bridge(child);
+        }
         child.set_runtime_with_min_bin_vheap_size(Some(runtime), min_bin_vheap as u64);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process initializes both
         // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
@@ -1193,19 +1196,21 @@ fn create_child(
         Ok(())
     };
     let spawned = scheduler
-        .spawn_unscheduled_try_init(
+        .spawn_unscheduled_try_prepare_init(
             || {
                 // erts allocates the Process before sizing the copied argument graph and
                 // allocating its initial heap.
                 let size = arinsal_term::size_object_litopt(args, &literals);
                 arg_size.set(size);
                 let heap_need = size.saturating_add(arinsal_term::S_RESERVED);
-                let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
-                    .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
+                arinsal_term::spawned_heap_words(heap_need, min_heap)
+                    .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))
+            },
+            |heap_words, slot| {
                 let mut heap =
                     arinsal_term::ProcessHeap::with_words_at(heap_words, parent_alloc_ix);
                 heap.set_min_heap_size(min_heap);
-                Ok(Process::spawn_registers_and_heap(3, 0, heap))
+                crate::proc_create::raw::initialize_spawned(slot, 3, 0, heap)
             },
             init_child,
             so.priority,
