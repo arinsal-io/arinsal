@@ -872,6 +872,14 @@ pub(crate) fn start_timer_bif(
     // A dead pid gets a ref but no timer entry; an unresolved name can become registered
     // before its timer expires.
     let id = process.next_ref();
+    let reference = reference(process, id)?;
+    // Port of erl_hl_timer.c (setup_bif_timer): the timeout tuple is the timer's queued
+    // message, so expiry can enqueue it without receiver-side signal conversion.
+    let message = if send_after {
+        message
+    } else {
+        process.tuple(&[atom("timeout"), reference, message])?
+    };
     let message = Message::copy_from_timer(message, id, process.heap.alloc_ix())?;
     // setup_bif_timer: a timer for a process that does not exist is never created.
     if let Some(pid) = pid
@@ -879,18 +887,17 @@ pub(crate) fn start_timer_bif(
             .scheduler()
             .is_ok_and(|scheduler| scheduler.lookup_from(pid, process.on_managed))
     {
-        return reference(process, id);
+        return Ok(reference);
     }
-    let wrapped = !send_after;
     let timer = if let Some(pid) = pid {
-        sink.schedule_timer(pid, ms, message, wrapped)
+        sink.schedule_timer(pid, ms, message, false)
     } else {
         let runtime = process.runtime.ok_or_else(|| badarg("timer/3"))?;
         let name = registered_name.expect("resolved timer name");
         sink.schedule_resolved_timer(
             ms,
             message,
-            wrapped,
+            false,
             std::sync::Arc::new(move || runtime.reg.whereis_proc(name)),
         )
     }
@@ -907,7 +914,7 @@ pub(crate) fn start_timer_bif(
         // The receiver exited meanwhile; its exit may already have swept its timers.
         scheduler.cancel_timer_async(timer, |_| {});
     }
-    reference(process, id)
+    Ok(reference)
 }
 
 pub(crate) fn reference(process: &mut Process, id: u64) -> Result<Term, VmError> {
