@@ -9514,7 +9514,9 @@ mod layout_tests {
         // The native ABI words (erts c_p htop/stop/heap/hend/fcalls/freason) moved into the heap.
         assert!(
             std::mem::size_of::<arinsal_term::ProcessHeap>()
-                <= 168 + std::mem::size_of::<arinsal_term::NativeAbi>()
+                <= 160
+                    + std::mem::size_of::<arinsal_term::NativeAbi>()
+                    + arinsal_term::ProcessHeap::OWNERS_SIZE
         );
         eprintln!(
             "Process={} ProcessHeap={} MessageHeap={} PreviousMessageHeap={} VecDeque={} RunOutcome={}",

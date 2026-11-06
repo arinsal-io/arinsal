@@ -431,11 +431,12 @@ fn emit_append(
     crate::emit_enter_runtime(&mut asm.code, root_live as usize, update)?;
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), C_P)?;
-        e.mov_const(Gpr::x(1), u64::from(source_index))?;
-        e.mov_const(Gpr::x(2), plan.extra_bits)?;
-        e.mov_const(Gpr::x(3), plan.unit)?;
-        e.mov_const(Gpr::x(4), u64::from(root_live))?;
-        e.mov_const(Gpr::x(5), u64::from(alloc))
+        e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
+        e.mov_const(Gpr::x(2), u64::from(source_index))?;
+        e.mov_const(Gpr::x(3), plan.extra_bits)?;
+        e.mov_const(Gpr::x(4), plan.unit)?;
+        e.mov_const(Gpr::x(5), u64::from(root_live))?;
+        e.mov_const(Gpr::x(6), u64::from(alloc))
     })?;
     asm.fragment_call(APPEND_CHECKED.load(Ordering::Relaxed))?;
     crate::emit_leave_runtime(&mut asm.code, root_live as usize, update)?;

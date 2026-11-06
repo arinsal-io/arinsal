@@ -2549,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn minor_collection_does_not_reallocate_an_empty_owner_box() {
+    fn minor_collection_preserves_empty_inline_owner_state() {
         let mut heap = ProcessHeap::with_words(128);
         heap.old_words = ProcessHeap::with_words(128).words;
         heap.owners.vheap.old = 0;
@@ -2557,7 +2557,8 @@ mod tests {
         heap.collect(&mut [], &mut [], 0).unwrap();
 
         assert!(!heap.collection_is_major());
-        assert!(!heap.owners.is_allocated());
+        similar_asserts::assert_eq!(heap.owners.chain_heads(), (0, 0));
+        similar_asserts::assert_eq!(heap.owners.overhead(), 0);
     }
 
     #[test]
