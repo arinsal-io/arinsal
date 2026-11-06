@@ -21,6 +21,7 @@ enum NativeTopRoots {
     BifArgs { start: usize, len: usize },
     BifRegisters { start: usize, len: usize },
     CurrentArgs(usize),
+    CurrentArgsNoLocation(usize),
 }
 
 #[inline]
@@ -242,6 +243,10 @@ pub(crate) fn gc_after_native_parts(
                 roots.push(*args);
                 Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
             }
+            crate::stacktrace::TopFrame::CurrentArgsNoLocation { args, .. } => {
+                roots.push(*args);
+                Some(NativeTopRoots::CurrentArgsNoLocation(roots.len() - 1))
+            }
             crate::stacktrace::TopFrame::CurrentArgsWithInfo(Some(args), _) => {
                 roots.push(*args);
                 Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
@@ -273,6 +278,9 @@ pub(crate) fn gc_after_native_parts(
                     NativeTopRoots::CurrentArgs(_) => {
                         unreachable!("BIF argument storage remains stable across GC")
                     }
+                    NativeTopRoots::CurrentArgsNoLocation(_) => {
+                        unreachable!("BIF argument storage remains stable across GC")
+                    }
                 },
                 Some(crate::stacktrace::TopFrame::BifRegisters { .. }) => {
                     if let NativeTopRoots::BifRegisters { start, len } = top_roots {
@@ -281,6 +289,11 @@ pub(crate) fn gc_after_native_parts(
                 }
                 Some(crate::stacktrace::TopFrame::CurrentArgs(args))
                     if let NativeTopRoots::CurrentArgs(index) = top_roots =>
+                {
+                    *args = roots[index]
+                }
+                Some(crate::stacktrace::TopFrame::CurrentArgsNoLocation { args, .. })
+                    if let NativeTopRoots::CurrentArgsNoLocation(index) = top_roots =>
                 {
                     *args = roots[index]
                 }

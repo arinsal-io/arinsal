@@ -2345,6 +2345,25 @@ macro_rules! word_adapter {
     };
 }
 
+macro_rules! primary_exception_adapter {
+    ($name:ident, $result:ident, $class:ident) => {
+        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+            if args.len() == 1 {
+                ctx.fail_exception(Class::$class, args[0])
+            } else {
+                match $result(ctx, args) {
+                    Ok(value) if ctx.has_deferred() => match ctx.take_deferred() {
+                        Some(trap) => ctx.trap(*trap),
+                        None => value,
+                    },
+                    Ok(value) => value,
+                    Err(error) => ctx.fail(error),
+                }
+            }
+        }
+    };
+}
+
 word_adapter!(abs, abs_result);
 word_adapter!(to_float, to_float_result);
 word_adapter!(trunc, trunc_result);
@@ -2410,9 +2429,10 @@ word_adapter!(is_map_key, is_map_key_result);
 word_adapter!(map_get, map_get_result);
 word_adapter!(map_size, map_size_result);
 word_adapter!(is_builtin, is_builtin_result);
-word_adapter!(error, error_result);
-word_adapter!(exit, exit_result);
-word_adapter!(throw, throw_result);
+// Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1.
+primary_exception_adapter!(error, error_result, Error);
+primary_exception_adapter!(exit, exit_result, Exit);
+primary_exception_adapter!(throw, throw_result, Throw);
 word_adapter!(cmp_term, cmp_term_result);
 word_adapter!(debug_copy_shared, debug_copy_shared_result);
 word_adapter!(debug_flat_size, debug_flat_size_result);

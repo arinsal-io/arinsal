@@ -89,6 +89,10 @@ pub trait ModuleEnv {
     fn raise_class_helper(&self) -> usize {
         0
     }
+    /// Return the runtime hook implementing `raw_raise/4`'s failure-word updates.
+    fn raw_raise_helper(&self) -> usize {
+        0
+    }
     /// Return the performance counter function native `os:perf_counter/0` calls
     /// (`erts_sys_perf_counter`).
     fn sys_perf_counter(&self) -> usize {
@@ -227,6 +231,11 @@ pub trait ModuleEnv {
     }
     /// Export identity of an import that is a plain (pure or heap-allocating) BIF, if it is one.
     fn plain_bif_identity(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {
+        None
+    }
+    /// Return the stable `Export.info.mfa` address for a plain BIF import.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1.
+    fn plain_bif_mfa(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {
         None
     }
     /// Runtime hook for the field-decoding `bs_match` commands.
@@ -2730,7 +2739,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         }
         EmitterKind::IntDiv if GENERIC == erts_tables::GENOP_I_M_DIV_5 => {
             count(5)?;
-            assembler.emit_i_m_div(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_m_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::IntDiv => {
             count(5)?;
@@ -3291,8 +3300,12 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             let identity = env
                 .plain_bif_identity(beam, import)
                 .ok_or_else(|| EmitError::Operand("BIF import is not a plain BIF".to_owned()))?;
+            // An import can resolve to a BIF without exposing a stable export MFA descriptor.
+            // erts passes a null `bif_mfa` in that case and lets `handle_error` use `current`.
+            let bif_mfa = env.plain_bif_mfa(beam, import).unwrap_or(0);
             assembler.emit_bif_by_identity(
                 identity,
+                bif_mfa,
                 &sources,
                 fail,
                 value(bif_at + 1)?,
@@ -3571,7 +3584,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 erts_tables::GENOP_RAW_RAISE_0 => {
                     count(0)?;
-                    assembler.emit_raw_raise(resolver)
+                    assembler.emit_raw_raise(env.raw_raise_helper(), resolver)
                 }
                 erts_tables::GENOP_NODE_1 => {
                     count(1)?;
@@ -4047,6 +4060,28 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                                 arinsal_beamasm::types::type_id::MAYBE_IMMEDIATE,
                             ),
                             env.map_runtime(),
+                        )
+                    } else if !operand_is_exact_map(args.get(map_at), beam) {
+                        // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-807
+                        // (`emit_bif_is_map_key`): a map that is not known to be one goes
+                        // through `emit_i_bif2`, so the operands and the BIF's MFA are in
+                        // place for `handle_error`.
+                        let Some(import) = as_u32(args.first()) else {
+                            return Err(EmitError::Operand(
+                                "BIF operand must be an import".to_owned(),
+                            ));
+                        };
+                        let identity = env.plain_bif_identity(beam, import).ok_or_else(|| {
+                            EmitError::Operand("BIF import is not a plain BIF".to_owned())
+                        })?;
+                        let bif_mfa = env.plain_bif_mfa(beam, import).unwrap_or(0);
+                        assembler.emit_bif_by_identity(
+                            identity,
+                            bif_mfa,
+                            &[value(key_at)?, value(map_at)?],
+                            n(1)?,
+                            value(dest_at)?,
+                            env.bif_identity_helper(identity),
                         )
                     } else {
                         assembler.emit_bif_is_map_key_typed(

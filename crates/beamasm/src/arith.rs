@@ -218,7 +218,17 @@ impl BeamModuleAssembler {
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_div_rem(lhs, rhs, dst, ArgVal::X(0), helper, fail, true, false)
+        self.emit_div_rem(
+            lhs,
+            rhs,
+            dst,
+            ArgVal::X(0),
+            helper,
+            fail,
+            true,
+            false,
+            &crate::bif::ERLANG_DIV_MFA,
+        )
     }
 
     /// Emits fused `i_div_rem`: quotient and remainder from one division.
@@ -246,7 +256,17 @@ impl BeamModuleAssembler {
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         let need_div = quotient != remainder;
-        self.emit_div_rem(lhs, rhs, quotient, remainder, helper, fail, need_div, true)
+        self.emit_div_rem(
+            lhs,
+            rhs,
+            quotient,
+            remainder,
+            helper,
+            fail,
+            need_div,
+            true,
+            &crate::bif::ERLANG_DIV_MFA,
+        )
     }
 
     /// Emits fused `i_rem_div`: remainder and quotient from one division.
@@ -274,7 +294,17 @@ impl BeamModuleAssembler {
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         let need_rem = quotient != remainder;
-        self.emit_div_rem(lhs, rhs, quotient, remainder, helper, fail, true, need_rem)
+        self.emit_div_rem(
+            lhs,
+            rhs,
+            quotient,
+            remainder,
+            helper,
+            fail,
+            true,
+            need_rem,
+            &crate::bif::ERLANG_REM_MFA,
+        )
     }
 
     /// Emits `i_m_div` (`/`): always a runtime call, like erts.
@@ -286,7 +316,30 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_helper_operation(12, lhs, rhs, dst, helper)
+        self.emit_i_m_div_with_fail(lhs, rhs, dst, 0, helper)
+    }
+
+    /// Emits `i_m_div` with the BEAM guard failure behavior.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1089-1125 (emit_i_m_div), OTP-29.1.1.
+    pub fn emit_i_m_div_with_fail(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        dst: ArgVal,
+        fail: u32,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        let left = self.source_reg(lhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        self.emit_arith_call_with_mfa(
+            12,
+            left,
+            right,
+            helper,
+            fail,
+            std::ptr::from_ref(&crate::bif::ERLANG_DIV_MFA) as usize,
+        )?;
+        self.store_result(dst, Gpr::x(0))
     }
 
     /// Emits `i_rem` with the Erlang remainder sign rule.
@@ -311,7 +364,17 @@ impl BeamModuleAssembler {
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_div_rem(lhs, rhs, ArgVal::X(0), dst, helper, fail, false, true)
+        self.emit_div_rem(
+            lhs,
+            rhs,
+            ArgVal::X(0),
+            dst,
+            helper,
+            fail,
+            false,
+            true,
+            &crate::bif::ERLANG_REM_MFA,
+        )
     }
 
     /// Emits `i_band`.
@@ -759,6 +822,18 @@ impl BeamModuleAssembler {
         fail: u32,
     ) -> Result<(), ModuleError> {
         self.emit_helper(op, lhs, rhs, helper, (fail != 0).then_some(fail))
+    }
+
+    fn emit_arith_call_with_mfa(
+        &mut self,
+        op: u32,
+        lhs: Gpr,
+        rhs: Gpr,
+        helper: ArithHelper,
+        fail: u32,
+        bif_mfa: usize,
+    ) -> Result<(), ModuleError> {
+        self.emit_helper_with_mfa(op, lhs, rhs, helper, (fail != 0).then_some(fail), bif_mfa)
     }
 
     /// `i_plus` / `i_minus`.
@@ -1242,6 +1317,7 @@ impl BeamModuleAssembler {
         fail: u32,
         need_div: bool,
         need_rem: bool,
+        bif_mfa: &'static crate::bif::ErtsCodeMfa,
     ) -> Result<(), ModuleError> {
         let (l, r) = self.take_arith_args(lhs, rhs);
         let mut divisor = if r.is_small() { r.small_value() } else { 0 };
@@ -1290,7 +1366,7 @@ impl BeamModuleAssembler {
             self.code.b(done)?;
         }
         self.code.bind(generic)?;
-        self.emit_int_div_rem_shared(need_div, need_rem, left, right, helper, fail)?;
+        self.emit_int_div_rem_shared(need_div, need_rem, left, right, helper, fail, bif_mfa)?;
         self.code.bind(done)?;
         if need_div {
             self.store_result(quotient_dst, ARG1)?;
@@ -1304,6 +1380,7 @@ impl BeamModuleAssembler {
     /// The shared `int_div_rem` fragment inlined: quotient in ARG1, remainder in ARG2.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:740-875 (emit_int_div_rem_guard_shared,
     // emit_int_div_rem_body_shared), OTP-29.1.1
+    #[allow(clippy::too_many_arguments)]
     fn emit_int_div_rem_shared(
         &mut self,
         need_div: bool,
@@ -1312,6 +1389,7 @@ impl BeamModuleAssembler {
         rhs: Gpr,
         helper: ArithHelper,
         fail: u32,
+        bif_mfa: &'static crate::bif::ErtsCodeMfa,
     ) -> Result<(), ModuleError> {
         let slow = self.code.new_label();
         let done = self.code.new_label();
@@ -1372,7 +1450,14 @@ impl BeamModuleAssembler {
         self.code.bind(slow)?;
         if need_div && need_rem {
             // Quotient comes back in x0; the helper stores the remainder in tmp_mem[1].
-            self.emit_arith_call(14, lhs, rhs, helper, fail)?;
+            self.emit_arith_call_with_mfa(
+                14,
+                lhs,
+                rhs,
+                helper,
+                fail,
+                std::ptr::from_ref(bif_mfa) as usize,
+            )?;
             self.code
                 .emit(|e| e.ldr_uoff(ARG2, Gpr::x(19), TMP_MEM_REM))?;
         } else {
@@ -1381,7 +1466,14 @@ impl BeamModuleAssembler {
             } else {
                 BinaryOp::Rem
             };
-            self.emit_arith_call(op.id(), lhs, rhs, helper, fail)?;
+            self.emit_arith_call_with_mfa(
+                op.id(),
+                lhs,
+                rhs,
+                helper,
+                fail,
+                std::ptr::from_ref(bif_mfa) as usize,
+            )?;
             self.mov_if_needed(if need_div { ARG1 } else { ARG2 }, ARG1)?;
         }
         self.code.bind(done)?;
@@ -1875,11 +1967,25 @@ impl BeamModuleAssembler {
         helper: ArithHelper,
         fail: Option<u32>,
     ) -> Result<(), ModuleError> {
+        let bif_mfa = crate::bif::arithmetic_bif_mfa(op).unwrap_or(0);
+        self.emit_helper_with_mfa(op, lhs, rhs, helper, fail, bif_mfa)
+    }
+
+    fn emit_helper_with_mfa(
+        &mut self,
+        op: u32,
+        lhs: Gpr,
+        rhs: Gpr,
+        helper: ArithHelper,
+        fail: Option<u32>,
+        bif_mfa: usize,
+    ) -> Result<(), ModuleError> {
         // The failure label comes from the instruction (guard arithmetic) or the emitting
         // context; with one the runtime records no BIF frame (QUIET_GUARD in the VM hook).
         let fail = fail.or((self.arith_fail != 0).then_some(self.arith_fail));
         let op = if fail.is_none() { op } else { op | 0x100 };
-        let fragment = self.arith_fragment(helper as usize, op);
+        let bif_mfa = if fail.is_none() { bif_mfa } else { 0 };
+        let fragment = self.arith_fragment(helper as usize, op, bif_mfa);
         self.mov_if_needed(ARG2, lhs)?;
         self.mov_if_needed(ARG3, rhs)?;
         self.code.bl(fragment)?;

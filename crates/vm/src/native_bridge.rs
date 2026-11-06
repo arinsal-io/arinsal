@@ -650,17 +650,13 @@ fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch
         return None;
     }
     let heap = &process.heap;
+    // Port of erts/emulator/beam/beam_catches.c:146-154 (`beam_catches_car` reads
+    // `bccix[erts_active_code_ix()]`), OTP-29.1.1: the slot is read directly, a raise allocates
+    // nothing on the process.
     if let Some(runtime) = process.runtime.as_ref() {
-        // The cache lives in the cold part, which a plain raise has not needed so far.
-        let cold = process.cold.get_or_insert_with(|| {
-            arinsal_alloc::typed::FixAllocBox::new(crate::proc_create::ProcessCold::default())
-                .expect("ProcessCold allocation")
-        });
         return runtime
             .code_indexes()
-            .with_active_catches_cached(&mut cold.catch_cache, |table| {
-                scan_catch(heap, table, native_only)
-            });
+            .with_active_catches(|table| scan_catch(heap, table, native_only));
     }
     crate::code_ix::for_scope(process_code_scope(process))
         .with_active_catches(|table| scan_catch(heap, table, native_only))
@@ -675,36 +671,9 @@ fn scan_catch(
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
     let mut traced = 0usize;
+    let trace_return_address = native_trace_return_address();
     while let Some((index, word)) = stack.next() {
         let raw = word.tagged_word();
-        let address = raw as usize;
-        if address == native_trace_return_address() {
-            traced = 1;
-            let actions = heap
-                .stack_get(index + 3)
-                .and_then(Term::as_small)
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(0);
-            let words = 4usize.saturating_add(actions.saturating_mul(2));
-            // The whole trace frame sits below the catching frame's Y slots.
-            previous_cp = index + words - arinsal_term::CP_WORDS;
-            seen_cp = true;
-            for _ in 1..words {
-                if stack.next().is_none() {
-                    break;
-                }
-            }
-            continue;
-        }
-        // Port of erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
-        if arinsal_term::is_cp(raw) {
-            previous_cp = index;
-            seen_cp = true;
-            for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
-                stack.next();
-            }
-            continue;
-        }
         if raw & 63 == 0x1b
             && let Some(catch_index) = u32::try_from(raw >> 6).ok()
             && let Some(target) = usize::try_from(catch_index)
@@ -729,6 +698,33 @@ fn scan_catch(
                 target,
                 traced,
             });
+        }
+        // Port of erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
+        if arinsal_term::is_cp(raw) {
+            if raw as usize == trace_return_address {
+                traced = 1;
+                let actions = heap
+                    .stack_get(index + 3)
+                    .and_then(Term::as_small)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .unwrap_or(0);
+                let words = 4usize.saturating_add(actions.saturating_mul(2));
+                // The whole trace frame sits below the catching frame's Y slots.
+                previous_cp = index + words - arinsal_term::CP_WORDS;
+                seen_cp = true;
+                for _ in 1..words {
+                    if stack.next().is_none() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            previous_cp = index;
+            seen_cp = true;
+            for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
+                stack.next();
+            }
+            continue;
         }
         if raw & 63 == 0x1b && interpreter_continuation(word) {
             previous_cp = index;
@@ -815,13 +811,6 @@ pub(crate) fn commit_catch(
     process.heap.abi.exc.fvalue = Term::NIL.tagged_word();
     process.heap.abi.exc.ftrace = 0;
     process.clear_native_failure();
-    if process.exc_side {
-        if let Some(cold) = process.cold.as_mut() {
-            cold.pending_trace_top = None;
-            cold.explicit_raise = None;
-        }
-        process.exc_side = false;
-    }
     match found.target {
         CatchTarget::Native(handler) => {
             process.native_continuation_resume = true;
@@ -1323,16 +1312,25 @@ fn native_exit(
         process.heap.abi.exc.freason = 0;
     } else if process.heap.abi.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
         // Port of erts/emulator/beam/beam_common.c (save_stacktrace, EXC_FUNCTION_CLAUSE):
-        // the top frame carries the current function's arguments.
-        process.heap.abi.exc.freason = 0;
-        let arity = native_function_at(registers.tmp_mem[6] as usize)
-            .map_or(0, |function| usize::from(function.arity));
+        // the top frame carries the current function's MFA and arguments. Keep the native pc
+        // through the initial save; raw_raise marks its serialized trace locationless on rethrow.
+        let function = native_function_at(registers.tmp_mem[6] as usize)
+            .ok_or_else(|| VmError::Unsupported("function_clause current MFA".into()))?;
+        let module = arinsal_term::global_atoms()
+            .get(function.module)
+            .ok_or_else(|| VmError::Unsupported("function_clause module atom".into()))?;
+        let function_atom = arinsal_term::global_atoms()
+            .get(function.function)
+            .ok_or_else(|| VmError::Unsupported("function_clause function atom".into()))?;
+        let arity = usize::from(function.arity);
         let args = process.x[..arity].to_vec();
         if exception_trace {
             eprintln!(
                 "native function_clause in {:?} args={:?}",
-                native_function_at(registers.tmp_mem[6] as usize)
-                    .map(|f| format!("{}:{}/{}", f.module, f.function, f.arity)),
+                Some(format!(
+                    "{}:{}/{}",
+                    function.module, function.function, function.arity
+                )),
                 args.iter()
                     .map(|arg| format!("{:#x}", arg.tagged_word()))
                     .collect::<Vec<_>>()
@@ -1343,7 +1341,12 @@ fn native_exit(
             .map_err(|error| VmError::Unsupported(format!("function_clause args {error:?}")))?;
         let mut trap =
             exceptions::native_trap(arinsal_beamasm::exc::EXC_ERROR, process.heap.abi.exc.fvalue)?;
-        trap.top = Some(crate::stacktrace::TopFrame::CurrentArgs(args));
+        trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsNoLocation {
+            module,
+            function: function_atom,
+            arity: function.arity,
+            args,
+        });
         return Err(VmError::Trap(trap));
     } else if process.heap.abi.exc.freason != 0
         && let Some(raised) = process.take_work(|w| w.native_trap.take())
@@ -1363,82 +1366,44 @@ fn native_exit(
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
         return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
     } else if process.heap.abi.exc.freason != 0
-        && let Some(failure) = process.take_work(|w| w.native_bif_error.take())
-        && failure.freason == process.heap.abi.exc.freason
-        && failure.fvalue == process.heap.abi.exc.fvalue
+        && process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_SAVETRACE != 0
+        && process.heap.abi.exc.ftrace != 0
     {
-        // `save_raw` also matches the pending BIF frame against this reason/value pair.
-        let error = match failure.call {
-            crate::proc_create::NativeBifCall::Export(export) => {
-                let args = process.x[..usize::from(export.arity)].to_vec();
-                exceptions::bif_error(
-                    process,
-                    &export.module,
-                    &export.function,
-                    &args,
-                    failure.error,
-                )
-            }
-            crate::proc_create::NativeBifCall::Registers {
-                module,
-                function,
-                arity,
-            } => {
-                let module = arinsal_term::global_atoms()
-                    .text(module)
-                    .unwrap_or("erlang");
-                let function = arinsal_term::global_atoms().text(function).unwrap_or("+");
-                let args = process.x[..usize::from(arity)].to_vec();
-                exceptions::bif_error(process, module, function, &args, failure.error)
-            }
-            crate::proc_create::NativeBifCall::Owned {
-                module,
-                function,
-                args,
-            } => exceptions::bif_error(process, &module, &function, &args, failure.error),
-        };
-        return Err(error);
-    } else if process.heap.abi.exc.freason != 0 && registers.tmp_mem[7] != 0 {
-        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_badarg): an inline
-        // BIF failure names the BIF, with its arguments from X0.., as the top frame.
-        let slot = std::mem::take(&mut registers.tmp_mem[7]) as usize;
-        let (module, function, arity) = arinsal_beamasm::guard::BADARG_MFAS[slot - 1];
-        let args = process.x[..usize::from(arity)].to_vec();
-        let tag = match process.heap.abi.exc.freason {
-            arinsal_beamasm::guard::EXC_BADMAP => Some("badmap"),
-            arinsal_beamasm::guard::EXC_BADKEY => Some("badkey"),
-            _ => None,
-        };
-        let error = if let Some(tag) = tag {
-            let value = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
-            let reason =
-                arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
-                    .tuple(&[crate::signals::atom(tag), value])
-                    .map_err(|error| VmError::Unsupported(format!("{tag} {error:?}")))?;
-            arinsal_bifs::BifError::Error(reason)
-        } else {
-            arinsal_bifs::BifError::BADARG
-        };
+        let freason = process.heap.abi.exc.freason;
+        let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
+        let reason = crate::native_helpers::expand_error_value(process)
+            .unwrap_or_else(|| crate::native_hooks::from_raw(process.heap.abi.exc.fvalue));
+        process.heap.abi.exc.ftrace = 0;
+        process.heap.abi.exc.fvalue = 0;
+        let class =
+            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
+        return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
+    } else if matches!(
+        process.heap.abi.exc.freason,
+        freason if freason == (crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Error)) & !arinsal_beamasm::exc::EXF_SAVETRACE)
+            || freason == (crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Exit)) & !arinsal_beamasm::exc::EXF_SAVETRACE)
+            || freason == (crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Throw)) & !arinsal_beamasm::exc::EXF_SAVETRACE)
+    ) && native_ftrace != 0
+    {
+        // Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1:
+        // `raw_raise` has already stored the trace and cleared EXF_SAVETRACE.
+        let freason = process.heap.abi.exc.freason;
+        let reason = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+        let trace = crate::native_hooks::from_raw(native_ftrace);
         process.heap.abi.exc.freason = 0;
-        return Err(exceptions::bif_error(
-            process, module, function, &args, error,
-        ));
-    } else if process.heap.abi.exc.freason
-        & (arinsal_beamasm::catch::RAW_RAISE | arinsal_beamasm::catch::RERAISE)
-        != 0
-    {
-        // Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise) and the i_raise
-        // instruction, OTP-29.1.1: both re-raise the stacktrace in `c_p->ftrace`.
-        let raw_rethrow = process.heap.abi.exc.freason & arinsal_beamasm::catch::RAW_RAISE != 0;
+        process.heap.abi.exc.ftrace = 0;
+        let class =
+            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
+        return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
+    } else if process.heap.abi.exc.freason & arinsal_beamasm::catch::RERAISE != 0 {
+        // Port of erts/emulator/beam/beam_common.c (`handle_error`) and `i_raise`, OTP-29.1.1.
+        // `raw_raise` clears EXF_SAVETRACE; its exact sanitized class is handled above.
+        // EXF_HAS_EXT_INFO remains ordinary error metadata and must not select this path.
+        let raw_rethrow = false;
         let class = crate::stacktrace::class_from_freason(process.heap.abi.exc.freason)
             .unwrap_or(arinsal_bifs::Class::Error);
         process.heap.abi.exc.freason = 0;
         let trace = crate::native_hooks::from_raw(native_ftrace);
-        if raw_rethrow {
-            // raw_raise stores the new class in the stacktrace too, so a later i_raise of
-            // the same trace keeps it. The compiler only passes stacktraces here.
-            crate::stacktrace::set_raw_class(process, trace, class);
-        }
         return Err(VmError::Trap(exceptions::Trap {
             export: None,
             class,
@@ -1463,19 +1428,17 @@ fn native_exit(
         )?));
     } else if process.heap.abi.exc.freason != 0 {
         let class = process.heap.abi.exc.freason;
-        let reason = process.heap.abi.exc.fvalue;
-        let mut trap = exceptions::native_trap(class, reason)?;
-        if let Some(info) = process
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.native_error_info.take())
-        {
-            let arity = native_function_at(registers.tmp_mem[6] as usize)
-                .map_or(0, |function| i64::from(function.arity));
-            trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-                Term::small(arity),
-                info,
-            ));
+        let has_ext_info = class & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0;
+        let info = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+        let reason = if has_ext_info {
+            crate::native_helpers::expand_error_value(process)
+                .ok_or_else(|| VmError::Unsupported("native error_info reason".into()))?
+        } else {
+            info
+        };
+        let mut trap = exceptions::native_trap(class, crate::native_hooks::raw(reason))?;
+        if has_ext_info && info.classify() == arinsal_term::TermKind::Map {
+            trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsInfoTerm(None, info));
         }
         return Err(VmError::Trap(trap));
     }

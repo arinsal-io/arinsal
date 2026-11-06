@@ -628,8 +628,7 @@ fn finish_direct(
     match bif_register_frame(module, function, args.len(), result) {
         Ok(value) => Some(value),
         Err(VmError::Trap(trap)) => {
-            let class = crate::stacktrace::class_to_freason(Some(trap.class));
-            let fvalue = crate::native_hooks::raw(trap.reason);
+            let (class, fvalue) = parked_freason_fvalue(&trap);
             process.heap.abi.exc.freason = class;
             process.heap.abi.exc.fvalue = fvalue;
             process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
@@ -641,6 +640,34 @@ fn finish_direct(
         }
         // Not an Erlang exception (yield, unsupported): redo on the scheduler path.
         Err(_) => None,
+    }
+}
+
+/// `freason` and `fvalue` of a parked BIF failure. Extended BIF error information is carried by
+/// `fvalue` with `EXF_HAS_EXT_INFO`, and must be rebuilt the same way after a collection moved
+/// the parked terms.
+// Port of erts/emulator/beam/beam_common.c:994-1008 (`save_stacktrace`), OTP-29.1.1.
+pub(crate) fn parked_freason_fvalue(trap: &crate::exceptions::Trap) -> (u64, u64) {
+    match trap.top.as_ref() {
+        Some(crate::stacktrace::TopFrame::BifRegisters {
+            info:
+                crate::stacktrace::BifErrorInfo::Cause(cause)
+                | crate::stacktrace::BifErrorInfo::Map(cause),
+            ..
+        })
+        | Some(crate::stacktrace::TopFrame::Bif {
+            info:
+                crate::stacktrace::BifErrorInfo::Cause(cause)
+                | crate::stacktrace::BifErrorInfo::Map(cause),
+            ..
+        }) => (
+            arinsal_beamasm::exc::EXC_BADARG | arinsal_beamasm::exc::EXF_HAS_EXT_INFO,
+            crate::native_hooks::raw(*cause),
+        ),
+        _ => (
+            crate::stacktrace::class_to_freason(Some(trap.class)),
+            crate::native_hooks::raw(trap.reason),
+        ),
     }
 }
 

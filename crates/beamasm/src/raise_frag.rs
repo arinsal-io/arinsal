@@ -30,7 +30,6 @@ const PROCESS_I: u32 = 72;
 const PROCESS_HTOP_STOP: u32 = 8;
 const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
 const SCHEDULER_RETURN_SLOT: u32 = 16_416;
-const BADARG_MFA_SLOT: u32 = 16_440;
 
 /// Exception fragments: `raise_shared` (the `raise/2` instruction) and `raise_exception`.
 pub struct RaiseFragments {
@@ -123,6 +122,10 @@ impl RaiseFragments {
         let map_get_badkey = code.new_label();
         let map_size_error = code.new_label();
         let bif_error = code.new_label();
+        let map_get_mfa = crate::bif::guard_bif_mfa(usize::from(MAP_GET_MFA_INDEX))
+            .expect("map_get MFA descriptor");
+        let map_size_mfa = crate::bif::guard_bif_mfa(usize::from(MAP_SIZE_MFA_INDEX))
+            .expect("map_size MFA descriptor");
 
         // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_handle_map_get_badmap):
         // map in ARG1, key in ARG2; fvalue is the map.
@@ -132,7 +135,7 @@ impl RaiseFragments {
             e.stp(TMP1, ARG1, C_P, PROCESS_FREASON as i16)?;
             e.mov_reg(XREG0, ARG2)?;
             e.mov_reg(XREG1, ARG1)?;
-            e.mov_const(TMP2, u64::from(MAP_GET_MFA_INDEX) + 1)
+            e.mov_const(TMP2, map_get_mfa as u64)
         })
         .map_err(fail)?;
         code.b(bif_error).map_err(fail)?;
@@ -144,7 +147,7 @@ impl RaiseFragments {
             e.stp(TMP1, ARG2, C_P, PROCESS_FREASON as i16)?;
             e.mov_reg(XREG0, ARG2)?;
             e.mov_reg(XREG1, ARG1)?;
-            e.mov_const(TMP2, u64::from(MAP_GET_MFA_INDEX) + 1)
+            e.mov_const(TMP2, map_get_mfa as u64)
         })
         .map_err(fail)?;
         code.b(bif_error).map_err(fail)?;
@@ -154,23 +157,21 @@ impl RaiseFragments {
         code.emit(|e| {
             e.mov_const(TMP1, EXC_BADMAP)?;
             e.stp(TMP1, XREG0, C_P, PROCESS_FREASON as i16)?;
-            e.mov_const(TMP2, u64::from(MAP_SIZE_MFA_INDEX) + 1)
+            e.mov_const(TMP2, map_size_mfa as u64)
         })
         .map_err(fail)?;
 
-        // Shared tail of the three fragments, the global counterpart of the module's
-        // `error_label`: names the BIF, records the raising address (`x30` is the return
-        // address of the calling `bl`) and leaves native code for the scheduler's `handle_error`.
+        // Pass the failure words and OTP's `bif_mfa` argument to `raise_exception_shared`,
+        // which invokes `handle_error` before `next_catch`.
         code.bind(bif_error).map_err(fail)?;
         code.emit(|e| {
-            e.str_uoff(TMP2, SCHEDULER_REGS, BADARG_MFA_SLOT)?;
-            e.sub_imm(TMP1, Gpr::x(30), 4, false)?;
-            e.str_uoff(TMP1, SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)?;
-            e.mov_reg(ARG1, Gpr::xzr())?;
-            e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, SCHEDULER_RETURN_SLOT)?;
-            e.br(Gpr::x(30))
+            e.ldr_uoff(ARG1, C_P, PROCESS_FREASON)?;
+            e.ldr_uoff(ARG2, C_P, PROCESS_FVALUE)?;
+            e.mov_reg(ARG3, Gpr::xzr())?;
+            e.mov_reg(Gpr::x(3), TMP2)
         })
         .map_err(fail)?;
+        code.b(raise_exception).map_err(fail)?;
 
         let (words, labels) = code.finish_with_labels().map_err(fail)?;
         let bytes = words

@@ -255,12 +255,10 @@ fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bo
             };
             if quiet {
                 set_light_error(process, &error);
-            } else if let Some((function, arity)) = arith_bif(2) {
+            } else if arith_bif(2).is_some() {
                 crate::native_helpers::set_native_bif_register_error(
                     process,
-                    arinsal_term::atoms::ERLANG,
-                    function,
-                    arity,
+                    arinsal_beamasm::bif::arithmetic_bif_mfa(2).unwrap_or(0),
                     error,
                 );
             }
@@ -295,8 +293,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     }
     let left = from_raw(lhs);
     let right = from_raw(rhs);
-    let mut guard_add_reductions = 0;
-    let mut mul_add_failure = None;
+    let mut add_reductions = 0;
     if op == 2 {
         return beamasm_mixed_times(process, left, right, quiet);
     }
@@ -378,29 +375,22 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             12 => arinsal_arith::fdiv(a, b, heap),
             // Port of erts/emulator/beam/erl_arith.c:919 (erts_mul_add), OTP-29.1.1.
             13 => {
-                // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:437-486
-                // (emit_mul_add_body_shared), OTP-29.1.1: the failing stage supplies its own
-                // BIF and operands to the exception frame.
+                // Port of erts/emulator/beam/erl_arith.c:919-965 (erts_mul_add): pp receives
+                // THE_NON_VALUE when multiplication fails, otherwise the intermediate product.
+                registers.tmp_mem[2] = arinsal_term::THE_NON_VALUE;
                 let product = match arinsal_arith::mul(a, b, heap) {
                     Ok(product) => product,
-                    Err(error) => {
-                        mul_add_failure = Some(("*", vec![a, b]));
-                        return Err(error);
-                    }
+                    Err(error) => return Err(error),
                 };
+                registers.tmp_mem[2] = raw(product);
                 let addend = from_raw(extra);
                 if quiet {
                     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
                     // The guard helper calls mixed_times then mixed_plus; charge both BUMP_REDS.
-                    guard_add_reductions = arinsal_arith::reduction_charge("+", &[product, addend]);
+                    // The body instruction charges only the product (bump_reds_quadratic).
+                    add_reductions = arinsal_arith::reduction_charge("+", &[product, addend]);
                 }
-                match arinsal_arith::add(product, addend, heap) {
-                    Ok(sum) => Ok(sum),
-                    Err(error) => {
-                        mul_add_failure = Some(("+", vec![product, addend]));
-                        Err(error)
-                    }
-                }
+                arinsal_arith::add(product, addend, heap)
             }
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:802-854 (erts_int_div_rem
             // body): quotient is the return value, remainder is published for the caller.
@@ -415,12 +405,12 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
         .map(raw),
         _ => Err(ArithError::Badarith),
     };
-    if guard_add_reductions != 0 {
+    if add_reductions != 0 {
         process.heap.abi.fcalls = process
             .heap
             .abi
             .fcalls
-            .saturating_sub(guard_add_reductions.min(i32::MAX as u32) as i32)
+            .saturating_sub(add_reductions.min(i32::MAX as u32) as i32)
             .max(0);
     }
     match result {
@@ -433,21 +423,19 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (the arithmetic BIF and its
             // operands are the top frame of a raised error), OTP-29.1.1.
             if op == 13 && !quiet {
-                if let Some((function, args)) = mul_add_failure {
-                    crate::native_helpers::set_native_bif_error(
-                        process, "erlang", function, &args, error,
-                    );
-                } else {
-                    set_light_error(process, &error);
-                }
+                // `emit_mul_add_body_shared` supplies the stage MFA and arguments at the
+                // shared raise entry, just as OTP does.
+                set_light_error(process, &error);
+            } else if matches!(op, 3 | 4 | 12) && !quiet {
+                // The arithmetic emitter restores the operands to X0/X1 and passes
+                // the instruction MFA to the shared exception resolver, as erts does.
+                set_light_error(process, &error);
             } else {
                 match arith_bif(op) {
-                    Some((function, arity)) if !quiet => {
+                    Some(_) if !quiet => {
                         crate::native_helpers::set_native_bif_register_error(
                             process,
-                            arinsal_term::atoms::ERLANG,
-                            function,
-                            arity,
+                            extra as usize,
                             error,
                         );
                     }
@@ -549,7 +537,21 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
         if quiet {
             set_light_error(process, &error);
         } else {
-            crate::native_helpers::set_native_bif_error(process, "erlang", name, args, error);
+            let index = match name {
+                "element" => 0,
+                "hd" => 1,
+                "tl" => 2,
+                "bit_size" => 3,
+                "byte_size" => 4,
+                "map_size" => 5,
+                "tuple_size" => 6,
+                "map_get" => 7,
+                "length" => 8,
+                "is_map_key" => 9,
+                _ => usize::MAX,
+            };
+            let bif_mfa = arinsal_beamasm::bif::guard_bif_mfa(index).unwrap_or(0);
+            crate::native_helpers::set_native_bif_error(process, bif_mfa, args, error);
         }
         0
     };

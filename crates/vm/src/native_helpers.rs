@@ -24,6 +24,11 @@ pub extern "C" fn arinsal_beamasm_raise_class(
         return 0;
     };
     let trace = crate::native_hooks::from_raw(trace_raw);
+    // erts_sanitize_freason treats NIL as a trace produced in native code: there is
+    // no saved class to restore, so handle_error must save a fresh trace.
+    if trace == Term::NIL {
+        return arinsal_beamasm::exc::EXC_ERROR;
+    }
     let empty_class = crate::exceptions::empty_trace_class(trace);
     let raw_class = crate::stacktrace::raw_class(process, trace);
     let class = empty_class
@@ -42,6 +47,34 @@ pub extern "C" fn arinsal_beamasm_raise_class(
             arinsal_beamasm::exc::EXC_ERROR
         }
     }
+}
+
+/// Stores the class, value, and already saved trace used by OTP's raw_raise.
+// Port of erts/emulator/beam/beam_common.c:1148-1178 (`raw_raise`), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_raw_raise(
+    header: *mut ProcessHeader,
+    trace_raw: u64,
+    class_raw: u64,
+    value_raw: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 1;
+    };
+    let class_term = crate::native_hooks::from_raw(class_raw);
+    let class = match class_term.as_atom() {
+        Some(atom) if atom == arinsal_term::atoms::ERROR => arinsal_bifs::Class::Error,
+        Some(atom) if atom == arinsal_term::atoms::EXIT => arinsal_bifs::Class::Exit,
+        Some(atom) if atom == arinsal_term::atoms::THROW => arinsal_bifs::Class::Throw,
+        _ => return 1,
+    };
+    let trace = crate::native_hooks::from_raw(trace_raw);
+    // `get_freason_ptr_from_exc` updates saved traces and tolerates NIL through its dummy word.
+    crate::stacktrace::set_raw_class(process, trace, class);
+    process.heap.abi.exc.freason =
+        crate::stacktrace::class_to_freason(Some(class)) & !arinsal_beamasm::exc::EXF_SAVETRACE;
+    process.heap.abi.exc.fvalue = value_raw;
+    process.heap.abi.exc.ftrace = trace_raw;
+    0
 }
 
 /// Materializes a process-owned raw trace on the process heap.
@@ -484,18 +517,14 @@ pub(crate) const BOUND_NIF: usize = 0;
 // and DirtyFunc in the function's code) and erl_nif.c:5149-5160 (load_nif_1st_finisher
 // copies them there), OTP-29.1.1: the site of the function holds the operands itself.
 pub(crate) struct NativeNifSite {
-    module: String,
-    function: String,
     arity: u8,
     /// The `call_nif` operands, written once by `load_nif` before the body is enabled.
     call: std::sync::OnceLock<crate::natives::nif::NativeFn>,
 }
 
 impl NativeNifSite {
-    pub(crate) fn new(module: String, function: String, arity: u8) -> Box<Self> {
+    pub(crate) fn new(_module: String, _function: String, arity: u8) -> Box<Self> {
         Box::new(Self {
-            module,
-            function,
             arity,
             call: std::sync::OnceLock::new(),
         })
@@ -622,7 +651,7 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
 fn leave_native_nif(
     process: &mut crate::Process,
     result: std::thread::Result<Result<Term, arinsal_bifs::BifError>>,
-    (identity, module, function, arity): (usize, &str, &str, u8),
+    (identity, arity): (usize, u8),
 ) -> u64 {
     match result {
         Ok(Ok(value)) => {
@@ -640,7 +669,9 @@ fn leave_native_nif(
         }
         Ok(Err(error)) => {
             let args = process.x[..usize::from(arity)].to_vec();
-            set_native_bif_error(process, module, function, &args, error);
+            let bif_mfa = crate::beamasm_integration::export_dispatch(identity)
+                .map_or(0, |export| std::ptr::from_ref(&export.mfa) as usize);
+            set_native_bif_error(process, bif_mfa, &args, error);
             0
         }
         Err(_) => {
@@ -686,11 +717,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
             &process.x[..usize::from(nif.arity)],
         )
     }));
-    leave_native_nif(
-        process,
-        result,
-        (identity as usize, &nif.module, &nif.function, nif.arity),
-    )
+    leave_native_nif(process, result, (identity as usize, nif.arity))
 }
 
 /// Calls the NIF that `load_nif` bound to a native call-NIF body.
@@ -716,11 +743,7 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
             &process.x[..usize::from(site.arity)],
         )
     }));
-    leave_native_nif(
-        process,
-        result,
-        (BOUND_NIF, &site.module, &site.function, site.arity),
-    )
+    leave_native_nif(process, result, (BOUND_NIF, site.arity))
 }
 
 /// The dirty scheduler class static NIF `module:function/arity` is flagged with in its library's
@@ -1794,7 +1817,7 @@ fn binary_guard_result(
             crate::native_hooks::raw(value)
         }
         Err(error) => {
-            set_native_bif_error(process, &export.module, &export.function, args, error);
+            set_native_bif_export_error(process, export, args, error);
             0
         }
     }
@@ -1955,7 +1978,7 @@ pub(crate) extern "C" fn binary_part_3_light(
             let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
                 return 0;
             };
-            set_native_bif_error(process, &export.module, &export.function, &args, error);
+            set_native_bif_export_error(process, export, &args, error);
             0
         }
     }
@@ -2517,6 +2540,15 @@ fn invoke_dispatch_bif(
         return dispatch_native_send(process, registers, saving_calls);
     }
     if let Some(export) = export {
+        if export_call {
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
+            // call_bif_shared stores the export's MFA in c_p->current before the BIF call.
+            process.heap.abi.current = if export.bif.is_some() {
+                std::ptr::from_ref(&export.mfa).cast()
+            } else {
+                std::ptr::null()
+            };
+        }
         // The light-BIF fragment already loaded `Export.is_bif_traced` and compared
         // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
         let export_checks = export_call
@@ -3129,9 +3161,22 @@ fn direct_bif_error_gc(process: &mut crate::Process, arity: usize) -> bool {
         return true;
     };
     let mut args = argument_registers(process, arity);
+    // Port of erts/emulator/beam/erl_gc.c (`erts_garbage_collect_nobump`): `c_p->fvalue` is a
+    // root of the collection. A BIF cause (EXF_HAS_EXT_INFO, always with reason `badarg`) lives
+    // there, so it takes the reason's root slot for the collection and goes back to `fvalue`.
+    let ext_info = parked.freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0;
+    let reason = parked.trap.reason;
+    if ext_info {
+        parked.trap.reason = crate::native_hooks::from_raw(parked.fvalue);
+    }
     let collected =
         crate::calls::gc_after_native_parts(process, &mut args, None, Some(&mut parked.trap));
-    parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
+    if ext_info {
+        parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
+        parked.trap.reason = reason;
+    } else {
+        parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
+    }
     process.heap.abi.exc.fvalue = parked.fvalue;
     process.slice_mut().native_trap = Some(parked);
     if collected.is_err() {
@@ -3419,6 +3464,39 @@ fn call_plain_bif_word(
     }
     let deferred = ctx.take_deferred();
     let error = ctx.take_error();
+    // Port of erts/emulator/beam/bif.c (`raise_3`): when the BIF wrote ftrace and the
+    // primary exception words directly, hand them to handle_error without a slow adapter.
+    if deferred.is_none()
+        && error.is_none()
+        && process.heap.abi.exc.ftrace != 0
+        && process.heap.abi.exc.freason
+            & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
+            == 0
+        && !process.heap.gc_after_bif_desired()
+    {
+        return 0;
+    }
+    // Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1: these BIFs
+    // return THE_NON_VALUE with `freason` and `fvalue` already set for the shared raise fragment.
+    if deferred.is_none()
+        && error.is_none()
+        && export.arity == 1
+        && export.module_atom == arinsal_term::atoms::ERLANG
+        && matches!(
+            export.function_atom,
+            arinsal_term::atoms::ERROR | arinsal_term::atoms::EXIT | arinsal_term::atoms::THROW
+        )
+        && process.heap.abi.exc.ftrace == 0
+        && matches!(
+            process.heap.abi.exc.freason,
+            arinsal_beamasm::exc::EXC_ERROR
+                | arinsal_beamasm::exc::EXC_EXIT
+                | arinsal_beamasm::exc::EXC_THROWN
+        )
+        && !process.heap.gc_after_bif_desired()
+    {
+        return 0;
+    }
     plain_bif_word_slow(process, registers, identity, export, word, deferred, error)
 }
 
@@ -3435,49 +3513,6 @@ fn plain_bif_word_slow(
     deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
     error: Option<arinsal_bifs::BifError>,
 ) -> u64 {
-    // `raise/3` from a word body: the failure words are complete (class code, `EXF_ARGLIST`,
-    // an immediate stacktrace in `ftrace`), so nothing is decoded or written again.
-    if word == arinsal_term::THE_NON_VALUE
-        && deferred.is_none()
-        && error.is_none()
-        && process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
-        && process.heap.abi.exc.ftrace != 0
-        && crate::native_hooks::from_raw(process.heap.abi.exc.ftrace).is_immed()
-        && !process.heap.gc_after_bif_desired()
-    {
-        crate::stacktrace::clear_pending_top(process);
-        if let Some(cold) = process.cold.as_mut() {
-            cold.explicit_raise = None;
-        }
-        return 0;
-    }
-    // Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1: `BIF_ERROR(p, EXC_*)` after
-    // `p->fvalue = reason`) and beam_common.c (save_stacktrace: these three BIFs take the
-    // `non_bif_stacktrace` branch, so no BIF frame is recorded), OTP-29.1.1. The failure words
-    // are complete, so nothing is decoded and no record of the failing call is kept.
-    if word == arinsal_term::THE_NON_VALUE
-        && deferred.is_none()
-        && error.is_none()
-        && export.arity == 1
-        && export.module_atom == arinsal_term::atoms::ERLANG
-        && matches!(
-            export.function_atom,
-            arinsal_term::atoms::ERROR | arinsal_term::atoms::EXIT | arinsal_term::atoms::THROW
-        )
-        && process.heap.abi.exc.ftrace == 0
-        && process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
-        && !process.heap.gc_after_bif_desired()
-    {
-        process.heap.abi.exc.freason &= !arinsal_beamasm::exc::EXF_ARGLIST;
-        process.clear_native_failure();
-        if process.exc_side {
-            crate::stacktrace::clear_pending_top(process);
-            if let Some(cold) = process.cold.as_mut() {
-                cold.explicit_raise = None;
-            }
-        }
-        return 0;
-    }
     // A migrated body left its failure in the process' exit words; an adapted `Result` body
     // left it in the context. Decoding clears the words, which are rewritten below.
     let error = if word == arinsal_term::THE_NON_VALUE {
@@ -3487,26 +3522,6 @@ fn plain_bif_word_slow(
     };
     // `raise/3` with an immediate stacktrace (`throw/1` compiles to it) is complete in the
     // failure words: set them and return the non-value, as erts' `raise_3` does.
-    if let Some(arinsal_bifs::BifError::Raise {
-        class,
-        reason,
-        stacktrace: Some(trace),
-    }) = &error
-        && deferred.is_none()
-        && word == arinsal_term::THE_NON_VALUE
-        && trace.is_immed()
-        && !process.heap.gc_after_bif_desired()
-    {
-        crate::stacktrace::clear_pending_top(process);
-        process.heap.abi.exc.ftrace = trace.word();
-        process.heap.abi.exc.freason =
-            crate::stacktrace::class_to_freason(Some(*class)) | arinsal_beamasm::exc::EXF_ARGLIST;
-        process.heap.abi.exc.fvalue = crate::native_hooks::raw(*reason);
-        if let Some(cold) = process.cold.as_mut() {
-            cold.explicit_raise = None;
-        }
-        return 0;
-    }
     let result = if word == arinsal_term::THE_NON_VALUE {
         Err(error.unwrap_or(arinsal_bifs::BifError::BADARG))
     } else {
@@ -3547,10 +3562,15 @@ fn decode_failure(exc: &mut arinsal_term::exc::ExcFields) -> Option<arinsal_bifs
         4 => BifError::Badarith,
         15 => BifError::SystemLimit,
         9 => BifError::Unsupported("undef"),
-        0 if freason & EXF_ARGLIST != 0 => BifError::Raise {
+        0 if freason & EXF_ARGLIST != 0 || !ftrace.is_non_value() => BifError::Raise {
             class,
             reason: fvalue,
             stacktrace: (!ftrace.is_non_value()).then_some(ftrace),
+        },
+        0 if class != arinsal_bifs::Class::Error => BifError::Raise {
+            class,
+            reason: fvalue,
+            stacktrace: None,
         },
         0 => BifError::Error(fvalue),
         _ => BifError::BADARG,
@@ -3831,7 +3851,8 @@ fn plain_bif_error(
     export: ExportDispatch,
     error: arinsal_bifs::BifError,
 ) -> u64 {
-    set_native_bif_export_error(process, export, error);
+    let args = process.x[..usize::from(export.arity)].to_vec();
+    set_native_bif_export_error(process, export, &args, error);
     0
 }
 
@@ -3877,9 +3898,7 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
             match export {
                 // `i_bif*` passes each operand explicitly; a literal BIF operand need not
                 // be present in X0..X2 when the scheduler expands the saved error.
-                Some(export) => {
-                    set_native_bif_error(process, &export.module, &export.function, args, error)
-                }
+                Some(export) => set_native_bif_export_error(process, export, args, error),
                 None => set_light_bif_error(process, &error),
             }
             0
@@ -3898,6 +3917,33 @@ fn set_tagged_error(process: &mut crate::Process, tag: &str, value: Term) {
         }
         Err(_) => crate::native_hooks::set_error(process, "system_limit"),
     }
+}
+
+/// Store a bit-syntax error and its extended map in the process failure words.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:911-1010 (`beam_jit_bs_construct_fail_info`), OTP-29.1.1.
+pub(crate) fn set_native_error_info(
+    process: &mut crate::Process,
+    reason: &str,
+    info: Option<Box<arinsal_etf::OwnedTerm>>,
+) {
+    process.heap.abi.exc.freason = match reason {
+        "badarg" => arinsal_beamasm::exc::EXC_BADARG,
+        "system_limit" => arinsal_beamasm::exc::EXC_SYSTEM_LIMIT,
+        _ => arinsal_beamasm::exc::EXC_ERROR,
+    };
+    let Some(info) = info else {
+        process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::signals::atom(reason));
+        return;
+    };
+    let Ok(info) = arinsal_term::from_owned(
+        &info,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    ) else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return;
+    };
+    process.heap.abi.exc.freason |= arinsal_beamasm::exc::EXF_HAS_EXT_INFO;
+    process.heap.abi.exc.fvalue = crate::native_hooks::raw(info);
 }
 
 /// Raises `{badfun,Fun}` or `{badarity,{Fun,Args}}` for a native fun call.
@@ -3924,130 +3970,98 @@ fn set_call_fun_error(process: &mut crate::Process, fun: Term, arity: u32) {
 /// Records a native BIF failure so the scheduler raises it with the BIF as the top frame.
 pub(crate) fn set_native_bif_error(
     process: &mut crate::Process,
-    module: &str,
-    function: &str,
+    bif_mfa: usize,
     args: &[Term],
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.heap.abi.exc.freason, process.heap.abi.exc.fvalue);
-    process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
-        call: crate::proc_create::NativeBifCall::Owned {
-            module: module.to_owned(),
-            function: function.to_owned(),
-            args: args.to_vec(),
-        },
-        error,
-        freason,
-        fvalue,
-    });
+    set_native_bif_context(process, bif_mfa, args);
 }
 
 /// Records a BIF failure whose arguments are in the live scheduler registers.
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
 pub(crate) fn set_native_bif_register_error(
     process: &mut crate::Process,
-    module: arinsal_term::Atom,
-    function: arinsal_term::Atom,
-    arity: u8,
+    bif_mfa: usize,
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.heap.abi.exc.freason, process.heap.abi.exc.fvalue);
-    process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
-        call: crate::proc_create::NativeBifCall::Registers {
-            module,
-            function,
-            arity,
-        },
-        error,
-        freason,
-        fvalue,
-    });
+    set_native_bif_context(process, bif_mfa, &[]);
 }
 
-/// Retains the export entry; its descriptor owns the BIF MFA while X registers own the arguments.
+/// Leaves the failing export's MFA and argument registers for `handle_error`.
 fn set_native_bif_export_error(
     process: &mut crate::Process,
     export: ExportDispatch,
+    args: &[Term],
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
     // A `raise/3` with an immediate stacktrace is complete in `freason`, `fvalue` and `ftrace`,
     // as in erts: no record of the failing call is kept for it.
-    if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+    if process.heap.abi.exc.freason
+        & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
+        == 0
         && process.heap.abi.exc.ftrace != 0
     {
         return;
     }
-    let (freason, fvalue) = (process.heap.abi.exc.freason, process.heap.abi.exc.fvalue);
-    process.slice_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
-        call: crate::proc_create::NativeBifCall::Export(export),
-        error,
-        freason,
-        fvalue,
-    });
+    set_native_bif_context(process, std::ptr::from_ref(&export.mfa) as usize, args);
+}
+
+fn set_native_bif_context(process: &mut crate::Process, bif_mfa: usize, args: &[Term]) {
+    if bif_mfa != 0 {
+        process.heap.abi.current = bif_mfa as *const std::ffi::c_void;
+    }
+    let count = args.len().min(process.x.len());
+    process.x[..count].copy_from_slice(&args[..count]);
 }
 
 fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifError) {
-    use arinsal_bifs::BifError;
-    // A new failure replaces any BIF frame left by the previous one.
-    crate::stacktrace::clear_pending_top(process);
-    // `raise/3`'s list is copied off-heap before `freason` changes, so a later
-    // collection cannot move the words the catch still has to return.
-    process.heap.abi.exc.ftrace = 0;
-    let mut in_ftrace = false;
-    let explicit = match error {
-        // An immediate list (`[]`) needs no copy: a collection cannot move it.
-        BifError::Raise {
-            stacktrace: Some(trace),
-            ..
-        } if trace.is_immed() => {
-            process.heap.abi.exc.ftrace = trace.word();
-            in_ftrace = true;
-            None
-        }
-        BifError::Raise {
-            stacktrace: Some(trace),
-            ..
-        } => arinsal_term::to_owned(*trace).ok(),
-        _ => None,
-    };
     use arinsal_beamasm::exc;
+    use arinsal_bifs::BifError;
     // `fvalue` also carries the reason for the coded failures: erts rebuilds it from the
     // code, and the stacktrace saver matches the pending BIF frame by the pair.
     // Deviation: `Unsupported` raises `undef` (`EXC_UNDEF`) and `Dirty`, which NIF bodies
     // turn into a trap to the dirty export before reaching here, is `EXC_NOTSUP`.
-    let (freason, reason) = match error {
-        BifError::Badarg { .. } => (exc::EXC_BADARG, crate::signals::atom("badarg")),
-        BifError::Badarith => (exc::EXC_BADARITH, crate::signals::atom("badarith")),
-        BifError::SystemLimit => (exc::EXC_SYSTEM_LIMIT, crate::signals::atom("system_limit")),
-        BifError::Error(reason) => (exc::EXC_ERROR, *reason),
-        BifError::Raise { class, reason, .. } => {
-            (crate::stacktrace::class_to_freason(Some(*class)), *reason)
-        }
-        BifError::Unsupported(_) => (exc::EXC_UNDEF, crate::signals::atom("undef")),
-        BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup")),
+    let (freason, reason, ftrace) = match error {
+        BifError::Badarg { cause } => (
+            exc::EXC_BADARG
+                | if cause.is_some() {
+                    exc::EXF_HAS_EXT_INFO
+                } else {
+                    0
+                },
+            cause.unwrap_or_else(|| crate::signals::atom("badarg")),
+            0,
+        ),
+        BifError::Badarith => (exc::EXC_BADARITH, crate::signals::atom("badarith"), 0),
+        BifError::SystemLimit => (
+            exc::EXC_SYSTEM_LIMIT,
+            crate::signals::atom("system_limit"),
+            0,
+        ),
+        BifError::Error(reason) => (exc::EXC_ERROR, *reason, 0),
+        BifError::Raise {
+            class,
+            reason,
+            stacktrace,
+        } => (
+            crate::stacktrace::class_to_freason(Some(*class))
+                | if stacktrace.is_none() {
+                    exc::EXF_ARGLIST
+                } else {
+                    0
+                },
+            *reason,
+            stacktrace.map_or(0, Term::word),
+        ),
+        BifError::Unsupported(_) => (exc::EXC_UNDEF, crate::signals::atom("undef"), 0),
+        BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup"), 0),
     };
-    // `EXF_ARGLIST`: `ftrace` holds the stacktrace of a `raise/3`.
-    process.heap.abi.exc.freason = if in_ftrace {
-        freason | exc::EXF_ARGLIST
-    } else {
-        freason
-    };
+    process.heap.abi.exc.freason = freason;
     process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
-    let freason = process.heap.abi.exc.freason;
-    let fvalue = process.heap.abi.exc.fvalue;
-    match explicit {
-        Some(trace) => {
-            process.cold_exc_mut().explicit_raise = Some(Box::new((freason, fvalue, trace)));
-        }
-        None => {
-            if let Some(cold) = process.cold.as_mut() {
-                cold.explicit_raise = None;
-            }
-        }
-    }
+    process.heap.abi.exc.ftrace = ftrace;
 }
 
 /// The `raise/3` list for this failure, copied back onto the heap.
@@ -4056,35 +4070,16 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
 /// list is already a stacktrace), OTP-29.1.1. The catch's `build_stacktrace`
 /// then returns that list instead of walking native frames.
 fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
-    if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+    if process.heap.abi.exc.freason
+        & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
+        == 0
         && process.heap.abi.exc.ftrace != 0
     {
         let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
         process.heap.abi.exc.ftrace = 0;
         return Some(trace);
     }
-    // Only `set_light_bif_error` parks a trace in the cold part, and it flags the process.
-    if !process.exc_side {
-        return None;
-    }
-    let owned = {
-        let cold = process.cold.as_mut()?;
-        let matches = cold
-            .explicit_raise
-            .as_deref()
-            .is_some_and(|(freason, fvalue, _)| {
-                *freason == process.heap.abi.exc.freason && *fvalue == process.heap.abi.exc.fvalue
-            });
-        if !matches {
-            return None;
-        }
-        cold.explicit_raise.take().map(|boxed| boxed.2)?
-    };
-    arinsal_term::from_owned(
-        &owned,
-        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-    )
-    .ok()
+    None
 }
 
 /// Resolves a native exception to the innermost catch handler, or 0 to let the scheduler exit.
@@ -4098,17 +4093,29 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     header: *mut ProcessHeader,
     _registers: *mut arinsal_beamasm::SchedulerRegisters,
     _stack: *mut u64,
+    bif_info: u64,
 ) -> usize {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    let (freason, catches) = (process.heap.abi.exc.freason, process.heap.abi.catches);
+    let freason = process.heap.abi.exc.freason;
+    let saved_trace = [
+        crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Error)),
+        crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Exit)),
+        crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Throw)),
+    ]
+    .into_iter()
+    .map(|code| code & !arinsal_beamasm::exc::EXF_SAVETRACE)
+    .any(|code| freason == code);
     // TRAP and raw re-raises stay on the scheduler. Primary exceptions are `EXC_ERROR`,
     // `EXC_EXIT` and `EXC_THROWN`; expanded errors (`badmatch`, `function_clause`,
     // `case_clause`, ...) use erts' `(index << 10) | EXC_ERROR`.
     let primary = is_primary_freason(freason);
-    let expanded = freason > 3 && freason & 0x3ff == 0x50 && freason & 4 == 0;
-    if catches == 0 || (!primary && !expanded) {
+    let expanded = freason & arinsal_beamasm::exc::EXC_INDEXBITS != 0
+        && freason
+            & !(arinsal_beamasm::exc::EXC_INDEXBITS | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
+            == arinsal_beamasm::exc::EXC_ERROR;
+    if !primary && !expanded && !saved_trace {
         return 0;
     }
     // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:300-318 (`raise_exception_shared`),
@@ -4118,26 +4125,25 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) else {
         return 0;
     };
-    // Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` reads the stack, and
-    // writes `stop` only at `found_catch`), OTP-29.1.1. Resolve the catch once before saving
-    // the trace; a miss or a caller catch remains with the scheduler's unwind.
+    // Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` follows save_stacktrace),
+    // OTP-29.1.1.
     let raising_pc = registers.tmp_mem[6] as usize;
-    // A function_clause list of the current function's arguments and an inline guard BIF's
-    // top frame (`tmp_mem[7]`) are built by the scheduler's native exit; leave them there.
+    // The scheduler builds the function_clause top frame from the current function arguments.
     if process.heap.abi.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
         return 0;
     }
-    let found = crate::native_bridge::next_native_catch(process);
-    let Some(found) = found else {
-        return 0;
-    };
-    let (class, reason) = if primary {
+    let (class, reason) = if primary || saved_trace {
         let class =
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
-        (
-            class,
-            crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
-        )
+        let reason = if freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0 {
+            match expand_error_value(process) {
+                Some(reason) => reason,
+                None => return 0,
+            }
+        } else {
+            crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
+        };
+        (class, reason)
     } else {
         match expand_error_value(process) {
             Some(reason) => (arinsal_bifs::Class::Error, reason),
@@ -4152,70 +4158,22 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
     // `build_stacktrace` resolves it against the active code ranges when the trace is requested.
     let native_pc = (raising_pc != 0).then_some(raising_pc);
-    // `exc_side_pending` is false for a plain `error/1`, `exit/1` or `throw/1` and for a raise
-    // from compiled code: nothing is parked in the cold part, so erts' two inputs to
-    // `save_stacktrace` (pc and registers) are all there is.
-    let side = process.exc_side_pending();
     // A `raise/3` carries the trace the catch must see, so no top frame is looked for.
-    let explicit = take_explicit_raise(process);
+    let explicit = if saved_trace {
+        Some(crate::native_hooks::from_raw(process.heap.abi.exc.ftrace))
+    } else {
+        take_explicit_raise(process)
+    };
     let top = if explicit.is_some() {
         None
-    } else if !side {
-        inline_bif_top(registers.tmp_mem[7])
     } else {
-        // An inline guard BIF (`element/2`, `hd/1`, ...) names itself as the top frame, with its
-        // arguments in X0.. Port of beam_asm_global.cpp (emit_raise_badarg passes the BIF's
-        // `ErtsCodeMFA` to `raise_exception`), OTP-29.1.1.
-        let inline_top = inline_bif_top(registers.tmp_mem[7]);
-        let top = inline_top.or_else(|| {
-            process
-                .cold
-                .as_ref()
-                .and_then(|cold| cold.native_trap.as_ref())
-                .filter(|native_trap| {
-                    native_trap.freason == process.heap.abi.exc.freason
-                        && native_trap.fvalue == process.heap.abi.exc.fvalue
-                })
-                .and_then(|native_trap| match native_trap.trap.top.as_ref() {
-                    Some(crate::stacktrace::TopFrame::BifRegisters {
-                        module,
-                        function,
-                        arity,
-                        info,
-                    }) => Some(crate::stacktrace::TopFrame::BifRegisters {
-                        module: *module,
-                        function: *function,
-                        arity: *arity,
-                        info: *info,
-                    }),
-                    _ => None,
-                })
-        });
-        // A failing BIF in the argument registers is the top frame, with its arguments read
-        // from the registers (erts `save_stacktrace` reads them from `reg`), no copies.
-        let top = top.or_else(|| failure_top(process, &registers.x_reg_array));
-        // A failure carrying only error_info (bit syntax) names the raising function, as the
-        // scheduler's native exit does for the same failure.
-        let top = top.or_else(|| {
-            let info = process
-                .cold
-                .as_ref()
-                .and_then(|cold| cold.native_error_info.as_deref().cloned())?;
-            let arity = crate::native_function_at(raising_pc)
-                .map_or(0, |function| i64::from(function.arity));
-            Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-                Term::small(arity),
-                Box::new(info),
-            ))
-        });
-        if top.is_none() {
-            note_owned_failure(process);
-        }
-        top
+        native_bif_top(process, bif_info, &registers.x_reg_array)
     };
     // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
     // A native walk would name `eval_external_handler` instead of that list.
-    let trace = if let Some(trace) = explicit {
+    let trace = if saved_trace {
+        explicit.expect("saved exception trace")
+    } else if let Some(trace) = explicit {
         if trace == Term::NIL {
             // `raise(Class, Reason, [])`, which is what `throw/1` compiles to: the empty
             // trace of that class, with nothing saved.
@@ -4226,174 +4184,97 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
             return 0;
         }
     } else {
-        let Ok(trace) = crate::stacktrace::save_lazy(
-            process,
+        let input = crate::stacktrace::StackTraceSave {
             class,
+            depth: crate::stacktrace::runtime_backtrace_depth(process, 8),
+            freason,
             native_pc,
-            top.as_ref(),
-            &registers.x_reg_array,
-        ) else {
+            top: top.as_ref().map(crate::stacktrace::SaveTop::Live),
+        };
+        let Ok(trace) =
+            crate::stacktrace::save_stacktrace(process, input, Some(&registers.x_reg_array))
+        else {
             return 0;
         };
         trace
     };
-    registers.tmp_mem[7] = 0;
+    process.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
+    let Some(found) = crate::native_bridge::next_native_catch(process) else {
+        return 0;
+    };
     let handler = match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
         crate::native_bridge::CatchHandler::Native(handler) => handler,
         crate::native_bridge::CatchHandler::Interpreted => {
             return 0;
         }
     };
-    if side {
-        crate::stacktrace::clear_pending_top(process);
-        if let Some(cold) = process.cold.as_mut() {
-            cold.native_error_info = None;
-        }
-    }
     // The branch below resumes the handler. The scheduler must not treat
     // the next native exit as a continuation resume.
     process.native_continuation_resume = false;
     handler
 }
 
-/// The top frame of an inline guard BIF failure, from `tmp_mem[7]` (`index + 1` into
-/// `BADARG_MFAS`), or `None` when no inline BIF failed.
-fn inline_bif_top(slot: u64) -> Option<crate::stacktrace::TopFrame> {
-    static ATOMS: std::sync::OnceLock<Vec<(arinsal_term::Atom, arinsal_term::Atom, usize)>> =
-        std::sync::OnceLock::new();
-    let index = usize::try_from(slot).ok()?.checked_sub(1)?;
-    let atoms = ATOMS.get_or_init(|| {
-        let table = arinsal_term::global_atoms();
-        arinsal_beamasm::guard::BADARG_MFAS
-            .iter()
-            .filter_map(|(module, function, arity)| {
-                Some((
-                    table.intern(module).ok()?,
-                    table.intern(function).ok()?,
-                    usize::from(*arity),
-                ))
-            })
-            .collect()
-    });
-    let (module, function, arity) = *atoms.get(index)?;
-    Some(crate::stacktrace::TopFrame::BifRegisters {
+/// Supplies erts' `bif_mfa` input to `save_stacktrace`, with arguments in the live X registers.
+// Port of erts/emulator/beam/beam_common.c:899-925 (`save_stacktrace`), OTP-29.1.1.
+fn native_bif_top(
+    process: &crate::Process,
+    bif_info: u64,
+    registers: &[Term],
+) -> Option<crate::stacktrace::TopFrame> {
+    use crate::stacktrace::TopFrame;
+    let freason = process.heap.abi.exc.freason;
+    let bif_info = if bif_info == 0 {
+        process.heap.abi.current as usize as u64
+    } else {
+        bif_info
+    };
+    if bif_info == 0 {
+        let info = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+        return (freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0
+            && info.classify() == arinsal_term::TermKind::Map)
+            .then_some(TopFrame::CurrentArgsInfoTerm(None, info));
+    }
+    let (module, function, arity) = arinsal_beamasm::bif::static_bif_mfa(bif_info)?;
+    if module == arinsal_term::atoms::ERLANG {
+        if (function == arinsal_term::atoms::ERROR
+            || function == arinsal_term::atoms::EXIT
+            || function == arinsal_term::atoms::THROW)
+            && arity == 1
+        {
+            return None;
+        }
+        if function == arinsal_term::atoms::ERROR && arity >= 2 {
+            let args = registers.get(1).copied();
+            return match registers
+                .get(2)
+                .filter(|_| arity > 2)
+                .and_then(|options| crate::exceptions::error_info_term(*options))
+            {
+                Some(info) => Some(TopFrame::CurrentArgsInfoTerm(args, info)),
+                None => args.map(TopFrame::CurrentArgs),
+            };
+        }
+    }
+    let info = native_bif_error_info(freason, process.heap.abi.exc.fvalue);
+    Some(TopFrame::BifRegisters {
         module,
         function,
-        arity,
-        info: crate::stacktrace::BifErrorInfo::Plain,
+        arity: usize::from(arity),
+        info,
     })
 }
 
-/// A failure whose BIF has no export entry keeps its frame in the owned record; park it as
-/// the pending top frame only now that a catch will consume it.
-#[cold]
-#[inline(never)]
-fn note_owned_failure(process: &mut crate::Process) {
-    // Only an owned record needs the move below; the record of an export failure stays put.
-    if !process.slice().is_some_and(|work| {
-        work.native_bif_error.as_ref().is_some_and(|failure| {
-            failure.freason == process.heap.abi.exc.freason
-                && failure.fvalue == process.heap.abi.exc.fvalue
-                && matches!(
-                    failure.call,
-                    crate::proc_create::NativeBifCall::Owned { .. }
-                )
-        })
-    }) {
-        return;
+fn native_bif_error_info(freason: u64, fvalue: u64) -> crate::stacktrace::BifErrorInfo {
+    if freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO == 0 {
+        return crate::stacktrace::BifErrorInfo::Plain;
     }
-    let Some(failure) = process.take_work(|w| w.native_bif_error.take()) else {
-        return;
-    };
-    if failure.freason == process.heap.abi.exc.freason
-        && failure.fvalue == process.heap.abi.exc.fvalue
-        && let crate::proc_create::NativeBifCall::Owned {
-            module,
-            function,
-            args,
-        } = &failure.call
-    {
-        crate::stacktrace::note_caught_bif_frame(process, module, function, args, &failure.error);
-    }
-    process.slice_mut().native_bif_error = Some(failure);
-}
-
-/// The top frame of a BIF failure parked by the native BIF helpers, built from the live
-/// argument registers.
-// Port of erts/emulator/beam/beam_common.c (save_stacktrace: a failing BIF other than
-// `error/1,2,3`, `exit/1` and `throw/1` is `s->current`; `error/2,3` name the caller and
-// keep the argument list and `error_info` map from `c_p->ftrace`), OTP-29.1.1.
-fn failure_top(
-    process: &mut crate::Process,
-    registers: &[Term],
-) -> Option<crate::stacktrace::TopFrame> {
-    use crate::stacktrace::{BifErrorInfo, TopFrame};
-    let cold = process.cold.as_ref()?;
-    let failure = cold.native_bif_error.as_ref()?;
-    if failure.freason != process.heap.abi.exc.freason
-        || failure.fvalue != process.heap.abi.exc.fvalue
-    {
-        return None;
-    }
-    match &failure.call {
-        crate::proc_create::NativeBifCall::Export(export) => {
-            let info = match failure.error {
-                arinsal_bifs::BifError::Badarg { cause: Some(cause) } => BifErrorInfo::Cause(cause),
-                arinsal_bifs::BifError::Badarg { .. }
-                | arinsal_bifs::BifError::Badarith
-                | arinsal_bifs::BifError::SystemLimit
-                | arinsal_bifs::BifError::Error(_) => BifErrorInfo::Plain,
-                arinsal_bifs::BifError::Raise { .. } => {
-                    let arity = usize::from(export.arity);
-                    if export.module_atom != arinsal_term::atoms::ERLANG
-                        || export.function_atom != arinsal_term::atoms::ERROR
-                        || arity < 2
-                    {
-                        return None;
-                    }
-                    // Port of erts/emulator/beam/bif.c:1448-1456 (error_2), OTP-29.1.1:
-                    // retain the caller-supplied argument term without validating it.
-                    let args = Some(registers[1]);
-                    return match registers
-                        .get(2)
-                        .filter(|_| arity > 2)
-                        .and_then(|options| crate::exceptions::error_info_term(*options))
-                    {
-                        Some(info) => Some(TopFrame::CurrentArgsInfoTerm(args, info)),
-                        None => args.map(TopFrame::CurrentArgs),
-                    };
-                }
-                arinsal_bifs::BifError::Unsupported(_) | arinsal_bifs::BifError::Dirty(_) => {
-                    return None;
-                }
-            };
-            Some(TopFrame::BifRegisters {
-                module: export.module_atom,
-                function: export.function_atom,
-                arity: usize::from(export.arity),
-                info,
-            })
-        }
-        crate::proc_create::NativeBifCall::Registers {
-            module,
-            function,
-            arity,
-        } => Some(TopFrame::BifRegisters {
-            module: *module,
-            function: *function,
-            arity: usize::from(*arity),
-            info: match failure.error {
-                arinsal_bifs::BifError::Badarg { cause: Some(cause) } => BifErrorInfo::Cause(cause),
-                arinsal_bifs::BifError::Badarg { .. }
-                | arinsal_bifs::BifError::Badarith
-                | arinsal_bifs::BifError::SystemLimit
-                | arinsal_bifs::BifError::Error(_) => BifErrorInfo::Plain,
-                arinsal_bifs::BifError::Raise { .. }
-                | arinsal_bifs::BifError::Unsupported(_)
-                | arinsal_bifs::BifError::Dirty(_) => return None,
-            },
-        }),
-        crate::proc_create::NativeBifCall::Owned { .. } => None,
+    let value = crate::native_hooks::from_raw(fvalue);
+    if value.classify() == arinsal_term::TermKind::Map {
+        // Port of erts/emulator/beam/beam_common.c:1015-1018 (`save_stacktrace`): an extended
+        // info map in fvalue is already complete and is attached directly to the BIF frame.
+        crate::stacktrace::BifErrorInfo::Map(value)
+    } else {
+        crate::stacktrace::BifErrorInfo::Cause(value)
     }
 }
 
@@ -5038,10 +4919,11 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         Ok(size) => size.heap_words + alloc,
         Err(error) => {
             let (reason, info) = crate::bits::native_error(error);
-            if !has_fail_label {
-                process.cold_exc_mut().native_error_info = info;
+            if has_fail_label {
+                crate::native_hooks::set_error(process, &reason);
+            } else {
+                set_native_error_info(process, &reason, info);
             }
-            crate::native_hooks::set_error(process, &reason);
             return 0;
         }
     };
@@ -5049,10 +4931,11 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         Ok(reductions) => reductions,
         Err(error) => {
             let (reason, info) = crate::bits::native_error(error);
-            if !has_fail_label {
-                process.cold_exc_mut().native_error_info = info;
+            if has_fail_label {
+                crate::native_hooks::set_error(process, &reason);
+            } else {
+                set_native_error_info(process, &reason, info);
             }
-            crate::native_hooks::set_error(process, &reason);
             return 0;
         }
     };
@@ -5087,12 +4970,13 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     match result {
         Ok(term) => crate::native_hooks::raw(term),
         Err(error) => {
-            // Port of erts/emulator/beam/erl_bits.c (bs_create_bin error_info), OTP-29.1.1.
+            // Port of erts/emulator/beam/jit/beam_jit_common.cpp (`beam_jit_bs_construct_fail_info`), OTP-29.1.1.
             let (reason, info) = crate::bits::native_error(error);
-            if !has_fail_label {
-                process.cold_exc_mut().native_error_info = info;
+            if has_fail_label {
+                crate::native_hooks::set_error(process, &reason);
+            } else {
+                set_native_error_info(process, &reason, info);
             }
-            crate::native_hooks::set_error(process, &reason);
             0
         }
     }

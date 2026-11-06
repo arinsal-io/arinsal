@@ -21,6 +21,9 @@ const RETURN_TRACE_FLAG: u64 = 1 << 22;
 const RETURN_TO_TRACE_FLAG: u64 = 1 << 21;
 const RETURN_CALL_ACC_TRACE_FLAG: u64 = 1 << 23;
 const TRACE_FLAGS: u64 = RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG | RETURN_CALL_ACC_TRACE_FLAG;
+const STACKTRACE_HEADER_WORDS: usize = 6;
+const STACKTRACE_NO_LOCATION: u64 = 1;
+const STACKTRACE_CURRENT_ARGS_MFA: u64 = 2;
 
 /// A catch handler: the code scope of its runtime, its module index and its code index.
 type CatchKey = (u64, usize, usize);
@@ -167,6 +170,10 @@ pub(super) struct RawTrace {
     code_table: bool,
     /// The process waits in a BIF trap: its pc is no function, so no frame stands for it.
     no_current: bool,
+    /// `StackTrace.pc == NULL` while `current` still names the top MFA.
+    no_location: bool,
+    /// `current` is an MFA paired with the saved argument list, rather than a BIF MFA.
+    current_args_mfa: bool,
 }
 
 enum Continuation {
@@ -181,6 +188,8 @@ struct StackTraceFields<'a> {
     freason: u64,
     pc: u64,
     current: u64,
+    no_location: bool,
+    current_args_mfa: bool,
     depth: usize,
     max_depth: usize,
     trace: &'a [u64],
@@ -197,14 +206,15 @@ impl StackTrace {
         freason: u64,
         pc: u64,
         current: u64,
+        trace_flags: u64,
     ) -> Result<Term, VmError> {
-        let digits = 5usize
+        let digits = STACKTRACE_HEADER_WORDS
             .checked_add(max_depth)
             .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
         let mut block = TermBuilder::new(heap)
             .pos_bignum_block(digits)
             .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))?;
-        for field in [freason, pc, current, 0, max_depth as u64] {
+        for field in [freason, pc, current, 0, max_depth as u64, trace_flags] {
             block.write_header(field).map_err(|error| {
                 VmError::Unsupported(format!("stacktrace allocation {error:?}"))
             })?;
@@ -220,12 +230,14 @@ impl StackTrace {
         if fields.depth > fields.max_depth || fields.trace.len() > fields.max_depth {
             return Err(VmError::Unsupported("stacktrace depth".into()));
         }
-        let digits = 5usize
+        let digits = STACKTRACE_HEADER_WORDS
             .checked_add(fields.max_depth)
             .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
         let freason = fields.freason;
         let pc = fields.pc;
         let current = fields.current;
+        let no_location = u64::from(fields.no_location);
+        let current_args_mfa = u64::from(fields.current_args_mfa) << 1;
         let depth = fields.depth as u64;
         let max_depth = fields.max_depth as u64;
         let trace = fields.trace;
@@ -236,7 +248,11 @@ impl StackTrace {
                 2 => current,
                 3 => depth,
                 4 => max_depth,
-                _ => trace.get(index - 5).copied().unwrap_or(0),
+                5 => no_location | current_args_mfa,
+                _ => trace
+                    .get(index - STACKTRACE_HEADER_WORDS)
+                    .copied()
+                    .unwrap_or(0),
             })
             .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))
     }
@@ -361,6 +377,12 @@ pub(super) enum StoredTopFrame {
         info: BifErrorInfo,
     },
     CurrentArgs(OwnedTerm),
+    CurrentArgsNoLocation {
+        module: Atom,
+        function: Atom,
+        arity: u8,
+        args: OwnedTerm,
+    },
     CurrentArgsWithInfo(Option<OwnedTerm>, Box<OwnedTerm>),
 }
 
@@ -436,6 +458,18 @@ pub(super) fn capture(
                 to_owned(*args)
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
             )),
+            TopFrame::CurrentArgsNoLocation {
+                module,
+                function,
+                arity,
+                args,
+            } => Ok(StoredTopFrame::CurrentArgsNoLocation {
+                module: *module,
+                function: *function,
+                arity: *arity,
+                args: to_owned(*args)
+                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+            }),
             TopFrame::CurrentArgsInfoTerm(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
                 args.map(|args| {
                     to_owned(args)
@@ -460,6 +494,8 @@ pub(super) fn capture(
     if captured_top.is_some() {
         raw.top = captured_top;
     }
+    raw.no_location = false;
+    raw.current_args_mfa = matches!(top, Some(TopFrame::CurrentArgsNoLocation { .. }));
     raw.module_index = Some(module);
     raw.module = modules.get(module).cloned();
     raw.ip = ip;
@@ -673,110 +709,6 @@ fn push_frame(raw: &mut RawTrace, continuation: Continuation) {
     raw.continuations.push(continuation);
 }
 
-/// BIF frame recorded by a caught native failure, matched against `freason`/`fvalue`
-/// so a later exception does not reuse it.
-#[derive(Clone)]
-pub(crate) struct PendingTop {
-    freason: u64,
-    fvalue: u64,
-    top: StoredTopFrame,
-}
-
-/// Drop a BIF frame that belonged to an exception this process has finished with.
-pub(crate) fn clear_pending_top(p: &mut Process) {
-    if let Some(cold) = p.cold.as_mut() {
-        cold.pending_trace_top = None;
-    }
-}
-
-/// Port of erts/emulator/beam/beam_common.c:899-925 (`save_stacktrace`), OTP-29.1.1:
-/// a failing BIF other than `error/1,2,3`, `exit/1` and `throw/1` is `s->current`.
-/// `error/1` and friends leave the frame to the Erlang caller (`c_p->current`).
-pub(crate) fn note_caught_bif_frame(
-    p: &mut Process,
-    module: &str,
-    function: &str,
-    args: &[Term],
-    error: &arinsal_bifs::BifError,
-) {
-    let info = match error {
-        // `error/2,3` is the caller's frame, with the option list's `error_info`
-        // map (beam_common.c:909-925). `exit/1` and `throw/1` keep the caller too,
-        // and have no map.
-        arinsal_bifs::BifError::Raise { .. } => {
-            if module == "erlang" && function == "error" && args.len() > 1 {
-                let args_term = arinsal_term::to_owned(args[1]).ok();
-                let top = match args.get(2).and_then(crate::exceptions::error_info_option) {
-                    Some(info) => StoredTopFrame::CurrentArgsWithInfo(args_term, Box::new(info)),
-                    None => {
-                        let Some(args_term) = args_term else {
-                            return;
-                        };
-                        StoredTopFrame::CurrentArgs(args_term)
-                    }
-                };
-                let freason = p.heap.abi.exc.freason;
-                let fvalue = p.heap.abi.exc.fvalue;
-                p.cold_exc_mut().pending_trace_top = Some(Box::new(PendingTop {
-                    freason,
-                    fvalue,
-                    top,
-                }));
-            }
-            return;
-        }
-        arinsal_bifs::BifError::Unsupported(_) | arinsal_bifs::BifError::Dirty(_) => return,
-        arinsal_bifs::BifError::Badarg { cause: Some(cause) } => BifErrorInfo::Cause(*cause),
-        _ => BifErrorInfo::Plain,
-    };
-    let Some(top) = bif_pending_top(module, function, args, info) else {
-        return;
-    };
-    let freason = p.heap.abi.exc.freason;
-    let fvalue = p.heap.abi.exc.fvalue;
-    p.cold_exc_mut().pending_trace_top = Some(Box::new(PendingTop {
-        freason,
-        fvalue,
-        top,
-    }));
-}
-
-fn bif_pending_top(
-    module: &str,
-    function: &str,
-    args: &[Term],
-    info: BifErrorInfo,
-) -> Option<StoredTopFrame> {
-    let module = global_atoms().intern(module).ok()?;
-    let function = global_atoms().intern(function).ok()?;
-    let args = BifArgs::from_terms(args).ok()?;
-    Some(StoredTopFrame::Bif {
-        module,
-        function,
-        args,
-        info,
-    })
-}
-
-fn clone_matching_pending(p: &Process) -> Option<StoredTopFrame> {
-    if !p.exc_side {
-        return None;
-    }
-    let pending = p.cold.as_ref()?.pending_trace_top.as_ref()?;
-    (pending.freason == p.heap.abi.exc.freason && pending.fvalue == p.heap.abi.exc.fvalue)
-        .then(|| pending.top.clone())
-}
-
-pub(super) fn take_matching_pending_top(p: &mut Process) -> Option<StoredTopFrame> {
-    let cold = p.cold.as_mut()?;
-    let matches = cold.pending_trace_top.as_ref().is_some_and(|pending| {
-        pending.freason == p.heap.abi.exc.freason && pending.fvalue == p.heap.abi.exc.fvalue
-    });
-    matches
-        .then(|| cold.pending_trace_top.take().map(|pending| pending.top))
-        .flatten()
-}
-
 /// Raw stacktrace for a caught exception, without building the symbolic list.
 ///
 /// Port of erts/emulator/beam/beam_common.c:505-507 and :880 (`save_stacktrace`),
@@ -786,33 +718,9 @@ pub(super) fn take_matching_pending_top(p: &mut Process) -> Option<StoredTopFram
 /// `native_pc` is the raising instruction (erts' `pc`). `backtrace_depth` counts the
 /// current frame plus continuations; `save_stacktrace` stores `depth - 1` continuation
 /// slots and always keeps the current function (beam_common.c:885).
-pub(crate) fn save_lazy(
-    p: &mut Process,
-    class: Class,
-    native_pc: Option<usize>,
-    top: Option<&TopFrame>,
-    registers: &[Term],
-) -> Result<Term, VmError> {
-    let pending = top.is_none().then(|| clone_matching_pending(p)).flatten();
-    let top = top
-        .map(SaveTop::Live)
-        .or_else(|| pending.as_ref().map(SaveTop::Stored));
-    save_direct(
-        p,
-        StackTraceSave {
-            class,
-            depth: runtime_backtrace_depth(p, 8),
-            freason: process_freason(p, class),
-            native_pc,
-            top,
-        },
-        Some(registers),
-    )
-}
-
 /// Port of erts/emulator/beam/beam_common.c:880-1010 (`save_stacktrace`), OTP-29.1.1.
 /// The trace block is sized and allocated before the stack walk, then filled in place.
-pub(super) fn save_direct(
+pub(super) fn save_stacktrace(
     p: &mut Process,
     input: StackTraceSave<'_>,
     registers: Option<&[Term]>,
@@ -870,10 +778,18 @@ pub(super) fn save_direct(
     let bif_top = top.is_some_and(SaveTop::is_bif);
     let max_depth = depth.saturating_sub(1);
     let current = match top {
+        Some(SaveTop::Live(TopFrame::CurrentArgsNoLocation {
+            module, function, ..
+        })) => pack_bif_mfa(*module, *function),
         Some(top) if let Some((module, function)) = top.bif_mfa() => pack_bif_mfa(module, function),
         _ => pack_indexed(site.0, site.1)
             .ok_or_else(|| VmError::Unsupported("stacktrace current address".into()))?,
     };
+    let current_args_mfa = matches!(
+        top,
+        Some(SaveTop::Live(TopFrame::CurrentArgsNoLocation { .. }))
+    );
+    let no_location = false;
     let pc = if bif_top {
         0
     } else {
@@ -891,9 +807,26 @@ pub(super) fn save_direct(
     // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1: the trace, its
     // argument list, the `error_info` map and the ftrace tuple are carved from one block that is
     // sized first. A full young heap then costs one heap fragment per raise, not one per term.
+    let trace_words = 1usize
+        .checked_add(STACKTRACE_HEADER_WORDS)
+        .and_then(|words| words.checked_add(max_depth))
+        .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
+    let total_words = save_ftrace_words(top, registers.unwrap_or(&p.x))
+        .and_then(|words| trace_words.checked_add(words));
     let (stack_trace, ftrace) = {
-        let mut heap = TraceHeap::new(&mut p.heap);
-        let stack_trace = StackTrace::reserve(&mut heap, max_depth, freason, pc, current)?;
+        let mut heap = if let Some(words) = total_words {
+            TraceHeap::with_block(&mut p.heap, words)
+        } else {
+            TraceHeap::new(&mut p.heap)
+        };
+        let stack_trace = StackTrace::reserve(
+            &mut heap,
+            max_depth,
+            freason,
+            pc,
+            current,
+            u64::from(no_location) | (u64::from(current_args_mfa) << 1),
+        )?;
         let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
         let ftrace = Ftrace {
             stack_trace,
@@ -905,12 +838,13 @@ pub(super) fn save_direct(
     };
     stack_trace
         .with_bignum_digits_mut(|digits| {
+            digits[5] = u64::from(no_location) | (u64::from(current_args_mfa) << 1);
             let mut offset = 0;
             if bif_top
                 && max_depth > 0
                 && let Some(pc) = native_top_word
             {
-                digits[5] = pc;
+                digits[STACKTRACE_HEADER_WORDS] = pc;
                 offset = 1;
             } else if bif_top
                 && max_depth > 0
@@ -918,18 +852,75 @@ pub(super) fn save_direct(
             {
                 // Port of beam_common.c:928-930 (`save_stacktrace`), OTP-29.1.1:
                 // a BIF frame owns current, so preserve its interpreter caller CP.
-                digits[5] = caller;
+                digits[STACKTRACE_HEADER_WORDS] = caller;
                 offset = 1;
             }
-            let end = 5 + max_depth;
-            let gathered =
-                gather_continuations(p, &mut digits[5 + offset..end], previous_native, previous);
+            let end = STACKTRACE_HEADER_WORDS + max_depth;
+            let gathered = gather_continuations(
+                p,
+                &mut digits[STACKTRACE_HEADER_WORDS + offset..end],
+                previous_native,
+                previous,
+            );
             let depth = offset + gathered;
             digits[3] = depth as u64;
             depth
         })
         .ok_or_else(|| VmError::Unsupported("stacktrace bignum".into()))?;
     Ok(ftrace)
+}
+
+/// Words reserved by the ftrace tuple and values that save_stacktrace constructs for its top.
+/// The native BIF path uses live registers or already-rooted terms, so the size is exact before
+/// the single HAlloc that holds StackTrace, Args, error_info, and ftrace.
+// Port of erts/emulator/beam/beam_common.c:889-998 (`save_stacktrace`), OTP-29.1.1.
+fn save_ftrace_words(top: Option<SaveTop<'_>>, registers: &[Term]) -> Option<usize> {
+    let Some(SaveTop::Live(top)) = top else {
+        return Some(4);
+    };
+    let (args_words, info) = match top {
+        TopFrame::Bif { args, info, .. } => {
+            let words = match args {
+                BifArgs::Inline { len, .. } => usize::from(*len).saturating_mul(2),
+                BifArgs::TermList(_) => 0,
+                BifArgs::Owned(_) => return None,
+            };
+            (words, *info)
+        }
+        TopFrame::BifRegisters { arity, info, .. } => {
+            registers.get(..*arity)?;
+            (arity.saturating_mul(2), *info)
+        }
+        TopFrame::CurrentArgs(_) | TopFrame::CurrentArgsNoLocation { .. } => return Some(4),
+        TopFrame::CurrentArgsInfoTerm(_, _) => return Some(9),
+        TopFrame::CurrentArgsWithInfo(_, _) => return None,
+    };
+    let info_words = match info {
+        BifErrorInfo::None => 0,
+        BifErrorInfo::Map(_) => 5,
+        BifErrorInfo::Plain | BifErrorInfo::Cause(_) => {
+            let module = match top {
+                TopFrame::Bif { module, .. } | TopFrame::BifRegisters { module, .. } => *module,
+                _ => unreachable!(),
+            };
+            if trace_atoms()
+                .format_modules
+                .iter()
+                .any(|(bif, _)| *bif == module)
+            {
+                if matches!(info, BifErrorInfo::Cause(_)) {
+                    13
+                } else {
+                    11
+                }
+            } else {
+                0
+            }
+        }
+    };
+    args_words
+        .checked_add(info_words)
+        .and_then(|words| words.checked_add(4))
 }
 
 pub(super) struct StackTraceSave<'a> {
@@ -943,16 +934,13 @@ pub(super) struct StackTraceSave<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum SaveTop<'a> {
     Live(&'a TopFrame),
-    Stored(&'a StoredTopFrame),
 }
 
 impl SaveTop<'_> {
     fn is_bif(self) -> bool {
         matches!(
             self,
-            Self::Live(TopFrame::Bif { .. })
-                | Self::Live(TopFrame::BifRegisters { .. })
-                | Self::Stored(StoredTopFrame::Bif { .. })
+            Self::Live(TopFrame::Bif { .. }) | Self::Live(TopFrame::BifRegisters { .. })
         )
     }
 
@@ -963,16 +951,13 @@ impl SaveTop<'_> {
             })
             | Self::Live(TopFrame::BifRegisters {
                 module, function, ..
-            })
-            | Self::Stored(StoredTopFrame::Bif {
-                module, function, ..
             }) => Some((*module, *function)),
             _ => None,
         }
     }
 }
 
-fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
+pub(super) fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
     p.runtime.as_ref().map_or(fallback, |runtime| {
         runtime
             .backtrace_depth
@@ -980,22 +965,11 @@ fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
     })
 }
 
-fn process_freason(p: &Process, class: Class) -> u64 {
-    if p.heap.abi.exc.freason != 0 {
-        p.heap.abi.exc.freason
-    } else {
-        class_to_freason(Some(class))
-    }
-}
-
 fn save_ftrace_values(
     heap: &mut TraceHeap<'_>,
     top: Option<SaveTop<'_>>,
     registers: &[Term],
 ) -> Result<(Term, Term), VmError> {
-    if let Some(SaveTop::Stored(top)) = top {
-        return ftrace_values(heap, Some(top));
-    }
     let args = match top {
         Some(SaveTop::Live(TopFrame::Bif { args, .. })) => args.to_term(heap)?,
         Some(SaveTop::Live(TopFrame::BifRegisters { arity, .. })) => {
@@ -1007,12 +981,12 @@ fn save_ftrace_values(
                 .map_err(|error| VmError::Unsupported(format!("exception args {error:?}")))?
         }
         Some(SaveTop::Live(TopFrame::CurrentArgs(args)))
+        | Some(SaveTop::Live(TopFrame::CurrentArgsNoLocation { args, .. }))
         | Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(Some(args), _)))
         | Some(SaveTop::Live(TopFrame::CurrentArgsInfoTerm(Some(args), _))) => *args,
         Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(None, _)))
         | Some(SaveTop::Live(TopFrame::CurrentArgsInfoTerm(None, _)))
         | None => Term::atom(arinsal_term::atoms::TRUE),
-        Some(SaveTop::Stored(_)) => unreachable!(),
     };
     let info_map = match top {
         Some(SaveTop::Live(TopFrame::Bif { module, info, .. })) => {
@@ -1026,7 +1000,6 @@ fn save_ftrace_values(
             from_owned(info, heap)
                 .map_err(|error| VmError::Unsupported(format!("error_info {error:?}")))?,
         ),
-        Some(SaveTop::Stored(_)) => unreachable!(),
         _ => None,
     };
     let error_info = if let Some(info) = info_map {
@@ -1044,43 +1017,6 @@ fn save_ftrace_values(
 
 fn pack_bif_mfa(module: Atom, function: Atom) -> u64 {
     (u64::from(module.0) << 32) | u64::from(function.0)
-}
-
-fn ftrace_values(
-    heap: &mut TraceHeap<'_>,
-    top: Option<&StoredTopFrame>,
-) -> Result<(Term, Term), VmError> {
-    let args = match top {
-        Some(StoredTopFrame::Bif { args, .. }) => args.to_term(heap)?,
-        Some(StoredTopFrame::CurrentArgs(args)) => from_owned(args, heap)
-            .map_err(|error| VmError::Unsupported(format!("exception args {error:?}")))?,
-        Some(StoredTopFrame::CurrentArgsWithInfo(Some(args), _)) => from_owned(args, heap)
-            .map_err(|error| VmError::Unsupported(format!("exception args {error:?}")))?,
-        Some(StoredTopFrame::CurrentArgsWithInfo(None, _)) | None => {
-            // Port of beam_common.c:922-925 (`save_stacktrace`), OTP-29.1.1: `Args` is
-            // the already-interned `true` atom when the current frame has no saved args.
-            Term::atom(arinsal_term::atoms::TRUE)
-        }
-    };
-    let info_map = match top {
-        Some(StoredTopFrame::Bif { module, info, .. }) => bif_error_info(heap, *module, *info)?,
-        Some(StoredTopFrame::CurrentArgsWithInfo(_, info)) => Some(
-            from_owned(info, heap)
-                .map_err(|error| VmError::Unsupported(format!("error_info {error:?}")))?,
-        ),
-        _ => None,
-    };
-    let error_info = if let Some(info) = info_map {
-        let entry = TermBuilder::new(heap)
-            .tuple(&[Term::atom(trace_atoms().error_info), info])
-            .map_err(|error| VmError::Unsupported(format!("error_info tuple {error:?}")))?;
-        TermBuilder::new(heap)
-            .cons(entry, Term::NIL)
-            .map_err(|error| VmError::Unsupported(format!("error_info list {error:?}")))?
-    } else {
-        Term::NIL
-    };
-    Ok((args, error_info))
 }
 
 /// Writes raw CP words the way `gather_stacktrace` does (beam_common.c:781), OTP-29.1.1.
@@ -1252,8 +1188,22 @@ fn ftrace_raw(term: Term) -> Option<RawTrace> {
         .flatten()
 }
 
+/// Reads `StackTrace.pc == NULL` without decoding its continuation array.
+// Port of erts/emulator/beam/beam_common.c:1217-1227 (`build_stacktrace`), OTP-29.1.1.
+fn raw_no_location(term: Term) -> Option<bool> {
+    let fields = arinsal_term::term_sequence_small(term)?;
+    if fields.len() != 3 {
+        return None;
+    }
+    fields[0].with_bignum_digits_mut(|digits| {
+        digits
+            .get(5)
+            .is_some_and(|flags| flags & STACKTRACE_NO_LOCATION != 0)
+    })
+}
+
 fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> Option<RawTrace> {
-    if digits.len() < 5 {
+    if digits.len() < STACKTRACE_HEADER_WORDS {
         return None;
     }
     let freason = digits[0];
@@ -1261,17 +1211,39 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
     let current = digits[2];
     let count = usize::try_from(digits[3]).ok()?;
     let max_depth = usize::try_from(digits[4]).ok()?;
-    if count > max_depth || digits.len() < 5 + count {
+    let trace_flags = digits[5];
+    let no_location = trace_flags & STACKTRACE_NO_LOCATION != 0;
+    let current_args_mfa = trace_flags & STACKTRACE_CURRENT_ARGS_MFA != 0;
+    if count > max_depth || digits.len() < STACKTRACE_HEADER_WORDS + count {
         return None;
     }
-    let (mut module_index, mut ip, top) = if args == Term::atom(arinsal_term::atoms::TRUE) {
+    let (mut module_index, mut ip, top) = if current_args_mfa {
+        if current & (1 << 63) != 0 || !matches!(args.classify(), TermKind::List | TermKind::Nil) {
+            return None;
+        }
+        let module = Atom((current >> 32) as u32);
+        let function = Atom(current as u32);
+        let arity = u8::try_from(arinsal_term::term_sequence_small(args)?.len()).ok()?;
+        (
+            None,
+            0,
+            Some(StoredTopFrame::CurrentArgsNoLocation {
+                module,
+                function,
+                arity,
+                args: to_owned(args).ok()?,
+            }),
+        )
+    } else if args == Term::atom(arinsal_term::atoms::TRUE) {
         if current & (1 << 63) == 0 {
             return None;
         }
+        let info = term_error_info_map(error_info).and_then(|term| to_owned(term).ok());
+        let top = info.map(|info| StoredTopFrame::CurrentArgsWithInfo(None, Box::new(info)));
         (
             Some(((current & !(1 << 63)) >> 32) as usize),
             current as u32 as usize,
-            None,
+            top,
         )
     } else if current & (1 << 63) == 0 {
         let module = Atom((current >> 32) as u32);
@@ -1309,28 +1281,29 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
         };
         (Some(module), ip, top)
     };
-    let mut trace_start = 5;
+    let mut trace_start = STACKTRACE_HEADER_WORDS;
     let current_is_bif = matches!(top, Some(StoredTopFrame::Bif { .. }));
     let native_top = (pc != 0 && pc & (1 << 63) == 0)
         .then(|| usize::try_from(pc).ok())
         .flatten()
         .or_else(|| {
-            if !current_is_bif || count == 0 || digits[5] & (1 << 63) != 0 {
+            if !current_is_bif || count == 0 || digits[STACKTRACE_HEADER_WORDS] & (1 << 63) != 0 {
                 return None;
             }
             trace_start += 1;
-            usize::try_from(digits[5]).ok()
+            usize::try_from(digits[STACKTRACE_HEADER_WORDS]).ok()
         });
     let mut bif_caller_interpreted = false;
-    if current_is_bif && pc == 0 && count != 0 && digits[5] & (1 << 63) != 0 {
-        let payload = digits[5] & !(1 << 63);
+    if current_is_bif && pc == 0 && count != 0 && digits[STACKTRACE_HEADER_WORDS] & (1 << 63) != 0 {
+        let payload = digits[STACKTRACE_HEADER_WORDS] & !(1 << 63);
         module_index = Some((payload >> 32) as usize);
         ip = payload as u32 as usize;
         trace_start += 1;
         bif_caller_interpreted = true;
     }
-    let mut continuations = Vec::with_capacity(count.saturating_sub(trace_start - 5));
-    for word in &digits[trace_start..5 + count] {
+    let mut continuations =
+        Vec::with_capacity(count.saturating_sub(trace_start - STACKTRACE_HEADER_WORDS));
+    for word in &digits[trace_start..STACKTRACE_HEADER_WORDS + count] {
         if word & (1 << 63) != 0 {
             let payload = word & !(1 << 63);
             continuations.push(Continuation::Indexed(
@@ -1350,6 +1323,8 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
         continuations,
         depth: count.saturating_add(1),
         code_table: !current_is_bif || bif_caller_interpreted,
+        no_location,
+        current_args_mfa,
         ..RawTrace::default()
     })
 }
@@ -1393,7 +1368,8 @@ pub(super) fn raised_args(term: Term) -> Option<Term> {
 
 /// Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise).
 pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool {
-    let code = class_to_freason(Some(class));
+    // raw_raise stores the class in the saved trace after EXF_SAVETRACE is cleared.
+    let code = class_to_freason(Some(class)) & !arinsal_beamasm::exc::EXF_SAVETRACE;
     if let Some(fields) = arinsal_term::term_sequence(term)
         && fields.len() == 3
         && fields[0]
@@ -1402,6 +1378,12 @@ pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool 
                     return false;
                 };
                 *freason = code;
+                if digits
+                    .get(5)
+                    .is_some_and(|flags| flags & STACKTRACE_CURRENT_ARGS_MFA != 0)
+                {
+                    digits[5] |= STACKTRACE_NO_LOCATION;
+                }
                 true
             })
             .unwrap_or(false)
@@ -1441,6 +1423,13 @@ pub(super) enum TopFrame {
         info: BifErrorInfo,
     },
     CurrentArgs(Term),
+    /// Function-clause top frame resolved from its native function pointer, without a source line.
+    CurrentArgsNoLocation {
+        module: Atom,
+        function: Atom,
+        arity: u8,
+        args: Term,
+    },
     CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
     /// `erlang:error/2,3` read straight from the argument registers: the supplied argument
     /// term and validated `error_info` map stay heap terms, as in erts' `c_p->ftrace`. Only
@@ -1815,6 +1804,11 @@ enum FramePrep {
 /// Lookups land in one `ERTS_ALC_T_TMP` array. The symbolic list is one `HAlloc`.
 /// `None` means the saved frame metadata needs the general builder.
 pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, VmError>> {
+    if raw_no_location(term) == Some(true) {
+        // `build_direct` only sees the raw pc and would restore its source line. OTP's
+        // function_clause path clears `s->pc` while retaining the current MFA and args.
+        return None;
+    }
     let fields = arinsal_term::term_sequence_small(term)?;
     if fields.len() != 3 || fields[0].is_negative_bignum() {
         return None;
@@ -1872,7 +1866,10 @@ fn prepare_frames(
     tables: Option<&crate::load::CodeTables>,
     block: &mut FrameScratch,
 ) -> Result<FramePrep, VmError> {
-    if digits.len() < 5 {
+    if digits.len() < STACKTRACE_HEADER_WORDS {
+        return Ok(FramePrep::Fallback);
+    }
+    if digits[5] != 0 {
         return Ok(FramePrep::Fallback);
     }
     let pc = digits[1];
@@ -1880,7 +1877,7 @@ fn prepare_frames(
     let count = usize::try_from(digits[3]).unwrap_or(usize::MAX);
     let depth = count.saturating_add(1);
     let max_depth = usize::try_from(digits[4]).unwrap_or(0);
-    if count > max_depth || digits.len() < 5 + count {
+    if count > max_depth || digits.len() < STACKTRACE_HEADER_WORDS + count {
         return Ok(FramePrep::Fallback);
     }
     if current & (1 << 63) == 0 {
@@ -1929,7 +1926,7 @@ fn prepare_frames(
     if pc & (1 << 63) != 0 && frames == 0 {
         return Ok(FramePrep::Fallback);
     }
-    for word in &digits[5..5 + count] {
+    for word in &digits[STACKTRACE_HEADER_WORDS..STACKTRACE_HEADER_WORDS + count] {
         if frames >= depth {
             break;
         }
@@ -1986,16 +1983,17 @@ fn prepare_bif_frames(
     block: &mut FrameScratch,
 ) -> Result<FramePrep, VmError> {
     const CURRENT_IS_FUNCTION: u64 = 1 << 63;
-    if digits.len() < 5 {
+    if digits.len() < STACKTRACE_HEADER_WORDS {
         return Ok(FramePrep::Fallback);
     }
     let (pc, current) = (digits[1], digits[2]);
     let count = usize::try_from(digits[3]).unwrap_or(usize::MAX);
     let max_depth = usize::try_from(digits[4]).unwrap_or(0);
     if pc != 0
+        || digits[5] != 0
         || current & CURRENT_IS_FUNCTION != 0
         || count > max_depth
-        || digits.len() < 5 + count
+        || digits.len() < STACKTRACE_HEADER_WORDS + count
     {
         return Ok(FramePrep::Fallback);
     }
@@ -2007,9 +2005,9 @@ fn prepare_bif_frames(
     block.clear();
     let mut frames = 0usize;
     let mut words = 0usize;
-    let mut first_continuation = 5;
+    let mut first_continuation = STACKTRACE_HEADER_WORDS;
     if count > 0 {
-        let word = digits[5];
+        let word = digits[STACKTRACE_HEADER_WORDS];
         if word & CURRENT_IS_FUNCTION != 0 {
             let payload = word & !CURRENT_IS_FUNCTION;
             let module_index = (payload >> 32) as usize;
@@ -2040,7 +2038,7 @@ fn prepare_bif_frames(
         frames += 1;
         first_continuation += 1;
     }
-    for word in &digits[first_continuation..5 + count] {
+    for word in &digits[first_continuation..STACKTRACE_HEADER_WORDS + count] {
         if word & CURRENT_IS_FUNCTION == 0 {
             let Some(frame) = usize::try_from(*word)
                 .ok()
@@ -2198,6 +2196,18 @@ pub(super) fn build_saved(
                 from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
             )),
+            StoredTopFrame::CurrentArgsNoLocation {
+                module,
+                function,
+                arity,
+                args,
+            } => Ok(TopFrame::CurrentArgsNoLocation {
+                module: *module,
+                function: *function,
+                arity: *arity,
+                args: from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
+                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+            }),
             StoredTopFrame::CurrentArgsWithInfo(args, info) => {
                 let args = args
                     .as_ref()
@@ -2317,18 +2327,28 @@ fn build_saved_active(
     if raw.module.is_none() {
         raw.module = table_module;
     }
+    let no_location = raw.no_location;
     let mut heap = TraceHeap::with_block(&mut p.heap, block_words);
     let current = raw.module.as_deref();
     let current_frame = if raw.no_current {
         None
+    } else if no_location {
+        match top {
+            Some(TopFrame::CurrentArgsNoLocation {
+                module,
+                function,
+                arity,
+                ..
+            }) => Some((*module, *function, *arity, None)),
+            _ => return Err(VmError::Unsupported("stacktrace current MFA".into())),
+        }
     } else if let Some(frame) = native_frame {
         // Port of erts/emulator/beam/utils.c:3430 (`erts_build_mfa_item`), OTP-29.1.1.
-        let location = frame.location;
         Some((
             frame.module_atom,
             frame.function_atom,
             frame.arity,
-            location,
+            frame.location,
         ))
     } else {
         current.map(|current| {
@@ -2394,6 +2414,11 @@ fn build_saved_active(
         let top_args = match top {
             Some(TopFrame::CurrentArgs(args))
             | Some(TopFrame::CurrentArgsWithInfo(Some(args), _))
+                if matches!(args.classify(), TermKind::List | TermKind::Nil) =>
+            {
+                *args
+            }
+            Some(TopFrame::CurrentArgsNoLocation { args, .. })
                 if matches!(args.classify(), TermKind::List | TermKind::Nil) =>
             {
                 *args
@@ -2525,6 +2550,8 @@ mod tests {
                 freason: arinsal_beamasm::exc::EXC_ERROR,
                 pc: 0x1000,
                 current: 0,
+                no_location: false,
+                current_args_mfa: false,
                 depth: 1,
                 max_depth: 2,
                 trace: &[0x2000],
@@ -2533,8 +2560,17 @@ mod tests {
         .unwrap();
         let mut layout_matches = false;
         trace.with_bignum_digits_mut(|digits| {
-            layout_matches =
-                digits == [arinsal_beamasm::exc::EXC_ERROR, 0x1000, 0, 1, 2, 0x2000, 0];
+            layout_matches = digits
+                == [
+                    arinsal_beamasm::exc::EXC_ERROR,
+                    0x1000,
+                    0,
+                    1,
+                    2,
+                    0,
+                    0x2000,
+                    0,
+                ];
         });
         assert!(layout_matches);
 

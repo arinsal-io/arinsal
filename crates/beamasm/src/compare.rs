@@ -480,7 +480,14 @@ impl BeamModuleAssembler {
             e.mov_const(TMP2, badarg)?;
             e.str_uoff(TMP2, Gpr::x(21), 48)
         })?;
-        self.branch_error_from_lr()
+        self.code.emit(|e| {
+            e.ldr_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.branch_error_from_lr_preserving_bif()
     }
 
     /// Emits `element/2` with the position test and tuple walk in the shared guard fragment.
