@@ -456,8 +456,8 @@ impl Eq for SharedPayload {}
 /// Control signals delivered in the same stream as messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Signal<M: SignalMessage> {
-    /// Link request.
-    Link,
+    /// Link half queued as the signal itself, as `erts_proc_sig_send_link` does.
+    Link { priority: bool },
     /// Unlink request carrying its acknowledgement id.
     Unlink(u64),
     /// Unlink acknowledgement.
@@ -1314,11 +1314,6 @@ struct ProcShared<M: SignalMessage> {
     /// The actual priority is the higher of the two.
     /// Port of erl_process.h (`ERTS_PSFLGS_ACT_PRIO_MASK`, `ERTS_PSFLG_SYS_TASKS`), OTP-29.1.1.
     sys_priority: AtomicU8,
-    /// Bumped each time the process is scheduled in. A run queue entry made in an
-    /// earlier epoch is stale: a system task enqueues the process a second time in a
-    /// higher priority queue, and whichever entry runs first retires the other.
-    /// Port of erl_process.h (`ERTS_PSFLGS_IN_PRQ_MASK`, proxy entries), OTP-29.1.1.
-    run_epoch: AtomicU64,
     /// `Process.next/prev`, `schedule_count` and `ERTS_PSFLG_IN_RUNQ`: the run queue links.
     rq_link: run_queue::RqLink,
     bound_worker: AtomicUsize,
@@ -1793,7 +1788,6 @@ impl<T: Task> ProcessTable<T> {
                     user_priority: AtomicU8::new(priority.index() as u8),
                     active: AtomicBool::new(true),
                     sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
-                    run_epoch: AtomicU64::new(0),
                     rq_link: run_queue::RqLink::default(),
                     bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
                     scheduler_id: AtomicUsize::new(0),
@@ -2151,8 +2145,6 @@ impl<T: Task> ProcessTable<T> {
 
 struct Scheduled<T: Task> {
     process: ProcRef<T>,
-    /// `run_epoch` of the process when this entry was queued.
-    epoch: u64,
     /// Port of erts/emulator/beam/erl_process.h (`Process.schedule_count`), OTP-29.1.1:
     /// times the entry reaches the head of the normal queue before it runs.
     schedule_count: u8,
@@ -2160,7 +2152,6 @@ struct Scheduled<T: Task> {
 
 impl<T: Task> Scheduled<T> {
     fn new(process: ProcRef<T>) -> Self {
-        let epoch = process.run_epoch.load(Ordering::Acquire);
         // Port of erts/emulator/beam/erl_process.c:3957 (enqueue_process), OTP-29.1.1.
         let schedule_count = if process.priority() == Priority::Low {
             balance::RESCHEDULE_LOW
@@ -2169,7 +2160,6 @@ impl<T: Task> Scheduled<T> {
         };
         Self {
             process,
-            epoch,
             schedule_count,
         }
     }
@@ -3033,10 +3023,10 @@ impl<T: Task> Inner<T> {
         }
     }
 
-    /// The entry is the process's live run queue entry, not a stale duplicate.
+    /// The process is queued: the entry is the one that will run it, or a duplicate of it
+    /// (a proxy entry) that an earlier dequeue may already have retired.
     fn is_current_entry(item: &Scheduled<T>) -> bool {
-        item.process.run_epoch.load(Ordering::Acquire) == item.epoch
-            && item.process.run_state().load(Ordering::Acquire) == QUEUED
+        item.process.run_state().load(Ordering::Acquire) == QUEUED
     }
 
     /// Port of erts/emulator/beam/erl_process.c:4115 (immigrate), OTP-29.1.1: for each
@@ -5748,6 +5738,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
 /// receiver is scheduled, including on exit.
 /// Set in the metadata of a lazy node that is a monitor signal, clear for a demonitor signal.
 pub const LAZY_MONITOR: u64 = 1 << 62;
+/// Metadata bit for an internal link half queued as the signal itself.
+pub const LAZY_LINK: u64 = 1 << 61;
+/// Metadata bit for an intrusive unlink operation, which is not a monitor half.
+pub const LAZY_UNLINK: u64 = 1 << 60;
 const _: () = assert!(PTAB_ID_DATA_MASK < LAZY_MONITOR);
 
 /// The metadata of a lazy node (a monitor half queued as its own signal) sent by `from`: what
@@ -5756,10 +5750,15 @@ pub fn lazy_meta(from: Pid, monitor: bool) -> u64 {
     from.data() | if monitor { LAZY_MONITOR } else { 0 }
 }
 
+/// Metadata for a local link half queued as a signal node.
+pub fn lazy_link_meta(from: Pid) -> u64 {
+    from.data() | LAZY_LINK
+}
+
 /// The sender of a node; a lazy node knows it without a value.
 fn node_from<M: SignalMessage>(signal: &OwnedSignal<Event<M>>) -> Pid {
     match signal.lazy_meta() {
-        Some(meta) => Pid::from_data(meta & !LAZY_MONITOR),
+        Some(meta) => Pid::from_data(meta & !(LAZY_MONITOR | LAZY_LINK)),
         None => signal.from,
     }
 }
@@ -6170,7 +6169,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let from = node_from(&signal);
         let lazy = signal.lazy_meta();
         let monitor = match lazy {
-            Some(meta) => meta & LAZY_MONITOR != 0,
+            Some(meta) => meta & LAZY_MONITOR != 0 && meta & (LAZY_LINK | LAZY_UNLINK) == 0,
             None => matches!(
                 signal.payload,
                 Payload::Signal(Signal::Monitor { .. } | Signal::MonitorOpaque { .. })
@@ -6241,7 +6240,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let managed = self.managed;
         let deliver = |process: &ProcRef<T>| -> Result<(), Error> {
             let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-            // A lazy node is a monitor or demonitor signal and is no link.
+            // A lazy link still takes the immediate path: erts queues the link half itself.
             let lazy = signal.is_lazy();
             // Port of erts/emulator/beam/erl_proc_sig_queue.c (proc_queue_signal) and
             // erl_proc_sig_queue.h (erts_proc_notify_new_sig), OTP-29.1.1: every signal schedules
@@ -6257,7 +6256,8 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             // already gone with a `noproc` link exit; a buffered link dropped at slice end would
             // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
             // OTP-29.1.1.
-            let link = !lazy && matches!(&signal.payload, Payload::Signal(Signal::Link));
+            let link = matches!(signal.lazy_meta(), Some(meta) if meta & LAZY_LINK != 0)
+                || (!lazy && matches!(&signal.payload, Payload::Signal(Signal::Link { .. })));
             if waiting || monitor || link || deferred.is_some() || force_enqueue {
                 if let Some(first) = deferred {
                     // The held monitor and this signal enter the queue together.
@@ -7112,12 +7112,10 @@ impl<T: Task> Scheduler<T> {
             local: None,
             managed,
         };
-        <Runner<'_, T> as ContextOps<T::Message>>::deliver(
-            &mut runner,
-            from,
-            to,
-            Payload::Signal(signal),
-        )
+        // Port of erts_proc_sig_send_* in erl_proc_sig_queue.c, OTP-29.1.1:
+        // construct the concrete signal node, then queue it directly.
+        let node = T::Message::signal_node(from, signal);
+        <Runner<'_, T> as ContextOps<T::Message>>::deliver_node(&mut runner, to, node)
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -8231,7 +8229,7 @@ mod spawn_request_tests {
 
         fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: &mut (), _: u32) -> RunOutcome {
             while let Some(event) = ctx.receive() {
-                if matches!(event.payload, Payload::Signal(Signal::Link)) {
+                if matches!(event.payload, Payload::Signal(Signal::Link { .. })) {
                     self.0.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -8254,7 +8252,7 @@ mod spawn_request_tests {
             .spawn_unscheduled(LinkSignalProbe(Arc::clone(&observed)))
             .unwrap();
         scheduler
-            .signal(Pid::new(7, 0), child, Signal::Link)
+            .signal(Pid::new(7, 0), child, Signal::Link { priority: false })
             .unwrap();
 
         assert!(!scheduler.step(), "setup signal scheduled the child");
@@ -8443,6 +8441,8 @@ mod proxy_requeue_tests {
     enum Probe {
         Blocker(Arc<AtomicBool>),
         SelfWaker(Arc<AtomicU32>),
+        /// Yields once, then exits.
+        Yielder(Arc<AtomicU32>),
     }
 
     impl Task for Probe {
@@ -8455,6 +8455,13 @@ mod proxy_requeue_tests {
                     while !release.load(Ordering::Acquire) {
                         std::thread::yield_now();
                     }
+                }
+                Probe::Yielder(runs) => {
+                    return if runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                        RunOutcome::Yield
+                    } else {
+                        RunOutcome::Exit(0)
+                    };
                 }
                 Probe::SelfWaker(runs) => {
                     if runs.fetch_add(1, Ordering::AcqRel) == 0 {
@@ -8509,6 +8516,38 @@ mod proxy_requeue_tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(scheduler.inner.run_queues[0].is_empty());
         assert_eq!(runs.load(Ordering::Acquire), 2, "no further run");
+    }
+
+    /// A duplicate (proxy) entry of a process that has already run and queued itself again
+    /// through its real entry runs it once (the state decides, `execute_process`); the later
+    /// entry of the same process finds it exited and runs nothing, without touching its state.
+    #[test]
+    fn a_duplicate_entry_of_a_requeued_process_runs_it_once_and_the_later_entry_is_retired() {
+        let scheduler = Scheduler::new(Config {
+            workers: 1,
+            max_processes: 8,
+            ..Config::default()
+        });
+        let release = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicU32::new(0));
+        scheduler
+            .spawn(Probe::Blocker(Arc::clone(&release)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let pid = scheduler.spawn(Probe::Yielder(Arc::clone(&runs))).unwrap();
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        // Queue order: real entry, then the duplicate. The real entry runs first and yields,
+        // which queues the process again behind the duplicate.
+        scheduler.inner.run_queues[0].push_proxy(Scheduled::new(process.clone()));
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runs.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(runs.load(Ordering::Acquire), 2, "run, yield, run, exit");
+        assert!(scheduler.inner.run_queues[0].is_empty());
+        assert_eq!(process.run_state().load(Ordering::Acquire), EXITED);
     }
 }
 
@@ -8874,20 +8913,8 @@ fn run_slice<T: Task>(
     dirty: Option<DirtyKind>,
 ) {
     let process = item.process;
-    // Claim this queue entry's epoch first: a stale duplicate entry (see
-    // `Process::run_epoch`) must not run a process that was queued again later.
-    if process
-        .run_epoch
-        .compare_exchange(
-            item.epoch,
-            item.epoch.wrapping_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return;
-    }
+    // A stale duplicate entry finds the process not queued below and runs nothing
+    // (execute_process in erts works from the state word the same way).
     if process
         .run_state()
         .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -9018,18 +9045,6 @@ fn run_process<T: Task>(
     consts: &SliceConsts,
 ) -> Option<SliceEnd<T>> {
     let process = item.process;
-    if process
-        .run_epoch
-        .compare_exchange(
-            item.epoch,
-            item.epoch.wrapping_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return None;
-    }
     if process
         .run_state()
         .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)

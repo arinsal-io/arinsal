@@ -463,7 +463,7 @@ fn route_incoming(
         1 if parts.len() == 3 => {
             let from = remote_proxy(handle, &parts[1])?;
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            publish_remote_signal(process, from, target, Signal::Link)?;
+            publish_remote_signal(process, from, target, Signal::Link { priority: false })?;
         }
         3 | 8 | 24 | 26 if parts.len() >= 3 => {
             let from = remote_proxy(handle, &parts[1])?;
@@ -590,7 +590,7 @@ fn route_incoming(
                         .as_ref()
                         .ok_or_else(badarg)?
                         .scheduler()?
-                        .signal(remote_child, req.caller, Signal::Link)
+                        .signal(remote_child, req.caller, Signal::Link { priority: false })
                         .map_err(|error| {
                             VmError::Unsupported(format!("dist spawn link setup: {error}"))
                         })?;
@@ -1302,7 +1302,7 @@ fn route_incoming_port(
             let from = remote_proxy(handle, &parts[1])?;
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
             sched
-                .signal(from, target, Signal::Link)
+                .signal(from, target, Signal::Link { priority: false })
                 .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
         }
         // Port of erts/emulator/beam/dist.c:2509-2539 (DOP_EXIT and
@@ -1446,7 +1446,7 @@ fn route_incoming_port(
                     // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
                     let child = remote_proxy(handle, &result)?;
                     sched
-                        .signal(child, req.caller, Signal::Link)
+                        .signal(child, req.caller, Signal::Link { priority: false })
                         .map_err(|error| {
                             VmError::Unsupported(format!("dist spawn link setup: {error}"))
                         })?;

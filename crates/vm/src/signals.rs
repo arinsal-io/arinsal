@@ -2768,7 +2768,12 @@ pub(crate) fn link_light(
     rt_ref(process)?
         .scheduler()
         .ok()?
-        .signal_ordered_from(me, pid, arinsal_sched::Signal::Link, process.on_managed)
+        .signal_ordered_from(
+            me,
+            pid,
+            arinsal_sched::Signal::Link { priority: false },
+            process.on_managed,
+        )
         .ok()?;
     link_node_create(&mut process.links, pid, false);
     Some(Ok(atom("true")))
@@ -4793,7 +4798,7 @@ fn link_opt(
         &[linked_term],
     );
     match if send {
-        ctx.signal(pid, Signal::Link)
+        ctx.signal(pid, Signal::Link { priority })
     } else {
         Ok(())
     } {
