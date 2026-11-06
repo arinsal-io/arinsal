@@ -22,6 +22,18 @@ pub(crate) struct ProcQueues<T: Task> {
     /// One bit per non-empty priority queue, changed under `lists` and readable without the
     /// lock like `rq->flags`.
     qmask: AtomicU32,
+    /// `rq->len`, `rq->max_len`, `rq->flags` (migration info), `rq->check_balance_reds` and
+    /// `rq->waiting`: the rest of `ErtsRunQueue`, reached through `Deref`.
+    pub(crate) info: crate::balance::RunQueueBalance,
+}
+
+impl<T: Task> std::ops::Deref for ProcQueues<T> {
+    type Target = crate::balance::RunQueueBalance;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.info
+    }
 }
 
 impl<T: Task> ProcQueues<T> {
@@ -29,6 +41,7 @@ impl<T: Task> ProcQueues<T> {
         Self {
             lists: raw::RqMutex::new(raw::Lists::new()),
             qmask: AtomicU32::new(0),
+            info: crate::balance::RunQueueBalance::new(),
         }
     }
 

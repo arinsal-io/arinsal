@@ -13,6 +13,9 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex};
 
+use crate::Task;
+use crate::run_queue::ProcQueues;
+
 // Port of erts/emulator/beam/erl_process.h:128-132, OTP-29.1.1.
 /// Process priority levels (`ERTS_NO_PROC_PRIO_LEVELS`).
 pub(crate) const PROC_PRIO_LEVELS: usize = 4;
@@ -79,7 +82,7 @@ pub(crate) struct RunQueueBalance {
 }
 
 impl RunQueueBalance {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             len: std::array::from_fn(|_| AtomicI32::new(0)),
             max_len: std::array::from_fn(|_| AtomicI32::new(0)),
@@ -268,8 +271,9 @@ fn percent(x: i64, y: i64) -> i64 {
 }
 
 /// Run queue balancing state shared by all normal schedulers.
-pub(crate) struct Balance {
-    pub(crate) rqs: Vec<RunQueueBalance>,
+pub(crate) struct Balance<T: Task> {
+    /// The run queues, each with its balance statistics (`ErtsRunQueue`).
+    pub(crate) rqs: Arc<[ProcQueues<T>]>,
     checking_balance: AtomicBool,
     state: Mutex<BalanceState>,
     /// Completed balance checks (`balance_info.n`).
@@ -287,12 +291,12 @@ pub(crate) struct Balance {
     no_empty_run_queues: AtomicI32,
 }
 
-impl Balance {
+impl<T: Task> Balance<T> {
     /// Port of erts/emulator/beam/erl_process.c:6330-6343 (balance_info initialization)
     /// and erl_process.c:4797 (init_migration_paths), OTP-29.1.1.
     pub(crate) fn new(schedulers: usize, online: usize, compact_load: bool) -> Self {
         Self {
-            rqs: (0..schedulers).map(|_| RunQueueBalance::new()).collect(),
+            rqs: (0..schedulers).map(|_| ProcQueues::new()).collect(),
             checking_balance: AtomicBool::new(false),
             state: Mutex::new(BalanceState {
                 halftime: true,
@@ -344,7 +348,7 @@ impl Balance {
     }
 
     fn rq(&self, ix: usize) -> &RunQueueBalance {
-        &self.rqs[ix.min(self.rqs.len() - 1)]
+        &self.rqs[ix.min(self.rqs.len() - 1)].info
     }
 
     /// A process of priority `prio` joined run queue `ix`; `queued_prio` remembers the
@@ -522,7 +526,7 @@ impl Balance {
         if state.halftime {
             state.halftime = false;
             self.checking_balance.store(false, Ordering::Release);
-            for rq in &self.rqs {
+            for rq in self.rqs.iter() {
                 if rq.waiting.load(Ordering::Acquire) {
                     rq.flags
                         .fetch_or(FLG_HALFTIME_OUT_OF_WORK, Ordering::AcqRel);
@@ -952,6 +956,19 @@ fn setup_migration_paths(info: &mut [QueueBalance], pix: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RunCtx, RunOutcome};
+
+    /// A task type for the run queues the balance tests create.
+    struct IdleTask;
+
+    impl Task for IdleTask {
+        type Message = ();
+        type SchedulerData = ();
+
+        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+            RunOutcome::Wait { timeout_ms: None }
+        }
+    }
 
     fn state(schedulers: usize) -> BalanceState {
         BalanceState {
@@ -1053,7 +1070,7 @@ mod tests {
 
     #[test]
     fn balance_counts_checks_after_halftime() {
-        let balance = Balance::new(2, 2, true);
+        let balance = Balance::<IdleTask>::new(2, 2, true);
         balance.check_balance(0);
         assert_eq!(balance.checks(), 0);
         balance.check_balance(0);
@@ -1066,7 +1083,7 @@ mod tests {
 
     #[test]
     fn offline_run_queues_evacuate() {
-        let balance = Balance::new(4, 4, true);
+        let balance = Balance::<IdleTask>::new(4, 4, true);
         balance.change_no_used_runqs(2);
         let paths = balance.migration_paths();
         assert_eq!(paths[3].prio[PRIORITY_LOW].runq, Some(1));
