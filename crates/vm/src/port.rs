@@ -516,6 +516,8 @@ type PortSlot = arinsal_sched::ProgressSlot<PortHandle>;
 /// erts_ptab_delete_element), OTP-29.1.1.
 pub(crate) struct PortTable {
     list: std::sync::RwLock<()>,
+    /// Number of published ports (`ptab->r.o.nobjs`).
+    count: std::sync::atomic::AtomicUsize,
     /// One slot per table index, allocated once (`erts_ptab_init_table`).
     slots: Box<[PortSlot]>,
     /// `ptab->r.o.pix_mask`.
@@ -547,6 +549,7 @@ impl PortTable {
             .collect();
         Self {
             list: std::sync::RwLock::new(()),
+            count: std::sync::atomic::AtomicUsize::new(0),
             slots,
             pix_mask: layout.max() as usize - 1,
             progress: OnceLock::new(),
@@ -659,8 +662,10 @@ impl PortTable {
         handle.started_interval.store(started, Ordering::Release);
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
         self.slots[pix].store(handle, self.progress.get());
+        self.count.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
     /// Clear the slot of port `id` and return its handle.
     pub(crate) fn remove(&self, id: u64) -> Option<Arc<PortHandle>> {
         let slot = self.slot(id)?;
@@ -671,6 +676,7 @@ impl PortTable {
             .unwrap_or(false)
         {
             let removed = slot.take(progress)?;
+            self.count.fetch_sub(1, Ordering::Relaxed);
             let started_interval = removed.started_interval.load(Ordering::Acquire);
             let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
             let index = arinsal_term::ptab::port_table_layout().data2pix(id);
@@ -708,12 +714,14 @@ impl PortTable {
     // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
     pub(crate) fn begin_ptab_list(&'static self) -> PortPtabListSnapshot {
         let _list = self.list.write().unwrap();
+        let count = self.count.load(Ordering::Relaxed);
         let invocation_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         let marker = self.list_deleted.lock().begin(invocation_interval);
         PortPtabListSnapshot {
             table: self,
             marker,
             invocation_interval,
+            count,
             active: true,
         }
     }
@@ -724,52 +732,60 @@ pub(crate) struct PortPtabListSnapshot {
     table: &'static PortTable,
     marker: usize,
     invocation_interval: u64,
+    count: usize,
     active: bool,
 }
 
 impl PortPtabListSnapshot {
     // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
-    pub(crate) fn scan_chunk(&self, first: u32, limit: u32) -> (Vec<u64>, u64) {
+    pub(crate) fn scan_chunk_with(
+        &self,
+        first: u32,
+        limit: u32,
+        mut append_id: impl FnMut(u64),
+    ) -> u64 {
         let _list = self.table.list.write().unwrap();
         let chunk_interval = self
             .table
             .interval
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        let mut ids = Vec::new();
         let layout = arinsal_term::ptab::port_table_layout();
         for index in first..limit.min(layout.max()) {
-            let Some(progress) = self.table.progress.get() else {
+            let Some(slot) = self.table.slot_at(index as usize) else {
                 continue;
             };
-            let Some(handle) = self
-                .table
-                .slot_at(index as usize)
-                .filter(|slot| slot.is_occupied())
-                .and_then(|slot| slot.load_arc(progress, false))
-            else {
-                continue;
-            };
-            if handle.started_interval.load(Ordering::Acquire) < self.invocation_interval {
-                ids.push(handle.id);
-            }
+            // The table write lock excludes insert/remove until this scan chunk completes.
+            slot.with_managed(|handle| {
+                if handle.started_interval.load(Ordering::Acquire) < self.invocation_interval {
+                    append_id(handle.id);
+                }
+            });
         }
-        (ids, chunk_interval)
+        chunk_interval
     }
 
-    pub(crate) fn inspect_deleted(
+    pub(crate) fn count(&self) -> usize {
+        // Arinsal's standard I/O port is represented outside this table, while erts stores it
+        // in erts_port and includes it in erts_ptab_count.
+        self.count.saturating_add(1)
+    }
+
+    pub(crate) fn inspect_deleted_with(
         &mut self,
         chunk_intervals: &[u64],
         max_reds: u32,
-    ) -> (Vec<u64>, u32, bool) {
+        append_id: impl FnMut(u64),
+    ) -> (u32, bool) {
         let _list = self.table.list.write().unwrap();
         let result = self.table.list_deleted.lock().inspect(
             self.marker,
             self.invocation_interval,
             chunk_intervals,
             max_reds,
+            append_id,
         );
-        self.active = !result.2;
+        self.active = !result.1;
         result
     }
 }

@@ -406,7 +406,7 @@ pub(crate) fn system_info_light(
     let [selector] = args else {
         return None;
     };
-    if atom_name(*selector)? != "process_count" {
+    if *selector != Term::atom(arinsal_term::atoms::PROCESS_COUNT) {
         return None;
     }
     let count = process_count(process) as u64;
@@ -620,7 +620,9 @@ fn call_values(
             TermKind::Pid => Ok(atom("false")),
             _ => Err(badarg()),
         }),
-        ("erlang", "system_info", 1) if atom_name(args[0]) == Some("process_count") => {
+        ("erlang", "system_info", 1)
+            if args[0] == Term::atom(arinsal_term::atoms::PROCESS_COUNT) =>
+        {
             // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
             // This selector is an atomic process-table count; avoid the generic tuple/allocator
             // selector conversion before reaching that branch.
@@ -1370,7 +1372,7 @@ fn process_count(process: &Process) -> usize {
     process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.scheduler().ok())
+        .and_then(|runtime| runtime.scheduler_if_started())
         .map_or(1, |scheduler| scheduler.process_count())
 }
 

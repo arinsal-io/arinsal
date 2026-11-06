@@ -1536,7 +1536,8 @@ impl<T: Copy> PtabListLog<T> {
         invocation_interval: u64,
         chunk_intervals: &[u64],
         max_reds: u32,
-    ) -> (Vec<T>, u32, bool) {
+        mut append_id: impl FnMut(T),
+    ) -> (u32, bool) {
         const DELETED_PER_RED: u32 = 10;
         debug_assert!(matches!(
             self.nodes[marker].as_ref().unwrap().entry,
@@ -1545,7 +1546,6 @@ impl<T: Copy> PtabListLog<T> {
         let marker_was_head = self.head == Some(marker);
         let mut cursor = self.nodes[marker].as_ref().and_then(|node| node.next);
         self.detach(marker);
-        let mut ids = Vec::new();
         let mut free_deleted = marker_was_head
             && cursor.is_some_and(|index| {
                 matches!(
@@ -1573,7 +1573,7 @@ impl<T: Copy> PtabListLog<T> {
                             .get(chunk)
                             .is_some_and(|interval| deleted.deleted_interval < *interval)
                     {
-                        ids.push(deleted.id);
+                        append_id(deleted.id);
                     }
                     inspected += 1;
                     if free_deleted {
@@ -1594,7 +1594,7 @@ impl<T: Copy> PtabListLog<T> {
         } else if let Some(next) = cursor {
             self.insert_before(next, marker);
         }
-        (ids, inspected as u32 / DELETED_PER_RED + freed, done)
+        (inspected as u32 / DELETED_PER_RED + freed, done)
     }
 
     fn unlink(&mut self, index: usize) {
@@ -1855,7 +1855,25 @@ impl<T: Task> ProcessTable<T> {
     // `is_managed_thread_of` above the branch and a managed caller still pays the lookup.
     #[inline(never)]
     fn with_slot_range(&self, first: u32, limit: u32, mut f: impl FnMut(&ProcRef<T>)) {
-        let delay = thr_progress::unmanaged_delay(&self.progress);
+        self.with_slot_range_inner(first, limit, false, &mut f);
+    }
+
+    /// Scan while the caller holds the table write lock, which prevents slot removal.
+    // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+    #[inline(never)]
+    fn with_slot_range_ptab_locked(&self, first: u32, limit: u32, mut f: impl FnMut(&ProcRef<T>)) {
+        self.with_slot_range_inner(first, limit, true, &mut f);
+    }
+
+    #[inline(never)]
+    fn with_slot_range_inner(
+        &self,
+        first: u32,
+        limit: u32,
+        ptab_locked: bool,
+        f: &mut impl FnMut(&ProcRef<T>),
+    ) {
+        let delay = (!ptab_locked).then(|| thr_progress::unmanaged_delay(&self.progress));
         let limit = limit.min(self.ids.process_slot_count());
         for pix in first.min(limit)..limit {
             let raw = self
@@ -1863,25 +1881,29 @@ impl<T: Task> ProcessTable<T> {
                 .expect("process-table slot is in range")
                 .load(Ordering::Acquire);
             if !raw.is_null() {
-                let _lookup = thr_progress::LookupScope::enter();
+                let _lookup = (!ptab_locked).then(thr_progress::LookupScope::enter);
                 // SAFETY: `raw` remains table-owned during the delay, and a later operation
-                // cannot release it until thread progress has passed this chunk.
-                unsafe { ProcRef::with_borrowed(raw, &mut f) }
+                // cannot release it until thread progress has passed this chunk, or until the
+                // caller releases the process-table write lock for a ptab list scan.
+                unsafe { ProcRef::with_borrowed(raw, &mut *f) }
             }
         }
-        thr_progress::unmanaged_continue(&self.progress, delay);
+        if let Some(delay) = delay {
+            thr_progress::unmanaged_continue(&self.progress, delay);
+        }
     }
 
     // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
-    fn begin_ptab_list(&self) -> (usize, u64) {
+    fn begin_ptab_list(&self) -> (usize, u64, usize) {
         let _exclusive = self.lock.write();
+        let count = self.ids.count();
         let interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         let mut log = self.list_deleted.lock();
         let marker = log.begin(interval);
         self.list_active
             .store(log.has_invocations(), Ordering::Release);
         drop(log);
-        (marker, interval)
+        (marker, interval, count)
     }
 
     // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
@@ -1890,16 +1912,16 @@ impl<T: Task> ProcessTable<T> {
         first: u32,
         limit: u32,
         invocation_interval: u64,
-    ) -> (Vec<Pid>, u64) {
+        append_pid: &mut impl FnMut(Pid),
+    ) -> u64 {
         let _exclusive = self.lock.write();
         let chunk_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        let mut pids = Vec::new();
-        self.with_slot_range(first, limit, |process| {
+        self.with_slot_range_ptab_locked(first, limit, |process| {
             if process.started_interval < invocation_interval {
-                pids.push(process.pid);
+                append_pid(process.pid);
             }
         });
-        (pids, chunk_interval)
+        chunk_interval
     }
 
     fn inspect_ptab_list_deleted(
@@ -1908,10 +1930,17 @@ impl<T: Task> ProcessTable<T> {
         invocation_interval: u64,
         chunk_intervals: &[u64],
         max_reds: u32,
-    ) -> (Vec<Pid>, u32, bool) {
+        append_pid: impl FnMut(Pid),
+    ) -> (u32, bool) {
         let _exclusive = self.lock.write();
         let mut log = self.list_deleted.lock();
-        let result = log.inspect(marker, invocation_interval, chunk_intervals, max_reds);
+        let result = log.inspect(
+            marker,
+            invocation_interval,
+            chunk_intervals,
+            max_reds,
+            append_pid,
+        );
         self.list_active
             .store(log.has_invocations(), Ordering::Release);
         result
@@ -6541,33 +6570,44 @@ pub struct PtabListSnapshot<T: Task> {
     scheduler: Arc<Scheduler<T>>,
     marker: usize,
     invocation_interval: u64,
+    count: usize,
     active: bool,
 }
 
 impl<T: Task> PtabListSnapshot<T> {
     // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
-    /// Read one table chunk and return live identifiers plus qualifying deletions.
-    pub fn scan_chunk(&self, first: u32, limit: u32) -> (Vec<Pid>, u64) {
-        self.scheduler
-            .inner
-            .table
-            .scan_ptab_list_chunk(first, limit, self.invocation_interval)
+    // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+    /// Read one table chunk directly into the caller's identifier buffer.
+    pub fn scan_chunk_with(&self, first: u32, limit: u32, mut append_pid: impl FnMut(Pid)) -> u64 {
+        self.scheduler.inner.table.scan_ptab_list_chunk(
+            first,
+            limit,
+            self.invocation_interval,
+            &mut append_pid,
+        )
+    }
+
+    /// Number of elements present when this listing began.
+    pub fn count(&self) -> usize {
+        self.count
     }
 
     /// Inspect the shared deletion list and advance this invocation marker.
     // Port of erts/emulator/beam/erl_ptab.c:1070 (ptab_list_bif_engine), OTP-29.1.1.
-    pub fn inspect_deleted(
+    pub fn inspect_deleted_with(
         &mut self,
         chunk_intervals: &[u64],
         max_reds: u32,
-    ) -> (Vec<Pid>, u32, bool) {
+        append_pid: impl FnMut(Pid),
+    ) -> (u32, bool) {
         let result = self.scheduler.inner.table.inspect_ptab_list_deleted(
             self.marker,
             self.invocation_interval,
             chunk_intervals,
             max_reds,
+            append_pid,
         );
-        self.active = !result.2;
+        self.active = !result.1;
         result
     }
 
@@ -7717,11 +7757,12 @@ impl<T: Task> Scheduler<T> {
     /// Begin an OTP-style process table listing, with per-chunk deletion reconciliation.
     // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
     pub fn begin_ptab_list(self: &Arc<Self>) -> PtabListSnapshot<T> {
-        let (marker, invocation_interval) = self.inner.table.begin_ptab_list();
+        let (marker, invocation_interval, count) = self.inner.table.begin_ptab_list();
         PtabListSnapshot {
             scheduler: Arc::clone(self),
             marker,
             invocation_interval,
+            count,
             active: true,
         }
     }
