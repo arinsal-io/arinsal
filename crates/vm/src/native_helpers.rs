@@ -1,8 +1,8 @@
 //! Runtime helper bodies called by BeamAsm generated code.
 
-use arinsal_beamasm::ProcessHeader;
+use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::MatchOps;
-use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError};
+use arinsal_term::{HeapAlloc, PreparedWritableAppend, Term, TermBuilder};
 
 use crate::beamasm_integration::ExportDispatch;
 
@@ -4985,85 +4985,117 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
 /// Starts `bs_create_bin` append and publishes its writable buffer to native stores.
 // Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_bs_append_checked(
-    process_header: *mut ProcessHeader,
+    process_header: &mut ProcessHeader,
+    scheduler_registers: &mut SchedulerRegisters,
     source_index: u64,
     extra_bits: u64,
     unit: u64,
     live: u64,
     alloc: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(process_header) else {
+    let Some((process, registers)) =
+        crate::native_hooks::enter_runtime_with_registers(process_header, scheduler_registers)
+    else {
         return 0;
     };
-    let (Ok(source_index), Ok(extra_bits), Ok(unit), Ok(live), Ok(alloc)) = (
-        usize::try_from(source_index),
-        usize::try_from(extra_bits),
-        usize::try_from(unit),
-        usize::try_from(live),
-        usize::try_from(alloc),
-    ) else {
-        return 0;
-    };
-    if unit == 0 || source_index >= process.x.len() || live > process.x.len() {
-        return 0;
-    }
-    let mut request = 5_usize.saturating_add(alloc);
-    let mut collect_before_append = false;
-    let start = 'append: loop {
-        if collect_before_append && process.ensure_native_roots(request, live).is_err() {
-            crate::native_hooks::set_error(process, "system_limit");
-            return u64::MAX;
-        }
-        let source = process.x[source_index];
-        match TermBuilder::new(&mut process.heap)
-            .writable_append_with_address(source, extra_bits, unit)
-        {
-            Ok(Some((term, data_address, offset_bits, grew))) => {
-                break 'append arinsal_bits::AppendStart {
-                    term,
-                    data_address,
-                    offset_bits,
-                    copied_bits: if grew { offset_bits } else { 0 },
-                };
-            }
-            Ok(None) => {
-                let mut fresh_request = 8_usize.saturating_add(alloc);
-                loop {
-                    if process.ensure_native_roots(fresh_request, live).is_err() {
+    let xregs = std::ptr::NonNull::new(registers.x_reg_array.as_mut_ptr())
+        .expect("SchedulerRegisters owns its fixed X register array");
+    let source_index = source_index as usize;
+    let extra_bits = extra_bits as usize;
+    let unit = unit as usize;
+    let live = live as usize;
+    let alloc = alloc as usize;
+    let source = arinsal_term::raw::trusted_jit_register(xregs, source_index);
+    let mut prepared = PreparedWritableAppend::default();
+    match TermBuilder::prepare_writable_append(
+        &mut process.heap,
+        source,
+        extra_bits,
+        unit,
+        &mut prepared,
+    ) {
+        Ok(true) => {
+            // erts stores `sb->orig` in `reg[live]`, collects once if the HAlloc
+            // reservation is short, then builds the successor directly at `htop`.
+            arinsal_term::raw::set_trusted_jit_register(xregs, live, prepared.bin_ref());
+            let used_words: usize = if extra_bits == 0 { 0 } else { 5 };
+            let heap_need = used_words.wrapping_add(alloc);
+            let reservation = match process.heap.reserve_native_halloc(used_words, alloc) {
+                Some(reservation) => reservation,
+                None => {
+                    if process.ensure_native_roots(heap_need, live + 1).is_err() {
                         crate::native_hooks::set_error(process, "system_limit");
                         return u64::MAX;
                     }
-                    let source = process.x[source_index];
-                    match arinsal_bits::append_start_nonwritable(
-                        source,
-                        extra_bits,
-                        unit,
-                        &mut process.heap,
-                    ) {
-                        Ok(start) => break 'append start,
-                        Err(arinsal_bits::BitsError::HeapFull { need_words }) => {
-                            fresh_request = need_words
-                                .saturating_add(alloc)
-                                .max(fresh_request.saturating_mul(2));
-                        }
-                        Err(_) => return 0,
-                    }
+                    process
+                        .heap
+                        .reserve_native_halloc(used_words, alloc)
+                        .expect("GC leaves the requested HeapWordsLeft reservation")
                 }
-            }
-            Err(TermError::HeapFull) => {
-                request = 5_usize.saturating_add(alloc).max(request.saturating_mul(2));
-                collect_before_append = true;
-            }
-            Err(_) => return 0,
+            };
+            let source = if extra_bits == 0 {
+                arinsal_term::raw::trusted_jit_register(xregs, source_index)
+            } else {
+                Term::NIL
+            };
+            let owner = arinsal_term::raw::trusted_jit_register(xregs, live);
+            let mut term = Term::NIL;
+            TermBuilder::<arinsal_term::ProcessHeap>::finish_writable_append(
+                reservation,
+                source,
+                owner,
+                prepared,
+                extra_bits,
+                &mut term,
+            );
+            let offset_bits = prepared.offset_bits(extra_bits);
+            registers.erl_bits_state = [prepared.data_address() as u64, offset_bits as u64];
+            // Port of `BUMP_REDS` in erts/emulator/beam/bif.h:71-77, OTP-29.1.1.
+            let reds = ((if prepared.grew() { offset_bits } else { 0 }) / (8 * 1024)) as i32;
+            process.heap.abi.fcalls = process.heap.abi.fcalls.wrapping_sub(reds).max(0);
+            crate::native_hooks::raw(term)
         }
-    };
-    registers.erl_bits_state = [start.data_address as u64, start.offset_bits as u64];
-    process.heap.abi.fcalls = process
-        .heap
-        .abi
-        .fcalls
-        .saturating_sub((start.copied_bits / (8 * 1024)).min(i32::MAX as usize) as i32);
-    crate::native_hooks::raw(start.term)
+        Ok(false) => {
+            let reservation = match process.heap.reserve_native_halloc(8, alloc) {
+                Some(reservation) => reservation,
+                None => {
+                    let fresh_request = 8_usize.wrapping_add(alloc);
+                    if process
+                        .ensure_native_roots(fresh_request, live + 1)
+                        .is_err()
+                    {
+                        crate::native_hooks::set_error(process, "system_limit");
+                        return u64::MAX;
+                    }
+                    process
+                        .heap
+                        .reserve_native_halloc(8, alloc)
+                        .expect("GC leaves the requested HeapWordsLeft reservation")
+                }
+            };
+            let source = arinsal_term::raw::trusted_jit_register(xregs, source_index);
+            match TermBuilder::<arinsal_term::ProcessHeap>::append_nonwritable(
+                reservation,
+                source,
+                extra_bits,
+                unit,
+            ) {
+                Ok((term, data_address, offset_bits)) => {
+                    registers.erl_bits_state = [data_address as u64, offset_bits as u64];
+                    // Port of `BUMP_REDS` in erts/emulator/beam/bif.h:71-77, OTP-29.1.1.
+                    let reds = (offset_bits / (8 * 1024)) as i32;
+                    process.heap.abi.fcalls = process.heap.abi.fcalls.wrapping_sub(reds).max(0);
+                    crate::native_hooks::raw(term)
+                }
+                Err(arinsal_term::TermError::HeapFull) => {
+                    crate::native_hooks::set_error(process, "system_limit");
+                    u64::MAX
+                }
+                Err(_) => 0,
+            }
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Runs the checked private append and charges its writable-binary overhead on the process.

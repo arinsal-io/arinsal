@@ -95,11 +95,27 @@ pub(crate) fn enter_runtime_after_bif<'a>(
     scheduler_registers(process)
 }
 
+/// Process and register base passed by a BeamAsm helper that already has `x19`'s reg pointer.
+pub(crate) fn enter_runtime_with_registers<'a>(
+    header: &'a mut ProcessHeader,
+    registers: &'a mut SchedulerRegisters,
+) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+    let process = process_from_header(header)?;
+    Some((process, registers))
+}
+
 pub(crate) fn scheduler_registers(
     process: &mut Process,
 ) -> Option<(&mut Process, &mut SchedulerRegisters)> {
     // `esdp->registers`: the scheduler's register file the process is attached to.
     let registers = process.x.scheduler_registers();
+    scheduler_registers_at(process, registers)
+}
+
+fn scheduler_registers_at(
+    process: &mut Process,
+    registers: *mut SchedulerRegisters,
+) -> Option<(&mut Process, &mut SchedulerRegisters)> {
     if registers.is_null() {
         return None;
     }

@@ -36,14 +36,14 @@ pub use atom::{
     IndexInfo, atoms, global_atoms, set_atom_table_limit,
 };
 pub use bits::{
-    BinaryOwner, ExternalBinary, PrivateAppendUpdate, RefcBinary, SUB_BITS_MUTABLE,
-    SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes, binary_offset_adjustment, binary_owner,
-    erts_bs_private_append_checked, erts_bs_private_append_checked_with_heap,
-    erts_bs_private_append_checked_with_update, erts_bs_private_append_fast,
-    erts_bs_private_append_fast_with_update, external_binary_magic, is_match_context,
-    is_writable_binary, match_position, set_match_position, sub_bits_flags, writable_bytes_mut,
-    writable_capacity, writable_extend_private, writable_finalize, writable_gc_visit,
-    writable_resize_private,
+    BinaryOwner, ExternalBinary, PreparedWritableAppend, PrivateAppendUpdate, RefcBinary,
+    SUB_BITS_MUTABLE, SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes,
+    binary_offset_adjustment, binary_owner, erts_bs_private_append_checked,
+    erts_bs_private_append_checked_with_heap, erts_bs_private_append_checked_with_update,
+    erts_bs_private_append_fast, erts_bs_private_append_fast_with_update, external_binary_magic,
+    is_match_context, is_writable_binary, match_position, set_match_position, sub_bits_flags,
+    writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
+    writable_gc_visit, writable_resize_private,
 };
 pub use copy::{
     SharedCopyCache, copy_ets_element, copy_flat_tuple, copy_shallow, copy_shared, copy_struct,
@@ -75,10 +75,10 @@ pub use hash::{
 };
 pub use heap::{
     AdoptError, BinaryRef, CP_WORDS, ConsHeapBuilder, ConsHeapChain, ConsHeapSegment,
-    ConsListBuilder, FrameLayout, HeapAlloc, HeapBinaryWriter, HeapBlockBuilder, HeapReservation,
-    HeapReservationState, HeapReservationWords, HeapTermSlot, LiteralArea, MfaLocation, NativeAbi,
-    ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TermBuilder, Tuple3Chain, TupleBuilder, VecHeap,
-    flat_key_cmp,
+    ConsListBuilder, FrameLayout, HAllocReservation, HeapAlloc, HeapBinaryWriter, HeapBlockBuilder,
+    HeapReservation, HeapReservationState, HeapReservationWords, HeapTermSlot, LiteralArea,
+    MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TermBuilder,
+    Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
 };
 pub use identity::{Identity, Node, set_this_node, this_node};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};

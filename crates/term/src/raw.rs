@@ -6,7 +6,8 @@
 //! [`Tuple`], [`boxed_header`]); it is public so that BIF loops outside this crate can walk
 //! lists and tuples with erts-shaped code while staying in safe Rust.
 
-use crate::{ARITY, EMPTY_TUPLE, HeapAlloc, Term, TermError};
+use crate::{ARITY, BIN_REF, EMPTY_TUPLE, HeapAlloc, SUB_BITS, Term, TermError};
+use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
 
 /// Rebuilds a term from its tagged word after it has been held by the ETF work stack.
@@ -149,6 +150,109 @@ pub(crate) fn copy_words(src: usize, dst: usize, words: usize) {
 pub(crate) fn boxed_words(header: u64, address: usize) -> usize {
     // SAFETY: the contract above.
     unsafe { crate::hamt::boxed_object_words(header, address as *const u64) }
+}
+
+/// Validated raw view of one `SUB_BITS` heap object.
+// Port of erts/emulator/beam/erl_bits.h (`ErlSubBits`), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) struct SubBitsRecord(usize);
+
+impl SubBitsRecord {
+    /// Resolve a live sub-bits term without retaining a Rust reference across mutation.
+    #[inline(always)]
+    pub(crate) fn from_term(term: Term) -> Option<Self> {
+        if term.header()? & 63 != SUB_BITS {
+            return None;
+        }
+        // SAFETY: the term header proves the five-word SUB_BITS layout and callers keep its
+        // owning heap stable until this view is discarded.
+        Some(Self(unsafe { term.raw_ptr() as usize }))
+    }
+
+    #[inline(always)]
+    pub(crate) fn flags(self) -> u64 {
+        load(self.0 + 8) & 3
+    }
+
+    #[inline(always)]
+    pub(crate) fn original(self) -> Term {
+        Term(load(self.0 + 32))
+    }
+
+    #[inline(always)]
+    pub(crate) fn end(self) -> usize {
+        load(self.0 + 24) as usize
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_flags(self, flags: u64) {
+        store(self.0 + 8, flags);
+    }
+
+    #[inline(always)]
+    pub(crate) fn address(self) -> usize {
+        self.0
+    }
+}
+
+/// Validated direct view of a process `BinRef` and its reference-counted `Binary`.
+// Port of erts/emulator/beam/erl_binary.h (`BinRef`), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) struct BinRefRecord {
+    address: usize,
+    binary: BinaryView<'static>,
+}
+
+/// Load an X register indexed by a value emitted from a validated Beam instruction.
+///
+/// The BeamAsm checked-append emitter passes constant register indexes taken from the
+/// instruction's X-register operands; these are within the process register vector.
+#[inline(always)]
+pub fn trusted_jit_register(registers: std::ptr::NonNull<Term>, index: usize) -> Term {
+    // SAFETY: the checked-append JIT call passes an X-register index validated while building
+    // the append plan, and the process-owned register base has that slot allocated.
+    unsafe { *registers.as_ptr().add(index) }
+}
+
+/// Store a rooted BinRef into an X register indexed by a checked-append JIT operand.
+#[inline(always)]
+pub fn set_trusted_jit_register(registers: std::ptr::NonNull<Term>, index: usize, term: Term) {
+    // SAFETY: the checked-append JIT call passes its live X-register index from the instruction
+    // metadata, bounded by the process register allocation.
+    unsafe { *registers.as_ptr().add(index) = term };
+}
+
+impl BinRefRecord {
+    /// Resolve a `BinRef` without consulting the heap's owner registry.
+    #[inline(always)]
+    pub(crate) fn from_term(term: Term) -> Option<Self> {
+        if term.header()? & 63 != BIN_REF {
+            return None;
+        }
+        // SAFETY: the validated live BinRef keeps its Binary allocation alive; its value word
+        // is stable while the process is not concurrently collecting or appending.
+        unsafe {
+            let address = term.raw_ptr() as usize;
+            let value = load(address + 8);
+            if crate::bits::bin_ref_val_is_external(value) {
+                return None;
+            }
+            let header = value as *const u64;
+            let capacity = load(header as usize + 24) as usize;
+            let binary = BinaryView::from_header(header, 4 + capacity.div_ceil(8));
+            Some(Self { address, binary })
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn address(&self) -> usize {
+        self.address
+    }
+
+    #[inline(always)]
+    pub(crate) fn binary(&self) -> BinaryView<'static> {
+        self.binary
+    }
 }
 
 // ---------------------------------------------------------------------------------------

@@ -270,6 +270,20 @@ pub(crate) fn exact_flat_key_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering 
 pub trait HeapAlloc {
     /// Reserve contiguous words, or return `None` so the caller can collect.
     fn alloc(&mut self, words: usize) -> Option<*mut u64>;
+    /// Reserve words with the `HAlloc` cursor check used by native term construction.
+    ///
+    /// Port of `HAlloc` in `erts/emulator/beam/erl_vm.h`, OTP-29.1.1.
+    #[inline]
+    fn alloc_halloc(&mut self, words: usize) -> Option<*mut u64> {
+        self.alloc(words)
+    }
+    /// Reserve `words` with `HAlloc`, requiring `extra` additional free words without consuming them.
+    ///
+    /// Port of `HeapWordsLeft` plus `HAlloc` in `erts/emulator/beam/erl_vm.h`, OTP-29.1.1.
+    #[inline]
+    fn alloc_halloc_with_extra(&mut self, words: usize, _extra: usize) -> Option<*mut u64> {
+        self.alloc_halloc(words)
+    }
     /// Stable identity for reservations which outlive one borrowing call.
     fn allocator_identity(&self) -> usize {
         std::ptr::from_ref(self).cast::<()>() as usize
@@ -1666,6 +1680,29 @@ pub struct ProcessHeap {
     live_frag_valid: std::cell::Cell<bool>,
 }
 
+/// HAlloc space validated for a fixed heap object plus words reserved for following stores.
+pub struct HAllocReservation<'a> {
+    heap: &'a mut ProcessHeap,
+    used_words: usize,
+}
+
+impl<'a> HAllocReservation<'a> {
+    /// Advance HTOP by the object size after the caller's single HeapWordsLeft check.
+    // Port of `HeapOnlyAlloc` in erts/emulator/beam/erl_vm.h:195-210, OTP-29.1.1.
+    #[inline(always)]
+    pub fn allocate(self) -> *mut u64 {
+        self.allocate_with_heap().0
+    }
+
+    /// Advance HTOP and return the same process heap for ProcBin linking.
+    #[inline(always)]
+    pub fn allocate_with_heap(self) -> (*mut u64, &'a mut ProcessHeap) {
+        let top = self.heap.abi.htop;
+        self.heap.abi.htop = top.wrapping_add(self.used_words);
+        (top, self.heap)
+    }
+}
+
 /// Word kinds found while walking the live Erlang stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StackWord {
@@ -1742,77 +1779,65 @@ impl Drop for OffHeapLists {
 }
 
 #[derive(Default)]
-pub(crate) struct LazyOwners(Option<Box<HeapOwners>>);
+pub(crate) struct LazyOwners(pub(crate) HeapOwners);
 impl Drop for LazyOwners {
     fn drop(&mut self) {
-        if let Some(owners) = self.0.as_deref() {
-            crate::gc::release_off_heap_chain(owners.off_heap_first);
-            crate::gc::release_off_heap_chain(owners.wrt_bins);
-        }
+        crate::gc::release_off_heap_chain(self.0.off_heap_first);
+        crate::gc::release_off_heap_chain(self.0.wrt_bins);
     }
 }
 
 impl LazyOwners {
     pub(crate) fn as_mut(&mut self) -> Option<&mut HeapOwners> {
-        self.0.as_deref_mut()
+        Some(&mut self.0)
     }
 
-    /// Whether the off-heap owner box has been created. A minor GC of a process
-    /// with no binaries must not allocate one.
+    /// Whether this process has state that needs off-heap collection work.
     pub(crate) fn is_allocated(&self) -> bool {
-        self.0.is_some()
+        self.0.off_heap_first != 0
+            || self.0.wrt_bins != 0
+            || self.0.overhead != 0
+            || self.0.vheap.min != 46_422
+            || self.0.vheap.old != 0
+            || self.0.vheap.old_size != 46_422
+            || self.0.detached.is_some()
     }
 
-    /// The refc and writable off-heap list heads, both zero without an owner box.
+    /// The refc and writable off-heap list heads in process state.
     pub(crate) fn chain_heads(&self) -> (usize, usize) {
-        self.0
-            .as_ref()
-            .map_or((0, 0), |owners| (owners.off_heap_first, owners.wrt_bins))
+        (self.0.off_heap_first, self.0.wrt_bins)
     }
 
     pub(crate) fn overhead(&self) -> u64 {
-        self.0.as_ref().map_or(0, |owners| owners.overhead)
+        self.0.overhead
     }
 
     pub(crate) fn vheap_min(&self) -> u64 {
-        self.0
-            .as_ref()
-            .map(|owners| owners.vheap.min)
-            .unwrap_or(46_422)
+        self.0.vheap.min
     }
 
     pub(crate) fn vheap_old(&self) -> u64 {
-        self.0.as_ref().map(|owners| owners.vheap.old).unwrap_or(0)
+        self.0.vheap.old
     }
 
     pub(crate) fn vheap_old_size(&self) -> u64 {
-        self.0
-            .as_ref()
-            .map(|owners| owners.vheap.old_size)
-            .unwrap_or(46_422)
+        self.0.vheap.old_size
     }
 
     pub(crate) fn has_collection_state(&self) -> bool {
-        let Some(owners) = self.0.as_deref() else {
-            return false;
-        };
-        owners.vheap.min != 46_422 || owners.vheap.old != 0 || owners.vheap.old_size != 46_422
+        self.0.vheap.min != 46_422 || self.0.vheap.old != 0 || self.0.vheap.old_size != 46_422
     }
 }
 
 impl std::ops::Deref for LazyOwners {
     type Target = HeapOwners;
     fn deref(&self) -> &Self::Target {
-        static EMPTY: std::sync::OnceLock<HeapOwners> = std::sync::OnceLock::new();
-        self.0
-            .as_deref()
-            .unwrap_or_else(|| EMPTY.get_or_init(HeapOwners::default))
+        &self.0
     }
 }
 impl std::ops::DerefMut for LazyOwners {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
-            .get_or_insert_with(|| Box::new(HeapOwners::default()))
+        &mut self.0
     }
 }
 
@@ -1856,10 +1881,12 @@ impl ProcessHeap {
     /// Byte offset of `fragment_words` (`mbuf_sz`) in the heap, for the native GC-desired test.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
     pub const FRAGMENT_WORDS_OFFSET: usize = std::mem::offset_of!(ProcessHeap, fragment_words);
-    /// Byte offset of the optional boxed `HeapOwners` pointer in the heap.
-    pub const OWNERS_POINTER_OFFSET: usize = std::mem::offset_of!(ProcessHeap, owners);
-    /// Byte offset of `HeapOwners::overhead` from the boxed owners pointer.
-    pub const OWNERS_OVERHEAD_OFFSET: usize = std::mem::offset_of!(HeapOwners, overhead);
+    /// Byte offset of the process off-heap overhead field.
+    /// Size of the owner state kept inline, as `Process.off_heap` is in erts.
+    pub const OWNERS_SIZE: usize = std::mem::size_of::<HeapOwners>();
+    pub const OFF_HEAP_OVERHEAD_OFFSET: usize = std::mem::offset_of!(ProcessHeap, owners)
+        + std::mem::offset_of!(LazyOwners, 0)
+        + std::mem::offset_of!(HeapOwners, overhead);
     /// Byte offset of `bin_vheap_size` (`bin_vheap_sz`) in the heap.
     pub const BIN_VHEAP_SIZE_OFFSET: usize = std::mem::offset_of!(ProcessHeap, bin_vheap_size);
     /// Byte offset of `gc_enabled` in the heap.
@@ -2067,8 +2094,74 @@ impl ProcessHeap {
     }
     /// Young-heap words available to `HAlloc` before it uses a fragment.
     // Port of erts/emulator/beam/erl_vm.h:150-175 (HAllocX/HeapWordsLeft), OTP-29.1.1.
+    #[inline(always)]
     pub fn halloc_words_left(&self) -> Option<usize> {
         (!self.detached).then(|| self.heap_limit_words().saturating_sub(self.htop_index()))
+    }
+    /// Check `HeapWordsLeft` once and reserve object words plus a following-store allowance.
+    #[inline(always)]
+    pub fn reserve_halloc(
+        &mut self,
+        used_words: usize,
+        extra_words: usize,
+    ) -> Option<HAllocReservation<'_>> {
+        if self.detached {
+            return None;
+        }
+        let required = used_words.wrapping_add(extra_words);
+        let top = self.abi.htop as usize;
+        let limit = (self.abi.stop as usize)
+            .wrapping_add(self.bif_hidden_words << 3)
+            .wrapping_sub(crate::S_REDZONE << 3)
+            .max(top);
+        let available_words = limit.wrapping_sub(top) >> 3;
+        (available_words >= required).then_some(HAllocReservation {
+            heap: self,
+            used_words,
+        })
+    }
+    /// Reserve process-heap words using the attached-process `HeapWordsLeft` path.
+    // Port of erts/emulator/beam/erl_vm.h:175 (`HeapWordsLeft`), OTP-29.1.1.
+    #[inline(always)]
+    pub fn reserve_native_halloc(
+        &mut self,
+        used_words: usize,
+        extra_words: usize,
+    ) -> Option<HAllocReservation<'_>> {
+        debug_assert!(!self.detached);
+        let required_bytes = used_words
+            .wrapping_add(extra_words)
+            .wrapping_mul(std::mem::size_of::<u64>());
+        let top = self.abi.htop as usize;
+        let limit = (self.abi.stop as usize)
+            .wrapping_add(self.bif_hidden_words << 3)
+            .wrapping_sub(crate::S_REDZONE << 3)
+            .max(top);
+        if limit.wrapping_sub(top) < required_bytes {
+            None
+        } else {
+            Some(HAllocReservation {
+                heap: self,
+                used_words,
+            })
+        }
+    }
+
+    /// Link a freshly built append binary to the process writable-bin chain.
+    // Port of `build_writable_bitstring` in erts/emulator/beam/erl_bits.c:1675-1700, OTP-29.1.1.
+    #[inline(always)]
+    pub fn link_writable_append_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        overhead_words: u64,
+        owner: arinsal_alloc::raw::OwnedBinaryRef,
+    ) {
+        debug_assert!(!self.detached);
+        let owners = &mut self.owners.0;
+        crate::raw::store(bin_ref.wrapping_add(2) as usize, owners.wrt_bins as u64);
+        owners.wrt_bins = bin_ref as usize;
+        owners.overhead = owners.overhead.wrapping_add(overhead_words);
+        owner.transfer_to_bin_ref(bin_ref);
     }
     /// Allocate on the young heap only when `HAlloc` stays below `HEAP_LIMIT`.
     // Port of erts/emulator/beam/erl_vm.h:150-162 (HAllocX), OTP-29.1.1.
@@ -2090,6 +2183,37 @@ impl ProcessHeap {
             return Some(top as *mut u64);
         }
         self.alloc_halloc_slow(words)
+    }
+
+    /// Allocate `words` while keeping `extra` words available for native stores.
+    // Port of `HeapWordsLeft` and `HAlloc` in erts/emulator/beam/erl_vm.h, OTP-29.1.1.
+    #[inline(always)]
+    pub fn alloc_halloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        if self.detached {
+            return self
+                .owners
+                .detached
+                .as_deref_mut()?
+                .alloc_with_extra(words, extra);
+        }
+        let required = words.checked_add(extra)?;
+        if required < (1 << 40) {
+            let top = self.abi.htop as usize;
+            let end = top.wrapping_add(required << 3);
+            if end.wrapping_add(crate::S_REDZONE << 3)
+                <= self.abi.stop as usize + (self.bif_hidden_words << 3)
+            {
+                self.abi.htop = top.wrapping_add(words << 3) as *mut u64;
+                return Some(top as *mut u64);
+            }
+        }
+        let limit = self.heap_limit_words();
+        if required > limit.saturating_sub(self.htop_index()) {
+            return None;
+        }
+        let top = self.abi.htop as usize;
+        self.abi.htop = top.checked_add(words.checked_mul(8)?)? as *mut u64;
+        Some(top as *mut u64)
     }
 
     #[cold]
@@ -2520,11 +2644,10 @@ impl ProcessHeap {
         for root in roots.iter_mut() {
             **root = Term(rebase(root.0));
         }
-        if let Some(owners) = source.owners.0.as_deref_mut() {
-            for head in [&mut owners.off_heap_first, &mut owners.wrt_bins] {
-                if range.contains(&*head) {
-                    *head = (*head as u64).wrapping_add(delta) as usize;
-                }
+        let owners = &mut source.owners.0;
+        for head in [&mut owners.off_heap_first, &mut owners.wrt_bins] {
+            if range.contains(&*head) {
+                *head = (*head as u64).wrapping_add(delta) as usize;
             }
         }
         self.set_htop_index(self.htop_index() + (used));
@@ -2607,18 +2730,20 @@ impl ProcessHeap {
     }
 
     pub(crate) fn absorb_owners(&mut self, mut source: LazyOwners, bin_vheap: u64) {
-        if let Some(owners) = source.0.take() {
-            let source_old_vheap = owners.vheap.old;
-            self.bin_vheap = self.bin_vheap.saturating_add(bin_vheap);
-            self.owners.vheap.old = self.owners.vheap.old.saturating_add(source_old_vheap);
-            if let Some(target) = self.owners.0.as_mut() {
-                Self::prepend_bin_ref_chain(&mut target.off_heap_first, owners.off_heap_first);
-                Self::prepend_bin_ref_chain(&mut target.wrt_bins, owners.wrt_bins);
-                target.overhead = target.overhead.saturating_add(owners.overhead);
-            } else {
-                self.owners.0 = Some(owners);
-            }
+        if !source.is_allocated() {
+            return;
         }
+        self.bin_vheap = self.bin_vheap.saturating_add(bin_vheap);
+        self.owners.vheap.old = self.owners.vheap.old.saturating_add(source.vheap.old);
+        Self::prepend_bin_ref_chain(
+            &mut self.owners.off_heap_first,
+            std::mem::take(&mut source.off_heap_first),
+        );
+        Self::prepend_bin_ref_chain(
+            &mut self.owners.wrt_bins,
+            std::mem::take(&mut source.wrt_bins),
+        );
+        self.owners.overhead = self.owners.overhead.saturating_add(source.overhead);
     }
 
     fn prepend_bin_ref_chain(head: &mut usize, prefix: usize) {
@@ -2931,6 +3056,14 @@ impl HeapAlloc for ProcessHeap {
         Some(ptr)
     }
     #[inline]
+    fn alloc_halloc(&mut self, words: usize) -> Option<*mut u64> {
+        ProcessHeap::alloc_halloc(self, words)
+    }
+    #[inline]
+    fn alloc_halloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        ProcessHeap::alloc_halloc_with_extra(self, words, extra)
+    }
+    #[inline]
     fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
         if self.detached {
             return self
@@ -2977,22 +3110,24 @@ impl HeapAlloc for ProcessHeap {
         overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
     ) -> Result<(), TermError> {
-        if self.detached
-            && let Some(heap) = self.owners.detached.as_deref_mut()
-        {
-            return heap.link_bin_ref(bin_ref, writable, overhead_words, owner);
+        if self.detached {
+            if let Some(heap) = self.owners.0.detached.as_deref_mut() {
+                return heap.link_bin_ref(bin_ref, writable, overhead_words, owner);
+            }
+            return Err(TermError::Unsupported("detached heap owner"));
         }
+        let owners = &mut self.owners.0;
         let head = if writable {
-            &mut self.owners.wrt_bins
+            &mut owners.wrt_bins
         } else {
-            &mut self.owners.off_heap_first
+            &mut owners.off_heap_first
         };
         store(bin_ref.wrapping_add(2), *head as u64);
         *head = bin_ref as usize;
         if let Some(owner) = owner {
             owner.transfer_to_bin_ref(bin_ref);
         }
-        self.owners.overhead = self.owners.overhead.saturating_add(overhead_words);
+        owners.overhead = owners.overhead.saturating_add(overhead_words);
         Ok(())
     }
     fn add_bin_vheap(&mut self, words: u64) {
@@ -3050,7 +3185,7 @@ impl HeapAlloc for ProcessHeap {
         new_size_bits: usize,
     ) {
         if self.detached {
-            if let Some(heap) = self.owners.detached.as_deref_mut() {
+            if let Some(heap) = self.owners.0.detached.as_deref_mut() {
                 heap.update_writable_binary_overhead(source, old_size_bits, new_size_bits);
             }
             return;
@@ -3062,12 +3197,13 @@ impl HeapAlloc for ProcessHeap {
             0
         };
         let old_start = self.old_words.as_ptr() as usize;
-        let old_end = old_start.saturating_add(self.old_htop.saturating_mul(8));
+        let old_end = old_start.wrapping_add(self.old_htop.wrapping_mul(8));
         let old_generation = bin_ref >= old_start && bin_ref < old_end;
+        let owners = &mut self.owners.0;
         if old_generation {
-            self.owners.vheap.old = self.owners.vheap.old.wrapping_add(increase);
+            owners.vheap.old = owners.vheap.old.wrapping_add(increase);
         } else {
-            self.owners.overhead = self.owners.overhead.wrapping_add(increase);
+            owners.overhead = owners.overhead.wrapping_add(increase);
         }
     }
     fn supports_writable_binary(&self) -> bool {
