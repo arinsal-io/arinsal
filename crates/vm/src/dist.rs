@@ -2298,7 +2298,7 @@ pub(crate) fn native_signal(
                 info,
                 crate::proc_create::OriginMonitor::Distributed { alias_mode },
             );
-            process.cold_mut().monitors.insert(origin);
+            process.monitors.insert(origin);
             Ok(reference)
         }
         "demonitor" => {

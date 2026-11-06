@@ -48,10 +48,11 @@ pub(super) fn system_info(
         )
         .map_err(|_| badarg());
         return Some(argument.and_then(|argument| {
-            Err(VmError::TrapExport(crate::ExportTrap {
-                continuation: "erlang:alloc_sizes/1",
-                args: vec![argument],
-            }))
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "erlang:alloc_sizes/1",
+                vec![argument],
+            )))
         }));
     }
     if let [OwnedTerm::Atom(operation), OwnedTerm::Atom(allocator)] = parts.as_slice()

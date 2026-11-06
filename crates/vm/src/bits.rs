@@ -892,6 +892,7 @@ fn construct_fail(segments: &[Segment<'_>], index: usize, frame: &str) -> VmErro
         ),
     ]);
     VmError::Trap(crate::exceptions::Trap {
+        export: None,
         class: arinsal_bifs::Class::Error,
         reason: crate::signals::atom("badarg"),
         trace: None,

@@ -5106,7 +5106,6 @@ pub(crate) fn fire_port_monitor(runtime: &crate::process::Runtime, port_id: u64,
 /// connected process).
 fn link_opener(process: &mut Process, id: u64) {
     let _ = process
-        .cold_mut()
         .links
         .lookup_insert(crate::proc_create::port_link(id));
 }
@@ -5135,10 +5134,7 @@ pub(crate) fn link(
             "unlink",
             &[port],
         );
-        process
-            .cold_mut()
-            .links
-            .remove(crate::proc_create::port_link_key(id));
+        process.links.remove(crate::proc_create::port_link_key(id));
     } else {
         link_opener(process, id);
     }
@@ -5146,10 +5142,7 @@ pub(crate) fn link(
     if let Some(drv) = handle.drv_port() {
         let done = drv_sig::link(runtime, &handle, &drv, pid, linked);
         if linked && !done {
-            process
-                .cold_mut()
-                .links
-                .remove(crate::proc_create::port_link_key(id));
+            process.links.remove(crate::proc_create::port_link_key(id));
         }
         return Ok(done || !linked);
     }
@@ -5159,10 +5152,7 @@ pub(crate) fn link(
     let ports = runtime.ports.read().unwrap();
     if linked && !runtime.ports.contains(id) {
         drop(ports);
-        process
-            .cold_mut()
-            .links
-            .remove(crate::proc_create::port_link_key(id));
+        process.links.remove(crate::proc_create::port_link_key(id));
         return Ok(false);
     }
     let mut links = handle.links.lock();

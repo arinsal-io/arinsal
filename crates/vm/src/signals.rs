@@ -724,8 +724,11 @@ fn light_demonitor_miss(
     let reference = *args.first()?;
     let ids = reference.local_ref_numbers()?;
     let id = arinsal_bifs::ordinary_ref_key(ids);
-    if let Some(cold) = process.cold.as_ref()
-        && (cold.monitors.get_state(id).is_some() || cold.dist_monitors.contains(&id))
+    if process.monitors.get_state(id).is_some()
+        || process
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.dist_monitors.contains(&id))
     {
         return None;
     }
@@ -745,11 +748,14 @@ fn light_demonitor_miss(
 /// `erts_internal:flush_monitor_messages(Ref, Multi, Res)`, with `Multi` false for a plain monitor.
 // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2 flush_messages: BIF_TRAP3
 // flush_monitor_messages_trap), OTP-29.1.1.
-fn flush_monitor_trap(reference: Term, result: Term) -> VmError {
-    VmError::TrapExport(crate::ExportTrap {
-        continuation: FLUSH_MONITOR_CONTINUATION,
-        args: vec![reference, atom("false"), result],
-    })
+fn flush_monitor_trap(process: &Process, reference: Term, result: Term) -> VmError {
+    VmError::TrapExport(crate::ExportTrap::new(
+        // This BIF may run without a scheduler runtime in unit-level VM calls; the export entry
+        // helper then uses the same unloaded-export stub as `make_fun/3`.
+        process,
+        FLUSH_MONITOR_CONTINUATION,
+        vec![reference, atom("false"), result],
+    ))
 }
 
 const FLUSH_MONITOR_CONTINUATION: &str = "erts_internal:flush_monitor_messages/3";
@@ -1150,7 +1156,6 @@ fn create_child(
         // The link must be on the child before it becomes schedulable.
         if so.link {
             child
-                .cold_mut()
                 .links
                 .insert(crate::proc_create::process_link(parent_pid, false));
         }
@@ -1167,8 +1172,8 @@ fn create_child(
                     alias_mode: monitor.alias,
                 }),
             );
-            parent.cold_mut().monitors.insert(origin);
-            child.cold_mut().lt_monitors.insert(target);
+            parent.monitors.insert(origin);
+            child.lt_monitors.insert(target);
             if monitor.priority {
                 parent.cold_mut().prio_monitors.insert(id);
             }
@@ -1217,7 +1222,6 @@ fn create_child(
     let pid = spawned.pid();
     if so.link {
         parent
-            .cold_mut()
             .links
             .insert(crate::proc_create::process_link(pid, false));
     }
@@ -2352,7 +2356,7 @@ pub(crate) fn monitor_light(
         crate::proc_create::MonitorInfo::default(),
         crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf { alias_mode }),
     );
-    process.cold_mut().monitors.insert(origin);
+    process.monitors.insert(origin);
     if alias_mode.is_some() {
         // Bound before the signal leaves: the target may reply through the alias at once.
         rt_ref(process)?.alias_bind_prio(id, Some(me), false);
@@ -2371,7 +2375,7 @@ pub(crate) fn monitor_light(
         )
         .is_err()
     {
-        process.cold_mut().monitors.remove(id);
+        process.monitors.remove(id);
         if alias_mode.is_some() {
             rt_ref(process)?.alias_bind(id, None);
         }
@@ -2413,14 +2417,11 @@ pub(crate) fn alias_light(
     let id = process.next_ref();
     let reference = reference(process, id).ok()?;
     rt_ref(process)?.alias_bind_prio(id, Some(me), priority);
-    process
-        .cold_mut()
-        .monitors
-        .insert(crate::proc_create::origin_monitor(
-            id,
-            0,
-            crate::proc_create::OriginMonitor::Alias { mode, priority },
-        ));
+    process.monitors.insert(crate::proc_create::origin_monitor(
+        id,
+        0,
+        crate::proc_create::OriginMonitor::Alias { mode, priority },
+    ));
     Some(Ok(reference))
 }
 
@@ -2446,8 +2447,8 @@ pub(crate) fn unalias_light(
 // Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
 pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
     let mut remove = false;
-    let owned = if let Some(cold) = process.cold.as_mut() {
-        match cold.monitors.get_state_mut(id) {
+    let owned = {
+        match process.monitors.get_state_mut(id) {
             Some(crate::proc_create::OriginMonitor::Process(half)) => {
                 half.alias_mode.take().is_some()
             }
@@ -2464,12 +2465,10 @@ pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
             ) => alias_mode.take().is_some(),
             Some(crate::proc_create::OriginMonitor::PortOrigin) | None => false,
         }
-    } else {
-        false
     };
     if owned {
-        if remove && let Some(cold) = process.cold.as_mut() {
-            cold.monitors.remove(id);
+        if remove {
+            process.monitors.remove(id);
         }
         if let Some(runtime) = &process.runtime {
             runtime.alias_bind(id, None);
@@ -2484,13 +2483,14 @@ pub(crate) fn take_origin_monitor_down(
     process: &mut Process,
     id: u64,
 ) -> Option<crate::proc_create::ProcessMonitor> {
-    let cold = process.cold.as_mut()?;
-    let entry = cold.monitors.get_state(id)?;
+    let entry = process.monitors.get_state(id)?;
     if matches!(entry, crate::proc_create::OriginMonitor::Alias { .. }) {
         return None;
     }
-    let entry = cold.monitors.remove(id)?;
-    cold.dist_monitors.remove(&id);
+    let entry = process.monitors.remove(id)?;
+    if let Some(cold) = process.cold.as_mut() {
+        cold.dist_monitors.remove(&id);
+    }
     let mode = entry
         .state()
         .and_then(crate::proc_create::OriginMonitor::alias_mode);
@@ -2514,17 +2514,14 @@ pub(crate) fn take_origin_monitor_down(
 
 /// The alias a monitor with `explicit_unalias` leaves behind once it is gone.
 fn insert_explicit_unalias(process: &mut Process, id: u64) {
-    process
-        .cold_mut()
-        .monitors
-        .insert(crate::proc_create::origin_monitor(
-            id,
-            0,
-            crate::proc_create::OriginMonitor::Alias {
-                mode: crate::proc_create::AliasMode::ExplicitUnalias,
-                priority: false,
-            },
-        ));
+    process.monitors.insert(crate::proc_create::origin_monitor(
+        id,
+        0,
+        crate::proc_create::OriginMonitor::Alias {
+            mode: crate::proc_create::AliasMode::ExplicitUnalias,
+            priority: false,
+        },
+    ));
 }
 
 pub(crate) enum OriginDemonitor {
@@ -2538,12 +2535,9 @@ pub(crate) enum OriginDemonitor {
 
 // Port of erts/emulator/beam/bif.c (demonitor), OTP-29.1.1.
 pub(crate) fn demonitor_origin(process: &mut Process, id: u64) -> OriginDemonitor {
-    let Some(cold) = process.cold.as_mut() else {
-        return OriginDemonitor::Missing;
-    };
     // The reference lookup also decides whether this is an alias placeholder; erts performs
     // the same classification from the found node's type before deleting it.
-    let entry = match cold.monitors.remove_if(id, |flags| {
+    let entry = match process.monitors.remove_if(id, |flags| {
         flags & crate::monitor_link::node_flag::TYPE_MASK
             != crate::monitor_link::node_type::MONITOR_ALIAS
     }) {
@@ -2583,8 +2577,7 @@ fn finish_demonitor_origin(
 fn demonitor_process_origin(process: &mut Process, id: u64) -> Option<OriginDemonitor> {
     // Port of erts/emulator/beam/bif.c (demonitor_2), OTP-29.1.1: classify the located origin
     // monitor and delete it only when it is a local process monitor.
-    let cold = process.cold.as_mut()?;
-    let entry = match cold.monitors.remove_if(id, |flags| {
+    let entry = match process.monitors.remove_if(id, |flags| {
         flags & crate::monitor_link::node_flag::TYPE_MASK
             == crate::monitor_link::node_type::MONITOR_PROC
     }) {
@@ -2603,7 +2596,7 @@ fn demonitor_process_origin(process: &mut Process, id: u64) -> Option<OriginDemo
 
 /// `demonitor(Ref)` / `demonitor(Ref, Opts)` called directly from native code (erts bif.c:437-454
 /// and the local monitor case). Aliases, port and remote monitors take the executor. A flush
-/// with the monitor already gone traps to `flush_monitor_messages`, so that case also falls back.
+/// with the monitor already gone traps to `flush_monitor_messages` with its resolved export.
 // Port of erts/emulator/beam/bif.c:437-454 (demonitor), OTP-29.1.1.
 pub(crate) fn demonitor_light(
     process: &mut Process,
@@ -2635,7 +2628,17 @@ pub(crate) fn demonitor_light(
         OriginDemonitor::Distributed | OriginDemonitor::Port(_) => unreachable!(),
     };
     if active.is_none() && flush {
-        return None;
+        let result = Term::atom(if info {
+            arinsal_term::atoms::FALSE
+        } else {
+            arinsal_term::atoms::TRUE
+        });
+        let trap = crate::ExportTrap::new(
+            process,
+            FLUSH_MONITOR_CONTINUATION,
+            vec![reference, atom("false"), result],
+        );
+        return Some(Err(crate::exceptions::Trap::export(trap)));
     }
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
     let result = if let Some(pid) = active {
@@ -2664,7 +2667,7 @@ pub(crate) fn demonitor_light(
 /// Port of erts/emulator/beam/bif.c:1231-1248 (unlink_1): after sending the unlink op, mark the node
 /// with its id; a refused send (the peer is gone) deletes the node.
 fn unlink_mark(process: &mut Process, pid: Pid, id: u64, sent: bool) {
-    let links = &mut process.cold_mut().links;
+    let links = &mut process.links;
     if sent {
         if let Some(mut node) = links.get_mut(pid.data()) {
             node.set_unlinking(id);
@@ -2690,8 +2693,7 @@ pub(crate) fn unlink_light(
     let pid = Pid::from_term(*target)?;
     let me = process.self_pid?;
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let cold = process.cold.as_deref()?;
-    if !cold
+    if !process
         .links
         .get(pid.data())
         .is_some_and(|node| node.unlinking() == 0)
@@ -2742,17 +2744,11 @@ pub(crate) fn link_light(
     // Port of erts/emulator/beam/bif.c:165-183 (link_opt): a link that exists and is not
     // unlinking sends nothing.
     if process
-        .cold
-        .as_deref()?
         .links
         .get(pid.data())
         .is_some_and(|node| node.unlinking() == 0)
     {
-        process
-            .cold_mut()
-            .links
-            .get_mut(pid.data())?
-            .set_priority(false);
+        process.links.get_mut(pid.data())?.set_priority(false);
         return Some(Ok(atom("true")));
     }
     // A refused signal means the target is gone: leave the link state untouched and let the
@@ -2762,7 +2758,7 @@ pub(crate) fn link_light(
         .ok()?
         .signal_ordered_from(me, pid, arinsal_sched::Signal::Link, process.on_managed)
         .ok()?;
-    link_node_create(process.cold_mut(), pid, false);
+    link_node_create(&mut process.links, pid, false);
     Some(Ok(atom("true")))
 }
 
@@ -3061,17 +3057,14 @@ fn monitor_port(
         {
             return Err(badarg("monitor/2"));
         }
-        process
-            .cold_mut()
-            .monitors
-            .insert(crate::proc_create::origin_monitor(
-                reference_id,
-                0,
-                crate::proc_create::OriginMonitor::DistPort {
-                    alias_mode,
-                    object: Box::new(object.clone()),
-                },
-            ));
+        process.monitors.insert(crate::proc_create::origin_monitor(
+            reference_id,
+            0,
+            crate::proc_create::OriginMonitor::DistPort {
+                alias_mode,
+                object: Box::new(object.clone()),
+            },
+        ));
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let object =
             arinsal_term::from_owned(&object, &mut heap).map_err(|_| badarg("monitor/2"))?;
@@ -3092,18 +3085,15 @@ fn monitor_port(
     };
     // The port monitor stays in the origin tree until its DOWN signal is processed,
     // just like the monitor object in `erts_proc_sig_send_monitor_down`.
-    process
-        .cold_mut()
-        .monitors
-        .insert(crate::proc_create::origin_monitor(
-            reference_id,
-            0,
-            crate::proc_create::OriginMonitor::Port {
-                port_id,
-                alias_mode,
-                name,
-            },
-        ));
+    process.monitors.insert(crate::proc_create::origin_monitor(
+        reference_id,
+        0,
+        crate::proc_create::OriginMonitor::Port {
+            port_id,
+            alias_mode,
+            name,
+        },
+    ));
     let registered = port_id.and_then(|id| {
         runtime.ports.with_from(id, process.on_managed, |handle| {
             if tag != Term::atom(arinsal_term::atoms::DOWN) {
@@ -3324,11 +3314,10 @@ fn call_resolved(
                         &[pid_term],
                     );
                 }
-                let should_unlink = process.cold.as_deref().is_some_and(|cold| {
-                    cold.links
-                        .get(pid.data())
-                        .is_some_and(|node| node.unlinking() == 0)
-                });
+                let should_unlink = process
+                    .links
+                    .get(pid.data())
+                    .is_some_and(|node| node.unlinking() == 0);
                 if should_unlink {
                     let id = process
                         .runtime
@@ -3393,13 +3382,13 @@ fn call_resolved(
                         alias_mode,
                     }),
                 );
-                process.cold_mut().monitors.insert(origin);
+                process.monitors.insert(origin);
                 let signal = arinsal_sched::Signal::Monitor {
                     reference: id,
                     shared: target_half.into_shared(),
                 };
                 if let Err(error) = ctx.signal(pid, signal) {
-                    process.cold_mut().monitors.remove(id);
+                    process.monitors.remove(id);
                     if error != arinsal_sched::Error::NoProcess {
                         return Err(VmError::Unsupported(format!("monitor: {error}")));
                     }
@@ -3500,7 +3489,7 @@ fn call_resolved(
                 arinsal_term::atoms::TRUE
             });
             if flush && !was_active {
-                return Err(flush_monitor_trap(*reference, result));
+                return Err(flush_monitor_trap(process, *reference, result));
             }
             Ok(result)
         }
@@ -4664,7 +4653,7 @@ fn send_noproc_down(
                 alias_mode,
             }),
         );
-        process.cold_mut().monitors.insert(origin);
+        process.monitors.insert(origin);
         let reason = Message::copy_from(atom("noproc"))?;
         return runtime
             .scheduler()?
@@ -4780,7 +4769,7 @@ fn link_opt(
     crate::trace::linked(process, ctx.pid(), pid);
     // Port of erts/emulator/beam/bif.c:165-183 (link_opt): one lookup_create on the link tree;
     // a link that exists and is not unlinking sends nothing.
-    let send = link_node_create(process.cold_mut(), pid, priority);
+    let send = link_node_create(&mut process.links, pid, priority);
     let linked_term = pid.to_term().ok_or_else(|| badarg("link"))?;
     crate::trace::emit(
         Some(vm),
@@ -4817,8 +4806,8 @@ fn link_opt(
 
 /// `erts_link_internal_tree_lookup_create` plus the `unlinking` reset of `link_opt`
 /// (bif.c:165-183): returns whether a link signal must be sent.
-fn link_node_create(cold: &mut crate::proc_create::ProcessCold, pid: Pid, priority: bool) -> bool {
-    match cold.links.get_mut(pid.data()) {
+fn link_node_create(links: &mut crate::proc_create::LinkTree, pid: Pid, priority: bool) -> bool {
+    match links.get_mut(pid.data()) {
         Some(mut node) => {
             node.set_priority(priority);
             let unlinking = node.view().unlinking();
@@ -4826,8 +4815,7 @@ fn link_node_create(cold: &mut crate::proc_create::ProcessCold, pid: Pid, priori
             unlinking != 0
         }
         None => {
-            cold.links
-                .insert(crate::proc_create::process_link(pid, priority));
+            links.insert(crate::proc_create::process_link(pid, priority));
             true
         }
     }

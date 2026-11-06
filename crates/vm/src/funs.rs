@@ -564,20 +564,18 @@ impl Vm {
         tail: bool,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
-        let (module, function, arity) = crate::bif_traps::continuation_parts(trap.continuation)
-            .ok_or_else(|| VmError::Unsupported("trap continuation is not an MFA".into()))?;
+        let target = trap.target;
+        let (module, function, arity) = (target.module, target.function, target.arity);
         if arity != trap.args.len() {
             return Err(VmError::Unsupported(format!(
-                "trap to {} with {} arguments",
-                trap.continuation,
+                "trap to {module}:{function}/{arity} with {} arguments",
                 trap.args.len()
             )));
         }
-        let module_atom = global_atoms().get(module);
-        let function_atom = global_atoms().get(function);
+        let module_atom = trap.entry.module;
+        let function_atom = trap.entry.function;
         if !crate::trace_bp::any_pattern()
             && !crate::trace::saves_calls(p)
-            && let (Some(module_atom), Some(function_atom)) = (module_atom, function_atom)
             && !self.unloaded_on_load(p, module)
             && let Some(&module_id) = self.code.loaded.get(&module_atom)
             && let Some(target) = self.code.modules[module_id]
@@ -601,12 +599,6 @@ impl Vm {
                     .wrapping_add(target),
             ));
         }
-        let module_atom = global_atoms()
-            .intern(module)
-            .map_err(|error| VmError::Unsupported(format!("trap module atom: {error:?}")))?;
-        let function_atom = global_atoms()
-            .intern(function)
-            .map_err(|error| VmError::Unsupported(format!("trap function atom: {error:?}")))?;
         p.x.ensure_x(arity);
         p.x[..arity].copy_from_slice(&trap.args);
         self.call_named_atoms(

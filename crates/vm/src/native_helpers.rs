@@ -2397,7 +2397,7 @@ pub(crate) extern "C" fn process_bif_light(
     let Some(bif) = export.light_process_bif else {
         return park_executor(process, export, identity, false);
     };
-    match call_process_bif(process, registers, export, bif, false) {
+    match call_process_bif(process, registers, export, bif, false, identity as usize) {
         Some(raw) => raw,
         // The entry declined before any side effect: the executor runs the whole BIF.
         None => park_executor(process, export, identity, false),
@@ -2414,7 +2414,7 @@ pub(crate) extern "C" fn thin_bif_light<B: crate::natives::ThinProcessBif>(
     _regs: *mut u64,
     _i: u64,
     descriptor: u64,
-    _identity: u64,
+    identity: u64,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
@@ -2424,7 +2424,7 @@ pub(crate) extern "C" fn thin_bif_light<B: crate::natives::ThinProcessBif>(
             registers.x_reg_array[0] = value;
             crate::native_hooks::raw(value)
         }
-        Err(trap) => thin_bif_failed(process, registers, descriptor, *trap),
+        Err(trap) => thin_bif_failed(process, registers, descriptor, *trap, identity as usize),
     }
 }
 
@@ -2436,11 +2436,18 @@ fn thin_bif_failed(
     _registers: &mut arinsal_beamasm::SchedulerRegisters,
     descriptor: u64,
     trap: crate::exceptions::Trap,
+    identity: usize,
 ) -> u64 {
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    process_bif_result(process, export, usize::from(export.arity), Err(trap))
+    process_bif_result(
+        process,
+        export,
+        usize::from(export.arity),
+        Err(trap),
+        identity,
+    )
 }
 
 /// An ETS or process-dictionary BIF whose body is `direct_ets`.
@@ -2558,7 +2565,7 @@ fn invoke_dispatch_bif(
         && !((bif as usize)
             == (crate::natives::sys::garbage_collect_bif as *const () as usize)
             && process.gc_outer_queue_pending())
-        && let Some(raw) = call_process_bif(process, registers, export, bif, export_call)
+        && let Some(raw) = call_process_bif(process, registers, export, bif, export_call, identity)
     {
         return Some(raw);
     }
@@ -2627,7 +2634,7 @@ fn try_light_monitor(
         registers.x_reg_array[0] = value;
         return Some(crate::native_hooks::raw(value));
     }
-    Some(process_bif_result(process, export, arity, result))
+    Some(process_bif_result(process, export, arity, result, 0))
 }
 
 /// Calls a trapping BIF straight from native code; `None` when it trapped.
@@ -3588,6 +3595,7 @@ fn call_process_bif(
     export: ExportDispatch,
     bif: crate::natives::ProcessBif,
     export_call: bool,
+    identity: usize,
 ) -> Option<u64> {
     if export_call {
         charge_bif_reductions(process, 1);
@@ -3613,7 +3621,7 @@ fn call_process_bif(
                 }
                 crate::native_hooks::raw(value)
             }
-            Err(error) => process_bif_result(process, export, arity, Err(error)),
+            Err(error) => process_bif_result(process, export, arity, Err(error), identity),
         });
     }
     // The light fragment tests the collection after its call (instr_bif.cpp:488-523).
@@ -3627,7 +3635,7 @@ fn call_process_bif(
         registers.x_reg_array[0] = value;
         return Some(crate::native_hooks::raw(value));
     }
-    Some(process_bif_result(process, export, arity, result))
+    Some(process_bif_result(process, export, arity, result, identity))
 }
 
 /// A process BIF's exception, or a value after which a collection is desired.
@@ -3640,7 +3648,35 @@ fn process_bif_result(
     export: ExportDispatch,
     arity: usize,
     mut result: Result<Term, crate::exceptions::Trap>,
+    identity: usize,
 ) -> u64 {
+    if let Err(trap) = &mut result
+        && let Some(export_trap) = trap.export.take()
+    {
+        let mut export_trap = *export_trap;
+        // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*) and
+        // jit/arm/beam_asm_global.cpp:145-155 (emit_bif_export_trap), OTP-29.1.1.
+        // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and are the live roots
+        // while the process is parked in `beam_bif_export_trap`.
+        if crate::calls::gc_after_native_parts(process, &mut export_trap.args, None, None).is_err()
+        {
+            crate::native_hooks::set_error(process, "system_limit");
+            return 0;
+        }
+        let arity = export_trap.args.len();
+        process.x.ensure_x(arity);
+        process.x[..arity].copy_from_slice(&export_trap.args);
+        process.gc_live = arity;
+        crate::bif_traps::install_export_trap(
+            process,
+            identity,
+            (export.module_atom, export.function_atom),
+            &export_trap,
+        );
+        crate::bif_traps::arm_export_trap(process);
+        process.heap.abi.exc.freason = 1 << 10;
+        return 0;
+    }
     let collected = process.heap.gc_after_bif_desired();
     if collected {
         let mut args = argument_registers(process, arity);

@@ -1429,6 +1429,10 @@ pub(crate) struct Runtime {
     code: Arc<crate::code_ix::CodeIndexes>,
     /// The node's code scope, which keys its native code registries.
     pub(crate) code_scope: u64,
+    /// Runtime-owned stable exports indexed by the target id interned with each continuation.
+    /// The entry remains the indirection when a module replaces code, as in erts' export table.
+    trap_exports:
+        [OnceLock<Arc<arinsal_beamasm::bif::ExportEntry>>; crate::bif_traps::TRAP_EXPORT_CAPACITY],
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
     otp_root: Option<std::path::PathBuf>,
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
@@ -1589,7 +1593,44 @@ impl std::hash::Hasher for IdHasher {
     }
 }
 
+impl Process {
+    pub(crate) fn trap_export_entry(
+        &self,
+        target: &'static crate::bif_traps::ContinuationTarget,
+    ) -> Arc<arinsal_beamasm::bif::ExportEntry> {
+        self.runtime.map_or_else(
+            || {
+                Arc::new(arinsal_beamasm::bif::ExportEntry::new(
+                    target.module_atom,
+                    target.function_atom,
+                    target.arity as u8,
+                ))
+            },
+            |runtime| runtime.trap_export_entry(target),
+        )
+    }
+}
+
 impl Runtime {
+    // Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
+    pub(crate) fn trap_export_entry(
+        &self,
+        target: &'static crate::bif_traps::ContinuationTarget,
+    ) -> Arc<arinsal_beamasm::bif::ExportEntry> {
+        let mfa = (target.module_atom, target.function_atom, target.arity as u8);
+        let export = self
+            .trap_exports
+            .get(target.trap_export_id)
+            .expect("trap export table capacity")
+            .get_or_init(|| {
+                crate::beamasm_integration::export_get_or_make_stub(self.code_scope, mfa)
+                    .unwrap_or_else(|| {
+                        Arc::new(arinsal_beamasm::bif::ExportEntry::new(mfa.0, mfa.1, mfa.2))
+                    })
+            });
+        Arc::clone(export)
+    }
+
     /// Read ranges and module tables from one active code index.
     pub(crate) fn with_active_code<R>(
         &self,
@@ -5046,7 +5087,6 @@ impl Runtime {
         }
         if let Some(linker) = linker {
             child
-                .cold_mut()
                 .links
                 .insert(crate::proc_create::process_link(linker, false));
         }
@@ -5060,7 +5100,7 @@ impl Runtime {
                 crate::proc_create::MonitorInfo::default(),
                 crate::proc_create::OriginMonitor::Distributed { alias_mode: None },
             );
-            child.cold_mut().monitors.insert(target);
+            child.monitors.insert(target);
         }
         if let Some(arity) = u8::try_from(args.len()).ok()
             && (arinsal_bifs::lookup(module, function, arity).is_some()
@@ -5111,23 +5151,23 @@ impl Process {
             return;
         };
         if target.view().kind() == crate::monitor_link::node_type::MONITOR_DIST_PROC {
-            self.cold_mut().monitors.insert(target);
+            self.monitors.insert(target);
         } else {
-            self.cold_mut().lt_monitors.insert(target);
+            self.lt_monitors.insert(target);
         }
     }
 
     /// A demonitor by reference: of a remote origin (its target half is in the monitor tree) or
     /// of a NIF resource.
     fn remove_target_monitor(&mut self, reference: u64) {
+        if self
+            .monitors
+            .get(reference)
+            .is_some_and(|monitor| monitor.is_target())
+        {
+            self.monitors.remove(reference);
+        }
         if let Some(cold) = self.cold.as_deref_mut() {
-            if cold
-                .monitors
-                .get(reference)
-                .is_some_and(|monitor| monitor.is_target())
-            {
-                cold.monitors.remove(reference);
-            }
             cold.resource_monitors.remove(&reference);
         }
     }
@@ -5142,10 +5182,7 @@ impl Process {
         let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(data, false) else {
             return;
         };
-        let target = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.lt_monitors.remove_target_of(&origin));
+        let target = self.lt_monitors.remove_target_of(&origin);
         if let Some(target) = target {
             crate::proc_create::ProcessMonitor::release_both(origin, target);
         } else {
@@ -5203,9 +5240,7 @@ impl Process {
                     }
                 }
                 Payload::Signal(Signal::Unlink(id)) => {
-                    if let Some(cold) = self.cold.as_mut() {
-                        cold.links.remove(from.data());
-                    }
+                    self.links.remove(from.data());
                     let _ = ctx.signal(from, Signal::UnlinkAckSignal(id));
                 }
                 Payload::Signal(Signal::LiteralAreaCopy(copy)) => {
@@ -5538,10 +5573,7 @@ impl Process {
         // Further publishes fail with `NoProcess` and the watcher synthesizes DOWN.
         // Signals already queued are installed before we notify.
         self.absorb_exit_signals(ctx);
-        let Some(cold) = self.cold.as_mut() else {
-            return;
-        };
-        let links = cold.links.drain();
+        let links = self.links.drain();
         for node in links {
             if node.view().unlinking() != 0 {
                 continue;
@@ -5593,12 +5625,7 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor): the target
         // halves, of remote origins in the monitor tree and of local ones in the list.
-        let monitors = self
-            .cold
-            .as_mut()
-            .expect("process cold part")
-            .monitors
-            .drain();
+        let monitors = self.monitors.drain();
         for monitor in monitors {
             if monitor.view().is_target() {
                 let half = monitor.view();
@@ -5664,12 +5691,7 @@ impl Process {
                 _ => {}
             }
         }
-        let lt_monitors = self
-            .cold
-            .as_mut()
-            .expect("process cold part")
-            .lt_monitors
-            .drain();
+        let lt_monitors = self.lt_monitors.drain();
         for target in lt_monitors {
             let half = target.view();
             let reference = half.reference();
@@ -6631,18 +6653,14 @@ impl Process {
         let Some((Some(_), priority)) = runtime.alias_lookup_prio(alias) else {
             return Ok(false);
         };
-        let Some(entry) = self
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.monitors.get_state(alias))
-        else {
+        let Some(entry) = self.monitors.get_state(alias) else {
             return Ok(false);
         };
         if entry.alias_priority() != priority {
             return Ok(false);
         }
         if entry.alias_mode() == Some(crate::proc_create::AliasMode::ReplyDemonitor) {
-            let entry = self.cold_mut().monitors.remove(alias);
+            let entry = self.monitors.remove(alias);
             let state = entry.as_ref().and_then(|entry| entry.state()).cloned();
             match state {
                 Some(crate::proc_create::OriginMonitor::Process(_)) => {
@@ -6771,7 +6789,6 @@ impl Process {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
                 // the receiver reports getting_linked in signal order, for a new link only.
                 if let Err(duplicate) = self
-                    .cold_mut()
                     .links
                     .lookup_insert(crate::proc_create::process_link(from, false))
                 {
@@ -6784,17 +6801,12 @@ impl Process {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK) for a
             // link whose origin is a port.
             arinsal_sched::Signal::PortLink(id) => {
-                let _ = self
-                    .cold_mut()
-                    .links
-                    .lookup_insert(crate::proc_create::port_link(id));
+                let _ = self.links.lookup_insert(crate::proc_create::port_link(id));
                 0
             }
             // Port of erl_proc_sig_queue.c:6693-6713 (ERTS_SIG_Q_OP_UNLINK) for a port origin.
             arinsal_sched::Signal::PortUnlink(id) => {
-                if let Some(cold) = self.cold.as_mut() {
-                    cold.links.remove(crate::proc_create::port_link_key(id));
-                }
+                self.links.remove(crate::proc_create::port_link_key(id));
                 0
             }
             // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
@@ -6807,14 +6819,11 @@ impl Process {
             arinsal_sched::Signal::Unlink(id) => {
                 // Port of erl_proc_sig_queue.c:6693-6713: a pending local unlink keeps its
                 // link record until the matching acknowledgement is handled.
-                let removed =
-                    self.cold
-                        .as_mut()
-                        .is_some_and(|cold| match cold.links.get(from.data()) {
-                            Some(node) if node.unlinking() != 0 => false,
-                            Some(_) => cold.links.remove(from.data()).is_some(),
-                            None => false,
-                        });
+                let removed = match self.links.get(from.data()) {
+                    Some(node) if node.unlinking() != 0 => false,
+                    Some(_) => self.links.remove(from.data()).is_some(),
+                    None => false,
+                };
                 if removed {
                     self.trace_getting_unlinked(ctx, from);
                 }
@@ -6880,16 +6889,11 @@ impl Process {
                 // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
                 // process that survives it traces getting_unlinked.
                 let priority = message.is_priority()
-                    || self.cold.as_ref().is_some_and(|cold| {
-                        cold.links
-                            .get(from.data())
-                            .is_some_and(|node| node.is_priority())
-                    });
-                let was_linked = linked_exit
-                    && self
-                        .cold
-                        .as_mut()
-                        .is_some_and(|cold| cold.links.remove(from.data()).is_some());
+                    || self
+                        .links
+                        .get(from.data())
+                        .is_some_and(|node| node.is_priority());
+                let was_linked = linked_exit && self.links.remove(from.data()).is_some();
                 let mut message = message;
                 let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
@@ -6938,8 +6942,8 @@ impl Process {
                 let port = port.into_receiver(self)?;
                 let reason = reason.into_receiver(self)?;
                 // erts_proc_sig_handle_exit: the link to the exiting port is deleted.
-                if let (Some(id), Some(cold)) = (port.as_port(), self.cold.as_mut()) {
-                    cold.links.remove(crate::proc_create::port_link_key(id));
+                if let Some(id) = port.as_port() {
+                    self.links.remove(crate::proc_create::port_link_key(id));
                 }
                 if reason == crate::signals::atom("kill") {
                     return Err(VmError::Trap(crate::exceptions::Trap::killed()));
@@ -6999,13 +7003,12 @@ impl Process {
             }
             arinsal_sched::Signal::UnlinkAckSignal(id) => {
                 // Port of erl_proc_sig_queue.c:6745-6772: removing the link costs 4.
-                if let Some(cold) = self.cold.as_mut()
-                    && cold
-                        .links
-                        .get(from.data())
-                        .is_some_and(|node| node.unlinking() == id)
+                if self
+                    .links
+                    .get(from.data())
+                    .is_some_and(|node| node.unlinking() == id)
                 {
-                    cold.links.remove(from.data());
+                    self.links.remove(from.data());
                     4
                 } else {
                     0
@@ -8802,9 +8805,7 @@ impl Process {
                             .as_ref()
                             .and_then(|cold| cold.receive_markers.as_ref())
                             .map_or(0, |markers| markers.len()),
-                        self.cold
-                            .as_ref()
-                            .map_or(0, |cold| cold.monitors.iter().count()),
+                        self.monitors.iter().count(),
                         crate::PF_SPAWN_CONSTRUCTS.load(Ordering::Relaxed),
                         crate::PF_SPAWN_CONSTRUCT_NS.load(Ordering::Relaxed),
                         crate::signals::PF_SPAWN_FUN_LOAD_NS.load(Ordering::Relaxed),
@@ -9067,6 +9068,7 @@ impl Vm {
                 backtrace_depth: AtomicUsize::new(8),
                 code: Arc::clone(&code),
                 code_scope: self.code_scope,
+                trap_exports: std::array::from_fn(|_| OnceLock::new()),
                 system_processes: Mutex::new(std::collections::HashSet::new()),
                 otp_root: self.otp_root.clone(),
                 dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),

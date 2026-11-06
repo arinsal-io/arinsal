@@ -191,10 +191,25 @@ pub enum VmError {
 /// An Erlang export a BIF traps to, with the arguments it is called with.
 #[derive(Debug)]
 pub struct ExportTrap {
-    /// The export as `module:function/arity`.
-    pub continuation: &'static str,
+    /// The stable export entry that dispatches the continuation after code replacement.
+    pub entry: std::sync::Arc<arinsal_beamasm::bif::ExportEntry>,
+    /// Parsed continuation metadata for Arinsal's interpreter and trap handler.
+    pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
     /// Arguments, X0 onwards.
     pub args: Vec<Term>,
+}
+
+impl ExportTrap {
+    /// Builds a BIF export trap from the runtime's stable export entry.
+    // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP* names the Export*), OTP-29.1.1.
+    pub(crate) fn new(process: &Process, continuation: &'static str, args: Vec<Term>) -> Self {
+        let target = crate::bif_traps::continuation_target(continuation);
+        Self {
+            entry: process.trap_export_entry(target),
+            target,
+            args,
+        }
+    }
 }
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -211,7 +226,17 @@ impl std::fmt::Display for VmError {
             Self::Trap(_) => write!(f, "unhandled BEAM exception"),
             Self::Raised(raised) => raised.fmt(f),
             Self::Load(s) => write!(f, "{s}"),
-            Self::TrapExport(trap) => write!(f, "trap to {}", trap.continuation),
+            Self::TrapExport(trap) => write!(
+                f,
+                "trap to {}:{}/{}",
+                arinsal_term::global_atoms()
+                    .text(trap.entry.module)
+                    .unwrap_or("?"),
+                arinsal_term::global_atoms()
+                    .text(trap.entry.function)
+                    .unwrap_or("?"),
+                trap.entry.arity
+            ),
         }
     }
 }

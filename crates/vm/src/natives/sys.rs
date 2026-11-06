@@ -2694,10 +2694,11 @@ fn system_flag(
             if args[1] != atom("true") && args[1] != atom("false") {
                 return Err(badarg());
             }
-            Err(VmError::TrapExport(crate::ExportTrap {
-                continuation: "erts_internal:system_flag_scheduler_wall_time/1",
-                args: vec![args[1]],
-            }))
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "erts_internal:system_flag_scheduler_wall_time/1",
+                vec![args[1]],
+            )))
         }
         "microstate_accounting" => set_microstate(process, ctx, args[1]),
         "outstanding_system_requests_limit" => outstanding_limit(process, args[1]),
