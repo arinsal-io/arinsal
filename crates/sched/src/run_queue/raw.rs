@@ -10,7 +10,7 @@
 //! by the thread that holds the run queue lock, which is the argument of every SAFETY comment
 //! below.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crate::proc_ref::ProcRef;
 use crate::{PROC_QUEUES, Scheduled, Task};
@@ -24,8 +24,6 @@ const PROXY: usize = 1;
 pub(crate) struct RqLink {
     next: AtomicUsize,
     prev: AtomicUsize,
-    /// `run_epoch` the entry was made in, see `Process::run_epoch`.
-    epoch: AtomicU64,
     /// `Process.schedule_count`.
     schedule_count: AtomicU8,
     /// `ERTS_PSFLG_IN_RUNQ`: the process node is linked in a list.
@@ -84,7 +82,6 @@ impl<T: Task> Lists<T> {
     pub(crate) fn push_back(&mut self, queue: usize, item: Scheduled<T>, proxy: bool) {
         let Scheduled {
             process,
-            epoch,
             schedule_count,
         } = item;
         // `ERTS_PSFLG_IN_RUNQ` (check_enqueue_in_prio_queue): a process whose real entry is still
@@ -108,7 +105,6 @@ impl<T: Task> Lists<T> {
             with_node::<T, _>(node, |link, _| {
                 link.next.store(0, Ordering::Relaxed);
                 link.prev.store(prev, Ordering::Relaxed);
-                link.epoch.store(epoch, Ordering::Relaxed);
                 link.schedule_count.store(schedule_count, Ordering::Relaxed);
                 link.in_runq.store(true, Ordering::Relaxed);
             });
@@ -125,11 +121,10 @@ impl<T: Task> Lists<T> {
     /// reference back (`unqueue_process`).
     fn unlink(&mut self, queue: usize, node: usize, prev: usize) -> Scheduled<T> {
         // SAFETY: `node` is in `queue` and `prev` precedes it; the caller holds the lock.
-        let (next, epoch, schedule_count) = unsafe {
+        let (next, schedule_count) = unsafe {
             with_node::<T, _>(node, |link, _| {
                 (
                     link.next.load(Ordering::Relaxed),
-                    link.epoch.load(Ordering::Relaxed),
                     link.schedule_count.load(Ordering::Relaxed),
                 )
             })
@@ -160,7 +155,6 @@ impl<T: Task> Lists<T> {
         };
         Scheduled {
             process,
-            epoch,
             schedule_count,
         }
     }

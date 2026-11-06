@@ -917,6 +917,166 @@ pub(crate) trait HalfSignal<I, O>: Sized {
         data: arinsal_alloc::typed::FixAllocArc<MonitorData<I, O, Self>>,
         target: bool,
     ) -> Self;
+
+    /// Value made when a link allocation's lazy signal header is materialised for disposal.
+    fn from_link_signal(header: NonNull<u8>) -> Self;
+
+    /// Value made when a queued unlink operation is materialised for disposal.
+    fn from_unlink_signal(from: arinsal_sched::Pid, id: u64, ack: bool) -> Self;
+}
+
+/// `ErtsSigUnlinkOp`: `ErtsNonMsgSignal`, sender and unlink id.
+// Port of erts/emulator/beam/erl_proc_sig_queue.h (ErtsNonMsgSignal, ErtsSigUnlinkOp), OTP-29.1.1.
+#[repr(C)]
+struct UnlinkOpData {
+    next: Option<NonNull<u8>>,
+    specific: Option<NonNull<u8>>,
+    tag: usize,
+    message_offsets: isize,
+    from: u64,
+    id: u64,
+}
+
+/// Unique owner of a `SIG_DATA` unlink operation while it is outside a signal queue.
+pub(crate) struct UnlinkOp {
+    header: NonNull<u8>,
+}
+
+const UNLINK_OP_WORDS: usize =
+    std::mem::size_of::<UnlinkOpData>().div_ceil(std::mem::size_of::<u64>());
+pub(crate) const LAZY_UNLINK: u64 = arinsal_sched::LAZY_UNLINK;
+const _: () = assert!(std::mem::size_of::<UnlinkOpData>() == 6 * std::mem::size_of::<u64>());
+
+impl UnlinkOp {
+    /// Allocate and queue the `ErtsSigUnlinkOp` itself, with its operation marker in the tag.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c
+    // (erts_proc_sig_make_unlink_op, erts_proc_sig_send_unlink), OTP-29.1.1.
+    pub(crate) fn signal<I, O, S>(
+        from: arinsal_sched::Pid,
+        id: u64,
+        ack: bool,
+    ) -> arinsal_sched::OwnedSignal<S>
+    where
+        S: HalfSignal<I, O>,
+    {
+        let mut block = arinsal_alloc::typed::AllocBlock::new(
+            arinsal_alloc::typed::ErtsAlcType::SIG_DATA,
+            UNLINK_OP_WORDS,
+        )
+        .expect("short-lived unlink signal allocation");
+        let op = block.as_mut_ptr().cast::<UnlinkOpData>();
+        // SAFETY: the allocator returned aligned storage for `UNLINK_OP_WORDS`; this writes the
+        // exact `ErtsSigUnlinkOp` header before transferring ownership to the queue node.
+        unsafe {
+            op.write(UnlinkOpData {
+                next: None,
+                specific: None,
+                tag: 0,
+                message_offsets: 0,
+                from: from.data(),
+                id,
+            });
+        }
+        let header = block.into_raw();
+        Self { header }.into_signal::<I, O, S>(from, ack)
+    }
+
+    /// Take an unlink operation directly from its popped queue node.
+    pub(crate) fn take_signal<S>(
+        signal: arinsal_sched::OwnedSignal<S>,
+    ) -> Option<(Self, arinsal_sched::Pid, u64, bool)> {
+        let meta = signal.lazy_meta()?;
+        if meta & LAZY_UNLINK == 0 {
+            return None;
+        }
+        let header = signal.into_raw().cast::<u8>();
+        let op = Self { header };
+        let (from, id) = op.read_fields();
+        let ack = meta & arinsal_sched::LAZY_MONITOR != 0;
+        Some((op, from, id, ack))
+    }
+
+    /// Forward the same operation allocation as the unlink acknowledgement.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_unlink_ack), OTP-29.1.1.
+    pub(crate) fn into_ack_signal<I, O, S>(
+        self,
+        from: arinsal_sched::Pid,
+    ) -> arinsal_sched::OwnedSignal<S>
+    where
+        S: HalfSignal<I, O>,
+    {
+        self.into_signal::<I, O, S>(from, true)
+    }
+
+    fn into_signal<I, O, S>(
+        self,
+        from: arinsal_sched::Pid,
+        ack: bool,
+    ) -> arinsal_sched::OwnedSignal<S>
+    where
+        S: HalfSignal<I, O>,
+    {
+        let header = self.header;
+        let op = header.cast::<UnlinkOpData>();
+        // SAFETY: `self` uniquely owns this live unlink operation and updates its sender before
+        // the same allocation is transferred back to the signal queue.
+        unsafe { (*op.as_ptr()).from = from.data() };
+        std::mem::forget(self);
+        arinsal_sched::OwnedSignal::lazy(
+            header,
+            from.data() | LAZY_UNLINK | if ack { arinsal_sched::LAZY_MONITOR } else { 0 },
+            Self::materialise::<I, O, S>,
+        )
+    }
+
+    /// # Safety
+    ///
+    /// `header` must point to the live allocation passed to [`Self::signal`] and must be taken
+    /// only once after its queue ownership ends.
+    unsafe fn materialise<I, O, S>(header: NonNull<u8>) -> S
+    where
+        S: HalfSignal<I, O>,
+    {
+        let op = Self { header };
+        let (from, id) = op.read_fields();
+        // `OwnedSignal::lazy` overlays its marker in the `specific` word of `ErtsNonMsgSignal`.
+        // SAFETY: `header` is a live lazy unlink operation whose marker shares this second word.
+        let marker = unsafe {
+            header
+                .as_ptr()
+                .add(std::mem::size_of::<usize>())
+                .cast::<usize>()
+                .read()
+        };
+        let ack = marker as u64 & arinsal_sched::LAZY_MONITOR != 0;
+        drop(op);
+        S::from_unlink_signal(from, id, ack)
+    }
+
+    fn read_fields(&self) -> (arinsal_sched::Pid, u64) {
+        let op = self.header.cast::<UnlinkOpData>();
+        // SAFETY: `header` is a live `UnlinkOp` allocation transferred by `signal`; queue
+        // ownership has ended or the caller owns this unique handle.
+        unsafe {
+            (
+                arinsal_sched::Pid::from_data((*op.as_ptr()).from),
+                (*op.as_ptr()).id,
+            )
+        }
+    }
+}
+
+impl Drop for UnlinkOp {
+    fn drop(&mut self) {
+        // SAFETY: this allocation was transferred by `AllocBlock::into_raw` and is unique here.
+        drop(unsafe {
+            arinsal_alloc::typed::AllocBlock::from_raw(
+                self.header,
+                arinsal_alloc::typed::ErtsAlcType::SIG_DATA,
+                UNLINK_OP_WORDS,
+            )
+        });
+    }
 }
 
 // SAFETY: each half's node and the origin state are only touched through the one handle that
@@ -1033,9 +1193,61 @@ impl<I, O, S> MonitorData<I, O, S> {
         // SAFETY: the node is the half's, in a live `MonitorData` that the signal's reference
         // keeps; `offset` points back to its start. The container links are reset to the state
         // a fresh half has, as the queue header overlaid them.
-        let (data, target) = unsafe {
+        let (link_signal, data, target) = unsafe {
+            let marker = header.cast::<usize>().as_ptr().add(1).read();
+            if marker as u64 & arinsal_sched::LAZY_LINK != 0 {
+                (true, None, false)
+            } else {
+                let offset = usize::from((*node.as_ptr()).offset);
+                let target = (*node.as_ptr()).flags & node_flag::TARGET != 0;
+                (*node.as_ptr()).node = NodeLinks {
+                    tree: TreeLinks {
+                        parent: 0,
+                        right: None,
+                        left: None,
+                    },
+                };
+                let data = NonNull::new_unchecked(header.as_ptr().sub(offset).cast::<Self>());
+                (
+                    false,
+                    Some(arinsal_alloc::typed::FixAllocArc::from_raw(data)),
+                    target,
+                )
+            }
+        };
+        if link_signal {
+            return S::from_link_signal(header);
+        }
+        let data = data.expect("monitor signal has monitor data");
+        let bit = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
+        data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
+        S::from_half(data, target)
+    }
+
+    /// Queue a local link allocation using the monitor half's existing lazy-node materialiser.
+    pub(crate) fn link_signal(link: Link, meta: u64) -> arinsal_term::message::OwnedSignal<S>
+    where
+        S: HalfSignal<I, O>,
+    {
+        arinsal_term::message::OwnedSignal::lazy(link.into_signal_header(), meta, Self::materialise)
+    }
+
+    /// Take a queued monitor or demonitor half back from its intrusive signal node.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_incoming), OTP-29.1.1.
+    pub(crate) fn take_signal_half(
+        signal: arinsal_term::message::OwnedSignal<S>,
+    ) -> Option<Monitor<I, O, S>>
+    where
+        S: HalfSignal<I, O>,
+    {
+        let meta = signal.lazy_meta()?;
+        let target = meta & arinsal_sched::LAZY_MONITOR != 0;
+        let header = signal.into_raw().cast::<u8>();
+        let node = header.cast::<MonLnkNode>();
+        // SAFETY: the lazy signal owns this monitor half; its node is not used again after it is
+        // taken from the queue, and the offset identifies the shared allocation's start.
+        let data = unsafe {
             let offset = usize::from((*node.as_ptr()).offset);
-            let target = (*node.as_ptr()).flags & node_flag::TARGET != 0;
             (*node.as_ptr()).node = NodeLinks {
                 tree: TreeLinks {
                     parent: 0,
@@ -1044,11 +1256,11 @@ impl<I, O, S> MonitorData<I, O, S> {
                 },
             };
             let data = NonNull::new_unchecked(header.as_ptr().sub(offset).cast::<Self>());
-            (arinsal_alloc::typed::FixAllocArc::from_raw(data), target)
+            arinsal_alloc::typed::FixAllocArc::from_raw(data)
         };
-        let bit = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
-        data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
-        S::from_half(data, target)
+        let queued = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
+        data.held.fetch_and(!queued, AtomicOrdering::AcqRel);
+        Self::take_half(data, target)
     }
 
     /// Turn a half in transit back into its handle. `None` when that half already has one.
@@ -1345,11 +1557,21 @@ struct ILink {
     link: MonLnkNode,
     /// The id of the unlink operation in progress, 0 when none.
     unlinking: u64,
+    reference_count: AtomicU32,
+}
+
+impl arinsal_alloc::typed::FixAllocRefCount for ILink {
+    const ALLOCATION_TYPE: arinsal_alloc::typed::ErtsAlcType =
+        arinsal_alloc::typed::ErtsAlcType::LINK;
+
+    fn reference_count(&self) -> &AtomicU32 {
+        &self.reference_count
+    }
 }
 
 /// A local link owned by the process at one end (`ErtsLink` of an `ErtsILink`).
 pub(crate) struct Link {
-    node: NodePtr,
+    data: arinsal_alloc::typed::FixAllocArc<ILink>,
 }
 
 // SAFETY: a link node holds plain data and is moved between processes only as a whole.
@@ -1359,13 +1581,17 @@ impl NodeHandle for Link {
     type Order = PidOrder;
 
     fn into_node(self) -> NodePtr {
-        let node = self.node;
-        std::mem::forget(self);
+        let node = NonNull::from(&self.data.link);
+        let _ = self.data.into_raw();
         node
     }
 
     fn from_node(node: ContainedNode<Self>) -> Self {
-        Self { node: node.node }
+        // SAFETY: `ContainedNode<Link>` is made only from a live link half transferred by
+        // `Link::into_node`, and each transfer carries one reference-counted owner.
+        let data =
+            unsafe { arinsal_alloc::typed::FixAllocArc::from_raw(node_to_main(node.node).cast()) };
+        Self { data }
     }
 }
 
@@ -1374,39 +1600,43 @@ impl Link {
     pub(crate) fn create(kind: u32, other: u64, flags: u32) -> Self {
         debug_assert!((node_type::LINK_PROC..=node_type::LINK_DIST_PORT).contains(&kind));
         debug_assert_eq!(flags & node_flag::RESERVED, 0);
-        let link = Box::new(ILink {
+        let data = arinsal_alloc::typed::FixAllocArc::new(ILink {
             link: MonLnkNode::new(other, 0, offset_of!(MonLnkNode, other), kind | flags),
             unlinking: 0,
-        });
-        let link = Box::into_raw(link);
-        // SAFETY: `link` was just allocated; the node is its first field.
-        let node = unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*link).link)) };
-        Self { node }
+            reference_count: AtomicU32::new(0),
+        })
+        .expect("fixed-size link allocation");
+        Self { data }
     }
 
     pub(crate) fn view(&self) -> LinkRef<'_> {
         LinkRef {
-            node: self.node,
+            node: NonNull::from(&self.data.link),
             _link: PhantomData,
         }
+    }
+
+    /// Give this half's allocation to an intrusive signal queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_link), OTP-29.1.1.
+    pub(crate) fn into_signal_header(self) -> NonNull<u8> {
+        self.data.into_raw().cast::<MonLnkNode>().cast()
+    }
+
+    /// Take back a link half whose tree links were overlaid by a signal queue header.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_incoming), OTP-29.1.1.
+    pub(crate) fn from_signal_header(header: NonNull<u8>) -> Self {
+        Self::from_node(ContainedNode {
+            node: header.cast(),
+            _handle: PhantomData,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn view_mut(&mut self) -> LinkMut<'_> {
         LinkMut {
-            node: self.node,
+            node: NonNull::from(&self.data.link),
             _link: PhantomData,
         }
-    }
-}
-
-impl Drop for Link {
-    /// `erts_link_release` of an internal link.
-    fn drop(&mut self) {
-        let main = node_to_main(self.node).cast::<ILink>();
-        // SAFETY: the node is the first field of an `ILink` allocated by `Box::new` in
-        // `Link::create`, and this handle owned it.
-        drop(unsafe { Box::from_raw(main.as_ptr()) });
     }
 }
 

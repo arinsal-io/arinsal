@@ -21,7 +21,7 @@ impl std::fmt::Debug for ErtsAlcType {
 
 /// Name and serving allocator (index in `ALLOCATOR_NAMES`, mapped like erl_alloc.types) of each
 /// type, indexed by the type number.
-const ALC_TYPES: [(&str, u8); 23] = [
+const ALC_TYPES: [(&str, u8); 25] = [
     ("HEAP", 4),
     ("OLD_HEAP", 4),
     ("HEAP_FRAG", 4),
@@ -45,6 +45,8 @@ const ALC_TYPES: [(&str, u8); 23] = [
     ("PRE_ALLOC_DATA", 3),
     ("MONITOR", 6),
     ("BIF_TIMER", 6),
+    ("LINK", 6),
+    ("SIG_DATA", 1),
 ];
 
 impl ErtsAlcType {
@@ -94,6 +96,10 @@ impl ErtsAlcType {
     pub const MONITOR: Self = Self(21);
     /// BIF timer data (`ERTS_ALC_T_BIF_TIMER`), a fixed-size type of fix_alloc.
     pub const BIF_TIMER: Self = Self(22);
+    /// Process links (`ERTS_ALC_T_LINK`), a fixed-size type of fix_alloc.
+    pub const LINK: Self = Self(23);
+    /// Short-lived process signal data (`ERTS_ALC_T_SIG_DATA`).
+    pub const SIG_DATA: Self = Self(24);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {
@@ -108,6 +114,7 @@ impl ErtsAlcType {
             8 => Some(1),
             21 => Some(2),
             22 => Some(3),
+            23 => Some(4),
             _ => None,
         }
     }
@@ -983,6 +990,47 @@ impl AllocBlock {
             handle,
             allocators,
         })
+    }
+
+    /// Transfer the allocation block to a raw node that will reconstruct this owner when freed.
+    pub fn into_raw(mut self) -> std::ptr::NonNull<u8> {
+        let pointer = std::ptr::NonNull::new(self.memory.as_mut_ptr().cast::<u8>())
+            .expect("live allocation block has a pointer");
+        std::mem::forget(self);
+        pointer
+    }
+
+    /// Reconstruct an allocation owner transferred by [`AllocBlock::into_raw`].
+    ///
+    /// # Safety
+    ///
+    /// `pointer`, `allocation_type`, and `words` must describe one live block previously
+    /// transferred by `into_raw`; no other owner may release or access it concurrently.
+    #[allow(unsafe_code)]
+    pub unsafe fn from_raw(
+        pointer: std::ptr::NonNull<u8>,
+        allocation_type: ErtsAlcType,
+        words: usize,
+    ) -> Self {
+        assert!(words > 0, "raw allocation blocks must be nonempty");
+        let bytes = words
+            .checked_mul(std::mem::size_of::<u64>())
+            .expect("raw allocation size fits");
+        // SAFETY: required by this function's contract; the payload header belongs to this live
+        // allocation and records its allocator instance and allocation id.
+        let (instance, id, size) =
+            crate::alloc_util::used_block_from_payload(pointer.as_ptr() as usize);
+        assert!(
+            size >= bytes,
+            "raw allocation must cover its requested payload"
+        );
+        let allocators = allocator_for(allocation_type).expect("raw allocation type is configured");
+        Self {
+            memory: WordView::new(pointer.as_ptr().cast(), words),
+            allocation_type,
+            handle: Some(InstanceAllocation::from_parts(instance, id, size)),
+            allocators,
+        }
     }
 
     /// Frees the block through the allocator index `ix` of the calling thread, without reading it

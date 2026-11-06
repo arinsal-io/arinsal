@@ -2,7 +2,7 @@
   "note": "Maximum source-level unsafe sites per crate. census.py --check fails when a crate rises above its number. Lower a number after a cleanup; see README.md.",
   "max_sites": {
     "a64": 15,
-    "alloc": 97,
+    "alloc": 98,
     "args": 0,
     "arith": 0,
     "beam": 0,
@@ -30,7 +30,7 @@
     "sched": 76,
     "spec": 0,
     "term": 346,
-    "vm": 502,
+    "vm": 508,
     "drv": 79
   }
 }

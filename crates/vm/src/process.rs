@@ -5152,6 +5152,10 @@ impl Process {
         let Some(target) = crate::proc_create::ProcessMonitorData::take_half(shared, true) else {
             return;
         };
+        self.insert_target_process_monitor_half(target);
+    }
+
+    fn insert_target_process_monitor_half(&mut self, target: crate::proc_create::ProcessMonitor) {
         if target.view().kind() == crate::monitor_link::node_type::MONITOR_DIST_PROC {
             self.monitors.insert(target);
         } else {
@@ -5184,6 +5188,10 @@ impl Process {
         let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(data, false) else {
             return;
         };
+        self.remove_demonitored_target_half(origin);
+    }
+
+    fn remove_demonitored_target_half(&mut self, origin: crate::proc_create::ProcessMonitor) {
         let target = self.lt_monitors.remove_target_of(&origin);
         if let Some(target) = target {
             crate::proc_create::ProcessMonitor::release_both(origin, target);
@@ -5233,7 +5241,7 @@ impl Process {
                 Payload::Signal(Signal::DemonitorOrigin(shared)) => {
                     self.remove_demonitored_target(shared);
                 }
-                Payload::Signal(Signal::Link) => {
+                Payload::Signal(Signal::Link { .. }) => {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
                     // (erts_proc_exit_handle_signal), OTP-29.1.1: a link reaching an
                     // exiting process is rejected with `noproc`.
@@ -6560,6 +6568,75 @@ impl Process {
                     Err(error) => break Err(error),
                 }
             }
+            if node.lazy_meta().is_some_and(|meta| {
+                meta & arinsal_sched::LAZY_LINK != 0 && meta & crate::monitor_link::LAZY_UNLINK == 0
+            }) {
+                // Port of erts_proc_sig_queue.c (ERTS_SIG_Q_OP_LINK): the receiver inserts
+                // the same ErtsLink allocation that arrived as the signal node.
+                let link = crate::monitor_link::Link::from_signal_header(node.into_raw().cast());
+                let link_from = link.view().other();
+                let from = Pid::from_data(link_from);
+                if let Err(duplicate) = self.links.lookup_insert(link) {
+                    drop(duplicate);
+                } else {
+                    self.trace_getting_linked(ctx, from);
+                }
+                cnt += 1;
+                continue;
+            }
+            if node
+                .lazy_meta()
+                .is_some_and(|meta| meta & crate::monitor_link::LAZY_UNLINK != 0)
+            {
+                let (unlink_op, from, id, ack) = crate::monitor_link::UnlinkOp::take_signal(node)
+                    .expect("lazy unlink node has an unlink operation");
+                let cost = if ack {
+                    drop(unlink_op);
+                    self.handle_unlink_ack_signal(from, id)
+                } else {
+                    self.handle_unlink_signal(ctx, from, id, Some(unlink_op))?
+                };
+                cnt += cost + 1;
+                continue;
+            }
+            if node.lazy_meta().is_some() {
+                // Port of erts_proc_sig_handle_incoming: an intrusive monitor node carries its
+                // operation in the half's target flag and is consumed without materialising an
+                // Event value.
+                if let Some(half) = crate::proc_create::ProcessMonitorData::take_signal_half(node) {
+                    if half.view().is_target() {
+                        self.insert_target_process_monitor_half(half);
+                    } else {
+                        self.remove_demonitored_target_half(half);
+                    }
+                    cnt += 1;
+                    continue;
+                }
+                unreachable!("non-link lazy signal is a monitor half");
+            }
+            let Event { from, payload } = &*node;
+            if let Payload::Signal(Signal::Demonitor(reference)) = payload {
+                self.remove_target_monitor(*reference);
+                cnt += 2;
+                continue;
+            }
+            if let Payload::Signal(Signal::Unlink(id)) = payload {
+                let cost = self.handle_unlink_signal(ctx, *from, *id, None)?;
+                cnt += cost + 1;
+                continue;
+            }
+            if let Payload::Signal(Signal::Link { priority }) = payload {
+                if let Err(duplicate) = self
+                    .links
+                    .lookup_insert(crate::proc_create::process_link(*from, *priority))
+                {
+                    drop(duplicate);
+                } else {
+                    self.trace_getting_linked(ctx, *from);
+                }
+                cnt += 1;
+                continue;
+            }
             let Event { from, payload } = node.into_value();
             match self.handle_signal(ctx, from, payload) {
                 Ok(cost) => cnt += cost + 1,
@@ -6763,12 +6840,12 @@ impl Process {
             unreachable!("message signals are moved to the message queue before this");
         };
         let cost = match signal {
-            arinsal_sched::Signal::Link => {
+            arinsal_sched::Signal::Link { priority } => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
                 // the receiver reports getting_linked in signal order, for a new link only.
                 if let Err(duplicate) = self
                     .links
-                    .lookup_insert(crate::proc_create::process_link(from, false))
+                    .lookup_insert(crate::proc_create::process_link(from, priority))
                 {
                     drop(duplicate);
                 } else {
@@ -6794,20 +6871,7 @@ impl Process {
                 }
                 0
             }
-            arinsal_sched::Signal::Unlink(id) => {
-                // Port of erl_proc_sig_queue.c:6693-6713: a pending local unlink keeps its
-                // link record until the matching acknowledgement is handled.
-                let removed = match self.links.get(from.data()) {
-                    Some(node) if node.unlinking() != 0 => false,
-                    Some(_) => self.links.remove(from.data()).is_some(),
-                    None => false,
-                };
-                if removed {
-                    self.trace_getting_unlinked(ctx, from);
-                }
-                let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
-                if removed { 4 } else { 0 }
-            }
+            arinsal_sched::Signal::Unlink(id) => self.handle_unlink_signal(ctx, from, id, None)?,
             arinsal_sched::Signal::Suspend { shared } => {
                 crate::suspend::activate(self, ctx.pid(), from, shared);
                 2
@@ -6979,19 +7043,7 @@ impl Process {
                     0
                 }
             }
-            arinsal_sched::Signal::UnlinkAckSignal(id) => {
-                // Port of erl_proc_sig_queue.c:6745-6772: removing the link costs 4.
-                if self
-                    .links
-                    .get(from.data())
-                    .is_some_and(|node| node.unlinking() == id)
-                {
-                    self.links.remove(from.data());
-                    4
-                } else {
-                    0
-                }
-            }
+            arinsal_sched::Signal::UnlinkAckSignal(id) => self.handle_unlink_ack_signal(from, id),
             arinsal_sched::Signal::Alias(_) | arinsal_sched::Signal::Unalias(_) => {
                 return Err(VmError::Unsupported("process aliases".into()));
             }
@@ -7030,6 +7082,50 @@ impl Process {
             }
         };
         Ok(cost)
+    }
+
+    fn handle_unlink_signal(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        from: Pid,
+        id: u64,
+        operation: Option<crate::monitor_link::UnlinkOp>,
+    ) -> Result<i32, VmError> {
+        // Port of erl_proc_sig_queue.c (ERTS_SIG_Q_OP_UNLINK), OTP-29.1.1: delete the link only
+        // when no unlink is pending, then send the operation's acknowledgement.
+        let removed = match self.links.get(from.data()) {
+            Some(node) if node.unlinking() != 0 => false,
+            Some(_) => self.links.remove(from.data()).is_some(),
+            None => false,
+        };
+        if removed {
+            self.trace_getting_unlinked(ctx, from);
+        }
+        if let Some(operation) = operation {
+            let ack = operation.into_ack_signal::<
+                crate::proc_create::MonitorInfo,
+                crate::proc_create::OriginMonitor,
+                Event<Message>,
+            >(ctx.pid());
+            let _ = ctx.send_node(from, ack);
+        } else {
+            let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
+        }
+        Ok(if removed { 4 } else { 0 })
+    }
+
+    fn handle_unlink_ack_signal(&mut self, from: Pid, id: u64) -> i32 {
+        // Port of erl_proc_sig_queue.c (ERTS_SIG_Q_OP_UNLINK_ACK), OTP-29.1.1.
+        if self
+            .links
+            .get(from.data())
+            .is_some_and(|node| node.unlinking() == id)
+        {
+            self.links.remove(from.data());
+            4
+        } else {
+            0
+        }
     }
 }
 
@@ -8152,6 +8248,26 @@ impl arinsal_sched::SignalMessage for Message {
         signal: arinsal_sched::Signal<Self>,
     ) -> arinsal_sched::OwnedSignal<Event<Self>> {
         use crate::proc_create::ProcessMonitorData;
+        if let arinsal_sched::Signal::Link { priority } = signal {
+            return ProcessMonitorData::link_signal(
+                crate::proc_create::process_link(from, priority),
+                arinsal_sched::lazy_link_meta(from),
+            );
+        }
+        if let arinsal_sched::Signal::Unlink(id) = signal {
+            return crate::monitor_link::UnlinkOp::signal::<
+                crate::proc_create::MonitorInfo,
+                crate::proc_create::OriginMonitor,
+                Event<Message>,
+            >(from, id, false);
+        }
+        if let arinsal_sched::Signal::UnlinkAckSignal(id) = signal {
+            return crate::monitor_link::UnlinkOp::signal::<
+                crate::proc_create::MonitorInfo,
+                crate::proc_create::OriginMonitor,
+                Event<Message>,
+            >(from, id, true);
+        }
         // A half stands for the signal only when the signal is what the half says: sent by the
         // origin, with the monitor's own reference.
         match signal {
@@ -8221,6 +8337,29 @@ impl
         Event {
             from,
             payload: Payload::Signal(signal),
+        }
+    }
+
+    fn from_link_signal(header: std::ptr::NonNull<u8>) -> Self {
+        let link = crate::monitor_link::Link::from_signal_header(header);
+        let view = link.view();
+        let from = Pid::from_data(view.other());
+        let priority = view.is_priority();
+        drop(link);
+        Event {
+            from,
+            payload: Payload::Signal(arinsal_sched::Signal::Link { priority }),
+        }
+    }
+
+    fn from_unlink_signal(from: Pid, id: u64, ack: bool) -> Self {
+        Event {
+            from,
+            payload: Payload::Signal(if ack {
+                arinsal_sched::Signal::UnlinkAckSignal(id)
+            } else {
+                arinsal_sched::Signal::Unlink(id)
+            }),
         }
     }
 }
@@ -8426,7 +8565,7 @@ impl Task for Process {
                 }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: a link that reaches a process after its exit handling gets `noproc`.
-                Payload::Signal(Signal::Link) => links.push(event.from),
+                Payload::Signal(Signal::Link { .. }) => links.push(event.from),
                 Payload::Signal(Signal::Unlink(id)) => {
                     links.retain(|from| *from != event.from);
                     unlink_acks.push((event.from, id));
