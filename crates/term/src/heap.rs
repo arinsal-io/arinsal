@@ -1824,6 +1824,35 @@ pub enum AdoptError {
 }
 
 impl ProcessHeap {
+    /// Release process-owned heap storage after the exit phases have finished.
+    // Port of erts/emulator/beam/erl_process.c (delete_process), OTP-29.1.1.
+    pub fn clear_for_exit(&mut self) {
+        self.abi = NativeAbi::default();
+        self.owners = LazyOwners::default();
+        self.fragments = Vec::new();
+        self.words = WordBlock::default();
+        self.old_words = WordBlock::default();
+        self.old_htop = 0;
+        self.min_heap_size = 233;
+        self.fullsweep_after = u16::MAX;
+        self.minor_since_major = 0;
+        self.alloc_ix = NO_ALLOC_IX;
+        self.bin_vheap = 0;
+        self.bin_vheap_size = 46_422;
+        self.heap_grow = false;
+        self.native_allocation = false;
+        self.native_redzone = false;
+        self.bif_hidden_words = 0;
+        self.detached = false;
+        self.abandoned = false;
+        self.mbuf_fast = MbufFast::default();
+        self.fragment_words = 0;
+        self.gc_enabled = true;
+        self.live_frags_armed.set(false);
+        self.live_frag_mark.set(0);
+        self.live_frag_valid.set(false);
+    }
+
     /// Byte offset of `fragment_words` (`mbuf_sz`) in the heap, for the native GC-desired test.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
     pub const FRAGMENT_WORDS_OFFSET: usize = std::mem::offset_of!(ProcessHeap, fragment_words);

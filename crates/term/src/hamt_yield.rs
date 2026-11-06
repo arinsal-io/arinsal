@@ -507,19 +507,38 @@ impl Unsorted {
                     self.ph = UnsortedPhase::OuterTest;
                 }
                 UnsortedPhase::OuterTest => {
-                    if self.ix < n - 1 {
-                        self.ph = UnsortedPhase::OuterBody;
+                    // Port the local `ix`/`cx` state in erl_map.c's outer
+                    // compaction loop; persist it only at a YCF reduction yield.
+                    let (mut ix, mut cx) = (self.ix, self.cx);
+                    while ix < n - 1 {
                         *reds -= 1;
                         if *reds <= 0 {
+                            self.ix = ix;
+                            self.cx = cx;
+                            self.ph = UnsortedPhase::OuterBody;
                             return UnsortedOut::Yield;
                         }
-                    } else {
-                        if self.ix < n {
-                            hxns[self.cx].hx = hxns[self.ix].hx;
-                            hxns[self.cx].val = hxns[self.ix].val;
-                            self.cx += 1;
+                        if hxns[ix].hx == hxns[ix + 1].hx {
+                            self.ix = ix;
+                            self.jx = ix + 2;
+                            self.cx = cx;
+                            self.ph = UnsortedPhase::JxTest;
+                            break;
                         }
-                        return UnsortedOut::Unique(self.cx);
+                        if ix > cx {
+                            hxns[cx].hx = hxns[ix].hx;
+                            hxns[cx].val = hxns[ix].val;
+                        }
+                        cx += 1;
+                        ix += 1;
+                    }
+                    if matches!(self.ph, UnsortedPhase::OuterTest) {
+                        if ix < n {
+                            hxns[cx].hx = hxns[ix].hx;
+                            hxns[cx].val = hxns[ix].val;
+                            cx += 1;
+                        }
+                        return UnsortedOut::Unique(cx);
                     }
                 }
                 UnsortedPhase::OuterBody => {
@@ -951,7 +970,13 @@ impl Chunked {
     }
 
     #[inline(always)]
-    fn run_simple_elements(&mut self, hxns: &[HxNode], reds: &mut i64, paid_first: bool) {
+    fn run_simple_elements<H: HeapAlloc + ?Sized>(
+        &mut self,
+        hxns: &[HxNode],
+        reds: &mut i64,
+        paid_first: bool,
+        heap: &mut H,
+    ) -> Result<(), TermError> {
         let mut elems = self.elems;
         let mut ix = self.ix;
         let mut d = self.d;
@@ -969,7 +994,7 @@ impl Chunked {
                     self.v = v;
                     self.ph = ChunkPhase::AfterElems;
                     *reds = remaining_reds;
-                    return;
+                    return Ok(());
                 }
                 elems -= 1;
                 remaining_reds -= 1;
@@ -981,7 +1006,7 @@ impl Chunked {
                     self.v = v;
                     self.ph = ChunkPhase::ElemsBody;
                     *reds = remaining_reds;
-                    return;
+                    return Ok(());
                 }
             }
             paid = false;
@@ -992,31 +1017,117 @@ impl Chunked {
             let vn = hxnode_word(hxns, ix + skip, 0);
             let dn = cdepth(v, vn);
             debug_assert!(v > vn);
-            let res = Term(hxnode_word(hxns, ix, 3));
-            if skip > 1 || d != dn {
-                self.elems = elems;
-                self.ix = ix;
-                self.d = d;
-                self.dn = dn;
-                self.vp = vp;
-                self.v = v;
-                self.vn = vn;
-                self.hdr = hdr;
-                self.res = res;
-                if skip > 1 {
-                    self.wat = d.max(dn);
-                    self.dc = HAMT_MAX_LEVEL - 1;
-                    self.ph = ChunkPhase::L4Test;
-                } else if d < dn {
-                    self.ph = ChunkPhase::L5Test;
-                } else {
-                    self.ph = ChunkPhase::L6Test;
+            let mut hdr = hdr;
+            let mut res = Term(hxnode_word(hxns, ix, 3));
+            if skip > 1 {
+                let wat = d.max(dn);
+                let mut dc = HAMT_MAX_LEVEL - 1;
+                while dc > wat {
+                    remaining_reds -= 1;
+                    if remaining_reds <= 0 {
+                        self.elems = elems;
+                        self.ix = ix;
+                        self.d = d;
+                        self.dn = dn;
+                        self.vp = vp;
+                        self.v = v;
+                        self.vn = vn;
+                        self.hdr = hdr;
+                        self.res = res;
+                        self.wat = wat;
+                        self.dc = dc;
+                        self.ph = ChunkPhase::L4Body;
+                        *reds = remaining_reds;
+                        return Ok(());
+                    }
+                    res = Self::collision_node(heap, v, dc, res)?;
+                    dc -= 1;
                 }
-                *reds = remaining_reds;
-                return;
             }
-            let bp = 1 << maskval(v, d);
-            self.push2(res.bits(), hdr | bp);
+
+            if d < dn {
+                while d < dn {
+                    remaining_reds -= 1;
+                    if remaining_reds <= 0 {
+                        self.elems = elems;
+                        self.ix = ix;
+                        self.d = d;
+                        self.dn = dn;
+                        self.vp = vp;
+                        self.v = v;
+                        self.vn = vn;
+                        self.hdr = hdr;
+                        self.res = res;
+                        self.ph = ChunkPhase::L5Body;
+                        *reds = remaining_reds;
+                        return Ok(());
+                    }
+                    let slot = maskval(v, d);
+                    self.stack.push(hdr | (1 << slot));
+                    d += 1;
+                    hdr = 0;
+                }
+                let slot = maskval(v, d);
+                self.push2(res.bits(), 1 << slot);
+            } else if d == dn {
+                let bp = 1 << maskval(v, d);
+                self.push2(res.bits(), hdr | bp);
+            } else {
+                while dn != d {
+                    remaining_reds -= 1;
+                    if remaining_reds <= 0 {
+                        self.elems = elems;
+                        self.ix = ix;
+                        self.d = d;
+                        self.dn = dn;
+                        self.vp = vp;
+                        self.v = v;
+                        self.vn = vn;
+                        self.hdr = hdr;
+                        self.res = res;
+                        self.ph = ChunkPhase::L6Body;
+                        *reds = remaining_reds;
+                        return Ok(());
+                    }
+                    let slot = maskval(v, d);
+                    hdr |= 1 << slot;
+                    let mut sz = (hdr as u16).count_ones() as usize;
+                    let mut builder =
+                        TermBuilder::new(heap).reserve_boxed_words(sz + 1, HALLOC_EXTRA)?;
+                    builder.write_words(&[node_bitmap_header(hdr), res.bits()])?;
+                    sz -= 1;
+                    if sz != 0 && remaining_reds > 1 {
+                        let count = sz.min((remaining_reds - 1) as usize);
+                        let stack_start = self.stack.len() - count;
+                        builder.write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
+                        self.stack.truncate(stack_start);
+                        sz -= count;
+                        remaining_reds -= count as i64;
+                    }
+                    if sz != 0 {
+                        sz -= 1;
+                        remaining_reds -= 1;
+                        self.elems = elems;
+                        self.ix = ix;
+                        self.d = d;
+                        self.dn = dn;
+                        self.vp = vp;
+                        self.v = v;
+                        self.vn = vn;
+                        self.hdr = hdr;
+                        self.res = res;
+                        self.sz = sz;
+                        self.pending = Some(builder);
+                        self.ph = ChunkPhase::L7Body;
+                        *reds = remaining_reds;
+                        return Ok(());
+                    }
+                    res = builder.finish()?;
+                    hdr = self.pop();
+                    d -= 1;
+                }
+                self.push2(res.bits(), hdr);
+            }
             vp = v;
             v = vn;
             d = dn;
@@ -1124,11 +1235,11 @@ impl Chunked {
                     phase = C::ElemsTest;
                 }
                 C::ElemsTest => {
-                    self.run_simple_elements(hxns, &mut remaining_reds, false);
+                    self.run_simple_elements(hxns, &mut remaining_reds, false, heap)?;
                     phase = self.ph;
                 }
                 C::ElemsBody => {
-                    self.run_simple_elements(hxns, &mut remaining_reds, true);
+                    self.run_simple_elements(hxns, &mut remaining_reds, true, heap)?;
                     phase = self.ph;
                 }
                 C::L4Test => {

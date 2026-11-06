@@ -8335,10 +8335,6 @@ impl Task for Process {
             // killed, which releases the permission; the update is already published here.
             self.persistent_terms
                 .release_update_permission(crate::natives::sys::persistent_owner(ctx.pid()));
-            // Port of erts/emulator/beam/erl_process.c (delete_process): free the heap and
-            // off-heap list. A fresh block would be allocated only to be dropped with the
-            // process.
-            self.heap = ProcessHeap::with_words(0);
         }
         if trace_scheduling {
             crate::trace::emit_process(
@@ -8397,7 +8393,7 @@ impl Task for Process {
     // the exiting scheduler, not when the last reference to the struct goes.
     fn delete_process(&mut self) {
         crate::trace::clear_save_calls(self);
-        self.heap = arinsal_term::ProcessHeap::with_words(0);
+        self.heap.clear_for_exit();
         self.cold = None;
         // The probe keeps a reference to this process; holding it past exit leaks the struct.
         self.set_signal_probe(None);

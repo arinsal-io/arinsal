@@ -1724,6 +1724,46 @@ impl<T: Task> ProcessTable<T> {
         priority: Priority,
         bound_worker: Option<usize>,
     ) -> Result<ProcRef<T>, SpawnInitError<E>> {
+        self.insert_with_cell_init(
+            |pid, cell| {
+                cell.init_with(make)?;
+                init(pid, cell.task_mut())
+            },
+            priority,
+            bound_worker,
+        )
+    }
+
+    /// Allocate the process block, prepare fallible task inputs, then construct the task value
+    /// directly in its final cell before the optional fallible in-place initialization.
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process/alloc_process), OTP-29.1.1.
+    #[inline(always)]
+    fn insert_try_prepare_init<P, E>(
+        &self,
+        prepare: impl FnOnce() -> Result<P, E>,
+        build: impl FnOnce(P, &mut std::mem::MaybeUninit<T>) -> &mut T,
+        init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
+        priority: Priority,
+        bound_worker: Option<usize>,
+    ) -> Result<ProcRef<T>, SpawnInitError<E>> {
+        self.insert_with_cell_init(
+            |pid, cell| {
+                let prepared = prepare()?;
+                cell.init_in_place(|slot| build(prepared, slot));
+                init(pid, cell.task_mut())
+            },
+            priority,
+            bound_worker,
+        )
+    }
+
+    #[inline(always)]
+    fn insert_with_cell_init<E>(
+        &self,
+        init: impl FnOnce(Pid, &mut TaskCell<T>) -> Result<(), E>,
+        priority: Priority,
+        bound_worker: Option<usize>,
+    ) -> Result<ProcRef<T>, SpawnInitError<E>> {
         // Port of erts/emulator/beam/erl_process.c (alloc_process), OTP-29.1.1: allocate the
         // Process block before erts_ptab_new_element takes the table lock.
         let Some((process, initialized, context)) = ProcRef::new_with(
@@ -1775,8 +1815,7 @@ impl<T: Task> ProcessTable<T> {
             |process, context| {
                 // alloc_process: the task is written straight into the allocated struct.
                 let cell = process.cell.get_mut();
-                cell.init_with(make)?;
-                init(context.pid, cell.task_mut())
+                init(context.pid, cell)
             },
         ) else {
             return Err(SpawnInitError::Table(Error::Capacity));
@@ -6923,6 +6962,40 @@ impl<T: Task> Scheduler<T> {
             .inner
             .table
             .insert_try_init(make, init, priority, bound)?;
+        process.run_state().store(UNSCHEDULED, Ordering::Release);
+        Ok(SpawnedProcess {
+            pid: process.pid,
+            process: process.erase(),
+            _message: std::marker::PhantomData,
+        })
+    }
+
+    /// Like [`Self::spawn_unscheduled_try_init`], but separates fallible preparation from the
+    /// infallible task constructor so the task is written directly into its allocated cell.
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process/alloc_process), OTP-29.1.1.
+    #[inline(always)]
+    pub fn spawn_unscheduled_try_prepare_init<P, E>(
+        &self,
+        prepare: impl FnOnce() -> Result<P, E>,
+        build: impl FnOnce(P, &mut std::mem::MaybeUninit<T>) -> &mut T,
+        init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
+        priority: Priority,
+        scheduler_id: Option<usize>,
+    ) -> Result<SpawnedProcess<T::Message>, SpawnInitError<E>> {
+        let bound = match scheduler_id {
+            Some(id) => {
+                let worker = id
+                    .checked_sub(1)
+                    .filter(|worker| *worker < self.inner.config.workers)
+                    .ok_or(SpawnInitError::Table(Error::Capacity))?;
+                Some(worker)
+            }
+            None => None,
+        };
+        let process = self
+            .inner
+            .table
+            .insert_try_prepare_init(prepare, build, init, priority, bound)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(SpawnedProcess {
             pid: process.pid,

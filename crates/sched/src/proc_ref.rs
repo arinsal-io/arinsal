@@ -16,6 +16,8 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
+pub(crate) mod raw;
+
 /// The fix_alloc block of one process: `common.refc`, its owner instance, and the process.
 struct ProcessBlock<T: Task> {
     refc: AtomicUsize,
