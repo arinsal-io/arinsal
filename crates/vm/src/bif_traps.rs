@@ -3355,6 +3355,7 @@ impl TrapMeter {
                 .saturating_sub(u64::from(virtual_reds)),
         );
         if let Some(run) = ctx {
+            run.add_virtual_reds(virtual_reds);
             let counted = run.consumed().saturating_sub(self.consumed);
             run.consume(work.saturating_sub(counted));
         }

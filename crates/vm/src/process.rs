@@ -1871,6 +1871,7 @@ impl Executor {
                 crate::trace::timeout_event(Some(&mut self.vm), process, ctx);
             }
             let virtual_reds = std::mem::take(&mut process.virtual_reds);
+            ctx.add_virtual_reds(virtual_reds);
             process.reductions_used = process.reductions_used.saturating_add(
                 u64::try_from(consumed)
                     .unwrap_or(0)
@@ -3844,6 +3845,7 @@ impl Executor {
                                     // Reductions the slice gave up with `ERTS_VBUMP_ALL_REDS` ended
                                     // the slice but are not the process's own.
                                     let virtual_reds = std::mem::take(&mut process.virtual_reds);
+                                    ctx.add_virtual_reds(virtual_reds);
                                     process.reductions_used =
                                         process.reductions_used.saturating_add(
                                             u64::try_from(consumed)

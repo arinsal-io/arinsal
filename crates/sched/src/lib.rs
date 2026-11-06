@@ -2148,6 +2148,7 @@ struct LocalInit<T: Task> {
     metric_marked: Vec<bool>,
     context_switches: u64,
     reductions: u64,
+    stat_reductions: u64,
     active_ns: u64,
     active_started: Option<Instant>,
     wall_enabled: bool,
@@ -2180,6 +2181,7 @@ impl<T: Task> LocalInit<T> {
             metric_marked: self.metric_marked,
             context_switches: self.context_switches,
             reductions: self.reductions,
+            stat_reductions: self.stat_reductions,
             active_ns: self.active_ns,
             active_started: self.active_started,
             wall_enabled: self.wall_enabled,
@@ -3091,6 +3093,7 @@ impl<T: Task> Inner<T> {
         }
         let reds = reds.max(0);
         local.reductions += reds as u64;
+        local.stat_reductions += reds as u64;
         self.balance.rqs[id].reductions_executed(balance::PORT_PRIO_LEVEL, i64::from(reds));
         local.wakeup_other_reds += i64::from(reds);
         local.check_time_reds = local.check_time_reds.saturating_add(reds as u32);
@@ -4888,6 +4891,8 @@ struct Local<T: Task> {
     metric_marked: Vec<bool>,
     context_switches: u64,
     reductions: u64,
+    /// `rq->procs.reductions`: what statistics(reductions) reports.
+    stat_reductions: u64,
     active_ns: u64,
     active_started: Option<Instant>,
     wall_enabled: bool,
@@ -4957,7 +4962,7 @@ impl<T: Task> Local<T> {
         };
         LocalStatsSnapshot {
             context_switches: self.context_switches,
-            reductions: self.reductions,
+            reductions: self.stat_reductions,
             active_ns,
             msacc_ns,
             metric_deltas: self.metric_deltas.clone(),
@@ -5217,6 +5222,8 @@ pub struct RunCtx<'a, M: SignalMessage> {
     consts: &'a SliceConsts,
     remaining: u32,
     budget: u32,
+    /// `esdp->virtual_reds`: part of the consumed budget that is not work.
+    virtual_reds: u32,
     msacc_enabled: bool,
     wall_enabled: bool,
     gc_accounted_total: u64,
@@ -5553,6 +5560,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
             target != UNBOUND_WORKER && self.consts.worker.is_some_and(|worker| worker != target);
         (previous_id, should_yield)
     }
+    /// Record that `reds` of the consumed budget are virtual: they end the slice but are not
+    /// work, so no scheduler counter sees them.
+    // Port of erts/emulator/beam/erl_process.c:9678 (`reds = actual_reds = calls -
+    // esdp->virtual_reds`), OTP-29.1.1.
+    #[inline]
+    pub fn add_virtual_reds(&mut self, reds: u32) {
+        self.virtual_reds = self.virtual_reds.saturating_add(reds);
+    }
     /// Remaining reductions in this quantum.
     pub fn remaining(&self) -> u32 {
         self.remaining
@@ -5572,7 +5587,9 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Scheduler-owned task and timing snapshot including this turn's pending changes.
     pub fn scheduler_stats(&self) -> SchedulerStats {
         let mut stats = self.inner.scheduler_stats();
-        stats.reductions = stats.reductions.saturating_add(u64::from(self.consumed()));
+        stats.reductions = stats
+            .reductions
+            .saturating_add(u64::from(self.consumed().saturating_sub(self.virtual_reds)));
         stats
     }
     /// Change the current scheduler worker's microstate category.
@@ -5975,6 +5992,7 @@ impl<T: Task> Runner<'_, T> {
             consts: &consts,
             remaining,
             budget: remaining,
+            virtual_reds: 0,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
@@ -6647,6 +6665,7 @@ impl<T: Task> Scheduler<T> {
                 metric_marked: vec![false; workers],
                 context_switches: 0,
                 reductions: 0,
+                stat_reductions: 0,
                 active_ns: 0,
                 active_started: None,
                 wall_enabled: false,
@@ -8065,6 +8084,7 @@ mod msgq_stage_microbench {
             consts: &consts,
             remaining: 1_000,
             budget: 1_000,
+            virtual_reds: 0,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
@@ -8507,10 +8527,9 @@ struct SliceEnd<T: Task> {
     outcome: RunOutcome,
     remaining: u32,
     budget: u32,
+    virtual_reds: u32,
     /// Wall time of the slice, only measured when wall accounting is on.
     active_ns: u64,
-    /// The scheduler's reduction count when the slice was dequeued (`wakeup_other_reds`).
-    reductions_before: u64,
 }
 
 /// The part of a process exit that needs the process cell: close the in-queue, reap what it
@@ -8552,11 +8571,19 @@ fn schedule_out<T: Task>(
         outcome,
         remaining,
         budget,
+        virtual_reds,
         active_ns,
-        reductions_before: _,
     } = end;
     let worker_id = worker.unwrap_or(0);
-    let consumed = u64::from(budget.saturating_sub(remaining));
+    // Port of erts/emulator/beam/erl_process.c:9678-9687 and erl_process.h:529
+    // (ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1: `actual` leaves out what the slice gave up
+    // without working; `reds` is that with the minimum context switch cost.
+    let actual = u64::from(
+        budget
+            .saturating_sub(remaining)
+            .saturating_sub(virtual_reds),
+    );
+    let consumed = actual.max(u64::from(inner.config.reductions / 10));
     if dirty.is_none() {
         // Port of erts/emulator/beam/erl_process.c:10200 (ERTS_PROC_REDUCTIONS_EXECUTED
         // with the user priority), OTP-29.1.1.
@@ -8570,10 +8597,11 @@ fn schedule_out<T: Task>(
         // Dirty schedulers keep no reduction or normal run queue counters.
     } else if let Some(local) = local.as_deref_mut() {
         local.reductions += consumed;
+        local.stat_reductions += actual;
         if inner.sim.is_none() {
             inner.worker_stats[local.worker_id]
                 .reductions
-                .fetch_add(consumed, Ordering::Relaxed);
+                .fetch_add(actual, Ordering::Relaxed);
         }
         if SCHED_POLL.get().is_some() {
             FUNCTION_CALLS.fetch_add(
@@ -8584,7 +8612,7 @@ fn schedule_out<T: Task>(
     } else {
         inner.worker_stats[worker_id]
             .reductions
-            .fetch_add(consumed, Ordering::Relaxed);
+            .fetch_add(actual, Ordering::Relaxed);
         inner.worker_stats[worker_id]
             .active_ns
             .fetch_add(active_ns, Ordering::Relaxed);
@@ -8592,7 +8620,8 @@ fn schedule_out<T: Task>(
     if let Some(local) = local.as_deref_mut() {
         local.check_time_reds = local
             .check_time_reds
-            .saturating_add(budget.saturating_sub(remaining));
+            .saturating_add(u32::try_from(actual).unwrap_or(u32::MAX));
+        local.wakeup_other_reds += actual as i64;
     }
     if dirty.is_some() {
         process.dirty.store(0, Ordering::Release);
@@ -8834,7 +8863,7 @@ fn run_slice<T: Task>(
         sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
         simulated: inner.sim.is_some(),
     };
-    let (outcome, remaining, active_ns) = {
+    let (outcome, remaining, virtual_reds, active_ns) = {
         let mut runner = Runner {
             inner,
             local: None,
@@ -8847,6 +8876,7 @@ fn run_slice<T: Task>(
                 proc: &process.shared,
                 consts: &consts,
                 remaining: budget,
+                virtual_reds: 0,
                 budget,
                 msacc_enabled,
                 wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
@@ -8878,7 +8908,7 @@ fn run_slice<T: Task>(
             let active_ns = accounting_started.map_or(0, |started| {
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64
             });
-            (outcome, ctx.remaining, active_ns)
+            (outcome, ctx.remaining, ctx.virtual_reds, active_ns)
         };
         runner.flush();
         result
@@ -8895,8 +8925,8 @@ fn run_slice<T: Task>(
             outcome,
             remaining,
             budget,
+            virtual_reds,
             active_ns,
-            reductions_before: 0,
         },
         worker,
         dirty,
@@ -8915,7 +8945,6 @@ fn run_process<T: Task>(
     data: &mut T::SchedulerData,
     id: usize,
     consts: &SliceConsts,
-    reductions_before: u64,
 ) -> Option<SliceEnd<T>> {
     let process = item.process;
     if process
@@ -8959,13 +8988,14 @@ fn run_process<T: Task>(
         local: Some(local_cell),
         managed: true,
     };
-    let (outcome, remaining, active_ns) = {
+    let (outcome, remaining, virtual_reds, active_ns) = {
         let task = cell.task_mut();
         let mut ctx = RunCtx {
             inner: &mut runner,
             proc: &process.shared,
             consts,
             remaining: budget,
+            virtual_reds: 0,
             budget,
             msacc_enabled,
             wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
@@ -8989,7 +9019,7 @@ fn run_process<T: Task>(
         let active_ns = accounting_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
         });
-        (outcome, ctx.remaining, active_ns)
+        (outcome, ctx.remaining, ctx.virtual_reds, active_ns)
     };
     runner.flush();
     if matches!(outcome, RunOutcome::Exit(_)) {
@@ -9001,8 +9031,8 @@ fn run_process<T: Task>(
         outcome,
         remaining,
         budget,
+        virtual_reds,
         active_ns,
-        reductions_before,
     })
 }
 
@@ -9585,7 +9615,7 @@ fn schedule_next<T: Task>(
     spin_count: u32,
     steal_armed: &mut bool,
     previous: Option<SliceEnd<T>>,
-) -> Option<(Scheduled<T>, u64)> {
+) -> Option<Scheduled<T>> {
     let mut local_guard = local_cell.borrow_mut();
     let local = &mut *local_guard;
     // Port of erts/emulator/beam/erl_process.c:9943 (schedule: non_empty_runq after
@@ -9595,14 +9625,12 @@ fn schedule_next<T: Task>(
     // (erts_schedule: schedule_out_process, then check_activities_to_run and the dequeue).
     // Every `None` below happens after it.
     if let Some(end) = previous {
-        let reductions_before = end.reductions_before;
         // Port of erts/emulator/beam/erl_process.c:9744 (schedule: schedule_out_process
         // "returns with rq locked"), OTP-29.1.1: the run queue lock covers the enqueue of the
         // slice that just ended up to the dequeue, so a thief (trylock EBUSY) cannot take
         // the process between the two.
         inner.in_schedule[id].store(true, Ordering::Release);
         schedule_out(inner, Some(&mut *local), end, Some(id), None);
-        local.wakeup_other_reds += (local.reductions - reductions_before) as i64;
     }
     // Port of erts/emulator/beam/erl_process.c:9857-9866 (schedule: the progress point
     // between two scheduled processes), OTP-29.1.1.
@@ -9940,13 +9968,12 @@ fn schedule_next<T: Task>(
             profile_scheduler_transition(inner, &item.process, id, true, count, &mut *local);
         }
         local.last_process = Some(item.process.pid);
-        let reductions = local.reductions;
         // The chosen process is off the run queue. Release the lock for the
         // slice so another scheduler can steal work that is still queued.
         inner.in_schedule[id].store(false, Ordering::Release);
         *steal_armed = true;
         drop(local_guard);
-        return Some((item, reductions));
+        return Some(item);
     }
     if ran_port {
         // erl_process.c:10047 (no process to run after a port: check activities again).
@@ -10139,7 +10166,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             &mut applied_binding,
             inherited_affinity.as_ref(),
         );
-        let Some((item, reductions)) = schedule_next(
+        let Some(item) = schedule_next(
             &inner,
             id,
             &local_cell,
@@ -10152,15 +10179,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         };
         // A managed thread runs its later operations at its progress point
         // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
-        previous = run_process(
-            &inner,
-            &local_cell,
-            item,
-            &mut scheduler_data,
-            id,
-            &consts,
-            reductions,
-        );
+        previous = run_process(&inner, &local_cell, item, &mut scheduler_data, id, &consts);
     }
     // A stop never drops a finished slice.
     if let Some(end) = previous.take() {
