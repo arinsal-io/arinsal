@@ -66,8 +66,6 @@ pub(crate) struct CodeIndexes {
     /// Boot and no-progress replacements stay owned here until scheduler progress resumes or the
     /// code indexes shut down; before scheduler creation there can be no concurrent table reader.
     pending_retired: Mutex<Vec<RetireOp>>,
-    /// Process-wide unique stamp of the latest catch-table store, see [`CATCH_CACHE`].
-    catch_stamp: AtomicU64,
     /// Serializes clone-and-publish of a catch table. The hot path does not take it.
     catch_publish: Mutex<()>,
     permission: Mutex<Permission>,
@@ -78,18 +76,6 @@ pub(crate) struct CodeIndexes {
     /// `erts_coverage_mode`: applies to modules loaded after it is set.
     coverage_mode: Mutex<arinsal_loader::CoverageMode>,
     pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
-}
-
-/// A stamp never handed out before, so a stamp names one store of one `CodeIndexes`.
-fn next_catch_stamp() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// A catch table a process saw, valid while the publish stamp and code index match.
-pub(crate) struct CatchCache {
-    stamp: u64,
-    index: usize,
 }
 
 impl CodeIndexes {
@@ -109,7 +95,6 @@ impl CodeIndexes {
             }),
             retire_hook: OnceLock::new(),
             pending_retired: Mutex::new(Vec::new()),
-            catch_stamp: AtomicU64::new(next_catch_stamp()),
             catch_publish: Mutex::default(),
             permission: Mutex::default(),
             released: Condvar::new(),
@@ -197,23 +182,6 @@ impl CodeIndexes {
         read: impl FnOnce(&[Option<crate::native_bridge::CatchTarget>]) -> R,
     ) -> R {
         let index = self.active();
-        self.catches[index].read(|table| read(table.as_slice()))
-    }
-
-    /// Read the active catch table, keeping only its stamp and index in the process cache.
-    // Port of erts/emulator/beam/beam_catches.c:146-154 (`beam_catches_car` reads
-    // `bccix[erts_active_code_ix()]` with plain loads), OTP-29.1.1. Each raise borrows the slot
-    // only for its scan, so no table reference remains across schedule-out.
-    pub(crate) fn with_active_catches_cached<R>(
-        &self,
-        cache: &mut Option<CatchCache>,
-        read: impl FnOnce(&[Option<crate::native_bridge::CatchTarget>]) -> R,
-    ) -> R {
-        let index = self.active();
-        let stamp = self.catch_stamp.load(Ordering::Acquire);
-        if !matches!(cache, Some(hit) if hit.stamp == stamp && hit.index == index) {
-            *cache = Some(CatchCache { stamp, index });
-        }
         self.catches[index].read(|table| read(table.as_slice()))
     }
 
@@ -340,8 +308,6 @@ impl CodeIndexes {
     fn stage_catches(&self) {
         let copy = Arc::new(self.catches[self.active()].read(Clone::clone));
         self.store_raw_slot(&self.catches[self.staging()], copy);
-        self.catch_stamp
-            .store(next_catch_stamp(), Ordering::Release);
     }
 
     /// Replaces one code index's catch table. Callers hold [`CodeIndexes::catch_publish`].
@@ -351,8 +317,6 @@ impl CodeIndexes {
         table: Vec<Option<crate::native_bridge::CatchTarget>>,
     ) {
         self.store_raw_slot(&self.catches[index], Arc::new(table));
-        self.catch_stamp
-            .store(next_catch_stamp(), Ordering::Release);
     }
 
     /// The catch table currently published at `index` (active or staging).

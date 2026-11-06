@@ -387,10 +387,6 @@ pub struct Process {
     // Port of erts/emulator/beam/erl_process.h (`p->state` and `p->flags` as the one word
     // erts_schedule reads), OTP-29.1.1.
     slow: u32,
-    /// `cold` may hold exception side state (`explicit_raise`, `pending_trace_top`,
-    /// `native_error_info`). Set by every writer, cleared once an exception reaches its handler;
-    /// while clear, `handle_error` reads none of them. erts keeps no such state.
-    pub(crate) exc_side: bool,
     /// The entry process has been scheduled once (its native start is decided then).
     entry_started: bool,
     // Last BEAM live operand or call arity for allocation instructions without one.
@@ -1224,9 +1220,6 @@ pub(crate) struct SliceWork {
     /// A system task woke the process while it was executing; it runs at the next scheduling
     /// point instead.
     pub(crate) sys_tasks_deferred: bool,
-    /// The BIF failure behind the current native exception, so the scheduler can name the BIF
-    /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
-    pub(crate) native_bif_error: Option<NativeBifError>,
     /// A table BIF failure raised from the direct path with its BIF frame already built, as
     /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
     pub(crate) native_trap: Option<Box<NativeTrap>>,
@@ -1279,7 +1272,6 @@ impl SliceWork {
             || self.dirty_exited
             || self.dirty_pickup.is_some()
             || self.suspend_parked
-            || self.native_bif_error.is_some()
             || self.native_trap.is_some()
             || !self.delayed_gc.is_empty()
     }
@@ -1301,8 +1293,6 @@ pub(crate) struct ProcessCold {
     pub(crate) dirty_bif_mfa: Option<(&'static str, &'static str, u8)>,
     /// Result of a static dirty NIF executed as a dirty job.
     pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
-    /// Catch table the last exception scan saw, see `CodeIndexes::active_catches_cached`.
-    pub(crate) catch_cache: Option<crate::code_ix::CatchCache>,
     /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
     /// for events raised outside a scheduler context (GC trace).
     pub(crate) scheduler_id: usize,
@@ -1333,8 +1323,6 @@ pub(crate) struct ProcessCold {
     pub(crate) trace_flags: (u64, Vec<(u64, u64)>),
     /// Meta tracers named by return frames on the stack, one entry per frame.
     pub(crate) meta_frames: Vec<std::sync::Arc<crate::trace_bp::MetaTracer>>,
-    /// `error_info` of the current native exception (erts keeps it with the stack trace).
-    pub(crate) native_error_info: Option<Box<arinsal_etf::OwnedTerm>>,
     /// `message_queue_data` is `off_heap` (erts `FS_OFF_HEAP_MSGQ` in `sig_qs.flags`).
     pub(crate) off_heap_msgq: bool,
     /// Stable snapshot and cursor for a trapped `persistent_term:get/0` call.
@@ -1416,14 +1404,6 @@ pub(crate) struct ProcessCold {
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
     pub(crate) entry_args_after_on_load: Option<Box<EntryArgsAfterOnLoad>>,
-    /// BIF MFA of a caught native failure. `save_stacktrace` keeps it as `s->current`
-    /// without the uncaught path's `String` box; cleared once the trace is taken.
-    pub(crate) pending_trace_top: Option<Box<crate::stacktrace::PendingTop>>,
-    /// Stack list from `erlang:raise/3`, keyed by that failure's `freason` and `fvalue`.
-    ///
-    /// Port of erts/emulator/beam/bif.c:1641-1688 (`raise_3` stores the caller's list
-    /// in `c_p->ftrace`), OTP-29.1.1. The list stays here until the catch reads it.
-    pub(crate) explicit_raise: Option<Box<(u64, u64, arinsal_etf::OwnedTerm)>>,
     /// Rare per-slice work (see [`SliceWork`]); reached through `Process::slice`/`slice_mut`.
     /// Only the collector's root walk borrows it field-wise next to its sibling fields, for
     /// roots whose update keeps the work pending.
@@ -2082,13 +2062,11 @@ impl Process {
         self.set_slow(Self::SLOW_COLD, busy);
         taken
     }
-    /// Clears the native failure records (`native_bif_error`, `native_trap`); both are empty
-    /// while `SLOW_COLD` is clear, so the common case is one test.
+    /// Clears a pending native trap; it is empty while `SLOW_COLD` is clear.
     #[inline(always)]
     pub(crate) fn clear_native_failure(&mut self) {
         if self.slow & Self::SLOW_COLD != 0 {
             self.update_work(|work| {
-                work.native_bif_error = None;
                 work.native_trap = None;
             });
         }
@@ -2183,20 +2161,6 @@ impl Process {
             self.allocate_cold();
         }
         SliceWorkMut(self)
-    }
-
-    /// The cold part for a write of exception side state (see `exc_side`).
-    #[inline]
-    pub(crate) fn cold_exc_mut(&mut self) -> &mut ProcessCold {
-        self.exc_side = true;
-        self.cold_mut()
-    }
-
-    /// Whether `handle_error` has to look at the cold part: exception side state or pending
-    /// slice work (`native_bif_error`, `native_trap`).
-    #[inline(always)]
-    pub(crate) fn exc_side_pending(&self) -> bool {
-        self.exc_side || self.slow & Self::SLOW_COLD != 0
     }
 
     #[inline]
@@ -2315,7 +2279,9 @@ impl Process {
         heap.abi.fcalls = crate::process::CONTEXT_REDS;
         let mut process = Self {
             heap,
-            x: ArgRegs::new(x_registers),
+            // erts' x_reg_array always has at least X0..X3 for `found_catch` to install
+            // the exception registers without growing the process on the raise path.
+            x: ArgRegs::new(x_registers.max(4)),
             fr: vec![0.0; float_registers].into_boxed_slice(),
             dictionary: None,
             seq_trace_token: None,
@@ -2330,7 +2296,6 @@ impl Process {
             initial_mfa: None,
             native_pc: None,
             slow: Self::SLOW_NOT_STARTED | Self::SLOW_NO_NATIVE_PC | Self::SLOW_NO_PROBE,
-            exc_side: false,
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
@@ -2649,33 +2614,6 @@ impl Default for Process {
 /// A table BIF exception with its BIF frame built, kept until the native exit raises it.
 pub(crate) struct NativeTrap {
     pub(crate) trap: crate::exceptions::Trap,
-    /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
-    pub(crate) freason: u64,
-    pub(crate) fvalue: u64,
-}
-
-/// The BIF frame whose error remains live across a native exit.
-pub(crate) enum NativeBifCall {
-    /// Native export metadata and the scheduler's register array are the MFA and arguments.
-    Export(crate::beamasm_integration::ExportDispatch),
-    /// A native operation writes its BIF arguments to X0.. before raising.
-    Registers {
-        module: arinsal_term::Atom,
-        function: arinsal_term::Atom,
-        arity: u8,
-    },
-    /// NIF and legacy helper calls have no export entry to retain.
-    Owned {
-        module: String,
-        function: String,
-        args: Vec<Term>,
-    },
-}
-
-/// A BIF failure raised from native code, kept until the native exit builds the exception.
-pub(crate) struct NativeBifError {
-    pub(crate) call: NativeBifCall,
-    pub(crate) error: arinsal_bifs::BifError,
     /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
     pub(crate) freason: u64,
     pub(crate) fvalue: u64,
@@ -3418,14 +3356,12 @@ mod layout_report {
             "static_nif_done",
             Option<Result<Term, arinsal_bifs::BifError>>
         );
-        field!("catch_cache", Option<crate::code_ix::CatchCache>);
         field!(
             "traced_native_call",
             Option<(usize, usize, Vec<crate::trace::CallActions>)>
         );
         field!("trace_flags", (u64, Vec<(u64, u64)>));
         field!("timer_pause", Option<crate::process::TimerPause>);
-        field!("native_bif_error", Option<NativeBifError>);
         field!("trap_return", Option<TrapReturn>);
         field!("bif_trap", Option<BifTrapPending>);
         field!("delayed_gc", Vec<DelayedGc>);

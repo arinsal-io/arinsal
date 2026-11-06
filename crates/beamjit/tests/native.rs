@@ -18,11 +18,24 @@ extern "C" fn build_stacktrace_for_compile(_header: *mut ProcessHeader, _trace: 
     0
 }
 
+extern "C" fn raw_raise_for_compile(
+    _header: *mut ProcessHeader,
+    _trace: u64,
+    _class: u64,
+    _value: u64,
+) -> u64 {
+    1
+}
+
 struct TestEnv;
 
 impl ModuleEnv for TestEnv {
     fn raise_class_helper(&self) -> usize {
         1
+    }
+
+    fn raw_raise_helper(&self) -> usize {
+        raw_raise_for_compile as *const () as usize
     }
 
     fn this_node_sysname(&self) -> usize {
@@ -196,6 +209,7 @@ extern "C" fn exception_resolver(
     _process: *mut ProcessHeader,
     _registers: *mut SchedulerRegisters,
     _stack: *mut u64,
+    _bif_info: u64,
 ) -> usize {
     0
 }

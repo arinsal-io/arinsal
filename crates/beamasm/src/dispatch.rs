@@ -874,6 +874,13 @@ fn emit_export_fragment(
         encoder.ldrb_uoff(Gpr::w(9), Gpr::x(0), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
         encoder.strb_uoff(Gpr::w(9), Gpr::x(21), 80)?;
         encoder.ldr_uoff(Gpr::x(3), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210
+        // (`emit_export_trampoline`), OTP-29.1.1: current points at Export.info.mfa.
+        encoder.str_uoff(
+            Gpr::x(3),
+            Gpr::x(21),
+            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+        )?;
         encoder.mov_reg(Gpr::x(4), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
@@ -888,6 +895,11 @@ fn emit_export_fragment(
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
         // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.str_uoff(
+            Gpr::x(2),
+            Gpr::x(21),
+            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+        )?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
@@ -1008,7 +1020,12 @@ fn emit_unloaded_fun_fragment(
     // exception pc from the top of E and pops the native frame itself.
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 24)?;
-        encoder.str_pre(Gpr::x(9), Gpr::x(20), -8)
+        encoder.str_pre(Gpr::x(9), Gpr::x(20), -8)?;
+        encoder.str_uoff(
+            Gpr::xzr(),
+            Gpr::x(21),
+            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+        )
     })?;
     code.b(raise_exception)
 }
@@ -1053,6 +1070,8 @@ fn emit_raise_exception_fragment(
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
         encoder.mov_reg(Gpr::x(2), Gpr::x(20))?;
+        // Export trampolines provide their MFA through c_p->current, like erts.
+        encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
         encoder.mov_const(Gpr::x(17), resolver as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1072,8 +1091,13 @@ fn emit_raise_exception_fragment(
         encoder.br(Gpr::x(0))
     })?;
     code.bind(exit)?;
-    // The host frame was already popped above; only the exit bridge remains.
+    // The host frame was already popped above; only the exit bridge remains. `handle_error`
+    // saved the stacktrace on the heap through `c_p->htop`; the bridge spills the cached HTOP
+    // and E, so reload them or the trace ends up above the top and is overwritten.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (emit_leave_runtime, eHeapAlloc).
     code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
+        encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
         encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
         encoder.br(Gpr::x(17))
@@ -1156,6 +1180,13 @@ fn emit_call_light_bif_shared(
     code.emit(|encoder| {
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.str_uoff(Gpr::x(3), Gpr::sp(), 16)?;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.str_uoff(
+            Gpr::x(9),
+            Gpr::x(21),
+            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+        )?;
+        encoder.str_uoff(Gpr::x(9), Gpr::sp(), 24)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
         Ok(())
     })?;
@@ -1187,15 +1218,14 @@ fn emit_call_light_bif_shared(
     })?;
     code.b_cond(Cond::Eq, trap)?;
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:539-545 (`raise_exception_shared`),
-    // OTP-29.1.1. A catch stays in this fragment. No catch, or a null resolver, returns
-    // to the scheduler so `handle_error` keeps the BIF frame.
-    code.emit(|encoder| {
-        encoder.mov_const(Gpr::x(17), resolver as u64)?;
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 0x40)
-    })?;
+    // OTP-29.1.1. Always call `handle_error`: it saves the trace before `next_catch`, even when
+    // there is no native catch frame.
+    code.emit(|encoder| encoder.mov_const(Gpr::x(17), resolver as u64))?;
     code.cbz(Gpr::x(17), scheduler_error)?;
-    code.cbz(Gpr::x(9), scheduler_error)?;
     code.emit(|encoder| {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:539-545, OTP-29.1.1:
+        // the BIF MFA is process->current; this fragment has no call-site bif_mfa argument.
+        encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
         encoder.mov_reg(Gpr::x(2), Gpr::x(20))?;
@@ -1215,8 +1245,12 @@ fn emit_call_light_bif_shared(
         encoder.br(Gpr::x(17))
     })?;
     code.bind(scheduler_error)?;
-    // Pop the host frame; x29 is its frame pointer here.
+    // Pop the host frame; x29 is its frame pointer here. `handle_error` may have saved the
+    // stacktrace through `c_p->htop`; the exit bridge spills the cached HTOP and E, so reload
+    // them first (erts' emit_leave_runtime reloads HTOP after the runtime call).
     code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
+        encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
         encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
         encoder.br(Gpr::x(30))

@@ -1,6 +1,7 @@
 //! BIF, export, and apply call emission for BeamAsm modules.
 
 use arinsal_a64::enc::Gpr;
+use std::sync::OnceLock;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
@@ -13,6 +14,174 @@ pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32
 /// `info` word (see [`ExportEntry::info`]) typed by the runtime, then up to three argument
 /// terms. Zero means an exception is pending in `freason`.
 pub type BifIdentityHelper = usize;
+
+/// OTP's `ErtsCodeMFA` layout used by arithmetic instructions that raise through the shared
+/// exception fragment.
+// Port of erts/emulator/beam/code_ix.h:89-99, OTP-29.1.1.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ErtsCodeMfa {
+    /// Tagged module atom.
+    pub module: u64,
+    /// Tagged function atom.
+    pub function: u64,
+    /// Word-sized arity.
+    pub arity: u64,
+}
+
+/// Static BIF descriptor stored by `emit_int_div_rem_body_shared` before calling its helper.
+// Port of erts/emulator/beam/jit/arm/instr_arith.cpp:740-875, OTP-29.1.1.
+pub static ERLANG_DIV_MFA: ErtsCodeMfa = ErtsCodeMfa {
+    module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+    function: arinsal_term::Term::atom(arinsal_term::atoms::DIV).word(),
+    arity: 2,
+};
+
+/// Static BIF descriptor for the remainder instructions.
+// Port of erts/emulator/beam/jit/arm/instr_arith.cpp:740-875, OTP-29.1.1.
+pub static ERLANG_REM_MFA: ErtsCodeMfa = ErtsCodeMfa {
+    module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+    function: arinsal_term::Term::atom(arinsal_term::atoms::REM).word(),
+    arity: 2,
+};
+
+macro_rules! arith_mfa {
+    ($name:ident, $function:ident, $arity:literal) => {
+        pub static $name: ErtsCodeMfa = ErtsCodeMfa {
+            module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+            function: arinsal_term::Term::atom(arinsal_term::atoms::$function).word(),
+            arity: $arity,
+        };
+    };
+}
+
+arith_mfa!(ERLANG_PLUS_MFA, PLUS, 2);
+arith_mfa!(ERLANG_MINUS_MFA, MINUS, 2);
+arith_mfa!(ERLANG_TIMES_MFA, TIMES, 2);
+arith_mfa!(ERLANG_BAND_MFA, BAND, 2);
+arith_mfa!(ERLANG_BOR_MFA, BOR, 2);
+arith_mfa!(ERLANG_BXOR_MFA, BXOR, 2);
+arith_mfa!(ERLANG_BNOT_MFA, BNOT, 1);
+arith_mfa!(ERLANG_NEGATE_MFA, MINUS, 1);
+arith_mfa!(ERLANG_BSL_MFA, BSL, 2);
+arith_mfa!(ERLANG_BSR_MFA, BSR, 2);
+arith_mfa!(ERLANG_DIV_2_MFA, DIV_2, 2);
+
+fn guard_mfas() -> &'static [ErtsCodeMfa; 10] {
+    static MFAS: OnceLock<[ErtsCodeMfa; 10]> = OnceLock::new();
+    MFAS.get_or_init(|| {
+        let module = arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word();
+        let function = |name| {
+            arinsal_term::Term::atom(
+                arinsal_term::global_atoms()
+                    .get(name)
+                    .unwrap_or_else(|| panic!("predefined BIF atom {name} is missing")),
+            )
+            .word()
+        };
+        [
+            ErtsCodeMfa {
+                module,
+                function: function("element"),
+                arity: 2,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("hd"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("tl"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("bit_size"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("byte_size"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("map_size"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("tuple_size"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("map_get"),
+                arity: 2,
+            },
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:278-299, OTP-29.1.1:
+            // `i_length` raises with this explicit `bif_mfa` when the list is improper.
+            ErtsCodeMfa {
+                module,
+                function: function("length"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("is_map_key"),
+                arity: 2,
+            },
+        ]
+    })
+}
+
+/// Stable MFA addresses for the inline guard BIFs that raise `badarg`.
+// Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:52-56, OTP-29.1.1.
+pub fn guard_bif_mfa(index: usize) -> Option<usize> {
+    let mfa = guard_mfas().get(index)?;
+    Some(std::ptr::from_ref(mfa) as usize)
+}
+
+/// Returns the static MFA used for an arithmetic slow-path operation.
+pub fn arithmetic_bif_mfa(op: u32) -> Option<usize> {
+    let mfa = match op {
+        0 => &ERLANG_PLUS_MFA,
+        1 => &ERLANG_MINUS_MFA,
+        2 => &ERLANG_TIMES_MFA,
+        3 | 14 => &ERLANG_DIV_MFA,
+        4 => &ERLANG_REM_MFA,
+        5 => &ERLANG_BAND_MFA,
+        6 => &ERLANG_BOR_MFA,
+        7 => &ERLANG_BXOR_MFA,
+        8 => &ERLANG_BNOT_MFA,
+        9 => &ERLANG_NEGATE_MFA,
+        10 => &ERLANG_BSL_MFA,
+        11 => &ERLANG_BSR_MFA,
+        12 => &ERLANG_DIV_2_MFA,
+        _ => return None,
+    };
+    Some(std::ptr::from_ref(mfa) as usize)
+}
+
+/// Decodes the MFA pointer passed to the exception resolver.
+// Port of erts/emulator/beam/beam_common.c (`save_stacktrace` reads `bif_mfa`), OTP-29.1.1.
+#[allow(unsafe_code)]
+pub fn static_bif_mfa(info: u64) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u8)> {
+    let info = usize::try_from(info).ok()?;
+    if info == 0 || !info.is_multiple_of(core::mem::align_of::<ErtsCodeMfa>()) {
+        return None;
+    }
+    // SAFETY: the JIT passes only live ErtsCodeMfa addresses from export, arithmetic, and
+    // guard callsites, matching handle_error's bif_mfa pointer contract.
+    let mfa = unsafe { (info as *const ErtsCodeMfa).read() };
+    let atom = |word: u64| (word & 0x3f == 0x0b).then_some(arinsal_term::Atom((word >> 6) as u32));
+    Some((
+        atom(mfa.module)?,
+        atom(mfa.function)?,
+        u8::try_from(mfa.arity).ok()?,
+    ))
+}
 
 /// Apply resolver supplied by the runtime; zero means the target could not be resolved.
 pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
@@ -300,6 +469,7 @@ impl BeamModuleAssembler {
     pub fn emit_bif_by_identity(
         &mut self,
         identity: usize,
+        bif_mfa: usize,
         args: &[ArgVal],
         fail: u32,
         dst: ArgVal,
@@ -320,6 +490,14 @@ impl BeamModuleAssembler {
         emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            if bif_mfa != 0 {
+                e.mov_const(Gpr::x(1), bif_mfa as u64)?;
+                e.str_uoff(
+                    Gpr::x(1),
+                    Gpr::x(21),
+                    std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+                )?;
+            }
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (i_bif*: the BIF is
             // bound at load time), OTP-29.1.1: the helper gets the export's descriptor word.
             e.mov_const(Gpr::x(1), identity as u64)?;
@@ -332,7 +510,16 @@ impl BeamModuleAssembler {
             Ok(())
         })?;
         self.fragment_call(helper)?;
-        emit_leave_runtime(&mut self.code, 6, update)?;
+        // A guard failure (`fail != 0`) must leave the live X registers alone: the helper
+        // stores the failing BIF's operands in the register array for `handle_error`, which
+        // only a raising call wants reloaded (erts passes guard BIF operands in ARG regs and
+        // never rewrites X on a guard failure).
+        let leave = if fail != 0 {
+            Update::HEAP_ALLOC.union(Update::REDUCTIONS)
+        } else {
+            update
+        };
+        emit_leave_runtime(&mut self.code, 6, leave)?;
         self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
         let ok = self.code.new_label();
         self.code.cbz(Gpr::x(9), ok)?;
@@ -341,7 +528,9 @@ impl BeamModuleAssembler {
             self.code.emit(|e| e.str_uoff(Gpr::xzr(), Gpr::x(21), 40))?;
             self.code.b(label)?;
         } else {
-            self.branch_error()?;
+            // The helper already left the operands in X0..X2 (`set_native_bif_context`);
+            // restaging them from the reloaded registers would read them back clobbered.
+            self.branch_error_with_bif()?;
         }
         self.code.bind(ok)?;
         self.store_bif_result(dst, Gpr::x(0))
@@ -377,6 +566,7 @@ impl BeamModuleAssembler {
             &[regs[0], regs[1], regs[2], Gpr::x(13)],
             state_live,
             update,
+            Some(args),
         )?;
         if let Some(label) = fail {
             self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(0)))?;
@@ -398,6 +588,7 @@ impl BeamModuleAssembler {
         args: &[Gpr],
         live: usize,
         update: Update,
+        error_args: Option<&[ArgVal]>,
     ) -> Result<(), ModuleError> {
         emit_enter_runtime(&mut self.code, live, update)?;
         self.code.emit(|e| {
@@ -410,7 +601,26 @@ impl BeamModuleAssembler {
         self.fragment_call(target)?;
         emit_leave_runtime(&mut self.code, live, update)?;
         self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
-        self.error_if_nonzero(Gpr::x(9))?;
+        if let Some(error_args) = error_args {
+            let ok = self.code.new_label();
+            self.code.cbz(Gpr::x(9), ok)?;
+            self.stage_bif_args_for_raise(error_args)?;
+            self.code.bind(ok)?;
+        }
+        self.error_if_nonzero_with_bif_context(Gpr::x(9))?;
+        Ok(())
+    }
+
+    fn stage_bif_args_for_raise(&mut self, args: &[ArgVal]) -> Result<(), ModuleError> {
+        let mut regs = [Gpr::xzr(); 3];
+        for (index, arg) in args.iter().copied().enumerate() {
+            let source = self.source_reg(arg)?;
+            regs[index] = Gpr::x(10 + index as u8);
+            self.code.emit(|e| e.mov_reg(regs[index], source))?;
+        }
+        for (index, reg) in regs.iter().copied().enumerate().take(args.len()) {
+            self.store_operand(ArgVal::X(index as u8), reg)?;
+        }
         Ok(())
     }
 
@@ -466,6 +676,7 @@ impl BeamModuleAssembler {
             &[Gpr::x(10), Gpr::x(11), Gpr::x(12)],
             live as usize,
             update,
+            None,
         )?;
         let resolved = self.code.new_label();
         self.code.cbnz(Gpr::x(0), resolved)?;

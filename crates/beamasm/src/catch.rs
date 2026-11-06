@@ -52,7 +52,7 @@ pub fn reserve_catch_indices(count: usize) -> Result<u32, ModuleError> {
 /// Resolves an exception against the process catch chain and returns a native handler address.
 /// A zero result means that the exception is uncaught and should return to the runtime.
 pub type ExceptionResolver =
-    extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, *mut u64) -> usize;
+    extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, *mut u64, u64) -> usize;
 /// Runtime callback that pairs an error reason with its materialized stacktrace.
 pub type AddStacktraceHook = extern "C" fn(*mut ProcessHeader, u64, u64) -> u64;
 /// Runtime callback that materializes a raw stacktrace term.
@@ -324,39 +324,45 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3037-3044, OTP-29.1.1
     // and erts/emulator/beam/beam_common.c:1148-1178 (raw_raise): an invalid class leaves
     // `badarg` in X0 and execution continues.
-    pub fn emit_raw_raise(&mut self, resolver: ExceptionResolver) -> Result<(), ModuleError> {
-        let raise = self.code.new_label();
-        let next = self.code.new_label();
-        for (class, code) in [
-            ("error", crate::exc::EXTAG_ERROR),
-            ("exit", crate::exc::EXTAG_EXIT),
-            ("throw", crate::exc::EXTAG_THROWN),
-        ] {
-            let word = atom_word(class);
-            self.code.emit(|e| {
-                e.mov_const(Gpr::x(8), word)?;
-                e.cmp_reg(XREGS[0], Gpr::x(8), arinsal_a64::enc::Shift::Lsl, 0)?;
-                e.mov_const(TMP, RAW_RAISE | code)
-            })?;
-            self.code.b_cond(arinsal_a64::enc::Cond::Eq, raise)?;
+    pub fn emit_raw_raise(
+        &mut self,
+        raw_raise_helper: usize,
+        resolver: ExceptionResolver,
+    ) -> Result<(), ModuleError> {
+        if raw_raise_helper == 0 {
+            return Err(ModuleError::InvalidOperand("raw raise helper is missing"));
         }
-        let badarg = atom_word("badarg");
-        self.code.emit(|e| e.mov_const(XREGS[0], badarg))?;
-        self.code.b(next)?;
-        self.code.bind(raise)?;
+        let next = self.code.new_label();
+        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3061-3076
+        // and beam_common.c:1148-1178 (`raw_raise`), OTP-29.1.1.
+        crate::emit_enter_runtime(&mut self.code, 3, crate::Update::NONE)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), C_P)?;
+            e.mov_reg(Gpr::x(1), XREGS[2])?;
+            e.mov_reg(Gpr::x(2), XREGS[0])?;
+            e.mov_reg(Gpr::x(3), XREGS[1])
+        })?;
+        self.fragment_call(raw_raise_helper)?;
+        crate::emit_leave_runtime(&mut self.code, 3, crate::Update::NONE)?;
+        self.code.cbnz(Gpr::x(0), next)?;
         if let Some((_, raise_exception)) = self.raise_fragments {
-            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3061-3076
-            // (emit_raw_raise), OTP-29.1.1: `fragment_call(raise_exception)`.
             self.code.emit(|e| {
-                e.mov_reg(Gpr::x(0), TMP)?;
-                e.mov_reg(Gpr::x(1), XREGS[1])?;
-                e.mov_reg(Gpr::x(2), XREGS[2])
+                e.ldr_uoff(Gpr::x(0), C_P, 40)?;
+                e.ldr_uoff(Gpr::x(1), C_P, 48)?;
+                e.ldr_uoff(Gpr::x(2), C_P, 56)
             })?;
             self.fragment_call(raise_exception)?;
         } else {
-            self.emit_exception_transfer(TMP, XREGS[1], XREGS[2], resolver)?;
+            self.code.emit(|e| {
+                e.ldr_uoff(TMP3, C_P, 40)?;
+                e.ldr_uoff(TMP2, C_P, 48)?;
+                e.ldr_uoff(TMP, C_P, 56)
+            })?;
+            self.emit_exception_transfer(TMP3, TMP2, TMP, resolver)?;
         }
         self.code.bind(next)?;
+        self.code
+            .emit(|e| e.mov_const(XREGS[0], atom_word("badarg")))?;
         Ok(())
     }
 

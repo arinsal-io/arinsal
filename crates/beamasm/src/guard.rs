@@ -67,29 +67,15 @@ const MAP_HEADER_FLATMAP: u64 = 0x12c;
 /// The empty list / `[]` immediate word.
 const NIL_WORD: u64 = 0x3b;
 
-/// BIFs whose inline guard code raises `badarg` with the BIF itself as the top stack frame.
-/// `SchedulerRegisters::tmp_mem[7]` holds `index + 1` of the raising BIF; its arguments are in
-/// X0.. (erts passes the `ErtsCodeMFA` to `raise_exception` the same way).
-pub const BADARG_MFAS: [(&str, &str, u8); 8] = [
-    ("erlang", "element", 2),
-    ("erlang", "hd", 1),
-    ("erlang", "tl", 1),
-    ("erlang", "bit_size", 1),
-    ("erlang", "byte_size", 1),
-    ("erlang", "map_size", 1),
-    ("erlang", "tuple_size", 1),
-    ("erlang", "map_get", 2),
-];
-/// Index of `erlang:map_size/1` in [`BADARG_MFAS`].
+/// Index of `erlang:map_size/1` in the guard BIF MFA table.
 pub const MAP_SIZE_MFA_INDEX: u8 = 5;
-/// Index of `erlang:map_get/2` in [`BADARG_MFAS`].
+/// Index of `erlang:map_get/2` in the guard BIF MFA table.
 pub const MAP_GET_MFA_INDEX: u8 = 7;
 /// `freason` of a missing key in exact map update: `{badkey, Key}` (erts `EXC_BADKEY`).
 // Port of erts/emulator/beam/error.h:168, OTP-29.1.1.
 pub use crate::exc::EXC_BADKEY;
 /// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
 pub use crate::exc::EXC_BADMAP;
-const BADARG_MFA_SLOT: u32 = 16_440;
 
 /// Target mode accepted by the function arity guard adapter.
 pub enum Function2TestTarget {
@@ -862,7 +848,7 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
             e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
         })?;
-        self.error_if_nonzero(Gpr::x(9))?;
+        self.error_if_nonzero_with_bif_context(Gpr::x(9))?;
         Ok(())
     }
 
@@ -2050,9 +2036,17 @@ impl BeamModuleAssembler {
     }
 
     pub(super) fn set_badarg_mfa(&mut self, index: u64) -> Result<(), ModuleError> {
+        let index = usize::try_from(index)
+            .map_err(|_| ModuleError::InvalidOperand("guard BIF MFA index"))?;
+        let mfa = crate::bif::guard_bif_mfa(index)
+            .ok_or(ModuleError::InvalidOperand("guard BIF MFA index"))?;
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(9), index + 1)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(19), BADARG_MFA_SLOT)
+            e.mov_const(Gpr::x(9), mfa as u64)?;
+            e.str_uoff(
+                Gpr::x(9),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
         })?;
         Ok(())
     }
@@ -2278,6 +2272,7 @@ impl BeamModuleAssembler {
         map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
         if !exact_map {
+            self.set_badarg_mfa(9)?;
             let slow = self.code.new_label();
             let done = self.code.new_label();
             self.emit_map_is_key_fast(

@@ -25,7 +25,12 @@ extern "C" fn add_stacktrace_stub(_: *mut ProcessHeader, reason: u64, _: u64) ->
     reason
 }
 
-extern "C" fn uncaught(_: *mut ProcessHeader, _: *mut SchedulerRegisters, _: *mut u64) -> usize {
+extern "C" fn uncaught(
+    _: *mut ProcessHeader,
+    _: *mut SchedulerRegisters,
+    _: *mut u64,
+    _: u64,
+) -> usize {
     0
 }
 
@@ -33,6 +38,7 @@ extern "C" fn route_to_header_handler(
     process: *mut ProcessHeader,
     _: *mut SchedulerRegisters,
     _: *mut u64,
+    _: u64,
 ) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
 }
@@ -41,6 +47,7 @@ extern "C" fn unwind_and_route_to_header_handler(
     process: *mut ProcessHeader,
     _: *mut SchedulerRegisters,
     _: *mut u64,
+    _: u64,
 ) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| {
         header.stop = header.stop.wrapping_add(arinsal_term::CP_WORDS);
@@ -356,6 +363,29 @@ fn atom_word(name: &str) -> u64 {
     Term::atom(global_atoms().intern(name).unwrap()).tagged_word()
 }
 
+extern "C" fn raw_raise_for_test(
+    process: *mut ProcessHeader,
+    trace: u64,
+    class: u64,
+    value: u64,
+) -> u64 {
+    arinsal_beamasm::rt::process_header_mut(process, |header| {
+        let freason = if class == atom_word("error") {
+            arinsal_beamasm::exc::EXC_ERROR
+        } else if class == atom_word("exit") {
+            arinsal_beamasm::exc::EXC_EXIT
+        } else if class == atom_word("throw") {
+            arinsal_beamasm::exc::EXC_THROWN
+        } else {
+            return 1;
+        };
+        header.exc.freason = freason & !arinsal_beamasm::exc::EXF_SAVETRACE;
+        header.exc.fvalue = value;
+        header.exc.ftrace = trace;
+        0
+    })
+}
+
 #[test]
 fn native_raw_raise() {
     let mut asm = BeamModuleAssembler::new();
@@ -364,12 +394,13 @@ fn native_raw_raise() {
         .unwrap();
     asm.move_(ArgVal::Immediate(12), ArgVal::X(1)).unwrap();
     asm.move_(ArgVal::Immediate(0x3b), ArgVal::X(2)).unwrap();
-    asm.emit_raw_raise(uncaught).unwrap();
+    asm.emit_raw_raise(raw_raise_for_test as *const () as usize, uncaught)
+        .unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
     assert_eq!(
         header.exc.freason,
-        arinsal_beamasm::catch::RAW_RAISE | arinsal_beamasm::exc::EXTAG_EXIT
+        arinsal_beamasm::exc::EXC_EXIT & !arinsal_beamasm::exc::EXF_SAVETRACE
     );
     assert_eq!(header.exc.fvalue, 12);
     assert_eq!(header.exc.ftrace, 0x3b);
@@ -383,7 +414,8 @@ fn native_raw_raise_invalid_class_continues_with_badarg() {
     asm.emit_i_func_label(1).unwrap();
     asm.move_(ArgVal::Immediate(atom_word("nonclass")), ArgVal::X(0))
         .unwrap();
-    asm.emit_raw_raise(uncaught).unwrap();
+    asm.emit_raw_raise(raw_raise_for_test as *const () as usize, uncaught)
+        .unwrap();
     finish(&mut asm);
     let (_, header, regs, _) = execute(asm, 1);
     assert_eq!(header.exc.freason, 0);

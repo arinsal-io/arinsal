@@ -15,6 +15,10 @@ const FCALLS: Gpr = Gpr::w(22);
 const C_P: Gpr = Gpr::x(21);
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
 const TMP_MEM_ARITH_ARGS: u32 = 16_384;
+const TMP_MEM_ARITH_MUL_ADD_PRODUCT: u32 = TMP_MEM_ARITH_ARGS + 16;
+// tmp_mem[7]: tmp_mem[3] (ARITH_ARGS + 24) is the native exit marker, which a stored addend
+// would turn into a bogus exit kind when the raise is caught.
+const TMP_MEM_ARITH_MUL_ADDEND: u32 = TMP_MEM_ARITH_ARGS + 56;
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),
     Gpr::x(26),
@@ -247,7 +251,7 @@ pub struct BeamModuleAssembler {
     /// Shared `call_fun` error handler and its resolver, bound in `finalize` when used.
     call_fun_error_stub: Option<(Label, usize)>,
     /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
-    arith_fragments: Vec<((usize, u32), Label)>,
+    arith_fragments: Vec<((usize, u32, usize), Label)>,
     /// Shared garbage-collection fragments of heap and stack checks, keyed by hook address.
     gc_fragments: Vec<(usize, Label)>,
     /// Module-local dispatch stubs for process-wide executable fragments.
@@ -1889,7 +1893,14 @@ impl BeamModuleAssembler {
             e.mov_const(Gpr::x(9), badarg)?;
             e.str_uoff(Gpr::x(9), C_P, 48)
         })?;
-        self.branch_error()
+        self.code.emit(|e| {
+            e.ldr_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.branch_error_preserving_bif()
     }
 
     /// Selects the failure label that arithmetic emitted next branches to instead of raising
@@ -1923,16 +1934,13 @@ impl BeamModuleAssembler {
     /// first use and emitted by `finalize`.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:114-143 (emit_plus_body_shared and
     // the other *_body_shared fragments), OTP-29.1.1
-    pub(super) fn arith_fragment(&mut self, helper: usize, op: u32) -> Label {
-        if let Some((_, label)) = self
-            .arith_fragments
-            .iter()
-            .find(|(key, _)| *key == (helper, op))
-        {
+    pub(super) fn arith_fragment(&mut self, helper: usize, op: u32, bif_mfa: usize) -> Label {
+        let key = (helper, op, bif_mfa);
+        if let Some((_, label)) = self.arith_fragments.iter().find(|(known, _)| *known == key) {
             return *label;
         }
         let label = self.code.new_label();
-        self.arith_fragments.push(((helper, op), label));
+        self.arith_fragments.push((key, label));
         label
     }
 
@@ -1955,18 +1963,73 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// Raises a failure from a native BIF helper, whose `current` MFA was stored by the helper.
+    pub(super) fn error_if_nonzero_with_bif_context(
+        &mut self,
+        reg: Gpr,
+    ) -> Result<(), ModuleError> {
+        let ok = self.code.new_label();
+        self.code.cbz(reg, ok)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.branch_error_preserving_bif()?;
+        self.code.bind(ok)?;
+        Ok(())
+    }
+
     /// Calls the module's raise stub, which never returns: the return address of this `bl` is
     /// the pc the raised exception names its source line by.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_raise_exception ARG2 = pc), OTP-29.1.1.
     pub(super) fn branch_error(&mut self) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
+            e.str_uoff(
+                Gpr::xzr(),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
         self.code.bl(self.error_pc_label)?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp, OTP-29.1.1.
         self.last_error_offset = self.code.offset();
         Ok(())
     }
 
+    fn branch_error_preserving_bif(&mut self) -> Result<(), ModuleError> {
+        self.code.bl(self.error_pc_label)?;
+        self.last_error_offset = self.code.offset();
+        Ok(())
+    }
+
+    /// Calls the shared error exit, which reads the current BIF MFA from the process.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1.
+    pub(super) fn branch_error_with_bif(&mut self) -> Result<(), ModuleError> {
+        self.code.emit(|e| e.mov_reg(Gpr::x(3), Gpr::xzr()))?;
+        self.code.bl(self.error_pc_label)?;
+        self.last_error_offset = self.code.offset();
+        Ok(())
+    }
+
     /// Branches to the shared error exit with LR already holding the raising pc.
     pub(super) fn branch_error_from_lr(&mut self) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
+            e.str_uoff(
+                Gpr::xzr(),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.code.b(self.error_label)?;
+        Ok(())
+    }
+
+    pub(super) fn branch_error_from_lr_preserving_bif(&mut self) -> Result<(), ModuleError> {
         self.code.b(self.error_label)?;
         Ok(())
     }
@@ -2280,7 +2343,8 @@ impl BeamModuleAssembler {
                 e.mov_const(Gpr::x(8), EXC_FUNCTION_CLAUSE)?;
                 e.str_uoff(Gpr::x(8), Gpr::x(21), 40)?;
                 e.mov_const(Gpr::x(8), function_clause)?;
-                e.str_uoff(Gpr::x(8), Gpr::x(21), 48)
+                e.str_uoff(Gpr::x(8), Gpr::x(21), 48)?;
+                e.mov_reg(Gpr::x(3), Gpr::xzr())
             })?;
             // x30 points 4 bytes into the function's `i_func_info` slot (the `bl` in
             // `emit_i_func_info`). Registered native function ranges start at the entry after
@@ -2303,7 +2367,7 @@ impl BeamModuleAssembler {
             self.emit_garbage_collect_fragment(hook)?;
         }
         let fragments = std::mem::take(&mut self.arith_fragments);
-        for ((helper, op), label) in fragments {
+        for ((helper, op, bif_mfa), label) in fragments {
             self.code.bind(label)?;
             let update = crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS);
             let raising = op & 0x100 == 0;
@@ -2316,6 +2380,10 @@ impl BeamModuleAssembler {
                     e.str_uoff(Gpr::x(14), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
                     if !unary {
                         e.str_uoff(Gpr::x(17), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                    }
+                    if op & 0xff == 13 {
+                        // Port of beam_asm.hpp TMP_MEM4q in `emit_mul_add_body_shared`.
+                        e.str_uoff(Gpr::x(3), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
                     }
                     Ok(())
                 })?;
@@ -2346,16 +2414,50 @@ impl BeamModuleAssembler {
                     self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
                     self.code.cbz(Gpr::x(9), success)?;
                 }
-                self.code.emit(|e| {
-                    e.ldr_uoff(Gpr::x(10), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
-                    e.mov_reg(Gpr::x(25), Gpr::x(10))?;
-                    if !unary {
-                        e.ldr_uoff(Gpr::x(11), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
-                        e.mov_reg(Gpr::x(26), Gpr::x(11))?;
-                    }
-                    Ok(())
-                })?;
-                self.code.b(self.error_label)?;
+                if op & 0xff == 13 {
+                    // Port of erts_mul_add's `pp` result and `emit_mul_add_body_shared`:
+                    // a product failure names `times/2`; otherwise the failing stage is `plus/2`.
+                    let multiply_failed = self.code.new_label();
+                    self.code.emit(|e| {
+                        e.ldr_uoff(Gpr::x(12), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADD_PRODUCT)
+                    })?;
+                    self.code.cbz(Gpr::x(12), multiply_failed)?;
+                    self.code.emit(|e| {
+                        e.mov_reg(Gpr::x(25), Gpr::x(12))?;
+                        e.ldr_uoff(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
+                        e.mov_const(
+                            Gpr::x(3),
+                            std::ptr::from_ref(&crate::bif::ERLANG_PLUS_MFA) as u64,
+                        )
+                    })?;
+                    self.code.b(self.error_label)?;
+                    self.code.bind(multiply_failed)?;
+                    self.code.emit(|e| {
+                        e.ldr_uoff(Gpr::x(25), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                        e.ldr_uoff(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                        e.mov_const(
+                            Gpr::x(3),
+                            std::ptr::from_ref(&crate::bif::ERLANG_TIMES_MFA) as u64,
+                        )
+                    })?;
+                    self.code.b(self.error_label)?;
+                } else {
+                    self.code.emit(|e| {
+                        e.ldr_uoff(Gpr::x(10), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                        e.mov_reg(Gpr::x(25), Gpr::x(10))?;
+                        if !unary {
+                            e.ldr_uoff(Gpr::x(11), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                            e.mov_reg(Gpr::x(26), Gpr::x(11))?;
+                        }
+                        if bif_mfa == 0 {
+                            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
+                        } else {
+                            e.mov_const(Gpr::x(3), bif_mfa as u64)?;
+                        }
+                        Ok(())
+                    })?;
+                    self.code.b(self.error_label)?;
+                }
                 self.code.bind(success)?;
             } else if !returns_non_value {
                 self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;

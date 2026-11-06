@@ -53,6 +53,15 @@ extern "C" fn eq(_: u64, _: u64) -> i32 {
     0
 }
 
+extern "C" fn raw_raise_for_compile(
+    _header: *mut ProcessHeader,
+    _trace: u64,
+    _class: u64,
+    _value: u64,
+) -> u64 {
+    1
+}
+
 impl ModuleEnv for CorpusEnv {
     fn integer_literal(&self, _value: i64) -> Result<u64, String> {
         Ok(Term::NIL.tagged_word())
@@ -143,6 +152,10 @@ impl ModuleEnv for CorpusEnv {
 
     fn raise_class_helper(&self) -> usize {
         1
+    }
+
+    fn raw_raise_helper(&self) -> usize {
+        raw_raise_for_compile as *const () as usize
     }
 
     fn this_node_sysname(&self) -> usize {
@@ -301,7 +314,12 @@ extern "C" fn map_many(_: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) ->
 extern "C" fn bs_create_bin(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
     0
 }
-extern "C" fn exception(_: *mut ProcessHeader, _: *mut SchedulerRegisters, _: *mut u64) -> usize {
+extern "C" fn exception(
+    _: *mut ProcessHeader,
+    _: *mut SchedulerRegisters,
+    _: *mut u64,
+    _: u64,
+) -> usize {
     0
 }
 extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32) -> usize {

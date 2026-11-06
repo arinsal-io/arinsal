@@ -7560,7 +7560,23 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`), OTP-29.1.1:
         // descriptors refer to live term slots; collection rewrites those slots in place.
+        // `fvalue` and `ftrace` are roots when they hold a heap pointer.
+        // Port of erts/emulator/beam/erl_gc.c:2678-2690 (`setup_rootset`), OTP-29.1.1.
+        let mut exc_roots = [
+            crate::native_hooks::from_raw(self.heap.abi.exc.fvalue),
+            crate::native_hooks::from_raw(self.heap.abi.exc.ftrace),
+        ];
+        let exc_heap = |word: u64| matches!(word & 3, 1 | 2);
+        let exc_rooted = [
+            exc_heap(self.heap.abi.exc.fvalue),
+            exc_heap(self.heap.abi.exc.ftrace),
+        ];
         let mut roots = arinsal_term::GcRootSet::new();
+        for (root, rooted) in exc_roots.iter_mut().zip(exc_rooted) {
+            if rooted {
+                roots.push_term(root);
+            }
+        }
         roots.push(&mut self.x[..live_x]);
         let mut moved = self.inbox.gc_root_slots_and_moved_messages(
             &moved_indices,
@@ -7632,6 +7648,12 @@ impl Process {
                 .collect();
             drop(moved);
             self.inbox.restore_moved_heaps(&moved_indices, heaps);
+        }
+        if exc_rooted[0] {
+            self.heap.abi.exc.fvalue = exc_roots[0].tagged_word();
+        }
+        if exc_rooted[1] {
+            self.heap.abi.exc.ftrace = exc_roots[1].tagged_word();
         }
         let stats =
             stats.map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;

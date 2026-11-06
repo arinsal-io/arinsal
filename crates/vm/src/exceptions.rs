@@ -680,10 +680,13 @@ pub(super) fn resume(
     if let Some(pending) = p.take_work(|w| w.bif_trap.take()) {
         p.set_gc_enabled(pending.gc_was_enabled);
     }
-    // `save_direct` consumes the flag; a trace that is not saved from the raising BIF must not
+    // `save_stacktrace` consumes the flag; a trace that is not saved from the raising BIF must not
     // leave it for a later exception.
     if trap.trace.is_some() || trap.untrappable {
-        p.cold_mut().apply_frame_released = 0;
+        // A process without a cold part has nothing to clear: a raise allocates nothing.
+        if let Some(cold) = p.cold.as_mut() {
+            cold.apply_frame_released = 0;
+        }
     }
     if trap.untrappable {
         let reason = to_owned(trap.reason)
@@ -904,18 +907,22 @@ pub(super) fn resume(
         }
         return Ok(None);
     }
-    if trap.class == Class::Throw {
-        trap.class = Class::Error;
-        trap.reason = tuple(p, &[atom("nocatch")?, trap.reason])?;
-    }
-    let reason = to_owned(trap.reason)
-        .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
-    let stack = if trap.class == Class::Error {
+    // Port of erts/emulator/beam/beam_common.c (`handle_error`, nocatch): the saved trace is
+    // built before `{nocatch, Value}` is allocated, because that allocation can collect and the
+    // local `trace` is not a root (erts keeps it in `c_p->ftrace`).
+    let thrown = trap.class == Class::Throw;
+    let stack = if trap.class == Class::Error || thrown {
         let trace = materialize(Some(vm), p, trace)?;
         to_owned(trace).map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?
     } else {
         OwnedTerm::Nil
     };
+    if thrown {
+        trap.class = Class::Error;
+        trap.reason = tuple(p, &[atom("nocatch")?, trap.reason])?;
+    }
+    let reason = to_owned(trap.reason)
+        .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
     Ok(Some(VmError::Raised(Box::new(Raised {
         class: trap.class,
         reason,
@@ -943,11 +950,7 @@ fn save_raw(
     // `handle_error` passes its `pc` directly to `save_stacktrace`; frame identity is
     // resolved later by `build_stacktrace` through the active ranges table.
     let native_pc = (error_pc != 0).then_some(error_pc);
-    let pending_top = stacktrace::take_matching_pending_top(p);
-    let save_top = top
-        .map(stacktrace::SaveTop::Live)
-        .or_else(|| pending_top.as_ref().map(stacktrace::SaveTop::Stored));
-    stacktrace::save_direct(
+    stacktrace::save_stacktrace(
         p,
         stacktrace::StackTraceSave {
             class,
@@ -958,7 +961,7 @@ fn save_raw(
                 stacktrace::class_to_freason(Some(class))
             },
             native_pc,
-            top: save_top,
+            top: top.map(stacktrace::SaveTop::Live),
         },
         None,
     )

@@ -272,6 +272,31 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
         Term::NON_VALUE
     }
 
+    /// Leave a primary exception in the process failure words without an argument-list flag.
+    ///
+    /// Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1.
+    #[inline]
+    pub fn fail_exception(&mut self, class: Class, reason: Term) -> Term {
+        if self.state.uses_process_exc
+            && let Some(abi) = self.heap.native_abi_mut()
+        {
+            abi.exc.freason = match class {
+                Class::Error => arinsal_term::exc::EXC_ERROR,
+                Class::Exit => arinsal_term::exc::EXC_EXIT,
+                Class::Throw => arinsal_term::exc::EXC_THROWN,
+            };
+            abi.exc.fvalue = reason.word();
+            abi.exc.ftrace = 0;
+        } else {
+            self.state.error = Some(BifError::Raise {
+                class,
+                reason,
+                stacktrace: None,
+            });
+        }
+        Term::NON_VALUE
+    }
+
     /// `BIF_ERROR(p, BADARG)`.
     #[inline]
     pub fn badarg(&mut self) -> Term {
@@ -464,7 +489,7 @@ fn encode_failure(exc: &mut arinsal_term::exc::ExcFields, error: BifError) {
         BifError::Badarg { cause: None } => exc.freason = EXC_BADARG,
         BifError::Badarg { cause: Some(cause) } => {
             exc.freason = EXC_BADARG | EXF_HAS_EXT_INFO;
-            exc.ftrace = cause.word();
+            exc.fvalue = cause.word();
         }
         BifError::Badarith => exc.freason = EXC_BADARITH,
         BifError::SystemLimit => exc.freason = EXC_SYSTEM_LIMIT,
@@ -477,9 +502,9 @@ fn encode_failure(exc: &mut arinsal_term::exc::ExcFields, error: BifError) {
             reason,
             stacktrace,
         } => {
-            // `EXF_ARGLIST` marks a raise (with or without a stacktrace in `ftrace`) and so
-            // tells it apart from a plain `error:Reason` failure.
-            exc.freason = class_code(class) | EXF_ARGLIST;
+            // raise/3 stores its trace in ftrace; error/2 and error/3 store their caller
+            // arguments in the EXF_ARGLIST failure representation.
+            exc.freason = class_code(class) | if stacktrace.is_none() { EXF_ARGLIST } else { 0 };
             exc.fvalue = reason.word();
             exc.ftrace = stacktrace.map_or(0, Term::word);
         }
