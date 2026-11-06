@@ -6453,7 +6453,6 @@ impl Process {
     fn is_ordinary_message(payload: &Payload<Message>) -> bool {
         match payload {
             Payload::Message(message) => !message.is_altact_msg(),
-            Payload::TimerMessage { message, .. } => !message.is_altact_msg(),
             Payload::Timer { .. } => true,
             Payload::Signal(_) => false,
         }
@@ -6698,32 +6697,9 @@ impl Process {
     fn move_message(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
-        mut node: MessageNode,
+        node: MessageNode,
     ) -> Result<(), VmError> {
         let from = node.from;
-        if let Payload::TimerMessage { .. } = node.payload {
-            // An expired `send_after`: the timer reference is retired and the message is queued
-            // as it is, in its own node.
-            let placeholder = Payload::Signal(arinsal_sched::Signal::GarbageCollect);
-            if let Payload::TimerMessage { message, .. } =
-                std::mem::replace(&mut node.payload, placeholder)
-            {
-                let priority = message.is_priority();
-                node.payload = Payload::Message(*message);
-                let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                let before = self.message_words_before();
-                let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
-                self.uncount_message_words(before);
-                self.cold_mut().prio_len = new_prio_len;
-                if priority {
-                    let priority_term = self.inbox.get(old_prio_len).copied().ok_or_else(|| {
-                        VmError::Unsupported("priority message missing after insertion".into())
-                    })?;
-                    self.priority_item_inserted(old_prio_len, priority_term)?;
-                }
-            }
-            return Ok(());
-        }
         if let Payload::Message(message) = &node.payload {
             let (alias, receive_traced, priority) =
                 (message.alias, message.receive_traced, message.is_priority());
@@ -7356,7 +7332,6 @@ impl Process {
     fn sig_cont_message_mut(payload: &mut Payload<Message>) -> Option<&mut Message> {
         match payload {
             Payload::Message(message) => Some(message),
-            Payload::TimerMessage { message, .. } => Some(&mut **message),
             _ => None,
         }
     }

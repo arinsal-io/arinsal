@@ -580,13 +580,8 @@ pub enum LiteralCopyHow {
 pub enum Payload<M: SignalMessage> {
     Message(M),
     Signal(Signal<M>),
-    /// An expired `start_timer`; the VM can form `{timeout, Ref, Msg}`.
+    /// Scheduler-only opaque timer envelope. VM BIF timers build their final message before expiry.
     Timer {
-        reference: TimerId,
-        message: Box<M>,
-    },
-    /// An expired `send_after`; the VM retires the timer reference and delivers the message as-is.
-    TimerMessage {
         reference: TimerId,
         message: Box<M>,
     },
@@ -668,10 +663,7 @@ impl<M: SignalMessage> InSignal for Event<M> {
     fn is_message(&self) -> bool {
         match &self.payload {
             Payload::Message(message) => !message.is_altact_msg(),
-            // Timer payloads need the scheduler's timer bookkeeping: counted as non-message
-            // signals they stop the splice in `take_all_if` without a walk under the msgq lock.
-            Payload::TimerMessage { .. } | Payload::Timer { .. } => false,
-            Payload::Signal(_) => false,
+            Payload::Signal(_) | Payload::Timer { .. } => false,
         }
     }
 }
@@ -4495,6 +4487,8 @@ impl<T: Task> Inner<T> {
         })
     }
 
+    // Port of erts/emulator/beam/erl_hl_timer.c (bif_timer_timeout), OTP-29.1.1: the
+    // scheduler removes timer links before publishing the prepared message to the receiver.
     fn fire_timer(
         &self,
         worker: usize,
@@ -4510,10 +4504,8 @@ impl<T: Task> Inner<T> {
                         message: Box::new(message),
                     }
                 } else {
-                    Payload::TimerMessage {
-                        reference: TimerId(id),
-                        message: Box::new(message),
-                    }
+                    // OTP calls erts_queue_message only after timer-side bookkeeping is retired.
+                    Payload::Message(message)
                 };
                 let _ = self.deliver(pid, pid, payload, local);
             }
@@ -4535,10 +4527,7 @@ impl<T: Task> Inner<T> {
                             message: Box::new(message),
                         }
                     } else {
-                        Payload::TimerMessage {
-                            reference: TimerId(id),
-                            message: Box::new(message),
-                        }
+                        Payload::Message(message)
                     };
                     let _ = self.deliver(pid, pid, payload, local);
                 }
