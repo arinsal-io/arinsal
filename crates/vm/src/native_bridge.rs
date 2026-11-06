@@ -1440,6 +1440,7 @@ fn native_exit(
             crate::stacktrace::set_raw_class(process, trace, class);
         }
         return Err(VmError::Trap(exceptions::Trap {
+            export: None,
             class,
             reason: crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
             trace: Some(trace),

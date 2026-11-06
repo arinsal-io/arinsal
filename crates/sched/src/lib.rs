@@ -8518,6 +8518,7 @@ struct SliceEnd<T: Task> {
 // Port of erts/emulator/beam/erl_process.c (erts_schedule: the exiting process is handed to
 // erts_continue_exit_process while it is still locked), OTP-29.1.1.
 fn exit_cleanup<T: Task>(inner: &Inner<T>, process: &Process<T>, cell: &mut TaskCell<T>) {
+    let ptab_deleted = process.run_state().load(Ordering::SeqCst) == EXITED;
     process.run_state().store(EXITED, Ordering::SeqCst);
     // Close the in-queue under the msgq lock and reap what it still holds; a later
     // enqueue fails and the sender sees the process gone.
@@ -8527,11 +8528,9 @@ fn exit_cleanup<T: Task>(inner: &Inner<T>, process: &Process<T>, cell: &mut Task
         cell.task_mut().reap_signals(process.pid, events);
     }
     cell.task_mut().delete_process();
-    // `begin_exit` already deleted the element (erts deletes once, at
-    // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
-    // this pix again would free the new occupant. A forced exit that never
-    // reached `begin_exit` still owns the slot.
-    if inner.table.lookup(process.pid).is_some() {
+    // `begin_exit` deletes the element at ERTS_CONTINUE_EXIT_FREE. Keep the forced-exit
+    // fallback, but use the process state as erts' FREE bit instead of looking up the pid again.
+    if !ptab_deleted {
         inner.table.remove(process.pid);
     }
 }

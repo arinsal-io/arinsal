@@ -1527,20 +1527,22 @@ fn re_run_trap(
                 args.get(2).copied().unwrap_or(Term::NIL),
             ]);
             process.gc_live = 3;
-            HandlerResult::Export(crate::ExportTrap {
-                continuation: RE_URUN_CONTINUATION,
-                args: vec![args[0], args[1], args.get(2).copied().unwrap_or(Term::NIL)],
-            })
+            HandlerResult::Export(crate::ExportTrap::new(
+                process,
+                RE_URUN_CONTINUATION,
+                vec![args[0], args[1], args.get(2).copied().unwrap_or(Term::NIL)],
+            ))
         }
         arinsal_re::RunDispatch::Global(arinsal_re::GlobalRun::Trap { pattern, options }) => {
             // Port of erts/emulator/beam/erl_bif_re.c:1557-1603 (grun_trap_exportp), OTP-29.1.1.
             process.x.ensure_x(3);
             process.x[..3].copy_from_slice(&[args[0], pattern, options]);
             process.gc_live = 3;
-            HandlerResult::Export(crate::ExportTrap {
-                continuation: RE_GRUN_CONTINUATION,
-                args: vec![args[0], pattern, options],
-            })
+            HandlerResult::Export(crate::ExportTrap::new(
+                process,
+                RE_GRUN_CONTINUATION,
+                vec![args[0], pattern, options],
+            ))
         }
     })
 }
@@ -2052,11 +2054,24 @@ fn lookup_entry(module: &str, function: &str, arity: usize) -> Option<&'static E
 /// The export a trap continues in. erts `BIF_TRAP` names the trap `Export*` directly; here the
 /// name-keyed lookup is done once, when the trap is installed, and a resume reads the result.
 pub(crate) struct ContinuationTarget {
+    pub(crate) continuation: &'static str,
+    pub(crate) trap_export_id: usize,
     pub(crate) module: &'static str,
     pub(crate) function: &'static str,
     pub(crate) arity: usize,
+    pub(crate) module_atom: arinsal_term::Atom,
+    pub(crate) function_atom: arinsal_term::Atom,
     /// The Rust handler of the continuation, absent when it is an Erlang export.
     pub(crate) entry: Option<&'static Entry>,
+}
+
+impl std::fmt::Debug for ContinuationTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContinuationTarget")
+            .field("continuation", &self.continuation)
+            .field("arity", &self.arity)
+            .finish()
+    }
 }
 
 impl ContinuationTarget {
@@ -2066,6 +2081,9 @@ impl ContinuationTarget {
 }
 
 /// The target of a continuation string, cached per string address so a trap pays no hashing.
+/// Its stable id indexes each runtime's `ExportEntry` table.
+pub(crate) const TRAP_EXPORT_CAPACITY: usize = 128;
+
 pub(crate) fn continuation_target(continuation: &'static str) -> &'static ContinuationTarget {
     use std::cell::Cell;
     const SLOTS: usize = 64;
@@ -2082,21 +2100,37 @@ pub(crate) fn continuation_target(continuation: &'static str) -> &'static Contin
     }
     static ALL: OnceLock<Mutex<HashMap<&'static str, &'static ContinuationTarget>>> =
         OnceLock::new();
-    let target = *ALL
+    let mut all = ALL
         .get_or_init(Default::default)
         .lock()
-        .expect("continuation targets")
-        .entry(continuation)
-        .or_insert_with(|| {
-            let (module, function, arity) = continuation_parts(continuation)
-                .expect("a continuation is `module:function/arity`");
-            Box::leak(Box::new(ContinuationTarget {
-                module,
-                function,
-                arity,
-                entry: lookup_entry(module, function, arity),
-            }))
-        });
+        .expect("continuation targets");
+    let target = if let Some(target) = all.get(continuation) {
+        *target
+    } else {
+        assert!(
+            all.len() < TRAP_EXPORT_CAPACITY,
+            "trap export table capacity"
+        );
+        let (module, function, arity) =
+            continuation_parts(continuation).expect("a continuation is `module:function/arity`");
+        let target: &'static ContinuationTarget = Box::leak(Box::new(ContinuationTarget {
+            continuation,
+            trap_export_id: all.len(),
+            module,
+            function,
+            arity,
+            module_atom: global_atoms()
+                .intern(module)
+                .expect("continuation module atom"),
+            function_atom: global_atoms()
+                .intern(function)
+                .expect("continuation function atom"),
+            entry: lookup_entry(module, function, arity),
+        }));
+        let _ = all.insert(continuation, target);
+        target
+    };
+    drop(all);
     RECENT.with(|recent| {
         let mut slots = recent.get();
         slots[slot] = Some((key.0, key.1, target));
@@ -2121,10 +2155,11 @@ pub(crate) fn run_trapped_export(
         clear_export_trap(process);
         // The arguments are the live X registers the trap left (erts BIF_TRAPn, reg[0..n]).
         let args = process.x[..pending.arity].to_vec();
-        return Some(Ok(ResumeResult::Export(crate::ExportTrap {
-            continuation: pending.continuation,
+        return Some(Ok(ResumeResult::Export(crate::ExportTrap::new(
+            process,
+            pending.continuation,
             args,
-        })));
+        ))));
     }
     let args = [
         process.x.first().copied().unwrap_or(Term::NIL),
@@ -2172,8 +2207,8 @@ pub(crate) fn install_export_trap(
         caller_ip: process.trap_site().1,
         schedule_out: true,
         import,
-        continuation: trap.continuation,
-        target: continuation_target(trap.continuation),
+        continuation: trap.target.continuation,
+        target: trap.target,
         state: argument_trap_state(()),
         direct_state: None,
         state_term: None,
@@ -2221,13 +2256,13 @@ fn original_trap_report<'a>(
 }
 
 /// Point `c_p->i` at `beam_bif_export_trap` and record the continuation export's arity.
+// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1.
 pub(crate) fn arm_export_trap(process: &mut Process) {
     if let Some(arity) = process
         .cold
         .as_ref()
         .and_then(|cold| cold.bif_trap.as_ref())
-        .and_then(|pending| continuation_parts(pending.continuation))
-        .map(|(_, _, arity)| arity)
+        .map(|pending| pending.target.arity)
     {
         process.heap.abi.arity = arity as u8;
     }
@@ -3108,8 +3143,8 @@ pub(crate) fn finish_light(
                 caller_ip: process.trap_site().1,
                 schedule_out: false,
                 import,
-                continuation: trap.continuation,
-                target: continuation_target(trap.continuation),
+                continuation: trap.target.continuation,
+                target: trap.target,
                 state,
                 direct_state: None,
                 state_term,
@@ -5295,10 +5330,11 @@ mod export_trap_tests {
             .unwrap();
         let false_atom = Term::atom(global_atoms().intern("false").unwrap());
         let true_atom = Term::atom(global_atoms().intern("true").unwrap());
-        let trap = crate::ExportTrap {
-            continuation: "erts_internal:flush_monitor_messages/3",
-            args: vec![tuple, false_atom, true_atom],
-        };
+        let trap = crate::ExportTrap::new(
+            &process,
+            "erts_internal:flush_monitor_messages/3",
+            vec![tuple, false_atom, true_atom],
+        );
         let callee = (
             global_atoms().intern("erlang").unwrap(),
             global_atoms().intern("demonitor").unwrap(),
@@ -5315,7 +5351,7 @@ mod export_trap_tests {
             panic!("the export trap resumes as an export call");
         };
         assert_eq!(
-            resumed.continuation,
+            resumed.target.continuation,
             "erts_internal:flush_monitor_messages/3"
         );
         assert_eq!(

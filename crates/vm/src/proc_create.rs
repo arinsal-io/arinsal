@@ -477,6 +477,12 @@ pub struct Process {
     /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
     /// re-read the operand (erts/emulator/beam/emu/msg_instrs.tab, wait.src).
     pub(crate) receive_infinity: bool,
+    /// `ERTS_P_LINKS(p)`: links are embedded in the process block in erts.
+    pub(crate) links: LinkTree,
+    /// `ERTS_P_MONITORS(p)`: origin monitor tree embedded in the process block in erts.
+    pub(crate) monitors: MonitorTree,
+    /// `ERTS_P_LT_MONITORS(p)`: target monitor list embedded in the process block in erts.
+    pub(crate) lt_monitors: TargetMonitorList,
     pub(crate) cold: Option<FixAllocBox<ProcessCold>>,
     /// `p->group_leader`. Kept on the process so a spawn does not allocate `ProcessCold`.
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
@@ -1384,11 +1390,6 @@ pub(crate) struct ProcessCold {
     pub(crate) parent_external: Option<Box<arinsal_etf::OwnedTerm>>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
-    /// Link nodes keyed by the other end (erts `ERTS_P_LINKS`, a tree of `ErtsILink`).
-    pub(crate) links: LinkTree,
-    /// Origin entries keyed by reference (erts `ERTS_P_MONITORS`), including standalone aliases,
-    /// and the target halves of monitors from remote processes.
-    pub(crate) monitors: MonitorTree,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
@@ -1396,8 +1397,6 @@ pub(crate) struct ProcessCold {
     /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
     /// every monitor kind, since the origin decides priority when it receives the DOWN.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
-    /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
-    pub(crate) lt_monitors: TargetMonitorList,
     /// Target halves of NIF resource monitors (erts `ERTS_MON_TYPE_RESOURCE` in `ERTS_P_LT_MONITORS`).
     pub(crate) resource_monitors:
         std::collections::BTreeMap<u64, std::sync::Arc<arinsal_nif::ResourceMonitor>>,
@@ -2371,6 +2370,9 @@ impl Process {
             receive_deadline: None,
             receive_deadline_ms: None,
             receive_infinity: false,
+            links: LinkTree::default(),
+            monitors: MonitorTree::default(),
+            lt_monitors: TargetMonitorList::default(),
             cold: None,
             group_leader: None,
             parent: None,
@@ -3430,9 +3432,6 @@ mod layout_report {
         field!("dirty_gc", Option<DirtyGc>);
         field!("dictionary_heap", arinsal_term::VecHeap);
         field!("flags", ProcFlags);
-        field!("links", LinkTree);
-        field!("monitors", MonitorTree);
-        field!("lt_monitors", TargetMonitorList);
         field!("btreeset", std::collections::BTreeSet<u64>);
         field!("suspend_map", std::collections::BTreeMap<arinsal_sched::Pid, std::sync::Arc<crate::suspend::SuspendMonitor>>);
         field!("initial_bif", Option<(String, String, u8)>);

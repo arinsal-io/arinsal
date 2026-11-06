@@ -910,6 +910,7 @@ fn bad_get_tuple_element(_p: &mut Process, tuple: Term, index: u16) -> VmError {
     });
     let index = Term::small(i64::from(index) + 1).expect("tuple element index is small");
     VmError::Trap(exceptions::Trap {
+        export: None,
         class: arinsal_bifs::Class::Error,
         reason: signals::atom("badarg"),
         trace: None,

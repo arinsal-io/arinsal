@@ -3953,10 +3953,11 @@ fn entry_info_2(
         // Port of erts/emulator/beam/erl_db.c (ets_info_2 traps to
         // ets_info_binary_trap), OTP-29.1.1. The Erlang export owns the walk so
         // each raw ETS operation has its own reductions and releases its table lock.
-        return Some(Err(VmError::TrapExport(crate::ExportTrap {
-            continuation: "erts_internal:ets_info_binary/1",
-            args: vec![target],
-        })));
+        return Some(Err(VmError::TrapExport(crate::ExportTrap::new(
+            process,
+            "erts_internal:ets_info_binary/1",
+            vec![target],
+        ))));
     }
     let _ = vm;
     let ctx_pid = ctx.pid();

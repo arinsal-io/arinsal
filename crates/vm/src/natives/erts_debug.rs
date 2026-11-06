@@ -1863,17 +1863,9 @@ struct Relations {
 }
 
 impl Relations {
-    fn empty() -> Self {
+    fn of(process: &Process) -> Self {
         Self {
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        }
-    }
-
-    fn of(cold: &crate::proc_create::ProcessCold) -> Self {
-        Self {
-            links: cold
+            links: process
                 .links
                 .iter()
                 .map(|node| {
@@ -1883,7 +1875,7 @@ impl Relations {
                     )
                 })
                 .collect(),
-            monitors: cold
+            monitors: process
                 .monitors
                 .iter()
                 .filter_map(|monitor| {
@@ -1899,10 +1891,15 @@ impl Relations {
                     ))
                 })
                 .collect(),
-            monitored_by: cold
+            monitored_by: process
                 .lt_monitors
                 .iter()
-                .chain(cold.monitors.iter().filter(|monitor| monitor.is_target()))
+                .chain(
+                    process
+                        .monitors
+                        .iter()
+                        .filter(|monitor| monitor.is_target()),
+                )
                 .map(|monitor| {
                     (
                         monitor.reference(),
@@ -1938,12 +1935,7 @@ fn remote_relations(
             signal_error = Some(error);
         }
         if signal_error.is_none() && !exiting(target) {
-            relations = Some(
-                target
-                    .cold
-                    .as_deref()
-                    .map_or_else(Relations::empty, Relations::of),
-            );
+            relations = Some(Relations::of(target));
         }
     });
     match locked {
@@ -1969,12 +1961,7 @@ fn current_relations(
     if !exiting(process) {
         process.drain(ctx)?;
     }
-    Ok((!exiting(process)).then(|| {
-        process
-            .cold
-            .as_deref()
-            .map_or_else(Relations::empty, Relations::of)
-    }))
+    Ok((!exiting(process)).then(|| Relations::of(process)))
 }
 
 fn internal_monitor_list_from(
