@@ -350,6 +350,13 @@ impl TimemTrace {
             .map(|(pid, (count, accumulator))| (pid, count, accumulator))
             .collect()
     }
+
+    /// Merge a stable temporary counter set into the active counter set.
+    fn merge_entries(&self, entries: &[(Pid, i64, i64)]) {
+        for &(pid, count, accumulator) in entries {
+            self.accum(pid, count, accumulator);
+        }
+    }
 }
 
 /// Port of erts/emulator/beam/beam_bp.h:75-83 (GenericBpData), OTP-29.1.1.
@@ -833,6 +840,10 @@ pub(crate) enum FinishStage {
     Consolidate,
     /// A phase that only waits for the barrier (event patterns, trace_info_finisher).
     Wait,
+    /// Commit temporary call counters after the first trace-info barrier.
+    TimemCommitBack,
+    /// Consolidate the temporary counters after the final trace-info barrier.
+    TimemConsolidate,
 }
 
 /// A breakpoint update that a trace BIF caller, suspended between code barriers, finishes
@@ -840,6 +851,12 @@ pub(crate) enum FinishStage {
 pub(crate) struct TraceFinish {
     pub(crate) functions: Vec<BpFunction>,
     pub(crate) stages: std::collections::VecDeque<FinishStage>,
+    /// Session whose active call counters are being collected by a trace-info barrier.
+    pub(crate) timem_session: Option<u64>,
+    pub(crate) timem_time_base: Option<TimemSnapshot>,
+    pub(crate) timem_memory_base: Option<TimemSnapshot>,
+    pub(crate) timem_time: Option<TimemSnapshot>,
+    pub(crate) timem_memory: Option<TimemSnapshot>,
     /// The BIF result once every stage ran; `None` when the BIF builds it again
     /// (bif_trace_info_finish_trap).
     pub(crate) result: Option<i64>,
@@ -860,6 +877,11 @@ impl TraceFinish {
         TraceFinish {
             functions,
             stages,
+            timem_session: None,
+            timem_time_base: None,
+            timem_memory_base: None,
+            timem_time: None,
+            timem_memory: None,
             result: Some(result),
         }
     }
@@ -869,7 +891,31 @@ impl TraceFinish {
         TraceFinish {
             functions: Vec::new(),
             stages: std::iter::repeat_n(FinishStage::Wait, barriers.saturating_sub(1)).collect(),
+            timem_session: None,
+            timem_time_base: None,
+            timem_memory_base: None,
+            timem_time: None,
+            timem_memory: None,
             result,
+        }
+    }
+
+    /// The three barrier phases of `trace_info_finisher` for active call counters.
+    pub(crate) fn timem(function: BpFunction, session: u64) -> Self {
+        TraceFinish {
+            functions: vec![function],
+            stages: [
+                FinishStage::Commit,
+                FinishStage::TimemCommitBack,
+                FinishStage::TimemConsolidate,
+            ]
+            .into(),
+            timem_session: Some(session),
+            timem_time_base: None,
+            timem_memory_base: None,
+            timem_time: None,
+            timem_memory: None,
+            result: None,
         }
     }
 }
@@ -1429,6 +1475,154 @@ pub(crate) const GOT_COUNT: u32 = BPF_COUNT;
 pub(crate) const GOT_TIME: u32 = BPF_TIME_TRACE;
 pub(crate) const GOT_MEMORY: u32 = BPF_MEM_TRACE;
 
+pub(crate) type TimemSnapshot = Vec<(Pid, i64, i64)>;
+type TimemInfoSnapshot = (Option<TimemSnapshot>, Option<TimemSnapshot>);
+
+/// Install empty staging hashes before the first active-counter trace-info barrier.
+// Port of erts/emulator/beam/beam_bp.c:1486-1561 (erts_prepare_timem_trace_info), OTP-29.1.1.
+pub(crate) fn prepare_timem_info(
+    process: &Process,
+    session: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+    want: u32,
+) {
+    let node = bp_node(process);
+    let staging = node.staging_bp_ix();
+    let mut table = node.tables.write().unwrap();
+    let Some(bp) = table
+        .get_mut(module)
+        .and_then(|functions| functions.get_mut(function))
+        .and_then(|arities| arities.get_mut(&arity))
+        .and_then(|bps| {
+            bps.iter_mut().find(|bp| {
+                bp.runtime == scope(process)
+                    && bp.code == code_scope(process)
+                    && bp.session == session
+            })
+        })
+    else {
+        return;
+    };
+    let data = &mut bp.data[staging];
+    if want & WANT_TIME != 0 && data.flags & BPF_TIME_TRACE_ACTIVE != 0 {
+        data.time = Some(Arc::new(TimemTrace::default()));
+    }
+    if want & WANT_MEMORY != 0 && data.flags & BPF_MEM_TRACE_ACTIVE != 0 {
+        data.memory = Some(Arc::new(TimemTrace::default()));
+    }
+}
+
+/// Collect the old counters after the temporary hashes have become active.
+// Port of erts/emulator/beam/beam_bp.c:1564-1575 (erts_timem_info_collect), OTP-29.1.1.
+pub(crate) fn collect_timem_info(
+    process: &Process,
+    session: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> TimemInfoSnapshot {
+    let node = bp_node(process);
+    let staging = node.staging_bp_ix();
+    let table = node.tables.read().unwrap();
+    let Some(bp) = table
+        .get(module)
+        .and_then(|functions| functions.get(function))
+        .and_then(|arities| arities.get(&arity))
+        .and_then(|bps| {
+            bps.iter().find(|bp| {
+                bp.runtime == scope(process)
+                    && bp.code == code_scope(process)
+                    && bp.session == session
+            })
+        })
+    else {
+        return (None, None);
+    };
+    let data = &bp.data[staging];
+    let time = (data.flags & BPF_TIME_TRACE_ACTIVE != 0)
+        .then(|| data.time.as_ref().map(|bdt| bdt.snapshot()))
+        .flatten();
+    let memory = (data.flags & BPF_MEM_TRACE_ACTIVE != 0)
+        .then(|| data.memory.as_ref().map(|bdt| bdt.snapshot()))
+        .flatten();
+    (time, memory)
+}
+
+// Port of erts/emulator/beam/beam_bp.c:1621-1645 (erts_timem_info_consolidate), OTP-29.1.1.
+fn merge_timem_snapshots(base: TimemSnapshot, temporary: TimemSnapshot) -> TimemSnapshot {
+    let mut merged: HashMap<Pid, (i64, i64), FastHash> = HashMap::default();
+    for (pid, count, accumulator) in base.into_iter().chain(temporary) {
+        let total = merged.entry(pid).or_default();
+        total.0 += count;
+        total.1 += accumulator;
+    }
+    merged
+        .into_iter()
+        .map(|(pid, (count, accumulator))| (pid, count, accumulator))
+        .collect()
+}
+
+/// Consolidate the stable temporary hashes into the restored active hashes.
+// Port of erts/emulator/beam/beam_bp.c:1564-1595 (erts_timem_info_consolidate), OTP-29.1.1.
+pub(crate) fn consolidate_timem_info(
+    process: &Process,
+    session: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+    time_base: Option<TimemSnapshot>,
+    memory_base: Option<TimemSnapshot>,
+) -> TimemInfoSnapshot {
+    let node = bp_node(process);
+    let (active, staging) = (node.active_bp_ix(), node.staging_bp_ix());
+    let mut table = node.tables.write().unwrap();
+    let Some(bp) = table
+        .get_mut(module)
+        .and_then(|functions| functions.get_mut(function))
+        .and_then(|arities| arities.get_mut(&arity))
+        .and_then(|bps| {
+            bps.iter_mut().find(|bp| {
+                bp.runtime == scope(process)
+                    && bp.code == code_scope(process)
+                    && bp.session == session
+            })
+        })
+    else {
+        return (time_base, memory_base);
+    };
+    let data = &mut bp.data;
+    let mut time_result = None;
+    let mut memory_result = None;
+    if data[active].flags & BPF_TIME_TRACE_ACTIVE != 0
+        && let (Some(real), Some(temporary)) = (&data[active].time, &data[staging].time)
+        && !Arc::ptr_eq(real, temporary)
+    {
+        let temporary_snapshot = temporary.snapshot();
+        real.merge_entries(&temporary_snapshot);
+        time_result = Some(merge_timem_snapshots(
+            time_base.unwrap_or_default(),
+            temporary_snapshot,
+        ));
+        data[staging].time = Some(Arc::clone(real));
+    }
+    if data[active].flags & BPF_MEM_TRACE_ACTIVE != 0
+        && let (Some(real), Some(temporary)) = (&data[active].memory, &data[staging].memory)
+        && !Arc::ptr_eq(real, temporary)
+    {
+        let temporary_snapshot = temporary.snapshot();
+        real.merge_entries(&temporary_snapshot);
+        memory_result = Some(merge_timem_snapshots(
+            memory_base.unwrap_or_default(),
+            temporary_snapshot,
+        ));
+        data[staging].memory = Some(Arc::clone(real));
+    }
+    node.update_active(&table);
+    (time_result, memory_result)
+}
+
 // Port of erts/emulator/beam/erl_bif_trace.c:1793-1850 (function_is_traced) and
 // erts/emulator/beam/beam_bp.c:1418-1486 (erts_is_trace_break, erts_is_mtrace_break,
 // erts_is_count_break, erts_is_time_break, erts_is_memory_break), OTP-29.1.1.
@@ -1439,6 +1633,7 @@ pub(crate) fn function_info(
     function: &str,
     arity: u8,
     want: u32,
+    snapshot_active: bool,
 ) -> FunctionInfo {
     let table = bp_node(process).tables.read().unwrap();
     let ix = bp_node(process).active_bp_ix();
@@ -1459,10 +1654,12 @@ pub(crate) fn function_info(
         got = BPF_GLOBAL_TRACE;
     }
     let source = |spec: &Option<Arc<MatchSpec>>| spec.as_deref().map(|spec| spec.source.clone());
-    let time = (got & BPF_TIME_TRACE != 0)
+    let time = (got & BPF_TIME_TRACE != 0
+        && (snapshot_active || bp.flags & BPF_TIME_TRACE_ACTIVE == 0))
         .then(|| bp.time.as_ref().map(|bdt| bdt.snapshot()))
         .flatten();
-    let memory = (got & BPF_MEM_TRACE != 0)
+    let memory = (got & BPF_MEM_TRACE != 0
+        && (snapshot_active || bp.flags & BPF_MEM_TRACE_ACTIVE == 0))
         .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
         .flatten();
     FunctionInfo {

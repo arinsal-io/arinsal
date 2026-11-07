@@ -1004,6 +1004,28 @@ impl Vm {
         if !tail {
             calls::push_continuation(p, p.module, p.ip() + 1, arity)?;
         }
+        // Port of erts/emulator/beam/beam_bp.c:1181-1250 (do_call_trace), OTP-29.1.1:
+        // apply resolves an export through its global breakpoint before entering native code.
+        // Its native export normally reaches this event via the export trampoline; a
+        // scheduler-interpreted apply must preserve that event when the module has no
+        // interpreter export-breakpoint entry.
+        if let Some(run) = ctx
+            && crate::trace_bp::breakpoint_kinds(p, module, function, arity as u8).1
+            && let Some(native) = self.beamasm_targets.function_for_target(
+                module_id,
+                &self.code.modules[module_id],
+                crate::load::native_code_range(&self.code.code_meta, module_id),
+                target,
+            )
+        {
+            let actions = crate::trace::executor_native_call_event(self, p, run, &native, false)?;
+            crate::trace::push_native_trace_frame(
+                p,
+                native.start,
+                &actions,
+                usize::from(native.arity),
+            )?;
+        }
         self.set_position(p, module_id, target);
         p.tick();
         Ok(ImportOutcome::Jump(

@@ -5212,9 +5212,6 @@ fn meta_tracer_from_term(vm: &Vm, flag: Term) -> Result<crate::trace::Tracer, Vm
 /// `trace_info({M,F,A}, Key)` of a session.
 // Port of erts/emulator/beam/erl_bif_trace.c:1913-1960 (trace_info_func) and 2132-2290
 // (trace_info_func_epilogue), OTP-29.1.1.
-/// Code barriers `trace_info` waits for (the initial one and one per `trace_info_finisher` phase).
-const TRACE_INFO_BARRIERS: usize = 3;
-
 fn trace_info_function(
     vm: &Vm,
     process: &mut Process,
@@ -5254,7 +5251,7 @@ fn trace_info_function(
         return make_tuple(process, &[item, atom("undefined")]);
     }
     let mut info =
-        crate::trace_bp::function_info(process, session, &module, &function, arity, want);
+        crate::trace_bp::function_info(process, session, &module, &function, arity, want, false);
     if info.counters_active {
         // erts stages the breakpoint data without the active counters and waits for a code
         // barrier per phase, so no scheduler updates a counter while it is collected.
@@ -5262,22 +5259,42 @@ fn trace_info_function(
         // trace_info_finisher phases 0-2), OTP-29.1.1.
         // Resumed after the last barrier, the caller builds the result again
         // (bif_trace_info_finish_trap).
-        let waited = process
+        let finish = process
             .cold
             .as_mut()
             .and_then(|cold| {
                 cold.trace_finish
                     .take_if(|finish| finish.stages.is_empty() && finish.result.is_none())
             })
-            .is_some();
-        if !waited {
-            wait_code_barriers(
-                process,
-                ctx,
-                crate::trace_bp::TraceFinish::wait(TRACE_INFO_BARRIERS, None),
-            )?;
+            .map(|boxed| *boxed);
+        let counters = if let Some(finish) = finish {
+            (finish.timem_time, finish.timem_memory)
+        } else {
+            crate::trace_bp::prepare_timem_info(process, session, &module, &function, arity, want);
+            let finish = crate::trace_bp::TraceFinish::timem(
+                crate::trace_bp::BpFunction {
+                    module: module.clone(),
+                    function: function.clone(),
+                    arity,
+                    entry: 0,
+                    exported: false,
+                },
+                session,
+            );
+            let finish = advance_timem_trace_finish(process, ctx, finish)?;
+            let counters = (finish.timem_time.clone(), finish.timem_memory.clone());
+            process.cold_mut().trace_finish = Some(Box::new(finish));
+            counters
+        };
+        info = crate::trace_bp::function_info(
+            process, session, &module, &function, arity, want, false,
+        );
+        if let Some(time) = counters.0 {
+            info.time = Some(time);
         }
-        info = crate::trace_bp::function_info(process, session, &module, &function, arity, want);
+        if let Some(memory) = counters.1 {
+            info.memory = Some(memory);
+        }
     }
     if info.got == 0 {
         return make_tuple(process, &[item, atom("false")]);
@@ -5670,7 +5687,78 @@ fn advance_trace_finish(
         let Some(stage) = finish.stages.pop_front() else {
             return Ok(finish);
         };
-        run_finish_stage(vm, process, &finish.functions, stage);
+        if matches!(
+            stage,
+            crate::trace_bp::FinishStage::TimemCommitBack
+                | crate::trace_bp::FinishStage::TimemConsolidate
+        ) {
+            run_timem_finish_stage(process, &mut finish, stage);
+        } else {
+            run_finish_stage(vm, process, &finish.functions, stage);
+        }
+    }
+}
+
+/// Runs the three stages of `trace_info_finisher` without needing the module assembler.
+// Port of erts/emulator/beam/erl_bif_trace.c:2052-2100 (trace_info_finisher), OTP-29.1.1.
+fn advance_timem_trace_finish(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    mut finish: crate::trace_bp::TraceFinish,
+) -> Result<crate::trace_bp::TraceFinish, VmError> {
+    loop {
+        if suspend_for_code_barrier(process, ctx) {
+            process.cold_mut().trace_finish = Some(Box::new(finish));
+            return Err(VmError::Yield);
+        }
+        let Some(stage) = finish.stages.pop_front() else {
+            return Ok(finish);
+        };
+        match stage {
+            crate::trace_bp::FinishStage::Commit => {
+                crate::trace_bp::commit_staged(process);
+            }
+            crate::trace_bp::FinishStage::TimemCommitBack
+            | crate::trace_bp::FinishStage::TimemConsolidate => {
+                run_timem_finish_stage(process, &mut finish, stage);
+            }
+            _ => unreachable!("trace_info_finisher only uses call-counter stages"),
+        }
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_trace.c:2065-2078 (trace_info_finisher), OTP-29.1.1.
+fn run_timem_finish_stage(
+    process: &Process,
+    finish: &mut crate::trace_bp::TraceFinish,
+    stage: crate::trace_bp::FinishStage,
+) {
+    if let (Some(session), Some(function)) = (finish.timem_session, finish.functions.first()) {
+        match stage {
+            crate::trace_bp::FinishStage::TimemCommitBack => {
+                (finish.timem_time_base, finish.timem_memory_base) =
+                    crate::trace_bp::collect_timem_info(
+                        process,
+                        session,
+                        &function.module,
+                        &function.function,
+                        function.arity,
+                    );
+                crate::trace_bp::commit_staged(process);
+            }
+            crate::trace_bp::FinishStage::TimemConsolidate => {
+                (finish.timem_time, finish.timem_memory) = crate::trace_bp::consolidate_timem_info(
+                    process,
+                    session,
+                    &function.module,
+                    &function.function,
+                    function.arity,
+                    finish.timem_time_base.take(),
+                    finish.timem_memory_base.take(),
+                );
+            }
+            _ => unreachable!("not a trace_info_finisher stage"),
+        }
     }
 }
 
@@ -5693,6 +5781,9 @@ fn run_finish_stage(
             vm.refresh_trace_functions(process, functions);
         }
         FinishStage::Consolidate => crate::trace_bp::consolidate_staged(process, functions),
+        FinishStage::TimemCommitBack | FinishStage::TimemConsolidate => {
+            unreachable!("call-counter phases are handled by run_timem_finish_stage")
+        }
         FinishStage::Wait => {}
     }
 }

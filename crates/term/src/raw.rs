@@ -132,6 +132,47 @@ pub(crate) fn store(address: usize, value: u64) {
     unsafe { *(address as *mut u64) = value }
 }
 
+/// Sorts evaluated flatmap keys and their values in place, keeping the last duplicate.
+///
+/// The map and its key tuple must belong to the current exclusive heap allocation, as in
+/// `matchMkFlatMap` immediately before OTP calls `erts_usort_flatmap`.
+// Port of erts/emulator/beam/erl_map.c:3218-3252 (erts_usort_flatmap), OTP-29.1.1.
+pub(crate) fn usort_flatmap_in_place(map: Term) {
+    // SAFETY: the caller passes a newly allocated flatmap and its owned key tuple; the heap
+    // remains exclusive while the match-spec instruction builds and normalizes the map.
+    unsafe {
+        let map_ptr = map.raw_ptr().cast_mut();
+        let mut size = *map_ptr.add(1) as usize;
+        let keys_term = Term(*map_ptr.add(2));
+        let keys_ptr = keys_term.raw_ptr().cast_mut();
+        let keys = keys_ptr.add(1).cast::<Term>();
+        let values = map_ptr.add(3).cast::<Term>();
+        let mut ix = 1;
+        while ix < size {
+            let mut jx = ix;
+            while jx > 0 {
+                let ordering = crate::heap::flat_key_cmp(*keys.add(jx), *keys.add(jx - 1));
+                if ordering == std::cmp::Ordering::Greater {
+                    break;
+                }
+                if ordering == std::cmp::Ordering::Equal {
+                    std::ptr::copy(keys.add(jx), keys.add(jx - 1), size - ix);
+                    std::ptr::copy(values.add(jx), values.add(jx - 1), size - ix);
+                    size -= 1;
+                    ix -= 1;
+                    break;
+                }
+                std::ptr::swap(keys.add(jx), keys.add(jx - 1));
+                std::ptr::swap(values.add(jx), values.add(jx - 1));
+                jx -= 1;
+            }
+            ix += 1;
+        }
+        *map_ptr.add(1) = size as u64;
+        *keys_ptr = ((size as u64) << 6) | ARITY;
+    }
+}
+
 /// Copies `words` words from `src` to `dst`.
 ///
 /// Contract: both ranges are word-aligned, inside owned live blocks, readable respectively

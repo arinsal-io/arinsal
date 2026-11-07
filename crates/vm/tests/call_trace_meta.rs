@@ -7,8 +7,8 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(call_trace_meta_diff).
--export([meta_calls/0, meta_info/0, call_time_info/0, bif_local/0, on_load_info/0,
-         call_memory_info/0, timestamps/0]).
+-export([meta_calls/0, meta_info/0, call_time_info/0, timem_all_snapshot/0, bif_local/0, on_load_info/0,
+         call_memory_info/0, timestamps/0, set_on_link_ordering/0]).
 -export([outer/1, inner/1]).
 
 outer(X) -> inner(X) + 1.
@@ -88,6 +88,29 @@ call_memory_info() ->
     erlang:trace_pattern({call_trace_meta_diff, '_', '_'}, false, [call_memory]),
     {R, erlang:trace_info({call_trace_meta_diff, inner, 1}, call_memory)}.
 
+timem_all_snapshot() ->
+    Worker = spawn_link(fun() -> receive go -> timem_busy_loop() end end),
+    1 = erlang:trace_pattern({call_trace_meta_diff, inner, 1}, true,
+                             [call_time, call_memory]),
+    1 = erlang:trace(Worker, true, [call]),
+    Worker ! go,
+    timer:sleep(10),
+    {all, Info} = erlang:trace_info({call_trace_meta_diff, inner, 1}, all),
+    {value, {call_time, Time}} = lists:keysearch(call_time, 1, Info),
+    {value, {call_memory, Memory}} = lists:keysearch(call_memory, 1, Info),
+    TimeCounts = lists:sort([{Pid, Count} || {Pid, Count, _, _} <- Time]),
+    MemoryCounts = lists:sort([{Pid, Count} || {Pid, Count, _} <- Memory]),
+    erlang:trace(Worker, false, [call]),
+    Worker ! stop,
+    erlang:trace_pattern({call_trace_meta_diff, inner, 1}, false,
+                         [call_time, call_memory]),
+    TimeCounts =:= MemoryCounts.
+
+timem_busy_loop() ->
+    receive stop -> ok
+    after 0 -> inner(1), timem_busy_loop()
+    end.
+
 bif_local() ->
     Self = self(),
     Tracer = spawn_link(fun() -> relay(Self) end),
@@ -129,6 +152,27 @@ on_load_info() ->
     erlang:trace_pattern(on_load, false, [local, meta, call_time, call_memory]),
     C = erlang:trace_info(on_load, traced),
     rep(Self, {A, B, CallTime, C}).
+
+set_on_link_ordering() ->
+    Parent = self(),
+    Tracer = spawn_link(fun() -> trace_relay(Parent) end),
+    Session = trace:session_create(link_order, Tracer, []),
+    1 = trace:process(Session, Parent, true, [procs, set_on_link]),
+    Child = spawn(fun() -> receive stop -> ok end end),
+    true = link(Child),
+    Disabled = trace:process(Session, Child, false, [procs, set_on_link]),
+    Events = lists:sort([link_event(Parent, Child, Event) || Event <- collect([])]),
+    unlink(Child),
+    exit(Child, kill),
+    true = trace:session_destroy(Session),
+    {Disabled, Events}.
+
+trace_relay(Parent) ->
+    receive Event -> Parent ! Event, trace_relay(Parent) end.
+
+link_event(Parent, Child, {trace, Parent, link, Child}) -> parent_link;
+link_event(Parent, Child, {trace, Child, getting_linked, Parent}) -> child_linked;
+link_event(_, _, _) -> unexpected.
 "#;
 
 fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
@@ -153,7 +197,7 @@ fn check(function: &str) {
         return;
     };
     let (expected, actual) = run(&reference, function);
-    assert_eq!(expected, CallResult::Ok(actual), "{function}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
 }
 
 #[test]
@@ -177,6 +221,11 @@ fn call_memory_info() {
 }
 
 #[test]
+fn active_call_time_and_memory_share_one_snapshot() {
+    check("timem_all_snapshot");
+}
+
+#[test]
 fn local_bif_trace_with_return_to() {
     check("bif_local");
 }
@@ -189,4 +238,9 @@ fn timestamp_flag_priority() {
 #[test]
 fn on_load_pattern_flags() {
     check("on_load_info");
+}
+
+#[test]
+fn set_on_link_trace_state_precedes_the_link_signal() {
+    check("set_on_link_ordering");
 }

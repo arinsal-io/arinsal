@@ -4813,6 +4813,20 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         Ok(Term::from_ptr(p, 2))
     }
+    /// Construct a flatmap from evaluated keys, sorting the owned key tuple in place.
+    ///
+    /// `keys` must be the fresh tuple produced while evaluating the map expression; OTP sorts
+    /// that tuple and the map values together in its `matchMkFlatMap` instruction.
+    // Port of erts/emulator/beam/erl_map.c:3218-3252 (erts_usort_flatmap), OTP-29.1.1.
+    pub fn flatmap_with_key_tuple_usort(
+        &mut self,
+        keys: Term,
+        values: &[Term],
+    ) -> Result<Term, TermError> {
+        let map = self.flatmap_with_key_tuple(keys, values)?;
+        crate::raw::usort_flatmap_in_place(map);
+        Ok(map)
+    }
     /// Build a decoded flatmap from already sorted, distinct key and value arrays.
     ///
     /// The key tuple and map share one reservation, as `erts_map_from_ks_and_vs` does.
