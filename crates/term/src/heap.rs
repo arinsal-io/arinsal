@@ -840,6 +840,18 @@ pub struct HeapReservation<'a, H: HeapAlloc + ?Sized> {
     end: *mut u64,
 }
 
+/// Allocation state of a [`ProcessHeap`] taken before a builder runs, to undo a failed build.
+// Port of the saved fields of erts/emulator/beam/erl_message.h (ErtsHeapFactory), OTP-29.1.1.
+#[derive(Clone, Copy, Debug)]
+pub struct HeapFactoryMark {
+    htop: usize,
+    fragments: usize,
+    last_used: usize,
+    off_heap_first: usize,
+    overhead: u64,
+    bin_vheap: u64,
+}
+
 /// A suspended heap reservation whose owning process heap remains live across a BIF trap.
 ///
 /// Resume this value only with the same live allocator. `ProcessHeap` allocations stay at a
@@ -1992,6 +2004,63 @@ impl ProcessHeap {
             }
         }
         fragments.clear();
+    }
+
+    /// Record the allocation state a failing builder can roll back to.
+    // Port of erts/emulator/beam/erl_message.c (erts_factory_proc_init / erts_factory_proc_prealloc_init:
+    // `original_htop`, `off_heap_saved`, `heap_frags_saved`, `heap_frags_saved_used`), OTP-29.1.1.
+    pub fn factory_mark(&mut self) -> HeapFactoryMark {
+        self.sync_mbuf_fast();
+        let last_used = match self.fragments.last() {
+            Some(Fragment::Block { used, .. }) => *used,
+            _ => 0,
+        };
+        HeapFactoryMark {
+            htop: self.htop_index(),
+            fragments: self.fragments.len(),
+            last_used,
+            off_heap_first: self.owners.off_heap_first,
+            overhead: self.owners.overhead,
+            bin_vheap: self.bin_vheap,
+        }
+    }
+
+    /// Discard everything allocated since `mark`: off-heap entries, heap fragments and the heap top.
+    // Port of erts/emulator/beam/erl_message.c:1543 (erts_factory_undo, FACTORY_HALLOC), OTP-29.1.1.
+    pub fn factory_undo(&mut self, mark: HeapFactoryMark) {
+        self.sync_mbuf_fast();
+        // Cleanup off-heap: cut the chain at the saved head and release the new entries.
+        let first = self.owners.off_heap_first;
+        if first != mark.off_heap_first {
+            let mut prev = first;
+            loop {
+                let next = load((prev as *const u64).wrapping_add(2)) as usize;
+                if next == mark.off_heap_first {
+                    break;
+                }
+                prev = next;
+            }
+            store((prev as *mut u64).wrapping_add(2), 0);
+            crate::gc::release_off_heap_chain(first);
+            self.owners.off_heap_first = mark.off_heap_first;
+            self.owners.overhead = mark.overhead;
+        }
+        self.bin_vheap = mark.bin_vheap;
+        // Free the heap fragments added since the mark.
+        if self.fragments.len() > mark.fragments {
+            let mut added = self.fragments.split_off(mark.fragments);
+            self.fragment_words -= added.iter().map(Fragment::len).sum::<usize>();
+            self.release_fragments(&mut added);
+        }
+        // Roll back the heap top and fix the last fragment.
+        self.set_htop_index(mark.htop);
+        if mark.fragments > 0
+            && let Some(Fragment::Block { used, .. }) = self.fragments.get_mut(mark.fragments - 1)
+        {
+            self.fragment_words -= *used - mark.last_used;
+            *used = mark.last_used;
+        }
+        self.rebuild_mbuf_fast();
     }
 
     /// Reserve contiguous words for a process object.

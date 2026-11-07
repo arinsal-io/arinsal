@@ -6,7 +6,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(crash_reg).
--export([limit_catch/0, limit_try/0, limit_class/0, deep_args/0]).
+-export([limit_catch/0, limit_try/0, limit_class/0, deep_args/0, bad_terms/0, bad_node_terms/0]).
 
 %% A negative maximum bignum minus one fails with system_limit after a huge reduction
 %% charge; the handler must still see x0-x3 and keep the saved stack trace alive.
@@ -30,6 +30,37 @@ deep_args() ->
     A = [[nest(300000, []), oops]],
     erlang:yield(),
     try erlang:list_to_binary(A) catch error:E:S -> [{M, F, _, _} | _] = S, {E, M, F} end.
+
+%% binary_SUITE:bad_terms/1: a truncated or bit-flipped external term must fail without leaving
+%% the partial term in a heap fragment that the collection after the BIF treats as live.
+bad_terms() ->
+    Terms = [{a, b, [1, 2, 3], "abc", <<1, 2, 3>>, 1.5, #{a => 1, b => [x]}},
+             lists:seq(1, 100), <<1:3>>, 1 bsl 100, [<<"x">> | y],
+             binary:copy(<<"0123456789">>, 20)],
+    lists:foldl(fun(T, Acc) -> corrupt(T, Acc) end, {0, 0}, Terms).
+
+%% Pids, references and funs encode differently on each node, so only the absence of a crash
+%% is compared.
+bad_node_terms() ->
+    Terms = [{self(), make_ref()}, [make_ref() || _ <- lists:seq(1, 20)], {fun() -> ok end, self()}],
+    _ = lists:foldl(fun(T, Acc) -> corrupt(T, Acc) end, {0, 0}, Terms),
+    ok.
+corrupt(Term, Acc0) ->
+    Bin = term_to_binary(Term),
+    Acc = corrupter(Bin, size(Bin) - 1, Acc0),
+    CBin = term_to_binary(Term, [compressed]),
+    corrupter(CBin, size(CBin) - 1, Acc).
+corrupter(Bin, Pos, Acc0) when Pos >= 0 ->
+    {Short, Rest} = split_binary(Bin, Pos),
+    Acc1 = tally(Short, tally(list_to_binary([Short]), Acc0)),
+    <<Byte, Tail/binary>> = Rest,
+    Acc = lists:foldl(fun(M, A) -> tally(<<Short/binary, (Byte bxor M), Tail/binary>>, A) end,
+                      Acc1, [1, 2, 4, 8, 16, 32, 64, 128, 255]),
+    corrupter(Bin, Pos - 1, Acc);
+corrupter(_, _, Acc) -> Acc.
+tally(Bin, {Ok, Bad}) ->
+    try binary_to_term(Bin), binary_to_term(Bin, [safe]), {Ok + 1, Bad}
+    catch error:_ -> {Ok, Bad + 1} end.
 "#;
 
 #[test]
@@ -40,7 +71,14 @@ fn crashes_match_otp() {
     };
     let beam = reference.compile_named("crash_reg", SOURCE, &[]).unwrap();
     reference.load("crash_reg", &beam).unwrap();
-    for function in ["limit_catch", "limit_try", "limit_class", "deep_args"] {
+    for function in [
+        "limit_catch",
+        "limit_try",
+        "limit_class",
+        "deep_args",
+        "bad_terms",
+        "bad_node_terms",
+    ] {
         let expected = reference.call("crash_reg", function, &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();

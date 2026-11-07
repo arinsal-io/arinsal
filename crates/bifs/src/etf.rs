@@ -4570,6 +4570,8 @@ pub struct DecodeWalk<'a> {
     sizing: DecodedSizeWalk,
     heap_words: Option<usize>,
     reservation: Option<HeapReservationState>,
+    /// Allocation state before the first decode slice, to undo a failed decode.
+    factory_mark: Option<arinsal_term::HeapFactoryMark>,
     size_done: bool,
     decode_started: bool,
     initial_work: usize,
@@ -4631,6 +4633,7 @@ impl<'a> DecodeWalk<'a> {
             sizing: DecodedSizeWalk::new(),
             heap_words: None,
             reservation: None,
+            factory_mark: None,
             size_done: false,
             decode_started: false,
             initial_work: 0,
@@ -4691,6 +4694,30 @@ impl<'a> DecodeWalk<'a> {
             )?);
             return Ok(None);
         }
+        // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1:
+        // a failed decode undoes the factory, so no partial term stays on the heap or in a
+        // heap fragment that the BIF epilogue would treat as live.
+        let mark = heap.factory_mark();
+        let result = Self::decode_reserved(
+            args, heap, local_node, &opts, body, heap_words, checked, size_work,
+        );
+        if result.is_err() {
+            heap.factory_undo(mark);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_reserved(
+        _args: &'a [Term],
+        heap: &mut ProcessHeap,
+        local_node: Option<(Atom, u32)>,
+        opts: &DecodeOpts,
+        body: &[u8],
+        heap_words: usize,
+        checked: usize,
+        size_work: usize,
+    ) -> Result<Option<(Term, usize)>, (BifError, usize)> {
         let mut reservation = HeapReservation::new(heap, heap_words)
             .map_err(|error| (map_term_build_error(error), size_work))?;
         let mut next = None;
@@ -4795,6 +4822,7 @@ impl<'a> DecodeWalk<'a> {
             sizing,
             heap_words,
             reservation,
+            factory_mark,
             size_done,
             decode_started,
             initial_work,
@@ -4838,6 +4866,7 @@ impl<'a> DecodeWalk<'a> {
             sizing,
             heap_words,
             reservation,
+            factory_mark,
             size_done,
             decode_started,
             initial_work,
@@ -4984,7 +5013,25 @@ impl<'a> DecodeWalk<'a> {
     }
 
     /// Parse and build a bounded prefix into the supplied live process heap.
+    ///
+    /// A failure undoes everything built since the first slice, as `erts_factory_undo` does
+    /// when `binary_to_term_int` fails.
     pub fn step_into(
+        &mut self,
+        byte_budget: usize,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<(Option<Term>, usize), (BifError, usize)> {
+        let result = self.step_into_slice(byte_budget, ctx);
+        if !matches!(result, Ok((None, _)))
+            && let Some(mark) = self.factory_mark.take()
+            && result.is_err()
+        {
+            ctx.heap.0.factory_undo(mark);
+        }
+        result
+    }
+
+    fn step_into_slice(
         &mut self,
         byte_budget: usize,
         ctx: &mut Ctx<'_>,
@@ -5014,8 +5061,11 @@ impl<'a> DecodeWalk<'a> {
         let process_heap = &mut *ctx.heap.0;
         let mut reservation = match self.reservation.take() {
             Some(state) => HeapReservation::resume(process_heap, state),
-            None => HeapReservation::new(process_heap, heap_words)
-                .map_err(|error| (map_term_build_error(error), consumed))?,
+            None => {
+                self.factory_mark = Some(process_heap.factory_mark());
+                HeapReservation::new(process_heap, heap_words)
+                    .map_err(|error| (map_term_build_error(error), consumed))?
+            }
         };
         let budget = byte_budget.max(1).saturating_sub(consumed);
         let before = self.decode_at;
