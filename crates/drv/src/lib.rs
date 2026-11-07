@@ -666,6 +666,9 @@ const SFLG_TERMINATING: u32 = 8;
 const SFLG_STARTED: u32 = 16;
 /// `stop` is running: unlike a closing port, it may still output (io.c:3698).
 const SFLG_STOPPING: u32 = 32;
+/// `ERTS_PORT_SFLG_INVALID`: the port is terminated; driver lookups of its handle fail while
+/// the record lives on (async jobs and the port data lock keep it, as `erts_port_inc_refc`).
+const SFLG_INVALID: u32 = 64;
 
 /// The driver side of one port (`Port` fields used by drivers in erts).
 pub struct DriverPort {
@@ -846,7 +849,10 @@ fn registry() -> &'static Mutex<PortSlab> {
 /// Live port for a driver-side handle (`erts_drvport2port`).
 pub(crate) fn port_of(handle: DrvPortPtr) -> Option<PortRef> {
     let slot = (handle as usize).checked_sub(1)?;
-    registry().lock().entries.get(slot)?.as_ref()?.upgrade()
+    let port = registry().lock().entries.get(slot)?.as_ref()?.upgrade()?;
+    // Port of erts/emulator/beam/erl_port.h (erts_thr_drvport2port), OTP-29.1.1: a terminated
+    // port is an invalid driver port, never another port that reused the table index.
+    port.is_valid().then_some(port)
 }
 
 /// Live port by VM port number (`erts_port_lookup_raw`).
@@ -856,7 +862,16 @@ pub(crate) fn port_by_id(id: u64) -> Option<PortRef> {
         .entries
         .iter()
         .filter_map(|entry| entry.as_ref()?.upgrade())
-        .find(|port| port.id == id)
+        .find(|port| port.id == id && port.is_valid())
+}
+
+impl Drop for DriverPort {
+    /// Port of erts/emulator/beam/erl_port_task.c (erts_port_free via the refc reaching zero),
+    /// OTP-29.1.1: the port table slot is released only when the last reference (an async job,
+    /// the port data lock) is gone, so a stale `ErlDrvPort` never names a newer port.
+    fn drop(&mut self) {
+        registry().lock().remove(self.slot(), &self.me);
+    }
 }
 
 impl DriverPort {
@@ -954,6 +969,11 @@ impl DriverPort {
         self.slot.load(Ordering::Acquire) as DrvPortPtr
     }
 
+    /// Not yet terminated (`!ERTS_PORT_SFLGS_INVALID_DRIVER_LOOKUP`).
+    fn is_valid(&self) -> bool {
+        self.state.load(Ordering::Acquire) & SFLG_INVALID == 0
+    }
+
     fn slot(&self) -> usize {
         self.slot.load(Ordering::Acquire).wrapping_sub(1)
     }
@@ -1039,8 +1059,8 @@ impl DriverPort {
     /// Drop a port whose `start` failed (io.c:747 error cleanup, no `stop`).
     pub fn abandon(&self) {
         self.state.fetch_or(SFLG_TERMINATING, Ordering::AcqRel);
-        registry().lock().remove(self.slot(), &self.me);
         self.release_resources();
+        self.state.fetch_or(SFLG_INVALID, Ordering::AcqRel);
     }
 
     /// Port state flags set by `open_port` after `start` (erl_bif_port.c:1140).
@@ -1333,9 +1353,10 @@ impl DriverPort {
             unsafe { stop(self.data()) };
             self.state.fetch_and(!SFLG_STOPPING, Ordering::AcqRel);
         }
-        registry().lock().remove(self.slot(), &self.me);
         self.release_resources();
         self.sched_free();
+        // The table index stays taken until the record is dropped (see `Drop`).
+        self.state.fetch_or(SFLG_INVALID, Ordering::AcqRel);
         true
     }
 

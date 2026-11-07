@@ -339,7 +339,7 @@ export! {
         let Some(port) = port_of(port) else {
             return std::ptr::null_mut();
         };
-        let pdl = threads::pdl_new();
+        let pdl = threads::pdl_new(port.clone());
         match port.pdl.compare_exchange(0, pdl as usize, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => pdl.cast(),
             Err(_) => {

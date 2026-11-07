@@ -43,6 +43,81 @@ impl HandlerResult {
     }
 }
 
+/// How a trapped BIF keeps its heap terms across a collection that runs while it is parked.
+// Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn) and erl_gc.c (F_DISABLE_GC,
+// erts_set_gc_state), OTP-29.1.1: a BIF continuation either keeps every heap term in the
+// arguments of its trap (the X registers, `c_p->arity`), which the collector updates, or it
+// keeps process-heap pointers in its off-heap state and disables collection while it is parked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrapGc {
+    /// The state may hold heap terms; the process is not collected while the trap is parked.
+    Disabled,
+    /// The first `n` of the trap's saved arguments are the live registers and the only heap
+    /// terms the trap keeps: collection roots.
+    RootedArgs(usize),
+    /// The arguments are the live X registers of the continuation export (`gc_live`).
+    LiveRegisters,
+    /// The state holds no heap term and the arguments are immediates.
+    NoTerms,
+}
+
+/// The one table of continuations that stay collectable while parked. Every other
+/// continuation disables collection, like erts' `erts_set_gc_state(c_p, 0)` before a
+/// state-carrying BIF_TRAP.
+pub(crate) fn trap_gc_policy(continuation: &str, state: &Arc<MagicRef>) -> TrapGc {
+    if continuation == PTAB_LIST_CONTINUATION {
+        // BIF_TRAP1 carries the accumulator in X0.
+        TrapGc::RootedArgs(1)
+    } else if continuation == REVERSE_CONTINUATION {
+        TrapGc::RootedArgs(2)
+    } else if continuation == BINARY_TO_LIST_CONTINUATION
+        && state
+            .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
+            .and_then(|walk| walk.lock().ok())
+            .is_some_and(|walk| walk.needs_initial_allocation())
+    {
+        // ERTS_BIF_YIELD1/3: no state exists yet; the call is retried with its arguments.
+        TrapGc::RootedArgs(1)
+    } else if continuation == CODE_PERMISSION_CONTINUATION {
+        TrapGc::NoTerms
+    } else if continuation == RE_GRUN_CONTINUATION
+        || continuation == RE_URUN_CONTINUATION
+        || continuation == "erlang:characters_to_utf8_trap/4"
+    {
+        TrapGc::LiveRegisters
+    } else {
+        TrapGc::Disabled
+    }
+}
+
+/// Whether the trap state of a parked BIF holds process-heap terms of its own.
+pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> bool {
+    macro_rules! any {
+        ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<Mutex<$t>>().is_some())* };
+    }
+    direct
+        || any!(
+            arinsal_bifs::BinaryToListWalk,
+            arinsal_bifs::AppendCont,
+            arinsal_bifs::UnicodeCont,
+            arinsal_bifs::ReverseCont,
+            arinsal_bifs::MemberCont,
+            arinsal_bifs::LengthCont,
+            arinsal_bifs::KeyfindCont,
+            arinsal_bifs::IolistVecWalk,
+            arinsal_bifs::IolistSizeWalk,
+            arinsal_bifs::DecodeWalk<'static>,
+            arinsal_bifs::ChksumCont,
+            arinsal_bifs::BinarySearchWalk,
+            TermEncodeState,
+            BinaryCopyState,
+            arinsal_bifs::SubtractWalk,
+        )
+        || state.downcast_ref::<MapsProjectionState>().is_some()
+        || state.downcast_ref::<MapsMergeState>().is_some()
+        || state.downcast_ref::<MapsBuildState>().is_some()
+}
+
 /// State copied into an ERTS-shaped trap continuation without a shared MagicRef mutex.
 pub(crate) enum DirectContinuation {
     Iolist { root: Term, state: ErtsL2BState },
@@ -81,7 +156,7 @@ const IOLIST_SIZE_CONTINUATION: &str = "erts_internal:iolist_size_continue/1";
 const IOLIST_TO_IOVEC_CONTINUATION: &str = "erts_internal:iolist_to_iovec_continue/1";
 const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
-const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
+pub(crate) const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
@@ -179,6 +254,7 @@ fn install_direct_iolist_trap(
         gc_was_enabled,
         arity: 1,
         callee,
+        root_args: 0,
         args: [root, Term::NIL, Term::NIL, Term::NIL],
     });
     state_ref
@@ -1563,6 +1639,18 @@ fn binary_to_list_trap(
         .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
         .ok_or(BifError::BADARG)?;
     let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
+    if walk.needs_initial_allocation() {
+        // ERTS_BIF_YIELD: the source is BIF_ARG_1 of the retried call, a root of the trap
+        // (`args_are_roots`) that any collection while the process was switched out updated.
+        if let Some(source) = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.bif_trap.as_ref())
+            .map(|trap| trap.args[0])
+        {
+            walk.refresh_source(source);
+        }
+    }
     let reds_left = process.heap.abi.fcalls.max(0) as usize;
     let chunk = reds_left.saturating_add(1).saturating_mul(256);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -2215,6 +2303,7 @@ pub(crate) fn install_export_trap(
         gc_was_enabled,
         arity,
         callee,
+        root_args: 0,
         args: {
             let mut saved = [Term::NIL; 4];
             saved[..arity].copy_from_slice(&trap.args);
@@ -2478,20 +2567,18 @@ pub(crate) fn execute_named(
                     }
                 }
             };
-            // The ptab list state holds no heap terms, so the process stays collectable
-            // while trapped (erts keeps it GC-able in ptab_list_continue/2). The same holds
-            // for a code-permission waiter: its state is a flag and its arguments are atoms,
-            // and erts runs a GC task of the suspended waiter (code_ix.c:323,
-            // erts_reject_code_permissions).
-            if continuation != PTAB_LIST_CONTINUATION
-                && continuation != CODE_PERMISSION_CONTINUATION
-                && continuation != REVERSE_CONTINUATION
-                && continuation != RE_GRUN_CONTINUATION
-                && continuation != RE_URUN_CONTINUATION
-                && continuation != "erlang:characters_to_utf8_trap/4"
-            {
+            // Which continuations stay collectable while parked is decided in one place,
+            // `trap_gc_policy`; every other one disables collection as erts does before a
+            // state-carrying BIF_TRAP (a ptab list or code-permission waiter keeps no heap
+            // term of its own, erts runs GC tasks of such a suspended process).
+            let gc_policy = trap_gc_policy(continuation, &state);
+            if gc_policy == TrapGc::Disabled {
                 process.set_gc_enabled(false);
             }
+            let root_args = match gc_policy {
+                TrapGc::RootedArgs(n) => n,
+                _ => 0,
+            };
             // A later slice of the continuation must keep blaming the BIF that trapped,
             // not the continuation export that is running now.
             let (callee, trap_arity) = if resumed {
@@ -2530,6 +2617,7 @@ pub(crate) fn execute_named(
                 gc_was_enabled,
                 arity: trap_arity,
                 callee,
+                root_args,
                 args: if let Some(trap_args) = reverse_args {
                     [trap_args[0], trap_args[1], Term::NIL, Term::NIL]
                 } else if continuation == PTAB_LIST_CONTINUATION {
@@ -3068,21 +3156,14 @@ pub(crate) fn finish_light(
             state,
             reductions,
         }) => {
-            let binary_to_list_retry = continuation == BINARY_TO_LIST_CONTINUATION
-                && state
-                    .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
-                    .and_then(|walk| walk.lock().ok())
-                    .is_some_and(|walk| walk.needs_initial_allocation());
-            if continuation != PTAB_LIST_CONTINUATION
-                && continuation != CODE_PERMISSION_CONTINUATION
-                && continuation != REVERSE_CONTINUATION
-                && continuation != RE_GRUN_CONTINUATION
-                && continuation != RE_URUN_CONTINUATION
-                && continuation != "erlang:characters_to_utf8_trap/4"
-                && !binary_to_list_retry
-            {
+            let gc_policy = trap_gc_policy(continuation, &state);
+            if gc_policy == TrapGc::Disabled {
                 process.set_gc_enabled(false);
             }
+            let root_args = match gc_policy {
+                TrapGc::RootedArgs(n) => n,
+                _ => 0,
+            };
             let mut saved = [Term::NIL; 4];
             let kept = args.len().min(4);
             saved[..kept].copy_from_slice(&args[..kept]);
@@ -3113,6 +3194,7 @@ pub(crate) fn finish_light(
                 gc_was_enabled,
                 arity: kept,
                 callee,
+                root_args,
                 args: saved,
             });
             charge_light(process, reductions);
@@ -3151,6 +3233,7 @@ pub(crate) fn finish_light(
                 gc_was_enabled,
                 arity: kept,
                 callee,
+                root_args: 0,
                 args: saved,
             });
             charge_light(process, 0);
@@ -3175,15 +3258,11 @@ pub(crate) fn install_deferred_trap(
     trap: Box<arinsal_bifs::DeferredTrap>,
 ) -> Result<(), arinsal_term::TermError> {
     let gc_was_enabled = process.heap.gc_enabled;
-    let mut disable_gc = true;
     let (continuation, state) = match *trap {
-        arinsal_bifs::DeferredTrap::BinaryToList(walk) => {
-            disable_gc = !walk.needs_initial_allocation();
-            (
-                BINARY_TO_LIST_CONTINUATION,
-                magic_binary_state(Mutex::new(walk), ERTS_BINARY_TO_LIST_STATE_SIZE),
-            )
-        }
+        arinsal_bifs::DeferredTrap::BinaryToList(walk) => (
+            BINARY_TO_LIST_CONTINUATION,
+            magic_binary_state(Mutex::new(walk), ERTS_BINARY_TO_LIST_STATE_SIZE),
+        ),
         arinsal_bifs::DeferredTrap::Key(cont) => (
             key_continuation(function),
             argument_trap_state(Mutex::new(cont)),
@@ -3226,9 +3305,14 @@ pub(crate) fn install_deferred_trap(
         ),
     };
     let state_term = trap_state_term(process, &state)?;
-    if disable_gc && continuation != REVERSE_CONTINUATION {
+    let gc_policy = trap_gc_policy(continuation, &state);
+    if gc_policy == TrapGc::Disabled {
         process.set_gc_enabled(false);
     }
+    let root_args = match gc_policy {
+        TrapGc::RootedArgs(n) => n,
+        _ => 0,
+    };
     let mut saved = [Term::NIL; 4];
     let arity = args.len().min(4);
     saved[..arity].copy_from_slice(&args[..arity]);
@@ -3250,6 +3334,7 @@ pub(crate) fn install_deferred_trap(
         gc_was_enabled,
         arity,
         callee,
+        root_args,
         args: saved,
     });
     Ok(())
