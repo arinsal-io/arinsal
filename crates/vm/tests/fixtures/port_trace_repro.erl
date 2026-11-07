@@ -10,7 +10,8 @@ run(Case, DriverDir) ->
         driver_send_term -> driver_send_term();
         open_close -> open_close();
         send_term -> send_term();
-        set_timer -> set_timer()
+        set_timer -> set_timer();
+        unlink -> unlink_trace()
     end,
     erlang:trace(new_ports, false, [all]),
     Trace = collect(),
@@ -104,6 +105,15 @@ set_timer() ->
     true = erlang:port_command(P, <<5>>),
     receive after 100 -> ok end,
     A = collect(), erlang:port_close(P), A ++ collect().
+
+unlink_trace() ->
+    process_flag(trap_exit, true),
+    P = open(),
+    1 = erlang:trace(P, true, [ports, running_ports]),
+    1 = erlang:trace(self(), true, [procs, running]),
+    true = unlink(P),
+    true = erlang:port_close(P),
+    {true, collect()}.
 
 open() -> erlang:open_port({spawn, echo_drv}, [binary]).
 open(Flags) -> P = open(), _ = erlang:trace(P, true, Flags), P.

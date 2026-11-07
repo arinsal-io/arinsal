@@ -757,7 +757,7 @@ pub(crate) fn exit_for_process_termination(
         if op == SigOp::Exec {
             // Port of erts/emulator/beam/io.c:2187 (`call_deliver_port_exit`),
             // OTP-29.1.1: the forced exit breaks the exiting process's port link.
-            handle.links.lock().remove(&from);
+            handle.links.lock().remove(from.data());
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
             deliver_exit(runtime, &handle, false, from, reason, None);
@@ -797,7 +797,10 @@ pub(crate) fn connect(
             signal_badsig(handle, handle.id);
             return REDS_CONNECT;
         }
-        handle.links.lock().insert(pid);
+        let _ = handle
+            .links
+            .lock()
+            .lookup_insert(crate::proc_create::port_peer_link(pid));
         handle.owner.set(pid);
         let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::PortLink(handle.id));
         connected_message(
@@ -820,6 +823,7 @@ pub(crate) fn link(
     drv: &DriverPort,
     pid: Pid,
     linked: bool,
+    unlink_id: u64,
 ) -> bool {
     let task_runtime = runtime;
     let task_handle = Arc::clone(handle);
@@ -834,7 +838,10 @@ pub(crate) fn link(
             if linked {
                 // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
                 if live {
-                    handle.links.lock().insert(pid);
+                    let _ = handle
+                        .links
+                        .lock()
+                        .lookup_insert(crate::proc_create::port_peer_link(pid));
                     trace_link(task_runtime, handle.id, pid, "getting_linked");
                 } else if let (Some(port), Ok(reason)) =
                     (Term::port(handle.id), Message::copy_from(atom("noproc")))
@@ -853,9 +860,21 @@ pub(crate) fn link(
             } else {
                 // Port of erts/emulator/beam/io.c:2507 (port_sig_unlink), OTP-29.1.1.
                 if live {
-                    handle.links.lock().remove(&pid);
-                    trace_link(task_runtime, handle.id, pid, "getting_unlinked");
+                    let removed = handle.links.lock().remove(pid.data()).is_some();
+                    if removed {
+                        trace_link(task_runtime, handle.id, pid, "getting_unlinked");
+                    }
                 }
+                // `port_sig_unlink` acknowledges both execution and abort; the caller's link
+                // remains pending until this id-matched process signal is handled.
+                let _ = handle.scheduler.signal(
+                    pid,
+                    pid,
+                    arinsal_sched::Signal::PortUnlinkAck {
+                        port: handle.id,
+                        unlink_id,
+                    },
+                );
                 REDS_UNLINK
             }
         },

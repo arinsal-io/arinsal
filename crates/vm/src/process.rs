@@ -2243,6 +2243,45 @@ impl Executor {
                         true,
                     )?;
                     crate::trace::push_native_trace_frame(process, resume_pc, &actions, arity)?;
+                    if crate::trace_bp::debug_breakpoint_enabled(
+                        process,
+                        function.module,
+                        function.function,
+                        function.arity,
+                    ) {
+                        // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:90-125
+                        // (`emit_debug_bp`) and beam_common.c:1294-1345
+                        // (`call_error_handler`), OTP-29.1.1: debug breakpoints
+                        // tail-call the process-configured breakpoint handler.
+                        process.gc_live = arity;
+                        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(1);
+                        process.reductions_used = process.reductions_used.saturating_add(1);
+                        match self.vm.call_debug_breakpoint_handler(
+                            process,
+                            function.module,
+                            function.function,
+                            arity,
+                            Some(ctx),
+                        )? {
+                            crate::ImportOutcome::Jump(_) => self.vm.enter_native_at_jump(process),
+                            crate::ImportOutcome::Advanced => {}
+                            crate::ImportOutcome::Yield => {
+                                if process.native_pc().is_some()
+                                    && native_transfer_continues(process, ctx)
+                                {
+                                    return Ok(Flow::Continue);
+                                }
+                                return Ok(Flow::Break(Ok(RunState::Yield)));
+                            }
+                            crate::ImportOutcome::Returned(value) => {
+                                process.x[0] = value;
+                                if process.native_pc().is_none() {
+                                    return Ok(Flow::Break(Ok(RunState::Done(value))));
+                                }
+                            }
+                        }
+                        return Ok(Flow::Continue);
+                    }
                     process.native_continuation_resume = true;
                     // Port of erts/emulator/beam/jit/arm/instr_trace.cpp (the
                     // breakpoint stub saves the function's arguments in
@@ -6864,6 +6903,17 @@ impl Process {
                 self.links.remove(crate::proc_create::port_link_key(id));
                 0
             }
+            arinsal_sched::Signal::PortUnlinkAck { port, unlink_id } => {
+                let key = crate::proc_create::port_link_key(port);
+                if self
+                    .links
+                    .get(key)
+                    .is_some_and(|link| link.unlinking() == unlink_id)
+                {
+                    self.links.remove(key);
+                }
+                0
+            }
             // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
             arinsal_sched::Signal::ProcSigBlock(milliseconds) => {
                 if milliseconds > 0 {
@@ -6983,9 +7033,18 @@ impl Process {
                 let arinsal_sched::PortExitSignal { port, reason } = *exit;
                 let port = port.into_receiver(self)?;
                 let reason = reason.into_receiver(self)?;
-                // erts_proc_sig_handle_exit: the link to the exiting port is deleted.
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_EXIT_LINKED):
+                // an exit arriving after unlink was requested removes the link but is ignored.
                 if let Some(id) = port.as_port() {
-                    self.links.remove(crate::proc_create::port_link_key(id));
+                    let key = crate::proc_create::port_link_key(id);
+                    let unlinking = self
+                        .links
+                        .get(key)
+                        .is_some_and(|link| link.unlinking() != 0);
+                    self.links.remove(key);
+                    if unlinking {
+                        return Ok(2);
+                    }
                 }
                 if reason == crate::signals::atom("kill") {
                     return Err(VmError::Trap(crate::exceptions::Trap::killed()));

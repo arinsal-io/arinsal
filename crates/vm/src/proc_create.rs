@@ -1161,6 +1161,11 @@ pub(crate) fn process_link(pid: arinsal_sched::Pid, priority: bool) -> crate::mo
     crate::monitor_link::Link::create(crate::monitor_link::node_type::LINK_PROC, pid.data(), flags)
 }
 
+/// A port's link half to `pid` (`erts_link_internal_create(ERTS_LNK_TYPE_PORT, ...)`).
+pub(crate) fn port_peer_link(pid: arinsal_sched::Pid) -> crate::monitor_link::Link {
+    crate::monitor_link::Link::create(crate::monitor_link::node_type::LINK_PORT, pid.data(), 0)
+}
+
 /// Bit that keeps the keys of port links apart from the pid data keys in one link tree: both are
 /// at most 60 bits, and erts keys the two kinds by differently tagged terms.
 const PORT_LINK_KEY_BIT: u64 = 1 << 63;

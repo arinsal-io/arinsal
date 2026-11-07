@@ -376,13 +376,14 @@ pub(super) enum StoredTopFrame {
         args: BifArgs,
         info: BifErrorInfo,
     },
-    CurrentArgs(OwnedTerm),
+    CurrentArgs(Term),
     CurrentArgsNoLocation {
         module: Atom,
         function: Atom,
         arity: u8,
-        args: OwnedTerm,
+        args: Term,
     },
+    CurrentArgsInfoTerm(Option<Term>, Term),
     CurrentArgsWithInfo(Option<OwnedTerm>, Box<OwnedTerm>),
 }
 
@@ -454,10 +455,7 @@ pub(super) fn capture(
                     info: *info,
                 })
             }
-            TopFrame::CurrentArgs(args) => Ok(StoredTopFrame::CurrentArgs(
-                to_owned(*args)
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
-            )),
+            TopFrame::CurrentArgs(args) => Ok(StoredTopFrame::CurrentArgs(*args)),
             TopFrame::CurrentArgsNoLocation {
                 module,
                 function,
@@ -467,20 +465,11 @@ pub(super) fn capture(
                 module: *module,
                 function: *function,
                 arity: *arity,
-                args: to_owned(*args)
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+                args: *args,
             }),
-            TopFrame::CurrentArgsInfoTerm(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
-                args.map(|args| {
-                    to_owned(args)
-                        .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
-                })
-                .transpose()?,
-                Box::new(
-                    to_owned(*info)
-                        .map_err(|e| VmError::Unsupported(format!("error_info {e:?}")))?,
-                ),
-            )),
+            TopFrame::CurrentArgsInfoTerm(args, info) => {
+                Ok(StoredTopFrame::CurrentArgsInfoTerm(*args, *info))
+            }
             TopFrame::CurrentArgsWithInfo(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
                 args.map(|args| {
                     to_owned(args)
@@ -1202,6 +1191,8 @@ fn raw_no_location(term: Term) -> Option<bool> {
     })
 }
 
+// Port of erts/emulator/beam/beam_common.c (get_args_from_exc, get_error_info_from_exc,
+// build_stacktrace), OTP-29.1.1: retain the heap terms that erts_build_mfa_item attaches directly.
 fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> Option<RawTrace> {
     if digits.len() < STACKTRACE_HEADER_WORDS {
         return None;
@@ -1231,15 +1222,15 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
                 module,
                 function,
                 arity,
-                args: to_owned(args).ok()?,
+                args,
             }),
         )
     } else if args == Term::atom(arinsal_term::atoms::TRUE) {
         if current & (1 << 63) == 0 {
             return None;
         }
-        let info = term_error_info_map(error_info).and_then(|term| to_owned(term).ok());
-        let top = info.map(|info| StoredTopFrame::CurrentArgsWithInfo(None, Box::new(info)));
+        let top = term_error_info_map(error_info)
+            .map(|info| StoredTopFrame::CurrentArgsInfoTerm(None, info));
         (
             Some(((current & !(1 << 63)) >> 32) as usize),
             current as u32 as usize,
@@ -1266,17 +1257,12 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
     } else {
         let module = ((current & !(1 << 63)) >> 32) as usize;
         let ip = current as u32 as usize;
-        let args = (args != Term::atom(arinsal_term::atoms::TRUE))
-            .then(|| to_owned(args).ok())
-            .flatten();
-        let info = term_error_info_map(error_info).and_then(|term| to_owned(term).ok());
+        let args = (args != Term::atom(arinsal_term::atoms::TRUE)).then_some(args);
+        let info = term_error_info_map(error_info);
         let top = match (args, info) {
-            (Some(args), Some(info)) => Some(StoredTopFrame::CurrentArgsWithInfo(
-                Some(args),
-                Box::new(info),
-            )),
+            (Some(args), Some(info)) => Some(StoredTopFrame::CurrentArgsInfoTerm(Some(args), info)),
             (Some(args), None) => Some(StoredTopFrame::CurrentArgs(args)),
-            (None, Some(info)) => Some(StoredTopFrame::CurrentArgsWithInfo(None, Box::new(info))),
+            (None, Some(info)) => Some(StoredTopFrame::CurrentArgsInfoTerm(None, info)),
             (None, None) => None,
         };
         (Some(module), ip, top)
@@ -2192,10 +2178,7 @@ pub(super) fn build_saved(
                 args: args.clone(),
                 info: *info,
             }),
-            StoredTopFrame::CurrentArgs(args) => Ok(TopFrame::CurrentArgs(
-                from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
-            )),
+            StoredTopFrame::CurrentArgs(args) => Ok(TopFrame::CurrentArgs(*args)),
             StoredTopFrame::CurrentArgsNoLocation {
                 module,
                 function,
@@ -2205,9 +2188,11 @@ pub(super) fn build_saved(
                 module: *module,
                 function: *function,
                 arity: *arity,
-                args: from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+                args: *args,
             }),
+            StoredTopFrame::CurrentArgsInfoTerm(args, info) => {
+                Ok(TopFrame::CurrentArgsInfoTerm(*args, *info))
+            }
             StoredTopFrame::CurrentArgsWithInfo(args, info) => {
                 let args = args
                     .as_ref()
@@ -2414,6 +2399,7 @@ fn build_saved_active(
         let top_args = match top {
             Some(TopFrame::CurrentArgs(args))
             | Some(TopFrame::CurrentArgsWithInfo(Some(args), _))
+            | Some(TopFrame::CurrentArgsInfoTerm(Some(args), _))
                 if matches!(args.classify(), TermKind::List | TermKind::Nil) =>
             {
                 *args
@@ -2433,6 +2419,7 @@ fn build_saved_active(
                 from_owned(info.as_ref(), &mut heap)
                     .map_err(|e| VmError::Unsupported(format!("exception info {e:?}")))?,
             ),
+            Some(TopFrame::CurrentArgsInfoTerm(_, info)) => Some(*info),
             _ => None,
         };
         if error_info.is_some() {

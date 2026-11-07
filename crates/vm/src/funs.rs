@@ -1082,6 +1082,47 @@ impl Vm {
         self.call_named(p, &handler, "undefined_function", 3, tail, ctx)
     }
 
+    /// Call the configured error handler for a debug breakpoint.
+    pub(super) fn call_debug_breakpoint_handler(
+        &mut self,
+        p: &mut Process,
+        module: &str,
+        function: &str,
+        arity: usize,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        // Port of erts/emulator/beam/beam_common.c:1294-1345
+        // (`call_error_handler`), OTP-29.1.1. A breakpoint dispatches through the
+        // process-configured handler just like an undefined call does.
+        let handler = error_handler_module(p);
+        let ready = self
+            .code
+            .loaded
+            .get(&handler)
+            .is_some_and(|id| self.code.modules[*id].export("breakpoint", 3).is_some());
+        if !ready {
+            return Err(VmError::Exception {
+                reason: "undef".into(),
+                frame: format!("{module}:{function}/{arity}"),
+            });
+        }
+        p.ensure(arity.saturating_mul(2).saturating_add(8), arity)?;
+        let args = p.x[..arity].to_vec();
+        let list = TermBuilder::new(&mut p.heap)
+            .list_from_iter(args)
+            .map_err(|error| VmError::Unsupported(format!("breakpoint arg list: {error:?}")))?;
+        let module_atom = global_atoms()
+            .intern(module)
+            .map_err(|_| VmError::Unsupported("breakpoint module atom".into()))?;
+        let function_atom = global_atoms()
+            .intern(function)
+            .map_err(|_| VmError::Unsupported("breakpoint function atom".into()))?;
+        p.x[0] = Term::atom(module_atom);
+        p.x[1] = Term::atom(function_atom);
+        p.x[2] = list;
+        self.call_named(p, &handler, "breakpoint", 3, true, ctx)
+    }
+
     #[inline]
     pub(super) fn apply_fixed(
         &mut self,

@@ -349,6 +349,7 @@ pub(crate) fn on_send(
             vm,
             process,
             ctx,
+            pid,
             &token,
             SeqEvent {
                 kind: "send",
@@ -400,6 +401,7 @@ pub(crate) fn on_receive(
         vm,
         process,
         ctx,
+        pid,
         &token,
         SeqEvent {
             kind: "receive",
@@ -434,6 +436,7 @@ pub(crate) fn on_exit_signal(
         None,
         process,
         Some(ctx),
+        to,
         &token,
         SeqEvent {
             kind: "send",
@@ -491,6 +494,7 @@ pub(crate) fn spawn_events(
             Some(&mut *vm),
             parent,
             Some(&mut *ctx),
+            parent_pid,
             request,
             SeqEvent {
                 kind,
@@ -508,6 +512,7 @@ pub(crate) fn spawn_events(
         Some(&mut *vm),
         parent,
         Some(&mut *ctx),
+        parent_pid,
         &reply,
         SeqEvent {
             kind: "send",
@@ -524,6 +529,7 @@ pub(crate) fn spawn_events(
             Some(vm),
             parent,
             Some(ctx),
+            parent_pid,
             &reply,
             SeqEvent {
                 kind: "receive",
@@ -551,6 +557,7 @@ fn emit(
     vm: Option<&mut Vm>,
     process: &mut Process,
     mut ctx: Option<&mut RunCtx<'_, Message>>,
+    tracee: Pid,
     token: &Token,
     event: SeqEvent,
 ) {
@@ -565,16 +572,10 @@ fn emit(
     if token.flags & flag == 0 {
         return;
     }
-    if process
-        .self_pid
-        .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
-    {
+    if crate::trace::is_sensitive(process, tracee) {
         return;
     }
-    if process
-        .self_pid
-        .is_some_and(|pid| tracer_enabled(process, pid) == Some(false))
-    {
+    if tracer_enabled(process, tracee) == Some(false) {
         return;
     }
     let target = tracer().lock().unwrap().clone();
@@ -969,6 +970,7 @@ fn print(
         Some(vm),
         process,
         Some(ctx),
+        pid,
         &t,
         SeqEvent {
             kind: "print",
@@ -1004,8 +1006,8 @@ mod tests {
             crate::signals::atom("true"),
         )
         .unwrap();
-        assert_eq!(token(&mut process).unwrap().label, OwnedTerm::Int(99));
-        assert_ne!(token(&mut process).unwrap().flags & SEND, 0);
+        similar_asserts::assert_eq!(token(&mut process).unwrap().label, OwnedTerm::Int(99));
+        similar_asserts::assert_eq!(token(&mut process).unwrap().flags & SEND != 0, true);
     }
 
     #[test]
@@ -1058,6 +1060,44 @@ msg_tag(Tag) -> Tag."#;
         let actual = vm
             .eval_scheduled("seq_trace_chain", "run", &[], 2, None)
             .unwrap();
-        assert_eq!(expected, CallResult::Ok(actual.term));
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn seq_trace_link_exit_uses_receiver_sensitivity() {
+        let _guard = test_lock().lock().unwrap();
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping sequential trace exit differential test");
+            return;
+        };
+        let source = r#"-module(seq_trace_sensitive_exit). -export([run/0]).
+run() ->
+  Tracer=spawn(fun() -> receive after infinity -> ok end end),
+  seq_trace:set_system_tracer(Tracer),
+  false=process_flag(sensitive,true),
+  Echo=spawn_link(fun() -> receive {Pid,Msg} -> Pid ! {reply,Msg} end end),
+  seq_trace:set_token(label,17),
+  seq_trace:set_token('receive',true),
+  seq_trace:set_token(send,true),
+  Echo ! {self(),hello},
+  receive {reply,hello} -> ok end,
+  Ref=erlang:trace_delivered(all),
+  receive {trace_delivered,all,Ref} -> ok end,
+  {messages,Messages}=process_info(Tracer,messages),
+  unlink(Echo), exit(Echo,kill), unlink(Tracer), exit(Tracer,kill),
+  [{Type,Serial,msg_tag(Info)} || {seq_trace,17,{Type,Serial,_,_,Info}} <- Messages].
+msg_tag({_,Tag}) -> Tag;
+msg_tag(Tag) -> Tag."#;
+        let beam = reference
+            .compile_named("seq_trace_sensitive_exit", source, &[])
+            .unwrap();
+        reference.load("seq_trace_sensitive_exit", &beam).unwrap();
+        let expected = reference.call("seq_trace_sensitive_exit", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("seq_trace_sensitive_exit", "run", &[], 2, None)
+            .unwrap();
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
     }
 }

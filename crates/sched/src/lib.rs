@@ -518,6 +518,9 @@ pub enum Signal<M: SignalMessage> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_UNLINK with a port origin),
     // OTP-29.1.1.
     PortUnlink(u64),
+    /// A port confirms an unlink operation, identified so a stale acknowledgement cannot remove
+    /// a newer link to the same port (erts `ERTS_SIG_Q_OP_UNLINK_ACK`).
+    PortUnlinkAck { port: u64, unlink_id: u64 },
     /// Monitor DOWN signal carrying an opaque reason envelope.
     MonitorDown { reference: u64, reason: Box<M> },
     /// Monitor DOWN signal whose reason is an immediate term, carried by value.

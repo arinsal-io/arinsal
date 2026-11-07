@@ -2256,34 +2256,17 @@ impl Vm {
                             if debug_break {
                                 let arity = usize::from(*arity);
                                 p.gc_live = arity;
-                                p.ensure(arity.saturating_mul(2), arity)?;
-                                let module_atom = arinsal_term::global_atoms()
-                                    .intern(&module.name)
-                                    .map_err(|_| debug_line_system_limit())?;
-                                let function_atom = arinsal_term::global_atoms()
-                                    .intern(function)
-                                    .map_err(|_| debug_line_system_limit())?;
-                                let arguments = p.x[..arity].to_vec();
-                                let argument_list = TermBuilder::new(
-                                    &mut arinsal_bifs::ProcessHeapHandle(&mut p.heap),
-                                )
-                                .list_from_iter(arguments)
-                                .map_err(|_| debug_line_system_limit())?;
-                                p.x[0] = Term::atom(module_atom);
-                                p.x[1] = Term::atom(function_atom);
-                                p.x[2] = argument_list;
-                                p.gc_live = 3;
                                 p.module = module_id;
                                 p.set_ip(entry_ip);
                                 p.heap.abi.fcalls = reds;
-                                let breakpoint_import = module.debug_breakpoint_import as usize;
-                                let outcome = self.call_import(
+                                let outcome = self.call_debug_breakpoint_handler(
                                     p,
-                                    breakpoint_import,
-                                    3,
-                                    true,
+                                    &module.name,
+                                    function,
+                                    arity,
                                     ctx.as_deref_mut(),
                                 )?;
+                                p.gc_live = 3;
                                 module_id = p.module;
                                 self.sync_module(module_id);
                                 base = self.code.modules[module_id].code.as_ptr();
