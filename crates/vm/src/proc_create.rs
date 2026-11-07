@@ -1201,6 +1201,10 @@ pub(crate) struct SliceWork {
     /// The process already exited while its dirty job keeps running.
     /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
     pub(crate) dirty_exited: bool,
+    /// Hold on literal-area release taken when the process exited while executing dirty: the
+    /// job may access any term on the heap, literals included, until it stops
+    /// (`trap_state->block_rla_ref`, erl_process.c:14374).
+    pub(crate) rla_block: Option<arinsal_pterm::RlaBlock>,
     /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
     pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this process currently has a runnable profile activation.
@@ -1272,6 +1276,7 @@ impl SliceWork {
             || self.native_timeout_trace
             || self.profile_active
             || self.dirty_exited
+            || self.rla_block.is_some()
             || self.dirty_pickup.is_some()
             || self.suspend_parked
             || self.native_trap.is_some()
@@ -1492,6 +1497,10 @@ pub(crate) struct BifTrapPending {
     pub(crate) args: [Term; 4],
     /// Number of meaningful entries in `args`.
     pub(crate) arity: usize,
+    /// Leading `args` entries that are collection roots: the only heap terms this trap keeps
+    /// while the process is collectable. A trap with state that holds heap terms of its own
+    /// runs with collection disabled and has none.
+    pub(crate) root_args: usize,
     /// The trapped BIF's module and function: an `apply` that trapped is redone as
     /// `apply(Module, Function, Args)` built from the trap state.
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
@@ -1501,19 +1510,16 @@ impl BifTrapPending {
     /// the caller's own X registers are dead while the process waits in the trap.
     // Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn: the arguments are `reg[0..n]`),
     // OTP-29.1.1.
+    #[inline]
     pub(crate) fn args_are_roots(&self) -> bool {
-        self.continuation == crate::bif_traps::REVERSE_CONTINUATION
-            || self.continuation == crate::bif_traps::PTAB_LIST_CONTINUATION
+        self.root_args != 0
     }
 
+    /// Number of leading `args` entries that are roots, chosen when the trap was installed
+    /// (`bif_traps::trap_gc_policy`).
+    #[inline]
     pub(crate) fn root_args_len(&self) -> usize {
-        if self.continuation == crate::bif_traps::PTAB_LIST_CONTINUATION {
-            1
-        } else if self.continuation == crate::bif_traps::REVERSE_CONTINUATION {
-            self.arity
-        } else {
-            0
-        }
+        self.root_args
     }
 }
 

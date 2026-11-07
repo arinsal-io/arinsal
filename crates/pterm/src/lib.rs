@@ -237,10 +237,35 @@ pub struct RetirementTrace {
     pub copied_roots: u64,
 }
 struct Writer {
+    /// `release_literal_areas.block_ix` and its counters.
+    block_ix: usize,
+    block: [usize; 2],
+    /// The area waiting for the counters of its block index (`block_area`).
+    held: Option<HeldArea>,
+    /// The collector pid data waiting for the held area's counter to drain.
+    waiter: Option<u64>,
     next_area: u64,
     retired: HashMap<u64, Pending>,
     retired_order: VecDeque<u64>,
 }
+struct HeldArea {
+    area: Arc<ActiveArea>,
+    ix: usize,
+}
+
+/// A hold on the release of literal areas (`erts_block_release_literal_area` result).
+#[derive(Debug)]
+pub struct RlaBlock(usize);
+
+/// Result of [`Store::collector_switch`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RlaSwitch {
+    /// The switch finished; `true` when a new area is active.
+    Switched(bool),
+    /// The old area is still blocked; the collector is woken by `unblock_release`.
+    Wait,
+}
+
 struct ActiveArea {
     id: u64,
     area: RetiredStorage,
@@ -286,6 +311,10 @@ impl Store {
             table: AtomicPtr::new(Box::into_raw(Box::new(Table::new()))),
             old_tables: Mutex::new(Vec::new()),
             writer: Mutex::new(Writer {
+                block_ix: 0,
+                block: [0; 2],
+                held: None,
+                waiter: None,
                 next_area: 1,
                 retired: HashMap::new(),
                 retired_order: VecDeque::new(),
@@ -556,7 +585,39 @@ impl Store {
     /// answered its copy request, so the previous area has no references left. The caller waits
     /// for thread progress around the switch.
     pub fn collector_switch_area(&self) -> bool {
+        matches!(self.collector_switch(0), RlaSwitch::Switched(true))
+    }
+
+    /// The switch of `erts_literal_area_collector_release_area_switch_0` with its block
+    /// counters; `collector` is the collector's pid data, woken by [`Store::unblock_release`]
+    /// when [`RlaSwitch::Wait`] was returned.
+    // Port of erts/emulator/beam/beam_bif_load.c (erts_literal_area_collector_release_area_switch_0),
+    // OTP-29.1.1, with one global counter pair instead of one pair per scheduler.
+    pub fn collector_switch(&self, collector: u64) -> RlaSwitch {
         let mut writer = self.lock_writer();
+        if let Some(held) = writer.held.as_ref() {
+            // ERTS_RLA_BLOCK_STATE_SWITCHED_IX / WAITING: counters of the old index.
+            if writer.block[held.ix] != 0 {
+                writer.waiter = Some(collector);
+                if literal_trace() {
+                    eprintln!("literal_wait held");
+                }
+                let idle = self
+                    .active_area
+                    .read()
+                    .expect("active literal area poisoned")
+                    .is_none();
+                // A new area showing up is worked on while the old one waits.
+                return if idle && self.activate_next(&mut writer) {
+                    RlaSwitch::Switched(true)
+                } else {
+                    RlaSwitch::Wait
+                };
+            }
+            let held = writer.held.take().expect("held area");
+            writer.waiter = None;
+            self.free_area(&mut writer, &held.area);
+        }
         let previous = self
             .active_area
             .write()
@@ -564,16 +625,86 @@ impl Store {
             .take();
         if let Some(active) = previous {
             self.active_set.store(false, Ordering::Release);
-            arinsal_term::set_literal_purge_area(&active.pointer_ranges, false);
-            if literal_trace() {
-                eprintln!("literal_release area={}", active.id);
+            let ix = writer.block_ix;
+            if writer.block[ix] == 0 {
+                self.free_area(&mut writer, &active);
+            } else {
+                // Switch the block index: processes blocking from now on belong to the
+                // next area; the old area is released when the old index drains.
+                if writer.retired_order.front() == Some(&active.id) {
+                    writer.retired_order.pop_front();
+                }
+                writer.block_ix = 1 - ix;
+                writer.held = Some(HeldArea { area: active, ix });
+                if self.activate_next(&mut writer) {
+                    return RlaSwitch::Switched(true);
+                }
+                writer.waiter = Some(collector);
+                return RlaSwitch::Wait;
             }
-            writer.retired.remove(&active.id);
-            if writer.retired_order.front() == Some(&active.id) {
-                writer.retired_order.pop_front();
-            }
-            self.note_area_freed();
         }
+        RlaSwitch::Switched(self.activate_next(&mut writer))
+    }
+
+    /// Whether the collector still waits for blockers of the held area (`wait_ix` counters).
+    pub fn release_blocked(&self) -> bool {
+        let writer = self.lock_writer();
+        writer
+            .held
+            .as_ref()
+            .is_some_and(|held| writer.block[held.ix] != 0)
+    }
+
+    /// Take the registered collector wakeup; `Some` means the caller must resume it.
+    pub fn take_release_waiter(&self) -> Option<u64> {
+        self.lock_writer().waiter.take()
+    }
+
+    /// Block the release of literal areas until [`Store::unblock_release`].
+    // Port of erts/emulator/beam/beam_bif_load.c (erts_block_release_literal_area), OTP-29.1.1.
+    pub fn block_release(&self) -> RlaBlock {
+        let mut writer = self.lock_writer();
+        let ix = writer.block_ix;
+        writer.block[ix] += 1;
+        if literal_trace() {
+            eprintln!("literal_block ix={ix} count={}", writer.block[ix]);
+        }
+        RlaBlock(ix)
+    }
+
+    /// Undo [`Store::block_release`]; returns the collector pid data to resume when the last
+    /// blocker of the area it waits for is gone.
+    // Port of erts/emulator/beam/beam_bif_load.c (erts_unblock_release_literal_area), OTP-29.1.1.
+    pub fn unblock_release(&self, block: RlaBlock) -> Option<u64> {
+        let mut writer = self.lock_writer();
+        writer.block[block.0] -= 1;
+        if literal_trace() {
+            eprintln!(
+                "literal_unblock ix={} count={} waiter={:?}",
+                block.0, writer.block[block.0], writer.waiter
+            );
+        }
+        if writer.block[block.0] == 0 && writer.held.as_ref().is_some_and(|held| held.ix == block.0)
+        {
+            return writer.waiter.take();
+        }
+        None
+    }
+
+    fn free_area(&self, writer: &mut Writer, active: &ActiveArea) {
+        arinsal_term::set_literal_purge_area(&active.pointer_ranges, false);
+        if literal_trace() {
+            eprintln!("literal_release area={}", active.id);
+        }
+        writer.retired.remove(&active.id);
+        if writer.retired_order.front() == Some(&active.id) {
+            writer.retired_order.pop_front();
+        }
+        self.note_area_freed();
+    }
+
+    /// `rla_switch_area`: make the next queued area the one processes copy.
+    fn activate_next(&self, writer: &mut Writer) -> bool {
         loop {
             let Some(id) = writer.retired_order.front().copied() else {
                 return false;

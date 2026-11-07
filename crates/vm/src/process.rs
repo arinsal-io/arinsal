@@ -7191,6 +7191,12 @@ impl Process {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // an exiting process is terminated while its dirty job keeps running.
             self.set_dirty_exited();
+            // Port of erts/emulator/beam/erl_process.c:14374-14392 (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS),
+            // OTP-29.1.1: block literal-area release before the sys tasks are answered.
+            // The hold is parked in a local: `notify_exit` releases the cold state it would live in.
+            let rla_block = ctx
+                .dirty_running()
+                .then(|| self.persistent_terms.block_release());
             crate::signals::process_exiting(self, ctx);
             let reason = exit_reason_from(self, &error);
             self.notify_exit(vm, ctx, reason);
@@ -7201,10 +7207,25 @@ impl Process {
             }
             // `notify_exit` released the cold state; the process stays marked exited.
             self.slice_mut().dirty_exited = true;
+            self.slice_mut().rla_block = rla_block;
         }
         // Replies, exit and DOWN signals must not wait for the dirty job to return.
         ctx.flush_pending();
         done
+    }
+
+    /// Drop the literal-release hold of a process that exited while executing dirty, and wake
+    /// the collector when it waited for it.
+    // Port of erts/emulator/beam/erl_process.c:13480 (delete_process calls erts_unblock_release_literal_area), OTP-29.1.1.
+    fn unblock_literal_release(&mut self) {
+        let Some(block) = self.slice_mut().rla_block.take() else {
+            return;
+        };
+        if let Some(waiter) = self.persistent_terms.unblock_release(block)
+            && let Some(runtime) = self.runtime
+        {
+            crate::natives::code::resume_suspended(runtime, Pid::from_data(waiter));
+        }
     }
 
     /// Whether this process already exited while executing a dirty job.
@@ -7672,6 +7693,21 @@ impl Process {
                 roots.push(pending.roots_mut());
             }
             if let Some(trap) = cold.work.bif_trap.as_mut() {
+                // erts keeps no process-heap pointer in a parked BIF's state that a collection
+                // would miss: either the arguments (X registers) carry the terms, or the
+                // process is not collectable (`F_DISABLE_GC`). A trap whose state holds
+                // heap terms must therefore not be collected unless they are roots.
+                debug_assert!(
+                    !self.heap.gc_enabled
+                        || trap.root_args_len() != 0
+                        || trap.target.entry.is_none()
+                        || !crate::bif_traps::state_holds_heap_terms(
+                            &trap.state,
+                            trap.direct_state.is_some()
+                        ),
+                    "collection with an unrooted heap term in the trap state of {}",
+                    trap.continuation
+                );
                 let root_args = trap.root_args_len();
                 if root_args != 0 {
                     roots.push(&mut trap.args[..root_args]);
@@ -8523,6 +8559,8 @@ impl Task for Process {
     // off-heap list, message queue, dictionary and the link and monitor state are freed by
     // the exiting scheduler, not when the last reference to the struct goes.
     fn delete_process(&mut self) {
+        // Before the cold state, which holds the hold, is released (erts keeps it in `p->u.terminate`).
+        self.unblock_literal_release();
         crate::trace::clear_save_calls(self);
         self.heap.clear_for_exit();
         self.cold = None;

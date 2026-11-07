@@ -1383,7 +1383,7 @@ fn literal_collector(vm: &Vm, process: &Process, pid: Pid) -> bool {
 // Persistent-term and purged-module literal areas share the collector queue.
 fn release_area_switch(
     vm: &Vm,
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, crate::process::Message>,
 ) -> Result<Term, VmError> {
     let store = process.persistent_terms;
@@ -1397,7 +1397,15 @@ fn release_area_switch(
         return Err(notsup());
     }
     let previous = store.collector_area();
-    let switched = store.collector_switch_area();
+    let switched = match store.collector_switch(pid.data()) {
+        arinsal_pterm::RlaSwitch::Switched(switched) => switched,
+        arinsal_pterm::RlaSwitch::Wait => {
+            // Port of beam_bif_load.c:1880-1892 (ERTS_RLA_BLOCK_STATE_WAITING), OTP-29.1.1:
+            // the collector sleeps until the last blocker of the old area unblocks; the call
+            // is then repeated and continues in the waiting state.
+            return wait_release_area(process, pid, store);
+        }
+    };
     if switched && store.collector_area() != previous {
         // Port of beam_bif_load.c:1830-1838 (publish_new_info), OTP-29.1.1: wait
         // for thread progress so every scheduler's in-flight send or spawn has
@@ -1405,6 +1413,25 @@ fn release_area_switch(
         ctx.block_thread_progress(std::time::Duration::ZERO);
     }
     Ok(atom(if switched { "true" } else { "false" }))
+}
+
+/// Suspend the collector until [`arinsal_pterm::Store::unblock_release`] wakes it, then yield so
+/// the BIF call is repeated (erts traps to `wait_release_literal_area_switch`).
+fn wait_release_area(
+    process: &mut Process,
+    pid: Pid,
+    store: &arinsal_pterm::Store,
+) -> Result<Term, VmError> {
+    crate::suspend::suspend_self(process);
+    // The last blocker may have unblocked before the suspend took effect: nobody resumes us
+    // then, unless the waiter registration is still ours to cancel.
+    if !store.release_blocked()
+        && store.take_release_waiter().is_some()
+        && let Some(runtime) = process.runtime
+    {
+        resume_suspended(runtime, pid);
+    }
+    Err(VmError::Yield)
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:1750

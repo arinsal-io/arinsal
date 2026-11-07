@@ -59,6 +59,9 @@ impl RawMutex {
 pub(crate) struct PortDataLock {
     lock: RawMutex,
     refc: std::sync::atomic::AtomicIsize,
+    /// `pdl->prt` with the port reference `driver_pdl_create` takes (`erts_port_inc_refc`),
+    /// dropped when the lock is destroyed (io.c:6678 pdl_destroy).
+    _port: crate::PortRef,
 }
 
 /// `ErlDrvMutex`.
@@ -512,8 +515,9 @@ pub(crate) fn thread_join(tid: *mut c_void, result: *mut *mut c_void) -> c_int {
 }
 
 /// `driver_pdl_create` lock (`struct erl_drv_port_data_lock`).
-pub(crate) fn pdl_new() -> *mut PortDataLock {
+pub(crate) fn pdl_new(port: crate::PortRef) -> *mut PortDataLock {
     mem::new_handle(PortDataLock {
+        _port: port,
         lock: RawMutex::default(),
         refc: std::sync::atomic::AtomicIsize::new(1),
     })

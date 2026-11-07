@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_pterm::Store;
+use arinsal_pterm::{RlaSwitch, Store};
 use arinsal_term::{Term, TermBuilder, VecHeap, to_owned};
 
 fn pair(term: Term) -> (i64, i64) {
@@ -98,6 +98,36 @@ fn erase_keeps_old_value_alive_for_readers() {
     assert!(store.has_retired());
     assert!(!store.collector_switch_area());
     assert!(!store.has_retired());
+}
+
+/// A process that exited while executing dirty blocks the release of the active literal area
+/// until it is gone (erts_block_release_literal_area, dirty_nif_SUITE:literal_area).
+#[test]
+fn a_blocker_holds_the_release_of_the_active_area() {
+    let store = Store::new();
+    let mut heap = VecHeap::new();
+    let mut builder = TermBuilder::new(&mut heap);
+    let key = Term::atom(arinsal_term::atoms::TRUE);
+    let value = builder
+        .tuple(&[Term::small(1).unwrap(), Term::small(2).unwrap()])
+        .unwrap();
+    store.put(key, value).unwrap();
+    assert!(store.erase(key));
+    assert_eq!(store.collector_switch(7), RlaSwitch::Switched(true));
+    let id = store.collector_area().unwrap();
+    let block = store.block_release();
+    assert!(store.acknowledge_copied(id, 0));
+    // The area is held, nothing is left to work on: the collector waits.
+    assert_eq!(store.collector_switch(7), RlaSwitch::Wait);
+    assert!(store.release_blocked());
+    assert!(store.has_retired());
+    assert_eq!(store.freed_literal_areas(), 0);
+    // The last blocker wakes the collector, which then releases the area.
+    assert_eq!(store.unblock_release(block), Some(7));
+    assert!(!store.release_blocked());
+    assert_eq!(store.collector_switch(7), RlaSwitch::Switched(false));
+    assert!(!store.has_retired());
+    assert_eq!(store.freed_literal_areas(), 1);
 }
 
 #[test]

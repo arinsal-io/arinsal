@@ -191,6 +191,17 @@ impl BinaryToListWalk {
         self.list.is_none()
     }
 
+    /// Re-read the source binary from the retried call's argument register.
+    // Port of erts/emulator/beam/binary.c (binary_to_list_1 / binary_to_list_3,
+    // ERTS_BIF_YIELD1 / ERTS_BIF_YIELD3), OTP-29.1.1: before the list is reserved erts creates
+    // no state, the yield retries the call with BIF_ARG_1 from the argument registers, which a
+    // collection while the process is switched out keeps current. This walk is created early
+    // and carries the source term, which that collection does not update.
+    pub fn refresh_source(&mut self, source: Term) {
+        debug_assert!(self.list.is_none());
+        self.source = source;
+    }
+
     /// Fill at most one scheduler chunk, visiting the source from its end.
     pub fn step<H: HeapAlloc + ?Sized>(
         &mut self,
