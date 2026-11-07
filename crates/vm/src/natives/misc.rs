@@ -219,32 +219,28 @@ fn profile_set(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
 /// Build the scheduler transition message for the scheduler's worker hook.
 // Port of erts/emulator/beam/erl_trace.c:1957 (profile_scheduler), OTP-29.1.1.
 pub(crate) fn profile_scheduler_event(
-    process: &mut Process,
-    _pid: arinsal_sched::Pid,
     scheduler_id: u32,
     active: bool,
     active_schedulers: u32,
 ) -> Option<(arinsal_sched::Pid, Message)> {
+    // erts reads the global flag and builds the message in a temporary message: no process, no
+    // process lock.
     let flags = PROFILE_FLAGS.load(Ordering::Relaxed);
     if flags & PROFILE_SCHEDULER == 0 {
         return None;
     }
     let profile = profile().lock().unwrap().clone();
     let target = profile_target(&profile)?;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let message = from_owned(
-        &O::Tuple(vec![
-            O::Atom("profile".into()),
-            O::Atom("scheduler".into()),
-            O::Int(scheduler_id as i64),
-            O::Atom(if active { "active" } else { "inactive" }.into()),
-            O::Int(active_schedulers as i64),
-            profile_timestamp(profile.timestamp),
-        ]),
-        &mut heap,
-    )
+    let message = Message::from_owned(&O::Tuple(vec![
+        O::Atom("profile".into()),
+        O::Atom("scheduler".into()),
+        O::Int(scheduler_id as i64),
+        O::Atom(if active { "active" } else { "inactive" }.into()),
+        O::Int(active_schedulers as i64),
+        profile_timestamp(profile.timestamp),
+    ]))
     .ok()?;
-    Some((target, Message::copy_from(message).ok()?))
+    Some((target, message))
 }
 
 /// Emit a port queue transition from the port task's runnable boundary.
