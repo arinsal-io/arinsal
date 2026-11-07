@@ -339,44 +339,6 @@ impl<V> IntoIterator for SmallMap<V> {
     }
 }
 
-/// The processes linked to a port: the owner and a few more, kept without a table
-/// (`ErtsLink` tree of the port, one node per link).
-#[derive(Default)]
-pub(crate) struct PidSet(smallvec::SmallVec<[Pid; 2]>);
-
-impl PidSet {
-    fn from_one(pid: Pid) -> Self {
-        Self(smallvec::smallvec![pid])
-    }
-
-    pub(crate) fn insert(&mut self, pid: Pid) -> bool {
-        if self.0.contains(&pid) {
-            false
-        } else {
-            self.0.push(pid);
-            true
-        }
-    }
-
-    pub(crate) fn remove(&mut self, pid: &Pid) -> bool {
-        match self.0.iter().position(|current| current == pid) {
-            Some(index) => {
-                self.0.remove(index);
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub(crate) fn contains(&self, pid: &Pid) -> bool {
-        self.0.contains(pid)
-    }
-
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Pid> {
-        self.0.iter()
-    }
-}
-
 /// What the spawn and fd drivers keep per port (`ErtsSysDriverData` of sys_drivers.c): the
 /// output descriptor, the wake-up of the worker thread, packet framing and busy limits.
 pub(crate) struct SpawnData {
@@ -465,7 +427,8 @@ pub(crate) struct PortHandle {
     /// with a worker thread.
     spawn: Option<Box<SpawnData>>,
     owner: OwnerCell,
-    links: Mutex<PidSet>,
+    /// `ERTS_P_LINKS`: an intrusive link tree, including the pending-unlink id on each node.
+    links: Mutex<crate::monitor_link::MonLnkTree<crate::monitor_link::Link>>,
     monitors: Mutex<SmallMap<PortMonitor>>,
     /// OS pid of the child: `OS_PID_PENDING` until the forker's `Go`, 0 for ports without one.
     os_pid: AtomicU32,
@@ -2229,7 +2192,7 @@ impl arinsal_drv::PortHost for DrvHost {
     fn unlink_connected(&self, port: &arinsal_drv::DriverPort) {
         if let Some(handle) = self.handle(port.id()) {
             let owner = handle.owner_pid();
-            handle.links.lock().remove(&owner);
+            handle.links.lock().remove(owner.data());
             let _ =
                 handle
                     .scheduler
@@ -2607,7 +2570,7 @@ fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
     let result = match result {
         Ok(()) => port_term,
         Err(errno) => {
-            handle.links.lock().remove(&opener);
+            handle.links.lock().remove(opener.data());
             let _ = handle.scheduler.signal(
                 opener,
                 opener,
@@ -2842,7 +2805,8 @@ fn notify_links_monitors(
     let Some(port) = Term::port(id) else {
         return;
     };
-    for linked in handle.links.lock().iter().copied() {
+    for link in handle.links.lock().iter() {
+        let linked = Pid::from_data(link.other());
         if skip_owner && linked == from {
             continue;
         }
@@ -3095,7 +3059,11 @@ fn make_handle_with(
             })
         }),
         owner: OwnerCell::new(owner),
-        links: Mutex::new(PidSet::from_one(owner)),
+        links: Mutex::new({
+            let mut links = crate::proc_create::LinkTree::default();
+            links.insert(crate::proc_create::port_peer_link(owner));
+            links
+        }),
         monitors: Mutex::new(SmallMap::default()),
         os_pid: AtomicU32::new(os_pid),
         name: name.into_boxed_str(),
@@ -4999,7 +4967,10 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         return Err(badarg());
     }
     let old_owner = handle.owner_pid();
-    handle.links.lock().insert(pid);
+    let _ = handle
+        .links
+        .lock()
+        .lookup_insert(crate::proc_create::port_peer_link(pid));
     handle.owner.set(pid);
     let _ = runtime
         .scheduler()?
@@ -5075,9 +5046,9 @@ pub(crate) fn owner_exit(
                 let handle = runtime.ports.get(*id)?;
                 let is_owner = handle.owner.get() == owner;
                 let linked = if handle.driver.as_ref().is_some() {
-                    handle.links.lock().contains(&owner)
+                    handle.links.lock().get(owner.data()).is_some()
                 } else {
-                    handle.links.lock().remove(&owner)
+                    handle.links.lock().remove(owner.data()).is_some()
                 };
                 (is_owner || (abnormal && linked)).then_some((*id, handle))
             })
@@ -5150,13 +5121,48 @@ pub(crate) fn link(
             "unlink",
             &[port],
         );
-        process.links.remove(crate::proc_create::port_link_key(id));
+        let key = crate::proc_create::port_link_key(id);
+        match process.links.get(key) {
+            Some(link) if link.unlinking() == 0 => {}
+            _ => return Ok(true),
+        }
+        let unlink_id = next_port_unlink_id(&mut process.uniq_counter);
+        if let Some(mut link) = process.links.get_mut(key) {
+            link.set_unlinking(unlink_id);
+        }
+        if let Some(drv) = handle.drv_port() {
+            if !drv_sig::link(runtime, &handle, &drv, pid, false, unlink_id) {
+                // `erts_port_unlink` acknowledges an invalid port lookup through
+                // `port_unlink_failure` instead of scheduling a port task.
+                let _ = handle.scheduler.signal(
+                    pid,
+                    pid,
+                    arinsal_sched::Signal::PortUnlinkAck {
+                        port: id,
+                        unlink_id,
+                    },
+                );
+            }
+            return Ok(true);
+        }
+        // Port of erts/emulator/beam/io.c (erts_port_unlink): the immediate port operation
+        // deletes the port half and sends an unlink acknowledgement to the caller.
+        handle.links.lock().remove(pid.data());
+        let _ = handle.scheduler.signal(
+            pid,
+            pid,
+            arinsal_sched::Signal::PortUnlinkAck {
+                port: id,
+                unlink_id,
+            },
+        );
+        return Ok(true);
     } else {
         link_opener(process, id);
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     if let Some(drv) = handle.drv_port() {
-        let done = drv_sig::link(runtime, &handle, &drv, pid, linked);
+        let done = drv_sig::link(runtime, &handle, &drv, pid, linked, 0);
         if linked && !done {
             process.links.remove(crate::proc_create::port_link_key(id));
         }
@@ -5173,9 +5179,7 @@ pub(crate) fn link(
     }
     let mut links = handle.links.lock();
     if linked {
-        links.insert(pid);
-    } else {
-        links.remove(&pid);
+        let _ = links.lookup_insert(crate::proc_create::process_link(pid, false));
     }
     drop(links);
     drop(ports);
@@ -5193,6 +5197,18 @@ pub(crate) fn link(
         );
     }
     Ok(true)
+}
+
+/// Port of erts/emulator/beam/erl_proc_sig_queue.h:1908-1929
+/// (`erts_proc_sig_new_unlink_id`), OTP-29.1.1.
+fn next_port_unlink_id(uniq: &mut i64) -> u64 {
+    loop {
+        let id = *uniq as u64;
+        *uniq = uniq.wrapping_add(1);
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 /// Register or remove a process monitor on a port the caller already looked up
@@ -5784,7 +5800,13 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;
     let connected = handle.owner.get().to_term().ok_or_else(badarg)?;
     let links = TermBuilder::new(&mut heap)
-        .list_from_iter(handle.links.lock().iter().filter_map(|pid| pid.to_term()))
+        .list_from_iter(
+            handle
+                .links
+                .lock()
+                .iter()
+                .filter_map(|link| Pid::from_data(link.other()).to_term()),
+        )
         .map_err(|e| VmError::Unsupported(format!("port info links: {e:?}")))?;
     let monitored_pids = handle
         .monitors
@@ -5892,7 +5914,7 @@ pub(crate) fn layout_sizes() -> Vec<String> {
     use std::mem::size_of;
     vec![
         format!("PortState={}", size_of::<PortState>()),
-        format!("PidSet={}", size_of::<PidSet>()),
+        format!("LinkTree={}", size_of::<crate::proc_create::LinkTree>()),
         format!("SmallMap={}", size_of::<SmallMap<PortMonitor>>()),
         format!("Option<HaltProgress>={}", size_of::<Option<HaltProgress>>()),
         format!("Option<SpawnData>={}", size_of::<Option<Box<SpawnData>>>()),

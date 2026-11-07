@@ -7,8 +7,9 @@ use arinsal_term::{ProcessHeap, from_owned};
 use arinsal_vm::Vm;
 
 const MODULE: &str = "port_trace7_repro";
-const CASES: [&str; 7] = [
+const CASES: [&str; 8] = [
     "set_timer",
+    "unlink",
     "command",
     "connect",
     "driver_remote_send_term",
@@ -112,7 +113,7 @@ fn port_trace_event_sequences_match_otp() {
             .eval_scheduled(MODULE, "run", &args, 1, Some(82))
             .unwrap_or_else(|error| panic!("{MODULE}:run({case}) on Arinsal: {error}"))
             .term;
-        assert_eq!(
+        similar_asserts::assert_eq!(
             actual,
             expected,
             "{case} trace sequence mismatch\nOTP: {}\nArinsal: {}",
