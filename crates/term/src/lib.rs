@@ -76,9 +76,9 @@ pub use hash::{
 pub use heap::{
     AdoptError, BinaryRef, CP_WORDS, ConsHeapBuilder, ConsHeapChain, ConsHeapSegment,
     ConsListBuilder, FrameLayout, HAllocReservation, HeapAlloc, HeapBinaryWriter, HeapBlockBuilder,
-    HeapReservation, HeapReservationState, HeapReservationWords, HeapTermSlot, LiteralArea,
-    MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TermBuilder,
-    Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
+    HeapFactoryMark, HeapReservation, HeapReservationState, HeapReservationWords, HeapTermSlot,
+    LiteralArea, MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord,
+    TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
 };
 pub use identity::{Identity, Node, set_this_node, this_node};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
