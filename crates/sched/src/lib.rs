@@ -458,6 +458,10 @@ impl Eq for SharedPayload {}
 pub enum Signal<M: SignalMessage> {
     /// Link half queued as the signal itself, as `erts_proc_sig_send_link` does.
     Link { priority: bool },
+    /// Apply trace flags ahead of the link signal that carries the same ordered update.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (sig_enqueue_trace,
+    // ERTS_SIG_Q_OP_TRACE_CHANGE_STATE), OTP-29.1.1.
+    TraceChangeState(SharedPayload),
     /// Unlink request carrying its acknowledgement id.
     Unlink(u64),
     /// Unlink acknowledgement.
@@ -9826,6 +9830,15 @@ fn schedule_next<T: Task>(
         || (inner.scheduling_blocked.load(Ordering::Acquire)
             && id != inner.scheduling_blocker.load(Ordering::Acquire))
     {
+        // Port of erts/emulator/beam/erl_process.c:3490 (sched_waiting), OTP-29.1.1:
+        // a blocked scheduler becomes inactive before it releases its run-queue lock.
+        if local.profile_active {
+            let count = inner.active_schedulers.fetch_sub(1, Ordering::Relaxed) - 1;
+            local.profile_active = false;
+            if let Some(pid) = local.last_process {
+                profile_scheduler_transition(inner, pid, id, false, count, &mut *local);
+            }
+        }
         rq.unlock();
         // An offline or blocked scheduler hands its queued work and due timers to the
         // schedulers still running.

@@ -48,6 +48,16 @@ struct Entry {
     tracer: Tracer,
 }
 
+/// Trace-state snapshot queued immediately before a process link signal.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:618-655 (sig_enqueue_trace), OTP-29.1.1.
+#[derive(Clone)]
+pub(crate) struct LinkedTraceChange {
+    session: u64,
+    flags_on: u64,
+    flags_off: u64,
+    tracer: Tracer,
+}
+
 #[derive(Clone, Default)]
 pub(crate) enum Tracer {
     #[default]
@@ -3711,42 +3721,70 @@ pub(crate) fn spawn_interested(process: &Process, parent: Pid) -> bool {
                 .any(|((runtime, _), (flags, _))| *runtime == scope(process) && *flags != 0)
 }
 
-// Port of erts/emulator/beam/erl_proc_sig_queue.c:618-655, OTP-29.1.1.
-pub(crate) fn linked(process: &Process, from: Pid, to: Pid) {
-    for (source, target) in [(from, to), (to, from)] {
-        if is_sensitive(process, source) {
-            continue;
-        }
-        let source_entries = table()
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((runtime, _, pid), entry)| {
-                *runtime == scope(process)
-                    && *pid == source
-                    && entry.flags & (SET_ON_LINK | FIRST_LINK) != 0
-            })
-            .map(|((_, session, _), entry)| (*session, entry.clone()))
-            .collect::<Vec<_>>();
-        for (session, entry) in source_entries {
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:618-655 (sig_enqueue_trace), OTP-29.1.1.
+pub(crate) fn linked(process: &Process, from: Pid) -> Vec<LinkedTraceChange> {
+    if is_sensitive(process, from) {
+        return Vec::new();
+    }
+    let source_entries = table()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((runtime, _, pid), entry)| {
+            *runtime == scope(process)
+                && *pid == from
+                && entry.flags & (SET_ON_LINK | FIRST_LINK) != 0
+        })
+        .map(|((_, session, _), entry)| (*session, entry.clone()))
+        .collect::<Vec<_>>();
+    source_entries
+        .into_iter()
+        .map(|(session, entry)| {
             let first_link = entry.flags & FIRST_LINK != 0;
-            let target_flags = if first_link {
-                entry.flags & !(SET_ON_LINK | FIRST_LINK)
-            } else {
-                entry.flags
-            };
-            replace_session_flags(process, session, target, target_flags, entry.tracer.clone());
             if first_link {
                 configure_session(
                     process,
                     session,
-                    source,
+                    from,
                     false,
                     SET_ON_LINK | FIRST_LINK,
-                    entry.tracer,
+                    entry.tracer.clone(),
                 );
             }
-        }
+            LinkedTraceChange {
+                session,
+                flags_on: entry.flags,
+                flags_off: if first_link {
+                    SET_ON_LINK | FIRST_LINK
+                } else {
+                    0
+                },
+                tracer: entry.tracer,
+            }
+        })
+        .collect()
+}
+
+/// Apply one ordered `TRACE_CHANGE_STATE` operation to the receiving process.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:8524-8565 (handle_trace_change_state), OTP-29.1.1.
+pub(crate) fn apply_linked_trace_change(process: &Process, pid: Pid, change: &LinkedTraceChange) {
+    configure_session(
+        process,
+        change.session,
+        pid,
+        true,
+        change.flags_on,
+        change.tracer.clone(),
+    );
+    if change.flags_off != 0 {
+        configure_session(
+            process,
+            change.session,
+            pid,
+            false,
+            change.flags_off,
+            change.tracer.clone(),
+        );
     }
 }
 
@@ -5100,6 +5138,7 @@ mod tests {
                 "function",
                 0,
                 crate::trace_bp::WANT_TRACE,
+                false,
             )
             .got
         };

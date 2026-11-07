@@ -4783,10 +4783,14 @@ fn link_opt(
     if !runtime(process)?.scheduler()?.lookup(pid) {
         return link_noproc(process, pid, priority);
     }
-    crate::trace::linked(process, ctx.pid(), pid);
     // Port of erts/emulator/beam/bif.c:165-183 (link_opt): one lookup_create on the link tree;
     // a link that exists and is not unlinking sends nothing.
     let send = link_node_create(&mut process.links, pid, priority);
+    let trace_changes = if send {
+        crate::trace::linked(process, ctx.pid())
+    } else {
+        Vec::new()
+    };
     let linked_term = pid.to_term().ok_or_else(|| badarg("link"))?;
     crate::trace::emit(
         Some(vm),
@@ -4797,11 +4801,22 @@ fn link_opt(
         "link",
         &[linked_term],
     );
-    match if send {
-        ctx.signal(pid, Signal::Link { priority })
-    } else {
-        Ok(())
-    } {
+    let mut signal_result = Ok(());
+    if send {
+        for change in trace_changes {
+            signal_result = ctx.signal(
+                pid,
+                Signal::TraceChangeState(arinsal_sched::SharedPayload(std::sync::Arc::new(change))),
+            );
+            if signal_result.is_err() {
+                break;
+            }
+        }
+        if signal_result.is_ok() {
+            signal_result = ctx.signal(pid, Signal::Link { priority });
+        }
+    }
+    match signal_result {
         // The linked process reports getting_linked when it handles the signal.
         Ok(()) => {}
         Err(arinsal_sched::Error::NoProcess) => {

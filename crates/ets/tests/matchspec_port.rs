@@ -75,7 +75,7 @@ fn canonical_list(term: OwnedTerm) -> OwnedTerm {
     let OwnedTerm::List { elems, tail } = &term else {
         panic!("expected result list")
     };
-    assert_eq!(**tail, OwnedTerm::Nil);
+    similar_asserts::assert_eq!(**tail, OwnedTerm::Nil);
     let mut elems = elems.clone();
     elems.sort_by_key(|value| format!("{value:?}"));
     list(elems)
@@ -127,7 +127,7 @@ fn test_ms_results_vs_erl() {
             &(),
         );
         match expected {
-            CallResult::Ok(expected) => assert_eq!(
+            CallResult::Ok(expected) => similar_asserts::assert_eq!(
                 actual.map(|term| to_owned(term).unwrap()),
                 Ok(expected),
                 "seed {seed}"
@@ -138,6 +138,46 @@ fn test_ms_results_vs_erl() {
             result => panic!("unexpected OTP result for seed {seed}: {result:?}"),
         }
     }
+}
+
+#[test]
+fn map_guard_sorts_evaluated_keys_like_otp() {
+    let Some(erl) = ref_erl() else { return };
+    let object = tuple(vec![
+        int(11),
+        OwnedTerm::Map(vec![(int(20), int(1)), (atom("b"), int(2))]),
+    ]);
+    let head = tuple(vec![atom("$1"), atom("$2")]);
+    let computed_key = tuple(vec![atom("+"), atom("$1"), int(9)]);
+    let computed_value = tuple(vec![atom("-"), atom("$1"), int(10)]);
+    let guard_map = OwnedTerm::Map(vec![
+        (computed_key, computed_value),
+        (atom("b"), tuple(vec![atom("const"), int(2)])),
+    ]);
+    let guard = tuple(vec![atom("=="), atom("$2"), guard_map]);
+    let spec = list(vec![tuple(vec![
+        head,
+        list(vec![guard]),
+        list(vec![atom("$2")]),
+    ])]);
+    let expected = match erl.call(
+        "erlang",
+        "match_spec_test",
+        &[object.clone(), spec.clone(), atom("table")],
+    ) {
+        CallResult::Ok(value) => value,
+        other => panic!("OTP match_spec_test failed: {other:?}"),
+    };
+    let mut heap = VecHeap::new();
+    let actual = match_spec_test(
+        from_owned(&object, &mut heap).unwrap(),
+        from_owned(&spec, &mut heap).unwrap(),
+        MatchDialect::Table,
+        &mut heap,
+        &(),
+    )
+    .map(|term| to_owned(term).unwrap());
+    similar_asserts::assert_eq!(actual, Ok(expected));
 }
 
 #[test]
@@ -185,7 +225,7 @@ fn tuple_construction_evaluates_nested_matchspec_expressions_like_otp() {
         .into_iter()
         .map(|term| to_owned(term).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(expected, CallResult::Ok(list(actual)));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(list(actual)));
 }
 
 #[test]
@@ -240,7 +280,7 @@ fn tuple_construction_in_guard_matches_otp() {
         .run(object, &mut output)
         .unwrap()
         .map(|term| to_owned(term).unwrap());
-    assert_eq!(expected, CallResult::Ok(list(actual.into_iter().collect())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(list(actual.into_iter().collect())));
 }
 
 #[test]
@@ -262,7 +302,7 @@ fn ets_test_ms_errors_vs_erl() {
         &(),
     )
     .map(|term| to_owned(term).unwrap());
-    assert_eq!(
+    similar_asserts::assert_eq!(
         actual,
         match expected {
             CallResult::Ok(value) => Ok(value),
@@ -305,9 +345,9 @@ fn select_order_vs_erl() {
         };
         let actual = local_select(table_type, &spec);
         if name == "ordered_set" {
-            assert_eq!(expected, actual, "{name} order");
+            similar_asserts::assert_eq!(expected, actual, "{name} order");
         } else {
-            assert_eq!(canonical_list(expected), actual, "{name}");
+            similar_asserts::assert_eq!(canonical_list(expected), actual, "{name}");
         }
     }
 }
@@ -355,7 +395,7 @@ fn select_replace_vs_erl() {
         .map(|term| to_owned(term).unwrap())
         .collect::<Vec<_>>();
     rows.sort_by_key(|value| format!("{value:?}"));
-    assert_eq!(
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(tuple(vec![int(count as i64), list(rows)]))
     );
@@ -388,5 +428,5 @@ fn match_spec_run_vs_erl() {
             .map(|term| to_owned(*term).unwrap())
             .collect(),
     );
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

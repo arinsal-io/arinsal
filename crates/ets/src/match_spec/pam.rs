@@ -571,8 +571,8 @@ pub(super) fn db_prog_match<C: MatchContext>(
                             fail!();
                         }
                     }
-                    let map =
-                        TermBuilder::new(heap).flatmap_with_key_tuple(keys_term, &esp[base..])?;
+                    let map = TermBuilder::new(heap)
+                        .flatmap_with_key_tuple_usort(keys_term, &esp[base..])?;
                     esp.truncate(base);
                     esp.push(map);
                 }

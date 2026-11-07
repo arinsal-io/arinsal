@@ -6879,6 +6879,16 @@ impl Process {
             unreachable!("message signals are moved to the message queue before this");
         };
         let cost = match signal {
+            arinsal_sched::Signal::TraceChangeState(shared) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:8524-8565
+                // (handle_trace_change_state), OTP-29.1.1.
+                let change = shared
+                    .0
+                    .downcast_ref::<crate::trace::LinkedTraceChange>()
+                    .expect("trace-change signal carries its trace state");
+                crate::trace::apply_linked_trace_change(self, ctx.pid(), change);
+                0
+            }
             arinsal_sched::Signal::Link { priority } => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
                 // the receiver reports getting_linked in signal order, for a new link only.
