@@ -8498,19 +8498,11 @@ impl Task for Process {
     }
 
     fn scheduler_profile_event(
-        &mut self,
-        pid: Pid,
         scheduler_id: u32,
         active: bool,
         active_schedulers: u32,
     ) -> Option<(Pid, Message)> {
-        crate::natives::misc::profile_scheduler_event(
-            self,
-            pid,
-            scheduler_id,
-            active,
-            active_schedulers,
-        )
+        crate::natives::misc::profile_scheduler_event(scheduler_id, active, active_schedulers)
     }
 
     fn take_dirty_job(
