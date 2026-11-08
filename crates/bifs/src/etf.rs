@@ -3201,17 +3201,24 @@ fn parse_step<H: HeapAlloc>(
                     }
                 } else if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
                     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
-                    // OTP-29.1.1: numbers of a saved magic reference give that reference.
+                    // OTP-29.1.1: local PID refs keep the creator PID in ETF words 3 and 4;
+                    // ordinary and saved magic refs use only their reference numbers.
                     let mut local = [0; 3];
                     for (slot, value) in local.iter_mut().zip(&ids[..ids_len]) {
                         *slot = *value;
                     }
-                    let saved = (local[1] & (1 << 17) != 0)
-                        .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local))
-                        .flatten();
-                    match saved {
-                        Some(owner) => built(&mut ctx, |b| b.magic_ref(owner))?,
-                        None => built(&mut ctx, |b| b.local_ref(local))?,
+                    if ids_len == 5 && ids[1] & (1 << 16) != 0 {
+                        built(&mut ctx, |b| {
+                            b.local_pid_ref_from_words(local, ids[3], ids[4])
+                        })?
+                    } else {
+                        let saved = (local[1] & (1 << 17) != 0)
+                            .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local))
+                            .flatten();
+                        match saved {
+                            Some(owner) => built(&mut ctx, |b| b.magic_ref(owner))?,
+                            None => built(&mut ctx, |b| b.local_ref(local))?,
+                        }
                     }
                 } else {
                     built(&mut ctx, |b| {
@@ -4384,16 +4391,22 @@ fn decode_direct_step(
                     for (slot, value) in local_ids.iter_mut().zip(&ids[..ids_len]) {
                         *slot = *value;
                     }
-                    let saved = (local_ids[1] & (1 << 17) != 0)
-                        .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local_ids))
-                        .flatten();
-                    match saved {
-                        Some(owner) => TermBuilder::new(&mut ctx.heap)
-                            .magic_ref(owner)
-                            .map_err(map_term_build_error)?,
-                        None => TermBuilder::new(&mut ctx.heap)
-                            .local_ref(local_ids)
-                            .map_err(map_term_build_error)?,
+                    if ids_len == 5 && ids[1] & (1 << 16) != 0 {
+                        TermBuilder::new(&mut ctx.heap)
+                            .local_pid_ref_from_words(local_ids, ids[3], ids[4])
+                            .map_err(map_term_build_error)?
+                    } else {
+                        let saved = (local_ids[1] & (1 << 17) != 0)
+                            .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local_ids))
+                            .flatten();
+                        match saved {
+                            Some(owner) => TermBuilder::new(&mut ctx.heap)
+                                .magic_ref(owner)
+                                .map_err(map_term_build_error)?,
+                            None => TermBuilder::new(&mut ctx.heap)
+                                .local_ref(local_ids)
+                                .map_err(map_term_build_error)?,
+                        }
                     }
                 } else {
                     TermBuilder::new(&mut ctx.heap)

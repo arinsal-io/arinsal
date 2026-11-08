@@ -331,24 +331,18 @@ impl Process {
         let mut via_alias = 0u64;
         let pid = if let Some(pid) = Pid::from_term(target) {
             Some(pid)
-        } else if let Some(id) = crate::signals::ref_id(target) {
-            let known = self
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.alias_lookup_prio(id));
-            match known {
-                Some((Some(pid), alias_prio)) => {
-                    via_prio_alias = alias_prio && want_priority;
-                    via_alias = id;
-                    Some(pid)
-                }
-                Some((None, _)) => return Ok(value),
-                None => {
-                    return Err(VmError::Trap(crate::exceptions::Trap::error(
-                        crate::signals::atom("badarg"),
-                    )));
-                }
-            }
+        } else if let (Some(pid_data), Some(id)) = (
+            target.local_pid_ref_pid_data(),
+            crate::signals::ref_id(target),
+        ) {
+            // Port of erts_get_pid_of_ref (erl_bif_unique.h), OTP-29.1.1.
+            via_alias = id;
+            via_prio_alias = want_priority;
+            Some(Pid::from_data(pid_data))
+        } else if crate::signals::ref_id(target).is_some() {
+            return Err(VmError::Trap(crate::exceptions::Trap::error(
+                crate::signals::atom("badarg"),
+            )));
         } else if let Some(name) = target.as_atom() {
             let runtime = self
                 .runtime

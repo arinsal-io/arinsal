@@ -25,7 +25,6 @@ pub(crate) struct Runtime {
     pub(super) scheduler: OnceLock<Arc<Scheduler<Process>>>,
     /// `process_reg` (`regtab_rwmtx`). Names are atom indexes, not strings.
     pub(crate) reg: crate::register::RegisterTable,
-    pub(super) aliases: AliasTable,
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: crate::port::PortTable,
     /// Persistent `erl_child_setup` process; all OS port children are forked there.
@@ -292,24 +291,6 @@ impl Runtime {
     #[inline]
     pub(crate) fn next_ref(&self) -> u64 {
         arinsal_bifs::next_ref_id()
-    }
-
-    pub(crate) fn alias_bind(&self, id: u64, target: Option<Pid>) {
-        self.alias_bind_prio(id, target, false);
-    }
-
-    /// Bind an alias; `priority` enables OTP 28+ priority-message reception on that alias.
-    pub(crate) fn alias_bind_prio(&self, id: u64, target: Option<Pid>, priority: bool) {
-        self.aliases.store(id, target, priority);
-    }
-
-    pub(crate) fn alias_lookup(&self, id: u64) -> Option<Option<Pid>> {
-        self.aliases.load(id).map(|(pid, _)| pid)
-    }
-
-    /// Lookup including whether the alias accepts priority messages.
-    pub(crate) fn alias_lookup_prio(&self, id: u64) -> Option<(Option<Pid>, bool)> {
-        self.aliases.load(id)
     }
 
     /// The scheduler once it exists; unlike [`Runtime::scheduler`] a missing one builds no error.

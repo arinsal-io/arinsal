@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
-mod alias;
 mod executor;
 mod executor_after_native;
 mod executor_run;
@@ -35,7 +34,6 @@ mod send;
 mod sig_queue;
 mod spawn_eval;
 
-use self::alias::*;
 pub(crate) use self::executor::*;
 use self::exit::*;
 pub(crate) use self::gc::*;

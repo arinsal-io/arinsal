@@ -191,7 +191,7 @@ fn monitor_data_is_one_small_block() {
     // boxed separately.
     assert_eq!(
         std::mem::size_of::<crate::proc_create::ProcessMonitorData>(),
-        144
+        136
     );
 }
 

@@ -415,11 +415,20 @@ impl Process {
                 2
             }
             signal @ (arinsal_sched::Signal::Exit(_) | arinsal_sched::Signal::ExitLinked(_)) => {
-                let (linked_exit, message) = match signal {
+                let (linked_exit, mut message) = match signal {
                     arinsal_sched::Signal::ExitLinked(message) => (true, message),
                     arinsal_sched::Signal::Exit(message) => (false, message),
                     _ => unreachable!(),
                 };
+                if message.alias != 0 {
+                    let Some(alias_priority) = self.alias_message_accepted(ctx, message.alias)?
+                    else {
+                        return Ok(1);
+                    };
+                    if !alias_priority {
+                        message.priority = false;
+                    }
+                }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:4685-4795
                 // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
                 // process that survives it traces getting_unlinked.
@@ -429,7 +438,6 @@ impl Process {
                         .get(from.data())
                         .is_some_and(|node| node.is_priority());
                 let was_linked = linked_exit && self.links.remove(from.data()).is_some();
-                let mut message = message;
                 let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
                 if reason == crate::signals::atom("kill") && !linked_exit {

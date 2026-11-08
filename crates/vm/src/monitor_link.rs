@@ -78,6 +78,8 @@ pub(crate) mod node_flag {
     pub(crate) const PRIO_ML: u32 = 1 << (BASE + 12);
     pub(crate) const PRIO_ALIAS: u32 = 1 << (BASE + 13);
     pub(crate) const SPAWN_LINK_PRIO: u32 = 1 << (BASE + 14);
+    /// The monitor key is a PID reference; its creator is the other pid in `MonitorData`.
+    pub(crate) const PID_REF: u32 = 1 << (BASE + 15);
     /// Flags a holder may not change: the container state and the half's identity.
     pub(crate) const RESERVED: u32 = TYPE_MASK | TARGET | IN_TABLE;
 }
@@ -1325,6 +1327,46 @@ pub(crate) struct Monitor<I, O, S = ()> {
     _data: arinsal_alloc::typed::FixAllocArc<MonitorData<I, O, S>>,
 }
 
+/// The identity in a monitor key, including the creator stored by a PID reference.
+#[derive(Clone, Copy)]
+pub(crate) struct MonitorReference {
+    pub(crate) id: u64,
+    flags: u32,
+}
+
+impl MonitorReference {
+    pub(crate) fn ordinary(id: u64) -> Self {
+        Self { id, flags: 0 }
+    }
+
+    pub(crate) fn pid_ref(id: u64) -> Self {
+        Self {
+            id,
+            flags: node_flag::PID_REF,
+        }
+    }
+
+    pub(crate) fn is_pid_ref(self) -> bool {
+        self.flags & node_flag::PID_REF != 0
+    }
+
+    // Port of erts/emulator/beam/erl_monitor_link.h (ERTS_ML_STATE_ALIAS_*), OTP-29.1.1.
+    pub(crate) fn with_alias_mode(mut self, mode: crate::proc_create::AliasMode) -> Self {
+        self.flags |= match mode {
+            crate::proc_create::AliasMode::ExplicitUnalias => node_flag::STATE_ALIAS_UNALIAS,
+            crate::proc_create::AliasMode::Demonitor => node_flag::STATE_ALIAS_DEMONITOR,
+            crate::proc_create::AliasMode::ReplyDemonitor => node_flag::STATE_ALIAS_ONCE,
+        };
+        self
+    }
+
+    // Port of erts/emulator/beam/erl_monitor_link.h (ERTS_ML_FLG_PRIO_ALIAS), OTP-29.1.1.
+    pub(crate) fn with_alias_priority(mut self) -> Self {
+        self.flags |= node_flag::PRIO_ALIAS;
+        self
+    }
+}
+
 // SAFETY: a half is moved between processes only as a whole; the data it shares with the other
 // half is `Sync` (see `MonitorData`).
 unsafe impl<I: Send + Sync, O: Send, S: Send> Send for Monitor<I, O, S> {}
@@ -1349,10 +1391,9 @@ impl<I, O, S> NodeHandle for Monitor<I, O, S> {
 impl<I, O, S> Monitor<I, O, S> {
     /// `erts_monitor_create`: both halves of a new monitor. The origin half's `other` is the
     /// target, the target half's `other` the origin.
-    #[cfg(test)]
     pub(crate) fn create(
         kind: u32,
-        reference: u64,
+        reference: MonitorReference,
         origin: u64,
         target: u64,
         flags: u32,
@@ -1377,7 +1418,7 @@ impl<I, O, S> Monitor<I, O, S> {
     pub(crate) fn create_at(
         ix: Option<usize>,
         kind: u32,
-        reference: u64,
+        reference: MonitorReference,
         origin: u64,
         target: u64,
         flags: u32,
@@ -1386,6 +1427,8 @@ impl<I, O, S> Monitor<I, O, S> {
     ) -> (Self, Self) {
         debug_assert!(kind <= node_type::MONITOR_ALIAS);
         debug_assert_eq!(flags & node_flag::RESERVED, 0);
+        let origin_flags = flags | reference.flags;
+        let target_flags = flags | (reference.flags & node_flag::PID_REF);
         let key_offset = offset_of!(MonitorData<I, O, S>, reference);
         let origin_offset = offset_of!(MonitorData<I, O, S>, origin);
         let target_offset = offset_of!(MonitorData<I, O, S>, target);
@@ -1394,15 +1437,15 @@ impl<I, O, S> Monitor<I, O, S> {
                 target,
                 origin_offset,
                 key_offset - origin_offset,
-                kind | flags,
+                kind | origin_flags,
             )),
             target: UnsafeCell::new(MonLnkNode::new(
                 origin,
                 target_offset,
                 key_offset - target_offset,
-                kind | flags | node_flag::TARGET,
+                kind | target_flags | node_flag::TARGET,
             )),
-            reference,
+            reference: reference.id,
             reference_count: AtomicU32::new(2),
             held: AtomicU32::new(ORIGIN_HELD | TARGET_HELD),
             target_list: AtomicU64::new(0),
@@ -1512,6 +1555,28 @@ impl<'a, I, O, S> MonitorRef<'a, I, O, S> {
         MonitorData::<I, O, S>::from_node(self.node).reference
     }
 
+    pub(crate) fn reference_creator(self) -> Option<u64> {
+        let node = node_flags(self.node);
+        if node & node_flag::PID_REF == 0 {
+            return None;
+        }
+        Some(MonitorData::<I, O, S>::from_node(self.node).origin_id())
+    }
+
+    // Port of erts/emulator/beam/erl_monitor_link.h (ERTS_ML_STATE_ALIAS_*), OTP-29.1.1.
+    pub(crate) fn alias_mode(self) -> Option<crate::proc_create::AliasMode> {
+        match node_flags(self.node) & node_flag::STATE_ALIAS_MASK {
+            node_flag::STATE_ALIAS_UNALIAS => Some(crate::proc_create::AliasMode::ExplicitUnalias),
+            node_flag::STATE_ALIAS_DEMONITOR => Some(crate::proc_create::AliasMode::Demonitor),
+            node_flag::STATE_ALIAS_ONCE => Some(crate::proc_create::AliasMode::ReplyDemonitor),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn alias_priority(self) -> bool {
+        node_flags(self.node) & node_flag::PRIO_ALIAS != 0
+    }
+
     pub(crate) fn info(self) -> &'a I {
         &MonitorData::<I, O, S>::from_node(self.node).info
     }
@@ -1545,6 +1610,12 @@ impl<'a, I, O, S> MonitorMut<'a, I, O, S> {
         // half exclusively.
         Some(unsafe { &mut *data.origin_state.get() })
     }
+
+    // Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
+    pub(crate) fn clear_alias_flags(&mut self) {
+        let flags = node_flags(self.node) & !(node_flag::STATE_ALIAS_MASK | node_flag::PRIO_ALIAS);
+        set_node_flags(self.node, flags);
+    }
 }
 
 impl<I, O, S> MonLnkTree<Monitor<I, O, S>> {
@@ -1570,7 +1641,9 @@ impl<I, O, S> MonLnkTree<Monitor<I, O, S>> {
     }
 
     pub(crate) fn get_state_mut(&mut self, reference: u64) -> Option<&mut O> {
-        self.get_mut(reference)?.origin_state()
+        let mut entry = self.get_mut(reference)?;
+        entry.clear_alias_flags();
+        entry.origin_state()
     }
 
     /// Port of erts/emulator/beam/erl_monitor_link.c:710 (`erts_monitor_tree_foreach`), OTP-29.1.1.
@@ -1858,8 +1931,15 @@ mod tests {
 
     #[test]
     fn monitor_halves_share_one_allocation_and_free_with_the_last() {
-        let (origin, target) =
-            TestMonitor::create(node_type::MONITOR_PROC, 77, 1, 2, node_flag::TAG, 9, 3);
+        let (origin, target) = TestMonitor::create(
+            node_type::MONITOR_PROC,
+            MonitorReference::ordinary(77),
+            1,
+            2,
+            node_flag::TAG,
+            9,
+            3,
+        );
         assert!(origin.is_other_half_of(&target));
         assert_eq!(origin.view().other(), 2);
         assert_eq!(target.view().other(), 1);
@@ -1881,7 +1961,11 @@ mod tests {
         for reference in 0..64u64 {
             let (origin, target) = TestMonitor::create(
                 node_type::MONITOR_PROC,
-                arinsal_bifs::ordinary_ref_key([reference as u32, 1, 0]),
+                MonitorReference::ordinary(arinsal_bifs::ordinary_ref_key([
+                    reference as u32,
+                    1,
+                    0,
+                ])),
                 1,
                 2,
                 0,
@@ -1915,7 +1999,15 @@ mod tests {
 
     #[test]
     fn a_half_in_transit_becomes_a_handle_once() {
-        let (origin, target) = TestMonitor::create(node_type::MONITOR_PROC, 5, 1, 2, 0, 7, 0);
+        let (origin, target) = TestMonitor::create(
+            node_type::MONITOR_PROC,
+            MonitorReference::ordinary(5),
+            1,
+            2,
+            0,
+            7,
+            0,
+        );
         let shared = target.into_shared();
         let copy = shared.clone();
         let target = MonitorData::take_half(shared, true).expect("target half");
@@ -1932,7 +2024,15 @@ mod tests {
     fn a_target_in_another_list_is_not_removed() {
         let mut first = MonitorList::<u32, u32>::default();
         let mut second = MonitorList::<u32, u32>::default();
-        let (origin, target) = TestMonitor::create(node_type::MONITOR_PROC, 1, 1, 2, 0, 0, 0);
+        let (origin, target) = TestMonitor::create(
+            node_type::MONITOR_PROC,
+            MonitorReference::ordinary(1),
+            1,
+            2,
+            0,
+            0,
+            0,
+        );
         first.insert(target);
         assert!(second.remove_target_of(&origin).is_none());
         assert!(first.remove_target_of(&origin).is_some());

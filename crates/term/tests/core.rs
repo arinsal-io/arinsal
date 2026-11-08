@@ -1155,6 +1155,40 @@ fn magic_reference_uses_erts_ref_thing_header_and_marker() {
 }
 
 #[test]
+fn pid_reference_keeps_its_creator_through_etf_copy() {
+    use arinsal_term::Identity;
+
+    let mut heap = VecHeap::new();
+    let owner = Term::pid(17, 3).unwrap();
+    let reference = TermBuilder::new(&mut heap)
+        .local_pid_ref([0x1234, 0x5678, 0x9abc], owner)
+        .unwrap();
+    assert_eq!(reference.header(), Some((3 << 6) | 0x10));
+    assert_eq!(
+        reference.local_ref_numbers(),
+        Some([0x1234, 0x1_5678, 0x9abc])
+    );
+    assert_eq!(reference.local_pid_ref_pid_data(), owner.as_pid_data());
+    assert!(matches!(
+        reference.identity(),
+        Some(Identity::Ref { ids, .. })
+            if ids.as_slice() == [0x1234, 0x1_5678, 0x9abc,
+                owner.tagged_word() as u32, (owner.tagged_word() >> 32) as u32]
+    ));
+
+    let owned = to_owned(reference).unwrap();
+    assert!(matches!(
+        &owned,
+        OwnedTerm::Ref { ids, .. }
+            if ids.len() == 5
+                && Term::local_pid_ref_data_from_words(ids[3], ids[4]) == owner.as_pid_data()
+    ));
+    let copy = from_owned(&owned, &mut heap).unwrap();
+    assert_eq!(copy.local_ref_numbers(), reference.local_ref_numbers());
+    assert_eq!(copy.local_pid_ref_pid_data(), owner.as_pid_data());
+}
+
+#[test]
 fn to_owned_copies_aligned_unaligned_and_partial_byte_bitstrings() {
     let bytes: Vec<u8> = (0..=255).collect();
     let mut heap = VecHeap::new();

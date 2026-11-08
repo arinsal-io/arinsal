@@ -67,7 +67,7 @@ impl Runtime {
                 watcher.data(),
                 0,
                 crate::proc_create::MonitorInfo::default(),
-                crate::proc_create::OriginMonitor::Distributed { alias_mode: None },
+                crate::proc_create::OriginMonitor::Distributed,
             );
             child.monitors.insert(target);
         }
@@ -314,7 +314,6 @@ impl Vm {
                 paths: self.paths.clone(),
                 scheduler: OnceLock::new(),
                 reg: crate::register::RegisterTable::new(),
-                aliases: AliasTable::new(),
                 next_trace_weak_id: AtomicU64::new(0),
                 ports: crate::port::PortTable::new(port_layout),
                 child_setup: Arc::clone(self.child_setup.as_ref().expect("child setup started")),

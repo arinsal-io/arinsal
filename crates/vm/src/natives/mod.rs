@@ -383,6 +383,9 @@ pub(crate) trait ThinProcessBif {
 pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     if module == "erlang" {
         match (function, arity) {
+            ("send", 3) => {
+                return Some(crate::native_helpers::send3_bif_light as *const () as usize);
+            }
             ("port_get_data", 1) => {
                 return Some(
                     crate::native_helpers::thin_bif_light::<crate::port::PortGetData> as *const ()

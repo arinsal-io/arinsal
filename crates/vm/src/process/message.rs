@@ -55,6 +55,12 @@ fn timer_fragment(fragment: MessageFragment, alloc_ix: Option<usize>) -> Message
 pub(super) type RemovedMessage = (Term, crate::seq_trace::SeqState);
 
 impl Message {
+    /// Mark a message as having arrived through a process alias.
+    pub(crate) fn with_alias(mut self, alias: u64) -> Self {
+        self.alias = alias;
+        self
+    }
+
     /// A message whose term lives on the receiver's heap (sent there by
     /// `erts_try_alloc_message_on_heap`), not in its own fragment.
     fn is_heap_root(&self) -> bool {

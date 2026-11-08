@@ -75,6 +75,35 @@ fn heap_etf_matches_otp_examples() {
     }
 }
 
+#[test]
+fn local_pid_refs_keep_their_creator_through_etf() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let probes = [
+        "A=alias(),term_to_binary(A)",
+        "P=spawn(fun()->receive stop->ok end end),R=monitor(process,P,[{alias,demonitor}]),B=term_to_binary(R),P!stop,B",
+    ];
+    for probe in probes {
+        let expected = reference.eval(probe).expect("OTP PID-ref ETF");
+        let O::Binary(bytes) = &expected else {
+            panic!("OTP probe did not return ETF bytes: {probe}");
+        };
+        let decoded = call("erlang", "binary_to_term", &[O::Binary(bytes.clone())]);
+        let CallResult::Ok(decoded_ref @ O::Ref { .. }) = decoded else {
+            panic!("Arinsal did not decode a local PID ref: {decoded:?}");
+        };
+        let O::Ref { ids, .. } = &decoded_ref else {
+            unreachable!();
+        };
+        assert_eq!(ids.len(), 5, "PID-ref creator words must survive decode");
+        let encoded = call("erlang", "term_to_binary", &[decoded_ref]);
+        assert_eq!(
+            encoded,
+            CallResult::Ok(O::Binary(bytes.clone())),
+            "PID-ref ETF bytes must match OTP"
+        );
+    }
+}
+
 fn has_atom_key_flatmap(term: &O) -> bool {
     match term {
         O::List { elems, tail } => {
@@ -262,7 +291,7 @@ fn local_ext_round_trips_and_matches_otp_after_hash_normalization() {
         panic!("OTP local encoding failed: {otp:?}");
     };
     assert_eq!(&ours_bytes[..2], &[131, 121]);
-    assert_ne!(&ours_bytes[2..6], &[0, 0, 0, 0]);
+    assert!(ours_bytes[2..6] != [0, 0, 0, 0]);
     assert_eq!(&ours_bytes[..2], &otp_bytes[..2]);
     assert_eq!(&ours_bytes[6..], &otp_bytes[6..]);
 

@@ -68,21 +68,52 @@ pub enum Identity {
     },
 }
 impl Term {
+    /// Decode a local creator PID from its serialized PID-reference words.
+    ///
+    /// Port of erts/emulator/beam/erl_bif_unique.h (`erts_get_pid_of_ref`), OTP-29.1.1.
+    pub fn local_pid_ref_data_from_words(pid_low: u32, pid_high: u32) -> Option<u64> {
+        Term(u64::from(pid_low) | (u64::from(pid_high) << 32)).as_pid_data()
+    }
+
+    /// Creator PID data stored in this local PID reference, if it is one.
+    pub fn local_pid_ref_pid_data(self) -> Option<u64> {
+        self.local_pid_ref_pid_word()?
+            .and_then(|word| Term(word).as_pid_data())
+    }
+
+    /// Encoded creator PID word for a local PID reference; ordinary refs return `None` inside
+    /// the outer option, while non-reference terms return no outer value.
+    pub fn local_pid_ref_pid_word(self) -> Option<Option<u64>> {
+        self.local_ref_parts().map(|(_, pid_word)| pid_word)
+    }
+
     /// Numbers of a local ordinary reference without allocating, as `identity` reads them.
     pub fn local_ref_numbers(self) -> Option<[u32; 3]> {
+        self.local_ref_parts().map(|(numbers, _)| numbers)
+    }
+
+    fn local_ref_parts(self) -> Option<([u32; 3], Option<u64>)> {
         let header = self.header()?;
         if header & 63 != REF {
             return None;
         }
-        // SAFETY: a REF thing has at least the header and two data words.
-        let (one, two) = unsafe {
+        // SAFETY: ordinary and magic refs have three words; PID refs have four as identified
+        // by their distinct header.
+        let (one, two, pid_word) = unsafe {
             let p = self.raw_ptr();
-            (*p.add(1), *p.add(2))
+            (
+                *p.add(1),
+                *p.add(2),
+                (header == crate::PID_REF_THING_HEADER).then(|| *p.add(3)),
+            )
         };
         if crate::is_magic_ref_thing_with_hdr(header, one) {
             return None;
         }
-        Some([(one >> 32) as u32, two as u32, (two >> 32) as u32])
+        Some((
+            [(one >> 32) as u32, two as u32, (two >> 32) as u32],
+            pid_word,
+        ))
     }
 
     /// Numbers of a local magic reference, read through its magic binary like
@@ -94,6 +125,8 @@ impl Term {
     }
 
     /// Read an identity as owned numeric fields.
+    // Port of erts/emulator/beam/external.c (`enc_term`, `REF_DEF`), OTP-29.1.1: a local PID
+    // reference contributes its three ref numbers and the two words of its creator PID.
     pub fn identity(self) -> Option<Identity> {
         if let Some((index, serial)) = self.as_pid() {
             return Some(Identity::Pid {
@@ -114,15 +147,22 @@ impl Term {
         // SAFETY: a valid identity's header determines initialized payload fields.
         let p = unsafe { self.raw_ptr() };
         match header & 63 {
-            REF => Some(Identity::Ref {
-                node: atoms::NONAME,
-                creation: 0,
-                ids: self
+            REF => {
+                let mut ids = self
                     .local_ref_numbers()
                     .or_else(|| self.magic_ref_numbers())?
                     .into_iter()
-                    .collect(),
-            }),
+                    .collect::<smallvec::SmallVec<[u32; 5]>>();
+                if let Some(Some(pid_word)) = self.local_pid_ref_pid_word() {
+                    ids.push(pid_word as u32);
+                    ids.push((pid_word >> 32) as u32);
+                }
+                Some(Identity::Ref {
+                    node: atoms::NONAME,
+                    creation: 0,
+                    ids,
+                })
+            }
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
                 // SAFETY: external thing stores a retained Node pointer at word one.
                 let node = unsafe { &*(*p.add(1) as *const Node) };
