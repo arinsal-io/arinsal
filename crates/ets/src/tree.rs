@@ -146,7 +146,7 @@ impl TreeRoot {
             key_clash_fail,
             |old| match old {
                 Some(old) => {
-                    StoredTerm::overwrite_from_input(old, term, compressed, keypos, PREFIX_WORDS)?;
+                    StoredTerm::replace_from_input(old, term, compressed, keypos, PREFIX_WORDS)?;
                     new_words = old.db_size_words();
                     Ok(None)
                 }

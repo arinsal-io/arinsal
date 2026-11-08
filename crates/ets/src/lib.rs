@@ -1065,11 +1065,36 @@ impl StoredTerm {
         Ok(fresh.expect("a new DbTerm was built"))
     }
 
-    /// Overwrite this object with `term`, as `replace_dbterm` does: the block is reused when
-    /// the size is unchanged, else reallocated, and the table links stay.
-    // Port of erts/emulator/beam/erl_db_hash.c (replace_dbterm) and erl_db_util.c
-    // (db_store_term with an old DbTerm), OTP-29.1.1.
+    /// Replace this object with a freshly built DbTerm while preserving the table prefix.
+    // Port of erts/emulator/beam/erl_db_util.c (db_finalize_resize), OTP-29.1.1.
     pub(crate) fn overwrite_from_input<P: Prefix>(
+        old: &mut DbTerm<P>,
+        term: Term,
+        compressed: bool,
+        keypos: usize,
+        prefix_words: usize,
+    ) -> Result<(), EtsError> {
+        // db_finalize_resize allocates and fills the replacement while the old DbTerm is still
+        // live, then publishes the new block. Terms passed here can point into the old block.
+        let mut replacement = None;
+        Self::store_term(
+            None,
+            &mut replacement,
+            term,
+            compressed,
+            keypos,
+            prefix_words,
+        )?;
+        let mut replacement = replacement.expect("a replacement DbTerm was built");
+        std::mem::swap(&mut old.prefix, &mut replacement.prefix);
+        std::mem::swap(old, &mut replacement);
+        Ok(())
+    }
+
+    /// Replace a row from an independent caller term, reusing its DbTerm allocation.
+    // Port of erts/emulator/beam/erl_db_hash.c (replace_dbterm) and erl_db_util.c
+    // (db_store_term and db_store_term_comp), OTP-29.1.1.
+    pub(crate) fn replace_from_input<P: Prefix>(
         old: &mut DbTerm<P>,
         term: Term,
         compressed: bool,
@@ -7136,6 +7161,29 @@ mod stored_size_tests {
         let copy = stored.copy_out(&mut out).unwrap();
         let reserved: usize = out.words.iter().map(|words| words.len()).sum();
         assert_eq!(reserved, arinsal_term::size_object(copy));
+    }
+
+    /// A source term may point into the DbTerm being overwritten. Keep that block readable until
+    /// the replacement has been fully copied, as `db_finalize_resize` does.
+    #[test]
+    fn overwrite_from_input_reads_its_own_block() {
+        let mut source = VecHeap::new();
+        let list = {
+            let mut builder = TermBuilder::new(&mut source);
+            let items: Vec<Term> = (0..40).map(|i| Term::small(i).unwrap()).collect();
+            builder.list_from_slice(&items).unwrap()
+        };
+        let object = TermBuilder::new(&mut source)
+            .tuple(&[Term::small(1).unwrap(), list])
+            .unwrap();
+        let mut stored = StoredTerm::copy_for_table::<()>(object, false, 1, 1).unwrap();
+        let expected = arinsal_term::size_object(object);
+        let own = stored.term();
+        StoredTerm::overwrite_from_input(&mut stored, own, false, 1, 1).unwrap();
+        let mut out = ObjectHeap::new();
+        let copy = stored.copy_out(&mut out).unwrap();
+        assert_eq!(arinsal_term::size_object(copy), expected);
+        assert!(arinsal_term::exact_eq(copy, object));
     }
 
     /// `copy_shallow` of a stored block equals the structural copy for every plain term kind,

@@ -411,3 +411,55 @@ fn slot_walk_across_bases_matches_avl() {
         check(&avl, &ca, index);
     }
 }
+
+// Regression for a lock-order inversion: `adapt` held the adaptation mutex while it blocked on
+// a base-node lock, and `adapt_locked` (reached from `insert_term_shared` and
+// `insert_new_prepared_shared`) holds a base-node lock while it takes the adaptation mutex.
+// erts adapts only while the caller holds the base-node lock (wunlock_adapt_base_node).
+#[test]
+fn concurrent_insert_term_and_delete_do_not_deadlock() {
+    let (registry, tid) = table(WriteConcurrency::Enabled);
+    let registry = Arc::new(registry);
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let workers = (0..8)
+        .map(|worker| {
+            let registry = Arc::clone(&registry);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                let mut heap = VecHeap::new();
+                for offset in 0..20_000u64 {
+                    if offset % 64 == 0 {
+                        heap = VecHeap::new();
+                    }
+                    let raw = ((worker * 7919 + offset * 31) % 1000) as i64;
+                    let key = Term::small(raw).unwrap();
+                    let object = TermBuilder::new(&mut heap).tuple(&[key, key]).unwrap();
+                    let table = registry.get_shared(tid).unwrap();
+                    match offset % 3 {
+                        0 => {
+                            table.insert_term_shared(object, false).unwrap();
+                        }
+                        1 => {
+                            table.delete_key_shared(key);
+                        }
+                        _ => {
+                            table.insert_term_shared(object, true).unwrap();
+                        }
+                    }
+                }
+                done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        })
+        .collect::<Vec<_>>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while done.load(std::sync::atomic::Ordering::SeqCst) < 8 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CA-tree operations deadlocked"
+        );
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}

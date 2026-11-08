@@ -517,6 +517,10 @@ impl Process {
         via_prio_alias: bool,
         mut seq_token: SendMeta,
     ) -> Result<Term, VmError> {
+        if arinsal_term::validate::active() {
+            arinsal_term::validate::check_roots_if_active(&self.heap, &[value], &[]);
+            arinsal_term::validate::check_deep_if_active(&self.heap, value, "send_counted value");
+        }
         // Port of erts/emulator/beam/erl_message.c (erts_send_message), OTP-29.1.1: a process
         // that sends to itself, with no sequential trace token and an on-heap message queue,
         // queues the term itself. It is neither sized nor copied, and no reductions are bumped
