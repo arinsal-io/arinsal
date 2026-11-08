@@ -65,6 +65,13 @@ pub mod psflg {
     pub const SIG_Q: u32 = bit(19);
     /// `ERTS_PSFLG_SIG_IN_Q`: either kind of signal in the outer signal queue.
     pub const SIG_IN_Q: u32 = MSG_SIG_IN_Q | NMSG_SIG_IN_Q;
+    /// `ERTS_PSFLG_DIRTY_CPU_PROC`: the process has work for a dirty CPU scheduler.
+    pub const DIRTY_CPU_PROC: u32 = bit(20);
+    /// `ERTS_PSFLG_DIRTY_IO_PROC`: the process has work for a dirty I/O scheduler.
+    pub const DIRTY_IO_PROC: u32 = bit(21);
+    /// `ERTS_PSFLGS_DIRTY_WORK` without `ERTS_PSFLG_DIRTY_ACTIVE_SYS`: Arinsal runs no system
+    /// task on a dirty scheduler (dirty GC / CLA), so nothing sets that bit.
+    pub const DIRTY_WORK: u32 = DIRTY_CPU_PROC | DIRTY_IO_PROC;
 }
 
 /// How a queued signal sets the in-queue state bits.

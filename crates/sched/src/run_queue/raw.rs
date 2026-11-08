@@ -26,6 +26,8 @@ pub(crate) struct RqLink {
     prev: AtomicUsize,
     /// `Process.schedule_count`.
     schedule_count: AtomicU8,
+    /// `ERTS_PSFLGS_GET_PRQ_PRIO` of the entry: the priority its run queue length counts.
+    prio: AtomicU8,
 }
 
 /// `ERTS_PSFLG_PROXY` entry: a second queue entry of a process.
@@ -81,6 +83,7 @@ impl<T: Task> Lists<T> {
         let Scheduled {
             process,
             schedule_count,
+            prio,
             kind: _,
             queue: _,
         } = item;
@@ -103,6 +106,7 @@ impl<T: Task> Lists<T> {
                 link.next.store(0, Ordering::Relaxed);
                 link.prev.store(prev, Ordering::Relaxed);
                 link.schedule_count.store(schedule_count, Ordering::Relaxed);
+                link.prio.store(prio, Ordering::Relaxed);
             });
             if prev == 0 {
                 self.first[queue] = node;
@@ -117,11 +121,12 @@ impl<T: Task> Lists<T> {
     /// reference back (`unqueue_process`).
     fn unlink(&mut self, queue: usize, node: usize, prev: usize) -> Scheduled<T> {
         // SAFETY: `node` is in `queue` and `prev` precedes it; the caller holds the lock.
-        let (next, schedule_count) = unsafe {
+        let (next, schedule_count, prio) = unsafe {
             with_node::<T, _>(node, |link, _| {
                 (
                     link.next.load(Ordering::Relaxed),
                     link.schedule_count.load(Ordering::Relaxed),
+                    link.prio.load(Ordering::Relaxed),
                 )
             })
         };
@@ -151,6 +156,7 @@ impl<T: Task> Lists<T> {
         Scheduled {
             process,
             schedule_count,
+            prio,
             kind: if proxy { Enqueue::Proxy } else { Enqueue::Real },
             queue,
         }
