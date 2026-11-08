@@ -916,42 +916,28 @@ impl From<DirtyKind> for SchedulerType {
 /// A process monitor held on this scheduler until its target gets another signal or the
 /// sending process is scheduled out. Port of erts `esdp->pending_signal`
 /// (erl_proc_sig_queue.c:1102-1125, erts_proc_sig_send_pending), OTP-29.1.1.
-#[derive(Clone)]
-enum PendingMonitorData {
-    Process(arinsal_alloc::typed::ErasedFixAllocArc),
-    Opaque(SharedPayload),
-}
-
-#[derive(Clone)]
 struct PendingProcMonitor {
     from: Pid,
     to: Pid,
     id: u64,
-    shared: PendingMonitorData,
+    /// The monitor signal node itself, as erts holds the `ErtsMonitor` it would queue.
+    node: sig_queue::HeldNode,
 }
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_pending), OTP-29.1.1.
-fn restore_held_monitor<M: SignalMessage>(held: PendingProcMonitor) -> Signal<M> {
-    match held.shared {
-        PendingMonitorData::Opaque(shared) => Signal::MonitorOpaque {
-            reference: held.id,
-            shared: Box::new(shared),
-        },
-        PendingMonitorData::Process(shared) => {
-            let data = shared
-                .downcast::<M::MonitorData>()
-                .unwrap_or_else(|_| panic!("held monitor payload type changed"));
-            Signal::Monitor {
-                reference: held.id,
-                shared: data,
-            }
-        }
-    }
+fn restore_held_monitor<M: SignalMessage>(held: PendingProcMonitor) -> OwnedSignal<Event<M>> {
+    held.node.into_signal::<Event<M>>()
 }
 
 thread_local! {
-    static PENDING_PROC_MONITOR: std::cell::RefCell<Option<PendingProcMonitor>> =
-        const { std::cell::RefCell::new(None) };
+    /// This scheduler's pending signal (`esdp->pending_signal`): its receiver is readable
+    /// without borrowing the held monitor, so the check every send makes is one load.
+    static PENDING_PROC_MONITOR: PendingSlot = const {
+        PendingSlot {
+            to: std::cell::Cell::new(None),
+            held: std::cell::RefCell::new(None),
+        }
+    };
     static SCHEDULER_TYPE: std::cell::Cell<SchedulerType> =
         const { std::cell::Cell::new(SchedulerType::Normal) };
     static NORMAL_SCHEDULER_ID: std::cell::Cell<Option<usize>> =
@@ -979,30 +965,35 @@ pub fn current_scheduler_type() -> SchedulerType {
 /// Take the held process monitor of this scheduler when it is for `to`, so the signal to `to`
 /// is sent after it. Port of erl_proc_sig_queue.c:1141-1150, OTP-29.1.1.
 fn take_held_monitor_for(to: Pid) -> Option<PendingProcMonitor> {
-    // Every send asks; erts tests `esdp->pending_signal.sig` through the scheduler data it
-    // already holds. A count of the threads that hold one keeps the common answer off the
-    // thread-local lookup.
-    if HELD_MONITOR_THREADS.load(Ordering::Relaxed) == 0 {
-        return None;
-    }
-    take_held_monitor_for_slow(to)
-}
-
-#[inline(never)]
-fn take_held_monitor_for_slow(to: Pid) -> Option<PendingProcMonitor> {
+    // Every send asks, as erts tests `esdp->pending_signal.to` (erl_proc_sig_queue.c:1146,
+    // erl_message.c:469 prepend_pending_sig_maybe).
     PENDING_PROC_MONITOR.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_some_and(|held| held.to == to) {
-            HELD_MONITOR_THREADS.fetch_sub(1, Ordering::Relaxed);
-            slot.take()
-        } else {
-            None
+        if slot.to.get() != Some(to) {
+            return None;
         }
+        slot.to.set(None);
+        slot.held.borrow_mut().take()
     })
 }
 
-/// Threads whose [`PENDING_PROC_MONITOR`] slot is occupied.
-static HELD_MONITOR_THREADS: AtomicUsize = AtomicUsize::new(0);
+/// The pending signal slot of one scheduler thread; `to` is `Some` exactly while `held` is.
+struct PendingSlot {
+    to: std::cell::Cell<Option<Pid>>,
+    held: std::cell::RefCell<Option<PendingProcMonitor>>,
+}
+
+impl PendingSlot {
+    fn take(&self) -> Option<PendingProcMonitor> {
+        self.to.get()?;
+        self.to.set(None);
+        self.held.borrow_mut().take()
+    }
+
+    fn replace(&self, held: PendingProcMonitor) -> Option<PendingProcMonitor> {
+        self.to.set(Some(held.to));
+        self.held.borrow_mut().replace(held)
+    }
+}
 
 /// A VM process or a benchmark dummy task.
 pub trait Task: Send + 'static {
@@ -2832,15 +2823,8 @@ impl<T: Task> Inner<T> {
         let id = held.id;
         let signal = restore_held_monitor::<T::Message>(held);
         let delivered = self.table.lookup(to).is_some_and(|process| {
-            self.deliver_process(
-                &process,
-                from,
-                Payload::Signal(signal),
-                local.as_deref_mut(),
-                true,
-                false,
-            )
-            .is_ok()
+            self.deliver_process_node(&process, signal, local.as_deref_mut(), true, false)
+                .is_ok()
         });
         if !delivered {
             let _ = self.deliver(to, from, Payload::Signal(Signal::MonitorNoproc(id)), local);
@@ -4279,25 +4263,6 @@ impl<T: Task> Inner<T> {
         self.fanin_delivery(process, 1);
         self.deliver_process_node(process, signal, local, true, force_enqueue)?;
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)] // `force_enqueue` routes literal-copy signals like erts.
-    fn deliver_process(
-        &self,
-        process: &ProcRef<T>,
-        from: Pid,
-        payload: Payload<T::Message>,
-        local: Option<&mut Local<T>>,
-        wake: bool,
-        force_enqueue: bool,
-    ) -> Result<u32, Error> {
-        self.deliver_process_node(
-            process,
-            event_node(from, payload),
-            local,
-            wake,
-            force_enqueue,
-        )
     }
 
     fn deliver_process_node(
@@ -6139,11 +6104,7 @@ impl<T: Task> Runner<'_, T> {
 
     /// Publish the held monitor of this scheduler, if any.
     fn publish_deferred_monitor(&mut self) {
-        if HELD_MONITOR_THREADS.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        if let Some(held) = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().take()) {
-            HELD_MONITOR_THREADS.fetch_sub(1, Ordering::Relaxed);
+        if let Some(held) = PENDING_PROC_MONITOR.with(PendingSlot::take) {
             self.publish_monitor(held);
         }
     }
@@ -6158,11 +6119,9 @@ impl<T: Task> Runner<'_, T> {
     /// Hold `held` as the scheduler's pending monitor; the one it replaces goes out first.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal), OTP-29.1.1.
     fn hold_monitor(&mut self, held: PendingProcMonitor) {
-        let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
+        let previous = PENDING_PROC_MONITOR.with(|slot| slot.replace(held));
         if let Some(previous) = previous {
             self.publish_monitor(previous);
-        } else {
-            HELD_MONITOR_THREADS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -6172,21 +6131,16 @@ impl<T: Task> Runner<'_, T> {
         let from = held.from;
         let to = held.to;
         let id = held.id;
-        let event: Event<T::Message> = Event {
-            from,
-            payload: Payload::Signal(restore_held_monitor::<T::Message>(held)),
-        };
-        let Event { from, payload } = event;
+        let node = restore_held_monitor::<T::Message>(held);
         let Some(process) = self.lookup(to) else {
             self.bounce_monitors(to, vec![(from, id)]);
             return;
         };
         if self
             .inner
-            .deliver_process(
+            .deliver_process_node(
                 &process,
-                from,
-                payload,
+                node,
                 self.local.map(RefCell::borrow_mut).as_deref_mut(),
                 true,
                 false,
@@ -6470,51 +6424,31 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 from,
                 to,
                 id: reference,
-                shared: PendingMonitorData::Process(shared.erase()),
+                node: sig_queue::HeldNode::new(T::Message::signal_node(
+                    from,
+                    Signal::Monitor { reference, shared },
+                )),
             });
             return Ok(());
         }
         if lazy.is_none()
-            && let Payload::Signal(Signal::Monitor { reference, shared }) = &signal.payload
             && self.local.is_some()
+            && let Payload::Signal(
+                Signal::Monitor { reference, .. } | Signal::MonitorOpaque { reference, .. },
+            ) = &signal.payload
         {
-            let held = PendingProcMonitor {
+            let id = *reference;
+            self.hold_monitor(PendingProcMonitor {
                 from,
                 to,
-                id: *reference,
-                shared: PendingMonitorData::Process(shared.clone().erase()),
-            };
-            let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
-            if let Some(previous) = previous {
-                self.publish_monitor(previous);
-            } else {
-                HELD_MONITOR_THREADS.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(());
-        }
-        if lazy.is_none()
-            && let Payload::Signal(Signal::MonitorOpaque { reference, shared }) = &signal.payload
-            && self.local.is_some()
-        {
-            let held = PendingProcMonitor {
-                from,
-                to,
-                id: *reference,
-                shared: PendingMonitorData::Opaque((**shared).clone()),
-            };
-            let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
-            if let Some(previous) = previous {
-                self.publish_monitor(previous);
-            } else {
-                HELD_MONITOR_THREADS.fetch_add(1, Ordering::Relaxed);
-            }
+                id,
+                node: sig_queue::HeldNode::new(signal),
+            });
             return Ok(());
         }
         // Erts sends the held monitor first when the next signal goes to its target
         // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
-        let deferred = take_held_monitor_for(to).map(|held| {
-            T::Message::signal_node(held.from, restore_held_monitor::<T::Message>(held))
-        });
+        let deferred = take_held_monitor_for(to).map(restore_held_monitor::<T::Message>);
         // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
         // reference count is taken on the receiver.
         let inner = self.inner;
@@ -7409,7 +7343,23 @@ impl<T: Task> Scheduler<T> {
         };
         // Port of erts_proc_sig_send_* in erl_proc_sig_queue.c, OTP-29.1.1:
         // construct the concrete signal node, then queue it directly.
+        // proc_queue_signal (erl_proc_sig_queue.c:1101, `is_normal_sched`): a BIF on a normal
+        // scheduler holds a process monitor as the scheduler's pending signal; the node itself
+        // is held, as erts holds the `ErtsMonitor`.
+        let monitor = match &signal {
+            Signal::Monitor { reference, .. } if managed => Some(*reference),
+            _ => None,
+        };
         let node = T::Message::signal_node(from, signal);
+        if let Some(id) = monitor {
+            runner.hold_monitor(PendingProcMonitor {
+                from,
+                to,
+                id,
+                node: sig_queue::HeldNode::new(node),
+            });
+            return Ok(());
+        }
         <Runner<'_, T> as ContextOps<T::Message>>::deliver_node(&mut runner, to, node)
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
