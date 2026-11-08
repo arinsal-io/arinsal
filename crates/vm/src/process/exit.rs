@@ -49,6 +49,8 @@ impl Process {
                 garbage: None,
                 entry_result: None,
                 code: 0,
+                pend_spawn: false,
+                waiter: None,
             })
             .expect("exit continuation allocation"),
         ));
@@ -56,6 +58,13 @@ impl Process {
         let mut garbage = None;
         self.exit_ets(ctx, &mut reds, &mut garbage);
         self.exit_stage3(ctx, reason);
+        // This synchronous exit cannot suspend: pending-spawn monitors whose child is not
+        // known yet are dropped (see `crate::dist::pend_spawn_exit`).
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0
+            && let Some(runtime) = self.runtime
+        {
+            let _ = crate::dist::pend_spawn_exit(runtime, ctx.pid(), reason, None);
+        }
     }
 
     /// Process exit up to the release of owned ETS tables.
@@ -342,7 +351,7 @@ impl Process {
         ctx.begin_exit();
         // Further publishes fail with `NoProcess` and the watcher synthesizes DOWN.
         // Signals already queued are installed before we notify.
-        self.absorb_exit_signals(ctx);
+        let spawn_replies = self.absorb_exit_signals(ctx);
         let links = self.links.drain();
         for node in links {
             if node.view().unlinking() != 0 {
@@ -515,6 +524,22 @@ impl Process {
                 );
             }
         }
+        // Port of erts/emulator/beam/erl_process.c:13932-13935 (proc_exit_handle_monitors,
+        // ERTS_ML_FLG_SPAWN_PENDING) with dist.c:665 (erts_dist_pend_spawn_exit_parent_setup),
+        // OTP-29.1.1: the MONITORS phase moves the pending-spawn monitors aside. A reply that
+        // arrives from now on is saved for this process by the distribution code.
+        let dist_spawn = ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0;
+        if dist_spawn {
+            crate::dist::pend_spawn_exit_parent_setup(ctx.pid());
+        }
+        // Port of erl_process.c:14589 (ERTS_CONTINUE_EXIT_HANDLE_PROC_SIG) for the spawn replies
+        // fetched before the links phase (erl_proc_sig_queue.c:5927
+        // handle_dist_spawn_reply_exiting): they answer with the actual exit reason.
+        if let Some(runtime) = self.runtime {
+            for shared in &spawn_replies {
+                crate::dist::handle_dist_spawn_reply_exiting(runtime, ctx.pid(), reason, shared);
+            }
+        }
     }
 }
 
@@ -642,6 +667,8 @@ impl Process {
             garbage: None,
             entry_result,
             code,
+            pend_spawn: false,
+            waiter: None,
         };
         // Port of erts/emulator/beam/erl_process.c:14229 (erts_do_exit_process:
         // `BUMP_REDS(p, 100)`), OTP-29.1.1: the rest of the exit runs on what is left, and the
@@ -674,11 +701,29 @@ impl Process {
                 );
             });
         }
-        let initial = ctx.remaining() as isize;
-        let mut reds = initial;
-        let done = self.exit_ets(ctx, &mut reds, &mut state.garbage);
-        ctx.consume((initial - reds).clamp(0, initial) as u32);
-        if !done {
+        if !state.pend_spawn {
+            let initial = ctx.remaining() as isize;
+            let mut reds = initial;
+            let done = self.exit_ets(ctx, &mut reds, &mut state.garbage);
+            ctx.consume((initial - reds).clamp(0, initial) as u32);
+            if !done {
+                with_executor(data, runtime, |executor| {
+                    crate::trace::emit(
+                        Some(&mut executor.vm),
+                        self,
+                        ctx,
+                        ctx.pid(),
+                        crate::trace::EXITING,
+                        "out_exiting",
+                        &zero,
+                    );
+                });
+                self.set_exit_cont(Some(
+                    arinsal_alloc::typed::FixAllocBox::new(state)
+                        .expect("exit continuation allocation"),
+                ));
+                return RunOutcome::Yield;
+            }
             with_executor(data, runtime, |executor| {
                 crate::trace::emit(
                     Some(&mut executor.vm),
@@ -686,29 +731,57 @@ impl Process {
                     ctx,
                     ctx.pid(),
                     crate::trace::EXITING,
-                    "out_exiting",
+                    "out_exited",
                     &zero,
                 );
             });
-            self.set_exit_cont(Some(
-                arinsal_alloc::typed::FixAllocBox::new(state)
-                    .expect("exit continuation allocation"),
-            ));
-            return RunOutcome::Yield;
+            // erts keeps `c_p` after the ptab delete of ERTS_CONTINUE_EXIT_FREE; Arinsal
+            // retains the process here, while its pid still resolves.
+            if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0 {
+                state.waiter = runtime
+                    .scheduler()
+                    .ok()
+                    .and_then(|scheduler| scheduler.exit_waiter(ctx.pid()));
+            }
+            self.exit_stage3(ctx, state.reason);
+            state.pend_spawn = true;
         }
-        let cont = state;
-        with_executor(data, runtime, |executor| {
-            crate::trace::emit(
-                Some(&mut executor.vm),
-                self,
-                ctx,
-                ctx.pid(),
-                crate::trace::EXITING,
-                "out_exited",
-                &zero,
+        // Port of erts/emulator/beam/erl_process.c:14674-14697
+        // (ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS), OTP-29.1.1.
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0 {
+            // Signals that still reach the exiting process are handled as erts does while it
+            // is suspended (erl_proc_sig_queue.c:7426 erts_proc_exit_handle_signal), so they
+            // do not keep re-queueing it.
+            let spawn_replies = self.absorb_exit_signals(ctx);
+            for shared in &spawn_replies {
+                crate::dist::handle_dist_spawn_reply_exiting(
+                    runtime,
+                    ctx.pid(),
+                    state.reason,
+                    shared,
+                );
+            }
+            let wait = matches!(
+                crate::dist::pend_spawn_exit(
+                    runtime,
+                    ctx.pid(),
+                    state.reason,
+                    state.waiter.as_ref(),
+                ),
+                crate::dist::PendSpawnExit::Wait
             );
-        });
-        self.exit_stage3(ctx, cont.reason);
+            if wait {
+                self.set_exit_cont(Some(
+                    arinsal_alloc::typed::FixAllocBox::new(state)
+                        .expect("exit continuation allocation"),
+                ));
+                return RunOutcome::Wait { timeout_ms: None };
+            }
+        }
+        let mut cont = state;
+        if let Some(waiter) = cont.waiter.take() {
+            waiter.cancel();
+        }
         if self.entry
             && let Some(result) = cont.entry_result
         {

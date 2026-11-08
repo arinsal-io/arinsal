@@ -684,6 +684,14 @@ pub enum Signal<M: SignalMessage> {
     LiteralAreaCopy(Box<LiteralAreaCopyRequest<M>>),
     /// Execute the process-signal blocking callback on the target process.
     ProcSigBlock(i64),
+    /// Reply to a distributed `spawn_request`: the receiver creates the link, adjusts the
+    /// monitor and queues the reply message in one step, or, when exiting, answers with its
+    /// exit reason. The VM keeps the reply data in the payload; it also queues the
+    /// `noconnection` outcome of a request whose connection went down this way (erts: the
+    /// monitor-down signal of the spawn-pending monitor).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3247 (erts_proc_sig_send_dist_spawn_reply,
+    // ERTS_SIG_Q_OP_DIST_SPAWN_REPLY), OTP-29.1.1.
+    DistSpawnReply(SharedPayload),
 }
 
 /// The fields of [`Signal::SyncSuspend`].
@@ -1405,6 +1413,10 @@ pub mod proc_flags {
     pub const REG: u32 = 1 << 7;
     pub const TRACE: u32 = 1 << 8;
     pub const TRACER: u32 = 1 << 9;
+    /// The process made a distributed `spawn_request`: its pending-spawn monitors live in the
+    /// distribution tables (erts keeps them in the process monitor tree with
+    /// ERTS_ML_FLG_SPAWN_PENDING, dist.c:6112 erts_internal_dist_spawn_request_4).
+    pub const DIST_SPAWN: u32 = 1 << 10;
     pub const OWNED_TIMERS: u32 = 1 << 11;
     /// A remote `process_info` / sys-task request is queued for this process
     /// (`erl_proc_sig_queue.c` request tables). Exit takes that table only then.
@@ -1500,6 +1512,13 @@ struct ProcShared<M: SignalMessage> {
     btm: parking_lot::Mutex<ProcBtm<M>>,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
     exit_flags: AtomicU32,
+    /// `begin_exit` removed the pid from the process table (erts deletes the ptab element at
+    /// ERTS_CONTINUE_EXIT_FREE while the process keeps running its exit).
+    ptab_deleted: AtomicBool,
+    /// An [`ExitWaiter`] resumed this exiting process while it had not yet left `RUNNING`:
+    /// the schedule-out of its wait re-queues it (erts_resume of a process that has not yet
+    /// been scheduled out suspended).
+    exit_resume: AtomicBool,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
     /// Port of erts/emulator/beam/erl_process.h (`common.u.alive.reg`), OTP-29.1.1.
     reg_atom: AtomicU32,
@@ -2010,6 +2029,8 @@ impl<T: Task> ProcessTable<T> {
                         paused: None,
                     }),
                     exit_flags: AtomicU32::new(0),
+                    ptab_deleted: AtomicBool::new(false),
+                    exit_resume: AtomicBool::new(false),
                     reg_atom: AtomicU32::new(u32::MAX),
                     wait_timer: AtomicU64::new(0),
                     input: Incoming::default(),
@@ -5356,6 +5377,65 @@ impl<T: Task> TimerCallbackCtx<T::Message> for CallbackCtx<'_, T> {
     }
 }
 
+/// A suspended exiting process, retained past its process-table entry.
+///
+/// Port of the `Process *` erts stores in a pending-spawn monitor
+/// (erts/emulator/beam/dist.c:758-790, erts_dist_pend_spawn_exit_parent_wait: `erts_suspend`
+/// plus `mdp->u.target.other.ptr = c_p`), OTP-29.1.1. Dropping the waiter is `erts_resume`
+/// (dist.c:552-640 dist_pend_spawn_exit_save_child_result and dist.c:326
+/// dist_pend_spawn_exit_connection_down): the process runs its exit again and looks at the
+/// state the resumer left.
+pub struct ExitWaiter<T: Task> {
+    process: Option<ProcRef<T>>,
+    inner: std::sync::Weak<Inner<T>>,
+}
+
+impl<T: Task> ExitWaiter<T> {
+    /// Drop the reference without resuming: the process itself takes its waiter back.
+    pub fn cancel(mut self) {
+        self.process = None;
+    }
+}
+
+impl<T: Task> Clone for ExitWaiter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            process: self.process.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: Task> fmt::Debug for ExitWaiter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExitWaiter")
+            .field("pid", &self.process.as_ref().map(|process| process.pid))
+            .finish()
+    }
+}
+
+impl<T: Task> Drop for ExitWaiter<T> {
+    // Port of erts/emulator/beam/erl_process.c:9402 (erts_resume), OTP-29.1.1, for the one
+    // suspend erts_dist_pend_spawn_exit_parent_wait takes.
+    fn drop(&mut self) {
+        let Some(process) = self.process.take() else {
+            return;
+        };
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        // Publish the resume before looking at the run state: a process still RUNNING sees
+        // the flag when its wait schedules out; a WAITING one is queued here. Both sides
+        // finish with the same enqueue CAS in wake(), so exactly one queues it.
+        process.exit_resume.store(true, Ordering::SeqCst);
+        // The exit wait arms no timer, so there is no wait epoch to advance.
+        let queue = queue_index(process.priority().index());
+        if let Some(kind) = process.run_state().wake(None, queue) {
+            inner.place_runnable(Scheduled::with_kind(process, kind, queue), None);
+        }
+    }
+}
+
 pub struct RunCtx<'a, M: SignalMessage> {
     inner: &'a mut dyn ContextOps<M>,
     /// The running process: the pointer erts passes around as `c_p`.
@@ -5489,9 +5569,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     ///
     /// Port of erts/emulator/beam/erl_process.c:14438-14456
     /// (`erts_ptab_delete_element` at `ERTS_CONTINUE_EXIT_FREE`), OTP-29.1.1.
+    ///
+    /// The run state stays `RUNNING`: as in erts, the process keeps executing its exit after
+    /// the ptab delete and may still wait (ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS). The
+    /// FREE state is set by the slice epilogue (`exit_cleanup`).
     pub fn begin_exit(&mut self) {
-        self.proc.run_state().store(EXITED, Ordering::SeqCst);
-        self.inner.mark_exited(self.proc.pid);
+        if !self.proc.ptab_deleted.swap(true, Ordering::SeqCst) {
+            self.inner.mark_exited(self.proc.pid);
+        }
     }
     /// Cancel pending BIF timers aimed at a terminating process.
     pub fn cancel_target_timers(&mut self, pid: Pid) {
@@ -7282,6 +7367,15 @@ impl<T: Task> Scheduler<T> {
             None => self.send(from, to, msg.take().expect("message not sent")),
         }
     }
+    /// Retain the live process `pid` so it can be resumed after `begin_exit` deleted its
+    /// process-table entry (see [`ExitWaiter`]).
+    pub fn exit_waiter(&self, pid: Pid) -> Option<ExitWaiter<T>> {
+        let process = self.inner.table.lookup(pid)?;
+        Some(ExitWaiter {
+            process: Some(process),
+            inner: Arc::downgrade(&self.inner),
+        })
+    }
     /// Queue a signal in the same ordered stream.
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner.publish_held_monitor_for(to, None);
@@ -8978,7 +9072,7 @@ struct SliceEnd<T: Task> {
 // Port of erts/emulator/beam/erl_process.c (erts_schedule: the exiting process is handed to
 // erts_continue_exit_process while it is still locked), OTP-29.1.1.
 fn exit_cleanup<T: Task>(inner: &Inner<T>, process: &Process<T>, cell: &mut TaskCell<T>) {
-    let ptab_deleted = process.run_state().load(Ordering::SeqCst) == EXITED;
+    let ptab_deleted = process.ptab_deleted.swap(true, Ordering::SeqCst);
     process.run_state().store(EXITED, Ordering::SeqCst);
     // Close the in-queue under the msgq lock and reap what it still holds; a later
     // enqueue fails and the sender sees the process gone.
@@ -9211,7 +9305,11 @@ fn schedule_out<T: Task>(
             // Port of erts/emulator/beam/erl_process.c:6695-6790 (schedule_out_process works
             // from the state word it read), OTP-29.1.1.
             let queue = queue_index(process.priority().index());
-            if left_running & psflg::SIG_IN_Q != 0
+            // An exit waiter resumed while the process still ran (ExitWaiter::drop) is seen
+            // here, after the transition to WAITING, so the resume is never lost.
+            if (left_running & psflg::SIG_IN_Q != 0
+                || (process.exit_resume.load(Ordering::SeqCst)
+                    && process.exit_resume.swap(false, Ordering::SeqCst)))
                 && let Some(kind) = process.run_state().wake(None, queue)
             {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);

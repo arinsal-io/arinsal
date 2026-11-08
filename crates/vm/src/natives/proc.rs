@@ -3459,7 +3459,7 @@ fn call_values(
             ("dist_spawn_request", [node, mfa, options, kind]) => {
                 dist_spawn_request(vm, process, ctx, *node, *mfa, *options, *kind)
             }
-            ("spawn_request_abandon", [id]) => spawn_request_abandon(*id),
+            ("spawn_request_abandon", [id]) => spawn_request_abandon(ctx.pid(), *id),
             ("process_display", [target, display]) if module == "erts_internal" => {
                 process_display_call(module, process, ctx, *target, *display)
             }
@@ -4133,13 +4133,18 @@ fn dist_spawn_request(
 }
 
 // Port of erts/emulator/beam/bif.c:1166 (`spawn_request_abandon_1`), OTP-29.1.1.
-fn spawn_request_abandon(id: Term) -> Result<Term, VmError> {
+fn spawn_request_abandon(caller: arinsal_sched::Pid, id: Term) -> Result<Term, VmError> {
     if id.classify() != TermKind::Ref {
         return Err(badarg());
     }
-    // A local request completes before `spawn_request` returns, so it is never
-    // still pending. Remote requests are answered with `noconnection` inline.
-    Ok(atom("false"))
+    // A local request completes before `spawn_request` returns, so it is never still
+    // pending; an external reference is not an outstanding request of this process. Only a
+    // distributed request can be pending (its spawn-pending monitor lives in the
+    // distribution tables).
+    let abandoned = id.local_ref_numbers().is_some()
+        && crate::signals::ref_id(id)
+            .is_some_and(|key| crate::dist::spawn_request_abandon(caller, key));
+    Ok(atom(if abandoned { "true" } else { "false" }))
 }
 
 struct LocalSpawn {

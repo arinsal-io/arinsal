@@ -75,7 +75,7 @@ fn dispatch(
         ("erts_internal", "dist_spawn_request", 4) => dist_spawn_request(vm, process, ctx, args),
         ("erts_internal", "new_connection", 1) => new_connection(process, args[0]),
         ("erts_internal", "abort_pending_connection", 2) => {
-            abort_pending_connection(args[0], args[1])
+            abort_pending_connection(process, args[0], args[1])
         }
         ("erts_internal", "get_dflags", 0) => get_dflags(process),
         ("erts_internal", "get_creation", 0) => get_creation(),
@@ -146,14 +146,33 @@ fn new_connection(process: &mut Process, node: Term) -> Result<Term, VmError> {
 }
 
 /// Port of erts/emulator/beam/dist.c:5693 (erts_internal_abort_pending_connection_2), OTP-29.1.1.
-fn abort_pending_connection(node: Term, dhandle: Term) -> Result<Term, VmError> {
+fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Result<Term, VmError> {
     let OwnedTerm::Atom(ref name) = owned(node)? else {
         return Err(badarg());
     };
     let (conn_id, entry_ref) = parse_dhandle(dhandle)?;
-    let result = node_tables::lock()
-        .abort_pending(name, conn_id, entry_ref)
-        .ok_or_else(badarg)?;
+    let (result, spawn_downs) = {
+        let mut tables = node_tables::lock();
+        // The pending connection's spawn-pending monitors are cleaned up with it
+        // (dist.c:5681 abort_pending_connection: schedule_con_monitor_link_seq_cleanup).
+        let aborts = tables.entries.get(name.as_str()).is_some_and(|entry| {
+            entry.entry_ref == entry_ref
+                && entry.connection_id == conn_id
+                && entry.state == node_tables::ConnState::Pending
+        });
+        let spawn_downs = if aborts {
+            take_connection_spawn_requests(&mut tables, name)
+        } else {
+            Vec::new()
+        };
+        let result = tables
+            .abort_pending(name, conn_id, entry_ref)
+            .ok_or_else(badarg)?;
+        (result, spawn_downs)
+    };
+    if let Some(runtime) = process.runtime {
+        notify_connection_spawn_requests(runtime, spawn_downs)?;
+    }
     Ok(boolean(result))
 }
 
@@ -560,54 +579,9 @@ fn route_incoming(
             handle_spawn_request(vm, process, ctx, handle, parts, &terms[0])?;
         }
         31 | 32 if (parts.len() == 5 && *op == 31) || (parts.len() == 6 && *op == 32) => {
-            let id = remote_ref_id(&parts[1]).ok_or_else(badarg)?;
-            let result = parts[4].clone();
-            if let Some(req) = take_spawn_request(handle, id) {
-                let ok = matches!(result, OwnedTerm::Pid { .. });
-                let flags = as_u64(&parts[3]).ok_or_else(badarg)?;
-                let status = if ok { "ok" } else { "error" };
-                if ok && req.monitor {
-                    // Activate local monitor using the spawn request ref.
-                    remember_monitor(
-                        node_tables::lock()
-                            .entries
-                            .values()
-                            .find(|e| e.dist.as_ref().is_some_and(|s| s.handle == handle))
-                            .map(|e| e.name.clone())
-                            .ok_or_else(badarg)?
-                            .as_str(),
-                        id,
-                        req.caller,
-                        result.clone(),
-                    )?;
-                }
-                if ok && flags & 1 != 0 {
-                    // Port of erts/emulator/beam/dist.c:1875-1898 (`erts_dsig_send_spawn_reply`), OTP-29.1.1.
-                    let remote_child = remote_proxy(handle, &result)?;
-                    process
-                        .runtime
-                        .as_ref()
-                        .ok_or_else(badarg)?
-                        .scheduler()?
-                        .signal(remote_child, req.caller, Signal::Link { priority: false })
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("dist spawn link setup: {error}"))
-                        })?;
-                }
-                if !(ok && req.no_success_msg) {
-                    let reply = OwnedTerm::tuple(vec![
-                        req.tag,
-                        parts[1].clone(),
-                        OwnedTerm::Atom(status.into()),
-                        result,
-                    ]);
-                    let reply = from_owned(&reply, &mut process.heap).map_err(|_| badarg())?;
-                    let envelope = Message::copy_from(reply)?;
-                    ctx.send(req.caller, envelope).map_err(|error| {
-                        VmError::Unsupported(format!("dist spawn reply: {error}"))
-                    })?;
-                }
-            }
+            // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
+            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+            dist_spawn_reply(runtime, handle, parts)?;
         }
         30 | 31 => {
             return Err(VmError::Unsupported(format!(
@@ -1078,7 +1052,7 @@ pub(crate) fn port_connection_closed(
     let Some(node) = node_tables::unregister_dist_port(port_id) else {
         return Ok(());
     };
-    let (watchers, node_events, monitor_downs) = {
+    let (watchers, node_events, monitor_downs, spawn_downs) = {
         let mut tables = node_tables::lock();
         let is_current_port = tables
             .entries
@@ -1096,6 +1070,7 @@ pub(crate) fn port_connection_closed(
             .unwrap_or(u32::MAX);
         let visible = tables.entries.get(&node).is_some_and(|entry| entry.visible);
         let monitor_downs = take_connection_monitors(&mut tables, &node);
+        let spawn_downs = take_connection_spawn_requests(&mut tables, &node);
         let watchers = tables.disconnect(&node);
         let events = tables.nodes_monitor_events(
             "nodedown",
@@ -1104,10 +1079,11 @@ pub(crate) fn port_connection_closed(
             visible,
             Some("connection_closed"),
         );
-        (watchers, events, monitor_downs)
+        (watchers, events, monitor_downs, spawn_downs)
     };
     notify_node_watchers(runtime, &node, watchers)?;
     notify_connection_monitors(runtime, monitor_downs)?;
+    notify_connection_spawn_requests(runtime, spawn_downs)?;
     send_nodes_monitor_events(runtime, node_events)
 }
 
@@ -1121,7 +1097,7 @@ pub(crate) fn kill_connection(
     if crate::debug_env::trace_dist() {
         eprintln!("DIST_KILL_CONNECTION node={node} connection_id={connection_id}");
     }
-    let (watchers, node_events, monitor_downs) = {
+    let (watchers, node_events, monitor_downs, spawn_downs) = {
         let mut tables = node_tables::lock();
         let Some(entry) = tables.entries.get(node) else {
             return Ok(false);
@@ -1131,13 +1107,15 @@ pub(crate) fn kill_connection(
         }
         let visible = entry.visible;
         let monitor_downs = take_connection_monitors(&mut tables, node);
+        let spawn_downs = take_connection_spawn_requests(&mut tables, node);
         let watchers = tables.disconnect(node);
         let events =
             tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
-        (watchers, events, monitor_downs)
+        (watchers, events, monitor_downs, spawn_downs)
     };
     notify_node_watchers(runtime, node, watchers)?;
     notify_connection_monitors(runtime, monitor_downs)?;
+    notify_connection_spawn_requests(runtime, spawn_downs)?;
     send_nodes_monitor_events(runtime, node_events)?;
     Ok(true)
 }
@@ -1231,6 +1209,89 @@ fn notify_connection_monitors(
         }
     }
     Ok(())
+}
+
+/// The spawn-pending monitors of a connection that goes down, taken out of the tables before
+/// the connection state is dropped.
+///
+/// Port of erts/emulator/beam/dist.c (monitor_connection_down for monitors with
+/// ERTS_ML_FLG_SPAWN_PENDING, and dist.c:326 dist_pend_spawn_exit_connection_down), OTP-29.1.1.
+fn take_connection_spawn_requests(
+    tables: &mut node_tables::NodeTables,
+    node: &str,
+) -> Vec<(u64, node_tables::SpawnRequest)> {
+    let Some(entry) = tables.entries.get_mut(node) else {
+        return Vec::new();
+    };
+    let mut requests = std::mem::take(&mut entry.pending_spawn_requests);
+    if let Some(state) = entry.dist.as_mut() {
+        requests.append(&mut state.spawn_requests);
+    }
+    requests.into_iter().collect()
+}
+
+/// A spawn request whose connection went down, as its parent receives it: the monitor-down
+/// signal of a spawn-pending monitor (erl_proc_sig_queue.c:4864 convert_to_down_message),
+/// queued as a [`Signal::DistSpawnReply`].
+pub(crate) struct DistSpawnNoconnection {
+    id: u64,
+    tag: OwnedTerm,
+    /// ERTS_ML_FLG_SPAWN_ABANDONED or ERTS_ML_FLG_SPAWN_NO_EMSG: no message.
+    quiet: bool,
+}
+
+/// Tell the parents of the spawn requests of a lost connection: a live parent gets
+/// `{Tag, Ref, error, noconnection}`; a parent suspended in its exit is resumed by dropping
+/// its waiter.
+fn notify_connection_spawn_requests(
+    runtime: &crate::process::Runtime,
+    requests: Vec<(u64, node_tables::SpawnRequest)>,
+) -> Result<(), VmError> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let scheduler = runtime.scheduler()?;
+    for (id, request) in requests {
+        if request.parent_exiting {
+            // dist_pend_spawn_exit_connection_down: erts_resume of a waiting parent.
+            drop(request);
+            continue;
+        }
+        let payload: std::sync::Arc<dyn std::any::Any + Send + Sync> =
+            std::sync::Arc::new(DistSpawnNoconnection {
+                id,
+                tag: request.tag.clone(),
+                quiet: request.abandoned || request.no_error_msg,
+            });
+        // A parent that is gone needs nothing more.
+        let _ = scheduler.signal(
+            request.caller,
+            request.caller,
+            Signal::DistSpawnReply(arinsal_sched::SharedPayload(payload)),
+        );
+    }
+    Ok(())
+}
+
+/// The `{Tag, Ref, error, noconnection}` message of a spawn request whose connection went
+/// down, or `None` when the request was abandoned or error replies are off.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:4864-4920 (convert_to_down_message for a
+/// spawn-pending monitor), OTP-29.1.1.
+pub(crate) fn spawn_noconnection_message(
+    process: &mut Process,
+    down: &DistSpawnNoconnection,
+) -> Result<Option<Term>, VmError> {
+    if down.quiet {
+        return Ok(None);
+    }
+    let reference = crate::signals::reference(process, down.id)?;
+    let tag = from_owned(&down.tag, &mut process.heap).map_err(|_| badarg())?;
+    tuple(
+        process,
+        vec![tag, reference, atom("error"), atom("noconnection")],
+    )
+    .map(Some)
 }
 
 fn send_nodes_monitor_events(
@@ -1448,45 +1509,8 @@ fn route_incoming_port(
             handle_spawn_request_port(runtime, handle, local, parts, &terms[0])?;
         }
         31 | 32 if (parts.len() == 5 && *op == 31) || (parts.len() == 6 && *op == 32) => {
-            let id = remote_ref_id(&parts[1]).ok_or_else(badarg)?;
-            let result = parts[4].clone();
-            if let Some(req) = take_spawn_request(handle, id) {
-                let ok = matches!(result, OwnedTerm::Pid { .. });
-                let flags = as_u64(&parts[3]).ok_or_else(badarg)?;
-                let status = if ok { "ok" } else { "error" };
-                if ok && req.monitor {
-                    let node = node_tables::lock()
-                        .entries
-                        .values()
-                        .find(|e| e.dist.as_ref().is_some_and(|s| s.handle == handle))
-                        .map(|e| e.name.clone())
-                        .ok_or_else(badarg)?;
-                    remember_monitor(&node, id, req.caller, result.clone())?;
-                }
-                if ok && flags & 1 != 0 {
-                    // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
-                    let child = remote_proxy(handle, &result)?;
-                    sched
-                        .signal(child, req.caller, Signal::Link { priority: false })
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("dist spawn link setup: {error}"))
-                        })?;
-                }
-                if !(ok && req.no_success_msg) {
-                    let reply = OwnedTerm::tuple(vec![
-                        req.tag,
-                        parts[1].clone(),
-                        OwnedTerm::Atom(status.into()),
-                        result,
-                    ]);
-                    let message = owned_to_message(&reply)?;
-                    sched
-                        .send(req.caller, req.caller, message)
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("dist spawn reply: {error}"))
-                        })?;
-                }
-            }
+            // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
+            dist_spawn_reply(runtime, handle, parts)?;
         }
         other => {
             let _ = other;
@@ -1584,7 +1608,9 @@ fn dist_spawn_request(
     let reference_owned = owned(reference)?;
     let mut tag = OwnedTerm::Atom("spawn_reply".into());
     let mut monitor = false;
+    let mut link = false;
     let mut no_success_msg = false;
+    let mut no_error_msg = false;
     let mut wire_opts = Vec::new();
     match &options {
         OwnedTerm::Nil => {}
@@ -1596,6 +1622,8 @@ fn dist_spawn_request(
                         wire_opts.push(option.clone());
                     }
                     OwnedTerm::Atom(name) if name == "link" => {
+                        // dist.c:5887 (monitor_oflags |= ERTS_ML_FLG_SPAWN_LINK).
+                        link = true;
                         wire_opts.push(option.clone());
                     }
                     OwnedTerm::Tuple(pair) if pair.len() == 2 => match &pair[0] {
@@ -1606,14 +1634,32 @@ fn dist_spawn_request(
                             tag = pair[1].clone();
                         }
                         OwnedTerm::Atom(name) if name == "reply" => match &pair[1] {
-                            OwnedTerm::Atom(v) if v == "error_only" || v == "no" => {
+                            // dist.c:5900-5920: ERTS_ML_FLG_SPAWN_NO_SMSG / _NO_EMSG.
+                            OwnedTerm::Atom(v) if v == "error_only" => {
                                 no_success_msg = true;
+                                no_error_msg = false;
                             }
-                            OwnedTerm::Atom(v) if v == "yes" || v == "success_only" => {}
+                            OwnedTerm::Atom(v) if v == "no" => {
+                                no_success_msg = true;
+                                no_error_msg = true;
+                            }
+                            OwnedTerm::Atom(v) if v == "success_only" => {
+                                no_success_msg = false;
+                                no_error_msg = true;
+                            }
+                            OwnedTerm::Atom(v) if v == "yes" => {
+                                no_success_msg = false;
+                                no_error_msg = false;
+                            }
                             _ => return Err(badarg()),
                         },
                         OwnedTerm::Atom(name) if name == "monitor" => {
                             monitor = true;
+                            wire_opts.push(option.clone());
+                        }
+                        // dist.c:5954 (`{link, Prio}`: ERTS_ML_FLG_SPAWN_LINK).
+                        OwnedTerm::Atom(name) if name == "link" => {
+                            link = true;
                             wire_opts.push(option.clone());
                         }
                         _ => wire_opts.push(option.clone()),
@@ -1647,21 +1693,57 @@ fn dist_spawn_request(
             wire_options,
         ],
     );
-    queue_outgoing(process, ctx, &node, control, Some(values[2].clone()))?;
-    let mut tables = node_tables::lock();
-    let entry = tables.entries.get_mut(&node).ok_or_else(badarg)?;
+    // Port of erts/emulator/beam/dist.c:6112-6120 (erts_internal_dist_spawn_request_4), OTP-29.1.1:
+    // the pending-spawn monitor of the request; its origin is found on exit through the
+    // resource bit (erts: the process monitor tree).
+    let _ =
+        arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DIST_SPAWN);
     let request = node_tables::SpawnRequest {
         caller: ctx.pid(),
         tag,
         monitor,
         no_success_msg,
+        no_error_msg,
+        abandoned: false,
+        link,
+        parent_exiting: false,
+        child: None,
+        waiter: None,
     };
-    if let Some(state) = entry.dist.as_mut() {
-        state.spawn_requests.insert(id, request);
-    } else {
-        entry.pending_spawn_requests.insert(id, request);
+    // A node without a table entry gets it from the auto-connect of the first send
+    // (erts_auto_connect, dist.c:3260); no reply can precede the connection, so the request is
+    // registered right after that send in this case.
+    let mut request = Some(request);
+    {
+        let mut tables = node_tables::lock();
+        if let Some(entry) = tables.entries.get_mut(&node) {
+            let request = request.take().expect("request present");
+            if let Some(state) = entry.dist.as_mut() {
+                state.spawn_requests.insert(id, request);
+            } else {
+                entry.pending_spawn_requests.insert(id, request);
+            }
+        }
     }
-    drop(tables);
+    if let Err(error) = queue_outgoing(process, ctx, &node, control, Some(values[2].clone())) {
+        let mut tables = node_tables::lock();
+        if let Some(entry) = tables.entries.get_mut(&node) {
+            entry.pending_spawn_requests.remove(&id);
+            if let Some(state) = entry.dist.as_mut() {
+                state.spawn_requests.remove(&id);
+            }
+        }
+        return Err(error);
+    }
+    if let Some(request) = request {
+        let mut tables = node_tables::lock();
+        let entry = tables.entries.get_mut(&node).ok_or_else(badarg)?;
+        if let Some(state) = entry.dist.as_mut() {
+            state.spawn_requests.insert(id, request);
+        } else {
+            entry.pending_spawn_requests.insert(id, request);
+        }
+    }
     if kind == "spawn_opt" {
         // Port of erts/emulator/beam/dist.c:6076 (ok_result = {Ref, SpawnsMonitor}), OTP-29.1.1.
         return tuple(process, vec![reference, boolean(monitor)]);
@@ -1694,14 +1776,498 @@ fn list_owned_len(term: &OwnedTerm) -> Option<usize> {
     }
 }
 
-fn take_spawn_request(handle: u64, id: u64) -> Option<node_tables::SpawnRequest> {
+/// `ERTS_DIST_SPAWN_FLAG_LINK` (dist.h:185) in the flags of DOP_SPAWN_REPLY.
+const DIST_SPAWN_FLAG_LINK: u64 = 1 << 0;
+/// `ERTS_DIST_SPAWN_FLAG_MONITOR` (dist.h:186) in the flags of DOP_SPAWN_REPLY.
+const DIST_SPAWN_FLAG_MONITOR: u64 = 1 << 1;
+
+/// A DOP_SPAWN_REPLY as its parent receives it in the [`Signal::DistSpawnReply`] signal.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c (ErtsDistSpawnReplySigData), OTP-29.1.1.
+/// erts builds the reply message on the sending side and patches the tag in on reception;
+/// Arinsal keeps the parts and builds the message on the receiver heap.
+pub(crate) struct DistSpawnReplyData {
+    /// The connection the reply arrived on (erts: `dep` plus its connection id).
+    handle: u64,
+    /// Key of the request reference.
+    id: u64,
+    /// `datap->ref`.
+    reference: OwnedTerm,
+    /// The parent as the wire names it, for DOP_DEMONITOR.
+    parent: OwnedTerm,
+    /// `datap->result`: the child pid, or the error atom of a failed spawn.
+    result: OwnedTerm,
+    /// The DOP_SPAWN_REPLY flags.
+    flags: u64,
+    /// `datap->link`: the proxy of the child of a successful spawn with link.
+    link: Option<Pid>,
+}
+
+impl DistSpawnReplyData {
+    /// Key of the request reference (`datap->ref`).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The spawn succeeded: the result is the child pid.
+    pub(crate) fn is_success(&self) -> bool {
+        matches!(self.result, OwnedTerm::Pid { .. })
+    }
+
+    /// The remote monitors the child: the distribution half of the spawn monitor exists.
+    fn monitor(&self) -> bool {
+        self.is_success() && self.flags & DIST_SPAWN_FLAG_MONITOR != 0
+    }
+
+    /// `datap->link`.
+    pub(crate) fn link(&self) -> Option<Pid> {
+        self.link
+    }
+}
+
+/// Handle DOP_SPAWN_REPLY / DOP_SPAWN_REPLY_TT on connection `handle`: queue one
+/// [`Signal::DistSpawnReply`] to the parent, or clean up when the parent is gone.
+///
+/// Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
+fn dist_spawn_reply(
+    runtime: &crate::process::Runtime,
+    handle: u64,
+    parts: &[OwnedTerm],
+) -> Result<(), VmError> {
+    let (local, node) = {
+        let tables = node_tables::lock();
+        let node = tables
+            .entries
+            .values()
+            .find(|entry| {
+                entry
+                    .dist
+                    .as_ref()
+                    .is_some_and(|state| state.handle == handle)
+            })
+            .map(|entry| entry.name.clone());
+        (tables.local_name.clone(), node)
+    };
+    let Some(node) = node else {
+        // The connection went down while the reply was routed.
+        return Ok(());
+    };
+    let Some(parent) = local_pid(&parts[2], &local) else {
+        // Old incarnation of this node.
+        return Ok(());
+    };
+    let id = remote_ref_id(&parts[1]).ok_or_else(badarg)?;
+    let flags = as_u64(&parts[3]).ok_or_else(badarg)?;
+    if flags >= 1 << 27 {
+        return Err(badarg());
+    }
+    let result = parts[4].clone();
+    let child = match &result {
+        OwnedTerm::Pid { .. } => Some(remote_proxy(handle, &result)?),
+        OwnedTerm::Atom(_) => None,
+        _ => return Err(badarg()),
+    };
+    // Successful spawn-link: the link the parent inserts (erts_link_external_create).
+    let link = child.filter(|_| flags & DIST_SPAWN_FLAG_LINK != 0);
+    let data = std::sync::Arc::new(DistSpawnReplyData {
+        handle,
+        id,
+        reference: parts[1].clone(),
+        parent: parts[2].clone(),
+        result,
+        flags,
+        link,
+    });
+    if data.monitor() {
+        // The distribution half of the spawn monitor, which erts creates with the request
+        // (dist.c:6112 erts_internal_dist_spawn_request_4): it routes the child's DOWN.
+        remember_monitor(&node, id, parent, data.result.clone())?;
+    }
+    // Ordered against signals from the spawned process; a failed spawn is ordered from the
+    // spawn service (erl_proc_sig_queue.c:3337-3352).
+    let ordered_from = child.unwrap_or(parent);
+    let payload: std::sync::Arc<dyn std::any::Any + Send + Sync> = data.clone();
+    let sent = runtime
+        .scheduler()?
+        .signal(
+            ordered_from,
+            parent,
+            Signal::DistSpawnReply(arinsal_sched::SharedPayload(payload)),
+        )
+        .is_ok();
+    if !sent {
+        spawn_reply_send_failed(runtime, &data);
+    }
+    Ok(())
+}
+
+/// erts_proc_sig_send_dist_spawn_reply failed: the parent left the process table. A
+/// monitored child is demonitored, and for a spawn with link the result is saved so the
+/// terminating parent can send the child an exit signal with the correct exit reason.
+///
+/// Port of erts/emulator/beam/dist.c:3090-3121 (DOP_SPAWN_REPLY), OTP-29.1.1. The link half
+/// was never inserted in a process, so there is nothing to release.
+pub(crate) fn spawn_reply_send_failed(
+    runtime: &crate::process::Runtime,
+    data: &DistSpawnReplyData,
+) {
+    if data.monitor() {
+        let _ = take_monitor(data.id);
+        spawn_reply_demonitor(
+            runtime,
+            data.handle,
+            &data.parent,
+            &data.result,
+            &data.reference,
+        );
+    }
+    if data.flags & DIST_SPAWN_FLAG_LINK != 0 {
+        dist_pend_spawn_exit_save_child_result(data.handle, data.id, &data.result);
+    }
+}
+
+/// Store the result of a spawn with link for its terminating parent and resume the parent if
+/// it suspended waiting for it. A parent that did not reach its pending-spawn phase yet finds
+/// the result in its request.
+///
+/// Port of erts/emulator/beam/dist.c:552-640 (dist_pend_spawn_exit_save_child_result),
+/// OTP-29.1.1: erts_resume after `dist->mtx` is released.
+fn dist_pend_spawn_exit_save_child_result(handle: u64, id: u64, result: &OwnedTerm) {
+    let resume = {
+        let mut tables = node_tables::lock();
+        let Some(state) = tables
+            .entries
+            .values_mut()
+            .find_map(|entry| entry.dist.as_mut().filter(|state| state.handle == handle))
+        else {
+            // !dist->alive
+            return;
+        };
+        state.spawn_requests.get_mut(&id).and_then(|request| {
+            if request.child.is_none() {
+                request.child = Some(result.clone());
+            }
+            request.waiter.take()
+        })
+    };
+    drop(resume);
+}
+
+/// Take the live pending request `id` of `parent`: the spawn-pending origin monitor of
+/// handle_dist_spawn_reply (erl_proc_sig_queue.c:5706 erts_monitor_tree_lookup with
+/// ERTS_ML_FLG_SPAWN_PENDING). A request already moved aside by the exiting parent is not
+/// live.
+pub(crate) fn take_spawn_request(parent: Pid, id: u64) -> Option<node_tables::SpawnRequest> {
     let mut tables = node_tables::lock();
-    tables.entries.values_mut().find_map(|entry| {
-        let state = entry.dist.as_mut()?;
-        (state.handle == handle)
-            .then(|| state.spawn_requests.remove(&id))
-            .flatten()
-    })
+    for entry in tables.entries.values_mut() {
+        let pending = &mut entry.pending_spawn_requests;
+        if pending
+            .get(&id)
+            .is_some_and(|request| request.caller == parent && !request.parent_exiting)
+        {
+            return pending.remove(&id);
+        }
+        if let Some(state) = entry.dist.as_mut()
+            && state
+                .spawn_requests
+                .get(&id)
+                .is_some_and(|request| request.caller == parent && !request.parent_exiting)
+        {
+            return state.spawn_requests.remove(&id);
+        }
+    }
+    None
+}
+
+/// The reply needs no monitor: release the distribution half the reply handler created
+/// (erl_proc_sig_queue.c:5866-5880, `erts_monitor_dist_delete` without a demonitor signal).
+pub(crate) fn spawn_reply_drop_monitor(data: &DistSpawnReplyData) {
+    if data.monitor() {
+        let _ = take_monitor(data.id);
+    }
+}
+
+/// Mark the live pending request `id` of `parent` abandoned, or drop it when it has no link.
+/// Returns false when `id` is not an outstanding request of `parent`.
+///
+/// Port of erts/emulator/beam/bif.c:1166 (spawn_request_abandon_1), OTP-29.1.1, for a
+/// distributed request: one with link is left for the reply, which sends the child an
+/// `abandoned` exit (erl_proc_sig_queue.c:5786-5830).
+pub(crate) fn spawn_request_abandon(parent: Pid, id: u64) -> bool {
+    let mut tables = node_tables::lock();
+    for entry in tables.entries.values_mut() {
+        let connected = entry.dist.as_mut().map(|state| &mut state.spawn_requests);
+        for requests in std::iter::once(&mut entry.pending_spawn_requests).chain(connected) {
+            let Some(request) = requests.get_mut(&id) else {
+                continue;
+            };
+            if request.caller != parent || request.parent_exiting || request.abandoned {
+                return false;
+            }
+            if request.link {
+                // Leave it for reply...
+                request.abandoned = true;
+            } else {
+                requests.remove(&id);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// The `{Tag, Ref, ok|error, Pid|ErrorAtom}` reply message on the parent's heap
+/// (erl_proc_sig_queue.c:5741 patch point plus convert_prepared_sig_to_msg).
+pub(crate) fn spawn_reply_message(
+    process: &mut Process,
+    tag: &OwnedTerm,
+    data: &DistSpawnReplyData,
+) -> Result<Term, VmError> {
+    let status = if data.is_success() { "ok" } else { "error" };
+    // The reference is the request's own local reference (erts `ref` of the spawn request):
+    // an owned remote-style copy would not compare equal to it with `=:=`.
+    let reference = crate::signals::reference(process, data.id)?;
+    let tag = from_owned(tag, &mut process.heap).map_err(|_| badarg())?;
+    let result = from_owned(&data.result, &mut process.heap).map_err(|_| badarg())?;
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    TermBuilder::new(&mut heap)
+        .tuple(&[tag, reference, crate::signals::atom(status), result])
+        .map_err(|_| badarg())
+}
+
+/// The child term of a successful reply on the parent's heap, for the `link` trace event.
+pub(crate) fn spawn_reply_child_term(
+    process: &mut Process,
+    data: &DistSpawnReplyData,
+) -> Result<Term, VmError> {
+    from_owned(&data.result, &mut process.heap).map_err(|_| badarg())
+}
+
+/// Handle a spawn reply that reaches its parent while the parent is exiting: a monitored child
+/// is demonitored and a linked child gets the parent's exit reason, or `abandoned`.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:5927 (handle_dist_spawn_reply_exiting),
+/// OTP-29.1.1. The pending-spawn monitors were moved aside by
+/// [`pend_spawn_exit_parent_setup`] in the monitors phase before this runs.
+pub(crate) fn handle_dist_spawn_reply_exiting(
+    runtime: &crate::process::Runtime,
+    parent: Pid,
+    reason: Term,
+    shared: &arinsal_sched::SharedPayload,
+) {
+    let Some(data) = shared.0.downcast_ref::<DistSpawnReplyData>() else {
+        return;
+    };
+    // erts_monitor_tree_lookup(pe_ctxt_p->pend_spawn_monitors) with
+    // erts_dist_pend_spawn_exit_delete: `connected` is false when the connection closed.
+    let found = {
+        let mut tables = node_tables::lock();
+        let mut found = None;
+        for entry in tables.entries.values_mut() {
+            if entry
+                .pending_spawn_requests
+                .get(&data.id)
+                .is_some_and(|request| request.caller == parent && request.parent_exiting)
+            {
+                found = entry
+                    .pending_spawn_requests
+                    .remove(&data.id)
+                    .map(|request| (request, false));
+                break;
+            }
+            if let Some(state) = entry.dist.as_mut()
+                && state
+                    .spawn_requests
+                    .get(&data.id)
+                    .is_some_and(|request| request.caller == parent && request.parent_exiting)
+            {
+                let connected = state.handle == data.handle;
+                found = state
+                    .spawn_requests
+                    .remove(&data.id)
+                    .map(|request| (request, connected));
+                break;
+            }
+        }
+        found
+    };
+    let Some((mut request, connected)) = found else {
+        // May happen when the connection concurrently closed.
+        spawn_reply_drop_monitor(data);
+        return;
+    };
+    if let Some(waiter) = request.waiter.take() {
+        // The parent runs this itself; it is not suspended on the request.
+        waiter.cancel();
+    }
+    if !data.is_success() {
+        return;
+    }
+    if request.monitor && connected {
+        // erts_proc_exit_dist_demonitor.
+        let _ = take_monitor(data.id);
+        spawn_reply_demonitor(
+            runtime,
+            data.handle,
+            &data.parent,
+            &data.result,
+            &data.reference,
+        );
+    } else {
+        spawn_reply_drop_monitor(data);
+    }
+    if let Some(child) = data.link {
+        // erts_proc_exit_handle_link: the link exit carries the actual reason, unless the
+        // operation was abandoned.
+        let reason = if request.abandoned {
+            atom("abandoned")
+        } else {
+            reason
+        };
+        forward_link_exit_if_proxy(runtime, child, parent, reason);
+    }
+}
+
+/// DOP_DEMONITOR of a child spawned for a parent that no longer takes the reply.
+// Port of erts/emulator/beam/dist.c:3092-3101 (erts_dsig_send_demonitor), OTP-29.1.1.
+fn spawn_reply_demonitor(
+    runtime: &crate::process::Runtime,
+    handle: u64,
+    parent: &OwnedTerm,
+    child: &OwnedTerm,
+    reference: &OwnedTerm,
+) {
+    let control = control(20, vec![parent.clone(), child.clone(), reference.clone()]);
+    let _ = emit_control_message_on_handle(runtime, handle, control, None);
+}
+
+/// Pending-spawn monitors of an exiting parent are moved aside: replies that arrive from now
+/// on are saved for the parent instead of delivered.
+///
+/// Port of erts/emulator/beam/erl_process.c:13932-13935 (proc_exit_handle_monitors) and
+/// dist.c:665 (erts_dist_pend_spawn_exit_parent_setup), OTP-29.1.1.
+pub(crate) fn pend_spawn_exit_parent_setup(parent: Pid) {
+    let mut tables = node_tables::lock();
+    for entry in tables.entries.values_mut() {
+        let pending = entry.pending_spawn_requests.values_mut();
+        let connected = entry
+            .dist
+            .iter_mut()
+            .flat_map(|state| state.spawn_requests.values_mut());
+        for request in pending.chain(connected) {
+            if request.caller == parent {
+                request.parent_exiting = true;
+            }
+        }
+    }
+}
+
+/// Result of one pass of ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS.
+pub(crate) enum PendSpawnExit {
+    /// Every pending-spawn monitor of the parent is handled.
+    Done,
+    /// The parent is suspended until a spawn reply or the loss of the connection resumes it.
+    Wait,
+}
+
+/// Handle the pending-spawn monitors of exiting `parent`: drop those without link, send the
+/// link exit to every child whose pid is known, and suspend on `waiter` for the others.
+/// Without a waiter (a synchronous exit that cannot suspend) those are dropped.
+///
+/// Port of erts/emulator/beam/erl_process.c:13647-13780 (proc_exit_handle_pend_spawn_monitors)
+/// with dist.c:641 (erts_dist_pend_spawn_exit_delete) and dist.c:758-790
+/// (erts_dist_pend_spawn_exit_parent_wait), OTP-29.1.1. The table lock is erts' `dist->mtx`:
+/// the suspend is recorded under it, so a reply cannot slip between test and suspend.
+pub(crate) fn pend_spawn_exit(
+    runtime: &crate::process::Runtime,
+    parent: Pid,
+    reason: Term,
+    waiter: Option<&arinsal_sched::ExitWaiter<Process>>,
+) -> PendSpawnExit {
+    let mut exits: Vec<(u64, OwnedTerm, bool, bool)> = Vec::new();
+    let mut wait = false;
+    let (local_name, local_creation) = {
+        let mut tables = node_tables::lock();
+        let local = (tables.local_name.clone(), tables.local_creation);
+        for entry in tables.entries.values_mut() {
+            let mut visit = |connection: Option<(u64, bool)>,
+                             requests: &mut std::collections::BTreeMap<
+                u64,
+                node_tables::SpawnRequest,
+            >| {
+                requests.retain(|_, request| {
+                    if request.caller != parent || !request.parent_exiting {
+                        return true;
+                    }
+                    if !request.link {
+                        // Just cleanup.
+                        return false;
+                    }
+                    match request.child.take() {
+                        // A failed spawn (an atom) needs no exit signal.
+                        Some(child) => {
+                            let is_pid = matches!(child, OwnedTerm::Pid { .. });
+                            if let (Some((handle, exit_payload)), true) = (connection, is_pid) {
+                                exits.push((handle, child, exit_payload, request.abandoned));
+                            }
+                            false
+                        }
+                        None => match waiter {
+                            Some(waiter) => {
+                                // `erts_suspend` plus `mdp->u.target.other.ptr = c_p`; a
+                                // waiter already stored from an earlier pass stays.
+                                if request.waiter.is_none() {
+                                    request.waiter = Some(waiter.clone());
+                                }
+                                wait = true;
+                                true
+                            }
+                            None => false,
+                        },
+                    }
+                });
+            };
+            visit(None, &mut entry.pending_spawn_requests);
+            if let Some(state) = entry.dist.as_mut() {
+                let exit_payload = state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0;
+                visit(
+                    Some((state.handle, exit_payload)),
+                    &mut state.spawn_requests,
+                );
+            }
+        }
+        local
+    };
+    if !exits.is_empty()
+        && let Ok(reason) = to_owned(reason)
+    {
+        let reason = node_tables::relabel_local_node(reason, &local_name, local_creation);
+        let abandoned = OwnedTerm::Atom("abandoned".into());
+        let from = OwnedTerm::Pid {
+            node: local_name.clone(),
+            id: parent.number(),
+            serial: parent.serial(),
+            creation: local_creation,
+        };
+        for (handle, child, exit_payload, was_abandoned) in exits {
+            // erl_process.c:13715: ERTS_ML_FLG_SPAWN_ABANDONED exits the child with `abandoned`.
+            let reason = if was_abandoned { &abandoned } else { &reason };
+            // erts_dsig_send_exit_tt (dist.c:1773), as `forward_link_exit_if_proxy` encodes a
+            // link exit; a connection that went away in between drops it, as the
+            // connection-id test of erl_process.c:13722 does.
+            let (control, payload) = if exit_payload {
+                (control(24, vec![from.clone(), child]), Some(reason.clone()))
+            } else {
+                (control(3, vec![from.clone(), child, reason.clone()]), None)
+            };
+            let _ = emit_control_message_on_handle(runtime, handle, control, payload);
+        }
+    }
+    if wait {
+        PendSpawnExit::Wait
+    } else {
+        PendSpawnExit::Done
+    }
 }
 
 fn handle_spawn_request(

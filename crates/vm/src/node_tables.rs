@@ -112,6 +112,25 @@ pub(crate) struct SpawnRequest {
     pub(crate) monitor: bool,
     /// `{reply, error_only}` / `{reply, no}` — suppress success mailbox message.
     pub(crate) no_success_msg: bool,
+    /// `{reply, success_only}` / `{reply, no}` — suppress error mailbox message
+    /// (ERTS_ML_FLG_SPAWN_NO_EMSG).
+    pub(crate) no_error_msg: bool,
+    /// `ERTS_ML_FLG_SPAWN_ABANDONED`: `spawn_request_abandon/1` was called on a request with
+    /// link; the reply sends the child an `abandoned` exit (bif.c:1166).
+    pub(crate) abandoned: bool,
+    /// `ERTS_ML_FLG_SPAWN_LINK` of the pending-spawn origin monitor.
+    pub(crate) link: bool,
+    /// The parent is exiting: erts moved the target half of the monitor to
+    /// `dist->dist_pend_spawn_exit` (dist.c:665 erts_dist_pend_spawn_exit_parent_setup).
+    pub(crate) parent_exiting: bool,
+    /// `mdp->origin.other.item` once a reply was saved for the exiting parent: the child pid,
+    /// or the error atom of a failed spawn. `None` is `am_pending`.
+    pub(crate) child: Option<OwnedTerm>,
+    /// `mdp->u.target.other.ptr`: the parent suspended until the reply arrives
+    /// (dist.c:758-790 erts_dist_pend_spawn_exit_parent_wait). Dropping it resumes the
+    /// parent, also when the connection goes down (dist.c:326
+    /// dist_pend_spawn_exit_connection_down).
+    pub(crate) waiter: Option<arinsal_sched::ExitWaiter<crate::Process>>,
 }
 
 impl DistState {
@@ -254,6 +273,16 @@ pub(crate) fn relabel_local_node(mut term: OwnedTerm, local: &str, creation: u32
             for (_, value) in fields {
                 let taken = std::mem::replace(value, OwnedTerm::Nil);
                 *value = relabel_local_node(taken, local, creation);
+            }
+        }
+        // The creator pid and the free variables of a fun travel with the fun
+        // (erts encodes every local pid with the current node name).
+        OwnedTerm::Fun { pid, free_vars, .. } => {
+            let taken = std::mem::replace(pid.as_mut(), OwnedTerm::Nil);
+            *pid.as_mut() = relabel_local_node(taken, local, creation);
+            for var in free_vars.iter_mut() {
+                let taken = std::mem::replace(var, OwnedTerm::Nil);
+                *var = relabel_local_node(taken, local, creation);
             }
         }
         _ => {}
@@ -644,6 +673,10 @@ impl NodeTables {
             entry.dist = None;
             entry.pending_out.clear();
             entry.pending_monitors.clear();
+            // The aborted connection takes its pending-spawn monitors along; dropping a
+            // suspended parent's waiter resumes it (dist.c:326
+            // dist_pend_spawn_exit_connection_down).
+            entry.pending_spawn_requests.clear();
         }
         Some(!was_connected)
     }
