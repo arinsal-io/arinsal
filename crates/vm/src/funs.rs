@@ -710,7 +710,7 @@ impl Vm {
         tail: bool,
         bif: arinsal_bifs::BifFn,
     ) -> Result<ImportOutcome, VmError> {
-        let (result, bif_reductions) = {
+        let (result, bif_reductions, deferred) = {
             let mut heap = ProcessHeapHandle(&mut p.heap);
             let mut state = arinsal_bifs::BifState::default();
             let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
@@ -720,8 +720,40 @@ impl Vm {
             .map_err(|_| {
                 VmError::Unsupported(format!("BIF {module}:{function}/{arity} panicked"))
             })?;
-            (result, bif_ctx.reductions())
+            let reductions = bif_ctx.reductions();
+            (result, reductions, bif_ctx.take_deferred())
         };
+        // Port of erts/emulator/beam/bif.h (BIF_TRAP*) and beam_common.c (fixed_apply returns the
+        // BIF's own export dispatch), OTP-29.1.1: a BIF that ran out of reductions returns
+        // THE_NON_VALUE with its continuation installed, and the process context-switches into
+        // the continuation export. Dropping the deferred state here would hand the non-value
+        // back to the caller as a result.
+        if let Some(trap) = deferred {
+            let module_atom = global_atoms()
+                .intern(module)
+                .map_err(|error| VmError::Unsupported(format!("BIF module atom: {error:?}")))?;
+            let function_atom = global_atoms()
+                .intern(function)
+                .map_err(|error| VmError::Unsupported(format!("BIF function atom: {error:?}")))?;
+            let args = p.x[..arity].to_vec();
+            p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
+            if let Some(run) = ctx {
+                run.consume(bif_reductions.saturating_add(1));
+            }
+            crate::bif_traps::install_deferred_trap(
+                p,
+                crate::bif_traps::APPLY_TRAP_KEY,
+                (module_atom, function_atom),
+                function,
+                &args,
+                trap,
+            )
+            .map_err(|_| {
+                exceptions::bif_error(p, module, function, &args, BifError::SystemLimit)
+            })?;
+            crate::bif_traps::arm_export_trap(p);
+            return Ok(ImportOutcome::Yield);
+        }
         let bif_args = p.x[..arity].to_vec();
         let result = result.map_err(|error| match error {
             BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),

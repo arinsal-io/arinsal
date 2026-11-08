@@ -418,57 +418,17 @@ impl Executor {
                                     {
                                         return Ok(Flow::Continue);
                                     }
-                                    // A trapping BIF yielded with its state pending: the apply is redone with
-                                    // its original operands when the process runs again.
+                                    // Port of erts/emulator/beam/bif.h (BIF_TRAP*) and
+                                    // beam_bif_export_trap, OTP-29.1.1: a BIF that trapped
+                                    // with its state pending context-switches into its trap
+                                    // export with the arguments the trap kept; the apply is
+                                    // not redone.
                                     if process
                                         .cold
                                         .as_ref()
                                         .is_some_and(|cold| cold.bif_trap.is_some())
                                     {
-                                        // Port of erts/emulator/beam/beam_common.c
-                                        // (BIF_TRAP: the trap export carries its own
-                                        // arguments), OTP-29.1.1: the operands saved
-                                        // before the call are stale once the BIF
-                                        // collected, so the redone apply is rebuilt
-                                        // from the arguments kept in the trap state.
-                                        let pending = process
-                                            .cold
-                                            .as_ref()
-                                            .and_then(|cold| cold.bif_trap.as_ref())
-                                            .map(|pending| {
-                                                (pending.callee, pending.args, pending.arity)
-                                            });
-                                        let retry_pc = if let Some((
-                                            (module, function),
-                                            args,
-                                            arity,
-                                        )) = pending
-                                        {
-                                            let list = {
-                                                let mut heap = arinsal_bifs::ProcessHeapHandle(
-                                                    &mut process.heap,
-                                                );
-                                                TermBuilder::new(&mut heap)
-                                                    .list_from_slice(&args[..arity])
-                                            };
-                                            match list {
-                                                Ok(list) => {
-                                                    process.x[0] = Term::atom(module);
-                                                    process.x[1] = Term::atom(function);
-                                                    process.x[2] = list;
-                                                    arinsal_beamasm::dispatch::APPLY3_UNPORTED
-                                                }
-                                                Err(_) => {
-                                                    return Ok(Flow::Break(Err(
-                                                        VmError::Unsupported(
-                                                            "trap state arguments".into(),
-                                                        ),
-                                                    )));
-                                                }
-                                            }
-                                        } else {
-                                            target_pc
-                                        };
+                                        let retry_pc = crate::bif_traps::bif_export_trap_pc();
                                         process.set_native_retry(Some(retry_pc));
                                         process.set_native_pc(Some(code_ptr));
                                     }
