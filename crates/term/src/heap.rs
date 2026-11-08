@@ -4857,6 +4857,61 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         block.finish_at(size + 1)
     }
+
+    /// Build a flatmap from key and value arrays, sorting the reserved flatmap in place.
+    ///
+    /// Port of erts/emulator/beam/erl_map.c:673 (`erts_map_from_ks_and_vs`) and :3187
+    /// (`erts_validate_and_sort_flatmap`), OTP-29.1.1.
+    pub fn flatmap_from_arrays(
+        &mut self,
+        keys: &[Term],
+        values: &[Term],
+    ) -> Result<Term, TermError> {
+        if keys.len() != values.len() || keys.is_empty() || keys.len() > 32 {
+            return Err(TermError::BadArg);
+        }
+        let size = keys.len();
+        let words = size
+            .checked_mul(2)
+            .and_then(|words| words.checked_add(4))
+            .ok_or(TermError::SystemLimit)?;
+        let mut block = self.reserve_boxed_words(words, 0)?;
+        block.write_header((size as u64) << 6)?;
+        for key in keys {
+            block.write_term(*key)?;
+        }
+        let key_tuple = block.term_at(0)?;
+        block.write_header(MAP_HEADER_FLATMAP)?;
+        block.write_header(size as u64)?;
+        block.write_term(key_tuple)?;
+        for value in values {
+            block.write_term(*value)?;
+        }
+
+        for ix in 1..size {
+            let mut jx = ix;
+            while jx > 0 {
+                let key = block.term_at(1 + jx)?;
+                let prior = block.term_at(jx)?;
+                match flat_key_cmp(key, prior) {
+                    Ordering::Equal => return Err(TermError::BadArg),
+                    Ordering::Greater => break,
+                    Ordering::Less => {
+                        block.replace_term_at(1 + jx, prior)?;
+                        block.replace_term_at(jx, key)?;
+                        let value_offset = size + 4 + jx;
+                        let prior_value_offset = value_offset - 1;
+                        let value = block.term_at(value_offset)?;
+                        let prior_value = block.term_at(prior_value_offset)?;
+                        block.replace_term_at(value_offset, prior_value)?;
+                        block.replace_term_at(prior_value_offset, value)?;
+                        jx -= 1;
+                    }
+                }
+            }
+        }
+        block.finish_at(size + 1)
+    }
     /// Port of erts/emulator/beam/erl_record.c:701-779 (records_create_4), OTP-29.1.1.
     /// Construct a native record, reusing the canonical definition of its module when one
     /// matches (`erts_canonical_record_def`). Fields are supplied in definition order and
@@ -5157,6 +5212,18 @@ impl HeapBlockBuilder {
             (self.start as *mut u64).wrapping_add(word_offset),
             2,
         ))
+    }
+
+    /// Replace a term in an initialized slot of the reservation.
+    pub fn replace_term_at(&mut self, word_offset: usize, term: Term) -> Result<(), TermError> {
+        if word_offset >= self.written {
+            return Err(TermError::BadArg);
+        }
+        crate::raw::store(
+            self.start + word_offset * std::mem::size_of::<u64>(),
+            term.bits(),
+        );
+        Ok(())
     }
 
     /// Identify a term slot in the reserved object before it is initialized.

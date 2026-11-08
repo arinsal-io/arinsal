@@ -97,7 +97,7 @@ pub(crate) use interp::{RunState, XREG_POISON, gc_stress_enabled, xreg_poison_en
 pub(crate) use load::{CodeMeta, CodeTables};
 pub(crate) use native_bridge::native_function_for;
 pub use native_bridge::{
-    NativeFunction, NativeLine, NativeLines, arinsal_native_raise, native_function_at,
+    NativeFile, NativeFunction, NativeLine, NativeLines, arinsal_native_raise, native_function_at,
     register_native_function, run_native,
 };
 pub use proc_create::Process;

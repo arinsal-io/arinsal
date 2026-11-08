@@ -2421,37 +2421,38 @@ pub(crate) fn compile(
         .map(|entry| (code_start + entry.offset, entry))
         .collect::<Vec<_>>();
     line_entries.sort_by_key(|(address, _)| *address);
-    // One location table for the module, with one file name per distinct file; each function
-    // gets a window onto it (`BeamCodeLineTab` of erts).
-    // The entries of a file follow each other, and the table has one `Arc` per file.
-    let mut last_file: Option<(*const str, Option<Term>)> = None;
+    // `BeamCodeLineTab` keeps packed file/line values in `loc_tab` and one shared filename
+    // table; each function points at its window in the module-wide PC table.
+    let mut file_indices = HashMap::new();
+    let mut file_names = Vec::new();
     let location_table: Arc<[crate::NativeLine]> = line_entries
         .iter()
         .map(|&(address, entry)| {
-            let file_term = match last_file {
-                Some((file, term)) if std::ptr::eq(file, Arc::as_ptr(&entry.file)) => term,
-                _ => {
-                    let term = module.line_file_terms.get(&*entry.file).copied();
-                    last_file = Some((Arc::as_ptr(&entry.file), term));
-                    term
-                }
+            let file_identity = Arc::as_ptr(&entry.file) as *const () as usize;
+            let file_index = *file_indices.entry(file_identity).or_insert_with(|| {
+                let index = file_names.len();
+                file_names.push(crate::NativeFile {
+                    name: Arc::clone(&entry.file),
+                    file_term: module.line_file_terms.get(&*entry.file).copied(),
+                });
+                index
+            });
+            // Port of beam_code.h:31-39 (`MAKE_LOCATION`): file indices must fit in eight
+            // bits with 255 reserved, and line numbers in the lower 24 bits.
+            let location = if file_index < 255 && u64::from(entry.line) < (1 << 24) - 1 {
+                ((file_index as u32) << 24) | entry.line
+            } else {
+                0
             };
-            crate::NativeLine {
-                address,
-                file: Arc::clone(&entry.file),
-                file_term,
-                // Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION),
-                // OTP-29.1.1: a line that does not fit in 24 bits has no location.
-                line: if u64::from(entry.line) < (1 << 24) - 1 {
-                    entry.line
-                } else {
-                    0
-                },
-            }
+            crate::NativeLine { address, location }
         })
         .collect();
-    let location_addresses: Arc<[usize]> =
-        location_table.iter().map(|entry| entry.address).collect();
+    let file_names: Arc<[crate::NativeFile]> = file_names.into();
+    let location_addresses: Arc<[usize]> = location_table
+        .iter()
+        .map(|entry| entry.address)
+        .chain(std::iter::once(code_end))
+        .collect();
     for function in &compiled.functions {
         let Some(start) = compiled
             .native
@@ -2490,7 +2491,13 @@ pub(crate) fn compile(
                 let last = location_table
                     .partition_point(|entry| entry.address < end)
                     .max(first);
-                crate::NativeLines::window(&location_table, &location_addresses, first, last)
+                crate::NativeLines::window(
+                    &location_table,
+                    &location_addresses,
+                    &file_names,
+                    first,
+                    last,
+                )
             },
             file_term: None,
         });
