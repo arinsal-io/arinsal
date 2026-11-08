@@ -152,7 +152,19 @@ impl Executor {
             process.x[saved_len..].fill(crate::XREG_POISON);
         }
         let mut fast_ran = false;
-        let fast_result = if Self::fast_entry_ok(process, ctx) {
+        // Port of erts/emulator/beam/erl_process.c:10318-10351 (erts_schedule), OTP-29.1.1:
+        // a process scheduled with non-message signals queued (a monitor, an alias message)
+        // handles them in the scheduler and then enters its code like any other; the signals
+        // are not a reason for a different entry path.
+        let mut signals_handled = false;
+        let mut signal_error = None;
+        if ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx) {
+            signals_handled = true;
+            signal_error = schedule_in_signals(process, ctx).err();
+        }
+        let fast_result = if let Some(error) = signal_error {
+            Some(Err(error))
+        } else if Self::fast_entry_ok(process, ctx) {
             self.fast_resume(process, ctx, &mut fast_ran)
         } else {
             None
@@ -224,43 +236,15 @@ impl Executor {
                     // and no dirty work, at most ERTS_SIG_HANDLE_REDS_MAX_PREFERED), OTP-29.1.1.
                     // A process parked on a request reply reads it from its message queue like
                     // erts_internal:await_result's receive, so the reply message is fetched here.
-                    if ctx.sys_task_run()
-                        || !process.sig_cont_empty()
-                        || process.delayed_gc_due()
-                        || ctx.has_pending_nmsg()
+                    // Signals already handled at this schedule-in (before the fast entry) are
+                    // not handled again: erts_schedule handles them once per schedule-in.
+                    if !signals_handled
+                        && (ctx.sys_task_run()
+                            || !process.sig_cont_empty()
+                            || process.delayed_gc_due()
+                            || ctx.has_pending_nmsg())
                     {
-                        let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
-                        let mut sig_reds = if process.slice().is_some_and(|work| work.dirty_sys_gc)
-                        {
-                            reds
-                        } else {
-                            SIG_HANDLE_REDS_MAX_PREFERED
-                        };
-                        if ctx.sys_task_run() {
-                            process.cold_mut().sys_task_point = true;
-                        }
-                        let max_reds = sig_reds;
-                        let handled = process.handle_incoming(ctx, &mut sig_reds, max_reds, false);
-                        ctx.consume(u32::try_from(sig_reds).unwrap_or(0));
-                        // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
-                        // then `p->fcalls = reds`; the process's reductions are what the slice
-                        // used), OTP-29.1.1: the signal handling is the process's own work.
-                        process.heap.abi.fcalls =
-                            process.heap.abi.fcalls.saturating_sub(sig_reds.max(0));
-                        process.reductions_used = process
-                            .reductions_used
-                            .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
-                        let executed = handled.and_then(|_| {
-                            if ctx.sys_task_run() {
-                                crate::signals::execute_sys_tasks(process, ctx)
-                            } else {
-                                Ok(())
-                            }
-                        });
-                        if ctx.sys_task_run() {
-                            process.cold_mut().sys_task_point = false;
-                        }
-                        executed?;
+                        schedule_in_signals(process, ctx)?;
                     }
 
                     // erts collects a process that is being scheduled in once signals have
@@ -786,4 +770,47 @@ impl Executor {
         }
         result
     }
+}
+
+/// The signal handling of a schedule-in: a process with signals or system tasks queued
+/// handles them before Erlang code, at most `SIG_HANDLE_REDS_MAX_PREFERED` reductions of
+/// signals when it has Erlang work and no dirty work.
+// Port of erts/emulator/beam/erl_process.c:10318-10351 (erts_schedule: the
+// ERTS_PSFLG_RUNNING_SYS branch, erts_proc_sig_handle_incoming then execute_sys_tasks),
+// OTP-29.1.1.
+fn schedule_in_signals(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<(), VmError> {
+    let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+    let mut sig_reds = if process.slice().is_some_and(|work| work.dirty_sys_gc) {
+        reds
+    } else {
+        SIG_HANDLE_REDS_MAX_PREFERED
+    };
+    if ctx.sys_task_run() {
+        process.cold_mut().sys_task_point = true;
+    }
+    let max_reds = sig_reds;
+    let handled = process.handle_incoming(ctx, &mut sig_reds, max_reds, false);
+    ctx.consume(u32::try_from(sig_reds).unwrap_or(0));
+    // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
+    // then `p->fcalls = reds`; the process's reductions are what the slice
+    // used), OTP-29.1.1: the signal handling is the process's own work.
+    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(sig_reds.max(0));
+    process.reductions_used = process
+        .reductions_used
+        .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
+    let executed = handled.and_then(|_| {
+        if ctx.sys_task_run() {
+            crate::signals::execute_sys_tasks(process, ctx)
+        } else {
+            Ok(())
+        }
+    });
+    if ctx.sys_task_run() {
+        process.cold_mut().sys_task_point = false;
+    }
+    executed?;
+    Ok(())
 }

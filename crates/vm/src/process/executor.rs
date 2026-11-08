@@ -157,8 +157,18 @@ impl Executor {
     // OTP-29.1.1.
     #[inline]
     pub(super) fn fast_entry_ok(process: &Process, ctx: &RunCtx<'_, Message>) -> bool {
+        !ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx)
+    }
+
+    /// [`Self::fast_entry_ok`] before the schedule-in signal handling: everything but the
+    /// queued non-message signals, which the scheduler handles first (erts_schedule).
+    #[inline]
+    pub(super) fn fast_entry_ok_before_signals(
+        process: &Process,
+        ctx: &RunCtx<'_, Message>,
+    ) -> bool {
         process.slice_is_plain()
-            && ctx.fast_slice_ok()
+            && ctx.fast_slice_ok_before_signals()
             && !crate::suspend::ctx_suspended(ctx)
             && !crate::dist::fragment_continuation_pending()
             && !trace_boot_enabled()
