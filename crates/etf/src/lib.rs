@@ -2079,6 +2079,35 @@ pub fn decode_dist_payload(packet: &DistributionPacket) -> Result<Vec<OwnedTerm>
     Ok(terms)
 }
 
+/// Decode the distribution payload and return each term's decoded heap size in words.
+///
+/// Port of `erts_decode_dist_ext_size` in `erts/emulator/beam/external.c`, OTP-29.1.1.
+pub fn decode_dist_payload_with_sizes(
+    packet: &DistributionPacket,
+) -> Result<Vec<(OwnedTerm, usize)>, DecodeError> {
+    let DistributionHeader::Start { translations, .. } = &packet.header else {
+        return Err(invalid(1, "continuation fragment has no translation table"));
+    };
+    let mut terms = Vec::new();
+    let mut at = 0;
+    while at < packet.payload.len() {
+        let bytes = &packet.payload[at..];
+        let mut size_walk = DecodedSizeWalk::new();
+        let (Some((heap_words, sized)), _) =
+            size_walk.step(bytes, usize::MAX, true, |_| u32::MAX)?
+        else {
+            return Err(DecodeError::Eof(at));
+        };
+        let (term, used) = parse(bytes, Some(translations))?;
+        if used == 0 || used != sized {
+            return Err(invalid(at, "distribution size and decode passes disagree"));
+        }
+        terms.push((term, heap_words));
+        at += used;
+    }
+    Ok(terms)
+}
+
 fn rank(t: &OwnedTerm) -> u8 {
     match t {
         OwnedTerm::Int(_) | OwnedTerm::BigInt(_) | OwnedTerm::Float(_) => 0,

@@ -1143,6 +1143,15 @@ fn system_info(
         Some("nif_version") => Some(crate::ddll::text_term(process, "2.18")),
         Some("threads") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
         Some("check_io") => Some(check_io_info(process)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3222 (system_info_1 cpu_quota), OTP-29.1.1.
+        Some("cpu_quota") => {
+            let quota = arinsal_alloc::cpuinfo::cpu_info().quota;
+            Some(if quota > 0 {
+                non_neg(process, quota as u64)
+            } else {
+                Ok(atom("unknown"))
+            })
+        }
         Some("ethread_info") => Some(ethread_info(process)),
         // Port of erts/emulator/beam/erl_bif_info.c (system_info_1) and
         // erts/lib_src/common/ethr_aux.c (ethr_no_used_tse), OTP-29.1.1. Arinsal does not
@@ -5471,6 +5480,20 @@ mod tests {
         normalize_check_io_counters(&mut expected);
         normalize_check_io_counters(&mut actual);
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn cpu_quota_system_info_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping CPU quota system_info differential test");
+            return;
+        };
+        let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("cpu_quota")]);
+        let selector = Term::atom(global_atoms().intern("cpu_quota").unwrap());
+        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+            .unwrap()
+            .unwrap();
+        similar_asserts::assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
     }
 
     fn normalize_check_io_counters(term: &mut OwnedTerm) {

@@ -625,7 +625,7 @@ impl NodeTables {
     ///
     /// Returns `(connection_id, entry_ref)` for the distribution handle.
     pub(crate) fn new_connection(&mut self, node: &str) -> Option<(u32, u64)> {
-        if !is_node_name(node) || node == self.local_name {
+        if node == self.local_name {
             return None;
         }
         self.pending_delete.remove(node);
@@ -948,6 +948,7 @@ pub(crate) fn test_node_tab_delayed_delete(milliseconds: i64) {
 #[cfg(test)]
 mod tests {
     use super::{ConnState, NodeTables};
+    use similar_asserts::assert_eq;
 
     #[test]
     fn setnode_initializes_local_node_and_clamps_creation() {
@@ -1002,6 +1003,17 @@ mod tests {
         let (id2, ref2) = tables.new_connection("b@host").unwrap();
         assert_eq!(id1, id2);
         assert_eq!(ref1, ref2);
+    }
+
+    #[test]
+    fn new_connection_accepts_unqualified_node_atoms() {
+        let mut tables = NodeTables::default();
+        assert!(tables.set_local_node("a@host".into(), 4));
+        let (id, entry_ref) = tables.new_connection("gurka").unwrap();
+        let entry = &tables.entries["gurka"];
+        assert_eq!(entry.state, ConnState::Pending);
+        assert_eq!(entry.connection_id, id);
+        assert_eq!(entry.entry_ref, entry_ref);
     }
 
     #[test]

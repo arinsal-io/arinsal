@@ -404,6 +404,10 @@ impl Process {
                 self.insert_target_process_monitor(shared);
                 1
             }
+            arinsal_sched::Signal::MonitorOrigin { reference, shared } => {
+                self.insert_spawn_origin_monitor(reference, shared);
+                2
+            }
             arinsal_sched::Signal::MonitorOpaque { reference, shared } => {
                 self.insert_target_monitor(reference, *shared);
                 2
@@ -719,6 +723,7 @@ impl Process {
             }
             adjust_monitor = request.monitor;
             if adjust_monitor {
+                crate::dist::spawn_reply_install_origin_monitor(self, ctx.pid(), data.id());
                 cnt += 2;
             }
         }
