@@ -269,6 +269,16 @@ pub(crate) fn relabel_local_node(mut term: OwnedTerm, local: &str, creation: u32
                 *value = relabel_local_node(taken_v, local, creation);
             }
         }
+        // Port of erts/emulator/beam/external.c:3970-3992 (`enc_term`, FUN_DEF), OTP-29.1.1.
+        // The creator pid and environment are encoded as ordinary terms.
+        OwnedTerm::Fun { pid, free_vars, .. } => {
+            let creator = std::mem::replace(pid.as_mut(), OwnedTerm::Nil);
+            **pid = relabel_local_node(creator, local, creation);
+            for value in free_vars.iter_mut() {
+                let taken = std::mem::replace(value, OwnedTerm::Nil);
+                *value = relabel_local_node(taken, local, creation);
+            }
+        }
         OwnedTerm::Record { fields, .. } => {
             for (_, value) in fields {
                 let taken = std::mem::replace(value, OwnedTerm::Nil);
