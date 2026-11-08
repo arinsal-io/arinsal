@@ -1535,6 +1535,8 @@ fn native_exit(
 /// has none of them.
 // Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: copy_in_registers and
 // `br c_p->i`, no per-entry bookkeeping), OTP-29.1.1.
+// Inlined into the scheduler's slice: see `Executor::run`.
+#[inline(always)]
 pub fn run_native_resume(
     process: &mut Process,
     registers: &mut SchedulerRegisters,

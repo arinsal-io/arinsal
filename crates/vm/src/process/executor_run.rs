@@ -1,6 +1,13 @@
 use super::*;
 
 impl Executor {
+    /// One process slice on this scheduler: schedule-in, native entry, schedule-out.
+    // Inlined into `Task::run` (its only caller), and `run_native_resume` into this: erts
+    // switches out through one C frame (the JIT `bl erts_schedule`), and every Rust frame
+    // between the worker loop and the native entry is a return the predictor misses after a
+    // switch-out, because Erlang code returning into earlier slices' frames drained the
+    // return-address stack.
+    #[inline(always)]
     pub(super) fn run(
         &mut self,
         process: &mut Process,
