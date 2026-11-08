@@ -18,6 +18,9 @@ pub use arinsal_term::message::{OwnedSignal, SignalNode};
 
 use crate::mailbox::InSignal;
 
+mod raw;
+pub(crate) use raw::HeldNode;
+
 /// A queue of signal nodes (`first`/`last` of `ErtsSignalInQueue` and of the private queues),
 /// with the count of its signals and of its non-message signals (erts tracks the latter with
 /// `nmsigs`).
