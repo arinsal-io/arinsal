@@ -285,16 +285,6 @@ pub(crate) fn relabel_local_node(mut term: OwnedTerm, local: &str, creation: u32
                 *value = relabel_local_node(taken, local, creation);
             }
         }
-        // The creator pid and the free variables of a fun travel with the fun
-        // (erts encodes every local pid with the current node name).
-        OwnedTerm::Fun { pid, free_vars, .. } => {
-            let taken = std::mem::replace(pid.as_mut(), OwnedTerm::Nil);
-            *pid.as_mut() = relabel_local_node(taken, local, creation);
-            for var in free_vars.iter_mut() {
-                let taken = std::mem::replace(var, OwnedTerm::Nil);
-                *var = relabel_local_node(taken, local, creation);
-            }
-        }
         _ => {}
     }
     term
