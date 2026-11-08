@@ -111,6 +111,7 @@ pub struct NativeLines {
     /// The module's native PCs alone, parallel to `table`: the search keys of
     /// `lookup_loc`, so a probe touches eight bytes (erts keeps `loc_tab` compact).
     addresses: Option<Arc<[usize]>>,
+    files: Option<Arc<[NativeFile]>>,
     lo: u32,
     hi: u32,
 }
@@ -120,13 +121,15 @@ impl NativeLines {
     pub fn window(
         table: &Arc<[NativeLine]>,
         addresses: &Arc<[usize]>,
+        files: &Arc<[NativeFile]>,
         lo: usize,
         hi: usize,
     ) -> Self {
-        debug_assert_eq!(table.len(), addresses.len());
+        debug_assert_eq!(table.len() + 1, addresses.len());
         Self {
             table: Some(Arc::clone(table)),
             addresses: Some(Arc::clone(addresses)),
+            files: Some(Arc::clone(files)),
             lo: lo as u32,
             hi: hi as u32,
         }
@@ -136,20 +139,27 @@ impl NativeLines {
     /// (beam_ranges.c): a branching binary search over the compact PC table.
     #[inline]
     fn find(&self, address: usize) -> Option<&NativeLine> {
-        let keys = &self.addresses.as_deref()?[self.lo as usize..self.hi as usize];
-        let (mut low, mut high) = (0usize, keys.len());
-        while low < high {
+        let keys = self.addresses.as_deref()?;
+        let (mut low, mut high) = (self.lo as usize, self.hi as usize);
+        while high > low {
             let mid = low + (high - low) / 2;
-            let key = keys[mid];
-            if address < key {
+            if address < keys[mid] {
                 high = mid;
+            } else if address < keys[mid + 1] {
+                return self.table.as_deref()?.get(mid);
             } else {
                 low = mid + 1;
             }
         }
-        let index = low.checked_sub(1)?;
-        self.table.as_deref()?.get(self.lo as usize + index)
+        None
     }
+}
+
+/// One entry in the module's `BeamCodeLineTab.fname_ptr` table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeFile {
+    pub name: Arc<str>,
+    pub file_term: Option<Term>,
 }
 
 impl std::ops::Deref for NativeLines {
@@ -173,22 +183,23 @@ impl Eq for NativeLines {}
 pub struct NativeLine {
     /// Native address at which this source line becomes current.
     pub address: usize,
-    /// Source filename.
-    pub file: Arc<str>,
-    /// Cached literal filename list from the owning BEAM module.
-    pub file_term: Option<Term>,
-    /// One-based source line.
-    pub line: u32,
+    /// Packed `MAKE_LOCATION(file, line)` value; zero is invalid.
+    pub location: u32,
 }
 
 impl NativeFunction {
     /// Resolve a native return PC to the nearest preceding BEAM line marker.
     pub fn line_at(&self, address: usize) -> Option<(&str, u32)> {
-        // Line 0 marks a location erts cannot represent (LINE_INVALID_LOCATION).
-        self.line_table
-            .find(address)
-            .filter(|entry| entry.line != 0)
-            .map(|entry| (entry.file.as_ref(), entry.line))
+        let location = self.line_table.find(address)?.location;
+        if location == 0 {
+            return None;
+        }
+        let file = self
+            .line_table
+            .files
+            .as_deref()?
+            .get((location >> 24) as usize)?;
+        Some((file.name.as_ref(), location & 0x00ff_ffff))
     }
 }
 
@@ -201,6 +212,27 @@ pub(crate) struct NativeStackFrame {
     pub location: Option<(Term, u64)>,
     pub line: Option<u32>,
     pub file_term: Option<Term>,
+}
+
+/// `FunctionInfo` filled by `erts_lookup_function_info` for one native PC.
+// Port of erts/emulator/beam/global.h:964-973 (`FunctionInfo`), OTP-29.1.1.
+#[derive(Clone, Copy)]
+struct FunctionInfo<'a> {
+    mfa: Option<&'a NativeFunction>,
+    needed: usize,
+    loc: Option<&'a NativeLine>,
+    fname_ptr: Option<&'a [NativeFile]>,
+}
+
+impl<'a> FunctionInfo<'a> {
+    fn new() -> Self {
+        Self {
+            mfa: None,
+            needed: 5,
+            loc: None,
+            fname_ptr: None,
+        }
+    }
 }
 
 /// The functions of one native module version, ordered by address: the function table of its
@@ -224,8 +256,7 @@ pub(crate) struct ModuleRange {
     /// The code header's function table. `erts_lookup_function_info` binary-searches the
     /// function start addresses (beam_ranges.c:262-278), OTP-29.1.1.
     functions: FunctionTable,
-    /// Compact `BeamCodeHeader.functions`-shaped search keys. Keeping metadata out of this
-    /// array makes each binary-search probe touch only one address, as in erts.
+    /// `BeamCodeHeader.functions` search keys, including its one-past-last sentinel.
     function_starts: Arc<[usize]>,
 }
 
@@ -275,6 +306,7 @@ fn module_range(
         function_starts: functions
             .iter()
             .map(|function| function.start)
+            .chain(std::iter::once(end))
             .collect::<Vec<_>>()
             .into(),
         functions,
@@ -380,9 +412,8 @@ fn unpublish_native_module_range(scope: u64, start: usize, end: usize) {
     }
 }
 
-/// `find_range` (beam_ranges.c:307-327), OTP-29.1.1. The search starts at the last module
-/// that matched (`r[active].mid`); a miss falls back to the binary search and stores the hit.
-/// `hint` is the caller's last-hit index: each table of ranges has its own.
+/// `find_range` (beam_ranges.c:307-327), OTP-29.1.1. The search begins at the cached midpoint,
+/// narrows the module interval, and stores a hit as the next midpoint.
 fn find_range_with<'a>(
     ranges: &'a [ModuleRange],
     address: usize,
@@ -392,25 +423,19 @@ fn find_range_with<'a>(
     if len == 0 {
         return None;
     }
-    let cached = hint.load(Ordering::Relaxed).min(len - 1);
-    let mid = &ranges[cached];
-    if address >= mid.start && address < mid.end() {
-        return Some(mid);
-    }
-    // Port of beam_ranges.c:307-327 (`find_range`), OTP-29.1.1: a branching search with the
-    // range test inside the loop, so a repeated lookup is predicted and hits `return` at once.
     let (mut low, mut high) = (0usize, len);
+    let mut mid = hint.load(Ordering::Relaxed).min(len - 1);
     while low < high {
-        let mid = low + (high - low) / 2;
         let range = &ranges[mid];
         if address < range.start {
             high = mid;
-        } else if address < range.end() {
+        } else if address >= range.end() {
+            low = mid + 1;
+        } else {
             hint.store(mid, Ordering::Relaxed);
             return Some(range);
-        } else {
-            low = mid + 1;
         }
+        mid = low + (high - low) / 2;
     }
     None
 }
@@ -424,27 +449,22 @@ fn frame_in(
     line_file_terms: Option<&std::collections::HashMap<String, Term>>,
 ) -> Option<NativeStackFrame> {
     let range = find_range_with(ranges, address, hint)?;
-    let function = function_in(range, address)?;
-    // Port of beam_ranges.c:331 (`lookup_loc`): binary search the function's pc table,
-    // then index its parallel location table. Filenames remain module literals.
-    let loc = function
-        .line_table
-        .find(address)
-        .filter(|entry| entry.line != 0);
-    let file_term = loc.as_ref().and_then(|entry| {
-        entry
-            .file_term
-            .or_else(|| line_file_terms?.get(entry.file.as_ref()).copied())
-    });
-    let location = loc
-        .as_ref()
-        .and_then(|entry| file_term.map(|file| (file, u64::from(entry.line))));
+    let info = lookup_function_info(range, address, true);
+    let function = info.mfa?;
+    let loc = info.loc.map(|entry| entry.location).filter(|&loc| loc != 0);
+    let file = loc.and_then(|location| info.fname_ptr?.get((location >> 24) as usize));
+    let file_term = file
+        .and_then(|file| file.file_term)
+        .or_else(|| file.and_then(|file| line_file_terms?.get(file.name.as_ref()).copied()));
+    let location =
+        loc.and_then(|location| file_term.map(|file| (file, u64::from(location & 0x00ff_ffff))));
+    debug_assert_eq!(info.needed, if location.is_some() { 15 } else { 5 });
     Some(NativeStackFrame {
         module_atom: function.module_atom,
         function_atom: function.function_atom,
         arity: function.arity,
         location,
-        line: loc.map(|entry| entry.line),
+        line: loc.map(|location| location & 0x00ff_ffff),
         file_term,
     })
 }
@@ -464,7 +484,9 @@ pub(crate) fn stack_frame_in(
         return native_frame_at(address, line_file_terms);
     };
     static HINT: AtomicUsize = AtomicUsize::new(0);
-    frame_in(ranges, address, &HINT, line_file_terms)
+    // Code-index ranges carry the owning module's cached file term on each line entry, like
+    // erts' BeamCodeLineTab. The caller's module table is only available on registry fallback.
+    frame_in(ranges, address, &HINT, None)
 }
 
 /// Runs `visit` on the function of a registered native module that contains `address`.
@@ -478,23 +500,48 @@ fn lookup_function<R>(address: usize, visit: impl FnOnce(&NativeFunction) -> R) 
     Some(visit(function))
 }
 
-// Port of erts/emulator/beam/beam_ranges.c:262-278 (`erts_lookup_function_info`), OTP-29.1.1:
-// search the compact code-header function address table, then read metadata for the hit only.
-fn function_in(range: &ModuleRange, address: usize) -> Option<&NativeFunction> {
+// Port of erts/emulator/beam/beam_ranges.c:262-280 (`erts_lookup_function_info`), OTP-29.1.1.
+fn lookup_function_info<'a>(
+    range: &'a ModuleRange,
+    address: usize,
+    full_info: bool,
+) -> FunctionInfo<'a> {
+    let mut info = FunctionInfo::new();
     let starts = &*range.function_starts;
-    let (mut low, mut high) = (0usize, starts.len());
+    let (mut low, mut high) = (0usize, range.functions.len());
     while low < high {
         let mid = low + (high - low) / 2;
         if address < starts[mid] {
             high = mid;
-        } else if starts.get(mid + 1).is_none_or(|next| address < *next) {
-            let function = range.functions.get(mid)?;
-            return (address < function.end).then_some(function);
+        } else if address < starts[mid + 1] {
+            let function = &range.functions[mid];
+            info.mfa = Some(function);
+            if full_info {
+                lookup_loc(&mut info, function, address);
+            }
+            return info;
         } else {
             low = mid + 1;
         }
     }
-    None
+    info
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:331-363 (`lookup_loc`), OTP-29.1.1.
+fn lookup_loc<'a>(info: &mut FunctionInfo<'a>, function: &'a NativeFunction, address: usize) {
+    info.fname_ptr = function.line_table.files.as_deref();
+    info.loc = function.line_table.find(address);
+    if info.loc.is_some_and(|entry| entry.location == 0) {
+        return;
+    }
+    if info.loc.is_some() {
+        info.needed += 3 + 2 + 3 + 2;
+    }
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:262-280 (`erts_lookup_function_info`), OTP-29.1.1.
+fn function_in(range: &ModuleRange, address: usize) -> Option<&NativeFunction> {
+    lookup_function_info(range, address, false).mfa
 }
 
 fn native_generation() -> &'static AtomicU64 {
@@ -1790,7 +1837,7 @@ mod version_selection_tests {
     }
 
     #[test]
-    fn function_lookup_searches_compact_starts_then_checks_the_hit() {
+    fn function_lookup_uses_function_boundaries_with_end_sentinel() {
         let atoms = arinsal_term::global_atoms();
         let module_atom = atoms
             .intern("native_bridge_compact_functions")
@@ -1804,12 +1851,17 @@ mod version_selection_tests {
             Arc::from(vec![first.clone(), second.clone()]),
         );
 
-        similar_asserts::assert_eq!(range.function_starts.as_ref(), &[0x1000, 0x1020]);
+        similar_asserts::assert_eq!(range.function_starts.as_ref(), &[0x1000, 0x1020, 0x1040]);
         similar_asserts::assert_eq!(
             function_in(&range, 0x100f).map(|f| f.start),
             Some(first.start)
         );
-        similar_asserts::assert_eq!(function_in(&range, 0x1010), None);
+        // `functions[mid + 1]` bounds a function in erts, so intervening code bytes stay
+        // assigned to the preceding function until the next code-info entry.
+        similar_asserts::assert_eq!(
+            function_in(&range, 0x1010).map(|f| f.start),
+            Some(first.start)
+        );
         similar_asserts::assert_eq!(
             function_in(&range, 0x1020).map(|f| f.start),
             Some(second.start)

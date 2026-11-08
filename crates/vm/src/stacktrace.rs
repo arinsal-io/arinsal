@@ -1716,6 +1716,27 @@ pub(super) fn build(
     top: Option<&TopFrame>,
     depth: usize,
 ) -> Result<Term, VmError> {
+    build_with_reserve(modules, p, top, depth, None)
+}
+
+/// Build the live `process_info` stacktrace using `erts_build_stacktrace`'s per-frame heap
+/// reservations and the caller's remaining result reserve.
+pub(super) fn build_for_process_info(
+    modules: &[Arc<Module>],
+    p: &mut Process,
+    depth: usize,
+    reserve: &mut usize,
+) -> Result<Term, VmError> {
+    build_with_reserve(modules, p, None, depth, Some(reserve))
+}
+
+fn build_with_reserve(
+    modules: &[Arc<Module>],
+    p: &mut Process,
+    top: Option<&TopFrame>,
+    depth: usize,
+    reserve: Option<&mut usize>,
+) -> Result<Term, VmError> {
     // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
     let trapped = p.heap.abi.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = p.native_call_pc;
@@ -1748,7 +1769,11 @@ pub(super) fn build(
         &p.heap,
         depth,
     )?;
-    build_saved(p, &mut raw, modules)
+    if let Some(reserve) = reserve {
+        build_saved_with_reserve(p, &mut raw, modules, Some(reserve))
+    } else {
+        build_saved(p, &mut raw, modules)
+    }
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
@@ -2163,6 +2188,15 @@ pub(super) fn build_saved(
     raw: &mut RawTrace,
     fallback_modules: &[Arc<Module>],
 ) -> Result<Term, VmError> {
+    build_saved_with_reserve(p, raw, fallback_modules, None)
+}
+
+fn build_saved_with_reserve(
+    p: &mut Process,
+    raw: &mut RawTrace,
+    fallback_modules: &[Arc<Module>],
+    reserve: Option<&mut usize>,
+) -> Result<Term, VmError> {
     let top = raw
         .top
         .as_ref()
@@ -2222,6 +2256,7 @@ pub(super) fn build_saved(
                     native_top,
                     ranges: Some(ranges),
                     tables: Some(tables),
+                    reserve,
                 },
             )
         })
@@ -2237,6 +2272,7 @@ pub(super) fn build_saved(
                 native_top,
                 ranges: None,
                 tables: None,
+                reserve,
             },
         )
     }
@@ -2250,6 +2286,7 @@ struct SavedBuildContext<'a> {
     native_top: Option<usize>,
     ranges: Option<&'a [crate::native_bridge::ModuleRange]>,
     tables: Option<&'a crate::load::CodeTables>,
+    reserve: Option<&'a mut usize>,
 }
 
 fn build_saved_active(
@@ -2265,6 +2302,7 @@ fn build_saved_active(
         native_top,
         ranges,
         tables,
+        reserve,
     } = context;
     raw.frames.clear();
     // Upper bound per frame: 4-tuple, 3-element info list, file/line/error_info tuples
@@ -2313,7 +2351,11 @@ fn build_saved_active(
         raw.module = table_module;
     }
     let no_location = raw.no_location;
-    let mut heap = TraceHeap::with_block(&mut p.heap, block_words);
+    let mut heap = if reserve.is_some() {
+        TraceHeap::new(&mut p.heap)
+    } else {
+        TraceHeap::with_block(&mut p.heap, block_words)
+    };
     let current = raw.module.as_deref();
     let current_frame = if raw.no_current {
         None
@@ -2363,7 +2405,9 @@ fn build_saved_active(
         Built(Term),
         Plain(Plain),
     }
-    let mut items = Vec::new();
+    // Port of erl_bif_info.c:2408-2454 (`erts_build_stacktrace`) and beam_common.c:1265,
+    // OTP-29.1.1: allocate the frame-info array once before resolving and assembling frames.
+    let mut items = Vec::with_capacity(frame_budget);
     if let Some(TopFrame::Bif {
         module: bif_module,
         function: bif_function,
@@ -2489,33 +2533,77 @@ fn build_saved_active(
     }
     let file_atom = Term::atom(trace_atoms().file);
     let line_atom = Term::atom(trace_atoms().line);
-    let mut builder = TermBuilder::new(&mut heap);
     let mut list = Term::NIL;
-    for item in items.iter().rev() {
-        list = match item {
-            Item::Built(frame) => builder
-                .cons(*frame, list)
-                .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?,
-            Item::Plain(frame) => {
-                let location = frame
-                    .location
-                    .map(|(file, number)| arinsal_term::MfaLocation {
-                        file_atom,
-                        file,
-                        line_atom,
-                        line: Term::small(number as i64).expect("source line is a small"),
-                    });
-                builder
-                    .cons_mfa_frame(
-                        Term::atom(frame.module),
-                        Term::atom(frame.function),
-                        frame.args,
-                        location,
-                        list,
-                    )
-                    .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?
-            }
-        };
+    if let Some(reserve) = reserve {
+        // Port of erl_bif_info.c:2433-2454 (`erts_build_stacktrace`), OTP-29.1.1:
+        // size valid frames first, then allocate each frame and list cell while retaining the
+        // reserve needed by the enclosing process_info tuple.
+        debug_assert!(items.iter().all(|item| matches!(item, Item::Plain(_))));
+        *reserve += 3 + items
+            .iter()
+            .map(|item| match item {
+                Item::Plain(frame) => 7 + usize::from(frame.location.is_some()) * 10,
+                Item::Built(_) => 0,
+            })
+            .sum::<usize>();
+        drop(heap);
+        let mut heap = ProcessHeapHandle(&mut p.heap);
+        for item in items.iter().rev() {
+            let Item::Plain(frame) = item else {
+                continue;
+            };
+            let words = 7 + usize::from(frame.location.is_some()) * 10;
+            *reserve = reserve.saturating_sub(words);
+            let mut block = arinsal_term::HeapReservation::with_extra(&mut heap, words, *reserve)
+                .map_err(|error| {
+                VmError::Unsupported(format!("stacktrace allocation: {error:?}"))
+            })?;
+            let location = frame
+                .location
+                .map(|(file, number)| arinsal_term::MfaLocation {
+                    file_atom,
+                    file,
+                    line_atom,
+                    line: Term::small(number as i64).expect("source line is a small"),
+                });
+            list = TermBuilder::new(&mut block)
+                .cons_mfa_frame(
+                    Term::atom(frame.module),
+                    Term::atom(frame.function),
+                    frame.args,
+                    location,
+                    list,
+                )
+                .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?;
+        }
+    } else {
+        let mut builder = TermBuilder::new(&mut heap);
+        for item in items.iter().rev() {
+            list = match item {
+                Item::Built(frame) => builder
+                    .cons(*frame, list)
+                    .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?,
+                Item::Plain(frame) => {
+                    let location = frame
+                        .location
+                        .map(|(file, number)| arinsal_term::MfaLocation {
+                            file_atom,
+                            file,
+                            line_atom,
+                            line: Term::small(number as i64).expect("source line is a small"),
+                        });
+                    builder
+                        .cons_mfa_frame(
+                            Term::atom(frame.module),
+                            Term::atom(frame.function),
+                            frame.args,
+                            location,
+                            list,
+                        )
+                        .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?
+                }
+            };
+        }
     }
     Ok(list)
 }

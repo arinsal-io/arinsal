@@ -4,7 +4,7 @@ use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{
-    FunRef, HeapReservation, Identity, Term, TermBuilder, TermError, TermKind, global_atoms,
+    Atom, FunRef, HeapReservation, Identity, Term, TermBuilder, TermError, TermKind, global_atoms,
 };
 use std::sync::atomic::Ordering;
 
@@ -238,6 +238,7 @@ impl ProcessInfoScratch {
         }
     }
 
+    #[inline(always)]
     fn grow_for_push(&mut self) -> Option<usize> {
         if self.len < self.capacity() {
             return None;
@@ -267,14 +268,6 @@ impl ProcessInfoScratch {
         } else {
             self.spill[index]
         })
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        if self.spill.is_empty() {
-            &self.inline[..self.len]
-        } else {
-            &self.spill[..self.len]
-        }
     }
 }
 
@@ -333,6 +326,7 @@ struct ProcessInfoArgs {
     reserve_size: usize,
     singleton: bool,
     always_wrap: bool,
+    want_messages: bool,
 }
 
 impl ProcessInfoArgs {
@@ -343,10 +337,14 @@ impl ProcessInfoArgs {
             reserve_size: 0,
             singleton,
             always_wrap,
+            want_messages: false,
         }
     }
 
+    #[inline(always)]
     fn push(&mut self, index: u8, extra: Option<Term>) {
+        // Port of erts/emulator/beam/erl_bif_info.c:1334-1336 (`process_info_bif` flags), OTP-29.1.1.
+        self.want_messages |= index == 4;
         if let Some(new_size) = self.items.grow_for_push()
             && let Some(extras) = &mut self.extras
         {
@@ -365,6 +363,7 @@ impl ProcessInfoArgs {
         }
     }
 
+    #[inline(always)]
     fn parse(item: Option<Term>) -> Result<Self, VmError> {
         let Some(item) = item else {
             let mut args = Self::new(false, false);
@@ -704,17 +703,17 @@ fn process_info(
             args.always_wrap,
             status,
             &mut reserve,
+            &mut info_reds,
         );
         if charge {
-            charge_info_reductions(process, 1);
+            charge_info_reductions(process, info_reds);
         }
         return result;
     }
 
     // `part_res` is indexed by the process-info argument index, like erts' ERTS_PI_ARGS array.
     let mut part_res = [Term::NON_VALUE; PROCESS_INFO_ARG_COUNT];
-    if args.items.as_slice().contains(&4) {
-        info_reds = info_reds.saturating_add(1);
+    if args.want_messages {
         part_res[4] = process_info_aux(
             vm,
             src,
@@ -725,6 +724,7 @@ fn process_info(
             args.always_wrap,
             status,
             &mut reserve,
+            &mut info_reds,
         )?;
     }
 
@@ -733,7 +733,6 @@ fn process_info(
         if index == 38 || part_res[index] != Term::NON_VALUE {
             continue;
         }
-        info_reds = info_reds.saturating_add(1);
         part_res[index] = process_info_aux(
             vm,
             src,
@@ -744,6 +743,7 @@ fn process_info(
             args.always_wrap,
             status,
             &mut reserve,
+            &mut info_reds,
         )?;
     }
 
@@ -751,7 +751,6 @@ fn process_info(
     for item in (0..args.len()).rev() {
         let index = args.index(item);
         let pair = if index == 38 {
-            info_reds = info_reds.saturating_add(1);
             process_info_aux(
                 vm,
                 src,
@@ -762,6 +761,7 @@ fn process_info(
                 args.always_wrap,
                 status,
                 &mut reserve,
+                &mut info_reds,
             )?
         } else {
             let pair = part_res[index];
@@ -868,7 +868,9 @@ fn process_info_aux(
     always_wrap: bool,
     status: Term,
     reserve: &mut usize,
+    info_reds: &mut i32,
 ) -> Result<Term, VmError> {
+    *info_reds = info_reds.saturating_add(1);
     // Port of the `ERTS_PI_UNRESERVE(reserve_size, pi_ix2rsz(item_ix))` that starts `process_info_aux`
     // (erl_bif_info.c), OTP-29.1.1.
     info_unreserve(reserve, info_reserve_words(item_ix));
@@ -913,10 +915,10 @@ fn process_info_aux(
         arinsal_term::atoms::MESSAGES => process_info_item_messages(process)?,
         // Port of erts/emulator/beam/erl_bif_info.c:1964 (ERTS_PI_IX_DICTIONARY), OTP-29.1.1.
         arinsal_term::atoms::DICTIONARY => process_info_item_dictionary(process)?,
-        arinsal_term::atoms::TRAP_EXIT => atom(if src.read(process).trap_exit {
-            "true"
+        arinsal_term::atoms::TRAP_EXIT => Term::atom(if src.read(process).trap_exit {
+            arinsal_term::atoms::TRUE
         } else {
-            "false"
+            arinsal_term::atoms::FALSE
         }),
         arinsal_term::atoms::HEAP_SIZE => {
             let value = src.read(process).heap.heap_size_words();
@@ -987,7 +989,7 @@ fn process_info_aux(
             .group_leader_pid(pid)
             .to_term()
             .unwrap_or(Term::NIL),
-        arinsal_term::atoms::LINKS => process_info_item_links(process, pid)?,
+        arinsal_term::atoms::LINKS => process_info_item_links(process, reserve, info_reds)?,
         arinsal_term::atoms::MONITORS => process_info_item_monitors(process, pid)?,
         arinsal_term::atoms::MONITORED_BY => process_info_item_monitored_by(process, pid)?,
         // The queue mode is the process's own (erts p->sig_qs.flags FS_OFF_HEAP_MSGQ).
@@ -1012,10 +1014,9 @@ fn process_info_aux(
             // are per name; only these arms read it.
             let text = PROCESS_INFO_ARG_NAMES[item_ix];
             flag_value(src.read(process), text).unwrap_or_else(|| match text {
-                "priority" => atom("normal"),
-                "error_handler" => atom("error_handler"),
-                "sensitive" | "async_dist" => atom("false"),
-                "save_calls" => atom("false"),
+                "priority" => Term::atom(arinsal_term::atoms::NORMAL),
+                "error_handler" => Term::atom(arinsal_term::atoms::ERROR_HANDLER),
+                "sensitive" | "async_dist" | "save_calls" => Term::atom(arinsal_term::atoms::FALSE),
                 _ => Term::small(0).unwrap(),
             })
         }
@@ -1068,7 +1069,7 @@ fn process_info_aux(
         },
         arinsal_term::atoms::CURRENT_FUNCTION => process_info_item_current_function(vm, process)?,
         arinsal_term::atoms::CURRENT_LOCATION => process_info_item_current_location(vm, process)?,
-        arinsal_term::atoms::CURRENT_STACKTRACE => current_stacktrace(vm, process)?,
+        arinsal_term::atoms::CURRENT_STACKTRACE => current_stacktrace(vm, process, reserve)?,
         arinsal_term::atoms::GARBAGE_COLLECTION => {
             process_info_item_garbage_collection(src, process, *reserve)?
         }
@@ -1077,15 +1078,19 @@ fn process_info_aux(
         }
         // Port of erts/emulator/beam/erl_bif_info.c:2183 (ERTS_PI_IX_LAST_CALLS), OTP-29.1.1.
         arinsal_term::atoms::LAST_CALLS => match crate::trace::saved_calls(src.read(process)) {
-            None => atom("false"),
+            None => Term::atom(arinsal_term::atoms::FALSE),
             Some(calls) => {
                 // erts conses newest first, so the list starts with the oldest call.
                 let mut terms = Vec::with_capacity(calls.len());
                 for call in calls.iter().rev() {
                     terms.push(match call {
-                        crate::trace::SavedCall::Send => atom("send"),
-                        crate::trace::SavedCall::Receive => atom("receive"),
-                        crate::trace::SavedCall::Timeout => atom("timeout"),
+                        crate::trace::SavedCall::Send => Term::atom(arinsal_term::atoms::SEND),
+                        crate::trace::SavedCall::Receive => {
+                            Term::atom(arinsal_term::atoms::RECEIVE)
+                        }
+                        crate::trace::SavedCall::Timeout => {
+                            Term::atom(arinsal_term::atoms::TIMEOUT)
+                        }
                         crate::trace::SavedCall::Mfa(m, f, a) => make_tuple(
                             process,
                             &[
@@ -1131,12 +1136,14 @@ fn process_info_aux(
                 rp.parent,
                 rp.cold.as_ref().and_then(|c| c.parent_external.clone()),
             ) {
-                (Some(parent), _) => parent.to_term().unwrap_or_else(|| atom("undefined")),
+                (Some(parent), _) => parent
+                    .to_term()
+                    .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED)),
                 (None, Some(external)) => {
                     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                     arinsal_term::from_owned(&external, &mut heap).map_err(|_| badarg())?
                 }
-                (None, None) => atom("undefined"),
+                (None, None) => Term::atom(arinsal_term::atoms::UNDEFINED),
             }
         }
         // Port of erts/emulator/beam/erl_bif_info.c:2274-2323 (magic_ref, label,
@@ -1191,30 +1198,65 @@ fn process_info_item_dictionary(process: &mut Process) -> Result<Term, VmError> 
     })
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessInfoLinkInfo {
+    entity: Term,
+    named: i32,
+    kind: u32,
+    node: Term,
+    pid: Term,
+}
+
 #[inline(never)]
-fn process_info_item_links(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
-    Ok({
-        // Port of erts/emulator/beam/erl_bif_info.c (collect_one_link, OTP-29.1.1):
-        // omit links while unlink is pending, then cons in tree order.
-        let kind_port = crate::monitor_link::node_type::LINK_PORT;
-        let mut links = process
-            .links
-            .iter()
-            .filter(|node| node.unlinking() == 0 && node.kind() != kind_port)
-            .filter_map(|node| Pid::from_data(node.other()).to_term())
-            .collect::<Vec<_>>();
-        links.reverse();
-        let mut ports = process
-            .links
-            .iter()
-            .filter(|node| node.kind() == kind_port)
-            .map(|node| crate::proc_create::port_of_link_key(node.other()))
-            .collect::<Vec<_>>();
-        ports.sort_unstable();
-        links.extend(ports.into_iter().filter_map(Term::port));
-        let _ = pid;
-        make_list(process, links)?
-    })
+fn process_info_item_links(
+    process: &mut Process,
+    reserve: &mut usize,
+    info_reds: &mut i32,
+) -> Result<Term, VmError> {
+    // Port of MonitorInfoCollection and collect_one_link in
+    // erts/emulator/beam/erl_bif_info.c:528-590, OTP-29.1.1. The link arm uses the same 32-byte
+    // records and grows its scratch array by MI_INC (50) only when the first eligible link arrives.
+    const MI_INC: usize = 50;
+    let mut links = Vec::<ProcessInfoLinkInfo>::new();
+    let mut heap_words = 0usize;
+    let kind_port = crate::monitor_link::node_type::LINK_PORT;
+    for node in process.links.iter() {
+        if node.unlinking() != 0 {
+            continue;
+        }
+        let entity = if node.kind() == kind_port {
+            Term::port(crate::proc_create::port_of_link_key(node.other()))
+        } else {
+            Pid::from_data(node.other()).to_term()
+        };
+        if let Some(entity) = entity {
+            if links.len() == links.capacity() {
+                links.reserve_exact(MI_INC);
+            }
+            links.push(ProcessInfoLinkInfo {
+                entity,
+                named: 0,
+                kind: node.kind(),
+                node: Term::NIL,
+                pid: Term::NIL,
+            });
+            // collect_one_link adds `2 + NC_HEAP_SIZE(entity)`; pid and port terms are
+            // immediate in Arinsal, so NC_HEAP_SIZE is zero.
+            heap_words += 2;
+        }
+    }
+
+    *info_reds = info_reds.saturating_add((links.len() / 4) as i32);
+    *reserve += heap_words;
+    let mut result = Term::NIL;
+    for link in links {
+        info_unreserve(reserve, 2);
+        result = info_produce(process, *reserve, 2, |block| {
+            block.cons(link.entity, result)
+        })?;
+    }
+    Ok(result)
 }
 
 #[inline(never)]
@@ -1352,12 +1394,14 @@ fn process_info_item_binary(process: &mut Process) -> Result<Term, VmError> {
 #[inline(never)]
 fn process_info_item_initial_call(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {
     Ok({
-        let (module_name, function, arity) = initial_call_mfa(vm, process)?;
+        // Port of erts/emulator/beam/erl_bif_info.c (`process_info_aux`,
+        // ERTS_PI_IX_INITIAL_CALL), OTP-29.1.1: the spawn MFA is already atom-valued.
+        let (module, function, arity) = initial_call_atoms(vm, process)?;
         make_tuple(
             process,
             &[
-                Term::atom(global_atoms().intern(&module_name).map_err(|_| badarg())?),
-                atom(&function),
+                Term::atom(module),
+                Term::atom(function),
                 Term::small(arity as i64).unwrap(),
             ],
         )?
@@ -1370,12 +1414,14 @@ fn process_info_item_current_function(
     process: &mut Process,
 ) -> Result<Term, VmError> {
     Ok({
-        let (module_name, function, arity) = resolve_mfa(vm, process)?;
+        // Port of erts/emulator/beam/erl_bif_info.c (`current_function`), OTP-29.1.1:
+        // function metadata already carries the module and function atoms.
+        let (module, function, arity) = resolve_mfa_atoms(vm, process)?;
         make_tuple(
             process,
             &[
-                Term::atom(global_atoms().intern(&module_name).map_err(|_| badarg())?),
-                atom(&function),
+                Term::atom(module),
+                Term::atom(function),
                 Term::small(arity as i64).unwrap(),
             ],
         )?
@@ -1466,15 +1512,26 @@ fn process_info_item_garbage_collection(
     let minor_gcs = Term::small(i64::from(minor_gcs)).unwrap();
     info_produce(process, reserve, 5 * (3 + 2), |block| {
         let mut rows = [Term::NIL; 5];
-        for (row, (key, value)) in rows.iter_mut().zip([
-            (arinsal_term::atoms::MAX_HEAP_SIZE, limit),
-            (arinsal_term::atoms::MIN_BIN_VHEAP_SIZE, min_bin_vheap_size),
-            (arinsal_term::atoms::MIN_HEAP_SIZE, min_heap_size),
-            (arinsal_term::atoms::FULLSWEEP_AFTER, fullsweep_after),
+        for (row, (name, value)) in rows.iter_mut().zip([
+            (Term::atom(arinsal_term::atoms::MAX_HEAP_SIZE), limit),
+            (
+                Term::atom(arinsal_term::atoms::MIN_BIN_VHEAP_SIZE),
+                min_bin_vheap_size,
+            ),
+            (
+                Term::atom(arinsal_term::atoms::MIN_HEAP_SIZE),
+                min_heap_size,
+            ),
+            (
+                Term::atom(arinsal_term::atoms::FULLSWEEP_AFTER),
+                fullsweep_after,
+            ),
+            // Port of DECL_AM(minor_gcs) in erl_bif_info.c's process_info_aux: OTP interns this
+            // per item while the other four row keys are predeclared atoms.
+            (atom("minor_gcs"), minor_gcs),
         ]) {
-            *row = block.tuple(&[Term::atom(key), value])?;
+            *row = block.tuple(&[name, value])?;
         }
-        rows[4] = block.tuple(&[atom("minor_gcs"), minor_gcs])?;
         block.list_from_slice(&rows)
     })
 }
@@ -1994,20 +2051,19 @@ pub(crate) fn native_call_site(
     crate::native_function_at(pc).map(|function| (function, pc))
 }
 
-// Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
-/// `process_info(Pid, initial_call)` from `p->u.initial` (the spawn entry), then the
-/// current MFA. Spawn stores the entry as a module id and instruction.
-fn initial_call_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
+// Port of erts/emulator/beam/erl_bif_info.c (`process_info_aux`, ERTS_PI_IX_INITIAL_CALL),
+// OTP-29.1.1: the spawn entry stores module and function atoms, so no name interning is needed.
+fn initial_call_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u8), VmError> {
     if let Some((module, function, arity)) = process.initial_mfa {
-        let names = arinsal_term::global_atoms();
-        let text = |atom| names.text(atom).unwrap_or_default().to_owned();
-        return Ok((text(module), text(function), arity));
+        return Ok((module, function, arity));
     }
-    if let Some((module_id, ip)) = process.initial_call {
+    if let Some((module_index, ip)) = process.initial_call {
         let resolve = |modules: &[std::sync::Arc<crate::Module>]| {
-            let module = modules.get(module_id)?;
-            let (function, arity) = module.function_at(ip).unwrap_or(("undefined", 0));
-            Some((module.name.clone(), function.to_owned(), arity))
+            let module = modules.get(module_index)?;
+            let (function, arity) = module
+                .function_atom_at(ip)
+                .unwrap_or((arinsal_term::atoms::UNDEFINED, 0));
+            Some((module.name_atom, function, arity))
         };
         if let Some(found) = vm.and_then(|vm| resolve(&vm.code.modules)) {
             return Ok(found);
@@ -2020,7 +2076,59 @@ fn initial_call_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, Strin
             return Ok(found);
         }
     }
-    resolve_mfa(vm, process)
+    resolve_mfa_atoms(vm, process)
+}
+
+// Port of erts/emulator/beam/erl_bif_info.c (`current_function`), OTP-29.1.1. The regular
+// interpreter and native paths already expose MFA atoms; only synthetic trap metadata needs
+// interning because Arinsal currently stores those exceptional names as text.
+fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u8), VmError> {
+    let intern = |name: &str| global_atoms().intern(name).map_err(|_| badarg());
+    if let Some((module, function, arity)) =
+        process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
+    {
+        return Ok((intern(module)?, intern(function)?, arity));
+    }
+    if let Some((module, rest)) = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .and_then(|pending| pending.continuation.split_once(':'))
+        && let Some((function, arity)) = rest.rsplit_once('/')
+        && let Ok(arity) = arity.parse::<u8>()
+    {
+        return Ok((intern(module)?, intern(function)?, arity));
+    }
+    if process.native_retry() == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
+        return Ok((arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2));
+    }
+    if crate::signals::is_waiting_for_process_info(process) {
+        return Ok((arinsal_term::atoms::ERLANG, intern("process_info")?, 2));
+    }
+    if let Some((function, _)) = native_call_site(process) {
+        return Ok((function.module_atom, function.function_atom, function.arity));
+    }
+    let native_position = process
+        .native_pc()
+        .or_else(|| Some(process.heap.abi.i as usize).filter(|&pc| pc != 0));
+    if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
+        return Ok((function.module_atom, function.function_atom, function.arity));
+    }
+    let resolve = |modules: &[std::sync::Arc<crate::Module>]| {
+        let module = modules.get(process.module)?;
+        let (function, arity) = module
+            .function_atom_at(process.ip())
+            .unwrap_or((arinsal_term::atoms::UNDEFINED, 0));
+        Some((module.name_atom, function, arity))
+    };
+    if let Some(found) = vm.and_then(|vm| resolve(&vm.code.modules)) {
+        return Ok(found);
+    }
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.with_modules(resolve))
+        .ok_or_else(badarg)
 }
 
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
@@ -2268,7 +2376,11 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
     text.into_bytes()
 }
 
-fn current_stacktrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {
+fn current_stacktrace(
+    vm: Option<&Vm>,
+    process: &mut Process,
+    reserve: &mut usize,
+) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_info.c:2397-2404 (current_stacktrace), OTP-29.1.1:
     // erts reads the runtime-wide limit, shared by every scheduler.
     let depth = process.runtime.as_ref().map_or_else(
@@ -2276,10 +2388,17 @@ fn current_stacktrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, Vm
         |runtime| runtime.backtrace_depth.load(Ordering::Acquire),
     );
     if let Some(vm) = vm {
-        return crate::stacktrace::build(&vm.code.modules, process, None, depth);
+        return crate::stacktrace::build_for_process_info(
+            &vm.code.modules,
+            process,
+            depth,
+            reserve,
+        );
     }
     let runtime = process.runtime.ok_or_else(badarg)?;
-    runtime.with_modules(|modules| crate::stacktrace::build(modules, process, None, depth))
+    runtime.with_modules(|modules| {
+        crate::stacktrace::build_for_process_info(modules, process, depth, reserve)
+    })
 }
 
 pub(crate) fn live(process: &Process, pid: Pid) -> Result<bool, VmError> {
@@ -2516,6 +2635,7 @@ fn process_info_single(
     charge: bool,
 ) -> Result<Term, VmError> {
     let mut reserve = 3 + info_reserve_words(index);
+    let mut info_reds = 0;
     let result = process_info_aux(
         vm,
         src,
@@ -2526,9 +2646,10 @@ fn process_info_single(
         always_wrap,
         status,
         &mut reserve,
+        &mut info_reds,
     );
     if charge {
-        charge_info_reductions(process, 1);
+        charge_info_reductions(process, info_reds);
     }
     result
 }
@@ -2612,6 +2733,30 @@ fn process_info_call(
         crate::signals::Submit::Sent(_) => Err(crate::signals::await_reply()),
         crate::signals::Submit::Dead => Ok(atom("undefined")),
     }
+}
+
+/// Resolve the statically registered process-info BIFs without the generic string family.
+// Port of erts/emulator/beam/erl_bif_info.c:1555-1566 (`process_info_1/2`), OTP-29.1.1.
+pub(crate) fn process_info_handler(
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<super::ResolvedNative> {
+    (module == "erlang" && function == "process_info" && matches!(arity, 1 | 2))
+        .then_some(process_info_resolved)
+}
+
+fn process_info_resolved(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: super::NativeArgs<'_>,
+) -> Option<Result<Term, VmError>> {
+    args.with_values(process, |process, values| match values {
+        [target] => Some(process_info_call(vm, process, ctx, *target, None)),
+        [target, item] => Some(process_info_call(vm, process, ctx, *target, Some(*item))),
+        _ => None,
+    })
 }
 
 pub(crate) fn collect_heap(
@@ -4233,37 +4378,35 @@ fn stored_max_heap(process: &Process) -> crate::process::MaxHeap {
 
 fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result<Term, VmError> {
     let size = Term::small(i64::try_from(limit.size).map_err(|_| badarg())?).ok_or_else(badarg)?;
-    let pairs = [
-        (
-            Term::atom(arinsal_term::atoms::ERROR_LOGGER),
-            Term::atom(if limit.log {
-                arinsal_term::atoms::TRUE
-            } else {
-                arinsal_term::atoms::FALSE
-            }),
-        ),
-        (
-            Term::atom(arinsal_term::atoms::INCLUDE_SHARED_BINARIES),
-            Term::atom(if limit.include_shared_binaries {
-                arinsal_term::atoms::TRUE
-            } else {
-                arinsal_term::atoms::FALSE
-            }),
-        ),
-        (
-            Term::atom(arinsal_term::atoms::KILL),
-            Term::atom(if limit.kill {
-                arinsal_term::atoms::TRUE
-            } else {
-                arinsal_term::atoms::FALSE
-            }),
-        ),
-        (Term::atom(arinsal_term::atoms::SIZE), size),
+    // Port of erts/emulator/beam/erl_gc.c:3807 (`erts_max_heap_size_map`), OTP-29.1.1.
+    // Its fixed C arrays are already in flatmap atom order; the key tuple and map share one
+    // factory reservation in `erts_map_from_ks_and_vs`.
+    let keys = [
+        Term::atom(arinsal_term::atoms::ERROR_LOGGER),
+        Term::atom(arinsal_term::atoms::INCLUDE_SHARED_BINARIES),
+        Term::atom(arinsal_term::atoms::KILL),
+        Term::atom(arinsal_term::atoms::SIZE),
     ];
-    // Port of `erts_map_from_ks_and_vs` (erts/emulator/beam/erl_map.c), OTP-29.1.1: the key
-    // tuple and the map are one factory allocation of `1 + 3 + 2 * n` words.
+    let values = [
+        Term::atom(if limit.log {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        }),
+        Term::atom(if limit.include_shared_binaries {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        }),
+        Term::atom(if limit.kill {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        }),
+        size,
+    ];
     info_produce(process, 0, MAX_HEAP_SIZE_MAP_WORDS, |block| {
-        block.flatmap_from_pairs(&pairs)
+        block.flatmap_from_arrays(&keys, &values)
     })
 }
 

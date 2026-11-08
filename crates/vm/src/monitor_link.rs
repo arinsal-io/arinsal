@@ -703,6 +703,37 @@ impl<H: NodeHandle> MonLnkTree<H> {
         nodes
     }
 
+    /// Walk the tree in erts' postorder without first materializing its node pointers.
+    // Port of erts/emulator/beam/erl_monitor_link.c:1353 (`erts_link_tree_foreach`), OTP-29.1.1.
+    fn iter_nodes(&self) -> impl Iterator<Item = NodePtr> {
+        fn first_postorder(mut node: NodePtr) -> NodePtr {
+            loop {
+                while let Some(child) = left(node) {
+                    node = child;
+                }
+                match right(node) {
+                    Some(child) => node = child,
+                    None => return node,
+                }
+            }
+        }
+
+        fn next_postorder(node: NodePtr) -> Option<NodePtr> {
+            let parent = parent(node)?;
+            match right(parent).filter(|child| *child != node) {
+                Some(child) => Some(first_postorder(child)),
+                None => Some(parent),
+            }
+        }
+
+        let mut node = self.root.map(first_postorder);
+        std::iter::from_fn(move || {
+            let current = node?;
+            node = next_postorder(current);
+            Some(current)
+        })
+    }
+
     /// `erts_monitor_tree_foreach_delete` / `erts_link_tree_foreach_delete`: empty the tree,
     /// handing out its nodes in foreach order.
     pub(crate) fn drain(&mut self) -> smallvec::IntoIter<[H; 4]> {
@@ -1542,9 +1573,9 @@ impl<I, O, S> MonLnkTree<Monitor<I, O, S>> {
         self.get_mut(reference)?.origin_state()
     }
 
-    /// `erts_monitor_tree_foreach`.
+    /// Port of erts/emulator/beam/erl_monitor_link.c:710 (`erts_monitor_tree_foreach`), OTP-29.1.1.
     pub(crate) fn iter(&self) -> impl Iterator<Item = MonitorRef<'_, I, O, S>> {
-        self.nodes().into_iter().map(|node| MonitorRef {
+        self.iter_nodes().map(|node| MonitorRef {
             node,
             _monitor: PhantomData,
         })
@@ -1722,9 +1753,9 @@ impl MonLnkTree<Link> {
         })
     }
 
-    /// `erts_link_tree_foreach`.
+    /// Port of erts/emulator/beam/erl_monitor_link.c:1353 (`erts_link_tree_foreach`), OTP-29.1.1.
     pub(crate) fn iter(&self) -> impl Iterator<Item = LinkRef<'_>> {
-        self.nodes().into_iter().map(|node| LinkRef {
+        self.iter_nodes().map(|node| LinkRef {
             node,
             _link: PhantomData,
         })

@@ -741,6 +741,9 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     if let Some(handle) = env::handler(module, function, arity) {
         return Some(NativeEntry::Direct(handle));
     }
+    if let Some(handle) = proc::process_info_handler(module, function, arity) {
+        return Some(NativeEntry::Resolved(handle));
+    }
     if proc_claims(module, function) {
         return Some(NativeEntry::DirectFamily(proc::call));
     }
