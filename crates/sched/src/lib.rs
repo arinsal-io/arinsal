@@ -366,13 +366,30 @@ impl RunStateWord<'_> {
         decision
     }
 
-    /// As [`Self::yield_running`] for a dirty job, whose entry is not in a run queue list.
-    fn yield_running_dirty(&self, queue: usize, order: Ordering) {
+    /// A running process with work for the dirty run queue of `kind` schedules out to it:
+    /// `RUNNING` is cleared, the `DIRTY_*_PROC` bit set and the entry decided in one change.
+    /// No `IN_PRQ` bit is set; a dirty run queue keeps its own in `xstate`
+    /// ([`ProcShared::fin_dirty_enq_s_change`]).
+    // Port of erts/emulator/beam/erl_process.c:6489-6529 (check_dirty_enqueue_in_prio_queue)
+    // as schedule_out_process (erl_process.c:6695-6820) reaches it through
+    // check_enqueue_in_prio_queue, OTP-29.1.1: the process struct takes the entry unless it is
+    // already in a run queue (`IN_RUNQ`), then a proxy does.
+    fn yield_running_dirty(&self, kind: DirtyKind, queue: usize, order: Ordering) -> Enqueue {
+        let mut decision = Enqueue::Not;
         let _ = self.0.fetch_update(order, load_order(order), |mut word| {
-            word &= !psflg::RUNNING;
-            word |= psflg::ACTIVE | psflg::IN_RUNQ | (psflg::IN_PRQ_OFFSET_BIT << queue);
+            debug_assert_eq!(run_state_of(word), RUNNING);
+            word = (word & !psflg::RUNNING) | kind.state_flag();
+            if word & psflg::IN_RUNQ != 0 {
+                decision = Enqueue::Proxy;
+            } else {
+                word = (word & !psflg::PRQ_PRIO_MASK)
+                    | psflg::IN_RUNQ
+                    | ((queue as u32) << psflg::PRQ_PRIO_OFFSET);
+                decision = Enqueue::Real;
+            }
             Some(word)
         });
+        decision
     }
 
     /// A queued process gets an entry at a higher priority (`active_sys_enqueue`): `None` when
@@ -381,7 +398,9 @@ impl RunStateWord<'_> {
         let mut decision = Enqueue::Not;
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
-                if run_state_of(word) != QUEUED {
+                // A process with dirty work is queued on a dirty run queue; a normal
+                // scheduler must not run it (its signals go to a dirty signal handler).
+                if run_state_of(word) != QUEUED || word & psflg::DIRTY_WORK != 0 {
                     return None;
                 }
                 decision = check_enqueue(&mut word, queue);
@@ -398,15 +417,29 @@ impl RunStateWord<'_> {
     // psflg_band_mask clears the IN_PRQ bit of the queue and IN_RUNQ unless the entry is a
     // proxy), OTP-29.1.1.
     fn claim(&self, proxy: bool, queue: usize) -> bool {
+        self.claim_masked(proxy, !(psflg::IN_PRQ_OFFSET_BIT << queue), false)
+    }
+
+    /// [`Self::claim`] for an entry of a dirty run queue: `psflg_band_mask` keeps every
+    /// `IN_PRQ` bit (erl_process.c:10046-10052); the caller clears the `xstate` bit.
+    fn claim_dirty(&self, proxy: bool) -> bool {
+        self.claim_masked(proxy, !0, true)
+    }
+
+    /// A normal scheduler does not run a process with dirty work: erts schedules it out to its
+    /// dirty run queue (erl_process.c:10233 "Migrate to dirty scheduler"); here the process
+    /// already has its dirty entry, so the normal entry is only consumed.
+    fn claim_masked(&self, proxy: bool, band_mask: u32, dirty_sched: bool) -> bool {
         let mut runs = false;
         let _ = self
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
-                word &= !(psflg::IN_PRQ_OFFSET_BIT << queue);
+                word &= band_mask;
                 if !proxy {
                     word &= !psflg::IN_RUNQ;
                 }
-                runs = word & RUN_STATE_MASK == psflg::ACTIVE;
+                runs = word & RUN_STATE_MASK == psflg::ACTIVE
+                    && (dirty_sched || word & psflg::DIRTY_WORK == 0);
                 if runs {
                     word |= psflg::RUNNING;
                 }
@@ -427,8 +460,6 @@ const fn load_order(order: Ordering) -> Ordering {
 
 const PID_LIMIT: u32 = 1 << 28;
 const UNBOUND_WORKER: usize = usize::MAX;
-const QUEUE_COUNT_SHIFT: u32 = 32;
-const QUEUE_COUNT_UNIT: u64 = 1_u64 << QUEUE_COUNT_SHIFT;
 
 /// OTP 29.1.1's default microstate categories for this build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -810,6 +841,23 @@ pub enum DirtyKind {
 }
 
 impl DirtyKind {
+    /// `ERTS_PXSFLGS_IN_CPU_PRQ_MASK_OFFSET` / `ERTS_PXSFLGS_IN_IO_PRQ_MASK_OFFSET`
+    /// (erl_process.h:1418-1419).
+    fn xstate_prq_offset(self) -> u32 {
+        match self {
+            Self::Cpu => 0,
+            Self::Io => 4,
+        }
+    }
+
+    /// `ERTS_PSFLG_DIRTY_CPU_PROC` / `ERTS_PSFLG_DIRTY_IO_PROC`.
+    fn state_flag(self) -> u32 {
+        match self {
+            Self::Cpu => psflg::DIRTY_CPU_PROC,
+            Self::Io => psflg::DIRTY_IO_PROC,
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             Self::Cpu => 0,
@@ -1460,14 +1508,13 @@ struct ProcShared<M: SignalMessage> {
     input: Incoming<Event<M>>,
     /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
     wait_timer_worker: AtomicUsize,
-    /// Dirty run queue that owns this process: 0 normal, 1 dirty CPU, 2 dirty I/O.
-    /// Port of erl_process.h (`ERTS_PSFLG_DIRTY_CPU_PROC`, `ERTS_PSFLG_DIRTY_IO_PROC`), OTP-29.1.1.
-    dirty: AtomicU8,
+    /// `p->xstate`: the `ERTS_PXSFLG_IN_CPU_PRQ_*` / `ERTS_PXSFLG_IN_IO_PRQ_*` bits, the
+    /// priority queues of the dirty run queues the process has an entry in.
+    /// Port of erts/emulator/beam/erl_process.h:1390-1425, OTP-29.1.1.
+    xstate: AtomicU32,
     /// One plus the dirty thread slot executing this process, 0 when not executing dirty.
     /// Port of erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
     dirty_runner: AtomicUsize,
-    /// Priority level whose run queue length counts this queued process.
-    queued_prio: AtomicU8,
 }
 
 struct Process<T: Task> {
@@ -1485,6 +1532,53 @@ impl<T: Task> std::ops::Deref for Process<T> {
 }
 
 impl<M: SignalMessage> ProcShared<M> {
+    /// The dirty run queue the process has work for (`ERTS_PSFLG_DIRTY_CPU_PROC` /
+    /// `ERTS_PSFLG_DIRTY_IO_PROC`).
+    fn dirty_kind(&self) -> Option<DirtyKind> {
+        let state = self.input.state().load(Ordering::Acquire);
+        if state & psflg::DIRTY_CPU_PROC != 0 {
+            Some(DirtyKind::Cpu)
+        } else if state & psflg::DIRTY_IO_PROC != 0 {
+            Some(DirtyKind::Io)
+        } else {
+            None
+        }
+    }
+
+    /// Claim priority queue `queue` of the dirty run queue of `kind` for a new entry; `false`
+    /// when the process already has one there. A process struct reserved for the entry
+    /// (`IN_RUNQ` set by the caller's state change) is released again then.
+    // Port of erts/emulator/beam/erl_process.c:6532-6565 (fin_dirty_enq_s_change),
+    // OTP-29.1.1. The reference count erts drops for a free process belongs to its own
+    // refcounting of queued structs; a `ProcRef` entry holds its own reference.
+    fn fin_dirty_enq_s_change(
+        &self,
+        pstruct_reserved: bool,
+        queue: usize,
+        kind: DirtyKind,
+    ) -> bool {
+        let qbit = 1_u32 << (queue as u32 + kind.xstate_prq_offset());
+        if self.xstate.fetch_or(qbit, Ordering::SeqCst) & qbit != 0 {
+            if pstruct_reserved {
+                let state = self
+                    .input
+                    .state()
+                    .fetch_and(!psflg::IN_RUNQ, Ordering::Relaxed);
+                debug_assert!(state & psflg::IN_RUNQ != 0);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// The entry of priority queue `queue` left the dirty run queue of `kind`.
+    // Port of erts/emulator/beam/erl_process.c:4288 (clear_proc_dirty_queue_bit), OTP-29.1.1.
+    fn clear_dirty_queue_bit(&self, queue: usize, kind: DirtyKind) {
+        let qbit = 1_u32 << (queue as u32 + kind.xstate_prq_offset());
+        let old = self.xstate.fetch_and(!qbit, Ordering::SeqCst);
+        debug_assert!(old & qbit != 0);
+    }
+
     /// The scheduling bits of the process state word (`p->state`).
     fn run_state(&self) -> RunStateWord<'_> {
         RunStateWord(self.input.state())
@@ -1920,9 +2014,8 @@ impl<T: Task> ProcessTable<T> {
                     wait_timer: AtomicU64::new(0),
                     input: Incoming::default(),
                     wait_timer_worker: AtomicUsize::new(0),
-                    dirty: AtomicU8::new(0),
+                    xstate: AtomicU32::new(0),
                     dirty_runner: AtomicUsize::new(0),
-                    queued_prio: AtomicU8::new(0),
                 },
                 cell: parking_lot::Mutex::new(TaskCell::uninit()),
             },
@@ -2267,6 +2360,11 @@ struct Scheduled<T: Task> {
     kind: Enqueue,
     /// The priority queue the entry is in or goes to.
     queue: usize,
+    /// The priority the entry is counted at in the run queue lengths: `prio` of
+    /// `enqueue_process`, read back as the entry's `ERTS_PSFLGS_GET_PRQ_PRIO` by
+    /// `dequeue_process` (erl_process.c:3951-4030), OTP-29.1.1. Unlike `queue` it tells low
+    /// from normal.
+    prio: u8,
     /// Port of erts/emulator/beam/erl_process.h (`Process.schedule_count`), OTP-29.1.1:
     /// times the entry reaches the head of the normal queue before it runs.
     schedule_count: u8,
@@ -2274,28 +2372,39 @@ struct Scheduled<T: Task> {
 
 impl<T: Task> Scheduled<T> {
     fn new(process: ProcRef<T>) -> Self {
-        // Port of erts/emulator/beam/erl_process.c:3957 (enqueue_process), OTP-29.1.1.
-        let schedule_count = if process.priority() == Priority::Low {
+        let prio = process.priority().index();
+        Self::at_prio(process, Enqueue::Real, prio)
+    }
+
+    /// An entry of `kind` enqueued at priority `prio`.
+    // Port of erts/emulator/beam/erl_process.c:3957 (enqueue_process: `schedule_count`
+    // from the enqueue priority), OTP-29.1.1.
+    fn at_prio(process: ProcRef<T>, kind: Enqueue, prio: usize) -> Self {
+        let schedule_count = if prio == balance::PRIORITY_LOW {
             balance::RESCHEDULE_LOW
         } else {
             1
         };
-        let queue = queue_index(process.priority().index());
         Self {
             process,
-            kind: Enqueue::Real,
-            queue,
+            kind,
+            queue: queue_index(prio),
+            prio: prio as u8,
             schedule_count,
         }
     }
 
-    /// An entry of the given kind (what `check_enqueue_in_prio_queue` decided).
+    /// An entry of the given kind (what `check_enqueue_in_prio_queue` decided) for priority
+    /// queue `queue`: the process's own priority when that is the queue's level, else the
+    /// elevated level of the queue (a proxy of `active_sys_enqueue`).
     fn with_kind(process: ProcRef<T>, kind: Enqueue, queue: usize) -> Self {
-        Self {
-            kind,
-            queue,
-            ..Self::new(process)
-        }
+        let actual = process.priority().index();
+        let prio = if queue_index(actual) == queue {
+            actual
+        } else {
+            queue
+        };
+        Self::at_prio(process, kind, prio)
     }
 
     /// Run queue priority queue of this entry: low priority processes share the normal
@@ -2319,7 +2428,6 @@ struct TimerService<M> {
 
 struct LocalInit<T: Task> {
     worker_id: usize,
-    balance: Arc<balance::Balance<T>>,
     timer_service: TimerService<T::Message>,
     message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     pending_waits: Vec<PendingWait<T>>,
@@ -2348,7 +2456,6 @@ impl<T: Task> LocalInit<T> {
     fn into_local(self) -> Local<T> {
         Local {
             worker_id: self.worker_id,
-            balance: self.balance,
             timer_service: Rc::new(RefCell::new(self.timer_service)),
             message_slabs: self.message_slabs,
             pending_waits: self.pending_waits,
@@ -2512,55 +2619,25 @@ struct MsbExec {
 /// One dirty scheduler pool: a single run queue shared by all of its threads.
 ///
 /// Port of erts/emulator/beam/erl_process.c:6050 (`ERTS_DIRTY_CPU_RUNQ`,
-/// `ERTS_DIRTY_IO_RUNQ`), OTP-29.1.1.
+/// `ERTS_DIRTY_IO_RUNQ`), OTP-29.1.1: the process part is the same `ErtsRunQueue.procs` as a
+/// normal run queue's (intrusive priority lists, `rq->len`, `procs.prio_info[].len`), filled by
+/// the same `enqueue_process` and emptied by the same `dequeue_process`.
 struct DirtyPool<T: Task> {
-    queue: Mutex<DirtyQueue<T>>,
+    /// `rq->procs` of the dirty run queue.
+    procs: run_queue::ProcQueues<T>,
+    queue: Mutex<DirtyQueue>,
     online: AtomicUsize,
     threads: Vec<DirtyThread>,
     /// Global dirty slot of this pool's first thread.
     first_slot: usize,
 }
 
-struct DirtyQueue<T: Task> {
+struct DirtyQueue {
     /// Sleeping dirty schedulers of this pool, the most recent last.
     /// Port of erts/emulator/beam/erl_process.c (`ErtsRunQueue.sleepers`), OTP-29.1.1.
+    /// A thread looks at `procs` while it holds this lock and only then joins the sleepers,
+    /// and an enqueuer takes this lock after its entry is linked, so no wake-up is lost.
     sleepers: VecDeque<usize>,
-    /// Queued processes with their `schedule_count`; low priority shares the normal queue.
-    by_priority: [VecDeque<(ProcRef<T>, u8)>; 4],
-    len: usize,
-}
-
-impl<T: Task> DirtyQueue<T> {
-    /// Port of erts/emulator/beam/erl_process.c:3951 (enqueue_process), OTP-29.1.1.
-    fn push(&mut self, process: ProcRef<T>) {
-        let priority = process.priority().index();
-        let schedule_count = if priority == balance::PRIORITY_LOW {
-            balance::RESCHEDULE_LOW
-        } else {
-            1
-        };
-        self.by_priority[queue_index(priority)].push_back((process, schedule_count));
-        self.len += 1;
-    }
-
-    /// Port of erts/emulator/beam/erl_process.c:4040 (check_requeue_process) and
-    /// erl_process.c:9988-10020 (pick_next_process), OTP-29.1.1.
-    fn pop(&mut self) -> Option<ProcRef<T>> {
-        let queue = self
-            .by_priority
-            .iter_mut()
-            .find(|queue| !queue.is_empty())?;
-        loop {
-            let (process, mut schedule_count) = queue.pop_front()?;
-            schedule_count = schedule_count.saturating_sub(1);
-            if schedule_count > 0 && !queue.is_empty() {
-                queue.push_back((process, schedule_count));
-                continue;
-            }
-            self.len -= 1;
-            return Some(process);
-        }
-    }
 }
 
 /// Active ns, microstate ns, and run queue length per dirty pool (CPU, then I/O).
@@ -2662,7 +2739,7 @@ impl<T: Task> DirtyPool<T> {
     /// spinning; nothing when all are busy.
     // Port of erts/emulator/beam/erl_process.c (wake_dirty_scheduler: `sleepers.list->next`
     // is the most recently inserted sleeper), OTP-29.1.1.
-    fn wake_one(&self, queue: &mut DirtyQueue<T>) {
+    fn wake_one(&self, queue: &mut DirtyQueue) {
         let online = self.online.load(Ordering::Acquire);
         let Some(position) = queue.sleepers.iter().rposition(|&index| index < online) else {
             return;
@@ -2692,10 +2769,9 @@ impl<T: Task> DirtyPool<T> {
 
     fn new(threads: usize, first_slot: usize) -> Self {
         Self {
+            procs: run_queue::ProcQueues::new(),
             queue: Mutex::new(DirtyQueue {
                 sleepers: VecDeque::new(),
-                by_priority: std::array::from_fn(|_| VecDeque::new()),
-                len: 0,
             }),
             online: AtomicUsize::new(threads),
             threads: (0..threads)
@@ -2758,20 +2834,28 @@ impl<T: Task> Inner<T> {
         }
     }
 
-    // Port of erts/emulator/beam/erl_process.c:6403 (schedule_dirty / enqueue on the
-    // dirty run queue), OTP-29.1.1.
-    fn enqueue_dirty(&self, process: ProcRef<T>, kind: DirtyKind) {
-        process
-            .dirty
-            .store(kind.index() as u8 + 1, Ordering::Release);
-        let pool = &self.dirty[kind.index()];
-        if let Some(sim) = &self.sim {
-            sim.lock().unwrap().queue.push_back(Scheduled::new(process));
+    /// Put the entry `schedule_out` decided for a process with dirty work on the dirty run
+    /// queue of `kind`.
+    // Port of erts/emulator/beam/erl_process.c:6631-6660 (select_enqueue_run_queue for
+    // ERTS_ENQUEUE_DIRTY_*_QUEUE, with fin_dirty_enq_s_change) and erl_process.c:6845-6865
+    // (schedule_out_process: enqueue_process on that run queue, smp_notify_inc_runq),
+    // OTP-29.1.1.
+    fn enqueue_dirty(&self, item: Scheduled<T>, kind: DirtyKind) {
+        if item.kind == Enqueue::Not
+            || !item
+                .process
+                .fin_dirty_enq_s_change(item.kind == Enqueue::Real, item.queue, kind)
+        {
             return;
         }
+        let pool = &self.dirty[kind.index()];
+        if let Some(sim) = &self.sim {
+            sim.lock().unwrap().queue.push_back(item);
+            return;
+        }
+        pool.procs.push(item);
         {
             let mut queue = pool.queue.lock().unwrap();
-            queue.push(process);
             // While multi-scheduling is blocked a wake-up is a state change for everyone.
             if self.scheduling_blocked.load(Ordering::Acquire) {
                 drop(queue);
@@ -2792,8 +2876,7 @@ impl<T: Task> Inner<T> {
 
     /// Highest dirty priority (lowest index) queued in `kind`'s pool.
     fn dirty_best_priority(&self, kind: DirtyKind) -> Option<usize> {
-        let queue = self.dirty[kind.index()].queue.lock().unwrap();
-        queue.by_priority.iter().position(|queue| !queue.is_empty())
+        self.dirty[kind.index()].procs.best_priority()
     }
 
     /// Hand execution from the blocking normal scheduler to a dirty scheduler when dirty
@@ -2881,7 +2964,7 @@ impl<T: Task> Inner<T> {
     /// Port of erts/emulator/beam/erl_process.h:1367 (`ERTS_PROC_IN_DIRTY_STATE`), OTP-29.1.1:
     /// queued on or executing on a dirty scheduler.
     fn in_dirty_state(process: &Process<T>) -> bool {
-        process.dirty.load(Ordering::SeqCst) != 0
+        process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_WORK != 0
             || process.dirty_runner.load(Ordering::SeqCst) != 0
     }
 
@@ -2916,7 +2999,7 @@ impl<T: Task> Inner<T> {
                 active[index].push(thread_active);
                 msacc[index].push(thread_msacc);
             }
-            lengths[index] = pool.queue.lock().unwrap().len as u64;
+            lengths[index] = pool.procs.total_len().max(0) as u64;
         }
         (active, msacc, lengths)
     }
@@ -3446,7 +3529,9 @@ impl<T: Task> Inner<T> {
         self.push_run_queue(scheduler, item, false);
     }
 
-    // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
+    /// The process becomes active on run queue `worker` (it was active already when
+    /// `already_active`). The queue lengths are counted per entry by the run queue itself
+    /// (`enqueue_process`); this keeps the active-process count of each run queue.
     fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
         // Simulation runs one worker but keeps the configured scheduler ids.
         let worker = worker.min(self.worker_counts.len() - 1);
@@ -3458,34 +3543,23 @@ impl<T: Task> Inner<T> {
             self.worker_counts[previous]
                 .0
                 .fetch_sub(1, Ordering::Relaxed);
-            self.worker_counts[worker]
-                .0
-                .fetch_add(QUEUE_COUNT_UNIT + 1, Ordering::Relaxed);
-        } else {
-            self.worker_counts[worker].0.fetch_add(
-                QUEUE_COUNT_UNIT + u64::from(!already_active),
-                Ordering::Relaxed,
-            );
+            self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
+        } else if !already_active {
+            self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
         }
         process.scheduler_id.store(worker, Ordering::Relaxed);
-        self.balance
-            .enqueued(process.priority().index(), &process.queued_prio, worker);
     }
 
+    /// The process runs on `worker`; the active count moves with it.
     fn record_running(&self, process: &Process<T>, worker: usize) {
         let previous = process
             .scheduler_id
             .load(Ordering::Relaxed)
             .min(self.worker_counts.len() - 1);
-        self.balance.dequeued(&process.queued_prio, previous);
-        if previous == worker {
-            self.worker_counts[worker]
-                .0
-                .fetch_sub(QUEUE_COUNT_UNIT, Ordering::Relaxed);
-        } else {
+        if previous != worker {
             self.worker_counts[previous]
                 .0
-                .fetch_sub(QUEUE_COUNT_UNIT + 1, Ordering::Relaxed);
+                .fetch_sub(1, Ordering::Relaxed);
             self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
         }
         process.scheduler_id.store(worker, Ordering::Relaxed);
@@ -3550,6 +3624,20 @@ impl<T: Task> Inner<T> {
         // Worker-owned deltas remain local; statistics readers aggregate them on demand.
     }
 
+    /// `rq->len` of each normal run queue: the process entries and ports it holds.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:9240 (run_queues_len_aux), OTP-29.1.1.
+    fn run_queue_lengths(&self) -> Vec<u64> {
+        (0..self.worker_counts.len())
+            .map(|ix| {
+                self.balance
+                    .rqs
+                    .get(ix)
+                    .map_or(0, |rq| rq.total_len().max(0) as u64)
+            })
+            .collect()
+    }
+
     /// Queued ports of each run queue (`rq->ports.info.len`, part of `rq->len` in
     /// erl_process.c:9240 run_queues_len_aux).
     fn queued_ports(&self) -> Vec<u64> {
@@ -3571,17 +3659,16 @@ impl<T: Task> Inner<T> {
             .collect();
         let dirty = self.dirty_stats();
         let ports = self.queued_ports();
+        // The simulator keeps runnable processes in its own queue, not in the run queues, so
+        // their entries are counted from the per-worker counts here.
+        let queued: Vec<u64> = counts
+            .iter()
+            .zip(&ports)
+            .map(|(value, ports)| value + ports)
+            .collect();
         SchedulerStats {
-            run_queue_lengths: counts
-                .iter()
-                .zip(&ports)
-                .map(|(value, ports)| (value >> QUEUE_COUNT_SHIFT) + ports)
-                .collect(),
-            active_tasks: counts
-                .iter()
-                .zip(&ports)
-                .map(|(value, ports)| (value & (QUEUE_COUNT_UNIT - 1)) + ports)
-                .collect(),
+            run_queue_lengths: queued.clone(),
+            active_tasks: queued,
             active_ns: self
                 .worker_stats
                 .iter()
@@ -3663,17 +3750,16 @@ impl<T: Task> Inner<T> {
         }
         let dirty = self.dirty_stats();
         let ports = self.queued_ports();
+        // The simulator keeps runnable processes in its own queue, not in the run queues, so
+        // their entries are counted from the per-worker counts here.
+        let queued: Vec<u64> = counts
+            .iter()
+            .zip(&ports)
+            .map(|(value, ports)| value + ports)
+            .collect();
         SchedulerStats {
-            run_queue_lengths: counts
-                .iter()
-                .zip(&ports)
-                .map(|(value, ports)| (value >> QUEUE_COUNT_SHIFT) + ports)
-                .collect(),
-            active_tasks: counts
-                .iter()
-                .zip(&ports)
-                .map(|(value, ports)| (value & (QUEUE_COUNT_UNIT - 1)) + ports)
-                .collect(),
+            run_queue_lengths: queued.clone(),
+            active_tasks: queued,
             active_ns: snapshots
                 .iter()
                 .map(|snapshot| snapshot.active_ns)
@@ -3718,20 +3804,7 @@ impl<T: Task> Inner<T> {
             .iter()
             .map(|worker| worker.context_switches.load(Ordering::Relaxed))
             .sum();
-        let run_queue = self
-            .worker_counts
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let queued = value.0.load(Ordering::Relaxed) >> QUEUE_COUNT_SHIFT;
-                let ports = self
-                    .balance
-                    .rqs
-                    .get(index)
-                    .map_or(0, |rq| rq.len(balance::PORT_PRIO_LEVEL).max(0) as u64);
-                queued + ports
-            })
-            .sum();
+        let run_queue = self.run_queue_lengths().into_iter().sum();
         (run_queue, reductions, context_switches)
     }
 
@@ -4095,7 +4168,7 @@ impl<T: Task> Inner<T> {
         if Self::in_dirty_state(&process) {
             self.notify_dirty_signal_handler(&process, Some(priority));
         }
-        if priority.index() < before.index() && process.dirty.load(Ordering::Acquire) == 0 {
+        if priority.index() < before.index() {
             let queue = queue_index(priority.index());
             // Port of erts/emulator/beam/erl_process.c:7028 (active_sys_enqueue): a queued process
             // gets an entry at the higher priority unless it already has one there or higher.
@@ -4103,8 +4176,8 @@ impl<T: Task> Inner<T> {
                 && kind != Enqueue::Not
             {
                 let item = Scheduled::with_kind(process.clone(), kind, queue);
-                // The extra entry is not counted in run queue lengths: the process is
-                // already counted where its first entry sits.
+                // The extra entry counts in the run queue lengths like any other entry
+                // (enqueue_process does not tell proxies apart).
                 if let Some(sim) = &self.sim {
                     sim.lock().unwrap().queue.push_back(item);
                 } else if let Some(worker) = process.bound_worker() {
@@ -4990,7 +5063,6 @@ struct PendingWait<T: Task> {
 
 struct Local<T: Task> {
     worker_id: usize,
-    balance: Arc<balance::Balance<T>>,
     timer_service: Rc<RefCell<TimerService<T::Message>>>,
     message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     /// Receive timeouts not yet published to the wheel.
@@ -5112,11 +5184,12 @@ impl<T: Task> Local<T> {
         self.metric_deltas[worker] += delta;
     }
 
+    /// See `Inner::record_queued`; the run queue lengths are counted by the run queue.
     fn record_queued(&mut self, process: &Process<T>, worker: usize, already_active: bool) {
         process.scheduler_id.store(worker, Ordering::Relaxed);
-        self.adjust_metric(worker, QUEUE_COUNT_UNIT as i64 + i64::from(!already_active));
-        self.balance
-            .enqueued(process.priority().index(), &process.queued_prio, worker);
+        if !already_active {
+            self.adjust_metric(worker, 1);
+        }
     }
 
     fn record_running(&mut self, process: &Process<T>, worker: usize) {
@@ -5124,11 +5197,8 @@ impl<T: Task> Local<T> {
             .scheduler_id
             .load(Ordering::Relaxed)
             .min(self.metric_deltas.len() - 1);
-        self.balance.dequeued(&process.queued_prio, previous);
-        if previous == worker {
-            self.adjust_metric(worker, -(QUEUE_COUNT_UNIT as i64));
-        } else {
-            self.adjust_metric(previous, -(QUEUE_COUNT_UNIT as i64 + 1));
+        if previous != worker {
+            self.adjust_metric(previous, -1);
             self.adjust_metric(worker, 1);
         }
         process.scheduler_id.store(worker, Ordering::Relaxed);
@@ -5147,10 +5217,8 @@ impl<T: Task> Local<T> {
             .scheduler_id
             .load(Ordering::Relaxed)
             .min(self.metric_deltas.len() - 1);
-        self.adjust_metric(previous, -(QUEUE_COUNT_UNIT as i64 + 1));
-        self.adjust_metric(target, QUEUE_COUNT_UNIT as i64 + 1);
-        self.balance
-            .migrated(&process.queued_prio, previous, target);
+        self.adjust_metric(previous, -1);
+        self.adjust_metric(target, 1);
         process.scheduler_id.store(target, Ordering::Relaxed);
     }
 
@@ -6082,7 +6150,7 @@ impl<T: Task> Runner<'_, T> {
             gc_accounted_total: 0,
             sys_task_run: false,
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
-            dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
+            dirty_queued: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_WORK != 0
                 && process.dirty_runner.load(Ordering::SeqCst) == 0,
         };
         handle(task, &mut ctx)
@@ -6744,7 +6812,6 @@ impl<T: Task> Scheduler<T> {
         for worker_id in 0..workers {
             locals.push(LocalInit {
                 worker_id,
-                balance: balance.clone(),
                 timer_service: TimerService {
                     wheel: Wheel::new(now).for_worker(worker_id),
                     commands: timer_commands[worker_id].clone(),
@@ -8041,11 +8108,7 @@ impl<T: Task> Scheduler<T> {
             let index = ready[sim.rng.next_u64() as usize % ready.len()];
             sim.queue.remove(index).unwrap()
         };
-        let dirty = match item.process.dirty.load(Ordering::Acquire) {
-            1 => Some(DirtyKind::Cpu),
-            2 => Some(DirtyKind::Io),
-            _ => None,
-        };
+        let dirty = item.process.dirty_kind();
         // A task stepping a simulation from inside its own slice gets a scheduler of its own.
         match self.inner.sim_data.try_lock() {
             Ok(mut data) => run_one(&self.inner, item, &mut data, None, dirty),
@@ -8488,12 +8551,65 @@ mod dirty_state_tests {
         let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
         let pid = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(pid).unwrap();
-        process.dirty.store(1, Ordering::Release);
+        process
+            .input
+            .state()
+            .fetch_or(psflg::DIRTY_CPU_PROC, Ordering::Release);
 
         assert!(!scheduler.is_executing_dirty(pid));
 
         process.dirty_runner.store(1, Ordering::Release);
         assert!(scheduler.is_executing_dirty(pid));
+    }
+
+    /// Every entry, a proxy too, counts in `rq->len` and `prio_info[prio].len` from
+    /// enqueue_process to dequeue_process (erl_process.c:3951-4030); a `Not` entry is none.
+    #[test]
+    fn run_queue_lengths_count_every_entry() {
+        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let pid = scheduler.spawn(Idle).unwrap();
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        let rq = run_queue::ProcQueues::<Idle>::new();
+        let normal = queue_index(Priority::Normal.index());
+        let high = queue_index(Priority::High.index());
+        rq.push(Scheduled::with_kind(process.clone(), Enqueue::Real, normal));
+        rq.push(Scheduled::with_kind(process.clone(), Enqueue::Proxy, high));
+        rq.push(Scheduled::with_kind(process.clone(), Enqueue::Not, high));
+        assert_eq!(rq.total_len(), 2);
+        assert_eq!(rq.len(Priority::Normal.index()), 1);
+        assert_eq!(rq.len(Priority::High.index()), 1);
+        let first = rq.pop_next().unwrap();
+        assert_eq!(first.kind, Enqueue::Proxy);
+        assert_eq!(rq.len(Priority::High.index()), 0);
+        assert_eq!(rq.total_len(), 1);
+        assert_eq!(rq.drain().len(), 1);
+        assert_eq!(rq.total_len(), 0);
+        assert_eq!(rq.len(Priority::Normal.index()), 0);
+    }
+
+    /// A dirty run queue takes one entry per priority queue of a process; the bits live in
+    /// `xstate`, one set per dirty run queue (erl_process.c:6532 fin_dirty_enq_s_change and
+    /// 4288 clear_proc_dirty_queue_bit).
+    #[test]
+    fn a_dirty_queue_takes_one_entry_per_priority() {
+        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let pid = scheduler.spawn(Idle).unwrap();
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        let normal = queue_index(Priority::Normal.index());
+        assert!(process.fin_dirty_enq_s_change(false, normal, DirtyKind::Cpu));
+        // A second entry is refused, and a process struct reserved for it is released.
+        process
+            .input
+            .state()
+            .fetch_or(psflg::IN_RUNQ, Ordering::Relaxed);
+        assert!(!process.fin_dirty_enq_s_change(true, normal, DirtyKind::Cpu));
+        assert_eq!(
+            process.input.state().load(Ordering::Relaxed) & psflg::IN_RUNQ,
+            0
+        );
+        assert!(process.fin_dirty_enq_s_change(false, normal, DirtyKind::Io));
+        process.clear_dirty_queue_bit(normal, DirtyKind::Cpu);
+        assert!(process.fin_dirty_enq_s_change(false, normal, DirtyKind::Cpu));
     }
 
     #[test]
@@ -8950,7 +9066,14 @@ fn schedule_out<T: Task>(
         local.wakeup_other_reds += actual as i64;
     }
     if dirty.is_some() {
-        process.dirty.store(0, Ordering::Release);
+        // Port of erts/emulator/beam/erl_nif.c:462 (erts_call_dirty_nif) and bif.c:5789
+        // (erts_call_dirty_bif), OTP-29.1.1: the dirty work is done, so the process has no
+        // dirty run queue to go back to. erts clears the bits when the call starts; while the
+        // job runs `dirty_runner` keeps the process in its dirty state, so nothing can tell.
+        process
+            .input
+            .state()
+            .fetch_and(!psflg::DIRTY_WORK, Ordering::AcqRel);
     }
     match outcome {
         RunOutcome::Dirty(kind) => {
@@ -8963,10 +9086,11 @@ fn schedule_out<T: Task>(
                     inner.record_waiting(&process);
                 }
             }
-            process
+            let queue = queue_index(process.priority().index());
+            let entry = process
                 .run_state()
-                .yield_running_dirty(queue_index(process.priority().index()), Ordering::Release);
-            inner.enqueue_dirty(process.clone(), kind);
+                .yield_running_dirty(kind, queue, Ordering::Release);
+            inner.enqueue_dirty(Scheduled::with_kind(process.clone(), entry, queue), kind);
             // Port of erts/emulator/beam/erl_process.c:9763 (ensure signals are handled while
             // scheduled dirty), OTP-29.1.1.
             if process.input.has_pending() {
@@ -9126,10 +9250,18 @@ fn run_slice<T: Task>(
     let process = item.process;
     // A stale duplicate entry finds the process not queued below and runs nothing
     // (execute_process in erts works from the state word the same way).
-    if !process
-        .run_state()
-        .claim(item.kind == Enqueue::Proxy, item.queue)
-    {
+    let runs = match dirty {
+        // Port of erts/emulator/beam/erl_process.c:10063-10066 (execute_process on a dirty
+        // scheduler: clear_proc_dirty_queue_bit, then the state change), OTP-29.1.1.
+        Some(kind) => {
+            process.clear_dirty_queue_bit(item.queue, kind);
+            process.run_state().claim_dirty(item.kind == Enqueue::Proxy)
+        }
+        None => process
+            .run_state()
+            .claim(item.kind == Enqueue::Proxy, item.queue),
+    };
+    if !runs {
         return;
     }
     // Port of erts/emulator/beam/erl_process.c:7028-7134 (active_sys_enqueue), OTP-29.1.1:
@@ -10649,7 +10781,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     let _ = thread.handle.set(thread::current());
     thread.stats.lock().unwrap().set_state(MsaccState::Other);
     loop {
-        let process = {
+        let item = {
             let mut queue = pool.queue.lock().unwrap();
             loop {
                 if inner.stopped.load(Ordering::Acquire)
@@ -10657,12 +10789,14 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 {
                     return;
                 }
+                // Port of erts/emulator/beam/erl_process.c:9988-10030 (pick_next_process and
+                // dequeue_process on the dirty run queue), OTP-29.1.1.
                 if index < pool.online.load(Ordering::Acquire)
-                    && queue.len != 0
+                    && !pool.procs.is_empty()
                     && inner.dirty_may_execute(kind, index)
-                    && let Some(process) = queue.pop()
+                    && let Some(item) = pool.procs.pop_next()
                 {
-                    break process;
+                    break item;
                 }
                 // Port of erts/emulator/beam/erl_process.c (scheduler_wait for a dirty
                 // scheduler): join the sleepers, spin for a wake-up (`sched_spin_wait`,
@@ -10702,14 +10836,9 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
             }
         };
         thread.stats.lock().unwrap().begin_active();
+        let process = item.process.clone();
         process.dirty_runner.store(slot + 1, Ordering::SeqCst);
-        run_one(
-            &inner,
-            Scheduled::new(process.clone()),
-            &mut scheduler_data,
-            None,
-            Some(kind),
-        );
+        run_one(&inner, item, &mut scheduler_data, None, Some(kind));
         process.dirty_runner.store(0, Ordering::SeqCst);
         {
             let mut stats = thread.stats.lock().unwrap();

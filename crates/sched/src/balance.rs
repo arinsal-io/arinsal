@@ -351,37 +351,6 @@ impl<T: Task> Balance<T> {
         &self.rqs[ix.min(self.rqs.len() - 1)].info
     }
 
-    /// A process of priority `prio` joined run queue `ix`; `queued_prio` remembers the
-    /// counted level for [`Self::dequeued`] (enqueue_process, erl_process.c:3951).
-    pub(crate) fn enqueued(
-        &self,
-        prio: usize,
-        queued_prio: &std::sync::atomic::AtomicU8,
-        ix: usize,
-    ) {
-        queued_prio.store(prio as u8, Ordering::Relaxed);
-        self.rq(ix).add_len(prio, 1);
-    }
-
-    /// A queued process left run queue `ix` to execute (dequeue_process,
-    /// erl_process.c:4000).
-    pub(crate) fn dequeued(&self, queued_prio: &std::sync::atomic::AtomicU8, ix: usize) {
-        self.rq(ix)
-            .sub_len(usize::from(queued_prio.load(Ordering::Relaxed)), 1);
-    }
-
-    /// A queued process moved from run queue `from` to `to` (erts_try_change_runq_proc).
-    pub(crate) fn migrated(
-        &self,
-        queued_prio: &std::sync::atomic::AtomicU8,
-        from: usize,
-        to: usize,
-    ) {
-        let prio = usize::from(queued_prio.load(Ordering::Relaxed));
-        self.rq(from).sub_len(prio, 1);
-        self.rq(to).add_len(prio, 1);
-    }
-
     /// Port of erts/emulator/beam/erl_process.c:3800 (get_no_runqs), OTP-29.1.1.
     pub(crate) fn no_runqs(&self) -> (usize, usize) {
         (

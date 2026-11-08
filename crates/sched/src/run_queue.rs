@@ -125,8 +125,18 @@ impl<T: Task> LockedRunQueue<'_, T> {
         }
         let queue = item.queue();
         let proxy = item.kind == crate::Enqueue::Proxy;
+        // Port of erts/emulator/beam/erl_process.c:3959 (enqueue_process:
+        // erts_inc_runq_len), OTP-29.1.1: every entry, a proxy too, counts at its priority.
+        self.owner.info.add_len(usize::from(item.prio), 1);
         self.lists.push_back(queue, item, proxy);
         self.owner.qmask.fetch_or(1 << queue, Ordering::Release);
+    }
+
+    /// `unqueue_process`: the entry leaves the lengths at the priority it was counted at
+    /// (erl_process.c:3990 erts_dec_runq_len with `ERTS_PSFLGS_GET_PRQ_PRIO`).
+    #[inline]
+    fn uncount(&self, item: &Scheduled<T>) {
+        self.owner.info.sub_len(usize::from(item.prio), 1);
     }
 
     /// Append stolen entries in order under one lock (`try_steal_task_from_victim` links the
@@ -151,8 +161,9 @@ impl<T: Task> LockedRunQueue<'_, T> {
             if self.lists.is_empty(priority) {
                 qmask.fetch_and(!bit, Ordering::Release);
             }
-            if item.is_some() {
-                return item;
+            if let Some(item) = item {
+                self.uncount(&item);
+                return Some(item);
             }
         }
     }
@@ -170,6 +181,9 @@ impl<T: Task> LockedRunQueue<'_, T> {
         if self.lists.is_empty(queue) {
             self.owner.qmask.fetch_and(!(1 << queue), Ordering::Release);
         }
+        for item in &taken {
+            self.uncount(item);
+        }
         taken
     }
 
@@ -177,6 +191,9 @@ impl<T: Task> LockedRunQueue<'_, T> {
     pub(crate) fn drain(&mut self) -> Vec<Scheduled<T>> {
         let all = self.lists.drain();
         self.owner.qmask.store(0, Ordering::Release);
+        for item in &all {
+            self.uncount(item);
+        }
         all
     }
 }
