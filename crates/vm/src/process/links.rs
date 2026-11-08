@@ -62,25 +62,29 @@ impl Process {
     /// The demonitor signal of a local monitor carries its origin half; the target half is
     /// reached through the data they share (erl_proc_sig_queue.c erts_proc_sig_handle_incoming,
     /// ERTS_SIG_Q_OP_DEMONITOR): both are released.
+    /// True when the target half was still in the table and both halves were released.
     pub(super) fn remove_demonitored_target(
         &mut self,
         data: arinsal_alloc::typed::FixAllocArc<crate::proc_create::ProcessMonitorData>,
-    ) {
+    ) -> bool {
         let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(data, false) else {
-            return;
+            return false;
         };
-        self.remove_demonitored_target_half(origin);
+        self.remove_demonitored_target_half(origin)
     }
 
+    /// True when the target half was still in the table and both halves were released.
     pub(super) fn remove_demonitored_target_half(
         &mut self,
         origin: crate::proc_create::ProcessMonitor,
-    ) {
+    ) -> bool {
         let target = self.lt_monitors.remove_target_of(&origin);
         if let Some(target) = target {
             crate::proc_create::ProcessMonitor::release_both(origin, target);
+            true
         } else {
             drop(origin);
+            false
         }
     }
 

@@ -926,7 +926,9 @@ pub struct MonitorData<I, O, S = ()> {
     /// References held by both halves and any in-flight signal (`ErtsMonitorData.refc`).
     reference_count: AtomicU32,
     /// Which halves have a [`Monitor`] handle ([`ORIGIN_HELD`], [`TARGET_HELD`]), so a half
-    /// in transit becomes a handle again at most once.
+    /// in transit becomes a handle again at most once. The bits only decide which handle owns
+    /// a half, so every access is relaxed: the half's contents reach the other process through
+    /// the signal queue that carried it (or the reference count), not through this word.
     held: AtomicU32,
     /// The id of the list holding the target half, 0 when none.
     target_list: AtomicU64,
@@ -1197,7 +1199,7 @@ impl<I, O, S> MonitorData<I, O, S> {
         S: HalfSignal<I, O>,
     {
         let bit = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
-        if this.held.fetch_or(bit, AtomicOrdering::AcqRel) & bit != 0 {
+        if this.held.fetch_or(bit, AtomicOrdering::Relaxed) & bit != 0 {
             return Err(this);
         }
         let header = Self::node_of(this.as_ptr(), target).cast::<u8>();
@@ -1253,7 +1255,7 @@ impl<I, O, S> MonitorData<I, O, S> {
         }
         let data = data.expect("monitor signal has monitor data");
         let bit = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
-        data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
+        data.held.fetch_and(!bit, AtomicOrdering::Relaxed);
         S::from_half(data, target)
     }
 
@@ -1291,9 +1293,23 @@ impl<I, O, S> MonitorData<I, O, S> {
             let data = NonNull::new_unchecked(header.as_ptr().sub(offset).cast::<Self>());
             arinsal_alloc::typed::FixAllocArc::from_raw(data)
         };
-        let queued = if target { TARGET_QUEUED } else { ORIGIN_QUEUED };
-        data.held.fetch_and(!queued, AtomicOrdering::AcqRel);
-        Self::take_half(data, target)
+        // The queued half becomes a held half in one read-modify-write: erts takes the node out
+        // of the queue and inserts it without any atomic operation on it.
+        let (queued, bit) = if target {
+            (TARGET_QUEUED, TARGET_HELD)
+        } else {
+            (ORIGIN_QUEUED, ORIGIN_HELD)
+        };
+        let old = data.held.fetch_xor(queued | bit, AtomicOrdering::Relaxed);
+        debug_assert!(old & queued != 0);
+        if old & bit != 0 {
+            data.held.fetch_or(bit, AtomicOrdering::Relaxed);
+            return None;
+        }
+        Some(Monitor {
+            node: Self::node_of(data.as_ptr(), target),
+            _data: data,
+        })
     }
 
     /// Turn a half in transit back into its handle. `None` when that half already has one.
@@ -1302,7 +1318,7 @@ impl<I, O, S> MonitorData<I, O, S> {
         target: bool,
     ) -> Option<Monitor<I, O, S>> {
         let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
-        if this.held.fetch_or(bit, AtomicOrdering::AcqRel) & bit != 0 {
+        if this.held.fetch_or(bit, AtomicOrdering::Relaxed) & bit != 0 {
             return None;
         }
         Some(Monitor {
@@ -1504,7 +1520,7 @@ impl<I, O, S> Monitor<I, O, S> {
     pub(crate) fn into_shared(self) -> arinsal_alloc::typed::FixAllocArc<MonitorData<I, O, S>> {
         let target = self.view().is_target();
         let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
-        self._data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
+        self._data.held.fetch_and(!bit, AtomicOrdering::Relaxed);
         self._data
     }
 

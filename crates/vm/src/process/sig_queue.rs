@@ -250,13 +250,15 @@ impl Process {
                 // Port of erts_proc_sig_handle_incoming: an intrusive monitor node carries its
                 // operation in the half's target flag and is consumed without materialising an
                 // Event value.
+                // Port of erl_proc_sig_queue.c (erts_proc_sig_handle_incoming), OTP-29.1.1: a
+                // monitor costs 2; a demonitor 1, plus 1 when it released the target half.
                 if let Some(half) = crate::proc_create::ProcessMonitorData::take_signal_half(node) {
                     if half.view().is_target() {
                         self.insert_target_process_monitor_half(half);
+                        cnt += 2;
                     } else {
-                        self.remove_demonitored_target_half(half);
+                        cnt += 1 + i32::from(self.remove_demonitored_target_half(half));
                     }
-                    cnt += 1;
                     continue;
                 }
                 unreachable!("non-link lazy signal is a monitor half");
@@ -400,7 +402,7 @@ impl Process {
                 shared,
             } => {
                 self.insert_target_process_monitor(shared);
-                2
+                1
             }
             arinsal_sched::Signal::MonitorOpaque { reference, shared } => {
                 self.insert_target_monitor(reference, *shared);
@@ -411,8 +413,7 @@ impl Process {
                 2
             }
             arinsal_sched::Signal::DemonitorOrigin(shared) => {
-                self.remove_demonitored_target(shared);
-                2
+                i32::from(self.remove_demonitored_target(shared))
             }
             signal @ (arinsal_sched::Signal::Exit(_) | arinsal_sched::Signal::ExitLinked(_)) => {
                 let (linked_exit, mut message) = match signal {
