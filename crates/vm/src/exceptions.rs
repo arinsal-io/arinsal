@@ -479,14 +479,22 @@ pub(super) fn direct_bif_error(
         VmError::Trap(trap) => trap,
         error => return error,
     };
+    // Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1: keep the live
+    // exception value in `fvalue` until termination or handler dispatch. The detached `Raised`
+    // snapshot is also needed by the host API, but it must not replace the process-owned term.
+    p.heap.abi.exc.fvalue = trap.reason.tagged_word();
     let result = (|| -> Result<Raised, VmError> {
         let mut class = trap.class;
-        let mut reason = to_owned(trap.reason)
+        let mut live_reason = trap.reason;
+        let mut reason = to_owned(live_reason)
             .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
         if class == Class::Throw {
             class = Class::Error;
-            reason = OwnedTerm::Tuple(vec![OwnedTerm::Atom("nocatch".into()), reason]);
+            live_reason = tuple(p, &[atom("nocatch")?, live_reason])?;
+            reason = to_owned(live_reason)
+                .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
         }
+        p.heap.abi.exc.fvalue = live_reason.tagged_word();
         let stack = match trap.trace {
             Some(trace) => to_owned(trace)
                 .map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?,
@@ -688,7 +696,11 @@ pub(super) fn resume(
             cold.apply_frame_released = 0;
         }
     }
+    // Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1: fvalue is the
+    // process-heap root for the exception value while save_stacktrace may collect.
+    p.heap.abi.exc.fvalue = trap.reason.tagged_word();
     if trap.untrappable {
+        p.heap.abi.exc.ftrace = 0;
         let reason = to_owned(trap.reason)
             .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
         return Ok(Some(VmError::Raised(Box::new(Raised {
@@ -710,6 +722,8 @@ pub(super) fn resume(
     } else {
         save_raw(p, vm.backtrace_depth, trap.class, trap.top.as_ref())?
     };
+    p.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
+    trap.reason = crate::native_hooks::from_raw(p.heap.abi.exc.fvalue);
     let trace = if trap.raw_rethrow && trap.reason == atom("function_clause")? {
         let cooked = materialize(Some(vm), p, trace)?;
         let stripped = strip_top_location(p, cooked)?;
@@ -799,10 +813,6 @@ pub(super) fn resume(
             };
             if let Some(trace_ctx) = ctx.as_deref_mut() {
                 crate::trace::unwound_return_to(vm, p, trace_ctx, &return_to_sessions, target)?;
-            }
-            // The exception is caught: an exit reason noted for it must not name a later death.
-            if let Some(cold) = p.cold.as_mut() {
-                cold.exit_reason = None;
             }
             return Ok(None);
         }
@@ -902,9 +912,6 @@ pub(super) fn resume(
             });
             crate::trace::unwound_return_to(vm, p, trace_ctx, &return_to_sessions, target)?;
         }
-        if let Some(cold) = p.cold.as_mut() {
-            cold.exit_reason = None;
-        }
         return Ok(None);
     }
     // Port of erts/emulator/beam/beam_common.c (`handle_error`, nocatch): the saved trace is
@@ -913,6 +920,7 @@ pub(super) fn resume(
     let thrown = trap.class == Class::Throw;
     let stack = if trap.class == Class::Error || thrown {
         let trace = materialize(Some(vm), p, trace)?;
+        trap.reason = crate::native_hooks::from_raw(p.heap.abi.exc.fvalue);
         to_owned(trace).map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?
     } else {
         OwnedTerm::Nil
@@ -920,6 +928,7 @@ pub(super) fn resume(
     if thrown {
         trap.class = Class::Error;
         trap.reason = tuple(p, &[atom("nocatch")?, trap.reason])?;
+        p.heap.abi.exc.fvalue = trap.reason.tagged_word();
     }
     let reason = to_owned(trap.reason)
         .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;

@@ -10,7 +10,8 @@ const SOURCE: &str = r#"
 -module(bin_vheap_differential).
 -export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0,
          allocation_gc/0, private_append_info/0, message_binary/0, sub_binary_tails/0,
-         match_alias_tails/0, append_trap_magic_orig_size/0, resource_magic_orig_sizes/0]).
+         match_alias_tails/0, append_trap_magic_orig_size/0, resource_magic_orig_sizes/0,
+         down_split_binary_info/0]).
 minimum() -> {erlang:system_info(min_bin_vheap_size), process_info(self(), min_bin_vheap_size)}.
 flag() -> Old=process_flag(min_bin_vheap_size, 80000), {Old,process_info(self(), min_bin_vheap_size)}.
 gc_info() ->
@@ -178,6 +179,19 @@ vheap_words() ->
     proplists:get_value(bin_vheap_size,Info)+proplists:get_value(bin_old_vheap_size,Info).
 resource_tag(Resource) when is_reference(Resource) -> ref;
 resource_tag(Resource) when is_tuple(Resource) -> tuple.
+down_split_binary_info() ->
+    Bin=list_to_binary(lists:seq(1,192)),
+    {Pid,Mon}=spawn_monitor(fun() -> exit(erlang:split_binary(Bin,68)) end),
+    {Left,Right}=receive {'DOWN',Mon,process,Pid,Result} -> Result end,
+    timer:sleep(10),
+    Before=down_binary_info(),
+    true=erlang:garbage_collect(),
+    true=erlang:garbage_collect(),
+    After=down_binary_info(),
+    {byte_size(Left),byte_size(Right),byte_size(Bin),Before,After}.
+down_binary_info() ->
+    {binary,Binaries}=process_info(self(),binary),
+    [{Size,Refc} || {_Address,Size,Refc} <- Binaries].
 alias(<<"FOR1",_/bits>>=C) -> C.
 rest(<<"FOR1",R/bits>>) -> R.
 append_loop(0,Acc) -> Acc;
@@ -216,6 +230,27 @@ fn bin_vheap_system_and_process_minimum_match_otp() {
 #[test]
 fn bin_vheap_process_flag_updates_the_process_minimum() {
     assert_equal("flag");
+}
+
+#[test]
+fn down_split_binary_preserves_refc_binary_identity_like_otp() {
+    let value = assert_equal("down_split_binary_info");
+    let OwnedTerm::Tuple(fields) = &value else {
+        panic!("expected DOWN split binary info tuple: {value:?}");
+    };
+    assert_eq!(fields[0], OwnedTerm::Int(68));
+    assert_eq!(fields[1], OwnedTerm::Int(124));
+    assert_eq!(fields[2], OwnedTerm::Int(192));
+    let expected = OwnedTerm::List {
+        elems: vec![
+            OwnedTerm::Tuple(vec![OwnedTerm::Int(192), OwnedTerm::Int(3)]),
+            OwnedTerm::Tuple(vec![OwnedTerm::Int(192), OwnedTerm::Int(3)]),
+            OwnedTerm::Tuple(vec![OwnedTerm::Int(192), OwnedTerm::Int(3)]),
+        ],
+        tail: Box::new(OwnedTerm::Nil),
+    };
+    assert_eq!(fields[3], expected);
+    assert_eq!(fields[4], expected);
 }
 
 #[test]

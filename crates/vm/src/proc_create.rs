@@ -1388,10 +1388,6 @@ pub(crate) struct ProcessCold {
     pub(crate) apply_roots: Vec<Term>,
     /// A NIF call rescheduled to another scheduler class; its arguments are GC roots.
     pub(crate) nif_pending: Option<Box<crate::natives::nif::PendingNif>>,
-    /// Explicit `exit/1` reason, owned off-heap. The process heap is collected
-    /// while the stacktrace is built, so a raw `Term` here would dangle and
-    /// monitors would observe a corrupted reason.
-    pub(crate) exit_reason: Option<Term>,
     /// Set while the process handles its signals before executing code (erts
     /// `ERTS_PSFLG_RUNNING_SYS`): the only place system tasks execute (erl_process.c
     /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially
@@ -1403,7 +1399,6 @@ pub(crate) struct ProcessCold {
     /// erts `F_HAVE_BLCKD_MSCHED | F_HAVE_BLCKD_NMSCHED`: this process holds a
     /// multi-scheduling block of its runtime.
     pub(crate) have_blocked_multi_scheduling: bool,
-    pub(crate) dictionary_heap: arinsal_term::VecHeap,
     pub(crate) flags: ProcFlags,
     pub(crate) monitor_nodes: usize,
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
@@ -2224,14 +2219,6 @@ impl Process {
             .unwrap_or(fallback)
     }
 
-    /// Remember an explicit exit reason across the GC that builds its stacktrace.
-    pub(crate) fn note_exit_reason(&mut self, reason: Term) -> Result<(), VmError> {
-        let cold = self.cold_mut();
-        let copied = arinsal_term::copy_term(reason, &mut cold.dictionary_heap)
-            .map_err(|error| VmError::Unsupported(format!("exit reason: {error:?}")))?;
-        cold.exit_reason = Some(copied);
-        Ok(())
-    }
     /// Construct a process with the erts minimum heap size.
     pub fn new() -> Self {
         Self::with_registers_and_min_heap(1024, 1024, 233)
@@ -3406,7 +3393,6 @@ mod layout_report {
         field!("bif_trap", Option<BifTrapPending>);
         field!("delayed_gc", Vec<DelayedGc>);
         field!("dirty_gc", Option<DirtyGc>);
-        field!("dictionary_heap", arinsal_term::VecHeap);
         field!("flags", ProcFlags);
         field!("btreeset", std::collections::BTreeSet<u64>);
         field!("suspend_map", std::collections::BTreeMap<arinsal_sched::Pid, std::sync::Arc<crate::suspend::SuspendMonitor>>);

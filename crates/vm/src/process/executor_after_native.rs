@@ -560,15 +560,11 @@ impl Executor {
                     if let Some(error) =
                         crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap)?
                     {
-                        process.heap.abi.exc.freason = 0;
-                        process.heap.abi.exc.fvalue = 0;
                         return Ok(Flow::Break(Err(error)));
                     }
                     process.heap.abi.exc.freason = 0;
                     process.heap.abi.exc.fvalue = 0;
-                    if let Some(cold) = process.cold.as_mut() {
-                        cold.exit_reason = None;
-                    }
+                    process.heap.abi.exc.ftrace = 0;
                     return Ok(Flow::Continue);
                 }
                 if target_pc == crate::bif_traps::bif_export_trap_pc() {
@@ -721,6 +717,7 @@ impl Executor {
                             }
                             process.heap.abi.exc.freason = 0;
                             process.heap.abi.exc.fvalue = 0;
+                            process.heap.abi.exc.ftrace = 0;
                             return Ok(Flow::Continue);
                         }
                         Some(Err(error)) => return Err(error),
@@ -1103,6 +1100,7 @@ impl Executor {
                                 }
                                 process.heap.abi.exc.freason = 0;
                                 process.heap.abi.exc.fvalue = 0;
+                                process.heap.abi.exc.ftrace = 0;
                                 return Ok(Flow::Continue);
                             }
                             Err(VmError::Unsupported(message))

@@ -2124,7 +2124,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "monitor", 3),
     ("erlang", "demonitor", 1),
     ("erlang", "demonitor", 2),
-    ("erlang", "exit", 1),
     ("erlang", "exit", 2),
     ("erlang", "exit", 3),
     ("erlang", "exit_signal", 2),
@@ -2213,7 +2212,6 @@ enum SignalBif {
     Monitor3,
     Demonitor1,
     Demonitor2,
-    Exit1,
     Exit2,
     Exit3,
     ExitSignal2,
@@ -2873,19 +2871,6 @@ pub(crate) fn send2_light(
     })
 }
 
-/// `exit(Reason)` called directly from native code: the reason travels in the exception, as
-/// erts `exit_1` leaves it in `c_p->fvalue` (`BIF_ERROR(BIF_P, EXC_EXIT)`).
-// Port of erts/emulator/beam/bif.c:1536 (exit_1), OTP-29.1.1.
-pub(crate) fn exit1_light(
-    _process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [reason] = args else {
-        return None;
-    };
-    Some(Err(crate::exceptions::Trap::exit(*reason)))
-}
-
 /// `exit(Pid, Reason)` called directly from native code (erts bif.c:1721 send_exit_signal_bif)
 /// for a local pid other than the caller.
 // Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.
@@ -2923,7 +2908,6 @@ resolved_signal_handler!(monitor2, Monitor2);
 resolved_signal_handler!(monitor3, Monitor3);
 resolved_signal_handler!(demonitor1, Demonitor1);
 resolved_signal_handler!(demonitor2, Demonitor2);
-resolved_signal_handler!(exit1, Exit1);
 resolved_signal_handler!(exit2, Exit2);
 resolved_signal_handler!(exit3, Exit3);
 resolved_signal_handler!(exit_signal2, ExitSignal2);
@@ -2966,7 +2950,6 @@ pub(crate) fn handler(
         ("erlang", "monitor", 3) => monitor3,
         ("erlang", "demonitor", 1) => demonitor1,
         ("erlang", "demonitor", 2) => demonitor2,
-        ("erlang", "exit", 1) => exit1,
         ("erlang", "exit", 2) => exit2,
         ("erlang", "exit", 3) => exit3,
         ("erlang", "exit_signal", 2) => exit_signal2,
@@ -3541,10 +3524,6 @@ fn call_resolved(
                 return Err(flush_monitor_trap(process, *reference, result));
             }
             Ok(result)
-        }
-        (SignalBif::Exit1, [reason]) => {
-            process.note_exit_reason(*reason)?;
-            Err(VmError::Trap(crate::exceptions::Trap::exit(*reason)))
         }
         (SignalBif::Exit2, [target, reason]) => {
             send_exit_signal_bif(process, ctx, *target, *reason, Term::NIL, true)
@@ -4911,7 +4890,7 @@ fn link_noproc_term(process: &mut Process, target: Term, priority: bool) -> Resu
         }
         return Ok(atom("true"));
     }
-    process.note_exit_reason(reason)?;
+    process.heap.abi.exc.fvalue = reason.tagged_word();
     Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
 }
 
@@ -4956,7 +4935,7 @@ fn send_exit_signal_bif(
         if reason == atom("kill") {
             return Err(VmError::Trap(crate::exceptions::Trap::killed()));
         }
-        process.note_exit_reason(reason)?;
+        process.heap.abi.exc.fvalue = reason.tagged_word();
         return Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
             reason,
         )));

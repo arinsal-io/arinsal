@@ -1,36 +1,50 @@
 use super::*;
 
 pub(super) fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
-    if let Some(reason) = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.exit_reason.take())
-    {
-        return reason;
-    }
-    // An exit signal that reached a running process (kill becomes killed) ends it with its
-    // reason (erts/emulator/beam/erl_proc_sig_queue.c, handle_exit_signal), OTP-29.1.1.
-    if let VmError::Trap(trap) = error
-        && trap.class == arinsal_bifs::Class::Exit
-    {
-        return trap.reason;
-    }
-    let VmError::Raised(raised) = error else {
-        return crate::signals::atom("error");
-    };
-    let owned = if raised.class == arinsal_bifs::Class::Error {
-        arinsal_etf::OwnedTerm::Tuple(vec![raised.reason.clone(), raised.stack.clone()])
-    } else {
-        raised.reason.clone()
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    match arinsal_term::from_owned(&owned, &mut heap) {
-        Ok(reason) => reason,
-        Err(conversion_error) => {
-            eprintln!("arinsal: exit reason conversion failed: {conversion_error:?}");
-            crate::signals::atom("system_limit")
+    // Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1: the expanded
+    // exception value is the value passed to `terminate_proc`; errors carry it in `fvalue`.
+    let value = match error {
+        VmError::Trap(trap) => trap.reason,
+        VmError::Raised(raised) => {
+            // Both Raised constructors keep the original process term in `fvalue`. Prefer it to
+            // the detached snapshot so sub-binary sharing survives the DOWN message copy.
+            let rooted = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+            if rooted.is_pointer() || (rooted.is_immed() && !rooted.is_non_value()) {
+                rooted
+            } else {
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+                arinsal_term::from_owned(&raised.reason, &mut heap)
+                    .unwrap_or_else(|_| crate::signals::atom("system_limit"))
+            }
         }
+        // These host-side failures have no BEAM exception value. Keep the process exit term valid
+        // while matching the VM's existing generic `error` exit behavior.
+        _ => crate::signals::atom("error"),
+    };
+    process.heap.abi.exc.fvalue = value.tagged_word();
+    if !matches!(error, VmError::Raised(raised) if raised.class == arinsal_bifs::Class::Error) {
+        return value;
     }
+
+    // Port of erts/emulator/beam/beam_common.c:685-694 (`terminate_proc` and `add_stacktrace`),
+    // OTP-29.1.1: add_stacktrace forms {Value, Stacktrace} on the process heap before exit.
+    // `Raised` already owns the symbolic stacktrace because `handle_error` detached it from
+    // `ftrace`; rebuilding from the cleared ABI slot would treat THE_NON_VALUE as a trace.
+    let VmError::Raised(raised) = error else {
+        unreachable!("the error-class guard above selects Raised")
+    };
+    let stacktrace = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        arinsal_term::from_owned(&raised.stack, &mut heap)
+            .unwrap_or_else(|_| crate::signals::atom("system_limit"))
+    };
+    process.heap.abi.exc.ftrace = stacktrace.tagged_word();
+    // Converting the detached stacktrace may collect, so reload rooted terms before building.
+    let value = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+    let stacktrace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
+    process
+        .tuple(&[value, stacktrace])
+        .unwrap_or_else(|_| crate::signals::atom("system_limit"))
 }
 
 impl Process {
@@ -42,6 +56,7 @@ impl Process {
     }
 
     pub(super) fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+        debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
         self.exit_stage1(vm, ctx, reason);
         self.set_exit_cont(Some(
             arinsal_alloc::typed::FixAllocBox::new(crate::proc_create::ExitCont {
@@ -657,6 +672,7 @@ impl Process {
         entry_result: Option<Result<ScheduledResult, VmError>>,
         code: u64,
     ) -> RunOutcome {
+        debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
         with_executor(data, runtime, |executor| {
             self.exit_stage1(&mut executor.vm, ctx, reason)
         });

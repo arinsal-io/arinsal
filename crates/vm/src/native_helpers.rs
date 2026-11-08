@@ -4084,22 +4084,17 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         return 0;
     };
     let freason = process.heap.abi.exc.freason;
-    let saved_trace = [
-        crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Error)),
-        crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Exit)),
-        crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Throw)),
-    ]
-    .into_iter()
-    .map(|code| code & !arinsal_beamasm::exc::EXF_SAVETRACE)
-    .any(|code| freason == code);
     // TRAP and raw re-raises stay on the scheduler. Primary exceptions are `EXC_ERROR`,
     // `EXC_EXIT` and `EXC_THROWN`; expanded errors (`badmatch`, `function_clause`,
     // `case_clause`, ...) use erts' `(index << 10) | EXC_ERROR`.
     let primary = is_primary_freason(freason);
-    let expanded = freason & arinsal_beamasm::exc::EXC_INDEXBITS != 0
+    let expanded = !primary
+        && freason & arinsal_beamasm::exc::EXC_INDEXBITS != 0
         && freason
             & !(arinsal_beamasm::exc::EXC_INDEXBITS | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
             == arinsal_beamasm::exc::EXC_ERROR;
+    // A re-raise of a saved trace: the class code without `EXF_SAVETRACE`.
+    let saved_trace = !primary && !expanded && is_saved_trace_freason(freason);
     if !primary && !expanded && !saved_trace {
         return 0;
     }
@@ -4261,6 +4256,14 @@ fn native_bif_error_info(freason: u64, fvalue: u64) -> crate::stacktrace::BifErr
     } else {
         crate::stacktrace::BifErrorInfo::Cause(value)
     }
+}
+
+/// The class code a re-raise carries once `EXF_SAVETRACE` is cleared.
+fn is_saved_trace_freason(freason: u64) -> bool {
+    use arinsal_beamasm::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN, EXF_SAVETRACE};
+    freason == EXC_ERROR & !EXF_SAVETRACE
+        || freason == EXC_EXIT & !EXF_SAVETRACE
+        || freason == EXC_THROWN & !EXF_SAVETRACE
 }
 
 /// A fresh generic exception: `EXC_ERROR`, `EXC_EXIT` or `EXC_THROWN` with no index and no

@@ -1979,7 +1979,6 @@ fn format_fun_atom(name: &str) -> String {
 /// `spawn_request` and `dist_spawn_request` are the exception: only the
 /// `erts_internal` entries are BIFs, so the `erlang` wrappers stay in BEAM.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erlang", "exit", 1),
     ("erlang", "group_leader", 0),
     ("erts_internal", "group_leader", 2),
     ("erts_internal", "group_leader", 3),
@@ -3227,10 +3226,6 @@ fn call_values(
     }
     let result = (|| -> Result<Term, VmError> {
         match (function, args) {
-            ("exit", [reason]) => {
-                // Port of erts/emulator/beam/bif.c:1536 (exit_1), OTP-29.1.1.
-                Err(VmError::Trap(crate::exceptions::Trap::exit(*reason)))
-            }
             ("group_leader", []) => Ok(process
                 .group_leader_pid(ctx.pid())
                 .to_term()
