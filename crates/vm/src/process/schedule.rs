@@ -26,7 +26,7 @@ pub(super) fn park_suspended(
         return Ok(RunState::Yield);
     }
     process.slice_mut().suspend_parked = true;
-    Ok(RunState::Wait { timeout_ms: None })
+    Ok(RunState::Wait { timeout_pos: None })
 }
 
 impl Task for Process {
@@ -404,7 +404,7 @@ impl Process {
             .and_then(|cold| cold.debug_wait_completion.as_ref())
             .is_some_and(|completed| !completed.load(Ordering::Acquire))
         {
-            Ok(RunState::Wait { timeout_ms: None })
+            Ok(RunState::Wait { timeout_pos: None })
         } else {
             result
         }
@@ -465,7 +465,7 @@ impl Process {
                 ctx.set_active(true);
                 RunOutcome::Yield
             }
-            Ok(RunState::Wait { timeout_ms }) => {
+            Ok(RunState::Wait { timeout_pos }) => {
                 // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
                 // OTP-29.1.1: suspension keeps ERTS_PSFLG_ACTIVE, so a process resumed while
                 // this slice ended is runnable, not waiting.
@@ -473,7 +473,10 @@ impl Process {
                     .take_work(|work| std::mem::take(&mut work.suspend_parked).then_some(()))
                     .is_some();
                 ctx.set_active(parked);
-                RunOutcome::Wait { timeout_ms }
+                match timeout_pos {
+                    Some(timeout_pos) => RunOutcome::WaitTimer { timeout_pos },
+                    None => RunOutcome::Wait { timeout_ms: None },
+                }
             }
             Ok(RunState::Done(term)) => {
                 if trace_boot_enabled() {

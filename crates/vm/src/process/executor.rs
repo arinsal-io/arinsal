@@ -273,7 +273,7 @@ impl Executor {
                 crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    let timeout_ms = process.native_wait.take().expect("checked above");
+                    let timeout_pos = process.native_wait.take().expect("checked above");
                     // A native receive found no matching message; see the full path.
                     process.gc_live = 0;
                     process.set_native_resume_arity(0);
@@ -289,7 +289,7 @@ impl Executor {
                             Err(error) => return Some(Err(error)),
                         }
                     }
-                    return Some(Ok(RunState::Wait { timeout_ms }));
+                    return Some(Ok(RunState::Wait { timeout_pos }));
                 }
                 crate::proc_create::NativeExit::SignalFetch => {
                     crate::beamasm_integration::count_native_yield();
@@ -344,18 +344,15 @@ impl Executor {
                 parked => Ok(Some(parked)),
             };
         }
-        if let Some(shift) = runtime.take_pause_shift(process) {
-            if let Some(deadline) = process.receive_deadline.as_mut() {
-                *deadline += shift;
-            }
-            if let Some(deadline) = process.receive_deadline_ms.as_mut() {
-                *deadline += shift.as_millis() as u64;
-            }
+        if let Some(shift) = runtime.take_pause_shift(process)
+            && let Some(deadline) = process.receive_timeout_pos.as_mut()
+        {
+            *deadline += shift.as_millis() as u64;
         }
         if process.slice().is_some_and(|work| work.hibernate_sched) {
             process.drain(ctx)?;
             if process.inbox.is_empty() {
-                return Ok(Some(RunState::Wait { timeout_ms: None }));
+                return Ok(Some(RunState::Wait { timeout_pos: None }));
             }
             // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
             let resume_in_place = process
@@ -399,8 +396,7 @@ impl Executor {
         let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
         self.vm.set_position(process, module_id, entry);
         process.inbox.set_save(0);
-        process.receive_deadline = None;
-        process.receive_deadline_ms = None;
+        process.receive_timeout_pos = None;
         process.receive_infinity = false;
         // erts resumes a hibernated process at the export address of apply/3 too.
         self.vm.enter_native_at_jump(process);

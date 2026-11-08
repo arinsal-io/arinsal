@@ -577,7 +577,7 @@ impl Executor {
                                     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                     process.slice_mut().hibernate_sched = true;
                                 }
-                                break Ok(RunState::Wait { timeout_ms: None });
+                                break Ok(RunState::Wait { timeout_pos: None });
                             }
                             self.install_apply(process, ctx)?;
                             continue;
@@ -592,7 +592,7 @@ impl Executor {
                             Err(VmError::Trap(trap)) => {
                                 // g_port_fix: busy port_command suspends the sender and retries the call.
                                 if crate::port::take_busy_suspend() {
-                                    break Ok(RunState::Wait { timeout_ms: None });
+                                    break Ok(RunState::Wait { timeout_pos: None });
                                 }
                                 trap
                             }
@@ -677,12 +677,12 @@ impl Executor {
         // new input, so the rest is handled before it sleeps. Messages it produces end the
         // wait like a new message would.
         let result = match result {
-            Ok(RunState::Wait { timeout_ms })
+            Ok(RunState::Wait { timeout_pos })
                 if !process.sig_cont_empty() || process.delayed_gc_due() =>
             {
                 let queued = process.inbox.len();
                 match process.handle_local_signals(ctx) {
-                    Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait { timeout_ms }),
+                    Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait { timeout_pos }),
                     Ok(()) => Ok(RunState::Yield),
                     Err(error) => Err(error),
                 }
