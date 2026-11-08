@@ -189,6 +189,16 @@ impl Task for Process {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: a link that reaches a process after its exit handling gets `noproc`.
                 Payload::Signal(Signal::Link { .. }) => links.push(event.from),
+                // A spawn reply that reached the queue after exit handling: answered as when
+                // erts_proc_sig_send_dist_spawn_reply fails (dist.c:3090-3121).
+                Payload::Signal(Signal::DistSpawnReply(shared)) => {
+                    if let (Some(runtime), Some(data)) = (
+                        self.runtime,
+                        shared.0.downcast_ref::<crate::dist::DistSpawnReplyData>(),
+                    ) {
+                        crate::dist::spawn_reply_send_failed(runtime, data);
+                    }
+                }
                 Payload::Signal(Signal::Unlink(id)) => {
                     links.retain(|from| *from != event.from);
                     unlink_acks.push((event.from, id));

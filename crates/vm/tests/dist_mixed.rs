@@ -485,6 +485,90 @@ fn dist_mixed_spawn_and_monitor() {
     );
 }
 
+/// A parent that exits while its remote `spawn_request(..., [link])` is pending waits for the
+/// reply and sends the child its exit reason (erl_process.c:13647
+/// proc_exit_handle_pend_spawn_monitors); the remote children do not leak.
+#[test]
+fn dist_mixed_pending_spawn_link_parent_exit_waits_for_reply() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            concat!(
+                "N={n}, pong=net_adm:ping(N), {{module,timer}}=erpc:call(N,code,ensure_loaded,[timer]), ",
+                "Before=erpc:call(N,erlang,system_info,[process_count]), ParentRefs=[begin {{_,R}}=spawn_opt(fun() -> erlang:spawn_request(N,timer,sleep,[60000],[link]), exit(parent_exit) end,[monitor]), R end || _ <- lists:seq(1,24)], ",
+                "[receive {{'DOWN',R,process,_,parent_exit}} -> ok after 10000 -> exit(parent_exit_timeout) end || R <- ParentRefs], ",
+                "Wait=fun Again(0) -> erpc:call(N,erlang,system_info,[process_count]) =< Before+3; Again(Count) -> case erpc:call(N,erlang,system_info,[process_count]) =< Before+3 of true -> true; false -> timer:sleep(50), Again(Count-1) end end, ",
+                "true=Wait(200), io:format(\"DIST_MIXED_OK pending_spawn_exit~n\")"
+            ),
+            n = n
+        ),
+    );
+}
+
+/// A linked remote child of a parent that exits around the time the spawn reply arrives gets
+/// the parent's actual exit reason, whether the reply was queued before the exit
+/// (erl_proc_sig_queue.c:5927 handle_dist_spawn_reply_exiting) or saved after it
+/// (dist.c:552 dist_pend_spawn_exit_save_child_result).
+#[test]
+fn dist_mixed_spawn_reply_exiting_parent_sends_real_reason() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            concat!(
+                "N={n}, pong=net_adm:ping(N), Self=self(), ",
+                "F=fun() -> process_flag(trap_exit,true), receive {{'EXIT',_,Why}} -> Self ! {{why,Why}} after 20000 -> Self ! {{why,timeout}} end end, ",
+                "Spin=fun Spin(0) -> ok; Spin(K) -> erlang:yield(), Spin(K-1) end, ",
+                "[spawn(fun() -> erlang:spawn_request(N,erlang,apply,[F,[]],[link]), case K rem 3 of 0 -> ok; 1 -> Spin(K); 2 -> receive {{spawn_reply,_,ok,_}} -> ok after 10000 -> ok end end, exit({{real_reason,K}}) end) || K <- lists:seq(1,24)], ",
+                "Got=lists:sort([receive {{why,W}} -> W after 20000 -> exit(no_child_exit) end || _ <- lists:seq(1,24)]), ",
+                "Expected=lists:sort([{{real_reason,K}} || K <- lists:seq(1,24)]), ",
+                "case Got of Expected -> ok; _ -> exit({{wrong_reasons,Got}}) end, ",
+                "io:format(\"DIST_MIXED_OK spawn_reply_exiting~n\")"
+            ),
+            n = n
+        ),
+    );
+}
+
+/// `spawn_request_abandon/1` of a pending remote request with link: the reply is dropped and
+/// the child gets an `abandoned` exit (bif.c:1166, erl_proc_sig_queue.c:5786). A request to
+/// a node that cannot be reached is answered `noconnection` when the pending connection is
+/// aborted, unless error replies are off (erl_proc_sig_queue.c:4864).
+#[test]
+fn dist_mixed_spawn_request_abandon_link() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            concat!(
+                "N={n}, pong=net_adm:ping(N), Self=self(), ",
+                "F=fun() -> process_flag(trap_exit,true), receive {{'EXIT',_,Why}} -> Self ! {{why,Why}} after 20000 -> Self ! {{why,timeout}} end end, ",
+                "R=erlang:spawn_request(N,erlang,apply,[F,[]],[link]), true=erlang:spawn_request_abandon(R), false=erlang:spawn_request_abandon(R), ",
+                "receive {{why,abandoned}} -> ok after 20000 -> exit(no_abandoned_exit) end, ",
+                "receive {{spawn_reply,R,_,_}}=Unexpected -> exit({{unexpected,Unexpected}}) after 200 -> ok end, ",
+                "{{links,[Init]}}=process_info(self(),links), Init=whereis(init), ",
+                "R2=erlang:spawn_request(N,erlang,node,[],[{{reply,no}}]), true=erlang:spawn_request_abandon(R2), ",
+                "receive {{spawn_reply,R2,_,_}}=Unexpected2 -> exit({{unexpected,Unexpected2}}) after 500 -> ok end, ",
+                "[_,Host]=string:split(atom_to_list(node()),\"@\"), Bad=list_to_atom(\"dm_nosuch@\" ++ Host), ",
+                "R4=erlang:spawn_request(Bad,erlang,node,[]), receive {{spawn_reply,R4,error,noconnection}} -> ok after 20000 -> exit(no_noconnection) end, ",
+                "R5=erlang:spawn_request(Bad,erlang,node,[],[{{reply,success_only}}]), receive {{spawn_reply,R5,_,_}}=Unexpected5 -> exit({{unexpected,Unexpected5}}) after 3000 -> ok end, ",
+                "io:format(\"DIST_MIXED_OK spawn_request_abandon~n\")"
+            ),
+            n = n
+        ),
+    );
+}
+
 #[test]
 fn dist_mixed_remote_tagged_monitor_down() {
     let _serial = serial_test();

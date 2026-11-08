@@ -84,7 +84,16 @@ impl Process {
         }
     }
 
-    pub(super) fn absorb_exit_signals(&mut self, ctx: &mut RunCtx<'_, Message>) {
+    /// Handle the signals an exiting process still has. Distributed spawn replies are returned:
+    /// erts handles them in ERTS_CONTINUE_EXIT_HANDLE_PROC_SIG, after the monitors phase moved
+    /// the pending-spawn monitors aside (erl_process.c:14589), and the caller hands them to
+    /// [`crate::dist::handle_dist_spawn_reply_exiting`] at that point.
+    #[must_use]
+    pub(super) fn absorb_exit_signals(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+    ) -> Vec<arinsal_sched::SharedPayload> {
+        let mut spawn_replies = Vec::new();
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
         // OTP-29.1.1: the signals left in the inner queue come before the outer queue's.
         let mut unhandled = std::mem::take(&mut *self.sig_cont_mut());
@@ -162,9 +171,13 @@ impl Process {
                     let _ =
                         crate::suspend::sync_reply(self, ctx, requester, tag, reply, async_, true);
                 }
+                // Port of erl_proc_sig_queue.c:7418 (erts_proc_exit_handle_signal,
+                // ERTS_SIG_Q_OP_DIST_SPAWN_REPLY), OTP-29.1.1.
+                Payload::Signal(Signal::DistSpawnReply(shared)) => spawn_replies.push(shared),
                 _ => {}
             }
         }
+        spawn_replies
     }
 }
 

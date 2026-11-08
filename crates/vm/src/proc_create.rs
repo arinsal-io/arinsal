@@ -2817,6 +2817,12 @@ pub(crate) struct ExitCont {
     /// Result the entry process reports once exit completes, and its exit code.
     pub(crate) entry_result: Option<Result<crate::ScheduledResult, crate::VmError>>,
     pub(crate) code: u64,
+    /// The phases up to ERTS_CONTINUE_EXIT_DIST_MONITORS are done; the exit continues at
+    /// ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS (erl_process.c:14674), OTP-29.1.1.
+    pub(crate) pend_spawn: bool,
+    /// This process, retained before its pid left the process table, for the suspend of
+    /// erts_dist_pend_spawn_exit_parent_wait (dist.c:758-790).
+    pub(crate) waiter: Option<arinsal_sched::ExitWaiter<Process>>,
 }
 
 #[cfg(test)]
