@@ -650,20 +650,12 @@ impl ProcDict {
         }
     }
 
-    // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`, ProcDict range), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`, ProcDict range), OTP-29.1.1:
+    // erts roots the whole `data` array, empty slots (NIL) included, with no liveness walk
+    // and no allocation. The node slab is that storage here; `free_node` leaves NIL in a
+    // freed node, so every node can be rooted as it stands.
     pub(crate) fn append_gc_root_slots<'a>(&'a mut self, roots: &mut arinsal_term::GcRootSet<'a>) {
-        let mut live = vec![false; self.nodes.len()];
-        for slot in 0..self.used_slots as usize {
-            let mut cur = self.heads[slot];
-            while cur != NIL_NODE {
-                live[cur as usize] = true;
-                cur = self.nodes[cur as usize].next;
-            }
-        }
-        for (index, node) in self.nodes.iter_mut().enumerate() {
-            if !live[index] {
-                continue;
-            }
+        for node in &mut self.nodes {
             roots.push_term(&mut node.key);
             roots.push_term(&mut node.value);
         }
