@@ -1,0 +1,801 @@
+use super::*;
+
+impl Executor {
+    pub(super) fn run(
+        &mut self,
+        process: &mut Process,
+        ctx: &mut RunCtx<'_, Message>,
+        budget: u32,
+    ) -> Result<RunState, VmError> {
+        let exec_key = ctx.scheduler_key();
+        let cached = exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
+        if !cached {
+            process.heap.abi.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
+            process.self_pid = Some(ctx.pid());
+        }
+        // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
+        // = p), OTP-29.1.1. A simulated scheduler shares its thread with other runtimes, so
+        // it binds the thread's hub on every turn.
+        if self.hub_bound && !ctx.simulated() {
+            self.current_process
+                .store(ctx.pid().data(), Ordering::Relaxed);
+        } else {
+            self.hub_bound =
+                crate::natives::nif::bind_scheduler_hub(process, &self.current_process);
+        }
+        if !cached {
+            process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
+            // Port of erts/emulator/beam/erl_process.h:2595 (erts_proc_sched_data): the process
+            // turn uses the scheduler thread's reference and unique-integer counters.
+            let thr = arinsal_bifs::scheduler_thr_id(
+                ctx.scheduler_id().map(|id| id as u32),
+                ctx.scheduler_count() as u32,
+            );
+            if process
+                .scheduler_ref_state
+                .as_ref()
+                .is_none_or(|state| state.thr_id() != thr)
+            {
+                let state = match self.ref_state {
+                    Some(state) if state.thr_id() == thr => state,
+                    _ => {
+                        let state = arinsal_bifs::bind_scheduler_ref_state(thr);
+                        self.ref_state = Some(state);
+                        state
+                    }
+                };
+                process.scheduler_ref_state = Some(state);
+            }
+            process.exec_key = exec_key;
+        }
+        let schedule_started = crate::natives::erts_debug::long_schedule_monitored(process)
+            .then(std::time::Instant::now);
+        // A process runs with the code index active when it is scheduled in. The `in` trace
+        // event resolves the current function against it, so this replica must be current
+        // first (erts_find_function_from_pc reads the active code index).
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
+        self.vm.refresh_code();
+        self.vm.sync_module(process.module);
+        // Port of erts/emulator/beam/erl_process.c:10539-10543 (schedule-in tests
+        // ERTS_TRACE_FLAGS(p) before any trace work), OTP-29.1.1: the process flag word has
+        // `proc_flags::TRACE` while the trace table holds an entry for this process.
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0 {
+            let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
+            let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
+            crate::trace::emit(
+                Some(&mut self.vm),
+                process,
+                ctx,
+                ctx.pid(),
+                crate::trace::RUNNING,
+                "in",
+                &running_fields,
+            );
+            // Port of erts/emulator/beam/erl_process.c:10541-10543 (trace_schedule_in),
+            // OTP-29.1.1.
+            if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
+                crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
+            }
+        }
+        // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
+        // A normal slice replaces leftover FCALLS so the send after a code-permission
+        // release is not skipped by a reduction check that still sees only a few: that
+        // yield lets the waiter run and send `{Pid, locked}` first.
+        // A 1-reduction quantum is the scheduler budget that splits `loop_rec` from
+        // `wait`. Light BIFs do `subs FCALLS, #1; b.le yield` and resume at the same
+        // entry (instr_bif.cpp:399-400, OTP-29.1.1), so installing FCALLS=1 never
+        // enters the BIF. Leave a positive count alone in that case.
+        let reds = budget.min(i32::MAX as u32) as i32;
+        if process.native_pc().is_some() {
+            if reds > 1 || process.heap.abi.fcalls <= 0 {
+                process.heap.abi.fcalls = reds;
+            }
+        } else if process.heap.abi.fcalls <= 0 && reds > 0 {
+            // Interpreted schedule-in. A trapping BIF charges FCALLS to 0 when it
+            // yields; the continuation (lists:member/2) reads that counter as its
+            // scan budget. Leaving it at 0 makes every resume yield without
+            // scanning, and the process never reaches halt.
+            process.heap.abi.fcalls = reds;
+        }
+        // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
+        // export's code address), OTP-29.1.1: every process starts its function natively on
+        // its first run; later runs continue wherever its interpreted or native continuation is.
+        // erts starts a spawned process at beam_run_process; its first run applies the MFA.
+        if !process.entry_started() && process.module == RUN_PROCESS {
+            match crate::beamasm_integration::run_process_entry()
+                .filter(|_| crate::beamasm_integration::enabled())
+            {
+                // The native start is the beam_run_process stub, which applies X0..X2 itself. The
+                // process meanwhile holds erlang:apply/3 with those arguments, so the stub's
+                // interpreter fallback runs there (native_bridge.rs apply3 resolver).
+                Some((start, _)) => {
+                    let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
+                    process.module = module_id;
+                    process.set_entry_ip(entry);
+                    process.set_native_pc(Some(start));
+                    // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->i =
+                    // beam_run_process; p->arity = 3`), OTP-29.1.1: the process starts like any
+                    // switched-out one, resuming at `c_p->i` with `c_p->arity` live registers.
+                    // The entry needs no registry lookup for the stub's arity.
+                    process.native_continuation_resume = true;
+                    process.set_native_resume_arity(3);
+                }
+                None => {
+                    self.vm.resolve_run_process(process)?;
+                }
+            }
+        }
+        let first_run = !process.replace_entry_started(true);
+        if first_run
+            && process.native_pc().is_none()
+            && let Some(start) = self
+                .vm
+                .native_entry_address(process.module, process.entry_ip())
+        {
+            process.set_native_pc(Some(start));
+        }
+        let need_x = self.vm.code.registers[process.module].0;
+        if need_x > crate::proc_create::ATTACHED_X_REGS {
+            return Err(VmError::Unsupported(format!(
+                "module needs {need_x} X registers, the scheduler array has {}",
+                crate::proc_create::ATTACHED_X_REGS
+            )));
+        }
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers) and
+        // erl_process.c (erts_schedule), OTP-29.1.1: the scheduler's one X register array is
+        // the process's file for the slice, loaded with the `c_p->arity` saved registers.
+        let saved_len = process.x.saved_arity();
+        // SAFETY: `self.native_registers` lives in this boxed `Executor`, which is not moved
+        // or dropped during the call, and the epilogue below detaches before `run` returns.
+        unsafe { process.x.attach(&mut self.native_registers) };
+        if crate::xreg_poison_enabled() {
+            process.x[saved_len..].fill(crate::XREG_POISON);
+        }
+        let mut fast_ran = false;
+        let fast_result = if Self::fast_entry_ok(process, ctx) {
+            self.fast_resume(process, ctx, &mut fast_ran)
+        } else {
+            None
+        };
+        let result = if let Some(result) = fast_result {
+            result
+        } else {
+            (|| -> Result<RunState, VmError> {
+                'execution: {
+                    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
+                    // A spawned MFA may name a BIF directly; execute it as the process entry so
+                    // exceptions such as exit/1 retain their BIF class and reason.
+                    let initial_bif = process.take_work(|work| work.initial_bif.take());
+                    let dirty_sys_gc = process.slice().is_some_and(|work| work.dirty_sys_gc);
+                    if let Some((module, function, arity)) = initial_bif {
+                        // Both spawn paths (erl_create_process and the distributed spawn) place the
+                        // BIF's arguments in X0..X(arity-1); the entry runs the BIF on them.
+                        let mut args = process.x[..usize::from(arity)].to_vec();
+                        let Some(bif) = arinsal_bifs::lookup(&module, &function, arity) else {
+                            // A BIF implemented by a VM native (process-aware BIFs such as
+                            // erlang:node/1 or register/2) runs through the native table.
+                            let resolved =
+                                crate::natives::classify(&module, &function, arity, true);
+                            match self.vm.dispatch_native(
+                                process,
+                                ctx,
+                                &module,
+                                &function,
+                                usize::from(arity),
+                                resolved,
+                            ) {
+                                Some(Ok(value)) => break 'execution Ok(RunState::Done(value)),
+                                Some(Err(error)) => break 'execution Err(error),
+                                None => {
+                                    break 'execution Err(VmError::Unsupported(format!(
+                                        "spawned BIF entry {module}:{function}/{arity} has no native"
+                                    )));
+                                }
+                            }
+                        };
+                        let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
+                        crate::calls::gc_after_bif(process, &mut args, &mut result)?;
+                        match result {
+                            Ok(value) => break 'execution Ok(RunState::Done(value)),
+                            Err(error) => {
+                                break 'execution Err(crate::exceptions::direct_bif_error(
+                                    process, &module, &function, &args, error,
+                                ));
+                            }
+                        }
+                    }
+                    // Port of erts/emulator/beam/erl_process.c:10318-10372 (ERTS_PSFLG_RUNNING_SYS:
+                    // handle signals and execute system tasks before Erlang code), OTP-29.1.1.
+                    // Port of erts/emulator/beam/erl_process.c:10363-10372 and 11018-11040
+                    // (a dirty scheduler executes the dirty GC system task, then the process
+                    // returns to a normal scheduler), OTP-29.1.1.
+                    if dirty_sys_gc {
+                        if !ctx.scheduler_type().is_dirty() {
+                            // ERTS_PSFLG_DIRTY_ACTIVE_SYS: the dirty work runs before Erlang code.
+                            break 'execution Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
+                        }
+                        process.slice_mut().dirty_sys_gc = false;
+                        process.run_dirty_gc()?;
+                        // The signals are handled on the normal scheduler the process returns to.
+                        break 'execution Ok(RunState::Yield);
+                    }
+                    // Port of erts/emulator/beam/erl_process.c:10318-10351 (schedule: a process
+                    // with signals queued handles them before Erlang code; with Erlang work to do
+                    // and no dirty work, at most ERTS_SIG_HANDLE_REDS_MAX_PREFERED), OTP-29.1.1.
+                    // A process parked on a request reply reads it from its message queue like
+                    // erts_internal:await_result's receive, so the reply message is fetched here.
+                    if ctx.sys_task_run()
+                    || !process.sig_cont_empty()
+                    || process.delayed_gc_due()
+                    || ctx.has_pending_nmsg()
+                    // A cross-process BIF's reply arrives as a message that only this fetch
+                    // moves into the message queue.
+                    || process.pending_signal_waiter().is_some()
+                    {
+                        let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+                        let mut sig_reds = if process.slice().is_some_and(|work| work.dirty_sys_gc)
+                        {
+                            reds
+                        } else {
+                            SIG_HANDLE_REDS_MAX_PREFERED
+                        };
+                        if ctx.sys_task_run() {
+                            process.cold_mut().sys_task_point = true;
+                        }
+                        let max_reds = sig_reds;
+                        let handled = process.handle_incoming(ctx, &mut sig_reds, max_reds, false);
+                        ctx.consume(u32::try_from(sig_reds).unwrap_or(0));
+                        // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
+                        // then `p->fcalls = reds`; the process's reductions are what the slice
+                        // used), OTP-29.1.1: the signal handling is the process's own work.
+                        process.heap.abi.fcalls =
+                            process.heap.abi.fcalls.saturating_sub(sig_reds.max(0));
+                        process.reductions_used = process
+                            .reductions_used
+                            .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
+                        let executed = handled.and_then(|_| {
+                            if ctx.sys_task_run() {
+                                crate::signals::execute_sys_tasks(process, ctx)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        if ctx.sys_task_run() {
+                            process.cold_mut().sys_task_point = false;
+                        }
+                        executed?;
+                    }
+
+                    // erts collects a process that is being scheduled in once signals have
+                    // been fetched (erl_process.c:10415). One check per slice: later
+                    // iterations have already executed and their live X count is gc_live,
+                    // not the switch-out arity.
+                    let mut schedule_in_gc = !fast_ran;
+                    // Native code that exited only for a fetch reenters without a scheduling point.
+                    let mut reenter = false;
+                    loop {
+                        // Port of erts/emulator/beam/erl_process.c (schedule: the scheduler-type
+                        // switch; check_dirty_enqueue_in_prio_queue), OTP-29.1.1: a process whose dirty NIF has not run yet carries its
+                        // ERTS_PSFLG_DIRTY_*_PROC flag, so it executes only on that dirty scheduler
+                        // class and every other scheduler sends it back to the dirty run queue.
+                        // Yielding or running here would resume the dirty-NIF dispatch stub as if
+                        // it were an unresolved export.
+                        let pending_dirty = process
+                            .cold
+                            .as_ref()
+                            .and_then(|cold| cold.native_dirty_nif)
+                            .map(|(_, _, class)| class);
+                        let dirty_here = pending_dirty
+                            .is_some_and(|class| class == scheduler_class(ctx.scheduler_type()));
+                        match pending_dirty {
+                            Some(arinsal_bifs::SchedulerClass::DirtyCpu) if !dirty_here => {
+                                break Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
+                            }
+                            Some(arinsal_bifs::SchedulerClass::DirtyIo) if !dirty_here => {
+                                break Err(VmError::Dirty(arinsal_sched::DirtyKind::Io));
+                            }
+                            _ => {}
+                        }
+                        let reentered = std::mem::take(&mut reenter);
+                        if !dirty_here && !reentered {
+                            // A caught exception re-enters this loop without replenishing its process slice.
+                            if ctx.remaining() == 0 {
+                                break Ok(RunState::Yield);
+                            }
+                            if process.force_yield() {
+                                process.set_force_yield(false);
+                                break Ok(RunState::Yield);
+                            }
+                            // g_proc_sched: a suspended process is not scheduled; a hibernating
+                            // one stays waiting until a message arrives, then continues at apply/3.
+                            if let Some(wait) = self.sched_preempt(process, ctx)? {
+                                break Ok(wait);
+                            }
+                        }
+                        process.native_transfer = false;
+                        crate::dist::continue_fragmented_send(process, ctx)?;
+                        // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1:
+                        // the dirty scheduler runs the NIF, then the process returns to a normal
+                        // scheduler to continue after the call.
+                        if let Some((identity, resume_pc, class)) =
+                            process.cold.as_ref().and_then(|cold| cold.native_dirty_nif)
+                            && scheduler_class(ctx.scheduler_type()) == class
+                        {
+                            process.slice_mut().native_dirty_nif = None;
+                            match crate::native_helpers::run_static_nif(process, identity) {
+                                Ok(value) => {
+                                    process.x[0] = value;
+                                    process.native_continuation_resume = true;
+                                    process.set_native_resume_arity(1);
+                                    process.set_native_pc(Some(resume_pc));
+                                    if ctx.scheduler_type().is_dirty() {
+                                        break Ok(RunState::Yield);
+                                    }
+                                    continue;
+                                }
+                                Err(error @ (VmError::Dirty(_) | VmError::Yield)) => {
+                                    // A continuation scheduled for another scheduler class.
+                                    let class = match error {
+                                        VmError::Dirty(arinsal_sched::DirtyKind::Cpu) => {
+                                            arinsal_bifs::SchedulerClass::DirtyCpu
+                                        }
+                                        VmError::Dirty(arinsal_sched::DirtyKind::Io) => {
+                                            arinsal_bifs::SchedulerClass::DirtyIo
+                                        }
+                                        _ => arinsal_bifs::SchedulerClass::Normal,
+                                    };
+                                    process.slice_mut().native_dirty_nif =
+                                        Some((identity, resume_pc, class));
+                                    break Err(error);
+                                }
+                                Err(VmError::Trap(trap)) => {
+                                    if let Some(error) = crate::exceptions::resume(
+                                        &mut self.vm,
+                                        process,
+                                        Some(ctx),
+                                        trap,
+                                    )? {
+                                        break Err(error);
+                                    }
+                                    continue;
+                                }
+                                Err(error) => break Err(error),
+                            }
+                        }
+                        if process.force_yield() {
+                            process.set_force_yield(false);
+                            break Ok(RunState::Yield);
+                        }
+                        if process.native_pc()
+                            == Some(crate::native_bridge::native_trace_return_address())
+                        {
+                            // The interpreter returned into a traced native function's return
+                            // frame: finish the frame here, as the stub does for native returns.
+                            // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195,
+                            // OTP-29.1.1.
+                            process.set_native_pc(None);
+                            let value = process.x[0];
+                            let popped =
+                                crate::trace::pop_native_trace_frames(process, |p, words| {
+                                    p.heap.release_stack(words);
+                                });
+                            let Some((frames, caller)) = popped else {
+                                break Err(VmError::Unsupported("native trace frame".into()));
+                            };
+                            let resume_pc = caller.tagged_word() as usize;
+                            self.emit_native_return_frames(process, ctx, frames, value, resume_pc)?;
+                            let bridge = arinsal_beamasm::rt::arinsal_enter_native_return
+                                as *const () as usize;
+                            if resume_pc == bridge {
+                                if !resume_after_native_return(process) {
+                                    break Ok(RunState::Done(process.x[0]));
+                                }
+                            } else {
+                                process.native_continuation_resume = true;
+                                process.set_native_resume_arity(1);
+                                process.set_native_pc(Some(resume_pc));
+                            }
+                            continue;
+                        }
+
+                        if let Some(code_ptr) = process.native_pc() {
+                            crate::beamasm_integration::count_native_call();
+                            if schedule_in_gc {
+                                schedule_in_gc = false;
+                                collect_on_schedule_in(process)?;
+                            }
+                            process.set_native_pc(None);
+
+                            let trace_boot = trace_boot_enabled();
+                            let function = trace_boot
+                                .then(|| crate::native_function_at(code_ptr))
+                                .flatten();
+                            if trace_boot {
+                                eprintln!(
+                                    "arinsal boot: enter native {:?} pc={code_ptr:#x}",
+                                    function
+                                );
+                                if function.as_ref().is_some_and(|f| {
+                                    f.module == "prim_file" && f.function == "decode_path"
+                                }) {
+                                    eprintln!(
+                                        "arinsal boot: decode_path input={:?}",
+                                        process.x.first()
+                                    );
+                                }
+                            }
+                            // A native call to a BIF that parked the process (cross-process signal
+                            // reply) is redone once the process wakes, like the interpreter re-executes
+                            // the call instruction.
+                            let retry = process.take_native_retry();
+                            let outcome = if let Some(target_pc) = retry {
+                                if let Some(call_arity) =
+                                    retry_call_arity(target_pc, process.x.saved_arity())
+                                {
+                                    process.heap.abi.arity = call_arity;
+                                }
+                                if process
+                                    .cold
+                                    .as_ref()
+                                    .and_then(|cold| cold.bif_trap.as_ref())
+                                    .is_some_and(|pending| {
+                                        !pending.schedule_out && pending.import == target_pc
+                                    })
+                                {
+                                    crate::native_helpers::debug_assert_native_heap(process);
+                                }
+                                // The redone call keeps its return address and call site, so a BIF
+                                // that fails after trapping raises at the original call.
+                                let (resume_pc, call_site_pc) =
+                                    process.take_native_retry_site().unwrap_or((0, 0));
+                                if call_site_pc != 0 {
+                                    process.native_error_pc = call_site_pc;
+                                }
+                                arinsal_beamasm::ExitReason::CallUnported {
+                                    target_pc,
+                                    resume_pc,
+                                }
+                            } else {
+                                // Port of erts/emulator/beam/erl_process.c (schedule: reductions
+                                // used = CONTEXT_REDS - FCALLS), OTP-29.1.1: native code counts down
+                                // FCALLS; the scheduler charges what it used.
+                                // FCALLS and the scheduler budget are one counter in erts. A BIF
+                                // charge can zero the process counter while the slice still
+                                // has reductions; refilling avoids yielding before the next
+                                // instruction (the send after a code-permission release).
+                                let native = {
+                                    if process.heap.abi.fcalls <= 0
+                                        && let Ok(remaining) = i32::try_from(ctx.remaining())
+                                        && remaining > 0
+                                    {
+                                        process.heap.abi.fcalls = remaining;
+                                    }
+                                    let fcalls_before = process.heap.abi.fcalls;
+                                    // A code change this scheduler committed waits for thread
+                                    // progress first: every other scheduler then finishes the slice it
+                                    // runs with the previous code index (erts' code barrier).
+                                    if crate::code_ix::take_code_barrier() {
+                                        ctx.block_thread_progress(std::time::Duration::ZERO);
+                                    }
+                                    self.native_registers.active_code_ix = self
+                                        .vm
+                                        .code_ix
+                                        .process_code_ix(crate::trace::saves_calls(process))
+                                        as u64;
+                                    let native = crate::native_bridge::run_native_resume(
+                                        process,
+                                        &mut self.native_registers,
+                                        code_ptr,
+                                    );
+                                    let consumed =
+                                        fcalls_before.saturating_sub(process.heap.abi.fcalls);
+                                    ctx.consume(u32::try_from(consumed).unwrap_or(0));
+                                    // Native `timeout` has no scheduler context to send its trace event.
+                                    if process.native_exit_kind
+                                        != crate::proc_create::NativeExit::None
+                                        && process.take_native_timeout_trace()
+                                    {
+                                        crate::trace::timeout_event(
+                                            Some(&mut self.vm),
+                                            process,
+                                            ctx,
+                                        );
+                                    }
+                                    // Port of erts/emulator/beam/erl_process.c (erts_current_reductions),
+                                    // OTP-29.1.1: the process's reduction count includes what its
+                                    // native code consumed from FCALLS.
+                                    // Reductions the slice gave up with `ERTS_VBUMP_ALL_REDS` ended
+                                    // the slice but are not the process's own.
+                                    let virtual_reds = std::mem::take(&mut process.virtual_reds);
+                                    ctx.add_virtual_reds(virtual_reds);
+                                    process.reductions_used =
+                                        process.reductions_used.saturating_add(
+                                            u64::try_from(consumed)
+                                                .unwrap_or(0)
+                                                .saturating_sub(u64::from(virtual_reds)),
+                                        );
+                                    native
+                                };
+                                match native {
+                                    Ok(outcome) => outcome,
+                                    Err(VmError::Trap(trap)) => {
+                                        if let Some(error) = crate::exceptions::resume(
+                                            &mut self.vm,
+                                            process,
+                                            Some(ctx),
+                                            trap,
+                                        )? {
+                                            process.heap.abi.exc.freason = 0;
+                                            process.heap.abi.exc.fvalue = 0;
+                                            break Err(error);
+                                        }
+                                        process.heap.abi.exc.freason = 0;
+                                        process.heap.abi.exc.fvalue = 0;
+                                        if let Some(cold) = process.cold.as_mut() {
+                                            cold.exit_reason = None;
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            };
+                            if trace_boot
+                                && function.as_ref().is_some_and(|f| {
+                                    f.module == "prim_file" && f.function == "decode_path"
+                                })
+                            {
+                                eprintln!(
+                                    "arinsal boot: decode_path exit={outcome:?} output={:?}",
+                                    process.x.first()
+                                );
+                            }
+                            match self.after_native(process, ctx, outcome, code_ptr, &mut reenter) {
+                                Ok(Flow::Continue) => continue,
+                                Ok(Flow::Break(result)) => break result,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        let remaining = ctx.remaining().min(budget);
+                        let result = process.drain(ctx).and_then(|()| {
+                            if schedule_in_gc {
+                                schedule_in_gc = false;
+                                collect_on_schedule_in(process)?;
+                            }
+                            // Interpreted code keeps no redzone: only a BIF run for a native exit does.
+                            process.heap.clear_native_redzone();
+                            self.vm.run_slice(process, Some(ctx), remaining)
+                        });
+                        // erts schedules out only when FCALLS runs out; an interpreted step that
+                        // just hands control to native code continues the slice.
+                        if matches!(&result, Ok(RunState::Yield))
+                            && process.native_pc().is_some()
+                            && !process.force_yield()
+                            && native_transfer_continues(process, ctx)
+                        {
+                            continue;
+                        }
+                        if hibernate_stopped(process) {
+                            if hibernate_fetch_collect(process, ctx)? {
+                                if let Some(runtime) = process.runtime {
+                                    runtime.mark_hibernating(ctx.pid(), true);
+                                    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+                                    process.slice_mut().hibernate_sched = true;
+                                }
+                                break Ok(RunState::Wait { timeout_ms: None });
+                            }
+                            self.install_apply(process, ctx)?;
+                            continue;
+                        }
+                        if matches!(&result, Ok(RunState::Yield))
+                            && process.runtime.is_some()
+                            && crate::suspend::ctx_suspended(ctx)
+                        {
+                            break park_suspended(process, ctx);
+                        }
+                        let trap = match result {
+                            // Port of erts/preloaded/src/erts_internal.erl:152 (await_result), OTP-29.1.1.
+                            // A cross-process BIF parked this process until the reply signal arrives.
+                            Err(VmError::Unsupported(message))
+                                if crate::signals::is_await_message(&message) =>
+                            {
+                                break Ok(RunState::Wait { timeout_ms: None });
+                            }
+                            Err(VmError::Trap(trap)) => {
+                                // g_port_fix: busy port_command suspends the sender and retries the call.
+                                if crate::port::take_busy_suspend() {
+                                    break Ok(RunState::Wait { timeout_ms: None });
+                                }
+                                trap
+                            }
+                            Err(VmError::Exception { reason, frame }) => {
+                                if trace_boot_enabled() {
+                                    eprintln!("arinsal boot: exception {reason} at {frame}");
+                                }
+                                let mut trap = crate::exceptions::from_legacy(&reason)?;
+                                if reason == "undef"
+                                    && let Some((mfa, arity)) = frame.rsplit_once('/')
+                                    && let Some((module, function)) = mfa.split_once(':')
+                                    && let Ok(arity) = arity.parse::<usize>()
+                                    && arity <= process.x.len()
+                                {
+                                    trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                                        module: arinsal_term::global_atoms()
+                                            .intern(module)
+                                            .map_err(|_| {
+                                                VmError::Unsupported("undef module atom".into())
+                                            })?,
+                                        function: arinsal_term::global_atoms()
+                                            .intern(function)
+                                            .map_err(|_| {
+                                                VmError::Unsupported("undef function atom".into())
+                                            })?,
+                                        args: crate::stacktrace::BifArgs::from_terms(
+                                            &process.x[..arity],
+                                        )?,
+                                        info: crate::stacktrace::BifErrorInfo::None,
+                                    });
+                                }
+                                trap
+                            }
+                            Err(VmError::ExceptionInfo {
+                                reason,
+                                frame,
+                                info,
+                            }) => {
+                                if trace_boot_enabled() {
+                                    eprintln!("arinsal boot: exception {reason} at {frame}");
+                                }
+                                let mut trap = crate::exceptions::from_legacy(&reason)?;
+                                let arity = self.vm.code.modules[process.module]
+                                    .function_at(process.ip())
+                                    .map(|(_, arity)| arity)
+                                    .unwrap_or(0);
+                                trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+                                    Some(Term::small(i64::from(arity)).expect("arity is small")),
+                                    info,
+                                ));
+                                trap
+                            }
+                            other => break other,
+                        };
+                        if trace_boot_enabled() {
+                            eprintln!(
+                                "arinsal boot: process {:?} trap in {} at ip {} line {:?} instruction {:?}: {:?} reason {:?}",
+                                ctx.pid(),
+                                self.vm.frame_name(process),
+                                process.ip(),
+                                self.vm.code.modules[process.module].lines.get(process.ip()),
+                                self.vm.code.modules[process.module].code.get(process.ip()),
+                                trap.class,
+                                arinsal_term::to_owned(trap.reason)
+                            );
+                        }
+                        let resumed =
+                            crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap)?;
+                        if let Some(error) = resumed {
+                            break Err(error);
+                        }
+                        // boot_loop2: a caught exit must not survive as a later process exit reason.
+                        if let Some(cold) = process.cold.as_mut() {
+                            cold.exit_reason = None;
+                        }
+                    }
+                }
+            })()
+        };
+        // erts keeps a process whose middle queue holds unhandled signals (ERTS_PSFLG_SIG_Q)
+        // scheduled for signal handling even when it waits (erl_process.c:10318-10351, with
+        // all reductions since it has no Erlang work); this scheduler only wakes a process for
+        // new input, so the rest is handled before it sleeps. Messages it produces end the
+        // wait like a new message would.
+        let result = match result {
+            Ok(RunState::Wait { timeout_ms })
+                if !process.sig_cont_empty() || process.delayed_gc_due() =>
+            {
+                let queued = process.inbox.len();
+                match process.handle_local_signals(ctx) {
+                    Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait { timeout_ms }),
+                    Ok(()) => Ok(RunState::Yield),
+                    Err(error) => Err(error),
+                }
+            }
+            other => other,
+        };
+        if matches!(
+            result,
+            Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
+        ) {
+            // Port of erts/emulator/beam/erl_process.c:10550 and beam_common.c (the yield or
+            // wait site stores its live X register count in `c_p->arity`, and only those are
+            // saved in `c_p->arg_reg`), OTP-29.1.1: a native continuation already holds it in
+            // `header.arity`; an interpreted switch-out has it in `gc_live`, the count of its
+            // last live operand or call arity (4 from exception handler entry until it runs).
+            // A native call the scheduler redoes (BIF trap, traced apply) carries the larger of
+            // the two, whichever side stated it. From here on `header.arity` is the one count
+            // every reader of the saved file takes.
+            let arity_set = process.native_pc().is_some() && process.native_arity_set;
+            let call_arity = usize::from(process.heap.abi.arity);
+            let mut live_x = if arity_set {
+                call_arity
+            } else if process.native_pc().is_some() {
+                process.gc_live.max(call_arity)
+            } else {
+                process.gc_live
+            };
+            // A fun call or apply the scheduler redoes reads its operands from the saved file:
+            // the arguments and the fun or module and function above them, and nothing else is
+            // live. The saved count is that operand count; the retry takes the call's own arity
+            // back from it (`retry_call_arity`).
+            if !arity_set
+                && process.native_pc().is_some()
+                && let Some(operands) = process
+                    .native_retry()
+                    .and_then(|target| retry_operand_count(target, call_arity))
+            {
+                live_x = operands;
+            }
+            process.heap.abi.arity = live_x.min(usize::from(u8::MAX)) as u8;
+            process.gc_live = live_x;
+            let save_x = live_x;
+            if crate::native_bridge::return_trace_enabled() && process.native_pc().is_some() {
+                eprintln!(
+                    "[sched-save-native] live_x={live_x} x0={:#x} module={} native_pc={:?}",
+                    process.x[0].tagged_word(),
+                    self.vm.code.modules[process.module].name,
+                    process.native_pc()
+                );
+            }
+            // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_out_registers),
+            // OTP-29.1.1: the `c_p->arity` registers go from the scheduler array into the
+            // process, six of them inline (`def_arg_reg`) so switching out allocates nothing.
+            process.x.detach_save(save_x);
+        } else {
+            process.x.detach_save(0);
+            process.x = crate::proc_create::ArgRegs::empty();
+        }
+        // A waiting process is not collected when it switches out: erts only runs
+        // `scheduler_gc_proc` for a process being scheduled in (a yielded process is still
+        // active) or handling signals/sys tasks, so a sleeping receiver with on-heap message
+        // fragments keeps them until it next runs.
+        if matches!(result, Ok(RunState::Yield)) {
+            // erts collects a switched-out process rooting only its `c_p->arity` live X
+            // registers; the saved register file above that holds dead registers whose
+            // pointers may refer to a heap an earlier collection already freed.
+            // Port of erts/emulator/beam/erl_process.c:10415 (ERTS_IS_GC_DESIRED ->
+            // scheduler_gc_proc, garbage_collect with p->arity), OTP-29.1.1.
+            let live = switched_out_live(process);
+            process.collect_bin_vheap_if_due(live)?;
+        }
+        // OTP emits regular `out` only when a process is scheduled out; normal exit uses the
+        // separate `out_exiting` event when that flag is enabled.
+        // Port of erts/emulator/beam/erl_process.c:10550-10567, OTP-29.1.1.
+        if (matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
+            || matches!(result, Err(VmError::Yield | VmError::Dirty(_))))
+            && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0
+        {
+            let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
+            // erl_trace.c:752-760 (trace_sched_session): no current function is reported as 0.
+            let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
+            // Port of erts/emulator/beam/erl_process.c:10556-10560 (trace_schedule_out).
+            if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
+                crate::trace_bp::schedule_time_break(process, ctx.pid(), true);
+            }
+            crate::trace::emit(
+                Some(&mut self.vm),
+                process,
+                ctx,
+                ctx.pid(),
+                crate::trace::RUNNING,
+                "out",
+                &running_fields,
+            );
+        }
+        if let Some(schedule_started) = schedule_started {
+            crate::natives::erts_debug::after_schedule(
+                process,
+                schedule_started.elapsed().as_nanos() as u64,
+            );
+        }
+        result
+    }
+}
