@@ -183,6 +183,9 @@ pub(crate) const EXTERNAL_REF: u64 = 0x38;
 /// `ERTS_REF_THING_HEADER`: ordinary and magic refs share this header on 64-bit little endian.
 // Port of erts/emulator/beam/erl_term.h:998 (ERTS_REF_THING_HEADER), OTP-29.1.1.
 pub(crate) const REF_THING_HEADER: u64 = (2 << 6) | REF;
+/// Internal reference carrying its creator PID in two trailing 32-bit numbers.
+// Port of erts/emulator/beam/erl_term.h:999 (ERTS_PID_REF_THING_HEADER), OTP-29.1.1.
+pub(crate) const PID_REF_THING_HEADER: u64 = (3 << 6) | REF;
 // Port of erts/emulator/beam/erl_term.h:794 (ERTS_ORDINARY_REF_MARKER), OTP-29.1.1.
 pub(crate) const ORDINARY_REF_MARKER: u32 = u32::MAX;
 

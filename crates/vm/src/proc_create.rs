@@ -1046,6 +1046,24 @@ pub(crate) fn create_monitor_at(
     info: MonitorInfo,
     state: OriginMonitor,
 ) -> (ProcessMonitor, ProcessMonitor) {
+    create_monitor_with_reference_at(
+        ix,
+        crate::monitor_link::MonitorReference::ordinary(reference),
+        origin,
+        target,
+        info,
+        state,
+    )
+}
+
+pub(crate) fn create_monitor_with_reference_at(
+    ix: Option<usize>,
+    reference: crate::monitor_link::MonitorReference,
+    origin: u64,
+    target: u64,
+    info: MonitorInfo,
+    state: OriginMonitor,
+) -> (ProcessMonitor, ProcessMonitor) {
     let kind = state.kind();
     crate::monitor_link::Monitor::create_at(ix, kind, reference, origin, target, 0, info, state)
 }
@@ -1063,7 +1081,7 @@ pub(crate) fn remote_monitor_signal(
         watcher.data(),
         target.data(),
         MonitorInfo::default(),
-        OriginMonitor::Distributed { alias_mode: None },
+        OriginMonitor::Distributed,
     );
     arinsal_sched::Signal::Monitor {
         reference,
@@ -1071,10 +1089,21 @@ pub(crate) fn remote_monitor_signal(
     }
 }
 
-/// An origin entry whose target half no process holds: an alias, or a monitor of a port or a
-/// remote process, whose other end keeps its own record.
-pub(crate) fn origin_monitor(reference: u64, target: u64, state: OriginMonitor) -> ProcessMonitor {
-    let (origin, _target) = create_monitor(reference, 0, target, MonitorInfo::default(), state);
+pub(crate) fn origin_monitor_with_reference(
+    reference: crate::monitor_link::MonitorReference,
+    creator: u64,
+    target: u64,
+    state: OriginMonitor,
+) -> ProcessMonitor {
+    let (origin, _target) = crate::monitor_link::Monitor::create(
+        state.kind(),
+        reference,
+        if reference.is_pid_ref() { creator } else { 0 },
+        target,
+        0,
+        MonitorInfo::default(),
+        state,
+    );
     origin
 }
 
@@ -1087,32 +1116,41 @@ pub enum AliasMode {
     ReplyDemonitor,
 }
 
+pub(crate) fn monitor_reference(
+    id: u64,
+    alias_mode: Option<AliasMode>,
+    alias_priority: bool,
+) -> crate::monitor_link::MonitorReference {
+    let mut reference = if let Some(mode) = alias_mode {
+        crate::monitor_link::MonitorReference::pid_ref(id).with_alias_mode(mode)
+    } else {
+        crate::monitor_link::MonitorReference::ordinary(id)
+    };
+    if alias_mode.is_some() && alias_priority {
+        reference = reference.with_alias_priority();
+    }
+    reference
+}
+
 /// An origin-side entry in the per-process monitor tree.
 // Port of erts/emulator/beam/erl_monitor_link.c (monitor tree origin entries), OTP-29.1.1.
 #[derive(Clone, Debug)]
 pub enum OriginMonitor {
     Process(OriginHalf),
-    Distributed {
-        alias_mode: Option<AliasMode>,
-    },
+    Distributed,
     /// `ERTS_MON_TYPE_PORT`: the port id (none when `name` is not registered) and the
     /// registered name the monitor was created with.
     Port {
         port_id: Option<u64>,
-        alias_mode: Option<AliasMode>,
         name: Option<arinsal_term::Atom>,
     },
     /// `ERTS_MON_TYPE_DIST_PORT`: an external port of an old incarnation of this node.
     DistPort {
-        alias_mode: Option<AliasMode>,
         /// Boxed so the common origin entries stay small: the monitor tree allocates a node
         /// per entry sized by its largest variant.
         object: Box<arinsal_etf::OwnedTerm>,
     },
-    Alias {
-        mode: AliasMode,
-        priority: bool,
-    },
+    Alias,
     /// `ERTS_MON_TYPE_PORT` with a port as the origin (`driver_monitor_process`): the process
     /// holds the target half.
     PortOrigin,
@@ -1124,26 +1162,11 @@ impl OriginMonitor {
         use crate::monitor_link::node_type;
         match self {
             Self::Process(_) => node_type::MONITOR_PROC,
-            Self::Distributed { .. } => node_type::MONITOR_DIST_PROC,
+            Self::Distributed => node_type::MONITOR_DIST_PROC,
             Self::Port { .. } | Self::PortOrigin => node_type::MONITOR_PORT,
             Self::DistPort { .. } => node_type::MONITOR_DIST_PORT,
-            Self::Alias { .. } => node_type::MONITOR_ALIAS,
+            Self::Alias => node_type::MONITOR_ALIAS,
         }
-    }
-
-    pub(crate) fn alias_mode(&self) -> Option<AliasMode> {
-        match self {
-            Self::Process(half) => half.alias_mode,
-            Self::Distributed { alias_mode }
-            | Self::Port { alias_mode, .. }
-            | Self::DistPort { alias_mode, .. } => *alias_mode,
-            Self::Alias { mode, .. } => Some(*mode),
-            Self::PortOrigin => None,
-        }
-    }
-
-    pub(crate) fn alias_priority(&self) -> bool {
-        matches!(self, Self::Alias { priority: true, .. })
     }
 }
 
@@ -1192,9 +1215,7 @@ pub(crate) fn port_link(id: u64) -> crate::monitor_link::Link {
 /// Origin state of a local process monitor; the target is the half's `other` and the shared
 /// data is its [`MonitorInfo`].
 #[derive(Clone, Debug)]
-pub struct OriginHalf {
-    pub(crate) alias_mode: Option<AliasMode>,
-}
+pub struct OriginHalf;
 
 /// The fields of the cold state that the scheduling-in half tests before it enters native
 /// code. They are written only through `Process::slice_mut`, whose guard keeps the process'

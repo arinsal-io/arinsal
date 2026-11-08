@@ -182,7 +182,7 @@ impl Process {
         // remote bookkeeping to release.
         let remote = matches!(
             origin.as_ref().and_then(|origin| origin.state()),
-            Some(crate::proc_create::OriginMonitor::Distributed { .. })
+            Some(crate::proc_create::OriginMonitor::Distributed)
         ) && crate::dist::take_monitor(reference).is_some();
         let active = origin.is_some() || remote;
         let priority = self
@@ -244,7 +244,7 @@ impl Process {
         let (info, port_object) = match entry.as_ref().and_then(|entry| entry.state()) {
             Some(
                 crate::proc_create::OriginMonitor::Process(_)
-                | crate::proc_create::OriginMonitor::Distributed { .. },
+                | crate::proc_create::OriginMonitor::Distributed,
             ) => (entry.as_ref().map(|entry| entry.view().info()), None),
             Some(crate::proc_create::OriginMonitor::Port { port_id, name, .. }) => {
                 (None, Some(PortObject::Local(*port_id, *name)))
@@ -262,7 +262,13 @@ impl Process {
             crate::signals::atom("DOWN")
         };
         let name = info.and_then(|info| info.name().map(str::to_owned));
-        let reference = crate::signals::reference(self, reference)?;
+        let reference = match entry
+            .as_ref()
+            .and_then(|entry| entry.view().reference_creator())
+        {
+            Some(owner) => crate::signals::pid_reference(self, reference, Pid::from_data(owner))?,
+            None => crate::signals::reference(self, reference)?,
+        };
         let (from_type, from) = if let Some(object) = port_object {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:4838-5056
             // (convert_to_down_message), OTP-29.1.1.
@@ -305,6 +311,7 @@ impl Process {
 pub(super) fn down_message_on_sender(
     process: &mut Process,
     reference: u64,
+    reference_creator: Option<u64>,
     data: &crate::proc_create::MonitorInfo,
     target: Pid,
     reason: Term,
@@ -317,7 +324,10 @@ pub(super) fn down_message_on_sender(
         }
         None => crate::signals::atom("DOWN"),
     };
-    let reference_term = crate::signals::reference(process, reference)?;
+    let reference_term = match reference_creator {
+        Some(owner) => crate::signals::pid_reference(process, reference, Pid::from_data(owner))?,
+        None => crate::signals::reference(process, reference)?,
+    };
     let from = target
         .to_term()
         .ok_or_else(|| VmError::Unsupported("invalid monitor target pid".into()))?;

@@ -4493,18 +4493,16 @@ fn create_alias(
         }
     }
     let id = process.next_ref();
-    let reference = crate::signals::reference(process, id)?;
     let pid = ctx.pid();
+    let reference = crate::signals::pid_reference(process, id, pid)?;
     process
-        .runtime
-        .as_ref()
-        .ok_or_else(badarg)?
-        .alias_bind_prio(id, Some(pid), priority);
-    process.monitors.insert(crate::proc_create::origin_monitor(
-        id,
-        0,
-        crate::proc_create::OriginMonitor::Alias { mode, priority },
-    ));
+        .monitors
+        .insert(crate::proc_create::origin_monitor_with_reference(
+            crate::proc_create::monitor_reference(id, Some(mode), priority),
+            pid.data(),
+            0,
+            crate::proc_create::OriginMonitor::Alias,
+        ));
     Ok(reference)
 }
 

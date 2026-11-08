@@ -84,16 +84,26 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     node,
                     creation,
                     ids,
-                } if node == "nonode@nohost" && *creation == 0 && ids.len() <= 3 => {
+                } if ids.len() <= 5
+                    && ((*node == "nonode@nohost" && *creation == 0)
+                        || (crate::identity::this_node().1 == *creation
+                            && global_atoms()
+                                .text(crate::identity::this_node().0)
+                                .is_some_and(|local| local == node))) =>
+                {
                     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
                     // OTP-29.1.1: numbers of a saved magic reference give that reference.
                     let mut local_ids = [0; 3];
-                    local_ids[..ids.len()].copy_from_slice(ids);
+                    let id_count = ids.len().min(3);
+                    local_ids[..id_count].copy_from_slice(&ids[..id_count]);
                     let saved = (local_ids[1] & (1 << 17) != 0)
                         .then(|| MagicRef::lookup_saved_numbers(local_ids))
                         .flatten();
                     values.push(match saved {
                         Some(owner) => builder.magic_ref(owner)?,
+                        None if ids.len() == 5 && ids[1] & (1 << 16) != 0 => {
+                            builder.local_pid_ref_from_words(local_ids, ids[3], ids[4])?
+                        }
                         None => builder.local_ref(local_ids)?,
                     });
                 }
@@ -334,17 +344,27 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                             )));
                         }
                         Identity::Ref {
-                            node,
-                            creation,
+                            node: ref_node,
+                            creation: ref_creation,
                             ids,
-                        } => values.push(OwnedTerm::Ref {
-                            node: global_atoms()
-                                .text(node)
-                                .ok_or(TermError::BadArg)?
-                                .to_string(),
-                            creation,
-                            ids: ids.to_vec(),
-                        }),
+                        } => {
+                            let (node, creation) = if term
+                                .local_pid_ref_pid_word()
+                                .is_some_and(|pid_word| pid_word.is_some())
+                            {
+                                crate::identity::this_node()
+                            } else {
+                                (ref_node, ref_creation)
+                            };
+                            values.push(OwnedTerm::Ref {
+                                node: global_atoms()
+                                    .text(node)
+                                    .ok_or(TermError::BadArg)?
+                                    .to_string(),
+                                creation,
+                                ids: ids.to_vec(),
+                            });
+                        }
                     }
                 }
                 TermKind::Bitstring => {

@@ -6,7 +6,7 @@ use crate::record_table::RecordLayout;
 use crate::{
     ARITY, Atom, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry,
     FLOAT, FunEntry, HEAP_BITS, MAP_HEADER_FLATMAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG,
-    RECORD, REF, SUB_BITS, Term, TermError, TermKind, cmp, exact_eq,
+    RECORD, SUB_BITS, Term, TermError, TermKind, cmp, exact_eq,
 };
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use num_bigint::{BigInt, Sign};
@@ -5138,6 +5138,21 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     pub fn local_ref(&mut self, ids: [u32; 3]) -> Result<Term, TermError> {
         Term::local_ref(self.heap, ids)
     }
+
+    /// Construct a local PID reference with its creator PID term.
+    pub fn local_pid_ref(&mut self, ids: [u32; 3], pid: Term) -> Result<Term, TermError> {
+        Term::local_pid_ref(self.heap, ids, pid)
+    }
+
+    /// Construct a local PID reference from its serialized creator PID words.
+    pub fn local_pid_ref_from_words(
+        &mut self,
+        ids: [u32; 3],
+        pid_low: u32,
+        pid_high: u32,
+    ) -> Result<Term, TermError> {
+        Term::local_pid_ref_from_words(self.heap, ids, pid_low, pid_high)
+    }
 }
 
 /// A boxed heap object filled in order after one contiguous allocation.
@@ -5759,12 +5774,63 @@ impl Term {
         heap: &mut (impl HeapAlloc + ?Sized),
         ids: [u32; 3],
     ) -> Result<Self, TermError> {
-        let p = heap.alloc(3).ok_or(TermError::HeapFull)?;
-        // SAFETY: three words reserved, matching ErtsORefThing on little endian.
+        Self::local_ref_with_pid(heap, ids, None)
+    }
+
+    /// Construct a local PID reference with its three reference numbers and creator PID.
+    ///
+    /// Port of erts/emulator/beam/erl_term.h:905-919 (`write_pid_ref_thing`), OTP-29.1.1.
+    pub fn local_pid_ref(
+        heap: &mut (impl HeapAlloc + ?Sized),
+        ids: [u32; 3],
+        pid: Term,
+    ) -> Result<Self, TermError> {
+        let pid_data = pid.as_pid_data().ok_or(TermError::BadArg)?;
+        let pid_word = pid.tagged_word();
+        debug_assert_eq!(Term(pid_word).as_pid_data(), Some(pid_data));
+        Self::local_ref_with_pid(heap, ids, Some(pid_word))
+    }
+
+    /// Construct a local PID reference from the serialized creator PID words.
+    pub fn local_pid_ref_from_words(
+        heap: &mut (impl HeapAlloc + ?Sized),
+        ids: [u32; 3],
+        pid_low: u32,
+        pid_high: u32,
+    ) -> Result<Self, TermError> {
+        let pid_data = u64::from(pid_low) | (u64::from(pid_high) << 32);
+        if Term(pid_data).as_pid_data().is_none() {
+            return Err(TermError::BadArg);
+        }
+        Self::local_ref_with_pid(heap, ids, Some(pid_data))
+    }
+
+    // Port of erts/emulator/beam/erl_term.h:844-919 (`write_ref_thing` / `write_pid_ref_thing`), OTP-29.1.1.
+    fn local_ref_with_pid(
+        heap: &mut (impl HeapAlloc + ?Sized),
+        mut ids: [u32; 3],
+        pid_data: Option<u64>,
+    ) -> Result<Self, TermError> {
+        if pid_data.is_some() {
+            // Port of erts/emulator/beam/erl_bif_unique.h:108 (`ERTS_REF1_PID_MARKER_BIT__`),
+            // OTP-29.1.1.
+            ids[1] |= 1 << 16;
+        }
+        let words = if pid_data.is_some() { 4 } else { 3 };
+        let p = heap.alloc(words).ok_or(TermError::HeapFull)?;
+        // SAFETY: the allocation reserves the exact ordinary or PID-ref thing size, matching
+        // the 64-bit little-endian ErtsORefThing/ErtsPRefThing layouts.
         unsafe {
-            *p = (2 << 6) | REF;
+            *p = if pid_data.is_some() {
+                crate::PID_REF_THING_HEADER
+            } else {
+                crate::REF_THING_HEADER
+            };
             *p.add(1) = ((ids[0] as u64) << 32) | 0xffff_ffff;
             *p.add(2) = ((ids[2] as u64) << 32) | ids[1] as u64;
+            if let Some(pid_data) = pid_data {
+                *p.add(3) = pid_data;
+            }
         }
         Ok(Term::from_ptr(p, 2))
     }

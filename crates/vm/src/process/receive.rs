@@ -117,27 +117,20 @@ impl Process {
     /// `reply` alias is deactivated by the first one.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message, ERTS_ALIAS_ONCE),
     // OTP-29.1.1.
-    fn alias_message_accepted(
+    pub(super) fn alias_message_accepted(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
         alias: u64,
-    ) -> Result<bool, VmError> {
+    ) -> Result<Option<bool>, VmError> {
         if alias == 0 {
-            return Ok(true);
+            return Ok(Some(false));
         }
-        let Some(runtime) = self.runtime else {
-            return Ok(true);
-        };
-        let Some((Some(_), priority)) = runtime.alias_lookup_prio(alias) else {
-            return Ok(false);
-        };
-        let Some(entry) = self.monitors.get_state(alias) else {
-            return Ok(false);
-        };
-        if entry.alias_priority() != priority {
-            return Ok(false);
+        if self.monitors.get_state(alias).is_none() {
+            return Ok(None);
         }
-        if entry.alias_mode() == Some(crate::proc_create::AliasMode::ReplyDemonitor) {
+        let monitor = self.monitors.get(alias).expect("monitor state has a node");
+        let priority = monitor.alias_priority();
+        if monitor.alias_mode() == Some(crate::proc_create::AliasMode::ReplyDemonitor) {
             let entry = self.monitors.remove(alias);
             let state = entry.as_ref().and_then(|entry| entry.state()).cloned();
             match state {
@@ -154,8 +147,8 @@ impl Process {
                 }) => {
                     crate::port::demonitor_port(self, ctx.pid(), port_id, alias);
                 }
-                Some(crate::proc_create::OriginMonitor::Alias { .. }) => {}
-                Some(crate::proc_create::OriginMonitor::Distributed { .. }) => {
+                Some(crate::proc_create::OriginMonitor::Alias) => {}
+                Some(crate::proc_create::OriginMonitor::Distributed) => {
                     crate::dist::demonitor_alias(self, ctx, alias)?;
                 }
                 Some(
@@ -165,24 +158,27 @@ impl Process {
                 )
                 | None => {}
             }
-            runtime.alias_bind(alias, None);
         }
-        Ok(true)
+        Ok(Some(priority))
     }
 
     /// Move a message signal into the message queue.
     pub(super) fn move_message(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
-        node: MessageNode,
+        mut node: MessageNode,
     ) -> Result<(), VmError> {
         let from = node.from;
-        if let Payload::Message(message) = &node.payload {
-            let (alias, receive_traced, priority) =
+        if let Payload::Message(message) = &mut node.payload {
+            let (alias, receive_traced, mut priority) =
                 (message.alias, message.receive_traced, message.is_priority());
             {
-                if !self.alias_message_accepted(ctx, alias)? {
+                let Some(alias_priority) = self.alias_message_accepted(ctx, alias)? else {
                     return Ok(());
+                };
+                if alias != 0 && !alias_priority {
+                    message.priority = false;
+                    priority = false;
                 }
                 let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                 let sender = from;

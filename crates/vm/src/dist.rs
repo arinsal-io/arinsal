@@ -546,11 +546,10 @@ fn route_incoming(
                 return Err(badarg());
             };
             let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
-            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-            if let Some(Some(target)) = runtime.alias_lookup(reference) {
+            if let Some(target) = remote_alias_pid(&parts[2]) {
                 for term in terms {
                     let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                    ctx.send(target, Message::copy_from(message)?)
+                    ctx.send(target, Message::copy_from(message)?.with_alias(reference))
                         .map_err(|error| {
                             VmError::Unsupported(format!("dist alias send: {error}"))
                         })?;
@@ -753,6 +752,30 @@ fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
         value |= u64::from(*id) << (index * 32);
     }
     Some(value)
+}
+
+fn remote_alias_pid(reference: &OwnedTerm) -> Option<Pid> {
+    let OwnedTerm::Ref {
+        node,
+        creation,
+        ids,
+    } = reference
+    else {
+        return None;
+    };
+    // Port of erts_pid_ref_lookup (erl_bif_unique.h), OTP-29.1.1: ETF carries the
+    // reference-number PID marker and creator PID, and only a local creator is routable.
+    let (local_node, local_creation) = arinsal_term::this_node();
+    if ids.len() != 5
+        || ids[1] & (1 << 16) == 0
+        || *creation != local_creation
+        || global_atoms().text(local_node)? != node
+    {
+        return None;
+    }
+    Some(Pid::from_data(Term::local_pid_ref_data_from_words(
+        ids[3], ids[4],
+    )?))
 }
 
 fn registered_pid(process: &Process, name: &str) -> Option<Pid> {
@@ -1371,9 +1394,9 @@ fn route_incoming_port(
                 return Err(badarg());
             };
             let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
-            if let Some(Some(target)) = runtime.alias_lookup(reference) {
+            if let Some(target) = remote_alias_pid(&parts[2]) {
                 for term in terms {
-                    let message = owned_to_message(&term)?;
+                    let message = owned_to_message(&term)?.with_alias(reference);
                     sched.send(target, target, message).map_err(|error| {
                         VmError::Unsupported(format!("dist alias send: {error}"))
                     })?;
@@ -1384,40 +1407,38 @@ fn route_incoming_port(
         // `{37, Flags, SenderPid, To}` — alias bit delivers like DOP_ALIAS_SEND.
         37 if parts.len() >= 4 => {
             let flags = as_u64(&parts[1]).ok_or_else(badarg)?;
+            const FLG_PRIO: u64 = 1 << 0;
             const FLG_ALIAS: u64 = 1 << 2;
             const FLG_NAME: u64 = 1 << 3;
             const FLG_EXIT: u64 = 1 << 4;
-            if flags & FLG_EXIT != 0 {
-                // Exit via altact not required for net_adm:ping; defer.
-                return Ok(());
-            }
-            if flags & FLG_ALIAS != 0 {
+            let from = remote_proxy(handle, &parts[2])?;
+            let (target, alias) = if flags & FLG_ALIAS != 0 {
                 let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-                if let Some(Some(target)) = runtime.alias_lookup(reference) {
-                    for term in terms {
-                        let message = owned_to_message(&term)?;
-                        sched.send(target, target, message).map_err(|error| {
-                            VmError::Unsupported(format!("dist altact alias: {error}"))
-                        })?;
-                    }
-                }
+                (remote_alias_pid(&parts[3]), Some(reference))
             } else if flags & FLG_NAME != 0 {
                 let OwnedTerm::Atom(name) = &parts[3] else {
                     return Err(badarg());
                 };
-                let target = runtime.reg.whereis_proc_str(name).ok_or_else(badarg)?;
-                for term in terms {
-                    let message = owned_to_message(&term)?;
-                    sched.send(target, target, message).map_err(|error| {
-                        VmError::Unsupported(format!("dist altact name: {error}"))
-                    })?;
-                }
+                (runtime.reg.whereis_proc_str(name), None)
             } else {
-                let target = local_pid(&parts[3], local).ok_or_else(badarg)?;
+                (local_pid(&parts[3], local), None)
+            };
+            if let Some(target) = target {
                 for term in terms {
-                    let message = owned_to_message(&term)?;
-                    sched.send(target, target, message).map_err(|error| {
-                        VmError::Unsupported(format!("dist altact pid: {error}"))
+                    let mut message = owned_to_message(&term)?;
+                    if let Some(alias) = alias {
+                        message = message.with_alias(alias);
+                    }
+                    if flags & FLG_PRIO != 0 {
+                        message = message.with_priority();
+                    }
+                    let result = if flags & FLG_EXIT != 0 {
+                        sched.signal(from, target, Signal::Exit(Box::new(message)))
+                    } else {
+                        sched.send(from, target, message)
+                    };
+                    result.map_err(|error| {
+                        VmError::Unsupported(format!("dist altact send: {error}"))
                     })?;
                 }
             }
@@ -2261,13 +2282,13 @@ pub(crate) fn native_signal(
             let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
             let info = crate::signals::monitor_info_for(tag, None)?;
             let id = arinsal_bifs::next_ref_id();
-            let reference = crate::signals::reference(process, id)?;
+            let reference = if alias_mode.is_some() {
+                crate::signals::pid_reference(process, id, ctx.pid())?
+            } else {
+                crate::signals::reference(process, id)?
+            };
             if priority {
                 process.cold_mut().prio_monitors.insert(id);
-            }
-            if alias_mode.is_some() {
-                let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-                runtime.alias_bind(id, Some(ctx.pid()));
             }
             // DOP_MONITOR_P ToProc is a pid or registered name atom (not {Name,Node}).
             let wire_target = match &target {
@@ -2291,12 +2312,13 @@ pub(crate) fn native_signal(
             )?;
             remember_monitor(&node, id, ctx.pid(), target)?;
             process.cold_mut().dist_monitors.insert(id);
-            let (origin, _) = crate::proc_create::create_monitor(
-                id,
+            let (origin, _) = crate::proc_create::create_monitor_with_reference_at(
+                process.heap.alloc_ix(),
+                crate::proc_create::monitor_reference(id, alias_mode, priority),
                 ctx.pid().data(),
                 0,
                 info,
-                crate::proc_create::OriginMonitor::Distributed { alias_mode },
+                crate::proc_create::OriginMonitor::Distributed,
             );
             process.monitors.insert(origin);
             Ok(reference)

@@ -2414,6 +2414,34 @@ pub(crate) extern "C" fn process_bif_light(
     }
 }
 
+/// `send_3`'s local fast path returns in registers; only a declined call enters the executor.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
+pub(crate) extern "C" fn send3_bif_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let args = &registers.x_reg_array[..3];
+    if crate::signals::send3_light_eligible(process, args) {
+        return match crate::signals::send3_light_call(process, args) {
+            Ok(value) => {
+                registers.x_reg_array[0] = value;
+                crate::native_hooks::raw(value)
+            }
+            Err(trap) => thin_bif_failed(process, registers, descriptor, *trap, identity as usize),
+        };
+    }
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    park_executor(process, export, identity, false)
+}
+
 /// A process BIF whose success path returns in registers: no `Result<Term, Trap>` is moved
 /// unless the BIF fails, and the export is not read unless it does.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1:
@@ -2584,9 +2612,16 @@ fn invoke_dispatch_bif(
         && !((bif as usize)
             == (crate::natives::sys::garbage_collect_bif as *const () as usize)
             && process.gc_outer_queue_pending())
-        && let Some(raw) = call_process_bif(process, registers, export, bif, export_call, identity)
     {
-        return Some(raw);
+        if (bif as usize) == (crate::signals::send3_light as *const () as usize) {
+            if let Some(raw) = call_send3_bif_light(process, registers, export, identity) {
+                return Some(raw);
+            }
+        } else if let Some(raw) =
+            call_process_bif(process, registers, export, bif, export_call, identity)
+        {
+            return Some(raw);
+        }
     }
     // The export trampoline has a separate interpreted-call sentinel. Only the light-BIF
     // fragment turns THE_NON_VALUE with TRAP into `context_switch_simplified`.
@@ -3643,6 +3678,28 @@ fn call_process_bif(
         return Some(crate::native_hooks::raw(value));
     }
     Some(process_bif_result(process, export, arity, result, identity))
+}
+
+/// Run `send_3` from an export entry without materializing its declining `Option<Result<…>>`.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
+#[inline(always)]
+fn call_send3_bif_light(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    identity: usize,
+) -> Option<u64> {
+    let args = &registers.x_reg_array[..3];
+    if !crate::signals::send3_light_eligible(process, args) {
+        return None;
+    }
+    Some(match crate::signals::send3_light_call(process, args) {
+        Ok(value) => {
+            registers.x_reg_array[0] = value;
+            crate::native_hooks::raw(value)
+        }
+        Err(trap) => process_bif_result(process, export, 3, Err(*trap), identity),
+    })
 }
 
 /// A process BIF's exception, or a value after which a collection is desired.

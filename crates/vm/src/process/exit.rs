@@ -419,9 +419,14 @@ impl Process {
                     continue;
                 }
                 if reason.is_pointer() {
-                    if let Ok(message) =
-                        down_message_on_sender(self, reference, half.info(), ctx.pid(), reason)
-                    {
+                    if let Ok(message) = down_message_on_sender(
+                        self,
+                        reference,
+                        half.reference_creator(),
+                        half.info(),
+                        ctx.pid(),
+                        reason,
+                    ) {
                         let _ = ctx.signal(
                             pid,
                             arinsal_sched::Signal::MonitorDownMsg {
@@ -484,9 +489,14 @@ impl Process {
                 continue;
             }
             if reason.is_pointer() {
-                if let Ok(message) =
-                    down_message_on_sender(self, reference, half.info(), ctx.pid(), reason)
-                {
+                if let Ok(message) = down_message_on_sender(
+                    self,
+                    reference,
+                    half.reference_creator(),
+                    half.info(),
+                    ctx.pid(),
+                    reason,
+                ) {
                     let _ = ctx.signal(
                         pid,
                         arinsal_sched::Signal::MonitorDownMsg {
