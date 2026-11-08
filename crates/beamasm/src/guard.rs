@@ -744,7 +744,7 @@ impl BeamModuleAssembler {
         let lhs = self.source_reg(first)?;
         let rhs = self.source_reg_into(second, Gpr::x(17))?;
         self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
-        self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), lhs, rhs])?;
+        self.emit_guard_helper_call_raising(helper as usize, lhs, rhs, first, second)?;
         self.store_guard_result(destination, Gpr::x(0))
     }
 
@@ -818,7 +818,7 @@ impl BeamModuleAssembler {
         let lhs = self.source_reg(first)?;
         let rhs = self.source_reg_into(second, Gpr::x(17))?;
         self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
-        self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), lhs, rhs])?;
+        self.emit_guard_helper_call_raising(helper as usize, lhs, rhs, first, second)?;
         self.code.emit(|e| {
             e.cmp_imm(Gpr::x(0), 0, false)?;
             e.mov_const(Gpr::x(10), 0x0b)?;
@@ -826,6 +826,69 @@ impl BeamModuleAssembler {
             e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Ne)
         })?;
         self.store_guard_result(destination, Gpr::x(0))
+    }
+
+    /// Calls a guard BIF helper outside a guard. On failure the BIF's arguments are moved
+    /// into the cached X0/X1 before raising: the raise stub spills the cached registers over
+    /// the register array, so arguments the helper published only in memory would be lost
+    /// (and a trapping BIF such as `length/1`, whose original argument sits in the trap state
+    /// above the live registers, would report a stale X0).
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_i_length_body_shared: "Move the
+    // original argument to x0" before emit_raise_exception) and instr_guard_bifs.cpp
+    // (mov_arg(XREG0/XREG1, ...) before the badarg/badmap raise), OTP-29.1.1.
+    fn emit_guard_helper_call_raising(
+        &mut self,
+        target: usize,
+        lhs: Gpr,
+        rhs: Gpr,
+        first: ArgVal,
+        second: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let update = Update::HEAP_ALLOC;
+        emit_enter_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            e.mov_reg(Gpr::x(1), Gpr::x(8))?;
+            e.mov_reg(Gpr::x(2), lhs)?;
+            e.mov_reg(Gpr::x(3), rhs)?;
+            e.mov_const(Gpr::x(17), target as u64)?;
+            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.blr(Gpr::x(17))
+        })?;
+        emit_leave_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+        })?;
+        let ok = self.code.new_label();
+        self.code.cbz(Gpr::x(9), ok)?;
+        // The call clobbered the caller-saved scratch registers: reload the operands from
+        // their homes. X0..X3 kept their callee-saved registers, X4/X5 were reloaded, Y and
+        // memory X registers are untouched by the helper.
+        let a = self.source_reg_into(first, Gpr::x(10))?;
+        if a != Gpr::x(10) {
+            self.code.emit(|e| e.mov_reg(Gpr::x(10), a))?;
+        }
+        let b = self.source_reg_into(second, Gpr::x(11))?;
+        if b != Gpr::x(11) {
+            self.code.emit(|e| e.mov_reg(Gpr::x(11), b))?;
+        }
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(25), Gpr::x(10))?;
+            e.mov_reg(Gpr::x(26), Gpr::x(11))
+        })?;
+        self.cache_invalidate_reg(Gpr::x(25));
+        self.cache_invalidate_reg(Gpr::x(26));
+        self.code.emit(|e| {
+            e.ldr_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.branch_error_preserving_bif()?;
+        self.code.bind(ok)?;
+        Ok(())
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:78-84,818-820,911-913, OTP-29.1.1

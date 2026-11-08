@@ -2010,7 +2010,7 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    fn branch_error_preserving_bif(&mut self) -> Result<(), ModuleError> {
+    pub(super) fn branch_error_preserving_bif(&mut self) -> Result<(), ModuleError> {
         self.code.bl(self.error_pc_label)?;
         self.last_error_offset = self.code.offset();
         Ok(())
