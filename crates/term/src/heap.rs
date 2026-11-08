@@ -3724,6 +3724,20 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(start, 2))
     }
 
+    /// Build a 3-tuple with the fixed `HAlloc(4)` layout of `TUPLE3`.
+    ///
+    /// Port of the `ftrace` tuple of `save_stacktrace` in erts/emulator/beam/beam_common.c:1042,
+    /// OTP-29.1.1.
+    #[inline(always)]
+    pub fn tuple3(&mut self, first: Term, second: Term, third: Term) -> Result<Term, TermError> {
+        let start = self.words(4)?;
+        store(start, (3 << 6) | ARITY);
+        store(start.wrapping_add(1), first.bits());
+        store(start.wrapping_add(2), second.bits());
+        store(start.wrapping_add(3), third.bits());
+        Ok(Term::from_ptr(start, 2))
+    }
+
     /// Build a list of 2-tuples by consing each pair from one `5 * len` word reservation.
     ///
     /// Port of `pd_hash_get_all` in erts/emulator/beam/erl_process_dict.c, OTP-29.1.1.
@@ -3969,6 +3983,29 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         let mut block = self.reserve_boxed_words(words, 0)?;
         block.write_header(((digits as u64) << 6) | POS_BIG)?;
         Ok(block)
+    }
+
+    /// Allocate a positive bignum of `digits` words and store its first digits, leaving the rest
+    /// for the caller. Same layout and contract as [`Self::pos_bignum_block`], in one `HAlloc`
+    /// with plain stores.
+    ///
+    /// Port of `HAlloc` and the header and field stores of `struct StackTrace` in
+    /// erts/emulator/beam/beam_common.c:889-897, OTP-29.1.1.
+    #[inline(always)]
+    pub fn pos_bignum_prefix<const N: usize>(
+        &mut self,
+        digits: usize,
+        prefix: [u64; N],
+    ) -> Result<Term, TermError> {
+        if digits < N || digits > 65_535 {
+            return Err(TermError::SystemLimit);
+        }
+        let start = self.words(digits + 1)?;
+        store(start, ((digits as u64) << 6) | POS_BIG);
+        for (index, value) in prefix.into_iter().enumerate() {
+            store(start.wrapping_add(1 + index), value);
+        }
+        Ok(Term::from_ptr(start, 2))
     }
 
     /// Cons `{Module, Function, ArityOrArgs, Location}` onto `tail`.

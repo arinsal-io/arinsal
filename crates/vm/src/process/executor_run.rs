@@ -357,6 +357,9 @@ impl Executor {
                                     )? {
                                         break Err(error);
                                     }
+                                    process.heap.abi.exc.freason = 0;
+                                    process.heap.abi.exc.fvalue = 0;
+                                    process.heap.abi.exc.ftrace = 0;
                                     continue;
                                 }
                                 Err(error) => break Err(error),
@@ -525,15 +528,11 @@ impl Executor {
                                             Some(ctx),
                                             trap,
                                         )? {
-                                            process.heap.abi.exc.freason = 0;
-                                            process.heap.abi.exc.fvalue = 0;
                                             break Err(error);
                                         }
                                         process.heap.abi.exc.freason = 0;
                                         process.heap.abi.exc.fvalue = 0;
-                                        if let Some(cold) = process.cold.as_mut() {
-                                            cold.exit_reason = None;
-                                        }
+                                        process.heap.abi.exc.ftrace = 0;
                                         continue;
                                     }
                                     Err(error) => return Err(error),
@@ -675,10 +674,9 @@ impl Executor {
                         if let Some(error) = resumed {
                             break Err(error);
                         }
-                        // boot_loop2: a caught exit must not survive as a later process exit reason.
-                        if let Some(cold) = process.cold.as_mut() {
-                            cold.exit_reason = None;
-                        }
+                        process.heap.abi.exc.freason = 0;
+                        process.heap.abi.exc.fvalue = 0;
+                        process.heap.abi.exc.ftrace = 0;
                     }
                 }
             })()

@@ -101,10 +101,11 @@ impl HeapAlloc for TraceHeap<'_> {
             self.used += words;
             return Some(ptr);
         }
-        if let Some(ptr) = HeapAlloc::alloc(self.heap, words) {
-            return Some(ptr);
-        }
-        Some(self.heap.gc_fragment(words))
+        // Port of HAllocX in erts/emulator/beam/erl_vm.h: an inline young-heap bump, then
+        // erts_heap_alloc in utils.c when the process heap cannot satisfy this HAlloc.
+        self.heap
+            .alloc_halloc(words)
+            .or_else(|| Some(self.heap.heap_fragment(words)))
     }
 
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
@@ -211,16 +212,11 @@ impl StackTrace {
         let digits = STACKTRACE_HEADER_WORDS
             .checked_add(max_depth)
             .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
-        let mut block = TermBuilder::new(heap)
-            .pos_bignum_block(digits)
-            .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))?;
-        for field in [freason, pc, current, 0, max_depth as u64, trace_flags] {
-            block.write_header(field).map_err(|error| {
-                VmError::Unsupported(format!("stacktrace allocation {error:?}"))
-            })?;
-        }
-        block
-            .term_at(0)
+        TermBuilder::new(heap)
+            .pos_bignum_prefix(
+                digits,
+                [freason, pc, current, 0, max_depth as u64, trace_flags],
+            )
             .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))
     }
 
@@ -277,7 +273,7 @@ impl Ftrace {
     /// Packages the already allocated trace and its associated values once.
     fn allocate(self, heap: &mut impl HeapAlloc) -> Result<Term, VmError> {
         TermBuilder::new(heap)
-            .tuple(&[self.stack_trace, self.args, self.error_info])
+            .tuple3(self.stack_trace, self.args, self.error_info)
             .map_err(|error| VmError::Unsupported(format!("ftrace tuple {error:?}")))
     }
 }
@@ -637,17 +633,18 @@ fn normalize_raise_trace(
     trace: Term,
     backtrace_depth: usize,
 ) -> Result<Term, VmError> {
-    let frames = arinsal_term::term_sequence(trace)
-        .ok_or_else(|| VmError::Unsupported("raise stacktrace list".into()))?;
+    // `raise/3` already validated the list; walk it in place, copying only when a frame needs
+    // converting or the backtrace limit truncates it (bif.c, `raise_3`).
+    if trace == Term::NIL {
+        return Ok(trace);
+    }
     let max_depth = runtime_backtrace_depth(p, backtrace_depth);
-    let depth = if max_depth < frames.len() {
-        max_depth.max(1)
-    } else {
-        frames.len()
-    };
-    let mut must_copy = max_depth < frames.len();
+    let frames = arinsal_term::term_sequence_frames(trace)
+        .ok_or_else(|| VmError::Unsupported("raise stacktrace list".into()))?;
+    let length = frames.len();
+    let mut must_copy = false;
     for frame in &frames {
-        let fields = arinsal_term::term_sequence(*frame)
+        let fields = arinsal_term::term_sequence_small(*frame)
             .ok_or_else(|| VmError::Unsupported("raise stacktrace frame".into()))?;
         match fields.as_slice() {
             [fun, _args] if fun.classify() == TermKind::Fun => must_copy = true,
@@ -659,10 +656,15 @@ fn normalize_raise_trace(
             _ => {}
         }
     }
+    let depth = if max_depth < length {
+        max_depth.max(1)
+    } else {
+        length
+    };
+    must_copy |= max_depth < length;
     if !must_copy {
         return Ok(trace);
     }
-
     let mut heap = TraceHeap::new(&mut p.heap);
     let mut normalized = Vec::with_capacity(depth);
     for frame in frames.iter().take(depth) {
@@ -793,21 +795,11 @@ pub(super) fn save_stacktrace(
     let interpreter_caller = (bif_top && native_top_word.is_none() && !frame_released)
         .then(|| pack_indexed(p.module, p.ip().saturating_add(1)))
         .flatten();
-    // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1: the trace, its
-    // argument list, the `error_info` map and the ftrace tuple are carved from one block that is
-    // sized first. A full young heap then costs one heap fragment per raise, not one per term.
-    let trace_words = 1usize
-        .checked_add(STACKTRACE_HEADER_WORDS)
-        .and_then(|words| words.checked_add(max_depth))
-        .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
-    let total_words = save_ftrace_words(top, registers.unwrap_or(&p.x))
-        .and_then(|words| trace_words.checked_add(words));
+    // Port of erts/emulator/beam/beam_common.c:880-1045 (`save_stacktrace`), OTP-29.1.1: the
+    // StackTrace bignum, the optional `error_info` map and arglist, and the ftrace tuple are
+    // separate `HAlloc`s on the process heap (young heap, heap fragment when it is full).
     let (stack_trace, ftrace) = {
-        let mut heap = if let Some(words) = total_words {
-            TraceHeap::with_block(&mut p.heap, words)
-        } else {
-            TraceHeap::new(&mut p.heap)
-        };
+        let mut heap = TraceHeap::new(&mut p.heap);
         let stack_trace = StackTrace::reserve(
             &mut heap,
             max_depth,
@@ -857,59 +849,6 @@ pub(super) fn save_stacktrace(
         })
         .ok_or_else(|| VmError::Unsupported("stacktrace bignum".into()))?;
     Ok(ftrace)
-}
-
-/// Words reserved by the ftrace tuple and values that save_stacktrace constructs for its top.
-/// The native BIF path uses live registers or already-rooted terms, so the size is exact before
-/// the single HAlloc that holds StackTrace, Args, error_info, and ftrace.
-// Port of erts/emulator/beam/beam_common.c:889-998 (`save_stacktrace`), OTP-29.1.1.
-fn save_ftrace_words(top: Option<SaveTop<'_>>, registers: &[Term]) -> Option<usize> {
-    let Some(SaveTop::Live(top)) = top else {
-        return Some(4);
-    };
-    let (args_words, info) = match top {
-        TopFrame::Bif { args, info, .. } => {
-            let words = match args {
-                BifArgs::Inline { len, .. } => usize::from(*len).saturating_mul(2),
-                BifArgs::TermList(_) => 0,
-                BifArgs::Owned(_) => return None,
-            };
-            (words, *info)
-        }
-        TopFrame::BifRegisters { arity, info, .. } => {
-            registers.get(..*arity)?;
-            (arity.saturating_mul(2), *info)
-        }
-        TopFrame::CurrentArgs(_) | TopFrame::CurrentArgsNoLocation { .. } => return Some(4),
-        TopFrame::CurrentArgsInfoTerm(_, _) => return Some(9),
-        TopFrame::CurrentArgsWithInfo(_, _) => return None,
-    };
-    let info_words = match info {
-        BifErrorInfo::None => 0,
-        BifErrorInfo::Map(_) => 5,
-        BifErrorInfo::Plain | BifErrorInfo::Cause(_) => {
-            let module = match top {
-                TopFrame::Bif { module, .. } | TopFrame::BifRegisters { module, .. } => *module,
-                _ => unreachable!(),
-            };
-            if trace_atoms()
-                .format_modules
-                .iter()
-                .any(|(bif, _)| *bif == module)
-            {
-                if matches!(info, BifErrorInfo::Cause(_)) {
-                    13
-                } else {
-                    11
-                }
-            } else {
-                0
-            }
-        }
-    };
-    args_words
-        .checked_add(info_words)
-        .and_then(|words| words.checked_add(4))
 }
 
 pub(super) struct StackTraceSave<'a> {

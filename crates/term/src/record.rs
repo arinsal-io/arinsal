@@ -188,6 +188,12 @@ pub fn term_sequence_small(term: Term) -> Option<smallvec::SmallVec<[Term; 4]>> 
     sequence_into(term)
 }
 
+/// [`term_sequence`] for a stacktrace list: the default backtrace depth is eight frames, so the
+/// copy stays inline for any list a raise supplies in practice.
+pub fn term_sequence_frames(term: Term) -> Option<smallvec::SmallVec<[Term; 16]>> {
+    sequence_into(term)
+}
+
 fn sequence_into<C: Default + Extend<Term>>(term: Term) -> Option<C> {
     // SAFETY: the caller holds all source heaps live during the synchronous copy.
     unsafe {

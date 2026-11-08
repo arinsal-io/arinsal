@@ -471,7 +471,7 @@ impl Process {
                     return Ok(1);
                 }
                 if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                    self.note_exit_reason(reason)?;
+                    self.heap.abi.exc.fvalue = reason.tagged_word();
                     return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
                 }
                 if was_linked {
@@ -507,7 +507,7 @@ impl Process {
                     return Ok(1);
                 }
                 if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                    self.note_exit_reason(reason)?;
+                    self.heap.abi.exc.fvalue = reason.tagged_word();
                     return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
                 }
                 2

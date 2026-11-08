@@ -19,8 +19,11 @@ pub(super) fn raise_undefined_call(
         other => return Err(other),
     };
     let resumed = crate::exceptions::resume(vm, process, Some(ctx), trap)?;
-    process.heap.abi.exc.freason = 0;
-    process.heap.abi.exc.fvalue = 0;
+    if resumed.is_none() {
+        process.heap.abi.exc.freason = 0;
+        process.heap.abi.exc.fvalue = 0;
+        process.heap.abi.exc.ftrace = 0;
+    }
     Ok(resumed)
 }
 
@@ -234,16 +237,12 @@ impl Executor {
                     match crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap) {
                         Err(error) => return Some(Err(error)),
                         Ok(Some(error)) => {
-                            process.heap.abi.exc.freason = 0;
-                            process.heap.abi.exc.fvalue = 0;
                             return Some(Err(error));
                         }
                         Ok(None) => {
                             process.heap.abi.exc.freason = 0;
                             process.heap.abi.exc.fvalue = 0;
-                            if let Some(cold) = process.cold.as_mut() {
-                                cold.exit_reason = None;
-                            }
+                            process.heap.abi.exc.ftrace = 0;
                             continue;
                         }
                     }
