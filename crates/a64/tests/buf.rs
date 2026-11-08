@@ -1,6 +1,7 @@
 use arinsal_a64::buf::CodeBuffer;
 use arinsal_a64::enc::{Cond, Gpr, Shift};
 use arinsal_a64::exec::CodeMemory;
+use similar_asserts::assert_eq;
 
 fn disp(words: &[u32], index: usize, shift: u8, bits: u8) -> i64 {
     let raw = (words[index] >> shift) & ((1_u32 << bits) - 1);
@@ -84,6 +85,42 @@ fn short_branch_uses_veneer_when_target_is_too_far() {
     let veneer = veneer_delta as usize / 4;
     assert_eq!(words[veneer] & 0xfc00_0000, 0x1400_0000);
     assert!(disp(&words, veneer, 0, 26).abs() < 128 * 1024 * 1024);
+}
+
+#[test]
+fn beam_label_tbnz_uses_reach_limited_veneer() {
+    let mut b = CodeBuffer::new();
+    let target = b.new_label();
+    b.mark_beam_label(target);
+    b.tbnz(Gpr::x(25), 0, target).unwrap();
+    for i in 0..10_240 {
+        b.word(0xd503_201f);
+        if i % 1024 == 1023 {
+            b.check_pending_stubs().unwrap();
+        }
+    }
+    b.bind(target).unwrap();
+    let words = b.finish().unwrap();
+    let delta = disp(&words, 0, 5, 14);
+    assert!(delta.abs() < 32 * 1024);
+    let veneer = delta as usize / 4;
+    assert_eq!(words[veneer] & 0xfc00_0000, 0x1400_0000);
+    assert!(disp(&words, veneer, 0, 26).abs() < 128 * 1024 * 1024);
+}
+
+#[test]
+fn nearby_forward_beam_label_binds_veneer_anchor_in_place() {
+    let mut b = CodeBuffer::new();
+    let target = b.new_label();
+    b.mark_beam_label(target);
+    b.tbnz(Gpr::x(25), 1, target).unwrap();
+    for _ in 0..32 {
+        b.word(0xd503_201f);
+    }
+    b.bind(target).unwrap();
+
+    let (words, labels) = b.finish_with_labels().unwrap();
+    assert_eq!(disp(&words, 0, 5, 14), labels[&target] as i64);
 }
 
 #[test]

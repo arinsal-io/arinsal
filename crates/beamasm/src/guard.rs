@@ -37,6 +37,8 @@ pub struct CompareShared {
     /// `bif_element_guard_shared`: position in x0, tuple in x1, the element or `THE_NON_VALUE`
     /// in x0.
     pub element_guard: usize,
+    /// `is_eq_exact_list_shared`: terms in x0/x1, equality in the Z flag.
+    pub eq_exact_list: usize,
     /// C `eq(Eterm, Eterm) -> int` (erts `eq`, utils.c:1125). Non-zero means equal; the general
     /// path of `=:=` / `=/=` calls it directly, so it must be set before emitting those ops.
     pub eq: usize,
@@ -1419,7 +1421,7 @@ impl BeamModuleAssembler {
                     "an inline literal shape needs a literal right operand",
                 ));
             }
-            return self.emit_literal_exact_eq(lhs.val, literal, fail, fail_on_equal);
+            return self.emit_literal_exact_eq(lhs.val, rhs.val, literal, fail, fail_on_equal);
         }
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1857-1897 (general path of
         // emit_is_eq_exact), OTP-29.1.1: compare the words, then call `eq` for the rest.
@@ -1492,6 +1494,7 @@ impl BeamModuleAssembler {
     fn emit_literal_exact_eq(
         &mut self,
         lhs: ArgVal,
+        rhs: ArgVal,
         literal: &EqLiteral,
         fail: u32,
         fail_on_equal: bool,
@@ -1511,14 +1514,24 @@ impl BeamModuleAssembler {
                 ));
             }
             EqLiteral::ListOfImmediates(words) => {
-                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1756-1770 (inlined list
-                // test) and is_eq_exact_list_shared, OTP-29.1.1: walk the cells, compare each
-                // head word, and require nil after the last one.
                 if words.is_empty() {
                     return Err(ModuleError::InvalidOperand(
                         "an empty list literal is nil, not a list shape",
                     ));
                 }
+                if words.len() > 1 && self.eq_exact_list_shared != 0 {
+                    let right = self.source_reg_into(rhs, Gpr::x(17))?;
+                    self.code.emit(|e| {
+                        e.mov_reg(Gpr::x(0), value)?;
+                        e.mov_reg(Gpr::x(1), right)
+                    })?;
+                    self.fragment_call(self.eq_exact_list_shared)?;
+                    self.code
+                        .b_cond(if fail_on_equal { Cond::Eq } else { Cond::Ne }, fail_label)?;
+                    return Ok(());
+                }
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1756-1770 (inlined list
+                // test), OTP-29.1.1: the one-element list test compares its head and nil tail.
                 self.emit_tag_check_and_untag(1, mismatch)?;
                 for (index, word) in words.iter().enumerate() {
                     self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 0))?;

@@ -1,6 +1,7 @@
 //! Label-aware AArch64 code buffer with branch veneers and a literal pool.
 
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -95,8 +96,52 @@ impl std::ops::Index<&Label> for LabelTable {
 }
 
 /// Opaque label allocated by [`CodeBuffer`].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Label(u32);
+
+/// Maximum displacement class used when resolving a BEAM label to a nearby veneer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchReach {
+    /// `tbz`, `tbnz`, or an 8-byte literal load.
+    Disp32K,
+    /// `b.cond`, `cbz`, `cbnz`, or `adr`.
+    Disp1MB,
+    /// `b` or `bl`.
+    Disp128MB,
+}
+
+impl BranchReach {
+    fn bytes(self) -> i64 {
+        match self {
+            Self::Disp32K => TB_RANGE - 4,
+            Self::Disp1MB => COND_RANGE - 4,
+            Self::Disp128MB => BRANCH_RANGE - 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingVeneer {
+    latest_offset: usize,
+    anchor: Label,
+    target: Label,
+}
+
+impl Ord for PendingVeneer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.latest_offset, self.anchor, self.target).cmp(&(
+            other.latest_offset,
+            other.anchor,
+            other.target,
+        ))
+    }
+}
+
+impl PartialOrd for PendingVeneer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Failure while building or finalizing a code buffer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +234,10 @@ pub struct CodeBuffer {
     emitter: Emitter,
     next_label: u32,
     labels: LabelTable,
+    beam_labels: HashSet<Label>,
+    managed_veneer_anchors: HashSet<Label>,
+    veneers: HashMap<Label, Vec<PendingVeneer>>,
+    pending_veneers: BinaryHeap<Reverse<PendingVeneer>>,
     /// Unresolved branches in emission order; a resolved one stays until the next flush as a
     /// tombstone so the indices of `waiting` hold.
     fixups: Vec<Fixup>,
@@ -237,19 +286,74 @@ impl CodeBuffer {
     pub fn label_offset(&self, label: Label) -> Option<usize> {
         self.labels.get(&label).copied()
     }
+
+    /// Marks a label created from a BEAM label so branches to it get OTP-style veneers.
+    pub fn mark_beam_label(&mut self, label: Label) {
+        self.beam_labels.insert(label);
+    }
+
+    /// Returns a BEAM label directly when it is near, or a queued anchor within `reach`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:650-722
+    // (resolve_beam_label / resolve_label), OTP-29.1.1.
+    pub fn resolve_beam_label(&mut self, target: Label, reach: BranchReach) -> Label {
+        let offset = self.offset() as i64;
+        let displacement = reach.bytes();
+        let min_offset = offset - displacement;
+        let max_offset = offset + displacement;
+        if let Some(target_offset) = self.label_offset(target)
+            && target_offset as i64 >= min_offset
+        {
+            return target;
+        }
+        if let Some(veneers) = self.veneers.get(&target) {
+            for veneer in veneers {
+                if let Some(veneer_offset) = self.label_offset(veneer.anchor) {
+                    if (min_offset..=max_offset).contains(&(veneer_offset as i64)) {
+                        return veneer.anchor;
+                    }
+                } else if (veneer.latest_offset as i64) <= max_offset {
+                    return veneer.anchor;
+                }
+            }
+        }
+        let veneer = PendingVeneer {
+            latest_offset: max_offset as usize,
+            anchor: self.new_label(),
+            target,
+        };
+        self.managed_veneer_anchors.insert(veneer.anchor);
+        self.veneers.entry(target).or_default().push(veneer);
+        self.pending_veneers.push(Reverse(veneer));
+        veneer.anchor
+    }
     /// Returns all currently bound labels and their byte offsets.
     pub fn label_offsets(&self) -> &LabelTable {
         &self.labels
     }
 
     /// Binds a label at the current offset and resolves waiting fixups.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:590-610, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:565-610, OTP-29.1.1
     pub fn bind(&mut self, label: Label) -> Result<(), BufferError> {
         if label.0 >= self.next_label {
             return Err(BufferError::InvalidLabel(label));
         }
         if self.labels.contains_key(&label) {
             return Err(BufferError::AlreadyBound(label));
+        }
+        // OTP binds each waiting veneer anchor at the target's address when the BEAM label is
+        // reached. This keeps forward branches direct when the label turned out to be nearby.
+        let mut index = 0;
+        while let Some(veneer) = self
+            .veneers
+            .get(&label)
+            .and_then(|veneers| veneers.get(index))
+            .copied()
+        {
+            index += 1;
+            if self.label_offset(veneer.anchor).is_none() {
+                assert!(self.offset() <= veneer.latest_offset);
+                self.bind(veneer.anchor)?;
+            }
         }
         let offset = self.offset();
         self.binds += 1;
@@ -267,7 +371,26 @@ impl CodeBuffer {
         Ok(())
     }
 
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:650-722
+    // (resolve_beam_label / resolve_label), OTP-29.1.1.
     fn emit_branch(&mut self, label: Label, kind: BranchKind) -> Result<(), BufferError> {
+        let label = if kind.is_control() && self.beam_labels.contains(&label) {
+            let reach = match kind {
+                BranchKind::Tbz(..) | BranchKind::Tbnz(..) => BranchReach::Disp32K,
+                BranchKind::Cond(..) | BranchKind::Cbz(..) | BranchKind::Cbnz(..) => {
+                    BranchReach::Disp1MB
+                }
+                BranchKind::B | BranchKind::Bl => BranchReach::Disp128MB,
+                BranchKind::Adr(..) | BranchKind::Literal(..) => unreachable!(),
+            };
+            self.resolve_beam_label(label, reach)
+        } else {
+            label
+        };
+        self.emit_branch_raw(label, kind)
+    }
+
+    fn emit_branch_raw(&mut self, label: Label, kind: BranchKind) -> Result<(), BufferError> {
         if label.0 >= self.next_label {
             return Err(BufferError::InvalidLabel(label));
         }
@@ -302,7 +425,7 @@ impl CodeBuffer {
                 &mut self.waiting[label.0 as usize],
                 self.fixups.len() as u32,
             );
-            if kind.is_control() {
+            if kind.is_control() && !self.managed_veneer_anchors.contains(&label) {
                 let deadline = site.saturating_add(kind.reach() as usize);
                 self.min_stub_deadline =
                     Some(self.min_stub_deadline.map_or(deadline, |m| m.min(deadline)));
@@ -426,13 +549,29 @@ impl CodeBuffer {
         let stub_due = self
             .min_stub_deadline
             .is_some_and(|deadline| deadline.saturating_sub(range) <= now);
+        let effective_offset = now.saturating_add(range);
+        let veneer_due = self
+            .pending_veneers
+            .peek()
+            .is_some_and(|veneer| veneer.0.latest_offset <= effective_offset);
         let literal_due = self.min_literal_site.is_some_and(|site| {
             site.saturating_add(COND_RANGE as usize)
                 .saturating_sub(range)
                 <= now
         });
-        if !stub_due && !literal_due {
+        if !stub_due && !veneer_due && !literal_due {
             return Ok(());
+        }
+        let mut due_veneers = Vec::new();
+        while self
+            .pending_veneers
+            .peek()
+            .is_some_and(|veneer| veneer.0.latest_offset <= effective_offset)
+        {
+            let veneer = self.pending_veneers.pop().expect("peeked veneer").0;
+            if self.label_offset(veneer.anchor).is_none() {
+                due_veneers.push(veneer);
+            }
         }
         // Drop the resolved branches and renumber the waiting lists.
         if self.fixups.iter().any(|fixup| fixup.resolved) {
@@ -452,7 +591,11 @@ impl CodeBuffer {
                 .site
                 .saturating_add(f.kind.reach() as usize)
                 .saturating_sub(range);
-            (f.kind.is_control() && f.veneer.is_none() && deadline <= now).then_some(i)
+            (f.kind.is_control()
+                && !self.managed_veneer_anchors.contains(&f.label)
+                && f.veneer.is_none()
+                && deadline <= now)
+                .then_some(i)
         }));
         let due_literals = self.literals.iter().any(|l| {
             l.sites().any(|(site, _)| {
@@ -461,7 +604,7 @@ impl CodeBuffer {
                     <= now
             })
         });
-        if due_fixups.is_empty() && !due_literals {
+        if due_fixups.is_empty() && due_veneers.is_empty() && !due_literals {
             self.due_fixups = due_fixups;
             self.recompute_stub_bounds();
             return Ok(());
@@ -471,6 +614,10 @@ impl CodeBuffer {
         let after = self.new_label();
         if !self.unreachable {
             self.emit_branch(after, BranchKind::B)?;
+        }
+        for veneer in due_veneers {
+            self.bind(veneer.anchor)?;
+            self.emit_veneer(veneer.target)?;
         }
         for &idx in &due_fixups {
             let site = self.fixups[idx].site;
@@ -518,7 +665,12 @@ impl CodeBuffer {
         self.min_stub_deadline = self
             .fixups
             .iter()
-            .filter(|f| f.kind.is_control() && f.veneer.is_none() && !f.resolved)
+            .filter(|f| {
+                f.kind.is_control()
+                    && !self.managed_veneer_anchors.contains(&f.label)
+                    && f.veneer.is_none()
+                    && !f.resolved
+            })
             .map(|f| f.site.saturating_add(f.kind.reach() as usize))
             .min();
         self.min_literal_site = self
@@ -532,11 +684,11 @@ impl CodeBuffer {
         let site = self.offset();
         if let Some(&to) = self.labels.get(&target) {
             if (to as i64 - site as i64).abs() < BRANCH_RANGE {
-                return self.emit_branch(target, BranchKind::B);
+                return self.emit_branch_raw(target, BranchKind::B);
             }
             self.emit_long_veneer(to as i64 - site as i64)?;
         } else {
-            self.emit_branch(target, BranchKind::B)?;
+            self.emit_branch_raw(target, BranchKind::B)?;
         }
         Ok(())
     }
@@ -626,6 +778,10 @@ impl Default for CodeBuffer {
             emitter: Emitter::with_capacity(CODE_BUFFER_INITIAL_BYTES / 4),
             next_label: 0,
             labels: LabelTable::default(),
+            beam_labels: HashSet::new(),
+            managed_veneer_anchors: HashSet::new(),
+            veneers: HashMap::default(),
+            pending_veneers: BinaryHeap::new(),
             fixups: Vec::new(),
             waiting: Vec::new(),
             literals: Vec::new(),

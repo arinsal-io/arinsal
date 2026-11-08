@@ -1817,6 +1817,9 @@ fn compile_parsed_module_with_options_in_arena(
     if shared.arith != 0 {
         assembler.set_arith_compare_shared(shared.arith);
     }
+    if shared.eq_exact_list != 0 {
+        assembler.set_eq_exact_list_shared(shared.eq_exact_list);
+    }
     if shared.element_guard != 0 {
         assembler.set_element_guard_shared(shared.element_guard);
     }
