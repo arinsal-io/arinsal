@@ -4450,6 +4450,25 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         self.install_refc_binary(binary, bit_len)
     }
 
+    /// Allocate the final bitstring and return its payload address for a native writer.
+    ///
+    /// The returned address remains valid while the term is rooted and the heap is not moved.
+    // Port of erts/emulator/beam/erl_bits.c (`erts_bs_init_bits` allocation contract), OTP-29.1.1.
+    pub fn bitstring_with_address(&mut self, bit_len: usize) -> Result<(Term, usize), TermError> {
+        let count = bit_len.div_ceil(8);
+        let mut address = 0;
+        if count <= 64 {
+            let term = self.heap_bitstring_with_data(bit_len, false, |destination| {
+                address = destination.as_mut_ptr() as usize;
+            })?;
+            return Ok((term, address));
+        }
+        let binary = RefcBinary::new_zeroed(count)?;
+        address = binary.as_ptr() as usize;
+        let term = self.install_refc_binary(binary, bit_len)?;
+        Ok((term, address))
+    }
+
     /// A sub-binary of `len` bytes at `offset` of a refc binary the caller keeps, as the
     /// driver delivers a slice of its input buffer without copying it
     /// (`driver_deliver_term` with `ERL_DRV_BINARY`, io.c).

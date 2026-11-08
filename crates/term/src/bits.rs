@@ -833,9 +833,6 @@ pub fn erts_bs_private_append_fast_with_update(
             return PrivateAppendUpdate::new(0);
         }
         let current = end_word - adjustment * 8;
-        if current & 7 != 0 {
-            return PrivateAppendUpdate::new(0);
-        }
         let Some(new_bits) = current.checked_add(extra_bits as usize) else {
             return PrivateAppendUpdate::new(u64::MAX);
         };
@@ -947,11 +944,6 @@ fn prepare_private_append(
         }
         let adjustment = binary.bytes_ptr() as usize & 3;
         let current = *term.raw_ptr().add(3) as usize - adjustment * 8;
-        // The inline store writes whole bytes. A non-byte cursor stays on the generic path,
-        // which has not yet grown the binary.
-        if !absolute && !ebs.is_null() && !current.is_multiple_of(8) {
-            return Ok(PrivateAppendUpdate::new(0));
-        }
         let new_bits = if absolute {
             bits
         } else {
@@ -1547,7 +1539,11 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
                     .get(byte_offset + index + 1)
                     .copied()
                     .unwrap_or(0);
-                output[index] = (current << bit_offset) | (next >> (8 - bit_offset));
+                output[index] = if bit_offset == 0 {
+                    current
+                } else {
+                    (current << bit_offset) | (next >> (8 - bit_offset))
+                };
             }
             if !prefix_bits.is_multiple_of(8) {
                 output[prefix_bytes - 1] &= 0xff << (8 - prefix_bits % 8);
@@ -1674,15 +1670,16 @@ mod private_append_checked {
     }
 
     #[test]
-    fn non_byte_cursor_is_left_for_the_generic_path() {
+    fn publishes_non_byte_cursor() {
         let mut heap = VecHeap::new();
         let bin = TermBuilder::new(&mut heap)
             .writable_binary(&[0xf0], 4, 64)
             .unwrap();
         let mut ebs = [7_u64; 2];
         let result = erts_bs_private_append_checked(ebs.as_mut_ptr(), bin.tagged_word(), 8);
-        assert_eq!(result, 0);
-        assert_eq!(ebs, [7, 7]);
+        similar_asserts::assert_eq!(result, bin.tagged_word());
+        similar_asserts::assert_eq!(ebs[1], 4);
+        assert_ne!(ebs[0], 0);
     }
 
     #[test]

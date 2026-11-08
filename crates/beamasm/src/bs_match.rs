@@ -48,7 +48,7 @@ impl BeamModuleAssembler {
         let update = crate::Update::HEAP_ALLOC
             .union(crate::Update::X_REGS)
             .union(crate::Update::REDUCTIONS);
-        crate::emit_enter_runtime(&mut self.code, 6, update)?;
+        crate::emit_enter_runtime(&mut self.code, live as usize, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
             e.mov_const(Gpr::x(1), u64::from(kind))?;

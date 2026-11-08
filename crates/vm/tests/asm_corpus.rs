@@ -7,6 +7,68 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+extern "C" fn bs_create_bin_append(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+    _unit: u64,
+    _live: u64,
+    _alloc: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_private_append(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_init(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _bits: u64,
+    _alloc: u64,
+    _live: u64,
+) -> u64 {
+    1
+}
+
+extern "C" fn bs_create_bin_size(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _index: u64,
+) -> u64 {
+    u64::MAX
+}
+
+extern "C" fn bs_create_bin_fail(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _packed: u64,
+    _arg3: u64,
+    _arg1: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_put(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+    _flags: u64,
+    _index: u64,
+    _total_bits: u64,
+) -> u64 {
+    1
+}
+
 #[cfg(feature = "bench-alloc-count")]
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 #[cfg(feature = "bench-alloc-count")]
@@ -245,8 +307,26 @@ impl ModuleEnv for CorpusEnv {
         }
     }
 
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelper {
-        bs_create_bin
+    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers {
+        use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
+        BsCreateBinHelpers {
+            append_checked: bs_create_bin_append,
+            private_append: bs_create_bin_private_append,
+            init_bits: bs_create_bin_init,
+            bit_size: bs_create_bin_size,
+            utf8_size: bs_create_bin_size,
+            utf16_size: bs_create_bin_size,
+            utf32_size: bs_create_bin_size,
+            fail: bs_create_bin_fail,
+            put_integer: bs_create_bin_put,
+            put_binary: bs_create_bin_put,
+            put_binary_all: bs_create_bin_put,
+            put_float: bs_create_bin_put,
+            put_utf8: bs_create_bin_put,
+            put_utf16: bs_create_bin_put,
+            put_utf32: bs_create_bin_put,
+            put_string: bs_create_bin_put,
+        }
     }
 
     fn binary_literal(&self, bytes: &[u8]) -> Result<u64, String> {
@@ -309,9 +389,6 @@ extern "C" fn map_get(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
     0
 }
 extern "C" fn map_many(_: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) -> u64 {
-    0
-}
-extern "C" fn bs_create_bin(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
     0
 }
 extern "C" fn exception(
