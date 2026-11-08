@@ -967,7 +967,11 @@ fn compiled_magic_term(
     let newline = code.info(INFO_NEWLINE);
     let mut heap = Heap(&mut ctx.heap);
     let captures = i64::from(captures);
-    let owner = MagicRef::with_erts_payload_size(RegexHandle(code.into_raw()), 8);
+    let owner = MagicRef::with_erts_payload_size_and_refn(
+        RegexHandle(code.into_raw()),
+        8,
+        arinsal_bifs::next_ref_words(),
+    );
     let fields = [
         atom_term("re_pattern")?,
         small_term(captures)?,
@@ -1039,9 +1043,10 @@ fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifErro
         .collect::<Result<Vec<_>, _>>()?;
     // Port of erts/emulator/beam/erl_bif_re.c (struct regex_magic_indirect): one code pointer.
     let reference = TermBuilder::new(&mut heap)
-        .magic_ref(MagicRef::with_erts_payload_size(
+        .magic_ref(MagicRef::with_erts_payload_size_and_refn(
             RegexHandle(code.into_raw()),
             8,
+            arinsal_bifs::next_ref_words(),
         ))
         .map_err(|_| BifError::SystemLimit)?;
     terms.push(reference);

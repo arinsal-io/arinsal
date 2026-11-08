@@ -1,9 +1,10 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(ets_bifs_diff).
--export([match_spec/0, raw_walk/0, setopts_delete/0, bad_super_user/0,
+-export([match_spec/0, raw_walk/0, tid_ref_roundtrip/0, setopts_delete/0, bad_super_user/0,
          super_user_access/0, binary_info/0, setopts_heir/0]).
 
 match_spec() ->
@@ -22,6 +23,11 @@ raw_walk() ->
   true = ets:insert(H, [{3,c},{1,a},{2,b}]),
   {First,Second,Third,End,
    lists:sort(raw_collect(H, erts_internal:ets_raw_first(H), []))}.
+
+tid_ref_roundtrip() ->
+  T = ets:new(tid_ref_roundtrip, [set, private]),
+  Text = erlang:ref_to_list(T),
+  {length(string:tokens(Text, ".")), erlang:list_to_ref(Text) =:= T}.
 
 raw_collect(_Table, '$end_of_table', Acc) -> lists:reverse(Acc);
 raw_collect(Table, Key, Acc) ->
@@ -95,6 +101,16 @@ fn ets_bifs_raw_key_walk_matches_otp_29() {
         .unwrap();
     reference.load("ets_bifs_diff", &beam).unwrap();
     run("raw_walk", &reference, &beam);
+}
+
+#[test]
+fn ets_table_magic_reference_text_roundtrips_like_otp_29() {
+    let reference = RefErl::start().expect("OTP 29 reference runtime");
+    let beam = reference
+        .compile_named("ets_bifs_diff", SOURCE, &[])
+        .unwrap();
+    reference.load("ets_bifs_diff", &beam).unwrap();
+    run("tid_ref_roundtrip", &reference, &beam);
 }
 
 #[test]

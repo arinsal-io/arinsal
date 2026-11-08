@@ -90,8 +90,7 @@ impl Term {
     // Port of erts/emulator/beam/erl_term.h:1083-1087 (internal_magic_thing_ref_numbers), OTP-29.1.1.
     pub(crate) fn magic_ref_numbers(self) -> Option<[u32; 3]> {
         // SAFETY: the magic binary is retained by the off-heap list of the term's heap.
-        let id = unsafe { self.magic_ref() }?.id();
-        Some([id as u32, (id >> 32) as u32, u32::MAX])
+        unsafe { self.magic_ref() }?.ref_numbers().into()
     }
 
     /// Read an identity as owned numeric fields.

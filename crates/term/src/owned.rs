@@ -89,12 +89,8 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     // OTP-29.1.1: numbers of a saved magic reference give that reference.
                     let mut local_ids = [0; 3];
                     local_ids[..ids.len()].copy_from_slice(ids);
-                    let saved = (local_ids[2] == u32::MAX)
-                        .then(|| {
-                            MagicRef::lookup_saved(
-                                u64::from(local_ids[0]) | (u64::from(local_ids[1]) << 32),
-                            )
-                        })
+                    let saved = (local_ids[1] & (1 << 17) != 0)
+                        .then(|| MagicRef::lookup_saved_numbers(local_ids))
                         .flatten();
                     values.push(match saved {
                         Some(owner) => builder.magic_ref(owner)?,

@@ -364,7 +364,7 @@ fn reference(
     options: HashMap<i32, O>,
     ctype: O,
 ) -> O {
-    let magic = MagicRef::with_orig_size(
+    let magic = MagicRef::with_orig_size_and_refn(
         Handle {
             socket: Mutex::new(Some(socket)),
             reference: OnceLock::new(),
@@ -380,6 +380,7 @@ fn reference(
             ctype,
         },
         SOCKET_MAGIC_ORIG_SIZE,
+        arinsal_bifs::next_ref_words(),
     );
     let id = magic.id();
     let reference = O::MagicRef(arinsal_etf::MagicHandle::strong(id, magic.clone()));

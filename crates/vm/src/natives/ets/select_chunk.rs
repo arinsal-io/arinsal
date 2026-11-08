@@ -242,7 +242,11 @@ fn match_program_owner(reference: Term, program: &Arc<MatchProgram>) -> Arc<Magi
 
 /// Create the binary owner used by the first continuation for a match program.
 pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> Arc<MagicRef> {
-    MagicRef::with_erts_payload_size(Arc::clone(program), program.erts_magic_payload_size())
+    MagicRef::with_erts_payload_size_and_refn(
+        Arc::clone(program),
+        program.erts_magic_payload_size(),
+        arinsal_bifs::next_ref_words(),
+    )
 }
 
 /// Build a continuation reference with the same identity as its predecessor.

@@ -674,11 +674,13 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // OTP-29.1.1: `HAlloc(BIF_P, ERTS_MAGIC_REF_THING_SIZE)` takes a heap fragment when the
     // young heap is full, so no collection happens here. The magic binary charges
     // `orig_size` of `erts_alloc_loader_state` (beam_load.c) to the virtual binary heap.
+    let refn = arinsal_bifs::ordinary_ref_words(process.next_ref());
     let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
-    let result = builder.magic_ref(MagicRef::with_orig_size(
+    let result = builder.magic_ref(MagicRef::with_orig_size_and_refn(
         prepared,
         LOADER_STATE_MAGIC_ORIG_SIZE,
+        refn,
     ));
     result.map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }

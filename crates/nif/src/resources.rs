@@ -173,7 +173,11 @@ impl Resource {
         if let Some(magic) = slot.upgrade() {
             return magic;
         }
-        let magic = MagicRef::with_orig_size(Arc::clone(self), self.magic_orig_size());
+        let magic = MagicRef::with_orig_size_and_refn(
+            Arc::clone(self),
+            self.magic_orig_size(),
+            arinsal_bifs::next_ref_words(),
+        );
         *slot = Arc::downgrade(&magic);
         magic
     }

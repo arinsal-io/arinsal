@@ -2715,7 +2715,11 @@ fn internal_state_set(
         Some("make") if value == atom("magic_ref") => {
             // Port of erts/emulator/beam/erl_bif_info.c (erts_debug_get_internal_state):
             // this probe creates a zero-payload magic binary.
-            let owner = arinsal_term::MagicRef::with_erts_payload_size((), 0);
+            let owner = arinsal_term::MagicRef::with_erts_payload_size_and_refn(
+                (),
+                0,
+                arinsal_bifs::ordinary_ref_words(process.next_ref()),
+            );
             let address = std::sync::Arc::as_ptr(&owner) as usize;
             let reference = TermBuilder::new(&mut process.heap)
                 .magic_ref(owner)

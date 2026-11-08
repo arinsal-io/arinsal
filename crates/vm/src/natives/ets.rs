@@ -2746,6 +2746,10 @@ fn call_inner(
     } else {
         RegistryAccess::Shared(rt.ets.read().unwrap())
     };
+    let table_refn =
+        (function == EtsBif::New).then(|| arinsal_bifs::ordinary_ref_words(process.next_ref()));
+    let match_program_refn = (function == EtsBif::MatchSpecCompile)
+        .then(|| arinsal_bifs::ordinary_ref_words(process.next_ref()));
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     match (function, args) {
         (EtsBif::New, [name, options]) => {
@@ -2877,9 +2881,10 @@ fn call_inner(
                 .unwrap_or(opts.decentralized_counters)
                 && opts.write_concurrency != WriteConcurrency::Disabled;
             // Port of erts/emulator/beam/erl_db.c (ets_new_2), OTP-29.1.1.
+            // db_create_table allocates its btid magic binary on this scheduler.
             let tid = registry
                 .exclusive()?
-                .create(opts)
+                .create_with_magic_ref_numbers(opts, table_refn.unwrap())
                 .map_err(|error| match error {
                     EtsError::NameTaken => badarg_cause("already_exists"),
                     error => err(error),
@@ -3326,9 +3331,10 @@ fn call_inner(
             let program = Arc::new(MatchProgram::compile(*spec).map_err(err)?);
             let payload_size = program.erts_magic_payload_size();
             TermBuilder::new(&mut heap)
-                .magic_ref(MagicRef::with_erts_payload_size(
+                .magic_ref(MagicRef::with_erts_payload_size_and_refn(
                     program,
                     payload_size,
+                    match_program_refn.expect("match-spec compile reference numbers"),
                 ))
                 .map_err(|_| badarg())
         }
