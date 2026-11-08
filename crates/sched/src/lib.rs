@@ -247,10 +247,12 @@ enum Enqueue {
 }
 
 /// Port of erts/emulator/beam/erl_process.c:6569 (check_enqueue_in_prio_queue), OTP-29.1.1:
-/// update `word` for an entry in priority queue `queue` unless the process is already queued
-/// at the same or a higher priority.
-fn check_enqueue(word: &mut u32, queue: usize) -> Enqueue {
-    let qbit = 1_u32 << queue;
+/// update `word` for an entry at priority `prio` (`aprio`, 0..=3) unless the process is
+/// already queued at the same or a higher priority. The `IN_PRQ_*` bit and `PRQ_PRIO` are
+/// indexed by the priority itself, so low and normal have bits of their own although they
+/// share the normal run queue (enqueue_process).
+fn check_enqueue(word: &mut u32, prio: usize) -> Enqueue {
+    let qbit = 1_u32 << prio;
     // The highest priority queue the process is in; a bit out of range when in none.
     let in_prq = ((*word & psflg::IN_PRQ_MASK) >> psflg::IN_PRQ_OFFSET) | (1 << 4);
     let max_qbit = in_prq.isolate_lowest_one();
@@ -263,7 +265,7 @@ fn check_enqueue(word: &mut u32, queue: usize) -> Enqueue {
     }
     *word = (*word & !psflg::PRQ_PRIO_MASK)
         | psflg::IN_RUNQ
-        | ((queue as u32) << psflg::PRQ_PRIO_OFFSET);
+        | ((prio as u32) << psflg::PRQ_PRIO_OFFSET);
     Enqueue::Real
 }
 
@@ -287,36 +289,36 @@ impl RunStateWord<'_> {
         });
     }
 
-    /// A process just created becomes queued: active with an entry in `queue`.
-    fn queue_new(&self, queue: usize, order: Ordering) {
+    /// A process just created becomes queued: active with an entry at priority `prio`.
+    fn queue_new(&self, prio: usize, order: Ordering) {
         let _ = self.0.fetch_update(order, load_order(order), |mut word| {
             word = word & !RUN_STATE_MASK | psflg::ACTIVE;
-            check_enqueue(&mut word, queue);
+            check_enqueue(&mut word, prio);
             Some(word)
         });
     }
 
     /// `UNSCHEDULED` to queued; `Err` when the process is not unscheduled.
-    fn schedule_unscheduled(&self, queue: usize) -> Result<Enqueue, ()> {
+    fn schedule_unscheduled(&self, prio: usize) -> Result<Enqueue, ()> {
         let mut decision = Enqueue::Not;
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
                 if run_state_of(word) != UNSCHEDULED {
                     return None;
                 }
-                decision = check_enqueue(&mut word, queue);
+                decision = check_enqueue(&mut word, prio);
                 Some(word)
             })
             .map(|_| decision)
             .map_err(|_| ())
     }
 
-    /// Make a waiting process active, and decide whether it needs an entry in `queue`; `None`
+    /// Make a waiting process active, and decide whether it needs an entry at `prio`; `None`
     /// when it is not waiting. The first read of the word decides, and the swap retries only
     /// while other bits change.
     // Port of erts/emulator/beam/erl_process.c:6899-7005 (change_proc_schedule_state setting
     // ERTS_PSFLG_ACTIVE, with check_enqueue_in_prio_queue), OTP-29.1.1.
-    fn wake(&self, known: Option<u32>, queue: usize) -> Option<Enqueue> {
+    fn wake(&self, known: Option<u32>, prio: usize) -> Option<Enqueue> {
         // The state word the sender's own read-modify-write produced is the first guess;
         // an active receiver then needs no further access to the shared word.
         let mut word = match known {
@@ -325,7 +327,7 @@ impl RunStateWord<'_> {
         };
         while word & RUN_STATE_MASK == 0 {
             let mut new = word | psflg::ACTIVE;
-            let decision = check_enqueue(&mut new, queue);
+            let decision = check_enqueue(&mut new, prio);
             match self
                 .0
                 .compare_exchange_weak(word, new, Ordering::SeqCst, Ordering::SeqCst)
@@ -353,14 +355,14 @@ impl RunStateWord<'_> {
         previous
     }
 
-    /// A running process stays active and queues itself in `queue`
+    /// A running process stays active and queues itself at `prio`
     /// (`schedule_out_process` with `ERTS_PSFLG_ACTIVE` still set).
-    fn yield_running(&self, queue: usize, order: Ordering) -> Enqueue {
+    fn yield_running(&self, prio: usize, order: Ordering) -> Enqueue {
         let mut decision = Enqueue::Not;
         let _ = self.0.fetch_update(order, load_order(order), |mut word| {
             debug_assert_eq!(run_state_of(word), RUNNING);
             word &= !psflg::RUNNING;
-            decision = check_enqueue(&mut word, queue);
+            decision = check_enqueue(&mut word, prio);
             Some(word)
         });
         decision
@@ -374,17 +376,25 @@ impl RunStateWord<'_> {
     // as schedule_out_process (erl_process.c:6695-6820) reaches it through
     // check_enqueue_in_prio_queue, OTP-29.1.1: the process struct takes the entry unless it is
     // already in a run queue (`IN_RUNQ`), then a proxy does.
-    fn yield_running_dirty(&self, kind: DirtyKind, queue: usize, order: Ordering) -> Enqueue {
+    fn yield_running_dirty(
+        &self,
+        kind: DirtyKind,
+        prio: usize,
+        user_prio: usize,
+        order: Ordering,
+    ) -> Enqueue {
         let mut decision = Enqueue::Not;
         let _ = self.0.fetch_update(order, load_order(order), |mut word| {
             debug_assert_eq!(run_state_of(word), RUNNING);
             word = (word & !psflg::RUNNING) | kind.state_flag();
-            if word & psflg::IN_RUNQ != 0 {
+            // Port of erl_process.c:6512, OTP-29.1.1: the process struct can represent the
+            // dirty entry only when the actual priority still matches the user priority.
+            if word & psflg::IN_RUNQ != 0 || prio != user_prio {
                 decision = Enqueue::Proxy;
             } else {
                 word = (word & !psflg::PRQ_PRIO_MASK)
                     | psflg::IN_RUNQ
-                    | ((queue as u32) << psflg::PRQ_PRIO_OFFSET);
+                    | ((prio as u32) << psflg::PRQ_PRIO_OFFSET);
                 decision = Enqueue::Real;
             }
             Some(word)
@@ -392,9 +402,9 @@ impl RunStateWord<'_> {
         decision
     }
 
-    /// A queued process gets an entry at a higher priority (`active_sys_enqueue`): `None` when
-    /// it is not queued.
-    fn enqueue_higher(&self, queue: usize) -> Option<Enqueue> {
+    /// A queued process gets an entry at the higher priority `prio` (`active_sys_enqueue`):
+    /// `None` when it is not queued.
+    fn enqueue_higher(&self, prio: usize) -> Option<Enqueue> {
         let mut decision = Enqueue::Not;
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
@@ -403,21 +413,21 @@ impl RunStateWord<'_> {
                 if run_state_of(word) != QUEUED || word & psflg::DIRTY_WORK != 0 {
                     return None;
                 }
-                decision = check_enqueue(&mut word, queue);
+                decision = check_enqueue(&mut word, prio);
                 Some(word)
             })
             .ok()
             .map(|_| decision)
     }
 
-    /// Dequeue an entry of priority queue `queue` and start running the process if it is
+    /// Dequeue an entry enqueued at priority `prio` and start running the process if it is
     /// runnable: `true` when it runs. A real entry clears `IN_RUNQ`; a proxy leaves it, as the
     /// process struct is still queued.
     // Port of erts/emulator/beam/erl_process.c:9990-10100 (erts_schedule execute_process:
     // psflg_band_mask clears the IN_PRQ bit of the queue and IN_RUNQ unless the entry is a
     // proxy), OTP-29.1.1.
-    fn claim(&self, proxy: bool, queue: usize) -> bool {
-        self.claim_masked(proxy, !(psflg::IN_PRQ_OFFSET_BIT << queue), false)
+    fn claim(&self, proxy: bool, prio: usize) -> bool {
+        self.claim_masked(proxy, !(psflg::IN_PRQ_OFFSET_BIT << prio), false)
     }
 
     /// [`Self::claim`] for an entry of a dirty run queue: `psflg_band_mask` keeps every
@@ -1570,13 +1580,8 @@ impl<M: SignalMessage> ProcShared<M> {
     // Port of erts/emulator/beam/erl_process.c:6532-6565 (fin_dirty_enq_s_change),
     // OTP-29.1.1. The reference count erts drops for a free process belongs to its own
     // refcounting of queued structs; a `ProcRef` entry holds its own reference.
-    fn fin_dirty_enq_s_change(
-        &self,
-        pstruct_reserved: bool,
-        queue: usize,
-        kind: DirtyKind,
-    ) -> bool {
-        let qbit = 1_u32 << (queue as u32 + kind.xstate_prq_offset());
+    fn fin_dirty_enq_s_change(&self, pstruct_reserved: bool, prio: usize, kind: DirtyKind) -> bool {
+        let qbit = 1_u32 << (prio as u32 + kind.xstate_prq_offset());
         if self.xstate.fetch_or(qbit, Ordering::SeqCst) & qbit != 0 {
             if pstruct_reserved {
                 let state = self
@@ -1590,10 +1595,10 @@ impl<M: SignalMessage> ProcShared<M> {
         true
     }
 
-    /// The entry of priority queue `queue` left the dirty run queue of `kind`.
+    /// The entry enqueued at priority `prio` left the dirty run queue of `kind`.
     // Port of erts/emulator/beam/erl_process.c:4288 (clear_proc_dirty_queue_bit), OTP-29.1.1.
-    fn clear_dirty_queue_bit(&self, queue: usize, kind: DirtyKind) {
-        let qbit = 1_u32 << (queue as u32 + kind.xstate_prq_offset());
+    fn clear_dirty_queue_bit(&self, prio: usize, kind: DirtyKind) {
+        let qbit = 1_u32 << (prio as u32 + kind.xstate_prq_offset());
         let old = self.xstate.fetch_and(!qbit, Ordering::SeqCst);
         debug_assert!(old & qbit != 0);
     }
@@ -2415,19 +2420,6 @@ impl<T: Task> Scheduled<T> {
         }
     }
 
-    /// An entry of the given kind (what `check_enqueue_in_prio_queue` decided) for priority
-    /// queue `queue`: the process's own priority when that is the queue's level, else the
-    /// elevated level of the queue (a proxy of `active_sys_enqueue`).
-    fn with_kind(process: ProcRef<T>, kind: Enqueue, queue: usize) -> Self {
-        let actual = process.priority().index();
-        let prio = if queue_index(actual) == queue {
-            actual
-        } else {
-            queue
-        };
-        Self::at_prio(process, kind, prio)
-    }
-
     /// Run queue priority queue of this entry: low priority processes share the normal
     /// queue (erl_process.c:3961, enqueue_process).
     fn queue(&self) -> usize {
@@ -2863,9 +2855,11 @@ impl<T: Task> Inner<T> {
     // OTP-29.1.1.
     fn enqueue_dirty(&self, item: Scheduled<T>, kind: DirtyKind) {
         if item.kind == Enqueue::Not
-            || !item
-                .process
-                .fin_dirty_enq_s_change(item.kind == Enqueue::Real, item.queue, kind)
+            || !item.process.fin_dirty_enq_s_change(
+                item.kind == Enqueue::Real,
+                usize::from(item.prio),
+                kind,
+            )
         {
             return;
         }
@@ -3154,8 +3148,8 @@ impl<T: Task> Inner<T> {
         let Some(process) = self.table.lookup(pid) else {
             return false;
         };
-        let queue = queue_index(process.priority().index());
-        let Some(kind) = process.run_state().wake(None, queue) else {
+        let prio = process.priority().index();
+        let Some(kind) = process.run_state().wake(None, prio) else {
             return false;
         };
         let wait_timer = process.wait_timer.load(Ordering::Acquire);
@@ -3163,7 +3157,7 @@ impl<T: Task> Inner<T> {
             process.wait_epoch.fetch_add(1, Ordering::AcqRel);
             self.cancel_wait_timer(&process, wait_timer);
         }
-        self.enqueue(Scheduled::with_kind(process, kind, queue), false);
+        self.enqueue(Scheduled::at_prio(process, kind, prio), false);
         true
     }
 
@@ -4190,13 +4184,13 @@ impl<T: Task> Inner<T> {
             self.notify_dirty_signal_handler(&process, Some(priority));
         }
         if priority.index() < before.index() {
-            let queue = queue_index(priority.index());
+            let prio = priority.index();
             // Port of erts/emulator/beam/erl_process.c:7028 (active_sys_enqueue): a queued process
             // gets an entry at the higher priority unless it already has one there or higher.
-            if let Some(kind) = process.run_state().enqueue_higher(queue)
+            if let Some(kind) = process.run_state().enqueue_higher(prio)
                 && kind != Enqueue::Not
             {
-                let item = Scheduled::with_kind(process.clone(), kind, queue);
+                let item = Scheduled::at_prio(process.clone(), kind, prio);
                 // The extra entry counts in the run queue lengths like any other entry
                 // (enqueue_process does not tell proxies apart).
                 if let Some(sim) = &self.sim {
@@ -4370,8 +4364,8 @@ impl<T: Task> Inner<T> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message),
         // OTP-29.1.1: read the state and schedule only a process that is not active. The
         // SeqCst load orders after the SeqCst enqueue (see the wake protocol above).
-        let queue = queue_index(process.priority().index());
-        let Some(kind) = process.run_state().wake(state, queue) else {
+        let prio = process.priority().index();
+        let Some(kind) = process.run_state().wake(state, prio) else {
             // Port of erts/emulator/beam/erl_proc_sig_queue.h:2072 (erts_proc_notify_new_sig),
             // OTP-29.1.1.
             if Self::in_dirty_state(process) {
@@ -4386,7 +4380,7 @@ impl<T: Task> Inner<T> {
             process.wait_epoch.fetch_add(1, Ordering::AcqRel);
             self.cancel_wait_timer(process, wait_timer);
         }
-        let item = Scheduled::with_kind(process.clone(), kind, queue);
+        let item = Scheduled::at_prio(process.clone(), kind, prio);
         if force_enqueue {
             self.enqueue(item, false);
         } else {
@@ -4526,13 +4520,13 @@ impl<T: Task> Inner<T> {
             let process = entry.process;
             if process.wait_epoch.load(Ordering::Acquire) == entry.epoch
                 && process.wait_timer.load(Ordering::Acquire) == WAIT_TIMER_DEFERRED
-                && let queue = queue_index(process.priority().index())
-                && let Some(kind) = process.run_state().wake(None, queue)
+                && let prio = process.priority().index()
+                && let Some(kind) = process.run_state().wake(None, prio)
             {
                 before_wake();
                 process.wait_timer.store(0, Ordering::Release);
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                self.place_runnable(Scheduled::with_kind(process, kind, queue), Some(local));
+                self.place_runnable(Scheduled::at_prio(process, kind, prio), Some(local));
             }
         }
     }
@@ -4770,11 +4764,11 @@ impl<T: Task> Inner<T> {
             TimerPayload::Wake(pid, epoch) => {
                 if let Some(process) = self.table.lookup(pid)
                     && process.wait_epoch.load(Ordering::Acquire) == epoch
-                    && let queue = queue_index(process.priority().index())
-                    && let Some(kind) = process.run_state().wake(None, queue)
+                    && let prio = process.priority().index()
+                    && let Some(kind) = process.run_state().wake(None, prio)
                 {
                     process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                    let item = Scheduled::with_kind(process, kind, queue);
+                    let item = Scheduled::at_prio(process, kind, prio);
                     self.place_runnable(item, local);
                 }
             }
@@ -5429,9 +5423,9 @@ impl<T: Task> Drop for ExitWaiter<T> {
         // finish with the same enqueue CAS in wake(), so exactly one queues it.
         process.exit_resume.store(true, Ordering::SeqCst);
         // The exit wait arms no timer, so there is no wait epoch to advance.
-        let queue = queue_index(process.priority().index());
-        if let Some(kind) = process.run_state().wake(None, queue) {
-            inner.place_runnable(Scheduled::with_kind(process, kind, queue), None);
+        let prio = process.priority().index();
+        if let Some(kind) = process.run_state().wake(None, prio) {
+            inner.place_runnable(Scheduled::at_prio(process, kind, prio), None);
         }
     }
 }
@@ -6108,13 +6102,13 @@ impl<T: Task> Runner<'_, T> {
     // Port of erts/emulator/beam/erl_process.c:12525 (erl_create_process), OTP-29.1.1: the
     // child joins its parent's run queue.
     fn schedule_process(&mut self, process: ProcRef<T>) -> Result<(), Error> {
-        let queue = queue_index(process.priority().index());
+        let prio = process.priority().index();
         let kind = process
             .run_state()
-            .schedule_unscheduled(queue)
+            .schedule_unscheduled(prio)
             .map_err(|_| Error::NoProcess)?;
         let bound = process.bound_worker().is_some();
-        let item = Scheduled::with_kind(process, kind, queue);
+        let item = Scheduled::at_prio(process, kind, prio);
         if bound {
             self.inner.enqueue(item, false);
         } else if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut() {
@@ -7253,13 +7247,13 @@ impl<T: Task> Scheduler<T> {
     /// Make an inserted child runnable after its caller publishes it.
     pub fn schedule_unscheduled(&self, pid: Pid) -> Result<(), Error> {
         let process = self.inner.table.lookup(pid).ok_or(Error::NoProcess)?;
-        let queue = queue_index(process.priority().index());
+        let prio = process.priority().index();
         let kind = process
             .run_state()
-            .schedule_unscheduled(queue)
+            .schedule_unscheduled(prio)
             .map_err(|_| Error::NoProcess)?;
         self.inner
-            .enqueue_new(Scheduled::with_kind(process, kind, queue));
+            .enqueue_new(Scheduled::at_prio(process, kind, prio));
         Ok(())
     }
     /// Spawn onto one run queue without binding the process to that scheduler.
@@ -7280,7 +7274,7 @@ impl<T: Task> Scheduler<T> {
         let pid = process.pid;
         process
             .run_state()
-            .queue_new(queue_index(process.priority().index()), Ordering::Release);
+            .queue_new(process.priority().index(), Ordering::Release);
         process.scheduler_id.store(worker, Ordering::Relaxed);
         let item = Scheduled::new(process);
         let scheduler = self.inner.enqueue_run_queue(&item.process);
@@ -7293,7 +7287,7 @@ impl<T: Task> Scheduler<T> {
         let pid = process.pid;
         process
             .run_state()
-            .queue_new(queue_index(process.priority().index()), Ordering::Release);
+            .queue_new(process.priority().index(), Ordering::Release);
         self.inner.enqueue_new(Scheduled::new(process));
         Ok(pid)
     }
@@ -8666,9 +8660,9 @@ mod dirty_state_tests {
         let rq = run_queue::ProcQueues::<Idle>::new();
         let normal = queue_index(Priority::Normal.index());
         let high = queue_index(Priority::High.index());
-        rq.push(Scheduled::with_kind(process.clone(), Enqueue::Real, normal));
-        rq.push(Scheduled::with_kind(process.clone(), Enqueue::Proxy, high));
-        rq.push(Scheduled::with_kind(process.clone(), Enqueue::Not, high));
+        rq.push(Scheduled::at_prio(process.clone(), Enqueue::Real, normal));
+        rq.push(Scheduled::at_prio(process.clone(), Enqueue::Proxy, high));
+        rq.push(Scheduled::at_prio(process.clone(), Enqueue::Not, high));
         assert_eq!(rq.total_len(), 2);
         assert_eq!(rq.len(Priority::Normal.index()), 1);
         assert_eq!(rq.len(Priority::High.index()), 1);
@@ -8704,6 +8698,59 @@ mod dirty_state_tests {
         assert!(process.fin_dirty_enq_s_change(false, normal, DirtyKind::Io));
         process.clear_dirty_queue_bit(normal, DirtyKind::Cpu);
         assert!(process.fin_dirty_enq_s_change(false, normal, DirtyKind::Cpu));
+    }
+
+    /// Dirty enqueue uses a proxy when system work raised the actual priority above the
+    /// user priority, as `check_dirty_enqueue_in_prio_queue` does in erl_process.c:6512.
+    #[test]
+    fn dirty_enqueue_uses_proxy_for_elevated_actual_priority() {
+        let state = AtomicU32::new(psflg::RUNNING | psflg::ACTIVE);
+        let entry = RunStateWord(&state).yield_running_dirty(
+            DirtyKind::Cpu,
+            Priority::High.index(),
+            Priority::Normal.index(),
+            Ordering::Release,
+        );
+        assert_eq!(entry, Enqueue::Proxy);
+        let word = state.load(Ordering::Relaxed);
+        assert_eq!(word & psflg::RUNNING, 0);
+        assert_eq!(word & psflg::DIRTY_CPU_PROC, psflg::DIRTY_CPU_PROC);
+        assert_eq!(word & psflg::IN_RUNQ, 0);
+    }
+
+    /// Low and normal have `IN_PRQ` bits of their own (erl_process.h ERTS_PSFLG_IN_PRQ_LOW /
+    /// _NORMAL; erl_process.c:6569 check_enqueue_in_prio_queue indexes them by `aprio`),
+    /// although both share the normal run queue: an elevation of a queued low process to
+    /// normal takes a proxy entry, and its dequeue clears only the normal bit.
+    #[test]
+    fn low_and_normal_have_separate_in_prq_bits() {
+        let low = balance::PRIORITY_LOW;
+        let normal = balance::PRIORITY_NORMAL;
+        let mut word = psflg::ACTIVE;
+        assert_eq!(check_enqueue(&mut word, low), Enqueue::Real);
+        assert_eq!(word & psflg::IN_PRQ_MASK, psflg::IN_PRQ_LOW);
+        assert_eq!(
+            (word & psflg::PRQ_PRIO_MASK) >> psflg::PRQ_PRIO_OFFSET,
+            low as u32
+        );
+        assert_eq!(check_enqueue(&mut word, low), Enqueue::Not);
+        assert_eq!(check_enqueue(&mut word, normal), Enqueue::Proxy);
+        assert_eq!(
+            word & psflg::IN_PRQ_MASK,
+            psflg::IN_PRQ_LOW | psflg::IN_PRQ_NORMAL
+        );
+        // The real entry keeps its own priority.
+        assert_eq!(
+            (word & psflg::PRQ_PRIO_MASK) >> psflg::PRQ_PRIO_OFFSET,
+            low as u32
+        );
+        assert_eq!(check_enqueue(&mut word, normal), Enqueue::Not);
+        assert_eq!(check_enqueue(&mut word, low), Enqueue::Not);
+        let state = AtomicU32::new(word);
+        assert!(RunStateWord(&state).claim(true, normal));
+        let word = state.load(Ordering::Relaxed);
+        assert_eq!(word & psflg::IN_PRQ_MASK, psflg::IN_PRQ_LOW);
+        assert_ne!(word & psflg::IN_RUNQ, 0);
     }
 
     #[test]
@@ -8852,10 +8899,10 @@ mod proxy_requeue_tests {
         process
             .sys_priority
             .store(Priority::High.index() as u8, Ordering::Release);
-        scheduler.inner.run_queues[0].push(Scheduled::with_kind(
+        scheduler.inner.run_queues[0].push(Scheduled::at_prio(
             process.clone(),
             Enqueue::Proxy,
-            queue_index(process.priority().index()),
+            process.priority().index(),
         ));
         release.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -8892,10 +8939,10 @@ mod proxy_requeue_tests {
         let process = scheduler.inner.table.lookup(pid).unwrap();
         // Queue order: real entry, then the duplicate. The real entry runs first and yields,
         // which queues the process again behind the duplicate.
-        scheduler.inner.run_queues[0].push(Scheduled::with_kind(
+        scheduler.inner.run_queues[0].push(Scheduled::at_prio(
             process.clone(),
             Enqueue::Proxy,
-            queue_index(process.priority().index()),
+            process.priority().index(),
         ));
         release.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -8960,7 +9007,7 @@ mod rq_double_enqueue_tests {
                             && kind != Enqueue::Not
                         {
                             let queue = inner.select_run_queue(process);
-                            inner.run_queues[queue].push(Scheduled::with_kind(
+                            inner.run_queues[queue].push(Scheduled::at_prio(
                                 process.clone(),
                                 kind,
                                 prio,
@@ -9180,11 +9227,14 @@ fn schedule_out<T: Task>(
                     inner.record_waiting(&process);
                 }
             }
-            let queue = queue_index(process.priority().index());
-            let entry = process
-                .run_state()
-                .yield_running_dirty(kind, queue, Ordering::Release);
-            inner.enqueue_dirty(Scheduled::with_kind(process.clone(), entry, queue), kind);
+            let prio = process.priority().index();
+            let entry = process.run_state().yield_running_dirty(
+                kind,
+                prio,
+                usize::from(process.user_priority.load(Ordering::Acquire)),
+                Ordering::Release,
+            );
+            inner.enqueue_dirty(Scheduled::at_prio(process.clone(), entry, prio), kind);
             // Port of erts/emulator/beam/erl_process.c:9763 (ensure signals are handled while
             // scheduled dirty), OTP-29.1.1.
             if process.input.has_pending() {
@@ -9194,14 +9244,14 @@ fn schedule_out<T: Task>(
         RunOutcome::Yield if dirty.is_some() => {
             // Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty job moves the
             // process back to a normal run queue), OTP-29.1.1.
-            let queue = queue_index(process.priority().index());
-            let kind = process.run_state().yield_running(queue, Ordering::Release);
-            inner.enqueue(Scheduled::with_kind(process.clone(), kind, queue), false);
+            let prio = process.priority().index();
+            let kind = process.run_state().yield_running(prio, Ordering::Release);
+            inner.enqueue(Scheduled::at_prio(process.clone(), kind, prio), false);
         }
         RunOutcome::Yield => {
-            let queue = queue_index(process.priority().index());
-            let kind = process.run_state().yield_running(queue, Ordering::Release);
-            let next = Scheduled::with_kind(process.clone(), kind, queue);
+            let prio = process.priority().index();
+            let kind = process.run_state().yield_running(prio, Ordering::Release);
+            let next = Scheduled::at_prio(process.clone(), kind, prio);
             if process.bound_worker().is_some() {
                 inner.enqueue(next, true);
             } else if let Some(local) = local.as_deref_mut() {
@@ -9258,10 +9308,10 @@ fn schedule_out<T: Task>(
             }
             if let Some(ms) = timeout_ms {
                 if ms == 0 {
-                    let queue = queue_index(process.priority().index());
-                    if let Some(kind) = process.run_state().wake(None, queue) {
+                    let prio = process.priority().index();
+                    if let Some(kind) = process.run_state().wake(None, prio) {
                         process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                        let item = Scheduled::with_kind(process.clone(), kind, queue);
+                        let item = Scheduled::at_prio(process.clone(), kind, prio);
                         inner.place_runnable(item, local.as_deref_mut());
                         return None;
                     }
@@ -9304,18 +9354,18 @@ fn schedule_out<T: Task>(
             // further load is needed; one that arrives later sees WAITING and wakes it.
             // Port of erts/emulator/beam/erl_process.c:6695-6790 (schedule_out_process works
             // from the state word it read), OTP-29.1.1.
-            let queue = queue_index(process.priority().index());
+            let prio = process.priority().index();
             // An exit waiter resumed while the process still ran (ExitWaiter::drop) is seen
             // here, after the transition to WAITING, so the resume is never lost.
             if (left_running & psflg::SIG_IN_Q != 0
                 || (process.exit_resume.load(Ordering::SeqCst)
                     && process.exit_resume.swap(false, Ordering::SeqCst)))
-                && let Some(kind) = process.run_state().wake(None, queue)
+                && let Some(kind) = process.run_state().wake(None, prio)
             {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
                 let id = process.wait_timer.load(Ordering::Acquire);
                 inner.cancel_wait_timer(&process, id);
-                let next = Scheduled::with_kind(process.clone(), kind, queue);
+                let next = Scheduled::at_prio(process.clone(), kind, prio);
                 inner.place_runnable(next, local.as_deref_mut());
             }
         }
@@ -9352,12 +9402,12 @@ fn run_slice<T: Task>(
         // Port of erts/emulator/beam/erl_process.c:10063-10066 (execute_process on a dirty
         // scheduler: clear_proc_dirty_queue_bit, then the state change), OTP-29.1.1.
         Some(kind) => {
-            process.clear_dirty_queue_bit(item.queue, kind);
+            process.clear_dirty_queue_bit(usize::from(item.prio), kind);
             process.run_state().claim_dirty(item.kind == Enqueue::Proxy)
         }
         None => process
             .run_state()
-            .claim(item.kind == Enqueue::Proxy, item.queue),
+            .claim(item.kind == Enqueue::Proxy, usize::from(item.prio)),
     };
     if !runs {
         return;
@@ -9487,7 +9537,7 @@ fn run_process<T: Task>(
     let process = item.process;
     if !process
         .run_state()
-        .claim(item.kind == Enqueue::Proxy, item.queue)
+        .claim(item.kind == Enqueue::Proxy, usize::from(item.prio))
     {
         return None;
     }
