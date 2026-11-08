@@ -892,6 +892,7 @@ fn emit_export_fragment(
     let helper_call = code.new_label();
     let direct_done = code.new_label();
     let direct_non_value = code.new_label();
+    let direct_trap = code.new_label();
     let return_term = code.new_label();
     code.emit(|encoder| {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776 (call_bif_shared),
@@ -969,12 +970,12 @@ fn emit_export_fragment(
     code.b(return_term)?;
     code.bind(direct_non_value)?;
     code.emit(|encoder| {
-        // THE_NON_VALUE with freason == TRAP, or with no reason, is the executor
-        // handoff (the helper's sentinel 1). Any other reason is the exception.
+        // THE_NON_VALUE with no reason is the executor handoff (the helper's sentinel
+        // 1). TRAP context-switches; any other reason is the exception.
         encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
         encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
     })?;
-    code.b_cond(Cond::Eq, interpreted)?;
+    code.b_cond(Cond::Eq, direct_trap)?;
     code.emit(|encoder| encoder.cmp_imm(Gpr::x(9), 0, false))?;
     code.b_cond(Cond::Eq, interpreted)?;
     code.b(raise_exception)?;
@@ -986,6 +987,19 @@ fn emit_export_fragment(
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
         encoder.ret(Gpr::x(30))
     })?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776 (call_bif_shared, then
+    // emit_bif_nif_epilogue's `trap` label) and process_main.cpp
+    // (context_switch_simplified), OTP-29.1.1: BIF_TRAP set c_p->i (beam_bif_export_trap),
+    // c_p->arity and c_p->current; the caller's return address pushed on entry stays on
+    // E, and the process switches out at c_p->i. The BIF call is not redone.
+    code.bind(direct_trap)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(1), Gpr::x(21), 72)?;
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(20), 0)?;
+        encoder.str_uoff(Gpr::xzr(), Gpr::x(21), 40)?;
+        encoder.mov_const(Gpr::x(0), 2)
+    })?;
+    emit_restore_and_exit_frame(code, 32)?;
     code.bind(interpreted)?;
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 16)?;

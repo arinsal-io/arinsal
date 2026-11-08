@@ -337,6 +337,11 @@ impl ExportEntry {
         self.light_bif_func.store(func, Ordering::Release);
     }
 
+    /// Returns the selected native entry for this BIF export, or zero when it has none.
+    pub fn light_bif_func(&self) -> usize {
+        self.light_bif_func.load(Ordering::Acquire)
+    }
+
     /// The runtime descriptor word published by [`ExportEntry::set_info`], zero before it.
     pub fn info(&self) -> usize {
         self.info.load(Ordering::Acquire)

@@ -397,8 +397,13 @@ extern "C" fn unused_big_to_float(_process: *mut ProcessHeader, _term: u64) -> u
     0
 }
 
-extern "C" fn unused_apply_resolver(_process: *mut ProcessHeader, _arity: u32) -> usize {
-    0
+extern "C" fn unused_apply_resolver(
+    _process: *mut ProcessHeader,
+    _arity: u32,
+    _return_ip: u64,
+    _stack_offset: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    arinsal_beamasm::misc::ApplyResolution::default()
 }
 
 extern "C" fn unused_apply3_resolver(_process: *mut ProcessHeader) -> usize {

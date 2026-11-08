@@ -6,14 +6,23 @@ use arinsal_beamasm::{
     misc::{self, ApplyKind, ApplyRuntime},
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
 };
+use similar_asserts::assert_eq;
 
 extern "C" fn light_bif_hook(_: *mut ProcessHeader, identity: u64) -> u64 {
     identity
 }
 
-extern "C" fn apply_hook(process: *mut ProcessHeader, arity: u32) -> usize {
+extern "C" fn apply_hook(
+    process: *mut ProcessHeader,
+    arity: u32,
+    _: u64,
+    _: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
     arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue = u64::from(arity));
-    arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
+    arinsal_beamasm::misc::ApplyResolution {
+        export: 0,
+        target: arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid),
+    }
 }
 
 extern "C" fn apply3_hook(_: *mut ProcessHeader) -> usize {

@@ -1,6 +1,7 @@
 //! Trapping BIFs called through `apply` (`erlang:F(..)`, `apply/3`) at sizes that exhaust the
 //! reductions, with the reductions left varying between iterations: the result must be the
-//! BIF's value, never the non-value of an installed continuation.
+//! BIF's value, never the non-value of an installed continuation. Funs of BIF exports reach
+//! the same BIFs through the export trampoline.
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
@@ -40,7 +41,12 @@ one(I, N) ->
     P = E:Ph(G),
     Q = apply(Lists, Rv, [G, [a]]),
     R = E:Apply(E, L, [G]),
-    {A, B, red(C), D, F, H, K, M, P, red(Q), R}.
+    Fl = id(fun erlang:length/1), Fr = id(fun lists:reverse/2),
+    burn(I * 23),
+    S = Fl(G),
+    burn(I * 29),
+    T = red(Fr(G, [b])),
+    {A, B, red(C), D, F, H, K, M, P, red(Q), R, S, T}.
 run(N) ->
     [one(I, N) || I <- lists:seq(1, 60)].
 "#;

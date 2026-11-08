@@ -4395,18 +4395,24 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
     }
 }
 
-/// Resolves `apply Arity` to a native entry, or to the fragment that lets the interpreter apply.
+/// Resolves `apply Arity` to a BIF export (called through its dispatch address with the
+/// Export* in ARG1), a native entry, or the fragment that lets the interpreter apply.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-320 (emit_fixed_apply) and
 // erts/emulator/beam/beam_common.c (fixed_apply), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, arity: u32) -> usize {
+pub extern "C" fn arinsal_beamasm_apply_resolver(
+    header: *mut ProcessHeader,
+    arity: u32,
+    return_ip: u64,
+    stack_offset: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
+        return arinsal_beamasm::misc::ApplyResolution::default();
     };
     let arity = arity as usize;
     let fragment = crate::beamasm_integration::apply_fixed_unported_entry();
     if fragment == 0 || arity + 1 >= registers.x_reg_array.len() {
         crate::native_hooks::set_error(process, "system_limit");
-        return 0;
+        return arinsal_beamasm::misc::ApplyResolution::default();
     }
     let module = registers.x_reg_array[arity];
     let function = registers.x_reg_array[arity + 1];
@@ -4418,29 +4424,87 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
     {
         let apply3 = crate::beamasm_integration::apply3_unported_entry();
         if apply3 != 0 {
-            return apply3;
+            return arinsal_beamasm::misc::ApplyResolution {
+                export: 0,
+                target: apply3 as u64,
+            };
         }
     }
     if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
         process.heap.abi.arity = arity.min(u8::MAX as usize) as u8;
-        return fragment;
+        return arinsal_beamasm::misc::ApplyResolution {
+            export: 0,
+            target: fragment as u64,
+        };
     }
     if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) {
-        let target = process.runtime.as_ref().and_then(|runtime| {
-            runtime.export_address(
-                (module, function, arity as u8),
-                registers.active_code_ix as usize,
-            )
-        });
-        if let Some(target) =
-            target.filter(|target| *target != crate::beamasm_integration::export_trampoline())
-        {
-            return target;
+        let code_ix = registers.active_code_ix as usize;
+        let export = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.export_entry((module, function, arity as u8), code_ix));
+        if let Some(export) = export {
+            let target = export.address(code_ix);
+            // Port of erts/emulator/beam/beam_common.c:1529-1550 (fixed_apply), OTP-29.1.1:
+            // `emit_setup_dispatchable_call` receives the Export*, loads its active
+            // dispatch address, and passes the Export* in ARG1. Return both words
+            // in AAPCS64's x0/x1 result pair for the generated call setup.
+            if export.light_bif_func() != 0 {
+                // Port of erts/emulator/beam/beam_common.c:1345-1427
+                // (apply_bif_error_adjustment), OTP-29.1.1. A tail apply of
+                // error/exit/throw restores the calling function's native CP.
+                let bif_name = (module, function, arity as u8);
+                let needs_error_cp = matches!(
+                    bif_name,
+                    (
+                        arinsal_term::atoms::ERLANG,
+                        arinsal_term::atoms::ERROR,
+                        1..=3
+                    ) | (arinsal_term::atoms::ERLANG, arinsal_term::atoms::EXIT, 1)
+                        | (arinsal_term::atoms::ERLANG, arinsal_term::atoms::THROW, 1)
+                );
+                if return_ip != 0 && needs_error_cp {
+                    let apply_only = stack_offset == 0;
+                    let need = (stack_offset as usize / std::mem::size_of::<u64>()).max(1);
+                    if process.ensure(need, arity + 2).is_err() {
+                        crate::native_hooks::set_error(process, "system_limit");
+                        return arinsal_beamasm::misc::ApplyResolution::default();
+                    }
+                    let continuation =
+                        crate::proc_create::native_continuation_term(return_ip as usize);
+                    if apply_only {
+                        if !process.heap.reserve_stack(need)
+                            || !process.heap.stack_set(0, continuation)
+                        {
+                            crate::native_hooks::set_error(process, "system_limit");
+                            return arinsal_beamasm::misc::ApplyResolution::default();
+                        }
+                    } else if !process.heap.stack_set(0, continuation)
+                        || !process.heap.reserve_stack(need)
+                    {
+                        crate::native_hooks::set_error(process, "system_limit");
+                        return arinsal_beamasm::misc::ApplyResolution::default();
+                    }
+                }
+                return arinsal_beamasm::misc::ApplyResolution {
+                    export: std::ptr::from_ref(export) as u64,
+                    target: target as u64,
+                };
+            }
+            if target != crate::beamasm_integration::export_trampoline() {
+                return arinsal_beamasm::misc::ApplyResolution {
+                    export: 0,
+                    target: target as u64,
+                };
+            }
         }
     }
     // Not natively compiled (or invalid): the interpreter applies and raises errors.
     process.heap.abi.arity = arity.min(u8::MAX as usize) as u8;
-    fragment
+    arinsal_beamasm::misc::ApplyResolution {
+        export: 0,
+        target: fragment as u64,
+    }
 }
 
 /// Resolves `apply/3` to a native entry with the arguments moved into the X registers, or to

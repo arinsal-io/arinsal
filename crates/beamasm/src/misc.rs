@@ -4,8 +4,18 @@ use arinsal_a64::enc::Gpr;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 
-/// Resolves `apply Arity` to a native entry or the interpreter fragment.
-pub type ApplyHook = extern "C" fn(*mut crate::ProcessHeader, u32) -> usize;
+/// What [`ApplyHook`] resolved, returned in AAPCS64 `x0` and `x1`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct ApplyResolution {
+    /// The Export* passed in ARG1 to its dispatch address, or zero for a direct entry.
+    pub export: u64,
+    /// The address to call, or zero when the resolver set an exception.
+    pub target: u64,
+}
+
+/// Resolves `apply Arity` to an export, a native entry or the interpreter fragment.
+pub type ApplyHook = extern "C" fn(*mut crate::ProcessHeader, u32, u64, u32) -> ApplyResolution;
 
 impl BeamModuleAssembler {
     /// Sends through the light-BIF trap path so the executor owns the scheduler context.
@@ -101,6 +111,12 @@ fn emit_apply_common(
     } else {
         asm.record_return_site(continuation)?;
     }
+    let live = match kind {
+        // Port of emit_fixed_apply's `emit_enter_runtime(Arity.get() + 2)`,
+        // erts/emulator/beam/jit/arm/instr_call.cpp:270-274, OTP-29.1.1.
+        ApplyKind::Fixed(arity) => arity as usize + 2,
+        _ => 6,
+    };
     let update = crate::Update::HEAP_ALLOC
         .union(crate::Update::REDUCTIONS)
         .union(crate::Update::X_REGS);
@@ -109,15 +125,40 @@ fn emit_apply_common(
             if arity > 255 {
                 return Err(ModuleError::InvalidOperand("apply arity exceeds 255"));
             }
+            let entry = asm.code.new_label();
+            asm.code.bind(entry)?;
             asm.code
                 .emit(|e| e.mov_const(Gpr::x(9), u64::from(arity)))?;
-            asm.emit_runtime_hook_with(runtime.resolver as usize, &[Gpr::x(9)], 6, update)?;
+            if tail {
+                asm.code.adr(Gpr::x(10), entry)?;
+            } else {
+                asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
+            }
+            asm.code.emit(|e| e.mov_const(Gpr::x(11), 0))?;
+            asm.emit_runtime_hook_with(
+                runtime.resolver as usize,
+                &[Gpr::x(9), Gpr::x(10), Gpr::x(11)],
+                live,
+                update,
+            )?;
         }
         // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply),
         // OTP-29.1.1: any number of X registers is live after the call.
-        _ => asm.emit_runtime_hook_with(runtime.apply3_resolver as usize, &[], 6, update)?,
+        _ => asm.emit_runtime_hook_with(runtime.apply3_resolver as usize, &[], live, update)?,
     }
-    asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(0)))?;
+    if matches!(kind, ApplyKind::Fixed(_)) {
+        // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-299 (emit_fixed_apply) and
+        // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1: the resolver
+        // leaves the Export* in ARG1 (x0; zero for a direct native entry or a fragment)
+        // and the address to call in x1. Zero there is the exception it set.
+        let resolved = asm.code.new_label();
+        asm.code.cbnz(Gpr::x(1), resolved)?;
+        asm.branch_error()?;
+        asm.code.bind(resolved)?;
+        asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(1)))?;
+    } else {
+        asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(0)))?;
+    }
     if tail {
         asm.emit_leave_frame()?;
         asm.code.emit(|e| e.br(Gpr::x(17)))?;
