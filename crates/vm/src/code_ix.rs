@@ -532,19 +532,35 @@ impl CodeIndexes {
         };
         let result = match work {
             Some(mut work) if !ended => {
-                let result = work.intern_fun_entry(candidate);
+                // erts_fun_entry_get_or_make_stub does not modify the table on a hit. Preserve
+                // that path before SharedTable's copy-on-write mutation clones the fun table.
+                let result = work
+                    .find_fun_entry(candidate.as_ref())
+                    .unwrap_or_else(|| work.intern_fun_entry(candidate));
                 self.lock_permission().work = Some(work);
                 result
             }
             mut work => {
-                let candidate = work.as_mut().map_or(candidate.clone(), |staging| {
-                    staging.intern_fun_entry(candidate.clone())
-                });
                 let mut tables = self.tables[self.active()].read(CodeTables::clone);
-                let result = tables.intern_fun_entry(candidate);
-                self.store_raw_slot(&self.tables[self.active()], Arc::new(tables));
+                let result = if let Some(existing) = tables.find_fun_entry(candidate.as_ref()) {
+                    if let Some(staging) = work.as_mut()
+                        && staging.find_fun_entry(existing.as_ref()).is_none()
+                    {
+                        staging.intern_fun_entry(Arc::clone(&existing));
+                    }
+                    existing
+                } else {
+                    let candidate = work.as_mut().map_or(candidate.clone(), |staging| {
+                        staging.intern_fun_entry(candidate.clone())
+                    });
+                    let result = tables.intern_fun_entry(candidate);
+                    self.store_raw_slot(&self.tables[self.active()], Arc::new(tables));
+                    result
+                };
                 if let Some(mut staging) = work {
-                    staging.intern_fun_entry(Arc::clone(&result));
+                    if staging.find_fun_entry(result.as_ref()).is_none() {
+                        staging.intern_fun_entry(Arc::clone(&result));
+                    }
                     self.lock_permission().work = Some(staging);
                 }
                 result
@@ -988,6 +1004,34 @@ mod tests {
         );
         drop(next);
         crate::beamasm_integration::release_code_scope(scope);
+    }
+
+    #[test]
+    fn repeated_fun_stub_hits_keep_active_tables_published_in_place() {
+        let (_scope, code) = node();
+        let candidate = Arc::new(FunEntry {
+            dispatch_target: Default::default(),
+            pend_purge_address: Default::default(),
+            module: arinsal_term::Atom(0),
+            arity: 0,
+            index: 17,
+            uniq: [23; 16],
+            old_uniq: 29,
+            old_index: 31,
+            pid: arinsal_term::Term::NIL,
+            dispatch: Default::default(),
+            dispatch_code: Default::default(),
+            dispatch_epoch: Default::default(),
+        });
+        let canonical = code.intern_fun_entry(Arc::clone(&candidate));
+        let tables = &code.tables[code.active()];
+        let published = tables.read(std::ptr::from_ref);
+
+        for _ in 0..100_000 {
+            let result = code.intern_fun_entry(Arc::clone(&candidate));
+            assert!(Arc::ptr_eq(&canonical, &result));
+            similar_asserts::assert_eq!(tables.read(std::ptr::from_ref), published);
+        }
     }
 
     #[test]
