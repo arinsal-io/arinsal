@@ -125,6 +125,9 @@ pub(super) fn enter_native(
 /// # Safety
 /// `code_ptr` must point into a live executable mapping produced by the module assembler, at a
 /// function entry that follows the BeamAsm register contract.
+// Inlined so the scheduler's slice calls the trampoline directly: one host frame fewer to
+// return through after a switch-out (see the VM's `Executor::run`).
+#[inline(always)]
 pub unsafe fn enter_native_raw(
     header: &mut ProcessHeader,
     regs: &mut SchedulerRegisters,

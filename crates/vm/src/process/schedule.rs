@@ -37,6 +37,9 @@ impl Task for Process {
         self.stats.gc.nanoseconds
     }
 
+    // Inlined into the worker loop: see `Executor::run`. The dirty and simulated scheduler
+    // path (`run_slice`) gets its own copy, which the normal schedulers never execute.
+    #[inline(always)]
     fn run(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
@@ -290,6 +293,7 @@ impl Task for Process {
     }
 }
 
+#[inline(always)]
 pub(super) fn abort_on_worker_panic(run: impl FnOnce() -> RunOutcome) -> RunOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
         Ok(outcome) => outcome,
@@ -306,6 +310,7 @@ pub(super) fn abort_on_worker_panic(run: impl FnOnce() -> RunOutcome) -> RunOutc
 }
 
 impl Process {
+    #[inline(always)]
     fn run_task(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
@@ -354,6 +359,7 @@ impl Process {
         self.runtime.expect("a scheduled process has a runtime")
     }
 
+    #[inline(always)]
     fn run_executor(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,

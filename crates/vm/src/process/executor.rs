@@ -155,14 +155,14 @@ impl Executor {
     // Port of erts/emulator/beam/erl_process.c (erts_schedule tests `p->state` and `p->flags`
     // once) and jit/arm/process_main.cpp (process_main: copy_in_registers, FCALLS, `br c_p->i`),
     // OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     pub(super) fn fast_entry_ok(process: &Process, ctx: &RunCtx<'_, Message>) -> bool {
         !ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx)
     }
 
     /// [`Self::fast_entry_ok`] before the schedule-in signal handling: everything but the
     /// queued non-message signals, which the scheduler handles first (erts_schedule).
-    #[inline]
+    #[inline(always)]
     pub(super) fn fast_entry_ok_before_signals(
         process: &Process,
         ctx: &RunCtx<'_, Message>,
@@ -182,6 +182,8 @@ impl Executor {
     /// dispatch the full loop uses.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: the scheduler enters
     // `c_p->i` directly), OTP-29.1.1.
+    // Inlined into the slice: see `Executor::run`.
+    #[inline(always)]
     pub(super) fn fast_resume(
         &mut self,
         process: &mut Process,
