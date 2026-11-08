@@ -1012,6 +1012,11 @@ impl Vm {
             && meta.has_beam_bytes
             && beamasm_integration::enabled()
             && matches!(self.coverage_mode(), arinsal_loader::CoverageMode::None)
+            // erts' asm_load.c overrides the VM mode for BEAMFILE_FORCE_LINE_COUNTERS.
+            && beam
+                .lines
+                .as_ref()
+                .is_none_or(|lines| lines.flags & 2 == 0)
             && !crate::trace_bp::line_breakpoints_instrumented()
             && beam.module != "erts_internal"
             && std::env::var_os("ARINSAL_FULL_SPECIALIZE").is_none()

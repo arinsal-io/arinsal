@@ -4544,13 +4544,14 @@ pub(crate) fn session_handle(
         });
     // Port of erts/emulator/beam/erl_bif_trace.c (trace_session_create): ErtsTraceSession is
     // 248 bytes on macOS arm64 and is allocated in an aligned magic binary.
-    let handle = arinsal_term::MagicRef::with_erts_payload_size(
+    let handle = arinsal_term::MagicRef::with_erts_payload_size_and_refn(
         TraceSessionHandle {
             owner,
             session,
             breakpoints,
         },
         248,
+        arinsal_bifs::ordinary_ref_words(process.next_ref()),
     );
     let magic_id = handle.id();
     session_handle_ids()

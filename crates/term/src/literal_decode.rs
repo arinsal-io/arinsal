@@ -434,8 +434,8 @@ impl<H: HeapAlloc> LiteralDecoder<'_, '_, H> {
             // A saved magic reference gives that reference again.
             let mut local = [0u32; 3];
             local[..count].copy_from_slice(&ids[..count]);
-            let saved = (local[2] == u32::MAX)
-                .then(|| MagicRef::lookup_saved(u64::from(local[0]) | (u64::from(local[1]) << 32)))
+            let saved = (local[1] & (1 << 17) != 0)
+                .then(|| MagicRef::lookup_saved_numbers(local))
                 .flatten();
             match saved {
                 Some(owner) => self.builder.magic_ref(owner).ok(),

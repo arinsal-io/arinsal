@@ -199,7 +199,11 @@ pub(crate) fn make_resource<T: Any + Send + Sync>(
     orig_size: usize,
 ) -> Result<Term, BifError> {
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::with_orig_size(payload, orig_size))
+        .magic_ref(MagicRef::with_orig_size_and_refn(
+            payload,
+            orig_size,
+            arinsal_bifs::next_ref_words(),
+        ))
         .map_err(|_| BifError::SystemLimit)
 }
 

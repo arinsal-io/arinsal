@@ -1722,7 +1722,11 @@ fn compile_pattern_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifE
     let orig_size = arinsal_term::MAGIC_BIN_DATA_OFFSET + compiled.erts_payload_size();
     let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
     let reference = TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::with_orig_size(compiled, orig_size))
+        .magic_ref(MagicRef::with_orig_size_and_refn(
+            compiled,
+            orig_size,
+            crate::next_ref_words(),
+        ))
         .map_err(|_| BifError::SystemLimit)?;
     Ok(tuple_build(ctx, &[tag, reference]))
 }

@@ -205,7 +205,11 @@ fn magic_binary_state<T: std::any::Any + Send + Sync>(
     payload: T,
     c_payload_size: usize,
 ) -> Arc<MagicRef> {
-    MagicRef::with_erts_payload_size(payload, c_payload_size)
+    MagicRef::with_erts_payload_size_and_refn(
+        payload,
+        c_payload_size,
+        arinsal_bifs::next_ref_words(),
+    )
 }
 
 /// OTP keeps these continuations in BIF arguments/registers and allocates no magic binary.

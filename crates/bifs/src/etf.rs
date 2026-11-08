@@ -3206,12 +3206,8 @@ fn parse_step<H: HeapAlloc>(
                     for (slot, value) in local.iter_mut().zip(&ids[..ids_len]) {
                         *slot = *value;
                     }
-                    let saved = (local[2] == u32::MAX)
-                        .then(|| {
-                            arinsal_term::MagicRef::lookup_saved(
-                                u64::from(local[0]) | (u64::from(local[1]) << 32),
-                            )
-                        })
+                    let saved = (local[1] & (1 << 17) != 0)
+                        .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local))
                         .flatten();
                     match saved {
                         Some(owner) => built(&mut ctx, |b| b.magic_ref(owner))?,
@@ -4388,12 +4384,8 @@ fn decode_direct_step(
                     for (slot, value) in local_ids.iter_mut().zip(&ids[..ids_len]) {
                         *slot = *value;
                     }
-                    let saved = (local_ids[2] == u32::MAX)
-                        .then(|| {
-                            arinsal_term::MagicRef::lookup_saved(
-                                u64::from(local_ids[0]) | (u64::from(local_ids[1]) << 32),
-                            )
-                        })
+                    let saved = (local_ids[1] & (1 << 17) != 0)
+                        .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local_ids))
                         .flatten();
                     match saved {
                         Some(owner) => TermBuilder::new(&mut ctx.heap)

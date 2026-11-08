@@ -5988,9 +5988,12 @@ impl SharedTable {
     /// Wrap a table lock in its magic binary and register the table's own reference.
     // Port of erts/emulator/beam/erl_db.c (db_create_table: erts_create_magic_binary with the
     // DbTable as its data and `tb->common.btid`), OTP-29.1.1.
-    fn new(lock: TableLock) -> Self {
+    fn new(lock: TableLock, refn: Option<[u32; 3]>) -> Self {
         let size = std::mem::size_of::<Table>();
-        let magic = arinsal_term::MagicRef::with_erts_payload_size(lock, size);
+        let magic = match refn {
+            Some(refn) => arinsal_term::MagicRef::with_erts_payload_size_and_refn(lock, size, refn),
+            None => arinsal_term::MagicRef::with_erts_payload_size(lock, size),
+        };
         let shared = Self(magic);
         let _ = shared.read().btid.set(Arc::downgrade(&shared.0));
         shared
@@ -6154,6 +6157,25 @@ impl Registry {
 
     /// Create a table and reserve its name if requested.
     pub fn create(&mut self, options: TableOptions) -> Result<Tid, EtsError> {
+        self.create_inner(options, None)
+    }
+
+    /// Create a table whose magic binary uses reference numbers from its owning scheduler.
+    // Port of erts/emulator/beam/erl_db.c (db_create_table) and erl_binary.h
+    // (erts_create_magic_binary_x), OTP-29.1.1.
+    pub fn create_with_magic_ref_numbers(
+        &mut self,
+        options: TableOptions,
+        refn: [u32; 3],
+    ) -> Result<Tid, EtsError> {
+        self.create_inner(options, Some(refn))
+    }
+
+    fn create_inner(
+        &mut self,
+        options: TableOptions,
+        refn: Option<[u32; 3]>,
+    ) -> Result<Tid, EtsError> {
         if options.named_table && self.names.contains_key(&options.name) {
             return Err(EtsError::NameTaken);
         }
@@ -6178,10 +6200,13 @@ impl Registry {
                 table: None,
             });
         }
-        let shared = SharedTable::new(TableLock::new(
-            table,
-            options.read_concurrency || options.write_concurrency != WriteConcurrency::Disabled,
-        ));
+        let shared = SharedTable::new(
+            TableLock::new(
+                table,
+                options.read_concurrency || options.write_concurrency != WriteConcurrency::Disabled,
+            ),
+            refn,
+        );
         self.tables[index].table = Some(shared.clone());
         self.insert_owned_table(options.owner, tid)?;
         if options.named_table {

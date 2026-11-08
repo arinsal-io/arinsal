@@ -96,7 +96,11 @@ fn new_ref(ctx: &mut Ctx<'_>, array: Array) -> Result<Term, BifError> {
         }
     };
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::with_erts_payload_size(array, payload_size))
+        .magic_ref(MagicRef::with_erts_payload_size_and_refn(
+            array,
+            payload_size,
+            crate::next_ref_words(),
+        ))
         .map_err(|_| BifError::SystemLimit)
 }
 

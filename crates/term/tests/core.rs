@@ -556,6 +556,11 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     let original = TermBuilder::new(&mut heap)
         .magic_ref(owner.clone())
         .unwrap();
+    let ids = match original.identity().unwrap() {
+        Identity::Ref { ids, .. } => ids,
+        _ => unreachable!(),
+    };
+    let ref_ids = ids.to_vec();
     // The owned form carries the owner pointer, so a copy resolves without any lookup.
     let owned = to_owned(original).unwrap();
     assert!(matches!(owned, OwnedTerm::MagicRef(_)));
@@ -566,13 +571,13 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     let plain = OwnedTerm::Ref {
         node: "nonode@nohost".into(),
         creation: 0,
-        ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
+        ids: ref_ids.clone(),
     };
     let decoded = from_owned(&plain, &mut heap).unwrap();
     assert!(!decoded.is_magic_ref());
     assert!(matches!(
         decoded.identity(),
-        Some(Identity::Ref { ids, .. }) if ids.as_slice() == [id as u32, (id >> 32) as u32, u32::MAX]
+        Some(Identity::Ref { ids, .. }) if ids.as_slice() == ref_ids
     ));
     // erts_magic_ref_save_bin (term_to_binary, ref_to_list) makes the numbers resolvable.
     original.save_magic_ref();

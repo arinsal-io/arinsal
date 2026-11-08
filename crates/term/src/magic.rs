@@ -14,6 +14,7 @@ pub const MAGIC_BIN_DATA_OFFSET: usize = 24;
 /// A reference payload whose lifetime follows every copied term and GC owner.
 pub struct MagicRef {
     id: u64,
+    refn: [u32; 3],
     /// `mb->orig_size`: what the owning heap charges to its virtual binary heap.
     orig_size: usize,
     /// Whether the reference numbers are in the lazily filled table (`erts_magic_ref_save_bin`).
@@ -35,6 +36,19 @@ impl MagicRef {
         Self::allocate_sized(NEXT_ID.fetch_add(1, Ordering::Relaxed), payload, orig_size)
     }
 
+    /// Allocate a magic binary with the reference words returned by its scheduler.
+    // Port of erts/emulator/beam/erl_binary.h (erts_create_magic_binary_x) and
+    // erl_bif_unique.c (erts_make_magic_ref_in_array), OTP-29.1.1.
+    pub fn with_orig_size_and_refn<T: Any + Send + Sync>(
+        payload: T,
+        orig_size: usize,
+        mut refn: [u32; 3],
+    ) -> Arc<Self> {
+        refn[1] |= 1 << 17;
+        let id = refn_key(refn);
+        Self::allocate_with_refn(id, payload, orig_size, refn)
+    }
+
     /// Allocate a reference backed by `erts_create_magic_binary(payload_size, ...)`.
     ///
     /// The reported `orig_size` includes the aligned magic binary data offset.
@@ -46,15 +60,37 @@ impl MagicRef {
         Self::with_orig_size(payload, MAGIC_BIN_DATA_OFFSET + payload_size)
     }
 
+    /// Allocate a magic binary with the reference numbers already assigned by its scheduler.
+    // Port of erts/emulator/beam/erl_binary.h (erts_create_magic_binary_x) and
+    // erl_bif_unique.c (erts_make_magic_ref_in_array), OTP-29.1.1.
+    pub fn with_erts_payload_size_and_refn<T: Any + Send + Sync>(
+        payload: T,
+        payload_size: usize,
+        refn: [u32; 3],
+    ) -> Arc<Self> {
+        Self::with_orig_size_and_refn(payload, MAGIC_BIN_DATA_OFFSET + payload_size, refn)
+    }
+
     fn allocate<T: Any + Send + Sync>(id: u64, payload: T) -> Arc<Self> {
         Self::allocate_sized(id, payload, std::mem::size_of::<T>())
     }
 
     fn allocate_sized<T: Any + Send + Sync>(id: u64, payload: T, orig_size: usize) -> Arc<Self> {
+        let refn = refn_for_key(id);
+        Self::allocate_with_refn(id, payload, orig_size, refn)
+    }
+
+    fn allocate_with_refn<T: Any + Send + Sync>(
+        id: u64,
+        payload: T,
+        orig_size: usize,
+        refn: [u32; 3],
+    ) -> Arc<Self> {
         // erts keeps no registry of magic binaries: the reference thing points at the
         // refcounted binary and the destructor runs on the last release.
         Arc::new(Self {
             id,
+            refn,
             orig_size,
             saved: AtomicBool::new(false),
             payload: Box::new(payload),
@@ -85,6 +121,11 @@ impl MagicRef {
     /// Return the reference identity used for term ordering and hashing.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The three erts reference words stored in the magic binary.
+    pub(crate) fn ref_numbers(&self) -> [u32; 3] {
+        self.refn
     }
 
     /// Borrow the payload if it has the requested Rust type.
@@ -128,6 +169,33 @@ impl MagicRef {
             .get(&id)?
             .upgrade()
     }
+
+    /// The live magic binary addressed by its local reference numbers.
+    pub fn lookup_saved_numbers(refn: [u32; 3]) -> Option<Arc<Self>> {
+        shard(refn_key(refn))
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&refn_key(refn))?
+            .upgrade()
+    }
+}
+
+// Port of erl_bif_unique.h (erts_get_ref_numbers_value/erts_set_ref_numbers), OTP-29.1.1.
+fn refn_key(refn: [u32; 3]) -> u64 {
+    (u64::from(refn[1] & 0xffff) << 48)
+        | (u64::from(refn[2]) << 32)
+        | u64::from(refn[1] & 0xfffc_0000)
+        | u64::from(refn[0] & 0x3ffff)
+}
+
+fn refn_for_key(id: u64) -> [u32; 3] {
+    let value = id & 0x0000_ffff_ffff_ffff;
+    let thr_id = (id >> 48) as u32;
+    [
+        value as u32 & 0x3ffff,
+        (value as u32 & 0xfffc_0000) | thr_id | (1 << 17),
+        (value >> 32) as u32,
+    ]
 }
 
 impl Drop for MagicRef {

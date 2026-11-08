@@ -232,7 +232,7 @@ pub extern "C" fn enif_ioq_peek_head(
                 entry.iov_len,
                 // Port of erts/emulator/beam/erl_nif.c (enif_ioq_peek_head), OTP-29.1.1:
                 // this wraps the retained refc Binary, whose orig_size is its allocation size.
-                MagicRef::with_orig_size(held, orig_size),
+                MagicRef::with_orig_size_and_refn(held, orig_size, arinsal_bifs::next_ref_words()),
             )
         };
         builder.external_binary(external)

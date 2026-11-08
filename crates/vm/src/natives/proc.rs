@@ -1623,19 +1623,14 @@ fn charlist(process: &mut Process, value: &str) -> Result<Term, VmError> {
 }
 
 /// `#Ref<0.ids reversed>`. OTP's first number is the distribution channel.
-/// This node has no distribution table, so every ref prints channel 0, which
-/// is what `make_ref/0` produces. A magic ref's sentinel third id is omitted.
+/// This node has no distribution table, so every ref prints channel 0.
 fn ref_to_list(term: Term) -> Result<String, VmError> {
     let Some(Identity::Ref { ids, .. }) = term.identity() else {
         return Err(badarg());
     };
     // Port of erts/emulator/beam/bif.c (ref_to_list_1), OTP-29.1.1.
     term.save_magic_ref();
-    let magic = term.is_magic_ref();
-    let mut numbers: Vec<u32> = ids.to_vec();
-    if magic && numbers.last() == Some(&u32::MAX) {
-        numbers.pop();
-    }
+    let numbers: Vec<u32> = ids.to_vec();
     let mut text = String::from("#Ref<0");
     for id in numbers.iter().rev() {
         text.push('.');
@@ -1836,10 +1831,8 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     // erts_magic_ref_lookup_bin: numbers of a saved magic reference give that reference.
-    let saved = (refn[2] == u32::MAX)
-        .then(|| {
-            arinsal_term::MagicRef::lookup_saved(u64::from(refn[0]) | (u64::from(refn[1]) << 32))
-        })
+    let saved = ((refn[1] & (1 << 17)) != 0)
+        .then(|| arinsal_term::MagicRef::lookup_saved_numbers(refn))
         .flatten();
     if let Some(owner) = saved {
         return arinsal_term::TermBuilder::new(&mut heap)
