@@ -11,3 +11,6 @@ workspace = true
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+similar-asserts = "2"

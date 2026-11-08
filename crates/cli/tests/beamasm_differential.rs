@@ -85,6 +85,55 @@ fn interpreted(dir: &Path, module: &str) -> Output {
         .unwrap()
 }
 
+fn compile_far_branch_fixture() -> Option<PathBuf> {
+    if !cfg!(target_arch = "aarch64") || Command::new("erlc").arg("-v").output().is_err() {
+        eprintln!("skipped: far-branch differential requires AArch64 and erlc");
+        return None;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "arinsal-beamasm-far-branch-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let effects = (0..5_000)
+        .map(|value| format!("erlang:put({value},{value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        "-module(beamasm_far_branch).\n-export([run/1]).\nrun(X) when is_tuple(X) -> begin {effects}, ok end;\nrun(_) -> no.\n"
+    );
+    let source_path = dir.join("beamasm_far_branch.erl");
+    std::fs::write(&source_path, source).unwrap();
+    let status = Command::new("timeout")
+        .args(["120", "erlc", "-o"])
+        .arg(&dir)
+        .arg(&source_path)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "erlc failed for the generated far-branch module"
+    );
+    Some(dir)
+}
+
+fn run_eval(dir: &Path, executable: &str, expression: &str, beamasm: bool) -> Output {
+    let mut command = Command::new("timeout");
+    command
+        .args(["120", executable, "-noshell", "-pa"])
+        .arg(dir)
+        .args(["-eval", expression])
+        .stdin(std::process::Stdio::null());
+    if beamasm {
+        command.env("ARINSAL_BEAMASM", "1");
+    }
+    command.output().unwrap()
+}
+
 #[test]
 fn native_modules_print_what_erl_prints() {
     let Some(dir) = compile_fixtures() else {
@@ -126,6 +175,24 @@ fn caught_bif_error_stacktrace_matches_jit_interpreter_and_otp() {
         String::from_utf8_lossy(&expected.stdout),
         "interpreter output differs from erl"
     );
+    assert_eq!(
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "BeamAsm output differs from erl"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn generated_far_beam_fail_branch_matches_erl() {
+    let Some(dir) = compile_far_branch_fixture() else {
+        return;
+    };
+    let expression = "io:format(\"~p~n\",[beamasm_far_branch:run({})]),halt().";
+    let expected = run_eval(&dir, "erl", expression, false);
+    assert!(expected.status.success(), "erl failed: {expected:?}");
+    let actual = run_eval(&dir, env!("CARGO_BIN_EXE_arinsal"), expression, true);
+    assert!(actual.status.success(), "BeamAsm failed: {actual:?}");
     assert_eq!(
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout),

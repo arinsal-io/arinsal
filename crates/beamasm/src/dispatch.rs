@@ -41,6 +41,7 @@ pub struct DispatchFragments {
     save_calls_fun_offset: usize,
     bif_is_eq_exact_offset: usize,
     bif_is_ne_exact_offset: usize,
+    eq_exact_list_offset: usize,
     arith_compare_offset: usize,
     bif_element_guard_offset: usize,
 }
@@ -259,6 +260,7 @@ impl DispatchFragments {
         let save_calls_fun = code.new_label();
         let bif_is_eq_exact = code.new_label();
         let bif_is_ne_exact = code.new_label();
+        let eq_exact_list = code.new_label();
         let arith_compare = code.new_label();
         let bif_element_guard = code.new_label();
         code.bind(export)
@@ -358,6 +360,10 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_bif_is_ne_exact_shared(&mut code, compare.eq)
             .map_err(|_| ExecError::InvalidSize("bif_is_ne_exact fragment"))?;
+        code.bind(eq_exact_list)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_is_eq_exact_list_shared(&mut code)
+            .map_err(|_| ExecError::InvalidSize("is_eq_exact_list fragment"))?;
         code.bind(arith_compare)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_arith_compare_shared(&mut code, compare.cmp_atoms, compare.cmp_compound)
@@ -428,6 +434,7 @@ impl DispatchFragments {
             save_calls_fun_offset: labels[&save_calls_fun],
             bif_is_eq_exact_offset: labels[&bif_is_eq_exact],
             bif_is_ne_exact_offset: labels[&bif_is_ne_exact],
+            eq_exact_list_offset: labels[&eq_exact_list],
             arith_compare_offset: labels[&arith_compare],
             bif_element_guard_offset: labels[&bif_element_guard],
         })
@@ -532,6 +539,11 @@ impl DispatchFragments {
         self.memory.ptr_at(self.bif_is_ne_exact_offset) as usize
     }
 
+    /// `is_eq_exact_list_shared`: terms in x0 and x1, equality in the Z flag.
+    pub fn is_eq_exact_list_shared(&self) -> usize {
+        self.memory.ptr_at(self.eq_exact_list_offset) as usize
+    }
+
     /// `bif_element_guard_shared`: position in x0, tuple in x1. The element is returned in x0,
     /// or `THE_NON_VALUE` with the arguments copied to x2 and x3 when `element/2` fails.
     pub fn bif_element_guard_shared(&self) -> usize {
@@ -611,6 +623,47 @@ fn emit_bif_is_ne_exact_shared(code: &mut CodeBuffer, eq: usize) -> Result<(), B
         e.mov_const(ARG1, AM_FALSE)?;
         e.ret(Gpr::x(30))
     })
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp:1672-1705
+// (emit_is_eq_exact_list_shared), OTP-29.1.1. x0 and x1 hold the terms; the Z flag reports equality.
+fn emit_is_eq_exact_list_shared(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let loop_label = code.new_label();
+    let mid = code.new_label();
+    let done = code.new_label();
+    let tmp1 = Gpr::x(8);
+    let tmp2 = Gpr::x(9);
+
+    code.b(mid)?;
+    code.bind(loop_label)?;
+    code.emit(|e| {
+        e.and_imm(ARG1, ARG1, !3)?;
+        e.and_imm(ARG2, ARG2, !3)?;
+        e.ldp(tmp1, ARG1, ARG1, 0)?;
+        e.ldp(tmp2, ARG2, ARG2, 0)?;
+        e.cmp_reg(tmp1, tmp2, Shift::Lsl, 0)
+    })?;
+    code.b_cond(Cond::Ne, done)?;
+
+    code.bind(mid)?;
+    code.emit(|e| e.cmp_reg(ARG1, ARG2, Shift::Lsl, 0))?;
+    code.b_cond(Cond::Eq, done)?;
+    code.emit(|e| {
+        e.orr_reg(
+            tmp1,
+            ARG1,
+            Shifted {
+                reg: ARG2,
+                shift: Shift::Lsl,
+                amount: 0,
+            },
+        )
+    })?;
+    // Both unequal tails must be conses to continue the list walk.
+    code.tbz(tmp1, 1, loop_label)?;
+    code.emit(|e| e.cmp_imm(tmp1, 0, false))?;
+    code.bind(done)?;
+    code.emit(|e| e.ret(Gpr::x(30)))
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:698-711 (emit_is_unequal_based_on_tags),

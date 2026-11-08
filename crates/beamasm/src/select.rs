@@ -210,6 +210,9 @@ impl BeamModuleAssembler {
         fail: Option<Label>,
         args: &[ArgVal],
     ) -> Result<(), ModuleError> {
+        // Port of erts/emulator/beam/jit/arm/instr_select.cpp:199-205 (emit_linear_search),
+        // OTP-29.1.1: keep the branch stubs in range before emitting the search.
+        self.check_pending_stubs()?;
         let count = args.len() / 2;
         let mut i = 0;
         while i < count {
@@ -435,6 +438,9 @@ impl BeamModuleAssembler {
             shrunk.extend_from_slice(&args[left + count..right + count]);
             return self.emit_linear_search(reg, Some(fail), &shrunk);
         }
+        // Port of erts/emulator/beam/jit/arm/instr_select.cpp:386-425 (emit_binsearch_nodes),
+        // OTP-29.1.1: flush veneers before emitting another subtree's branches.
+        self.check_pending_stubs()?;
         let mid = (left + right) / 2;
         let ArgVal::Label(target) = args[mid + count] else {
             return Err(ModuleError::InvalidOperand(

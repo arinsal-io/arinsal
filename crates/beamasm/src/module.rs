@@ -260,6 +260,8 @@ pub struct BeamModuleAssembler {
     dispatch_fragments: Vec<(usize, Label)>,
     /// Address of the process-wide `arith_compare_shared` fragment (0: not installed).
     pub(crate) arith_compare_shared: usize,
+    /// Address of the process-wide exact-list comparison fragment (0: not installed).
+    pub(crate) eq_exact_list_shared: usize,
     /// Address of the process-wide `bif_element_guard_shared` fragment (0: not installed).
     pub(crate) element_guard_shared: usize,
     /// Shared `element/2` error raisers (entered after the guard fragment failed, entered with
@@ -371,6 +373,7 @@ impl BeamModuleAssembler {
             yield_stubs: Vec::new(),
             yield_fragments: None,
             arith_compare_shared: 0,
+            eq_exact_list_shared: 0,
             element_guard_shared: 0,
             element_error: None,
             raise_fragments: None,
@@ -530,7 +533,9 @@ impl BeamModuleAssembler {
         if slot.is_none() {
             *slot = Some(self.code.new_label());
         }
-        slot.expect("label was just created")
+        let label = slot.expect("label was just created");
+        self.code.mark_beam_label(label);
+        label
     }
 
     pub(super) fn lambda_label(&mut self, id: u32) -> Label {
@@ -637,6 +642,11 @@ impl BeamModuleAssembler {
     /// equality tests keep only their small fast path inline.
     pub fn set_arith_compare_shared(&mut self, fragment: usize) {
         self.arith_compare_shared = fragment;
+    }
+
+    /// Installs the process-wide exact-list comparison fragment used for immediate-list literals.
+    pub fn set_eq_exact_list_shared(&mut self, fragment: usize) {
+        self.eq_exact_list_shared = fragment;
     }
 
     /// Installs the process-wide `bif_element_guard_shared` fragment, so `element/2` keeps only
