@@ -314,7 +314,30 @@ impl BeamModuleAssembler {
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
         let out = self.destination_reg(dst)?;
-        self.code.emit(|e| e.ldr_uoff(out, ptr, element))?;
+        if element <= 8 * 0xfff {
+            self.code.emit(|e| e.ldr_uoff(out, ptr, element))?;
+        } else {
+            // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:760-783 (add) and 1830-1841
+            // (safe_ldr), OTP-29.1.1. Large tuple offsets use the same split as add().
+            self.code.emit(|e| {
+                if element < (1 << 24) {
+                    let low = element & 0xfff;
+                    let high = element & 0xfff000;
+                    let mut base = ptr;
+                    if low != 0 {
+                        e.add_imm(SUPER_TMP, base, low as u16, false)?;
+                        base = SUPER_TMP;
+                    }
+                    if high != 0 {
+                        e.add_imm(SUPER_TMP, base, (high >> 12) as u16, true)?;
+                    }
+                } else {
+                    e.mov_const(SUPER_TMP, u64::from(element))?;
+                    e.add_reg(SUPER_TMP, ptr, SUPER_TMP, arinsal_a64::enc::Shift::Lsl, 0)?;
+                }
+                e.ldr_uoff(out, SUPER_TMP, 0)
+            })?;
+        }
         self.store_arg(dst, out)
     }
 
