@@ -693,12 +693,6 @@ impl Process {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // an exiting process is terminated while its dirty job keeps running.
             self.set_dirty_exited();
-            // Port of erts/emulator/beam/erl_process.c:14374-14392 (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS),
-            // OTP-29.1.1: block literal-area release before the sys tasks are answered.
-            // The hold is parked in a local: `notify_exit` releases the cold state it would live in.
-            let rla_block = ctx
-                .dirty_running()
-                .then(|| self.persistent_terms.block_release());
             crate::signals::process_exiting(self, ctx);
             let reason = exit_reason_from(self, &error);
             self.notify_exit(vm, ctx, reason);
@@ -709,7 +703,6 @@ impl Process {
             }
             // `notify_exit` released the cold state; the process stays marked exited.
             self.slice_mut().dirty_exited = true;
-            self.slice_mut().rla_block = rla_block;
         }
         // Replies, exit and DOWN signals must not wait for the dirty job to return.
         ctx.flush_pending();

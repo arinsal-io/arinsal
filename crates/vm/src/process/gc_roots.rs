@@ -383,10 +383,28 @@ impl Process {
             self.heap.request_full_sweep();
         }
         let live = switched_out_live(self);
+        self.verify_dirty_gc_roots(live, "before dirty GC");
         let stats = self.collect_heap_roots(live, &mut [], 0)?;
+        self.verify_dirty_gc_roots(live, "after dirty GC");
         crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         Ok(())
     }
+
+    /// Check the roots presented to a dirty system task when validation is enabled.
+    #[cfg(debug_assertions)]
+    pub(crate) fn verify_dirty_gc_roots(&self, live: usize, when: &str) {
+        if !arinsal_term::validate::active() {
+            return;
+        }
+        arinsal_term::validate::set_context(when);
+        let mut roots: Vec<Term> = self.x[..live.min(self.x.len())].to_vec();
+        roots.extend(self.dirty_result_roots());
+        arinsal_term::validate::check_roots_if_active(&self.heap, &roots, &[]);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub(crate) fn verify_dirty_gc_roots(&self, _live: usize, _when: &str) {}
 
     // Port of erts/emulator/beam/beam_bif_load.c:1149 (check_process_code), OTP-29.1.1.
     // A process suspended in native code is checked by its native resume address and the
