@@ -18,6 +18,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock, Weak};
 
 mod drv_sig;
+mod raw;
 
 // Port of erts/emulator/beam/erl_bif_port.c:824 (open_port defaults), OTP-29.1.1.
 const DEFAULT_HIGH: usize = 8192;
@@ -413,8 +414,6 @@ struct HandleCold {
     /// `port->common.u.alive.reg->name`, shared with the register table entry.
     reg_word: Option<Arc<AtomicU32>>,
     halt_progress: Option<HaltProgress>,
-    /// `port_set_data/2` data that is not an atom or a small integer.
-    data_block: Option<Box<PortDataBlock>>,
 }
 
 /// State retained for a live child or fd port.
@@ -439,7 +438,7 @@ pub(crate) struct PortHandle {
     /// The runtime the port belongs to (`ERTS_...` trace scope is its address).
     runtime: &'static crate::process::Runtime,
     /// `port_set_data/2` term. `undefined` until the first store.
-    data: AtomicU64,
+    data: raw::PortDataCell,
     /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
     /// Dynamically loaded (`erl_ddll`) driver port.
     driver: Option<arinsal_drv::DriverPort>,
@@ -639,6 +638,7 @@ impl PortTable {
             .unwrap_or(false)
         {
             let removed = slot.take(progress)?;
+            raw::retire_data(removed.data.swap(0), &removed.scheduler);
             self.count.fetch_sub(1, Ordering::Relaxed);
             let started_interval = removed.started_interval.load(Ordering::Acquire);
             let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
@@ -3087,7 +3087,7 @@ fn make_handle_with(
         }),
         scheduler,
         runtime,
-        data: AtomicU64::new(PORT_DATA_UNDEFINED),
+        data: raw::PortDataCell::new(PORT_DATA_UNDEFINED),
         driver: driver.map(|(driver, runtime)| {
             let owner_ref: std::sync::Weak<dyn arinsal_drv::PortOwner> = me.clone();
             arinsal_drv::DriverPort::new(
@@ -4033,10 +4033,9 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
     handle.is_some_and(|handle| !handle.state.lock().exit_complete)
 }
 
-/// `prt->data` (erl_port.h): an immediate term is stored as its own word, so `port_get_data/1`
-/// is one atomic load. A word with a zero tag is the block of a non-immediate term, which
-/// lives in the cold part of the handle (`ErtsPortDataHeap`).
-const PORT_DATA_BLOCK: u64 = 0;
+/// `prt->data` (erl_port.h): an immediate term is stored as its own word, while a zero-tag word
+/// is the pointer to the heap block of a non-immediate term (`ErtsPortDataHeap`). Zero marks a
+/// port whose data was cleared during termination.
 const PORT_DATA_UNDEFINED: u64 = Term::atom(arinsal_term::atoms::UNDEFINED).tagged_word();
 
 /// The word `port_set_data_2` stores for an immediate `data`.
@@ -4044,23 +4043,16 @@ fn port_data_word(term: Term) -> Option<u64> {
     term.is_immed().then(|| term.tagged_word())
 }
 
-/// `if ((data & 0x3) != 0) res = data` of `port_get_data_1`.
-fn port_data_term(word: u64) -> Option<Term> {
-    if word & 3 != 0 {
-        Term::from_immed_word(word)
-    } else {
-        None
-    }
-}
-
 /// The term of `port_set_data/2` in a heap block of its own (`ErtsPortDataHeap`: the term and
 /// the heap fragment it was copied into, with the off-heap list).
 // Port of erts/emulator/beam/erl_port.h (ErtsPortDataHeap), OTP-29.1.1.
+#[repr(C)]
 struct PortDataBlock {
+    /// The number of trailing words holding the copied term, as `ErtsPortDataHeap::hsize`.
+    hsize: usize,
     term: Term,
-    /// The words `term` points into, when it is not an immediate (erts keeps them in the same
-    /// allocation, `ErtsPortDataHeap`).
-    _fragment: Option<Box<arinsal_term::VecHeap>>,
+    /// Off-heap links for objects in the trailing words; the words follow this header inline.
+    _owners: arinsal_term::message::InlineHeapOwners,
 }
 
 /// Errors of a port BIF as the exception a light BIF raises; any other failure declines.
@@ -4127,13 +4119,12 @@ impl crate::natives::ThinProcessBif for PortGetData {
         // module atom): one lookup and one load, as `erts_port_data_read` does.
         if args[0].is_port()
             && let Some(runtime) = process.runtime.as_ref()
-            && let Some(data) =
-                runtime
-                    .ports
-                    .with_word(args[0].tagged_word(), process.on_managed, |handle| {
-                        handle.data.load(Ordering::Acquire)
-                    })
-            && let Some(term) = port_data_term(data)
+            && let Some(term) = runtime
+                .ports
+                .with_word(args[0].tagged_word(), process.on_managed, |handle| {
+                    handle.data.load_immediate()
+                })
+                .flatten()
         {
             return Ok(term);
         }
@@ -4195,23 +4186,8 @@ fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     runtime
         .ports
         .with_from(id, managed, |handle| {
-            loop {
-                if let Some(term) = port_data_term(handle.data.load(Ordering::Acquire)) {
-                    return Ok(term);
-                }
-                let cold = handle.cold.lock();
-                let Some(block) = cold.as_ref().and_then(|cold| cold.data_block.as_ref()) else {
-                    // `port_set_data` replaced the block by an immediate meanwhile.
-                    continue;
-                };
-                if block._fragment.is_none() {
-                    return Ok(block.term);
-                }
-                let size = arinsal_term::size_object(block.term);
-                let mut heap = arinsal_bifs::ProcessHeapHandle(heap);
-                return arinsal_term::copy_struct(block.term, &mut heap, size)
-                    .map_err(|_| badarg());
-            }
+            let mut heap = arinsal_bifs::ProcessHeapHandle(heap);
+            handle.data.copy_term(&mut heap).map_err(|_| badarg())
         })
         .ok_or_else(badarg)?
 }
@@ -4219,27 +4195,18 @@ fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
 // Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
 fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
-    if let Some(word) = port_data_word(data) {
-        handle.data.store(word, Ordering::Release);
-        handle.peek_cold(|cold| cold.data_block = None);
-        return Ok(atom("true"));
-    }
-    let size = arinsal_term::size_object(data);
-    let block = if size == 0 {
-        PortDataBlock {
-            term: data,
-            _fragment: None,
-        }
+    let new_data = if let Some(word) = port_data_word(data) {
+        word
     } else {
-        let mut heap = Box::new(arinsal_term::VecHeap::with_initial_chunk_words(size));
-        let term = arinsal_term::copy_struct(data, &mut *heap, size).map_err(|_| badarg())?;
-        PortDataBlock {
-            term,
-            _fragment: Some(heap),
-        }
+        let size = arinsal_term::size_object(data);
+        raw::new_data_word(data, size).map_err(|_| badarg())?
     };
-    handle.with_cold(|cold| cold.data_block = Some(Box::new(block)));
-    handle.data.store(PORT_DATA_BLOCK, Ordering::Release);
+    let old_data = handle.data.swap(new_data);
+    if old_data == 0 {
+        raw::retire_data(handle.data.swap(0), &handle.scheduler);
+        return Err(badarg());
+    }
+    raw::retire_data(old_data, &handle.scheduler);
     Ok(atom("true"))
 }
 

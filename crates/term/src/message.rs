@@ -191,6 +191,129 @@ impl HeapAlloc for MessageHeapBlock {
     }
 }
 
+/// Off-heap references owned by a copied term whose words live in caller-provided storage.
+///
+/// This is used when the owner stores its header and heap words in one allocation.
+pub struct InlineHeapOwners(crate::heap::OffHeapLists);
+
+impl InlineHeapOwners {
+    /// Create an empty off-heap owner list.
+    pub fn new() -> Self {
+        Self(crate::heap::OffHeapLists::default())
+    }
+}
+
+impl Default for InlineHeapOwners {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A bounded heap allocator over caller-provided, uninitialized words.
+pub struct InlineHeapAlloc<'a> {
+    words: &'a mut [std::mem::MaybeUninit<u64>],
+    owners: &'a mut InlineHeapOwners,
+    used: usize,
+}
+
+impl<'a> InlineHeapAlloc<'a> {
+    /// Borrow a word region and its owner header for a term copy.
+    pub fn new(
+        words: &'a mut [std::mem::MaybeUninit<u64>],
+        owners: &'a mut InlineHeapOwners,
+    ) -> Self {
+        Self {
+            words,
+            owners,
+            used: 0,
+        }
+    }
+}
+
+impl HeapAlloc for InlineHeapAlloc<'_> {
+    fn allocator_identity(&self) -> usize {
+        self.words.as_ptr() as usize
+    }
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        let end = self.used.checked_add(words)?;
+        if end > self.words.len() {
+            return None;
+        }
+        let pointer = self.words[self.used..].as_mut_ptr().cast::<u64>();
+        self.used = end;
+        Some(pointer)
+    }
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        drop(binary);
+    }
+    fn add_bin_vheap(&mut self, _words: u64) {}
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        self.add_bin_vheap((binary.capacity() / 8) as u64);
+        Ok(())
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        _binary: Arc<WritableBinary>,
+        bits: usize,
+    ) -> Result<(), TermError> {
+        self.add_bin_vheap((bits.div_ceil(8) / 8) as u64);
+        Ok(())
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let head = if writable {
+            &mut self.owners.0.wrt_bins
+        } else {
+            &mut self.owners.0.off_heap_first
+        };
+        store(bin_ref.wrapping_add(2), *head as u64);
+        *head = bin_ref as usize;
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        self.owners.0.overhead = self.owners.0.overhead.saturating_add(overhead_words);
+        Ok(())
+    }
+    fn supports_writable_binary(&self) -> bool {
+        true
+    }
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        link_external_bin_ref(&mut self.owners.0.off_heap_first, bin_ref, binary);
+        Ok(())
+    }
+    fn supports_external_binary(&self) -> bool {
+        true
+    }
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        link_node_thing(&mut self.owners.0.off_heap_first, thing, node);
+    }
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        link_magic_thing(
+            &mut self.owners.0.off_heap_first,
+            &mut self.owners.0.overhead,
+            thing,
+            owner,
+        );
+        Ok(())
+    }
+    fn supports_magic(&self) -> bool {
+        true
+    }
+}
+
 /// The layout of a node of `T` with an inline fragment of `words`, and the offset of the
 /// fragment header (0 when `words` is 0).
 fn node_layout<T>(words: usize) -> (Layout, usize) {
