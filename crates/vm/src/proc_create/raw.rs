@@ -91,6 +91,7 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).sig_cont).write(sig_cont);
         std::ptr::addr_of_mut!((*process).sig_cont_taken).write(0);
         std::ptr::addr_of_mut!((*process).receive_timeout_pos).write(None);
+        std::ptr::addr_of_mut!((*process).receive_timeout_next).write(0);
         std::ptr::addr_of_mut!((*process).receive_infinity).write(false);
         std::ptr::addr_of_mut!((*process).links).write(links);
         std::ptr::addr_of_mut!((*process).monitors).write(monitors);
@@ -179,6 +180,7 @@ fn process_fields_are_initialized(process: Process) {
         sig_cont,
         sig_cont_taken,
         receive_timeout_pos,
+        receive_timeout_next,
         receive_infinity,
         links,
         monitors,
@@ -252,6 +254,7 @@ fn process_fields_are_initialized(process: Process) {
         sig_cont,
         sig_cont_taken,
         receive_timeout_pos,
+        receive_timeout_next,
         receive_infinity,
         links,
         monitors,

@@ -193,8 +193,12 @@ thread_local! {
 }
 
 const QUEUED: u8 = 0;
-/// Receive timeout armed on this worker, not yet inserted in the timer wheel.
-const WAIT_TIMER_DEFERRED: u64 = u64::MAX;
+/// `ERTS_PTMR_TIMEDOUT`: the receive timer fired; the receiver takes the timeout branch.
+const PTMR_TIMEDOUT: u64 = u64::MAX;
+/// Tag bit of a receive timer armed on its scheduler's pending list, not in a timer wheel;
+/// the low bits are the arm sequence number, so a stale entry never matches a later timer.
+const PTMR_DEFERRED: u64 = 1 << 63;
+const PTMR_DEFERRED_SEQ: u64 = (1 << 62) - 1;
 const RUNNING: u8 = 1;
 const WAITING: u8 = 2;
 const EXITED: u8 = 3;
@@ -1485,7 +1489,57 @@ impl<M> SpawnedProcess<M> {
     }
 }
 
+/// The receive timer of a process: erts `p->common.timer` and its owner bookkeeping.
+///
+/// The word is 0 (`ERTS_PTMR_NONE`), [`PTMR_TIMEDOUT`], a deferred tag or the wheel timer id.
+/// The scheduler sets it when the process waits with a timer, the timer moves it to
+/// `TIMEDOUT` when it fires, and only the receiver clears it (`CANCEL_TIMER` in
+/// `remove_message`, `timeout` and exit). A wake leaves it alone.
+// Port of erts/emulator/beam/erl_hl_timer.c (set_proc_timer_common, proc_timeout_common,
+// erts_cancel_proc_timer) and erl_hl_timer.h (ERTS_PTMR_*), OTP-29.1.1.
+#[derive(Default)]
+pub struct ReceiveTimer {
+    word: AtomicU64,
+    /// Wheel that owns a wheel timer id in `word`.
+    worker: AtomicUsize,
+    /// A wheel timer id the receiver cancelled, removed from its wheel when the process is
+    /// scheduled out (continue_cancel_ptimer sends the cancel to the owning wheel).
+    cancel: AtomicU64,
+}
+
+impl ReceiveTimer {
+    /// `ERTS_PTMR_IS_TIMED_OUT(c_p)`.
+    #[inline(always)]
+    pub fn timed_out(&self) -> bool {
+        self.word.load(Ordering::Acquire) == PTMR_TIMEDOUT
+    }
+
+    /// `erts_cancel_proc_timer`, run by the receiver: the timer word is cleared, so a fire
+    /// racing with it finds nothing to time out.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2832-2846 (erts_cancel_proc_timer), OTP-29.1.1.
+    #[inline]
+    pub fn cancel(&self) {
+        if self.word.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let old = self.word.swap(0, Ordering::AcqRel);
+        if is_wheel_timer(old) {
+            self.cancel.store(old, Ordering::Release);
+        }
+    }
+}
+
+#[inline(always)]
+fn is_wheel_timer(word: u64) -> bool {
+    word != 0 && word & PTMR_DEFERRED == 0
+}
+
 impl<M: SignalMessage> SignalProbe<M> {
+    /// The process's receive timer, read without a table lookup.
+    pub fn receive_timer(&self) -> &ReceiveTimer {
+        self.timer()
+    }
+
     /// Whether the outer signal queue holds unfetched signals.
     pub fn has_pending(&self) -> bool {
         self.input().has_pending()
@@ -1662,8 +1716,8 @@ struct ProcShared<M: SignalMessage> {
     rq_link: run_queue::RqLink,
     bound_worker: AtomicUsize,
     scheduler_id: AtomicUsize,
+    /// Arm sequence of deferred receive timers (the low bits of a [`PTMR_DEFERRED`] tag).
     wait_epoch: AtomicU64,
-    timer_epoch_used: AtomicBool,
     /// Wheels that may hold BIF timers aimed at this process: bit `w` for scheduler `w`, the
     /// top bit for every scheduler from 63 on.
     ///
@@ -1689,11 +1743,10 @@ struct ProcShared<M: SignalMessage> {
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
     /// Port of erts/emulator/beam/erl_process.h (`common.u.alive.reg`), OTP-29.1.1.
     reg_atom: AtomicU32,
-    wait_timer: AtomicU64,
+    /// `p->common.timer`: the receive timer.
+    pub(crate) rtimer: ReceiveTimer,
     // Port of erts `Process.sig_inq`; shared with the task so receive can fetch in place.
     input: Incoming<Event<M>>,
-    /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
-    wait_timer_worker: AtomicUsize,
     /// `p->xstate`: the `ERTS_PXSFLG_IN_CPU_PRQ_*` / `ERTS_PXSFLG_IN_IO_PRQ_*` bits, the
     /// priority queues of the dirty run queues the process has an entry in.
     /// Port of erts/emulator/beam/erl_process.h:1390-1425, OTP-29.1.1.
@@ -2185,7 +2238,6 @@ impl<T: Task> ProcessTable<T> {
                     bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
                     scheduler_id: AtomicUsize::new(0),
                     wait_epoch: AtomicU64::new(0),
-                    timer_epoch_used: AtomicBool::new(false),
                     bif_timer_wheels: AtomicU64::new(0),
                     btm: parking_lot::Mutex::new(ProcBtm {
                         tree: std::collections::BTreeMap::new(),
@@ -2195,9 +2247,8 @@ impl<T: Task> ProcessTable<T> {
                     ptab_deleted: AtomicBool::new(false),
                     exit_resume: AtomicBool::new(false),
                     reg_atom: AtomicU32::new(u32::MAX),
-                    wait_timer: AtomicU64::new(0),
+                    rtimer: ReceiveTimer::default(),
                     input: Incoming::default(),
-                    wait_timer_worker: AtomicUsize::new(0),
                     xstate: AtomicU32::new(0),
                     dirty_runner: AtomicUsize::new(0),
                 },
@@ -3303,11 +3354,6 @@ impl<T: Task> Inner<T> {
         let Some(kind) = process.run_state().wake(None, prio) else {
             return false;
         };
-        let wait_timer = process.wait_timer.load(Ordering::Acquire);
-        if wait_timer != 0 {
-            process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-            self.cancel_wait_timer(&process, wait_timer);
-        }
         self.enqueue(Scheduled::at_prio(process, kind, prio), false);
         true
     }
@@ -4505,13 +4551,8 @@ impl<T: Task> Inner<T> {
             }
             return;
         };
-        // Read only for a receiver that is scheduled: its wait started before it published
-        // WAITING, and the state word's read-modify-write orders this load after that store.
-        let wait_timer = process.wait_timer.load(Ordering::Acquire);
-        if wait_timer != 0 {
-            process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-            self.cancel_wait_timer(process, wait_timer);
-        }
+        // The receive timer stays set: the receiver cancels it when it matches a message
+        // (erts_proc_notify_new_message only schedules the process).
         let item = Scheduled::at_prio(process.clone(), kind, prio);
         if force_enqueue {
             self.enqueue(item, false);
@@ -4555,20 +4596,26 @@ impl<T: Task> Inner<T> {
         self.enqueue(item, false);
     }
 
-    fn cancel_wait_timer(&self, process: &Process<T>, id: u64) {
-        if id == 0
-            || process
-                .wait_timer
-                .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
+    /// `erts_cancel_proc_timer` on behalf of the receiver itself (its own schedule-out or
+    /// exit), and the wheel removal of a timer the receiver cancelled while it ran.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2832-2846 (erts_cancel_proc_timer) and
+    // continue_cancel_ptimer, OTP-29.1.1.
+    fn cancel_proc_timer(&self, process: &Process<T>) {
+        process.rtimer.cancel();
+        self.cancel_proc_timer_wheel(process);
+    }
+
+    /// Removes from its wheel a timer id the receiver cleared from its timer word.
+    #[inline]
+    fn cancel_proc_timer_wheel(&self, process: &Process<T>) {
+        if process.rtimer.cancel.load(Ordering::Relaxed) == 0 {
             return;
         }
-        // Deferred receive timeouts are not in the wheel yet.
-        if id == WAIT_TIMER_DEFERRED {
+        let id = process.rtimer.cancel.swap(0, Ordering::AcqRel);
+        if id == 0 {
             return;
         }
-        let worker = process.wait_timer_worker.load(Ordering::Relaxed);
+        let worker = process.rtimer.worker.load(Ordering::Relaxed);
         if let Some(timers) = self.sim_timers.as_ref() {
             if let Some(wheel) = timers.get(worker) {
                 wheel
@@ -4580,6 +4627,34 @@ impl<T: Task> Inner<T> {
             queue.push(CanceledTimer { id });
             self.flag_timer_work(worker);
             self.wake_worker(worker);
+        }
+    }
+
+    /// The receive timer `expected` fired: mark the process timed out, and schedule it if it
+    /// waits. A running or runnable process sees the mark when it next waits or is scheduled
+    /// in.
+    // Port of erts/emulator/beam/erl_hl_timer.c:692-706 (proc_timeout_common), OTP-29.1.1.
+    fn proc_timeout(
+        &self,
+        process: ProcRef<T>,
+        expected: u64,
+        local: Option<&mut Local<T>>,
+        before_wake: &mut dyn FnMut(),
+    ) {
+        // SeqCst pairs with the schedule-out that stores WAITING and then reads the word, as
+        // erts serializes the two on the MSG_RECEIVE lock: one of them schedules the process.
+        if process
+            .rtimer
+            .word
+            .compare_exchange(expected, PTMR_TIMEDOUT, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let prio = process.priority().index();
+        if let Some(kind) = process.run_state().wake(None, prio) {
+            before_wake();
+            self.place_runnable(Scheduled::at_prio(process, kind, prio), local);
         }
     }
 
@@ -4634,10 +4709,11 @@ impl<T: Task> Inner<T> {
         if !force && local.check_time_reds < self.config.reductions {
             return;
         }
-        local.pending_waits.retain(|entry| {
-            entry.process.wait_epoch.load(Ordering::Acquire) == entry.epoch
-                && entry.process.run_state().load(Ordering::Acquire) == WAITING
-        });
+        // An entry lives while its tag is the process's timer word, whatever the process's
+        // run state: a receiver kept runnable by non-matching messages still times out.
+        local
+            .pending_waits
+            .retain(|entry| entry.process.rtimer.word.load(Ordering::Acquire) == entry.tag);
         if local.pending_waits.is_empty() {
             return;
         }
@@ -4649,17 +4725,7 @@ impl<T: Task> Inner<T> {
                 continue;
             }
             let entry = local.pending_waits.swap_remove(index);
-            let process = entry.process;
-            if process.wait_epoch.load(Ordering::Acquire) == entry.epoch
-                && process.wait_timer.load(Ordering::Acquire) == WAIT_TIMER_DEFERRED
-                && let prio = process.priority().index()
-                && let Some(kind) = process.run_state().wake(None, prio)
-            {
-                before_wake();
-                process.wait_timer.store(0, Ordering::Release);
-                process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                self.place_runnable(Scheduled::at_prio(process, kind, prio), Some(local));
-            }
+            self.proc_timeout(entry.process, entry.tag, Some(local), before_wake);
         }
     }
 
@@ -4893,15 +4959,9 @@ impl<T: Task> Inner<T> {
                     let _ = self.deliver(pid, pid, payload, local);
                 }
             }
-            TimerPayload::Wake(pid, epoch) => {
-                if let Some(process) = self.table.lookup(pid)
-                    && process.wait_epoch.load(Ordering::Acquire) == epoch
-                    && let prio = process.priority().index()
-                    && let Some(kind) = process.run_state().wake(None, prio)
-                {
-                    process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                    let item = Scheduled::at_prio(process, kind, prio);
-                    self.place_runnable(item, local);
+            TimerPayload::Wake(pid) => {
+                if let Some(process) = self.table.lookup(pid) {
+                    self.proc_timeout(process, id, local, &mut || {});
                 }
             }
         }
@@ -5204,7 +5264,8 @@ impl<T: Task> Inner<T> {
 
 struct PendingWait<T: Task> {
     process: ProcRef<T>,
-    epoch: u64,
+    /// The [`PTMR_DEFERRED`] tag the process's timer word holds while this entry is current.
+    tag: u64,
     deadline_ms: u64,
 }
 
@@ -9424,21 +9485,67 @@ fn schedule_out<T: Task>(
         }
         outcome @ (RunOutcome::Wait { .. } | RunOutcome::WaitTimer { .. }) => {
             // A receive timer arrives either as a relative time (tasks that leave the position
-            // to the scheduler) or as the wheel position the process computed when it set the
-            // timer.
+            // to the scheduler; such a timer belongs to this one wait) or as the wheel position
+            // the process computed when it set the timer, which stays set across the waits of
+            // one receive until the receiver cancels it.
             let (timeout_ms, wait_pos) = match outcome {
                 RunOutcome::WaitTimer { timeout_pos } => (None, Some(timeout_pos)),
                 RunOutcome::Wait { timeout_ms } => (timeout_ms, None),
                 _ => (None, None),
             };
-            let epoch = if timeout_ms.is_some() || wait_pos.is_some() {
-                process.timer_epoch_used.store(true, Ordering::Release);
-                process.wait_epoch.fetch_add(1, Ordering::AcqRel) + 1
-            } else if process.timer_epoch_used.load(Ordering::Acquire) {
-                process.wait_epoch.fetch_add(1, Ordering::AcqRel) + 1
+            if wait_pos.is_none() {
+                inner.cancel_proc_timer(&process);
             } else {
-                process.wait_epoch.load(Ordering::Relaxed)
+                inner.cancel_proc_timer_wheel(&process);
+            }
+            // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1240
+            // (beam_jit_wait_timeout: with F_INSLPQUEUE set the timer is not set again) and
+            // erl_hl_timer.c (set_proc_timer_common), OTP-29.1.1. The timer is set before the
+            // process publishes WAITING: once it waits, another scheduler may run it.
+            let arm_ms = match (timeout_ms, wait_pos) {
+                (Some(ms), _) if ms != 0 => Some(ms),
+                (None, Some(_)) if process.rtimer.word.load(Ordering::Relaxed) == 0 => Some(1),
+                _ => None,
             };
+            if let Some(ms) = arm_ms {
+                if let Some(local) = local.as_deref_mut().filter(|_| worker.is_some()) {
+                    // Arm the timeout locally. The wheel insert waits until this
+                    // worker is about to park, or until the deadline is due.
+                    let seq = process.wait_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+                    let tag = PTMR_DEFERRED | (seq & PTMR_DEFERRED_SEQ);
+                    process.rtimer.word.store(tag, Ordering::Release);
+                    local.pending_waits.push(PendingWait {
+                        process: process.clone(),
+                        tag,
+                        deadline_ms: wait_pos.unwrap_or_else(|| inner.clock.timeout_pos(ms)),
+                    });
+                } else {
+                    // Off the scheduler-local path (dirty or simulated) the timer goes on a
+                    // wheel through the relative interface. The id is in the timer word before
+                    // the timer can fire (set_proc_timer_common publishes `tmr` after
+                    // create_timer, under the main lock no fire contends for).
+                    let wheels = inner.timer_commands.len().max(1);
+                    let owner = worker
+                        .filter(|worker| *worker < wheels)
+                        .unwrap_or(process.pid.number() as usize % wheels);
+                    let id = inner.next_timer.fetch_add(1, Ordering::Relaxed);
+                    process.rtimer.worker.store(owner, Ordering::Relaxed);
+                    process.rtimer.word.store(id, Ordering::Release);
+                    let rel =
+                        wait_pos.map_or(ms, |pos| pos.saturating_sub(inner.clock.now_ms()).max(1));
+                    if inner
+                        .insert_timer(owner, id, TimerPayload::Wake(process.pid), None, rel)
+                        .is_err()
+                    {
+                        let _ = process.rtimer.word.compare_exchange(
+                            id,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
             let left_running = process
                 .run_state()
                 .store_from_running(WAITING, Ordering::SeqCst);
@@ -9449,75 +9556,44 @@ fn schedule_out<T: Task>(
             } else {
                 inner.record_waiting(&process);
             }
-            if timeout_ms.is_some() || wait_pos.is_some() {
-                let ms = timeout_ms.unwrap_or(1);
-                if ms == 0 {
-                    let prio = process.priority().index();
-                    if let Some(kind) = process.run_state().wake(None, prio) {
-                        process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                        let item = Scheduled::at_prio(process.clone(), kind, prio);
-                        inner.place_runnable(item, local.as_deref_mut());
-                        return None;
-                    }
-                } else if let Some(local) = local.as_deref_mut().filter(|_| worker.is_some()) {
-                    // Arm the timeout locally. The wheel insert waits until this
-                    // worker is about to park, or until the deadline is due.
-                    process
-                        .wait_timer
-                        .store(WAIT_TIMER_DEFERRED, Ordering::Release);
-                    local.pending_waits.push(PendingWait {
-                        process: process.clone(),
-                        epoch,
-                        deadline_ms: wait_pos.unwrap_or_else(|| inner.clock.timeout_pos(ms)),
-                    });
-                    if process.run_state().load(Ordering::Acquire) != WAITING
-                        || process.wait_epoch.load(Ordering::Acquire) != epoch
-                    {
-                        process.wait_timer.store(0, Ordering::Release);
-                    }
-                } else if let Ok(reference) = inner.start_timer(
-                    process.pid,
-                    // Off the scheduler-local path (dirty or simulated) the timer goes on a
-                    // wheel through the relative interface.
-                    wait_pos.map_or(ms, |pos| pos.saturating_sub(inner.clock.now_ms()).max(1)),
-                    TimerPayload::Wake(process.pid, epoch),
-                    None,
-                    worker,
-                ) {
-                    process
-                        .wait_timer_worker
-                        .store(reference.worker, Ordering::Relaxed);
-                    process.wait_timer.store(reference.id, Ordering::Release);
-                    if process.run_state().load(Ordering::Acquire) != WAITING
-                        || process.wait_epoch.load(Ordering::Acquire) != epoch
-                    {
-                        inner.cancel_wait_timer(&process, reference.id);
-                    }
-                }
+            let prio = process.priority().index();
+            if timeout_ms == Some(0)
+                && let Some(kind) = process.run_state().wake(None, prio)
+            {
+                let item = Scheduled::at_prio(process.clone(), kind, prio);
+                inner.place_runnable(item, local.as_deref_mut());
+                return None;
             }
             // A signal that arrived while the process ran found it active and did not wake it.
             // Its in-queue bit is in the word the transition to WAITING returned, so no
             // further load is needed; one that arrives later sees WAITING and wakes it.
             // Port of erts/emulator/beam/erl_process.c:6695-6790 (schedule_out_process works
             // from the state word it read), OTP-29.1.1.
-            let prio = process.priority().index();
+            //
+            // A receive timer that fired while the process ran found it active and did not
+            // schedule it; the SeqCst load after the SeqCst transition sees its mark.
+            // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1196 (beam_jit_wait_locked
+            // keeps ERTS_PSFLG_ACTIVE when ERTS_PTMR_IS_TIMED_OUT), OTP-29.1.1.
+            //
             // An exit waiter resumed while the process still ran (ExitWaiter::drop) is seen
             // here, after the transition to WAITING, so the resume is never lost.
             // `ERTS_PSFLG_ACTIVE_SYS` keeps a process with unrun system tasks active too.
             if (left_running & psflg::SIG_IN_Q != 0
                 || active_sys
+                || (wait_pos.is_some()
+                    && process.rtimer.word.load(Ordering::SeqCst) == PTMR_TIMEDOUT)
                 || (process.exit_resume.load(Ordering::SeqCst)
                     && process.exit_resume.swap(false, Ordering::SeqCst)))
                 && let Some(kind) = process.run_state().wake(None, prio)
             {
-                process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                let id = process.wait_timer.load(Ordering::Acquire);
-                inner.cancel_wait_timer(&process, id);
                 let next = Scheduled::at_prio(process.clone(), kind, prio);
                 inner.place_runnable(next, local.as_deref_mut());
             }
         }
         RunOutcome::Exit(_) => {
+            // Port of erts/emulator/beam/erl_process.c:14209 (erts_continue_exit_process
+            // cancels the process timer), OTP-29.1.1.
+            inner.cancel_proc_timer(&process);
             if dirty.is_some() {
                 // Already outside the normal run queue accounting.
             } else if let Some(local) = local.as_deref_mut() {

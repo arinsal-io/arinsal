@@ -468,6 +468,10 @@ pub struct Process {
     /// middle queue are positioned by it.
     pub(crate) sig_cont_taken: u64,
     pub(crate) receive_timeout_pos: Option<u64>,
+    /// `def_arg_reg[0]` of a receive with a timer: where the process continues when it is
+    /// scheduled in timed out. A native code address, or `(ip << 1) | 1` in the interpreter;
+    /// 0 when unset.
+    pub(crate) receive_timeout_next: usize,
     /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
     /// re-read the operand (erts/emulator/beam/emu/msg_instrs.tab, wait.src).
     pub(crate) receive_infinity: bool,
@@ -2338,6 +2342,7 @@ impl Process {
             sig_cont: arinsal_sched::SignalQueue::default(),
             sig_cont_taken: 0,
             receive_timeout_pos: None,
+            receive_timeout_next: 0,
             receive_infinity: false,
             links: LinkTree::default(),
             monitors: MonitorTree::default(),

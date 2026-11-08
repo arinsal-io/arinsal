@@ -347,7 +347,14 @@ impl Executor {
         if let Some(shift) = runtime.take_pause_shift(process)
             && let Some(deadline) = process.receive_timeout_pos.as_mut()
         {
+            // erts_pause_proc_timer cancels the set timer; the next wait sets it again at the
+            // shifted position. A timer that already fired stays fired.
             *deadline += shift.as_millis() as u64;
+            if !process.receive_timer_timed_out()
+                && let Some(probe) = process.signal_probe()
+            {
+                probe.receive_timer().cancel();
+            }
         }
         if process.slice().is_some_and(|work| work.hibernate_sched) {
             process.drain(ctx)?;
@@ -396,8 +403,7 @@ impl Executor {
         let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
         self.vm.set_position(process, module_id, entry);
         process.inbox.set_save(0);
-        process.receive_timeout_pos = None;
-        process.receive_infinity = false;
+        process.cancel_receive_timer();
         // erts resumes a hibernated process at the export address of apply/3 too.
         self.vm.enter_native_at_jump(process);
         Ok(())

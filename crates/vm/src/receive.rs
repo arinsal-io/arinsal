@@ -597,8 +597,7 @@ impl Process {
         }
         self.delay_gc = false;
         crate::natives::erts_debug::after_message_queue_change(self);
-        self.receive_timeout_pos = None;
-        self.receive_infinity = false;
+        self.cancel_receive_timer();
         Ok(true)
     }
 
@@ -674,8 +673,7 @@ impl Process {
         if let Some(cold) = self.cold.as_mut() {
             cold.priority_resume_cursor = None;
         }
-        self.receive_timeout_pos = None;
-        self.receive_infinity = false;
+        self.cancel_receive_timer();
         Ok(())
     }
 
@@ -688,8 +686,7 @@ impl Process {
         if let Some(cold) = self.cold.as_mut() {
             cold.priority_resume_cursor = None;
         }
-        self.receive_timeout_pos = None;
-        self.receive_infinity = false;
+        self.cancel_receive_timer();
         if let Some(markers) = self
             .cold
             .as_mut()
@@ -698,6 +695,54 @@ impl Process {
             markers.clear_leading();
         }
         self.release_empty_marker_block();
+    }
+
+    /// `CANCEL_TIMER(c_p)`: leaves the receive (F_INSLPQUEUE / F_TIMO cleared) and cancels a
+    /// receive timer the scheduler set for it.
+    // Port of erts/emulator/beam/erl_process.h:1841-1849 (CANCEL_TIMER) and
+    // erl_hl_timer.c:2832-2846 (erts_cancel_proc_timer), OTP-29.1.1.
+    #[inline(always)]
+    pub(crate) fn cancel_receive_timer(&mut self) {
+        self.receive_infinity = false;
+        if self.receive_timeout_pos.take().is_some() {
+            self.receive_timeout_next = 0;
+            if let Some(probe) = self.signal_probe() {
+                probe.receive_timer().cancel();
+            }
+        }
+    }
+
+    /// `ERTS_PTMR_IS_TIMED_OUT(c_p)`.
+    #[inline]
+    pub(crate) fn receive_timer_timed_out(&self) -> bool {
+        self.signal_probe()
+            .is_some_and(|probe| probe.receive_timer().timed_out())
+    }
+
+    /// Schedule-in of a process whose receive timer fired: it continues at the `timeout`
+    /// instruction of its receive (`p->i = def_arg_reg[0]`), whatever it was doing in the
+    /// receive loop, and the timer word is cleared.
+    // Port of erts/emulator/beam/erl_process.c:10451-10459 (erts_schedule), OTP-29.1.1.
+    pub(crate) fn receive_timeout_schedule_in(&mut self) {
+        let next = self.receive_timeout_next;
+        let Some(probe) = self.signal_probe() else {
+            return;
+        };
+        if next == 0
+            || probe.proc_flags().load(Ordering::Acquire) & arinsal_sched::proc_flags::EXITING != 0
+            || !probe.receive_timer().timed_out()
+        {
+            return;
+        }
+        // ERTS_PTMR_CLEAR; F_INSLPQUEUE becomes F_TIMO (`receive_timeout_pos` stays set until
+        // `timeout` runs).
+        probe.receive_timer().cancel();
+        if next & 1 == 0 {
+            self.set_native_pc(Some(next));
+        } else {
+            self.set_native_pc(None);
+            self.set_ip(next >> 1);
+        }
     }
 
     /// `i_wait_timeout`: sets the receive timer once per receive. `Some(0)` takes the
@@ -715,13 +760,14 @@ impl Process {
         // already set and the operand is not read again (no X register is live across the
         // wait); the position computed when it was set is kept.
         if let Some(pos) = self.receive_timeout_pos {
-            // erts learns that the timer fired from the timer word (ERTS_PTMR_IS_TIMED_OUT);
-            // here a wake does not tell a timeout from a message, so the clock decides.
-            let now = match self.runtime.as_ref() {
-                Some(runtime) if simulated => runtime.virtual_ms.load(Ordering::Relaxed),
-                _ => arinsal_sched::monotonic_now_ms(),
-            };
-            return Ok(Some(if now >= pos { 0 } else { pos }));
+            // No clock is read: the timer word says whether the timer fired
+            // (ERTS_PTMR_IS_TIMED_OUT, which beam_jit_wait_locked tests), and a timer that has
+            // not fired stays set.
+            return Ok(Some(if self.receive_timer_timed_out() {
+                0
+            } else {
+                pos
+            }));
         }
         if self.receive_infinity {
             return Ok(None);

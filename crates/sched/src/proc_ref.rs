@@ -280,6 +280,7 @@ impl Drop for ErasedProcRef {
 pub struct SignalProbe<M: SignalMessage> {
     input: NonNull<Incoming<Event<M>>>,
     flags: NonNull<AtomicU32>,
+    timer: NonNull<crate::ReceiveTimer>,
     /// The thread progress domain the process's signal buffers are read through.
     progress: Progress,
     _owner: ErasedProcRef,
@@ -297,6 +298,7 @@ impl<M: SignalMessage> SignalProbe<M> {
         Self {
             input: NonNull::from(&process.input),
             flags: NonNull::from(&process.exit_flags),
+            timer: NonNull::from(&process.rtimer),
             progress,
             _owner: process.clone().erase(),
         }
@@ -318,6 +320,12 @@ impl<M: SignalMessage> SignalProbe<M> {
         // SAFETY: the pointer is to a field of the process struct `_owner` keeps alive.
         unsafe { self.flags.as_ref() }
     }
+
+    /// The process's receive timer.
+    pub(crate) fn timer(&self) -> &crate::ReceiveTimer {
+        // SAFETY: the pointer is to a field of the process struct `_owner` keeps alive.
+        unsafe { self.timer.as_ref() }
+    }
 }
 
 impl<M: SignalMessage> Clone for SignalProbe<M> {
@@ -325,6 +333,7 @@ impl<M: SignalMessage> Clone for SignalProbe<M> {
         Self {
             input: self.input,
             flags: self.flags,
+            timer: self.timer,
             progress: self.progress.clone(),
             _owner: self._owner.clone(),
         }
