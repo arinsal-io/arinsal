@@ -962,6 +962,13 @@ pub enum RunOutcome {
     Yield,
     /// The task blocks in receive; an optional timeout wakes it.
     Wait { timeout_ms: Option<u64> },
+    /// The task blocks in receive with its receive timer already set at wheel position
+    /// `timeout_pos` (from [`receive_timeout_pos`] on a real-time scheduler, virtual
+    /// milliseconds on a simulated one): no clock is read to arm it.
+    ///
+    /// Port of erts/emulator/beam/erl_hl_timer.c (erts_set_proc_timer_term computes the
+    /// position once, while the process runs `i_wait_timeout`), OTP-29.1.1.
+    WaitTimer { timeout_pos: u64 },
     /// The task has terminated; reason interpretation belongs to the VM.
     Exit(u64),
     /// The task must continue on a dirty scheduler of this kind. A task that
@@ -1351,6 +1358,50 @@ impl Rng for SeededRng {
     }
 }
 
+/// Base of the real-time scheduler clock: one per OS process, as erts has one
+/// `time_sup` monotonic clock, so a running process computes wheel positions without
+/// reaching its scheduler.
+fn monotonic_base() -> Instant {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+// Port of erts/emulator/beam/erl_hl_timer.c:670-679 (get_timeout_pos), OTP-29.1.1.
+fn real_timeout_pos(base: Instant, ms: u64) -> u64 {
+    // 64-bit nanoseconds (584 years) keep the tick conversion a single machine division, as
+    // ERTS_MONOTONIC_TO_CLKTCKS is on ErtsMonotonicTime.
+    let elapsed = base.elapsed();
+    let nanos = elapsed
+        .as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(elapsed.subsec_nanos()));
+    if ms == 0 {
+        return nanos / 1_000_000;
+    }
+    (nanos.saturating_sub(1) / 1_000_000)
+        .saturating_add(ms)
+        .saturating_add(1)
+}
+
+/// Wheel position of a receive timeout of `ms` milliseconds on a real-time scheduler: one
+/// monotonic clock read, the position a [`RunOutcome::WaitTimer`] carries.
+///
+/// Port of erts/emulator/beam/erl_hl_timer.c (erts_set_proc_timer_term: parse_timeout_pos
+/// reads erts_get_monotonic_time once, get_timeout_pos turns it into the wheel position),
+/// OTP-29.1.1.
+pub fn receive_timeout_pos(ms: u64) -> u64 {
+    real_timeout_pos(monotonic_base(), ms)
+}
+
+/// Current wheel position (milliseconds) of the real-time scheduler clock.
+pub fn monotonic_now_ms() -> u64 {
+    let elapsed = monotonic_base().elapsed();
+    elapsed
+        .as_secs()
+        .saturating_mul(1000)
+        .saturating_add(u64::from(elapsed.subsec_millis()))
+}
+
 struct RealClock(Instant);
 impl Clock for RealClock {
     fn now_ms(&self) -> u64 {
@@ -1367,15 +1418,7 @@ impl Clock for RealClock {
     }
 
     fn timeout_pos(&self, ms: u64) -> u64 {
-        if ms == 0 {
-            return self.now_ms();
-        }
-        // Port of erts/emulator/beam/erl_hl_timer.c:670-679 (get_timeout_pos), OTP-29.1.1.
-        let ticks = self.0.elapsed().as_nanos().saturating_sub(1) / 1_000_000;
-        u64::try_from(ticks)
-            .unwrap_or(u64::MAX)
-            .saturating_add(ms)
-            .saturating_add(1)
+        real_timeout_pos(self.0, ms)
     }
 
     fn time_left_now_ms(&self) -> u64 {
@@ -6907,7 +6950,7 @@ impl<T: Task> Scheduler<T> {
         // erts_no_schedulers), OTP-29.1.1. A launcher that already configured the allocators
         // (with `+Mdai`) or an earlier runtime in this process keeps its counts.
         let _ = arinsal_alloc::typed::configure(config.workers.max(1), 0);
-        Self::build(config, Arc::new(RealClock(Instant::now())), None, None)
+        Self::build(config, Arc::new(RealClock(monotonic_base())), None, None)
     }
 
     /// Build a single-threaded scheduler with a reproducible seed and virtual clock.
@@ -9379,8 +9422,16 @@ fn schedule_out<T: Task>(
                 inner.enqueue(next, true);
             }
         }
-        RunOutcome::Wait { timeout_ms } => {
-            let epoch = if timeout_ms.is_some() {
+        outcome @ (RunOutcome::Wait { .. } | RunOutcome::WaitTimer { .. }) => {
+            // A receive timer arrives either as a relative time (tasks that leave the position
+            // to the scheduler) or as the wheel position the process computed when it set the
+            // timer.
+            let (timeout_ms, wait_pos) = match outcome {
+                RunOutcome::WaitTimer { timeout_pos } => (None, Some(timeout_pos)),
+                RunOutcome::Wait { timeout_ms } => (timeout_ms, None),
+                _ => (None, None),
+            };
+            let epoch = if timeout_ms.is_some() || wait_pos.is_some() {
                 process.timer_epoch_used.store(true, Ordering::Release);
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel) + 1
             } else if process.timer_epoch_used.load(Ordering::Acquire) {
@@ -9398,7 +9449,8 @@ fn schedule_out<T: Task>(
             } else {
                 inner.record_waiting(&process);
             }
-            if let Some(ms) = timeout_ms {
+            if timeout_ms.is_some() || wait_pos.is_some() {
+                let ms = timeout_ms.unwrap_or(1);
                 if ms == 0 {
                     let prio = process.priority().index();
                     if let Some(kind) = process.run_state().wake(None, prio) {
@@ -9416,7 +9468,7 @@ fn schedule_out<T: Task>(
                     local.pending_waits.push(PendingWait {
                         process: process.clone(),
                         epoch,
-                        deadline_ms: inner.clock.timeout_pos(ms),
+                        deadline_ms: wait_pos.unwrap_or_else(|| inner.clock.timeout_pos(ms)),
                     });
                     if process.run_state().load(Ordering::Acquire) != WAITING
                         || process.wait_epoch.load(Ordering::Acquire) != epoch
@@ -9425,7 +9477,9 @@ fn schedule_out<T: Task>(
                     }
                 } else if let Ok(reference) = inner.start_timer(
                     process.pid,
-                    ms,
+                    // Off the scheduler-local path (dirty or simulated) the timer goes on a
+                    // wheel through the relative interface.
+                    wait_pos.map_or(ms, |pos| pos.saturating_sub(inner.clock.now_ms()).max(1)),
                     TimerPayload::Wake(process.pid, epoch),
                     None,
                     worker,

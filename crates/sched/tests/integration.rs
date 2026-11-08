@@ -881,3 +881,56 @@ fn progress_slot_releases_after_thread_progress() {
     }
     assert_eq!(Arc::strong_count(&value), 1);
 }
+
+#[test]
+fn wait_timer_keeps_its_position_across_reentry() {
+    // A receive timer set once (erts' F_INSLPQUEUE) keeps its wheel position when a
+    // non-matching message makes the process scan and wait again.
+    struct Timed {
+        pos: Option<u64>,
+        fired: Arc<Mutex<Option<Instant>>>,
+    }
+    impl Task for Timed {
+        type Message = ();
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+            while ctx.receive().is_some() {}
+            let pos = *self
+                .pos
+                .get_or_insert_with(|| arinsal_sched::receive_timeout_pos(200));
+            if arinsal_sched::monotonic_now_ms() >= pos {
+                *self.fired.lock().unwrap() = Some(Instant::now());
+                return RunOutcome::Exit(0);
+            }
+            RunOutcome::WaitTimer { timeout_pos: pos }
+        }
+    }
+    let sched = Scheduler::new(Config {
+        workers: 1,
+        max_processes: 1,
+        ..Config::default()
+    });
+    let fired = Arc::new(Mutex::new(None));
+    let start = Instant::now();
+    let pid = sched
+        .spawn(Timed {
+            pos: None,
+            fired: fired.clone(),
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    sched.send(pid, pid, ()).unwrap();
+    let deadline = start + Duration::from_secs(5);
+    while fired.lock().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let elapsed = fired
+        .lock()
+        .unwrap()
+        .expect("receive timer fired")
+        .duration_since(start);
+    assert!(
+        elapsed >= Duration::from_millis(199) && elapsed < Duration::from_millis(295),
+        "timer fired after {elapsed:?}, not at its first position"
+    );
+}

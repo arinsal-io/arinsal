@@ -1432,7 +1432,7 @@ pub(crate) fn instr_name(instr: Instr) -> &'static str {
 pub(crate) enum RunState {
     Done(Term),
     Yield,
-    Wait { timeout_ms: Option<u64> },
+    Wait { timeout_pos: Option<u64> },
 }
 
 // Port of erts/emulator/beam/beam_bp.c:1242-1268, OTP-29.1.1.
@@ -4004,7 +4004,7 @@ impl Vm {
                     p.set_ip(target as usize);
                     p.heap.abi.fcalls = reds;
                     p.gc_live = 0;
-                    return Ok(RunState::Wait { timeout_ms: None });
+                    return Ok(RunState::Wait { timeout_pos: None });
                 }
                 Instr::WaitTimeout { target, time } => {
                     sync_cursor(p, htop, &mut heap_dirty);
@@ -4044,7 +4044,7 @@ impl Vm {
                     p.heap.abi.fcalls = reds;
                     p.gc_live = 0;
                     return Ok(RunState::Wait {
-                        timeout_ms: remaining,
+                        timeout_pos: remaining,
                     });
                 }
                 Instr::Timeout => {

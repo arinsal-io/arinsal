@@ -51,7 +51,7 @@ impl Executor {
                         return Ok(Flow::Continue);
                     }
                     if exit_kind == crate::proc_create::NativeExit::Wait
-                        && let Some(timeout_ms) = process.native_wait.take()
+                        && let Some(timeout_pos) = process.native_wait.take()
                     {
                         // A native receive found no matching message. Like the
                         // interpreter's `wait`, sleep only if nothing arrived since the
@@ -69,7 +69,7 @@ impl Executor {
                         } else if !Vm::mailbox_ready_to_wait(process, &mut Some(&mut *ctx))? {
                             return Ok(Flow::Continue);
                         }
-                        return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms })));
+                        return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos })));
                     }
                 }
                 // A native `i_yield` is a scheduler boundary even when the
@@ -353,7 +353,7 @@ impl Executor {
                         Err(VmError::Trap(_)) if crate::port::take_busy_suspend() => {
                             process.set_native_retry(Some(target_pc));
                             process.set_native_pc(Some(code_ptr));
-                            return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
+                            return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
                         }
                         Err(error) => return Err(error),
                     };
@@ -459,7 +459,7 @@ impl Executor {
                             }
                             process.set_native_retry(Some(target_pc));
                             process.set_native_pc(Some(code_ptr));
-                            return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
+                            return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
                         }
                         Err(VmError::Yield) => {
                             // A collection the call ran (the epilogue of a
@@ -494,7 +494,7 @@ impl Executor {
                                 hibernate_fetch_collect(process, ctx)?;
                                 process.set_native_retry(Some(target_pc));
                                 process.set_native_pc(Some(code_ptr));
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
+                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
                             }
                             process.set_native_pc(None);
                             process.native_continuation_resume = false;
@@ -504,7 +504,7 @@ impl Executor {
                                     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                     process.slice_mut().hibernate_sched = true;
                                 }
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
+                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
                             }
                             self.install_apply(process, ctx)?;
                             return Ok(Flow::Continue);
@@ -1043,7 +1043,7 @@ impl Executor {
                                 }
                                 process.set_native_retry(Some(target_pc));
                                 process.set_native_pc(Some(code_ptr));
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
+                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
                             }
                             Err(VmError::Trap(mut trap)) => {
                                 // Port of erts/emulator/beam/beam_common.c
@@ -1134,7 +1134,7 @@ impl Executor {
                                     process.set_native_retry(Some(target_pc));
                                     process.set_native_pc(Some(code_ptr));
                                     return Ok(Flow::Break(Ok(RunState::Wait {
-                                        timeout_ms: None,
+                                        timeout_pos: None,
                                     })));
                                 }
                                 process.set_native_pc(None);
@@ -1146,7 +1146,7 @@ impl Executor {
                                         process.slice_mut().hibernate_sched = true;
                                     }
                                     return Ok(Flow::Break(Ok(RunState::Wait {
-                                        timeout_ms: None,
+                                        timeout_pos: None,
                                     })));
                                 }
                                 self.install_apply(process, ctx)?;

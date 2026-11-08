@@ -436,7 +436,7 @@ pub struct Process {
     pub(crate) hibernated: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
-    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
+    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (receive timer position, `None` for
     /// `infinity`); the process resumes at the native `loop_rec` label.
     pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
@@ -445,7 +445,7 @@ pub struct Process {
     pub(crate) native_apply: bool,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
     pub(crate) native_call_pc: usize,
-    /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
+    /// Receive timer position set by a native `wait_timeout`, consumed by the following wait.
     pub(crate) native_wait_timeout: Option<u64>,
     /// The pending native wait belongs to a receive without clauses.
     pub(crate) native_wait_self: bool,
@@ -467,8 +467,7 @@ pub struct Process {
     /// Signals taken from the front of `sig_cont` so far; receive markers inserted into the
     /// middle queue are positioned by it.
     pub(crate) sig_cont_taken: u64,
-    pub(crate) receive_deadline: Option<std::time::Instant>,
-    pub(crate) receive_deadline_ms: Option<u64>,
+    pub(crate) receive_timeout_pos: Option<u64>,
     /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
     /// re-read the operand (erts/emulator/beam/emu/msg_instrs.tab, wait.src).
     pub(crate) receive_infinity: bool,
@@ -2338,8 +2337,7 @@ impl Process {
             inbox: process::MessageQueue::default(),
             sig_cont: arinsal_sched::SignalQueue::default(),
             sig_cont_taken: 0,
-            receive_deadline: None,
-            receive_deadline_ms: None,
+            receive_timeout_pos: None,
             receive_infinity: false,
             links: LinkTree::default(),
             monitors: MonitorTree::default(),
@@ -3272,12 +3270,8 @@ mod layout_report {
             size_of_val(&process.sig_cont_taken)
         );
         eprintln!(
-            "  Process.receive_deadline {}",
-            size_of_val(&process.receive_deadline)
-        );
-        eprintln!(
-            "  Process.receive_deadline_ms {}",
-            size_of_val(&process.receive_deadline_ms)
+            "  Process.receive_timeout_pos {}",
+            size_of_val(&process.receive_timeout_pos)
         );
         eprintln!(
             "  Process.receive_infinity {}",

@@ -4,7 +4,6 @@ use crate::{Process, VmError};
 use arinsal_loader::Arg;
 use arinsal_term::Term;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 
 // Port of erts/emulator/beam/erl_message.h:322 (ERTS_RECV_MARKER_BLOCK_SIZE)
 // and erl_proc_sig_queue.h:276 (ERTS_RECV_MARKER_PASS_MAX), OTP-29.1.1.
@@ -598,8 +597,7 @@ impl Process {
         }
         self.delay_gc = false;
         crate::natives::erts_debug::after_message_queue_change(self);
-        self.receive_deadline = None;
-        self.receive_deadline_ms = None;
+        self.receive_timeout_pos = None;
         self.receive_infinity = false;
         Ok(true)
     }
@@ -676,8 +674,7 @@ impl Process {
         if let Some(cold) = self.cold.as_mut() {
             cold.priority_resume_cursor = None;
         }
-        self.receive_deadline = None;
-        self.receive_deadline_ms = None;
+        self.receive_timeout_pos = None;
         self.receive_infinity = false;
         Ok(())
     }
@@ -691,8 +688,7 @@ impl Process {
         if let Some(cold) = self.cold.as_mut() {
             cold.priority_resume_cursor = None;
         }
-        self.receive_deadline = None;
-        self.receive_deadline_ms = None;
+        self.receive_timeout_pos = None;
         self.receive_infinity = false;
         if let Some(markers) = self
             .cold
@@ -704,43 +700,36 @@ impl Process {
         self.release_empty_marker_block();
     }
 
+    /// `i_wait_timeout`: sets the receive timer once per receive. `Some(0)` takes the
+    /// timeout now, `Some(pos)` waits with the timer at wheel position `pos` (see
+    /// [`arinsal_sched::RunOutcome::WaitTimer`]), `None` waits without a timer.
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:231 (F_DELAY_GC cleared), OTP-29.1.1.
         self.delay_gc = false;
-        // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1214-1218
-        // (beam_jit_wait_timeout), OTP-29.1.1: with no installed receive timer, literal zero
-        // immediately selects RET_next without consulting scheduler time.
-        if !self.receive_infinity
-            && self.receive_deadline.is_none()
-            && self.receive_deadline_ms.is_none()
-            && value.as_small() == Some(0)
-        {
-            return Ok(Some(0));
-        }
-        // Port of erts/emulator/beam/emu/msg_instrs.tab:329-334 (wait.src), OTP-29.1.1:
-        // once the timer is set (F_TIMO), a re-executed wait_timeout must not read
-        // its operand again; no X register is live across the wait.
         let simulated = self
             .runtime
             .as_ref()
             .is_some_and(|runtime| runtime.simulated);
-        if simulated {
-            if let (Some(deadline), Some(runtime)) =
-                (self.receive_deadline_ms, self.runtime.as_ref())
-            {
-                let now = runtime.virtual_ms.load(Ordering::Relaxed);
-                return Ok(Some(deadline.saturating_sub(now)));
-            }
-        } else if let Some(deadline) = self.receive_deadline {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(Some(0));
-            }
-            let remaining = deadline.saturating_duration_since(now).as_millis() as u64;
-            return Ok(Some(remaining.max(1)));
+        // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1240
+        // (beam_jit_wait_timeout), OTP-29.1.1: with F_INSLPQUEUE or F_TIMO set the timer is
+        // already set and the operand is not read again (no X register is live across the
+        // wait); the position computed when it was set is kept.
+        if let Some(pos) = self.receive_timeout_pos {
+            // erts learns that the timer fired from the timer word (ERTS_PTMR_IS_TIMED_OUT);
+            // here a wake does not tell a timeout from a message, so the clock decides.
+            let now = match self.runtime.as_ref() {
+                Some(runtime) if simulated => runtime.virtual_ms.load(Ordering::Relaxed),
+                _ => arinsal_sched::monotonic_now_ms(),
+            };
+            return Ok(Some(if now >= pos { 0 } else { pos }));
         }
         if self.receive_infinity {
             return Ok(None);
+        }
+        // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1216-1218: with no timer set,
+        // literal zero selects RET_next without consulting time.
+        if value.as_small() == Some(0) {
+            return Ok(Some(0));
         }
         if value.as_atom() == Some(arinsal_term::atoms::INFINITY) {
             self.receive_infinity = true;
@@ -751,43 +740,27 @@ impl Process {
                 "timeout_value",
             )))
         };
-        let Some(ms) = value.as_small() else {
-            // Port of erts/emulator/beam/emu/msg_instrs.tab:342-345
-            // (invalid timer resets the save pointer), OTP-29.1.1.
-            self.timeout();
-            return Err(timeout_value());
+        // Port of erts/emulator/beam/erl_hl_timer.c:2786-2806 (erts_set_proc_timer_term:
+        // negative, non-integer and > 2^32-1 values are rejected) and msg_instrs.tab:342-345
+        // (an invalid timer resets the save pointer), OTP-29.1.1.
+        let ms = match value.as_small() {
+            Some(ms) if (0..=i64::from(u32::MAX)).contains(&ms) => ms as u64,
+            _ => {
+                self.timeout();
+                return Err(timeout_value());
+            }
         };
-        if ms < 0 {
-            // Port of erts/emulator/beam/emu/msg_instrs.tab:342-345
-            // (invalid timer resets the save pointer), OTP-29.1.1.
-            self.timeout();
-            return Err(timeout_value());
-        }
-        if ms > u32::MAX as i64 {
-            // Port of erts/emulator/beam/erl_hl_timer.c:2799-2804
-            // (erts_set_proc_timer_term), OTP-29.1.1.
-            self.timeout();
-            return Err(timeout_value());
-        }
-        if let Some(runtime) = self.runtime.as_ref()
-            && runtime.simulated
-        {
-            let now = runtime.virtual_ms.load(Ordering::Relaxed);
-            let deadline = *self
-                .receive_deadline_ms
-                .get_or_insert_with(|| now.saturating_add(ms as u64));
-            let remaining = deadline.saturating_sub(now);
-            return Ok(Some(remaining));
-        }
-        let now = Instant::now();
-        let deadline = *self
-            .receive_deadline
-            .get_or_insert_with(|| now + Duration::from_millis(ms as u64));
-        let remaining = deadline.saturating_duration_since(now).as_millis() as u64;
-        if now >= deadline {
-            return Ok(Some(0));
-        }
-        Ok(Some(remaining.max(1)))
+        // Port of erts/emulator/beam/erl_hl_timer.c:2786-2806 (erts_set_proc_timer_term),
+        // OTP-29.1.1: one monotonic clock read gives the wheel position the timer keeps.
+        let pos = match self.runtime.as_ref() {
+            Some(runtime) if simulated => runtime
+                .virtual_ms
+                .load(Ordering::Relaxed)
+                .saturating_add(ms),
+            _ => arinsal_sched::receive_timeout_pos(ms),
+        };
+        self.receive_timeout_pos = Some(pos);
+        Ok(Some(pos))
     }
 }
 
