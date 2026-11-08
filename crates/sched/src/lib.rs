@@ -11016,6 +11016,13 @@ fn apply_scheduler_cpu_binding<T: Task>(
 /// which is a full extra millisecond on every timer. The coarse part of the sleep is
 /// therefore shortened by the observed overshoot and the rest is waited for by yielding
 /// until the deadline or a wake-up.
+///
+/// A return from the kernel wait that is not a wake-up (`parked` still set: an unpark that
+/// did not wake this scheduler, or a spurious return) sleeps again for the time left, as
+/// `ethr_event_twait` returns EINTR and `scheduler_wait` waits again with a recomputed
+/// timeout; only the last `SLACK_NS` before the deadline is spent yielding.
+// Port of erts/lib_src/pthread/ethr_event.c (wait__: timeout_time - ethr_get_monotonic_time
+// once per select), erts/emulator/beam/erl_process.c (scheduler_wait), OTP-29.1.1.
 fn park_until<T: Task>(inner: &Inner<T>, id: usize, wait_ns: u64) {
     const SLACK_NS: u64 = if cfg!(target_os = "macos") {
         2_500_000
@@ -11023,18 +11030,22 @@ fn park_until<T: Task>(inner: &Inner<T>, id: usize, wait_ns: u64) {
         0
     };
     let deadline = Instant::now() + Duration::from_nanos(wait_ns);
-    let coarse = wait_ns.saturating_sub(SLACK_NS);
-    if coarse >= 200_000 || SLACK_NS == 0 {
-        thread::park_timeout(Duration::from_nanos(coarse.max(1_000)));
-    }
-    if SLACK_NS == 0 {
-        return;
-    }
-    while Instant::now() < deadline
-        && inner.parked[id].load(Ordering::SeqCst)
-        && !inner.stopped.load(Ordering::Acquire)
-    {
-        thread::yield_now();
+    let mut left = wait_ns;
+    loop {
+        let coarse = left.saturating_sub(SLACK_NS);
+        if coarse >= 200_000 || SLACK_NS == 0 {
+            thread::park_timeout(Duration::from_nanos(coarse.max(1_000)));
+        } else {
+            thread::yield_now();
+        }
+        if !inner.parked[id].load(Ordering::SeqCst) || inner.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        left = u64::try_from((deadline - now).as_nanos()).unwrap_or(u64::MAX);
     }
 }
 
