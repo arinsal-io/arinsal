@@ -1392,12 +1392,7 @@ impl Vm {
         };
         let reexec_apply =
             matches!(&result, Ok(ImportOutcome::Yield)) && p.position_marker() == original_position;
-        if matches!(
-            &result,
-            Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
-        ) || matches!(&result, Err(VmError::Dirty(_)))
-            || reexec_apply
-        {
+        if matches!(&result, Err(VmError::Dirty(_))) || reexec_apply {
             // Only a yield that re-executes this apply may restore its argument registers; a yield after the
             // callee returned (reductions exhausted, ip advanced) must keep the result in x0.
             p.x[..operand_len].copy_from_slice(&operand_buf[..operand_len]);

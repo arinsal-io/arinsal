@@ -5,7 +5,7 @@ use crate::{Process, ProcessHeapHandle, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{Atom, HeapReservation, Term, TermBuilder, TermKind, global_atoms, to_owned};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "pf-mem-counters")]
@@ -1800,6 +1800,7 @@ pub(crate) fn timer_query_sync(
     reference: Term,
     cancel: bool,
     info: bool,
+    request: bool,
 ) -> Result<Term, VmError> {
     let id = ref_id(reference).ok_or_else(|| {
         badarg(if cancel {
@@ -1808,15 +1809,12 @@ pub(crate) fn timer_query_sync(
             "read_timer/1"
         })
     })?;
-    if let Some(done) = poll(process)? {
-        return Ok(done);
-    }
     let rt = runtime(process)?;
     let timer = rt
         .scheduler()
         .ok()
         .map(|scheduler| scheduler.timer_for_ref_key(id));
-    access_timer_sync(process, caller, reference, timer, cancel, info)
+    access_timer_sync(process, caller, reference, timer, cancel, info, request)
 }
 
 /// Synchronous `cancel_timer`/`read_timer`.
@@ -1832,6 +1830,7 @@ fn access_timer_sync(
     timer: Option<arinsal_sched::TimerRef>,
     cancel: bool,
     info: bool,
+    request: bool,
 ) -> Result<Term, VmError> {
     let rt = runtime(process)?;
     let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) else {
@@ -1843,6 +1842,11 @@ fn access_timer_sync(
             .and_then(|ms| Term::small(ms as i64))
             .unwrap_or_else(|| atom("false"));
         return Ok(if info { value } else { atom("ok") });
+    }
+    // The light-BIF fragment sends no request: it hands the call to the executor, which would
+    // otherwise find the timer already cancelled by the first attempt.
+    if !request {
+        return Err(VmError::Yield);
     }
     // Slow path: the parked reply keeps the scheduler while `process` is mutated.
     let scheduler = std::sync::Arc::clone(scheduler);
@@ -1899,18 +1903,21 @@ fn access_timer_sync(
         },
         _ => return Err(badarg("timer reference")),
     };
-    process.set_pending_signal_waiter(Some(Waiter {
-        id,
-        kind: WaitKind::Info,
-        save: process.inbox.len(),
-    }));
+    // Port of erts/emulator/beam/erl_hl_timer.c:2290 (ERTS_BIF_PREP_TRAP1(erts_await_result,
+    // rref)), OTP-29.1.1: the caller continues in erts_internal:await_result/1.
+    let rref = reference(process, id)?;
     *guard = TimerAccess::Parked {
         target: caller,
         reply,
         info,
         scheduler,
     };
-    Err(await_reply())
+    drop(guard);
+    Err(VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        "erts_internal:await_result/1",
+        vec![rref],
+    )))
 }
 
 fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool {
@@ -2089,7 +2096,7 @@ fn request_system_task(
     if alive
         && matches!(
             submit_sys_task(process, ctx, requester, target_pid, op, priority)?,
-            Submit::Sent(_)
+            Submit::Sent
         )
     {
         return Ok(atom("ok"));
@@ -3359,7 +3366,7 @@ fn call_resolved(
                     let sent = ctx.signal(pid, Signal::Unlink(id)).is_ok();
                     unlink_mark(process, pid, id, sent);
                 }
-                wake_for_procs_trace(process, ctx, pid);
+                wake_for_procs_trace(process, pid);
                 atom("true")
             })
         }
@@ -3564,7 +3571,7 @@ fn call_resolved(
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("cancel_timer/1"))?;
             if !options.asynchronous {
-                return timer_query_sync(process, ctx.pid(), *reference, true, options.info);
+                return timer_query_sync(process, ctx.pid(), *reference, true, options.info, true);
             }
             let rt = runtime(process)?;
             if options.asynchronous {
@@ -3627,7 +3634,7 @@ fn call_resolved(
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("read_timer/1"))?;
             if !options.asynchronous {
-                return timer_query_sync(process, ctx.pid(), *reference, false, options.info);
+                return timer_query_sync(process, ctx.pid(), *reference, false, options.info, true);
             }
             let rt = runtime(process)?;
             let timer = rt
@@ -3762,8 +3769,6 @@ pub(crate) enum RemoteOp {
     Collect { request_id: Message, major: bool },
     /// `process_display(Pid, backtrace)`.
     Display,
-    /// `is_process_alive/1` signal-ordering probe.
-    Alive,
     /// Check whether the target still has a direct reference to old module code.
     CheckProcessCode {
         /// Old code of the checked module; `None` when it has none (the result is `false`).
@@ -3780,24 +3785,9 @@ pub(crate) enum RemoteOp {
     PrioSig,
 }
 
-/// How the caller extracts the reply once it is in the mailbox.
-#[derive(Clone, Copy)]
-pub(crate) enum WaitKind {
-    /// `{Ref, Result}` and `Result` is the BIF return value.
-    Info,
-    /// `{Ref, true | badarg}`. Anything but `true` is `badarg`.
-    GroupLeader,
-    /// `{Ref, true | badarg | badopt}`. Anything but `true` is `badarg`.
-    Display,
-    /// `{Ref, Bool}`.
-    Alive,
-    /// `{Ref, OldSaveCalls}`; `badarg` is raised in the caller.
-    ProcessFlag,
-}
-
 pub(crate) enum Submit {
-    /// The request is in the target's queue. The id is the reply reference.
-    Sent(u64),
+    /// The task is in the target's queue.
+    Sent,
     /// The target had already exited.
     Dead,
 }
@@ -3809,53 +3799,24 @@ pub(crate) struct Pending {
     pub(crate) op: RemoteOp,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Waiter {
-    pub(crate) id: u64,
-    pub(crate) kind: WaitKind,
-    /// Mailbox length when the request was sent: the reply is queued after it.
-    ///
-    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:3398 (erts_msgq_set_save_end),
-    /// OTP-29.1.1: the wait skips the messages that predate the request instead of
-    /// rescanning them on every retry.
-    pub(crate) save: usize,
-}
-
-/// Runtime address plus pid. Simulations reuse pid numbers, and tests run in parallel.
-type Slot = (usize, Pid);
-
-/// Requests queued for one target: plain signal requests in submission order and system
-/// tasks per priority, as in erts' `ErtsProcSysTaskQs`.
+/// The system tasks of one process, per priority, as in erts' `ErtsProcSysTaskQs`
+/// (`p->sys_task_qs`).
 #[derive(Default)]
-struct Requests {
-    plain: VecDeque<Pending>,
-    /// System tasks whose ordered wakeup signal has not reached the target yet.
-    pending_sys: [VecDeque<Pending>; 4],
+pub(crate) struct SysTaskQueues {
     sys: [VecDeque<Pending>; 4],
     /// Normal-priority tasks run since the last low-priority one.
     ncount: u8,
 }
 
-impl Requests {
-    fn is_empty(&self) -> bool {
-        self.plain.is_empty()
-            && self.pending_sys.iter().all(VecDeque::is_empty)
-            && self.sys.iter().all(VecDeque::is_empty)
-    }
+/// The payload of `Signal::SysTask`: the task, or `None` for a kick.
+pub(crate) struct SysTaskSignal {
+    index: usize,
+    task: Mutex<Option<Pending>>,
+}
 
-    /// Make a task eligible only after its ordered system-task signal is handled.
-    fn handle_sys_wakeup(&mut self, id: u64) {
-        if id == u64::MAX {
-            return;
-        }
-        for (index, queue) in self.pending_sys.iter_mut().enumerate() {
-            if let Some(position) = queue.iter().position(|pending| pending.id == id) {
-                if let Some(pending) = queue.remove(position) {
-                    self.sys[index].push_back(pending);
-                }
-                return;
-            }
-        }
+impl SysTaskQueues {
+    fn is_empty(&self) -> bool {
+        self.sys.iter().all(VecDeque::is_empty)
     }
 
     /// The highest-priority queued check_process_code task.
@@ -3887,8 +3848,22 @@ impl Requests {
         } else {
             first
         };
-        self.sys[index].pop_front()
+        let task = self.sys[index].pop_front();
+        // erts frees the queue set when its last task is fetched, which resets the counter.
+        if self.is_empty() {
+            self.ncount = 0;
+        }
+        task
     }
+}
+
+fn sys_task_signal(index: usize, task: Option<Pending>) -> Signal<Message> {
+    Signal::SysTask(arinsal_sched::SharedPayload(std::sync::Arc::new(
+        SysTaskSignal {
+            index,
+            task: Mutex::new(task),
+        },
+    )))
 }
 
 pub(crate) fn sys_index(priority: Priority) -> usize {
@@ -3898,20 +3873,6 @@ pub(crate) fn sys_index(priority: Priority) -> usize {
         Priority::Normal => 2,
         Priority::Low => 3,
     }
-}
-
-struct Tables {
-    /// Per-target requests in submission order; wakeups usually arrive in that order,
-    /// so lookups hit the front (system task blasts queue hundreds of thousands).
-    requests: BTreeMap<Slot, Requests>,
-}
-
-fn scope(process: &Process) -> usize {
-    process
-        .runtime
-        .as_ref()
-        .map(|runtime| *runtime as *const crate::process::Runtime as usize)
-        .unwrap_or(0)
 }
 
 /// Whether `pid` of the runtime at `runtime` already began its exit.
@@ -3936,40 +3897,6 @@ fn proc_is_exiting_runtime(runtime: &crate::process::Runtime, pid: Pid) -> bool 
         .unwrap_or(false)
 }
 
-fn proc_is_exiting(process: &Process, pid: Pid) -> bool {
-    process
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime| proc_is_exiting_runtime(runtime, pid))
-}
-
-/// Record that `pid` has a queued remote request. False when its exit already
-/// finished that table, so the caller must drop the queue entry.
-fn note_request(process: &Process, pid: Pid) -> bool {
-    process
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::REQUESTS))
-}
-
-fn tables() -> &'static Mutex<Tables> {
-    static TABLES: std::sync::OnceLock<Mutex<Tables>> = std::sync::OnceLock::new();
-    TABLES.get_or_init(|| {
-        Mutex::new(Tables {
-            requests: BTreeMap::new(),
-        })
-    })
-}
-
-/// Park the caller until [`poll`] observes the reply. The process retries this BIF.
-pub(crate) fn await_reply() -> VmError {
-    VmError::Unsupported("AWAIT_SIGNAL_REPLY".into())
-}
-
-pub(crate) fn is_await_message(message: &str) -> bool {
-    message.contains("AWAIT_SIGNAL_REPLY")
-}
-
 pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
     process
         .runtime
@@ -3977,101 +3904,11 @@ pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
         .is_some_and(|runtime| runtime.remote_status(pid) == "waiting")
 }
 
-/// Whether `process` is parked in `erlang:process_info/2` awaiting a target reply.
-// Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
-pub(crate) fn is_waiting_for_process_info(process: &Process) -> bool {
-    process
-        .pending_signal_waiter()
-        .is_some_and(|waiter| matches!(waiter.kind, WaitKind::Info))
-}
-
-/// `Ok(None)` when this process has no outstanding request.
-/// `Ok(Some(term))` when the reply has arrived.
-/// `Err(await)` when the reply is still pending.
-pub(crate) fn poll(process: &mut Process) -> Result<Option<Term>, VmError> {
-    let Some(waiter) = process.pending_signal_waiter() else {
-        return Ok(None);
-    };
-    let (id, kind, save) = (waiter.id, waiter.kind, waiter.save);
-    let Some(index) = process
-        .inbox
-        .position_from(save, |term| reply_inner(*term, id, kind).is_some())
-    else {
-        return Err(await_reply());
-    };
-    let old_prio_len = process.cold.as_ref().map_or(0, |cold| cold.prio_len);
-    let (removed, new_prio_len) =
-        process
-            .inbox
-            .remove_to_heap(index, &mut process.heap, old_prio_len)?;
-    process.cold_mut().prio_len = new_prio_len;
-    let term = removed.expect("reply index");
-    process.message_removed(index);
-    process.set_pending_signal_waiter(None);
-    let inner = reply_inner(term, id, kind).ok_or_else(|| badarg("request reply"))?;
-    interpret(kind, inner).map(Some)
-}
-
-fn interpret(kind: WaitKind, inner: Term) -> Result<Term, VmError> {
-    match kind {
-        WaitKind::Info | WaitKind::Alive => Ok(inner),
-        WaitKind::ProcessFlag if inner == atom("badarg") => Err(badarg("remote process_flag")),
-        WaitKind::ProcessFlag => Ok(inner),
-        WaitKind::GroupLeader | WaitKind::Display => {
-            if inner == atom("true") {
-                Ok(atom("true"))
-            } else {
-                Err(badarg("remote request"))
-            }
-        }
-    }
-}
-
-fn reply_inner(term: Term, id: u64, kind: WaitKind) -> Option<Term> {
-    // SAFETY: Inbox terms are rooted on the caller's heap for this scan.
-    let tuple = unsafe { term.tuple_ref() }?;
-    match kind {
-        WaitKind::Info
-        | WaitKind::GroupLeader
-        | WaitKind::Display
-        | WaitKind::Alive
-        | WaitKind::ProcessFlag => {
-            if tuple.len() == 2 && tuple.get(0).and_then(ref_id) == Some(id) {
-                tuple.get(1)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Enqueue `op` on `target` and, when `wait` is set, park the caller on the reply.
-pub(crate) fn submit(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    target: Pid,
-    op: RemoteOp,
-    wait: Option<WaitKind>,
-) -> Result<Submit, VmError> {
-    let id = process.next_ref();
-    submit_id(process, ctx, target, id, op, wait)
-}
-
-/// Like [`submit`], but the reply reference uses `id` (`0` allocates one).
-pub(crate) fn submit_id(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    target: Pid,
-    id: u64,
-    op: RemoteOp,
-    wait: Option<WaitKind>,
-) -> Result<Submit, VmError> {
-    submit_from(process, ctx, ctx.pid(), target, id, op, wait, None)
-}
-
 /// Queue a process system task on `target` at `priority`; the reply goes to `requester`.
 ///
-/// Port of erts/emulator/beam/erl_process.c:7221 (schedule_process_sys_task), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_process.c:7221 (schedule_process_sys_task), OTP-29.1.1: the
+/// task travels in the target's signal queue, so it is ordered after the signals the requester
+/// sent before; the target's own queues take it when the signal is handled.
 pub(crate) fn submit_sys_task(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -4080,101 +3917,19 @@ pub(crate) fn submit_sys_task(
     op: RemoteOp,
     priority: Priority,
 ) -> Result<Submit, VmError> {
-    submit_from(process, ctx, requester, target, 0, op, None, Some(priority))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn submit_from(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    from: Pid,
-    target: Pid,
-    id: u64,
-    op: RemoteOp,
-    wait: Option<WaitKind>,
-    priority: Option<Priority>,
-) -> Result<Submit, VmError> {
-    let id = if id == 0 { process.next_ref() } else { id };
-    let slot_of = scope(process);
-    let elevates = matches!(
+    let id = process.next_ref();
+    let task = Pending {
+        id,
+        from: requester,
         op,
-        RemoteOp::GroupLeader { .. } | RemoteOp::Info { .. } | RemoteOp::Display | RemoteOp::Alive
-    );
-    {
-        let mut tables = tables().lock().unwrap();
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c (signals to an exiting process are
-        // handled by its exit), OTP-29.1.1: the target already ran its exit handling.
-        // `ERTS_PSFLG_EXITING` is the process word; the request table is not a list of
-        // every pid that has ever exited.
-        if proc_is_exiting(process, target) {
-            return Ok(Submit::Dead);
-        }
-        let queues = tables.requests.entry((slot_of, target)).or_default();
-        let pending = Pending { id, from, op };
-        match priority {
-            Some(priority) => queues.pending_sys[sys_index(priority)].push_back(pending),
-            None => queues.plain.push_back(pending),
-        }
-        if let Some(kind) = wait {
-            process.set_pending_signal_waiter(Some(Waiter {
-                id,
-                kind,
-                save: process.inbox.len(),
-            }));
-        }
-        if !note_request(process, target) || proc_is_exiting(process, target) {
-            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
-                match priority {
-                    Some(priority) => {
-                        queues.pending_sys[sys_index(priority)].retain(|pending| pending.id != id);
-                        queues.sys[sys_index(priority)].retain(|pending| pending.id != id);
-                    }
-                    None => queues.plain.retain(|pending| pending.id != id),
-                }
-            }
-            if process
-                .pending_signal_waiter()
-                .is_some_and(|waiter| waiter.id == id)
-            {
-                process.set_pending_signal_waiter(None);
-            }
-            return Ok(Submit::Dead);
-        }
-    }
-    let sent = match priority {
-        Some(priority) => ctx.signal_sys_task(target, Signal::UnlinkAck(id), priority),
-        None => ctx.signal(target, Signal::UnlinkAck(id)),
     };
-    match sent {
-        Ok(()) => {
-            // Port of erts/emulator/beam/erl_proc_sig_queue.c:3012, 3062, 3183, 3423
-            // (erts_proc_sig_send_group_leader, _is_alive_request, _process_info_request,
-            // _rpc_request_prio), OTP-29.1.1: these senders elevate the receiver's signal
-            // handling priority to their own.
-            if elevates && priority.is_none() {
-                elevate_sig_handling_prio(process, ctx, slot_of, target)?;
-            }
-            Ok(Submit::Sent(id))
-        }
-        Err(arinsal_sched::Error::NoProcess) => {
-            let mut tables = tables().lock().unwrap();
-            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
-                queues.plain.retain(|pending| pending.id != id);
-                for queue in &mut queues.sys {
-                    queue.retain(|pending| pending.id != id);
-                }
-                for queue in &mut queues.pending_sys {
-                    queue.retain(|pending| pending.id != id);
-                }
-            }
-            if process
-                .pending_signal_waiter()
-                .is_some_and(|waiter| waiter.id == id)
-            {
-                process.set_pending_signal_waiter(None);
-            }
-            Ok(Submit::Dead)
-        }
+    match ctx.signal_sys_task(
+        target,
+        sys_task_signal(sys_index(priority), Some(task)),
+        priority,
+    ) {
+        Ok(()) => Ok(Submit::Sent),
+        Err(arinsal_sched::Error::NoProcess) => Ok(Submit::Dead),
         Err(error) => Err(VmError::Unsupported(format!("request signal: {error}"))),
     }
 }
@@ -4188,7 +3943,6 @@ fn submit_from(
 fn elevate_sig_handling_prio(
     process: &Process,
     ctx: &mut RunCtx<'_, Message>,
-    slot_of: usize,
     target: Pid,
 ) -> Result<(), VmError> {
     let min_prio = crate::natives::proc::user_priority(process);
@@ -4197,39 +3951,17 @@ fn elevate_sig_handling_prio(
         _ => return Ok(()),
     }
     let id = process.next_ref();
-    {
-        let mut tables = tables().lock().unwrap();
-        if proc_is_exiting(process, target) {
-            return Ok(());
-        }
-        tables
-            .requests
-            .entry((slot_of, target))
-            .or_default()
-            .pending_sys[sys_index(min_prio)]
-        .push_back(Pending {
-            id,
-            from: ctx.pid(),
-            op: RemoteOp::PrioSig,
-        });
-        if !note_request(process, target) || proc_is_exiting(process, target) {
-            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
-                queues.pending_sys[sys_index(min_prio)].retain(|pending| pending.id != id);
-                queues.sys[sys_index(min_prio)].retain(|pending| pending.id != id);
-            }
-            return Ok(());
-        }
-    }
-    match ctx.signal_sys_task(target, Signal::UnlinkAck(id), min_prio) {
-        Ok(()) => Ok(()),
-        Err(arinsal_sched::Error::NoProcess) => {
-            let mut tables = tables().lock().unwrap();
-            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
-                queues.pending_sys[sys_index(min_prio)].retain(|pending| pending.id != id);
-                queues.sys[sys_index(min_prio)].retain(|pending| pending.id != id);
-            }
-            Ok(())
-        }
+    let task = Pending {
+        id,
+        from: ctx.pid(),
+        op: RemoteOp::PrioSig,
+    };
+    match ctx.signal_sys_task(
+        target,
+        sys_task_signal(sys_index(min_prio), Some(task)),
+        min_prio,
+    ) {
+        Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
         Err(error) => Err(VmError::Unsupported(format!(
             "signal priority task: {error}"
         ))),
@@ -4245,63 +3977,56 @@ pub(crate) fn elevate_for_signal_request(
     ctx: &mut RunCtx<'_, Message>,
     target: Pid,
 ) -> Result<(), VmError> {
-    elevate_sig_handling_prio(process, ctx, scope(process), target)
+    elevate_sig_handling_prio(process, ctx, target)
 }
 
-/// Run the request whose wakeup is `id`, if it is still queued for this process.
-pub(crate) fn handle_request(
+/// Handle a system task signal: queue the task on the process' own queues, then run what
+/// can run now.
+// Port of erts/emulator/beam/erl_process.c:11518 (sched_sig_sys_task: the task enters the
+// process' system task queues when its ordered signal is consumed), OTP-29.1.1.
+pub(crate) fn handle_sys_task(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    id: u64,
+    payload: &arinsal_sched::SharedPayload,
 ) -> Result<(), VmError> {
-    let pending = {
-        let mut tables = tables().lock().unwrap();
-        let Some(queues) = tables.requests.get_mut(&(scope(process), ctx.pid())) else {
-            return Ok(());
-        };
-        // Port of erts/emulator/beam/erl_process.c:11518 (`sched_sig_sys_task`), OTP-29.1.1:
-        // the request enters the system-task queue only when its ordered signal is consumed.
-        queues.handle_sys_wakeup(id);
-        // A wakeup for a system task only makes it eligible; erts runs queued system tasks
-        // after the complete incoming-signal batch has been handled. Plain requests run here.
-        let plain = queues
-            .plain
-            .iter()
-            .position(|pending| pending.id == id)
-            .and_then(|index| queues.plain.remove(index));
-        // Port of erts/emulator/beam/erl_process.c:10368 (erts_schedule runs
-        // execute_sys_tasks only while the process is scheduled in and not executing),
-        // OTP-29.1.1: a system task woken in the middle of a BIF, a receive or native code
-        // waits for the next scheduling point. check_process_code in particular must see the
-        // process' continuation, which a half-done native call keeps outside its stack.
-        let at_point = process
-            .cold
-            .as_ref()
-            .is_some_and(|cold| cold.sys_task_point);
-        let dirty_cpc = if plain.is_none() && !at_point {
-            if queues.sys.iter().any(|queue| !queue.is_empty()) {
-                process.slice_mut().sys_tasks_deferred = true;
-            }
-            // Port of erts/emulator/beam/erl_process.c:11255 (dispatch_system_task),
-            // OTP-29.1.1: check_process_code of a process executing dirty is run by the dirty
-            // signal handler on its behalf; the other tasks wait for the process.
-            if !ctx.dirty_running() {
-                return Ok(());
-            }
-            let Some(pending) = queues.take_check_process_code() else {
-                return Ok(());
-            };
-            Some(pending)
-        } else {
-            None
-        };
-        let Some(pending) = plain.or(dirty_cpc) else {
-            return Ok(());
-        };
-        if queues.is_empty() {
-            tables.requests.remove(&(scope(process), ctx.pid()));
-        }
-        pending
+    let signal = payload
+        .0
+        .downcast_ref::<SysTaskSignal>()
+        .expect("system task signal carries its task");
+    if let Some(task) = signal.task.lock().unwrap().take() {
+        process.cold_mut().sys_tasks.sys[signal.index].push_back(task);
+    }
+    // Port of erts/emulator/beam/erl_process.c:10368 (erts_schedule runs
+    // execute_sys_tasks only while the process is scheduled in and not executing),
+    // OTP-29.1.1: a system task woken in the middle of a BIF, a receive or native code
+    // waits for the next scheduling point. check_process_code in particular must see the
+    // process' continuation, which a half-done native call keeps outside its stack.
+    let at_point = process
+        .cold
+        .as_ref()
+        .is_some_and(|cold| cold.sys_task_point);
+    if at_point {
+        return Ok(());
+    }
+    if process
+        .cold
+        .as_ref()
+        .is_some_and(|cold| !cold.sys_tasks.is_empty())
+    {
+        process.slice_mut().sys_tasks_deferred = true;
+    }
+    // Port of erts/emulator/beam/erl_process.c:11255 (dispatch_system_task),
+    // OTP-29.1.1: check_process_code of a process executing dirty is run by the dirty
+    // signal handler on its behalf; the other tasks wait for the process.
+    if !ctx.dirty_running() {
+        return Ok(());
+    }
+    let Some(pending) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.sys_tasks.take_check_process_code())
+    else {
+        return Ok(());
     };
     run_request(process, ctx, pending)?;
     clear_sys_task_priority_if_idle(process, ctx);
@@ -4366,20 +4091,10 @@ pub(crate) fn execute_sys_tasks(
 ) -> Result<(), VmError> {
     process.slice_mut().sys_tasks_deferred = false;
     loop {
-        let pending = {
-            let mut tables = tables().lock().unwrap();
-            let slot = (scope(process), ctx.pid());
-            let (pending, empty) = if let Some(queues) = tables.requests.get_mut(&slot) {
-                let pending = queues.fetch_sys_task();
-                (pending, queues.is_empty())
-            } else {
-                (None, false)
-            };
-            if empty {
-                tables.requests.remove(&slot);
-            }
-            pending
-        };
+        let pending = process
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.sys_tasks.fetch_sys_task());
         let Some(pending) = pending else {
             clear_sys_task_priority_if_idle(process, ctx);
             return Ok(());
@@ -4389,16 +4104,11 @@ pub(crate) fn execute_sys_tasks(
 }
 
 fn clear_sys_task_priority_if_idle(process: &Process, ctx: &RunCtx<'_, Message>) {
-    let pending = tables()
-        .lock()
-        .unwrap()
-        .requests
-        .get(&(scope(process), ctx.pid()))
-        .is_some_and(|queues| {
-            queues.sys.iter().any(|queue| !queue.is_empty())
-                || queues.pending_sys.iter().any(|queue| !queue.is_empty())
-        });
-    if !pending {
+    if process
+        .cold
+        .as_ref()
+        .is_none_or(|cold| cold.sys_tasks.is_empty())
+    {
         ctx.clear_sys_task_priority();
     }
 }
@@ -4421,26 +4131,25 @@ fn wake_for_deferred_sys_tasks(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<(), VmError> {
-    let priority = {
-        let tables = tables().lock().unwrap();
-        let Some(queues) = tables.requests.get(&(scope(process), ctx.pid())) else {
-            process.slice_mut().sys_tasks_deferred = false;
-            return Ok(());
-        };
-        let Some(index) = queues.sys.iter().position(|queue| !queue.is_empty()) else {
-            process.slice_mut().sys_tasks_deferred = false;
-            return Ok(());
-        };
-        [
-            Priority::Max,
-            Priority::High,
-            Priority::Normal,
-            Priority::Low,
-        ][index]
+    let Some(index) = process.cold.as_ref().and_then(|cold| {
+        cold.sys_tasks
+            .sys
+            .iter()
+            .position(|queue| !queue.is_empty())
+    }) else {
+        process.slice_mut().sys_tasks_deferred = false;
+        return Ok(());
     };
-    // No plain request has this id: the wakeup fetches the next system task.
-    ctx.signal_sys_task(ctx.pid(), Signal::UnlinkAck(u64::MAX), priority)
-        .map_err(|error| VmError::Unsupported(format!("system task wakeup: {error}")))
+    let priority = [
+        Priority::Max,
+        Priority::High,
+        Priority::Normal,
+        Priority::Low,
+    ][index];
+    // Port of erts/emulator/beam/erl_process.c:7028 (ERTS_PSFLG_ACTIVE_SYS): the process stays
+    // active at the task's priority until `execute_sys_tasks` has run the queues.
+    ctx.set_active_sys(priority);
+    Ok(())
 }
 
 /// Run a queued request and send its reply.
@@ -4476,36 +4185,76 @@ pub(crate) fn reply_request(
     }
 }
 
+/// `{Ref, undefined}` to the requester of a `process_info` signal the exiting target never ran.
+pub(crate) fn reply_request_failure(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    requester: Pid,
+    id: u64,
+) -> Result<(), VmError> {
+    reply_failure(process, ctx, requester, id, RemoteOp::Info { items: None })
+}
+
+/// The failure reply of request `op` to the requester of a signal the exiting target never ran.
+pub(crate) fn reply_failure(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    requester: Pid,
+    id: u64,
+    op: RemoteOp,
+) -> Result<(), VmError> {
+    let reply =
+        crate::natives::proc::failure_reply(process, id, op).and_then(Message::copy_from)?;
+    match ctx.send(requester, reply) {
+        Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
+        Err(error) => Err(VmError::Unsupported(format!("request reply: {error}"))),
+    }
+}
+
+/// The failure reply of a system task signal that reached the exiting target.
+pub(crate) fn sys_task_signal_failed(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    payload: &arinsal_sched::SharedPayload,
+) {
+    let Some(signal) = payload.0.downcast_ref::<SysTaskSignal>() else {
+        return;
+    };
+    let Some(task) = signal.task.lock().unwrap().take() else {
+        return;
+    };
+    if matches!(task.op, RemoteOp::PrioSig) {
+        return;
+    }
+    let Ok(reply) = crate::natives::proc::failure_reply(process, task.id, task.op) else {
+        return;
+    };
+    let Ok(message) = Message::copy_from(reply) else {
+        return;
+    };
+    let _ = ctx.send(task.from, message);
+}
+
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
 pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
     crate::natives::sys::release_multi_scheduling_blocks(process, ctx.pid());
-    process.set_pending_signal_waiter(None);
     // OTP destroys the trapped BIF state together with the exiting process.
     // Persistent get/0's snapshot retains a table generation and its literals.
     if let Some(cold) = process.cold.as_mut() {
         cold.persistent_get_all = None;
         cold.persistent_update_result = None;
     }
-    let slot = (scope(process), ctx.pid());
-    // Port of erl_nif.c:2323 (`ERTS_PSFLG_EXITING` on the process). The request table is
-    // taken only when this process was given a remote request (erl_proc_sig_queue.c).
+    // Port of erl_nif.c:2323 (`ERTS_PSFLG_EXITING` on the process).
     let _ =
         arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::EXITING);
-    let pending = if ctx.exit_flags().load(std::sync::atomic::Ordering::Acquire)
-        & arinsal_sched::proc_flags::REQUESTS
-        == 0
-    {
-        VecDeque::new()
-    } else {
-        let mut tables = tables().lock().unwrap();
-        let queues = tables.requests.remove(&slot).unwrap_or_default();
-        let mut all = queues.plain;
-        for queue in queues.sys.into_iter().chain(queues.pending_sys) {
-            all.extend(queue);
+    // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1: the
+    // queued tasks of the exiting process get their failure reply.
+    let mut pending = VecDeque::new();
+    if let Some(cold) = process.cold.as_mut() {
+        for queue in std::mem::take(&mut cold.sys_tasks).sys {
+            pending.extend(queue);
         }
-        all
-    };
-    let mut pending = pending;
+    }
     {
         for task in process.take_delayed_gc() {
             match task {
@@ -4749,9 +4498,7 @@ fn is_process_alive(
     ctx: &mut RunCtx<'_, Message>,
     pid: Term,
 ) -> Result<Term, VmError> {
-    if let Some(done) = poll(process)? {
-        return Ok(done);
-    }
+    let pid_term = pid;
     let pid = Pid::from_term(pid).ok_or_else(|| badarg("is_process_alive/1"))?;
     if pid == ctx.pid() {
         return Ok(atom("true"));
@@ -4759,15 +4506,37 @@ fn is_process_alive(
     if !runtime(process)?.scheduler()?.lookup(pid) {
         return Ok(atom("false"));
     }
-    if let Some(result) = alive_fast(
-        process,
-        pid.to_term().ok_or_else(|| badarg("is_process_alive/1"))?,
-    ) {
+    if let Some(result) = alive_fast(process, pid_term) {
         return Ok(Term::atom(result));
     }
-    match submit(process, ctx, pid, RemoteOp::Alive, Some(WaitKind::Alive))? {
-        Submit::Sent(_) => Err(await_reply()),
-        Submit::Dead => Ok(atom("false")),
+    // Port of erts/emulator/beam/erl_bif_info.c:4090 (BIF_TRAP1(is_process_alive_trap)):
+    // erts_internal:is_process_alive/1 sends the request and receives `{Ref, Res}`.
+    Err(VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        "erts_internal:is_process_alive/1",
+        vec![pid_term],
+    )))
+}
+
+/// The target's answer to an `ERTS_SIG_Q_OP_IS_ALIVE` signal: `{Ref, Alive}` as an ordinary
+/// message to the requester.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:3625 (is_alive_response), OTP-29.1.1.
+pub(crate) fn alive_response(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    requester: Pid,
+    id: u64,
+    alive: bool,
+) -> Result<(), VmError> {
+    let reference = reference(process, id)?;
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let tuple = TermBuilder::new(&mut heap)
+        .tuple(&[reference, atom(if alive { "true" } else { "false" })])
+        .map_err(|_| system_limit())?;
+    let message = Message::copy_from(tuple)?;
+    match ctx.send(requester, message) {
+        Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
+        Err(error) => Err(VmError::Unsupported(format!("alive reply: {error}"))),
     }
 }
 
@@ -4846,7 +4615,7 @@ fn link_opt(
         Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
         Err(_) => return Err(badarg("link")),
     }
-    wake_for_procs_trace(process, ctx, pid);
+    wake_for_procs_trace(process, pid);
     Ok(atom("true"))
 }
 
@@ -4897,9 +4666,12 @@ fn link_noproc_term(process: &mut Process, target: Term, priority: bool) -> Resu
 /// Link and unlink signals are applied lazily, but erts handles them on arrival, which is when a
 /// `procs` trace reports getting_linked/getting_unlinked: wake a receiver that is traced for it.
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:8578-8589 (getting_unlinked/getting_linked), OTP-29.1.1.
-fn wake_for_procs_trace(process: &Process, ctx: &mut RunCtx<'_, Message>, target: Pid) {
-    if crate::trace::flags(process, target) & crate::trace::PROCS != 0 {
-        let _ = ctx.signal(target, Signal::UnlinkAck(u64::MAX));
+fn wake_for_procs_trace(process: &Process, target: Pid) {
+    if crate::trace::flags(process, target) & crate::trace::PROCS != 0
+        && let Some(runtime) = process.runtime.as_ref()
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        let _ = scheduler.wake(target);
     }
 }
 
@@ -4978,9 +4750,14 @@ fn is_process_alive_2(
 ) -> Result<Term, VmError> {
     let pid = Pid::from_term(pid).ok_or_else(|| badarg("is_process_alive/2"))?;
     let id = ref_id(reference).ok_or_else(|| badarg("is_process_alive/2"))?;
-    match submit_id(process, ctx, pid, id, RemoteOp::Alive, None)? {
-        Submit::Sent(_) => Ok(atom("ok")),
-        Submit::Dead => {
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3027 (erts_proc_sig_send_is_alive_request):
+    // queue the signal; a target that is gone is answered here, on the requester itself.
+    match ctx.signal(pid, Signal::IsAlive(id)) {
+        Ok(()) => {
+            elevate_sig_handling_prio(process, ctx, pid)?;
+            Ok(atom("ok"))
+        }
+        Err(arinsal_sched::Error::NoProcess) => {
             // Port of erl_proc_sig_queue.c:3065-3070: reply `{Ref, false}` to self.
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let reply = TermBuilder::new(&mut heap)
@@ -4989,6 +4766,7 @@ fn is_process_alive_2(
             process.inbox.push_back(reply);
             Ok(atom("ok"))
         }
+        Err(error) => Err(VmError::Unsupported(format!("alive request: {error}"))),
     }
 }
 

@@ -541,19 +541,62 @@ impl Process {
                 self.trace_new_message(ctx, queued, from);
                 8
             }
-            arinsal_sched::Signal::UnlinkAck(id) => {
+            arinsal_sched::Signal::ProcessInfo(request) => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6794
-                // (ERTS_SIG_Q_OP_PROCESS_INFO), OTP-29.1.1.
-                // The scheduler signal enum has no request op; a nonzero
-                // unlink-ack id is the wakeup for a queued request.
-                // handle_process_info (erl_proc_sig_queue.c:5312) costs at least 8.
-                if id != 0 {
-                    crate::signals::handle_request(self, ctx, id)?;
-                    8
-                } else {
-                    0
-                }
+                // (ERTS_SIG_Q_OP_PROCESS_INFO, handle_process_info at :5312, which costs at
+                // least 8), OTP-29.1.1.
+                let arinsal_sched::ProcessInfoRequest { id, items } = *request;
+                crate::signals::reply_request(
+                    self,
+                    ctx,
+                    crate::signals::Pending {
+                        id,
+                        from,
+                        op: crate::signals::RemoteOp::Info { items },
+                    },
+                )?;
+                8
             }
+            arinsal_sched::Signal::GroupLeader(request) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_GROUP_LEADER:
+                // erts_set_group_leader, then `{Ref, true | badarg}` to the sender), OTP-29.1.1.
+                let arinsal_sched::GroupLeaderRequest { id, leader } = *request;
+                crate::signals::reply_request(
+                    self,
+                    ctx,
+                    crate::signals::Pending {
+                        id,
+                        from,
+                        op: crate::signals::RemoteOp::GroupLeader { leader },
+                    },
+                )?;
+                1
+            }
+            arinsal_sched::Signal::Rpc(request) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_RPC,
+                // handle_rpc), OTP-29.1.1.
+                let arinsal_sched::RpcRequest { id, op } = *request;
+                let op = match op {
+                    arinsal_sched::RpcOp::SaveCalls(value) => {
+                        crate::signals::RemoteOp::SaveCalls { value }
+                    }
+                    arinsal_sched::RpcOp::Display => crate::signals::RemoteOp::Display,
+                };
+                crate::signals::reply_request(self, ctx, crate::signals::Pending { id, from, op })?;
+                1
+            }
+            arinsal_sched::Signal::IsAlive(id) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:6787 (ERTS_SIG_Q_OP_IS_ALIVE)
+                // and is_alive_response (:3625), OTP-29.1.1.
+                crate::signals::alive_response(self, ctx, from, id, true)?;
+                1
+            }
+            arinsal_sched::Signal::SysTask(task) => {
+                // Port of erts/emulator/beam/erl_process.c:11518 (sched_sig_sys_task), OTP-29.1.1.
+                crate::signals::handle_sys_task(self, ctx, &task)?;
+                8
+            }
+            arinsal_sched::Signal::UnlinkAck(_) => 0,
             arinsal_sched::Signal::UnlinkAckSignal(id) => self.handle_unlink_ack_signal(from, id),
             // Port of erl_proc_sig_queue.c:6879 (ERTS_SIG_Q_OP_DIST_SPAWN_REPLY): the handler
             // counts the signal itself, so the caller's `cnt++` is taken back.

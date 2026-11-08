@@ -268,6 +268,13 @@ impl Vm {
             })?);
         }
         let module_id = self.load_named(module)?;
+        // Port of erts/emulator/beam/erl_init.c:508 (load_preloaded), OTP-29.1.1:
+        // erts_internal is preloaded, so the `erts_internal:await_result/1` trap of every
+        // request BIF finds it loaded. A bare VM loads modules on first call; that load needs
+        // the staging permission a running purge holds, and the trapping caller would wait for it.
+        if module != "erl_init" {
+            let _ = self.load_named("erts_internal");
+        }
         let ip = self.code.modules[module_id]
             .export(function, args.len() as u8)
             .ok_or_else(|| {

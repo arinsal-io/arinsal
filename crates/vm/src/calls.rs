@@ -543,10 +543,6 @@ impl Vm {
         args: &[Term],
         result: &Result<Term, VmError>,
     ) {
-        if matches!(result, Err(VmError::Unsupported(message)) if signals::is_await_message(message))
-        {
-            return;
-        }
         let outcome = match result {
             Ok(value) => Ok(*value),
             Err(VmError::Trap(trap)) => {

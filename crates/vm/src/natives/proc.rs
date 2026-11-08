@@ -1435,18 +1435,12 @@ fn process_info_item_current_location(
 ) -> Result<Term, VmError> {
     Ok({
         let (module_name, function, arity) = resolve_mfa(vm, process)?;
-        let waiting_for_process_info = crate::signals::is_waiting_for_process_info(process);
-        let native = (!waiting_for_process_info)
-            .then(|| native_call_site(process))
-            .flatten()
-            .map(|(function, pc)| {
-                function
-                    .line_at(pc)
-                    .map(|(file, line)| (file.to_owned(), u64::from(line)))
-            });
-        let source = if waiting_for_process_info {
-            None
-        } else {
+        let native = native_call_site(process).map(|(function, pc)| {
+            function
+                .line_at(pc)
+                .map(|(file, line)| (file.to_owned(), u64::from(line)))
+        });
+        let source = {
             native.flatten().or_else(|| {
                 process.runtime.as_ref().and_then(|runtime| {
                     runtime.with_modules(|modules| {
@@ -2101,9 +2095,6 @@ fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, 
     if process.native_retry() == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
         return Ok((arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2));
     }
-    if crate::signals::is_waiting_for_process_info(process) {
-        return Ok((arinsal_term::atoms::ERLANG, intern("process_info")?, 2));
-    }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module_atom, function.function_atom, function.arity));
     }
@@ -2150,9 +2141,6 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     // A send suspended on a busy port yields to the send/2 export (bif.c:2581 SEND_YIELD).
     if process.native_retry() == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
         return Ok(("erlang".to_owned(), "send".to_owned(), 2));
-    }
-    if crate::signals::is_waiting_for_process_info(process) {
-        return Ok(("erlang".to_owned(), "process_info".to_owned(), 2));
     }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((
@@ -2673,9 +2661,6 @@ fn process_info_call(
     target: Term,
     item: Option<Term>,
 ) -> Result<Term, VmError> {
-    if let Some(done) = crate::signals::poll(process)? {
-        return Ok(done);
-    }
     let args = ProcessInfoArgs::parse(item)?;
     let readable = args.all_remote_readable();
     let pid = Pid::from_term(target).ok_or_else(badarg)?;
@@ -2722,15 +2707,27 @@ fn process_info_call(
         Some(item) => Some(Message::copy_from(item)?),
         None => None,
     };
-    match crate::signals::submit(
-        process,
-        ctx,
-        pid,
-        crate::signals::RemoteOp::Info { items },
-        Some(crate::signals::WaitKind::Info),
-    )? {
-        crate::signals::Submit::Sent(_) => Err(crate::signals::await_reply()),
-        crate::signals::Submit::Dead => Ok(atom("undefined")),
+    // Port of erts/emulator/beam/erl_bif_info.c:1491-1500 (erts_proc_sig_send_process_info_request,
+    // then ERTS_BIF_PREP_TRAP1(erts_await_result, ref)), OTP-29.1.1.
+    let id = process.next_ref();
+    let signal = arinsal_sched::Signal::ProcessInfo(Box::new(arinsal_sched::ProcessInfoRequest {
+        id,
+        items,
+    }));
+    match ctx.signal(pid, signal) {
+        Ok(()) => {
+            crate::signals::elevate_for_signal_request(process, ctx, pid)?;
+            let reference = crate::signals::reference(process, id)?;
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "erts_internal:await_result/1",
+                vec![reference],
+            )))
+        }
+        Err(arinsal_sched::Error::NoProcess) => Ok(atom("undefined")),
+        Err(error) => Err(VmError::Unsupported(format!(
+            "process_info request: {error}"
+        ))),
     }
 }
 
@@ -2902,7 +2899,6 @@ pub(crate) fn fulfill_request(
             eprintln!("process {:?}: backtrace", ctx.pid());
             make_tuple(process, &[reference, atom("true")])
         }
-        crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("true")]),
         crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
             "priority signal task has no reply".into(),
         )),
@@ -2951,7 +2947,6 @@ pub(crate) fn failure_reply(
         crate::signals::RemoteOp::SaveCalls { .. } => {
             make_tuple(process, &[reference, atom("badarg")])
         }
-        crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("false")]),
         crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
             "priority signal task has no reply".into(),
         )),
@@ -2999,9 +2994,6 @@ fn group_leader_call(
     target: Term,
     signal_ref: Option<Term>,
 ) -> Result<Term, VmError> {
-    if let Some(done) = crate::signals::poll(process)? {
-        return Ok(done);
-    }
     let internal = module == "erts_internal";
     let Some(leader) = Pid::from_term(leader) else {
         return if internal {
@@ -3033,37 +3025,31 @@ fn group_leader_call(
             Err(badarg())
         };
     }
-    // erts_internal:group_leader/2 reports the lock as busy and lets the
-    // Erlang wrapper send group_leader/3. erlang:group_leader/2 waits here.
-    if internal && signal_ref.is_none() {
+    // erts_internal:group_leader/2 reports the lock as busy and lets the Erlang wrapper
+    // send group_leader/3 and receive the reply itself.
+    let Some(reference) = signal_ref else {
         return Ok(atom("false"));
-    }
-    let wait = if signal_ref.is_some() {
-        None
-    } else {
-        Some(crate::signals::WaitKind::GroupLeader)
     };
-    let reply_id = match signal_ref {
-        Some(reference) => Some(crate::signals::ref_id(reference).ok_or_else(badarg)?),
-        None => None,
-    };
-    match crate::signals::submit_id(
-        process,
-        ctx,
-        pid,
-        reply_id.unwrap_or(0),
-        crate::signals::RemoteOp::GroupLeader { leader },
-        wait,
-    )? {
-        crate::signals::Submit::Sent(_) if signal_ref.is_some() => Ok(atom("ok")),
-        crate::signals::Submit::Sent(_) => Err(crate::signals::await_reply()),
-        crate::signals::Submit::Dead if signal_ref.is_some() => {
-            let reference = signal_ref.ok_or_else(badarg)?;
+    // Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3) and
+    // erl_proc_sig_queue.c (erts_proc_sig_send_group_leader), OTP-29.1.1.
+    let id = crate::signals::ref_id(reference).ok_or_else(badarg)?;
+    let signal = arinsal_sched::Signal::GroupLeader(Box::new(arinsal_sched::GroupLeaderRequest {
+        id,
+        leader,
+    }));
+    match ctx.signal(pid, signal) {
+        Ok(()) => {
+            crate::signals::elevate_for_signal_request(process, ctx, pid)?;
+            Ok(atom("ok"))
+        }
+        Err(arinsal_sched::Error::NoProcess) => {
             let reply = make_tuple(process, &[reference, atom("badarg")])?;
             process.inbox.push_back(reply);
             Ok(atom("ok"))
         }
-        crate::signals::Submit::Dead => Err(badarg()),
+        Err(error) => Err(VmError::Unsupported(format!(
+            "group_leader request: {error}"
+        ))),
     }
 }
 
@@ -3076,9 +3062,6 @@ fn process_display_call(
     target: Term,
     display: Term,
 ) -> Result<Term, VmError> {
-    if let Some(done) = crate::signals::poll(process)? {
-        return Ok(done);
-    }
     let internal = module == "erts_internal";
     if display != atom("backtrace") {
         return if internal {
@@ -3105,21 +3088,29 @@ fn process_display_call(
             Err(badarg())
         };
     }
-    let wait = if internal {
-        None
-    } else {
-        Some(crate::signals::WaitKind::Display)
-    };
-    match crate::signals::submit(process, ctx, pid, crate::signals::RemoteOp::Display, wait)? {
-        crate::signals::Submit::Sent(id) if internal => crate::signals::reference(process, id),
-        crate::signals::Submit::Sent(_) => Err(crate::signals::await_reply()),
-        crate::signals::Submit::Dead => {
+    // Port of erts/emulator/beam/erl_bif_info.c:4133 (erts_internal_process_display_2:
+    // erts_proc_sig_send_rpc_request returns the reference the Erlang wrapper receives on),
+    // OTP-29.1.1.
+    let id = process.next_ref();
+    let signal = arinsal_sched::Signal::Rpc(Box::new(arinsal_sched::RpcRequest {
+        id,
+        op: arinsal_sched::RpcOp::Display,
+    }));
+    match ctx.signal(pid, signal) {
+        Ok(()) => {
+            crate::signals::elevate_for_signal_request(process, ctx, pid)?;
+            crate::signals::reference(process, id)
+        }
+        Err(arinsal_sched::Error::NoProcess) => {
             if internal {
                 Ok(atom("badarg"))
             } else {
                 Err(badarg())
             }
         }
+        Err(error) => Err(VmError::Unsupported(format!(
+            "process_display request: {error}"
+        ))),
     }
 }
 
@@ -3401,29 +3392,37 @@ fn call_values(
                 }
                 Ok(previous)
             }
+            // Port of erts/emulator/beam/bif.c:2262 (erts_internal_process_flag_3): another
+            // process gets an RPC request and the caller receives `{Ref, Result}` itself.
             ("process_flag", [target, name, value]) if module == "erts_internal" => {
-                if let Some(done) = crate::signals::poll(process)? {
-                    return Ok(done);
-                }
-                let pid = Pid::from_term(*target).ok_or_else(badarg)?;
                 let name = atom_name(*name).ok_or_else(badarg)?;
+                if Pid::from_term(*target) == Some(ctx.pid()) {
+                    if name != "save_calls" {
+                        return Err(badarg());
+                    }
+                    return save_calls_flag(process, *value).map_err(VmError::Trap);
+                }
+                let Some(pid) = Pid::from_term(*target) else {
+                    return Ok(atom("badtype"));
+                };
                 if name != "save_calls" {
                     return Err(badarg());
                 }
-                if pid == ctx.pid() {
-                    save_calls_flag(process, *value).map_err(VmError::Trap)
-                } else {
-                    let value = Message::copy_from(*value)?;
-                    match crate::signals::submit(
-                        process,
-                        ctx,
-                        pid,
-                        crate::signals::RemoteOp::SaveCalls { value },
-                        Some(crate::signals::WaitKind::ProcessFlag),
-                    )? {
-                        crate::signals::Submit::Sent(_) => Err(crate::signals::await_reply()),
-                        crate::signals::Submit::Dead => Err(badarg()),
+                let value = Message::copy_from(*value)?;
+                let id = process.next_ref();
+                let signal = arinsal_sched::Signal::Rpc(Box::new(arinsal_sched::RpcRequest {
+                    id,
+                    op: arinsal_sched::RpcOp::SaveCalls(value),
+                }));
+                match ctx.signal(pid, signal) {
+                    Ok(()) => {
+                        crate::signals::elevate_for_signal_request(process, ctx, pid)?;
+                        crate::signals::reference(process, id)
                     }
+                    Err(arinsal_sched::Error::NoProcess) => Ok(atom("badtype")),
+                    Err(error) => Err(VmError::Unsupported(format!(
+                        "process_flag request: {error}"
+                    ))),
                 }
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),

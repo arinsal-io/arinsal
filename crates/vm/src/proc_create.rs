@@ -422,9 +422,6 @@ pub struct Process {
     /// The running scheduler's native sender (`c_p->scheduler_data` of erts), fetched on first
     /// use in a run and dropped when the run ends.
     pub(crate) native: Option<arinsal_sched::NativeHandle<process::Message>>,
-    /// Saved continuation data for the process's pending `erts_await_result` BIF.
-    // Port of erts/emulator/beam/erl_bif_info.c:1480-1500, OTP-29.1.1.
-    pending_signal_waiter: Option<crate::signals::Waiter>,
     /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
     /// like erts' `c_p->scheduler_data`.
     pub(crate) scheduler_id: u32,
@@ -1393,6 +1390,9 @@ pub(crate) struct ProcessCold {
     /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially
     /// long GC request there moves the process to a dirty CPU scheduler.
     pub(crate) sys_task_point: bool,
+    /// erts `p->sys_task_qs`: the system tasks whose ordered signal was handled, until
+    /// `execute_sys_tasks` runs them.
+    pub(crate) sys_tasks: crate::signals::SysTaskQueues,
     /// erts `F_DIRTY_MAJOR_GC` / `F_DIRTY_MINOR_GC`: a potentially long collection the
     /// process started itself waits for a dirty CPU scheduler.
     pub(crate) dirty_gc: Option<DirtyGc>,
@@ -1911,8 +1911,6 @@ impl Process {
     pub(crate) const SLOW_FORCE_YIELD: u32 = 1 << 2;
     /// The entry process has not run yet.
     pub(crate) const SLOW_NOT_STARTED: u32 = 1 << 3;
-    /// A cross-process BIF waits for its reply message.
-    pub(crate) const SLOW_PENDING_WAITER: u32 = 1 << 4;
     /// The middle signal queue is not empty.
     pub(crate) const SLOW_SIG_CONT: u32 = 1 << 5;
     /// No native continuation: the process runs in the interpreter.
@@ -1936,9 +1934,6 @@ impl Process {
         }
         if !self.entry_started {
             slow |= Self::SLOW_NOT_STARTED;
-        }
-        if self.pending_signal_waiter.is_some() {
-            slow |= Self::SLOW_PENDING_WAITER;
         }
         if !self.sig_cont.is_empty() {
             slow |= Self::SLOW_SIG_CONT;
@@ -2013,15 +2008,6 @@ impl Process {
     pub(crate) fn take_exit_cont(&mut self) -> Option<FixAllocBox<ExitCont>> {
         self.set_slow(Self::SLOW_EXIT_CONT, false);
         self.exit_cont.take()
-    }
-    #[inline(always)]
-    pub(crate) fn pending_signal_waiter(&self) -> Option<crate::signals::Waiter> {
-        self.pending_signal_waiter
-    }
-    #[inline(always)]
-    pub(crate) fn set_pending_signal_waiter(&mut self, waiter: Option<crate::signals::Waiter>) {
-        self.set_slow(Self::SLOW_PENDING_WAITER, waiter.is_some());
-        self.pending_signal_waiter = waiter;
     }
     #[inline(always)]
     pub(crate) fn native_retry(&self) -> Option<usize> {
@@ -2333,7 +2319,6 @@ impl Process {
             self_pid: None,
             on_managed: false,
             native: None,
-            pending_signal_waiter: None,
             scheduler_id: 0,
             scheduler_ref_state: None,
             run_key: 0,
@@ -3228,10 +3213,6 @@ mod layout_report {
         eprintln!("  Process.runtime {}", size_of_val(&process.runtime));
         eprintln!("  Process.self_pid {}", size_of_val(&process.self_pid));
         eprintln!(
-            "  Process.pending_signal_waiter {}",
-            size_of_val(&process.pending_signal_waiter)
-        );
-        eprintln!(
             "  Process.scheduler_id {}",
             size_of_val(&process.scheduler_id)
         );
@@ -3400,10 +3381,6 @@ mod layout_report {
         field!(
             "native_dirty_nif",
             Option<(usize, usize, arinsal_bifs::SchedulerClass)>
-        );
-        eprintln!(
-            "Option<Waiter> {}",
-            size_of::<Option<crate::signals::Waiter>>()
         );
         eprintln!(
             "Option<SchedulerRefState> {}",

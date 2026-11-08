@@ -2437,7 +2437,7 @@ impl arinsal_drv::PortHost for DrvHost {
         for pid in pids {
             let pid = Pid::from_data(pid);
             if runtime.resume_internal(pid) {
-                let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::UnlinkAck(u64::MAX));
+                let _ = scheduler.wake(pid);
             }
         }
     }
@@ -3211,8 +3211,8 @@ fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
         // A busy-port sender owns one internal suspend until the port falls below its low
         // watermark. The port task releases it before making the retried send runnable.
         let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::SuspendResume);
-        // UnlinkAck wakes a waiting process without entering its mailbox.
-        let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::UnlinkAck(0));
+        // Wakes a waiting process without entering its mailbox.
+        let _ = scheduler.wake(pid);
     }
 }
 

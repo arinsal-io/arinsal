@@ -146,6 +146,37 @@ impl Process {
                         let _ = ctx.signal(from, Signal::ExitLinked(Box::new(reason)));
                     }
                 }
+                // Port of erl_proc_sig_queue.c:7400 (erts_proc_exit_handle_signal,
+                // ERTS_SIG_Q_OP_IS_ALIVE): an exiting process answers `false`.
+                // Port of erl_proc_sig_queue.c:7400 area (process_info request of an exiting
+                // process): the requester gets `undefined`.
+                Payload::Signal(Signal::ProcessInfo(request)) => {
+                    let _ = crate::signals::reply_request_failure(self, ctx, from, request.id);
+                }
+                Payload::Signal(Signal::GroupLeader(request)) => {
+                    let _ = crate::signals::reply_failure(
+                        self,
+                        ctx,
+                        from,
+                        request.id,
+                        crate::signals::RemoteOp::GroupLeader { leader: from },
+                    );
+                }
+                Payload::Signal(Signal::Rpc(request)) => {
+                    let op = match request.op {
+                        arinsal_sched::RpcOp::SaveCalls(value) => {
+                            crate::signals::RemoteOp::SaveCalls { value }
+                        }
+                        arinsal_sched::RpcOp::Display => crate::signals::RemoteOp::Display,
+                    };
+                    let _ = crate::signals::reply_failure(self, ctx, from, request.id, op);
+                }
+                Payload::Signal(Signal::SysTask(task)) => {
+                    crate::signals::sys_task_signal_failed(self, ctx, &task);
+                }
+                Payload::Signal(Signal::IsAlive(id)) => {
+                    let _ = crate::signals::alive_response(self, ctx, from, id, false);
+                }
                 Payload::Signal(Signal::Unlink(id)) => {
                     self.links.remove(from.data());
                     let _ = ctx.signal(from, Signal::UnlinkAckSignal(id));
