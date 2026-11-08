@@ -169,6 +169,7 @@ impl Process {
         if self.dirty_exiting() {
             return None;
         }
+        self.verify_dirty_gc_roots(crate::process::switched_out_live(self), "dirty job entry");
         let cold = self.cold.as_mut()?;
         if matches!(&cold.dirty_bif, Some(DirtyBif::Job(wanted, _)) if *wanted == kind) {
             let Some(DirtyBif::Job(_, body)) = cold.dirty_bif.take() else {

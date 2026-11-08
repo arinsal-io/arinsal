@@ -295,6 +295,15 @@ impl Process {
 
     /// Process exit after its tables are released: pending signals, names, links and monitors.
     fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+        // Port of erts/emulator/beam/erl_process.c:14374-14392
+        // (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS), OTP-29.1.1. Keep the literal area alive
+        // through system task replies while the reason or a dirty-running process can access it.
+        if (!reason.is_immed() || ctx.dirty_running())
+            && self.slice().is_none_or(|work| work.rla_block.is_none())
+        {
+            let block = self.persistent_terms.block_release();
+            self.slice_mut().rla_block = Some(block);
+        }
         // delete_all_trace_refs (erl_trace.c:3774) is a no-op when first_ref is NULL.
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0 {
             crate::trace::clear(self, ctx.pid());
