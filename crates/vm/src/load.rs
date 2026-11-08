@@ -668,6 +668,12 @@ impl CodeTables {
         Arc::clone(self.funs.entry(key).or_insert(candidate))
     }
 
+    /// Finds a canonical fun entry without making the copy-on-write table mutable.
+    // Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
+    pub(crate) fn find_fun_entry(&self, candidate: &FunEntry) -> Option<Arc<FunEntry>> {
+        self.funs.get(&FunKey::from(candidate)).cloned()
+    }
+
     /// Canonicalizes the module's lambda slots through the staged global fun table.
     pub(crate) fn intern_fun_entries(&mut self, module: &mut Module) {
         for slot in &mut module.funs {
