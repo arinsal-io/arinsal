@@ -3,7 +3,7 @@
 //! Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1076-2494 and
 //! erts/emulator/beam/jit/beam_jit_bs.cpp:162-250, OTP-29.1.1.
 
-use crate::bs_construct::{BsCreateBinHelper, BsSegment, BsSegmentKind};
+use crate::bs_construct::{BsCreateBinHelpers, BsSegment, BsSegmentKind};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,30 +107,30 @@ pub(crate) fn emit_fast_bs_create_bin(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helper: BsCreateBinHelper,
+    helpers: BsCreateBinHelpers,
 ) -> Result<bool, ModuleError> {
     if let Some(plan) = private_plan(segments) {
-        emit_private(asm, fail, alloc, live, dst, segments, helper, &plan)?;
+        emit_private(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
     if APPEND_CHECKED.load(Ordering::Relaxed) != 0
         && let Some(plan) = append_plan(segments)
     {
-        emit_append(asm, fail, alloc, live, dst, segments, helper, &plan)?;
+        emit_append(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
     if let Some(plan) = fixed_plan(segments, alloc) {
-        emit_fixed(asm, fail, alloc, live, dst, segments, helper, &plan)?;
+        emit_fixed(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
     if let Some(src) = utf8_plan(segments) {
-        emit_utf8(asm, fail, alloc, live, dst, segments, helper, src)?;
+        emit_utf8(asm, fail, alloc, live, dst, segments, helpers, src)?;
         return Ok(true);
     }
     if APPEND_BINARY.load(Ordering::Relaxed) != 0
         && let Some((src, extra)) = append_binary_plan(segments)
     {
-        emit_append_binary(asm, fail, alloc, live, dst, segments, helper, src, extra)?;
+        emit_append_binary(asm, fail, alloc, live, dst, segments, helpers, src, extra)?;
         return Ok(true);
     }
     Ok(false)
@@ -254,12 +254,7 @@ fn integer_bits(seg: &BsSegment) -> Option<u64> {
 }
 
 fn is_all(seg: &BsSegment) -> bool {
-    match seg.size {
-        ArgVal::Immediate(word) | ArgVal::Literal(word) if !seg.size_is_units => {
-            word & 0x3f == 0x0b
-        }
-        _ => false,
-    }
+    seg.size_is_all
 }
 
 fn x_index(src: ArgVal) -> Option<u32> {
@@ -332,7 +327,7 @@ fn emit_private(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helper: BsCreateBinHelper,
+    helpers: BsCreateBinHelpers,
     plan: &PrivatePlan,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -396,7 +391,7 @@ fn emit_private(
     let segments = segments.to_vec();
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
         asm.code.b(done)?;
         Ok(())
     }));
@@ -411,7 +406,7 @@ fn emit_append(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helper: BsCreateBinHelper,
+    helpers: BsCreateBinHelpers,
     plan: &AppendPlan,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -480,7 +475,7 @@ fn emit_append(
         asm.code.bind(failed)?;
         asm.branch_error()?;
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
         asm.code.b(done)?;
         Ok(())
     }));
@@ -495,7 +490,7 @@ fn emit_fixed(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helper: BsCreateBinHelper,
+    helpers: BsCreateBinHelpers,
     plan: &FixedPlan,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -552,7 +547,7 @@ fn emit_fixed(
     let stub = gc_stub;
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
         asm.code.b(done)?;
         if let Some(stub) = stub {
             asm.code.bind(stub)?;
@@ -571,7 +566,7 @@ fn emit_utf8(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helper: BsCreateBinHelper,
+    helpers: BsCreateBinHelpers,
     src: ArgVal,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -694,7 +689,7 @@ fn emit_utf8(
     let segments = segments.to_vec();
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
         asm.code.b(done)?;
         asm.code.bind(shared)?;
         emit_construct_utf8_shared(asm)
@@ -813,7 +808,7 @@ fn emit_append_binary(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helper: BsCreateBinHelper,
+    helpers: BsCreateBinHelpers,
     src: u32,
     extra: u32,
 ) -> Result<(), ModuleError> {
@@ -840,7 +835,7 @@ fn emit_append_binary(
     let segments = segments.to_vec();
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helper)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
         asm.code.b(done)?;
         Ok(())
     }));

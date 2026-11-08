@@ -2143,7 +2143,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
         crate::native_helpers::arinsal_beamasm_bs_match_command
     }
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelper {
+    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers {
         arinsal_beamasm::bs_construct::install_bs_append_binary(
             crate::erl_bits::append_binary as *const () as usize,
         );
@@ -2154,7 +2154,25 @@ impl ModuleEnv for VmModuleEnv<'_> {
         arinsal_beamasm::bs_construct::install_bs_private_append(
             crate::native_helpers::arinsal_beamasm_bs_private_append_checked as *const () as usize,
         );
-        crate::native_helpers::arinsal_beamasm_bs_create_bin
+        use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
+        BsCreateBinHelpers {
+            append_checked: crate::native_helpers::bs_construct_raw::append_checked,
+            private_append: crate::native_helpers::bs_construct_raw::private_append,
+            init_bits: crate::native_helpers::bs_construct_raw::init_bits,
+            bit_size: crate::native_helpers::bs_construct_raw::bit_size,
+            utf8_size: crate::native_helpers::bs_construct_raw::utf8_size,
+            utf16_size: crate::native_helpers::bs_construct_raw::utf16_size,
+            utf32_size: crate::native_helpers::bs_construct_raw::utf32_size,
+            fail: crate::native_helpers::bs_construct_raw::fail,
+            put_integer: crate::native_helpers::bs_construct_raw::put_integer,
+            put_binary: crate::native_helpers::bs_construct_raw::put_binary,
+            put_binary_all: crate::native_helpers::bs_construct_raw::put_binary_all,
+            put_float: crate::native_helpers::bs_construct_raw::put_float,
+            put_utf8: crate::native_helpers::bs_construct_raw::put_utf8,
+            put_utf16: crate::native_helpers::bs_construct_raw::put_utf16,
+            put_utf32: crate::native_helpers::bs_construct_raw::put_utf32,
+            put_string: crate::native_helpers::bs_construct_raw::put_string,
+        }
     }
     fn binary_literal(&self, bytes: &[u8]) -> Result<u64, String> {
         let mut heap = self.literal_heap.borrow_mut();

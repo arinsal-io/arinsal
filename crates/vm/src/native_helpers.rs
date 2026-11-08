@@ -1,5 +1,8 @@
 //! Runtime helper bodies called by BeamAsm generated code.
 
+#[path = "native_helpers/bs_construct_raw.rs"]
+pub(crate) mod bs_construct_raw;
+
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::MatchOps;
 use arinsal_term::{HeapAlloc, PreparedWritableAppend, Term, TermBuilder};
@@ -407,68 +410,6 @@ fn match_strings() -> &'static std::sync::RwLock<Vec<std::sync::Arc<[u8]>>> {
     static STRINGS: std::sync::OnceLock<std::sync::RwLock<Vec<std::sync::Arc<[u8]>>>> =
         std::sync::OnceLock::new();
     STRINGS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
-}
-
-// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1442-1600 and 2387-2400, OTP-29.1.1.
-fn parse_bs_create_bin_segments<'a>(
-    process: &crate::Process,
-    count: usize,
-    base_slot: usize,
-    all: Term,
-    strings: Option<&'a [std::sync::Arc<[u8]>]>,
-) -> Option<smallvec::SmallVec<[arinsal_bits::Segment<'a>; 4]>> {
-    use arinsal_bits::{SegFlags, SegSize, SegType, Segment, SegmentValue};
-
-    let mut segments = smallvec::SmallVec::with_capacity(count);
-    for index in 0..count {
-        let base = base_slot + index * 7;
-        let small = |offset: usize| {
-            process.x[base + offset]
-                .as_small()
-                .and_then(|n| u64::try_from(n).ok())
-        };
-        let ty = match small(0)? {
-            0 => SegType::Integer,
-            1 => SegType::Float,
-            2 => SegType::Binary,
-            3 => SegType::Append,
-            4 => SegType::PrivateAppend,
-            5 => SegType::Utf8,
-            6 => SegType::Utf16,
-            7 => SegType::Utf32,
-            8 => SegType::String,
-            _ => return None,
-        };
-        let source = process.x[base + 5];
-        let value = if ty == SegType::String {
-            let string = usize::try_from(source.as_small()?).ok()?;
-            SegmentValue::String(strings?.get(string)?.as_ref())
-        } else {
-            SegmentValue::Term(source)
-        };
-        let flags = small(3)?;
-        let size_term = process.x[base + 6];
-        let size = if small(4)? != 0 {
-            SegSize::Units(size_term.as_small().and_then(|n| u64::try_from(n).ok())?)
-        } else if size_term == all {
-            SegSize::All
-        } else {
-            SegSize::Term(size_term)
-        };
-        segments.push(Segment {
-            ty,
-            index: usize::try_from(small(1)?).ok()?,
-            unit: u8::try_from(small(2)?).ok()?,
-            flags: SegFlags {
-                little: flags & 2 != 0,
-                signed: flags & 4 != 0,
-                native: flags & 16 != 0,
-            },
-            value,
-            size,
-        });
-    }
-    Some(segments)
 }
 
 /// Registers a string-table constant matched by `i_bs_match_string` and returns its handle.
@@ -4913,120 +4854,16 @@ pub extern "C" fn arinsal_beamasm_map_get_elements(
     1
 }
 
-/// Builds the binary of a native `bs_create_bin` from the segments the emitted code staged in
-/// the X register array (six terms per segment starting at X6), then leaves the result in X0.
-// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1442-1600 and erl_bits.c:1523, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_bs_create_bin(
-    header: *mut ProcessHeader,
-    count: u64,
-    live: u64,
-    alloc: u64,
-) -> u64 {
-    use arinsal_bits::{BitsError, SegSize, SegType};
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
+/// Starts `bs_create_bin` append and publishes its writable buffer to native stores.
+// Port of erts/emulator/beam/erl_bits.c:1744-1818 (`erts_bs_append_checked` error fields), OTP-29.1.1.
+fn set_bs_append_error(process: &mut crate::Process, detail: &str, reason: &str) {
+    process.heap.abi.exc.freason = match reason {
+        "system_limit" => arinsal_beamasm::exc::EXC_SYSTEM_LIMIT,
+        _ => arinsal_beamasm::exc::EXC_BADARG,
     };
-    let has_fail_label = live >> 32 != 0;
-    let (count, live, alloc) = (
-        count as usize,
-        (live & 0xffff_ffff) as usize,
-        alloc as usize,
-    );
-    let base_slot = live.max(6);
-    let root_live = base_slot + count * 7;
-    if root_live > crate::proc_create::ATTACHED_X_REGS {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    }
-    // Dead X registers below the staged segments must not become GC roots.
-    process.x[live..base_slot].fill(Term::NIL);
-    let all = crate::signals::atom("all");
-    let has_string = (0..count).any(|index| process.x[base_slot + index * 7].as_small() == Some(8));
-    let string_table = has_string.then(|| {
-        match_strings()
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-    });
-    let strings = string_table.as_deref().map(Vec::as_slice);
-    let parse = |process: &crate::Process| {
-        parse_bs_create_bin_segments(process, count, base_slot, all, strings)
-    };
-    let Some(initial) = parse(process) else {
-        crate::native_hooks::set_error(process, "badarg");
-        return 0;
-    };
-    let fragment_only_append = initial.first().is_some_and(|segment| {
-        segment.ty == SegType::PrivateAppend && matches!(segment.size, SegSize::All)
-    });
-    let mut request = match arinsal_bits::create_bin_size(&initial) {
-        Ok(_) if fragment_only_append => 0,
-        Ok(size) => size.heap_words + alloc,
-        Err(error) => {
-            let (reason, info) = crate::bits::native_error(error);
-            if has_fail_label {
-                crate::native_hooks::set_error(process, &reason);
-            } else {
-                set_native_error_info(process, &reason, info);
-            }
-            return 0;
-        }
-    };
-    let copy_reductions = match arinsal_bits::create_bin_reductions(&initial) {
-        Ok(reductions) => reductions,
-        Err(error) => {
-            let (reason, info) = crate::bits::native_error(error);
-            if has_fail_label {
-                crate::native_hooks::set_error(process, &reason);
-            } else {
-                set_native_error_info(process, &reason, info);
-            }
-            return 0;
-        }
-    };
-    drop(initial);
-    let result = loop {
-        if request != 0 && process.ensure(request, root_live).is_err() {
-            crate::native_hooks::set_error(process, "system_limit");
-            return 0;
-        }
-        let Some(segments) = parse(process) else {
-            crate::native_hooks::set_error(process, "badarg");
-            return 0;
-        };
-        match arinsal_bits::create_bin(&segments, &mut process.heap) {
-            Err(BitsError::HeapFull { need_words }) => {
-                // The builder's own need excludes the `Alloc` words the following stores use
-                // without a heap test (`extra_words` in erts), which the retry must keep.
-                request = need_words
-                    .saturating_add(alloc)
-                    .max(request.saturating_mul(2));
-            }
-            other => break other,
-        }
-    };
-    if result.is_ok() {
-        process.heap.abi.fcalls = process
-            .heap
-            .abi
-            .fcalls
-            .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32);
-    }
-    match result {
-        Ok(term) => crate::native_hooks::raw(term),
-        Err(error) => {
-            // Port of erts/emulator/beam/jit/beam_jit_common.cpp (`beam_jit_bs_construct_fail_info`), OTP-29.1.1.
-            let (reason, info) = crate::bits::native_error(error);
-            if has_fail_label {
-                crate::native_hooks::set_error(process, &reason);
-            } else {
-                set_native_error_info(process, &reason, info);
-            }
-            0
-        }
-    }
+    process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::signals::atom(detail));
 }
 
-/// Starts `bs_create_bin` append and publishes its writable buffer to native stores.
 // Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_bs_append_checked(
     process_header: &mut ProcessHeader,
@@ -5068,8 +4905,8 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                 Some(reservation) => reservation,
                 None => {
                     if process.ensure_native_roots(heap_need, live + 1).is_err() {
-                        crate::native_hooks::set_error(process, "system_limit");
-                        return u64::MAX;
+                        set_bs_append_error(process, "size", "system_limit");
+                        return 0;
                     }
                     process
                         .heap
@@ -5108,8 +4945,8 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                         .ensure_native_roots(fresh_request, live + 1)
                         .is_err()
                     {
-                        crate::native_hooks::set_error(process, "system_limit");
-                        return u64::MAX;
+                        set_bs_append_error(process, "size", "system_limit");
+                        return 0;
                     }
                     process
                         .heap
@@ -5132,13 +4969,52 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                     crate::native_hooks::raw(term)
                 }
                 Err(arinsal_term::TermError::HeapFull) => {
-                    crate::native_hooks::set_error(process, "system_limit");
-                    u64::MAX
+                    set_bs_append_error(process, "size", "system_limit");
+                    0
                 }
-                Err(_) => 0,
+                Err(error) => {
+                    let source = arinsal_term::raw::trusted_jit_register(xregs, source_index);
+                    let is_binary = source.classify() == arinsal_term::TermKind::Bitstring;
+                    let detail = if error == arinsal_term::TermError::SystemLimit {
+                        "size"
+                    } else if is_binary && unit > 1 {
+                        "unit"
+                    } else {
+                        "type"
+                    };
+                    set_bs_append_error(
+                        process,
+                        detail,
+                        if error == arinsal_term::TermError::SystemLimit {
+                            "system_limit"
+                        } else {
+                            "badarg"
+                        },
+                    );
+                    0
+                }
             }
         }
-        Err(_) => 0,
+        Err(error) => {
+            let is_binary = source.classify() == arinsal_term::TermKind::Bitstring;
+            let detail = if error == arinsal_term::TermError::SystemLimit {
+                "size"
+            } else if is_binary && unit > 1 {
+                "unit"
+            } else {
+                "type"
+            };
+            set_bs_append_error(
+                process,
+                detail,
+                if error == arinsal_term::TermError::SystemLimit {
+                    "system_limit"
+                } else {
+                    "badarg"
+                },
+            );
+            0
+        }
     }
 }
 
@@ -5191,11 +5067,16 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let base = (live as usize).max(6);
-    let root_live = base + 4;
-    // The X registers below `base` and the staged operands (the context among them) are the
-    // roots of a collection; the staged copies follow the registers in `process.x`, which is
-    // the scheduler's array.
+    let base = live as usize;
+    let Some(root_live) = base
+        .checked_add(4)
+        .filter(|&count| count <= process.x.len())
+    else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    };
+    // The live X prefix and staged operands (the context among them) form the exact GC root
+    // prefix. Registers beyond `live` are dead and may contain non-term scratch values.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_gc_test_preserve), OTP-29.1.1.
     for (index, slot) in registers.match_staging.iter().enumerate() {
         process.x[base + index] = crate::native_hooks::from_raw(*slot);

@@ -149,8 +149,26 @@ impl ModuleEnv for TestEnv {
         }
     }
 
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelper {
-        bs_create_bin_helper
+    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers {
+        use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
+        BsCreateBinHelpers {
+            append_checked: bs_create_bin_append,
+            private_append: bs_create_bin_private_append,
+            init_bits: bs_create_bin_init,
+            bit_size: bs_create_bin_size,
+            utf8_size: bs_create_bin_size,
+            utf16_size: bs_create_bin_size,
+            utf32_size: bs_create_bin_size,
+            fail: bs_create_bin_fail,
+            put_integer: bs_create_bin_put,
+            put_binary: bs_create_bin_put,
+            put_binary_all: bs_create_bin_put,
+            put_float: bs_create_bin_put,
+            put_utf8: bs_create_bin_put,
+            put_utf16: bs_create_bin_put,
+            put_utf32: bs_create_bin_put,
+            put_string: bs_create_bin_put,
+        }
     }
 
     fn exception_resolver(&self) -> arinsal_beamasm::catch::ExceptionResolver {
@@ -201,7 +219,65 @@ extern "C" fn map_update_helper(
     0
 }
 
-extern "C" fn bs_create_bin_helper(_process: *mut ProcessHeader, _a: u64, _b: u64, _c: u64) -> u64 {
+extern "C" fn bs_create_bin_init(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _bits: u64,
+    _alloc: u64,
+    _live: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_append(
+    _process: *mut arinsal_beamasm::ProcessHeader,
+    _registers: *mut arinsal_beamasm::SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+    _unit: u64,
+    _live: u64,
+    _alloc: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_private_append(
+    _process: *mut arinsal_beamasm::ProcessHeader,
+    _registers: *mut arinsal_beamasm::SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_size(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _index: u64,
+) -> u64 {
+    u64::MAX
+}
+
+extern "C" fn bs_create_bin_fail(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _packed: u64,
+    _arg3: u64,
+    _arg1: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_create_bin_put(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+    _flags: u64,
+    _index: u64,
+    _total_bits: u64,
+) -> u64 {
     0
 }
 

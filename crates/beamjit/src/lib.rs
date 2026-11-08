@@ -242,8 +242,8 @@ pub trait ModuleEnv {
     fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
         unused_bs_match_cmd
     }
-    /// Runtime hook that builds the binary of `bs_create_bin` from staged segments.
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelper;
+    /// Runtime primitives for native `bs_create_bin` allocation and segment writes.
+    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers;
     /// Register a string-table constant for `i_bs_match_string` and return its handle.
     fn match_string(&self, _bytes: &[u8]) -> Result<u64, String> {
         Err("module environment cannot register match strings".into())
@@ -3200,6 +3200,10 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 let unit = number(fields.get(2)).map_err(EmitError::Operand)?;
                 let flags = number(fields.get(3)).map_err(EmitError::Operand)?;
                 let size_is_units = matches!(fields.get(5), Some(SpecificOperand::Unsigned(_)));
+                let size_is_all = matches!(
+                    fields.get(5),
+                    Some(SpecificOperand::Atom(index)) if beamops::atom_name(*index) == Some("all")
+                );
                 let size = arg(fields.get(5), beam, env).map_err(EmitError::Operand)?;
                 if name == "string" {
                     // Port of instr_bs.cpp am_string handling: retain the module string bytes
@@ -3229,6 +3233,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                                 })?,
                         ),
                         size: ArgVal::Immediate(length as u64),
+                        size_is_all: false,
                         size_is_units: true,
                         unit: 8,
                         flags: 0,
@@ -3251,6 +3256,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     index: number(fields.get(1)).map_err(EmitError::Operand)?,
                     src: arg(fields.get(4), beam, env).map_err(EmitError::Operand)?,
                     size,
+                    size_is_all,
                     size_is_units,
                     unit,
                     flags,

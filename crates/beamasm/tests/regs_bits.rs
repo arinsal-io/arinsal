@@ -1,12 +1,13 @@
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters,
-    bs_construct::{BsCreateBinHelper, BsInitWritableHelper, BsSegment, BsSegmentKind},
+    bs_construct::{BsCreateBinHelpers, BsInitWritableHelper, BsSegment, BsSegmentKind},
     bs_match::BsMatchHelper,
     enter_native,
     float::{BigToFloat, emit_fconv},
     module::{ArgVal, BeamModuleAssembler},
 };
+use similar_asserts::assert_eq;
 use std::cell::RefCell;
 
 thread_local! {
@@ -29,9 +30,92 @@ extern "C" fn writable_hook(_process: *mut ProcessHeader, value: u64) -> u64 {
     1
 }
 
-extern "C" fn segment_hook(_process: *mut ProcessHeader, count: u64, live: u64, alloc: u64) -> u64 {
-    SEEN.with(|seen| *seen.borrow_mut() = vec![count, live, alloc]);
+extern "C" fn construct_init_hook(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    bits: u64,
+    alloc: u64,
+    live: u64,
+) -> u64 {
+    SEEN.with(|seen| *seen.borrow_mut() = vec![bits, alloc, live]);
     1
+}
+
+extern "C" fn construct_size_hook(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _index: u64,
+) -> u64 {
+    u64::MAX
+}
+
+extern "C" fn construct_put_hook(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    source: u64,
+    bits: u64,
+    flags: u64,
+    index: u64,
+    total: u64,
+) -> u64 {
+    SEEN.with(|seen| {
+        seen.borrow_mut()
+            .extend([source, bits, flags, index, total])
+    });
+    1
+}
+
+extern "C" fn construct_fail_hook(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _packed: u64,
+    _arg3: u64,
+    _arg1: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn construct_append_hook(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+    _unit: u64,
+    _live: u64,
+    _alloc: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn construct_private_append_hook(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _source: u64,
+    _bits: u64,
+) -> u64 {
+    0
+}
+
+fn construct_helpers() -> BsCreateBinHelpers {
+    BsCreateBinHelpers {
+        append_checked: construct_append_hook,
+        private_append: construct_private_append_hook,
+        init_bits: construct_init_hook,
+        bit_size: construct_size_hook,
+        utf8_size: construct_size_hook,
+        utf16_size: construct_size_hook,
+        utf32_size: construct_size_hook,
+        fail: construct_fail_hook,
+        put_integer: construct_put_hook,
+        put_binary: construct_put_hook,
+        put_binary_all: construct_put_hook,
+        put_float: construct_put_hook,
+        put_utf8: construct_put_hook,
+        put_utf16: construct_put_hook,
+        put_utf32: construct_put_hook,
+        put_string: construct_put_hook,
+    }
 }
 
 extern "C" fn float_hook(_process: *mut ProcessHeader, _value: u64) -> u64 {
@@ -101,6 +185,7 @@ fn construction_runtime_keeps_non_destination_x_registers() {
         index: 1,
         src: ArgVal::X(0),
         size: ArgVal::X(1),
+        size_is_all: false,
         size_is_units: false,
         unit: 1,
         flags: 0,
@@ -108,18 +193,11 @@ fn construction_runtime_keeps_non_destination_x_registers() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
-    asm.emit_i_bs_create_bin(
-        0,
-        3,
-        2,
-        ArgVal::X(2),
-        &[segment],
-        segment_hook as BsCreateBinHelper,
-    )
-    .unwrap();
+    asm.emit_i_bs_create_bin(0, 3, 6, ArgVal::X(2), &[segment], construct_helpers())
+        .unwrap();
     finish(&mut asm);
     let (_, regs) = execute(asm, &[0x123, 0x2f, 0xabc, 4, 5, 6]);
-    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 2, 3]));
+    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[2, 3, 6, 0x123, 2, 1 << 32, 1, 2]));
     assert_eq!(
         arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..2]),
         [0x123, 0x2f]
@@ -212,6 +290,7 @@ fn fixed_integer_construction_is_inline() {
             index: 1,
             src: ArgVal::X(0),
             size: ArgVal::Immediate(small(8)),
+            size_is_all: false,
             size_is_units: false,
             unit: 1,
             flags: 0,
@@ -221,6 +300,7 @@ fn fixed_integer_construction_is_inline() {
             index: 2,
             src: ArgVal::X(1),
             size: ArgVal::Immediate(small(16)),
+            size_is_all: false,
             size_is_units: false,
             unit: 1,
             flags: 0,
@@ -230,6 +310,7 @@ fn fixed_integer_construction_is_inline() {
             index: 3,
             src: ArgVal::X(2),
             size: ArgVal::Immediate(small(32)),
+            size_is_all: false,
             size_is_units: false,
             unit: 1,
             flags: 0,
@@ -238,15 +319,8 @@ fn fixed_integer_construction_is_inline() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
-    asm.emit_i_bs_create_bin(
-        0,
-        0,
-        3,
-        ArgVal::X(0),
-        &segments,
-        segment_hook as BsCreateBinHelper,
-    )
-    .unwrap();
+    asm.emit_i_bs_create_bin(0, 0, 3, ArgVal::X(0), &segments, construct_helpers())
+        .unwrap();
     finish(&mut asm);
     let (mem, _, _) = execute_inline(asm, &[small(0x11), small(0x2233), small(0x4455_6677)]);
     SEEN.with(|seen| assert!(seen.borrow().is_empty()));
@@ -263,6 +337,7 @@ fn utf8_construction_is_inline() {
         index: 1,
         src: ArgVal::X(0),
         size: ArgVal::Immediate(0),
+        size_is_all: false,
         size_is_units: false,
         unit: 1,
         flags: 0,
@@ -272,15 +347,8 @@ fn utf8_construction_is_inline() {
     // The UTF-8 path `bl`s the shared encoder the way BeamAsm does.
     asm.emit_i_func_label(2).unwrap();
     asm.emit_enter_frame().unwrap();
-    asm.emit_i_bs_create_bin(
-        0,
-        0,
-        1,
-        ArgVal::X(0),
-        &[segment],
-        segment_hook as BsCreateBinHelper,
-    )
-    .unwrap();
+    asm.emit_i_bs_create_bin(0, 0, 1, ArgVal::X(0), &[segment], construct_helpers())
+        .unwrap();
     asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
     // Caller: list-comprehension shape (`get_list` saves the tail in y0, then `call`).
@@ -318,6 +386,7 @@ fn non_small_integer_construction_uses_the_helper() {
         index: 1,
         src: ArgVal::X(0),
         size: ArgVal::Immediate(small(8)),
+        size_is_all: false,
         size_is_units: false,
         unit: 1,
         flags: 0,
@@ -325,18 +394,11 @@ fn non_small_integer_construction_uses_the_helper() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
-    asm.emit_i_bs_create_bin(
-        0,
-        0,
-        2,
-        ArgVal::X(2),
-        &[segment],
-        segment_hook as BsCreateBinHelper,
-    )
-    .unwrap();
+    asm.emit_i_bs_create_bin(0, 0, 2, ArgVal::X(2), &[segment], construct_helpers())
+        .unwrap();
     finish(&mut asm);
     let (_, regs) = execute(asm, &[0x2, 0x22, 0x33, 4, 5, 6]);
-    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 2, 0]));
+    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[8, 0, 2, 0x2, 8, 1 << 32, 1, 8]));
     assert_eq!(
         arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..2]),
         [0x2, 0x22]

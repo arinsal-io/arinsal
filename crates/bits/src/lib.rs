@@ -920,10 +920,15 @@ fn fresh_append<H: HeapAlloc>(
     result.map_err(|e| term_error(e, index, 8))
 }
 
-fn write_segments(
+fn write_segments(segments: &[Segment<'_>], bytes: &mut [u8], pos: usize) -> Result<(), BitsError> {
+    write_segments_with_finalize(segments, bytes, pos, true)
+}
+
+fn write_segments_with_finalize(
     segments: &[Segment<'_>],
     bytes: &mut [u8],
     mut pos: usize,
+    finalize_binary: bool,
 ) -> Result<(), BitsError> {
     // Port of erts/emulator/beam/erl_bits.c:1162/1222/1285/1311/1341 (put UTF/binary/float), OTP-29.1.1.
     for segment in segments {
@@ -957,7 +962,9 @@ fn write_segments(
             }
             SegType::Binary | SegType::Append | SegType::PrivateAppend => {
                 let term = source(segment)?;
-                writable_finalize(term);
+                if finalize_binary {
+                    writable_finalize(term);
+                }
                 with_binary(term, |payload, start, _| {
                     copy_bits(bytes, pos, payload, start, bits);
                 })
@@ -1004,6 +1011,29 @@ fn write_segments(
         pos += bits;
     }
     Ok(())
+}
+
+/// Write one validated segment into an already allocated bitstring at the given bit offset.
+///
+/// This is used by BeamAsm's native `erl_bits_state` cursor so allocation stays in the emitted
+/// instruction and each segment is written by its corresponding runtime primitive.
+// Port of erts/emulator/beam/erl_bits.c (`erts_bs_put_*`), OTP-29.1.1.
+pub fn write_segment_at(
+    segment: &Segment<'_>,
+    bytes: &mut [u8],
+    bit_offset: usize,
+) -> Result<usize, BitsError> {
+    let bits = size_of(segment)?;
+    if bit_offset
+        .checked_add(bits)
+        .is_none_or(|end| end > bytes.len().saturating_mul(8))
+    {
+        return Err(BitsError::SystemLimit {
+            segment: segment.index,
+        });
+    }
+    write_segments_with_finalize(std::slice::from_ref(segment), bytes, bit_offset, false)?;
+    Ok(bits)
 }
 
 /// Build `bs_init_writable`'s empty binary with OTP's default capacity.
