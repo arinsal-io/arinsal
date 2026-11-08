@@ -22,6 +22,25 @@ pub mod psflg {
     const fn bit(n: u32) -> u32 {
         1 << (ZERO_BIT_OFFSET + n)
     }
+    /// `ERTS_PSFLG_IN_PRQ_MAX`/`HIGH`/`NORMAL`/`LOW`: the process has an entry in that priority
+    /// queue (its own struct or a proxy).
+    pub const IN_PRQ_MAX: u32 = bit(0);
+    /// See [`IN_PRQ_MAX`].
+    pub const IN_PRQ_HIGH: u32 = bit(1);
+    /// See [`IN_PRQ_MAX`].
+    pub const IN_PRQ_NORMAL: u32 = bit(2);
+    /// See [`IN_PRQ_MAX`].
+    pub const IN_PRQ_LOW: u32 = bit(3);
+    /// The `IN_PRQ_*` bit of queue 0 (max priority); queue `q` is this shifted left by `q`.
+    pub const IN_PRQ_OFFSET_BIT: u32 = IN_PRQ_MAX;
+    /// `ERTS_PSFLGS_IN_PRQ_MASK`.
+    pub const IN_PRQ_MASK: u32 = IN_PRQ_MAX | IN_PRQ_HIGH | IN_PRQ_NORMAL | IN_PRQ_LOW;
+    /// `ERTS_PSFLGS_IN_PRQ_MASK_OFFSET`: the first `IN_PRQ_*` bit.
+    pub const IN_PRQ_OFFSET: u32 = ZERO_BIT_OFFSET;
+    /// `ERTS_PSFLGS_PRQ_PRIO_OFFSET`: the priority queue the process struct itself is in.
+    pub const PRQ_PRIO_OFFSET: u32 = 4;
+    /// `ERTS_PSFLGS_PRQ_PRIO_MASK`.
+    pub const PRQ_PRIO_MASK: u32 = 3 << PRQ_PRIO_OFFSET;
     /// `ERTS_PSFLG_FREE`.
     pub const FREE: u32 = bit(4);
     /// `ERTS_PSFLG_EXITING`.

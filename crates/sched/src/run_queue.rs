@@ -78,15 +78,12 @@ impl<T: Task> ProcQueues<T> {
             .map(|lists| LockedRunQueue { owner: self, lists })
     }
 
-    /// Lock, enqueue, unlock (`add2runq`).
+    /// Lock, enqueue, unlock (`add2runq`). An entry of kind `Not` is not queued.
     #[inline]
     pub(crate) fn push(&self, item: Scheduled<T>) {
-        self.lock().push(item);
-    }
-
-    /// Lock, enqueue a proxy entry, unlock (`add2runq` with `enqueue < 0`).
-    pub(crate) fn push_proxy(&self, item: Scheduled<T>) {
-        self.lock().push_proxy(item);
+        if item.kind != crate::Enqueue::Not {
+            self.lock().push(item);
+        }
     }
 
     /// Lock, take the next entry, unlock.
@@ -118,11 +115,17 @@ pub(crate) struct LockedRunQueue<'a, T: Task> {
 }
 
 impl<T: Task> LockedRunQueue<'_, T> {
-    /// Append to the tail of the entry's priority queue (`enqueue_process`).
+    /// Append to the tail of the entry's priority queue (`enqueue_process`); a `Proxy` entry
+    /// is the second entry of an already queued process (`ERTS_PSFLG_PROXY`).
     #[inline]
     pub(crate) fn push(&mut self, item: Scheduled<T>) {
+        // `ERTS_ENQUEUE_NOT`: the process already has an entry at this priority or higher.
+        if item.kind == crate::Enqueue::Not {
+            return;
+        }
         let queue = item.queue();
-        self.lists.push_back(queue, item, false);
+        let proxy = item.kind == crate::Enqueue::Proxy;
+        self.lists.push_back(queue, item, proxy);
         self.owner.qmask.fetch_or(1 << queue, Ordering::Release);
     }
 
@@ -132,14 +135,6 @@ impl<T: Task> LockedRunQueue<'_, T> {
         for item in items {
             self.push(item);
         }
-    }
-
-    /// Append a second entry of a process that is already queued (`ERTS_PSFLG_PROXY`,
-    /// `active_sys_enqueue`).
-    pub(crate) fn push_proxy(&mut self, item: Scheduled<T>) {
-        let queue = item.queue();
-        self.lists.push_back(queue, item, true);
-        self.owner.qmask.fetch_or(1 << queue, Ordering::Release);
     }
 
     /// The next entry of `pick_next_process` in `erts_schedule`: the first entry of the highest

@@ -200,17 +200,18 @@ const WAITING: u8 = 2;
 const EXITED: u8 = 3;
 const UNSCHEDULED: u8 = 4;
 
-/// The `ERTS_PSFLG_*` bits that hold the scheduler's run state.
-const RUN_STATE_MASK: u32 = psflg::ACTIVE | psflg::IN_RUNQ | psflg::RUNNING | psflg::FREE;
+/// The `ERTS_PSFLG_*` bits that hold the scheduler's run state. `IN_RUNQ` and the `IN_PRQ_*` bits
+/// are not part of it: they say which queue entries of the process exist, and outlive the
+/// state (a process that ran from a proxy entry may wait while its own entry is still queued).
+const RUN_STATE_MASK: u32 = psflg::ACTIVE | psflg::RUNNING | psflg::FREE;
 
-/// The state word bits of each run state: `QUEUED` is active in a run queue, `RUNNING`
-/// active and executing, `WAITING` inactive, `EXITED` free, and `UNSCHEDULED` (created,
-/// not yet published) active outside any run queue.
+/// The state word bits of each run state but `QUEUED`: `RUNNING` is active and executing,
+/// `WAITING` inactive, `EXITED` free, and `UNSCHEDULED` (created, not yet published) active
+/// outside any run queue. `QUEUED` is active, not running, with an entry in a priority queue.
 // Port of erts/emulator/beam/erl_process.h:1231-1340 (ERTS_PSFLG_ACTIVE, ERTS_PSFLG_IN_RUNQ,
 // ERTS_PSFLG_RUNNING, ERTS_PSFLG_FREE), OTP-29.1.1.
 const fn run_state_bits(state: u8) -> u32 {
     match state {
-        QUEUED => psflg::ACTIVE | psflg::IN_RUNQ,
         RUNNING => psflg::ACTIVE | psflg::RUNNING,
         EXITED => psflg::FREE,
         UNSCHEDULED => psflg::ACTIVE,
@@ -223,13 +224,47 @@ const fn run_state_of(word: u32) -> u8 {
         EXITED
     } else if word & psflg::RUNNING != 0 {
         RUNNING
-    } else if word & psflg::IN_RUNQ != 0 {
-        QUEUED
     } else if word & psflg::ACTIVE != 0 {
-        UNSCHEDULED
+        if word & (psflg::IN_RUNQ | psflg::IN_PRQ_MASK) != 0 {
+            QUEUED
+        } else {
+            UNSCHEDULED
+        }
     } else {
         WAITING
     }
+}
+
+/// What `check_enqueue_in_prio_queue` decides for a process that becomes runnable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Enqueue {
+    /// Already queued at the same or a higher priority: no new entry.
+    Not,
+    /// Enqueue the process struct itself (`IN_RUNQ` was clear).
+    Real,
+    /// The struct is already queued (at a lower priority): enqueue a proxy entry.
+    Proxy,
+}
+
+/// Port of erts/emulator/beam/erl_process.c:6569 (check_enqueue_in_prio_queue), OTP-29.1.1:
+/// update `word` for an entry in priority queue `queue` unless the process is already queued
+/// at the same or a higher priority.
+fn check_enqueue(word: &mut u32, queue: usize) -> Enqueue {
+    let qbit = 1_u32 << queue;
+    // The highest priority queue the process is in; a bit out of range when in none.
+    let in_prq = ((*word & psflg::IN_PRQ_MASK) >> psflg::IN_PRQ_OFFSET) | (1 << 4);
+    let max_qbit = in_prq.isolate_lowest_one();
+    if qbit >= max_qbit {
+        return Enqueue::Not;
+    }
+    *word |= qbit << psflg::IN_PRQ_OFFSET;
+    if *word & psflg::IN_RUNQ != 0 {
+        return Enqueue::Proxy;
+    }
+    *word = (*word & !psflg::PRQ_PRIO_MASK)
+        | psflg::IN_RUNQ
+        | ((queue as u32) << psflg::PRQ_PRIO_OFFSET);
+    Enqueue::Real
 }
 
 /// The run state view of the process state word. Every change is a read-modify-write of
@@ -243,67 +278,141 @@ impl RunStateWord<'_> {
         run_state_of(self.0.load(order))
     }
 
+    /// Set a run state other than `QUEUED` (see [`Self::queue_new`] for that one).
     fn store(&self, state: u8, order: Ordering) {
+        debug_assert_ne!(state, QUEUED);
         let bits = run_state_bits(state);
         let _ = self.0.fetch_update(order, load_order(order), |word| {
             Some(word & !RUN_STATE_MASK | bits)
         });
     }
 
-    /// Make a waiting process active and queued; `false` when it is not waiting. The first
-    /// read of the word decides, and the swap retries only while other bits change.
+    /// A process just created becomes queued: active with an entry in `queue`.
+    fn queue_new(&self, queue: usize, order: Ordering) {
+        let _ = self.0.fetch_update(order, load_order(order), |mut word| {
+            word = word & !RUN_STATE_MASK | psflg::ACTIVE;
+            check_enqueue(&mut word, queue);
+            Some(word)
+        });
+    }
+
+    /// `UNSCHEDULED` to queued; `Err` when the process is not unscheduled.
+    fn schedule_unscheduled(&self, queue: usize) -> Result<Enqueue, ()> {
+        let mut decision = Enqueue::Not;
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
+                if run_state_of(word) != UNSCHEDULED {
+                    return None;
+                }
+                decision = check_enqueue(&mut word, queue);
+                Some(word)
+            })
+            .map(|_| decision)
+            .map_err(|_| ())
+    }
+
+    /// Make a waiting process active, and decide whether it needs an entry in `queue`; `None`
+    /// when it is not waiting. The first read of the word decides, and the swap retries only
+    /// while other bits change.
     // Port of erts/emulator/beam/erl_process.c:6899-7005 (change_proc_schedule_state setting
-    // ERTS_PSFLG_ACTIVE: enqueue only when the result is active alone), OTP-29.1.1.
-    fn schedule_waiting(&self, known: Option<u32>) -> bool {
-        let (from, to) = (run_state_bits(WAITING), run_state_bits(QUEUED));
+    // ERTS_PSFLG_ACTIVE, with check_enqueue_in_prio_queue), OTP-29.1.1.
+    fn wake(&self, known: Option<u32>, queue: usize) -> Option<Enqueue> {
         // The state word the sender's own read-modify-write produced is the first guess;
         // an active receiver then needs no further access to the shared word.
         let mut word = match known {
             Some(word) => word,
             None => self.0.load(Ordering::SeqCst),
         };
-        while word & RUN_STATE_MASK == from {
-            match self.0.compare_exchange_weak(
-                word,
-                word & !RUN_STATE_MASK | to,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
+        while word & RUN_STATE_MASK == 0 {
+            let mut new = word | psflg::ACTIVE;
+            let decision = check_enqueue(&mut new, queue);
+            match self
+                .0
+                .compare_exchange_weak(word, new, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(decision),
                 Err(current) => word = current,
             }
         }
-        false
+        None
     }
 
-    /// Leave `RUNNING` for `state`. Only the scheduler running the process changes the run
-    /// state bits of a running process, so one atomic read-modify-write flips them.
+    /// Leave `RUNNING` for `state` (not `QUEUED`). Only the scheduler running the process
+    /// changes the run state bits of a running process, so one atomic read-modify-write flips
+    /// them.
     // Port of erts/emulator/beam/erl_process.c:10483-10520 (schedule: the RUNNING bit is
     // cleared with an atomic band/bset on `p->state`), OTP-29.1.1.
     ///
     /// Returns the state word before the change, which carries the in-queue signal bits a
     /// sender set while the process ran.
     fn store_from_running(&self, state: u8, order: Ordering) -> u32 {
+        debug_assert_ne!(state, QUEUED);
         let flip = run_state_bits(RUNNING) ^ run_state_bits(state);
         let previous = self.0.fetch_xor(flip, order);
         debug_assert_eq!(run_state_of(previous), RUNNING);
         previous
     }
 
-    fn compare_exchange(
-        &self,
-        current: u8,
-        new: u8,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<u8, u8> {
-        let (from, to) = (run_state_bits(current), run_state_bits(new));
+    /// A running process stays active and queues itself in `queue`
+    /// (`schedule_out_process` with `ERTS_PSFLG_ACTIVE` still set).
+    fn yield_running(&self, queue: usize, order: Ordering) -> Enqueue {
+        let mut decision = Enqueue::Not;
+        let _ = self.0.fetch_update(order, load_order(order), |mut word| {
+            debug_assert_eq!(run_state_of(word), RUNNING);
+            word &= !psflg::RUNNING;
+            decision = check_enqueue(&mut word, queue);
+            Some(word)
+        });
+        decision
+    }
+
+    /// As [`Self::yield_running`] for a dirty job, whose entry is not in a run queue list.
+    fn yield_running_dirty(&self, queue: usize, order: Ordering) {
+        let _ = self.0.fetch_update(order, load_order(order), |mut word| {
+            word &= !psflg::RUNNING;
+            word |= psflg::ACTIVE | psflg::IN_RUNQ | (psflg::IN_PRQ_OFFSET_BIT << queue);
+            Some(word)
+        });
+    }
+
+    /// A queued process gets an entry at a higher priority (`active_sys_enqueue`): `None` when
+    /// it is not queued.
+    fn enqueue_higher(&self, queue: usize) -> Option<Enqueue> {
+        let mut decision = Enqueue::Not;
         self.0
-            .fetch_update(success, failure, |word| {
-                (word & RUN_STATE_MASK == from).then_some(word & !RUN_STATE_MASK | to)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
+                if run_state_of(word) != QUEUED {
+                    return None;
+                }
+                decision = check_enqueue(&mut word, queue);
+                Some(word)
             })
-            .map(run_state_of)
-            .map_err(run_state_of)
+            .ok()
+            .map(|_| decision)
+    }
+
+    /// Dequeue an entry of priority queue `queue` and start running the process if it is
+    /// runnable: `true` when it runs. A real entry clears `IN_RUNQ`; a proxy leaves it, as the
+    /// process struct is still queued.
+    // Port of erts/emulator/beam/erl_process.c:9990-10100 (erts_schedule execute_process:
+    // psflg_band_mask clears the IN_PRQ bit of the queue and IN_RUNQ unless the entry is a
+    // proxy), OTP-29.1.1.
+    fn claim(&self, proxy: bool, queue: usize) -> bool {
+        let mut runs = false;
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut word| {
+                word &= !(psflg::IN_PRQ_OFFSET_BIT << queue);
+                if !proxy {
+                    word &= !psflg::IN_RUNQ;
+                }
+                runs = word & RUN_STATE_MASK == psflg::ACTIVE;
+                if runs {
+                    word |= psflg::RUNNING;
+                }
+                Some(word)
+            });
+        runs
     }
 }
 
@@ -2153,6 +2262,11 @@ impl<T: Task> ProcessTable<T> {
 
 struct Scheduled<T: Task> {
     process: ProcRef<T>,
+    /// Which entry the process gets: its own (`Real`), a duplicate (`Proxy`) or none (`Not`,
+    /// the process is already queued at the same or a higher priority).
+    kind: Enqueue,
+    /// The priority queue the entry is in or goes to.
+    queue: usize,
     /// Port of erts/emulator/beam/erl_process.h (`Process.schedule_count`), OTP-29.1.1:
     /// times the entry reaches the head of the normal queue before it runs.
     schedule_count: u8,
@@ -2166,16 +2280,28 @@ impl<T: Task> Scheduled<T> {
         } else {
             1
         };
+        let queue = queue_index(process.priority().index());
         Self {
             process,
+            kind: Enqueue::Real,
+            queue,
             schedule_count,
+        }
+    }
+
+    /// An entry of the given kind (what `check_enqueue_in_prio_queue` decided).
+    fn with_kind(process: ProcRef<T>, kind: Enqueue, queue: usize) -> Self {
+        Self {
+            kind,
+            queue,
+            ..Self::new(process)
         }
     }
 
     /// Run queue priority queue of this entry: low priority processes share the normal
     /// queue (erl_process.c:3961, enqueue_process).
     fn queue(&self) -> usize {
-        queue_index(self.process.priority().index())
+        self.queue
     }
 }
 
@@ -2924,19 +3050,16 @@ impl<T: Task> Inner<T> {
         let Some(process) = self.table.lookup(pid) else {
             return false;
         };
-        if process
-            .run_state()
-            .compare_exchange(WAITING, QUEUED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        let queue = queue_index(process.priority().index());
+        let Some(kind) = process.run_state().wake(None, queue) else {
             return false;
-        }
+        };
         let wait_timer = process.wait_timer.load(Ordering::Acquire);
         if wait_timer != 0 {
             process.wait_epoch.fetch_add(1, Ordering::AcqRel);
             self.cancel_wait_timer(&process, wait_timer);
         }
-        self.enqueue(Scheduled::new(process), false);
+        self.enqueue(Scheduled::with_kind(process, kind, queue), false);
         true
     }
 
@@ -3973,20 +4096,25 @@ impl<T: Task> Inner<T> {
             self.notify_dirty_signal_handler(&process, Some(priority));
         }
         if priority.index() < before.index() && process.dirty.load(Ordering::Acquire) == 0 {
-            let item = Scheduled::new(process.clone());
-            if process.run_state().load(Ordering::Acquire) == QUEUED {
-                // The proxy entry is not counted in run queue lengths: the process is
+            let queue = queue_index(priority.index());
+            // Port of erts/emulator/beam/erl_process.c:7028 (active_sys_enqueue): a queued process
+            // gets an entry at the higher priority unless it already has one there or higher.
+            if let Some(kind) = process.run_state().enqueue_higher(queue)
+                && kind != Enqueue::Not
+            {
+                let item = Scheduled::with_kind(process.clone(), kind, queue);
+                // The extra entry is not counted in run queue lengths: the process is
                 // already counted where its first entry sits.
                 if let Some(sim) = &self.sim {
                     sim.lock().unwrap().queue.push_back(item);
                 } else if let Some(worker) = process.bound_worker() {
-                    self.run_queues[worker].push_proxy(item);
+                    self.run_queues[worker].push(item);
                     self.note_queued(worker);
                     self.wake_scheduler(worker);
                 } else {
-                    // The proxy joins the run queue the process sits in (erts_get_runq_proc).
+                    // The entry joins the run queue the process sits in (erts_get_runq_proc).
                     let scheduler = self.select_run_queue(&process);
-                    self.run_queues[scheduler].push_proxy(item);
+                    self.run_queues[scheduler].push(item);
                     self.note_queued(scheduler);
                     self.wake_scheduler(scheduler);
                 }
@@ -4148,26 +4276,27 @@ impl<T: Task> Inner<T> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message),
         // OTP-29.1.1: read the state and schedule only a process that is not active. The
         // SeqCst load orders after the SeqCst enqueue (see the wake protocol above).
-        if !process.run_state().schedule_waiting(state) {
+        let queue = queue_index(process.priority().index());
+        let Some(kind) = process.run_state().wake(state, queue) else {
             // Port of erts/emulator/beam/erl_proc_sig_queue.h:2072 (erts_proc_notify_new_sig),
             // OTP-29.1.1.
             if Self::in_dirty_state(process) {
                 self.notify_dirty_signal_handler(process, None);
             }
+            return;
+        };
+        // Read only for a receiver that is scheduled: its wait started before it published
+        // WAITING, and the state word's read-modify-write orders this load after that store.
+        let wait_timer = process.wait_timer.load(Ordering::Acquire);
+        if wait_timer != 0 {
+            process.wait_epoch.fetch_add(1, Ordering::AcqRel);
+            self.cancel_wait_timer(process, wait_timer);
+        }
+        let item = Scheduled::with_kind(process.clone(), kind, queue);
+        if force_enqueue {
+            self.enqueue(item, false);
         } else {
-            // Read only for a receiver that is scheduled: its wait started before it published
-            // WAITING, and the state word's read-modify-write orders this load after that store.
-            let wait_timer = process.wait_timer.load(Ordering::Acquire);
-            if wait_timer != 0 {
-                process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                self.cancel_wait_timer(process, wait_timer);
-            }
-            let item = Scheduled::new(process.clone());
-            if force_enqueue {
-                self.enqueue(item, false);
-            } else {
-                self.place_runnable(item, local);
-            }
+            self.place_runnable(item, local);
         }
     }
 
@@ -4303,15 +4432,13 @@ impl<T: Task> Inner<T> {
             let process = entry.process;
             if process.wait_epoch.load(Ordering::Acquire) == entry.epoch
                 && process.wait_timer.load(Ordering::Acquire) == WAIT_TIMER_DEFERRED
-                && process
-                    .run_state()
-                    .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+                && let queue = queue_index(process.priority().index())
+                && let Some(kind) = process.run_state().wake(None, queue)
             {
                 before_wake();
                 process.wait_timer.store(0, Ordering::Release);
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                self.place_runnable(Scheduled::new(process), Some(local));
+                self.place_runnable(Scheduled::with_kind(process, kind, queue), Some(local));
             }
         }
     }
@@ -4549,13 +4676,11 @@ impl<T: Task> Inner<T> {
             TimerPayload::Wake(pid, epoch) => {
                 if let Some(process) = self.table.lookup(pid)
                     && process.wait_epoch.load(Ordering::Acquire) == epoch
-                    && process
-                        .run_state()
-                        .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
+                    && let queue = queue_index(process.priority().index())
+                    && let Some(kind) = process.run_state().wake(None, queue)
                 {
                     process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                    let item = Scheduled::new(process);
+                    let item = Scheduled::with_kind(process, kind, queue);
                     self.place_runnable(item, local);
                 }
             }
@@ -5830,12 +5955,13 @@ impl<T: Task> Runner<'_, T> {
     // Port of erts/emulator/beam/erl_process.c:12525 (erl_create_process), OTP-29.1.1: the
     // child joins its parent's run queue.
     fn schedule_process(&mut self, process: ProcRef<T>) -> Result<(), Error> {
-        process
+        let queue = queue_index(process.priority().index());
+        let kind = process
             .run_state()
-            .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .schedule_unscheduled(queue)
             .map_err(|_| Error::NoProcess)?;
         let bound = process.bound_worker().is_some();
-        let item = Scheduled::new(process);
+        let item = Scheduled::with_kind(process, kind, queue);
         if bound {
             self.inner.enqueue(item, false);
         } else if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut() {
@@ -6975,11 +7101,13 @@ impl<T: Task> Scheduler<T> {
     /// Make an inserted child runnable after its caller publishes it.
     pub fn schedule_unscheduled(&self, pid: Pid) -> Result<(), Error> {
         let process = self.inner.table.lookup(pid).ok_or(Error::NoProcess)?;
-        process
+        let queue = queue_index(process.priority().index());
+        let kind = process
             .run_state()
-            .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .schedule_unscheduled(queue)
             .map_err(|_| Error::NoProcess)?;
-        self.inner.enqueue_new(Scheduled::new(process));
+        self.inner
+            .enqueue_new(Scheduled::with_kind(process, kind, queue));
         Ok(())
     }
     /// Spawn onto one run queue without binding the process to that scheduler.
@@ -6998,7 +7126,9 @@ impl<T: Task> Scheduler<T> {
         }
         let process = self.inner.table.insert(task, priority, None)?;
         let pid = process.pid;
-        process.run_state().store(QUEUED, Ordering::Release);
+        process
+            .run_state()
+            .queue_new(queue_index(process.priority().index()), Ordering::Release);
         process.scheduler_id.store(worker, Ordering::Relaxed);
         let item = Scheduled::new(process);
         let scheduler = self.inner.enqueue_run_queue(&item.process);
@@ -7009,7 +7139,9 @@ impl<T: Task> Scheduler<T> {
     pub fn spawn_priority(&self, task: T, priority: Priority) -> Result<Pid, Error> {
         let process = self.inner.table.insert(task, priority, None)?;
         let pid = process.pid;
-        process.run_state().store(QUEUED, Ordering::Release);
+        process
+            .run_state()
+            .queue_new(queue_index(process.priority().index()), Ordering::Release);
         self.inner.enqueue_new(Scheduled::new(process));
         Ok(pid)
     }
@@ -8510,7 +8642,11 @@ mod proxy_requeue_tests {
         process
             .sys_priority
             .store(Priority::High.index() as u8, Ordering::Release);
-        scheduler.inner.run_queues[0].push_proxy(Scheduled::new(process.clone()));
+        scheduler.inner.run_queues[0].push(Scheduled::with_kind(
+            process.clone(),
+            Enqueue::Proxy,
+            queue_index(process.priority().index()),
+        ));
         release.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(10);
         while runs.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
@@ -8546,7 +8682,11 @@ mod proxy_requeue_tests {
         let process = scheduler.inner.table.lookup(pid).unwrap();
         // Queue order: real entry, then the duplicate. The real entry runs first and yields,
         // which queues the process again behind the duplicate.
-        scheduler.inner.run_queues[0].push_proxy(Scheduled::new(process.clone()));
+        scheduler.inner.run_queues[0].push(Scheduled::with_kind(
+            process.clone(),
+            Enqueue::Proxy,
+            queue_index(process.priority().index()),
+        ));
         release.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(10);
         while runs.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
@@ -8556,6 +8696,76 @@ mod proxy_requeue_tests {
         assert_eq!(runs.load(Ordering::Acquire), 2, "run, yield, run, exit");
         assert!(scheduler.inner.run_queues[0].is_empty());
         assert_eq!(process.run_state().load(Ordering::Acquire), EXITED);
+    }
+}
+
+#[cfg(test)]
+mod rq_double_enqueue_tests {
+    use super::*;
+
+    struct YieldForever;
+
+    impl Task for YieldForever {
+        type Message = ();
+        type SchedulerData = ();
+
+        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+            RunOutcome::Yield
+        }
+    }
+
+    /// Processes yield on several schedulers while another thread keeps adding proxy entries
+    /// (the second entry an elevated system task gives). A stale proxy may run a process
+    /// between its `IN_RUNQ` decision and its link, so two run queues can link the real node
+    /// at once; `raw.rs` asserts that (`!rq_link.in_runq`) in debug builds.
+    #[test]
+    fn concurrent_requeue_and_proxy_entries_never_link_a_process_twice() {
+        let scheduler = Scheduler::new(Config {
+            workers: 6,
+            max_processes: 256,
+            ..Config::default()
+        });
+        let processes: Vec<_> = (0..12)
+            .map(|_| {
+                let pid = scheduler.spawn(YieldForever).unwrap();
+                scheduler.inner.table.lookup(pid).unwrap()
+            })
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let proxies: Vec<_> = (0..3)
+            .map(|seed| {
+                let inner = Arc::clone(&scheduler.inner);
+                let processes = processes.clone();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut x = 0x9e37_79b9_u32.wrapping_mul(seed + 1);
+                    while !stop.load(Ordering::Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        let process = &processes[x as usize % processes.len()];
+                        // The elevated priority an ordered system task gives.
+                        let prio = queue_index(Priority::High.index());
+                        if let Some(kind) = process.run_state().enqueue_higher(prio)
+                            && kind != Enqueue::Not
+                        {
+                            let queue = inner.select_run_queue(process);
+                            inner.run_queues[queue].push(Scheduled::with_kind(
+                                process.clone(),
+                                kind,
+                                prio,
+                            ));
+                            inner.note_queued(queue);
+                        }
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(8));
+        stop.store(true, Ordering::Relaxed);
+        for handle in proxies {
+            handle.join().unwrap();
+        }
     }
 }
 
@@ -8755,7 +8965,7 @@ fn schedule_out<T: Task>(
             }
             process
                 .run_state()
-                .store_from_running(QUEUED, Ordering::Release);
+                .yield_running_dirty(queue_index(process.priority().index()), Ordering::Release);
             inner.enqueue_dirty(process.clone(), kind);
             // Port of erts/emulator/beam/erl_process.c:9763 (ensure signals are handled while
             // scheduled dirty), OTP-29.1.1.
@@ -8766,16 +8976,14 @@ fn schedule_out<T: Task>(
         RunOutcome::Yield if dirty.is_some() => {
             // Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty job moves the
             // process back to a normal run queue), OTP-29.1.1.
-            process
-                .run_state()
-                .store_from_running(QUEUED, Ordering::Release);
-            inner.enqueue(Scheduled::new(process.clone()), false);
+            let queue = queue_index(process.priority().index());
+            let kind = process.run_state().yield_running(queue, Ordering::Release);
+            inner.enqueue(Scheduled::with_kind(process.clone(), kind, queue), false);
         }
         RunOutcome::Yield => {
-            process
-                .run_state()
-                .store_from_running(QUEUED, Ordering::Release);
-            let next = Scheduled::new(process.clone());
+            let queue = queue_index(process.priority().index());
+            let kind = process.run_state().yield_running(queue, Ordering::Release);
+            let next = Scheduled::with_kind(process.clone(), kind, queue);
             if process.bound_worker().is_some() {
                 inner.enqueue(next, true);
             } else if let Some(local) = local.as_deref_mut() {
@@ -8832,13 +9040,10 @@ fn schedule_out<T: Task>(
             }
             if let Some(ms) = timeout_ms {
                 if ms == 0 {
-                    if process
-                        .run_state()
-                        .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
+                    let queue = queue_index(process.priority().index());
+                    if let Some(kind) = process.run_state().wake(None, queue) {
                         process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                        let item = Scheduled::new(process.clone());
+                        let item = Scheduled::with_kind(process.clone(), kind, queue);
                         inner.place_runnable(item, local.as_deref_mut());
                         return None;
                     }
@@ -8881,16 +9086,14 @@ fn schedule_out<T: Task>(
             // further load is needed; one that arrives later sees WAITING and wakes it.
             // Port of erts/emulator/beam/erl_process.c:6695-6790 (schedule_out_process works
             // from the state word it read), OTP-29.1.1.
+            let queue = queue_index(process.priority().index());
             if left_running & psflg::SIG_IN_Q != 0
-                && process
-                    .run_state()
-                    .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+                && let Some(kind) = process.run_state().wake(None, queue)
             {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
                 let id = process.wait_timer.load(Ordering::Acquire);
                 inner.cancel_wait_timer(&process, id);
-                let next = Scheduled::new(process.clone());
+                let next = Scheduled::with_kind(process.clone(), kind, queue);
                 inner.place_runnable(next, local.as_deref_mut());
             }
         }
@@ -8923,10 +9126,9 @@ fn run_slice<T: Task>(
     let process = item.process;
     // A stale duplicate entry finds the process not queued below and runs nothing
     // (execute_process in erts works from the state word the same way).
-    if process
+    if !process
         .run_state()
-        .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
+        .claim(item.kind == Enqueue::Proxy, item.queue)
     {
         return;
     }
@@ -9053,10 +9255,9 @@ fn run_process<T: Task>(
     consts: &SliceConsts,
 ) -> Option<SliceEnd<T>> {
     let process = item.process;
-    if process
+    if !process
         .run_state()
-        .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
+        .claim(item.kind == Enqueue::Proxy, item.queue)
     {
         return None;
     }

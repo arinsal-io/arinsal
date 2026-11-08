@@ -4,16 +4,16 @@
 //! `Process.next/prev`) and erl_process.c (`enqueue_process_internal`, `dequeue_process`,
 //! `unqueue_process`, the `ERTS_PSFLG_PROXY` entries made by `active_sys_enqueue`), OTP-29.1.1.
 //!
-//! A node is either a process (links in `Process.rq_link`, `IN_RUNQ` is `RqLink.in_runq`) or a
+//! A node is either a process (links in `Process.rq_link`; `IN_RUNQ` lives in the process state word) or a
 //! proxy (a small heap node that stands for a process already queued at a lower priority).
 //! Every node in a list owns one counted reference to its process. The links are only touched
 //! by the thread that holds the run queue lock, which is the argument of every SAFETY comment
 //! below.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::proc_ref::ProcRef;
-use crate::{PROC_QUEUES, Scheduled, Task};
+use crate::{Enqueue, PROC_QUEUES, Scheduled, Task};
 
 /// Tag bit of a node address that names a [`Proxy`].
 const PROXY: usize = 1;
@@ -26,8 +26,6 @@ pub(crate) struct RqLink {
     prev: AtomicUsize,
     /// `Process.schedule_count`.
     schedule_count: AtomicU8,
-    /// `ERTS_PSFLG_IN_RUNQ`: the process node is linked in a list.
-    in_runq: AtomicBool,
 }
 
 /// `ERTS_PSFLG_PROXY` entry: a second queue entry of a process.
@@ -83,11 +81,11 @@ impl<T: Task> Lists<T> {
         let Scheduled {
             process,
             schedule_count,
+            kind: _,
+            queue: _,
         } = item;
-        // `ERTS_PSFLG_IN_RUNQ` (check_enqueue_in_prio_queue): a process whose real entry is still
-        // linked, because a proxy ran it first, must not be linked a second time; the new entry is
-        // a proxy.
-        let proxy = proxy || process.rq_link.in_runq.load(Ordering::Relaxed);
+        // Whether this entry is the process struct or a proxy was decided by the state word CAS
+        // (`check_enqueue_in_prio_queue` set `IN_RUNQ` for exactly one real entry).
         let node = if proxy {
             let boxed = Box::new(Proxy {
                 link: RqLink::default(),
@@ -95,7 +93,6 @@ impl<T: Task> Lists<T> {
             });
             Box::into_raw(boxed) as usize | PROXY
         } else {
-            debug_assert!(!process.rq_link.in_runq.load(Ordering::Relaxed));
             process.into_raw() as usize
         };
         let prev = self.last[queue];
@@ -106,7 +103,6 @@ impl<T: Task> Lists<T> {
                 link.next.store(0, Ordering::Relaxed);
                 link.prev.store(prev, Ordering::Relaxed);
                 link.schedule_count.store(schedule_count, Ordering::Relaxed);
-                link.in_runq.store(true, Ordering::Relaxed);
             });
             if prev == 0 {
                 self.first[queue] = node;
@@ -142,12 +138,11 @@ impl<T: Task> Lists<T> {
                 with_node::<T, _>(next, |link, _| link.prev.store(prev, Ordering::Relaxed));
             }
         }
+        let proxy = node & PROXY != 0;
         let process = if node & PROXY == 0 {
             // SAFETY: the list held the reference `into_raw` gave up in `push_back`; the node
             // is unlinked, so this is its only owner.
-            let process = unsafe { ProcRef::<T>::from_raw(node as *mut ()) };
-            process.rq_link.in_runq.store(false, Ordering::Relaxed);
-            process
+            unsafe { ProcRef::<T>::from_raw(node as *mut ()) }
         } else {
             // SAFETY: the box made in `push_back`, unlinked now.
             let proxy = unsafe { Box::from_raw((node & !PROXY) as *mut Proxy<T>) };
@@ -156,6 +151,8 @@ impl<T: Task> Lists<T> {
         Scheduled {
             process,
             schedule_count,
+            kind: if proxy { Enqueue::Proxy } else { Enqueue::Real },
+            queue,
         }
     }
 
