@@ -1167,19 +1167,6 @@ fn dispatch_native_send(
             if !idle && crate::trace::saves_calls(process) {
                 crate::trace::save_call(process, crate::trace::SavedCall::Send);
             }
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_send mirrors
-            // call_light_bif, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the send is a light
-            // BIF call, so heap fragments that outgrew the free young area are collected
-            // right after it, with the BIF result as the only root.
-            let mut value = value;
-            if process.heap.gc_after_bif_desired() {
-                let collected =
-                    crate::calls::gc_after_native_parts(process, &mut [], Some(&mut value), None);
-                if collected.is_err() {
-                    crate::native_hooks::set_error(process, "system_limit");
-                    return Some(0);
-                }
-            }
             let raw = crate::native_hooks::raw(value);
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send jumps into
             // call_light_bif_shared) and 488-523 (ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1:

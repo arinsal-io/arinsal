@@ -359,6 +359,49 @@ pub fn check_if_active(heap: &ProcessHeap, term: Term) {
     fail(heap, term, &context_label(""));
 }
 
+/// Check every pointer reachable through cons cells and tuples of `term` (debug builds with
+/// validation active). A message about to be copied must only name live allocations; the
+/// first dangling child is reported with the path depth so the step that left it stale can be
+/// named. Not an erts function: erts relies on `erts_check_heap` in debug builds.
+pub fn check_deep_if_active(heap: &ProcessHeap, term: Term, context: &str) {
+    if !active() || !term.is_pointer() {
+        return;
+    }
+    let mut stack = vec![term];
+    let mut seen = 0usize;
+    while let Some(t) = stack.pop() {
+        if !t.is_pointer() {
+            continue;
+        }
+        seen += 1;
+        if seen > 4_000_000 {
+            return;
+        }
+        if !accepted(heap, t) {
+            fail(
+                heap,
+                t,
+                &format!("{context} (deep, after {seen} nodes, root {:#x})", term.0),
+            );
+        }
+        let ptr = (t.0 & !7) as *const u64;
+        // SAFETY: `accepted` just confirmed `ptr` lies in a live allocation.
+        unsafe {
+            if t.0 & 3 == 1 {
+                stack.push(Term(*ptr));
+                stack.push(Term(*ptr.add(1)));
+            } else if t.0 & 3 == 2 && is_static_empty_tuple(ptr as usize) {
+                continue;
+            } else if t.0 & 3 == 2 && *ptr & 63 == crate::ARITY {
+                let n = (*ptr >> 6) as usize;
+                for i in 1..=n {
+                    stack.push(Term(*ptr.add(i)));
+                }
+            }
+        }
+    }
+}
+
 /// Check every root the collector just rewrote, including the live stack.
 #[inline]
 pub fn check_roots_if_active(heap: &ProcessHeap, roots: &[Term], extra: &[Term]) {

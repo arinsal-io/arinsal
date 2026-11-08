@@ -2380,7 +2380,7 @@ fn put_term_in_bucket(
         let revived = node.prefix.pseudo_deleted();
         let old_words = node.db_size_words();
         // replace_dbterm: the stored term is rewritten in the existing block.
-        StoredTerm::overwrite_from_input(
+        StoredTerm::replace_from_input(
             node,
             term,
             options.compressed,

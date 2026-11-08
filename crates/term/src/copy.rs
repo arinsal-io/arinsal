@@ -534,6 +534,16 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                         continue;
                     }
                     let hdr = *objp;
+                    // Debug-only: the sized block must hold this object (erts copy_struct
+                    // asserts `htop <= hbot` on exit; here also before each object).
+                    debug_assert!(
+                        (hbot as usize).wrapping_sub(htop as usize) / 8
+                            >= copy_object_words(objp, hdr),
+                        "copy_struct overflow: root={:#x} size={size} src={:#x} hdr={hdr:#x} free={}",
+                        root.0,
+                        objp as usize,
+                        (hbot as usize).wrapping_sub(htop as usize) / 8
+                    );
                     match hdr & 63 {
                         ARITY => {
                             let n = (hdr >> 6) as usize;
@@ -1214,5 +1224,23 @@ mod ets_element_tests {
 
         similar_asserts::assert_eq!(copied.tagged_word(), expected);
         similar_asserts::assert_eq!(destination.used_words(), 3);
+    }
+}
+
+/// Destination words `copy_struct` needs for the boxed object at `objp` (debug checks only).
+fn copy_object_words(objp: *const u64, hdr: u64) -> usize {
+    match hdr & 63 {
+        // The empty tuple is the shared literal: nothing is copied.
+        ARITY if hdr >> 6 == 0 => 0,
+        ARITY | RECORD => ((hdr >> 6) as usize) + 1,
+        FUN => 2 + ((hdr >> 16) & 255) as usize,
+        MAP => match (hdr >> 6) & 3 {
+            // The flatmap header is live; its size word follows (read through the raw module).
+            0 => crate::raw::load(objp as usize + 8) as usize + 3,
+            1 => 1 + ((hdr >> 16) as u16).count_ones() as usize,
+            _ => 2 + ((hdr >> 16) as u16).count_ones() as usize,
+        },
+        SUB_BITS => 5,
+        _ => ((hdr >> 6) as usize) + 1,
     }
 }

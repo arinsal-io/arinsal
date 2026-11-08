@@ -987,6 +987,10 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (wunlock_adapt_base_node), OTP-29.1.1.
+    /// erts adapts while the caller still holds the base node's write lock. This entry takes
+    /// the lock again after the operation released it, so the order is always base node, then
+    /// the adaptation mutex: locking the mutex first and the base node second deadlocks against
+    /// `adapt_locked`, whose caller already holds the base node.
     fn adapt(&self, base: &Arc<BaseNode>, _stat: i64) {
         if self.force_split.load(AtomicOrdering::Relaxed) {
             base.lock_statistics
@@ -996,25 +1000,8 @@ impl CATree {
         if (LOW_CONTENTION_LIMIT..=HIGH_CONTENTION_LIMIT).contains(&stat) {
             return;
         }
-        let _adaptation = self.adaptation.lock().expect("CA-tree adaptation poisoned");
-        let routes = self.routes.load();
-        let Some(index) = routes
-            .iter()
-            .position(|route| Arc::ptr_eq(&route.base, base))
-        else {
-            return;
-        };
-        if stat < LOW_CONTENTION_LIMIT && routes.len() == 1 && index == 0 {
-            // A parentless base cannot join; erts resets its statistics and releases it.
-            base.lock_statistics.store(0, AtomicOrdering::Relaxed);
-            return;
-        }
-        drop(routes);
-        if stat > HIGH_CONTENTION_LIMIT {
-            self.split(base);
-        } else if stat < LOW_CONTENTION_LIMIT {
-            self.join(base, JoinCause::LowStatistic);
-        }
+        let root = base.write_no_stats();
+        self.adapt_locked(base, root, stat);
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (wunlock_adapt_base_node), OTP-29.1.1.
