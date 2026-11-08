@@ -5216,7 +5216,7 @@ fn pull(sock: &Arc<Sock>) -> Option<&'static str> {
         pull_accept(sock);
         return None;
     }
-    let (eof, bytes_read, read_error) = {
+    let (eof, _bytes_read, read_error) = {
         let mut inner = sock.inner.lock();
         // Port of inet_drv.c:2819 (sock_select only while active or receiving).
         // A passive socket must leave the FIN unread so `{active, true}` still
@@ -5305,10 +5305,6 @@ fn pull(sock: &Arc<Sock>) -> Option<&'static str> {
         let _ = flush_send(&mut inner);
         (eof, bytes_read, read_error)
     };
-    if bytes_read > 0 && crate::node_tables::is_dist_port(sock.id) && crate::debug_env::trace_dist()
-    {
-        eprintln!("DIST_SOCKET_READ port={} bytes={bytes_read}", sock.id);
-    }
     read_error.or_else(|| eof.then_some("closed"))
 }
 

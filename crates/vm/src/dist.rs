@@ -7,7 +7,7 @@ use crate::node_tables::{self, DistState};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::{DistributionHeader, OwnedTerm};
-use arinsal_sched::{Pid, RunCtx, Signal};
+use arinsal_sched::{Event, Payload, Pid, RunCtx, Signal};
 use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -123,9 +123,6 @@ fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
 /// Port of erts/emulator/beam/dist.c:5571 (erts_internal_get_creation_0), OTP-29.1.1.
 fn get_creation() -> Result<Term, VmError> {
     let creation = node_tables::lock().local_creation;
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_GET_CREATION {creation}");
-    }
     if creation == 0 {
         Ok(atom("undefined"))
     } else {
@@ -219,13 +216,6 @@ fn create_channel(
     }
     let flags = as_u64(&options[0]).ok_or_else(badarg)?;
     let creation = as_u32(&options[1]).ok_or_else(badarg)?;
-    if crate::debug_env::trace_dist() {
-        let tables = node_tables::lock();
-        eprintln!(
-            "DIST_HANDSHAKE local={} local_creation={} remote={} remote_creation={} flags={flags:#x}",
-            tables.local_name, tables.local_creation, node, creation
-        );
-    }
     if flags & node_tables::DFLAG_DIST_MANDATORY != node_tables::DFLAG_DIST_MANDATORY {
         return Err(badarg());
     }
@@ -408,7 +398,7 @@ fn put_data(
         let DistributionHeader::Start { .. } = packet.header else {
             return Ok((state.handle, Vec::new()));
         };
-        let decoded = arinsal_etf::decode_dist_payload(&packet).map_err(|_| badarg())?;
+        let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
         Ok((state.handle, decoded))
     })?;
     route_incoming(vm, process, ctx, handle_id, &local_name, decoded)?;
@@ -421,48 +411,67 @@ fn route_incoming(
     ctx: &mut RunCtx<'_, Message>,
     handle: u64,
     local: &str,
-    mut terms: Vec<OwnedTerm>,
+    mut terms: Vec<(OwnedTerm, usize)>,
 ) -> Result<(), VmError> {
     if terms.is_empty() {
         return Ok(());
     }
-    let control = terms.remove(0);
+    let (control, _) = terms.remove(0);
+    let local_creation = node_tables::lock().local_creation;
+    let terms: Vec<(OwnedTerm, usize)> = terms
+        .into_iter()
+        .map(|(term, heap_words)| {
+            (
+                internalize_local_node(term, local, local_creation),
+                heap_words,
+            )
+        })
+        .collect();
     let OwnedTerm::Tuple(parts) = &control else {
         return Err(badarg());
     };
     let Some(OwnedTerm::Int(op)) = parts.first() else {
         return Err(badarg());
     };
-    if crate::debug_env::trace_dist() {
-        let tables = node_tables::lock();
-        let destination = match *op {
-            2 | 12 | 22 | 23 => parts.get(2),
-            6 => parts.get(3),
-            33 | 34 => parts.get(2),
-            _ => None,
-        };
-        eprintln!(
-            "DIST_RX op={op} node={} creation={} destination={destination:?}",
-            tables.local_name, tables.local_creation
-        );
-    }
     match *op {
         // Port of dist.c:2519 (DOP_SEND), OTP-29.1.1.
         // Port of erts/emulator/beam/dist.c:2509-2539, OTP-29.1.1.
         2 | 22 if parts.len() == 3 => {
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            for term in terms {
+            let from = if *op == 22 {
+                remote_proxy(handle, &parts[1])?
+            } else {
+                target
+            };
+            for (term, _) in terms {
                 let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                ctx.send(target, Message::copy_from(message)?)
-                    .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
+                ctx.send_node(
+                    target,
+                    arinsal_sched::OwnedSignal::new(Event {
+                        from,
+                        payload: Payload::Message(Message::copy_from(message)?),
+                    }),
+                )
+                .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
             }
         }
         12 | 23 if parts.len() == 4 => {
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            for term in terms {
+            let from = if *op == 23 {
+                remote_proxy(handle, &parts[1])?
+            } else {
+                target
+            };
+            for (term, _) in terms {
                 let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                ctx.send(target, Message::copy_from(message)?)
-                    .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
+                ctx.send_node(
+                    target,
+                    arinsal_sched::OwnedSignal::new(Event {
+                        from,
+                        payload: Payload::Message(Message::copy_from(message)?),
+                    }),
+                )
+                .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
             }
         }
         // Port of dist.c:2468 (DOP_REG_SEND), OTP-29.1.1.
@@ -473,7 +482,7 @@ fn route_incoming(
             };
             let _ = sender;
             let target = registered_pid(process, name).ok_or_else(badarg)?;
-            for term in terms {
+            for (term, _) in terms {
                 let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
                 ctx.send(target, Message::copy_from(message)?)
                     .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
@@ -490,9 +499,14 @@ fn route_incoming(
             let reason = if parts.len() == 4 {
                 &parts[3]
             } else {
-                terms.first().ok_or_else(badarg)?
+                &terms.first().ok_or_else(badarg)?.0
             };
-            let reason = from_owned(reason, &mut process.heap).map_err(|_| badarg())?;
+            let reason = if parts.len() == 4 {
+                from_owned(reason, &mut process.heap).map_err(|_| badarg())?
+            } else {
+                from_owned(&terms.first().ok_or_else(badarg)?.0, &mut process.heap)
+                    .map_err(|_| badarg())?
+            };
             publish_remote_signal(
                 process,
                 from,
@@ -546,10 +560,15 @@ fn route_incoming(
             let reason = if *op == 21 {
                 &parts[4]
             } else {
-                terms.first().ok_or_else(badarg)?
+                &terms.first().ok_or_else(badarg)?.0
             };
             let from = remote_proxy(handle, target_owned)?;
-            let reason = from_owned(reason, &mut process.heap).map_err(|_| badarg())?;
+            let reason = if *op == 21 {
+                from_owned(reason, &mut process.heap).map_err(|_| badarg())?
+            } else {
+                from_owned(&terms.first().ok_or_else(badarg)?.0, &mut process.heap)
+                    .map_err(|_| badarg())?
+            };
             publish_remote_signal(
                 process,
                 from,
@@ -566,7 +585,7 @@ fn route_incoming(
             };
             let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
             if let Some(target) = remote_alias_pid(&parts[2]) {
-                for term in terms {
+                for (term, _) in terms {
                     let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
                     ctx.send(target, Message::copy_from(message)?.with_alias(reference))
                         .map_err(|error| {
@@ -576,7 +595,7 @@ fn route_incoming(
             }
         }
         29 if parts.len() == 6 && terms.len() == 1 => {
-            handle_spawn_request(vm, process, ctx, handle, parts, &terms[0])?;
+            handle_spawn_request(vm, process, ctx, handle, parts, &terms[0].0)?;
         }
         31 | 32 if (parts.len() == 5 && *op == 31) || (parts.len() == 6 && *op == 32) => {
             // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
@@ -792,11 +811,6 @@ fn queue_outgoing_with_options(
     connect: bool,
     suspend: bool,
 ) -> Result<DistSendResult, VmError> {
-    if crate::debug_env::trace_dist()
-        && matches!(&control, OwnedTerm::Tuple(parts) if matches!(parts.first(), Some(OwnedTerm::Int(6))) && matches!(parts.get(3), Some(OwnedTerm::Atom(name)) if name == "global_name_server"))
-    {
-        eprintln!("DIST_TX_GLOBAL node={node} control={control:?} message={message:?}");
-    }
     let mut tables = node_tables::lock();
     if !tables.alive {
         return Ok(DistSendResult::NotConnected);
@@ -928,9 +942,6 @@ pub(crate) fn ingest_port_data(
     if bytes.is_empty() {
         return Ok(());
     }
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_FRAME port={port_id} bytes={}", bytes.len());
-    }
     let local_name = node_tables::lock().local_name.clone();
     let (handle, decoded) = {
         let mut tables = node_tables::lock();
@@ -946,25 +957,12 @@ pub(crate) fn ingest_port_data(
             .ok_or_else(badarg)?;
         let state = entry.dist.as_mut().ok_or_else(badarg)?;
         state.read = state.read.saturating_add(1);
-        let packet =
-            arinsal_etf::decode_dist_packet(bytes, &mut state.incoming_cache).map_err(|error| {
-                if crate::debug_env::trace_dist() {
-                    eprintln!("DIST_DECODE_HEADER_ERROR {error:?} bytes={}", bytes.len());
-                }
-                badarg()
-            })?;
+        let packet = arinsal_etf::decode_dist_packet(bytes, &mut state.incoming_cache)
+            .map_err(|_| badarg())?;
         let Some(packet) = reassemble_port_fragment(state, packet)? else {
             return Ok(());
         };
-        let decoded = arinsal_etf::decode_dist_payload(&packet).map_err(|error| {
-            if crate::debug_env::trace_dist() {
-                eprintln!(
-                    "DIST_DECODE_PAYLOAD_ERROR {error:?} payload={}",
-                    packet.payload.len()
-                );
-            }
-            badarg()
-        })?;
+        let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
         (state.handle, decoded)
     };
     route_incoming_port(runtime, handle, &local_name, decoded)
@@ -1046,9 +1044,6 @@ pub(crate) fn port_connection_closed(
     runtime: &crate::process::Runtime,
     port_id: u64,
 ) -> Result<(), VmError> {
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_PORT_CLOSED port={port_id}");
-    }
     let Some(node) = node_tables::unregister_dist_port(port_id) else {
         return Ok(());
     };
@@ -1094,9 +1089,6 @@ pub(crate) fn kill_connection(
     node: &str,
     connection_id: u32,
 ) -> Result<bool, VmError> {
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_KILL_CONNECTION node={node} connection_id={connection_id}");
-    }
     let (watchers, node_events, monitor_downs, spawn_downs) = {
         let mut tables = node_tables::lock();
         let Some(entry) = tables.entries.get(node) else {
@@ -1160,12 +1152,6 @@ fn take_connection_monitors(
     }
     if !monitors.is_empty() {
         PROXIES_CREATED.store(true, Ordering::Release);
-    }
-    if crate::debug_env::trace_dist() {
-        eprintln!(
-            "DIST_MONITOR_CONNECTION_DOWN node={node} monitors={}",
-            monitors.len()
-        );
     }
     monitors
         .into_iter()
@@ -1314,59 +1300,46 @@ fn route_incoming_port(
     runtime: &'static crate::process::Runtime,
     handle: u64,
     local: &str,
-    mut terms: Vec<OwnedTerm>,
+    mut terms: Vec<(OwnedTerm, usize)>,
 ) -> Result<(), VmError> {
     if terms.is_empty() {
         return Ok(());
     }
-    let control = terms.remove(0);
+    let (control, control_heap_words) = terms.remove(0);
     let OwnedTerm::Tuple(parts) = &control else {
         return Err(badarg());
     };
     let Some(OwnedTerm::Int(op)) = parts.first() else {
         return Err(badarg());
     };
-    if crate::debug_env::trace_dist() {
-        let tables = node_tables::lock();
-        let destination = match *op {
-            2 | 12 | 22 | 23 => parts.get(2),
-            6 => parts.get(3),
-            33 | 34 => parts.get(2),
-            _ => None,
-        };
-        eprintln!(
-            "DIST_RX_PORT op={op} arity={} node={} creation={} destination={destination:?}",
-            parts.len(),
-            tables.local_name,
-            tables.local_creation
-        );
-        if matches!(*op, 28 | 31 | 32) {
-            eprintln!("DIST_RX_PORT_CONTROL {control:?} payload={terms:?}");
-        }
-        if *op == 6
-            && matches!(parts.get(3), Some(OwnedTerm::Atom(name)) if name == "global_name_server")
-        {
-            eprintln!("DIST_RX_GLOBAL control={control:?} payload={terms:?}");
-        }
-    }
     let sched = runtime.scheduler()?;
     match *op {
         // Port of erts/emulator/beam/dist.c:2509-2539, OTP-29.1.1.
         2 | 22 if parts.len() == 3 => {
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            for term in terms {
-                let message = owned_to_message(&term)?;
+            let from = if *op == 22 {
+                remote_proxy(handle, &parts[1])?
+            } else {
+                target
+            };
+            for (term, heap_words) in terms {
+                let message = owned_to_message_with_heap_size(&term, heap_words)?;
                 sched
-                    .send(target, target, message)
+                    .send(from, target, message)
                     .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
             }
         }
         12 | 23 if parts.len() == 4 => {
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            for term in terms {
-                let message = owned_to_message(&term)?;
+            let from = if *op == 23 {
+                remote_proxy(handle, &parts[1])?
+            } else {
+                target
+            };
+            for (term, heap_words) in terms {
+                let message = owned_to_message_with_heap_size(&term, heap_words)?;
                 sched
-                    .send(target, target, message)
+                    .send(from, target, message)
                     .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
             }
         }
@@ -1375,8 +1348,8 @@ fn route_incoming_port(
                 return Err(badarg());
             };
             let target = runtime.reg.whereis_proc_str(name).ok_or_else(badarg)?;
-            for term in terms {
-                let message = owned_to_message(&term)?;
+            for (term, heap_words) in terms {
+                let message = owned_to_message_with_heap_size(&term, heap_words)?;
                 sched
                     .send(target, target, message)
                     .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
@@ -1398,9 +1371,14 @@ fn route_incoming_port(
             let reason = if parts.len() == 4 {
                 &parts[3]
             } else {
-                terms.first().ok_or_else(badarg)?
+                &terms.first().ok_or_else(badarg)?.0
             };
-            let reason = owned_to_message(reason)?;
+            let heap_words = if parts.len() == 4 {
+                control_heap_words
+            } else {
+                terms.first().ok_or_else(badarg)?.1
+            };
+            let reason = owned_to_message_with_heap_size(reason, heap_words)?;
             sched
                 .signal(from, target, Signal::Exit(Box::new(reason)))
                 .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
@@ -1434,10 +1412,15 @@ fn route_incoming_port(
             let reason = if *op == 21 {
                 &parts[4]
             } else {
-                terms.first().ok_or_else(badarg)?
+                &terms.first().ok_or_else(badarg)?.0
             };
             let from = remote_proxy(handle, target_owned)?;
-            let reason_msg = owned_to_message(reason)?;
+            let heap_words = if *op == 21 {
+                control_heap_words
+            } else {
+                terms.first().ok_or_else(badarg)?.1
+            };
+            let reason_msg = owned_to_message_with_heap_size(reason, heap_words)?;
             sched
                 .signal(
                     from,
@@ -1456,8 +1439,9 @@ fn route_incoming_port(
             };
             let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
             if let Some(target) = remote_alias_pid(&parts[2]) {
-                for term in terms {
-                    let message = owned_to_message(&term)?.with_alias(reference);
+                for (term, heap_words) in terms {
+                    let message =
+                        owned_to_message_with_heap_size(&term, heap_words)?.with_alias(reference);
                     sched.send(target, target, message).map_err(|error| {
                         VmError::Unsupported(format!("dist alias send: {error}"))
                     })?;
@@ -1473,40 +1457,75 @@ fn route_incoming_port(
             const FLG_NAME: u64 = 1 << 3;
             const FLG_EXIT: u64 = 1 << 4;
             let from = remote_proxy(handle, &parts[2])?;
-            let (target, alias) = if flags & FLG_ALIAS != 0 {
+            if flags & FLG_ALIAS != 0 {
                 let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-                (remote_alias_pid(&parts[3]), Some(reference))
+                if let Some(target) = remote_alias_pid(&parts[3]) {
+                    for (term, heap_words) in terms {
+                        let message = owned_to_message_with_heap_size(&term, heap_words)?
+                            .with_alias(reference);
+                        let message = if flags & FLG_PRIO != 0 {
+                            message.with_priority()
+                        } else {
+                            message
+                        };
+                        let result = if flags & FLG_EXIT != 0 {
+                            sched.signal(from, target, Signal::Exit(Box::new(message)))
+                        } else {
+                            sched.send(from, target, message)
+                        };
+                        result.map_err(|error| {
+                            VmError::Unsupported(format!("dist altact alias: {error}"))
+                        })?;
+                    }
+                }
             } else if flags & FLG_NAME != 0 {
                 let OwnedTerm::Atom(name) = &parts[3] else {
                     return Err(badarg());
                 };
-                (runtime.reg.whereis_proc_str(name), None)
+                let target = runtime.reg.whereis_proc_str(name);
+                if let Some(target) = target {
+                    for (term, heap_words) in terms {
+                        let message = owned_to_message_with_heap_size(&term, heap_words)?;
+                        let message = if flags & FLG_PRIO != 0 {
+                            message.with_priority()
+                        } else {
+                            message
+                        };
+                        let result = if flags & FLG_EXIT != 0 {
+                            sched.signal(from, target, Signal::Exit(Box::new(message)))
+                        } else {
+                            sched.send(from, target, message)
+                        };
+                        result.map_err(|error| {
+                            VmError::Unsupported(format!("dist altact name: {error}"))
+                        })?;
+                    }
+                }
             } else {
-                (local_pid(&parts[3], local), None)
-            };
-            if let Some(target) = target {
-                for term in terms {
-                    let mut message = owned_to_message(&term)?;
-                    if let Some(alias) = alias {
-                        message = message.with_alias(alias);
+                let target = local_pid(&parts[3], local);
+                if let Some(target) = target {
+                    for (term, heap_words) in terms {
+                        let message = owned_to_message_with_heap_size(&term, heap_words)?;
+                        let message = if flags & FLG_PRIO != 0 {
+                            message.with_priority()
+                        } else {
+                            message
+                        };
+                        let result = if flags & FLG_EXIT != 0 {
+                            sched.signal(from, target, Signal::Exit(Box::new(message)))
+                        } else {
+                            sched.send(from, target, message)
+                        };
+                        result.map_err(|error| {
+                            VmError::Unsupported(format!("dist altact pid: {error}"))
+                        })?;
                     }
-                    if flags & FLG_PRIO != 0 {
-                        message = message.with_priority();
-                    }
-                    let result = if flags & FLG_EXIT != 0 {
-                        sched.signal(from, target, Signal::Exit(Box::new(message)))
-                    } else {
-                        sched.send(from, target, message)
-                    };
-                    result.map_err(|error| {
-                        VmError::Unsupported(format!("dist altact send: {error}"))
-                    })?;
                 }
             }
         }
         // Port of dist.c:2885 (DOP_SPAWN_REQUEST) / DOP_SPAWN_REPLY on Port DistCtrlr.
         29 if parts.len() == 6 && terms.len() == 1 => {
-            handle_spawn_request_port(runtime, handle, local, parts, &terms[0])?;
+            handle_spawn_request_port(runtime, handle, local, parts, &terms[0].0)?;
         }
         31 | 32 if (parts.len() == 5 && *op == 31) || (parts.len() == 6 && *op == 32) => {
             // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
@@ -1521,21 +1540,32 @@ fn route_incoming_port(
 }
 
 fn owned_to_message(term: &OwnedTerm) -> Result<Message, VmError> {
-    let local = node_tables::lock().local_name.clone();
-    let term = internalize_local_node(term.clone(), &local);
-    let mut heap = arinsal_term::ProcessHeap::with_words(256);
+    owned_to_message_with_heap_size(term, 256)
+}
+
+fn owned_to_message_with_heap_size(
+    term: &OwnedTerm,
+    heap_words: usize,
+) -> Result<Message, VmError> {
+    let (local, creation) = {
+        let tables = node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let term = internalize_local_node(term.clone(), &local, creation);
+    let mut heap = arinsal_term::ProcessHeap::with_words(heap_words);
     let term = from_owned(&term, &mut heap).map_err(|_| badarg())?;
     Message::copy_from(term)
 }
 
-/// Convert peer-encoded local identities back to internal `nonode@nohost` form
-/// so they compare equal to locally created pids/refs (OTP external.c decode).
-fn internalize_local_node(mut term: OwnedTerm, local: &str) -> OwnedTerm {
+/// Port of erts/emulator/beam/external.c (dec_is_this_node, dec_pid, dec_term), OTP-29.1.1.
+/// Decode peer-encoded local identities as internal pids, ports, and references so they compare
+/// equal to locally created terms.
+fn internalize_local_node(mut term: OwnedTerm, local: &str, local_creation: u32) -> OwnedTerm {
     match &mut term {
         OwnedTerm::Pid { node, creation, .. }
         | OwnedTerm::Port { node, creation, .. }
         | OwnedTerm::Ref { node, creation, .. }
-            if node.as_str() == local =>
+            if node.as_str() == local && *creation == local_creation =>
         {
             *node = "nonode@nohost".into();
             *creation = 0;
@@ -1543,29 +1573,37 @@ fn internalize_local_node(mut term: OwnedTerm, local: &str) -> OwnedTerm {
         OwnedTerm::Tuple(parts) => {
             for part in parts.iter_mut() {
                 let taken = std::mem::replace(part, OwnedTerm::Nil);
-                *part = internalize_local_node(taken, local);
+                *part = internalize_local_node(taken, local, local_creation);
             }
         }
         OwnedTerm::List { elems, tail } => {
             for elem in elems.iter_mut() {
                 let taken = std::mem::replace(elem, OwnedTerm::Nil);
-                *elem = internalize_local_node(taken, local);
+                *elem = internalize_local_node(taken, local, local_creation);
             }
             let taken = std::mem::replace(tail.as_mut(), OwnedTerm::Nil);
-            *tail.as_mut() = internalize_local_node(taken, local);
+            *tail.as_mut() = internalize_local_node(taken, local, local_creation);
         }
         OwnedTerm::Map(entries) => {
             for (key, value) in entries.iter_mut() {
                 let taken_k = std::mem::replace(key, OwnedTerm::Nil);
-                *key = internalize_local_node(taken_k, local);
+                *key = internalize_local_node(taken_k, local, local_creation);
                 let taken_v = std::mem::replace(value, OwnedTerm::Nil);
-                *value = internalize_local_node(taken_v, local);
+                *value = internalize_local_node(taken_v, local, local_creation);
+            }
+        }
+        OwnedTerm::Fun { pid, free_vars, .. } => {
+            let creator = std::mem::replace(pid.as_mut(), OwnedTerm::Nil);
+            **pid = internalize_local_node(creator, local, local_creation);
+            for value in free_vars.iter_mut() {
+                let taken = std::mem::replace(value, OwnedTerm::Nil);
+                *value = internalize_local_node(taken, local, local_creation);
             }
         }
         OwnedTerm::Record { fields, .. } => {
             for (_, value) in fields {
                 let taken = std::mem::replace(value, OwnedTerm::Nil);
-                *value = internalize_local_node(taken, local);
+                *value = internalize_local_node(taken, local, local_creation);
             }
         }
         _ => {}
@@ -1987,6 +2025,23 @@ pub(crate) fn spawn_reply_drop_monitor(data: &DistSpawnReplyData) {
     }
 }
 
+/// Install the origin half of a successful monitored spawn in the caller's monitor tree.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:5740-5878
+/// (handle_dist_spawn_reply), OTP-29.1.1.
+pub(crate) fn spawn_reply_install_origin_monitor(process: &mut Process, parent: Pid, id: u64) {
+    process.cold_mut().dist_monitors.insert(id);
+    let (origin, _) = crate::proc_create::create_monitor_with_reference_at(
+        process.heap.alloc_ix(),
+        crate::proc_create::monitor_reference(id, None, false),
+        parent.data(),
+        0,
+        crate::proc_create::MonitorInfo::default(),
+        crate::proc_create::OriginMonitor::Distributed,
+    );
+    process.monitors.insert(origin);
+}
+
 /// Mark the live pending request `id` of `parent` abandoned, or drop it when it has no link.
 /// Returns false when `id` is not an outstanding request of `parent`.
 ///
@@ -2284,7 +2339,8 @@ fn handle_spawn_request(
     let mfa = &parts[4];
     let options = &parts[5];
     let local_name = node_tables::lock().local_name.clone();
-    let arguments = internalize_local_node(arguments.clone(), &local_name);
+    let local_creation = node_tables::lock().local_creation;
+    let arguments = internalize_local_node(arguments.clone(), &local_name, local_creation);
     let (module, function, arity) = match mfa {
         OwnedTerm::Tuple(items) if items.len() == 3 => (&items[0], &items[1], &items[2]),
         _ => return Err(badarg()),
@@ -2406,16 +2462,10 @@ fn handle_spawn_request_port(
 ) -> Result<(), VmError> {
     let reference = parts[1].clone();
     let from = parts[2].clone();
-    if crate::debug_env::trace_dist() {
-        let tables = node_tables::lock();
-        eprintln!(
-            "DIST_SPAWN_IDENT_PORT local={} creation={} from={from:?} ref={reference:?}",
-            tables.local_name, tables.local_creation
-        );
-    }
     let mfa = &parts[4];
     let options = &parts[5];
-    let arguments = internalize_local_node(arguments.clone(), local);
+    let local_creation = node_tables::lock().local_creation;
+    let arguments = internalize_local_node(arguments.clone(), local, local_creation);
     let (module, function, arity) = match mfa {
         OwnedTerm::Tuple(items) if items.len() == 3 => (&items[0], &items[1], &items[2]),
         _ => return Err(badarg()),
@@ -2456,11 +2506,6 @@ fn handle_spawn_request_port(
     } else {
         Err(VmError::Unsupported("bad spawn options".into()))
     };
-    if crate::debug_env::trace_dist() {
-        eprintln!(
-            "DIST_SPAWN_REQUEST {mod_name}:{fun_name}/{arity} args={arg_list:?} options={options:?} result={spawn_result:?}"
-        );
-    }
     let mut child_to_schedule = None;
     if let Ok(child) = spawn_result {
         let tables = node_tables::lock();
@@ -2496,11 +2541,6 @@ fn emit_control_message_on_handle(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
-    if crate::debug_env::trace_dist()
-        && matches!(&control, OwnedTerm::Tuple(parts) if matches!(parts.first(), Some(OwnedTerm::Int(21 | 31))))
-    {
-        eprintln!("DIST_TX_CONTROL {control:?}");
-    }
     let mut tables = node_tables::lock();
     let local_name = tables.local_name.clone();
     let local_creation = tables.local_creation;
@@ -2686,9 +2726,6 @@ pub(crate) fn forward_monitor_down_if_proxy(
             None,
         )
     };
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_MONITOR_DOWN reference={reference} term={control:?}");
-    }
     let _ = emit_control_message_on_handle(_runtime, handle, control, payload);
     true
 }
@@ -3029,9 +3066,6 @@ fn remember_monitor(node: &str, id: u64, watcher: Pid, target: OwnedTerm) -> Res
         entry
             .pending_monitors
             .insert(id, node_tables::RemoteMonitor { watcher, target });
-    }
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_MONITOR_SET node={node} ref={id} watcher={watcher:?}");
     }
     Ok(())
 }

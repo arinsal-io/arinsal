@@ -11,12 +11,6 @@ fn presence(cell: &'static OnceLock<bool>, name: &str) -> bool {
     *cell.get_or_init(|| std::env::var_os(name).is_some())
 }
 
-/// `ARINSAL_TRACE_DIST`: log distribution send and receive.
-pub(crate) fn trace_dist() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    presence(&FLAG, "ARINSAL_TRACE_DIST")
-}
-
 /// `ARINSAL_LITERAL_TRACE`: log literal-area and resource lifetime events.
 pub(crate) fn literal_trace() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();

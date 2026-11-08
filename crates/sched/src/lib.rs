@@ -645,6 +645,11 @@ pub enum Signal<M: SignalMessage> {
         reference: u64,
         shared: arinsal_alloc::typed::FixAllocArc<M::MonitorData>,
     },
+    /// A distributed spawn reply activates the caller's origin monitor.
+    MonitorOrigin {
+        reference: u64,
+        shared: arinsal_alloc::typed::FixAllocArc<M::MonitorData>,
+    },
     /// Opaque monitor request, used for NIF resources without a process monitor allocation.
     MonitorOpaque {
         reference: u64,

@@ -33,6 +33,18 @@ impl Process {
         self.insert_target_process_monitor_half(target);
     }
 
+    pub(super) fn insert_spawn_origin_monitor(
+        &mut self,
+        reference: u64,
+        shared: arinsal_alloc::typed::FixAllocArc<crate::proc_create::ProcessMonitorData>,
+    ) {
+        let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(shared, false) else {
+            return;
+        };
+        self.cold_mut().dist_monitors.insert(reference);
+        self.monitors.insert(origin);
+    }
+
     pub(super) fn insert_target_process_monitor_half(
         &mut self,
         target: crate::proc_create::ProcessMonitor,
