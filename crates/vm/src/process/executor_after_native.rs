@@ -461,16 +461,6 @@ impl Executor {
                             process.set_native_pc(Some(code_ptr));
                             return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
                         }
-                        Err(VmError::Unsupported(message))
-                            if crate::signals::is_await_message(&message) =>
-                        {
-                            for (register, value) in process.x.iter_mut().zip(&saved_x) {
-                                *register = *value;
-                            }
-                            process.set_native_retry(Some(target_pc));
-                            process.set_native_pc(Some(code_ptr));
-                            return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
-                        }
                         Err(VmError::Yield) => {
                             // A collection the call ran (the epilogue of a
                             // yielding BIF that allocated) moved the registers;
@@ -1102,18 +1092,6 @@ impl Executor {
                                 process.heap.abi.exc.fvalue = 0;
                                 process.heap.abi.exc.ftrace = 0;
                                 return Ok(Flow::Continue);
-                            }
-                            Err(VmError::Unsupported(message))
-                                if crate::signals::is_await_message(&message) =>
-                            {
-                                // The X registers still hold the arguments, moved
-                                // by any collection the call ran (signal handling
-                                // on entry); the copies taken before it are stale.
-                                // They stay live until the call is redone.
-                                process.gc_live = saved_arguments.len();
-                                process.set_native_retry(Some(target_pc));
-                                process.set_native_pc(Some(code_ptr));
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_ms: None })));
                             }
                             // ERTS_BIF_YIELD (e.g. a persistent_term updater
                             // waiting for thread progress): the native call is

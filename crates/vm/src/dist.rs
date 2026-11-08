@@ -3674,7 +3674,7 @@ fn resume_dist_senders(runtime: &crate::process::Runtime, senders: Vec<Pid>) {
     };
     for sender in senders {
         if runtime.resume_internal(sender) {
-            let _ = scheduler.signal(sender, sender, Signal::UnlinkAck(0));
+            let _ = scheduler.wake(sender);
         }
     }
 }

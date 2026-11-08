@@ -124,7 +124,7 @@ fn signal_resumed(runtime: &Runtime, pids: &[Pid]) {
         // The waiter joins its own run queue. That queue's scheduler is woken
         // only if it sleeps. Another scheduler takes the waiter by stealing
         // after it ran out of work, or by wakeup_other past its limit.
-        let _ = scheduler.signal(*pid, *pid, Signal::UnlinkAck(u64::MAX));
+        let _ = scheduler.wake(*pid);
     }
 }
 
@@ -328,7 +328,7 @@ impl PurgeState {
 /// Port of erts/emulator/beam/beam_bif_load.c:2028-2036 (finalize_purge_operation), OTP-29.1.1.
 fn resume_pending_lambda_callers(
     process: &Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    _ctx: &mut RunCtx<'_, crate::process::Message>,
     pids: Vec<Pid>,
 ) {
     let Some(runtime) = process.runtime else {
@@ -337,7 +337,9 @@ fn resume_pending_lambda_callers(
     for pid in pids {
         if runtime.resume_internal(pid) {
             // The signal only reschedules the target; a dead target needs no wake.
-            let _ = ctx.signal(pid, Signal::UnlinkAck(u64::MAX));
+            if let Ok(scheduler) = runtime.scheduler() {
+                let _ = scheduler.wake(pid);
+            }
         }
     }
 }

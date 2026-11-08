@@ -614,8 +614,29 @@ pub enum Signal<M: SignalMessage> {
     TraceChangeState(SharedPayload),
     /// Unlink request carrying its acknowledgement id.
     Unlink(u64),
-    /// Unlink acknowledgement.
+    /// Unlink acknowledgement of a distributed unlink (`DOP_UNLINK_ID_ACK`).
     UnlinkAck(u64),
+    /// A process system task, or a kick for the system tasks the receiver already holds. The
+    /// payload is the VM's task; the scheduler delivers it at the task's priority.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_SYNC... system task
+    // signal handled by sched_sig_sys_task, erl_process.c:11518), OTP-29.1.1.
+    SysTask(SharedPayload),
+    /// `is_process_alive` request: the receiver answers `{Ref, true}` to the sender once it
+    /// handles the signal (`{Ref, false}` when it is exiting). The value is the reference id.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_IS_ALIVE), OTP-29.1.1.
+    IsAlive(u64),
+    /// `process_info/1,2` request for another process: the receiver answers `{Ref, Info}` to
+    /// the sender. Boxed: the request is rare and would otherwise widen every queued event.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_PROCESS_INFO), OTP-29.1.1.
+    ProcessInfo(Box<ProcessInfoRequest<M>>),
+    /// `erts_internal:group_leader/3` request: the receiver sets its group leader and answers
+    /// `{Ref, true}` to the sender.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_GROUP_LEADER), OTP-29.1.1.
+    GroupLeader(Box<GroupLeaderRequest>),
+    /// `erts_internal:process_flag/3` (save_calls) and `process_display/2` request: the
+    /// receiver runs the operation and answers `{Ref, Result}` to the sender.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_RPC), OTP-29.1.1.
+    Rpc(Box<RpcRequest<M>>),
     /// Acknowledgement for the link protocol's unlink operation.
     UnlinkAckSignal(u64),
     /// Monitor request carrying a VM reference and the monitor's shared data.
@@ -702,6 +723,42 @@ pub enum Signal<M: SignalMessage> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:3247 (erts_proc_sig_send_dist_spawn_reply,
     // ERTS_SIG_Q_OP_DIST_SPAWN_REPLY), OTP-29.1.1.
     DistSpawnReply(SharedPayload),
+}
+
+/// The fields of [`Signal::GroupLeader`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupLeaderRequest {
+    /// The reply reference id.
+    pub id: u64,
+    /// The new group leader.
+    pub leader: Pid,
+}
+
+/// The operation of an [`RpcRequest`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RpcOp<M: SignalMessage> {
+    /// `process_flag(Pid, save_calls, Value)`.
+    SaveCalls(M),
+    /// `process_display(Pid, backtrace)`.
+    Display,
+}
+
+/// The fields of [`Signal::Rpc`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RpcRequest<M: SignalMessage> {
+    /// The reply reference id.
+    pub id: u64,
+    /// What the receiver runs.
+    pub op: RpcOp<M>,
+}
+
+/// The fields of [`Signal::ProcessInfo`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessInfoRequest<M: SignalMessage> {
+    /// The reply reference id.
+    pub id: u64,
+    /// The requested item or item list; `None` for `process_info/1`.
+    pub items: Option<M>,
 }
 
 /// The fields of [`Signal::SyncSuspend`].
@@ -1419,10 +1476,7 @@ pub mod proc_flags {
     /// ERTS_ML_FLG_SPAWN_PENDING, dist.c:6112 erts_internal_dist_spawn_request_4).
     pub const DIST_SPAWN: u32 = 1 << 10;
     pub const OWNED_TIMERS: u32 = 1 << 11;
-    /// A remote `process_info` / sys-task request is queued for this process
-    /// (`erl_proc_sig_queue.c` request tables). Exit takes that table only then.
-    pub const REQUESTS: u32 = 1 << 12;
-    pub const ALL: u32 = (1 << 13) - 1;
+    pub const ALL: u32 = (1 << 12) - 1;
     /// `ERTS_PSFLG_EXITING`, outside `ALL` so cleanup does not retire the bit.
     /// Port of erl_nif.c:2323 (`enif_is_process_alive` sees the state flag), OTP-29.1.1.
     pub const EXITING: u32 = 1 << 15;
@@ -1492,6 +1546,9 @@ struct ProcShared<M: SignalMessage> {
     /// The actual priority is the higher of the two.
     /// Port of erl_process.h (`ERTS_PSFLGS_ACT_PRIO_MASK`, `ERTS_PSFLG_SYS_TASKS`), OTP-29.1.1.
     sys_priority: AtomicU8,
+    /// erts `ERTS_PSFLG_ACTIVE_SYS`: system tasks are queued on the process and not yet run, so
+    /// the process stays active when its slice ends. Consumed by `schedule_out`.
+    active_sys: AtomicBool,
     /// `Process.next/prev`, `schedule_count` and `ERTS_PSFLG_IN_RUNQ`: the run queue links.
     rq_link: run_queue::RqLink,
     bound_worker: AtomicUsize,
@@ -2014,6 +2071,7 @@ impl<T: Task> ProcessTable<T> {
                     user_priority: AtomicU8::new(priority.index() as u8),
                     active: AtomicBool::new(true),
                     sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
+                    active_sys: AtomicBool::new(false),
                     rq_link: run_queue::RqLink::default(),
                     bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
                     scheduler_id: AtomicUsize::new(0),
@@ -5900,6 +5958,18 @@ impl<M: SignalMessage> RunCtx<'_, M> {
             .sys_priority
             .store(NO_SYS_PRIORITY, Ordering::Release);
     }
+    /// Mark the process active for system tasks it holds but did not run in this slice: its
+    /// actual priority is raised to `priority` and it is not parked when the slice ends.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:7028 (active_sys_enqueue sets
+    /// `ERTS_PSFLG_ACTIVE_SYS | ERTS_PSFLG_SYS_TASKS` and the process stays in a run queue),
+    /// OTP-29.1.1.
+    pub fn set_active_sys(&self, priority: Priority) {
+        self.proc
+            .sys_priority
+            .fetch_min(priority.index() as u8, Ordering::AcqRel);
+        self.proc.active_sys.store(true, Ordering::Release);
+    }
     /// Whether this run was scheduled for system tasks (erts `ERTS_PSFLG_RUNNING_SYS`).
     /// The task should handle its queued signals before executing code.
     pub fn sys_task_run(&self) -> bool {
@@ -9108,6 +9178,12 @@ fn schedule_out<T: Task>(
     } = end;
     let worker_id = worker.unwrap_or(0);
     let mut own_enqueue = None;
+    // Only the thread running the process sets and clears the flag (erts keeps it in the state
+    // word it already read-modify-writes), so a plain load keeps an atomic RMW off every slice end.
+    let active_sys = process.active_sys.load(Ordering::Relaxed) && {
+        process.active_sys.store(false, Ordering::Relaxed);
+        true
+    };
     // Port of erts/emulator/beam/erl_process.c:9678-9687 and erl_process.h:529
     // (ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1: `actual` leaves out what the slice gave up
     // without working; `reds` is that with the minimum context switch cost.
@@ -9307,7 +9383,9 @@ fn schedule_out<T: Task>(
             let prio = process.priority().index();
             // An exit waiter resumed while the process still ran (ExitWaiter::drop) is seen
             // here, after the transition to WAITING, so the resume is never lost.
+            // `ERTS_PSFLG_ACTIVE_SYS` keeps a process with unrun system tasks active too.
             if (left_running & psflg::SIG_IN_Q != 0
+                || active_sys
                 || (process.exit_resume.load(Ordering::SeqCst)
                     && process.exit_resume.swap(false, Ordering::SeqCst)))
                 && let Some(kind) = process.run_state().wake(None, prio)

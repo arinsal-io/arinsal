@@ -244,26 +244,13 @@ impl MessageQueue {
             .fold(0, usize::saturating_add)
     }
 
-    /// Index of the first message at or after `start` that matches.
-    pub(crate) fn position_from(
-        &self,
-        start: usize,
-        mut matches: impl FnMut(&Term) -> bool,
-    ) -> Option<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .skip(start)
-            .find(|(_, entry)| matches(&queued(entry).term))
-            .map(|(index, _)| index)
-    }
-
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Term> {
         self.entries.iter().map(|entry| &queued(entry).term)
     }
 
     /// Remove a message, transferring any off-heap fragment into the process heap.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7142 (message receive), OTP-29.1.1.
+    #[cfg(test)]
     pub(crate) fn remove_to_heap(
         &mut self,
         index: usize,

@@ -225,12 +225,9 @@ impl Executor {
                     // A process parked on a request reply reads it from its message queue like
                     // erts_internal:await_result's receive, so the reply message is fetched here.
                     if ctx.sys_task_run()
-                    || !process.sig_cont_empty()
-                    || process.delayed_gc_due()
-                    || ctx.has_pending_nmsg()
-                    // A cross-process BIF's reply arrives as a message that only this fetch
-                    // moves into the message queue.
-                    || process.pending_signal_waiter().is_some()
+                        || !process.sig_cont_empty()
+                        || process.delayed_gc_due()
+                        || ctx.has_pending_nmsg()
                     {
                         let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
                         let mut sig_reds = if process.slice().is_some_and(|work| work.dirty_sys_gc)
@@ -592,13 +589,6 @@ impl Executor {
                             break park_suspended(process, ctx);
                         }
                         let trap = match result {
-                            // Port of erts/preloaded/src/erts_internal.erl:152 (await_result), OTP-29.1.1.
-                            // A cross-process BIF parked this process until the reply signal arrives.
-                            Err(VmError::Unsupported(message))
-                                if crate::signals::is_await_message(&message) =>
-                            {
-                                break Ok(RunState::Wait { timeout_ms: None });
-                            }
                             Err(VmError::Trap(trap)) => {
                                 // g_port_fix: busy port_command suspends the sender and retries the call.
                                 if crate::port::take_busy_suspend() {

@@ -71,7 +71,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).self_pid).write(None);
         std::ptr::addr_of_mut!((*process).on_managed).write(false);
         std::ptr::addr_of_mut!((*process).native).write(None);
-        std::ptr::addr_of_mut!((*process).pending_signal_waiter).write(None);
         std::ptr::addr_of_mut!((*process).scheduler_id).write(0);
         std::ptr::addr_of_mut!((*process).run_key).write(0);
         std::ptr::addr_of_mut!((*process).exec_key).write(0);
@@ -161,7 +160,6 @@ fn process_fields_are_initialized(process: Process) {
         self_pid,
         on_managed,
         native,
-        pending_signal_waiter,
         scheduler_id,
         run_key,
         exec_key,
@@ -236,7 +234,6 @@ fn process_fields_are_initialized(process: Process) {
         self_pid,
         on_managed,
         native,
-        pending_signal_waiter,
         scheduler_id,
         run_key,
         exec_key,
