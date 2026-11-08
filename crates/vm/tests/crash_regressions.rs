@@ -32,7 +32,9 @@ deep_args() ->
     try erlang:list_to_binary(A) catch error:E:S -> [{M, F, _, _} | _] = S, {E, M, F} end.
 
 %% binary_SUITE:bad_terms/1: a truncated or bit-flipped external term must fail without leaving
-%% the partial term in a heap fragment that the collection after the BIF treats as live.
+%% the partial term in a heap fragment that the collection after the BIF treats as live. The
+%% deterministic option keeps both runtimes' map encodings byte-identical. The [safe] result is
+%% exercised but not tallied because it depends on each VM's atom table.
 bad_terms() ->
     Terms = [{a, b, [1, 2, 3], "abc", <<1, 2, 3>>, 1.5, #{a => 1, b => [x]}},
              lists:seq(1, 100), <<1:3>>, 1 bsl 100, [<<"x">> | y],
@@ -46,9 +48,9 @@ bad_node_terms() ->
     _ = lists:foldl(fun(T, Acc) -> corrupt(T, Acc) end, {0, 0}, Terms),
     ok.
 corrupt(Term, Acc0) ->
-    Bin = term_to_binary(Term),
+    Bin = term_to_binary(Term, [deterministic]),
     Acc = corrupter(Bin, size(Bin) - 1, Acc0),
-    CBin = term_to_binary(Term, [compressed]),
+    CBin = term_to_binary(Term, [compressed, deterministic]),
     corrupter(CBin, size(CBin) - 1, Acc).
 corrupter(Bin, Pos, Acc0) when Pos >= 0 ->
     {Short, Rest} = split_binary(Bin, Pos),
@@ -59,8 +61,12 @@ corrupter(Bin, Pos, Acc0) when Pos >= 0 ->
     corrupter(Bin, Pos - 1, Acc);
 corrupter(_, _, Acc) -> Acc.
 tally(Bin, {Ok, Bad}) ->
-    try binary_to_term(Bin), binary_to_term(Bin, [safe]), {Ok + 1, Bad}
-    catch error:_ -> {Ok, Bad + 1} end.
+    Default = try binary_to_term(Bin), true catch error:_ -> false end,
+    _ = try binary_to_term(Bin, [safe]) catch error:_ -> error end,
+    case Default of
+        true -> {Ok + 1, Bad};
+        false -> {Ok, Bad + 1}
+    end.
 "#;
 
 #[test]
@@ -86,6 +92,6 @@ fn crashes_match_otp() {
             .eval_scheduled("crash_reg", function, &[], 1, None)
             .map(|result| result.term)
             .unwrap_or_else(|error| panic!("{function}: VM error {error:?}"));
-        assert_eq!(expected, CallResult::Ok(actual), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
     }
 }
