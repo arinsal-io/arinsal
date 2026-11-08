@@ -95,6 +95,9 @@ impl Task for Process {
             .get_or_insert_with(arinsal_alloc::thread_alloc_ix);
         self.heap.set_alloc_ix(Some(alloc_ix));
         self.on_managed = !ctx.scheduler_type().is_dirty() && !ctx.simulated();
+        if self.receive_timeout_pos.is_some() {
+            self.receive_timeout_schedule_in();
+        }
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
         self.heap.set_alloc_ix(None);
         self.native = None;

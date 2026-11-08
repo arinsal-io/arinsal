@@ -519,7 +519,7 @@ pub(crate) enum LinkEvent<M> {
 pub(crate) enum TimerPayload<M> {
     Message(Pid, M, bool),
     ResolvedMessage(Arc<dyn Fn() -> Option<Pid> + Send + Sync>, M, bool),
-    Wake(Pid, u64),
+    Wake(Pid),
     /// Runtime callback owned by a process (erts `erts_start_timer_callback`).
     Callback(Pid, crate::TimerCallback<M>),
     /// A port timer (`erts_set_port_timer`): the callback queues the port's timeout task.

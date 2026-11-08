@@ -4039,6 +4039,10 @@ impl Vm {
                         ip = hot_next(ip);
                         continue;
                     }
+                    if remaining.is_some() {
+                        // `c_p->def_arg_reg[0] = next` (beam_jit_wait_timeout).
+                        p.receive_timeout_next = ((wait_ip + 1) << 1) | 1;
+                    }
                     p.module = module_id;
                     p.set_ip(target as usize);
                     p.heap.abi.fcalls = reds;

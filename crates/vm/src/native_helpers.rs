@@ -364,7 +364,7 @@ pub extern "C" fn arinsal_beamasm_take_receive_lock(_header: *mut ProcessHeader)
 pub extern "C" fn arinsal_beamasm_wait_timeout(
     header: *mut ProcessHeader,
     timeout: u64,
-    _next: usize,
+    next: usize,
 ) -> i32 {
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1222
     // (beam_jit_wait_timeout), OTP-29.1.1: timeout setup updates process wait state but does
@@ -375,6 +375,11 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
         Ok(Some(0)) => 0,
         Ok(remaining) => {
+            if remaining.is_some() {
+                // `c_p->def_arg_reg[0] = next`: the timeout label a timed-out schedule-in
+                // continues at.
+                process.receive_timeout_next = next;
+            }
             process.native_wait_timeout = remaining;
             1
         }
