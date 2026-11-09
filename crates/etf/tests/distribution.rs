@@ -1,6 +1,7 @@
 use arinsal_etf::{
-    AtomCache, DistributionHeader, OwnedTerm, decode_dist_packet, decode_dist_payload,
-    encode_dist_continuation, encode_dist_packet,
+    AtomCache, DistributionHeader, OwnedTerm, decode_dist_packet, decode_dist_packet_indexed,
+    decode_dist_payload, encode_dist_continuation, encode_dist_packet,
+    encode_dist_packet_terms_indexed,
 };
 use proptest::prelude::*;
 
@@ -23,6 +24,56 @@ fn distribution_atom_cache_round_trip_and_reuse() {
     let second = encode_dist_packet(&term, &mut outgoing, None);
     let cached = decode_dist_packet(&second, &mut incoming).unwrap();
     assert_eq!(decode_dist_payload(&cached).unwrap(), vec![term]);
+}
+
+#[test]
+fn indexed_outgoing_atom_cache_header_matches_erts_layout() {
+    let term = OwnedTerm::tuple(vec![
+        OwnedTerm::atom("a"),
+        OwnedTerm::atom("b"),
+        OwnedTerm::atom("c"),
+        OwnedTerm::atom("d"),
+    ]);
+    let mut cache = AtomCache::new();
+    let packet = encode_dist_packet_terms_indexed(&[&term], &mut cache, None, |name| {
+        Some(match name {
+            "a" => 1,    // 1 % 2039
+            "b" => 2039, // 2039 % 2039
+            "c" => 4095, // 4095 % 2039
+            "d" => 2040, // collides with a and is sent inline
+            _ => return None,
+        })
+    });
+
+    // Port of external.c atom2cix/insert_acache_map/finalize: touched slots
+    // are emitted in first-use order; the colliding atom is absent from the map.
+    assert_eq!(
+        &packet[..14],
+        &[131, 68, 3, 0x88, 0x08, 1, 1, b'a', 0, 1, b'b', 17, 1, b'c']
+    );
+    assert_eq!(&packet[14..], &[104, 4, 82, 0, 82, 1, 82, 2, 119, 1, b'd']);
+
+    let mut incoming = AtomCache::new();
+    let atom_id = |name: &str| match name {
+        "a" => Some(1),
+        "b" => Some(2039),
+        "c" => Some(4095),
+        _ => None,
+    };
+    let atom_name = |index| match index {
+        1 => Some("a".to_owned()),
+        2039 => Some("b".to_owned()),
+        4095 => Some("c".to_owned()),
+        _ => None,
+    };
+    let decoded = decode_dist_packet_indexed(&packet, &mut incoming, atom_id, atom_name).unwrap();
+    assert_eq!(decode_dist_payload(&decoded).unwrap(), vec![term.clone()]);
+    assert_eq!(incoming.get(1), None); // Indexed cache entries retain no atom text.
+
+    let reused = encode_dist_packet_terms_indexed(&[&term], &mut cache, None, atom_id);
+    assert_eq!(&reused[..8], &[131, 68, 3, 0, 0, 1, 0, 17]);
+    let decoded = decode_dist_packet_indexed(&reused, &mut incoming, atom_id, atom_name).unwrap();
+    assert_eq!(decode_dist_payload(&decoded).unwrap(), vec![term]);
 }
 
 #[test]
