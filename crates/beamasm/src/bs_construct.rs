@@ -302,7 +302,9 @@ fn emit_bs_create_bin_generic(
             e.mov_const(Gpr::x(2), u64::from(live))?;
             e.mov_reg(Gpr::x(3), BITS)?;
             e.mov_const(Gpr::x(4), u64::from(segment.unit))?;
-            e.mov_const(Gpr::x(5), u64::from(live + 1))?;
+            // erts passes `Live` itself: the helper reads the source from `reg[live]` and
+            // collects with `live + 1` roots (instr_bs.cpp:1816, erl_bits.c:1744).
+            e.mov_const(Gpr::x(5), u64::from(live))?;
             e.mov_const(Gpr::x(6), u64::from(alloc))
         })?;
         emit_bs_helper_call(

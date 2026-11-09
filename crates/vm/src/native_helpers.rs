@@ -4943,6 +4943,8 @@ fn set_bs_append_error(process: &mut crate::Process, detail: &str, reason: &str)
 }
 
 // Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.
+// The source is `reg[live]` (`source_index` is that same slot) and every collection here
+// keeps exactly `live + 1` X roots, the source or its `sb->orig` included.
 pub extern "C" fn arinsal_beamasm_bs_append_checked(
     process_header: &mut ProcessHeader,
     scheduler_registers: &mut SchedulerRegisters,
@@ -4959,12 +4961,17 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
     };
     let xregs = std::ptr::NonNull::new(registers.x_reg_array.as_mut_ptr())
         .expect("SchedulerRegisters owns its fixed X register array");
-    let source_index = source_index as usize;
     let extra_bits = extra_bits as usize;
     let unit = unit as usize;
     let live = live as usize;
     let alloc = alloc as usize;
-    let source = arinsal_term::raw::trusted_jit_register(xregs, source_index);
+    debug_assert_eq!(source_index as usize, live, "append source is reg[live]");
+    let source = arinsal_term::raw::trusted_jit_register(xregs, live);
+    // erl_bits.c:1744-1756: anything but a boxed bitstring is a type error, before any GC.
+    if source.classify() != arinsal_term::TermKind::Bitstring {
+        set_bs_append_error(process, "type", "badarg");
+        return 0;
+    }
     let mut prepared = PreparedWritableAppend::default();
     match TermBuilder::prepare_writable_append(
         &mut process.heap,
@@ -4973,11 +4980,23 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
         unit,
         &mut prepared,
     ) {
+        Ok(true) if extra_bits == 0 => {
+            // erl_bits.c:1782-1793: collect if the caller's words do not fit, then return
+            // `reg[live]` itself with a cursor that crashes on use.
+            if process.heap.reserve_native_halloc(0, alloc).is_none()
+                && process.ensure_native_roots(alloc, live + 1).is_err()
+            {
+                set_bs_append_error(process, "size", "system_limit");
+                return 0;
+            }
+            registers.erl_bits_state = [0, 5];
+            crate::native_hooks::raw(arinsal_term::raw::trusted_jit_register(xregs, live))
+        }
         Ok(true) => {
-            // erts stores `sb->orig` in `reg[live]`, collects once if the HAlloc
-            // reservation is short, then builds the successor directly at `htop`.
+            // erl_bits.c:1832-1842: `reg[live] = sb->orig`, collect once if the HAlloc
+            // reservation is short, then build the successor directly at `htop`.
             arinsal_term::raw::set_trusted_jit_register(xregs, live, prepared.bin_ref());
-            let used_words: usize = if extra_bits == 0 { 0 } else { 5 };
+            let used_words: usize = 5;
             let heap_need = used_words.wrapping_add(alloc);
             let reservation = match process.heap.reserve_native_halloc(used_words, alloc) {
                 Some(reservation) => reservation,
@@ -4992,16 +5011,11 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                         .expect("GC leaves the requested HeapWordsLeft reservation")
                 }
             };
-            let source = if extra_bits == 0 {
-                arinsal_term::raw::trusted_jit_register(xregs, source_index)
-            } else {
-                Term::NIL
-            };
             let owner = arinsal_term::raw::trusted_jit_register(xregs, live);
             let mut term = Term::NIL;
             TermBuilder::<arinsal_term::ProcessHeap>::finish_writable_append(
                 reservation,
-                source,
+                Term::NIL,
                 owner,
                 prepared,
                 extra_bits,
@@ -5015,8 +5029,10 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
             crate::native_hooks::raw(term)
         }
         Ok(false) => {
+            // erl_bits.c:1854-1866 (`not_writable`): ERL_REFC_BITS_SIZE + extra_words, with
+            // the source kept in `reg[live]` across the collection.
             let reservation = match process.heap.reserve_native_halloc(8, alloc) {
-                Some(reservation) => reservation,
+                Some(reservation) => Some(reservation),
                 None => {
                     let fresh_request = 8_usize.wrapping_add(alloc);
                     if process
@@ -5026,13 +5042,30 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                         set_bs_append_error(process, "size", "system_limit");
                         return 0;
                     }
-                    process
-                        .heap
-                        .reserve_native_halloc(8, alloc)
-                        .expect("GC leaves the requested HeapWordsLeft reservation")
+                    None
                 }
             };
-            let source = arinsal_term::raw::trusted_jit_register(xregs, source_index);
+            let source = arinsal_term::raw::trusted_jit_register(xregs, live);
+            if extra_bits == 0 {
+                // erl_bits.c:1871-1883: only the unit is checked; the source itself is the
+                // result and no writable binary is built.
+                let bits = arinsal_term::raw::BinRef::try_from(source)
+                    .map(arinsal_term::raw::BinRef::bit_len)
+                    .unwrap_or(0);
+                if unit > 1 && !bits.is_multiple_of(unit) {
+                    set_bs_append_error(process, "unit", "badarg");
+                    return 0;
+                }
+                registers.erl_bits_state = [0, 5];
+                return crate::native_hooks::raw(source);
+            }
+            let reservation = match reservation {
+                Some(reservation) => reservation,
+                None => process
+                    .heap
+                    .reserve_native_halloc(8, alloc)
+                    .expect("GC leaves the requested HeapWordsLeft reservation"),
+            };
             match TermBuilder::<arinsal_term::ProcessHeap>::append_nonwritable(
                 reservation,
                 source,
@@ -5051,46 +5084,27 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                     0
                 }
                 Err(error) => {
-                    let source = arinsal_term::raw::trusted_jit_register(xregs, source_index);
-                    let is_binary = source.classify() == arinsal_term::TermKind::Bitstring;
-                    let detail = if error == arinsal_term::TermError::SystemLimit {
-                        "size"
-                    } else if is_binary && unit > 1 {
-                        "unit"
+                    let (detail, reason) = if error == arinsal_term::TermError::SystemLimit {
+                        ("size", "system_limit")
+                    } else if unit > 1 {
+                        ("unit", "badarg")
                     } else {
-                        "type"
+                        ("type", "badarg")
                     };
-                    set_bs_append_error(
-                        process,
-                        detail,
-                        if error == arinsal_term::TermError::SystemLimit {
-                            "system_limit"
-                        } else {
-                            "badarg"
-                        },
-                    );
+                    set_bs_append_error(process, detail, reason);
                     0
                 }
             }
         }
         Err(error) => {
-            let is_binary = source.classify() == arinsal_term::TermKind::Bitstring;
-            let detail = if error == arinsal_term::TermError::SystemLimit {
-                "size"
-            } else if is_binary && unit > 1 {
-                "unit"
+            let (detail, reason) = if error == arinsal_term::TermError::SystemLimit {
+                ("size", "system_limit")
+            } else if unit > 1 {
+                ("unit", "badarg")
             } else {
-                "type"
+                ("type", "badarg")
             };
-            set_bs_append_error(
-                process,
-                detail,
-                if error == arinsal_term::TermError::SystemLimit {
-                    "system_limit"
-                } else {
-                    "badarg"
-                },
-            );
+            set_bs_append_error(process, detail, reason);
             0
         }
     }
