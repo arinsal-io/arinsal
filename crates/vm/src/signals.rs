@@ -3028,6 +3028,17 @@ pub(crate) fn handler_atoms(
                     (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("demonitor")? => {
                         crate::natives::NativeEntry::Direct(crate::dist::native_demonitor)
                     }
+                    // erts has one link_1/unlink_1/exit_2 for every caller (bif.c); an external
+                    // pid reaches the distribution signal from apply as from a static import.
+                    (m, f, 1) if m == arinsal_term::atoms::ERLANG && f == atom_id("link")? => {
+                        crate::natives::NativeEntry::Direct(crate::dist::native_link)
+                    }
+                    (m, f, 1) if m == arinsal_term::atoms::ERLANG && f == atom_id("unlink")? => {
+                        crate::natives::NativeEntry::Direct(crate::dist::native_unlink)
+                    }
+                    (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("exit")? => {
+                        crate::natives::NativeEntry::Direct(crate::dist::native_exit2)
+                    }
                     _ => crate::natives::NativeEntry::Resolved(handler(
                         global_atoms().text(module)?,
                         global_atoms().text(function)?,

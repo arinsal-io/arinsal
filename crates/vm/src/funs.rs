@@ -813,7 +813,34 @@ impl Vm {
                     crate::natives::NativeArgs::Registers(arity),
                     entry,
                 ) {
-                    p.x[0] = result?;
+                    let result = match result {
+                        // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1: an
+                        // applied BIF that traps (demonitor_2 to flush_monitor_messages/3)
+                        // continues in the trap's export, as the same BIF called statically.
+                        Err(VmError::TrapExport(trap)) => {
+                            return self.trap_to_export(p, trap, tail, Some(run));
+                        }
+                        // Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace),
+                        // OTP-29.1.1: BIF_ERROR names the applied BIF as the top frame.
+                        Err(VmError::Trap(mut trap))
+                            if trap.class == arinsal_bifs::Class::Error
+                                && trap.top.is_none()
+                                && trap.trace.is_none() =>
+                        {
+                            trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                                module: module_atom,
+                                function: function_atom,
+                                args: crate::stacktrace::BifArgs::from_terms(&p.x[..arity])?,
+                                info: crate::stacktrace::BifErrorInfo::Plain,
+                            });
+                            Err(VmError::Trap(trap))
+                        }
+                        result => result,
+                    };
+                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776
+                    // (call_bif_shared, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the export
+                    // trampoline an apply reaches collects after the BIF as a static call does.
+                    p.x[0] = p.gc_after_bif(result?)?;
                     if tail {
                         return Ok(match Self::ret(p) {
                             Some(value) => ImportOutcome::Returned(value),

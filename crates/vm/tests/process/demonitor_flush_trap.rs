@@ -1,6 +1,7 @@
 //! `demonitor(Ref, [flush])` traps to `erts_internal:flush_monitor_messages/3`: the flush is an
 //! Erlang receive, so selective receive order of the other messages must match erl, under the
-//! JIT and under `ARINSAL_INTERP=1`.
+//! JIT and under `ARINSAL_INTERP=1`. The `apply_*` and `eval_*` cases reach the BIF the way
+//! `erl_eval` does (`apply/3` with a runtime argument list, and `erl_eval:exprs/2` itself).
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
@@ -17,6 +18,14 @@ const CASES: &[&str] = &[
     "transit_info",
     "tail_queued",
     "gc_queued",
+    "apply_queued",
+    "apply_queued_info",
+    "apply_missing",
+    "apply_missing_info",
+    "apply_active",
+    "apply_badarg",
+    "eval_queued",
+    "eval_missing",
 ];
 
 const SOURCE: &str = r#"-module(demonitor_flush_trap).
@@ -60,9 +69,64 @@ run(Case) ->
             Live = [{live, N, lists:seq(1, 40)} || N <- lists:seq(1, 4000)],
             Last = length(Live),
             R2 = erlang:demonitor(M, [flush]),
-            {R2, Last}
+            {R2, Last};
+        apply_queued ->
+            P ! stop,
+            wait_down(M),
+            Self ! last,
+            apply(id(erlang), id(demonitor), id([M, [flush]]));
+        apply_queued_info ->
+            P ! stop,
+            wait_down(M),
+            Self ! last,
+            apply(id(erlang), id(demonitor), id([M, [flush, info]]));
+        apply_missing ->
+            P ! stop,
+            wait_down(M),
+            drop_down(M, apply(id(erlang), id(demonitor), id([make_ref(), [flush]])));
+        apply_missing_info ->
+            P ! stop,
+            wait_down(M),
+            drop_down(M, apply(id(erlang), id(demonitor), id([make_ref(), [flush, info]])));
+        apply_active ->
+            R3 = apply(id(erlang), id(demonitor), id([M, [flush, info]])),
+            P ! stop,
+            R3;
+        apply_badarg ->
+            P ! stop,
+            wait_down(M),
+            drop_down(M, try apply(id(erlang), id(demonitor), id([M, [bad]])) of
+                Unexpected -> {unexpected, Unexpected}
+            catch
+                Class:Reason:Stack ->
+                    [{Mod, Fun, Args, _} | _] = Stack,
+                    {Class, Reason, Mod, Fun, length(Args)}
+            end);
+        eval_queued ->
+            P ! stop,
+            wait_down(M),
+            Self ! last,
+            eval("erlang:demonitor(M, [flush]).", M);
+        eval_missing ->
+            P ! stop,
+            wait_down(M),
+            drop_down(M, eval("demonitor(make_ref(), [flush, info]).", M))
     end,
     {R, messages(), Keep}.
+
+id(X) -> X.
+
+%% The DOWN of `M` names a pid and a ref that differ between the runtimes.
+drop_down(M, Result) ->
+    true = erlang:demonitor(M, [flush]),
+    Result.
+
+%% The expression runs in erl_eval, as `erl -eval` and the shell run it.
+eval(String, M) ->
+    {ok, Tokens, _} = erl_scan:string(String),
+    {ok, Exprs} = erl_parse:parse_exprs(Tokens),
+    {value, Value, _} = erl_eval:exprs(Exprs, erl_eval:add_binding('M', M, erl_eval:new_bindings())),
+    Value.
 
 %% The demonitor is the last call of this function: a tail call from Erlang.
 tail_demonitor(M) -> erlang:demonitor(M, [flush]).
