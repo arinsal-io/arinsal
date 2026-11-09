@@ -11,6 +11,11 @@ use arinsal_sched::{Event, Payload, Pid, RunCtx, Signal};
 use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+mod elink;
+pub(crate) use elink::{
+    DistLinkHalf, external_pid_term, proc_exit_handle_link, reply_dist_unlink_ack,
+};
+
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1 << 40);
 static NEXT_REMOTE_PID: AtomicU32 = AtomicU32::new(1 << 27);
 /// Set once the first scheduler proxy for a remote pid exists. Until then no link, monitor or
@@ -22,7 +27,6 @@ static PROXIES_CREATED: AtomicBool = AtomicBool::new(false);
 fn may_be_proxy() -> bool {
     PROXIES_CREATED.load(Ordering::Acquire)
 }
-static NEXT_UNLINK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Distribution controller BIFs implemented by this module.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
@@ -148,7 +152,7 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
         return Err(badarg());
     };
     let (conn_id, entry_ref) = parse_dhandle(dhandle)?;
-    let (result, spawn_downs) = {
+    let (result, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
         // The pending connection's spawn-pending monitors are cleaned up with it
         // (dist.c:5681 abort_pending_connection: schedule_con_monitor_link_seq_cleanup).
@@ -162,12 +166,14 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
         } else {
             Vec::new()
         };
+        let mld = if aborts { tables.take_mld(name) } else { None };
         let result = tables
             .abort_pending(name, conn_id, entry_ref)
             .ok_or_else(badarg)?;
-        (result, spawn_downs)
+        (result, spawn_downs, mld)
     };
     if let Some(runtime) = process.runtime {
+        elink::links_connection_down(runtime, mld);
         notify_connection_spawn_requests(runtime, spawn_downs)?;
     }
     Ok(boolean(result))
@@ -236,6 +242,7 @@ fn create_channel(
     if entry.state == node_tables::ConnState::Idle {
         entry.connection_id = (entry.connection_id + 1) & 0x00ff_ffff;
         entry.state = node_tables::ConnState::Pending;
+        entry.mld = Some(node_tables::new_mld(&entry.name, entry.connection_id));
     }
     if entry.state != node_tables::ConnState::Pending {
         return Err(badarg());
@@ -488,12 +495,17 @@ fn route_incoming(
                     .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
             }
         }
+        // Port of erts/emulator/beam/dist.c (DOP_LINK), OTP-29.1.1.
         1 if parts.len() == 3 => {
+            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
             let from = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            publish_remote_signal(process, from, target, Signal::Link { priority: false })?;
+            let target = local_pid(&parts[2], local);
+            elink::incoming_link(runtime, handle, from, &parts[1], target)?;
         }
+        // Port of erts/emulator/beam/dist.c (DOP_EXIT, DOP_PAYLOAD_EXIT, DOP_EXIT2,
+        // DOP_PAYLOAD_EXIT2), OTP-29.1.1.
         3 | 8 | 24 | 26 if parts.len() >= 3 => {
+            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
             let from = remote_proxy(handle, &parts[1])?;
             let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
             let reason = if parts.len() == 4 {
@@ -501,41 +513,34 @@ fn route_incoming(
             } else {
                 &terms.first().ok_or_else(badarg)?.0
             };
-            let reason = if parts.len() == 4 {
-                from_owned(reason, &mut process.heap).map_err(|_| badarg())?
-            } else {
-                from_owned(&terms.first().ok_or_else(badarg)?.0, &mut process.heap)
-                    .map_err(|_| badarg())?
-            };
-            publish_remote_signal(
-                process,
+            let reason = owned_to_message(reason)?;
+            elink::incoming_exit(
+                runtime,
                 from,
+                &parts[1],
                 target,
-                Signal::Exit(Box::new(Message::copy_from(reason)?)),
+                matches!(*op, 3 | 24),
+                reason,
             )?;
         }
-        35 if parts.len() == 4 => {
+        // Port of erts/emulator/beam/dist.c (DOP_UNLINK_ID, DOP_UNLINK_ID_ACK), OTP-29.1.1.
+        35 | 36 if parts.len() == 4 => {
+            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
             let unlink_id = as_u64(&parts[1]).ok_or_else(badarg)?;
+            if *op == 35 && unlink_id == 0 {
+                return Err(badarg());
+            }
             let from = remote_proxy(handle, &parts[2])?;
             let target = local_pid(&parts[3], local).ok_or_else(badarg)?;
-            publish_remote_signal(process, from, target, Signal::Unlink(unlink_id))?;
-            queue_remote_control(
-                process,
-                ctx,
+            elink::incoming_unlink(
+                runtime,
                 handle,
-                OwnedTerm::tuple(vec![
-                    OwnedTerm::Int(36),
-                    OwnedTerm::Int(unlink_id as i64),
-                    parts[3].clone(),
-                    parts[2].clone(),
-                ]),
+                from,
+                unlink_id,
+                &parts[2],
+                target,
+                *op == 36,
             )?;
-        }
-        36 if parts.len() == 4 => {
-            let unlink_id = as_u64(&parts[1]).ok_or_else(badarg)?;
-            let from = remote_proxy(handle, &parts[2])?;
-            let target = local_pid(&parts[3], local).ok_or_else(badarg)?;
-            publish_remote_signal(process, from, target, Signal::UnlinkAck(unlink_id))?;
         }
         19 | 20 if parts.len() == 4 => {
             let watcher = remote_proxy(handle, &parts[1])?;
@@ -1047,7 +1052,7 @@ pub(crate) fn port_connection_closed(
     let Some(node) = node_tables::unregister_dist_port(port_id) else {
         return Ok(());
     };
-    let (watchers, node_events, monitor_downs, spawn_downs) = {
+    let (watchers, node_events, monitor_downs, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
         let is_current_port = tables
             .entries
@@ -1066,6 +1071,7 @@ pub(crate) fn port_connection_closed(
         let visible = tables.entries.get(&node).is_some_and(|entry| entry.visible);
         let monitor_downs = take_connection_monitors(&mut tables, &node);
         let spawn_downs = take_connection_spawn_requests(&mut tables, &node);
+        let mld = tables.take_mld(&node);
         let watchers = tables.disconnect(&node);
         let events = tables.nodes_monitor_events(
             "nodedown",
@@ -1074,8 +1080,9 @@ pub(crate) fn port_connection_closed(
             visible,
             Some("connection_closed"),
         );
-        (watchers, events, monitor_downs, spawn_downs)
+        (watchers, events, monitor_downs, spawn_downs, mld)
     };
+    elink::links_connection_down(runtime, mld);
     notify_node_watchers(runtime, &node, watchers)?;
     notify_connection_monitors(runtime, monitor_downs)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
@@ -1089,7 +1096,7 @@ pub(crate) fn kill_connection(
     node: &str,
     connection_id: u32,
 ) -> Result<bool, VmError> {
-    let (watchers, node_events, monitor_downs, spawn_downs) = {
+    let (watchers, node_events, monitor_downs, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
         let Some(entry) = tables.entries.get(node) else {
             return Ok(false);
@@ -1100,11 +1107,13 @@ pub(crate) fn kill_connection(
         let visible = entry.visible;
         let monitor_downs = take_connection_monitors(&mut tables, node);
         let spawn_downs = take_connection_spawn_requests(&mut tables, node);
+        let mld = tables.take_mld(node);
         let watchers = tables.disconnect(node);
         let events =
             tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
-        (watchers, events, monitor_downs, spawn_downs)
+        (watchers, events, monitor_downs, spawn_downs, mld)
     };
+    elink::links_connection_down(runtime, mld);
     notify_node_watchers(runtime, node, watchers)?;
     notify_connection_monitors(runtime, monitor_downs)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
@@ -1355,15 +1364,14 @@ fn route_incoming_port(
                     .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
             }
         }
+        // Port of erts/emulator/beam/dist.c (DOP_LINK), OTP-29.1.1.
         1 if parts.len() == 3 => {
             let from = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            sched
-                .signal(from, target, Signal::Link { priority: false })
-                .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
+            let target = local_pid(&parts[2], local);
+            elink::incoming_link(runtime, handle, from, &parts[1], target)?;
         }
-        // Port of erts/emulator/beam/dist.c:2509-2539 (DOP_EXIT and
-        // DOP_EXIT2), OTP-29.1.1. Payload exits carry the reason outside the
+        // Port of erts/emulator/beam/dist.c (DOP_EXIT, DOP_PAYLOAD_EXIT, DOP_EXIT2,
+        // DOP_PAYLOAD_EXIT2), OTP-29.1.1. Payload exits carry the reason outside the
         // control tuple so large reasons can use fragmented distribution frames.
         3 | 8 | 24 | 26 if parts.len() >= 3 => {
             let from = remote_proxy(handle, &parts[1])?;
@@ -1379,9 +1387,32 @@ fn route_incoming_port(
                 terms.first().ok_or_else(badarg)?.1
             };
             let reason = owned_to_message_with_heap_size(reason, heap_words)?;
-            sched
-                .signal(from, target, Signal::Exit(Box::new(reason)))
-                .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
+            elink::incoming_exit(
+                runtime,
+                from,
+                &parts[1],
+                target,
+                matches!(*op, 3 | 24),
+                reason,
+            )?;
+        }
+        // Port of erts/emulator/beam/dist.c (DOP_UNLINK_ID, DOP_UNLINK_ID_ACK), OTP-29.1.1.
+        35 | 36 if parts.len() == 4 => {
+            let unlink_id = as_u64(&parts[1]).ok_or_else(badarg)?;
+            if *op == 35 && unlink_id == 0 {
+                return Err(badarg());
+            }
+            let from = remote_proxy(handle, &parts[2])?;
+            let target = local_pid(&parts[3], local).ok_or_else(badarg)?;
+            elink::incoming_unlink(
+                runtime,
+                handle,
+                from,
+                unlink_id,
+                &parts[2],
+                target,
+                *op == 36,
+            )?;
         }
         // Port of dist.c:2341 (DOP_MONITOR_P); ToProc may be a pid or registered name.
         19 | 20 if parts.len() == 4 => {
@@ -1837,8 +1868,9 @@ pub(crate) struct DistSpawnReplyData {
     result: OwnedTerm,
     /// The DOP_SPAWN_REPLY flags.
     flags: u64,
-    /// `datap->link`: the proxy of the child of a successful spawn with link.
-    link: Option<Pid>,
+    /// `datap->link`: the proc half of the external link to the child of a successful spawn
+    /// with link, its dist half already in the connection.
+    link: Option<elink::DistLinkHalf>,
 }
 
 impl DistSpawnReplyData {
@@ -1857,9 +1889,9 @@ impl DistSpawnReplyData {
         self.is_success() && self.flags & DIST_SPAWN_FLAG_MONITOR != 0
     }
 
-    /// `datap->link`.
-    pub(crate) fn link(&self) -> Option<Pid> {
-        self.link
+    /// Take `datap->link`.
+    pub(crate) fn link(&self) -> Option<crate::monitor_link::Link> {
+        self.link.as_ref().and_then(elink::DistLinkHalf::take_half)
     }
 }
 
@@ -1905,8 +1937,14 @@ fn dist_spawn_reply(
         OwnedTerm::Atom(_) => None,
         _ => return Err(badarg()),
     };
-    // Successful spawn-link: the link the parent inserts (erts_link_external_create).
-    let link = child.filter(|_| flags & DIST_SPAWN_FLAG_LINK != 0);
+    // Successful spawn-link: the link the parent inserts (dist.c DOP_SPAWN_REPLY:
+    // erts_link_external_create, erts_link_dist_insert).
+    let link = match child {
+        Some(_) if flags & DIST_SPAWN_FLAG_LINK != 0 => {
+            Some(elink::spawn_reply_link(runtime, handle, parent, &result)?)
+        }
+        _ => None,
+    };
     let data = std::sync::Arc::new(DistSpawnReplyData {
         handle,
         id,
@@ -2171,7 +2209,7 @@ pub(crate) fn handle_dist_spawn_reply_exiting(
     } else {
         spawn_reply_drop_monitor(data);
     }
-    if let Some(child) = data.link {
+    if let Some(link) = data.link() {
         // erts_proc_exit_handle_link: the link exit carries the actual reason, unless the
         // operation was abandoned.
         let reason = if request.abandoned {
@@ -2179,7 +2217,7 @@ pub(crate) fn handle_dist_spawn_reply_exiting(
         } else {
             reason
         };
-        forward_link_exit_if_proxy(runtime, child, parent, reason);
+        proc_exit_handle_link(Some(runtime), parent, link, reason);
     }
 }
 
@@ -2841,34 +2879,8 @@ pub(crate) fn native_signal(
     };
     let target = owned(args[target_idx])?;
     match function {
-        "link" => {
-            queue_outgoing(
-                process,
-                ctx,
-                &node,
-                control(1, vec![local_pid_owned(ctx.pid()), target]),
-                None,
-            )?;
-            Ok(atom("true"))
-        }
-        "unlink" => {
-            let unlink_id = NEXT_UNLINK_ID.fetch_add(1, Ordering::Relaxed);
-            queue_outgoing(
-                process,
-                ctx,
-                &node,
-                control(
-                    35,
-                    vec![
-                        OwnedTerm::Int(unlink_id as i64),
-                        local_pid_owned(ctx.pid()),
-                        target,
-                    ],
-                ),
-                None,
-            )?;
-            Ok(atom("true"))
-        }
+        "link" => elink::link_external(process, ctx, &node, target),
+        "unlink" => elink::unlink_external(process, ctx, &node, target),
         "exit" => {
             let reason = owned(args[1])?;
             queue_outgoing(

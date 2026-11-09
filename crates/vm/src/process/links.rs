@@ -150,6 +150,23 @@ impl Process {
                 Payload::Signal(Signal::DemonitorOrigin(shared)) => {
                     self.remove_demonitored_target(shared);
                 }
+                // Port of erl_proc_sig_queue.c (erts_proc_exit_handle_signal,
+                // ERTS_SIG_Q_OP_LINK and ERTS_SIG_Q_OP_UNLINK with a remote origin).
+                Payload::Signal(Signal::DistLink(shared)) => {
+                    if let Some(link) = crate::dist::DistLinkHalf::take(&shared) {
+                        crate::dist::proc_exit_handle_link(
+                            self.runtime,
+                            ctx.pid(),
+                            link,
+                            crate::signals::atom("noproc"),
+                        );
+                    }
+                }
+                Payload::Signal(Signal::DistUnlink(op)) => {
+                    if let Some(runtime) = self.runtime {
+                        crate::dist::reply_dist_unlink_ack(runtime, &op);
+                    }
+                }
                 Payload::Signal(Signal::Link { .. }) => {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
                     // (erts_proc_exit_handle_signal), OTP-29.1.1: a link reaching an

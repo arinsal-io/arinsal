@@ -614,8 +614,20 @@ pub enum Signal<M: SignalMessage> {
     TraceChangeState(SharedPayload),
     /// Unlink request carrying its acknowledgement id.
     Unlink(u64),
-    /// Unlink acknowledgement of a distributed unlink (`DOP_UNLINK_ID_ACK`).
-    UnlinkAck(u64),
+    /// A remote process links the receiver: the payload is the proc half of the external link
+    /// the distribution entry created, queued as the signal itself (erts queues `&ldp->proc`,
+    /// dist.c DOP_LINK, erts_proc_sig_send_link). The VM downcasts the payload.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_LINK,
+    // ERTS_LNK_TYPE_DIST_PROC), OTP-29.1.1.
+    DistLink(SharedPayload),
+    /// A remote process unlinks the receiver (`DOP_UNLINK_ID`).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_unlink,
+    // ERTS_SIG_Q_OP_UNLINK with ERTS_SIG_Q_TYPE_DIST_LINK), OTP-29.1.1.
+    DistUnlink(Box<DistUnlinkOp>),
+    /// A remote process acknowledges the receiver's unlink (`DOP_UNLINK_ID_ACK`).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_unlink_ack,
+    // ERTS_SIG_Q_OP_UNLINK_ACK with ERTS_SIG_Q_TYPE_DIST_LINK), OTP-29.1.1.
+    DistUnlinkAck(Box<DistUnlinkOp>),
     /// A process system task, or a kick for the system tasks the receiver already holds. The
     /// payload is the VM's task; the scheduler delivers it at the task's priority.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_SYNC... system task
@@ -686,6 +698,11 @@ pub enum Signal<M: SignalMessage> {
     /// Exit signal of a link: removes the receiver's link to the sender.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:4640 (ERTS_SIG_Q_OP_EXIT_LINKED), OTP-29.1.1.
     ExitLinked(Box<M>),
+    /// Exit signal whose origin is a process on another node (`DOP_EXIT`, `DOP_EXIT2`, or the
+    /// `noconnection` exit of a link whose connection went down).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_link_exit,
+    // erts_proc_sig_send_dist_exit, erts_proc_sig_send_link_exit_noconnection), OTP-29.1.1.
+    DistExit(Box<DistExitSignal<M>>),
     /// Port exit signal preserving the port term used as the signal origin.
     /// Boxed: the signal is rare and would otherwise widen every queued event.
     PortExit(Box<PortExitSignal<M>>),
@@ -728,6 +745,50 @@ pub enum Signal<M: SignalMessage> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:3247 (erts_proc_sig_send_dist_spawn_reply,
     // ERTS_SIG_Q_OP_DIST_SPAWN_REPLY), OTP-29.1.1.
     DistSpawnReply(SharedPayload),
+}
+
+/// An external pid as a signal from another node carries it (erts copies the pid term into
+/// the signal's own heap): the node name atom index and creation, then the pid data words.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ExternalPid {
+    /// `node->sysname`: the node name atom index.
+    pub sysname: u32,
+    /// `node->creation`.
+    pub creation: u32,
+    /// `data.ui[0]`.
+    pub number: u32,
+    /// `data.ui[1]`.
+    pub serial: u32,
+}
+
+/// The fields of [`Signal::DistExit`] (`ErtsExitSignalData` with an external `from`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistExitSignal<M: SignalMessage> {
+    /// `xsigd->from`.
+    pub from: ExternalPid,
+    /// `ERTS_SIG_Q_OP_EXIT_LINKED` rather than `ERTS_SIG_Q_OP_EXIT`.
+    pub linked: bool,
+    /// `ERTS_SIG_LNK_X_FLAG_CONNECTION_LOST` with `xsigd->u.link.connection_id`: set only on
+    /// the `noconnection` exit of a link, which must not dissolve a link made over a newer
+    /// connection.
+    pub connection_lost: Option<u32>,
+    /// `xsigd->reason`.
+    pub reason: M,
+}
+
+/// The fields of [`Signal::DistUnlink`] and [`Signal::DistUnlinkAck`] (`ErtsSigDistUnlinkOp`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistUnlinkOp {
+    /// `nodename`: the node the operation arrived from.
+    pub nodename: u32,
+    /// `connection_id` of the connection it arrived on.
+    pub connection_id: u32,
+    /// `local`.
+    pub local: Pid,
+    /// `remote`.
+    pub remote: ExternalPid,
+    /// `id`.
+    pub id: u64,
 }
 
 /// The fields of [`Signal::GroupLeader`].

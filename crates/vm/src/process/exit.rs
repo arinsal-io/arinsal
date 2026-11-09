@@ -369,6 +369,10 @@ impl Process {
         let spawn_replies = self.absorb_exit_signals(ctx);
         let links = self.links.drain();
         for node in links {
+            if node.view().is_external() {
+                crate::dist::proc_exit_handle_link(self.runtime, ctx.pid(), node, reason);
+                continue;
+            }
             if node.view().unlinking() != 0 {
                 continue;
             }
