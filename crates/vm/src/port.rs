@@ -450,6 +450,9 @@ pub(crate) struct PortHandle {
     /// The driver's own state (`prt->drv_data`): the tcp or udp socket, or the ram_file data
     /// from `rfile_start` until `rfile_stop`.
     drv_data: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
+    /// `erts_prtsd_get(prt, ERTS_PRTSD_DIST_ENTRY)`: the distribution entry this port controls,
+    /// set by `setnode/3` and cleared when the port terminates (dist.c:5299, io.c:3917).
+    dist_entry: Mutex<Option<Arc<crate::node_tables::DistEntry>>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -911,6 +914,21 @@ impl PortHandle {
             .as_ref()?
             .native_data::<crate::inet_drv::Sock>()
             .filter(|sock| !sock.stopped())
+    }
+
+    /// The distribution entry this port is the controller of, if any.
+    pub(crate) fn dist_entry(&self) -> Option<Arc<crate::node_tables::DistEntry>> {
+        self.dist_entry.lock().clone()
+    }
+
+    /// Bind (or with `None`, unbind) the distribution entry this port controls.
+    // Port of erts/emulator/beam/dist.c:5299 (setup_connection: erts_prtsd_set) and
+    // io.c:3911-3917 (terminate_port), OTP-29.1.1.
+    pub(crate) fn set_dist_entry(
+        &self,
+        dep: Option<Arc<crate::node_tables::DistEntry>>,
+    ) -> Option<Arc<crate::node_tables::DistEntry>> {
+        std::mem::replace(&mut *self.dist_entry.lock(), dep)
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -3103,6 +3121,7 @@ fn make_handle_with(
         cold: Mutex::new(None),
         reg_closing: AtomicBool::new(false),
         drv_data: Mutex::new(None),
+        dist_entry: Mutex::new(None),
     });
     Ok(handle)
 }

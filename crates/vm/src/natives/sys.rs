@@ -1162,7 +1162,7 @@ fn system_info(
         // Port of erts/emulator/beam/erl_bif_info.c:3179 (system_info_1), OTP-29.1.1.
         Some("creation") => Some(non_neg(
             process,
-            u64::from(crate::node_tables::lock().local_creation),
+            u64::from(crate::node_tables::this_node().1),
         )),
         // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
         Some("schedulers_online") => Some(read_flags(process, |process, flags| {
@@ -1413,7 +1413,12 @@ fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Te
         "dist" => {
             let tables = crate::node_tables::lock();
             let mut dump = String::new();
-            for entry in tables.entries.values().filter(|entry| entry.connected) {
+            for entry in tables
+                .entries
+                .values()
+                .map(|dep| dep.lock())
+                .filter(|entry| entry.connected)
+            {
                 use std::fmt::Write as _;
                 let _ = writeln!(dump, "{} ({})", entry.name, entry.connection_id);
             }

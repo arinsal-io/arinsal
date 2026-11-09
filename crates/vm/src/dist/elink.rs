@@ -5,7 +5,7 @@
 //! (erts_proc_sig_send_dist_*, reply_dist_unlink_ack, erts_proc_sig_send_link_exit_noconnection),
 //! erl_process.c (erts_proc_exit_handle_link) and bif.c (link_opt, unlink_1), OTP-29.1.1.
 
-use super::{atom, badarg, control, emit_control_message_on_handle, local_pid_owned};
+use super::{atom, badarg, control, local_pid_owned};
 use crate::monitor_link::{ExternalPid, Link, node_type};
 use crate::node_tables;
 use crate::process::Message;
@@ -123,13 +123,8 @@ pub(crate) fn external_pid_term(
 pub(super) fn connection_of_handle(
     handle: u64,
 ) -> Option<(String, u32, Arc<crate::monitor_link::MonLnkDist>)> {
-    let tables = node_tables::lock();
-    let entry = tables.entries.values().find(|entry| {
-        entry
-            .dist
-            .as_ref()
-            .is_some_and(|state| state.handle == handle)
-    })?;
+    let dep = node_tables::lock().dep_by_handle(handle)?;
+    let entry = dep.lock();
     Some((entry.name.clone(), entry.connection_id, entry.mld.clone()?))
 }
 
@@ -146,13 +141,12 @@ pub(super) fn send_on_connection(
     let Some(node) = global_atoms().text(arinsal_term::Atom(nodename)) else {
         return;
     };
+    let Some(dep) = node_tables::find_dist_entry(node) else {
+        return;
+    };
     let handle = {
-        let mut tables = node_tables::lock();
-        let local_name = tables.local_name.clone();
-        let local_creation = tables.local_creation;
-        let Some(entry) = tables.entries.get_mut(node) else {
-            return;
-        };
+        let (local_name, local_creation) = node_tables::this_node();
+        let mut entry = dep.lock();
         if entry.connection_id != connection_id {
             return;
         }
@@ -162,16 +156,16 @@ pub(super) fn send_on_connection(
                 None => return,
             },
             node_tables::ConnState::Pending => {
-                let control = node_tables::relabel_local_node(control, &local_name, local_creation);
-                let payload = payload
-                    .map(|m| node_tables::relabel_local_node(m, &local_name, local_creation));
+                let control = node_tables::relabel_local_node(control, local_name, local_creation);
+                let payload =
+                    payload.map(|m| node_tables::relabel_local_node(m, local_name, local_creation));
                 entry.pending_out.push_back((control, payload));
                 return;
             }
             _ => return,
         }
     };
-    let _ = emit_control_message_on_handle(runtime, handle, control, payload);
+    let _ = super::emit_control_message_on_entry(runtime, &dep, handle, control, payload);
 }
 
 /// Whether the connection to `node` is up with this id (for a reply on the same connection).
@@ -179,11 +173,12 @@ pub(super) fn exit_payload_flag(nodename: u32) -> bool {
     let Some(node) = global_atoms().text(arinsal_term::Atom(nodename)) else {
         return false;
     };
-    node_tables::lock()
-        .entries
-        .get(node)
-        .and_then(|entry| entry.dist.as_ref())
-        .is_some_and(|state| state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0)
+    node_tables::find_dist_entry(node).is_some_and(|dep| {
+        dep.lock()
+            .dist
+            .as_ref()
+            .is_some_and(|state| state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0)
+    })
 }
 
 /// `erts_dsig_send_exit_tt(ctx, from, to, reason)` on connection `connection_id`.
@@ -546,7 +541,8 @@ pub(super) fn unlink_external(
         link.set_unlinking(id);
         link.view().external_dist().map(|dist| dist.connection_id)
     };
-    let current = node_tables::lock().entries.get(node).and_then(|entry| {
+    let current = node_tables::find_dist_entry(node).and_then(|dep| {
+        let entry = dep.lock();
         matches!(
             entry.state,
             node_tables::ConnState::Connected | node_tables::ConnState::Pending

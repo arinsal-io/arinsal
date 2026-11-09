@@ -338,12 +338,15 @@ pub(crate) fn attach(runtime: &'static Runtime, handle: &Arc<PortHandle>, port: 
 /// OTP-29.1.1: the port terminates; waiters receive `{error, closed}`.
 fn tcp_inet_stop(sock: &Arc<Sock>) {
     sock.stopped.store(true, Ordering::Release);
-    let id = sock.id;
     // The port closed while owning a dist connection (its controller exited, e.g. through
     // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
     // Port of erts/emulator/beam/dist.c (erts_do_net_exits via the dist port's exit), OTP-29.1.1.
-    if crate::node_tables::is_dist_port(id) {
-        let _ = crate::dist::port_connection_closed(sock.runtime, id);
+    if let Some(handle) = sock
+        .handle
+        .upgrade()
+        .filter(|handle| crate::node_tables::is_dist_port(handle))
+    {
+        let _ = crate::dist::port_connection_closed(sock.runtime, &handle);
     }
     let pending = {
         let mut inner = sock.inner.lock();
@@ -4084,15 +4087,22 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     // Distribution ports feed the emulator decoder, not the port owner.
     // Port of inet_drv.c + dist.c:2017 (erts_net_message), OTP-29.1.1.
     if let Out::PortData { bytes, .. } = &out
-        && crate::node_tables::is_dist_port(sock.id)
+        && let Some(dep) = sock
+            .handle
+            .upgrade()
+            .and_then(|handle| handle.dist_entry())
+            .filter(|dep| crate::node_tables::dep_controls_port(dep, sock.id))
     {
-        let _ = crate::dist::ingest_port_data(sock.runtime(), sock.id, bytes);
+        let _ = crate::dist::ingest_port_data(sock.runtime(), &dep, sock.id, bytes);
         return None;
     }
     if let Out::TcpClosed { .. } = &out
-        && crate::node_tables::is_dist_port(sock.id)
+        && let Some(handle) = sock
+            .handle
+            .upgrade()
+            .filter(|handle| crate::node_tables::is_dist_port(handle))
     {
-        let _ = crate::dist::port_connection_closed(sock.runtime(), sock.id);
+        let _ = crate::dist::port_connection_closed(sock.runtime(), &handle);
         // Still deliver tcp_closed to the connection ticker so it shuts down.
     }
     let out = match out {

@@ -1384,7 +1384,12 @@ fn internal_state_tuple_get(
         && name == "connection_id"
     {
         let tables = crate::node_tables::lock();
-        let Some(entry) = tables.entries.get(node).filter(|entry| entry.connected) else {
+        let Some(entry) = tables
+            .entries
+            .get(node)
+            .map(|dep| dep.lock())
+            .filter(|entry| entry.connected)
+        else {
             return Err(badarg());
         };
         return int(process, entry.connection_id as usize).map(Some);
@@ -1535,6 +1540,7 @@ fn internal_state_tuple_get(
             let channel = tables
                 .entries
                 .get(node)
+                .map(|dep| dep.lock())
                 .filter(|entry| entry.connected)
                 .map(|entry| entry.connection_id);
             match channel {
@@ -1548,6 +1554,7 @@ fn internal_state_tuple_get(
             let controller = tables
                 .entries
                 .get(node)
+                .map(|dep| dep.lock())
                 .filter(|entry| entry.connected)
                 .and_then(|entry| {
                     entry.dist.as_ref().and_then(|state| {
@@ -2631,7 +2638,12 @@ fn internal_state_set(
             };
             let (port_id, connection_id) = {
                 let tables = crate::node_tables::lock();
-                let Some(entry) = tables.entries.get(&node).filter(|entry| entry.connected) else {
+                let Some(entry) = tables
+                    .entries
+                    .get(&node)
+                    .map(|dep| dep.lock())
+                    .filter(|entry| entry.connected)
+                else {
                     return Ok(atom("false"));
                 };
                 (
@@ -2640,10 +2652,13 @@ fn internal_state_set(
                 )
             };
             if let Some(port_id) = port_id {
+                let port = runtime.ports.get(port_id);
                 if !crate::port::close_by_id(process, ctx, port_id)? {
                     return Ok(atom("false"));
                 }
-                crate::dist::port_connection_closed(runtime, port_id)?;
+                if let Some(port) = port {
+                    crate::dist::port_connection_closed(runtime, &port)?;
+                }
                 return Ok(atom("true"));
             }
             return Ok(atom(
