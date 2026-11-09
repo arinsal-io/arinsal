@@ -113,8 +113,11 @@ pub(crate) fn emit_fast_bs_create_bin(
         emit_private(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
+    // The slow path rebuilds from the source register, so a collection inside the helper
+    // must have updated it: only a source among the live roots takes this path.
     if APPEND_CHECKED.load(Ordering::Relaxed) != 0
         && let Some(plan) = append_plan(segments)
+        && x_index(plan.bin).is_some_and(|index| index < live)
     {
         emit_append(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
@@ -417,24 +420,31 @@ fn emit_append(
             emit_is_small(asm, seg.src, slow)?;
         }
     }
-    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1.
-    let source_index = x_index(plan.bin).expect("append_plan requires an X register");
-    let root_live = live.max(source_index + 1);
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1:
+    // `mov_arg(ArgXRegister(Live), src)`, then `erts_bs_append_checked(c_p, reg, Live, ...)`
+    // with `Live + 1` X registers synced. The helper collects with exactly those roots.
+    let append_source = if live < 6 {
+        ArgVal::X(live as u8)
+    } else {
+        ArgVal::XMemory(live)
+    };
+    let source = asm.source_reg(plan.bin)?;
+    asm.store_register(append_source, source)?;
     let update = crate::Update::HEAP_ALLOC
         .union(crate::Update::X_REGS)
         .union(crate::Update::REDUCTIONS);
-    crate::emit_enter_runtime(&mut asm.code, root_live as usize, update)?;
+    crate::emit_enter_runtime(&mut asm.code, live as usize + 1, update)?;
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), C_P)?;
         e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
-        e.mov_const(Gpr::x(2), u64::from(source_index))?;
+        e.mov_const(Gpr::x(2), u64::from(live))?;
         e.mov_const(Gpr::x(3), plan.extra_bits)?;
         e.mov_const(Gpr::x(4), plan.unit)?;
-        e.mov_const(Gpr::x(5), u64::from(root_live))?;
+        e.mov_const(Gpr::x(5), u64::from(live))?;
         e.mov_const(Gpr::x(6), u64::from(alloc))
     })?;
     asm.fragment_call(APPEND_CHECKED.load(Ordering::Relaxed))?;
-    crate::emit_leave_runtime(&mut asm.code, root_live as usize, update)?;
+    crate::emit_leave_runtime(&mut asm.code, live as usize + 1, update)?;
     asm.code.cbz(Gpr::x(0), slow)?;
     asm.code.emit(|e| e.cmn_imm(Gpr::x(0), 1, false))?;
     asm.code.b_cond(Cond::Eq, failed)?;
