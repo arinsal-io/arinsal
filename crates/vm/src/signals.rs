@@ -2557,7 +2557,7 @@ pub(crate) enum OriginDemonitor {
     Alias,
     /// The origin half of a local process monitor, to be sent to its target.
     Process(crate::proc_create::ProcessMonitor),
-    Port(Option<u64>),
+    Port(Option<u64>, Option<crate::proc_create::ProcessMonitor>),
     /// The origin half of a monitor of a remote process.
     Distributed(crate::proc_create::ProcessMonitor),
 }
@@ -2587,12 +2587,14 @@ fn finish_demonitor_origin(
         insert_explicit_unalias(process, id);
     }
     process.cold_mut().prio_monitors.remove(&id);
-    match entry.state() {
+    match entry.state().cloned() {
         Some(crate::proc_create::OriginMonitor::Process(_)) => OriginDemonitor::Process(entry),
         Some(crate::proc_create::OriginMonitor::Port { port_id, .. }) => {
-            OriginDemonitor::Port(*port_id)
+            OriginDemonitor::Port(port_id, Some(entry))
         }
-        Some(crate::proc_create::OriginMonitor::DistPort { .. }) => OriginDemonitor::Port(None),
+        Some(crate::proc_create::OriginMonitor::DistPort { .. }) => {
+            OriginDemonitor::Port(None, None)
+        }
         _ => OriginDemonitor::Distributed(entry),
     }
 }
@@ -2648,7 +2650,7 @@ pub(crate) fn demonitor_light(
             return Some(Ok(Term::atom(arinsal_term::atoms::FALSE)));
         }
         OriginDemonitor::Missing => (None, None),
-        OriginDemonitor::Distributed(_) | OriginDemonitor::Port(_) => unreachable!(),
+        OriginDemonitor::Distributed(_) | OriginDemonitor::Port(_, _) => unreachable!(),
     };
     if active.is_none() && flush {
         let result = Term::atom(if info {
@@ -3138,21 +3140,22 @@ fn monitor_port(
     };
     // The port monitor stays in the origin tree until its DOWN signal is processed,
     // just like the monitor object in `erts_proc_sig_send_monitor_down`.
-    process
-        .monitors
-        .insert(crate::proc_create::origin_monitor_with_reference(
-            crate::proc_create::monitor_reference(reference_id, alias_mode, false),
-            me.data(),
-            0,
-            crate::proc_create::OriginMonitor::Port { port_id, name },
-        ));
+    let (origin, target_half) = crate::proc_create::create_monitor_with_reference_at(
+        process.heap.alloc_ix(),
+        crate::proc_create::monitor_reference(reference_id, alias_mode, false),
+        me.data(),
+        0,
+        crate::proc_create::MonitorInfo::with_port_name(name),
+        crate::proc_create::OriginMonitor::Port { port_id, name },
+    );
+    process.monitors.insert(origin);
     let registered = port_id.and_then(|id| {
         runtime.ports.with_from(id, process.on_managed, |handle| {
             if tag != Term::atom(arinsal_term::atoms::DOWN) {
                 // Port monitors carry no tag yet (typed gap, see report).
                 return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
             }
-            crate::port::monitor(process, id, handle, reference_id, me, name, true)
+            crate::port::monitor(process, id, handle, target_half, true)
         })
     });
     if let Some(registered) = registered {
@@ -3515,12 +3518,12 @@ fn call_resolved(
             }
             let flush = options.contains(&Term::atom(arinsal_term::atoms::FLUSH));
             let entry = demonitor_origin(process, id);
-            let (was_alias, process_target, port_target, distributed) = match entry {
-                OriginDemonitor::Alias => (true, None, None, None),
-                OriginDemonitor::Process(origin) => (false, Some(origin), None, None),
-                OriginDemonitor::Port(port_id) => (false, None, port_id, None),
-                OriginDemonitor::Distributed(origin) => (false, None, None, Some(origin)),
-                OriginDemonitor::Missing => (false, None, None, None),
+            let (was_alias, process_target, port_target, port_origin, distributed) = match entry {
+                OriginDemonitor::Alias => (true, None, None, None, None),
+                OriginDemonitor::Process(origin) => (false, Some(origin), None, None, None),
+                OriginDemonitor::Port(port_id, origin) => (false, None, port_id, origin, None),
+                OriginDemonitor::Distributed(origin) => (false, None, None, None, Some(origin)),
+                OriginDemonitor::Missing => (false, None, None, None, None),
             };
             let mut was_active = false;
             if let Some(origin) = process_target {
@@ -3534,8 +3537,8 @@ fn call_resolved(
             // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT),
             // OTP-29.1.1: the origin is in this process's monitor tree. The port id
             // there selects the port; `erts_port_demonitor` sends the demonitor signal.
-            if let Some(port_id) = port_target {
-                crate::port::demonitor_port(process, ctx.pid(), port_id, id);
+            if let (Some(port_id), Some(origin)) = (port_target, port_origin) {
+                crate::port::demonitor_port(process, ctx.pid(), port_id, origin);
                 was_active = true;
             }
             if let Some(origin) = distributed {

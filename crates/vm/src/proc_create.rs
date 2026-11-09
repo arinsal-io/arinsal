@@ -982,6 +982,7 @@ struct MonitorExtension {
     name: Option<String>,
     dist_origin: Option<DistOrigin>,
     dist_target: Option<DistTarget>,
+    port_name: Option<arinsal_term::Atom>,
 }
 
 /// The remote target of an `ERTS_MON_TYPE_DIST_PROC` monitor a local process holds, as
@@ -1020,6 +1021,7 @@ impl MonitorInfo {
             name,
             dist_origin: None,
             dist_target: None,
+            port_name: None,
         })))
     }
 
@@ -1031,6 +1033,7 @@ impl MonitorInfo {
                 name: None,
                 dist_origin: None,
                 dist_target: None,
+                port_name: None,
             })
         });
         extension.dist_target = Some(target);
@@ -1050,12 +1053,29 @@ impl MonitorInfo {
             name,
             dist_origin: Some(origin),
             dist_target: None,
+            port_name: None,
         })))
     }
 
     /// The external watcher of a monitor of a local process.
     pub(crate) fn external_origin(&self) -> Option<&DistOrigin> {
         self.0.as_ref()?.dist_origin.as_ref()
+    }
+
+    pub(crate) fn with_port_name(name: Option<arinsal_term::Atom>) -> Self {
+        name.map_or_else(Self::default, |port_name| {
+            Self(Some(Box::new(MonitorExtension {
+                tag: None,
+                name: None,
+                dist_origin: None,
+                dist_target: None,
+                port_name: Some(port_name),
+            })))
+        })
+    }
+
+    pub(crate) fn port_name(&self) -> Option<arinsal_term::Atom> {
+        self.0.as_ref()?.port_name
     }
 
     pub(crate) fn tag(&self) -> Option<&arinsal_etf::OwnedTerm> {

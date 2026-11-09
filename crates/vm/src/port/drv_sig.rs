@@ -885,14 +885,19 @@ pub(crate) fn link(
 /// Port of erts/emulator/beam/io.c:2850 (`erts_port_demonitor`) and :2836
 /// (`port_sig_demonitor`), OTP-29.1.1. The origin monitor is already gone; this
 /// deletes the target half on the port, or drops it when the signal is aborted.
-pub(crate) fn demonitor(handle: &Arc<PortHandle>, drv: &DriverPort, caller: Pid, reference: u64) {
-    if demonitor_now(handle, drv, reference) {
+pub(crate) fn demonitor(
+    handle: &Arc<PortHandle>,
+    drv: &DriverPort,
+    caller: Pid,
+    origin: crate::proc_create::ProcessMonitor,
+) {
+    if demonitor_now(handle, drv, &origin) {
         return;
     }
     let task_handle = Arc::clone(handle);
     schedule(drv, caller, move |op| {
         if op == SigOp::Exec {
-            task_handle.monitors.lock().remove(&reference);
+            let _ = task_handle.lt_monitors.lock().remove_target_of(&origin);
         }
         REDS_DEMONITOR
     });
@@ -900,10 +905,14 @@ pub(crate) fn demonitor(handle: &Arc<PortHandle>, drv: &DriverPort, caller: Pid,
 
 /// `erts_port_demonitor` when the port is free (`try_imm_drv_call`): `false` when the signal
 /// has to be scheduled as a port task.
-pub(crate) fn demonitor_now(handle: &PortHandle, drv: &DriverPort, reference: u64) -> bool {
+pub(crate) fn demonitor_now(
+    handle: &PortHandle,
+    drv: &DriverPort,
+    origin: &crate::proc_create::ProcessMonitor,
+) -> bool {
     match drv.try_imm_call(0, true, "demonitor", (CONTEXT_REDS / 10) as u32) {
         Ok(imm) => {
-            handle.monitors.lock().remove(&reference);
+            let _ = handle.lt_monitors.lock().remove_target_of(origin);
             drop(imm);
             true
         }

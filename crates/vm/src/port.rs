@@ -280,66 +280,6 @@ impl Suspended {
     }
 }
 
-#[derive(Clone)]
-struct PortMonitor {
-    pid: Pid,
-    /// Registered name the monitor was created with (`{Name, node()}` in the DOWN message).
-    name: Option<arinsal_term::Atom>,
-}
-
-/// A few `u64`-keyed entries in one vector that allocates on the first insert, in place of a
-/// hash table: a port has no monitors until one is made (`prt->common.monitors` is a null tree
-/// in erts until then).
-// Boxed on purpose: the empty map is one null pointer where an empty `Vec` is 24 bytes.
-#[allow(clippy::box_collection)]
-pub(crate) struct SmallMap<V>(Option<Box<Vec<(u64, V)>>>);
-
-impl<V> Default for SmallMap<V> {
-    fn default() -> Self {
-        Self(None)
-    }
-}
-
-impl<V> SmallMap<V> {
-    fn entries(&self) -> &[(u64, V)] {
-        self.0.as_deref().map_or(&[], Vec::as_slice)
-    }
-
-    pub(crate) fn insert(&mut self, key: u64, value: V) -> Option<V> {
-        let entries = self.0.get_or_insert_with(Default::default);
-        match entries.iter_mut().find(|entry| entry.0 == key) {
-            Some(entry) => Some(std::mem::replace(&mut entry.1, value)),
-            None => {
-                entries.push((key, value));
-                None
-            }
-        }
-    }
-
-    pub(crate) fn remove(&mut self, key: &u64) -> Option<V> {
-        let entries = self.0.as_mut()?;
-        let index = entries.iter().position(|entry| entry.0 == *key)?;
-        // The emptied vector is kept: a port that is monitored once is monitored again.
-        Some(entries.swap_remove(index).1)
-    }
-
-    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
-        self.entries().iter().map(|entry| &entry.1)
-    }
-}
-
-impl<V> IntoIterator for SmallMap<V> {
-    type Item = (u64, V);
-    type IntoIter = std::vec::IntoIter<(u64, V)>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0
-            .map(|entries| *entries)
-            .unwrap_or_default()
-            .into_iter()
-    }
-}
-
 /// What the spawn and fd drivers keep per port (`ErtsSysDriverData` of sys_drivers.c): the
 /// output descriptor, the wake-up of the worker thread, packet framing and busy limits.
 pub(crate) struct SpawnData {
@@ -406,14 +346,15 @@ impl OwnerCell {
 /// The rarely used parts of a [`PortHandle`].
 #[derive(Default)]
 struct HandleCold {
-    /// Processes this driver port monitors (`driver_monitor_process`): monitor id to the pid and
-    /// the origin half (`ERTS_P_MONITORS` of the port); the process holds the target half.
-    drv_monitors: SmallMap<(Pid, crate::proc_create::ProcessMonitor)>,
     /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
     async_open: Option<(u64, Pid)>,
     /// `port->common.u.alive.reg->name`, shared with the register table entry.
     reg_word: Option<Arc<AtomicU32>>,
     halt_progress: Option<HaltProgress>,
+    /// `erts_prtsd_get(prt, ERTS_PRTSD_DIST_ENTRY)`: the distribution entry this port controls,
+    /// set by `setnode/3` and cleared when the port terminates (dist.c:5299, io.c:3917). erts
+    /// keeps it in the separately allocated port-specific data, so it lives in the cold part.
+    dist_entry: Option<Arc<crate::node_tables::DistEntry>>,
 }
 
 /// State retained for a live child or fd port.
@@ -428,7 +369,10 @@ pub(crate) struct PortHandle {
     owner: OwnerCell,
     /// `ERTS_P_LINKS`: an intrusive link tree, including the pending-unlink id on each node.
     links: Mutex<crate::monitor_link::MonLnkTree<crate::monitor_link::Link>>,
-    monitors: Mutex<SmallMap<PortMonitor>>,
+    /// `ERTS_P_MONITORS`: driver monitor origin halves; user port monitors are in `lt_monitors`.
+    monitors: Mutex<crate::proc_create::MonitorTree>,
+    /// `ERTS_P_LT_MONITORS`: process-origin monitor target halves, in insertion order.
+    lt_monitors: Mutex<crate::proc_create::TargetMonitorList>,
     /// OS pid of the child: `OS_PID_PENDING` until the forker's `Go`, 0 for ports without one.
     os_pid: AtomicU32,
     name: Box<str>,
@@ -450,9 +394,6 @@ pub(crate) struct PortHandle {
     /// The driver's own state (`prt->drv_data`): the tcp or udp socket, or the ram_file data
     /// from `rfile_start` until `rfile_stop`.
     drv_data: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
-    /// `erts_prtsd_get(prt, ERTS_PRTSD_DIST_ENTRY)`: the distribution entry this port controls,
-    /// set by `setnode/3` and cleared when the port terminates (dist.c:5299, io.c:3917).
-    dist_entry: Mutex<Option<Arc<crate::node_tables::DistEntry>>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -918,7 +859,7 @@ impl PortHandle {
 
     /// The distribution entry this port is the controller of, if any.
     pub(crate) fn dist_entry(&self) -> Option<Arc<crate::node_tables::DistEntry>> {
-        self.dist_entry.lock().clone()
+        self.peek_cold(|cold| cold.dist_entry.clone()).flatten()
     }
 
     /// Bind (or with `None`, unbind) the distribution entry this port controls.
@@ -928,7 +869,10 @@ impl PortHandle {
         &self,
         dep: Option<Arc<crate::node_tables::DistEntry>>,
     ) -> Option<Arc<crate::node_tables::DistEntry>> {
-        std::mem::replace(&mut *self.dist_entry.lock(), dep)
+        match dep {
+            Some(dep) => self.with_cold(|cold| cold.dist_entry.replace(dep)),
+            None => self.peek_cold(|cold| cold.dist_entry.take()).flatten(),
+        }
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -2478,7 +2422,7 @@ impl arinsal_drv::PortHost for DrvHost {
             crate::proc_create::MonitorInfo::default(),
             crate::proc_create::OriginMonitor::PortOrigin,
         );
-        handle.with_cold(|cold| cold.drv_monitors.insert(monitor, (target, origin)));
+        handle.monitors.lock().insert(origin);
         let owner = handle.owner_pid();
         let sent = handle.scheduler.signal(
             owner,
@@ -2489,7 +2433,7 @@ impl arinsal_drv::PortHost for DrvHost {
             },
         );
         if sent.is_err() {
-            handle.peek_cold(|cold| cold.drv_monitors.remove(&monitor));
+            handle.monitors.lock().remove(monitor);
             return false;
         }
         true
@@ -2499,9 +2443,8 @@ impl arinsal_drv::PortHost for DrvHost {
         if let Some(handle) = self.handle(port.id()) {
             // erts_proc_sig_send_demonitor: the origin half goes to the target, which drops
             // its half.
-            if let Some(Some((pid, origin))) =
-                handle.peek_cold(|cold| cold.drv_monitors.remove(&monitor))
-            {
+            if let Some(origin) = handle.monitors.lock().remove(monitor) {
+                let pid = Pid::from_data(origin.view().other());
                 let _ = handle.scheduler.signal(
                     handle.owner_pid(),
                     pid,
@@ -2841,11 +2784,26 @@ fn notify_links_monitors(
             );
         }
     }
-    // The lock is held while the DOWNs are queued so that a concurrent `demonitor` either
-    // removes the monitor first or leaves a signal the origin discards.
-    let mut guard = handle.monitors.lock();
-    let monitors = std::mem::take(&mut *guard);
-    for (reference, monitor) in monitors {
+    // Port of io.c (monitor_port_exit): origin halves are demonitor signals; target halves
+    // are DOWNs. The tree's drain follows erts' postorder foreach-delete traversal.
+    let mut origins = handle.monitors.lock();
+    for origin in origins.drain() {
+        let target = Pid::from_data(origin.view().other());
+        let _ = scheduler.signal(
+            from,
+            target,
+            arinsal_sched::Signal::DemonitorOrigin(origin.into_shared()),
+        );
+    }
+    drop(origins);
+
+    // Keep the target list locked while queuing DOWNs, as erts holds the driver monitor lock.
+    let mut guard = handle.lt_monitors.lock();
+    for target in guard.drain() {
+        let monitor = target.view();
+        let reference = monitor.reference();
+        let pid = Pid::from_data(monitor.other());
+        let name = monitor.info().port_name();
         let mut heap = ProcessHeap::with_words(32);
         if reason.is_pointer() {
             let Ok(reference_term) =
@@ -2853,8 +2811,7 @@ fn notify_links_monitors(
             else {
                 continue;
             };
-            let Ok(object) = crate::signals::port_monitor_object(&mut heap, Some(id), monitor.name)
-            else {
+            let Ok(object) = crate::signals::port_monitor_object(&mut heap, Some(id), name) else {
                 continue;
             };
             let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
@@ -2870,7 +2827,7 @@ fn notify_links_monitors(
                 // Port of erl_proc_sig_queue.c (erts_proc_sig_send_monitor_down), OTP-29.1.1.
                 let _ = scheduler.signal(
                     from,
-                    monitor.pid,
+                    pid,
                     arinsal_sched::Signal::MonitorDownMsg {
                         reference,
                         message: Box::new(message),
@@ -2881,7 +2838,7 @@ fn notify_links_monitors(
             // The reference and monitor type stay in the signal for immediate exit reasons.
             let _ = scheduler.signal(
                 from,
-                monitor.pid,
+                pid,
                 arinsal_sched::Signal::MonitorDown {
                     reference,
                     reason: Box::new(reason),
@@ -3082,7 +3039,8 @@ fn make_handle_with(
             links.insert(crate::proc_create::port_peer_link(owner));
             links
         }),
-        monitors: Mutex::new(SmallMap::default()),
+        monitors: Mutex::new(crate::proc_create::MonitorTree::default()),
+        lt_monitors: Mutex::new(crate::proc_create::TargetMonitorList::default()),
         os_pid: AtomicU32::new(os_pid),
         name: name.into_boxed_str(),
         parallelism,
@@ -3121,7 +3079,6 @@ fn make_handle_with(
         cold: Mutex::new(None),
         reg_closing: AtomicBool::new(false),
         drv_data: Mutex::new(None),
-        dist_entry: Mutex::new(None),
     });
     Ok(handle)
 }
@@ -5065,11 +5022,7 @@ pub(crate) fn fire_port_monitor(runtime: &crate::process::Runtime, port_id: u64,
     let Some(drv_port) = handle.driver.as_ref() else {
         return;
     };
-    if handle
-        .peek_cold(|cold| cold.drv_monitors.remove(&monitor))
-        .flatten()
-        .is_some()
-    {
+    if handle.monitors.lock().remove(monitor).is_some() {
         drv_port.arc().process_exit(monitor);
     }
 }
@@ -5204,27 +5157,22 @@ pub(crate) fn monitor(
     process: &Process,
     id: u64,
     handle: &PortHandle,
-    reference: u64,
-    pid: Pid,
-    name: Option<arinsal_term::Atom>,
+    target: crate::proc_create::ProcessMonitor,
     monitored: bool,
 ) -> Result<bool, VmError> {
     if monitored && let Some(drv_port) = handle.driver.as_ref() {
         // Port of erts/emulator/beam/io.c:6787 (erts_port_monitor): the request is a port
         // signal, handled once the callback holding the port lock has returned.
-        return drv_port
-            .serialized(|| register_monitor(process, id, handle, reference, pid, name, monitored));
+        return drv_port.serialized(|| register_monitor(process, id, handle, target, monitored));
     }
-    register_monitor(process, id, handle, reference, pid, name, monitored)
+    register_monitor(process, id, handle, target, monitored)
 }
 
 fn register_monitor(
     process: &Process,
     id: u64,
     handle: &PortHandle,
-    reference: u64,
-    pid: Pid,
-    name: Option<arinsal_term::Atom>,
+    target: crate::proc_create::ProcessMonitor,
     monitored: bool,
 ) -> Result<bool, VmError> {
     if monitored && handle.state.lock().exit_complete {
@@ -5245,11 +5193,10 @@ fn register_monitor(
     {
         return Ok(false);
     }
-    let mut monitors = handle.monitors.lock();
     if monitored {
-        monitors.insert(reference, PortMonitor { pid, name });
+        handle.lt_monitors.lock().insert(target);
     } else {
-        monitors.remove(&reference);
+        drop(target);
     }
     Ok(true)
 }
@@ -5260,7 +5207,12 @@ fn register_monitor(
 /// OTP-29.1.1. A loaded driver gets a proc-to-port demonitor signal (immediate when
 /// the port is free). A spawn or fd port has no driver task queue; the target half
 /// is dropped under the port's monitor lock, which is that port's `try_imm` path.
-pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, reference: u64) {
+pub(crate) fn demonitor_port(
+    process: &Process,
+    caller: Pid,
+    port_id: u64,
+    origin: crate::proc_create::ProcessMonitor,
+) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
@@ -5269,9 +5221,9 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
         .ports
         .with_from(port_id, process.on_managed, |handle| {
             match handle.driver.as_ref() {
-                Some(drv) => drv_sig::demonitor_now(handle, drv, reference),
+                Some(drv) => drv_sig::demonitor_now(handle, drv, &origin),
                 None => {
-                    handle.monitors.lock().remove(&reference);
+                    let _ = handle.lt_monitors.lock().remove_target_of(&origin);
                     true
                 }
             }
@@ -5283,7 +5235,7 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
     if let Some(handle) = runtime.ports.get(port_id)
         && let Some(drv) = handle.drv_port()
     {
-        drv_sig::demonitor(&handle, &drv, caller, reference);
+        drv_sig::demonitor(&handle, &drv, caller, origin);
     }
 }
 
@@ -5794,24 +5746,28 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
                 .filter_map(|link| Pid::from_data(link.other()).to_term()),
         )
         .map_err(|e| VmError::Unsupported(format!("port info links: {e:?}")))?;
-    let monitored_pids = handle
+    let mut monitored_pids = handle
+        .lt_monitors
+        .lock()
+        .iter()
+        .filter_map(|monitor| Pid::from_data(monitor.other()).to_term())
+        .collect::<Vec<_>>();
+    monitored_pids.reverse();
+    let drv_port = handle.driver.as_ref();
+    let mut process_monitors = handle
         .monitors
         .lock()
-        .values()
-        .filter_map(|monitor| monitor.pid.to_term())
-        .collect::<Vec<_>>();
-    let drv_port = handle.driver.as_ref();
-    let process_monitors = drv_port
-        .map(|drv| drv.monitored())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|data| {
-            let pid = Pid::from_data(data).to_term().ok_or_else(badarg)?;
+        .iter()
+        .map(|monitor| {
+            let pid = Pid::from_data(monitor.other())
+                .to_term()
+                .ok_or_else(badarg)?;
             TermBuilder::new(&mut heap)
                 .tuple(&[atom("process"), pid])
                 .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    process_monitors.reverse();
     let monitors = TermBuilder::new(&mut heap)
         .list_from_iter(process_monitors)
         .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))?;
@@ -5901,7 +5857,14 @@ pub(crate) fn layout_sizes() -> Vec<String> {
     vec![
         format!("PortState={}", size_of::<PortState>()),
         format!("LinkTree={}", size_of::<crate::proc_create::LinkTree>()),
-        format!("SmallMap={}", size_of::<SmallMap<PortMonitor>>()),
+        format!(
+            "MonitorTree={}",
+            size_of::<crate::proc_create::MonitorTree>()
+        ),
+        format!(
+            "MonitorList={}",
+            size_of::<crate::proc_create::TargetMonitorList>()
+        ),
         format!("Option<HaltProgress>={}", size_of::<Option<HaltProgress>>()),
         format!("Option<SpawnData>={}", size_of::<Option<Box<SpawnData>>>()),
     ]
