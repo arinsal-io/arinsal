@@ -131,7 +131,7 @@ fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
 
 /// Port of erts/emulator/beam/dist.c:5571 (erts_internal_get_creation_0), OTP-29.1.1.
 fn get_creation() -> Result<Term, VmError> {
-    let creation = node_tables::lock().local_creation;
+    let creation = node_tables::this_node().1;
     if creation == 0 {
         Ok(atom("undefined"))
     } else {
@@ -161,11 +161,15 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
         let mut tables = node_tables::lock();
         // The pending connection's spawn-pending monitors are cleaned up with it
         // (dist.c:5681 abort_pending_connection: schedule_con_monitor_link_seq_cleanup).
-        let aborts = tables.entries.get(name.as_str()).is_some_and(|entry| {
-            entry.entry_ref == entry_ref
-                && entry.connection_id == conn_id
-                && entry.state == node_tables::ConnState::Pending
-        });
+        let aborts = tables
+            .entries
+            .get(name.as_str())
+            .map(|dep| dep.lock())
+            .is_some_and(|entry| {
+                entry.entry_ref == entry_ref
+                    && entry.connection_id == conn_id
+                    && entry.state == node_tables::ConnState::Pending
+            });
         let spawn_downs = if aborts {
             take_connection_spawn_requests(&mut tables, name)
         } else {
@@ -243,7 +247,8 @@ fn create_channel(
     if !tables.entries.contains_key(node) {
         let _ = tables.new_connection(node);
     }
-    let entry = tables.entries.get_mut(node).ok_or_else(badarg)?;
+    let dep = tables.entries.get(node).cloned().ok_or_else(badarg)?;
+    let mut entry = dep.lock();
     // Accept path may race ahead of new_connection; promote Idle → Pending.
     if entry.state == node_tables::ConnState::Idle {
         entry.connection_id = (entry.connection_id + 1) & 0x00ff_ffff;
@@ -285,8 +290,15 @@ fn create_channel(
     if let Some(state) = entry.dist.as_mut() {
         state.spawn_requests.extend(pending_spawn_requests);
     }
-    if let Some(port_id) = port_controller {
-        node_tables::register_dist_port(port_id, node.clone());
+    // Port of erts/emulator/beam/dist.c:5299 (setup_connection): the controlling port
+    // keeps a reference to the entry in its port-specific data.
+    if let Some(port_id) = port_controller
+        && let Some(port) = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.ports.get(port_id))
+    {
+        port.set_dist_entry(Some(dep.clone()));
     }
     // Flush signals buffered during auto-connect (erts pending queue).
     let mut flush_notify = None;
@@ -308,6 +320,7 @@ fn create_channel(
             }
         }
     }
+    drop(entry);
     let nodeup_events = tables.nodes_monitor_events("nodeup", node, conn_id, visible, None);
     drop(tables);
     // OTP queues the net_kernel controller notification before node monitor
@@ -401,7 +414,7 @@ fn put_data(
         OwnedTerm::Nil => Vec::new(),
         _ => return Err(badarg()),
     };
-    let local_name = node_tables::lock().local_name.clone();
+    let local_name = node_tables::this_node().0.to_owned();
     let (handle_id, decoded) = with_dhandle_input(handle, ctx.pid(), |state| {
         state.read = state.read.saturating_add(1);
         let packet = arinsal_etf::decode_dist_packet(&bytes, &mut state.incoming_cache)
@@ -428,7 +441,7 @@ fn route_incoming(
         return Ok(());
     }
     let (control, _) = terms.remove(0);
-    let local_creation = node_tables::lock().local_creation;
+    let local_creation = node_tables::this_node().1;
     let terms: Vec<(OwnedTerm, usize)> = terms
         .into_iter()
         .map(|(term, heap_words)| {
@@ -641,20 +654,14 @@ fn remote_proxy(handle: u64, remote: &OwnedTerm) -> Result<Pid, VmError> {
         return Err(badarg());
     };
     let key = (*id, *serial, *creation);
-    let mut tables = node_tables::lock();
-    let local_creation = tables.local_creation;
-    let entry = tables
-        .entries
-        .values_mut()
-        .find(|entry| {
-            entry.name == *node
-                && entry
-                    .dist
-                    .as_ref()
-                    .is_some_and(|state| state.handle == handle)
-        })
+    let local_creation = node_tables::this_node().1;
+    let dep = node_tables::find_dist_entry(node).ok_or_else(badarg)?;
+    let mut entry = dep.lock();
+    let state = entry
+        .dist
+        .as_mut()
+        .filter(|state| state.handle == handle)
         .ok_or_else(badarg)?;
-    let state = entry.dist.as_mut().ok_or_else(badarg)?;
     if let Some(pid) = state.remote_pids.get(&key) {
         return Ok(*pid);
     }
@@ -679,6 +686,7 @@ pub(crate) fn remote_pid_term(process: &mut Process, proxy: Pid) -> Result<Optio
         tables
             .entries
             .values()
+            .map(|dep| dep.lock())
             .find_map(|entry| entry.dist.as_ref()?.proxy_to_remote.get(&proxy).cloned())
     };
     remote
@@ -705,33 +713,25 @@ fn queue_remote_control(
     handle: u64,
     control: OwnedTerm,
 ) -> Result<(), VmError> {
-    let mut tables = node_tables::lock();
-    let local_name = tables.local_name.clone();
-    let local_creation = tables.local_creation;
-    let control = node_tables::relabel_local_node(control, &local_name, local_creation);
-    let entry = tables
-        .entries
-        .values_mut()
-        .find(|entry| {
-            entry
-                .dist
-                .as_ref()
-                .is_some_and(|state| state.handle == handle)
-        })
+    let (local_name, local_creation) = node_tables::this_node();
+    let control = node_tables::relabel_local_node(control, local_name, local_creation);
+    let dep = node_tables::lock()
+        .dep_by_handle(handle)
         .ok_or_else(badarg)?;
-    let state = entry.dist.as_mut().expect("matched dist state");
+    let mut entry = dep.lock();
+    let state = entry.dist.as_mut().ok_or_else(badarg)?;
     if let Some(port_id) = state.port_id {
         let packets = state.encode_term(control, None).map_err(|_| badarg())?;
         state.written = state.written.saturating_add(1);
         enqueue_port_output_no_suspend_locked(state, packets);
-        drop(tables);
+        drop(entry);
         let runtime = process.runtime.ok_or_else(badarg)?;
         return flush_port_output(runtime, port_id);
     }
     state.queue_term(control, None).map_err(|_| badarg())?;
     let notify = state.notify.then_some(state.owner);
     state.notify = false;
-    drop(tables);
+    drop(entry);
     if let Some(handler) = notify {
         ctx.send(handler, Message::copy_from(atom("dist_data"))?)
             .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
@@ -826,14 +826,15 @@ pub(crate) fn dsig_prepare(
 ) -> Result<DsigPrepare, VmError> {
     loop {
         let (conn_id, entry_ref) = {
-            let mut tables = node_tables::lock();
-            if !tables.alive {
+            if !node_tables::is_alive() {
                 return Ok(DsigPrepare::NotAlive);
             }
-            if node == tables.local_name {
+            if node == node_tables::this_node().0 {
                 return Err(badarg());
             }
-            match tables.entries.get(node) {
+            // The table lock covers the lookup only; the state is read under the entry lock.
+            let dep = node_tables::find_dist_entry(node);
+            match dep.as_ref().map(|dep| dep.lock()) {
                 Some(entry)
                     if matches!(
                         entry.state,
@@ -853,7 +854,9 @@ pub(crate) fn dsig_prepare(
                 }
                 _ => {}
             }
-            tables.new_connection(node).ok_or_else(badarg)?
+            node_tables::lock()
+                .new_connection(node)
+                .ok_or_else(badarg)?
         };
         if !notify_auto_connect(process, ctx, node, conn_id, entry_ref)? {
             return Ok(DsigPrepare::NotAlive);
@@ -905,43 +908,46 @@ fn queue_outgoing_with_options(
     suspend: bool,
     expect_connection: Option<u32>,
 ) -> Result<DistSendResult, VmError> {
-    let mut tables = node_tables::lock();
-    if !tables.alive {
+    if !node_tables::is_alive() {
         return Ok(DistSendResult::NotConnected);
     }
-    let local_name = tables.local_name.clone();
-    let local_creation = tables.local_creation;
+    let (local_name, local_creation) = node_tables::this_node();
     if node == local_name {
         return Err(badarg());
     }
-    let control = node_tables::relabel_local_node(control, &local_name, local_creation);
-    let message = message.map(|m| node_tables::relabel_local_node(m, &local_name, local_creation));
+    let control = node_tables::relabel_local_node(control, local_name, local_creation);
+    let message = message.map(|m| node_tables::relabel_local_node(m, local_name, local_creation));
+    // The table lock is held for the membership lookup only (find_dist_entry); the send
+    // itself runs under the entry's own lock, as erts_dsig_prepare/erts_dsig_send do.
+    let mut dep = node_tables::find_dist_entry(node);
     // Port of dist.c:3260 (erts_auto_connect on Idle), OTP-29.1.1.
-    let was_idle = match tables.entries.get(node) {
+    let was_idle = match dep.as_ref().map(|dep| dep.lock()) {
         Some(entry) if entry.state == node_tables::ConnState::Exiting => {
             return Ok(DistSendResult::NotConnected);
         }
-        Some(entry) => entry.state == node_tables::ConnState::Idle,
+        Some(entry) => {
+            if let Some(expected) = expect_connection
+                && entry.connection_id != expected
+            {
+                return Ok(DistSendResult::NotConnected);
+            }
+            entry.state == node_tables::ConnState::Idle
+        }
+        None if expect_connection.is_some() => return Ok(DistSendResult::NotConnected),
         None => true,
     };
     if was_idle && !connect {
         return Ok(DistSendResult::NotConnected);
     }
-    if let Some(expected) = expect_connection
-        && tables
-            .entries
-            .get(node)
-            .is_none_or(|entry| entry.connection_id != expected)
-    {
-        return Ok(DistSendResult::NotConnected);
+    let mut conn = None;
+    if was_idle {
+        let mut tables = node_tables::lock();
+        conn = Some(tables.new_connection(node).ok_or_else(badarg)?);
+        dep = tables.entries.get(node).cloned();
     }
-    let (conn_id, entry_ref) = if was_idle {
-        tables.new_connection(node).ok_or_else(badarg)?
-    } else {
-        let entry = tables.entries.get(node).ok_or_else(badarg)?;
-        (entry.connection_id, entry.entry_ref)
-    };
-    let entry = tables.entries.get_mut(node).ok_or_else(badarg)?;
+    let dep = dep.ok_or_else(badarg)?;
+    let mut entry = dep.lock();
+    let (conn_id, entry_ref) = conn.unwrap_or((entry.connection_id, entry.entry_ref));
 
     if entry.state == node_tables::ConnState::Exiting {
         return Ok(DistSendResult::NotConnected);
@@ -963,7 +969,7 @@ fn queue_outgoing_with_options(
                 enqueue_port_output_no_suspend_locked(state, packets);
                 false
             };
-            drop(tables);
+            drop(entry);
             if suspend {
                 finish_port_enqueue(process, ctx.pid(), port_id, should_suspend)?;
             } else {
@@ -977,7 +983,7 @@ fn queue_outgoing_with_options(
         }
         let notify = state.notify.then_some(state.owner);
         state.notify = false;
-        drop(tables);
+        drop(entry);
         if let Some(handler) = notify {
             ctx.send(handler, Message::copy_from(atom("dist_data"))?)
                 .map_err(|error| {
@@ -991,7 +997,7 @@ fn queue_outgoing_with_options(
     // Pending (or Connected without a controller yet): buffer until channel is up.
     entry.pending_out.push_back((control, message));
     let notify = was_idle.then(|| (node.to_string(), conn_id, entry_ref));
-    drop(tables);
+    drop(entry);
     if let Some((node, conn_id, entry_ref)) = notify
         && !notify_auto_connect(process, ctx, &node, conn_id, entry_ref)?
     {
@@ -1016,11 +1022,15 @@ fn notify_auto_connect(
     let Some(net_kernel) = runtime.reg.whereis_proc_str("net_kernel") else {
         let mld = {
             let mut tables = node_tables::lock();
-            let aborts = tables.entries.get(node).is_some_and(|entry| {
-                entry.entry_ref == entry_ref
-                    && entry.connection_id == conn_id
-                    && entry.state == node_tables::ConnState::Pending
-            });
+            let aborts = tables
+                .entries
+                .get(node)
+                .map(|dep| dep.lock())
+                .is_some_and(|entry| {
+                    entry.entry_ref == entry_ref
+                        && entry.connection_id == conn_id
+                        && entry.state == node_tables::ConnState::Pending
+                });
             let (mld, spawn_downs) = if aborts {
                 (
                     tables.take_mld(node),
@@ -1064,6 +1074,7 @@ fn notify_auto_connect(
 /// Port of erts/emulator/beam/dist.c:2017 (erts_net_message), OTP-29.1.1.
 pub(crate) fn ingest_port_data(
     runtime: &'static crate::process::Runtime,
+    dep: &node_tables::DistEntry,
     port_id: u64,
     bytes: &[u8],
 ) -> Result<(), VmError> {
@@ -1071,20 +1082,15 @@ pub(crate) fn ingest_port_data(
     if bytes.is_empty() {
         return Ok(());
     }
-    let local_name = node_tables::lock().local_name.clone();
+    let (local_name, _) = node_tables::this_node();
+    // The port's own `ERTS_PRTSD_DIST_ENTRY` reference: only the entry lock is taken.
     let (handle, decoded) = {
-        let mut tables = node_tables::lock();
-        let entry = tables
-            .entries
-            .values_mut()
-            .find(|entry| {
-                entry
-                    .dist
-                    .as_ref()
-                    .is_some_and(|state| state.port_id == Some(port_id))
-            })
+        let mut entry = dep.lock();
+        let state = entry
+            .dist
+            .as_mut()
+            .filter(|state| state.port_id == Some(port_id))
             .ok_or_else(badarg)?;
-        let state = entry.dist.as_mut().ok_or_else(badarg)?;
         state.read = state.read.saturating_add(1);
         let packet = arinsal_etf::decode_dist_packet(bytes, &mut state.incoming_cache)
             .map_err(|_| badarg())?;
@@ -1094,7 +1100,7 @@ pub(crate) fn ingest_port_data(
         let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
         (state.handle, decoded)
     };
-    route_incoming_port(runtime, handle, &local_name, decoded)
+    route_incoming_port(runtime, handle, local_name, decoded)
 }
 
 /// Reassemble one ordered OTP distribution signal before decoding its ETF terms.
@@ -1171,28 +1177,30 @@ fn reassemble_port_fragment(
 /// Tear down a port-controlled connection after the peer socket closes.
 pub(crate) fn port_connection_closed(
     runtime: &crate::process::Runtime,
-    port_id: u64,
+    port: &crate::port::PortHandle,
 ) -> Result<(), VmError> {
-    let Some(node) = node_tables::unregister_dist_port(port_id) else {
+    let port_id = port.id();
+    // Port of erts/emulator/beam/io.c:3911-3917 (terminate_port): the port drops its
+    // `ERTS_PRTSD_DIST_ENTRY` reference.
+    let Some(dep) = port.set_dist_entry(None) else {
         return Ok(());
     };
+    let node = dep.sysname.clone();
     let (watchers, node_events, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
-        let is_current_port = tables
-            .entries
-            .get(&node)
-            .and_then(|entry| entry.dist.as_ref())
-            .is_some_and(|state| state.port_id == Some(port_id));
-        // Port of erts/emulator/beam/dist.c:3599-3611 (discard output from an obsolete connection), OTP-29.1.1.
-        if !is_current_port {
-            return Ok(());
-        }
-        let connection_id = tables
-            .entries
-            .get(&node)
-            .map(|entry| entry.connection_id)
-            .unwrap_or(u32::MAX);
-        let visible = tables.entries.get(&node).is_some_and(|entry| entry.visible);
+        let (connection_id, visible) = {
+            let entry = dep.lock();
+            // Port of erts/emulator/beam/dist.c:3599-3611 (discard output from an obsolete
+            // connection), OTP-29.1.1.
+            if !entry
+                .dist
+                .as_ref()
+                .is_some_and(|state| state.port_id == Some(port_id))
+            {
+                return Ok(());
+            }
+            (entry.connection_id, entry.visible)
+        };
         let spawn_downs = take_connection_spawn_requests(&mut tables, &node);
         let mld = tables.take_mld(&node);
         let watchers = tables.disconnect(&node);
@@ -1221,13 +1229,14 @@ pub(crate) fn kill_connection(
 ) -> Result<bool, VmError> {
     let (watchers, node_events, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
-        let Some(entry) = tables.entries.get(node) else {
+        let Some(entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
             return Ok(false);
         };
         if !entry.connected || entry.connection_id != connection_id {
             return Ok(false);
         }
         let visible = entry.visible;
+        drop(entry);
         let spawn_downs = take_connection_spawn_requests(&mut tables, node);
         let mld = tables.take_mld(node);
         let watchers = tables.disconnect(node);
@@ -1270,7 +1279,7 @@ fn take_connection_spawn_requests(
     tables: &mut node_tables::NodeTables,
     node: &str,
 ) -> Vec<(u64, node_tables::SpawnRequest)> {
-    let Some(entry) = tables.entries.get_mut(node) else {
+    let Some(mut entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
         return Vec::new();
     };
     let mut requests = std::mem::take(&mut entry.pending_spawn_requests);
@@ -1845,8 +1854,8 @@ fn dist_spawn_request(
     // registered right after that send in this case.
     let mut request = Some(request);
     {
-        let mut tables = node_tables::lock();
-        if let Some(entry) = tables.entries.get_mut(&node) {
+        let tables = node_tables::lock();
+        if let Some(mut entry) = tables.entries.get(&node).map(|dep| dep.lock()) {
             let request = request.take().expect("request present");
             if let Some(state) = entry.dist.as_mut() {
                 state.spawn_requests.insert(id, request);
@@ -1863,8 +1872,8 @@ fn dist_spawn_request(
         control,
         Some(values[2].clone()),
     ) {
-        let mut tables = node_tables::lock();
-        if let Some(entry) = tables.entries.get_mut(&node) {
+        let tables = node_tables::lock();
+        if let Some(mut entry) = tables.entries.get(&node).map(|dep| dep.lock()) {
             entry.pending_spawn_requests.remove(&id);
             if let Some(state) = entry.dist.as_mut() {
                 state.spawn_requests.remove(&id);
@@ -1873,8 +1882,12 @@ fn dist_spawn_request(
         return Err(error);
     }
     if let Some(request) = request {
-        let mut tables = node_tables::lock();
-        let entry = tables.entries.get_mut(&node).ok_or_else(badarg)?;
+        let tables = node_tables::lock();
+        let mut entry = tables
+            .entries
+            .get(&node)
+            .map(|dep| dep.lock())
+            .ok_or_else(badarg)?;
         if let Some(state) = entry.dist.as_mut() {
             state.spawn_requests.insert(id, request);
         } else {
@@ -1987,6 +2000,7 @@ fn dist_spawn_reply(
         let node = tables
             .entries
             .values()
+            .map(|dep| dep.lock())
             .find(|entry| {
                 entry
                     .dist
@@ -2106,11 +2120,12 @@ pub(crate) fn spawn_reply_send_failed(
 /// OTP-29.1.1: erts_resume after `dist->mtx` is released.
 fn dist_pend_spawn_exit_save_child_result(handle: u64, id: u64, result: &OwnedTerm) {
     let resume = {
-        let mut tables = node_tables::lock();
-        let Some(state) = tables
-            .entries
-            .values_mut()
-            .find_map(|entry| entry.dist.as_mut().filter(|state| state.handle == handle))
+        let dep = node_tables::lock().dep_by_handle(handle);
+        let mut entry = dep.as_ref().map(|dep| dep.lock());
+        let Some(state) = entry
+            .as_mut()
+            .and_then(|entry| entry.dist.as_mut())
+            .filter(|state| state.handle == handle)
         else {
             // !dist->alive
             return;
@@ -2130,8 +2145,8 @@ fn dist_pend_spawn_exit_save_child_result(handle: u64, id: u64, result: &OwnedTe
 /// ERTS_ML_FLG_SPAWN_PENDING). A request already moved aside by the exiting parent is not
 /// live.
 pub(crate) fn take_spawn_request(parent: Pid, id: u64) -> Option<node_tables::SpawnRequest> {
-    let mut tables = node_tables::lock();
-    for entry in tables.entries.values_mut() {
+    let tables = node_tables::lock();
+    for mut entry in tables.entries.values().map(|dep| dep.lock()) {
         let pending = &mut entry.pending_spawn_requests;
         if pending
             .get(&id)
@@ -2177,8 +2192,10 @@ pub(crate) fn spawn_reply_install_origin_monitor(process: &mut Process, data: &D
 /// distributed request: one with link is left for the reply, which sends the child an
 /// `abandoned` exit (erl_proc_sig_queue.c:5786-5830).
 pub(crate) fn spawn_request_abandon(parent: Pid, id: u64) -> bool {
-    let mut tables = node_tables::lock();
-    for entry in tables.entries.values_mut() {
+    let tables = node_tables::lock();
+    for dep in tables.entries.values() {
+        let mut guard = dep.lock();
+        let entry = &mut *guard;
         let connected = entry.dist.as_mut().map(|state| &mut state.spawn_requests);
         for requests in std::iter::once(&mut entry.pending_spawn_requests).chain(connected) {
             let Some(request) = requests.get_mut(&id) else {
@@ -2244,9 +2261,9 @@ pub(crate) fn handle_dist_spawn_reply_exiting(
     // erts_monitor_tree_lookup(pe_ctxt_p->pend_spawn_monitors) with
     // erts_dist_pend_spawn_exit_delete: `connected` is false when the connection closed.
     let found = {
-        let mut tables = node_tables::lock();
+        let tables = node_tables::lock();
         let mut found = None;
-        for entry in tables.entries.values_mut() {
+        for mut entry in tables.entries.values().map(|dep| dep.lock()) {
             if entry
                 .pending_spawn_requests
                 .get(&data.id)
@@ -2330,8 +2347,10 @@ fn spawn_reply_demonitor(
 /// Port of erts/emulator/beam/erl_process.c:13932-13935 (proc_exit_handle_monitors) and
 /// dist.c:665 (erts_dist_pend_spawn_exit_parent_setup), OTP-29.1.1.
 pub(crate) fn pend_spawn_exit_parent_setup(parent: Pid) {
-    let mut tables = node_tables::lock();
-    for entry in tables.entries.values_mut() {
+    let tables = node_tables::lock();
+    for dep in tables.entries.values() {
+        let mut guard = dep.lock();
+        let entry = &mut *guard;
         let pending = entry.pending_spawn_requests.values_mut();
         let connected = entry
             .dist
@@ -2370,9 +2389,9 @@ pub(crate) fn pend_spawn_exit(
     let mut exits: Vec<(u64, OwnedTerm, bool, bool)> = Vec::new();
     let mut wait = false;
     let (local_name, local_creation) = {
-        let mut tables = node_tables::lock();
+        let tables = node_tables::lock();
         let local = (tables.local_name.clone(), tables.local_creation);
-        for entry in tables.entries.values_mut() {
+        for mut entry in tables.entries.values().map(|dep| dep.lock()) {
             let mut visit = |connection: Option<(u64, bool)>,
                              requests: &mut std::collections::BTreeMap<
                 u64,
@@ -2466,8 +2485,8 @@ fn handle_spawn_request(
     let from = parts[2].clone();
     let mfa = &parts[4];
     let options = &parts[5];
-    let local_name = node_tables::lock().local_name.clone();
-    let local_creation = node_tables::lock().local_creation;
+    let local_name = node_tables::this_node().0.to_owned();
+    let local_creation = node_tables::this_node().1;
     let arguments = internalize_local_node(arguments.clone(), &local_name, local_creation);
     let (module, function, arity) = match mfa {
         OwnedTerm::Tuple(items) if items.len() == 3 => (&items[0], &items[1], &items[2]),
@@ -2584,7 +2603,7 @@ fn handle_spawn_request_port(
     let from = parts[2].clone();
     let mfa = &parts[4];
     let options = &parts[5];
-    let local_creation = node_tables::lock().local_creation;
+    let local_creation = node_tables::this_node().1;
     let arguments = internalize_local_node(arguments.clone(), local, local_creation);
     let (module, function, arity) = match mfa {
         OwnedTerm::Tuple(items) if items.len() == 3 => (&items[0], &items[1], &items[2]),
@@ -2674,26 +2693,34 @@ fn emit_control_message_on_handle(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
-    let mut tables = node_tables::lock();
-    let local_name = tables.local_name.clone();
-    let local_creation = tables.local_creation;
-    let control = node_tables::relabel_local_node(control, &local_name, local_creation);
-    let entry = tables
-        .entries
-        .values_mut()
-        .find(|entry| {
-            entry
-                .dist
-                .as_ref()
-                .is_some_and(|state| state.handle == handle)
-        })
+    let dep = node_tables::lock()
+        .dep_by_handle(handle)
         .ok_or_else(badarg)?;
-    let state = entry.dist.as_mut().ok_or_else(badarg)?;
+    emit_control_message_on_entry(runtime, &dep, handle, control, message)
+}
+
+/// Encode and queue a control message on `dep`'s connection while it still has `handle`;
+/// only the entry lock is taken.
+pub(crate) fn emit_control_message_on_entry(
+    runtime: &crate::process::Runtime,
+    dep: &node_tables::DistEntry,
+    handle: u64,
+    control: OwnedTerm,
+    message: Option<OwnedTerm>,
+) -> Result<(), VmError> {
+    let (local_name, local_creation) = node_tables::this_node();
+    let control = node_tables::relabel_local_node(control, local_name, local_creation);
+    let mut entry = dep.lock();
+    let state = entry
+        .dist
+        .as_mut()
+        .filter(|state| state.handle == handle)
+        .ok_or_else(badarg)?;
     if let Some(port_id) = state.port_id {
         let packets = state.encode_term(control, message).map_err(|_| badarg())?;
         state.written = state.written.saturating_add(1);
         enqueue_port_output_no_suspend_locked(state, packets);
-        drop(tables);
+        drop(entry);
         return flush_port_output(runtime, port_id);
     }
     state.queue_term(control, message).map_err(|_| badarg())?;
@@ -2712,10 +2739,10 @@ pub(crate) fn forward_link_exit_if_proxy(
         return false;
     }
     let (remote_watcher, handle, local_name, local_creation, exit_payload) = {
-        let mut tables = node_tables::lock();
+        let tables = node_tables::lock();
         let local_name = tables.local_name.clone();
         let local_creation = tables.local_creation;
-        let Some(entry) = tables.entries.values_mut().find(|entry| {
+        let Some(mut entry) = tables.entries.values().map(|dep| dep.lock()).find(|entry| {
             entry
                 .dist
                 .as_ref()
@@ -2894,7 +2921,7 @@ pub(crate) fn native_signal(
             let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
             // bif.c monitor: `{Name, Node}` on a node that is not alive is badarg.
             if matches!(&target, OwnedTerm::Tuple(parts) if parts.len() == 2)
-                && !node_tables::lock().alive
+                && !node_tables::is_alive()
             {
                 return Err(badarg());
             }
@@ -3079,7 +3106,7 @@ fn remote_node(term: Term) -> Result<Option<String>, VmError> {
         },
         _ => return Ok(None),
     };
-    let local = node_tables::lock().local_name.clone();
+    let local = node_tables::this_node().0.to_owned();
     Ok((node != local && node != "nonode@nohost").then_some(node))
 }
 
@@ -3118,7 +3145,7 @@ pub(crate) fn is_remote_target(target: Term) -> Result<bool, VmError> {
     if target.local_ref_numbers().is_some() {
         return Ok(false);
     }
-    let local = node_tables::lock().local_name.clone();
+    let local = node_tables::this_node().0.to_owned();
     let remote = |node: &str| node != local && node != "nonode@nohost";
     if let Some((_, node)) = name_node_tuple(target)? {
         return Ok(remote(&node));
@@ -3158,7 +3185,7 @@ fn queue_remote_send(
     connect: bool,
     suspend: bool,
 ) -> Result<RemoteSendOutcome, VmError> {
-    if !node_tables::lock().alive {
+    if !node_tables::is_alive() {
         return Ok(RemoteSendOutcome::NotConnected);
     }
     Ok(
@@ -3183,7 +3210,7 @@ pub(crate) fn try_remote_send_with_options(
 ) -> Result<RemoteSendOutcome, VmError> {
     // {Name, Node} — registered send on a (possibly remote) node.
     if let Some((name, node)) = name_node_tuple(target)? {
-        let local = node_tables::lock().local_name.clone();
+        let local = node_tables::this_node().0.to_owned();
         if node == local || node == "nonode@nohost" {
             return Ok(RemoteSendOutcome::NotRemote);
         }
@@ -3211,7 +3238,7 @@ pub(crate) fn try_remote_send_with_options(
     let target_owned = owned(target)?;
     if let OwnedTerm::Ref { node, .. } = &target_owned {
         let target_node = node.clone();
-        let local = node_tables::lock().local_name.clone();
+        let local = node_tables::this_node().0.to_owned();
         if target_node == local || target_node == "nonode@nohost" {
             return Ok(RemoteSendOutcome::NotRemote);
         }
@@ -3236,7 +3263,7 @@ pub(crate) fn try_remote_send_with_options(
     else {
         return Ok(RemoteSendOutcome::NotRemote);
     };
-    let local = node_tables::lock().local_name.clone();
+    let local = node_tables::this_node().0.to_owned();
     if node == &local || node == "nonode@nohost" {
         return Ok(RemoteSendOutcome::NotRemote);
     }
@@ -3288,13 +3315,12 @@ fn enqueue_port_packets_locked(
     state.output.extend(packets);
     state.output_ready_packets += ready_count;
     if deferred_count != 0 {
-        node_tables::ANY_FRAGMENT_CONTINUATION.store(true, std::sync::atomic::Ordering::Release);
         state
             .fragment_continuations
-            .push_back(node_tables::DistFragmentContinuation {
-                sender: Some(sender),
-                remaining_packets: deferred_count,
-            });
+            .push_back(node_tables::DistFragmentContinuation::new(
+                Some(sender),
+                deferred_count,
+            ));
     }
     if deferred_count != 0 || has_older_continuation {
         process.set_force_yield(true);
@@ -3316,16 +3342,17 @@ fn finish_port_enqueue(
         let suspended = suspend_dist_sender(process, sender);
         if suspended {
             process.set_force_yield(true);
-            let mut tables = node_tables::lock();
-            if let Some(state) = tables.entries.values_mut().find_map(|entry| {
-                entry
+            if let Some(dep) = process
+                .runtime
+                .and_then(|runtime| node_tables::port_dist_entry(runtime, port_id))
+                && let Some(state) = dep
+                    .lock()
                     .dist
                     .as_mut()
                     .filter(|state| state.port_id == Some(port_id))
-            }) {
+            {
                 state.suspended_senders.push(sender);
             }
-            drop(tables);
             crate::natives::erts_debug::notify_busy_dist_port(process, sender, port_id);
         }
     }
@@ -3342,14 +3369,13 @@ fn enqueue_port_output_no_suspend_locked(
     if state.fragment_continuations.is_empty() {
         state.output_ready_packets += packets.len();
     } else {
-        node_tables::ANY_FRAGMENT_CONTINUATION.store(true, std::sync::atomic::Ordering::Release);
         state.pending_bytes = state.pending_bytes.saturating_sub(packet_bytes);
         state
             .fragment_continuations
-            .push_back(node_tables::DistFragmentContinuation {
-                sender: None,
-                remaining_packets: packets.len(),
-            });
+            .push_back(node_tables::DistFragmentContinuation::new(
+                None,
+                packets.len(),
+            ));
     }
     state.output.extend(packets);
     if state.pending_bytes >= state.busy_limit {
@@ -3363,7 +3389,7 @@ fn enqueue_port_output_no_suspend_locked(
 /// [`continue_fragmented_send`].
 #[inline]
 pub(crate) fn fragment_continuation_pending() -> bool {
-    node_tables::ANY_FRAGMENT_CONTINUATION.load(std::sync::atomic::Ordering::Acquire)
+    node_tables::FRAGMENT_CONTINUATIONS.load(std::sync::atomic::Ordering::Acquire) != 0
 }
 
 pub(crate) fn continue_fragmented_send(
@@ -3372,31 +3398,28 @@ pub(crate) fn continue_fragmented_send(
 ) -> Result<(), VmError> {
     // Called every scheduling iteration: skip the global node-table lock while no
     // distribution entry has a deferred fragmented send (erts keeps this per process).
-    if !node_tables::ANY_FRAGMENT_CONTINUATION.load(std::sync::atomic::Ordering::Acquire) {
+    if !fragment_continuation_pending() {
         return Ok(());
     }
     let sender = ctx.pid();
     let send_count = (ctx.remaining() as usize / 10).max(1);
+    let has_sender = |state: &DistState| {
+        state
+            .fragment_continuations
+            .iter()
+            .any(|continuation| continuation.sender == Some(sender))
+    };
+    let Some(dep) = node_tables::lock()
+        .entries
+        .values()
+        .find(|dep| dep.lock().dist.as_ref().is_some_and(has_sender))
+        .cloned()
+    else {
+        return Ok(());
+    };
     let (port_id, packet_count, more) = {
-        let mut tables = node_tables::lock();
-        let Some(state) = tables.entries.values_mut().find_map(|entry| {
-            entry.dist.as_mut().filter(|state| {
-                state
-                    .fragment_continuations
-                    .iter()
-                    .any(|continuation| continuation.sender == Some(sender))
-            })
-        }) else {
-            // Flag writers hold this lock, so clearing it here cannot lose a new push.
-            if !tables.entries.values().any(|entry| {
-                entry
-                    .dist
-                    .as_ref()
-                    .is_some_and(|state| !state.fragment_continuations.is_empty())
-            }) {
-                node_tables::ANY_FRAGMENT_CONTINUATION
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
+        let mut entry = dep.lock();
+        let Some(state) = entry.dist.as_mut().filter(|state| has_sender(state)) else {
             return Ok(());
         };
         let port_id = state.port_id.ok_or_else(badarg)?;
@@ -3462,13 +3485,13 @@ pub(crate) fn continue_fragmented_send(
         process.set_force_yield(true);
     }
     let busy = {
-        let mut tables = node_tables::lock();
-        let Some(state) = tables.entries.values_mut().find_map(|entry| {
-            entry
-                .dist
-                .as_mut()
-                .filter(|state| state.port_id == Some(port_id))
-        }) else {
+        let dep = node_tables::port_dist_entry(process.runtime.ok_or_else(badarg)?, port_id);
+        let mut entry = dep.as_ref().map(|dep| dep.lock());
+        let Some(state) = entry
+            .as_mut()
+            .and_then(|entry| entry.dist.as_mut())
+            .filter(|state| state.port_id == Some(port_id))
+        else {
             return Err(badarg());
         };
         if state.pending_bytes >= state.busy_limit {
@@ -3480,16 +3503,17 @@ pub(crate) fn continue_fragmented_send(
     };
     if busy && suspend_dist_sender(process, sender) {
         process.set_force_yield(true);
-        let mut tables = node_tables::lock();
-        if let Some(state) = tables.entries.values_mut().find_map(|entry| {
-            entry
+        if let Some(dep) = process
+            .runtime
+            .and_then(|runtime| node_tables::port_dist_entry(runtime, port_id))
+            && let Some(state) = dep
+                .lock()
                 .dist
                 .as_mut()
                 .filter(|state| state.port_id == Some(port_id))
-        }) {
+        {
             state.suspended_senders.push(sender);
         }
-        drop(tables);
         crate::natives::erts_debug::notify_busy_dist_port(process, sender, port_id);
     }
     flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)
@@ -3501,13 +3525,13 @@ pub(crate) fn continue_fragmented_send(
 /// a `ERTS_PORT_TASK_DIST_CMD` task of the connection's port, at most one scheduled at a time.
 fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<(), VmError> {
     let claimed = {
-        let mut tables = node_tables::lock();
-        let Some(state) = tables.entries.values_mut().find_map(|entry| {
-            entry
-                .dist
-                .as_mut()
-                .filter(|state| state.port_id == Some(port_id))
-        }) else {
+        let dep = node_tables::port_dist_entry(runtime, port_id);
+        let mut entry = dep.as_ref().map(|dep| dep.lock());
+        let Some(state) = entry
+            .as_mut()
+            .and_then(|entry| entry.dist.as_mut())
+            .filter(|state| state.port_id == Some(port_id))
+        else {
             return Ok(());
         };
         if state.port_busy || state.flushing_output || state.output_ready_packets == 0 {
@@ -3527,14 +3551,14 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
     ) else {
         // The port is gone: erts drops the data and the port exit tears the connection down
         // (dist.c, dist_port_exit / erts_do_net_exits), OTP-29.1.1.
-        dist_cmd_done(port_id);
+        dist_cmd_done(runtime, port_id);
         return Ok(());
     };
     drv.schedule_dist_cmd(Box::new(move |op| {
         if op == arinsal_drv::port_task::SigOp::Exec {
             dist_cmd(task_runtime, port_id)
         } else {
-            dist_cmd_done(port_id);
+            dist_cmd_done(task_runtime, port_id);
             0
         }
     }));
@@ -3542,14 +3566,14 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
 }
 
 /// The dist command task is no longer scheduled or running.
-fn dist_cmd_done(port_id: u64) {
-    let mut tables = node_tables::lock();
-    if let Some(state) = tables.entries.values_mut().find_map(|entry| {
-        entry
+fn dist_cmd_done(runtime: &crate::process::Runtime, port_id: u64) {
+    if let Some(dep) = node_tables::port_dist_entry(runtime, port_id)
+        && let Some(state) = dep
+            .lock()
             .dist
             .as_mut()
             .filter(|state| state.port_id == Some(port_id))
-    }) {
+    {
         state.flushing_output = false;
     }
 }
@@ -3565,33 +3589,27 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
     loop {
         if written >= DIST_CMD_PACKETS {
             // Out of reductions: stay scheduled by queueing the next slice.
-            let again = {
-                let mut tables = node_tables::lock();
-                tables
-                    .entries
-                    .values_mut()
-                    .find_map(|entry| {
-                        entry
-                            .dist
-                            .as_mut()
-                            .filter(|state| state.port_id == Some(port_id))
-                    })
+            let again = node_tables::port_dist_entry(runtime, port_id).is_some_and(|dep| {
+                dep.lock()
+                    .dist
+                    .as_ref()
+                    .filter(|state| state.port_id == Some(port_id))
                     .is_some_and(|state| !state.port_busy && state.output_ready_packets != 0)
-            };
-            dist_cmd_done(port_id);
+            });
+            dist_cmd_done(runtime, port_id);
             if again {
                 let _ = flush_port_output(runtime, port_id);
             }
             break;
         }
         let packet = {
-            let mut tables = node_tables::lock();
-            let Some(state) = tables.entries.values_mut().find_map(|entry| {
-                entry
-                    .dist
-                    .as_mut()
-                    .filter(|state| state.port_id == Some(port_id))
-            }) else {
+            let dep = node_tables::port_dist_entry(runtime, port_id);
+            let mut entry = dep.as_ref().map(|dep| dep.lock());
+            let Some(state) = entry
+                .as_mut()
+                .and_then(|entry| entry.dist.as_mut())
+                .filter(|state| state.port_id == Some(port_id))
+            else {
                 return 0;
             };
             if state.port_busy || state.output_ready_packets == 0 {
@@ -3615,13 +3633,13 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
             .unwrap_or_default();
         written += 1;
         let resumed = {
-            let mut tables = node_tables::lock();
-            let Some(state) = tables.entries.values_mut().find_map(|entry| {
-                entry
-                    .dist
-                    .as_mut()
-                    .filter(|state| state.port_id == Some(port_id))
-            }) else {
+            let dep = node_tables::port_dist_entry(runtime, port_id);
+            let mut entry = dep.as_ref().map(|dep| dep.lock());
+            let Some(state) = entry
+                .as_mut()
+                .and_then(|entry| entry.dist.as_mut())
+                .filter(|state| state.port_id == Some(port_id))
+            else {
                 return 0;
             };
             state.pending_bytes = state.pending_bytes.saturating_sub(packet.len() as u64);
@@ -3676,13 +3694,13 @@ pub(crate) fn distribution_port_state_changed(
     port_busy: bool,
 ) {
     let (senders, needs_flush) = {
-        let mut tables = node_tables::lock();
-        let Some(state) = tables.entries.values_mut().find_map(|entry| {
-            entry
-                .dist
-                .as_mut()
-                .filter(|state| state.port_id == Some(port_id))
-        }) else {
+        let dep = node_tables::port_dist_entry(runtime, port_id);
+        let mut entry = dep.as_ref().map(|dep| dep.lock());
+        let Some(state) = entry
+            .as_mut()
+            .and_then(|entry| entry.dist.as_mut())
+            .filter(|state| state.port_id == Some(port_id))
+        else {
             return;
         };
         state.port_busy = port_busy;
@@ -3761,7 +3779,7 @@ fn local_pid(term: &OwnedTerm, local: &str) -> Option<Pid> {
     else {
         return None;
     };
-    let local_creation = node_tables::lock().local_creation;
+    let local_creation = node_tables::this_node().1;
     if !local_pid_matches(node, *creation, local, local_creation)
         || *id > arinsal_term::ptab::MAX_INTERNAL_PID_NUMBER
     {
@@ -3858,15 +3876,11 @@ fn with_dhandle<R>(
     f: impl FnOnce(&mut DistState) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
     let (conn_id, entry_ref) = parse_dhandle(handle)?;
-    let mut tables = node_tables::lock();
-    let entry = tables
-        .entries
-        .values_mut()
-        .find(|entry| {
-            entry.entry_ref == entry_ref && entry.connection_id == conn_id && entry.dist.is_some()
-        })
+    let dep = node_tables::lock()
+        .dep_by_dhandle(conn_id, entry_ref)
         .ok_or_else(badarg)?;
-    let state = entry.dist.as_mut().expect("matched controller state");
+    let mut entry = dep.lock();
+    let state = entry.dist.as_mut().ok_or_else(badarg)?;
     if require_owner && state.owner != caller {
         return Err(badarg());
     }
@@ -3879,15 +3893,11 @@ fn with_dhandle_input<R>(
     f: impl FnOnce(&mut DistState) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
     let (conn_id, entry_ref) = parse_dhandle(handle)?;
-    let mut tables = node_tables::lock();
-    let entry = tables
-        .entries
-        .values_mut()
-        .find(|entry| {
-            entry.entry_ref == entry_ref && entry.connection_id == conn_id && entry.dist.is_some()
-        })
+    let dep = node_tables::lock()
+        .dep_by_dhandle(conn_id, entry_ref)
         .ok_or_else(badarg)?;
-    let state = entry.dist.as_mut().expect("matched controller state");
+    let mut entry = dep.lock();
+    let state = entry.dist.as_mut().ok_or_else(badarg)?;
     if state.input_handler != caller {
         return Err(badarg());
     }

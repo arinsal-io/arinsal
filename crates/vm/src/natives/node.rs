@@ -260,7 +260,7 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
     if want_this {
         entries.push((tables.local_name.clone(), node_tables::NodeKind::This, None));
     }
-    for entry in tables.entries.values() {
+    for entry in tables.entries.values().map(|dep| dep.lock()) {
         if entry.name == tables.local_name {
             continue;
         }

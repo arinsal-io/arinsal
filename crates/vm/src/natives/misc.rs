@@ -293,7 +293,7 @@ fn profile_target(profile: &Profile) -> Option<arinsal_sched::Pid> {
     else {
         return None;
     };
-    let local_name = crate::node_tables::lock().local_name.clone();
+    let local_name = crate::node_tables::this_node().0.to_owned();
     if *creation != 0 || (node != "nonode@nohost" && node != &local_name) {
         return None;
     }
@@ -326,7 +326,7 @@ pub(crate) fn profile_process_event(
     else {
         return;
     };
-    let local_name = crate::node_tables::lock().local_name.clone();
+    let local_name = crate::node_tables::this_node().0.to_owned();
     if *creation != 0 || (node != "nonode@nohost" && node != &local_name) {
         return;
     }

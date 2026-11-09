@@ -5,7 +5,7 @@ use arinsal_sched::Pid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 pub(crate) const DFLAG_FRAGMENTS: u64 = 0x0080_0000;
@@ -41,6 +41,36 @@ pub(crate) struct NodeEntry {
     pub(crate) pending_spawn_requests: BTreeMap<u64, SpawnRequest>,
     /// `dep->mld`: the links and monitors of the current (pending or up) connection.
     pub(crate) mld: Option<std::sync::Arc<crate::monitor_link::MonLnkDist>>,
+}
+
+/// One element of the dist table: a (potential) connection to a node, keyed by name.
+///
+/// Port of erts/emulator/beam/erl_node_tables.h (`struct dist_entry_`), OTP-29.1.1. The
+/// `Arc` strong count is `dep->refc`: the table, the controlling port
+/// (`ERTS_PRTSD_DIST_ENTRY`) and in-flight senders each hold a reference, and the table only
+/// erases an entry nobody else references (`try_delete_dist_entry`). `rwmtx` protects the
+/// connection state; the table lock protects membership only. Lock order: table, then entry;
+/// code holding an entry lock never takes the table lock.
+#[derive(Debug)]
+pub(crate) struct DistEntry {
+    /// `dep->sysname`.
+    pub(crate) sysname: String,
+    /// `dep->rwmtx`: state, connection id, `mld`, the controller's queues and caches.
+    rwmtx: parking_lot::Mutex<NodeEntry>,
+}
+
+impl DistEntry {
+    fn new(entry: NodeEntry) -> Arc<Self> {
+        Arc::new(Self {
+            sysname: entry.name.clone(),
+            rwmtx: parking_lot::Mutex::new(entry),
+        })
+    }
+
+    /// `erts_de_rwlock(dep)`.
+    pub(crate) fn lock(&self) -> parking_lot::MutexGuard<'_, NodeEntry> {
+        self.rwmtx.lock()
+    }
 }
 
 /// Controller-owned state for one active distribution connection.
@@ -80,11 +110,34 @@ pub(crate) struct DistState {
     pub(crate) spawn_requests: BTreeMap<u64, SpawnRequest>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct DistFragmentContinuation {
     /// `None` is output from a no-suspend controller/exit path.
     pub(crate) sender: Option<Pid>,
     pub(crate) remaining_packets: usize,
+}
+
+impl DistFragmentContinuation {
+    /// A deferred fragment tail; counted in [`FRAGMENT_CONTINUATIONS`] while it exists.
+    pub(crate) fn new(sender: Option<Pid>, remaining_packets: usize) -> Self {
+        FRAGMENT_CONTINUATIONS.fetch_add(1, Ordering::AcqRel);
+        Self {
+            sender,
+            remaining_packets,
+        }
+    }
+}
+
+impl Clone for DistFragmentContinuation {
+    fn clone(&self) -> Self {
+        Self::new(self.sender, self.remaining_packets)
+    }
+}
+
+impl Drop for DistFragmentContinuation {
+    fn drop(&mut self) {
+        FRAGMENT_CONTINUATIONS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Reassembly state for an OTP `DIST_FRAG_HEADER` signal.
@@ -369,7 +422,8 @@ pub(crate) struct NodeTables {
     pub(crate) local_creation: u32,
     pub(crate) alive: bool,
     pub(crate) distribution_buffer_busy_limit: u64,
-    pub(crate) entries: BTreeMap<String, NodeEntry>,
+    /// `erts_dist_table`: name to entry; this table lock covers membership only.
+    pub(crate) entries: BTreeMap<String, Arc<DistEntry>>,
     pub(crate) monitors: Vec<NodeMonitor>,
     pending_delete: HashMap<String, Instant>,
     pub(crate) nodes_monitors: Vec<NodesMonitor>,
@@ -399,7 +453,7 @@ impl Default for NodeTables {
         let mut entries = BTreeMap::new();
         entries.insert(
             "nonode@nohost".into(),
-            NodeEntry {
+            DistEntry::new(NodeEntry {
                 name: "nonode@nohost".into(),
                 creation: 0,
                 connection_id: 0,
@@ -411,7 +465,7 @@ impl Default for NodeTables {
                 pending_out: VecDeque::new(),
                 pending_spawn_requests: BTreeMap::new(),
                 mld: None,
-            },
+            }),
         );
         Self {
             local_name: "nonode@nohost".into(),
@@ -436,8 +490,13 @@ impl NodeTables {
             .collect::<Vec<_>>();
         for node in expired {
             self.pending_delete.remove(&node);
+            // Port of erl_node_tables.c (try_delete_dist_entry), OTP-29.1.1: an entry is
+            // only erased once the table holds the last reference (`refc` reached zero).
             if node != self.local_name
-                && !self.entries.get(&node).is_some_and(|entry| entry.connected)
+                && self
+                    .entries
+                    .get(&node)
+                    .is_some_and(|dep| Arc::strong_count(dep) == 1 && !dep.lock().connected)
                 && !self.monitors.iter().any(|monitor| monitor.node == node)
             {
                 self.entries.remove(&node);
@@ -451,13 +510,11 @@ static NEXT_ENTRY_REF: AtomicU64 = AtomicU64::new(1);
 static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(-1);
 static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
 
-/// Ports currently acting as distribution controllers (`port_id` → node name).
-static DIST_PORTS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
-
-/// Set (under the table lock) whenever a fragmented send is deferred; cleared by
-/// `continue_fragmented_send` once no entry holds one.
-pub(crate) static ANY_FRAGMENT_CONTINUATION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Number of live [`DistFragmentContinuation`]s over all entries. Exact (each continuation
+/// counts itself from creation to drop), so it needs no lock; schedulers skip the
+/// continuation scan while it is zero.
+pub(crate) static FRAGMENT_CONTINUATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// `erts_this_node->sysname`: the local node name atom, which native `node/0` loads
 /// without a runtime call; [`set_this_node`] updates it.
@@ -503,30 +560,55 @@ pub(crate) fn lock() -> NodeTablesGuard {
     )
 }
 
-fn dist_ports() -> MutexGuard<'static, HashMap<u64, String>> {
-    DIST_PORTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// `erts_this_node`: the local node name and creation, read without the table lock.
+///
+/// Port of erts/emulator/beam/erl_node_tables.c (erts_this_node), OTP-29.1.1: published by
+/// [`set_this_node`] and only changed by `setnode/2`.
+pub(crate) fn this_node() -> (&'static str, u32) {
+    let (atom, creation) = arinsal_term::this_node();
+    (
+        arinsal_term::global_atoms()
+            .text(atom)
+            .unwrap_or("nonode@nohost"),
+        creation,
+    )
 }
 
-/// True when `port_id` is the DistCtrlr for an active connection.
-pub(crate) fn is_dist_port(port_id: u64) -> bool {
-    dist_ports().contains_key(&port_id)
+/// `erts_is_alive`.
+pub(crate) fn is_alive() -> bool {
+    arinsal_term::this_node().0 != arinsal_term::atoms::NONAME
 }
 
-/// Node name for a distribution port, if any.
-#[allow(dead_code)] // retained for DistCtrlr diagnostics / future teardown
-pub(crate) fn dist_port_node(port_id: u64) -> Option<String> {
-    dist_ports().get(&port_id).cloned()
+/// `find_dist_entry`: a reference to the entry for `sysname`, holding the table lock only for
+/// the lookup.
+// Port of erts/emulator/beam/erl_node_tables.c (erts_find_dist_entry), OTP-29.1.1.
+pub(crate) fn find_dist_entry(sysname: &str) -> Option<Arc<DistEntry>> {
+    lock().entries.get(sysname).cloned()
 }
 
-pub(crate) fn register_dist_port(port_id: u64, node: String) {
-    dist_ports().insert(port_id, node);
+/// `erts_prtsd_get(prt, ERTS_PRTSD_DIST_ENTRY)` of `port_id`; callers check
+/// `dep->cid == prt->common.id` under the entry lock.
+// Port of erts/emulator/beam/dist.c:3999 (erts_dist_command), OTP-29.1.1.
+pub(crate) fn port_dist_entry(
+    runtime: &crate::process::Runtime,
+    port_id: u64,
+) -> Option<Arc<DistEntry>> {
+    runtime.ports.get(port_id)?.dist_entry()
 }
 
-pub(crate) fn unregister_dist_port(port_id: u64) -> Option<String> {
-    dist_ports().remove(&port_id)
+/// `dep->cid == port`: `port_id` is the controller of the entry's current connection.
+pub(crate) fn dep_controls_port(dep: &DistEntry, port_id: u64) -> bool {
+    dep.lock()
+        .dist
+        .as_ref()
+        .is_some_and(|state| state.port_id == Some(port_id))
+}
+
+/// True when the port handle controls a live distribution connection.
+pub(crate) fn is_dist_port(handle: &crate::port::PortHandle) -> bool {
+    handle
+        .dist_entry()
+        .is_some_and(|dep| dep_controls_port(&dep, handle.id()))
 }
 
 const CON_ID_MASK: u32 = 0x00ff_ffff;
@@ -570,12 +652,49 @@ impl NodeTables {
     }
 
     pub(crate) fn local_identity(&self) -> (&str, u32) {
-        let entry = self
+        let dep = self
             .entries
             .get(&self.local_name)
             .expect("the local distribution entry is always present");
-        debug_assert_eq!(entry.creation, self.local_creation);
-        (&entry.name, entry.creation)
+        debug_assert_eq!(dep.lock().creation, self.local_creation);
+        (&dep.sysname, self.local_creation)
+    }
+
+    /// The entry whose current connection has distribution handle `handle` (the
+    /// `DistEntry` pointer of an erts dhandle).
+    pub(crate) fn dep_by_handle(&self, handle: u64) -> Option<Arc<DistEntry>> {
+        self.entries
+            .values()
+            .find(|dep| {
+                dep.lock()
+                    .dist
+                    .as_ref()
+                    .is_some_and(|state| state.handle == handle)
+            })
+            .cloned()
+    }
+
+    /// The entry a distribution handle `{ConnId, Ref}` names, while that connection is up
+    /// (erts `erts_dhandle_to_dist_entry` plus its connection id check).
+    pub(crate) fn dep_by_dhandle(&self, conn_id: u32, entry_ref: u64) -> Option<Arc<DistEntry>> {
+        self.entries
+            .values()
+            .find(|dep| {
+                let entry = dep.lock();
+                entry.entry_ref == entry_ref
+                    && entry.connection_id == conn_id
+                    && entry.dist.is_some()
+            })
+            .cloned()
+    }
+
+    /// `erts_find_or_insert_dist_entry`.
+    // Port of erts/emulator/beam/erl_node_tables.c (erts_find_or_insert_dist_entry), OTP-29.1.1.
+    pub(crate) fn find_or_insert(&mut self, sysname: &str) -> Arc<DistEntry> {
+        self.entries
+            .entry(sysname.to_string())
+            .or_insert_with(|| DistEntry::new(fresh_entry(sysname.to_string())))
+            .clone()
     }
 
     /// Return whether a pid's distribution entry advertises Unicode I/O.
@@ -585,10 +704,12 @@ impl NodeTables {
         if node == self.local_name {
             return true;
         }
-        self.entries
-            .get(node)
-            .and_then(|entry| entry.dist.as_ref())
-            .is_some_and(|dist| dist.flags & DFLAG_UNICODE_IO != 0)
+        self.entries.get(node).is_some_and(|dep| {
+            dep.lock()
+                .dist
+                .as_ref()
+                .is_some_and(|dist| dist.flags & DFLAG_UNICODE_IO != 0)
+        })
     }
 
     /// Port of erts/emulator/beam/dist.c:4978 (setnode_2), OTP-29.1.1.
@@ -604,7 +725,7 @@ impl NodeTables {
         self.alive = true;
         self.entries.insert(
             name.clone(),
-            NodeEntry {
+            DistEntry::new(NodeEntry {
                 name,
                 creation,
                 connection_id: 0,
@@ -616,7 +737,7 @@ impl NodeTables {
                 pending_out: VecDeque::new(),
                 pending_spawn_requests: BTreeMap::new(),
                 mld: None,
-            },
+            }),
         );
         true
     }
@@ -629,10 +750,8 @@ impl NodeTables {
             return None;
         }
         self.pending_delete.remove(node);
-        let entry = self
-            .entries
-            .entry(node.to_string())
-            .or_insert_with(|| fresh_entry(node.to_string()));
+        let dep = self.find_or_insert(node);
+        let mut entry = dep.lock();
         match entry.state {
             ConnState::Connected | ConnState::Exiting | ConnState::Pending => {}
             ConnState::Idle => {
@@ -660,7 +779,7 @@ impl NodeTables {
         if node == self.local_name {
             return None;
         }
-        let entry = self.entries.get_mut(node)?;
+        let mut entry = self.entries.get(node)?.lock();
         if entry.entry_ref != entry_ref {
             return None;
         }
@@ -692,28 +811,20 @@ impl NodeTables {
         visible: bool,
     ) {
         self.pending_delete.remove(&name);
-        let entry_ref = self
-            .entries
-            .get(&name)
-            .map(|entry| entry.entry_ref)
-            .unwrap_or_else(|| NEXT_ENTRY_REF.fetch_add(1, Ordering::Relaxed));
         let mld = Some(new_mld(&name, connection_id));
-        self.entries.insert(
-            name.clone(),
-            NodeEntry {
-                name,
-                creation,
-                connection_id,
-                entry_ref,
-                state: ConnState::Connected,
-                visible,
-                connected: true,
-                dist: None,
-                pending_out: VecDeque::new(),
-                pending_spawn_requests: BTreeMap::new(),
-                mld,
-            },
-        );
+        let dep = self.find_or_insert(&name);
+        let mut entry = dep.lock();
+        // Port of erl_node_tables.c (erts_set_dist_entry_connected), OTP-29.1.1: the entry is
+        // updated in place; references to it stay valid.
+        entry.creation = creation;
+        entry.connection_id = connection_id;
+        entry.state = ConnState::Connected;
+        entry.visible = visible;
+        entry.connected = true;
+        entry.dist = None;
+        entry.pending_out.clear();
+        entry.pending_spawn_requests.clear();
+        entry.mld = mld;
     }
 
     /// Record a monitor and return true when an immediate down event is due.
@@ -749,12 +860,14 @@ impl NodeTables {
                 references: 1,
             });
         }
-        if self.entries.get(&node).is_some_and(|entry| entry.connected) {
+        if self
+            .entries
+            .get(&node)
+            .is_some_and(|dep| dep.lock().connected)
+        {
             return false;
         }
-        self.entries
-            .entry(node.clone())
-            .or_insert_with(|| fresh_entry(node.clone()));
+        self.find_or_insert(&node);
         !self.disconnect(&node).is_empty()
     }
 
@@ -889,19 +1002,19 @@ impl NodeTables {
         &mut self,
         node: &str,
     ) -> Option<std::sync::Arc<crate::monitor_link::MonLnkDist>> {
-        self.entries.get_mut(node)?.mld.take()
+        self.entries.get(node)?.lock().mld.take()
     }
 
     pub(crate) fn disconnect(&mut self, node: &str) -> Vec<NodeMonitor> {
-        if let Some(entry) = self.entries.get_mut(node) {
+        // Port of erl_node_tables.c (erts_set_dist_entry_not_connected), OTP-29.1.1. The
+        // controlling port keeps its `ERTS_PRTSD_DIST_ENTRY` reference until it terminates;
+        // `dep->cid` is reset here, so the port no longer counts as this entry's controller.
+        if let Some(dep) = self.entries.get(node) {
+            let mut entry = dep.lock();
             entry.connected = false;
             entry.state = ConnState::Idle;
             entry.mld = None;
-            if let Some(state) = entry.dist.take()
-                && let Some(port_id) = state.port_id
-            {
-                drop(unregister_dist_port(port_id));
-            }
+            entry.dist = None;
         }
         let delay = NODE_TAB_DELETE_DELAY_MS.load(Ordering::Acquire);
         if delay < 0 {
@@ -994,7 +1107,7 @@ mod tests {
     fn connected_node_is_reported_with_connection_metadata() {
         let mut tables = NodeTables::default();
         tables.connect("peer@localhost".into(), 9, 12, true);
-        let entry = &tables.entries["peer@localhost"];
+        let entry = tables.entries["peer@localhost"].lock();
         assert!(entry.connected);
         assert!(entry.visible);
         assert_eq!(entry.creation, 9);
@@ -1007,10 +1120,12 @@ mod tests {
         let mut tables = NodeTables::default();
         assert!(tables.set_local_node("a@host".into(), 4));
         let (id1, ref1) = tables.new_connection("b@host").unwrap();
-        let entry = &tables.entries["b@host"];
-        assert_eq!(entry.state, ConnState::Pending);
-        assert_eq!(entry.connection_id, id1);
-        assert_eq!(entry.entry_ref, ref1);
+        {
+            let entry = tables.entries["b@host"].lock();
+            assert_eq!(entry.state, ConnState::Pending);
+            assert_eq!(entry.connection_id, id1);
+            assert_eq!(entry.entry_ref, ref1);
+        }
         let (id2, ref2) = tables.new_connection("b@host").unwrap();
         assert_eq!(id1, id2);
         assert_eq!(ref1, ref2);
@@ -1021,7 +1136,7 @@ mod tests {
         let mut tables = NodeTables::default();
         assert!(tables.set_local_node("a@host".into(), 4));
         let (id, entry_ref) = tables.new_connection("gurka").unwrap();
-        let entry = &tables.entries["gurka"];
+        let entry = tables.entries["gurka"].lock();
         assert_eq!(entry.state, ConnState::Pending);
         assert_eq!(entry.connection_id, id);
         assert_eq!(entry.entry_ref, entry_ref);
@@ -1033,7 +1148,7 @@ mod tests {
         assert!(tables.set_local_node("a@host".into(), 4));
         let (id, eref) = tables.new_connection("b@host").unwrap();
         assert_eq!(tables.abort_pending("b@host", id, eref), Some(true));
-        assert_eq!(tables.entries["b@host"].state, ConnState::Idle);
+        assert_eq!(tables.entries["b@host"].lock().state, ConnState::Idle);
         assert!(tables.abort_pending("a@host", id, eref).is_none());
     }
 }

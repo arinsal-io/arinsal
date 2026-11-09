@@ -3093,7 +3093,7 @@ fn monitor_port(
         reference(process, reference_id)?
     };
     // Port of erts/emulator/beam/bif.c:895-945 (monitor/3, type `port`), OTP-29.1.1.
-    let local_node = || global_atoms().get(&crate::node_tables::lock().local_name);
+    let local_node = || global_atoms().get(crate::node_tables::this_node().0);
     let (port_id, name) = if let Some(id) = target.as_port() {
         (Some(id), None)
     } else if let Some(name) = target.as_atom() {
@@ -3104,7 +3104,7 @@ fn monitor_port(
         // A port of another node is badarg; a port of another incarnation of this node
         // never matches a live port (ERTS_MON_TYPE_DIST_PORT).
         if let arinsal_etf::OwnedTerm::Port { node, .. } = &object
-            && *node != crate::node_tables::lock().local_name
+            && *node != crate::node_tables::this_node().0
         {
             return Err(badarg("monitor/2"));
         }
@@ -4495,7 +4495,7 @@ pub(crate) fn monitor_object(
     let Some(name) = name else {
         return Ok(target);
     };
-    let node = crate::node_tables::lock().local_name.clone();
+    let node = crate::node_tables::this_node().0.to_owned();
     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[atom(name), atom(&node)])
         .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))
@@ -4510,7 +4510,7 @@ pub(crate) fn port_monitor_object<H: arinsal_term::HeapAlloc + ?Sized>(
     name: Option<Atom>,
 ) -> Result<Term, VmError> {
     if let Some(name) = name {
-        let node = crate::node_tables::lock().local_name.clone();
+        let node = crate::node_tables::this_node().0.to_owned();
         return TermBuilder::new(heap)
             .tuple(&[Term::atom(name), atom(&node)])
             .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")));

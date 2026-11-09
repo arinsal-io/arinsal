@@ -1325,7 +1325,7 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
                                 .map(|text| text.to_string())
                                 .unwrap_or_default(),
                         ),
-                        arinsal_etf::OwnedTerm::Atom(crate::node_tables::lock().local_name.clone()),
+                        arinsal_etf::OwnedTerm::Atom(crate::node_tables::this_node().0.to_owned()),
                     ])),
                     Some(crate::proc_create::OriginMonitor::Port {
                         port_id: Some(id), ..
