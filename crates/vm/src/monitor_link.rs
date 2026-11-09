@@ -167,21 +167,27 @@ pub(crate) struct PidOrder;
 
 impl KeyOrder for PidOrder {
     /// Port of erts/emulator/beam/erl_monitor_link.c (ml_cmp_keys), OTP-29.1.1: immediate
-    /// keys by value before boxed external pid keys, which compare by their contents.
+    /// keys by value before boxed external pid keys, which compare by their contents. The
+    /// external tag is the top two bits, so a plain `u64` compare already orders an internal
+    /// key before an external one; only two external keys need the boxed compare.
+    #[inline(always)]
     fn compare(left: u64, right: u64) -> Ordering {
-        match (is_external_key(left), is_external_key(right)) {
-            (false, false) => left.cmp(&right),
-            (false, true) => Ordering::Less,
-            (true, false) => Ordering::Greater,
-            (true, true) => {
-                let pid = |key: u64| (key & !EXTERNAL_KEY) as *const ExternalPid;
-                // SAFETY: a key with `EXTERNAL_KEY` is made only by `ExternalPid::key`, from an
-                // external pid inside a live `ELink` in the tree or one the looking-up caller
-                // borrows for the whole lookup.
-                unsafe { external_ml_cmp(&*pid(left), &*pid(right)) }
-            }
+        if left & right & EXTERNAL_KEY == EXTERNAL_KEY {
+            return external_keys_cmp(left, right);
         }
+        left.cmp(&right)
     }
+}
+
+/// `ml_cmp_keys` of two boxed external pid keys, off the internal-key path.
+#[cold]
+#[inline(never)]
+fn external_keys_cmp(left: u64, right: u64) -> Ordering {
+    let pid = |key: u64| (key & !EXTERNAL_KEY) as *const ExternalPid;
+    // SAFETY: a key with `EXTERNAL_KEY` is made only by `external_key`, from an external pid
+    // inside a live `ELink` in the tree or one the looking-up caller borrows for the whole
+    // lookup.
+    unsafe { external_ml_cmp(&*pid(left), &*pid(right)) }
 }
 
 /// A handle that owns one node.
@@ -1847,6 +1853,7 @@ unsafe impl Send for Link {}
 
 impl Drop for Link {
     /// `erts_link_release`.
+    #[inline]
     fn drop(&mut self) {
         if node_flags(self.node) & node_flag::EXTENDED != 0 {
             elink_release(self.node, 1);
@@ -2065,6 +2072,8 @@ impl Link {
 
 /// Drop `count` owners of the external link holding `node` (`erts_link_release`,
 /// `erts_link_release_both`, `erts_link_destroy_elink__`).
+#[cold]
+#[inline(never)]
 fn elink_release(node: NodePtr, count: u32) {
     let main = node_to_main(node).cast::<ELink>();
     // SAFETY: an extended link node lives in an `ELink` that `Link::create_external`
@@ -2079,15 +2088,23 @@ fn elink_release(node: NodePtr, count: u32) {
     }
 }
 
+#[inline(always)]
 fn ilink_unlinking(node: NodePtr) -> *mut u64 {
     if node_flags(node) & node_flag::EXTENDED != 0 {
-        let main = node_to_main(node).cast::<ELink>();
-        // SAFETY: extended link nodes live in an `ELink`; this only forms a field pointer.
-        return unsafe { std::ptr::addr_of_mut!((*main.as_ptr()).unlinking) };
+        return elink_unlinking(node);
     }
     let main = node_to_main(node).cast::<ILink>();
     // SAFETY: unextended link nodes are created only by `Link::create` as the first field of
     // a live `ILink`; this only forms a pointer to its `unlinking` field.
+    unsafe { std::ptr::addr_of_mut!((*main.as_ptr()).unlinking) }
+}
+
+/// `erts_link_to_elink(lnk)->unlinking`, off the local-link path.
+#[cold]
+#[inline(never)]
+fn elink_unlinking(node: NodePtr) -> *mut u64 {
+    let main = node_to_main(node).cast::<ELink>();
+    // SAFETY: extended link nodes live in an `ELink`; this only forms a field pointer.
     unsafe { std::ptr::addr_of_mut!((*main.as_ptr()).unlinking) }
 }
 
