@@ -418,7 +418,11 @@ impl Process {
     // Port of erts/emulator/beam/beam_bif_load.c:1149 (check_process_code), OTP-29.1.1.
     // A process suspended in native code is checked by its native resume address and the
     // native continuation pointers on its stack; `self.module` is only its interpreter module.
-    pub(crate) fn references_code(&self, module: usize, in_native: impl Fn(usize) -> bool) -> bool {
+    pub(crate) fn references_code(
+        &mut self,
+        module: usize,
+        in_native: impl Fn(usize) -> bool,
+    ) -> bool {
         // While native code runs (a signal handled from a runtime helper), `self.module` is
         // stale and the running function shows up through the native stack instead.
         match self.native_pc() {
@@ -468,6 +472,29 @@ impl Process {
                 return true;
             }
         }
+        // Port of erts/emulator/beam/beam_bif_load.c:1186-1214 (check_process_code), OTP-29.1.1.
+        // Reached only when `i`, the native function and the stack do not use this module.
+        // A saved exception dump that names the module is discarded; the process is still
+        // not using the code, so the check returns false and a later purge may free it.
+        self.discard_ftrace_in_code(module, &in_native);
         false
+    }
+
+    /// Drop `freason`, `fvalue` and `ftrace` when the saved stacktrace names `module`.
+    // Port of erts/emulator/beam/beam_bif_load.c:1191-1213 (check_process_code), OTP-29.1.1.
+    fn discard_ftrace_in_code(&mut self, module: usize, in_native: &impl Fn(usize) -> bool) {
+        let word = self.heap.abi.exc.ftrace;
+        // erts compares with `NIL`. This ABI stores "no trace" as 0 (every other clear of
+        // the slot); `NIL` is `0x3b` and would pass the `!= 0` tests that stand in for `!= NIL`.
+        if word == 0 || word == Term::NIL.tagged_word() {
+            return;
+        }
+        let term = crate::native_hooks::from_raw(word);
+        if !crate::stacktrace::saved_trace_names_code(term, module, in_native) {
+            return;
+        }
+        self.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_NULL;
+        self.heap.abi.exc.fvalue = 0;
+        self.heap.abi.exc.ftrace = 0;
     }
 }

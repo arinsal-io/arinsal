@@ -870,7 +870,7 @@ pub(crate) fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str)
     vm.refresh_trace_pattern(process, name, "_", None);
 }
 
-fn check_process_code(vm: &Vm, process: &Process, name: &str) -> bool {
+fn check_process_code(vm: &Vm, process: &mut Process, name: &str) -> bool {
     let Some(&old) = vm.code.old.get(name) else {
         return false;
     };
@@ -1193,7 +1193,7 @@ fn delete(
 }
 
 fn module_id_referenced(
-    process: &Process,
+    process: &mut Process,
     code_meta: &[Option<std::sync::Arc<crate::load::CodeMeta>>],
     id: usize,
 ) -> bool {

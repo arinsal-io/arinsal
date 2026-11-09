@@ -1106,6 +1106,59 @@ pub(crate) fn class_from_freason(value: u64) -> Option<Class> {
     })
 }
 
+/// Whether the saved `ftrace` tuple's `pc`, `current` or `trace[]` names `module`.
+///
+/// Port of erts/emulator/beam/beam_bif_load.c:1191-1213 (`check_process_code`), OTP-29.1.1.
+/// `pc` and each `trace[]` entry are an interpreter continuation (bit 63, module index in
+/// the high half) or a native address. `current` is that continuation, or a BIF MFA packed
+/// from two atoms (bit 63 clear): the atom pair is not a pointer into the caller's code,
+/// matching `ErtsInArea` on a BIF `ErtsCodeMFA*` that lives in the BIF's own module.
+pub(crate) fn saved_trace_names_code(
+    term: Term,
+    module: usize,
+    in_native: impl Fn(usize) -> bool,
+) -> bool {
+    let Some(fields) = arinsal_term::term_sequence_small(term) else {
+        return false;
+    };
+    if fields.len() != 3 {
+        return false;
+    }
+    fields[0]
+        .with_bignum_digits_mut(|digits| digits_name_code(digits, module, &in_native))
+        .unwrap_or(false)
+}
+
+fn digits_name_code(digits: &[u64], module: usize, in_native: &impl Fn(usize) -> bool) -> bool {
+    if digits.len() < STACKTRACE_HEADER_WORDS {
+        return false;
+    }
+    let indexed =
+        |word: u64| word & (1 << 63) != 0 && ((word & !(1 << 63)) >> 32) as usize == module;
+    let native = |word: u64| {
+        word != 0 && word & (1 << 63) == 0 && usize::try_from(word).is_ok_and(in_native)
+    };
+    if indexed(digits[1]) || native(digits[1]) || indexed(digits[2]) {
+        return true;
+    }
+    let Ok(depth) = usize::try_from(digits[3]) else {
+        return false;
+    };
+    let Ok(max_depth) = usize::try_from(digits[4]) else {
+        return false;
+    };
+    if depth > max_depth {
+        return false;
+    }
+    let end = STACKTRACE_HEADER_WORDS.saturating_add(depth);
+    if digits.len() < end {
+        return false;
+    }
+    digits[STACKTRACE_HEADER_WORDS..end]
+        .iter()
+        .any(|word| indexed(*word) || native(*word))
+}
+
 fn ftrace_raw(term: Term) -> Option<RawTrace> {
     let fields = arinsal_term::term_sequence_small(term)?;
     if fields.len() != 3 {
