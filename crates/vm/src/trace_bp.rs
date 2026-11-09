@@ -407,84 +407,57 @@ impl std::hash::Hasher for FnvHasher {
 
 pub(crate) type FastHash = std::hash::BuildHasherDefault<FnvHasher>;
 
-/// The breakpoints of one function, by module, name and arity; borrowed-key lookups keep the
-/// traced call path allocation free.
-type BpTable =
-    HashMap<String, HashMap<String, HashMap<u8, Vec<GenericBp>, FastHash>, FastHash>, FastHash>;
-
-/// The breakpoint table as readers see it: an immutable snapshot that writers replace
-/// wholesale. Calls only clone the snapshot pointer, so a writer building a new table (which
-/// can take milliseconds with a breakpoint on every function) never stalls running processes.
-// Port of the idea of erts/emulator/beam/beam_bp.c (staging and active breakpoint indices,
-// writers publish with a code barrier, readers never lock), OTP-29.1.1.
-struct BpTables {
-    current: RwLock<Arc<BpTable>>,
-    writer: Mutex<()>,
+/// The breakpoint data of one function: erts hangs a `GenericBp` chain off the function's
+/// `ErtsCodeInfo`; here the chain hangs off the function's id (`func_id`, the `ci` stored in
+/// trace frames), so one lookup reaches it and writers only touch the matched functions.
+// Port of erts/emulator/beam/beam_bp.h:85-94 (ErtsCodeInfo.u.gen_bp), OTP-29.1.1.
+pub(crate) struct FunctionBp {
+    id: u32,
+    module: String,
+    function: String,
+    arity: u8,
+    /// One `GenericBp` per runtime and session. Readers only use the active slot, writers
+    /// (serialized by the node's `writer`) only the staging slot, as in erts; the lock only
+    /// guards the chain itself.
+    bps: RwLock<Vec<GenericBp>>,
+    /// Bumped with every write of `bps`, under its write lock: caches of the active data of this
+    /// function compare it together with the node's active index.
+    version: AtomicU64,
 }
 
-impl BpTables {
-    fn read(&self) -> std::sync::LockResult<Arc<BpTable>> {
-        Ok(self.current.read().unwrap().clone())
+impl FunctionBp {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<GenericBp>> {
+        self.bps.read().unwrap()
     }
 
-    /// A copy-on-write handle: the table is copied when first modified and published when the
-    /// handle is dropped; handles are serialized.
-    fn write(&self) -> std::sync::LockResult<BpWriteGuard<'_>> {
-        let guard = self.writer.lock().unwrap();
-        let base = self.current.read().unwrap().clone();
-        Ok(BpWriteGuard {
-            tables: self,
-            _guard: guard,
-            base,
-            copy: None,
-        })
-    }
-}
-
-struct BpWriteGuard<'a> {
-    tables: &'a BpTables,
-    _guard: std::sync::MutexGuard<'a, ()>,
-    base: Arc<BpTable>,
-    copy: Option<BpTable>,
-}
-
-impl std::ops::Deref for BpWriteGuard<'_> {
-    type Target = BpTable;
-
-    fn deref(&self) -> &BpTable {
-        self.copy.as_ref().unwrap_or(&self.base)
+    /// Modify the chain; keeps `node`'s breakpoint count and the cache version current.
+    fn write<R>(&self, node: &BpNode, change: impl FnOnce(&mut Vec<GenericBp>) -> R) -> R {
+        let runtime = node.code_scope as usize;
+        let mut bps = self.bps.write().unwrap();
+        let before = bps.iter().filter(|g| g.runtime == runtime).count();
+        let result = change(&mut bps);
+        let after = bps.iter().filter(|g| g.runtime == runtime).count();
+        self.version.fetch_add(1, Ordering::AcqRel);
+        drop(bps);
+        node.adjust(after as isize - before as isize);
+        result
     }
 }
 
-impl std::ops::DerefMut for BpWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut BpTable {
-        let base = &self.base;
-        self.copy.get_or_insert_with(|| (**base).clone())
-    }
-}
-
-impl Drop for BpWriteGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(copy) = self.copy.take() {
-            *self.tables.current.write().unwrap() = Arc::new(copy);
-            // Readers that cached the old table under the epoch bumped before the publish.
-            BP_EPOCH.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-}
-
-/// The breakpoint data of one node (a runtime and its code scope): erts keeps the breakpoint
-/// tables and the active breakpoint index per node, and only the holder of that node's code
-/// modification permission changes them.
+/// The breakpoint data of one node (a runtime and its code scope): erts keeps the active
+/// breakpoint index per node, and only the holder of that node's code modification permission
+/// changes breakpoints.
 // Port of erts/emulator/beam/beam_bp.c:73-80 (erts_active_bp_index, erts_staging_bp_index)
 // and beam_bp.h:230-238 (erts_active_bp_ix, erts_staging_bp_ix), OTP-29.1.1.
 pub(crate) struct BpNode {
     code_scope: u64,
-    tables: BpTables,
-    /// Only changed with the table write lock held.
+    /// Serializes writers (erts: the code modification permission).
+    writer: Mutex<()>,
+    /// Only changed with `writer` held.
     active_ix: AtomicUsize,
-    /// Whether some function of this node has a breakpoint (counted in `ACTIVE_NODES`).
-    active: AtomicBool,
+    /// `GenericBp`s of this node in all functions; while non-zero the node counts in
+    /// `ACTIVE_NODES`. Only changed with `writer` held.
+    entries: AtomicUsize,
 }
 
 /// Nodes in this OS process that hold a function breakpoint.
@@ -494,12 +467,9 @@ impl BpNode {
     pub(crate) fn new(code_scope: u64) -> Self {
         BpNode {
             code_scope,
-            tables: BpTables {
-                current: RwLock::new(Arc::new(HashMap::default())),
-                writer: Mutex::new(()),
-            },
+            writer: Mutex::new(()),
             active_ix: AtomicUsize::new(0),
-            active: AtomicBool::new(false),
+            entries: AtomicUsize::new(0),
         }
     }
 
@@ -511,19 +481,28 @@ impl BpNode {
         self.active_bp_ix() ^ 1
     }
 
-    /// Recomputes whether this node holds a breakpoint; called with the table write lock.
-    fn update_active(&self, table: &BpTable) {
-        BP_EPOCH.fetch_add(1, Ordering::AcqRel);
-        let any = table
-            .values()
-            .flat_map(|functions| functions.values())
-            .flat_map(|arities| arities.values())
-            .any(|bps| !bps.is_empty());
-        match (self.active.swap(any, Ordering::AcqRel), any) {
-            (false, true) => {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn has_entries(&self) -> bool {
+        self.entries.load(Ordering::Acquire) != 0
+    }
+
+    fn adjust(&self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let before = self.entries.load(Ordering::Acquire);
+        let after = before.wrapping_add_signed(delta);
+        self.entries.store(after, Ordering::Release);
+        match (before, after) {
+            (0, _) => {
                 ACTIVE_NODES.fetch_add(1, Ordering::AcqRel);
             }
-            (true, false) => {
+            (_, 0) => {
                 ACTIVE_NODES.fetch_sub(1, Ordering::AcqRel);
             }
             _ => {}
@@ -533,9 +512,14 @@ impl BpNode {
 
 impl Drop for BpNode {
     fn drop(&mut self) {
-        if *self.active.get_mut() {
-            ACTIVE_NODES.fetch_sub(1, Ordering::AcqRel);
-            BP_EPOCH.fetch_add(1, Ordering::AcqRel);
+        if !self.has_entries() {
+            return;
+        }
+        let runtime = self.code_scope as usize;
+        for cell in all_cells() {
+            if cell.read().iter().any(|g| g.runtime == runtime) {
+                cell.write(self, |bps| bps.retain(|g| g.runtime != runtime));
+            }
         }
     }
 }
@@ -550,20 +534,8 @@ fn bp_node(process: &Process) -> &BpNode {
 }
 
 /// The breakpoints of one function in this VM, any session.
-fn function_bps<'a>(
-    table: &'a BpTable,
-    runtime: usize,
-    code: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> impl Iterator<Item = &'a GenericBp> {
-    table
-        .get(module)
-        .and_then(|functions| functions.get(function))
-        .and_then(|arities| arities.get(&arity))
-        .into_iter()
-        .flatten()
+fn function_bps(bps: &[GenericBp], runtime: usize, code: u64) -> impl Iterator<Item = &GenericBp> {
+    bps.iter()
         .filter(move |g| g.runtime == runtime && g.code == code)
 }
 
@@ -580,23 +552,15 @@ fn code_scope(process: &Process) -> u64 {
 // erts/emulator/beam/beam_bif_load.c:470-480 and 714-720, OTP-29.1.1.
 pub(crate) fn module_code_changed(process: &Process, code: u64, module: &str) {
     let node = bp_node(process);
-    let mut table = node.tables.write().unwrap();
-    if let Some(functions) = table.get_mut(module) {
-        for bps in functions
-            .values_mut()
-            .flat_map(|arities| arities.values_mut())
-        {
-            bps.retain(|g| g.code != code);
-        }
-        functions.retain(|_, arities| {
-            arities.retain(|_, bps| !bps.is_empty());
-            !arities.is_empty()
-        });
-        if functions.is_empty() {
-            table.remove(module);
+    if !node.has_entries() {
+        return;
+    }
+    let _permission = node.lock();
+    for cell in module_cells(module) {
+        if cell.read().iter().any(|g| g.code == code) {
+            cell.write(node, |bps| bps.retain(|g| g.code != code));
         }
     }
-    node.update_active(&table);
 }
 
 /// Port of erts/emulator/beam/beam_bp.c:2145-2295 (set_function_break), OTP-29.1.1, for the
@@ -735,36 +699,21 @@ fn clear_function_break(
 // Port of erts/emulator/beam/beam_bp.c:443-560 (consolidate_bp_data,
 // consolidate_bp_data_session), OTP-29.1.1.
 fn consolidate_bp_data(node: &BpNode, bps: &mut Vec<GenericBp>) {
+    let runtime = node.code_scope as usize;
     let (active, staging) = (node.active_bp_ix(), node.staging_bp_ix());
-    for g in bps.iter_mut() {
+    for g in bps.iter_mut().filter(|g| g.runtime == runtime) {
         g.data[staging] = g.data[active].clone();
     }
-    bps.retain(|g| g.data[active].flags != 0);
+    bps.retain(|g| g.runtime != runtime || g.data[active].flags != 0);
 }
 
-fn function_entry<'a>(
-    table: &'a mut BpTable,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> &'a mut Vec<GenericBp> {
-    table
-        .entry(module.to_owned())
-        .or_default()
-        .entry(function.to_owned())
-        .or_default()
-        .entry(arity)
-        .or_default()
-}
-
-/// Make the staged breakpoint data active.
+/// Make the staged breakpoint data active: only the node's index flips, no function is touched.
 // Port of erts/emulator/beam/beam_bp.c:562-569 (erts_commit_staged_bp), OTP-29.1.1.
 pub(crate) fn commit_staged(process: &Process) {
     let node = bp_node(process);
-    let table = node.tables.write().unwrap();
+    let _permission = node.lock();
     node.active_ix
         .store(node.staging_bp_ix(), Ordering::Release);
-    node.update_active(&table);
 }
 
 /// Copy the active data of `functions` to the staging area and unlink disabled breakpoints.
@@ -772,44 +721,26 @@ pub(crate) fn commit_staged(process: &Process) {
 // erts_consolidate_all_bp_data), OTP-29.1.1.
 pub(crate) fn consolidate_staged(process: &Process, functions: &[BpFunction]) {
     let node = bp_node(process);
-    let mut table = node.tables.write().unwrap();
-    consolidate_functions(node, &mut table, functions);
-}
-
-fn consolidate_functions(node: &BpNode, table: &mut BpTable, functions: &[BpFunction]) {
+    let _permission = node.lock();
+    let runtime = node.code_scope as usize;
     for function in functions {
-        let Some(arities) = table
-            .get_mut(&function.module)
-            .and_then(|functions| functions.get_mut(&function.function))
-        else {
+        let Some(cell) = lookup_cell(&function.module, &function.function, function.arity) else {
             continue;
         };
-        if let Some(bps) = arities.get_mut(&function.arity) {
+        let traced = cell.write(node, |bps| {
             consolidate_bp_data(node, bps);
-            if bps.is_empty() {
-                arities.remove(&function.arity);
-            }
-        }
-        // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1.
-        let ix = node.active_bp_ix();
-        let traced = arities
-            .get(&function.arity)
-            .is_some_and(|bps| bps.iter().any(|bp| bp.data[ix].flags != 0));
+            // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1.
+            let ix = node.active_bp_ix();
+            bps.iter()
+                .any(|bp| bp.runtime == runtime && bp.data[ix].flags != 0)
+        });
         crate::beamasm_integration::set_bif_traced(
             &function.module,
             &function.function,
             function.arity,
             traced,
         );
-        if arities.is_empty() {
-            let functions = table.get_mut(&function.module).unwrap();
-            functions.remove(&function.function);
-            if functions.is_empty() {
-                table.remove(&function.module);
-            }
-        }
     }
-    node.update_active(table);
 }
 
 thread_local! {
@@ -965,109 +896,112 @@ pub(crate) fn stage_trace_pattern(
     let meta_match_spec = meta_match_spec.map(|source| Arc::new(MatchSpec::new(source)));
     let node = bp_node(process);
     let ix = node.staging_bp_ix();
-    let mut table = node.tables.write().unwrap();
-    // First the code breakpoints ("local" tracing).
+    let _permission = node.lock();
+    // First the code breakpoints ("local" tracing), each in the staging slot of the matched
+    // function's own chain.
     for function in functions {
-        let bps = function_entry(
-            &mut table,
-            &function.module,
-            &function.function,
-            function.arity,
-        );
-        if on != BreakOp::Nop {
-            if !flags.breakpoint {
-                clear_function_break(ix, bps, tag, BPF_ALL & !BPF_GLOBAL_TRACE);
+        let cell = function_cell(&function.module, &function.function, function.arity);
+        cell.write(node, |bps| {
+            if on != BreakOp::Nop {
+                if !flags.breakpoint {
+                    clear_function_break(ix, bps, tag, BPF_ALL & !BPF_GLOBAL_TRACE);
+                } else {
+                    if flags.local {
+                        set_function_break(
+                            ix,
+                            bps,
+                            tag,
+                            match_spec.as_ref(),
+                            BPF_LOCAL_TRACE,
+                            BreakOp::Nop,
+                            None,
+                        );
+                    }
+                    if flags.meta {
+                        set_function_break(
+                            ix,
+                            bps,
+                            tag,
+                            meta_match_spec.as_ref(),
+                            BPF_META_TRACE,
+                            BreakOp::Nop,
+                            Some(meta_tracer),
+                        );
+                    }
+                    if flags.call_count {
+                        set_function_break(
+                            ix,
+                            bps,
+                            tag,
+                            None,
+                            BPF_COUNT | BPF_COUNT_ACTIVE,
+                            on,
+                            None,
+                        );
+                    }
+                    if flags.call_time {
+                        set_function_break(
+                            ix,
+                            bps,
+                            tag,
+                            None,
+                            BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE,
+                            on,
+                            None,
+                        );
+                    }
+                    if flags.call_memory {
+                        set_function_break(
+                            ix,
+                            bps,
+                            tag,
+                            None,
+                            BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE,
+                            on,
+                            None,
+                        );
+                    }
+                }
             } else {
                 if flags.local {
-                    set_function_break(
-                        ix,
-                        bps,
-                        tag,
-                        match_spec.as_ref(),
-                        BPF_LOCAL_TRACE,
-                        BreakOp::Nop,
-                        None,
-                    );
+                    clear_function_break(ix, bps, tag, BPF_LOCAL_TRACE);
                 }
                 if flags.meta {
-                    set_function_break(
-                        ix,
-                        bps,
-                        tag,
-                        meta_match_spec.as_ref(),
-                        BPF_META_TRACE,
-                        BreakOp::Nop,
-                        Some(meta_tracer),
-                    );
+                    clear_function_break(ix, bps, tag, BPF_META_TRACE);
                 }
                 if flags.call_count {
-                    set_function_break(ix, bps, tag, None, BPF_COUNT | BPF_COUNT_ACTIVE, on, None);
+                    clear_function_break(ix, bps, tag, BPF_COUNT | BPF_COUNT_ACTIVE);
                 }
                 if flags.call_time {
-                    set_function_break(
-                        ix,
-                        bps,
-                        tag,
-                        None,
-                        BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE,
-                        on,
-                        None,
-                    );
+                    clear_function_break(ix, bps, tag, BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE);
                 }
                 if flags.call_memory {
-                    set_function_break(
-                        ix,
-                        bps,
-                        tag,
-                        None,
-                        BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE,
-                        on,
-                        None,
-                    );
+                    clear_function_break(ix, bps, tag, BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE);
                 }
             }
-        } else {
-            if flags.local {
-                clear_function_break(ix, bps, tag, BPF_LOCAL_TRACE);
-            }
-            if flags.meta {
-                clear_function_break(ix, bps, tag, BPF_META_TRACE);
-            }
-            if flags.call_count {
-                clear_function_break(ix, bps, tag, BPF_COUNT | BPF_COUNT_ACTIVE);
-            }
-            if flags.call_time {
-                clear_function_break(ix, bps, tag, BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE);
-            }
-            if flags.call_memory {
-                clear_function_break(ix, bps, tag, BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE);
-            }
-        }
+        });
     }
     // Then the export entries, once the code breakpoints are set.
     for function in functions.iter().filter(|function| function.exported) {
-        let bps = function_entry(
-            &mut table,
-            &function.module,
-            &function.function,
-            function.arity,
-        );
-        if on != BreakOp::Nop && !flags.breakpoint {
-            set_function_break(
-                ix,
-                bps,
-                tag,
-                match_spec.as_ref(),
-                BPF_GLOBAL_TRACE,
-                BreakOp::Nop,
-                None,
-            );
-        } else if on == BreakOp::Nop && flags.breakpoint {
-            // Turning off breakpoint tracing leaves global tracing alone.
-        } else {
-            // Turn off global tracing, explicitly or before turning on breakpoint tracing.
-            clear_function_break(ix, bps, tag, BPF_GLOBAL_TRACE);
-        }
+        let cell = function_cell(&function.module, &function.function, function.arity);
+        cell.write(node, |bps| {
+            if on != BreakOp::Nop && !flags.breakpoint {
+                set_function_break(
+                    ix,
+                    bps,
+                    tag,
+                    match_spec.as_ref(),
+                    BPF_GLOBAL_TRACE,
+                    BreakOp::Nop,
+                    None,
+                );
+            } else if on == BreakOp::Nop && flags.breakpoint {
+                // Turning off breakpoint tracing leaves global tracing alone.
+            } else {
+                // Turn off global tracing, explicitly or before turning on breakpoint tracing.
+                clear_function_break(ix, bps, tag, BPF_GLOBAL_TRACE);
+            }
+        });
     }
 }
 
@@ -1081,19 +1015,17 @@ pub(crate) fn clear_session(process: &Process, session: u64) {
 /// [`clear_session`] for the node that created the session.
 pub(crate) fn clear_session_node(node: &BpNode, session: u64) {
     let runtime = node.code_scope as usize;
-    let mut table = node.tables.write().unwrap();
-    table.retain(|_, functions| {
-        functions.retain(|_, arities| {
-            arities.retain(|_, bps| {
-                bps.retain(|g| g.runtime != runtime || g.session != session);
-                !bps.is_empty()
-            });
-            !arities.is_empty()
-        });
-        !functions.is_empty()
-    });
-    node.update_active(&table);
-    drop(table);
+    if node.has_entries() {
+        let _permission = node.lock();
+        // Port of erts/emulator/beam/erl_bif_trace.c (erts_bp_match_functions over all code):
+        // a destroyed session is cleared from every function.
+        for cell in all_cells() {
+            let owned = |g: &GenericBp| g.runtime == runtime && g.session == session;
+            if cell.read().iter().any(owned) {
+                cell.write(node, |bps| bps.retain(|g| !owned(g)));
+            }
+        }
+    }
     on_load_patterns()
         .lock()
         .unwrap()
@@ -1116,35 +1048,29 @@ pub(crate) struct Hit {
 // Port of erts/emulator/beam/beam_bp.c:994-1015 (erts_generic_breakpoint, the GenericBp loop),
 // OTP-29.1.1.
 pub(crate) fn hits(process: &Process, module: &str, function: &str, arity: u8) -> Vec<Hit> {
-    let table = bp_node(process).tables.read().unwrap();
     let ix = bp_node(process).active_bp_ix();
-    function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .filter(|g| g.data[ix].flags != 0)
-    .map(|g| {
-        let data = &g.data[ix];
-        Hit {
-            session: g.session,
-            flags: data.flags,
-            count: if data.flags & BPF_COUNT_ACTIVE != 0 {
-                data.count.clone()
-            } else {
-                None
-            },
-            local_ms: data.local_ms.clone(),
-            meta_ms: data.meta_ms.clone(),
-            meta_tracer: data.meta_tracer.clone(),
-            time: data.time.clone(),
-            memory: data.memory.clone(),
-        }
+    with_function_bps(module, function, arity, |bps| {
+        function_bps(bps, scope(process), code_scope(process))
+            .filter(|g| g.data[ix].flags != 0)
+            .map(|g| {
+                let data = &g.data[ix];
+                Hit {
+                    session: g.session,
+                    flags: data.flags,
+                    count: if data.flags & BPF_COUNT_ACTIVE != 0 {
+                        data.count.clone()
+                    } else {
+                        None
+                    },
+                    local_ms: data.local_ms.clone(),
+                    meta_ms: data.meta_ms.clone(),
+                    meta_tracer: data.meta_tracer.clone(),
+                    time: data.time.clone(),
+                    memory: data.memory.clone(),
+                }
+            })
+            .collect()
     })
-    .collect()
 }
 
 /// `Hit::flags` bits: global call trace of the export entry.
@@ -1157,19 +1083,20 @@ pub(crate) const HIT_META: u32 = BPF_META_TRACE;
 pub(crate) const HIT_COUNT_ACTIVE: u32 = BPF_COUNT_ACTIVE;
 
 /// The breakpoints a native trampoline hit finds in its function, for one runtime and code
-/// scope; valid while no breakpoint and no native code changed.
+/// scope; valid while the function's chain (`version`), the node's active index and the native
+/// code are unchanged.
 struct SiteBreakpoints {
     site: usize,
     runtime: usize,
     code: u64,
-    epoch: u64,
+    /// The function's breakpoint chain (erts: the code info the trampoline belongs to).
+    cell: Arc<FunctionBp>,
+    version: u64,
+    ix: usize,
     generation: u64,
     bps: Vec<SiteBp>,
-    /// The traced function: arity, `func_id` and names (the initial-call test of call_memory).
-    arity: u8,
+    /// The traced function's `func_id`.
     ci: u32,
-    module: String,
-    function: String,
 }
 
 struct SiteBp {
@@ -1184,7 +1111,7 @@ struct SiteBp {
 const SITE_CACHE_SIZE: usize = 64;
 
 thread_local! {
-    /// Direct-mapped, per scheduler thread: a hit costs two atomic loads and a compare.
+    /// Direct-mapped, per scheduler thread: a hit costs three atomic loads and a compare.
     static SITE_CACHE: std::cell::RefCell<[Option<Arc<SiteBreakpoints>>; SITE_CACHE_SIZE]> =
         const { std::cell::RefCell::new([const { None }; SITE_CACHE_SIZE]) };
 }
@@ -1193,7 +1120,7 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
     let runtime = scope(process);
     let code = code_scope(process);
     let slot = (site >> 2) % SITE_CACHE_SIZE;
-    let epoch = BP_EPOCH.load(Ordering::Acquire);
+    let ix = bp_node(process).active_bp_ix();
     let generation = crate::native_bridge::native_registry_generation();
     if let Some(found) = SITE_CACHE.with(|cache| {
         cache.borrow()[slot]
@@ -1202,25 +1129,26 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
                 entry.site == site
                     && entry.runtime == runtime
                     && entry.code == code
-                    && entry.epoch == epoch
+                    && entry.ix == ix
                     && entry.generation == generation
+                    && entry.version == entry.cell.version.load(Ordering::Acquire)
             })
             .cloned()
     }) {
         return Some(found);
     }
-    let ix = bp_node(process).active_bp_ix();
-    let table = bp_node(process).tables.current.read().unwrap();
-    let (bps, arity, module, function_name) =
+    let (module, function_name, arity) =
         crate::native_bridge::with_native_function_at(site, |function| {
-            let bps = function_bps(
-                &table,
-                runtime,
-                code,
-                function.module,
-                function.function,
+            (
+                function.module.to_owned(),
+                function.function.to_owned(),
                 function.arity,
             )
+        })?;
+    let cell = function_cell(&module, &function_name, arity);
+    let (version, bps) = {
+        let chain = cell.read();
+        let bps = function_bps(&chain, runtime, code)
             .map(|g| SiteBp {
                 session: g.session,
                 flags: g.data[ix].flags & !BPF_GLOBAL_TRACE,
@@ -1229,25 +1157,18 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
                 memory: g.data[ix].memory.clone(),
             })
             .collect::<Vec<_>>();
-            (
-                bps,
-                function.arity,
-                function.module.to_owned(),
-                function.function.to_owned(),
-            )
-        })?;
-    drop(table);
+        (cell.version.load(Ordering::Acquire), bps)
+    };
     let entry = Arc::new(SiteBreakpoints {
         site,
         runtime,
         code,
-        epoch,
+        ci: cell.id,
+        cell,
+        version,
+        ix,
         generation,
         bps,
-        arity,
-        ci: func_id(&module, &function_name, arity),
-        module,
-        function: function_name,
     });
     SITE_CACHE.with(|cache| cache.borrow_mut()[slot] = Some(entry.clone()));
     Some(entry)
@@ -1281,7 +1202,12 @@ pub(crate) fn native_breakpoint_accounting(
     let entry = site_breakpoints(process, site)?;
     let acc = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
     if DEBUG_BREAKPOINTS_USED.load(Ordering::Relaxed)
-        && debug_breakpoint_enabled(process, &entry.module, &entry.function, entry.arity)
+        && debug_breakpoint_enabled(
+            process,
+            &entry.cell.module,
+            &entry.cell.function,
+            entry.cell.arity,
+        )
         || crate::trace::return_to_enabled(process)
     {
         return None;
@@ -1315,7 +1241,7 @@ pub(crate) fn native_breakpoint_accounting(
         } else if !crate::native_bridge::is_native_function_at(top) {
             return None;
         }
-        if entry.arity > 6 {
+        if entry.cell.arity > 6 {
             return None;
         }
     }
@@ -1349,9 +1275,9 @@ pub(crate) fn native_breakpoint_accounting(
             let allocated = if adjustment.is_none()
                 && crate::trace::is_initial_call(
                     process,
-                    &entry.module,
-                    &entry.function,
-                    entry.arity,
+                    &entry.cell.module,
+                    &entry.cell.function,
+                    entry.cell.arity,
                 ) {
                 0
             } else {
@@ -1374,29 +1300,24 @@ pub(crate) fn native_breakpoint_accounting(
     }
     Some(NativeBreakpointHit {
         action,
-        arity: entry.arity,
+        arity: entry.cell.arity,
     })
 }
 
 /// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
 /// restarting a breakpoint only concerns them.
 pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) -> Vec<BpFunction> {
-    let table = bp_node(process).tables.read().unwrap();
     let runtime = scope(process);
     let code = code_scope(process);
     functions
         .into_iter()
         .filter(|function| {
-            function_bps(
-                &table,
-                runtime,
-                code,
+            with_function_bps(
                 &function.module,
                 &function.function,
                 function.arity,
+                |bps| function_bps(bps, runtime, code).next().is_some(),
             )
-            .next()
-            .is_some()
         })
         .collect()
 }
@@ -1409,13 +1330,12 @@ pub(crate) fn any_pattern() -> bool {
 /// Whether a breakpoint of any session or runtime is set on this function.
 // Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
 pub(crate) fn selects(process: &Process, module: &str, function: &str, arity: u8) -> bool {
-    let table = bp_node(process).tables.read().unwrap();
     let ix = bp_node(process).active_bp_ix();
-    table
-        .get(module)
-        .and_then(|functions| functions.get(function))
-        .and_then(|arities| arities.get(&arity))
-        .is_some_and(|bps| bps.iter().any(|g| g.data[ix].flags != 0))
+    let runtime = scope(process);
+    with_function_bps(module, function, arity, |bps| {
+        bps.iter()
+            .any(|g| g.runtime == runtime && g.data[ix].flags != 0)
+    })
 }
 
 /// Count a call entering the function's code.
@@ -1426,23 +1346,17 @@ pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: 
     if !local || !any_pattern() {
         return;
     }
-    let table = bp_node(process).tables.read().unwrap();
     let ix = bp_node(process).active_bp_ix();
-    for g in function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    ) {
-        let bp = &g.data[ix];
-        if bp.flags & BPF_COUNT_ACTIVE != 0
-            && let Some(count) = &bp.count
-        {
-            count.fetch_add(1, Ordering::Relaxed);
+    with_function_bps(module, function, arity, |bps| {
+        for g in function_bps(bps, scope(process), code_scope(process)) {
+            let bp = &g.data[ix];
+            if bp.flags & BPF_COUNT_ACTIVE != 0
+                && let Some(count) = &bp.count
+            {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
         }
-    }
+    });
 }
 
 /// What `trace_info` reports about one function of one session.
@@ -1489,29 +1403,27 @@ pub(crate) fn prepare_timem_info(
     want: u32,
 ) {
     let node = bp_node(process);
+    let _permission = node.lock();
     let staging = node.staging_bp_ix();
-    let mut table = node.tables.write().unwrap();
-    let Some(bp) = table
-        .get_mut(module)
-        .and_then(|functions| functions.get_mut(function))
-        .and_then(|arities| arities.get_mut(&arity))
-        .and_then(|bps| {
-            bps.iter_mut().find(|bp| {
-                bp.runtime == scope(process)
-                    && bp.code == code_scope(process)
-                    && bp.session == session
-            })
-        })
-    else {
+    let Some(cell) = lookup_cell(module, function, arity) else {
         return;
     };
-    let data = &mut bp.data[staging];
-    if want & WANT_TIME != 0 && data.flags & BPF_TIME_TRACE_ACTIVE != 0 {
-        data.time = Some(Arc::new(TimemTrace::default()));
-    }
-    if want & WANT_MEMORY != 0 && data.flags & BPF_MEM_TRACE_ACTIVE != 0 {
-        data.memory = Some(Arc::new(TimemTrace::default()));
-    }
+    let tag = (scope(process), code_scope(process), session);
+    cell.write(node, |bps| {
+        let Some(bp) = bps
+            .iter_mut()
+            .find(|bp| (bp.runtime, bp.code, bp.session) == tag)
+        else {
+            return;
+        };
+        let data = &mut bp.data[staging];
+        if want & WANT_TIME != 0 && data.flags & BPF_TIME_TRACE_ACTIVE != 0 {
+            data.time = Some(Arc::new(TimemTrace::default()));
+        }
+        if want & WANT_MEMORY != 0 && data.flags & BPF_MEM_TRACE_ACTIVE != 0 {
+            data.memory = Some(Arc::new(TimemTrace::default()));
+        }
+    });
 }
 
 /// Collect the old counters after the temporary hashes have become active.
@@ -1523,31 +1435,24 @@ pub(crate) fn collect_timem_info(
     function: &str,
     arity: u8,
 ) -> TimemInfoSnapshot {
-    let node = bp_node(process);
-    let staging = node.staging_bp_ix();
-    let table = node.tables.read().unwrap();
-    let Some(bp) = table
-        .get(module)
-        .and_then(|functions| functions.get(function))
-        .and_then(|arities| arities.get(&arity))
-        .and_then(|bps| {
-            bps.iter().find(|bp| {
-                bp.runtime == scope(process)
-                    && bp.code == code_scope(process)
-                    && bp.session == session
-            })
-        })
-    else {
-        return (None, None);
-    };
-    let data = &bp.data[staging];
-    let time = (data.flags & BPF_TIME_TRACE_ACTIVE != 0)
-        .then(|| data.time.as_ref().map(|bdt| bdt.snapshot()))
-        .flatten();
-    let memory = (data.flags & BPF_MEM_TRACE_ACTIVE != 0)
-        .then(|| data.memory.as_ref().map(|bdt| bdt.snapshot()))
-        .flatten();
-    (time, memory)
+    let staging = bp_node(process).staging_bp_ix();
+    let tag = (scope(process), code_scope(process), session);
+    with_function_bps(module, function, arity, |bps| {
+        let Some(bp) = bps
+            .iter()
+            .find(|bp| (bp.runtime, bp.code, bp.session) == tag)
+        else {
+            return (None, None);
+        };
+        let data = &bp.data[staging];
+        let time = (data.flags & BPF_TIME_TRACE_ACTIVE != 0)
+            .then(|| data.time.as_ref().map(|bdt| bdt.snapshot()))
+            .flatten();
+        let memory = (data.flags & BPF_MEM_TRACE_ACTIVE != 0)
+            .then(|| data.memory.as_ref().map(|bdt| bdt.snapshot()))
+            .flatten();
+        (time, memory)
+    })
 }
 
 // Port of erts/emulator/beam/beam_bp.c:1621-1645 (erts_timem_info_consolidate), OTP-29.1.1.
@@ -1576,51 +1481,48 @@ pub(crate) fn consolidate_timem_info(
     memory_base: Option<TimemSnapshot>,
 ) -> TimemInfoSnapshot {
     let node = bp_node(process);
+    let _permission = node.lock();
     let (active, staging) = (node.active_bp_ix(), node.staging_bp_ix());
-    let mut table = node.tables.write().unwrap();
-    let Some(bp) = table
-        .get_mut(module)
-        .and_then(|functions| functions.get_mut(function))
-        .and_then(|arities| arities.get_mut(&arity))
-        .and_then(|bps| {
-            bps.iter_mut().find(|bp| {
-                bp.runtime == scope(process)
-                    && bp.code == code_scope(process)
-                    && bp.session == session
-            })
-        })
-    else {
+    let Some(cell) = lookup_cell(module, function, arity) else {
         return (time_base, memory_base);
     };
-    let data = &mut bp.data;
-    let mut time_result = None;
-    let mut memory_result = None;
-    if data[active].flags & BPF_TIME_TRACE_ACTIVE != 0
-        && let (Some(real), Some(temporary)) = (&data[active].time, &data[staging].time)
-        && !Arc::ptr_eq(real, temporary)
-    {
-        let temporary_snapshot = temporary.snapshot();
-        real.merge_entries(&temporary_snapshot);
-        time_result = Some(merge_timem_snapshots(
-            time_base.unwrap_or_default(),
-            temporary_snapshot,
-        ));
-        data[staging].time = Some(Arc::clone(real));
-    }
-    if data[active].flags & BPF_MEM_TRACE_ACTIVE != 0
-        && let (Some(real), Some(temporary)) = (&data[active].memory, &data[staging].memory)
-        && !Arc::ptr_eq(real, temporary)
-    {
-        let temporary_snapshot = temporary.snapshot();
-        real.merge_entries(&temporary_snapshot);
-        memory_result = Some(merge_timem_snapshots(
-            memory_base.unwrap_or_default(),
-            temporary_snapshot,
-        ));
-        data[staging].memory = Some(Arc::clone(real));
-    }
-    node.update_active(&table);
-    (time_result, memory_result)
+    let tag = (scope(process), code_scope(process), session);
+    cell.write(node, |bps| {
+        let Some(bp) = bps
+            .iter_mut()
+            .find(|bp| (bp.runtime, bp.code, bp.session) == tag)
+        else {
+            return (time_base, memory_base);
+        };
+        let data = &mut bp.data;
+        let mut time_result = None;
+        let mut memory_result = None;
+        if data[active].flags & BPF_TIME_TRACE_ACTIVE != 0
+            && let (Some(real), Some(temporary)) = (&data[active].time, &data[staging].time)
+            && !Arc::ptr_eq(real, temporary)
+        {
+            let temporary_snapshot = temporary.snapshot();
+            real.merge_entries(&temporary_snapshot);
+            time_result = Some(merge_timem_snapshots(
+                time_base.unwrap_or_default(),
+                temporary_snapshot,
+            ));
+            data[staging].time = Some(Arc::clone(real));
+        }
+        if data[active].flags & BPF_MEM_TRACE_ACTIVE != 0
+            && let (Some(real), Some(temporary)) = (&data[active].memory, &data[staging].memory)
+            && !Arc::ptr_eq(real, temporary)
+        {
+            let temporary_snapshot = temporary.snapshot();
+            real.merge_entries(&temporary_snapshot);
+            memory_result = Some(merge_timem_snapshots(
+                memory_base.unwrap_or_default(),
+                temporary_snapshot,
+            ));
+            data[staging].memory = Some(Arc::clone(real));
+        }
+        (time_result, memory_result)
+    })
 }
 
 // Port of erts/emulator/beam/erl_bif_trace.c:1793-1850 (function_is_traced) and
@@ -1635,20 +1537,13 @@ pub(crate) fn function_info(
     want: u32,
     snapshot_active: bool,
 ) -> FunctionInfo {
-    let table = bp_node(process).tables.read().unwrap();
     let ix = bp_node(process).active_bp_ix();
-    let bp = function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .find(|g| g.session == session)
-    .map(|g| g.data[ix].clone())
-    .unwrap_or_default();
-    drop(table);
+    let bp = with_function_bps(module, function, arity, |bps| {
+        function_bps(bps, scope(process), code_scope(process))
+            .find(|g| g.session == session)
+            .map(|g| g.data[ix].clone())
+            .unwrap_or_default()
+    });
     let mut got = bp.flags & want;
     if got & BPF_GLOBAL_TRACE != 0 {
         got = BPF_GLOBAL_TRACE;
@@ -1692,18 +1587,12 @@ pub(crate) fn sessions_for_function(
     function: &str,
     arity: u8,
 ) -> Vec<u64> {
-    let table = bp_node(process).tables.read().unwrap();
     let ix = bp_node(process).active_bp_ix();
-    let mut sessions = function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .filter_map(|bp| (bp.data[ix].flags != 0).then_some(bp.session))
-    .collect::<Vec<_>>();
+    let mut sessions = with_function_bps(module, function, arity, |bps| {
+        function_bps(bps, scope(process), code_scope(process))
+            .filter_map(|bp| (bp.data[ix].flags != 0).then_some(bp.session))
+            .collect::<Vec<_>>()
+    });
     sessions.sort_unstable();
     sessions.dedup();
     sessions
@@ -1722,45 +1611,40 @@ pub(crate) fn breakpoint_kinds(
     let mut local = crate::trace::return_to_enabled(process)
         || debug_breakpoint_enabled(process, module, function, arity);
     let mut global = false;
-    let table = bp_node(process).tables.read().unwrap();
-    let ix = bp_node(process).active_bp_ix();
-    for g in function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    ) {
-        let mut flags = g.data[ix].flags;
-        if INSTALL_VIEW.with(std::cell::Cell::get) {
-            flags |= g.data[bp_node(process).staging_bp_ix()].flags;
+    let (ix, staging) = (
+        bp_node(process).active_bp_ix(),
+        bp_node(process).staging_bp_ix(),
+    );
+    let install = INSTALL_VIEW.with(std::cell::Cell::get);
+    with_function_bps(module, function, arity, |bps| {
+        for g in function_bps(bps, scope(process), code_scope(process)) {
+            let mut flags = g.data[ix].flags;
+            if install {
+                flags |= g.data[staging].flags;
+            }
+            local |= flags & !BPF_GLOBAL_TRACE != 0;
+            global |= flags & BPF_GLOBAL_TRACE != 0;
         }
-        local |= flags & !BPF_GLOBAL_TRACE != 0;
-        global |= flags & BPF_GLOBAL_TRACE != 0;
-    }
+    });
     (local, global)
 }
 
 /// Whether some session has any breakpoint flag on the function, as `breakpoint_kinds` sees it.
 // Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
 pub(crate) fn any_breakpoint(process: &Process, module: &str, function: &str, arity: u8) -> bool {
-    let table = bp_node(process).tables.read().unwrap();
-    let ix = bp_node(process).active_bp_ix();
-    function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .any(|g| {
-        let mut flags = g.data[ix].flags;
-        if INSTALL_VIEW.with(std::cell::Cell::get) {
-            flags |= g.data[bp_node(process).staging_bp_ix()].flags;
-        }
-        flags != 0
+    let (ix, staging) = (
+        bp_node(process).active_bp_ix(),
+        bp_node(process).staging_bp_ix(),
+    );
+    let install = INSTALL_VIEW.with(std::cell::Cell::get);
+    with_function_bps(module, function, arity, |bps| {
+        function_bps(bps, scope(process), code_scope(process)).any(|g| {
+            let mut flags = g.data[ix].flags;
+            if install {
+                flags |= g.data[staging].flags;
+            }
+            flags != 0
+        })
     })
 }
 
@@ -2085,20 +1969,25 @@ pub(crate) struct ProcBpTrace {
     pub(crate) accumulator: i64,
     /// Adjustment for GC and messages on the heap (call_memory only).
     pub(crate) allocated: i64,
-    /// The counters of function `.0` as of breakpoint epoch `.2`: a tight loop of calls would
-    /// otherwise look the same function up by name on every call and return.
-    cache: Option<(u32, u64, Arc<TimemTrace>)>,
+    /// The counters of the function last looked up: a tight loop of calls would otherwise
+    /// look its chain up on every call and return.
+    cache: Option<PbtCache>,
 }
 
-/// Incremented whenever breakpoints change; invalidates `ProcBpTrace::cache`.
-static BP_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// The active call time or memory counters of one function, valid while the function's chain
+/// version and the node's active index are unchanged (erts reads `ci->gen_bp` directly).
+#[derive(Clone)]
+struct PbtCache {
+    cell: Arc<FunctionBp>,
+    version: u64,
+    ix: usize,
+    bdt: Arc<TimemTrace>,
+}
 
-type FuncName = (String, String, u8);
-
-/// Function ids: nested by name so a lookup does not allocate.
+/// Function ids and their breakpoint chains, nested by name so a lookup does not allocate.
 #[derive(Default)]
 struct FuncIds {
-    names: Vec<FuncName>,
+    cells: Vec<Arc<FunctionBp>>,
     ids: HashMap<String, FunctionIds, FastHash>,
 }
 
@@ -2109,51 +1998,103 @@ fn func_ids() -> &'static RwLock<FuncIds> {
     IDS.get_or_init(|| RwLock::new(FuncIds::default()))
 }
 
-/// A small id of a function, stored in trace frames in place of erts' `ErtsCodeInfo` pointer.
-pub(crate) fn func_id(module: &str, function: &str, arity: u8) -> u32 {
-    if let Some(id) = func_ids()
-        .read()
-        .unwrap()
+/// The breakpoint chain of a function, if it ever had an id.
+fn lookup_cell(module: &str, function: &str, arity: u8) -> Option<Arc<FunctionBp>> {
+    let ids = func_ids().read().unwrap();
+    let id = *ids.ids.get(module)?.get(function)?.get(&arity)?;
+    Some(ids.cells[id as usize].clone())
+}
+
+/// The breakpoint chain of a function, created with its id.
+fn function_cell(module: &str, function: &str, arity: u8) -> Arc<FunctionBp> {
+    if let Some(cell) = lookup_cell(module, function, arity) {
+        return cell;
+    }
+    let mut ids = func_ids().write().unwrap();
+    if let Some(&id) = ids
         .ids
         .get(module)
         .and_then(|functions| functions.get(function))
         .and_then(|arities| arities.get(&arity))
     {
-        return *id;
+        return ids.cells[id as usize].clone();
     }
-    let mut ids = func_ids().write().unwrap();
-    let id = ids.names.len() as u32;
-    ids.names
-        .push((module.to_owned(), function.to_owned(), arity));
+    let id = ids.cells.len() as u32;
+    let cell = Arc::new(FunctionBp {
+        id,
+        module: module.to_owned(),
+        function: function.to_owned(),
+        arity,
+        bps: RwLock::new(Vec::new()),
+        version: AtomicU64::new(0),
+    });
+    ids.cells.push(cell.clone());
     ids.ids
         .entry(module.to_owned())
         .or_default()
         .entry(function.to_owned())
         .or_default()
         .insert(arity, id);
-    id
+    cell
 }
 
-fn func_name(id: u32) -> Option<FuncName> {
-    func_ids().read().unwrap().names.get(id as usize).cloned()
+fn cell_by_id(id: u32) -> Option<Arc<FunctionBp>> {
+    func_ids().read().unwrap().cells.get(id as usize).cloned()
+}
+
+/// Every function chain (erts: all code infos of all loaded modules).
+fn all_cells() -> Vec<Arc<FunctionBp>> {
+    func_ids().read().unwrap().cells.clone()
+}
+
+/// The function chains of one module.
+fn module_cells(module: &str) -> Vec<Arc<FunctionBp>> {
+    let ids = func_ids().read().unwrap();
+    ids.ids
+        .get(module)
+        .into_iter()
+        .flat_map(|functions| functions.values())
+        .flat_map(|arities| arities.values())
+        .map(|&id| ids.cells[id as usize].clone())
+        .collect()
+}
+
+/// Runs `read` on the breakpoint chain of a function, empty when it has none.
+fn with_function_bps<R>(
+    module: &str,
+    function: &str,
+    arity: u8,
+    read: impl FnOnce(&[GenericBp]) -> R,
+) -> R {
+    match lookup_cell(module, function, arity) {
+        Some(cell) => read(&cell.read()),
+        None => read(&[]),
+    }
+}
+
+/// A small id of a function, stored in trace frames in place of erts' `ErtsCodeInfo` pointer.
+pub(crate) fn func_id(module: &str, function: &str, arity: u8) -> u32 {
+    function_cell(module, function, arity).id
 }
 
 // Port of erts/emulator/beam/beam_bp.c:2410-2442 (get_time_break, get_memory_break,
 // check_break), OTP-29.1.1.
 fn timem_break(process: &Process, session: u64, id: u32, memory: bool) -> Option<Arc<TimemTrace>> {
-    let (module, function, arity) = func_name(id)?;
-    let table = bp_node(process).tables.read().unwrap();
+    let cell = cell_by_id(id)?;
+    timem_break_of(process, &cell, session, memory)
+}
+
+fn timem_break_of(
+    process: &Process,
+    cell: &FunctionBp,
+    session: u64,
+    memory: bool,
+) -> Option<Arc<TimemTrace>> {
     let ix = bp_node(process).active_bp_ix();
-    let bp = function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        &module,
-        &function,
-        arity,
-    )
-    .find(|g| g.session == session)
-    .map(|g| &g.data[ix])?;
+    let bps = cell.read();
+    let bp = function_bps(&bps, scope(process), code_scope(process))
+        .find(|g| g.session == session)
+        .map(|g| &g.data[ix])?;
     if memory {
         (bp.flags & BPF_MEM_TRACE != 0).then(|| bp.memory.clone())?
     } else {
@@ -2168,17 +2109,25 @@ fn cached_timem_break(
     id: u32,
     memory: bool,
 ) -> Option<Arc<TimemTrace>> {
-    let epoch = BP_EPOCH.load(Ordering::Acquire);
-    if let Some((cached_id, cached_epoch, bdt)) =
-        pbt_list(process, memory).get(pbt_index)?.cache.as_ref()
-        && *cached_id == id
-        && *cached_epoch == epoch
+    let ix = bp_node(process).active_bp_ix();
+    if let Some(cache) = pbt_list(process, memory).get(pbt_index)?.cache.as_ref()
+        && cache.cell.id == id
+        && cache.ix == ix
+        && cache.version == cache.cell.version.load(Ordering::Acquire)
     {
-        return Some(bdt.clone());
+        return Some(cache.bdt.clone());
     }
     let session = pbt_list(process, memory).get(pbt_index)?.session;
-    let found = timem_break(process, session, id, memory)?;
-    pbt_list(process, memory).get_mut(pbt_index)?.cache = Some((id, epoch, found.clone()));
+    let cell = cell_by_id(id)?;
+    // Read the version before the data: a later write makes the cache entry stale, not wrong.
+    let version = cell.version.load(Ordering::Acquire);
+    let found = timem_break_of(process, &cell, session, memory)?;
+    pbt_list(process, memory).get_mut(pbt_index)?.cache = Some(PbtCache {
+        cell,
+        version,
+        ix,
+        bdt: found.clone(),
+    });
     Some(found)
 }
 
