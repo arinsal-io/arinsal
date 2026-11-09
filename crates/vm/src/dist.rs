@@ -12,9 +12,11 @@ use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 mod elink;
+mod emon;
 pub(crate) use elink::{
     DistLinkHalf, external_pid_term, proc_exit_handle_link, reply_dist_unlink_ack,
 };
+pub(crate) use emon::{handle_dist_demonitor, proc_exit_handle_target};
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1 << 40);
 static NEXT_REMOTE_PID: AtomicU32 = AtomicU32::new(1 << 27);
@@ -177,7 +179,8 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
     };
     let (spawn_downs, monitor_downs) = spawn_downs;
     if let Some(runtime) = process.runtime {
-        elink::links_connection_down(runtime, mld);
+        elink::links_connection_down(runtime, mld.clone());
+        emon::monitors_connection_down(runtime, mld.as_ref());
         notify_connection_monitors(runtime, monitor_downs)?;
         notify_connection_spawn_requests(runtime, spawn_downs)?;
     }
@@ -547,21 +550,19 @@ fn route_incoming(
                 *op == 36,
             )?;
         }
+        // Port of erts/emulator/beam/dist.c (DOP_MONITOR_P, DOP_DEMONITOR_P), OTP-29.1.1.
         19 | 20 if parts.len() == 4 => {
-            let watcher = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-            remember_remote_monitor_ref(handle, reference, &parts[3], *op == 19)?;
-            publish_remote_signal(
-                process,
-                watcher,
-                target,
-                if *op == 19 {
-                    crate::proc_create::remote_monitor_signal(reference, watcher, target)
-                } else {
-                    Signal::Demonitor(reference)
-                },
-            )?;
+            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+            let proxy = remote_proxy(handle, &parts[1])?;
+            if *op == 19 {
+                emon::incoming_monitor(
+                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
+                )?;
+            } else {
+                emon::incoming_demonitor(
+                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
+                )?;
+            }
         }
         21 | 28 if (parts.len() == 5 && *op == 21) || (parts.len() == 4 && *op == 28) => {
             let target_owned = &parts[1];
@@ -1037,7 +1038,8 @@ fn notify_auto_connect(
             (mld, monitor_downs, spawn_downs)
         };
         let (mld, monitor_downs, spawn_downs) = mld;
-        elink::links_connection_down(runtime, mld);
+        elink::links_connection_down(runtime, mld.clone());
+        emon::monitors_connection_down(runtime, mld.as_ref());
         notify_connection_monitors(runtime, monitor_downs)?;
         notify_connection_spawn_requests(runtime, spawn_downs)?;
         return Ok(false);
@@ -1210,7 +1212,8 @@ pub(crate) fn port_connection_closed(
         );
         (watchers, events, monitor_downs, spawn_downs, mld)
     };
-    elink::links_connection_down(runtime, mld);
+    elink::links_connection_down(runtime, mld.clone());
+    emon::monitors_connection_down(runtime, mld.as_ref());
     notify_node_watchers(runtime, &node, watchers)?;
     notify_connection_monitors(runtime, monitor_downs)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
@@ -1241,7 +1244,8 @@ pub(crate) fn kill_connection(
             tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
         (watchers, events, monitor_downs, spawn_downs, mld)
     };
-    elink::links_connection_down(runtime, mld);
+    elink::links_connection_down(runtime, mld.clone());
+    emon::monitors_connection_down(runtime, mld.as_ref());
     notify_node_watchers(runtime, node, watchers)?;
     notify_connection_monitors(runtime, monitor_downs)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
@@ -1573,24 +1577,16 @@ fn route_incoming_port(
         }
         // Port of dist.c:2341 (DOP_MONITOR_P); ToProc may be a pid or registered name.
         19 | 20 if parts.len() == 4 => {
-            let watcher = remote_proxy(handle, &parts[1])?;
-            let target = match &parts[2] {
-                OwnedTerm::Atom(name) => runtime.reg.whereis_proc_str(name),
-                other => local_pid(other, local),
-            };
-            let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-            remember_remote_monitor_ref(handle, reference, &parts[3], *op == 19)?;
-            if let Some(target) = target {
-                let signal = if *op == 19 {
-                    crate::proc_create::remote_monitor_signal(reference, watcher, target)
-                } else {
-                    Signal::Demonitor(reference)
-                };
-                sched.signal(watcher, target, signal).map_err(|error| {
-                    VmError::Unsupported(format!("incoming dist signal: {error}"))
-                })?;
+            let proxy = remote_proxy(handle, &parts[1])?;
+            if *op == 19 {
+                emon::incoming_monitor(
+                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
+                )?;
+            } else {
+                emon::incoming_demonitor(
+                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
+                )?;
             }
-            // Missing local name/pid: OTP replies with MONITOR_P_EXIT noproc; deferred.
         }
         // Port of dist.c (DOP_MONITOR_P_EXIT / payload exit).
         21 | 28 if (parts.len() == 5 && *op == 21) || (parts.len() == 4 && *op == 28) => {

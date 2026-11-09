@@ -120,7 +120,7 @@ pub(crate) fn external_pid_term(
 }
 
 /// The node name, connection id and `mld` of the connection with handle `handle`.
-fn connection_of_handle(
+pub(super) fn connection_of_handle(
     handle: u64,
 ) -> Option<(String, u32, Arc<crate::monitor_link::MonLnkDist>)> {
     let tables = node_tables::lock();
@@ -136,7 +136,7 @@ fn connection_of_handle(
 /// `erts_dsig_prepare(dep)` with a connection id check, then send: queue `control` on the
 /// connection to `nodename` only if it is still connection `connection_id` (connected or
 /// pending). Never sets up a connection.
-fn send_on_connection(
+pub(super) fn send_on_connection(
     runtime: &crate::process::Runtime,
     nodename: u32,
     connection_id: u32,
@@ -175,7 +175,7 @@ fn send_on_connection(
 }
 
 /// Whether the connection to `node` is up with this id (for a reply on the same connection).
-fn exit_payload_flag(nodename: u32) -> bool {
+pub(super) fn exit_payload_flag(nodename: u32) -> bool {
     let Some(node) = global_atoms().text(arinsal_term::Atom(nodename)) else {
         return false;
     };

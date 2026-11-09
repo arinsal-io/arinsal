@@ -1348,12 +1348,23 @@ fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Ter
                 Pid::from_data(monitor.other()).to_term()
             }
         });
+        let mut vals = local.flatten().collect::<Vec<_>>();
+        // Target halves of remote watchers show the external pid (`ERTS_MON_TYPE_DIST_PROC`).
         let remote = process
             .monitors
             .iter()
             .filter(|monitor| monitor.is_target())
-            .map(|monitor| Pid::from_data(monitor.other()).to_term());
-        let mut vals = local.chain(remote).flatten().collect::<Vec<_>>();
+            .map(|monitor| match monitor.info().external_origin() {
+                Some(origin) => Err(origin.watcher),
+                None => Ok(Pid::from_data(monitor.other())),
+            })
+            .collect::<Vec<_>>();
+        for watcher in remote {
+            match watcher {
+                Ok(pid) => vals.extend(pid.to_term()),
+                Err(pid) => vals.push(crate::dist::external_pid_term(&mut process.heap, pid)?),
+            }
+        }
         vals.reverse();
         let _ = pid;
         // Resource monitors are in the same monitor tree (ERTS_MON_TYPE_RESOURCE).

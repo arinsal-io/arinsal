@@ -434,6 +434,10 @@ impl Process {
                     }
                     continue;
                 }
+                if half.info().external_origin().is_some() {
+                    crate::dist::proc_exit_handle_target(self.runtime, ctx.pid(), monitor, reason);
+                    continue;
+                }
                 let pid = Pid::from_data(half.other());
                 if let Some(runtime) = self.runtime.as_ref()
                     && crate::dist::forward_monitor_down_if_proxy(

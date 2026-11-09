@@ -825,7 +825,6 @@ fn dist_mixed_external_monitors_connection_down_match_otp() {
 /// The monitored side of [`EMON_CLIENT`] on the tested node: incoming DOP_MONITOR_P /
 /// DOP_DEMONITOR_P and the target halves dropped with a lost connection.
 #[test]
-#[ignore = "elink s4 remainder: incoming monitors still have proxy-pid origins (monitored_by lists the proxy, connection down leaves it)"]
 fn dist_mixed_external_monitors_monitored_side_match_otp() {
     let _serial = serial_test();
     let expected = emon_run(false, false, EMON_CLIENT, "EMON_RESULT");

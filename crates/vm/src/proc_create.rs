@@ -980,6 +980,18 @@ pub struct MonitorInfo(Option<Box<MonitorExtension>>);
 struct MonitorExtension {
     tag: Option<arinsal_etf::OwnedTerm>,
     name: Option<String>,
+    dist_origin: Option<DistOrigin>,
+}
+
+/// The external watcher of an `ERTS_MON_TYPE_DIST_PROC` monitor of a local process, as
+/// `ErtsMonitorDataExtended` keeps it: the watcher pid (`md.u.target.other.item`, copied
+/// into `heap`), the reference as the remote node made it (`md.ref`), and the connection
+/// the origin half was inserted in (`dist`).
+#[derive(Debug)]
+pub(crate) struct DistOrigin {
+    pub(crate) watcher: crate::monitor_link::ExternalPid,
+    pub(crate) reference: arinsal_etf::OwnedTerm,
+    pub(crate) dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
 }
 
 impl MonitorInfo {
@@ -990,7 +1002,26 @@ impl MonitorInfo {
         if tag.is_none() && name.is_none() {
             return Self(None);
         }
-        Self(Some(Box::new(MonitorExtension { tag, name })))
+        Self(Some(Box::new(MonitorExtension {
+            tag,
+            name,
+            dist_origin: None,
+        })))
+    }
+
+    /// The shared data of a monitor of a local process by the external `origin`, created by
+    /// the name `name` when it has one.
+    pub(crate) fn dist_origin(origin: DistOrigin, name: Option<String>) -> Self {
+        Self(Some(Box::new(MonitorExtension {
+            tag: None,
+            name,
+            dist_origin: Some(origin),
+        })))
+    }
+
+    /// The external watcher of a monitor of a local process.
+    pub(crate) fn external_origin(&self) -> Option<&DistOrigin> {
+        self.0.as_ref()?.dist_origin.as_ref()
     }
 
     pub(crate) fn tag(&self) -> Option<&arinsal_etf::OwnedTerm> {
@@ -1058,27 +1089,6 @@ pub(crate) fn create_monitor_with_reference_at(
 ) -> (ProcessMonitor, ProcessMonitor) {
     let kind = state.kind();
     crate::monitor_link::Monitor::create_at(ix, kind, reference, origin, target, 0, info, state)
-}
-
-/// The monitor signal of a remote process monitoring local `target` (erts
-/// `ERTS_MON_TYPE_DIST_PROC`): the target half in transit, inserted into the target's monitor
-/// tree; the origin side of a remote monitor is kept by the distribution tables.
-pub(crate) fn remote_monitor_signal(
-    reference: u64,
-    watcher: arinsal_sched::Pid,
-    target: arinsal_sched::Pid,
-) -> arinsal_sched::Signal<crate::process::Message> {
-    let (_origin, target_half) = create_monitor(
-        reference,
-        watcher.data(),
-        target.data(),
-        MonitorInfo::default(),
-        OriginMonitor::Distributed,
-    );
-    arinsal_sched::Signal::Monitor {
-        reference,
-        shared: target_half.into_shared(),
-    }
 }
 
 pub(crate) fn origin_monitor_with_reference(

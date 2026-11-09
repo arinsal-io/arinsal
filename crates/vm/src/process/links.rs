@@ -56,16 +56,8 @@ impl Process {
         }
     }
 
-    /// A demonitor by reference: of a remote origin (its target half is in the monitor tree) or
-    /// of a NIF resource.
+    /// A demonitor by reference of a NIF resource.
     pub(super) fn remove_target_monitor(&mut self, reference: u64) {
-        if self
-            .monitors
-            .get(reference)
-            .is_some_and(|monitor| monitor.is_target())
-        {
-            self.monitors.remove(reference);
-        }
         if let Some(cold) = self.cold.as_deref_mut() {
             cold.resource_monitors.remove(&reference);
         }
@@ -90,7 +82,11 @@ impl Process {
         &mut self,
         origin: crate::proc_create::ProcessMonitor,
     ) -> bool {
-        let target = self.lt_monitors.remove_target_of(&origin);
+        let target = if origin.view().kind() == crate::monitor_link::node_type::MONITOR_DIST_PROC {
+            self.monitors.remove_target_of(&origin)
+        } else {
+            self.lt_monitors.remove_target_of(&origin)
+        };
         if let Some(target) = target {
             crate::proc_create::ProcessMonitor::release_both(origin, target);
             true
@@ -130,22 +126,30 @@ impl Process {
                     // OTP-29.1.1: a monitor arriving after exit has begun is answered as noproc.
                     // A driver port's monitor (`ERTS_MON_TYPE_PORT`) fires at once instead
                     // (erts_proc_exit_handle_monitor).
-                    let port_origin = crate::proc_create::ProcessMonitorData::take_half(
-                        shared, true,
-                    )
-                    .filter(|half| {
-                        half.view().kind() == crate::monitor_link::node_type::MONITOR_PORT
-                    });
-                    if let Some(half) = port_origin {
-                        if let Some(runtime) = self.runtime.as_ref() {
+                    let half = crate::proc_create::ProcessMonitorData::take_half(shared, true);
+                    let kind = half.as_ref().map(|half| half.view().kind());
+                    if kind == Some(crate::monitor_link::node_type::MONITOR_PORT) {
+                        if let (Some(runtime), Some(half)) = (self.runtime.as_ref(), half) {
                             crate::port::fire_port_monitor(runtime, half.view().other(), reference);
                         }
+                    } else if let Some(half) =
+                        half.filter(|half| half.view().info().external_origin().is_some())
+                    {
+                        crate::dist::proc_exit_handle_target(
+                            self.runtime,
+                            ctx.pid(),
+                            half,
+                            crate::signals::atom("noproc"),
+                        );
                     } else {
                         let _ = ctx.signal(from, Signal::MonitorNoproc(reference));
                     }
                 }
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     self.remove_target_monitor(reference);
+                }
+                Payload::Signal(Signal::DistDemonitor(reference)) => {
+                    crate::dist::handle_dist_demonitor(self, reference);
                 }
                 Payload::Signal(Signal::DemonitorOrigin(shared)) => {
                     self.remove_demonitored_target(shared);

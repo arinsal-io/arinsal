@@ -1655,6 +1655,28 @@ impl<'a, I, O, S> MonitorMut<'a, I, O, S> {
 }
 
 impl<I, O, S> MonLnkTree<Monitor<I, O, S>> {
+    /// Take the target half of `origin`'s monitor out of this tree, if it is here: the
+    /// `ERTS_MON_TYPE_DIST_PROC` case of a demonitor signal carrying the origin half
+    /// (erl_proc_sig_queue.c, ERTS_SIG_Q_OP_DEMONITOR).
+    pub(crate) fn remove_target_of(
+        &mut self,
+        origin: &Monitor<I, O, S>,
+    ) -> Option<Monitor<I, O, S>> {
+        let data = MonitorData::<I, O, S>::from_node(origin.node);
+        let target = data.target_node();
+        if node_flags(target) & node_flag::IN_TABLE == 0
+            || self.lookup_node(data.reference) != Some(target)
+        {
+            return None;
+        }
+        self.delete_node(target);
+        set_node_flags(target, node_flags(target) & !node_flag::IN_TABLE);
+        Some(Monitor::from_node(ContainedNode {
+            node: target,
+            _handle: PhantomData,
+        }))
+    }
+
     /// `erts_monitor_tree_lookup`.
     pub(crate) fn get(&self, reference: u64) -> Option<MonitorRef<'_, I, O, S>> {
         self.lookup_node(reference).map(|node| MonitorRef {
@@ -1756,6 +1778,11 @@ struct MonLnkDistState {
     alive: bool,
     /// `links`: a circular list of dist halves, each owning one reference to its `ELink`.
     links: Option<NodePtr>,
+    /// `monitors`: a circular list of monitor halves held by the connection, each owning one
+    /// reference to its `MonitorData`.
+    monitors: Option<NodePtr>,
+    /// `orig_name_monitors`: the origin halves of monitors by name, a tree keyed by reference.
+    orig_name_monitors: Option<NodePtr>,
 }
 
 // SAFETY: the list nodes are dist halves of `ELink`s whose shared fields are atomic or
@@ -1786,6 +1813,8 @@ impl MonLnkDist {
             state: std::sync::Mutex::new(MonLnkDistState {
                 alive: true,
                 links: None,
+                monitors: None,
+                orig_name_monitors: None,
             }),
         }
     }
@@ -1821,6 +1850,147 @@ impl MonLnkDist {
             }
         }
         links
+    }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.h (erts_monitor_dist_insert), OTP-29.1.1:
+    /// put a monitor half into the connection unless it is dead, in which case the half comes
+    /// back. An origin half by name goes into `orig_name_monitors`, any other into `monitors`.
+    pub(crate) fn monitor_insert<I, O, S>(
+        &self,
+        monitor: Monitor<I, O, S>,
+    ) -> Result<(), Monitor<I, O, S>> {
+        let mut state = self.lock();
+        if !state.alive {
+            return Err(monitor);
+        }
+        if node_flags(monitor.node) & (node_flag::NAME | node_flag::TARGET) == node_flag::NAME {
+            let mut tree = MonLnkTree::<Monitor<I, O, S>> {
+                root: state.orig_name_monitors.take(),
+                _handles: PhantomData,
+            };
+            tree.insert(monitor);
+            state.orig_name_monitors = tree.root.take();
+        } else {
+            let node = monitor.into_node();
+            dl_list_insert(&mut state.monitors, node);
+            set_node_flags(node, node_flags(node) | node_flag::IN_TABLE);
+        }
+        Ok(())
+    }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.h (erts_monitor_dist_delete), OTP-29.1.1,
+    /// on the other half of `monitor`: when the connection is alive and holds that half, it
+    /// comes out and passes to the caller.
+    pub(crate) fn monitor_delete_other<I, O, S>(
+        &self,
+        monitor: &Monitor<I, O, S>,
+    ) -> Option<Monitor<I, O, S>> {
+        let data = MonitorData::<I, O, S>::from_node(monitor.node);
+        let other = MonitorData::<I, O, S>::node_of(data, !monitor.view().is_target());
+        let mut state = self.lock();
+        let flags = node_flags(other);
+        if !state.alive || flags & node_flag::IN_TABLE == 0 {
+            return None;
+        }
+        if flags & (node_flag::NAME | node_flag::TARGET) == node_flag::NAME {
+            let mut tree = MonLnkTree::<Monitor<I, O, S>> {
+                root: state.orig_name_monitors.take(),
+                _handles: PhantomData,
+            };
+            tree.delete_node(other);
+            state.orig_name_monitors = tree.root.take();
+        } else {
+            dl_list_delete(&mut state.monitors, other);
+        }
+        set_node_flags(other, flags & !node_flag::IN_TABLE);
+        Some(Monitor::from_node(ContainedNode {
+            node: other,
+            _handle: PhantomData,
+        }))
+    }
+
+    /// `erts_monitor_tree_lookup` and `erts_monitor_tree_delete` of `orig_name_monitors`
+    /// under `mtx`, when the connection is alive (dist.c DOP_DEMONITOR_P by name).
+    pub(crate) fn name_monitor_remove<I, O, S>(&self, reference: u64) -> Option<Monitor<I, O, S>> {
+        let mut state = self.lock();
+        if !state.alive {
+            return None;
+        }
+        let mut tree = MonLnkTree::<Monitor<I, O, S>> {
+            root: state.orig_name_monitors.take(),
+            _handles: PhantomData,
+        };
+        let monitor = tree.remove(reference);
+        state.orig_name_monitors = tree.root.take();
+        monitor
+    }
+
+    /// Port of erts/emulator/beam/dist.c (con_monitor_link_seq_cleanup, the monitors and
+    /// orig_name_monitors states), OTP-29.1.1: mark the connection dead and take its monitor
+    /// halves, the list in list order, then the name tree in its foreach order.
+    pub(crate) fn take_monitors<I, O, S>(&self) -> Vec<Monitor<I, O, S>> {
+        let mut state = self.lock();
+        state.alive = false;
+        let mut monitors = Vec::new();
+        if let Some(first) = state.monitors.take() {
+            let mut node = first;
+            loop {
+                let next = list_links(node).next.expect("circular list");
+                set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
+                monitors.push(Monitor::from_node(ContainedNode {
+                    node,
+                    _handle: PhantomData,
+                }));
+                if next == first {
+                    break;
+                }
+                node = next;
+            }
+        }
+        let mut tree = MonLnkTree::<Monitor<I, O, S>> {
+            root: state.orig_name_monitors.take(),
+            _handles: PhantomData,
+        };
+        monitors.extend(tree.drain());
+        monitors
+    }
+}
+
+/// `erts_ml_dl_list_insert__`: append `node` before the first node of a circular list.
+fn dl_list_insert(first: &mut Option<NodePtr>, node: NodePtr) {
+    match *first {
+        None => {
+            *list_links_mut(node) = ListLinks {
+                next: Some(node),
+                prev: Some(node),
+            };
+            *first = Some(node);
+        }
+        Some(head) => {
+            let last = list_links(head).prev.expect("circular list");
+            *list_links_mut(node) = ListLinks {
+                next: Some(head),
+                prev: Some(last),
+            };
+            list_links_mut(head).prev = Some(node);
+            list_links_mut(last).next = Some(node);
+        }
+    }
+}
+
+/// `erts_ml_dl_list_delete__`.
+fn dl_list_delete(first: &mut Option<NodePtr>, node: NodePtr) {
+    let links = list_links(node);
+    let next = links.next.expect("circular list");
+    if next == node {
+        *first = None;
+    } else {
+        let prev = links.prev.expect("circular list");
+        if *first == Some(node) {
+            *first = Some(next);
+        }
+        list_links_mut(prev).next = Some(next);
+        list_links_mut(next).prev = Some(prev);
     }
 }
 
@@ -2524,6 +2694,64 @@ mod tests {
             .unwrap_err();
         assert_eq!(duplicate.view().flags() & node_flag::IN_TABLE, 0);
         assert_eq!(tree.get(5).unwrap().flags() & node_flag::PRIO_ML, 0);
+    }
+
+    /// erts_monitor_dist_insert / erts_monitor_dist_delete / con_monitor_link_seq_cleanup:
+    /// origin halves by pid go into the connection list, origin halves by name into the
+    /// name tree; a target half takes its origin out through the shared data, a dead
+    /// connection keeps nothing.
+    #[test]
+    fn monitor_origin_halves_enter_and_leave_the_connection() {
+        let mld = MonLnkDist::with_connection(42, 7);
+        let mut targets = Vec::new();
+        for (reference, flags) in [
+            (1_u64, 0),
+            (2, node_flag::NAME),
+            (3, 0),
+            (4, node_flag::NAME),
+        ] {
+            let (origin, target) = TestMonitor::create(
+                node_type::MONITOR_DIST_PROC,
+                MonitorReference::ordinary(reference),
+                0,
+                11,
+                flags,
+                0,
+                0,
+            );
+            assert!(mld.monitor_insert(origin).is_ok());
+            targets.push(target);
+        }
+        // DOP_DEMONITOR_P by name: looked up in the name tree only.
+        assert!(mld.name_monitor_remove::<u32, u32, ()>(1).is_none());
+        let named = mld.name_monitor_remove::<u32, u32, ()>(2).expect("named");
+        assert_eq!(named.view().other(), 11);
+        assert!(mld.monitor_delete_other(&targets[1]).is_none());
+        TestMonitor::release_both(named, targets.remove(1));
+        // Demonitor through the target half: removed once.
+        let origin = mld.monitor_delete_other(&targets[0]).expect("in the list");
+        assert!(mld.monitor_delete_other(&targets[0]).is_none());
+        TestMonitor::release_both(origin, targets.remove(0));
+        // Connection down: the list (reference 3), then the name tree (reference 4).
+        let taken = mld.take_monitors::<u32, u32, ()>();
+        let references = taken
+            .iter()
+            .map(|half| half.view().reference())
+            .collect::<Vec<_>>();
+        assert_eq!(references, [3, 4]);
+        assert!(!mld.is_alive());
+        assert!(mld.monitor_delete_other(&targets[0]).is_none());
+        let (origin, _target) = TestMonitor::create(
+            node_type::MONITOR_DIST_PROC,
+            MonitorReference::ordinary(5),
+            0,
+            11,
+            0,
+            0,
+            0,
+        );
+        assert!(mld.monitor_insert(origin).is_err());
+        drop(taken);
     }
 
     #[test]
