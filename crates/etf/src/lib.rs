@@ -661,6 +661,20 @@ pub struct DecodedSizeWalk {
     local_hash: Option<(u32, usize)>,
     local_term_end: u32,
     done: bool,
+    checked_input: Option<(usize, usize, usize)>,
+}
+
+/// A body whose structure and byte bounds were checked by [`DecodedSizeWalk`].
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatedEtfBody<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ValidatedEtfBody<'a> {
+    /// The complete term body, excluding bytes following the decoded term.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 impl DecodedSizeWalk {
@@ -674,7 +688,19 @@ impl DecodedSizeWalk {
             local_hash: None,
             local_term_end: u32::MAX,
             done: false,
+            checked_input: None,
         }
+    }
+
+    /// Return a token for this exact input after the complete sizing pass succeeds.
+    pub fn validated_body<'a>(&self, bytes: &'a [u8]) -> Option<ValidatedEtfBody<'a>> {
+        let (source, length, end) = self.checked_input?;
+        if !self.done || source != bytes.as_ptr() as usize || length != bytes.len() {
+            return None;
+        }
+        Some(ValidatedEtfBody {
+            bytes: bytes.get(..end)?,
+        })
     }
 
     /// Scan at most `work_budget` tags, allowing a tag to consume its complete payload.
@@ -741,6 +767,7 @@ impl DecodedSizeWalk {
         }
         if self.terms == 0 {
             self.done = true;
+            self.checked_input = Some((bytes.as_ptr() as usize, bytes.len(), self.at));
             Ok((Some((self.heap_words, self.at)), work))
         } else if input_complete && self.at == input_len {
             Err(DecodeError::Eof(self.at))
@@ -801,6 +828,7 @@ impl DecodedSizeWalk {
         self.local_term_end = local_term_end;
         if terms == 0 {
             self.done = true;
+            self.checked_input = Some((bytes.as_ptr() as usize, bytes.len(), at));
             Ok((Some((heap_words, at)), work))
         } else {
             Err(DecodeError::Eof(at))

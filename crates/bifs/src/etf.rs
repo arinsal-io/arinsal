@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
-use arinsal_etf::DecodedSizeWalk;
+use arinsal_etf::{DecodedSizeWalk, ValidatedEtfBody};
 use arinsal_term::raw::{Cons, Tuple, term_at_pointer, term_from_bits};
 use arinsal_term::{
     Atom, AtomEncoding, BinaryOwner, BinaryRef, ConsListBuilder, ExportEntry, FunEntry, FunRef,
@@ -2463,7 +2463,7 @@ fn badopt() -> BifError {
 }
 
 enum DecodeInput<'a> {
-    Inline(SmallVec<[u8; 64]>),
+    Inline(Box<[u8]>),
     Borrowed {
         bytes: &'a [u8],
         term: Term,
@@ -2514,16 +2514,28 @@ fn decode_input(args: &[Term]) -> Result<DecodeInput<'_>, BifError> {
             len,
         })
     } else {
-        Ok(DecodeInput::Inline(bit_bytes(term)?.0))
+        Ok(DecodeInput::Inline(
+            bit_bytes(term)?.0.into_vec().into_boxed_slice(),
+        ))
     }
 }
 
-struct Reader<'a> {
+struct Reader<'a, const VALIDATED: bool = false> {
     bytes: &'a [u8],
     at: usize,
+    validated: Option<ValidatedEtfBody<'a>>,
 }
-impl Reader<'_> {
+impl<const VALIDATED: bool> Reader<'_, VALIDATED> {
     fn take(&mut self, n: usize) -> Result<&[u8], BifError> {
+        if VALIDATED {
+            let part = super::raw::take_validated(
+                self.validated.expect("validated reader token"),
+                self.at,
+                n,
+            );
+            self.at += n;
+            return Ok(part);
+        }
         let end = self.at.checked_add(n).ok_or(BifError::BADARG)?;
         let part = self
             .bytes
@@ -2594,6 +2606,30 @@ impl Reader<'_> {
     }
 }
 
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8], at: usize) -> Self {
+        Self {
+            bytes,
+            at,
+            validated: None,
+        }
+    }
+}
+
+impl<'a> Reader<'a, true> {
+    fn from_validated(body: ValidatedEtfBody<'a>) -> Self {
+        Self::from_validated_at(body, 0)
+    }
+
+    fn from_validated_at(body: ValidatedEtfBody<'a>, at: usize) -> Self {
+        Self {
+            bytes: body.as_bytes(),
+            at,
+            validated: Some(body),
+        }
+    }
+}
+
 enum Shape {
     /// `None` is an interned atom. `Some` keeps the text only when the index is `NONAME`.
     Atom(Option<String>),
@@ -2639,7 +2675,7 @@ struct Frame {
 #[derive(Clone, Copy)]
 enum DecodeTarget {
     Root,
-    Heap(HeapTermSlot),
+    Heap(super::raw::HeapSlotPtr),
 }
 
 enum DecodeMap {
@@ -2660,18 +2696,18 @@ enum DecodePending {
         block: HeapBlockBuilder,
         arity: usize,
         next_index: usize,
-        continuation: Option<HeapTermSlot>,
+        continuation: Option<super::raw::HeapSlotPtr>,
     },
     List {
         block: HeapBlockBuilder,
         size: usize,
         next_index: usize,
-        chain: Option<HeapTermSlot>,
-        continuation: Option<HeapTermSlot>,
+        chain: Option<super::raw::HeapSlotPtr>,
+        continuation: Option<super::raw::HeapSlotPtr>,
     },
     String {
         target: DecodeTarget,
-        continuation: Option<HeapTermSlot>,
+        continuation: Option<super::raw::HeapSlotPtr>,
         builder: ConsListBuilder,
         source_at: usize,
         size: usize,
@@ -2679,7 +2715,7 @@ enum DecodePending {
     },
     Binary {
         target: DecodeTarget,
-        continuation: Option<HeapTermSlot>,
+        continuation: Option<super::raw::HeapSlotPtr>,
         binary: RefcBinary,
         remaining: usize,
         bit_len: usize,
@@ -3324,7 +3360,7 @@ fn parse_step<H: HeapAlloc>(
 }
 
 fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, usize), BifError> {
-    let mut reader = Reader { bytes, at: 0 };
+    let mut reader = Reader::new(bytes, 0);
     let mut stack = SmallVec::new();
     match parse_step(&mut reader, &mut stack, safe, None, ctx, usize::MAX, true)? {
         Some(value) => Ok(value),
@@ -3332,20 +3368,41 @@ fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, u
     }
 }
 
-fn write_decode_target(
-    ctx: &mut Ctx<'_, &mut HeapReservationWords<'_>>,
-    target: DecodeTarget,
-    root: &mut Term,
-    term: Term,
-) -> Result<(), BifError> {
+fn write_decode_target(target: DecodeTarget, root: &mut Term, term: Term) -> Result<(), BifError> {
     match target {
         DecodeTarget::Root => *root = term,
-        DecodeTarget::Heap(slot) => ctx
-            .heap
-            .write_term_slot(slot, term)
-            .map_err(map_term_build_error)?,
+        DecodeTarget::Heap(slot) => slot.store(term.word()),
     }
     Ok(())
+}
+
+#[inline(always)]
+fn decode_slot_ptr(
+    ctx: &mut Ctx<'_, &mut HeapReservationWords<'_>>,
+    slot: HeapTermSlot,
+) -> Result<super::raw::HeapSlotPtr, BifError> {
+    let index = slot.word_index().ok_or(BifError::BADARG)?;
+    let (words, _) = ctx.heap.words_and_cursor();
+    super::raw::HeapSlotPtr::at(words, index).ok_or(BifError::BADARG)
+}
+
+#[inline(always)]
+fn decode_heap_slot(
+    ctx: &mut Ctx<'_, &mut HeapReservationWords<'_>>,
+    slot: super::raw::HeapSlotPtr,
+) -> Result<HeapTermSlot, BifError> {
+    let (words, _) = ctx.heap.words_and_cursor();
+    let index = super::raw::slot_index(words.as_ptr() as usize, words.len(), slot)
+        .ok_or(BifError::BADARG)?;
+    Ok(HeapTermSlot::from_index(index))
+}
+
+#[inline(always)]
+fn decode_slot_ptrs(
+    ctx: &mut Ctx<'_, &mut HeapReservationWords<'_>>,
+    slots: Option<HeapTermSlot>,
+) -> Result<Option<super::raw::HeapSlotPtr>, BifError> {
+    slots.map(|slot| decode_slot_ptr(ctx, slot)).transpose()
 }
 
 // Port of erts/emulator/beam/external.c:5425-5460 (dec_term map_array post-pass), OTP-29.1.1.
@@ -3430,12 +3487,10 @@ fn finish_decode_maps(
                     .map_err(map_term_build_error)?
                     .ok_or(BifError::BADARG)?;
                 reservation
-                    .with_words(|words| {
+                    .with_words(|_| {
                         match target {
                             DecodeTarget::Root => *root = map,
-                            DecodeTarget::Heap(slot) => words
-                                .write_term_slot(slot, map)
-                                .map_err(map_term_build_error)?,
+                            DecodeTarget::Heap(slot) => slot.store(map.word()),
                         }
                         Ok(())
                     })
@@ -3447,7 +3502,9 @@ fn finish_decode_maps(
 }
 
 // Port of erts/emulator/beam/external.c:4325-5445 (`dec_term`), OTP-29.1.1.
-fn read_small_integer(r: &mut Reader<'_>) -> Result<i64, BifError> {
+fn read_small_integer<const VALIDATED: bool>(
+    r: &mut Reader<'_, VALIDATED>,
+) -> Result<i64, BifError> {
     let tag = r.u8()?;
     let number = match tag {
         97 => r.u8()? as i64,
@@ -3475,8 +3532,8 @@ fn read_small_integer(r: &mut Reader<'_>) -> Result<i64, BifError> {
 }
 
 // Port of erts/emulator/beam/external.c:4640-4694 (PID_EXT/NEW_PID_EXT), OTP-29.1.1.
-fn read_pid_term<H: HeapAlloc>(
-    r: &mut Reader<'_>,
+fn read_pid_term<H: HeapAlloc, const VALIDATED: bool>(
+    r: &mut Reader<'_, VALIDATED>,
     safe: bool,
     local_node: Option<(Atom, u32)>,
     ctx: &mut Ctx<'_, H>,
@@ -3507,8 +3564,8 @@ fn read_pid_term<H: HeapAlloc>(
 // Port of erts/emulator/beam/external.c:4325-5445 (`dec_term`, in-place `next` walk), OTP-29.1.1.
 #[allow(clippy::too_many_arguments)]
 fn decode_direct_step(
-    r: &mut Reader<'_>,
-    next: &mut Option<HeapTermSlot>,
+    r: &mut Reader<'_, true>,
+    next: &mut Option<super::raw::HeapSlotPtr>,
     root: &mut Term,
     root_started: &mut bool,
     maps: &mut SmallVec<[DecodeMap; 10]>,
@@ -3539,6 +3596,8 @@ fn decode_direct_step(
                 let first = next_index - count + 1;
                 let terminal = if next_index == arity {
                     continuation
+                        .map(|slot| decode_heap_slot(ctx, slot))
+                        .transpose()?
                 } else {
                     Some(
                         block
@@ -3561,7 +3620,10 @@ fn decode_direct_step(
                 });
                 return Ok((None, work));
             }
-            *next = Some(block.term_slot(1).map_err(map_term_build_error)?);
+            *next = Some(decode_slot_ptr(
+                ctx,
+                block.term_slot(1).map_err(map_term_build_error)?,
+            )?);
         }
         if pending
             .as_ref()
@@ -3579,11 +3641,14 @@ fn decode_direct_step(
             };
             let count = next_index.min(budget.saturating_sub(work));
             if count > 0 {
-                chain = Some(
-                    block
-                        .write_list_chain(next_index - count, count, chain.ok_or(BifError::BADARG)?)
-                        .map_err(map_term_build_error)?,
-                );
+                let first = block
+                    .write_list_chain(
+                        next_index - count,
+                        count,
+                        decode_heap_slot(ctx, chain.ok_or(BifError::BADARG)?)?,
+                    )
+                    .map_err(map_term_build_error)?;
+                chain = Some(decode_slot_ptr(ctx, first)?);
                 next_index -= count;
             }
             work += count;
@@ -3638,7 +3703,7 @@ fn decode_direct_step(
                 return Ok((None, work));
             }
             let term = builder.finish(Term::NIL).map_err(map_term_build_error)?;
-            write_decode_target(ctx, target, root, term)?;
+            write_decode_target(target, root, term)?;
             *root_started = true;
             *next = continuation;
         }
@@ -3687,28 +3752,31 @@ fn decode_direct_step(
             let term = TermBuilder::new(&mut ctx.heap)
                 .refc_binary(binary, bit_len)
                 .map_err(map_term_build_error)?;
-            write_decode_target(ctx, target, root, term)?;
+            write_decode_target(target, root, term)?;
             *root_started = true;
             *next = continuation;
             work += copy_len / B2T_MEMCPY_FACTOR;
         }
     }
+    if work >= budget {
+        if *root_started && next.is_none() {
+            return Ok((Some((*root, r.at)), work));
+        }
+        return Ok((None, work));
+    }
     let mut hp = {
         let (_, cursor) = ctx.heap.words_and_cursor();
         *cursor
     };
-    let mut cur = next.and_then(HeapTermSlot::word_index);
-    while !*root_started || work < budget {
-        if *root_started && cur.is_none() {
-            *next = None;
-            return Ok((Some((*root, r.at)), work));
-        }
-        let target = if *root_started {
-            DecodeTarget::Heap(HeapTermSlot::from_index(
-                cur.take().ok_or(BifError::BADARG)?,
-            ))
-        } else {
-            DecodeTarget::Root
+    let mut cur = *next;
+    loop {
+        let target = match cur {
+            Some(slot) => DecodeTarget::Heap(slot),
+            None if !*root_started => DecodeTarget::Root,
+            None => {
+                *next = None;
+                return Ok((Some((*root, r.at)), work));
+            }
         };
         let mut next_was_set = false;
         let mut defer_output = false;
@@ -3720,34 +3788,12 @@ fn decode_direct_step(
             *cursor = hp;
             let len = words.len();
             let base = words.as_ptr() as usize as u64;
-            let slot_index = match target {
+            let slot_ptr = match target {
                 DecodeTarget::Root => None,
-                DecodeTarget::Heap(slot) => Some(slot.word_index().ok_or(BifError::BADARG)?),
+                DecodeTarget::Heap(slot) => Some(slot),
             };
-            let chain = if let Some(index) = slot_index {
-                let chain = *words.get(index).ok_or(BifError::BADARG)? as usize;
-                if chain > len {
-                    return Err(BifError::BADARG);
-                }
-                words[index] = 0;
-                chain
-            } else {
-                0
-            };
-            let continuation = if chain == 0 {
-                None
-            } else {
-                Some(HeapTermSlot::from_index(chain - 1))
-            };
-            let tag = loop {
-                let tag = r.u8()?;
-                if tag == 121 {
-                    r.take(4)?;
-                    *internal_nc = true;
-                } else {
-                    break tag;
-                }
-            };
+            let continuation = slot_ptr.and_then(super::raw::HeapSlotPtr::take_next);
+            let tag = r.u8()?;
             let payload_at = r.at;
             let mut root_term = None;
             let mut root_block = None;
@@ -3755,8 +3801,8 @@ fn decode_direct_step(
             let direct_work = match tag {
                 97 => {
                     let term = Term::small(i64::from(r.u8()?)).ok_or(BifError::BADARG)?;
-                    if let Some(index) = slot_index {
-                        words[index] = term.word();
+                    if let Some(slot) = slot_ptr {
+                        slot.store(term.word());
                     } else {
                         root_term = Some(term);
                     }
@@ -3764,16 +3810,16 @@ fn decode_direct_step(
                 }
                 98 => {
                     let term = Term::small(i64::from(r.u32()? as i32)).ok_or(BifError::BADARG)?;
-                    if let Some(index) = slot_index {
-                        words[index] = term.word();
+                    if let Some(slot) = slot_ptr {
+                        slot.store(term.word());
                     } else {
                         root_term = Some(term);
                     }
                     Some(1)
                 }
                 106 => {
-                    if let Some(index) = slot_index {
-                        words[index] = Term::NIL.word();
+                    if let Some(slot) = slot_ptr {
+                        slot.store(Term::NIL.word());
                     } else {
                         root_term = Some(Term::NIL);
                     }
@@ -3782,8 +3828,8 @@ fn decode_direct_step(
                 100 | 115 | 118 | 119 => {
                     r.at = payload_at - 1;
                     let (term, _) = r.atom(safe, true)?;
-                    if let Some(index) = slot_index {
-                        words[index] = term.word();
+                    if let Some(slot) = slot_ptr {
+                        slot.store(term.word());
                     } else {
                         root_term = Some(term);
                     }
@@ -3797,8 +3843,8 @@ fn decode_direct_step(
                     };
                     let end = hp.checked_add(arity + 1).ok_or(BifError::BADARG)?;
                     if arity == 0 {
-                        if let Some(index) = slot_index {
-                            words[index] = arinsal_term::global_empty_tuple().word();
+                        if let Some(slot) = slot_ptr {
+                            slot.store(arinsal_term::global_empty_tuple().word());
                         } else {
                             root_term = Some(arinsal_term::global_empty_tuple());
                         }
@@ -3810,17 +3856,19 @@ fn decode_direct_step(
                         let block = words.get_mut(hp..end).ok_or(BifError::BADARG)?;
                         block[0] = (arity as u64) << 6;
                         for (offset, word) in block[1..arity].iter_mut().enumerate() {
-                            *word = (hp + offset + 3) as u64;
+                            *word = super::raw::slot_address(base as usize, hp + offset + 2);
                         }
-                        block[arity] = chain as u64;
+                        block[arity] = continuation.map_or(0, super::raw::HeapSlotPtr::address);
                         let term_word = base.wrapping_add((hp * 8) as u64) | 2;
-                        if let Some(index) = slot_index {
-                            words[index] = term_word;
+                        if let Some(slot) = slot_ptr {
+                            slot.store(term_word);
                         } else {
                             root_block = Some((hp, 2));
                         }
                         *cursor = end;
-                        direct_next = Some(HeapTermSlot::from_index(hp + 1));
+                        direct_next = Some(
+                            super::raw::HeapSlotPtr::at(words, hp + 1).ok_or(BifError::BADARG)?,
+                        );
                         let extra = arity + 1;
                         hp = end;
                         Some(extra)
@@ -3836,8 +3884,8 @@ fn decode_direct_step(
                         return Err(BifError::BADARG);
                     };
                     if size == 0 {
-                        if let Some(index) = slot_index {
-                            words[index] = Term::NIL.word();
+                        if let Some(slot) = slot_ptr {
+                            slot.store(Term::NIL.word());
                         } else {
                             root_term = Some(Term::NIL);
                         }
@@ -3860,8 +3908,8 @@ fn decode_direct_step(
                             };
                         }
                         let term_word = base.wrapping_add((hp * 8) as u64) | 1;
-                        if let Some(index) = slot_index {
-                            words[index] = term_word;
+                        if let Some(slot) = slot_ptr {
+                            slot.store(term_word);
                         } else {
                             root_block = Some((hp, 1));
                         }
@@ -3885,20 +3933,13 @@ fn decode_direct_step(
                             .is_some_and(|end| end <= len)
                     {
                         let end = hp + size * 2;
-                        let tail = continuation
-                            .map(|slot| {
-                                slot.word_index()
-                                    .and_then(|index| index.checked_add(1))
-                                    .ok_or(BifError::BADARG)
-                            })
-                            .transpose()?
-                            .unwrap_or(0) as u64;
+                        let tail = continuation.map_or(0, super::raw::HeapSlotPtr::address);
                         for index in 0..size {
                             let car = hp + index * 2;
                             words[car] = if index + 1 == size {
-                                (car + 2) as u64
+                                super::raw::slot_address(base as usize, car + 1)
                             } else {
-                                (car + 3) as u64
+                                super::raw::slot_address(base as usize, car + 2)
                             };
                             words[car + 1] = if index + 1 == size {
                                 tail
@@ -3907,13 +3948,14 @@ fn decode_direct_step(
                             };
                         }
                         let term_word = base.wrapping_add((hp * 8) as u64) | 1;
-                        if let Some(index) = slot_index {
-                            words[index] = term_word;
+                        if let Some(slot) = slot_ptr {
+                            slot.store(term_word);
                         } else {
                             root_block = Some((hp, 1));
                         }
                         *cursor = end;
-                        direct_next = Some(HeapTermSlot::from_index(hp));
+                        direct_next =
+                            Some(super::raw::HeapSlotPtr::at(words, hp).ok_or(BifError::BADARG)?);
                         hp = end;
                         Some(size)
                     } else {
@@ -3958,8 +4000,8 @@ fn decode_direct_step(
                             words[hp + 2 + index] = u64::from_ne_bytes(word);
                         }
                         let term_word = base.wrapping_add((hp * 8) as u64) | 2;
-                        if let Some(index) = slot_index {
-                            words[index] = term_word;
+                        if let Some(slot) = slot_ptr {
+                            slot.store(term_word);
                         } else {
                             root_block = Some((hp, 2));
                         }
@@ -3968,12 +4010,19 @@ fn decode_direct_step(
                         Some(1 + (budget.saturating_sub(work).min(size / B2T_MEMCPY_FACTOR)))
                     }
                 }
+                121 => {
+                    // Port of external.c:5250-5255 (`dec_term`, LOCAL_EXT), OTP-29.1.1.
+                    r.take(4)?;
+                    *internal_nc = true;
+                    None
+                }
                 _ => None,
             };
             if direct_work.is_none()
-                && let Some(index) = slot_index
+                && tag == 121
+                && let Some(slot) = slot_ptr
             {
-                words[index] = chain as u64;
+                slot.store(continuation.map_or(0, super::raw::HeapSlotPtr::address));
             }
             let direct = direct_work.map(|amount| (root_term, root_block, direct_next, amount));
             (tag, continuation, direct, *cursor)
@@ -3993,15 +4042,26 @@ fn decode_direct_step(
                 };
             }
             *root_started = true;
-            *next = direct_next;
-            cur = direct_next.and_then(HeapTermSlot::word_index);
+            cur = direct_next;
             hp = cursor_hp;
-            work = work.saturating_add(direct_work);
+            work += direct_work;
+            if work >= budget && cur.is_some() {
+                *next = cur;
+                return Ok((None, work));
+            }
             continue;
         }
         *next = None;
         let term = match tag {
             97 | 98 | 106 => unreachable!("hot immediate tags are decoded in the loop"),
+            121 => {
+                if let DecodeTarget::Heap(slot) = target {
+                    *next = Some(slot);
+                    next_was_set = true;
+                }
+                reprocess_target = true;
+                None
+            }
             110 | 111 => {
                 let length = if tag == 110 {
                     r.u8()? as usize
@@ -4111,9 +4171,7 @@ fn decode_direct_step(
                 let size = r.u32()? as usize;
                 if size == 0 {
                     if let DecodeTarget::Heap(slot) = target {
-                        ctx.heap
-                            .write_next_slot(slot, continuation)
-                            .map_err(map_term_build_error)?;
+                        slot.store(continuation.map_or(0, super::raw::HeapSlotPtr::address));
                         *next = Some(slot);
                         next_was_set = true;
                     }
@@ -4125,13 +4183,17 @@ fn decode_direct_step(
                         .map_err(map_term_build_error)?;
                     let term = block.list_at(0).map_err(map_term_build_error)?;
                     let last_car = block
-                        .write_list_tail(continuation)
+                        .write_list_tail(
+                            continuation
+                                .map(|slot| decode_heap_slot(ctx, slot))
+                                .transpose()?,
+                        )
                         .map_err(map_term_build_error)?;
                     *pending = Some(DecodePending::List {
                         block,
                         size,
                         next_index: size - 1,
-                        chain: Some(last_car),
+                        chain: Some(decode_slot_ptr(ctx, last_car)?),
                         continuation,
                     });
                     next_was_set = true;
@@ -4175,7 +4237,9 @@ fn decode_direct_step(
                     let term = block.term_at(size + 1).map_err(map_term_build_error)?;
                     let keys = block.term_slot(1).map_err(map_term_build_error)?;
                     let values = block.term_slot(size + 4).map_err(map_term_build_error)?;
-                    let mut child = continuation;
+                    let mut child = continuation
+                        .map(|slot| decode_heap_slot(ctx, slot))
+                        .transpose()?;
                     for index in (0..size).rev() {
                         let key = ctx
                             .heap
@@ -4194,7 +4258,7 @@ fn decode_direct_step(
                         child = Some(key);
                     }
                     maps.push(DecodeMap::Flatmap { keys, values, size });
-                    *next = child;
+                    *next = decode_slot_ptrs(ctx, child)?;
                     next_was_set = true;
                     Some(term)
                 } else {
@@ -4202,7 +4266,9 @@ fn decode_direct_step(
                         .reserve_boxed_words(size * 2, 0)
                         .map_err(map_term_build_error)?;
                     let pairs = block.term_slot(0).map_err(map_term_build_error)?;
-                    let mut child = continuation;
+                    let mut child = continuation
+                        .map(|slot| decode_heap_slot(ctx, slot))
+                        .transpose()?;
                     for index in (0..size).rev() {
                         let key = block.term_slot(index * 2).map_err(map_term_build_error)?;
                         let value = block
@@ -4221,7 +4287,7 @@ fn decode_direct_step(
                         pairs,
                         size,
                     });
-                    *next = child;
+                    *next = decode_slot_ptrs(ctx, child)?;
                     next_was_set = true;
                     defer_output = true;
                     None
@@ -4291,7 +4357,9 @@ fn decode_direct_step(
                     .reserve_local_fun_stub(entry, free)
                     .map_err(map_term_build_error)?;
                 if let Some(first) = environment {
-                    let mut child = continuation;
+                    let mut child = continuation
+                        .map(|slot| decode_heap_slot(ctx, slot))
+                        .transpose()?;
                     for offset in (0..free).rev() {
                         let slot = ctx
                             .heap
@@ -4302,7 +4370,7 @@ fn decode_direct_step(
                             .map_err(map_term_build_error)?;
                         child = Some(slot);
                     }
-                    *next = child;
+                    *next = decode_slot_ptrs(ctx, child)?;
                     next_was_set = true;
                 }
                 Some(term)
@@ -4495,10 +4563,7 @@ fn decode_direct_step(
                 }
             }
             _ => {
-                let mut legacy = Reader {
-                    bytes: r.bytes,
-                    at: tag_start,
-                };
+                let mut legacy = Reader::new(r.bytes, tag_start);
                 let mut legacy_stack = SmallVec::new();
                 let parsed = parse_step(
                     &mut legacy,
@@ -4518,7 +4583,7 @@ fn decode_direct_step(
         };
         if let Some(term) = term {
             if !defer_output {
-                write_decode_target(ctx, target, root, term)?;
+                write_decode_target(target, root, term)?;
             }
             *root_started = true;
             if !next_was_set {
@@ -4527,8 +4592,10 @@ fn decode_direct_step(
         } else if !reprocess_target && !*root_started {
             *root_started = true;
         }
-        work = work.saturating_add(1);
-        cur = next.and_then(HeapTermSlot::word_index);
+        if tag != 121 {
+            work += 1;
+        }
+        cur = *next;
         if !matches!(tag, 97 | 98 | 104 | 105 | 106 | 107 | 108) {
             let (_, cursor) = ctx.heap.words_and_cursor();
             hp = *cursor;
@@ -4536,14 +4603,11 @@ fn decode_direct_step(
         if yield_after_write {
             return Ok((None, work));
         }
-    }
-    if pending.is_none() && *root_started && cur.is_none() {
-        Ok((Some((*root, r.at)), work))
-    } else {
-        // `cur` is the next unfilled slot after the local dec_term-style walk.
-        // Publish it only when the reduction budget stops this invocation.
-        *next = cur.map(HeapTermSlot::from_index);
-        Ok((None, work))
+        if work >= budget && cur.is_some() {
+            // Publish `next` only when the reduction budget stops this invocation.
+            *next = cur;
+            return Ok((None, work));
+        }
     }
 }
 
@@ -4554,7 +4618,7 @@ pub struct DecodeWalk<'a> {
     validator_at: usize,
     decode_at: usize,
     stack: SmallVec<[Frame; 4]>,
-    decode_next: Option<HeapTermSlot>,
+    decode_next: Option<super::raw::HeapSlotPtr>,
     decode_root: Term,
     decode_root_started: bool,
     // Port of `PSTACK_DECLARE(map_array, 10)` in external.c:4316, OTP-29.1.1.
@@ -4655,48 +4719,32 @@ impl<'a> DecodeWalk<'a> {
         byte_budget: usize,
         trap_context: &mut Option<DecodeWalk<'a>>,
     ) -> Result<Option<(Term, usize)>, (BifError, usize)> {
-        let opts = decode_options(args.get(1).copied()).map_err(|error| (error, 0))?;
-        let (_, view) = decode_binary_view(args).map_err(|error| (error, 0))?;
-        if !view.bit_len().is_multiple_of(8) {
-            return Err((BifError::BADARG, 0));
-        }
-        if !view.start_bit().is_multiple_of(8) {
+        let mut decoder = Self::new(args).map_err(|error| (error, 0))?;
+        if decoder.compressed {
             return Ok(None);
         }
-        let start = view.start_bit() / 8;
-        let len = view.bit_len() / 8;
-        let bytes = view
-            .bytes()
-            .get(start..start + len)
-            .ok_or((BifError::BADARG, 0))?;
-        if bytes.first() != Some(&131) {
-            return Err((BifError::BADARG, 0));
-        }
-        if bytes.get(1) == Some(&80) {
-            return Ok(None);
-        }
-        let body = &bytes[1..];
-
-        let mut sizing = DecodedSizeWalk::new();
-        let (size, size_work) = sizing
+        let body = &decoder.input.bytes()[1..];
+        let (size, size_work) = decoder
+            .sizing
             .step(body, byte_budget, true, local_term_hash)
             .map_err(|_| (BifError::BADARG, 0))?;
         let Some((heap_words, checked)) = size else {
-            *trap_context = Some(Self::after_sizing(
-                args, local_node, sizing, None, false, size_work,
-            )?);
+            decoder.local_node = local_node;
+            decoder.initial_work = size_work;
+            *trap_context = Some(decoder);
             return Ok(None);
         };
+        let validated_body = decoder
+            .sizing
+            .validated_body(body)
+            .ok_or((BifError::BADARG, size_work))?;
         let remaining_reds = byte_budget.saturating_sub(size_work);
         if body.len() > remaining_reds {
-            *trap_context = Some(Self::after_sizing(
-                args,
-                local_node,
-                sizing,
-                Some(heap_words),
-                true,
-                size_work,
-            )?);
+            decoder.local_node = local_node;
+            decoder.heap_words = Some(heap_words);
+            decoder.size_done = true;
+            decoder.initial_work = size_work;
+            *trap_context = Some(decoder);
             return Ok(None);
         }
         // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1:
@@ -4704,7 +4752,17 @@ impl<'a> DecodeWalk<'a> {
         // heap fragment that the BIF epilogue would treat as live.
         let mark = heap.factory_mark();
         let result = Self::decode_reserved(
-            args, heap, local_node, &opts, body, heap_words, checked, size_work,
+            args,
+            heap,
+            local_node,
+            &DecodeOpts {
+                safe: decoder.safe,
+                used: decoder.used,
+            },
+            validated_body,
+            heap_words,
+            checked,
+            size_work,
         );
         if result.is_err() {
             heap.factory_undo(mark);
@@ -4718,7 +4776,7 @@ impl<'a> DecodeWalk<'a> {
         heap: &mut ProcessHeap,
         local_node: Option<(Atom, u32)>,
         opts: &DecodeOpts,
-        body: &[u8],
+        validated_body: ValidatedEtfBody<'_>,
         heap_words: usize,
         checked: usize,
         size_work: usize,
@@ -4735,7 +4793,7 @@ impl<'a> DecodeWalk<'a> {
             .with_words(|reserved_words| {
                 let mut state = crate::BifState::default();
                 let mut decode_ctx = Ctx::with_allocator(reserved_words, &mut state);
-                let mut reader = Reader { bytes: body, at: 0 };
+                let mut reader = Reader::from_validated(validated_body);
                 let parsed = decode_direct_step(
                     &mut reader,
                     &mut next,
@@ -4774,24 +4832,6 @@ impl<'a> DecodeWalk<'a> {
             root
         };
         Ok(Some((value, size_work + decode_work)))
-    }
-
-    fn after_sizing(
-        args: &'a [Term],
-        local_node: Option<(Atom, u32)>,
-        sizing: DecodedSizeWalk,
-        heap_words: Option<usize>,
-        size_done: bool,
-        size_work: usize,
-    ) -> Result<Self, (BifError, usize)> {
-        // Port of external.c B2TSize -> B2TDecodeInit state transfer, OTP-29.1.1.
-        let mut decoder = Self::new(args).map_err(|error| (error, size_work))?;
-        decoder.local_node = local_node;
-        decoder.sizing = sizing;
-        decoder.heap_words = heap_words;
-        decoder.size_done = size_done;
-        decoder.initial_work = size_work;
-        Ok(decoder)
     }
 
     /// Configure this node's identity for external pid, port, and reference terms.
@@ -4971,7 +5011,7 @@ impl<'a> DecodeWalk<'a> {
                 } else {
                     &self.input.bytes()[1..]
                 };
-                let mut reader = Reader { bytes, at: before };
+                let mut reader = Reader::new(bytes, before);
                 let parsed = parse_step(
                     &mut reader,
                     &mut self.stack,
@@ -5085,7 +5125,11 @@ impl<'a> DecodeWalk<'a> {
                 } else {
                     &self.input.bytes()[1..]
                 };
-                let mut reader = Reader { bytes, at: before };
+                let validated_body = self
+                    .sizing
+                    .validated_body(bytes)
+                    .expect("direct decode follows a completed sizing pass");
+                let mut reader = Reader::from_validated_at(validated_body, before);
                 let parsed = decode_direct_step(
                     &mut reader,
                     &mut self.decode_next,
