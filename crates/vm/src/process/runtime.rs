@@ -252,13 +252,12 @@ impl Runtime {
 }
 
 /// Suspend-monitor pause of one process's receive timeout (erts `ErtsPausedProcTimer`): the
-/// number of active suspends holding it and the time spent paused.
+/// number of active suspends holding it and the time the timer had left when it was paused.
 pub(crate) struct TimerPause {
     count: u32,
-    since: std::time::Instant,
-    /// `since` on the virtual clock of a simulated runtime.
-    since_ms: u64,
-    shift: std::time::Duration,
+    /// `time_left_in_msec`; `None` when no unfired receive timer was set at the first pause
+    /// (erts then creates no paused timer and the resume leaves the timer word alone).
+    time_left_ms: Option<u64>,
 }
 
 /// Text and counters returned by a scheduler-backed entry process.
@@ -332,32 +331,43 @@ impl Runtime {
     }
 
     /// `erts_pause_proc_timer`: one more active suspend holds `process`' receive timeout and the
-    /// BIF timers aimed at it. The count nests like erts' `pptmr->count` and
+    /// BIF timers aimed at it. The first pause cancels a set receive timer that has not fired
+    /// and records the time it had left, so it cannot fire while the process is suspended; a
+    /// timer that already fired stays fired. The count nests like erts' `pptmr->count` and
     /// `paused_bif_timers->count`.
-    // Port of erts/emulator/beam/erl_hl_timer.c:2849 (erts_pause_proc_timer) and :2864
-    // (erts_pause_bif_timers), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2849 (erts_pause_proc_timer), :1029
+    // (create_paused_proc_timer) and :2864 (erts_pause_bif_timers), OTP-29.1.1.
     pub(crate) fn erts_pause_proc_timer(&self, process: &mut Process, pid: Pid) {
-        let first = {
-            let mut work = process.slice_mut();
-            let pause = work.timer_pause.get_or_insert_with(|| TimerPause {
-                count: 0,
-                since: std::time::Instant::now(),
-                since_ms: 0,
-                shift: std::time::Duration::ZERO,
-            });
+        if let Some(pause) = process.timer_pause_mut() {
             pause.count += 1;
-            if pause.count == 1 {
-                pause.since = std::time::Instant::now();
-                pause.since_ms = self.virtual_ms.load(Ordering::Relaxed);
+            return;
+        }
+        // create_paused_proc_timer: only a set timer that is neither NONE nor TIMEDOUT is paused.
+        let time_left_ms = match process.receive_timeout_pos {
+            Some(pos) if !process.receive_timer_timed_out() => {
+                let now = self.receive_clock_now_ms();
+                // CANCEL_TIMER: the timer word is cleared, so a fire racing with the pause finds
+                // nothing to time out. `receive_timeout_pos` stays set, as erts keeps
+                // `common.timer` non-NONE (the paused timer) and the wait does not set it again.
+                if let Some(probe) = process.signal_probe() {
+                    probe.receive_timer().cancel();
+                }
+                Some(pos.saturating_sub(now))
             }
-            pause.count == 1
+            _ => None,
         };
-        if first && let Ok(scheduler) = self.scheduler() {
+        process.slice_mut().timer_pause = Some(TimerPause {
+            count: 1,
+            time_left_ms,
+        });
+        if let Ok(scheduler) = self.scheduler() {
             scheduler.pause_target_timers(pid);
         }
     }
 
-    /// `erts_resume_paused_proc_timer`: the last resume re-arms what the pauses held.
+    /// `erts_resume_paused_proc_timer`: the last resume sets the receive timer again with the
+    /// time it had left (`erts_set_proc_timer_uword(c_p, time_left)`, a zero left times out at
+    /// once), and re-arms the BIF timers the pauses held.
     // Port of erts/emulator/beam/erl_hl_timer.c:2919 (erts_resume_paused_proc_timer) and :2949
     // (erts_resume_paused_bif_timers), OTP-29.1.1.
     pub(crate) fn erts_resume_proc_timer(&self, process: &mut Process, pid: Pid) {
@@ -365,31 +375,30 @@ impl Runtime {
             return;
         };
         pause.count = pause.count.saturating_sub(1);
-        if pause.count == 0 {
-            pause.shift += if self.simulated {
-                std::time::Duration::from_millis(
-                    self.virtual_ms
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(pause.since_ms),
-                )
-            } else {
-                pause.since.elapsed()
-            };
-            if let Ok(scheduler) = self.scheduler() {
-                scheduler.resume_target_timers(pid);
-            }
+        if pause.count != 0 {
+            return;
+        }
+        let Some(pause) = process.take_work(|work| work.timer_pause.take()) else {
+            return;
+        };
+        if let Some(left) = pause.time_left_ms
+            && process.receive_timeout_pos.is_some()
+        {
+            // The next wait finds the timer word clear and sets the timer at this position.
+            process.receive_timeout_pos = Some(self.receive_clock_now_ms().saturating_add(left));
+        }
+        if let Ok(scheduler) = self.scheduler() {
+            scheduler.resume_target_timers(pid);
         }
     }
 
-    /// Time the process spent suspended since it last asked; shifts its receive deadline.
-    pub(crate) fn take_pause_shift(&self, process: &mut Process) -> Option<std::time::Duration> {
-        let pause = process.slice()?.timer_pause.as_ref()?;
-        if pause.count != 0 {
-            return None;
+    /// Current position of the clock receive timeout positions are taken on.
+    fn receive_clock_now_ms(&self) -> u64 {
+        if self.simulated {
+            self.virtual_ms.load(Ordering::Relaxed)
+        } else {
+            arinsal_sched::receive_timeout_pos(0)
         }
-        process
-            .take_work(|work| work.timer_pause.take())
-            .map(|pause| pause.shift)
     }
 
     /// Live pids in this runtime's process table.
