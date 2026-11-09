@@ -703,6 +703,18 @@ impl DecodedSizeWalk {
         })
     }
 
+    /// Move a completed sizing proof from `sized` to `copy` when both hold the same bytes.
+    pub fn rebind_input(&mut self, sized: &[u8], copy: &[u8]) -> bool {
+        let Some((source, length, end)) = self.checked_input else {
+            return false;
+        };
+        if source != sized.as_ptr() as usize || length != sized.len() || sized != copy {
+            return false;
+        }
+        self.checked_input = Some((copy.as_ptr() as usize, length, end));
+        true
+    }
+
     /// Scan at most `work_budget` tags, allowing a tag to consume its complete payload.
     /// `input_complete` distinguishes
     /// an invalid short term from a compressed term whose next bytes are not inflated yet.
