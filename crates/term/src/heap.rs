@@ -5398,9 +5398,11 @@ impl HeapBlockBuilder {
             (self.start as *mut u64).wrapping_add(cdr_offset),
             continuation as u64,
         );
+        // external.c:4592 `objp[0] = (Eterm) (objp+1)`: the last car links to its own cdr,
+        // where the list tail is decoded.
         store(
             (self.start as *mut u64).wrapping_add(car_offset),
-            base.wrapping_add(cdr + 1) as u64,
+            base.wrapping_add(cdr) as u64,
         );
         Ok(HeapTermSlot::index(car))
     }

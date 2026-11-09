@@ -138,3 +138,43 @@ fn binary_to_term_borrowed_and_copied_inputs_match_erts() {
         .term;
     assert_eq!(actual, expected);
 }
+
+const TRAPPED_LIST_SOURCE: &str = r#"
+-module(etf_external_trapped_list_diff).
+-export([run/0]).
+%% Lists longer than the slice budget take the B2TDecodeList path of dec_term: the last car
+%% links to its own cdr, where the tail is decoded in a later slice.
+run() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    Long = lists:seq(1, 300),
+    Improper = lists:foldr(fun(X, Acc) -> [X | Acc] end, tail, Long),
+    Terms = [Long, Improper, [Long | Improper], {Long, [Improper], "abc"},
+             [make_ref(), self(), 1 bsl 300 | Long]],
+    [[decode(Reds, term_to_binary(T)) =:= T || T <- Terms] || Reds <- [1, 2, 3, 7, 40]].
+decode(Reds, Bin) ->
+    erts_debug:set_internal_state(reds_left, Reds),
+    binary_to_term(Bin).
+"#;
+
+#[test]
+fn binary_to_term_trapped_list_tail_matches_erts() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping binary_to_term trapped-list differential test");
+        return;
+    };
+    let module = "etf_external_trapped_list_diff";
+    let beam = reference
+        .compile_named(module, TRAPPED_LIST_SOURCE, &[])
+        .unwrap();
+    reference.load(module, &beam).unwrap();
+    let CallResult::Ok(expected) = reference.call(module, "run", &[]) else {
+        panic!("reference call failed");
+    };
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled(module, "run", &[], 1, Some(73))
+        .unwrap()
+        .term;
+    assert_eq!(actual, expected);
+}
