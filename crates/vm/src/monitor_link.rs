@@ -166,8 +166,21 @@ impl KeyOrder for ReferenceOrder {
 pub(crate) struct PidOrder;
 
 impl KeyOrder for PidOrder {
+    /// Port of erts/emulator/beam/erl_monitor_link.c (ml_cmp_keys), OTP-29.1.1: immediate
+    /// keys by value before boxed external pid keys, which compare by their contents.
     fn compare(left: u64, right: u64) -> Ordering {
-        left.cmp(&right)
+        match (is_external_key(left), is_external_key(right)) {
+            (false, false) => left.cmp(&right),
+            (false, true) => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            (true, true) => {
+                let pid = |key: u64| (key & !EXTERNAL_KEY) as *const ExternalPid;
+                // SAFETY: a key with `EXTERNAL_KEY` is made only by `ExternalPid::key`, from an
+                // external pid inside a live `ELink` in the tree or one the looking-up caller
+                // borrows for the whole lookup.
+                unsafe { external_ml_cmp(&*pid(left), &*pid(right)) }
+            }
+        }
     }
 }
 
@@ -1526,6 +1539,7 @@ impl<I, O, S> Monitor<I, O, S> {
 
     /// Releases both halves after a local demonitor removed each from its owning table.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_DEMONITOR), OTP-29.1.1.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn release_both(origin: Self, target: Self) {
         debug_assert!(!origin.view().is_target());
         debug_assert!(target.view().is_target());
@@ -1689,29 +1703,174 @@ impl arinsal_alloc::typed::FixAllocRefCount for ILink {
     }
 }
 
-/// A local link owned by the process at one end (`ErtsLink` of an `ErtsILink`).
-pub(crate) struct Link {
-    data: arinsal_alloc::typed::FixAllocArc<ILink>,
+/// Tag of a link key that is a boxed external pid (erts: a boxed `Eterm` key pointing into
+/// `ErtsELink::heap`). Internal pid keys are 60-bit table data and port keys set only bit 63
+/// (`proc_create::port_link_key`), so with both top bits external pids sort after both, as in
+/// erts `ml_cmp_keys`: internal pid < internal port < external pid.
+const EXTERNAL_KEY: u64 = 3 << 62;
+
+fn is_external_key(key: u64) -> bool {
+    key & EXTERNAL_KEY == EXTERNAL_KEY
 }
 
-// SAFETY: a link node holds plain data and is moved between processes only as a whole.
+/// The external pid an external link is keyed by: the `ExternalThing` erts copies into
+/// `ErtsELink::heap` with `STORE_NC` (node sysname and creation, then the data words).
+pub(crate) use arinsal_sched::ExternalPid;
+
+/// Port of erts/emulator/beam/erl_monitor_link.c (ml_cmp_keys, external keys), OTP-29.1.1:
+/// node sysname atom, then creation, then the data words. Like erts this is not term order.
+fn external_ml_cmp(left: &ExternalPid, right: &ExternalPid) -> Ordering {
+    left.sysname
+        .cmp(&right.sysname)
+        .then(left.creation.cmp(&right.creation))
+        .then(left.number.cmp(&right.number))
+        .then(left.serial.cmp(&right.serial))
+}
+
+/// The boxed key of `pid` while it stays in place.
+fn external_key(pid: &ExternalPid) -> u64 {
+    EXTERNAL_KEY | std::ptr::from_ref(pid) as u64
+}
+
+/// Distribution state attached to an external link or monitor (`ErtsMonLnkDist`): the
+/// connection the dist half was inserted in, or the dead-dist record of a link made while the
+/// node was not alive or not connected.
+pub(crate) struct MonLnkDist {
+    /// `nodename`: the node name atom index.
+    pub(crate) nodename: u32,
+    /// `connection_id`; `!0` until a connection sets it.
+    pub(crate) connection_id: u32,
+    /// `mtx` and what it protects.
+    state: std::sync::Mutex<MonLnkDistState>,
+}
+
+/// The fields of `ErtsMonLnkDist` under `mtx`.
+struct MonLnkDistState {
+    /// `alive`.
+    alive: bool,
+    /// `links`: a circular list of dist halves, each owning one reference to its `ELink`.
+    links: Option<NodePtr>,
+}
+
+// SAFETY: the list nodes are dist halves of `ELink`s whose shared fields are atomic or
+// immutable; they are reached only under the mutex.
+unsafe impl Send for MonLnkDistState {}
+
+impl std::fmt::Debug for MonLnkDist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonLnkDist")
+            .field("nodename", &self.nodename)
+            .field("connection_id", &self.connection_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MonLnkDist {
+    /// Port of erts/emulator/beam/erl_monitor_link.c (erts_mon_link_dist_create), OTP-29.1.1.
+    pub(crate) fn new(nodename: u32) -> Self {
+        Self::with_connection(nodename, !0)
+    }
+
+    /// `erts_mon_link_dist_create` followed by `mld->connection_id = dep->connection_id`
+    /// (erl_node_tables.c, erts_set_dist_entry_pending).
+    pub(crate) fn with_connection(nodename: u32, connection_id: u32) -> Self {
+        Self {
+            nodename,
+            connection_id,
+            state: std::sync::Mutex::new(MonLnkDistState {
+                alive: true,
+                links: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MonLnkDistState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `mld->alive`.
+    #[cfg(test)]
+    pub(crate) fn is_alive(&self) -> bool {
+        self.lock().alive
+    }
+
+    /// Port of erts/emulator/beam/dist.c (con_monitor_link_seq_cleanup, the links state),
+    /// OTP-29.1.1: mark the connection dead and take its link list, in list order.
+    pub(crate) fn take_links(&self) -> Vec<Link> {
+        let mut state = self.lock();
+        state.alive = false;
+        let mut links = Vec::new();
+        if let Some(first) = state.links.take() {
+            let mut node = first;
+            loop {
+                let next = list_links(node).next.expect("circular list");
+                set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
+                links.push(Link { node });
+                if next == first {
+                    break;
+                }
+                node = next;
+            }
+        }
+        links
+    }
+}
+
+/// An external link (`ErtsELink`): both halves in one allocation shared by reference count.
+#[repr(C)]
+struct ELink {
+    /// `ld.proc`: held in the process link tree, keyed by the external pid.
+    proc_half: MonLnkNode,
+    /// `ld.dist`: held by the dist entry; its other item is the local pid.
+    dist_half: MonLnkNode,
+    /// `ld.refc`.
+    reference_count: AtomicU32,
+    /// `dist`.
+    dist: Option<std::sync::Arc<MonLnkDist>>,
+    /// `unlinking`.
+    unlinking: u64,
+    /// `heap`: the key of `proc_half`.
+    pid: ExternalPid,
+}
+
+/// A link half owned by the process at one end, or by a dist entry (`ErtsLink`): one node of
+/// an `ErtsILink` (local link) or of an `ErtsELink` (external link, `ERTS_ML_FLG_EXTENDED`).
+pub(crate) struct Link {
+    node: NodePtr,
+}
+
+// SAFETY: a link node holds plain data and is moved between processes only as a whole; the
+// two halves of an external link share only their atomic reference count and immutable data.
 unsafe impl Send for Link {}
+
+impl Drop for Link {
+    /// `erts_link_release`.
+    fn drop(&mut self) {
+        if node_flags(self.node) & node_flag::EXTENDED != 0 {
+            elink_release(self.node, 1);
+        } else {
+            // SAFETY: an unextended link node is the first field of an `ILink` that
+            // `Link::create` allocated, and this handle owns one transferred reference to it.
+            drop(unsafe {
+                arinsal_alloc::typed::FixAllocArc::<ILink>::from_raw(node_to_main(self.node).cast())
+            });
+        }
+    }
+}
 
 impl NodeHandle for Link {
     type Order = PidOrder;
 
     fn into_node(self) -> NodePtr {
-        let node = NonNull::from(&self.data.link);
-        let _ = self.data.into_raw();
+        let node = self.node;
+        std::mem::forget(self);
         node
     }
 
     fn from_node(node: ContainedNode<Self>) -> Self {
-        // SAFETY: `ContainedNode<Link>` is made only from a live link half transferred by
-        // `Link::into_node`, and each transfer carries one reference-counted owner.
-        let data =
-            unsafe { arinsal_alloc::typed::FixAllocArc::from_raw(node_to_main(node.node).cast()) };
-        Self { data }
+        Self { node: node.node }
     }
 }
 
@@ -1720,18 +1879,169 @@ impl Link {
     pub(crate) fn create(kind: u32, other: u64, flags: u32) -> Self {
         debug_assert!((node_type::LINK_PROC..=node_type::LINK_DIST_PORT).contains(&kind));
         debug_assert_eq!(flags & node_flag::RESERVED, 0);
+        debug_assert!(!is_external_key(other));
         let data = arinsal_alloc::typed::FixAllocArc::new(ILink {
             link: MonLnkNode::new(other, 0, offset_of!(MonLnkNode, other), kind | flags),
             unlinking: 0,
             reference_count: AtomicU32::new(0),
         })
         .expect("fixed-size link allocation");
-        Self { data }
+        let main = data.into_raw();
+        Self {
+            node: main.cast::<MonLnkNode>(),
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.c (erts_link_external_create), OTP-29.1.1:
+    /// an external link from local process `this` to `other`. The first half (`ld.proc`) is
+    /// keyed by `other` and goes into the process link tree; the second (`ld.dist`) has
+    /// `this` as its other item and goes into the dist entry's link list.
+    pub(crate) fn create_external(kind: u32, this: u64, other: ExternalPid) -> (Self, Self) {
+        debug_assert!(kind == node_type::LINK_DIST_PROC || kind == node_type::LINK_DIST_PORT);
+        debug_assert!(!is_external_key(this));
+        let flags = node_flag::EXTENDED | kind;
+        let elink = Box::new(ELink {
+            proc_half: MonLnkNode::new(
+                0,
+                offset_of!(ELink, proc_half),
+                offset_of!(MonLnkNode, other),
+                flags,
+            ),
+            dist_half: MonLnkNode::new(
+                this,
+                offset_of!(ELink, dist_half),
+                offset_of!(MonLnkNode, other),
+                flags,
+            ),
+            reference_count: AtomicU32::new(2),
+            dist: None,
+            unlinking: 0,
+            pid: other,
+        });
+        let main = NonNull::from(Box::leak(elink));
+        // SAFETY: `main` is the only pointer to the fresh allocation; the proc half's key is
+        // a boxed pointer to the external pid in the same allocation, as erts stores the key
+        // `Eterm` into `elnk->heap`. Neither field is written again while the link lives.
+        unsafe {
+            let pid = std::ptr::addr_of!((*main.as_ptr()).pid);
+            (*main.as_ptr()).proc_half.other = EXTERNAL_KEY | pid as u64;
+        }
+        // SAFETY: as above; these form pointers to the two node fields of the live allocation.
+        let (proc_half, dist_half) = unsafe {
+            (
+                NonNull::new_unchecked(std::ptr::addr_of_mut!((*main.as_ptr()).proc_half)),
+                NonNull::new_unchecked(std::ptr::addr_of_mut!((*main.as_ptr()).dist_half)),
+            )
+        };
+        (Self { node: proc_half }, Self { node: dist_half })
+    }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.h (erts_link_release_both), OTP-29.1.1.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn release_both(first: Self, second: Self) {
+        debug_assert_eq!(node_to_main(first.node), node_to_main(second.node));
+        let node = first.into_node();
+        let _ = second.into_node();
+        if node_flags(node) & node_flag::EXTENDED != 0 {
+            elink_release(node, 2);
+        } else {
+            unreachable!("only an external link has two halves");
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.h (erts_link_dist_insert), OTP-29.1.1:
+    /// put this dist half into the connection's link list unless the connection is dead, in
+    /// which case the half comes back.
+    pub(crate) fn dist_insert(self, dist: &std::sync::Arc<MonLnkDist>) -> Result<(), Self> {
+        let elink = elink_of(self.node).expect("dist insert of an external link");
+        debug_assert_eq!(
+            node_flags(self.node) & node_flag::TYPE_MASK,
+            node_type::LINK_DIST_PROC
+        );
+        let mut state = dist.lock();
+        if !state.alive {
+            return Err(self);
+        }
+        // SAFETY: the dist half is not published yet, so nothing reads `dist` meanwhile.
+        unsafe {
+            debug_assert!((*elink.as_ptr()).dist.is_none());
+            (*elink.as_ptr()).dist = Some(dist.clone());
+        }
+        let node = self.into_node();
+        match state.links {
+            None => {
+                *list_links_mut(node) = ListLinks {
+                    next: Some(node),
+                    prev: Some(node),
+                };
+                state.links = Some(node);
+            }
+            Some(first) => {
+                let last = list_links(first).prev.expect("circular list");
+                *list_links_mut(node) = ListLinks {
+                    next: Some(first),
+                    prev: Some(last),
+                };
+                list_links_mut(first).prev = Some(node);
+                list_links_mut(last).next = Some(node);
+            }
+        }
+        set_node_flags(node, node_flags(node) | node_flag::IN_TABLE);
+        Ok(())
+    }
+
+    /// `erts_link_dist_delete(erts_link_to_other(lnk))` on the proc half of an external link:
+    /// whether the dist half left its connection's list now (or never had a connection), so
+    /// that its reference passes to the caller.
+    pub(crate) fn dist_delete_other(&self) -> bool {
+        let elink = elink_of(self.node).expect("dist delete of an external link");
+        // SAFETY: `dist` is written only before the dist half is published.
+        let dist = unsafe { (*elink.as_ptr()).dist.as_ref() };
+        let Some(dist) = dist else {
+            return true;
+        };
+        // SAFETY: the dist half lives in the same allocation; this forms a field pointer.
+        let node =
+            unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*elink.as_ptr()).dist_half)) };
+        let mut state = dist.lock();
+        let delete = state.alive && node_flags(node) & node_flag::IN_TABLE != 0;
+        if delete {
+            let links = list_links(node);
+            let next = links.next.expect("circular list");
+            if next == node {
+                state.links = None;
+            } else {
+                let prev = links.prev.expect("circular list");
+                if state.links == Some(node) {
+                    state.links = Some(next);
+                }
+                list_links_mut(prev).next = Some(next);
+                list_links_mut(next).prev = Some(prev);
+            }
+            set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
+        }
+        delete
+    }
+
+    /// Release the proc half of an external link after [`Link::dist_delete_other`]:
+    /// `erts_link_release_both` when the dist half's reference came along, else
+    /// `erts_link_release`.
+    pub(crate) fn release_external(self, other_deleted: bool) {
+        let node = self.into_node();
+        elink_release(node, if other_deleted { 2 } else { 1 });
     }
 
     pub(crate) fn view(&self) -> LinkRef<'_> {
         LinkRef {
-            node: NonNull::from(&self.data.link),
+            node: self.node,
+            _link: PhantomData,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn view_mut(&mut self) -> LinkMut<'_> {
+        LinkMut {
+            node: self.node,
             _link: PhantomData,
         }
     }
@@ -1739,7 +2049,8 @@ impl Link {
     /// Give this half's allocation to an intrusive signal queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_link), OTP-29.1.1.
     pub(crate) fn into_signal_header(self) -> NonNull<u8> {
-        self.data.into_raw().cast::<MonLnkNode>().cast()
+        debug_assert_eq!(node_flags(self.node) & node_flag::EXTENDED, 0);
+        self.into_node().cast()
     }
 
     /// Take back a link half whose tree links were overlaid by a signal queue header.
@@ -1750,21 +2061,38 @@ impl Link {
             _handle: PhantomData,
         })
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn view_mut(&mut self) -> LinkMut<'_> {
-        LinkMut {
-            node: NonNull::from(&self.data.link),
-            _link: PhantomData,
-        }
+/// Drop `count` owners of the external link holding `node` (`erts_link_release`,
+/// `erts_link_release_both`, `erts_link_destroy_elink__`).
+fn elink_release(node: NodePtr, count: u32) {
+    let main = node_to_main(node).cast::<ELink>();
+    // SAFETY: an extended link node lives in an `ELink` that `Link::create_external`
+    // leaked from a `Box`; the caller gives up `count` owners of it.
+    let old = unsafe { main.as_ref() }
+        .reference_count
+        .fetch_sub(count, AtomicOrdering::AcqRel);
+    debug_assert!(old >= count);
+    if old == count {
+        // SAFETY: these were the last owners, so nothing else reaches the allocation.
+        drop(unsafe { Box::from_raw(main.as_ptr()) });
     }
 }
 
 fn ilink_unlinking(node: NodePtr) -> *mut u64 {
+    if node_flags(node) & node_flag::EXTENDED != 0 {
+        let main = node_to_main(node).cast::<ELink>();
+        // SAFETY: extended link nodes live in an `ELink`; this only forms a field pointer.
+        return unsafe { std::ptr::addr_of_mut!((*main.as_ptr()).unlinking) };
+    }
     let main = node_to_main(node).cast::<ILink>();
-    // SAFETY: link nodes are created only by `Link::create` as the first field of a live
-    // `ILink`; this only forms a pointer to its `unlinking` field.
+    // SAFETY: unextended link nodes are created only by `Link::create` as the first field of
+    // a live `ILink`; this only forms a pointer to its `unlinking` field.
     unsafe { std::ptr::addr_of_mut!((*main.as_ptr()).unlinking) }
+}
+
+fn elink_of(node: NodePtr) -> Option<NonNull<ELink>> {
+    (node_flags(node) & node_flag::EXTENDED != 0).then(|| node_to_main(node).cast::<ELink>())
 }
 
 /// A borrowed link.
@@ -1774,7 +2102,7 @@ pub(crate) struct LinkRef<'a> {
     _link: PhantomData<&'a Link>,
 }
 
-impl LinkRef<'_> {
+impl<'a> LinkRef<'a> {
     #[cfg(test)]
     pub(crate) fn flags(self) -> u32 {
         node_flags(self.node)
@@ -1797,6 +2125,29 @@ impl LinkRef<'_> {
     pub(crate) fn unlinking(self) -> u64 {
         // SAFETY: the view borrows the link, so the field is live and not written meanwhile.
         unsafe { ilink_unlinking(self.node).read() }
+    }
+
+    /// `ERTS_ML_FLG_EXTENDED`: a half of an external link.
+    pub(crate) fn is_external(self) -> bool {
+        node_flags(self.node) & node_flag::EXTENDED != 0
+    }
+
+    /// The external pid of an external link (`erts_link_to_elink(lnk)->ld.proc.other.item`).
+    pub(crate) fn external_pid(self) -> Option<ExternalPid> {
+        // SAFETY: the view borrows the link; `pid` is never written after creation.
+        elink_of(self.node).map(|elink| unsafe { elink.as_ref() }.pid)
+    }
+
+    /// The local pid of an external link (`ld.dist.other.item`).
+    pub(crate) fn external_local(self) -> Option<u64> {
+        // SAFETY: as in `external_pid`.
+        elink_of(self.node).map(|elink| unsafe { elink.as_ref() }.dist_half.other)
+    }
+
+    /// `elnk->dist`: the connection or dead-dist record of an external link.
+    pub(crate) fn external_dist(self) -> Option<&'a MonLnkDist> {
+        // SAFETY: as in `external_pid`; `dist` is written only through a `LinkMut`.
+        elink_of(self.node).and_then(|elink| unsafe { (*elink.as_ptr()).dist.as_deref() })
     }
 }
 
@@ -1824,6 +2175,24 @@ impl LinkMut<'_> {
         // SAFETY: the view borrows the link exclusively, so nothing else reads the field.
         unsafe { ilink_unlinking(self.node).write(unlinking) }
     }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.c (erts_link_set_dead_dist), OTP-29.1.1.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_dead_dist(&mut self, nodename: u32) {
+        let elink = elink_of(self.node).expect("dead dist on an external link");
+        debug_assert_eq!(
+            node_flags(self.node) & node_flag::TYPE_MASK,
+            node_type::LINK_DIST_PROC
+        );
+        let dist = MonLnkDist::new(nodename);
+        dist.lock().alive = false;
+        // SAFETY: the view borrows this half exclusively; the other half is not yet
+        // published, as erts sets dead dist before the link reaches a dist entry.
+        unsafe {
+            debug_assert!((*elink.as_ptr()).dist.is_none());
+            (*elink.as_ptr()).dist = Some(std::sync::Arc::new(dist));
+        }
+    }
 }
 
 impl MonLnkTree<Link> {
@@ -1840,6 +2209,56 @@ impl MonLnkTree<Link> {
             node,
             _link: PhantomData,
         })
+    }
+
+    /// `erts_link_tree_lookup` of an external pid key.
+    pub(crate) fn get_external(&self, pid: &ExternalPid) -> Option<LinkRef<'_>> {
+        self.lookup_node(external_key(pid)).map(|node| LinkRef {
+            node,
+            _link: PhantomData,
+        })
+    }
+
+    pub(crate) fn get_external_mut(&mut self, pid: &ExternalPid) -> Option<LinkMut<'_>> {
+        self.lookup_node(external_key(pid)).map(|node| LinkMut {
+            node,
+            _link: PhantomData,
+        })
+    }
+
+    pub(crate) fn remove_external(&mut self, pid: &ExternalPid) -> Option<Link> {
+        self.remove(external_key(pid))
+    }
+
+    /// Port of erts/emulator/beam/erl_monitor_link.c (erts_link_external_tree_lookup_create),
+    /// OTP-29.1.1: the link to `other`, created and inserted when missing. A created link
+    /// comes back with its dist half, which the caller inserts into the dist entry or
+    /// releases, as erts does with `&elnk->ld.dist`.
+    pub(crate) fn lookup_create_external(
+        &mut self,
+        kind: u32,
+        this: u64,
+        other: ExternalPid,
+    ) -> (LinkMut<'_>, Option<Link>) {
+        if let Some(node) = self.lookup_node(external_key(&other)) {
+            return (
+                LinkMut {
+                    node,
+                    _link: PhantomData,
+                },
+                None,
+            );
+        }
+        let (proc_half, dist_half) = Link::create_external(kind, this, other);
+        let node = proc_half.node;
+        self.insert(proc_half);
+        (
+            LinkMut {
+                node,
+                _link: PhantomData,
+            },
+            Some(dist_half),
+        )
     }
 
     /// Port of erts/emulator/beam/erl_monitor_link.c:1353 (`erts_link_tree_foreach`), OTP-29.1.1.
@@ -1889,6 +2308,114 @@ mod tests {
         *state ^= *state >> 7;
         *state ^= *state << 17;
         *state
+    }
+
+    fn external(number: u32) -> ExternalPid {
+        ExternalPid {
+            sysname: 7,
+            creation: 3,
+            number,
+            serial: 0,
+        }
+    }
+
+    #[test]
+    fn external_links_share_the_link_tree_with_internal_ones() {
+        let mut tree = MonLnkTree::<Link>::default();
+        for other in [5_u64, 1, 9] {
+            tree.insert(Link::create(node_type::LINK_PROC, other, 0));
+        }
+        let mut dist_halves = Vec::new();
+        for number in [40_u32, 2, 17] {
+            let (link, dist) =
+                tree.lookup_create_external(node_type::LINK_DIST_PROC, 5, external(number));
+            assert!(link.view().is_external());
+            dist_halves.push(dist.expect("created"));
+        }
+        check_tree(&tree);
+        tree.insert(Link::create(node_type::LINK_PORT, (1 << 63) | 4, 0));
+        // A second lookup-create finds the link by an equal pid stored elsewhere.
+        let probe = external(17);
+        let (found, dist) = tree.lookup_create_external(node_type::LINK_DIST_PROC, 5, probe);
+        assert!(dist.is_none());
+        assert_eq!(found.view().external_pid(), Some(probe));
+        assert_eq!(found.view().external_local(), Some(5));
+        // ml_cmp_keys: internal pids before external pids.
+        let order = tree
+            .iter()
+            .map(|link| link.is_external())
+            .collect::<Vec<_>>();
+        assert_eq!(order.iter().filter(|external| **external).count(), 3);
+        assert_eq!(tree.nodes().len(), 7);
+        assert!(PidOrder::compare((1 << 63) | 4, external_key(&probe)).is_lt());
+        assert!(PidOrder::compare(9, (1 << 63) | 4).is_lt());
+        assert!(tree.get(9).is_some_and(|link| !link.is_external()));
+        assert!(tree.get_external(&external(3)).is_none());
+        let removed = tree.remove_external(&external(2)).expect("present");
+        let dist = dist_halves.remove(1);
+        Link::release_both(removed, dist);
+        assert!(tree.get_external(&external(2)).is_none());
+        check_tree(&tree);
+        // The tree drops the proc halves; the dist halves are released on their own.
+        drop(dist_halves);
+    }
+
+    #[test]
+    fn dist_halves_enter_and_leave_the_connection_list() {
+        let mld = std::sync::Arc::new(MonLnkDist::with_connection(42, 7));
+        let mut tree = MonLnkTree::<Link>::default();
+        for number in [1_u32, 2, 3] {
+            let (_, dist) =
+                tree.lookup_create_external(node_type::LINK_DIST_PROC, 11, external(number));
+            assert!(dist.expect("created").dist_insert(&mld).is_ok());
+        }
+        // erts_link_dist_delete through the proc half: removed once, then not in the list.
+        let link = tree.remove_external(&external(2)).expect("present");
+        assert_eq!(
+            link.view().external_dist().map(|d| d.connection_id),
+            Some(7)
+        );
+        assert!(link.dist_delete_other());
+        assert!(!link.dist_delete_other());
+        link.release_external(true);
+        // Connection down: the remaining dist halves come out in insertion order, and a
+        // later delete through a proc half finds the connection dead.
+        let taken = mld.take_links();
+        let pids = taken
+            .iter()
+            .map(|half| half.view().external_pid().map(|pid| pid.number))
+            .collect::<Vec<_>>();
+        assert_eq!(pids, [Some(1), Some(3)]);
+        assert!(!mld.is_alive());
+        let link = tree.remove_external(&external(1)).expect("present");
+        assert!(!link.dist_delete_other());
+        link.release_external(false);
+        let (_, dist) = tree.lookup_create_external(node_type::LINK_DIST_PROC, 11, external(9));
+        assert!(dist.expect("created").dist_insert(&mld).is_err());
+        drop(taken);
+    }
+
+    #[test]
+    fn dead_dist_and_unlinking_live_in_the_external_link() {
+        let mut tree = MonLnkTree::<Link>::default();
+        let (mut link, dist) =
+            tree.lookup_create_external(node_type::LINK_DIST_PROC, 11, external(1));
+        link.set_dead_dist(42);
+        link.set_unlinking(99);
+        let mut dist = dist.expect("created");
+        let view = dist.view();
+        let mld = view.external_dist().expect("dead dist");
+        assert_eq!(mld.nodename, 42);
+        assert_eq!(mld.connection_id, !0);
+        assert!(!mld.is_alive());
+        assert_eq!(view.unlinking(), 99);
+        dist.view_mut().set_unlinking(0);
+        assert_eq!(
+            tree.get_external(&external(1))
+                .expect("present")
+                .unlinking(),
+            0
+        );
     }
 
     #[test]

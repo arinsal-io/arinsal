@@ -3328,6 +3328,18 @@ fn call_resolved(
         }
         (SignalBif::Whereis1, [name]) => whereis_1(process, *name),
         (SignalBif::Registered0, []) => registered_names(process),
+        // Port of erts/emulator/beam/bif.c (link_opt and unlink_1, is_external_pid): one BIF
+        // for every caller, so an applied call reaches the external-link path too.
+        (SignalBif::Link1, [target]) | (SignalBif::Unlink1, [target])
+            if crate::dist::is_remote_target(*target)? =>
+        {
+            let function = if matches!(entry, SignalBif::Link1) {
+                "link"
+            } else {
+                "unlink"
+            };
+            crate::dist::native_signal(vm, process, ctx, args, function)
+        }
         (SignalBif::Link1, [target]) => link_opt(vm, process, ctx, *target, Term::NIL),
         (SignalBif::Link2, [target, opts]) => link_opt(vm, process, ctx, *target, *opts),
         (SignalBif::Unlink1, [port]) if port.as_port().is_some() => {

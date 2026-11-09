@@ -600,7 +600,64 @@ impl Process {
                 crate::signals::handle_sys_task(self, ctx, &task)?;
                 8
             }
-            arinsal_sched::Signal::UnlinkAck(_) => 0,
+            arinsal_sched::Signal::DistLink(shared) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_LINK,
+                // ERTS_LNK_TYPE_DIST_PROC), OTP-29.1.1: a duplicate takes its dist half out of
+                // the connection.
+                if let Some(link) = crate::dist::DistLinkHalf::take(&shared) {
+                    let remote = link.view().external_pid();
+                    match self.links.lookup_insert(link) {
+                        Ok(()) => {
+                            if let Some(remote) = remote {
+                                self.trace_getting_linked_external(ctx, remote);
+                            }
+                        }
+                        Err(duplicate) => {
+                            let deleted = duplicate.dist_delete_other();
+                            duplicate.release_external(deleted);
+                        }
+                    }
+                }
+                0
+            }
+            arinsal_sched::Signal::DistUnlink(op) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_UNLINK,
+                // ERTS_SIG_Q_TYPE_DIST_LINK), OTP-29.1.1.
+                let mut cnt = 0;
+                let active = self
+                    .links
+                    .get_external(&op.remote)
+                    .is_some_and(|link| link.unlinking() == 0);
+                if active && let Some(link) = self.links.remove_external(&op.remote) {
+                    let deleted = link.dist_delete_other();
+                    link.release_external(deleted);
+                    cnt += 8;
+                    self.trace_getting_unlinked_external(ctx, op.remote);
+                }
+                if let Some(runtime) = self.runtime {
+                    crate::dist::reply_dist_unlink_ack(runtime, &op);
+                }
+                cnt + 1
+            }
+            arinsal_sched::Signal::DistUnlinkAck(op) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_UNLINK_ACK,
+                // ERTS_SIG_Q_TYPE_DIST_LINK), OTP-29.1.1.
+                if self
+                    .links
+                    .get_external(&op.remote)
+                    .is_some_and(|link| link.unlinking() == op.id)
+                    && let Some(link) = self.links.remove_external(&op.remote)
+                {
+                    let deleted = link.dist_delete_other();
+                    link.release_external(deleted);
+                    8
+                } else {
+                    0
+                }
+            }
+            arinsal_sched::Signal::DistExit(exit) => {
+                self.handle_dist_exit_signal(ctx, from, *exit)?
+            }
             arinsal_sched::Signal::UnlinkAckSignal(id) => self.handle_unlink_ack_signal(from, id),
             // Port of erl_proc_sig_queue.c:6879 (ERTS_SIG_Q_OP_DIST_SPAWN_REPLY): the handler
             // counts the signal itself, so the caller's `cnt++` is taken back.
@@ -687,11 +744,11 @@ impl Process {
         } else if request.abandoned {
             // Spawn operation has been abandoned and link option was passed: send exit
             // signal with exit reason `abandoned` and drop the message.
-            if let (Some(child), Some(runtime)) = (data.link(), self.runtime) {
-                crate::dist::forward_link_exit_if_proxy(
-                    runtime,
-                    child,
+            if let Some(link) = data.link() {
+                crate::dist::proc_exit_handle_link(
+                    self.runtime,
                     ctx.pid(),
+                    link,
                     crate::signals::atom("abandoned"),
                 );
             }
@@ -700,13 +757,11 @@ impl Process {
             if request.no_success_msg {
                 convert_to_message = false;
             }
-            if let Some(child) = data.link() {
+            if let Some(link) = data.link() {
                 cnt += 1;
-                if let Err(duplicate) = self
-                    .links
-                    .lookup_insert(crate::proc_create::process_link(child, false))
-                {
-                    drop(duplicate);
+                if let Err(duplicate) = self.links.lookup_insert(link) {
+                    let deleted = duplicate.dist_delete_other();
+                    duplicate.release_external(deleted);
                 } else if crate::trace::active() {
                     // linking(c_p, result)
                     let result = crate::dist::spawn_reply_child_term(self, data)?;
@@ -785,6 +840,123 @@ impl Process {
 }
 
 impl Process {
+    /// `handle_exit_signal` for an exit signal from a remote process: the link is found by the
+    /// external pid and, for a `noconnection` exit, kept when it belongs to a newer connection.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_exit_signal), OTP-29.1.1.
+    fn handle_dist_exit_signal(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        sender: Pid,
+        exit: arinsal_sched::DistExitSignal<Message>,
+    ) -> Result<i32, VmError> {
+        let arinsal_sched::DistExitSignal {
+            from,
+            linked,
+            connection_lost,
+            reason,
+        } = exit;
+        let mut prio = false;
+        let mut was_linked = false;
+        if linked {
+            let state = self.links.get_external(&from).map(|link| {
+                let lost_elsewhere = connection_lost.is_some_and(|id| {
+                    link.external_dist()
+                        .is_some_and(|dist| dist.connection_id != id)
+                });
+                (link.unlinking() != 0, lost_elsewhere, link.is_priority())
+            });
+            let Some((unlinking, lost_elsewhere, link_prio)) = state else {
+                // No longer active.
+                return Ok(2);
+            };
+            if lost_elsewhere {
+                // The link was made over a newer connection: drop the signal silently.
+                return Ok(2);
+            }
+            if let Some(link) = self.links.remove_external(&from) {
+                let deleted = link.dist_delete_other();
+                link.release_external(deleted);
+            }
+            if unlinking {
+                return Ok(2);
+            }
+            was_linked = true;
+            prio = link_prio;
+        }
+        let mut message = reason;
+        let seq_token = message.take_seq_token();
+        let reason = message.into_receiver(self)?;
+        if self.trap_exit && (linked || reason != crate::signals::atom("kill")) {
+            let from_term = crate::dist::external_pid_term(&mut self.heap, from)?;
+            let tuple = self.tuple(&[crate::signals::atom("EXIT"), from_term, reason])?;
+            if prio {
+                self.push_priority_message(tuple)?;
+            } else if let Some(token) = seq_token {
+                self.inbox.push_back_token(tuple, token);
+            } else {
+                self.inbox.push_back_nil(tuple);
+            }
+            self.trace_converted_signal(ctx, tuple, sender);
+            if was_linked {
+                self.trace_getting_unlinked_external(ctx, from);
+            }
+            return Ok(1);
+        }
+        if !linked && reason == crate::signals::atom("kill") {
+            return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+        }
+        if reason != Term::atom(arinsal_term::atoms::NORMAL) {
+            self.heap.abi.exc.fvalue = reason.tagged_word();
+            return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+        }
+        if was_linked {
+            self.trace_getting_unlinked_external(ctx, from);
+        }
+        Ok(2)
+    }
+
+    /// `getting_linked` with an external linker.
+    fn trace_getting_linked_external(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        linker: crate::monitor_link::ExternalPid,
+    ) {
+        if crate::trace::active()
+            && let Ok(linker) = crate::dist::external_pid_term(&mut self.heap, linker)
+        {
+            crate::trace::emit(
+                None,
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::PROCS,
+                "getting_linked",
+                &[linker],
+            );
+        }
+    }
+
+    /// `getting_unlinked` with an external unlinker.
+    fn trace_getting_unlinked_external(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        unlinker: crate::monitor_link::ExternalPid,
+    ) {
+        if crate::trace::active()
+            && let Ok(unlinker) = crate::dist::external_pid_term(&mut self.heap, unlinker)
+        {
+            crate::trace::emit(
+                None,
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::PROCS,
+                "getting_unlinked",
+                &[unlinker],
+            );
+        }
+    }
+
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8585 (getting_linked), OTP-29.1.1.
     fn trace_getting_linked(&mut self, ctx: &mut RunCtx<'_, Message>, linker: Pid) {
         if let Some(linker) = linker.to_term() {

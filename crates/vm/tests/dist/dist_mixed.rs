@@ -610,3 +610,84 @@ fn dist_mixed_distributed_term_identity_and_node_monitor() {
         ),
     );
 }
+
+/// Links made by a remote process to processes on the tested node, and by those processes to
+/// the remote one: remote exits with trap_exit on and off, `{'EXIT', Pid, _}` carrying the very
+/// pid the remote sent, local exits reaching the remote end, `process_info(links)` listing the
+/// external pid, and unlink from both sides. Run from an OTP client against an OTP node and
+/// against an Arinsal node; the results must be equal.
+const ELINK_CLIENT: &str = concat!(
+    "Me=self(), ",
+    "Srv=fun(Trap) -> spawn(N,fun() -> process_flag(trap_exit,Trap), Me ! {ready,self()}, (fun L() -> receive {do,F} -> F(), L(); M -> Me ! {got,self(),M}, L() end end)() end) end, ",
+    "Ready=fun(S) -> receive {ready,S} -> ok after 10000 -> exit(no_ready) end end, ",
+    "Links=fun(S) -> {links,L} = erpc:call(N,erlang,process_info,[S,links]), L end, ",
+    "Quiet=fun(S) -> receive {got,S,M} -> {unexpected,M} after 500 -> quiet end end, ",
+    "SA=Srv(true), Ready(SA), ",
+    "CA=spawn(fun() -> link(SA), Me ! {linked,self()}, receive go -> exit(r1) end end), ",
+    "receive {linked,CA} -> ok end, timer:sleep(300), LA=Links(SA), CA ! go, ",
+    "A=receive {got,SA,{'EXIT',PA,RA}} -> {LA=:=[CA],PA=:=CA,node(PA)=:=node(),RA} after 10000 -> no_exit end, ",
+    "SB=Srv(false), Ready(SB), MB=monitor(process,SB), ",
+    "CB=spawn(fun() -> link(SB), Me ! {linked,self()}, receive go -> exit(r2) end end), ",
+    "receive {linked,CB} -> ok end, timer:sleep(300), CB ! go, ",
+    "B=receive {'DOWN',MB,process,SB,RB} -> RB after 10000 -> no_down end, ",
+    "SC=Srv(true), Ready(SC), ",
+    "CC=spawn(fun() -> process_flag(trap_exit,true), link(SC), Me ! {linked,self()}, receive {'EXIT',P,R} -> Me ! {c_exit,P=:=SC,R} end end), ",
+    "receive {linked,CC} -> ok end, timer:sleep(300), SC ! {do,fun() -> exit(r3) end}, ",
+    "C=receive {c_exit,PC,RC} -> {PC,RC} after 10000 -> no_exit end, ",
+    "SD=Srv(true), Ready(SD), ",
+    "CD=spawn(fun() -> link(SD), Me ! {linked,self()}, receive unlink -> true=unlink(SD), Me ! unlinked end, receive go -> exit(r4) end end), ",
+    "receive {linked,CD} -> ok end, timer:sleep(300), LD1=Links(SD), CD ! unlink, receive unlinked -> ok end, timer:sleep(300), LD2=Links(SD), CD ! go, ",
+    "D={LD1=:=[CD],LD2,Quiet(SD)}, ",
+    "SE=Srv(true), Ready(SE), ",
+    "CE=spawn(fun() -> process_flag(trap_exit,true), link(SE), Me ! {linked,self()}, receive M -> Me ! {e_got,M} end end), ",
+    "receive {linked,CE} -> ok end, timer:sleep(300), SE ! {do,fun() -> true=unlink(CE) end}, timer:sleep(300), ",
+    "{links,LE} = process_info(CE,links), LE2=Links(SE), SE ! {do,fun() -> exit(r5) end}, ",
+    "E={LE,LE2,receive {e_got,ME} -> {unexpected,ME} after 500 -> quiet end}, ",
+    "SF=Srv(true), Ready(SF), ",
+    "CF=spawn(fun() -> process_flag(trap_exit,true), Me ! {ready_f,self()}, receive go -> exit(r6) end end), ",
+    "receive {ready_f,CF} -> ok end, SF ! {do,fun() -> true=link(CF) end}, timer:sleep(300), ",
+    "{links,LF} = process_info(CF,links), LF2=Links(SF), CF ! go, ",
+    "F=receive {got,SF,{'EXIT',PF,RF}} -> {LF=:=[SF],LF2=:=[CF],PF=:=CF,RF} after 10000 -> no_exit end, ",
+    "SG=Srv(true), Ready(SG), ",
+    "CG=spawn(fun() -> receive stop -> ok end end), ",
+    "SG ! {do,fun() -> true=link(CG), true=unlink(CG) end}, timer:sleep(300), ",
+    "{links,LG} = process_info(CG,links), LG2=Links(SG), exit(CG,kill), ",
+    "G={LG,LG2,Quiet(SG)}, ",
+    "[exit(S,kill) || S <- [SA,SC,SD,SE,SF,SG]], ",
+    "io:format(\"ELINK_RESULT ~p~n\",[[A,B,C,D,E,F,G]]), ",
+    "io:format(\"DIST_MIXED_OK elink~n\")"
+);
+
+fn elink_result(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| line.starts_with("ELINK_RESULT"))
+        .unwrap_or_else(|| panic!("no ELINK_RESULT in {output}"))
+        .to_owned()
+}
+
+#[test]
+fn dist_mixed_external_links_match_otp() {
+    let _serial = serial_test();
+    let expected = {
+        let (_erl, node, cookie, _host) = start_erl();
+        let n = node_literal(&node);
+        let output = otp_eval(
+            &cookie,
+            &format!("N={n}, pong=net_adm:ping(N), {ELINK_CLIENT}"),
+        );
+        assert!(output.contains("DIST_MIXED_OK"), "{output}");
+        elink_result(&output)
+    };
+    let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let cookie = format!("dm_cookie_{}_{id:04x}", std::process::id() % 100_000);
+    let host = short_hostname();
+    let (_arinsal, node) = start_arinsal_server(&cookie, &host);
+    let n = node_literal(&node);
+    let output = otp_eval(
+        &cookie,
+        &format!("N={n}, pong=net_adm:ping(N), {ELINK_CLIENT}"),
+    );
+    assert!(output.contains("DIST_MIXED_OK"), "{output}");
+    assert_eq!(elink_result(&output), expected);
+}

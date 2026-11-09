@@ -1221,8 +1221,15 @@ fn process_info_item_links(
     let mut links = Vec::<ProcessInfoLinkInfo>::new();
     let mut heap_words = 0usize;
     let kind_port = crate::monitor_link::node_type::LINK_PORT;
+    let mut external = Vec::new();
     for node in process.links.iter() {
         if node.unlinking() != 0 {
+            continue;
+        }
+        if let Some(pid) = node.external_pid() {
+            // collect_one_link: `2 + NC_HEAP_SIZE(entity)` for the external pid.
+            external.push(pid);
+            heap_words += 2 + 4;
             continue;
         }
         let entity = if node.kind() == kind_port {
@@ -1249,11 +1256,20 @@ fn process_info_item_links(
 
     *info_reds = info_reds.saturating_add((links.len() / 4) as i32);
     *reserve += heap_words;
+    *info_reds = info_reds.saturating_add((external.len() / 4) as i32);
     let mut result = Term::NIL;
     for link in links {
         info_unreserve(reserve, 2);
         result = info_produce(process, *reserve, 2, |block| {
             block.cons(link.entity, result)
+        })?;
+    }
+    for pid in external {
+        info_unreserve(reserve, 6);
+        result = info_produce(process, *reserve, 6, |block| {
+            let node = arinsal_term::Node::new(arinsal_term::Atom(pid.sysname), pid.creation);
+            let entity = block.external_pid(node, pid.number, pid.serial)?;
+            block.cons(entity, result)
         })?;
     }
     Ok(result)

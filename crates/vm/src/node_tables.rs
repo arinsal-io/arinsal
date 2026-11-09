@@ -41,6 +41,8 @@ pub(crate) struct NodeEntry {
     pub(crate) pending_monitors: BTreeMap<u64, RemoteMonitor>,
     /// Distributed spawn requests retained while auto-connect is pending.
     pub(crate) pending_spawn_requests: BTreeMap<u64, SpawnRequest>,
+    /// `dep->mld`: the links and monitors of the current (pending or up) connection.
+    pub(crate) mld: Option<std::sync::Arc<crate::monitor_link::MonLnkDist>>,
 }
 
 /// Controller-owned state for one active distribution connection.
@@ -425,6 +427,7 @@ impl Default for NodeTables {
                 pending_out: VecDeque::new(),
                 pending_monitors: BTreeMap::new(),
                 pending_spawn_requests: BTreeMap::new(),
+                mld: None,
             },
         );
         Self {
@@ -546,6 +549,21 @@ pub(crate) fn unregister_dist_port(port_id: u64) -> Option<String> {
 
 const CON_ID_MASK: u32 = 0x00ff_ffff;
 
+/// Port of erts/emulator/beam/erl_node_tables.c (erts_set_dist_entry_pending: the new
+/// connection's `ErtsMonLnkDist`), OTP-29.1.1.
+pub(crate) fn new_mld(
+    node: &str,
+    connection_id: u32,
+) -> std::sync::Arc<crate::monitor_link::MonLnkDist> {
+    let sysname = arinsal_term::global_atoms()
+        .intern(node)
+        .map_or(0, |atom| atom.0);
+    std::sync::Arc::new(crate::monitor_link::MonLnkDist::with_connection(
+        sysname,
+        connection_id,
+    ))
+}
+
 fn fresh_entry(name: String) -> NodeEntry {
     NodeEntry {
         name,
@@ -559,6 +577,7 @@ fn fresh_entry(name: String) -> NodeEntry {
         pending_out: VecDeque::new(),
         pending_monitors: BTreeMap::new(),
         pending_spawn_requests: BTreeMap::new(),
+        mld: None,
     }
 }
 
@@ -616,6 +635,7 @@ impl NodeTables {
                 pending_out: VecDeque::new(),
                 pending_monitors: BTreeMap::new(),
                 pending_spawn_requests: BTreeMap::new(),
+                mld: None,
             },
         );
         true
@@ -641,6 +661,7 @@ impl NodeTables {
                 entry.state = ConnState::Pending;
                 entry.connected = false;
                 entry.dist = None;
+                entry.mld = Some(new_mld(&entry.name, entry.connection_id));
             }
         }
         Some((entry.connection_id, entry.entry_ref))
@@ -671,6 +692,7 @@ impl NodeTables {
             entry.state = ConnState::Idle;
             entry.connected = false;
             entry.dist = None;
+            entry.mld = None;
             entry.pending_out.clear();
             entry.pending_monitors.clear();
             // The aborted connection takes its pending-spawn monitors along; dropping a
@@ -696,6 +718,7 @@ impl NodeTables {
             .get(&name)
             .map(|entry| entry.entry_ref)
             .unwrap_or_else(|| NEXT_ENTRY_REF.fetch_add(1, Ordering::Relaxed));
+        let mld = Some(new_mld(&name, connection_id));
         self.entries.insert(
             name.clone(),
             NodeEntry {
@@ -710,6 +733,7 @@ impl NodeTables {
                 pending_out: VecDeque::new(),
                 pending_monitors: BTreeMap::new(),
                 pending_spawn_requests: BTreeMap::new(),
+                mld,
             },
         );
     }
@@ -882,10 +906,19 @@ impl NodeTables {
     }
 
     /// Remove a connection and return its subscribed monitors for nodedown delivery.
+    /// Take `dep->mld` before the connection state goes (dist.c erts_do_net_exits).
+    pub(crate) fn take_mld(
+        &mut self,
+        node: &str,
+    ) -> Option<std::sync::Arc<crate::monitor_link::MonLnkDist>> {
+        self.entries.get_mut(node)?.mld.take()
+    }
+
     pub(crate) fn disconnect(&mut self, node: &str) -> Vec<NodeMonitor> {
         if let Some(entry) = self.entries.get_mut(node) {
             entry.connected = false;
             entry.state = ConnState::Idle;
+            entry.mld = None;
             if let Some(state) = entry.dist.take()
                 && let Some(port_id) = state.port_id
             {
