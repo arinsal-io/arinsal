@@ -23,17 +23,17 @@ inet = { max-threads = 1 }
 binary-memory = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "binary(iex_shell) | binary(tty)"
+filter = "binary(misc) & (test(tty::) | test(iex_shell::))"
 test-group = "pty"
 
 [[profile.default.overrides]]
-filter = "binary(dist_mixed)"
+filter = "binary(dist)"
 test-group = "dist"
 
 [[profile.default.overrides]]
-filter = "binary(inet_full)"
+filter = "binary(inet) & test(inet_full::)"
 test-group = "inet"
 
 [[profile.default.overrides]]
-filter = "binary(bin_accounting)"
+filter = "binary(gc) & test(bin_accounting::)"
 test-group = "binary-memory"
