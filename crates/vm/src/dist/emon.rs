@@ -12,7 +12,7 @@
 use super::elink::{connection_of_handle, exit_payload_flag, external_pid, send_on_connection};
 use super::{badarg, control, local_pid, local_pid_owned, remote_ref_id};
 use crate::monitor_link::{Monitor, MonitorReference, node_flag, node_type};
-use crate::proc_create::{DistOrigin, MonitorInfo, OriginMonitor, ProcessMonitor};
+use crate::proc_create::{DistOrigin, DistTarget, MonitorInfo, OriginMonitor, ProcessMonitor};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Signal};
 use arinsal_term::{Term, to_owned};
@@ -245,12 +245,223 @@ pub(super) fn monitors_connection_down(
     };
     for monitor in mld.take_monitors::<_, _, _>() {
         let monitor: ProcessMonitor = monitor;
+        let to = Pid::from_data(monitor.view().other());
         if monitor.view().is_target() {
-            // Target halves of local watchers of remote processes are kept by the
-            // distribution tables (see `take_connection_monitors`).
+            // A local watcher of a remote process: erts_proc_sig_send_monitor_down(NULL,
+            // ..., mon, am_noconnection) with the target half.
+            let reference = monitor.view().reference();
+            drop(monitor);
+            send_monitor_down_noconnection(scheduler, to, reference);
             continue;
         }
-        let to = Pid::from_data(monitor.view().other());
         let _ = scheduler.signal(to, to, Signal::DemonitorOrigin(monitor.into_shared()));
+    }
+}
+
+/// The `noconnection` DOWN of the monitor `reference` of the local `watcher`, whose target
+/// half left the connection (or never reached one).
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_monitor_down with
+// am_noconnection), OTP-29.1.1.
+fn send_monitor_down_noconnection(
+    scheduler: &arinsal_sched::Scheduler<crate::Process>,
+    watcher: Pid,
+    reference: u64,
+) {
+    let _ = scheduler.signal(
+        watcher,
+        watcher,
+        Signal::MonitorDownImmediate {
+            reference,
+            reason: crate::signals::atom("noconnection").word(),
+        },
+    );
+}
+
+/// `ToProc` of the `DOP_DEMONITOR_P` of a monitor of a remote process: the name of a
+/// monitor by name, otherwise the external pid.
+fn watched_remote(info: &crate::proc_create::MonitorInfo, target: &DistTarget) -> OwnedTerm {
+    match info.name() {
+        Some(name) => OwnedTerm::Atom(name.to_owned()),
+        None => target.target.clone(),
+    }
+}
+
+/// Create a monitor of the remote `target` by the local `watcher` on connection `mld`, or a
+/// dead-dist monitor when `mld` is `None` (bif.c monitor, `remote_process`): the origin half
+/// goes to the caller, the target half into the connection (`erts_monitor_dist_insert`).
+/// Returns the origin half and, when the target half did not reach a connection, `false`:
+/// the caller then sends itself the `noconnection` DOWN.
+// Port of erts/emulator/beam/bif.c (erts_internal_monitor_process_2, remote_process),
+// OTP-29.1.1.
+pub(crate) fn create_origin(
+    ix: Option<usize>,
+    reference: crate::monitor_link::MonitorReference,
+    watcher: Pid,
+    info: crate::proc_create::MonitorInfo,
+    target: DistTarget,
+) -> (ProcessMonitor, bool) {
+    let dist = target.dist.clone();
+    let named = info.name().is_some();
+    let info = info.with_dist_target(target);
+    let (origin, target) = Monitor::create_at(
+        ix,
+        node_type::MONITOR_DIST_PROC,
+        reference,
+        watcher.data(),
+        0,
+        if named { node_flag::NAME } else { 0 },
+        info,
+        OriginMonitor::Distributed,
+    );
+    match dist.monitor_insert(target) {
+        Ok(()) => (origin, true),
+        Err(target) => {
+            drop(target);
+            (origin, false)
+        }
+    }
+}
+
+/// [`create_origin`] followed by the `noconnection` DOWN when the target half reached no
+/// connection, for an origin half the caller inserts itself.
+pub(crate) fn create_origin_or_down(
+    runtime: &crate::process::Runtime,
+    ix: Option<usize>,
+    reference: crate::monitor_link::MonitorReference,
+    watcher: Pid,
+    info: crate::proc_create::MonitorInfo,
+    target: DistTarget,
+) -> Result<ProcessMonitor, crate::VmError> {
+    let (origin, connected) = create_origin(ix, reference, watcher, info, target);
+    if !connected {
+        send_monitor_down_noconnection(runtime.scheduler()?, watcher, origin.view().reference());
+    }
+    Ok(origin)
+}
+
+/// Release an origin half of a monitor of a remote process that leaves the watcher's
+/// monitor tree, taking its target half out of the connection (`erts_monitor_dist_delete(
+/// &mdp->u.target)`). Returns whether the target half was still in the connection.
+pub(crate) fn release_origin(origin: ProcessMonitor) -> bool {
+    let dist = origin
+        .view()
+        .info()
+        .dist_target()
+        .map(|target| target.dist.clone());
+    match dist.and_then(|dist| dist.monitor_delete_other(&origin)) {
+        Some(target) => {
+            ProcessMonitor::release_both(origin, target);
+            true
+        }
+        None => {
+            drop(origin);
+            false
+        }
+    }
+}
+
+/// `demonitor` of a monitor of a remote process, and its exit-time variant
+/// `erts_proc_exit_dist_demonitor`: the target half leaves the connection and the remote
+/// node gets `DOP_DEMONITOR_P` over the connection the monitor was made on.
+// Port of erts/emulator/beam/bif.c (demonitor, ERTS_MON_TYPE_DIST_PROC) and
+// erl_process.c (erts_proc_exit_handle_monitor, origin ERTS_MON_TYPE_DIST_PROC), OTP-29.1.1.
+pub(crate) fn demonitor_remote(
+    runtime: Option<&crate::process::Runtime>,
+    watcher: Pid,
+    origin: ProcessMonitor,
+) {
+    let view = origin.view();
+    let info = view.info();
+    let send = info.dist_target().map(|target| {
+        (
+            target.dist.nodename,
+            target.dist.connection_id,
+            watched_remote(info, target),
+            target.reference.clone(),
+        )
+    });
+    release_origin(origin);
+    if let (Some(runtime), Some((nodename, connection_id, watched, reference))) = (runtime, send) {
+        send_on_connection(
+            runtime,
+            nodename,
+            connection_id,
+            control(20, vec![local_pid_owned(watcher), watched, reference]),
+            None,
+        );
+    }
+}
+
+/// The monitored object of a DOWN or `process_info(monitors)` entry of a monitor of a remote
+/// process: the external pid, or `{Name, Node}` for a monitor by name.
+pub(crate) fn remote_object(info: &crate::proc_create::MonitorInfo) -> Option<OwnedTerm> {
+    let target = info.dist_target()?;
+    Some(match info.name() {
+        Some(name) => OwnedTerm::Tuple(vec![
+            OwnedTerm::Atom(name.to_owned()),
+            target.target.clone(),
+        ]),
+        None => target.target.clone(),
+    })
+}
+
+/// The origin half of a spawn monitor in transit with a spawn reply. A half dropped without
+/// reaching the parent's monitor tree takes its target half out of the connection.
+pub(crate) struct DistMonitorHalf(std::sync::Mutex<Option<ProcessMonitor>>);
+
+impl DistMonitorHalf {
+    pub(super) fn new(origin: ProcessMonitor) -> Self {
+        Self(std::sync::Mutex::new(Some(origin)))
+    }
+
+    /// Take the origin half.
+    pub(crate) fn take_half(&self) -> Option<ProcessMonitor> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl Drop for DistMonitorHalf {
+    fn drop(&mut self) {
+        let origin = self
+            .0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(origin) = origin {
+            release_origin(origin);
+        }
+    }
+}
+
+impl std::fmt::Debug for DistMonitorHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistMonitorHalf").finish_non_exhaustive()
+    }
+}
+
+/// The monitor of a child spawned by a remote `spawn_request` with `monitor`: the origin half
+/// (the remote parent) goes into the connection, the target half into the child's monitor
+/// tree; both are released when the connection is gone.
+// Port of erts/emulator/beam/erl_process.c (erl_create_process, SPO_MONITOR), OTP-29.1.1.
+pub(crate) fn insert_spawn_child_monitor(child: &mut crate::Process, pid: Pid, origin: DistOrigin) {
+    let Some(id) = super::remote_ref_id(&origin.reference) else {
+        return;
+    };
+    let dist = origin.dist.clone();
+    let (origin, target): (ProcessMonitor, ProcessMonitor) = Monitor::create(
+        node_type::MONITOR_DIST_PROC,
+        MonitorReference::ordinary(id),
+        0,
+        pid.data(),
+        0,
+        MonitorInfo::dist_origin(origin, None),
+        OriginMonitor::Distributed,
+    );
+    match dist.monitor_insert(origin) {
+        Ok(()) => child.monitors.insert(target),
+        Err(origin) => ProcessMonitor::release_both(origin, target),
     }
 }

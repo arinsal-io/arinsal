@@ -1279,12 +1279,16 @@ fn process_info_item_links(
 fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
     Ok({
         // Port of erts/emulator/beam/erl_bif_info.c (process_info_aux, ERTS_PI_IX_MONITORS).
+        // A monitor of a remote process shows the external pid, or `{Name, Node}`.
         let mut raw = process
             .monitors
             .iter()
             .filter_map(|monitor| match monitor.origin_state() {
                 Some(crate::proc_create::OriginMonitor::Process(_)) => {
-                    Pid::from_data(monitor.other()).to_term()
+                    Pid::from_data(monitor.other()).to_term().map(Ok)
+                }
+                Some(crate::proc_create::OriginMonitor::Distributed) => {
+                    crate::dist::remote_object(monitor.info()).map(Err)
                 }
                 _ => None,
             })
@@ -1292,7 +1296,17 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
         raw.reverse();
         let vals = raw
             .into_iter()
-            .map(|p| make_tuple(process, &[atom("process"), p]))
+            .map(|object| {
+                let object = match object {
+                    Ok(pid) => pid,
+                    Err(remote) => arinsal_term::from_owned(
+                        &remote,
+                        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                    )
+                    .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))?,
+                };
+                make_tuple(process, &[atom("process"), object])
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let _ = pid;
         // The origin entries of the monitors of ports (`ERTS_MON_TYPE_PORT`): the port, or

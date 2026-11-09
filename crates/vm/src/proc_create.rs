@@ -981,6 +981,19 @@ struct MonitorExtension {
     tag: Option<arinsal_etf::OwnedTerm>,
     name: Option<String>,
     dist_origin: Option<DistOrigin>,
+    dist_target: Option<DistTarget>,
+}
+
+/// The remote target of an `ERTS_MON_TYPE_DIST_PROC` monitor a local process holds, as
+/// `ErtsMonitorDataExtended` keeps it: the origin half's `other.item` (the external pid, or
+/// the node of a monitor by name, whose name is the monitor's `name`), the reference sent in
+/// `DOP_MONITOR_P` (`md.ref`), and the connection the target half was inserted in, or the
+/// dead-dist record of a monitor made while not connected (`dist`).
+#[derive(Debug)]
+pub(crate) struct DistTarget {
+    pub(crate) target: arinsal_etf::OwnedTerm,
+    pub(crate) reference: arinsal_etf::OwnedTerm,
+    pub(crate) dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
 }
 
 /// The external watcher of an `ERTS_MON_TYPE_DIST_PROC` monitor of a local process, as
@@ -1006,7 +1019,27 @@ impl MonitorInfo {
             tag,
             name,
             dist_origin: None,
+            dist_target: None,
         })))
+    }
+
+    /// This monitor info for a monitor of the remote `target`.
+    pub(crate) fn with_dist_target(self, target: DistTarget) -> Self {
+        let mut extension = self.0.unwrap_or_else(|| {
+            Box::new(MonitorExtension {
+                tag: None,
+                name: None,
+                dist_origin: None,
+                dist_target: None,
+            })
+        });
+        extension.dist_target = Some(target);
+        Self(Some(extension))
+    }
+
+    /// The remote target of a monitor this process holds.
+    pub(crate) fn dist_target(&self) -> Option<&DistTarget> {
+        self.0.as_ref()?.dist_target.as_ref()
     }
 
     /// The shared data of a monitor of a local process by the external `origin`, created by
@@ -1016,6 +1049,7 @@ impl MonitorInfo {
             tag: None,
             name,
             dist_origin: Some(origin),
+            dist_target: None,
         })))
     }
 

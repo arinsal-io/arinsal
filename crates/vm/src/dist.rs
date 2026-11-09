@@ -16,7 +16,10 @@ mod emon;
 pub(crate) use elink::{
     DistLinkHalf, external_pid_term, proc_exit_handle_link, reply_dist_unlink_ack,
 };
-pub(crate) use emon::{handle_dist_demonitor, proc_exit_handle_target};
+pub(crate) use emon::{
+    demonitor_remote, handle_dist_demonitor, insert_spawn_child_monitor, proc_exit_handle_target,
+    release_origin, remote_object,
+};
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1 << 40);
 static NEXT_REMOTE_PID: AtomicU32 = AtomicU32::new(1 << 27);
@@ -163,25 +166,20 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
                 && entry.connection_id == conn_id
                 && entry.state == node_tables::ConnState::Pending
         });
-        let (spawn_downs, monitor_downs) = if aborts {
-            (
-                take_connection_spawn_requests(&mut tables, name),
-                take_connection_monitors(&mut tables, name),
-            )
+        let spawn_downs = if aborts {
+            take_connection_spawn_requests(&mut tables, name)
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
         let mld = if aborts { tables.take_mld(name) } else { None };
         let result = tables
             .abort_pending(name, conn_id, entry_ref)
             .ok_or_else(badarg)?;
-        (result, (spawn_downs, monitor_downs), mld)
+        (result, spawn_downs, mld)
     };
-    let (spawn_downs, monitor_downs) = spawn_downs;
     if let Some(runtime) = process.runtime {
         elink::links_connection_down(runtime, mld.clone());
         emon::monitors_connection_down(runtime, mld.as_ref());
-        notify_connection_monitors(runtime, monitor_downs)?;
         notify_connection_spawn_requests(runtime, spawn_downs)?;
     }
     Ok(boolean(result))
@@ -282,11 +280,9 @@ fn create_channel(
     entry.connected = true;
     entry.state = node_tables::ConnState::Connected;
     let pending = std::mem::take(&mut entry.pending_out);
-    let pending_monitors = std::mem::take(&mut entry.pending_monitors);
     let pending_spawn_requests = std::mem::take(&mut entry.pending_spawn_requests);
     entry.dist = Some(state);
     if let Some(state) = entry.dist.as_mut() {
-        state.remote_monitors.extend(pending_monitors);
         state.spawn_requests.extend(pending_spawn_requests);
     }
     if let Some(port_id) = port_controller {
@@ -573,7 +569,13 @@ fn route_incoming(
             } else {
                 &terms.first().ok_or_else(badarg)?.0
             };
-            let from = remote_proxy(handle, target_owned)?;
+            // erts_proc_sig_send_dist_monitor_down: the watcher finds the origin half by
+            // reference; the sender orders the DOWN behind the dead process' signals.
+            let from = match target_owned {
+                OwnedTerm::Pid { .. } => remote_proxy(handle, target_owned)?,
+                OwnedTerm::Atom(_) => watcher,
+                _ => return Err(badarg()),
+            };
             let reason = if *op == 21 {
                 from_owned(reason, &mut process.heap).map_err(|_| badarg())?
             } else {
@@ -673,21 +675,15 @@ pub(crate) fn remote_pid_term(process: &mut Process, proxy: Pid) -> Result<Optio
         return Ok(None);
     }
     let remote = {
-        let mut tables = node_tables::lock();
+        let tables = node_tables::lock();
         tables
             .entries
             .values()
             .find_map(|entry| entry.dist.as_ref()?.proxy_to_remote.get(&proxy).cloned())
-            .or_else(|| tables.disconnected_monitor_pids.remove(&proxy))
     };
     remote
         .map(|pid| from_owned(&pid, &mut process.heap).map_err(|_| badarg()))
         .transpose()
-}
-
-/// Discard a closed-connection proxy when its DOWN raced with demonitor or process exit.
-pub(crate) fn discard_disconnected_monitor_pid(proxy: Pid) {
-    node_tables::lock().disconnected_monitor_pids.remove(&proxy);
 }
 
 fn publish_remote_signal(
@@ -1025,22 +1021,20 @@ fn notify_auto_connect(
                     && entry.connection_id == conn_id
                     && entry.state == node_tables::ConnState::Pending
             });
-            let (mld, monitor_downs, spawn_downs) = if aborts {
+            let (mld, spawn_downs) = if aborts {
                 (
                     tables.take_mld(node),
-                    take_connection_monitors(&mut tables, node),
                     take_connection_spawn_requests(&mut tables, node),
                 )
             } else {
-                (None, Vec::new(), Vec::new())
+                (None, Vec::new())
             };
             let _ = tables.abort_pending(node, conn_id, entry_ref);
-            (mld, monitor_downs, spawn_downs)
+            (mld, spawn_downs)
         };
-        let (mld, monitor_downs, spawn_downs) = mld;
+        let (mld, spawn_downs) = mld;
         elink::links_connection_down(runtime, mld.clone());
         emon::monitors_connection_down(runtime, mld.as_ref());
-        notify_connection_monitors(runtime, monitor_downs)?;
         notify_connection_spawn_requests(runtime, spawn_downs)?;
         return Ok(false);
     };
@@ -1182,7 +1176,7 @@ pub(crate) fn port_connection_closed(
     let Some(node) = node_tables::unregister_dist_port(port_id) else {
         return Ok(());
     };
-    let (watchers, node_events, monitor_downs, spawn_downs, mld) = {
+    let (watchers, node_events, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
         let is_current_port = tables
             .entries
@@ -1199,7 +1193,6 @@ pub(crate) fn port_connection_closed(
             .map(|entry| entry.connection_id)
             .unwrap_or(u32::MAX);
         let visible = tables.entries.get(&node).is_some_and(|entry| entry.visible);
-        let monitor_downs = take_connection_monitors(&mut tables, &node);
         let spawn_downs = take_connection_spawn_requests(&mut tables, &node);
         let mld = tables.take_mld(&node);
         let watchers = tables.disconnect(&node);
@@ -1210,12 +1203,11 @@ pub(crate) fn port_connection_closed(
             visible,
             Some("connection_closed"),
         );
-        (watchers, events, monitor_downs, spawn_downs, mld)
+        (watchers, events, spawn_downs, mld)
     };
     elink::links_connection_down(runtime, mld.clone());
     emon::monitors_connection_down(runtime, mld.as_ref());
     notify_node_watchers(runtime, &node, watchers)?;
-    notify_connection_monitors(runtime, monitor_downs)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
     send_nodes_monitor_events(runtime, node_events)
 }
@@ -1227,7 +1219,7 @@ pub(crate) fn kill_connection(
     node: &str,
     connection_id: u32,
 ) -> Result<bool, VmError> {
-    let (watchers, node_events, monitor_downs, spawn_downs, mld) = {
+    let (watchers, node_events, spawn_downs, mld) = {
         let mut tables = node_tables::lock();
         let Some(entry) = tables.entries.get(node) else {
             return Ok(false);
@@ -1236,18 +1228,16 @@ pub(crate) fn kill_connection(
             return Ok(false);
         }
         let visible = entry.visible;
-        let monitor_downs = take_connection_monitors(&mut tables, node);
         let spawn_downs = take_connection_spawn_requests(&mut tables, node);
         let mld = tables.take_mld(node);
         let watchers = tables.disconnect(node);
         let events =
             tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
-        (watchers, events, monitor_downs, spawn_downs, mld)
+        (watchers, events, spawn_downs, mld)
     };
     elink::links_connection_down(runtime, mld.clone());
     emon::monitors_connection_down(runtime, mld.as_ref());
     notify_node_watchers(runtime, node, watchers)?;
-    notify_connection_monitors(runtime, monitor_downs)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
     send_nodes_monitor_events(runtime, node_events)?;
     Ok(true)
@@ -1267,102 +1257,6 @@ fn notify_node_watchers(
             .map_err(|_| badarg())?;
         let message = Message::copy_from(term)?;
         let _ = sched.send(watcher.pid, watcher.pid, message);
-    }
-    Ok(())
-}
-
-struct ConnectionMonitorDown {
-    watcher: Pid,
-    proxy: Pid,
-    reference: u64,
-}
-
-/// Prepare one local monitor-down signal per remote monitor before dropping the connection tree.
-// Port of erts/emulator/beam/dist.c (`monitor_connection_down`), OTP-29.1.1.
-fn take_connection_monitors(
-    tables: &mut node_tables::NodeTables,
-    node: &str,
-) -> Vec<ConnectionMonitorDown> {
-    let local_creation = tables.local_creation;
-    let Some(entry) = tables.entries.get_mut(node) else {
-        return Vec::new();
-    };
-    let mut monitors = std::mem::take(&mut entry.pending_monitors);
-    if let Some(state) = entry.dist.as_mut() {
-        monitors.append(&mut state.remote_monitors);
-    }
-    if !monitors.is_empty() {
-        PROXIES_CREATED.store(true, Ordering::Release);
-    }
-    monitors
-        .into_iter()
-        .map(|(reference, monitor)| {
-            let proxy = Pid::new(
-                NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
-                local_creation,
-            );
-            tables
-                .disconnected_monitor_pids
-                .insert(proxy, monitor.target);
-            ConnectionMonitorDown {
-                watcher: monitor.watcher,
-                proxy,
-                reference,
-            }
-        })
-        .collect()
-}
-
-/// The `noconnection` DOWN of a monitor made while the node is not alive or not connected
-/// (bif.c monitor: erts_proc_sig_send_monitor_down of the dead-dist target half), sent by a
-/// closed-connection proxy that resolves to `target` in the DOWN message.
-fn send_monitor_down_noconnection(
-    runtime: &crate::process::Runtime,
-    watcher: Pid,
-    reference: u64,
-    target: OwnedTerm,
-) -> Result<(), VmError> {
-    let proxy = {
-        let mut tables = node_tables::lock();
-        let proxy = Pid::new(
-            NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
-            tables.local_creation,
-        );
-        PROXIES_CREATED.store(true, Ordering::Release);
-        tables.disconnected_monitor_pids.insert(proxy, target);
-        proxy
-    };
-    notify_connection_monitors(
-        runtime,
-        vec![ConnectionMonitorDown {
-            watcher,
-            proxy,
-            reference,
-        }],
-    )
-}
-
-/// Deliver `noconnection` through the same monitor signal path used for remote process exits.
-fn notify_connection_monitors(
-    runtime: &crate::process::Runtime,
-    monitors: Vec<ConnectionMonitorDown>,
-) -> Result<(), VmError> {
-    let scheduler = runtime.scheduler()?;
-    for monitor in monitors {
-        let reason = Message::copy_from(atom("noconnection"))?;
-        if scheduler
-            .signal(
-                monitor.proxy,
-                monitor.watcher,
-                Signal::MonitorDown {
-                    reference: monitor.reference,
-                    reason: Box::new(reason),
-                },
-            )
-            .is_err()
-        {
-            discard_disconnected_monitor_pid(monitor.proxy);
-        }
     }
     Ok(())
 }
@@ -1598,7 +1492,13 @@ fn route_incoming_port(
             } else {
                 &terms.first().ok_or_else(badarg)?.0
             };
-            let from = remote_proxy(handle, target_owned)?;
+            // erts_proc_sig_send_dist_monitor_down: the watcher finds the origin half by
+            // reference; the sender orders the DOWN behind the dead process' signals.
+            let from = match target_owned {
+                OwnedTerm::Pid { .. } => remote_proxy(handle, target_owned)?,
+                OwnedTerm::Atom(_) => watcher,
+                _ => return Err(badarg()),
+            };
             let heap_words = if *op == 21 {
                 control_heap_words
             } else {
@@ -2039,6 +1939,9 @@ pub(crate) struct DistSpawnReplyData {
     /// `datap->link`: the proc half of the external link to the child of a successful spawn
     /// with link, its dist half already in the connection.
     link: Option<elink::DistLinkHalf>,
+    /// The origin half of the monitor of the child of a successful spawn with monitor, its
+    /// target half already in the connection.
+    monitor_half: Option<emon::DistMonitorHalf>,
 }
 
 impl DistSpawnReplyData {
@@ -2055,6 +1958,13 @@ impl DistSpawnReplyData {
     /// The remote monitors the child: the distribution half of the spawn monitor exists.
     fn monitor(&self) -> bool {
         self.is_success() && self.flags & DIST_SPAWN_FLAG_MONITOR != 0
+    }
+
+    /// Take the origin half of the spawn monitor.
+    fn take_monitor_half(&self) -> Option<crate::proc_create::ProcessMonitor> {
+        self.monitor_half
+            .as_ref()
+            .and_then(emon::DistMonitorHalf::take_half)
     }
 
     /// Take `datap->link`.
@@ -2086,7 +1996,7 @@ fn dist_spawn_reply(
             .map(|entry| entry.name.clone());
         (tables.local_name.clone(), node)
     };
-    let Some(node) = node else {
+    let Some(_node) = node else {
         // The connection went down while the reply was routed.
         return Ok(());
     };
@@ -2113,6 +2023,28 @@ fn dist_spawn_reply(
         }
         _ => None,
     };
+    // The spawn monitor of the child: its target half goes into the connection, which erts
+    // does with the request (dist.c erts_internal_dist_spawn_request_4,
+    // erts_monitor_dist_insert), and the parent's origin half travels with the reply.
+    let monitor_half = if child.is_some() && flags & DIST_SPAWN_FLAG_MONITOR != 0 {
+        let (_node, _connection_id, mld) =
+            elink::connection_of_handle(handle).ok_or_else(badarg)?;
+        let origin = emon::create_origin_or_down(
+            runtime,
+            None,
+            crate::monitor_link::MonitorReference::ordinary(id),
+            parent,
+            crate::proc_create::MonitorInfo::default(),
+            crate::proc_create::DistTarget {
+                target: result.clone(),
+                reference: parts[1].clone(),
+                dist: mld,
+            },
+        )?;
+        Some(emon::DistMonitorHalf::new(origin))
+    } else {
+        None
+    };
     let data = std::sync::Arc::new(DistSpawnReplyData {
         handle,
         id,
@@ -2121,12 +2053,8 @@ fn dist_spawn_reply(
         result,
         flags,
         link,
+        monitor_half,
     });
-    if data.monitor() {
-        // The distribution half of the spawn monitor, which erts creates with the request
-        // (dist.c:6112 erts_internal_dist_spawn_request_4): it routes the child's DOWN.
-        remember_monitor(&node, id, parent, data.result.clone())?;
-    }
     // Ordered against signals from the spawned process; a failed spawn is ordered from the
     // spawn service (erl_proc_sig_queue.c:3337-3352).
     let ordered_from = child.unwrap_or(parent);
@@ -2156,7 +2084,7 @@ pub(crate) fn spawn_reply_send_failed(
     data: &DistSpawnReplyData,
 ) {
     if data.monitor() {
-        let _ = take_monitor(data.id);
+        spawn_reply_drop_monitor(data);
         spawn_reply_demonitor(
             runtime,
             data.handle,
@@ -2226,8 +2154,8 @@ pub(crate) fn take_spawn_request(parent: Pid, id: u64) -> Option<node_tables::Sp
 /// The reply needs no monitor: release the distribution half the reply handler created
 /// (erl_proc_sig_queue.c:5866-5880, `erts_monitor_dist_delete` without a demonitor signal).
 pub(crate) fn spawn_reply_drop_monitor(data: &DistSpawnReplyData) {
-    if data.monitor() {
-        let _ = take_monitor(data.id);
+    if let Some(origin) = data.take_monitor_half() {
+        emon::release_origin(origin);
     }
 }
 
@@ -2235,17 +2163,11 @@ pub(crate) fn spawn_reply_drop_monitor(data: &DistSpawnReplyData) {
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:5740-5878
 /// (handle_dist_spawn_reply), OTP-29.1.1.
-pub(crate) fn spawn_reply_install_origin_monitor(process: &mut Process, parent: Pid, id: u64) {
-    process.cold_mut().dist_monitors.insert(id);
-    let (origin, _) = crate::proc_create::create_monitor_with_reference_at(
-        process.heap.alloc_ix(),
-        crate::proc_create::monitor_reference(id, None, false),
-        parent.data(),
-        0,
-        crate::proc_create::MonitorInfo::default(),
-        crate::proc_create::OriginMonitor::Distributed,
-    );
-    process.monitors.insert(origin);
+pub(crate) fn spawn_reply_install_origin_monitor(process: &mut Process, data: &DistSpawnReplyData) {
+    if let Some(origin) = data.take_monitor_half() {
+        process.cold_mut().dist_monitors.insert(data.id);
+        process.monitors.insert(origin);
+    }
 }
 
 /// Mark the live pending request `id` of `parent` abandoned, or drop it when it has no link.
@@ -2366,7 +2288,7 @@ pub(crate) fn handle_dist_spawn_reply_exiting(
     }
     if request.monitor && connected {
         // erts_proc_exit_dist_demonitor.
-        let _ = take_monitor(data.id);
+        spawn_reply_drop_monitor(data);
         spawn_reply_demonitor(
             runtime,
             data.handle,
@@ -2577,28 +2499,20 @@ fn handle_spawn_request(
             _ => return Err(badarg()),
         };
         let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-        let watcher = (monitor || link)
-            .then(|| remote_proxy(handle, &from))
-            .transpose()?;
-        let monitor_ref = if monitor {
-            remote_ref_id(&reference)
-        } else {
-            None
-        };
+        // The link of the child still has a proxy origin.
+        let watcher = link.then(|| remote_proxy(handle, &from)).transpose()?;
+        let monitor_origin = spawn_child_monitor_origin(handle, monitor, &from, &reference);
         let child = runtime.spawn_mfa_unscheduled_watched(
             module,
             function,
             &args,
             link.then_some(watcher).flatten(),
-            watcher.zip(monitor_ref),
+            monitor_origin,
             &from,
         );
         if let Ok(child) = child {
             result = local_pid_owned(child);
             child_to_schedule = Some(child);
-            if let Some(ref_id) = monitor_ref {
-                remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
-            }
         }
     }
     // Port of erts/emulator/beam/dist.c:1875-1898 (erts_dsig_send_spawn_reply), OTP-29.1.1.
@@ -2690,23 +2604,19 @@ fn handle_spawn_request_port(
         OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
         _ => return Err(badarg()),
     };
-    let watcher = if monitor || link {
+    let watcher = if link {
         Some(remote_proxy(handle, &from)?)
     } else {
         None
     };
-    let monitor_ref = if monitor {
-        remote_ref_id(&reference)
-    } else {
-        None
-    };
+    let monitor_origin = spawn_child_monitor_origin(handle, monitor, &from, &reference);
     let spawn_result = if spawn_opts_acceptable(options) {
         runtime.spawn_mfa_unscheduled_watched(
             mod_name,
             fun_name,
             &arg_list,
             link.then_some(watcher).flatten(),
-            watcher.zip(monitor_ref),
+            monitor_origin,
             &from,
         )
     } else {
@@ -2723,9 +2633,6 @@ fn handle_spawn_request_port(
         };
         drop(tables);
         child_to_schedule = Some(child);
-        if let Some(ref_id) = monitor_ref {
-            remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
-        }
     }
     let flags = if matches!(result, OwnedTerm::Pid { .. }) {
         (i64::from(monitor) << 1) | i64::from(link)
@@ -2739,6 +2646,26 @@ fn handle_spawn_request_port(
         runtime.schedule_spawn(child)?;
     }
     reply_result
+}
+
+/// The external parent of a child spawned by a remote `spawn_request` with `monitor`, with
+/// the request reference and the connection it arrived on.
+fn spawn_child_monitor_origin(
+    handle: u64,
+    monitor: bool,
+    from: &OwnedTerm,
+    reference: &OwnedTerm,
+) -> Option<crate::proc_create::DistOrigin> {
+    if !monitor {
+        return None;
+    }
+    let watcher = elink::external_pid(from)?;
+    let (_node, _connection_id, dist) = elink::connection_of_handle(handle)?;
+    Some(crate::proc_create::DistOrigin {
+        watcher,
+        reference: reference.clone(),
+        dist,
+    })
 }
 
 fn emit_control_message_on_handle(
@@ -2824,115 +2751,6 @@ pub(crate) fn forward_link_exit_if_proxy(
         (control(3, vec![local, remote_watcher, reason]), None)
     };
     let _ = emit_control_message_on_handle(runtime, handle, control, payload);
-    true
-}
-
-fn remember_remote_monitor_ref(
-    handle: u64,
-    id: u64,
-    reference: &OwnedTerm,
-    active: bool,
-) -> Result<(), VmError> {
-    let mut tables = node_tables::lock();
-    let entry = tables
-        .entries
-        .values_mut()
-        .find(|entry| {
-            entry
-                .dist
-                .as_ref()
-                .is_some_and(|state| state.handle == handle)
-        })
-        .ok_or_else(badarg)?;
-    let state = entry.dist.as_mut().ok_or_else(badarg)?;
-    if active {
-        state.remote_monitor_refs.insert(id, reference.clone());
-    } else {
-        state.remote_monitor_refs.remove(&id);
-    }
-    Ok(())
-}
-
-/// When a local process exits and a dist proxy was monitoring it, emit MONITOR_P_EXIT.
-pub(crate) fn forward_monitor_down_if_proxy(
-    _runtime: &crate::process::Runtime,
-    watcher: Pid,
-    deceased: Pid,
-    reference: u64,
-    reason: Term,
-) -> bool {
-    if !may_be_proxy() {
-        return false;
-    }
-    let (
-        remote_watcher,
-        reference_term,
-        handle,
-        deceased_term,
-        local_name,
-        local_creation,
-        exit_payload,
-    ) = {
-        let mut tables = node_tables::lock();
-        let local_name = tables.local_name.clone();
-        let local_creation = tables.local_creation;
-        let Some(entry) = tables.entries.values_mut().find(|entry| {
-            entry
-                .dist
-                .as_ref()
-                .is_some_and(|state| state.proxy_to_remote.contains_key(&watcher))
-        }) else {
-            return false;
-        };
-        let state = entry.dist.as_mut().unwrap();
-        let Some(remote) = state.proxy_to_remote.get(&watcher).cloned() else {
-            return false;
-        };
-        let reference_term = state
-            .remote_monitor_refs
-            .remove(&reference)
-            .unwrap_or_else(|| OwnedTerm::Ref {
-                node: "nonode@nohost".into(),
-                creation: 0,
-                ids: arinsal_bifs::ordinary_ref_words(reference).to_vec(),
-            });
-        let deceased_term = OwnedTerm::Pid {
-            node: local_name.clone(),
-            id: deceased.number(),
-            serial: deceased.serial(),
-            creation: local_creation,
-        };
-        let exit_payload = state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0;
-        (
-            remote,
-            reference_term,
-            state.handle,
-            deceased_term,
-            local_name,
-            local_creation,
-            exit_payload,
-        )
-    };
-    let Ok(reason_owned) = to_owned(reason) else {
-        return true;
-    };
-    let reason_owned = node_tables::relabel_local_node(reason_owned, &local_name, local_creation);
-    // Port of erts/emulator/beam/dist.c:1497-1524 (`erts_dsig_send_m_exit`), OTP-29.1.1.
-    let (control, payload) = if exit_payload {
-        (
-            control(28, vec![deceased_term, remote_watcher, reference_term]),
-            Some(reason_owned),
-        )
-    } else {
-        (
-            control(
-                21,
-                vec![deceased_term, remote_watcher, reference_term, reason_owned],
-            ),
-            None,
-        )
-    };
-    let _ = emit_control_message_on_handle(_runtime, handle, control, payload);
     true
 }
 
@@ -3026,7 +2844,12 @@ pub(crate) fn native_signal(
                     .as_ref()
                     .is_some_and(|cold| cold.dist_monitors.contains(id))
             })
-            .and_then(monitor_node);
+            .filter(|id| {
+                process.monitors.get(*id).is_some_and(|monitor| {
+                    !monitor.is_target() && monitor.info().dist_target().is_some()
+                })
+            })
+            .map(|_| String::new());
         (remote, 0usize)
     } else if function == "monitor" {
         if args.len() < 2 || args[0] != atom("process") {
@@ -3069,7 +2892,6 @@ pub(crate) fn native_signal(
         "monitor" => {
             // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
             let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
-            let info = crate::signals::monitor_info_for(tag, None)?;
             // bif.c monitor: `{Name, Node}` on a node that is not alive is badarg.
             if matches!(&target, OwnedTerm::Tuple(parts) if parts.len() == 2)
                 && !node_tables::lock().alive
@@ -3095,37 +2917,56 @@ pub(crate) fn native_signal(
                 _ => target.clone(),
             };
             let reference_owned = owned(reference)?;
-            let (origin, _) = crate::proc_create::create_monitor_with_reference_at(
+            let name = match &target {
+                OwnedTerm::Tuple(parts) if parts.len() == 2 => match &parts[0] {
+                    OwnedTerm::Atom(name) => Some(name.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let info = crate::signals::monitor_info_for(tag, name.as_deref())?;
+            let prepared = dsig_prepare(process, ctx, &node)?;
+            let dist = match &prepared {
+                DsigPrepare::Connected { mld, .. } => mld.clone(),
+                DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
+                    // bif.c monitor: erts_monitor_set_dead_dist.
+                    let sysname = global_atoms().intern(&node).map_err(|_| badarg())?.0;
+                    std::sync::Arc::new(crate::monitor_link::MonLnkDist::dead(sysname))
+                }
+            };
+            let runtime = process.runtime.ok_or_else(badarg)?;
+            // origin `other.item`: the external pid, or the node of a monitor by name.
+            let remote = if name.is_some() {
+                OwnedTerm::Atom(node.clone())
+            } else {
+                target.clone()
+            };
+            let origin = emon::create_origin_or_down(
+                runtime,
                 process.heap.alloc_ix(),
                 crate::proc_create::monitor_reference(id, alias_mode, priority),
-                ctx.pid().data(),
-                0,
+                ctx.pid(),
                 info,
-                crate::proc_create::OriginMonitor::Distributed,
-            );
+                crate::proc_create::DistTarget {
+                    target: remote,
+                    reference: reference_owned.clone(),
+                    dist,
+                },
+            )?;
             process.monitors.insert(origin);
-            match dsig_prepare(process, ctx, &node)? {
-                DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
-                    // bif.c monitor: erts_monitor_set_dead_dist, then
-                    // erts_proc_sig_send_monitor_down(..., am_noconnection).
-                    let runtime = process.runtime.ok_or_else(badarg)?;
-                    send_monitor_down_noconnection(runtime, ctx.pid(), id, target)?;
-                }
-                DsigPrepare::Connected { connection_id, .. } => {
-                    remember_monitor(&node, id, ctx.pid(), target)?;
-                    process.cold_mut().dist_monitors.insert(id);
-                    queue_outgoing_on(
-                        process,
-                        ctx,
-                        &node,
-                        connection_id,
-                        control(
-                            19,
-                            vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
-                        ),
-                        None,
-                    )?;
-                }
+            process.cold_mut().dist_monitors.insert(id);
+            if let DsigPrepare::Connected { connection_id, .. } = prepared {
+                queue_outgoing_on(
+                    process,
+                    ctx,
+                    &node,
+                    connection_id,
+                    control(
+                        19,
+                        vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
+                    ),
+                    None,
+                )?;
             }
             Ok(reference)
         }
@@ -3137,38 +2978,22 @@ pub(crate) fn native_signal(
             if args.len() == 2 && !valid_demonitor_options(args[1]) {
                 return Err(badarg());
             }
-            let origin = crate::signals::demonitor_origin(process, id);
-            if matches!(origin, crate::signals::OriginDemonitor::Alias) {
-                return Ok(atom("false"));
-            }
-            let Some((node, target)) = take_monitor(id) else {
-                process.cold_mut().dist_monitors.remove(&id);
-                return Ok(atom(if args.len() == 1 || !demonitor_info(args[1]) {
-                    "true"
-                } else {
-                    "false"
-                }));
-            };
-            process.cold_mut().dist_monitors.remove(&id);
-            let wire_target = match &target {
-                OwnedTerm::Tuple(parts)
-                    if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) =>
-                {
-                    parts[0].clone()
+            match crate::signals::demonitor_origin(process, id) {
+                crate::signals::OriginDemonitor::Alias => Ok(atom("false")),
+                crate::signals::OriginDemonitor::Distributed(origin) => {
+                    process.cold_mut().dist_monitors.remove(&id);
+                    emon::demonitor_remote(process.runtime, ctx.pid(), origin);
+                    Ok(atom("true"))
                 }
-                _ => target,
-            };
-            queue_outgoing(
-                process,
-                ctx,
-                &node,
-                control(
-                    20,
-                    vec![local_pid_owned(ctx.pid()), wire_target, owned(args[0])?],
-                ),
-                None,
-            )?;
-            Ok(atom("true"))
+                _ => {
+                    process.cold_mut().dist_monitors.remove(&id);
+                    Ok(atom(if args.len() == 1 || !demonitor_info(args[1]) {
+                        "true"
+                    } else {
+                        "false"
+                    }))
+                }
+            }
         }
         _ => Err(badarg()),
     }
@@ -3256,81 +3081,6 @@ fn remote_node(term: Term) -> Result<Option<String>, VmError> {
     };
     let local = node_tables::lock().local_name.clone();
     Ok((node != local && node != "nonode@nohost").then_some(node))
-}
-
-fn remember_monitor(node: &str, id: u64, watcher: Pid, target: OwnedTerm) -> Result<(), VmError> {
-    let mut tables = node_tables::lock();
-    let entry = tables.entries.get_mut(node).ok_or_else(badarg)?;
-    if let Some(state) = entry.dist.as_mut() {
-        state
-            .remote_monitors
-            .insert(id, node_tables::RemoteMonitor { watcher, target });
-    } else {
-        entry
-            .pending_monitors
-            .insert(id, node_tables::RemoteMonitor { watcher, target });
-    }
-    Ok(())
-}
-
-pub(crate) fn take_monitor(id: u64) -> Option<(String, OwnedTerm)> {
-    let mut tables = node_tables::lock();
-    for (node, entry) in &mut tables.entries {
-        if let Some(monitor) = entry.pending_monitors.remove(&id) {
-            return Some((node.clone(), monitor.target));
-        }
-        if let Some(state) = entry.dist.as_mut()
-            && let Some(monitor) = state.remote_monitors.remove(&id)
-        {
-            return Some((node.clone(), monitor.target));
-        }
-    }
-    None
-}
-
-/// Send the remote demonitor caused by the first message through a reply_demonitor alias.
-// Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message), OTP-29.1.1.
-pub(crate) fn demonitor_alias(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    id: u64,
-) -> Result<(), VmError> {
-    process.cold_mut().dist_monitors.remove(&id);
-    let Some((node, target)) = take_monitor(id) else {
-        return Ok(());
-    };
-    let wire_target = match &target {
-        OwnedTerm::Tuple(parts) if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) => {
-            parts[0].clone()
-        }
-        _ => target,
-    };
-    let reference = crate::signals::reference(process, id)?;
-    queue_outgoing(
-        process,
-        ctx,
-        &node,
-        control(
-            20,
-            vec![local_pid_owned(ctx.pid()), wire_target, owned(reference)?],
-        ),
-        None,
-    )
-}
-
-fn monitor_node(id: u64) -> Option<String> {
-    let tables = node_tables::lock();
-    tables.entries.iter().find_map(|(node, entry)| {
-        if entry.pending_monitors.contains_key(&id) {
-            return Some(node.clone());
-        }
-        entry
-            .dist
-            .as_ref()?
-            .remote_monitors
-            .contains_key(&id)
-            .then(|| node.clone())
-    })
 }
 
 fn local_pid_owned(pid: Pid) -> OwnedTerm {

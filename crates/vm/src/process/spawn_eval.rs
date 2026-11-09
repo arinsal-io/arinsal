@@ -12,7 +12,7 @@ impl Runtime {
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
         linker: Option<Pid>,
-        monitor: Option<(Pid, u64)>,
+        monitor: Option<crate::proc_create::DistOrigin>,
         parent: &arinsal_etf::OwnedTerm,
     ) -> Result<Pid, VmError> {
         self.spawn_mfa_scheduled(module, function, args, linker, monitor, Some(parent))
@@ -24,7 +24,7 @@ impl Runtime {
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
         linker: Option<Pid>,
-        monitor: Option<(Pid, u64)>,
+        monitor: Option<crate::proc_create::DistOrigin>,
         parent: Option<&arinsal_etf::OwnedTerm>,
     ) -> Result<Pid, VmError> {
         let (module_id, ip) = {
@@ -59,18 +59,6 @@ impl Runtime {
                 .links
                 .insert(crate::proc_create::process_link(linker, false));
         }
-        if let Some((watcher, reference)) = monitor {
-            // The watcher is a remote process: the target half is an `ERTS_MON_TYPE_DIST_PROC`
-            // entry of the child's monitor tree.
-            let (_origin, target) = crate::proc_create::create_monitor(
-                reference,
-                watcher.data(),
-                0,
-                crate::proc_create::MonitorInfo::default(),
-                crate::proc_create::OriginMonitor::Distributed,
-            );
-            child.monitors.insert(target);
-        }
         if let Some(arity) = u8::try_from(args.len()).ok()
             && (arinsal_bifs::lookup(module, function, arity).is_some()
                 || arinsal_spec::bif_lookup(module, function, arity).is_some())
@@ -83,10 +71,32 @@ impl Runtime {
                 .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?;
         }
         let scheduler = self.scheduler()?;
-        let pid = scheduler
-            .spawn_unscheduled(child)
-            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        Ok(pid)
+        let Some(monitor) = monitor else {
+            return scheduler
+                .spawn_unscheduled(child)
+                .map_err(|error| VmError::Unsupported(format!("spawn: {error}")));
+        };
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process, SPO_MONITOR with a
+        // remote parent), OTP-29.1.1: the origin half goes into the connection and the target
+        // half into the child's monitor tree, or both are released when the connection is
+        // gone.
+        let spawned = scheduler
+            .spawn_unscheduled_init(
+                || child,
+                |pid, child: &mut Process| {
+                    crate::dist::insert_spawn_child_monitor(child, pid, monitor);
+                    Ok::<(), std::convert::Infallible>(())
+                },
+                arinsal_sched::Priority::Normal,
+                None,
+            )
+            .map_err(|error| match error {
+                arinsal_sched::SpawnInitError::Table(error) => {
+                    VmError::Unsupported(format!("spawn: {error}"))
+                }
+                arinsal_sched::SpawnInitError::Init(never) => match never {},
+            })?;
+        Ok(spawned.pid())
     }
 
     /// Schedule a distributed child after its spawn reply was queued.
