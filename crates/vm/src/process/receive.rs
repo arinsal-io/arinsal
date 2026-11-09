@@ -145,7 +145,9 @@ impl Process {
                     port_id: Some(port_id),
                     ..
                 }) => {
-                    crate::port::demonitor_port(self, ctx.pid(), port_id, alias);
+                    if let Some(origin) = entry {
+                        crate::port::demonitor_port(self, ctx.pid(), port_id, origin);
+                    }
                 }
                 Some(crate::proc_create::OriginMonitor::Alias) => {}
                 Some(crate::proc_create::OriginMonitor::Distributed) => {

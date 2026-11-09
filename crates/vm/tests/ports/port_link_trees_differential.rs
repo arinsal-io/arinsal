@@ -52,8 +52,21 @@ run() ->
     G = [X || {port, X} <- element(2, process_info(self(), monitors))] =:= [P1],
     true = erlang:demonitor(M, [flush]),
     H = [X || {port, X} <- element(2, process_info(self(), monitors))] =:= [],
-    port_close(P1),
-    {A, B, C, D, E =/= undefined, F, G, H}.
+    ObserverA = spawn(fun() -> erlang:monitor(port, P1), Parent ! {ready, self()}, receive stop -> ok end end),
+    receive {ready, ObserverA} -> ok end,
+    ObserverB = spawn(fun() -> erlang:monitor(port, P1), Parent ! {ready, self()}, receive stop -> ok end end),
+    receive {ready, ObserverB} -> ok end,
+    I = element(2, erlang:port_info(P1, monitored_by)) =:= [ObserverB, ObserverA],
+    ObserverA ! stop,
+    ObserverB ! stop,
+    receive after 20 -> ok end,
+    RefA = erlang:monitor(port, P1),
+    RefB = erlang:monitor(port, P1),
+    true = port_close(P1),
+    DownA = receive {'DOWN', RefA, port, P1, normal} -> RefA after 1000 -> timeout end,
+    DownB = receive {'DOWN', RefB, port, P1, normal} -> RefB after 1000 -> timeout end,
+    J = [DownA, DownB] =:= [RefA, RefB],
+    {A, B, C, D, E =/= undefined, F, G, H, I, J}.
 "#;
 
 #[test]

@@ -477,12 +477,7 @@ impl Process {
                     port_id: Some(port_id),
                     ..
                 }) => {
-                    crate::port::demonitor_port(
-                        self,
-                        ctx.pid(),
-                        *port_id,
-                        monitor.view().reference(),
-                    );
+                    crate::port::demonitor_port(self, ctx.pid(), *port_id, monitor);
                 }
                 // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor,
                 // origin ERTS_MON_TYPE_DIST_PROC): erts_proc_exit_dist_demonitor.
