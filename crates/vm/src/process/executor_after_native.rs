@@ -475,8 +475,13 @@ impl Executor {
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
                         Err(VmError::Dirty(kind)) => {
-                            for (register, value) in process.x.iter_mut().zip(&saved_x) {
-                                *register = *value;
+                            // Scheduling the dirty BIF is a trap, after which the call path
+                            // may collect (erts_gc_after_bif_call_lhf with `p->arity`); the
+                            // copies taken before such a collection are stale.
+                            if process.stats.gc.collections == collections_before {
+                                for (register, value) in process.x.iter_mut().zip(&saved_x) {
+                                    *register = *value;
+                                }
                             }
                             if process.dirty_bif_scheduled() {
                                 // Port of erts/emulator/beam/bif.c:5814-5835
@@ -1127,9 +1132,15 @@ impl Executor {
                             // A dirty BIF called on a normal scheduler is redone
                             // on a dirty one (erts_schedule_bif), OTP-29.1.1.
                             Err(VmError::Dirty(kind)) => {
-                                for (register, value) in process.x.iter_mut().zip(&saved_arguments)
-                                {
-                                    *register = *value;
+                                // A collection after the dirty schedule trap
+                                // (erts_gc_after_bif_call_lhf) moved the registers; the
+                                // copies taken before it are stale.
+                                if process.stats.gc.collections == collections_before {
+                                    for (register, value) in
+                                        process.x.iter_mut().zip(&saved_arguments)
+                                    {
+                                        *register = *value;
+                                    }
                                 }
                                 if process.dirty_bif_scheduled() {
                                     // Port of erts/emulator/beam/bif.c:5814-5835

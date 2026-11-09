@@ -253,9 +253,12 @@ impl Process {
             if let Some(state) = cold.ets_select.as_mut() {
                 roots.push(state.saved.roots_mut());
             }
-            for root in crate::dirty::dirty_result_slots(
-                cold.dirty_bif.as_mut(),
-                cold.static_nif_done.as_mut(),
+            for root in crate::dirty::dirty_root_slots(
+                &mut cold.dirty_bif,
+                &mut cold.static_nif_done,
+                &mut cold.dirty_bif_trap_target,
+                &mut cold.dirty_bif_original,
+                &mut cold.dirty_bif_exception_trace,
             ) {
                 roots.push_term(root);
             }
