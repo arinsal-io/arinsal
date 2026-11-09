@@ -417,8 +417,22 @@ fn put_data(
     let local_name = node_tables::this_node().0.to_owned();
     let (handle_id, decoded) = with_dhandle_input(handle, ctx.pid(), |state| {
         state.read = state.read.saturating_add(1);
-        let packet = arinsal_etf::decode_dist_packet(&bytes, &mut state.incoming_cache)
-            .map_err(|_| badarg())?;
+        let packet = arinsal_etf::decode_dist_packet_indexed(
+            &bytes,
+            &mut state.incoming_cache,
+            |name| {
+                arinsal_term::global_atoms()
+                    .intern(name)
+                    .ok()
+                    .map(|atom| atom.0)
+            },
+            |index| {
+                arinsal_term::global_atoms()
+                    .text(arinsal_term::Atom(index))
+                    .map(str::to_owned)
+            },
+        )
+        .map_err(|_| badarg())?;
         let DistributionHeader::Start { .. } = packet.header else {
             return Ok((state.handle, Vec::new()));
         };
@@ -1092,8 +1106,22 @@ pub(crate) fn ingest_port_data(
             .filter(|state| state.port_id == Some(port_id))
             .ok_or_else(badarg)?;
         state.read = state.read.saturating_add(1);
-        let packet = arinsal_etf::decode_dist_packet(bytes, &mut state.incoming_cache)
-            .map_err(|_| badarg())?;
+        let packet = arinsal_etf::decode_dist_packet_indexed(
+            bytes,
+            &mut state.incoming_cache,
+            |name| {
+                arinsal_term::global_atoms()
+                    .intern(name)
+                    .ok()
+                    .map(|atom| atom.0)
+            },
+            |index| {
+                arinsal_term::global_atoms()
+                    .text(arinsal_term::Atom(index))
+                    .map(str::to_owned)
+            },
+        )
+        .map_err(|_| badarg())?;
         let Some(packet) = reassemble_port_fragment(state, packet)? else {
             return Ok(());
         };

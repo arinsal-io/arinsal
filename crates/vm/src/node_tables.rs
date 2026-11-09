@@ -232,17 +232,19 @@ impl DistState {
             terms.push(message);
         }
         let packets = if self.flags & DFLAG_FRAGMENTS != 0 {
-            arinsal_etf::encode_dist_packet_terms_fragmented(
+            arinsal_etf::encode_dist_packet_terms_fragmented_indexed(
                 &terms,
                 &mut self.outgoing_cache,
                 sequence_id,
                 64 * 1024,
+                |name| arinsal_term::global_atoms().get(name).map(|atom| atom.0),
             )?
         } else {
-            vec![arinsal_etf::encode_dist_packet_terms(
+            vec![arinsal_etf::encode_dist_packet_terms_indexed(
                 &terms,
                 &mut self.outgoing_cache,
                 None,
+                |name| arinsal_term::global_atoms().get(name).map(|atom| atom.0),
             )]
         };
         Ok(packets)

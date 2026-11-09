@@ -222,9 +222,19 @@ pub enum DecodeError {
 /// OTP distribution atom cache, with 8 segments of 256 entries each.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomCache {
-    entries: Vec<Option<String>>,
+    entries: Vec<Option<CacheAtom>>,
     next_slot: usize,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CacheAtom {
+    Text(String),
+    Indexed(u32),
+}
+
+type AtomIndexFn<'a> = &'a dyn Fn(&str) -> Option<u32>;
+type AtomNameFn<'a> = &'a dyn Fn(u32) -> Option<String>;
+type AtomCallbacks<'a> = (AtomIndexFn<'a>, AtomNameFn<'a>);
 
 impl Default for AtomCache {
     fn default() -> Self {
@@ -243,7 +253,13 @@ impl AtomCache {
 
     /// Read one cache slot by its 11-bit index.
     pub fn get(&self, slot: usize) -> Option<&str> {
-        self.entries.get(slot).and_then(Option::as_deref)
+        self.entries
+            .get(slot)
+            .and_then(Option::as_ref)
+            .and_then(|atom| match atom {
+                CacheAtom::Text(text) => Some(text.as_str()),
+                CacheAtom::Indexed(_) => None,
+            })
     }
 
     /// Replace one cache slot by its 11-bit index.
@@ -252,22 +268,34 @@ impl AtomCache {
             .entries
             .get_mut(slot)
             .ok_or_else(|| invalid(0, "atom cache slot out of range"))?;
-        *entry = Some(atom.into());
+        *entry = Some(CacheAtom::Text(atom.into()));
         Ok(())
     }
 
     fn allocate(&mut self, atom: &str) -> (usize, bool) {
-        if let Some(slot) = self
-            .entries
-            .iter()
-            .position(|entry| entry.as_deref() == Some(atom))
-        {
+        if let Some(slot) = self.entries.iter().position(|entry| {
+            entry.as_ref().is_some_and(|entry| match entry {
+                CacheAtom::Text(text) => text == atom,
+                CacheAtom::Indexed(_) => false,
+            })
+        }) {
             return (slot, false);
         }
         let slot = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.entries.len();
-        self.entries[slot] = Some(atom.to_owned());
+        self.entries[slot] = Some(CacheAtom::Text(atom.to_owned()));
         (slot, true)
+    }
+
+    fn set_indexed(&mut self, slot: usize, index: u32) {
+        self.entries[slot] = Some(CacheAtom::Indexed(index));
+    }
+
+    fn get_indexed(&self, slot: usize) -> Option<u32> {
+        match self.entries.get(slot)?.as_ref()? {
+            CacheAtom::Indexed(index) => Some(*index),
+            CacheAtom::Text(_) => None,
+        }
     }
 }
 
@@ -1913,6 +1941,32 @@ pub fn encode_dist_packet_terms(
     cache: &mut AtomCache,
     fragment: Option<(u64, u64)>,
 ) -> Vec<u8> {
+    encode_dist_packet_terms_impl(terms, cache, fragment, None)
+}
+
+/// Encode a distribution packet using the runtime atom indices used by OTP's outgoing cache.
+///
+/// The callback must return the atom table index for each atom. OTP-29.1.1 selects
+/// cache slots as `atom_val(atom) % 2039`; the callback lets the ETF crate retain
+/// its owned-string term model while the VM supplies those stable indices.
+/// Port of `erts/emulator/beam/external.c` (`atom2cix`, `insert_acache_map`,
+/// `get_iix_acache_map`, `erts_finalize_atom_cache_map`, and
+/// `erts_encode_ext_dist_header_finalize`), OTP-29.1.1.
+pub fn encode_dist_packet_terms_indexed(
+    terms: &[&OwnedTerm],
+    cache: &mut AtomCache,
+    fragment: Option<(u64, u64)>,
+    atom_index: impl Fn(&str) -> Option<u32>,
+) -> Vec<u8> {
+    encode_dist_packet_terms_impl(terms, cache, fragment, Some(&atom_index))
+}
+
+fn encode_dist_packet_terms_impl(
+    terms: &[&OwnedTerm],
+    cache: &mut AtomCache,
+    fragment: Option<(u64, u64)>,
+    atom_index: Option<AtomIndexFn<'_>>,
+) -> Vec<u8> {
     // Port of erts/emulator/beam/external.c:284-346, 390-489, 763-817,
     // OTP-29.1.1. The allocator is local to this library; OTP chooses cache
     // slots from its atom table's internal cache index.
@@ -1920,18 +1974,42 @@ pub fn encode_dist_packet_terms(
     for term in terms {
         collect_atoms(term, &mut ordered);
     }
-    let mut seen = std::collections::HashSet::new();
-    ordered.retain(|atom| seen.insert(atom.clone()));
-    ordered.truncate(255);
-
     let mut refs = std::collections::HashMap::new();
     let mut updates = Vec::with_capacity(ordered.len());
     let mut long_atoms = false;
-    for (index, atom) in ordered.iter().enumerate() {
-        let (slot, is_new) = cache.allocate(atom);
-        refs.insert(atom.clone(), index as u8);
-        updates.push((slot, is_new, atom));
-        long_atoms |= atom.len() > u8::MAX as usize;
+    let mut touched = std::collections::HashMap::<usize, (u32, String, u8)>::new();
+    for atom in &ordered {
+        if let Some(atom_index) = atom_index {
+            let Some(index) = atom_index(atom) else {
+                continue;
+            };
+            let slot = index as usize % 2039;
+            if let Some((old_index, _, translation_index)) = touched.get(&slot) {
+                if *old_index == index {
+                    refs.insert(atom.clone(), *translation_index);
+                }
+                continue;
+            }
+            if touched.len() == 255 {
+                continue;
+            }
+            let translation_index = touched.len() as u8;
+            touched.insert(slot, (index, atom.clone(), translation_index));
+            let is_new =
+                !matches!(cache.entries[slot], Some(CacheAtom::Indexed(old)) if old == index);
+            cache.set_indexed(slot, index);
+            refs.insert(atom.clone(), translation_index);
+            updates.push((slot, is_new, atom));
+            long_atoms |= atom.len() > u8::MAX as usize;
+        } else {
+            if refs.contains_key(atom) || updates.len() == 255 {
+                continue;
+            }
+            let (slot, is_new) = cache.allocate(atom);
+            refs.insert(atom.clone(), updates.len() as u8);
+            updates.push((slot, is_new, atom));
+            long_atoms |= atom.len() > u8::MAX as usize;
+        }
     }
 
     let mut out = vec![131, if fragment.is_some() { 69 } else { 68 }];
@@ -1978,27 +2056,52 @@ pub fn encode_dist_packet_terms_fragmented(
     sequence_id: u64,
     fragment_size: usize,
 ) -> Result<Vec<Vec<u8>>, DecodeError> {
+    encode_dist_packet_terms_fragmented_impl(terms, cache, sequence_id, fragment_size, None)
+}
+
+/// Indexed counterpart of [`encode_dist_packet_terms_fragmented`].
+pub fn encode_dist_packet_terms_fragmented_indexed(
+    terms: &[&OwnedTerm],
+    cache: &mut AtomCache,
+    sequence_id: u64,
+    fragment_size: usize,
+    atom_index: impl Fn(&str) -> Option<u32>,
+) -> Result<Vec<Vec<u8>>, DecodeError> {
+    encode_dist_packet_terms_fragmented_impl(
+        terms,
+        cache,
+        sequence_id,
+        fragment_size,
+        Some(&atom_index),
+    )
+}
+
+fn encode_dist_packet_terms_fragmented_impl(
+    terms: &[&OwnedTerm],
+    cache: &mut AtomCache,
+    sequence_id: u64,
+    fragment_size: usize,
+    atom_index: Option<AtomIndexFn<'_>>,
+) -> Result<Vec<Vec<u8>>, DecodeError> {
     if fragment_size == 0 {
         return Err(invalid(0, "zero distribution fragment size"));
     }
-    let cache_before = cache.clone();
-    let packet = encode_dist_packet_terms(terms, cache, None);
-    let mut decode_cache = cache_before;
-    let decoded = decode_dist_packet(&packet, &mut decode_cache)?;
-    let payload_start = packet.len() - decoded.payload.len();
-    if decoded.payload.len() <= fragment_size {
+    let packet = encode_dist_packet_terms_impl(terms, cache, None, atom_index);
+    let payload_start = dist_header_payload_offset(&packet)?;
+    let payload_len = packet.len() - payload_start;
+    if payload_len <= fragment_size {
         return Ok(vec![packet]);
     }
-    let fragment_count = decoded.payload.len().div_ceil(fragment_size);
+    let fragment_count = payload_len.div_ceil(fragment_size);
     let mut fragments = Vec::with_capacity(fragment_count);
     let mut first = Vec::with_capacity(18 + payload_start + fragment_size);
     first.extend_from_slice(&[131, 69]);
     first.extend_from_slice(&sequence_id.to_be_bytes());
     first.extend_from_slice(&(fragment_count as u64).to_be_bytes());
     first.extend_from_slice(&packet[2..payload_start]);
-    first.extend_from_slice(&decoded.payload[..fragment_size]);
+    first.extend_from_slice(&packet[payload_start..payload_start + fragment_size]);
     fragments.push(first);
-    for (index, payload) in decoded.payload[fragment_size..]
+    for (index, payload) in packet[payload_start + fragment_size..]
         .chunks(fragment_size)
         .enumerate()
     {
@@ -2010,6 +2113,33 @@ pub fn encode_dist_packet_terms_fragmented(
         ));
     }
     Ok(fragments)
+}
+
+fn dist_header_payload_offset(packet: &[u8]) -> Result<usize, DecodeError> {
+    let mut reader = Reader {
+        bytes: packet,
+        at: 0,
+    };
+    if reader.u8()? != 131 || reader.u8()? != 68 {
+        return Err(invalid(0, "invalid distribution packet header"));
+    }
+    let count = reader.u8()? as usize;
+    let flag_len = (count + 2) / 2;
+    let flags = reader.take(flag_len)?;
+    let long_atoms = count > 0 && (flags[count / 2] >> ((count % 2) * 4)) & 1 != 0;
+    for index in 0..count {
+        let nibble = (flags[index / 2] >> ((index % 2) * 4)) & 0x0f;
+        reader.u8()?;
+        if nibble & 8 != 0 {
+            let len = if long_atoms {
+                reader.u16()? as usize
+            } else {
+                reader.u8()? as usize
+            };
+            reader.take(len)?;
+        }
+    }
+    Ok(reader.at)
 }
 
 /// Encode one `DIST_FRAG_CONT` packet.
@@ -2027,6 +2157,28 @@ pub fn encode_dist_continuation(sequence_id: u64, fragment_id: u64, payload: &[u
 pub fn decode_dist_packet(
     bytes: &[u8],
     cache: &mut AtomCache,
+) -> Result<DistributionPacket, DecodeError> {
+    decode_dist_packet_impl(bytes, cache, None)
+}
+
+/// Decode a distribution packet while retaining incoming cache values as atom indices.
+///
+/// `intern` stores newly received names in the runtime atom table; `atom_name` resolves
+/// old cache references without keeping atom strings in the per-connection cache.
+/// Port of `erts/emulator/beam/external.c` distribution-header decode, OTP-29.1.1.
+pub fn decode_dist_packet_indexed(
+    bytes: &[u8],
+    cache: &mut AtomCache,
+    intern: impl Fn(&str) -> Option<u32>,
+    atom_name: impl Fn(u32) -> Option<String>,
+) -> Result<DistributionPacket, DecodeError> {
+    decode_dist_packet_impl(bytes, cache, Some((&intern, &atom_name)))
+}
+
+fn decode_dist_packet_impl(
+    bytes: &[u8],
+    cache: &mut AtomCache,
+    atom_callbacks: Option<AtomCallbacks<'_>>,
 ) -> Result<DistributionPacket, DecodeError> {
     // Port of erts_prepare_dist_ext, external.c:908-1160, OTP-29.1.1.
     let mut r = Reader { bytes, at: 0 };
@@ -2080,8 +2232,19 @@ pub fn decode_dist_packet(
                 let atom = std::str::from_utf8(raw)
                     .map_err(|_| invalid(r.at - len, "invalid UTF-8 distribution atom"))?
                     .to_owned();
-                cache.entries[slot] = Some(atom.clone());
+                if let Some((intern, _)) = atom_callbacks {
+                    let index = intern(&atom)
+                        .ok_or_else(|| invalid(r.at - len, "could not intern distribution atom"))?;
+                    cache.set_indexed(slot, index);
+                } else {
+                    cache.entries[slot] = Some(CacheAtom::Text(atom.clone()));
+                }
                 atom
+            } else if let Some((_, atom_name)) = atom_callbacks {
+                let index = cache
+                    .get_indexed(slot)
+                    .ok_or_else(|| invalid(flags_at, "reference to empty atom cache slot"))?;
+                atom_name(index).ok_or_else(|| invalid(flags_at, "cached atom index is invalid"))?
             } else {
                 cache
                     .get(slot)
