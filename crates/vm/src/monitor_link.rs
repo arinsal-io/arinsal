@@ -1944,7 +1944,6 @@ impl Link {
     }
 
     /// Port of erts/emulator/beam/erl_monitor_link.h (erts_link_release_both), OTP-29.1.1.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn release_both(first: Self, second: Self) {
         debug_assert_eq!(node_to_main(first.node), node_to_main(second.node));
         let node = first.into_node();
@@ -2045,7 +2044,6 @@ impl Link {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn view_mut(&mut self) -> LinkMut<'_> {
         LinkMut {
             node: self.node,
@@ -2194,7 +2192,6 @@ impl LinkMut<'_> {
     }
 
     /// Port of erts/emulator/beam/erl_monitor_link.c (erts_link_set_dead_dist), OTP-29.1.1.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_dead_dist(&mut self, nodename: u32) {
         let elink = elink_of(self.node).expect("dead dist on an external link");
         debug_assert_eq!(
@@ -2410,6 +2407,46 @@ mod tests {
         let (_, dist) = tree.lookup_create_external(node_type::LINK_DIST_PROC, 11, external(9));
         assert!(dist.expect("created").dist_insert(&mld).is_err());
         drop(taken);
+    }
+
+    /// bif.c link_opt `replace`: an unlinking link of an old connection is replaced in the
+    /// tree by a fresh one inserted in the new connection; the old dist half leaves the old
+    /// list, and a replacement on a dead connection gets a dead dist of its own.
+    #[test]
+    fn unlinking_link_of_an_old_connection_is_replaced() {
+        let old = std::sync::Arc::new(MonLnkDist::with_connection(42, 1));
+        let new = std::sync::Arc::new(MonLnkDist::with_connection(42, 2));
+        let mut tree = MonLnkTree::<Link>::default();
+        let (mut link, dist) =
+            tree.lookup_create_external(node_type::LINK_DIST_PROC, 11, external(5));
+        link.set_unlinking(7);
+        assert!(dist.expect("created").dist_insert(&old).is_ok());
+        let (proc_half, dist_half) =
+            Link::create_external(node_type::LINK_DIST_PROC, 11, external(5));
+        let replaced = tree.remove_external(&external(5)).expect("present");
+        let deleted = replaced.dist_delete_other();
+        assert!(deleted);
+        replaced.release_external(deleted);
+        tree.insert(proc_half);
+        assert!(dist_half.dist_insert(&new).is_ok());
+        assert!(old.take_links().is_empty());
+        let view = tree.get_external(&external(5)).expect("replaced");
+        assert_eq!(view.unlinking(), 0);
+        assert_eq!(view.external_dist().map(|d| d.connection_id), Some(2));
+        assert_eq!(new.take_links().len(), 1);
+        // Not connected: the replacement carries a dead dist and its dist half is the one
+        // the `noconnection` exit is built from.
+        let (proc_half, mut dist_half) =
+            Link::create_external(node_type::LINK_DIST_PROC, 11, external(6));
+        dist_half.view_mut().set_dead_dist(42);
+        tree.insert(proc_half);
+        let view = dist_half.view();
+        assert_eq!(view.external_dist().map(|d| d.connection_id), Some(!0));
+        assert_eq!(view.external_local(), Some(11));
+        drop(dist_half);
+        let link = tree.remove_external(&external(6)).expect("present");
+        assert!(!link.dist_delete_other());
+        link.release_external(false);
     }
 
     #[test]
