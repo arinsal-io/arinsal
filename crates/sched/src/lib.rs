@@ -475,6 +475,15 @@ const fn load_order(order: Ordering) -> Ordering {
 const PID_LIMIT: u32 = 1 << 28;
 const UNBOUND_WORKER: usize = usize::MAX;
 
+/// The sentinel pid for an absent sender: erts' `am_undefined` where a `Pid` is required.
+///
+/// Not a live process-table id. Identifier data `0` is the first pid erts hands out
+/// (`<0.0.0>`), so the sentinel is the invalid element (`ERTS_PTAB_ID_DATA_MASK`), which
+/// `erts_ptab_new_element` never returns.
+// Port of erts/emulator/beam/erl_nif.c:963 (`from = c_p ? c_p->common.id : am_undefined`)
+// and erl_ptab.h (`ERTS_PTAB_INVALID_DATA`), OTP-29.1.1.
+pub const UNDEFINED_PID: Pid = Pid::from_data(arinsal_term::ptab::PTAB_INVALID_DATA);
+
 /// OTP 29.1.1's default microstate categories for this build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -547,6 +556,12 @@ impl Pid {
     /// Convert to the term crate's tagged local pid.
     pub fn to_term(self) -> Option<arinsal_term::Term> {
         Some(arinsal_term::Term::pid_from_data(self.data))
+    }
+
+    /// Whether this is the sentinel for an absent sender (`am_undefined` in erts'
+    /// `enif_send` when `c_p == NULL`). A live pid, including `<0.0.0>`, is not absent.
+    pub const fn is_undefined(self) -> bool {
+        self.data == arinsal_term::ptab::PTAB_INVALID_DATA
     }
 
     /// Decode a tagged local pid.

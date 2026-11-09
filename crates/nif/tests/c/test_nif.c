@@ -249,6 +249,44 @@ static ERL_NIF_TERM send_probe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     if (!enif_self(env, &pid)) return enif_make_badarg(env);
     return enif_make_int(env, enif_send(env, &pid, NULL, enif_make_atom(env, "delivered")));
 }
+
+/* Send `msg` to `to` from a NIF-created thread: once with a NULL env (so the sender is
+ * `undefined`) and once with an `enif_alloc_env` env (process-independent, also
+ * `undefined`). Mirrors erts/emulator/beam/erl_nif.c:860 (enif_send) on a non-scheduler
+ * thread (execution_state: c_p == NULL). */
+struct thread_send_arg { ErlNifPid to; ERL_NIF_TERM tag; };
+static void *thread_send_fn(void *arg) {
+    struct thread_send_arg *a = (struct thread_send_arg *)arg;
+    ErlNifPid to = a->to;
+    /* Call 1: env == NULL. The message lives in its own msg_env. */
+    {
+        ErlNifEnv *msg_env = enif_alloc_env();
+        ERL_NIF_TERM msg = enif_make_tuple(msg_env, 2, a->tag, enif_make_atom(msg_env, "null_env"));
+        enif_send(NULL, &to, msg_env, msg);
+        enif_free_env(msg_env);
+    }
+    /* Call 2: env == enif_alloc_env() (process-independent). */
+    {
+        ErlNifEnv *env = enif_alloc_env();
+        ERL_NIF_TERM msg = enif_make_tuple(env, 2, a->tag, enif_make_atom(env, "alloc_env"));
+        enif_send(env, &to, env, msg);
+        enif_free_env(env);
+    }
+    return NULL;
+}
+static ERL_NIF_TERM thread_send_probe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    if (argc != 1) return enif_make_badarg(env);
+    struct thread_send_arg *a = enif_alloc(sizeof(struct thread_send_arg));
+    if (!a) return enif_make_badarg(env);
+    if (!enif_get_local_pid(env, argv[0], &a->to)) { enif_free(a); return enif_make_badarg(env); }
+    a->tag = enif_make_atom(env, "thread_send");
+    ErlNifTid tid;
+    int started = enif_thread_create("nif_sender", &tid, thread_send_fn, a, NULL) == 0;
+    void *result = NULL;
+    int joined = started && enif_thread_join(tid, &result) == 0;
+    enif_free(a);
+    return enif_make_int(env, joined);
+}
 static ERL_NIF_TERM exception_probe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc; (void)argv;
     return enif_raise_exception(env, enif_make_atom(env, "test_exception"));
@@ -264,6 +302,7 @@ static ErlNifFunc funcs[] = {
     {"time_probe",0,time_probe,0}, {"hash_probe",0,hash_probe,0},
     {"ioq_probe",0,ioq_probe,0}, {"iovec_probe",0,iovec_probe,0},
     {"thread_probe",0,thread_probe,0}, {"send_probe",0,send_probe,0},
+    {"thread_send_probe",1,thread_send_probe,0},
     {"exception_probe",0,exception_probe,0}
 };
 ERL_NIF_INIT(test_nif, funcs, load, NULL, NULL, NULL)

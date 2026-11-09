@@ -3809,10 +3809,17 @@ pub(crate) fn receive_event(
     message: Term,
     from: Option<Pid>,
 ) {
-    let node = crate::signals::atom("nonode@nohost");
-    let from = from
+    // Port of erts/emulator/beam/erl_trace.c:887-895 (trace_receive_session), OTP-29.1.1:
+    // a pid `from` is `(node_name, pid)`; an atom `from` (`am_undefined` from `enif_send`
+    // with no caller) is passed as the node-name slot and `am_undefined` as the sender.
+    let undefined = crate::signals::atom("undefined");
+    let (node, from) = match from
+        .filter(|pid| !pid.is_undefined())
         .and_then(Pid::to_term)
-        .unwrap_or(crate::signals::atom("undefined"));
+    {
+        Some(pid) => (crate::signals::atom("nonode@nohost"), pid),
+        None => (undefined, undefined),
+    };
     emit_filtered(
         vm,
         process,
