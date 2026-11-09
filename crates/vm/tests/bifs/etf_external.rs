@@ -94,3 +94,47 @@ fn external_size_local_identities_match_term_to_binary_on_named_node() {
     let actual = run(&arinsal);
     assert_eq!(actual, expected);
 }
+
+const COPIED_INPUT_SOURCE: &str = r#"
+-module(etf_external_copied_input_diff).
+-export([run/0]).
+writable(Bin) ->
+    lists:foldl(fun(Byte, Acc) -> <<Acc/binary, Byte>> end, <<>>, binary_to_list(Bin)).
+%% An appended-to binary is writable, so binary_to_term copies it instead of borrowing.
+writable_tail(<<131, Rest/binary>>) ->
+    W0 = <<131>>,
+    W1 = <<W0/binary, Rest/binary>>,
+    <<W1/binary, 9>>.
+run() ->
+    Small = {ok, 42, [a, b]},
+    Big = {<<0:(8 * 2000000)>>, lists:seq(1, 3000), "text"},
+    Enc = term_to_binary(Big),
+    [binary_to_term(term_to_binary(Small)) =:= Small,
+     binary_to_term(writable(term_to_binary(Small))) =:= Small,
+     binary_to_term(Enc) =:= Big,
+     binary_to_term(writable_tail(Enc), [used]) =:= {Big, byte_size(Enc)},
+     try binary_to_term(<<131, 104, 2, 97, 1>>) catch error:Reason -> Reason end].
+"#;
+
+#[test]
+fn binary_to_term_borrowed_and_copied_inputs_match_erts() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping binary_to_term copied-input differential test");
+        return;
+    };
+    let module = "etf_external_copied_input_diff";
+    let beam = reference
+        .compile_named(module, COPIED_INPUT_SOURCE, &[])
+        .unwrap();
+    reference.load(module, &beam).unwrap();
+    let CallResult::Ok(expected) = reference.call(module, "run", &[]) else {
+        panic!("reference call failed");
+    };
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled(module, "run", &[], 1, Some(73))
+        .unwrap()
+        .term;
+    assert_eq!(actual, expected);
+}

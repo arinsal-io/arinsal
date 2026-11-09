@@ -4719,32 +4719,54 @@ impl<'a> DecodeWalk<'a> {
         byte_budget: usize,
         trap_context: &mut Option<DecodeWalk<'a>>,
     ) -> Result<Option<(Term, usize)>, (BifError, usize)> {
-        let mut decoder = Self::new(args).map_err(|error| (error, 0))?;
-        if decoder.compressed {
+        // The synchronous path borrows the input as `binary_to_term_int` keeps its B2TContext
+        // on the C stack; the trap context (and its owned copy of the input) is built only
+        // when the decode yields.
+        let opts = decode_options(args.get(1).copied()).map_err(|error| (error, 0))?;
+        let (_, view) = decode_binary_view(args).map_err(|error| (error, 0))?;
+        if !view.bit_len().is_multiple_of(8) {
+            return Err((BifError::BADARG, 0));
+        }
+        if !view.start_bit().is_multiple_of(8) {
             return Ok(None);
         }
-        let body = &decoder.input.bytes()[1..];
-        let (size, size_work) = decoder
-            .sizing
+        let start = view.start_bit() / 8;
+        let len = view.bit_len() / 8;
+        let bytes = view
+            .bytes()
+            .get(start..start + len)
+            .ok_or((BifError::BADARG, 0))?;
+        if bytes.first() != Some(&131) {
+            return Err((BifError::BADARG, 0));
+        }
+        if bytes.get(1) == Some(&80) {
+            return Ok(None);
+        }
+        let body = &bytes[1..];
+
+        let mut sizing = DecodedSizeWalk::new();
+        let (size, size_work) = sizing
             .step(body, byte_budget, true, local_term_hash)
             .map_err(|_| (BifError::BADARG, 0))?;
         let Some((heap_words, checked)) = size else {
-            decoder.local_node = local_node;
-            decoder.initial_work = size_work;
-            *trap_context = Some(decoder);
+            *trap_context = Some(Self::after_sizing(
+                args, local_node, sizing, body, None, size_work,
+            )?);
             return Ok(None);
         };
-        let validated_body = decoder
-            .sizing
+        let validated_body = sizing
             .validated_body(body)
             .ok_or((BifError::BADARG, size_work))?;
         let remaining_reds = byte_budget.saturating_sub(size_work);
         if body.len() > remaining_reds {
-            decoder.local_node = local_node;
-            decoder.heap_words = Some(heap_words);
-            decoder.size_done = true;
-            decoder.initial_work = size_work;
-            *trap_context = Some(decoder);
+            *trap_context = Some(Self::after_sizing(
+                args,
+                local_node,
+                sizing,
+                body,
+                Some(heap_words),
+                size_work,
+            )?);
             return Ok(None);
         }
         // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1:
@@ -4755,10 +4777,7 @@ impl<'a> DecodeWalk<'a> {
             args,
             heap,
             local_node,
-            &DecodeOpts {
-                safe: decoder.safe,
-                used: decoder.used,
-            },
+            &opts,
             validated_body,
             heap_words,
             checked,
@@ -4832,6 +4851,33 @@ impl<'a> DecodeWalk<'a> {
             root
         };
         Ok(Some((value, size_work + decode_work)))
+    }
+
+    /// Build the trap context after a synchronous sizing slice.
+    ///
+    /// Port of external.c B2TSize -> B2TDecodeInit state transfer, OTP-29.1.1.
+    fn after_sizing(
+        args: &'a [Term],
+        local_node: Option<(Atom, u32)>,
+        mut sizing: DecodedSizeWalk,
+        sized_body: &[u8],
+        heap_words: Option<usize>,
+        size_work: usize,
+    ) -> Result<Self, (BifError, usize)> {
+        let mut decoder = Self::new(args).map_err(|error| (error, size_work))?;
+        if heap_words.is_some() {
+            // The context may own a copy of the input; the sizing proof follows the bytes.
+            let body = &decoder.input.bytes()[1..];
+            if !sizing.rebind_input(sized_body, body) {
+                return Err((BifError::BADARG, size_work));
+            }
+        }
+        decoder.local_node = local_node;
+        decoder.sizing = sizing;
+        decoder.size_done = heap_words.is_some();
+        decoder.heap_words = heap_words;
+        decoder.initial_work = size_work;
+        Ok(decoder)
     }
 
     /// Configure this node's identity for external pid, port, and reference terms.
