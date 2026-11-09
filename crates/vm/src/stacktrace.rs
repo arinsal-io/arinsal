@@ -516,6 +516,10 @@ pub(super) fn capture(
             previous = None;
         } else {
             raw.native_top = Some(pc);
+            // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
+            // OTP-29.1.1: the current native PC seeds the same duplicate check as `rp->i`.
+            previous_native = Some(pc);
+            previous = None;
         }
     }
     if let Some(return_ip) = trap_return

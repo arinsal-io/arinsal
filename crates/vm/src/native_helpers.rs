@@ -4053,6 +4053,7 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
         ),
         BifError::Unsupported(_) => (exc::EXC_UNDEF, crate::signals::atom("undef"), 0),
         BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup"), 0),
+        BifError::DirtyTrap => unreachable!("dirty BIF trap is handled by process apply"),
     };
     process.heap.abi.exc.freason = freason;
     process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);

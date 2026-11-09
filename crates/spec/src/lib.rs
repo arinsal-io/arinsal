@@ -60,6 +60,51 @@ type BifIndex = std::collections::HashMap<
     std::hash::BuildHasherDefault<FnvHasher>,
 >;
 
+// OTP registers these internal continuations from bif.c rather than listing them in the
+// published bif.tab. Keep them after the generated table so the frozen spec stays untouched.
+const DIRTY_CONTINUATION_BIFS: [BifSpec; 5] = [
+    BifSpec {
+        index: 553,
+        kind: BifKind::Bif,
+        module: "erts_internal",
+        name: "dirty_bif_result",
+        arity: 1,
+        c_name: None,
+    },
+    BifSpec {
+        index: 554,
+        kind: BifKind::Bif,
+        module: "erts_internal",
+        name: "dirty_bif_exception",
+        arity: 2,
+        c_name: None,
+    },
+    BifSpec {
+        index: 555,
+        kind: BifKind::Bif,
+        module: "erts_internal",
+        name: "dirty_bif_trap",
+        arity: 1,
+        c_name: None,
+    },
+    BifSpec {
+        index: 556,
+        kind: BifKind::Bif,
+        module: "erts_internal",
+        name: "dirty_bif_trap",
+        arity: 2,
+        c_name: None,
+    },
+    BifSpec {
+        index: 557,
+        kind: BifKind::Bif,
+        module: "erts_internal",
+        name: "dirty_bif_trap",
+        arity: 3,
+        c_name: None,
+    },
+];
+
 /// Find a BIF by MFA using an index built once. Port of erts/emulator/beam/export.c (the BIF
 /// export lookup is a hash probe, not a search), OTP-29.1.1.
 pub fn bif_lookup(module: &str, name: &str, arity: u8) -> Option<&'static BifSpec> {
@@ -71,7 +116,14 @@ pub fn bif_lookup(module: &str, name: &str, arity: u8) -> Option<&'static BifSpe
             // The first entry wins, as the sorted search did on duplicates.
             index.entry((bif.module, bif.name, bif.arity)).or_insert(at);
         }
+        for bif in &DIRTY_CONTINUATION_BIFS {
+            index
+                .entry((bif.module, bif.name, bif.arity))
+                .or_insert(BIFS.len() + (bif.index as usize - BIFS.len()));
+        }
         index
     });
-    index.get(&(module, name, arity)).map(|&at| &BIFS[at])
+    let at = *index.get(&(module, name, arity))?;
+    BIFS.get(at)
+        .or_else(|| DIRTY_CONTINUATION_BIFS.get(at - BIFS.len()))
 }

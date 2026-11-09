@@ -11,6 +11,7 @@ mod bs_create_bin_alloc;
 mod bs_match_segments_differential;
 mod bs_private_append_grow;
 mod bs_utf8_differential;
+mod dirty_bif_continuation;
 mod dirty_major_gc;
 mod dirty_nif;
 mod dirty_sched;

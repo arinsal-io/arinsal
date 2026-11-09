@@ -2284,11 +2284,24 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
             let pc = if pc & tag != 0 { (pc & !tag) - 1 } else { pc };
             (pc != 0 && crate::native_bridge::is_native_function_at(pc)).then_some(pc)
         });
-    let (address, description) = match native_pc {
-        Some(pc) => (pc, pc_description(modules, Term::NIL, true)),
-        None => (process.ip(), String::new()),
+    let dirty_continuation = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.dirty_bif_mfa)
+        .filter(|(_, function, _)| function.starts_with("dirty_bif_"));
+    let (address, description) = if let Some((module, function, arity)) = dirty_continuation {
+        // erts has already set p->i to the scheduled dirty continuation while it waits to run.
+        // The interpreter position remains at the suspended caller until the scheduler dispatches it.
+        (process.ip(), format!("{module}:{function}/{arity} + 0"))
+    } else {
+        match native_pc {
+            Some(pc) => (pc, pc_description(modules, Term::NIL, true)),
+            None => (process.ip(), String::new()),
+        }
     };
-    let description = if native_pc.is_some() {
+    let description = if dirty_continuation.is_some() {
+        description
+    } else if native_pc.is_some() {
         let function = crate::native_bridge::native_function_at(address);
         function.map_or(description, |f| {
             format!(

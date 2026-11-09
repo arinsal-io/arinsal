@@ -37,6 +37,11 @@ pub fn call(module: &str, name: &str, args: &[OwnedTerm]) -> CallResult {
                 BifError::Dirty(class) => {
                     return CallResult::TransportError(format!("dirty reschedule: {class:?}"));
                 }
+                BifError::DirtyTrap => {
+                    return CallResult::TransportError(
+                        "dirty trap requires process context".into(),
+                    );
+                }
             };
             CallResult::Exception {
                 class: class.to_owned(),

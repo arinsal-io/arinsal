@@ -904,7 +904,11 @@ impl Vm {
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
             return self.finish_bif(p, index, arity, tail, bif, ctx);
         }
-        self.call_import_general(p, index, arity, tail, ctx, class)
+        let result = self.call_import_general(p, index, arity, tail, ctx, class);
+        if matches!(result, Err(VmError::Dirty(_))) {
+            p.set_dirty_bif_tail(tail);
+        }
+        result
     }
     #[cold]
     #[inline(never)]

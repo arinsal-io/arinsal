@@ -478,6 +478,19 @@ impl Executor {
                             for (register, value) in process.x.iter_mut().zip(&saved_x) {
                                 *register = *value;
                             }
+                            if process.dirty_bif_scheduled() {
+                                // Port of erts/emulator/beam/bif.c:5814-5835
+                                // (erts_call_dirty_bif) and erl_nfunc_sched.c
+                                // (erts_nfunc_schedule), OTP-29.1.1: keep the native
+                                // return address while the dirty result export runs.
+                                process.gc_live = saved_live;
+                                process.native_continuation_resume = true;
+                                process.set_native_resume_arity(1);
+                                process.set_native_retry(None);
+                                process.set_native_retry_site(None);
+                                process.set_native_pc(Some(resume_pc));
+                                return Ok(Flow::Break(Err(VmError::Dirty(kind))));
+                            }
                             process.set_native_retry(Some(target_pc));
                             process.set_native_pc(Some(code_ptr));
                             return Ok(Flow::Break(Err(VmError::Dirty(kind))));
@@ -1117,6 +1130,19 @@ impl Executor {
                                 for (register, value) in process.x.iter_mut().zip(&saved_arguments)
                                 {
                                     *register = *value;
+                                }
+                                if process.dirty_bif_scheduled() {
+                                    // Port of erts/emulator/beam/bif.c:5814-5835
+                                    // (erts_call_dirty_bif) and erl_nfunc_sched.c
+                                    // (erts_nfunc_schedule), OTP-29.1.1: resume after the
+                                    // scheduled result export instead of retrying the BIF.
+                                    process.gc_live = saved_arguments.len();
+                                    process.native_continuation_resume = true;
+                                    process.set_native_resume_arity(1);
+                                    process.set_native_retry(None);
+                                    process.set_native_retry_site(None);
+                                    process.set_native_pc(Some(resume_pc));
+                                    return Ok(Flow::Break(Err(VmError::Dirty(kind))));
                                 }
                                 process.set_native_retry(Some(target_pc));
                                 process.set_native_pc(Some(code_ptr));

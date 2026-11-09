@@ -390,6 +390,18 @@ impl ExportIndex {
                 index.put_builtin(&module, &function, arity);
             }
         }
+        // Port of erts/emulator/beam/bif.c (dirty_bif_result, dirty_bif_exception,
+        // dirty_bif_trap), OTP-29.1.1: these scheduler continuations are registered BIF
+        // exports even though OTP keeps them out of the generated bif.tab snapshot.
+        for (function, arity) in [
+            ("dirty_bif_result", 1),
+            ("dirty_bif_exception", 2),
+            ("dirty_bif_trap", 1),
+            ("dirty_bif_trap", 2),
+            ("dirty_bif_trap", 3),
+        ] {
+            index.put_builtin("erts_internal", function, arity);
+        }
         // Port of erts/emulator/beam/erl_bif_re.c:222 (erts_init_bif_re) and
         // erts/emulator/beam/erl_unicode.c:103 (erts_init_unicode), OTP-29.1.1.
         // These trap entries are inserted after install_bifs and before any

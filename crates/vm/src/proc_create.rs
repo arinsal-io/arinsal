@@ -1359,7 +1359,18 @@ pub(crate) struct ProcessCold {
     /// A dirty BIF call waiting for its dirty job, or the job's result.
     pub(crate) dirty_bif: Option<crate::dirty::DirtyBif>,
     /// Export of the dirty BIF that is scheduled or running; `current_function` reports it.
-    pub(crate) dirty_bif_mfa: Option<(&'static str, &'static str, u8)>,
+    pub(crate) dirty_bif_mfa: Option<crate::dirty::DirtyBifMfa>,
+    /// Original dirty BIF frame preserved by the native trap wrapper across reschedules.
+    pub(crate) dirty_bif_original: Option<crate::dirty::DirtyBifCall>,
+    /// Native call site of the original dirty BIF (`nep->pc`), where its exception is raised.
+    pub(crate) dirty_bif_call_pc: Option<usize>,
+    /// Whether the original BIF call was in tail position, like the saved return state in
+    /// erts' native export wrapper.
+    pub(crate) dirty_bif_tail: Option<bool>,
+    /// Saved target export and registers restored by `erts_internal:dirty_bif_trap`.
+    pub(crate) dirty_bif_trap_target: Option<crate::dirty::DirtyBifCall>,
+    /// Saved `ftrace` restored by `dirty_bif_exception/2` from the dirty shadow process.
+    pub(crate) dirty_bif_exception_trace: Option<Term>,
     /// Result of a static dirty NIF executed as a dirty job.
     pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
     /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
