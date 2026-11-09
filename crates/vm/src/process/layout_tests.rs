@@ -140,6 +140,86 @@ fn check_process_code_sees_the_return_address_of_a_native_trace_frame() {
     assert!(!process.references_code(usize::MAX, |_| false));
 }
 
+/// `check_process_code` drops a saved exception trace that names the module and still
+/// answers false. A trace for another module, and a process whose own code is the module,
+/// are left alone (the latter answers true).
+#[test]
+fn check_process_code_clears_ftrace_that_names_the_module() {
+    fn packed(module: usize, ip: usize) -> u64 {
+        (1 << 63) | ((module as u64) << 32) | ip as u64
+    }
+    fn install(process: &mut Process, pc: u64, current: u64, trace: &[u64]) {
+        let mut digits = vec![
+            arinsal_beamasm::exc::EXC_ERROR,
+            pc,
+            current,
+            trace.len() as u64,
+            trace.len() as u64,
+            0,
+        ];
+        digits.extend_from_slice(trace);
+        let stack = TermBuilder::new(&mut process.heap)
+            .pos_bignum_from_digits(&digits)
+            .unwrap();
+        let ftrace = TermBuilder::new(&mut process.heap)
+            .tuple3(stack, Term::NIL, Term::NIL)
+            .unwrap();
+        process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+        process.heap.abi.exc.fvalue = Term::small(1).unwrap().tagged_word();
+        process.heap.abi.exc.ftrace = ftrace.tagged_word();
+    }
+
+    let mut process = Process::new();
+    process.module = 1;
+    install(&mut process, packed(7, 4), 0, &[]);
+    assert!(!process.references_code(7, |_| false));
+    assert_eq!(process.heap.abi.exc.freason, 0);
+    assert_eq!(process.heap.abi.exc.fvalue, 0);
+    assert_eq!(process.heap.abi.exc.ftrace, 0);
+
+    install(&mut process, 0, packed(7, 9), &[]);
+    assert!(!process.references_code(7, |_| false));
+    assert_eq!(process.heap.abi.exc.ftrace, 0);
+
+    install(&mut process, 0, 0, &[packed(7, 3)]);
+    assert!(!process.references_code(7, |_| false));
+    assert_eq!(process.heap.abi.exc.ftrace, 0);
+
+    install(&mut process, 0x4500, 0, &[]);
+    assert!(!process.references_code(7, |address| address == 0x4500));
+    assert_eq!(process.heap.abi.exc.ftrace, 0);
+
+    install(&mut process, 0, 0, &[0x4500]);
+    assert!(!process.references_code(7, |address| address == 0x4500));
+    assert_eq!(process.heap.abi.exc.ftrace, 0);
+
+    // Another module, and a BIF MFA in `current` (atom pair, not a code pointer).
+    install(&mut process, packed(9, 1), (20 << 32) | 30, &[packed(9, 2)]);
+    let other = process.heap.abi.exc.ftrace;
+    assert!(!process.references_code(7, |_| true));
+    assert_eq!(process.heap.abi.exc.ftrace, other);
+    assert_eq!(
+        process.heap.abi.exc.freason,
+        arinsal_beamasm::exc::EXC_ERROR
+    );
+
+    // The process itself is in the module: erts returns before looking at ftrace.
+    process.module = 7;
+    install(&mut process, packed(7, 4), 0, &[]);
+    let live = process.heap.abi.exc.ftrace;
+    assert!(process.references_code(7, |_| false));
+    assert_eq!(process.heap.abi.exc.ftrace, live);
+
+    process.module = 1;
+    process.heap.abi.exc.ftrace = 0;
+    process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+    assert!(!process.references_code(7, |_| false));
+    assert_eq!(
+        process.heap.abi.exc.freason,
+        arinsal_beamasm::exc::EXC_ERROR
+    );
+}
+
 #[test]
 fn worker_panic_aborts_instead_of_hanging() {
     const TEST_NAME: &str = "process::layout_tests::worker_panic_aborts_instead_of_hanging";
