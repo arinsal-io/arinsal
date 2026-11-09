@@ -149,7 +149,14 @@ impl Process {
                 }
                 Some(crate::proc_create::OriginMonitor::Alias) => {}
                 Some(crate::proc_create::OriginMonitor::Distributed) => {
-                    crate::dist::demonitor_alias(self, ctx, alias)?;
+                    // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message,
+                    // ERTS_MON_TYPE_DIST_PROC): demonitor of the remote process.
+                    if let Some(cold) = self.cold.as_mut() {
+                        cold.dist_monitors.remove(&alias);
+                        cold.prio_monitors.remove(&alias);
+                    }
+                    let origin = entry.expect("origin half of the entry");
+                    crate::dist::demonitor_remote(self.runtime, ctx.pid(), origin);
                 }
                 Some(
                     crate::proc_create::OriginMonitor::Port { .. }

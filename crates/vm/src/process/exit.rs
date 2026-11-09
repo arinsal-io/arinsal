@@ -439,17 +439,6 @@ impl Process {
                     continue;
                 }
                 let pid = Pid::from_data(half.other());
-                if let Some(runtime) = self.runtime.as_ref()
-                    && crate::dist::forward_monitor_down_if_proxy(
-                        runtime,
-                        pid,
-                        ctx.pid(),
-                        reference,
-                        reason,
-                    )
-                {
-                    continue;
-                }
                 if reason.is_pointer() {
                     if let Ok(message) = down_message_on_sender(
                         self,
@@ -495,6 +484,11 @@ impl Process {
                         monitor.view().reference(),
                     );
                 }
+                // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor,
+                // origin ERTS_MON_TYPE_DIST_PROC): erts_proc_exit_dist_demonitor.
+                Some(crate::proc_create::OriginMonitor::Distributed) => {
+                    crate::dist::demonitor_remote(self.runtime, ctx.pid(), monitor);
+                }
                 _ => {}
             }
         }
@@ -509,17 +503,6 @@ impl Process {
                 continue;
             }
             let pid = Pid::from_data(half.other());
-            if let Some(runtime) = self.runtime.as_ref()
-                && crate::dist::forward_monitor_down_if_proxy(
-                    runtime,
-                    pid,
-                    ctx.pid(),
-                    reference,
-                    reason,
-                )
-            {
-                continue;
-            }
             if reason.is_pointer() {
                 if let Ok(message) = down_message_on_sender(
                     self,

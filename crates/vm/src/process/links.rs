@@ -258,14 +258,14 @@ impl Process {
         message: Message,
     ) -> Result<(), VmError> {
         let origin = crate::signals::take_origin_monitor_down(self, reference);
-        // erts reads the monitor type from the origin node in the process's own tree
-        // (erl_proc_sig_queue.c handle_monitor_down); only a distributed monitor has
-        // remote bookkeeping to release.
-        let remote = matches!(
-            origin.as_ref().and_then(|origin| origin.state()),
-            Some(crate::proc_create::OriginMonitor::Distributed)
-        ) && crate::dist::take_monitor(reference).is_some();
-        let active = origin.is_some() || remote;
+        let active = origin.is_some();
+        // erl_proc_sig_queue.c (ERTS_SIG_Q_OP_MONITOR_DOWN): a monitor of a remote process
+        // takes its target half out of the connection (erts_monitor_dist_delete).
+        if let Some(origin) = origin
+            && origin.view().info().dist_target().is_some()
+        {
+            crate::dist::release_origin(origin);
+        }
         let priority = self
             .cold
             .as_mut()
@@ -304,17 +304,7 @@ impl Process {
         // OTP-29.1.1: a DOWN whose origin monitor is no longer in the table (a demonitor
         // raced with the target's exit) is dropped instead of becoming a message.
         let entry = crate::signals::take_origin_monitor_down(self, reference);
-        // erts takes the monitor type from the origin node in the process's own tree
-        // (erl_proc_sig_queue.c handle_monitor_down): a local process monitor has no
-        // distribution bookkeeping to release.
-        let remote = !matches!(
-            entry.as_ref().and_then(|entry| entry.state()),
-            Some(crate::proc_create::OriginMonitor::Process(_))
-        ) && crate::dist::take_monitor(reference).is_some();
-        let active = entry.is_some() || remote;
-        if !active {
-            crate::dist::discard_disconnected_monitor_pid(from);
-        }
+        let active = entry.is_some();
         let priority = self
             .cold
             .as_mut()
@@ -365,9 +355,17 @@ impl Process {
                 }
             };
             (crate::signals::atom("port"), object)
+        } else if let Some(object) = info.and_then(crate::dist::remote_object) {
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c (convert_to_down_message and
+            // erts_proc_sig_send_dist_monitor_down), OTP-29.1.1: the external pid, or
+            // `{Name, Node}` for a monitor by name.
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
+            let object = arinsal_term::from_owned(&object, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))?;
+            (crate::signals::atom("process"), object)
         } else {
-            let from = crate::dist::remote_pid_term(self, from)?
-                .or_else(|| from.to_term())
+            let from = from
+                .to_term()
                 .ok_or_else(|| VmError::Unsupported("invalid monitor sender pid".into()))?;
             (
                 crate::signals::atom("process"),
@@ -375,6 +373,12 @@ impl Process {
             )
         };
         let tuple = self.tuple(&[tag, reference, from_type, from, reason])?;
+        // The monitor of a remote process leaves its connection (erts_monitor_dist_delete).
+        if let Some(entry) = entry
+            && entry.view().info().dist_target().is_some()
+        {
+            crate::dist::release_origin(entry);
+        }
         if priority {
             self.push_priority_message(tuple)?;
         } else {

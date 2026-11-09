@@ -871,3 +871,26 @@ fn dist_mixed_eval_signal_bifs_to_remote_pid() {
     );
     arinsal_eval(&cookie, &host, &expression);
 }
+
+/// The origin side of monitors of remote processes: by pid and by `{Name, Node}` with the
+/// remote exit (`DOP_MONITOR_P_EXIT`), `process_info(monitors)`, demonitor, a name that does
+/// not exist (`noproc`), the watcher's exit demonitoring (`monitored_by` on the remote side),
+/// `spawn_request` with `monitor` (DOWN of the child, and of a child that is still running
+/// when the connection goes down) and DOWN `noconnection` on connection loss.
+const ORIGIN_CLIENT: &str = r#"Me=self(), Srv=fun() -> spawn(N, fun() -> (fun L() -> receive stop -> ok; {exit,R} -> exit(R); _ -> L() end end)() end) end, MB=fun(P) -> {monitored_by,L}=erpc:call(N,erlang,process_info,[P,monitored_by]), L end, P1=Srv(), P2=Srv(), true=erpc:call(N,erlang,register,[dm_o,P2]), M1=monitor(process,P1), M2=monitor(process,{dm_o,N}), Mons=process_info(self(),monitors), MI=(lists:sort(element(2,Mons))=:=lists:sort([{process,P1},{process,{dm_o,N}}])), P1 ! {exit,boom}, D1=receive {'DOWN',M1,process,O1,R1} -> {O1=:=P1,R1} after 5000 -> timeout end, P2 ! {exit,{shape,[1,2]}}, D2=receive {'DOWN',M2,process,O2,R2} -> {O2=:={dm_o,N},R2} after 5000 -> timeout end, P3=Srv(), M3=monitor(process,P3), timer:sleep(200), B3a=MB(P3), true=demonitor(M3), timer:sleep(200), B3=MB(P3), P3 ! {exit,x}, Q3=receive {'DOWN',M3,_,_,_} -> got after 300 -> quiet end, M4=monitor(process,{dm_absent,N}), D4=receive {'DOWN',M4,process,O4,R4} -> {O4=:={dm_absent,N},R4} after 5000 -> timeout end, P5=Srv(), W=spawn(fun() -> monitor(process,P5), Me ! ready, receive stop -> ok end end), receive ready -> ok end, timer:sleep(200), B5a=MB(P5), W ! stop, timer:sleep(300), B5b=MB(P5), R6=erlang:spawn_request(N,erlang,exit,[sr_done],[monitor]), S6=receive {spawn_reply,R6,ok,C6} -> receive {'DOWN',R6,process,O6,RR6} -> {O6=:=C6,RR6} after 5000 -> no_down end after 5000 -> timeout end, R7=erlang:spawn_request(N,erlang,apply,[fun() -> receive stop -> ok end end,[]],[monitor]), C7=receive {spawn_reply,R7,ok,C} -> C after 5000 -> timeout end, timer:sleep(200), MI7={lists:member({process,C7},element(2,process_info(self(),monitors))), MB(C7)=:=[Me]}, P8=Srv(), M8=monitor(process,P8), true=erlang:disconnect_node(N), D7=receive {'DOWN',R7,process,O7,RR7} -> {O7=:=C7,RR7} after 5000 -> timeout end, D8=receive {'DOWN',M8,process,O8,R8} -> {O8=:=P8,R8} after 5000 -> timeout end, MonsEnd=process_info(self(),monitors), Q=receive Any -> {unexpected,Any} after 300 -> quiet end, io:format("ORIGIN_RESULT ~p~n",[[MI,D1,D2,B3a=:=[Me],B3,Q3,D4,B5a=:=[W],B5b,S6,MI7,D7,D8,MonsEnd,Q]]), io:format("DIST_MIXED_OK origin~n")"#;
+
+/// [`ORIGIN_CLIENT`] from the tested node against an OTP node, and from an OTP node against
+/// the tested node (the monitored side and the child of a monitored `spawn_request`).
+#[test]
+fn dist_mixed_external_monitors_origin_side_match_otp() {
+    let _serial = serial_test();
+    let expected = emon_run(false, false, ORIGIN_CLIENT, "ORIGIN_RESULT");
+    assert_eq!(
+        emon_run(true, false, ORIGIN_CLIENT, "ORIGIN_RESULT"),
+        expected
+    );
+    assert_eq!(
+        emon_run(false, true, ORIGIN_CLIENT, "ORIGIN_RESULT"),
+        expected
+    );
+}

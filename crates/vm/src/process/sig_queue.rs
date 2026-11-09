@@ -785,7 +785,7 @@ impl Process {
             }
             adjust_monitor = request.monitor;
             if adjust_monitor {
-                crate::dist::spawn_reply_install_origin_monitor(self, ctx.pid(), data.id());
+                crate::dist::spawn_reply_install_origin_monitor(self, data);
                 cnt += 2;
             }
         }

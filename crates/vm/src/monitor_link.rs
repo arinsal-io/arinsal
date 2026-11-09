@@ -1819,6 +1819,14 @@ impl MonLnkDist {
         }
     }
 
+    /// The dead-dist record of a monitor made while the node is not alive or not connected.
+    // Port of erts/emulator/beam/erl_monitor_link.c (erts_monitor_set_dead_dist), OTP-29.1.1.
+    pub(crate) fn dead(nodename: u32) -> Self {
+        let dist = Self::new(nodename);
+        dist.lock().alive = false;
+        dist
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, MonLnkDistState> {
         self.state
             .lock()

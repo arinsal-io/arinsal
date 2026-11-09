@@ -37,8 +37,6 @@ pub(crate) struct NodeEntry {
     pub(crate) dist: Option<DistState>,
     /// Signals queued while the connection is still pending (auto-connect).
     pub(crate) pending_out: VecDeque<(OwnedTerm, Option<OwnedTerm>)>,
-    /// Remote monitors armed before the distribution channel exists.
-    pub(crate) pending_monitors: BTreeMap<u64, RemoteMonitor>,
     /// Distributed spawn requests retained while auto-connect is pending.
     pub(crate) pending_spawn_requests: BTreeMap<u64, SpawnRequest>,
     /// `dep->mld`: the links and monitors of the current (pending or up) connection.
@@ -79,17 +77,7 @@ pub(crate) struct DistState {
     pub(crate) remote_pids: HashMap<(u32, u32, u32), Pid>,
     /// Reverse map for local proxy pids created by [`Self::remote_pids`].
     pub(crate) proxy_to_remote: HashMap<Pid, OwnedTerm>,
-    pub(crate) remote_monitors: BTreeMap<u64, RemoteMonitor>,
-    /// Original ETF refs from remote monitor requests, preserving all reference words.
-    pub(crate) remote_monitor_refs: BTreeMap<u64, OwnedTerm>,
     pub(crate) spawn_requests: BTreeMap<u64, SpawnRequest>,
-}
-
-/// A local origin monitor retained by a distribution connection.
-#[derive(Clone, Debug)]
-pub(crate) struct RemoteMonitor {
-    pub(crate) watcher: Pid,
-    pub(crate) target: OwnedTerm,
 }
 
 #[derive(Clone, Debug)]
@@ -162,8 +150,6 @@ impl DistState {
             flags,
             remote_pids: HashMap::new(),
             proxy_to_remote: HashMap::new(),
-            remote_monitors: BTreeMap::new(),
-            remote_monitor_refs: BTreeMap::new(),
             spawn_requests: BTreeMap::new(),
         }
     }
@@ -387,8 +373,6 @@ pub(crate) struct NodeTables {
     pub(crate) monitors: Vec<NodeMonitor>,
     pending_delete: HashMap<String, Instant>,
     pub(crate) nodes_monitors: Vec<NodesMonitor>,
-    /// Remote target terms needed to build DOWN objects after a connection is removed.
-    pub(crate) disconnected_monitor_pids: HashMap<Pid, OwnedTerm>,
 }
 
 pub(crate) struct NodeTablesGuard(MutexGuard<'static, NodeTables>);
@@ -425,7 +409,6 @@ impl Default for NodeTables {
                 connected: false,
                 dist: None,
                 pending_out: VecDeque::new(),
-                pending_monitors: BTreeMap::new(),
                 pending_spawn_requests: BTreeMap::new(),
                 mld: None,
             },
@@ -439,7 +422,6 @@ impl Default for NodeTables {
             monitors: Vec::new(),
             pending_delete: HashMap::new(),
             nodes_monitors: Vec::new(),
-            disconnected_monitor_pids: HashMap::new(),
         }
     }
 }
@@ -575,7 +557,6 @@ fn fresh_entry(name: String) -> NodeEntry {
         connected: false,
         dist: None,
         pending_out: VecDeque::new(),
-        pending_monitors: BTreeMap::new(),
         pending_spawn_requests: BTreeMap::new(),
         mld: None,
     }
@@ -633,7 +614,6 @@ impl NodeTables {
                 connected: false,
                 dist: None,
                 pending_out: VecDeque::new(),
-                pending_monitors: BTreeMap::new(),
                 pending_spawn_requests: BTreeMap::new(),
                 mld: None,
             },
@@ -694,7 +674,6 @@ impl NodeTables {
             entry.dist = None;
             entry.mld = None;
             entry.pending_out.clear();
-            entry.pending_monitors.clear();
             // The aborted connection takes its pending-spawn monitors along; dropping a
             // suspended parent's waiter resumes it (dist.c:326
             // dist_pend_spawn_exit_connection_down).
@@ -731,7 +710,6 @@ impl NodeTables {
                 connected: true,
                 dist: None,
                 pending_out: VecDeque::new(),
-                pending_monitors: BTreeMap::new(),
                 pending_spawn_requests: BTreeMap::new(),
                 mld,
             },
