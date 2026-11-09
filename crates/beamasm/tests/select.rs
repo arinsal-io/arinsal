@@ -244,6 +244,74 @@ fn native_i_jump_on_val_zero() {
 }
 
 #[test]
+fn native_i_jump_on_val_uses_rodata_for_large_tables() {
+    let table = TARGETS
+        .iter()
+        .copied()
+        .map(ArgVal::Label)
+        .collect::<Vec<_>>();
+    for i in [0, 7, 15] {
+        assert_eq!(
+            run(
+                |m| m.emit_i_jump_on_val_zero(ArgVal::X(0), ArgVal::Label(99), 16, &table),
+                tagged_small(i as i64),
+                None,
+            ),
+            100 + i as u64,
+        );
+    }
+    assert_eq!(
+        run(
+            |m| m.emit_i_jump_on_val_zero(ArgVal::X(0), ArgVal::Label(99), 16, &table),
+            tagged_small(16),
+            None,
+        ),
+        999,
+    );
+}
+
+#[test]
+fn native_i_jump_on_val_large_otp_table() {
+    let count = 16_385;
+    let labels = (0..count).map(|i| 1_000 + i as u32).collect::<Vec<_>>();
+    let table = labels
+        .iter()
+        .copied()
+        .map(ArgVal::Label)
+        .collect::<Vec<_>>();
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.emit_i_jump_on_val_zero(ArgVal::X(0), ArgVal::Label(999_999), count, &table)
+        .unwrap();
+    for (i, label) in labels.into_iter().enumerate() {
+        asm.emit_i_func_label(label).unwrap();
+        asm.emit_raw(|e| e.mov_const(Gpr::x(25), 100 + i as u64))
+            .unwrap();
+        asm.emit_raw(|e| e.mov_reg(Gpr::x(0), Gpr::xzr())).unwrap();
+        asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
+    }
+    asm.emit_i_func_label(999_999).unwrap();
+    asm.emit_raw(|e| e.mov_const(Gpr::x(25), 999)).unwrap();
+    asm.emit_raw(|e| e.mov_reg(Gpr::x(0), Gpr::xzr())).unwrap();
+    asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
+    let module = asm.finalize().unwrap();
+    let mut heap = [0u64; 16];
+    let mut header = ProcessHeader {
+        htop: heap.as_mut_ptr(),
+        stop: heap.as_mut_ptr().wrapping_add(heap.len()),
+        heap: heap.as_mut_ptr(),
+        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+        fcalls: 100,
+        ..ProcessHeader::default()
+    };
+    let mut regs = SchedulerRegisters::default();
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small((count - 1) as i64));
+    let reason = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
+    assert_eq!(reason, ExitReason::Returned);
+    assert_eq!(regs.x_reg_array[0].tagged_word(), 100 + count as u64 - 1);
+}
+
+#[test]
 fn native_i_select_tuple_arity() {
     let args = [ArgVal::Immediate(2), ArgVal::Immediate(5), dest(0), dest(1)];
     for (arity, expected) in [(2, 100), (5, 101)] {

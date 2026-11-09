@@ -314,14 +314,23 @@ impl Process {
             return false;
         }
         // erl_gc.h:26 (ERTS_POTENTIALLY_LONG_GC_HSIZE).
-        const POTENTIALLY_LONG_GC_HSIZE: usize = 128 * 1024;
+        const DEFAULT_LIMIT: usize = 128 * 1024;
+        // Debug builds take `ARINSAL_TEST_LONG_GC_HSIZE` so that tests reach the dirty
+        // collection path with small heaps.
+        #[cfg(debug_assertions)]
+        let long_gc_hsize: usize = std::env::var("ARINSAL_TEST_LONG_GC_HSIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_LIMIT);
+        #[cfg(not(debug_assertions))]
+        let long_gc_hsize: usize = DEFAULT_LIMIT;
         let mut size = self
             .heap
             .young_gen_usage()
             .saturating_add(self.heap.stack_words());
         // The old generation only counts for a major collection, so a young generation
         // plus old heap below the limit is below it whichever collection runs.
-        if size.saturating_add(self.heap.old_used_words()) < POTENTIALLY_LONG_GC_HSIZE {
+        if size.saturating_add(self.heap.old_used_words()) < long_gc_hsize {
             return false;
         }
         // A collection that starts as minor is checked on its young generation alone. If
@@ -329,14 +338,14 @@ impl Process {
         // collection it falls back to. Otherwise the minor attempt runs here, and a minor
         // that cannot tenure is checked again as a major collection.
         let counted_major = self.heap.collection_is_major();
-        let minor_is_long = !counted_major && size >= POTENTIALLY_LONG_GC_HSIZE;
+        let minor_is_long = !counted_major && size >= long_gc_hsize;
         let failed_minor =
             !counted_major && !minor_is_long && self.heap.minor_falls_back_to_major();
         let major = counted_major || failed_minor;
         if major {
             size = size.saturating_add(self.heap.old_used_words());
         }
-        if size < POTENTIALLY_LONG_GC_HSIZE {
+        if size < long_gc_hsize {
             return false;
         }
         if failed_minor {

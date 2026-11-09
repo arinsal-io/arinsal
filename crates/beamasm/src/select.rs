@@ -272,6 +272,10 @@ impl BeamModuleAssembler {
         }
         if let Some(fail) = fail {
             self.code.b(fail)?;
+            // Port of erts/emulator/beam/jit/arm/instr_select.cpp:254
+            // (mark_unreachable_check_pending_stubs), OTP-29.1.1.
+            self.code.mark_unreachable();
+            self.check_pending_stubs()?;
         }
         Ok(())
     }
@@ -615,12 +619,45 @@ impl BeamModuleAssembler {
             self.code.emit(|e| e.cmp_reg(TMP1, TMP2, Shift::Lsl, 0))?;
         }
         self.code.b_cond(Cond::Cs, fail)?;
-        let table = self.code.new_label();
-        self.code.adr(TMP2, table)?;
-        self.code
-            .emit(|e| e.add_reg(TMP2, TMP2, TMP1, Shift::Lsl, 2))?;
-        self.code.emit(|e| e.br(TMP2))?;
-        self.code.bind(table)?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:104-135
+        // (embed_vararg_rodata), OTP-29.1.1.
+        let inline_data = size <= 6;
+        let data = inline_data.then(|| self.code.new_label());
+        if let Some(data) = data {
+            self.code.adr(TMP2, data)?;
+            let next = self.code.new_label();
+            self.code.b(next)?;
+            self.code.align_data_u64();
+            self.code.bind(data)?;
+            self.emit_jump_table_data(targets)?;
+            self.code.bind(next)?;
+        } else {
+            let relocation = self.code.ldr_literal_reloc(TMP2)?;
+            self.rodata_pointer_patches
+                .push((relocation, self.rodata_words.len()));
+            for target in targets {
+                let ArgVal::Label(id) = target else {
+                    return Err(ModuleError::InvalidOperand(
+                        "jump table destinations must be labels",
+                    ));
+                };
+                let label = self.label(*id);
+                let word = self.rodata_words.len();
+                self.rodata_words.push(0);
+                self.rodata_label_patches.push((word, label));
+            }
+        }
+        self.code.emit(|e| e.ldr_regoff(TMP3, TMP2, TMP1, 3))?;
+        self.code.emit(|e| e.br(TMP3))?;
+        self.code.mark_unreachable();
+        self.check_pending_stubs()?;
+        if fallthrough {
+            self.code.bind(fail)?;
+        }
+        Ok(())
+    }
+
+    fn emit_jump_table_data(&mut self, targets: &[ArgVal]) -> Result<(), ModuleError> {
         for target in targets {
             let ArgVal::Label(id) = target else {
                 return Err(ModuleError::InvalidOperand(
@@ -628,10 +665,9 @@ impl BeamModuleAssembler {
                 ));
             };
             let label = self.label(*id);
-            self.code.b(label)?;
-        }
-        if fallthrough {
-            self.code.bind(fail)?;
+            let site = self.code.offset();
+            self.code.data_u64(0);
+            self.code_label_patches.push((site, label));
         }
         Ok(())
     }

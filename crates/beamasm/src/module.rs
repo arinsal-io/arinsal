@@ -221,6 +221,14 @@ impl FinalizedModule {
 /// Builds one module's native code and associates BEAM labels with code offsets.
 pub struct BeamModuleAssembler {
     pub(super) code: CodeBuffer,
+    /// 64-bit words in BeamAsm's module-local read-only data section.
+    pub(super) rodata_words: Vec<u64>,
+    /// Relocations from read-only words to module code labels.
+    pub(super) rodata_label_patches: Vec<(usize, Label)>,
+    /// Literal relocations to read-only words: (literal id, word index).
+    pub(super) rodata_pointer_patches: Vec<(usize, usize)>,
+    /// Inline text-data relocations to module code labels.
+    pub(super) code_label_patches: Vec<(usize, Label)>,
     pub(super) reg_cache: crate::regcache::RegCache,
     pub(super) map_lookups: Vec<crate::map::MapLookupTable>,
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
@@ -351,6 +359,10 @@ impl BeamModuleAssembler {
         let error_pc_label = code.new_label();
         Self {
             code,
+            rodata_words: Vec::new(),
+            rodata_label_patches: Vec::new(),
+            rodata_pointer_patches: Vec::new(),
+            code_label_patches: Vec::new(),
             reg_cache: crate::regcache::RegCache::default(),
             map_lookups: Vec::new(),
             labels: LabelIds::default(),
@@ -1076,6 +1088,10 @@ impl BeamModuleAssembler {
         for emit in std::mem::take(&mut self.bs_cold) {
             emit(self)?;
         }
+        // erts flushes the stubs due within two check intervals here: the next function's
+        // `ErtsCodeInfo` must sit right before its entry, where `i_test_yield_shared` reads the
+        // MFA arity as the live X register count.
+        self.code.flush_stubs_before_function()?;
         Ok(())
     }
 
@@ -1284,10 +1300,22 @@ impl BeamModuleAssembler {
             let bytes = words
                 .checked_mul(8)
                 .ok_or(ModuleError::InvalidOperand("stack allocation overflow"))?;
-            let imm = u16::try_from(bytes).map_err(|_| {
-                ModuleError::InvalidOperand("stack allocation exceeds immediate range")
-            })?;
-            self.code.emit(|e| e.sub_imm(E, E, imm, false))?;
+            // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:738-758 (sub), OTP-29.1.1.
+            if bytes < (1 << 24) {
+                let low = (bytes & 0xfff) as u16;
+                let high = (bytes >> 12) as u16;
+                if low != 0 {
+                    self.code.emit(|e| e.sub_imm(E, E, low, false))?;
+                }
+                if high != 0 {
+                    self.code.emit(|e| e.sub_imm(E, E, high, true))?;
+                }
+            } else {
+                self.code.emit(|e| {
+                    e.mov_const(Gpr::x(17), u64::from(bytes))?;
+                    e.sub_reg(E, E, Gpr::x(17), Shift::Lsl, 0)
+                })?;
+            }
         }
         Ok(())
     }
@@ -1330,10 +1358,22 @@ impl BeamModuleAssembler {
             let bytes = words
                 .checked_mul(8)
                 .ok_or(ModuleError::InvalidOperand("stack deallocation overflow"))?;
-            let imm = u16::try_from(bytes).map_err(|_| {
-                ModuleError::InvalidOperand("stack deallocation exceeds immediate range")
-            })?;
-            self.code.emit(|e| e.add_imm(E, E, imm, false))?;
+            // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:760-780 (add), OTP-29.1.1.
+            if bytes < (1 << 24) {
+                let low = (bytes & 0xfff) as u16;
+                let high = (bytes >> 12) as u16;
+                if low != 0 {
+                    self.code.emit(|e| e.add_imm(E, E, low, false))?;
+                }
+                if high != 0 {
+                    self.code.emit(|e| e.add_imm(E, E, high, true))?;
+                }
+            } else {
+                self.code.emit(|e| {
+                    e.mov_const(Gpr::x(17), u64::from(bytes))?;
+                    e.add_reg(E, E, Gpr::x(17), Shift::Lsl, 0)
+                })?;
+            }
         }
         Ok(())
     }
@@ -2538,7 +2578,8 @@ impl BeamModuleAssembler {
                 e.br(Gpr::x(17))
             })?;
         }
-        let (mut words, labels) = self.code.finish_with_labels()?;
+        let (mut words, labels, literal_relocations) =
+            self.code.finish_with_labels_and_relocations()?;
         let trace_breakpoints = self
             .trace_breakpoints
             .iter()
@@ -2577,9 +2618,42 @@ impl BeamModuleAssembler {
                 handler_offset
             })
             .collect::<Vec<_>>();
-        let mut bytes = vec![0u8; words.len() * 4];
-        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+        let code_bytes_len = words.len() * 4;
+        let rodata_offset = (code_bytes_len + 7) & !7;
+        let total_bytes = rodata_offset + self.rodata_words.len() * 8;
+        let mut bytes = vec![0u8; total_bytes];
+        for (chunk, word) in bytes[..code_bytes_len]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&words)
+        {
             chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        for (chunk, word) in bytes[rodata_offset..]
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(&self.rodata_words)
+        {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        let mut memory = CodeMemory::new(total_bytes.max(4))?;
+        let offset = memory.alloc(total_bytes.max(4))?;
+        let code_base = memory.ptr_at(offset) as usize;
+        for (site, label) in self.code_label_patches {
+            let address = code_base + *labels.get(&label).expect("select label is bound");
+            bytes[site..site + 8].copy_from_slice(&(address as u64).to_le_bytes());
+        }
+        for (word, label) in self.rodata_label_patches {
+            let site = rodata_offset + word * 8;
+            let address = code_base + *labels.get(&label).expect("select label is bound");
+            bytes[site..site + 8].copy_from_slice(&(address as u64).to_le_bytes());
+        }
+        for (literal_id, word) in self.rodata_pointer_patches {
+            let site = literal_relocations[literal_id];
+            let address = code_base + rodata_offset + word * 8;
+            bytes[site..site + 8].copy_from_slice(&(address as u64).to_le_bytes());
         }
         if let Some(module) = &self.dump_module {
             let directory =
@@ -2587,8 +2661,6 @@ impl BeamModuleAssembler {
             crate::dump::write_module(Path::new(directory), module, &self.dump_functions, &bytes)
                 .map_err(ModuleError::Dump)?;
         }
-        let mut memory = CodeMemory::new(bytes.len().max(4))?;
-        let offset = memory.alloc(bytes.len().max(4))?;
         memory.write_bytes(offset, &bytes)?;
         if let Some(module) = &self.dump_module
             && let Some(directory) = crate::dump_directory()
