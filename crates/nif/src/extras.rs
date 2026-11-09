@@ -1,7 +1,7 @@
 //! Independent environments, time, ETF, and VM extension hooks.
 use crate::raw::{cstr, deref, deref_mut, slice};
 use crate::{ErlNifBinary, ErlNifEnv, put, terms};
-use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned};
+use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, size_object};
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::hint::black_box;
 use std::ptr;
@@ -37,10 +37,15 @@ pub type WhereisPortHook = fn(Term) -> Option<Term>;
 pub type PortAliveHook = fn(Term) -> bool;
 /// `enif_port_command`: sender pid, port, data.
 pub type PortCommandHook = fn(Option<Term>, Term, Term) -> bool;
+/// `enif_send`: caller pid (`None` when the env has no process), target pid, message.
+pub type SendHook = fn(Option<Term>, Term, Term) -> bool;
 #[derive(Default, Clone, Copy)]
 pub struct VmHooks {
-    /// Deliver a term to a local process.
-    pub send: Option<fn(Term, Term) -> bool>,
+    /// Deliver a term to a local process. The first argument is the calling process's pid
+    /// (`None` for a `NULL` or process-independent env, so the sender is `undefined`), matching
+    /// erts' `enif_send` `from = c_p ? c_p->common.id : am_undefined` (erl_nif.c:963,
+    /// OTP-29.1.1).
+    pub send: Option<SendHook>,
     /// Resolve an atom name to a pid.
     pub whereis_pid: Option<fn(Term) -> Option<Term>>,
     /// Check whether a local process is present in the caller's runtime.
@@ -129,7 +134,7 @@ pub extern "C" fn enif_clear_env(e: *mut ErlNifEnv) {
 pub extern "C" fn enif_send(
     env: *mut ErlNifEnv,
     pid: *const Term,
-    _msg_env: *mut ErlNifEnv,
+    msg_env: *mut ErlNifEnv,
     msg: Term,
 ) -> c_int {
     if pid.is_null() {
@@ -144,26 +149,50 @@ pub extern "C" fn enif_send(
         let hooks = hooks().lock().unwrap();
         (hooks.send, hooks.thread_type, hooks.current_process_exiting)
     };
-    // Port of erts/emulator/beam/erl_nif.c:860-885 (enif_send: a process-bound env on a dirty
-    // scheduler whose process is exiting sends nothing), OTP-29.1.1.
-    if !env.is_null()
-        && thread_type.is_some_and(|thread_type| thread_type() > ERL_NIF_THR_NORMAL_SCHEDULER)
-        && exiting.is_some_and(|exiting| exiting())
-    {
+    // Port of erts/emulator/beam/erl_nif.c:871,963 (execution_state, `from = c_p ? ... :
+    // am_undefined`), OTP-29.1.1. A `NULL` or process-independent env has no caller.
+    let caller = env_pid(env);
+    // Port of erts/emulator/beam/erl_nif.c:882-886, OTP-29.1.1: only a non-normal thread
+    // (`scheduler <= 0`) with a process-bound env returns 0 when that process is exiting.
+    // A normal scheduler does not check, and a process-independent env has `c_p == NULL`.
+    let normal_scheduler =
+        thread_type.is_some_and(|thread_type| thread_type() == ERL_NIF_THR_NORMAL_SCHEDULER);
+    if caller.is_some() && !normal_scheduler && exiting.is_some_and(|exiting| exiting()) {
         return 0;
     }
-    if let Some(hook) = send {
-        return i32::from(hook(to, msg));
+    let sent = if let Some(hook) = send {
+        hook(caller, to, msg)
+    } else {
+        let mut heap = VecHeap::new();
+        let Ok(copy) = copy_term(msg, &mut heap) else {
+            return 0;
+        };
+        messages().lock().unwrap().push(SentMessage {
+            to,
+            message: copy,
+            _heap: heap,
+        });
+        true
     };
-    let mut heap = VecHeap::new();
-    let Ok(copy) = copy_term(msg, &mut heap) else {
+    if !sent {
         return 0;
-    };
-    messages().lock().unwrap().push(SentMessage {
-        to,
-        message: copy,
-        _heap: heap,
-    });
+    }
+    // Port of erts/emulator/beam/erl_nif.c:960 (erts_create_message_from_nif_env moves the
+    // message heap and leaves the env clear), OTP-29.1.1. A failed lookup does not consume it.
+    if !msg_env.is_null() {
+        enif_clear_env(msg_env);
+    } else if caller.is_some() && !env.is_null() {
+        // Port of erts/emulator/beam/erl_nif.c:1008-1012, OTP-29.1.1: a real copy on a normal
+        // scheduler (`msg_env == NULL`, `scheduler > 0`, `c_p` set) charges
+        // `copy_sz / ERTS_MSG_COPY_WORDS_PER_REDUCTION`, capped at `CONTEXT_REDS`.
+        let env = deref_mut(env);
+        if env.reds_left.is_some() {
+            let words = size_object(msg);
+            if words > 64 {
+                env.consumed += (words / 64).min(4000) as i64;
+            }
+        }
+    }
     1
 }
 #[unsafe(no_mangle)]

@@ -1993,12 +1993,19 @@ fn nif_resource_demonitor(target: Term, id: u64) {
     }
 }
 
-// Port of erts/emulator/beam/erl_nif.c:3593 (enif_thread_type), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_nif.c:3586 (enif_thread_type / is_scheduler), OTP-29.1.1.
+// No scheduler data is `ERL_NIF_THR_UNDEFINED` (0). A dirty job publishes its type on the
+// thread even when that thread also has a normal scheduler id; the type wins, as `esdp->type` does.
 fn nif_thread_type() -> std::ffi::c_int {
     match arinsal_sched::current_scheduler_type() {
-        SchedulerType::Normal => 1,
-        SchedulerType::DirtyCpu => 2,
-        SchedulerType::DirtyIo => 3,
+        SchedulerType::DirtyCpu => return 2,
+        SchedulerType::DirtyIo => return 3,
+        SchedulerType::Normal => {}
+    }
+    if arinsal_sched::current_normal_scheduler().is_some() {
+        1
+    } else {
+        0
     }
 }
 
@@ -2015,31 +2022,44 @@ fn nif_is_process_alive(caller: Term, target: Term) -> bool {
         && !crate::signals::has_begun_exit(hub.runtime, target)
 }
 
-fn nif_send_hook(target: Term, message: Term) -> bool {
+// Port of erts/emulator/beam/erl_nif.c:860-1075 (enif_send), OTP-29.1.1.
+//
+// `execution_state(env, &c_p, &scheduler)` resolves the caller: `c_p == NULL` for a `NULL`
+// or process-independent env (an `enif_alloc_env` env has `proc->common.id == ERTS_INVALID_PID`),
+// so `from = c_p ? c_p->common.id : am_undefined`. The receiver is looked up against the
+// process table (`erts_proc_lookup` on a normal scheduler, `erts_pid2proc_opt` elsewhere),
+// not against the caller's scheduler. Arinsal's hook receives the caller pid (or `None`)
+// from `enif_send` and resolves the target's runtime with `hub_for_pid`; it never attributes
+// the send to the `GLOBAL_HUB` process.
+fn nif_send_hook(caller: Option<Term>, target: Term, message: Term) -> bool {
     let Some(pid) = Pid::from_term(target) else {
         return false;
     };
-    let Some(hub) = current_hub() else {
+    let sender = caller
+        .and_then(Pid::from_term)
+        .unwrap_or(arinsal_sched::UNDEFINED_PID);
+    let trace_message = message;
+    let Ok(message) = Message::copy_from(message) else {
+        return false;
+    };
+    let Some(hub) = hub_for_pid(pid) else {
         return false;
     };
     let Some(scheduler) = hub.scheduler.upgrade() else {
         return false;
     };
-    let trace_message = message;
-    let Ok(message) = Message::copy_from(message) else {
-        return false;
-    };
     let deliverable = scheduler.lookup(pid);
-    let dirty_scheduler = arinsal_sched::current_scheduler_type() != SchedulerType::Normal;
-    if deliverable && dirty_scheduler {
-        // Port of erts/emulator/beam/erl_nif.c:1005 (trace_send), OTP-29.1.1.
+    if deliverable && !sender.is_undefined() && crate::trace::active() {
+        // Port of erts/emulator/beam/erl_nif.c:998-1007 (trace_send), OTP-29.1.1: only a
+        // resolved caller (`c_p`) is traced. A `NULL` or process-independent env has no
+        // process, so the send is not a traced `send` from `GLOBAL_HUB`'s pid either.
         let _ = with_dirty_trace_emission(|| {
-            crate::trace::emit_dirty_send(hub.runtime, hub.pid, target, trace_message)
+            crate::trace::emit_dirty_send(hub.runtime, sender, target, trace_message)
         });
     }
-    let sent = scheduler.send(hub.pid, pid, message).is_ok();
+    let sent = scheduler.send(sender, pid, message).is_ok();
     if crate::debug_env::literal_trace() {
-        eprintln!("resource_send from={:?} to={:?} sent={sent}", hub.pid, pid);
+        eprintln!("resource_send from={:?} to={:?} sent={sent}", sender, pid);
     }
     sent
 }

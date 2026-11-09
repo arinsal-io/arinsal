@@ -38,6 +38,7 @@ mod monotonic_time_units_differential;
 mod msacc_threads;
 mod nif_binding;
 mod nif_dynamic;
+mod nif_thread_send_env;
 mod otp_triage_d_differential;
 mod pid_layout_differential;
 mod preloaded_stacktrace_differential;

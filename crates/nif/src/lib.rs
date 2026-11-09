@@ -13,7 +13,7 @@ mod resources;
 mod terms;
 
 pub use extras::{
-    SelectMessage, SelectRequest, SentMessage, VmHooks, set_vm_hooks, take_test_messages,
+    SelectMessage, SelectRequest, SendHook, SentMessage, VmHooks, set_vm_hooks, take_test_messages,
 };
 pub use res_monitor::ResourceMonitor;
 pub use resources::{
