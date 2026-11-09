@@ -224,7 +224,9 @@ impl Task for Process {
                     links.retain(|from| *from != event.from);
                     unlink_acks.push((event.from, id));
                 }
-                Payload::Signal(Signal::Demonitor(reference)) => {
+                Payload::Signal(
+                    Signal::Demonitor(reference) | Signal::DistDemonitor(reference),
+                ) => {
                     monitors.retain(|(id, _)| *id != reference);
                 }
                 Payload::Signal(Signal::DemonitorOrigin(shared)) => {

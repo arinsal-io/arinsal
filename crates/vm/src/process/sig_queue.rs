@@ -269,6 +269,10 @@ impl Process {
                 cnt += 2;
                 continue;
             }
+            if let Payload::Signal(Signal::DistDemonitor(reference)) = payload {
+                cnt += 1 + 2 * i32::from(crate::dist::handle_dist_demonitor(self, *reference));
+                continue;
+            }
             if let Payload::Signal(Signal::Unlink(id)) = payload {
                 let cost = self.handle_unlink_signal(ctx, *from, *id, None)?;
                 cnt += cost + 1;
@@ -415,6 +419,9 @@ impl Process {
             arinsal_sched::Signal::Demonitor(reference) => {
                 self.remove_target_monitor(reference);
                 2
+            }
+            arinsal_sched::Signal::DistDemonitor(reference) => {
+                1 + 2 * i32::from(crate::dist::handle_dist_demonitor(self, reference))
             }
             arinsal_sched::Signal::DemonitorOrigin(shared) => {
                 i32::from(self.remove_demonitored_target(shared))

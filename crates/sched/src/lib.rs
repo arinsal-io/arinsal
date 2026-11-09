@@ -693,6 +693,11 @@ pub enum Signal<M: SignalMessage> {
     MonitorNoproc(u64),
     /// Demonitor request carrying a VM reference.
     Demonitor(u64),
+    /// A remote process demonitors the receiver (`DOP_DEMONITOR_P`): the reference of the
+    /// target half in the receiver's monitor tree.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_demonitor,
+    // ERTS_SIG_Q_TYPE_DIST_PROC_DEMONITOR), OTP-29.1.1.
+    DistDemonitor(u64),
     /// Demonitor request carrying the origin half of the monitor itself, as erts queues the
     /// origin node (erl_proc_sig_queue.c, erts_proc_sig_send_demonitor): the target reaches
     /// its own half through the data both halves share.
