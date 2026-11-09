@@ -7452,6 +7452,12 @@ impl<T: Task> Scheduler<T> {
             .queue_new(process.priority().index(), Ordering::Release);
         process.scheduler_id.store(worker, Ordering::Relaxed);
         let item = Scheduled::new(process);
+        if self.inner.sim.is_some() {
+            // The simulator has no worker run-queue loop; erts' newly created process
+            // is runnable on its selected scheduler, represented by the simulation queue.
+            self.inner.enqueue(item, false);
+            return Ok(pid);
+        }
         let scheduler = self.inner.enqueue_run_queue(&item.process);
         self.inner.push_run_queue(scheduler, item, false);
         Ok(pid)
@@ -8375,6 +8381,11 @@ impl<T: Task> Scheduler<T> {
             let mut sim = sim.lock().unwrap();
             let len = sim.queue.len();
             if len == 0 {
+                drop(sim);
+                // Port of erts/emulator/beam/erl_process.c:scheduler_wait, OTP-29.1.1:
+                // yield while the idle simulated scheduler waits for asynchronous I/O workers
+                // to publish work into the scheduler queue.
+                std::thread::yield_now();
                 return false;
             }
             // Port of erts/emulator/beam/erl_process.c:9603 (priority queues), OTP-29.1.1:
