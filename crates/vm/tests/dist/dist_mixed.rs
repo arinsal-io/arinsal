@@ -691,3 +691,143 @@ fn dist_mixed_external_links_match_otp() {
     assert!(output.contains("DIST_MIXED_OK"), "{output}");
     assert_eq!(elink_result(&output), expected);
 }
+
+/// The Arinsal release binary next to this test's target directory.
+fn arinsal_binary() -> std::path::PathBuf {
+    std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("target directory")
+        .join("release/arinsal")
+}
+
+/// Run `expression` once on `erl` (`arinsal == false`) or on Arinsal, not distributed or as a
+/// short-named loopback node, and return the line starting with `marker`.
+fn local_eval(arinsal: bool, distributed: bool, expression: &str, marker: &str) -> String {
+    let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=3", "60"]);
+    if arinsal {
+        command.env("ARINSAL_OTP_ROOT", otp_root());
+        command.arg(arinsal_binary());
+    } else {
+        command.arg("erl");
+    }
+    command.arg("-noshell");
+    if distributed {
+        let node = format!("dm_l{}@localhost", unique_suffix(id));
+        command.args([
+            "-sname",
+            &node,
+            "-kernel",
+            "inet_dist_use_interface",
+            "{127,0,0,1}",
+        ]);
+    }
+    let output = command
+        .args(["-eval", &format!("{expression}, halt().")])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run timeout-supervised node");
+    let stdout = String::from_utf8_lossy(&output.stdout).replace('\n', " ");
+    let stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    match stdout.find(marker) {
+        Some(start) => stdout[start..].to_owned(),
+        None => panic!(
+            "no {marker} (arinsal={arinsal}, distributed={distributed}): status={} stdout={stdout} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+/// link/1, monitor/2, send and spawn_request towards a node that cannot be reached: the
+/// node is not alive, it is alive but the node does not exist, or `net_kernel` is gone so the
+/// auto-connect fails (bif.c link_opt and monitor on ERTS_DSIG_PREP_NOT_ALIVE /
+/// ERTS_DSIG_PREP_NOT_CONNECTED, remote_send, erts_internal_dist_spawn_request_4).
+const NOCONN_CLIENT: &str = r#"process_flag(trap_exit,true), Far=list_to_atom("dm_absent_"++integer_to_list(erlang:unique_integer([positive]))++"@localhost"), FarB=atom_to_binary(Far), FarL=byte_size(FarB), Ext=binary_to_term(<<131,88,100,FarL:16,FarB/binary,7:32,0:32,1:32>>), Has=fun() -> {links,Ls}=process_info(self(),links), lists:member(Ext,Ls) end, L1=link(Ext), E1=receive {'EXIT',Ext,R1} -> R1 after 3000 -> timeout end, H1=Has(), L2=link(Ext), E2=receive {'EXIT',Ext,R2} -> R2 after 3000 -> timeout end, {NT,NTM}=spawn_monitor(fun() -> link(Ext), receive after 3000 -> survived end end), NTR=receive {'DOWN',NTM,process,NT,R3} -> R3 after 5000 -> timeout end, M1=monitor(process,Ext), D1=receive {'DOWN',M1,process,O1,R4} -> {O1=:=Ext,R4} after 3000 -> timeout end, D2=try monitor(process,{x,Far}) of M2 -> receive {'DOWN',M2,process,O2,R5} -> {O2=:={x,Far},R5} after 3000 -> timeout end catch error:Er -> {error,Er} end, M3=monitor(process,Ext), DI=demonitor(M3,[info]), DQ=receive {'DOWN',M3,_,_,_} -> got_down after 300 -> quiet end, DIQ=(DI andalso DQ=:=quiet) orelse (not DI andalso DQ=:=got_down), M4=monitor(process,Ext), receive {'DOWN',M4,_,_,_} -> ok after 3000 -> ok end, DF=demonitor(M4,[info]), DF2=demonitor(M4), M5=monitor(process,Ext,[{tag,mytag}]), D5=receive {mytag,M5,process,_,R6} -> R6 after 3000 -> timeout end, S1=(Ext ! hi), S2=erlang:send({x,Far},hi), S3=erlang:send(Ext,hi,[noconnect]), S4=erlang:send({x,Far},hi,[noconnect]), SR1=erlang:spawn_request(Far,erlang,self,[],[]), SP1=receive {spawn_reply,SR1,A1,B1} -> {A1,B1} after 5000 -> timeout end, SR2=erlang:spawn_request(Far,erlang,self,[],[{reply_tag,tg},monitor,link]), SP2=receive {tg,SR2,A2,B2} -> {A2,B2} after 5000 -> timeout end, U=unlink(Ext), Mons=process_info(self(),monitors), Q=receive Any -> {unexpected,Any} after 300 -> quiet end, io:format("NOCONN_RESULT ~p~n",[[node()=/=nonode@nohost,L1,E1,H1,L2,E2,NTR,D1,D2,DIQ,DF,DF2,D5,S1,S2,S3,S4,SP1,SP2,U,Mons,Q]])"#;
+
+#[test]
+fn dist_mixed_unavailable_node_links_monitors_match_otp() {
+    let _serial = serial_test();
+    let without_net_kernel = format!("true=unregister(net_kernel), {NOCONN_CLIENT}");
+    for (distributed, expression) in [
+        (false, NOCONN_CLIENT),
+        (true, NOCONN_CLIENT),
+        (true, without_net_kernel.as_str()),
+    ] {
+        let expected = local_eval(false, distributed, expression, "NOCONN_RESULT");
+        let actual = local_eval(true, distributed, expression, "NOCONN_RESULT");
+        assert_eq!(
+            actual, expected,
+            "distributed={distributed} expression={expression}"
+        );
+    }
+}
+
+/// Monitors of remote processes by pid and by `{Name, Node}`, demonitor seen from the
+/// monitored side (`monitored_by`), DOWN `noconnection` for both kinds when the connection
+/// goes down, the monitored side forgetting the monitors of a lost connection, and a link
+/// re-made after an unlink while the connection went down. Run from the tested node against
+/// an OTP node and from an OTP node against the tested node.
+const EMON_CLIENT: &str = r#"process_flag(trap_exit,true), Me=self(), Srv=fun() -> spawn(N, fun() -> process_flag(trap_exit,true), (fun L() -> receive stop -> ok; _ -> L() end end)() end) end, MB=fun(P) -> {monitored_by,L}=erpc:call(N,erlang,process_info,[P,monitored_by]), L end, P1=Srv(), P2=Srv(), P3=Srv(), true=erpc:call(N,erlang,register,[dm_named,P2]), M1=monitor(process,P1), M2=monitor(process,{dm_named,N}), M5=monitor(process,P1), timer:sleep(300), B1=MB(P1), B2=MB(P2), true=demonitor(M5), timer:sleep(300), B3=MB(P1), A={lists:sort(B1)=:=[Me,Me], B2=:=[Me], B3=:=[Me]}, true=link(P3), timer:sleep(300), true=unlink(P3), true=erlang:disconnect_node(N), true=link(P3), D1=receive {'DOWN',M1,process,O1,R1} -> {O1=:=P1,R1} after 5000 -> timeout end, D2=receive {'DOWN',M2,process,O2,R2} -> {O2=:={dm_named,N},R2} after 5000 -> timeout end, Q5=receive {'DOWN',M5,_,_,_} -> got after 300 -> quiet end, timer:sleep(500), L3=receive {'EXIT',P3,R3} -> {early_exit,R3} after 0 -> none end, Linked=lists:member(P3, element(2,process_info(self(),links))), B4=MB(P1), B5=MB(P2), erpc:call(N,erlang,exit,[P3,kill]), L4=receive {'EXIT',P3,R4} -> R4 after 2000 -> timeout end, M6=monitor(process,P1), erpc:call(N,erlang,exit,[P1,kill]), D6=receive {'DOWN',M6,process,_,R6} -> R6 after 5000 -> timeout end, P2 ! stop, Mons=process_info(self(),monitors), io:format("EMON_RESULT ~p~n",[[A,D1,D2,Q5,L3,Linked,B4,B5,L4,D6,Mons]]), io:format("DIST_MIXED_OK emon~n")"#;
+
+/// `link/1` while the old external link is still unlinking on a connection that went down:
+/// the remote end is suspended, so its unlink ack never comes (bif.c link_opt `replace`).
+const ELINK_REPLACE_CLIENT: &str = r#"process_flag(trap_exit,true), Me=self(), P3=spawn(N, fun() -> process_flag(trap_exit,true), receive stop -> ok end end), true=link(P3), timer:sleep(300), Sus=spawn(N, fun() -> true=erlang:suspend_process(P3), Me ! suspended, receive resume -> true=erlang:resume_process(P3) end, receive stop -> ok end end), receive suspended -> ok end, true=unlink(P3), spawn(fun() -> erlang:disconnect_node(N), Me ! dc end), Spin=fun S(0) -> gave_up; S(K) -> case nodes() of [] -> down; _ -> S(K-1) end end, Down=Spin(100000000), true=link(P3), receive dc -> ok end, timer:sleep(500), L3=receive {'EXIT',P3,R3} -> {early_exit,R3} after 0 -> none end, Linked=lists:member(P3, element(2,process_info(self(),links))), pong=net_adm:ping(N), Sus ! resume, timer:sleep(300), erpc:call(N,erlang,exit,[P3,kill]), L4=receive {'EXIT',P3,R4} -> R4 after 2000 -> timeout end, Sus ! stop, io:format("REP_RESULT ~p~n",[[Down,L3,Linked,L4]])"#;
+
+fn emon_run(client_arinsal: bool, server_arinsal: bool, expression: &str, marker: &str) -> String {
+    let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let host = short_hostname();
+    let (output, _server) = if server_arinsal {
+        let cookie = format!("dm_cookie_{}_{id:04x}", std::process::id() % 100_000);
+        let (server, node) = start_arinsal_server(&cookie, &host);
+        let n = node_literal(&node);
+        let output = otp_eval(
+            &cookie,
+            &format!("N={n}, pong=net_adm:ping(N), {expression}"),
+        );
+        (output, Some(server))
+    } else {
+        let (erl, node, cookie, host) = start_erl();
+        let n = node_literal(&node);
+        let full = format!("N={n}, pong=net_adm:ping(N), {expression}");
+        let output = if client_arinsal {
+            arinsal_eval(&cookie, &host, &full)
+        } else {
+            otp_eval(&cookie, &full)
+        };
+        drop(erl);
+        (output, None)
+    };
+    let flat = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("DIST_MIXED_OK"), "{flat}");
+    let start = flat
+        .find(marker)
+        .unwrap_or_else(|| panic!("no {marker} in {flat}"));
+    let line = &flat[start..];
+    line[..line.find(" DIST_MIXED_OK").unwrap_or(line.len())].to_owned()
+}
+
+#[test]
+fn dist_mixed_external_monitors_connection_down_match_otp() {
+    let _serial = serial_test();
+    let expected = emon_run(false, false, EMON_CLIENT, "EMON_RESULT");
+    assert_eq!(emon_run(true, false, EMON_CLIENT, "EMON_RESULT"), expected);
+    let replace = format!("{ELINK_REPLACE_CLIENT}, io:format(\"DIST_MIXED_OK replace~n\")");
+    let expected = emon_run(false, false, &replace, "REP_RESULT");
+    assert_eq!(emon_run(true, false, &replace, "REP_RESULT"), expected);
+}
+
+/// The monitored side of [`EMON_CLIENT`] on the tested node: incoming DOP_MONITOR_P /
+/// DOP_DEMONITOR_P and the target halves dropped with a lost connection.
+#[test]
+#[ignore = "elink s4 remainder: incoming monitors still have proxy-pid origins (monitored_by lists the proxy, connection down leaves it)"]
+fn dist_mixed_external_monitors_monitored_side_match_otp() {
+    let _serial = serial_test();
+    let expected = emon_run(false, false, EMON_CLIENT, "EMON_RESULT");
+    assert_eq!(emon_run(false, true, EMON_CLIENT, "EMON_RESULT"), expected);
+}

@@ -161,19 +161,24 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
                 && entry.connection_id == conn_id
                 && entry.state == node_tables::ConnState::Pending
         });
-        let spawn_downs = if aborts {
-            take_connection_spawn_requests(&mut tables, name)
+        let (spawn_downs, monitor_downs) = if aborts {
+            (
+                take_connection_spawn_requests(&mut tables, name),
+                take_connection_monitors(&mut tables, name),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let mld = if aborts { tables.take_mld(name) } else { None };
         let result = tables
             .abort_pending(name, conn_id, entry_ref)
             .ok_or_else(badarg)?;
-        (result, spawn_downs, mld)
+        (result, (spawn_downs, monitor_downs), mld)
     };
+    let (spawn_downs, monitor_downs) = spawn_downs;
     if let Some(runtime) = process.runtime {
         elink::links_connection_down(runtime, mld);
+        notify_connection_monitors(runtime, monitor_downs)?;
         notify_connection_spawn_requests(runtime, spawn_downs)?;
     }
     Ok(boolean(result))
@@ -793,9 +798,94 @@ pub(crate) fn queue_outgoing(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
-    match queue_outgoing_with_options(process, ctx, node, control, message, true, true)? {
+    match queue_outgoing_with_options(process, ctx, node, control, message, true, true, None)? {
         DistSendResult::Queued => Ok(()),
         DistSendResult::NotConnected | DistSendResult::WouldSuspend => Err(badarg()),
+    }
+}
+
+/// The outcome of [`dsig_prepare`] (`ERTS_DSIG_PREP_*`, without the busy states).
+pub(crate) enum DsigPrepare {
+    /// `ERTS_DSIG_PREP_NOT_ALIVE`: this node is not distributed, or the auto-connect failed.
+    NotAlive,
+    /// `ERTS_DSIG_PREP_NOT_CONNECTED`: the connection is going down.
+    NotConnected,
+    /// `ERTS_DSIG_PREP_PENDING` or `ERTS_DSIG_PREP_CONNECTED`: connection `connection_id`
+    /// with its `dep->mld`.
+    Connected {
+        connection_id: u32,
+        mld: std::sync::Arc<crate::monitor_link::MonLnkDist>,
+    },
+}
+
+/// Port of erts/emulator/beam/dist.c (erts_dsig_prepare with `connect`), OTP-29.1.1: the
+/// state of the connection to `node`, set up with `erts_auto_connect` when idle. A signal
+/// prepared here goes out with [`queue_outgoing_on`], which drops it when the connection is
+/// no longer `connection_id`, as `erts_dsig_send` does.
+pub(crate) fn dsig_prepare(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    node: &str,
+) -> Result<DsigPrepare, VmError> {
+    loop {
+        let (conn_id, entry_ref) = {
+            let mut tables = node_tables::lock();
+            if !tables.alive {
+                return Ok(DsigPrepare::NotAlive);
+            }
+            if node == tables.local_name {
+                return Err(badarg());
+            }
+            match tables.entries.get(node) {
+                Some(entry)
+                    if matches!(
+                        entry.state,
+                        node_tables::ConnState::Connected | node_tables::ConnState::Pending
+                    ) =>
+                {
+                    return Ok(match entry.mld.clone() {
+                        Some(mld) => DsigPrepare::Connected {
+                            connection_id: entry.connection_id,
+                            mld,
+                        },
+                        None => DsigPrepare::NotConnected,
+                    });
+                }
+                Some(entry) if entry.state == node_tables::ConnState::Exiting => {
+                    return Ok(DsigPrepare::NotConnected);
+                }
+                _ => {}
+            }
+            tables.new_connection(node).ok_or_else(badarg)?
+        };
+        if !notify_auto_connect(process, ctx, node, conn_id, entry_ref)? {
+            return Ok(DsigPrepare::NotAlive);
+        }
+    }
+}
+
+/// Queue a signal prepared by [`dsig_prepare`] on connection `connection_id`; a signal for a
+/// connection that is gone is dropped (dist.c erts_dsig_send: "Not the same connection").
+pub(crate) fn queue_outgoing_on(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    node: &str,
+    connection_id: u32,
+    control: OwnedTerm,
+    message: Option<OwnedTerm>,
+) -> Result<(), VmError> {
+    match queue_outgoing_with_options(
+        process,
+        ctx,
+        node,
+        control,
+        message,
+        false,
+        true,
+        Some(connection_id),
+    )? {
+        DistSendResult::Queued | DistSendResult::NotConnected => Ok(()),
+        DistSendResult::WouldSuspend => Err(badarg()),
     }
 }
 
@@ -807,6 +897,7 @@ enum DistSendResult {
 }
 
 // Port of erts/emulator/beam/dist.c:3216-3280 (erts_dsig_prepare), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
 fn queue_outgoing_with_options(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -815,6 +906,7 @@ fn queue_outgoing_with_options(
     message: Option<OwnedTerm>,
     connect: bool,
     suspend: bool,
+    expect_connection: Option<u32>,
 ) -> Result<DistSendResult, VmError> {
     let mut tables = node_tables::lock();
     if !tables.alive {
@@ -836,6 +928,14 @@ fn queue_outgoing_with_options(
         None => true,
     };
     if was_idle && !connect {
+        return Ok(DistSendResult::NotConnected);
+    }
+    if let Some(expected) = expect_connection
+        && tables
+            .entries
+            .get(node)
+            .is_none_or(|entry| entry.connection_id != expected)
+    {
         return Ok(DistSendResult::NotConnected);
     }
     let (conn_id, entry_ref) = if was_idle {
@@ -895,24 +995,52 @@ fn queue_outgoing_with_options(
     entry.pending_out.push_back((control, message));
     let notify = was_idle.then(|| (node.to_string(), conn_id, entry_ref));
     drop(tables);
-    if let Some((node, conn_id, entry_ref)) = notify {
-        notify_auto_connect(process, ctx, &node, conn_id, entry_ref)?;
+    if let Some((node, conn_id, entry_ref)) = notify
+        && !notify_auto_connect(process, ctx, &node, conn_id, entry_ref)?
+    {
+        // dist.c erts_dsig_prepare: a failed auto-connect is ERTS_DSIG_PREP_NOT_ALIVE; the
+        // aborted connection dropped the queued signal.
+        return Ok(DistSendResult::NotConnected);
     }
     Ok(DistSendResult::Queued)
 }
 
-/// Port of erts/emulator/beam/dist.c:5713 (erts_auto_connect), OTP-29.1.1.
+/// Port of erts/emulator/beam/dist.c:5713 (erts_auto_connect), OTP-29.1.1. Without a
+/// `net_kernel` the pending connection is aborted (dist.c abort_pending_connection, with
+/// schedule_con_monitor_link_seq_cleanup of its `mld`) and the result is `false`.
 fn notify_auto_connect(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     node: &str,
     conn_id: u32,
     entry_ref: u64,
-) -> Result<(), VmError> {
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+) -> Result<bool, VmError> {
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let Some(net_kernel) = runtime.reg.whereis_proc_str("net_kernel") else {
-        let _ = node_tables::lock().abort_pending(node, conn_id, entry_ref);
-        return Err(badarg());
+        let mld = {
+            let mut tables = node_tables::lock();
+            let aborts = tables.entries.get(node).is_some_and(|entry| {
+                entry.entry_ref == entry_ref
+                    && entry.connection_id == conn_id
+                    && entry.state == node_tables::ConnState::Pending
+            });
+            let (mld, monitor_downs, spawn_downs) = if aborts {
+                (
+                    tables.take_mld(node),
+                    take_connection_monitors(&mut tables, node),
+                    take_connection_spawn_requests(&mut tables, node),
+                )
+            } else {
+                (None, Vec::new(), Vec::new())
+            };
+            let _ = tables.abort_pending(node, conn_id, entry_ref);
+            (mld, monitor_downs, spawn_downs)
+        };
+        let (mld, monitor_downs, spawn_downs) = mld;
+        elink::links_connection_down(runtime, mld);
+        notify_connection_monitors(runtime, monitor_downs)?;
+        notify_connection_spawn_requests(runtime, spawn_downs)?;
+        return Ok(false);
     };
     let (local_name, local_creation) = {
         let tables = node_tables::lock();
@@ -932,7 +1060,7 @@ fn notify_auto_connect(
     ]);
     ctx.send(net_kernel, owned_to_message(&msg)?)
         .map_err(|error| VmError::Unsupported(format!("auto_connect notify: {error}")))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Ingest one length-delimited distribution packet from a DistCtrlr inet port.
@@ -1179,6 +1307,35 @@ fn take_connection_monitors(
             }
         })
         .collect()
+}
+
+/// The `noconnection` DOWN of a monitor made while the node is not alive or not connected
+/// (bif.c monitor: erts_proc_sig_send_monitor_down of the dead-dist target half), sent by a
+/// closed-connection proxy that resolves to `target` in the DOWN message.
+fn send_monitor_down_noconnection(
+    runtime: &crate::process::Runtime,
+    watcher: Pid,
+    reference: u64,
+    target: OwnedTerm,
+) -> Result<(), VmError> {
+    let proxy = {
+        let mut tables = node_tables::lock();
+        let proxy = Pid::new(
+            NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
+            tables.local_creation,
+        );
+        PROXIES_CREATED.store(true, Ordering::Release);
+        tables.disconnected_monitor_pids.insert(proxy, target);
+        proxy
+    };
+    notify_connection_monitors(
+        runtime,
+        vec![ConnectionMonitorDown {
+            watcher,
+            proxy,
+            reference,
+        }],
+    )
 }
 
 /// Deliver `noconnection` through the same monitor signal path used for remote process exits.
@@ -1659,6 +1816,14 @@ fn dist_spawn_request(
     if node == local || node == "nonode@nohost" || !alive {
         return fallback_dist_spawn(vm, process, ctx, args);
     }
+    // dist.c erts_internal_dist_spawn_request_4: ERTS_DSIG_PREP_NOT_ALIVE and
+    // ERTS_DSIG_PREP_NOT_CONNECTED reply `{error, noconnection}` at once.
+    let connection_id = match dsig_prepare(process, ctx, &node)? {
+        DsigPrepare::Connected { connection_id, .. } => connection_id,
+        DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
+            return fallback_dist_spawn(vm, process, ctx, args);
+        }
+    };
     let mfa = owned(args[1])?;
     let OwnedTerm::Tuple(values) = &mfa else {
         return Err(badarg());
@@ -1794,7 +1959,14 @@ fn dist_spawn_request(
             }
         }
     }
-    if let Err(error) = queue_outgoing(process, ctx, &node, control, Some(values[2].clone())) {
+    if let Err(error) = queue_outgoing_on(
+        process,
+        ctx,
+        &node,
+        connection_id,
+        control,
+        Some(values[2].clone()),
+    ) {
         let mut tables = node_tables::lock();
         if let Some(entry) = tables.entries.get_mut(&node) {
             entry.pending_spawn_requests.remove(&id);
@@ -2882,20 +3054,32 @@ pub(crate) fn native_signal(
         "link" => elink::link_external(process, ctx, &node, target),
         "unlink" => elink::unlink_external(process, ctx, &node, target),
         "exit" => {
+            // Port of erts/emulator/beam/bif.c (exit_signal, external pid): an exit to a node
+            // that is not alive or not connected is dropped.
             let reason = owned(args[1])?;
-            queue_outgoing(
-                process,
-                ctx,
-                &node,
-                control(8, vec![local_pid_owned(ctx.pid()), target, reason]),
-                None,
-            )?;
+            if let DsigPrepare::Connected { connection_id, .. } = dsig_prepare(process, ctx, &node)?
+            {
+                queue_outgoing_on(
+                    process,
+                    ctx,
+                    &node,
+                    connection_id,
+                    control(8, vec![local_pid_owned(ctx.pid()), target, reason]),
+                    None,
+                )?;
+            }
             Ok(atom("true"))
         }
         "monitor" => {
             // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
             let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
             let info = crate::signals::monitor_info_for(tag, None)?;
+            // bif.c monitor: `{Name, Node}` on a node that is not alive is badarg.
+            if matches!(&target, OwnedTerm::Tuple(parts) if parts.len() == 2)
+                && !node_tables::lock().alive
+            {
+                return Err(badarg());
+            }
             let id = arinsal_bifs::next_ref_id();
             let reference = if alias_mode.is_some() {
                 crate::signals::pid_reference(process, id, ctx.pid())?
@@ -2915,18 +3099,6 @@ pub(crate) fn native_signal(
                 _ => target.clone(),
             };
             let reference_owned = owned(reference)?;
-            queue_outgoing(
-                process,
-                ctx,
-                &node,
-                control(
-                    19,
-                    vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
-                ),
-                None,
-            )?;
-            remember_monitor(&node, id, ctx.pid(), target)?;
-            process.cold_mut().dist_monitors.insert(id);
             let (origin, _) = crate::proc_create::create_monitor_with_reference_at(
                 process.heap.alloc_ix(),
                 crate::proc_create::monitor_reference(id, alias_mode, priority),
@@ -2936,6 +3108,29 @@ pub(crate) fn native_signal(
                 crate::proc_create::OriginMonitor::Distributed,
             );
             process.monitors.insert(origin);
+            match dsig_prepare(process, ctx, &node)? {
+                DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
+                    // bif.c monitor: erts_monitor_set_dead_dist, then
+                    // erts_proc_sig_send_monitor_down(..., am_noconnection).
+                    let runtime = process.runtime.ok_or_else(badarg)?;
+                    send_monitor_down_noconnection(runtime, ctx.pid(), id, target)?;
+                }
+                DsigPrepare::Connected { connection_id, .. } => {
+                    remember_monitor(&node, id, ctx.pid(), target)?;
+                    process.cold_mut().dist_monitors.insert(id);
+                    queue_outgoing_on(
+                        process,
+                        ctx,
+                        &node,
+                        connection_id,
+                        control(
+                            19,
+                            vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
+                        ),
+                        None,
+                    )?;
+                }
+            }
             Ok(reference)
         }
         "demonitor" => {
@@ -3221,7 +3416,9 @@ fn queue_remote_send(
         return Ok(RemoteSendOutcome::NotConnected);
     }
     Ok(
-        match queue_outgoing_with_options(process, ctx, node, control, message, connect, suspend)? {
+        match queue_outgoing_with_options(
+            process, ctx, node, control, message, connect, suspend, None,
+        )? {
             DistSendResult::Queued => RemoteSendOutcome::Sent,
             DistSendResult::NotConnected => RemoteSendOutcome::NotConnected,
             DistSendResult::WouldSuspend => RemoteSendOutcome::WouldSuspend,

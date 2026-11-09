@@ -431,50 +431,96 @@ pub(super) fn link_external(
 ) -> Result<Term, crate::VmError> {
     let remote = external_pid(&target).ok_or_else(badarg)?;
     let me = ctx.pid();
-    let (created, dist_half) = {
+    // `created` comes with the new link's dist half; an existing link being unlinked comes
+    // with the connection it was made on and a prepared replacement (`pelnk`).
+    let (dist_half, old_connection, prepared) = {
         let (mut link, dist_half) =
             process
                 .links
                 .lookup_create_external(node_type::LINK_DIST_PROC, me.data(), remote);
-        if dist_half.is_none() {
-            if link.view().unlinking() == 0 {
-                link.set_priority(false);
-                return Ok(atom("true"));
+        link.set_priority(false);
+        match dist_half {
+            Some(dist_half) => (Some(dist_half), None, None),
+            None => {
+                if link.view().unlinking() == 0 {
+                    return Ok(atom("true"));
+                }
+                let old_connection = link.view().external_dist().map(|dist| dist.connection_id);
+                let prepared = Link::create_external(node_type::LINK_DIST_PROC, me.data(), remote);
+                (None, old_connection, Some(prepared))
             }
-            link.set_unlinking(0);
         }
-        (dist_half.is_some(), dist_half)
     };
-    let sent = super::queue_outgoing(
-        process,
-        ctx,
-        node,
-        control(1, vec![local_pid_owned(me), target]),
-        None,
-    );
-    if let Err(error) = sent {
-        if created && let Some(link) = process.links.remove_external(&remote) {
-            drop(dist_half);
-            drop(link);
-        }
-        return Err(error);
-    }
-    if let Some(dist_half) = dist_half {
-        let mld = node_tables::lock()
-            .entries
-            .get(node)
-            .and_then(|entry| entry.mld.clone());
-        let inserted = match mld {
-            Some(mld) => dist_half.dist_insert(&mld),
-            None => Err(dist_half),
-        };
-        if let Err(dist_half) = inserted
-            && let Some(runtime) = process.runtime
-        {
+    let runtime = process.runtime.ok_or_else(badarg)?;
+    match super::dsig_prepare(process, ctx, node)? {
+        super::DsigPrepare::NotAlive | super::DsigPrepare::NotConnected => {
+            let nodename = global_atoms().intern(node).map_err(|_| badarg())?.0;
+            let mut dist_half = match (dist_half, prepared) {
+                (Some(dist_half), _) => dist_half,
+                // Unlinking an old link of an old connection: replace it with the prepared
+                // one (`erts_link_tree_replace`, then `erts_link_release(rlnk)`).
+                (None, Some((proc_half, dist_half))) => {
+                    replace_proc_half(process, &remote, proc_half, false);
+                    dist_half
+                }
+                (None, None) => unreachable!("an existing link is replaced"),
+            };
+            dist_half.view_mut().set_dead_dist(nodename);
             send_link_exit_noconnection(runtime, dist_half);
+        }
+        super::DsigPrepare::Connected { connection_id, mld } => {
+            let inserting = match (dist_half, prepared) {
+                (Some(dist_half), _) => Some(dist_half),
+                (None, Some((proc_half, dist_half))) if old_connection != Some(connection_id) => {
+                    // Unlinking an old link of an old connection: replace it, taking the old
+                    // dist half out of its connection (`erts_link_dist_delete`).
+                    replace_proc_half(process, &remote, proc_half, true);
+                    Some(dist_half)
+                }
+                (None, prepared) => {
+                    // The same connection: the unlink is cancelled; `pelnk` is released.
+                    if let Some((proc_half, dist_half)) = prepared {
+                        Link::release_both(proc_half, dist_half);
+                    }
+                    if let Some(mut link) = process.links.get_external_mut(&remote) {
+                        link.set_unlinking(0);
+                    }
+                    None
+                }
+            };
+            if let Some(dist_half) = inserting
+                && let Err(dist_half) = dist_half.dist_insert(&mld)
+            {
+                // The connection went down after the prepare.
+                send_link_exit_noconnection(runtime, dist_half);
+            }
+            super::queue_outgoing_on(
+                process,
+                ctx,
+                node,
+                connection_id,
+                control(1, vec![local_pid_owned(me), target]),
+                None,
+            )?;
         }
     }
     Ok(atom("true"))
+}
+
+/// `erts_link_tree_replace` of the proc half keyed by `remote` with `proc_half`, then the
+/// release of the old half: with its dist half when `delete_dist` takes that out of its
+/// connection (`erts_link_release_both`), else alone (`erts_link_release`).
+fn replace_proc_half(
+    process: &mut crate::Process,
+    remote: &ExternalPid,
+    proc_half: Link,
+    delete_dist: bool,
+) {
+    if let Some(old) = process.links.remove_external(remote) {
+        let deleted = delete_dist && old.dist_delete_other();
+        old.release_external(deleted);
+    }
+    process.links.insert(proc_half);
 }
 
 /// `unlink(Pid)` for an external pid.
