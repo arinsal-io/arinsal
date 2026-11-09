@@ -20,7 +20,7 @@ pub(crate) fn isolate_dyld_environment(test_name: &str) -> bool {
     command
         .arg("120")
         .arg(std::env::current_exe().expect("current test executable"))
-        .args(["--exact", test_name, "--nocapture"])
+        .args([test_name, "--nocapture"])
         .env(CHILD_MARKER, "1");
     for key in dyld_vars {
         command.env_remove(key);

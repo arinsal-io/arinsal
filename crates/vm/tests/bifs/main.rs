@@ -1,0 +1,47 @@
+#[allow(dead_code)]
+#[path = "../common/mod.rs"]
+mod common;
+
+mod arith_red;
+mod atom_order_differential;
+mod atom_table_differential;
+mod atomics_error_info;
+mod bif_trap_append;
+mod bif_trap_subtract;
+mod big_integer_select_differential;
+mod big_reds_differential;
+mod binary_copy_reductions;
+mod binary_iolist_differential;
+mod binary_replace_differential;
+mod binary_search_differential;
+mod binary_to_list_trap;
+mod etf_external;
+mod guard_arith;
+mod guard_compare_differential;
+mod iolist_reductions;
+mod iolist_to_iovec_compat;
+mod light_bif_boundary_differential;
+mod light_bif_self;
+mod list_halloc_differential;
+mod list_traps;
+mod list_tuple_construction_differential;
+mod lists_error_info;
+mod lists_reverse_differential;
+mod map_get_errors_differential;
+mod map_update_exact;
+mod maps_bits;
+mod maps_iterator_differential;
+mod maps_yield;
+mod misc_bifs;
+mod missing_bifs;
+mod phash2_unaligned_differential;
+mod re;
+mod re_error_info;
+mod re_run_yield;
+mod records_bifs;
+mod records_doctest_stack;
+mod reds_after_bif_differential;
+mod reds_overcharge_differential;
+mod reds_size_bifs_differential;
+mod reg_table;
+mod small_gaps;
