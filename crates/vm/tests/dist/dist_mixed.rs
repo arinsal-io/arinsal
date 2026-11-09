@@ -830,3 +830,44 @@ fn dist_mixed_external_monitors_monitored_side_match_otp() {
     let expected = emon_run(false, false, EMON_CLIENT, "EMON_RESULT");
     assert_eq!(emon_run(false, true, EMON_CLIENT, "EMON_RESULT"), expected);
 }
+
+/// Signal BIFs with an external pid called from `-eval` reach the BIF through `erl_eval`'s
+/// `apply/3`; erts has one `exit_2`/`link_1`/`unlink_1`/`demonitor_2` for every caller (bif.c),
+/// so each must route to the distribution as a static call does. The expected values are what
+/// erl 29.1.1 returns for the same expression.
+#[test]
+fn dist_mixed_eval_signal_bifs_to_remote_pid() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    let expression = format!(
+        concat!(
+            "N={n}, pong=net_adm:ping(N), Spawn=fun() -> rpc:call(N,erlang,spawn,[timer,sleep,[60000]]) end, ",
+            "P1=Spawn(), R1=monitor(process,P1), true=exit(P1,eval_kill), ",
+            "receive {{'DOWN',R1,process,P1,eval_kill}} -> ok after 10000 -> exit(no_exit2_down) end, ",
+            "P2=Spawn(), R2=monitor(process,P2), true=apply(erlang,exit,[P2,applied_kill]), ",
+            "receive {{'DOWN',R2,process,P2,applied_kill}} -> ok after 10000 -> exit(no_apply_exit2_down) end, ",
+            "P3=Spawn(), R3=monitor(process,P3), true=exit(P3,normal), ",
+            "receive {{'DOWN',R3,process,P3,_}}=D3 -> exit({{normal_killed,D3}}) after 300 -> ok end, ",
+            "process_flag(trap_exit,true), true=link(P3), true=unlink(P3), true=exit(P3,kill), ",
+            "receive {{'DOWN',R3,process,P3,killed}} -> ok after 10000 -> exit(no_kill_down) end, ",
+            "receive {{'EXIT',P3,_}}=E3 -> exit({{unlinked_exit,E3}}) after 300 -> ok end, ",
+            "P4=Spawn(), true=link(P4), true=exit(P4,linked_kill), ",
+            "receive {{'EXIT',P4,linked_kill}} -> ok after 10000 -> exit(no_link_exit) end, ",
+            "P5=Spawn(), R5=monitor(process,P5), true=demonitor(R5,[flush]), true=exit(P5,kill), ",
+            "receive {{'DOWN',R5,_,_,_}}=D5 -> exit({{demonitored_down,D5}}) after 300 -> ok end, ",
+            "P6=Spawn(), R6=monitor(process,P6), true=exit(P6,queued), ",
+            "Wait=fun W() -> {{messages,Ms}}=process_info(self(),messages), case lists:keymember(R6,2,Ms) of true -> ok; false -> timer:sleep(10), W() end end, ",
+            "ok=Wait(), false=demonitor(R6,[flush,info]), {{messages,[]}}=process_info(self(),messages), ",
+            "io:format(\"DIST_MIXED_OK eval_signal_bifs~n\")"
+        ),
+        n = n
+    );
+    // The reference: the same expression on an erl client node.
+    let reference = otp_eval(&cookie, &expression);
+    assert!(
+        reference.contains("DIST_MIXED_OK eval_signal_bifs"),
+        "{reference}"
+    );
+    arinsal_eval(&cookie, &host, &expression);
+}
