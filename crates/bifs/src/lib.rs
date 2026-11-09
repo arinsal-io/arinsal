@@ -29,6 +29,7 @@ mod etf;
 mod lists;
 mod maps_bifs;
 mod pure;
+mod raw;
 mod sys;
 mod time;
 mod unicode;

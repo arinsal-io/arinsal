@@ -46,3 +46,18 @@ fn malformed_terms_have_none() {
 fn bytes_after_the_term_are_not_looked_at() {
     assert!(decode_ext_size(&[131, 97, 1, 97, 2]).is_ok());
 }
+
+#[test]
+fn validated_body_is_bound_to_the_scanned_input_and_term_end() {
+    let body = [97, 42, 97, 43];
+    let mut walk = arinsal_etf::DecodedSizeWalk::new();
+    let (size, _) = walk
+        .step(&body, usize::MAX, true, |_| 0)
+        .expect("valid ETF body");
+    assert!(size.is_some());
+    let validated = walk.validated_body(&body).expect("same scanned bytes");
+    assert!(validated.as_bytes() == &body[..2]);
+    let mut other = body.to_vec();
+    other[1] = 41;
+    assert!(walk.validated_body(&other).is_none());
+}

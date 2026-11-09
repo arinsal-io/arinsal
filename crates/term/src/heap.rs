@@ -1300,7 +1300,8 @@ impl HeapReservationWords<'_> {
         Ok(HeapTermSlot::index(value))
     }
 
-    /// Store an index to the next unfilled slot, matching `dec_term`'s `*objp` chain.
+    /// Store the next slot address, matching `dec_term`'s `*objp` chain.
+    // Port of erts/emulator/beam/external.c:4368-4376, OTP-29.1.1.
     #[inline(always)]
     pub fn write_next_slot(
         &mut self,
@@ -1308,7 +1309,9 @@ impl HeapReservationWords<'_> {
         next: Option<HeapTermSlot>,
     ) -> Result<(), TermError> {
         let value = match next {
-            Some(next) if next.indexed => next.value.checked_add(1).ok_or(TermError::BadArg)?,
+            Some(next) if next.indexed && next.value < self.words.len() => {
+                self.words.as_mut_ptr().wrapping_add(next.value) as usize
+            }
             Some(_) => return Err(TermError::BadArg),
             None => 0,
         };
@@ -1323,7 +1326,8 @@ impl HeapReservationWords<'_> {
         Ok(())
     }
 
-    /// Read and clear the next unfilled slot index.
+    /// Read and clear the next unfilled slot address.
+    // Port of erts/emulator/beam/external.c:4368-4376, OTP-29.1.1.
     #[inline(always)]
     pub fn take_next_slot(
         &mut self,
@@ -1342,7 +1346,12 @@ impl HeapReservationWords<'_> {
         if next == 0 {
             Ok(None)
         } else {
-            let index = next - 1;
+            let base = self.words.as_mut_ptr() as usize;
+            let offset = next
+                .checked_sub(base)
+                .filter(|offset| offset.is_multiple_of(std::mem::size_of::<u64>()))
+                .ok_or(TermError::BadArg)?;
+            let index = offset / std::mem::size_of::<u64>();
             (index < self.words.len())
                 .then_some(HeapTermSlot::index(index))
                 .ok_or(TermError::BadArg)
@@ -5334,8 +5343,9 @@ impl HeapBlockBuilder {
         if count == 0 || !self.slot_base.indexed {
             return Err(TermError::BadArg);
         }
+        let base = (self.start as *mut u64).wrapping_sub(self.slot_base.value);
         let mut next = match continuation {
-            Some(slot) if slot.indexed => slot.value.checked_add(1).ok_or(TermError::BadArg)?,
+            Some(slot) if slot.indexed => base.wrapping_add(slot.value) as usize,
             Some(_) => return Err(TermError::BadArg),
             None => 0,
         };
@@ -5351,7 +5361,7 @@ impl HeapBlockBuilder {
                 .checked_add(offset)
                 .ok_or(TermError::BadArg)?;
             store((self.start as *mut u64).wrapping_add(offset), next as u64);
-            next = index.checked_add(1).ok_or(TermError::BadArg)?;
+            next = base.wrapping_add(index) as usize;
         }
         Ok(HeapTermSlot::index(first))
     }
@@ -5378,8 +5388,9 @@ impl HeapBlockBuilder {
             .value
             .checked_add(cdr_offset)
             .ok_or(TermError::BadArg)?;
+        let base = (self.start as *mut u64).wrapping_sub(self.slot_base.value);
         let continuation = match continuation {
-            Some(slot) if slot.indexed => slot.value.checked_add(1).ok_or(TermError::BadArg)?,
+            Some(slot) if slot.indexed => base.wrapping_add(slot.value) as usize,
             Some(_) => return Err(TermError::BadArg),
             None => 0,
         };
@@ -5389,7 +5400,7 @@ impl HeapBlockBuilder {
         );
         store(
             (self.start as *mut u64).wrapping_add(car_offset),
-            cdr.checked_add(1).ok_or(TermError::BadArg)? as u64,
+            base.wrapping_add(cdr + 1) as u64,
         );
         Ok(HeapTermSlot::index(car))
     }
@@ -5411,6 +5422,7 @@ impl HeapBlockBuilder {
         if !self.slot_base.indexed || !chain.indexed {
             return Err(TermError::BadArg);
         }
+        let base = (self.start as *mut u64).wrapping_sub(self.slot_base.value);
         for cell in (first_cell..end).rev() {
             let car_offset = cell.checked_mul(2).ok_or(TermError::BadArg)?;
             let cdr_offset = car_offset.checked_add(1).ok_or(TermError::BadArg)?;
@@ -5427,7 +5439,7 @@ impl HeapBlockBuilder {
             );
             store(
                 (self.start as *mut u64).wrapping_add(car_offset),
-                chain.value.checked_add(1).ok_or(TermError::BadArg)? as u64,
+                base.wrapping_add(chain.value) as u64,
             );
             chain = HeapTermSlot::index(car);
         }
