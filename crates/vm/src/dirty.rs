@@ -17,8 +17,9 @@ use crate::natives::nif::PendingNif;
 pub(crate) type DirtyBifMfa = (&'static str, &'static str, u8);
 pub(crate) type DirtyBifCall = (DirtyBifMfa, Vec<Term>);
 
-/// Body of a dirty BIF: it builds its result on the shadow heap it is given.
-pub(crate) type DirtyBifBody = Box<dyn FnOnce(&mut ProcessHeap) -> DirtyBifOutcome + Send>;
+/// Body of a dirty BIF: it reads its arguments from the registers it is given and builds its
+/// result on the shadow heap it is given.
+pub(crate) type DirtyBifBody = Box<dyn FnOnce(&mut ProcessHeap, &[Term]) -> DirtyBifOutcome + Send>;
 
 /// The exception state copied from the dirty shadow process by `erts_call_dirty_bif`.
 #[derive(Clone, Copy)]
@@ -47,7 +48,10 @@ pub(crate) enum DirtyBifOutcome {
 
 /// A dirty BIF call waiting for its job, or its finished result.
 pub(crate) enum DirtyBif {
-    Job(DirtyKind, DirtyBifBody),
+    /// The scheduled call: its kind, the argument registers `erts_schedule_bif` set up
+    /// (`c_p->arg_reg` with `c_p->arity`, GC roots while the process waits for a dirty
+    /// scheduler) and the body that reads them.
+    Job(DirtyKind, Vec<Term>, DirtyBifBody),
     Done(DirtyBifOutcome),
 }
 
@@ -122,6 +126,7 @@ pub(crate) fn dirty_result_slots<'a>(
     use arinsal_bifs::BifError;
     let mut slots = Vec::new();
     match dirty_bif {
+        Some(DirtyBif::Job(_, args, _)) => slots.extend(args.iter_mut()),
         Some(DirtyBif::Done(DirtyBifOutcome::Complete(Ok(value)))) => slots.push(value),
         Some(DirtyBif::Done(DirtyBifOutcome::Complete(Err(exception)))) => {
             slots.push(&mut exception.reason);
@@ -148,6 +153,29 @@ pub(crate) fn dirty_result_slots<'a>(
     slots
 }
 
+/// Every term slot of the dirty BIF/NIF state that is a GC root: the scheduled job's argument
+/// registers, a finished job's result, the saved trap target and original call arguments
+/// (`nep->argv`), and the saved exception trace. Same order as [`Process::dirty_result_roots`].
+// Port of erts/emulator/beam/erl_nfunc_sched.h (erts_setup_nfunc_rootset) and erl_gc.c
+// (setup_rootset roots `p->arg_reg` with `p->arity`), OTP-29.1.1.
+pub(crate) fn dirty_root_slots<'a>(
+    dirty_bif: &'a mut Option<DirtyBif>,
+    static_nif_done: &'a mut Option<Result<Term, arinsal_bifs::BifError>>,
+    trap_target: &'a mut Option<DirtyBifCall>,
+    original: &'a mut Option<DirtyBifCall>,
+    exception_trace: &'a mut Option<Term>,
+) -> Vec<&'a mut Term> {
+    let mut roots = dirty_result_slots(dirty_bif.as_mut(), static_nif_done.as_mut());
+    if let Some((_, args)) = trap_target {
+        roots.extend(args.iter_mut());
+    }
+    if let Some((_, args)) = original {
+        roots.extend(args.iter_mut());
+    }
+    roots.extend(exception_trace.iter_mut());
+    roots
+}
+
 impl Process {
     /// A dirty job is finished and its scheduled export must run on a normal scheduler.
     // Port of erts/emulator/beam/bif.c:5814-5843 (erts_call_dirty_bif), OTP-29.1.1.
@@ -159,10 +187,7 @@ impl Process {
 
     pub(crate) fn dirty_bif_scheduled(&self) -> bool {
         self.cold.as_ref().is_some_and(|cold| {
-            matches!(
-                cold.dirty_bif,
-                Some(DirtyBif::Job(_, _) | DirtyBif::Done(_))
-            )
+            matches!(cold.dirty_bif, Some(DirtyBif::Job(..) | DirtyBif::Done(_)))
         })
     }
 
@@ -250,14 +275,16 @@ impl Process {
         let Some(cold) = self.cold.as_ref() else {
             return false;
         };
-        matches!(
-            &cold.dirty_bif,
-            Some(DirtyBif::Done(DirtyBifOutcome::Complete(Ok(_))))
-                | Some(DirtyBif::Done(DirtyBifOutcome::Trap { .. }))
-                | Some(DirtyBif::Done(DirtyBifOutcome::Reschedule { .. }))
-        ) || cold.static_nif_done.is_some()
+        let dirty_bif = match &cold.dirty_bif {
+            Some(DirtyBif::Job(_, args, _)) => !args.is_empty(),
+            Some(DirtyBif::Done(_)) => true,
+            None => false,
+        };
+        dirty_bif
+            || cold.static_nif_done.is_some()
             || cold.dirty_bif_trap_target.is_some()
             || cold.dirty_bif_original.is_some()
+            || cold.dirty_bif_exception_trace.is_some()
     }
 
     /// The result of a finished dirty job that waits for its call to be executed again.
@@ -272,6 +299,10 @@ impl Process {
     pub(crate) fn dirty_result_roots(&self) -> Vec<Term> {
         let Some(cold) = self.cold.as_ref() else {
             return Vec::new();
+        };
+        let job_args = match &cold.dirty_bif {
+            Some(DirtyBif::Job(_, args, _)) => args.clone(),
+            _ => Vec::new(),
         };
         let mut dirty_bif = match &cold.dirty_bif {
             Some(DirtyBif::Done(DirtyBifOutcome::Complete(Ok(value)))) => {
@@ -295,10 +326,12 @@ impl Process {
             _ => None,
         };
         let mut static_nif_done = cold.static_nif_done;
-        let mut roots: Vec<Term> = dirty_result_slots(dirty_bif.as_mut(), static_nif_done.as_mut())
-            .into_iter()
-            .map(|term| *term)
-            .collect();
+        let mut roots: Vec<Term> = job_args;
+        roots.extend(
+            dirty_result_slots(dirty_bif.as_mut(), static_nif_done.as_mut())
+                .into_iter()
+                .map(|term| *term),
+        );
         if let Some((_, args)) = &cold.dirty_bif_trap_target {
             roots.extend(args.iter().copied());
         }
@@ -311,21 +344,15 @@ impl Process {
 
     /// Mutable view of [`Process::dirty_result_roots`], in the same order.
     pub(crate) fn dirty_result_roots_mut(&mut self) -> Vec<&mut Term> {
-        match self.cold.as_deref_mut() {
-            Some(cold) => {
-                let mut roots =
-                    dirty_result_slots(cold.dirty_bif.as_mut(), cold.static_nif_done.as_mut());
-                if let Some((_, args)) = &mut cold.dirty_bif_trap_target {
-                    roots.extend(args.iter_mut());
-                }
-                if let Some((_, args)) = &mut cold.dirty_bif_original {
-                    roots.extend(args.iter_mut());
-                }
-                roots.extend(cold.dirty_bif_exception_trace.iter_mut());
-                roots
-            }
-            None => Vec::new(),
-        }
+        self.cold.as_deref_mut().map_or_else(Vec::new, |cold| {
+            dirty_root_slots(
+                &mut cold.dirty_bif,
+                &mut cold.static_nif_done,
+                &mut cold.dirty_bif_trap_target,
+                &mut cold.dirty_bif_original,
+                &mut cold.dirty_bif_exception_trace,
+            )
+        })
     }
 
     /// The dirty job this process executes next on a dirty scheduler of `kind`.
@@ -340,13 +367,16 @@ impl Process {
         }
         self.verify_dirty_gc_roots(crate::process::switched_out_live(self), "dirty job entry");
         let cold = self.cold.as_mut()?;
-        if matches!(&cold.dirty_bif, Some(DirtyBif::Job(wanted, _)) if *wanted == kind) {
-            let Some(DirtyBif::Job(_, body)) = cold.dirty_bif.take() else {
+        if matches!(&cold.dirty_bif, Some(DirtyBif::Job(wanted, _, _)) if *wanted == kind) {
+            let Some(DirtyBif::Job(_, args, body)) = cold.dirty_bif.take() else {
                 return None;
             };
+            // The process cannot be collected while its dirty job runs (erts handles a GC
+            // request to a dirty-running process after the job), so the registers the job reads
+            // need not stay roots meanwhile.
             return Some(Box::new(move || {
                 let mut heap = shadow_heap();
-                let result = body(&mut heap);
+                let result = body(&mut heap, &args);
                 Box::new(DirtyDone::Bif(result, heap)) as Box<dyn Any>
             }));
         }
@@ -454,14 +484,16 @@ impl Process {
         }
     }
 
-    /// Execute a dirty BIF `body` as a dirty job of `kind`.
+    /// Execute a dirty BIF `body` as a dirty job of `kind` with argument registers `args`.
     ///
-    /// Port of erts/emulator/beam/bif.c:5760 (erts_call_dirty_bif), OTP-29.1.1.
+    /// Port of erts/emulator/beam/bif.c:5760 (erts_call_dirty_bif) and erl_nfunc_sched.c
+    /// (erts_nfunc_schedule copies `argv` into the argument registers), OTP-29.1.1.
     pub(crate) fn dirty_bif(
         &mut self,
         kind: DirtyKind,
         mfa: DirtyBifMfa,
-        body: impl FnOnce(&mut ProcessHeap) -> DirtyBifOutcome + Send + 'static,
+        args: &[Term],
+        body: impl FnOnce(&mut ProcessHeap, &[Term]) -> DirtyBifOutcome + Send + 'static,
     ) -> Result<DirtyBifOutcome, crate::VmError> {
         if self
             .cold
@@ -475,12 +507,10 @@ impl Process {
         }
         // Port of erts/emulator/beam/bif.c:5760 (erts_schedule_bif sets `c_p->i` to the BIF's
         // export), OTP-29.1.1: while the job is scheduled or runs the process is "in" the BIF.
-        let arity = usize::from(mfa.2);
-        let original_args = self.x[..arity].to_vec();
-        self.set_dirty_bif_original(mfa, &original_args);
+        self.set_dirty_bif_original(mfa, args);
         self.cold_mut().dirty_bif_mfa = Some(mfa);
         self.cold_mut().dirty_bif_exception_trace = None;
-        self.cold_mut().dirty_bif = Some(DirtyBif::Job(kind, Box::new(body)));
+        self.cold_mut().dirty_bif = Some(DirtyBif::Job(kind, args.to_vec(), Box::new(body)));
         Err(crate::VmError::Dirty(kind))
     }
 

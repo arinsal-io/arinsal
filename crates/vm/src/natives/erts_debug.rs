@@ -945,9 +945,12 @@ fn dirty_test(
                     let next_operation = args[0];
                     let next_value = args[1];
                     process.set_dirty_bif_original(original_mfa, original_args);
-                    let result = process.dirty_bif(kind, target, move |_| {
-                        dirty_reschedule_step(next_scheduler, next_operation, next_value)
-                    })?;
+                    let result = process.dirty_bif(
+                        kind,
+                        target,
+                        &[next_operation, next_value],
+                        move |_, args| dirty_reschedule_step(next_scheduler, args[0], args[1]),
+                    )?;
                     return match result {
                         DirtyBifOutcome::Complete(result) => result.map_err(|exception| {
                             dirty_bif_error(process, original_mfa, original_args, exception)
@@ -989,16 +992,24 @@ fn dirty_test(
             };
             let function = if busy { "dirty_cpu" } else { "dirty_io" };
             process.set_dirty_bif_original(original_mfa, original_args);
-            process.dirty_bif(kind, ("erts_debug", function, 2), move |heap| {
-                if arg_name(operation).as_deref() == Some("reschedule") {
-                    dirty_reschedule_step(scheduler, operation, value)
-                } else {
-                    DirtyBifOutcome::Complete(
-                        dirty_test_body(&env, heap, busy, operation, value)
-                            .map_err(dirty_bif_exception),
-                    )
-                }
-            })?
+            // Port of erts/emulator/beam/beam_debug.c:1190 (erts_debug_dirty_3 passes
+            // `argv` to erts_schedule_bif): the body reads its arguments from the registers.
+            process.dirty_bif(
+                kind,
+                ("erts_debug", function, 2),
+                &[operation, value],
+                move |heap, args| {
+                    let (operation, value) = (args[0], args[1]);
+                    if arg_name(operation).as_deref() == Some("reschedule") {
+                        dirty_reschedule_step(scheduler, operation, value)
+                    } else {
+                        DirtyBifOutcome::Complete(
+                            dirty_test_body(&env, heap, busy, operation, value)
+                                .map_err(dirty_bif_exception),
+                        )
+                    }
+                },
+            )?
         }
     };
     match result {
