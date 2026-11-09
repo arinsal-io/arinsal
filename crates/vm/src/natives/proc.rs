@@ -5874,15 +5874,26 @@ fn advance_trace_finish(
         let Some(stage) = finish.stages.pop_front() else {
             return Ok(finish);
         };
-        if matches!(
-            stage,
-            crate::trace_bp::FinishStage::TimemCommitBack
-                | crate::trace_bp::FinishStage::TimemConsolidate
-        ) {
-            run_timem_finish_stage(process, &mut finish, stage);
-        } else {
-            run_finish_stage(vm, process, &finish.functions, stage);
-        }
+        dispatch_finish_stage(vm, process, &mut finish, stage);
+    }
+}
+
+/// Runs one stage with the runner of the finisher that owns it: `trace_info_finisher`
+/// phases for the call-counter stages, `erts_finish_breakpointing` for the rest.
+fn dispatch_finish_stage(
+    vm: &mut Vm,
+    process: &Process,
+    finish: &mut crate::trace_bp::TraceFinish,
+    stage: crate::trace_bp::FinishStage,
+) {
+    if matches!(
+        stage,
+        crate::trace_bp::FinishStage::TimemCommitBack
+            | crate::trace_bp::FinishStage::TimemConsolidate
+    ) {
+        run_timem_finish_stage(process, finish, stage);
+    } else {
+        run_finish_stage(vm, process, &finish.functions, stage);
     }
 }
 
@@ -5999,7 +6010,9 @@ pub(crate) fn trace_finish_process_exit(
     let staged = !finish.stages.is_empty();
     while let Some(stage) = finish.stages.pop_front() {
         ctx.block_thread_progress(std::time::Duration::ZERO);
-        run_finish_stage(vm, process, &finish.functions, stage);
+        // trace_info_finisher runs its phases to the end for a killed caller too (only
+        // the resume is skipped): the collect phase switches the staged tables back.
+        dispatch_finish_stage(vm, process, &mut finish, stage);
     }
     if staged {
         ctx.block_thread_progress(std::time::Duration::ZERO);

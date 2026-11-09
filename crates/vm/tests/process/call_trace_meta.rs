@@ -8,7 +8,9 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(call_trace_meta_diff).
 -export([meta_calls/0, meta_info/0, call_time_info/0, timem_all_snapshot/0, bif_local/0, on_load_info/0,
-         call_memory_info/0, timestamps/0, set_on_link_ordering/0]).
+         call_memory_info/0, timestamps/0, set_on_link_ordering/0,
+         trace_info_killed/0]).
+-export([tik_foo/0]).
 -export([outer/1, inner/1]).
 
 outer(X) -> inner(X) + 1.
@@ -173,6 +175,39 @@ trace_relay(Parent) ->
 link_event(Parent, Child, {trace, Parent, link, Child}) -> parent_link;
 link_event(Parent, Child, {trace, Child, getting_linked, Parent}) -> child_linked;
 link_event(_, _, _) -> unexpected.
+%% Port of erts/emulator/test/trace_call_time_SUITE.erl (trace_info_killed), OTP-29.1.1:
+%% the caller of trace_info is killed while it waits between the finisher's barriers.
+trace_info_killed() ->
+    [tik_run(Type) || Type <- [call_time, call_memory]].
+
+tik_foo() -> ok.
+
+tik_run(Type) ->
+    Tester = self(),
+    MFA = {call_trace_meta_diff, tik_foo, 0},
+    1 = erlang:trace_pattern(MFA, true, [local, Type]),
+    {Victim, MRef} = spawn_opt(fun() ->
+                                       Tester ! {self(), ready},
+                                       receive go1 -> ok end,
+                                       call_trace_meta_diff:tik_foo(),
+                                       receive go2 -> ok end,
+                                       erlang:trace_info(MFA, Type),
+                                       never_reached
+                               end, [monitor]),
+    receive {Victim, ready} -> ok end,
+    1 = erlang:trace(Victim, true, [call]),
+    Bifs = [{erlang, trace_info, 2}, {erts_internal, trace_info, 3}],
+    [1 = erlang:trace_pattern(B, true, [local]) || B <- Bifs],
+    Victim ! go1,
+    receive {trace, Victim, call, {call_trace_meta_diff, tik_foo, []}} -> ok end,
+    Victim ! go2,
+    receive {trace, Victim, call, {_, trace_info, _}} -> ok end,
+    exit(Victim, abort),
+    receive {'DOWN', MRef, process, Victim, abort} -> ok end,
+    {Type, Info} = erlang:trace_info(MFA, Type),
+    [1 = erlang:trace_pattern(B, false, [local]) || B <- Bifs],
+    1 = erlang:trace_pattern(MFA, false, [Type]),
+    {Type, [{P =:= Victim, element(2, E)} || {P, _, _} = E <- Info]}.
 "#;
 
 fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
@@ -243,4 +278,9 @@ fn on_load_pattern_flags() {
 #[test]
 fn set_on_link_trace_state_precedes_the_link_signal() {
     check("set_on_link_ordering");
+}
+
+#[test]
+fn trace_info_caller_killed_between_barriers() {
+    check("trace_info_killed");
 }
