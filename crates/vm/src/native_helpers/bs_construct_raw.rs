@@ -4,7 +4,8 @@ use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::{SegFlags, SegSize, SegType, Segment, SegmentValue, write_segment_at};
 use arinsal_term::TermBuilder;
 
-/// Calls the checked append allocator after the emitted size pass.
+/// Calls the checked append allocator. Both the generic `bs_create_bin` sequence and the
+/// fast append path call it; the source is `reg[live]`.
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1808-1858, OTP-29.1.1.
 pub(crate) extern "C" fn append_checked(
     header: *mut ProcessHeader,
@@ -18,18 +19,12 @@ pub(crate) extern "C" fn append_checked(
     if header.is_null() || registers.is_null() {
         return 0;
     }
-    // SAFETY: the native call ABI supplies live process and scheduler-register pointers.
-    unsafe {
-        crate::native_helpers::arinsal_beamasm_bs_append_checked(
-            &mut *header,
-            &mut *registers,
-            source_index,
-            extra_bits,
-            unit,
-            live,
-            alloc,
-        )
-    }
+    debug_assert_eq!(source_index, live, "append source is reg[live]");
+    // SAFETY: native code passes its scheduler register area. Only `erl_bits_state` is
+    // borrowed: the X registers are reached through the process's attached X file, the array
+    // the collection inside the helper rewrites.
+    let ebs = unsafe { &mut *std::ptr::addr_of_mut!((*registers).erl_bits_state) };
+    crate::native_helpers::bs_append_checked(header, ebs, extra_bits, unit, live, alloc)
 }
 
 /// Runs the checked private append against the scheduler's live write cursor.

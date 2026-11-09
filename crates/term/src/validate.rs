@@ -466,6 +466,130 @@ pub(crate) fn verify_copied_term_after_collection(heap: &ProcessHeap, term: Term
     }
 }
 
+/// The used areas of a process heap: young `0..htop`, old `0..old_htop` and every fragment.
+fn used_areas(heap: &ProcessHeap) -> Vec<(usize, usize, &'static str)> {
+    let mut areas = Vec::new();
+    let young = heap.words.as_ptr() as usize;
+    if !heap.words.is_empty() {
+        areas.push((young, young + heap.htop_index() * 8, "young"));
+    }
+    let old = heap.old_words.as_ptr() as usize;
+    if !heap.old_words.is_empty() {
+        areas.push((old, old + heap.old_htop * 8, "old"));
+    }
+    for (index, fragment) in heap.fragments.iter().enumerate() {
+        let start = fragment.as_ptr() as usize;
+        areas.push((
+            start,
+            start + heap.fragment_used_words(index, fragment) * 8,
+            "fragment",
+        ));
+    }
+    areas
+}
+
+fn area_of(areas: &[(usize, usize, &'static str)], address: usize) -> Option<&'static str> {
+    areas
+        .iter()
+        .find(|&&(start, end, _)| address >= start && address < end)
+        .map(|&(_, _, name)| name)
+}
+
+/// Check the writable-binary structure of a process heap (debug builds with validation
+/// active): every `SUB_BITS` `orig` names a `BinRef` or heap-bits header in a used heap area
+/// or a literal, no old-generation object points into the young generation, and every
+/// `wrt_bins` node is a `BinRef` in a used heap area. Not an erts function: erts checks the
+/// same heap shape in debug builds with `erts_check_heap` and `disallow_heap_frag_ref_in_old_heap`.
+pub fn check_heap_bits_if_active(heap: &ProcessHeap, context: &str) {
+    if !active() {
+        return;
+    }
+    let areas = used_areas(heap);
+    let literals = crate::literal::literal_area();
+    let valid_target = |address: usize| -> Result<&'static str, String> {
+        let area = if let Some(area) = area_of(&areas, address) {
+            area
+        } else if address >= literals.0 && address < literals.1 || stable_contains(address) {
+            "literal"
+        } else {
+            return Err(format!("{address:#x} outside every used heap area"));
+        };
+        let header = crate::raw::load(address);
+        if header & 3 != 0 || !matches!(header & 63, crate::BIN_REF | crate::HEAP_BITS) {
+            return Err(format!(
+                "{address:#x} ({area}) has header {header:#x}, not BinRef/heap bits"
+            ));
+        }
+        Ok(area)
+    };
+    for &(start, end, name) in &areas {
+        let mut at = start;
+        while at < end {
+            let word = crate::raw::load(at);
+            if word & 3 != 0 {
+                at += 8;
+                continue;
+            }
+            let words = if word & 63 == crate::ARITY || word & 63 == crate::RECORD {
+                1 + (word >> 6) as usize
+            } else {
+                crate::raw::boxed_words(word, at)
+            };
+            if word & 63 == crate::SUB_BITS {
+                let orig = crate::raw::load(at + 32);
+                let result = if orig & 3 != 2 {
+                    Err(format!("orig {orig:#x} is not boxed"))
+                } else {
+                    valid_target((orig & !7) as usize)
+                };
+                match result {
+                    Ok(target) if name == "old" && matches!(target, "young" | "fragment") => {
+                        panic!(
+                            "heap bits validation failed ({context}): old SUB_BITS at {at:#x} \
+                             has orig {orig:#x} in {target}\n  {}",
+                            describe(heap)
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!(
+                        "heap bits validation failed ({context}): SUB_BITS at {at:#x} ({name}) \
+                         flags {:#x}: {error}\n  {}",
+                        crate::raw::load(at + 8) & 3,
+                        describe(heap)
+                    ),
+                }
+            }
+            at += words.max(1) * 8;
+        }
+    }
+    if !heap.old_generation_is_closed() {
+        panic!(
+            "heap bits validation failed ({context}): the old generation points into the \
+             young generation\n  {}",
+            describe(heap)
+        );
+    }
+    let (_, mut node) = heap.owners.chain_heads();
+    let mut count = 0usize;
+    while node != 0 {
+        let header = if area_of(&areas, node).is_some() {
+            crate::raw::load(node)
+        } else {
+            0
+        };
+        if header & 3 != 0 || header & 63 != crate::BIN_REF {
+            panic!(
+                "heap bits validation failed ({context}): wrt_bins node {node:#x} #{count} \
+                 (area {:?}) has header {header:#x}\n  {}",
+                area_of(&areas, node),
+                describe(heap)
+            );
+        }
+        node = crate::raw::load(node + 16) as usize;
+        count += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::check_term;

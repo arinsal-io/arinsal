@@ -244,25 +244,6 @@ pub(crate) struct BinRefRecord {
     binary: BinaryView<'static>,
 }
 
-/// Load an X register indexed by a value emitted from a validated Beam instruction.
-///
-/// The BeamAsm checked-append emitter passes constant register indexes taken from the
-/// instruction's X-register operands; these are within the process register vector.
-#[inline(always)]
-pub fn trusted_jit_register(registers: std::ptr::NonNull<Term>, index: usize) -> Term {
-    // SAFETY: the checked-append JIT call passes an X-register index validated while building
-    // the append plan, and the process-owned register base has that slot allocated.
-    unsafe { *registers.as_ptr().add(index) }
-}
-
-/// Store a rooted BinRef into an X register indexed by a checked-append JIT operand.
-#[inline(always)]
-pub fn set_trusted_jit_register(registers: std::ptr::NonNull<Term>, index: usize, term: Term) {
-    // SAFETY: the checked-append JIT call passes its live X-register index from the instruction
-    // metadata, bounded by the process register allocation.
-    unsafe { *registers.as_ptr().add(index) = term };
-}
-
 impl BinRefRecord {
     /// Resolve a `BinRef` without consulting the heap's owner registry.
     #[inline(always)]
