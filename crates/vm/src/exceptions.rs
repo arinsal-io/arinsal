@@ -292,6 +292,32 @@ pub(super) fn bif_error(
     bif_error_with_atoms(p, module, function, module_atom, function_atom, args, error)
 }
 
+/// Restore the original dirty BIF frame before building its exception trace.
+// Port of erts/emulator/beam/bif.c:5630-5640 (dirty_bif_exception), OTP-29.1.1.
+pub(super) fn dirty_bif_exception(
+    p: &mut Process,
+    module: &str,
+    function: &str,
+    args: &[Term],
+    error: BifError,
+) -> Result<VmError, VmError> {
+    let mut result = bif_error(p, module, function, args, error);
+    let VmError::Trap(trap) = &mut result else {
+        return Ok(result);
+    };
+    trap.top = Some(stacktrace::TopFrame::Bif {
+        module: global_atoms()
+            .intern(module)
+            .map_err(|_| VmError::Unsupported(format!("exception module atom {module}")))?,
+        function: global_atoms()
+            .intern(function)
+            .map_err(|_| VmError::Unsupported(format!("exception function atom {function}")))?,
+        args: stacktrace::BifArgs::from_terms(args)?,
+        info: stacktrace::BifErrorInfo::Plain,
+    });
+    Ok(result)
+}
+
 /// The exception of a `raise/3` whose stacktrace is already in `ftrace`.
 // Port of erts/emulator/beam/bif.c (raise_3 stores the stacktrace in `c_p->ftrace`), OTP-29.1.1.
 pub(crate) fn raise_from_ftrace(
@@ -389,7 +415,10 @@ pub(super) fn bif_error_with_atoms(
             BifError::Badarith => atom("badarith")?,
             BifError::SystemLimit => atom("system_limit")?,
             BifError::Error(value) => value,
-            BifError::Raise { .. } | BifError::Unsupported(_) | BifError::Dirty(_) => {
+            BifError::Raise { .. }
+            | BifError::Unsupported(_)
+            | BifError::Dirty(_)
+            | BifError::DirtyTrap => {
                 unreachable!()
             }
         };

@@ -300,6 +300,69 @@ impl Executor {
                                 break Ok(wait);
                             }
                         }
+                        // Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty
+                        // job returns the process to a normal scheduler before its continuation).
+                        if ctx.scheduler_type().is_dirty() && process.dirty_bif_completed() {
+                            break Ok(RunState::Yield);
+                        }
+                        // Port of erts/emulator/beam/bif.c:5814-5835
+                        // (erts_call_dirty_bif): a completed dirty BIF resumes by calling its
+                        // internal result/exception export with the scheduled argument registers.
+                        if let Some(((module, function, arity), args)) =
+                            process.take_dirty_bif_continuation()
+                        {
+                            let arity = usize::from(arity);
+                            process.x.ensure_x(arity + 2);
+                            process.x[arity] = Term::atom(
+                                arinsal_term::global_atoms().intern(module).map_err(|_| {
+                                    VmError::Unsupported("dirty continuation module atom".into())
+                                })?,
+                            );
+                            process.x[arity + 1] = Term::atom(
+                                arinsal_term::global_atoms().intern(function).map_err(|_| {
+                                    VmError::Unsupported("dirty continuation function atom".into())
+                                })?,
+                            );
+                            process.x[..arity].copy_from_slice(&args);
+                            process.heap.abi.arity = arity as u8;
+                            process.gc_live = arity;
+                            let tail = process.take_dirty_bif_tail().unwrap_or(true);
+                            let continuation =
+                                self.vm.apply_fixed(process, arity, tail, 0, Some(ctx));
+                            let continuation = match continuation {
+                                Ok(outcome) => outcome,
+                                Err(VmError::Trap(trap)) => {
+                                    if let Some(error) = crate::exceptions::resume(
+                                        &mut self.vm,
+                                        process,
+                                        Some(ctx),
+                                        trap,
+                                    )? {
+                                        process.heap.abi.exc.freason = 0;
+                                        process.heap.abi.exc.fvalue = 0;
+                                        break Err(error);
+                                    }
+                                    process.heap.abi.exc.freason = 0;
+                                    process.heap.abi.exc.fvalue = 0;
+                                    continue;
+                                }
+                                Err(error) => break Err(error),
+                            };
+                            match continuation {
+                                crate::ImportOutcome::Advanced => continue,
+                                crate::ImportOutcome::Jump(_) => {
+                                    self.vm.enter_native_at_jump(process);
+                                    continue;
+                                }
+                                crate::ImportOutcome::Yield => break Ok(RunState::Yield),
+                                crate::ImportOutcome::Returned(value) => {
+                                    if process.native_pc().is_none() {
+                                        break Ok(RunState::Done(value));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         process.native_transfer = false;
                         crate::dist::continue_fragmented_send(process, ctx)?;
                         // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1:

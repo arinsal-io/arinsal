@@ -674,6 +674,9 @@ impl Vm {
         };
         let result =
             self.call_named_untraced(p, atoms, module, function, arity, tail, ctx.as_deref_mut());
+        if matches!(result, Err(VmError::Dirty(_))) {
+            p.set_dirty_bif_tail(tail);
+        }
         let (Some((module, function, args)), Some(run)) = (traced, ctx) else {
             return result;
         };
@@ -755,6 +758,71 @@ impl Vm {
             return Ok(ImportOutcome::Yield);
         }
         let bif_args = p.x[..arity].to_vec();
+        if matches!(&result, Err(BifError::DirtyTrap)) {
+            // Port of erts/emulator/beam/bif.c:5612-5627 (dirty_bif_trap): restore the
+            // saved BIF arguments and continue at the export saved by the dirty scheduler.
+            let Some(((target_module, target_function, target_arity), args)) =
+                p.take_dirty_bif_trap_target()
+            else {
+                return Err(VmError::Unsupported(
+                    "dirty_bif_trap has no saved export continuation".into(),
+                ));
+            };
+            p.take_dirty_bif_original();
+            let target_arity = usize::from(target_arity);
+            p.x.ensure_x(target_arity + 2);
+            p.x[..target_arity].copy_from_slice(&args);
+            p.x[target_arity] = Term::atom(
+                global_atoms()
+                    .intern(target_module)
+                    .map_err(|_| VmError::Unsupported("dirty trap module atom".into()))?,
+            );
+            p.x[target_arity + 1] = Term::atom(
+                global_atoms()
+                    .intern(target_function)
+                    .map_err(|_| VmError::Unsupported("dirty trap function atom".into()))?,
+            );
+            p.gc_live = target_arity;
+            return self.apply_fixed(p, target_arity, true, 0, ctx);
+        }
+        if module == "erts_internal" && function == "dirty_bif_result" {
+            p.take_dirty_bif_original();
+        }
+        let result = match result {
+            Err(error @ BifError::Raise { .. })
+                if module == "erts_internal" && function == "dirty_bif_exception" =>
+            {
+                let mut error = error;
+                if let Some(stacktrace) = p.take_dirty_bif_exception_trace()
+                    && let BifError::Raise {
+                        stacktrace: saved, ..
+                    } = &mut error
+                {
+                    *saved = Some(stacktrace);
+                }
+                let call_pc = p.take_dirty_bif_call_pc();
+                if let Some(((original_module, original_function, _), original_args)) =
+                    p.take_dirty_bif_original()
+                {
+                    // Port of erts/emulator/beam/erl_nfunc_sched.h (erts_nfunc_restore_error),
+                    // OTP-29.1.1: `handle_error` raises at the saved `nep->pc`, the call
+                    // site of the original BIF, while the return address pushed by the trap
+                    // stays on the stack as the caller's continuation.
+                    if let Some(call_pc) = call_pc {
+                        p.native_error_pc = call_pc;
+                    }
+                    return Err(exceptions::dirty_bif_exception(
+                        p,
+                        original_module,
+                        original_function,
+                        &original_args,
+                        error,
+                    )?);
+                }
+                Err(error)
+            }
+            result => result,
+        };
         let result = result.map_err(|error| match error {
             BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
             error => exceptions::bif_error(p, module, function, &bif_args, error),

@@ -25,6 +25,7 @@ mod arith;
 mod atomics;
 mod binary_mod;
 mod checksum;
+mod dirty;
 mod etf;
 mod lists;
 mod maps_bifs;
@@ -108,6 +109,8 @@ pub enum BifError {
     /// The call must continue on a scheduler of this class; the VM re-executes it there.
     /// Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif dirty flags), OTP-29.1.1.
     Dirty(SchedulerClass),
+    /// Trap marker returned by the dirty BIF trampoline after restoring its native wrapper.
+    DirtyTrap,
 }
 
 /// Scheduler class a rescheduled native call continues on.
@@ -518,6 +521,8 @@ fn encode_failure(exc: &mut arinsal_term::exc::ExcFields, error: BifError) {
                 SchedulerClass::DirtyIo => 3,
             };
         }
+        // The process-aware apply path consumes this before failure encoding.
+        BifError::DirtyTrap => exc.freason = TRAP,
     }
 }
 
@@ -596,6 +601,9 @@ pub fn visit_bif<V: BifTableVisitor>(
         return Some(found);
     }
     if let Some(found) = checksum::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = dirty::lookup(module, name, arity, visitor) {
         return Some(found);
     }
     if let Some(found) = etf::lookup(module, name, arity, visitor) {

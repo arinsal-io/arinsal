@@ -1,5 +1,6 @@
 //! Introspection natives implemented by the emulator debug modules.
 
+use crate::dirty::{DirtyBifException, DirtyBifOutcome};
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
 use arinsal_etf::OwnedTerm;
@@ -901,19 +902,71 @@ fn dirty_test_body(
 fn dirty_test(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    scheduler: &str,
+    scheduler: &'static str,
     operation: Term,
     value: Term,
+    original_mfa: (&'static str, &'static str, u8),
+    original_args: &[Term],
 ) -> Result<Term, VmError> {
-    let busy = scheduler == "dirty_cpu";
     let scheduler_handle = process
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.scheduler_arc().ok());
+    if scheduler == "normal" && arg_name(operation).as_deref() == Some("reschedule") {
+        let mut scheduler = "normal";
+        let mut operation = operation;
+        let mut value = value;
+        loop {
+            match dirty_reschedule_step(scheduler, operation, value) {
+                DirtyBifOutcome::Complete(result) => {
+                    return result.map_err(|exception| {
+                        dirty_bif_error(process, original_mfa, original_args, exception)
+                    });
+                }
+                DirtyBifOutcome::Trap { target, args }
+                | DirtyBifOutcome::Reschedule { target, args } => {
+                    let next_scheduler = match (target.1, target.2) {
+                        ("dirty_cpu", 2) => "dirty_cpu",
+                        ("dirty_io", 2) => "dirty_io",
+                        ("dirty", 3) => "normal",
+                        _ => return Err(VmError::Unsupported("dirty BIF trap target".into())),
+                    };
+                    if next_scheduler == "normal" {
+                        scheduler = next_scheduler;
+                        operation = args[1];
+                        value = args[2];
+                        continue;
+                    }
+                    let kind = if next_scheduler == "dirty_cpu" {
+                        DirtyKind::Cpu
+                    } else {
+                        DirtyKind::Io
+                    };
+                    let next_operation = args[0];
+                    let next_value = args[1];
+                    process.set_dirty_bif_original(original_mfa, original_args);
+                    let result = process.dirty_bif(kind, target, move |_| {
+                        dirty_reschedule_step(next_scheduler, next_operation, next_value)
+                    })?;
+                    return match result {
+                        DirtyBifOutcome::Complete(result) => result.map_err(|exception| {
+                            dirty_bif_error(process, original_mfa, original_args, exception)
+                        }),
+                        DirtyBifOutcome::Trap { .. } | DirtyBifOutcome::Reschedule { .. } => {
+                            Err(VmError::Unsupported(
+                                "dirty BIF continuation escaped its scheduler".into(),
+                            ))
+                        }
+                    };
+                }
+            }
+        }
+    }
+    let busy = scheduler == "dirty_cpu";
     let kind = match scheduler {
-        "normal" => None,
         "dirty_cpu" => Some(DirtyKind::Cpu),
         "dirty_io" => Some(DirtyKind::Io),
+        "normal" => None,
         _ => return Err(badarg()),
     };
     let result = match kind {
@@ -923,7 +976,10 @@ fn dirty_test(
                 scheduler: scheduler_handle,
                 exiting: std::sync::Arc::new(AtomicBool::new(false)),
             };
-            dirty_test_body(&env, &mut process.heap, busy, operation, value)
+            DirtyBifOutcome::Complete(
+                dirty_test_body(&env, &mut process.heap, busy, operation, value)
+                    .map_err(dirty_bif_exception),
+            )
         }
         Some(kind) => {
             let env = DirtyTestEnv {
@@ -932,12 +988,102 @@ fn dirty_test(
                 exiting: process.dirty_exit_flag(),
             };
             let function = if busy { "dirty_cpu" } else { "dirty_io" };
+            process.set_dirty_bif_original(original_mfa, original_args);
             process.dirty_bif(kind, ("erts_debug", function, 2), move |heap| {
-                dirty_test_body(&env, heap, busy, operation, value)
+                if arg_name(operation).as_deref() == Some("reschedule") {
+                    dirty_reschedule_step(scheduler, operation, value)
+                } else {
+                    DirtyBifOutcome::Complete(
+                        dirty_test_body(&env, heap, busy, operation, value)
+                            .map_err(dirty_bif_exception),
+                    )
+                }
             })?
         }
     };
-    result.map_err(|reason| VmError::Trap(exceptions::Trap::error(atom(reason))))
+    match result {
+        DirtyBifOutcome::Complete(result) => result
+            .map_err(|exception| dirty_bif_error(process, original_mfa, original_args, exception)),
+        DirtyBifOutcome::Trap { .. } | DirtyBifOutcome::Reschedule { .. } => Err(
+            VmError::Unsupported("dirty BIF continuation escaped its scheduler".into()),
+        ),
+    }
+}
+
+fn dirty_bif_exception(reason: &'static str) -> DirtyBifException {
+    DirtyBifException {
+        freason: arinsal_term::exc::EXC_ERROR,
+        reason: atom(reason),
+        stacktrace: None,
+    }
+}
+
+fn dirty_bif_error(
+    process: &mut Process,
+    mfa: (&'static str, &'static str, u8),
+    args: &[Term],
+    exception: DirtyBifException,
+) -> VmError {
+    let class = match exception.freason & 3 {
+        2 => arinsal_bifs::Class::Exit,
+        3 => arinsal_bifs::Class::Throw,
+        _ => arinsal_bifs::Class::Error,
+    };
+    exceptions::dirty_bif_exception(
+        process,
+        mfa.0,
+        mfa.1,
+        args,
+        arinsal_bifs::BifError::Raise {
+            class,
+            reason: exception.reason,
+            stacktrace: exception.stacktrace,
+        },
+    )
+    .unwrap_or_else(|error| error)
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:1304-1369 (`reschedule`), OTP-29.1.1.
+fn dirty_reschedule_step(scheduler: &'static str, operation: Term, value: Term) -> DirtyBifOutcome {
+    let Some(rounds) = value.as_small().filter(|rounds| *rounds >= 0) else {
+        return DirtyBifOutcome::Complete(Err(dirty_bif_exception("badarg")));
+    };
+    if rounds % 2 != 0 {
+        return DirtyBifOutcome::Complete(Err(dirty_bif_exception("badarg")));
+    }
+    if rounds == 0 {
+        return DirtyBifOutcome::Complete(Ok(atom("ok")));
+    }
+    let next_scheduler = if rounds % 4 != 0 {
+        scheduler
+    } else {
+        match scheduler {
+            "dirty_cpu" => "dirty_io",
+            "dirty_io" => "normal",
+            "normal" => "dirty_cpu",
+            _ => return DirtyBifOutcome::Complete(Err(dirty_bif_exception("badarg"))),
+        }
+    };
+    let next_rounds = Term::small(rounds - 2).expect("reschedule count stays a small integer");
+    if next_scheduler == "normal" {
+        DirtyBifOutcome::Reschedule {
+            target: ("erts_debug", "dirty", 3),
+            args: vec![atom("normal"), operation, next_rounds],
+        }
+    } else {
+        DirtyBifOutcome::Reschedule {
+            target: (
+                "erts_debug",
+                if next_scheduler == "dirty_cpu" {
+                    "dirty_cpu"
+                } else {
+                    "dirty_io"
+                },
+                2,
+            ),
+            args: vec![operation, next_rounds],
+        }
+    }
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:1190 (erts_debug_dirty_3), OTP-29.1.1.
@@ -952,7 +1098,15 @@ fn dirty(
         Some("dirty_io") => "dirty_io",
         _ => return Err(badarg()),
     };
-    dirty_test(process, ctx, scheduler, args[1], args[2])
+    dirty_test(
+        process,
+        ctx,
+        scheduler,
+        args[1],
+        args[2],
+        ("erts_debug", "dirty", 3),
+        args,
+    )
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:86 (erts_debug_size_shared_1), OTP-29.1.1.
@@ -1202,8 +1356,24 @@ fn build(
         }
         ("erts_debug", "instructions", 0) => instructions(process),
         ("erts_debug", "dirty", 3) => dirty(process, ctx, args),
-        ("erts_debug", "dirty_cpu", 2) => dirty_test(process, ctx, "dirty_cpu", args[0], args[1]),
-        ("erts_debug", "dirty_io", 2) => dirty_test(process, ctx, "dirty_io", args[0], args[1]),
+        ("erts_debug", "dirty_cpu", 2) => dirty_test(
+            process,
+            ctx,
+            "dirty_cpu",
+            args[0],
+            args[1],
+            ("erts_debug", "dirty_cpu", 2),
+            args,
+        ),
+        ("erts_debug", "dirty_io", 2) => dirty_test(
+            process,
+            ctx,
+            "dirty_io",
+            args[0],
+            args[1],
+            ("erts_debug", "dirty_io", 2),
+            args,
+        ),
         ("erts_debug", "unaligned_bitstring", 2) => unaligned_bitstring(process, args),
         ("erts_internal", "gather_alloc_histograms", 1) => {
             gather_allocator_info(process, ctx, args[0], false)
