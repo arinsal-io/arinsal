@@ -94,3 +94,39 @@ fn append_collects_with_live_plus_one_roots_like_erts() {
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+const RETAINED_MODULE: &str = "bs_create_bin_append_retained";
+
+// Every intermediate writable handle stays live (`c/3` keeps the appended binary itself, `b/3`
+// a copy, `a/2` only the accumulator), so the helper's successor `SUB_BITS` must take its `orig`
+// from `reg[live]` as the collection inside the append rewrote it. A pre-collection `orig`
+// dangles into the freed heap and a later collection copies the writable BinRef twice.
+const RETAINED_SOURCE: &str = "-module(bs_create_bin_append_retained).\n\
+-export([run/0]).\n\
+a(0, Acc) -> {byte_size(Acc), erlang:md5(Acc)};\n\
+a(N, Acc) -> a(N - 1, <<Acc/binary, (N band 255)>>).\n\
+b(0, Acc, Out) -> {byte_size(Acc), length(Out), erlang:md5(Out)};\n\
+b(N, Acc, Out) -> A = <<Acc/binary, (N band 255)>>, b(N - 1, A, [<<A/binary>> | Out]).\n\
+c(0, Acc, Out) -> {byte_size(Acc), length(Out), erlang:md5(Out)};\n\
+c(N, Acc, Out) -> A = <<Acc/binary, (N band 255)>>, c(N - 1, A, [A | Out]).\n\
+run() -> [{a(N, <<>>), b(N, <<>>, []), c(N, <<>>, [])} || N <- [1, 100, 3000, 20000]].\n";
+
+#[test]
+fn append_successor_takes_its_owner_from_the_collected_register() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping differential check");
+        return;
+    };
+    let beam = reference
+        .compile_named(RETAINED_MODULE, RETAINED_SOURCE, &[])
+        .unwrap();
+    reference.load(RETAINED_MODULE, &beam).unwrap();
+    let expected = reference.call(RETAINED_MODULE, "run", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled(RETAINED_MODULE, "run", &[], 2, None)
+        .unwrap();
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}

@@ -1475,6 +1475,7 @@ impl ProcessHeap {
         messages: &mut [GcMessageRoot<'_>],
     ) -> Result<GcStats, TermError> {
         self.sync_mbuf_fast();
+        crate::validate::check_heap_bits_if_active(self, "before collection");
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
@@ -1783,6 +1784,7 @@ impl ProcessHeap {
         self.bin_vheap_size =
             next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
         self.rebuild_mbuf_fast();
+        crate::validate::check_heap_bits_if_active(self, "after collection");
         Ok(stats)
     }
 

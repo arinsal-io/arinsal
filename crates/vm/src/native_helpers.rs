@@ -3,7 +3,7 @@
 #[path = "native_helpers/bs_construct_raw.rs"]
 pub(crate) mod bs_construct_raw;
 
-use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_bits::MatchOps;
 use arinsal_term::{HeapAlloc, PreparedWritableAppend, Term, TermBuilder};
 
@@ -4943,30 +4943,28 @@ fn set_bs_append_error(process: &mut crate::Process, detail: &str, reason: &str)
 }
 
 // Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.
-// The source is `reg[live]` (`source_index` is that same slot) and every collection here
-// keeps exactly `live + 1` X roots, the source or its `sb->orig` included.
-pub extern "C" fn arinsal_beamasm_bs_append_checked(
-    process_header: &mut ProcessHeader,
-    scheduler_registers: &mut SchedulerRegisters,
-    source_index: u64,
+// The source is `reg[live]` and every collection here keeps exactly `live + 1` X roots, the
+// source or its `sb->orig` included. `reg` is the process's X file (`process.x`), the array the
+// collector rewrites: erts passes the same `reg` to `erts_garbage_collect`. Reading the
+// registers through any other handle that the compiler may assume unaliased (a `&mut
+// SchedulerRegisters`) would let it reuse the pre-collection `reg[live]`.
+pub(crate) fn bs_append_checked(
+    process_header: *mut ProcessHeader,
+    ebs: &mut [u64; 2],
     extra_bits: u64,
     unit: u64,
     live: u64,
     alloc: u64,
 ) -> u64 {
-    let Some((process, registers)) =
-        crate::native_hooks::enter_runtime_with_registers(process_header, scheduler_registers)
-    else {
+    let Some(process) = crate::native_hooks::process_from_header(process_header) else {
         return 0;
     };
-    let xregs = std::ptr::NonNull::new(registers.x_reg_array.as_mut_ptr())
-        .expect("SchedulerRegisters owns its fixed X register array");
     let extra_bits = extra_bits as usize;
     let unit = unit as usize;
     let live = live as usize;
     let alloc = alloc as usize;
-    debug_assert_eq!(source_index as usize, live, "append source is reg[live]");
-    let source = arinsal_term::raw::trusted_jit_register(xregs, live);
+    arinsal_term::validate::check_heap_bits_if_active(&process.heap, "bs_append_checked entry");
+    let source = process.x[live];
     // erl_bits.c:1744-1756: anything but a boxed bitstring is a type error, before any GC.
     if source.classify() != arinsal_term::TermKind::Bitstring {
         set_bs_append_error(process, "type", "badarg");
@@ -4989,13 +4987,13 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                 set_bs_append_error(process, "size", "system_limit");
                 return 0;
             }
-            registers.erl_bits_state = [0, 5];
-            crate::native_hooks::raw(arinsal_term::raw::trusted_jit_register(xregs, live))
+            *ebs = [0, 5];
+            crate::native_hooks::raw(process.x[live])
         }
         Ok(true) => {
             // erl_bits.c:1832-1842: `reg[live] = sb->orig`, collect once if the HAlloc
             // reservation is short, then build the successor directly at `htop`.
-            arinsal_term::raw::set_trusted_jit_register(xregs, live, prepared.bin_ref());
+            process.x[live] = prepared.bin_ref();
             let used_words: usize = 5;
             let heap_need = used_words.wrapping_add(alloc);
             let reservation = match process.heap.reserve_native_halloc(used_words, alloc) {
@@ -5011,7 +5009,7 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                         .expect("GC leaves the requested HeapWordsLeft reservation")
                 }
             };
-            let owner = arinsal_term::raw::trusted_jit_register(xregs, live);
+            let owner = process.x[live];
             let mut term = Term::NIL;
             TermBuilder::<arinsal_term::ProcessHeap>::finish_writable_append(
                 reservation,
@@ -5022,7 +5020,11 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                 &mut term,
             );
             let offset_bits = prepared.offset_bits(extra_bits);
-            registers.erl_bits_state = [prepared.data_address() as u64, offset_bits as u64];
+            *ebs = [prepared.data_address() as u64, offset_bits as u64];
+            arinsal_term::validate::check_heap_bits_if_active(
+                &process.heap,
+                "bs_append_checked writable exit",
+            );
             // Port of `BUMP_REDS` in erts/emulator/beam/bif.h:71-77, OTP-29.1.1.
             let reds = ((if prepared.grew() { offset_bits } else { 0 }) / (8 * 1024)) as i32;
             process.heap.abi.fcalls = process.heap.abi.fcalls.wrapping_sub(reds).max(0);
@@ -5045,7 +5047,7 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                     None
                 }
             };
-            let source = arinsal_term::raw::trusted_jit_register(xregs, live);
+            let source = process.x[live];
             if extra_bits == 0 {
                 // erl_bits.c:1871-1883: only the unit is checked; the source itself is the
                 // result and no writable binary is built.
@@ -5056,7 +5058,7 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                     set_bs_append_error(process, "unit", "badarg");
                     return 0;
                 }
-                registers.erl_bits_state = [0, 5];
+                *ebs = [0, 5];
                 return crate::native_hooks::raw(source);
             }
             let reservation = match reservation {
@@ -5073,7 +5075,7 @@ pub extern "C" fn arinsal_beamasm_bs_append_checked(
                 unit,
             ) {
                 Ok((term, data_address, offset_bits)) => {
-                    registers.erl_bits_state = [data_address as u64, offset_bits as u64];
+                    *ebs = [data_address as u64, offset_bits as u64];
                     // Port of `BUMP_REDS` in erts/emulator/beam/bif.h:71-77, OTP-29.1.1.
                     let reds = (offset_bits / (8 * 1024)) as i32;
                     process.heap.abi.fcalls = process.heap.abi.fcalls.wrapping_sub(reds).max(0);

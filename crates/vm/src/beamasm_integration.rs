@@ -2148,7 +2148,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
             crate::erl_bits::append_binary as *const () as usize,
         );
         arinsal_beamasm::bs_construct::install_bs_append_checked(
-            crate::native_helpers::arinsal_beamasm_bs_append_checked as *const () as usize,
+            crate::native_helpers::bs_construct_raw::append_checked as *const () as usize,
         );
         arinsal_beamasm::bs_construct::install_bs_gc(self.gc_hook());
         arinsal_beamasm::bs_construct::install_bs_private_append(
