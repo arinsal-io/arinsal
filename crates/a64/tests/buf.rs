@@ -161,6 +161,20 @@ fn literal_pool_stays_in_range_after_more_than_one_megabyte() {
     );
 }
 
+#[test]
+fn literal_pool_uses_the_32k_reach_of_erts_constants() {
+    let mut b = CodeBuffer::new();
+    b.ldr_literal(Gpr::x(17), 0x1234_5678_9abc_def0).unwrap();
+    for i in 0..30_000 {
+        b.word(0xd503_201f);
+        if i % 1024 == 1023 {
+            b.check_pending_stubs().unwrap();
+        }
+    }
+    let words = b.finish().unwrap();
+    assert!(disp(&words, 0, 5, 19).abs() < 32 * 1024);
+}
+
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn generated_function_executes_forward_branch_loop_and_literal() {
@@ -197,4 +211,43 @@ fn generated_function_executes_forward_branch_loop_and_literal() {
     // SAFETY: the generated function uses the AArch64 C ABI with no arguments and returns u64.
     let f: extern "C" fn() -> u64 = memory.entry(offset).get();
     assert_eq!(f(), 0);
+}
+
+/// erts `emit_i_flush_stubs` restarts the stub check interval, so the per-instruction check
+/// cannot place a veneer between a function's `ErtsCodeInfo` and its entry.
+#[test]
+fn function_boundary_flush_keeps_stubs_out_of_the_next_prologue() {
+    let interval = arinsal_a64::buf::STUB_CHECK_INTERVAL;
+    // Function boundaries around the point where the pending veneer falls due.
+    for boundary in (32 * 1024 - 3 * interval..32 * 1024 - interval).step_by(4) {
+        let mut b = CodeBuffer::new();
+        let target = b.new_label();
+        b.mark_beam_label(target);
+        b.tbnz(Gpr::x(25), 0, target).unwrap();
+        while b.offset() < boundary {
+            b.word(0xd503_201f);
+        }
+        b.flush_stubs_before_function().unwrap();
+        let prologue = b.offset();
+        // A 40-byte prologue with the stub check before each instruction, as the loader runs it.
+        for _ in 0..10 {
+            b.check_pending_stubs().unwrap();
+            b.word(0xd503_201f);
+        }
+        assert_eq!(
+            b.offset(),
+            prologue + 40,
+            "stub inside the prologue at {boundary}"
+        );
+        for i in 0..2048 {
+            b.word(0xd503_201f);
+            if i % 256 == 255 {
+                b.check_pending_stubs().unwrap();
+            }
+        }
+        b.bind(target).unwrap();
+        let words = b.finish().unwrap();
+        let veneer = disp(&words, 0, 5, 14) as usize / 4;
+        assert_eq!(words[veneer] & 0xfc00_0000, 0x1400_0000);
+    }
 }

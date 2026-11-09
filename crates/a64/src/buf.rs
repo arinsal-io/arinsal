@@ -11,6 +11,8 @@ use crate::enc::{Cond, Emitter, EncodeError, Gpr, Shift};
 pub const STUB_CHECK_INTERVAL: usize = 4 << 10;
 const TB_RANGE: i64 = 1 << 15;
 const COND_RANGE: i64 = 1 << 20;
+/// Reach of an 8-byte literal load: ERTS embeds constants with `disp32K`.
+const LITERAL_RANGE: i64 = TB_RANGE;
 const BRANCH_RANGE: i64 = 1 << 27;
 // Port of erts/emulator/asmjit/core/codeholder.cpp (CodeHolder::grow_buffer), OTP-29.1.1.
 // Its first allocation is 16 KiB minus three 32-byte allocator overheads.
@@ -220,6 +222,7 @@ struct Literal {
     first: (usize, Gpr),
     more: Vec<(usize, Gpr)>,
     value: u64,
+    relocation: Option<usize>,
 }
 
 impl Literal {
@@ -244,6 +247,7 @@ pub struct CodeBuffer {
     /// The newest unresolved branch to each label; the older ones follow through `Fixup::next`.
     waiting: Vec<u32>,
     literals: Vec<Literal>,
+    literal_relocations: Vec<Option<usize>>,
     /// Index into `literals` of the pending literal with a value.
     pending_literals: HashMap<u64, usize, BuildHasherDefault<LabelHasher>>,
     /// The offset of the last pool entry emitted for a value: the entries only move forward, so
@@ -491,7 +495,7 @@ impl CodeBuffer {
         if let Some(&offset) = self
             .literal_sites
             .get(&value)
-            .filter(|&&p| (p as i64 - site as i64).abs() < COND_RANGE - 16)
+            .filter(|&&p| (p as i64 - site as i64).abs() <= LITERAL_RANGE - 4)
         {
             self.patch(site, BranchKind::Literal(reg), offset)?;
             return Ok(());
@@ -505,9 +509,27 @@ impl CodeBuffer {
                 first: (site, reg),
                 more: Vec::new(),
                 value,
+                relocation: None,
             });
         }
         Ok(())
+    }
+
+    /// Emits a literal load whose payload is filled after code allocation.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:736-769 (embed_label), OTP-29.1.1.
+    pub fn ldr_literal_reloc(&mut self, reg: Gpr) -> Result<usize, BufferError> {
+        let site = self.offset();
+        self.emitter.ldr_literal(reg, 0)?;
+        let id = self.literal_relocations.len();
+        self.literal_relocations.push(None);
+        self.min_literal_site = Some(self.min_literal_site.map_or(site, |m| m.min(site)));
+        self.literals.push(Literal {
+            first: (site, reg),
+            more: Vec::new(),
+            value: 0,
+            relocation: Some(id),
+        });
+        Ok(id)
     }
 
     /// Emits an instruction through the underlying encoder.
@@ -529,14 +551,62 @@ impl CodeBuffer {
         self.unreachable = false;
     }
 
+    /// Embeds a 64-bit data word without changing control-flow state.
+    pub fn data_u64(&mut self, value: u64) {
+        self.emitter.embed_uint64(value);
+    }
+
+    /// Aligns following embedded data to eight bytes.
+    pub fn align_data_u64(&mut self) {
+        self.align8();
+    }
+
+    /// Marks the current instruction as a control transfer before embedded data.
+    pub fn mark_unreachable(&mut self) {
+        self.unreachable = true;
+    }
+
     /// Emits all stubs approaching their architecture reach limits.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:796-814, OTP-29.1.1
     pub fn check_pending_stubs(&mut self) -> Result<(), BufferError> {
         if self.offset().saturating_sub(self.last_check) < STUB_CHECK_INTERVAL {
+            if self.unreachable {
+                self.flush_label_relocations_unreachable()?;
+            }
             return Ok(());
         }
         self.flush_pending_stubs(STUB_CHECK_INTERVAL * 2)?;
         self.last_check = self.offset();
+        Ok(())
+    }
+
+    /// Flushes every stub due within the next two check intervals and restarts the check
+    /// interval here, so that no stub lands inside the function prologue that follows.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:788-794 (emit_i_flush_stubs),
+    // OTP-29.1.1.
+    pub fn flush_stubs_before_function(&mut self) -> Result<(), BufferError> {
+        self.flush_pending_stubs(STUB_CHECK_INTERVAL * 2)?;
+        self.last_check = self.offset();
+        Ok(())
+    }
+
+    /// Emits pending relocated literals while control flow is unreachable.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (flush_pending_labels), OTP-29.1.1.
+    fn flush_label_relocations_unreachable(&mut self) -> Result<(), BufferError> {
+        let labels: Vec<Literal> = self
+            .literals
+            .extract_if(.., |literal| literal.relocation.is_some())
+            .collect();
+        for literal in labels {
+            self.align8();
+            let offset = self.offset();
+            for (site, reg) in literal.sites() {
+                self.patch(site, BranchKind::Literal(reg), offset)?;
+            }
+            self.emitter.embed_uint64(literal.value);
+            self.literal_relocations[literal.relocation.expect("relocated literal")] = Some(offset);
+        }
+        self.recompute_stub_bounds();
         Ok(())
     }
 
@@ -555,11 +625,15 @@ impl CodeBuffer {
             .peek()
             .is_some_and(|veneer| veneer.0.latest_offset <= effective_offset);
         let literal_due = self.min_literal_site.is_some_and(|site| {
-            site.saturating_add(COND_RANGE as usize)
+            site.saturating_add((LITERAL_RANGE - 4) as usize)
                 .saturating_sub(range)
                 <= now
         });
-        if !stub_due && !veneer_due && !literal_due {
+        let labels_pending = self
+            .literals
+            .iter()
+            .any(|literal| literal.relocation.is_some());
+        if !stub_due && !veneer_due && !literal_due && !labels_pending {
             return Ok(());
         }
         let mut due_veneers = Vec::new();
@@ -598,13 +672,14 @@ impl CodeBuffer {
                 .then_some(i)
         }));
         let due_literals = self.literals.iter().any(|l| {
-            l.sites().any(|(site, _)| {
-                site.saturating_add(COND_RANGE as usize)
-                    .saturating_sub(range)
-                    <= now
-            })
+            l.relocation.is_none()
+                && l.sites().any(|(site, _)| {
+                    site.saturating_add((LITERAL_RANGE - 4) as usize)
+                        .saturating_sub(range)
+                        <= now
+                })
         });
-        if due_fixups.is_empty() && due_veneers.is_empty() && !due_literals {
+        if due_fixups.is_empty() && due_veneers.is_empty() && !due_literals && !labels_pending {
             self.due_fixups = due_fixups;
             self.recompute_stub_bounds();
             return Ok(());
@@ -614,6 +689,19 @@ impl CodeBuffer {
         let after = self.new_label();
         if !self.unreachable {
             self.emit_branch(after, BranchKind::B)?;
+        }
+        let due_labels: Vec<Literal> = self
+            .literals
+            .extract_if(.., |literal| literal.relocation.is_some())
+            .collect();
+        for literal in due_labels {
+            self.align8();
+            let offset = self.offset();
+            for (site, reg) in literal.sites() {
+                self.patch(site, BranchKind::Literal(reg), offset)?;
+            }
+            self.emitter.embed_uint64(literal.value);
+            self.literal_relocations[literal.relocation.expect("relocated literal")] = Some(offset);
         }
         for veneer in due_veneers {
             self.bind(veneer.anchor)?;
@@ -632,16 +720,19 @@ impl CodeBuffer {
         let due: Vec<Literal> = self
             .literals
             .extract_if(.., |item| {
-                item.sites().any(|(site, _)| {
-                    site.saturating_add(COND_RANGE as usize)
-                        .saturating_sub(range)
-                        <= now
-                })
+                item.relocation.is_none()
+                    && item.sites().any(|(site, _)| {
+                        site.saturating_add((LITERAL_RANGE - 4) as usize)
+                            .saturating_sub(range)
+                            <= now
+                    })
             })
             .collect();
         self.pending_literals.clear();
         for (index, literal) in self.literals.iter().enumerate() {
-            self.pending_literals.insert(literal.value, index);
+            if literal.relocation.is_none() {
+                self.pending_literals.insert(literal.value, index);
+            }
         }
         for literal in due {
             self.align8();
@@ -650,7 +741,11 @@ impl CodeBuffer {
                 self.patch(site, BranchKind::Literal(reg), offset)?;
             }
             self.emitter.embed_uint64(literal.value);
-            self.literal_sites.insert(literal.value, offset);
+            if let Some(id) = literal.relocation {
+                self.literal_relocations[id] = Some(offset);
+            } else {
+                self.literal_sites.insert(literal.value, offset);
+            }
         }
         self.recompute_stub_bounds();
         self.bind(after)?;
@@ -763,12 +858,27 @@ impl CodeBuffer {
     }
 
     /// Finalizes the buffer and returns both words and the label offset map.
-    pub fn finish_with_labels(mut self) -> Result<(Vec<u32>, LabelTable), BufferError> {
+    pub fn finish_with_labels(self) -> Result<(Vec<u32>, LabelTable), BufferError> {
+        let (words, labels, _) = self.finish_with_labels_and_relocations()?;
+        Ok((words, labels))
+    }
+
+    /// Finalizes code and returns relocated literal payload offsets.
+    pub fn finish_with_labels_and_relocations(
+        mut self,
+    ) -> Result<(Vec<u32>, LabelTable, Vec<usize>), BufferError> {
         self.flush_pending_stubs(usize::MAX / 2)?;
         if let Some(fixup) = self.fixups.iter().find(|fixup| !fixup.resolved) {
             return Err(BufferError::UnboundLabel(fixup.label));
         }
-        Ok((self.emitter.words, self.labels))
+        Ok((
+            self.emitter.words,
+            self.labels,
+            self.literal_relocations
+                .into_iter()
+                .map(|offset| offset.expect("relocated literal emitted"))
+                .collect(),
+        ))
     }
 }
 
@@ -785,6 +895,7 @@ impl Default for CodeBuffer {
             fixups: Vec::new(),
             waiting: Vec::new(),
             literals: Vec::new(),
+            literal_relocations: Vec::new(),
             pending_literals: HashMap::default(),
             literal_sites: HashMap::default(),
             unreachable: false,
