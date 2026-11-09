@@ -16,9 +16,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod raw;
+
 const EVENT_CAPACITY: usize = 512;
-const FD_TABLE_MIN_LENGTH: usize = 1024;
-const FD_TABLE_EXP_THRESHOLD: usize = 2048 * 1024;
 
 #[derive(Clone, Copy)]
 enum PollState {
@@ -157,70 +157,7 @@ struct SetState {
 /// a read descriptor re-enabled more than this many times moves to the scheduler pollset.
 const SCHEDULER_MIGRATION_COUNT: u32 = 10;
 
-struct FdStateTable {
-    slots: RwLock<Vec<parking_lot::Mutex<FdState>>>,
-    max_fds: usize,
-}
-
-impl Default for FdStateTable {
-    fn default() -> Self {
-        Self {
-            slots: RwLock::new(Vec::new()),
-            max_fds: erts_poll_max_fds(),
-        }
-    }
-}
-
-impl FdStateTable {
-    fn ensure_fd(&self, fd: RawFd) -> io::Result<usize> {
-        let index = usize::try_from(fd)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative descriptor"))?;
-        if index >= self.max_fds {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "descriptor exceeds the ERTS poll limit",
-            ));
-        }
-        {
-            let slots = self.slots.read().unwrap();
-            if index < slots.len() {
-                return Ok(index);
-            }
-        }
-        let mut slots = self.slots.write().unwrap();
-        if index >= slots.len() {
-            let need_len = index + 1;
-            let mut new_len = if need_len < FD_TABLE_MIN_LENGTH {
-                FD_TABLE_MIN_LENGTH
-            } else {
-                slots.len().max(FD_TABLE_MIN_LENGTH)
-            };
-            while new_len < need_len {
-                new_len = if new_len < FD_TABLE_EXP_THRESHOLD {
-                    new_len.saturating_mul(2)
-                } else {
-                    new_len.saturating_add(FD_TABLE_EXP_THRESHOLD)
-                };
-            }
-            slots.resize_with(new_len.min(self.max_fds), || {
-                parking_lot::Mutex::new(FdState::default())
-            });
-        }
-        Ok(index)
-    }
-
-    fn lock_slots(
-        &self,
-        fd: RawFd,
-    ) -> io::Result<(
-        usize,
-        std::sync::RwLockReadGuard<'_, Vec<parking_lot::Mutex<FdState>>>,
-    )> {
-        let index = self.ensure_fd(fd)?;
-        let slots = self.slots.read().unwrap();
-        Ok((index, slots))
-    }
-}
+type FdStateTable = raw::FdStateTable<FdState>;
 
 struct Poller {
     next_registration: AtomicUsize,
@@ -514,13 +451,12 @@ pub(crate) fn register(
 /// of directions the poller rejected (`ERTS_POLL_EV_NVAL`).
 pub(crate) fn with_sel(fd: RawFd, f: &mut dyn FnMut(&mut arinsal_drv::SelSlot)) -> i32 {
     let poller = poller();
-    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
+    let Ok(mut state) = poller.states.lock_slots(fd) else {
         // A descriptor the table cannot hold is never polled.
         let mut slot = None;
         f(&mut slot);
         return arinsal_drv::rejected(&mut slot);
     };
-    let mut state = slots[index].lock();
     f(&mut state.sel);
     let (read, write) = arinsal_drv::wanted(&state.sel);
     if read || write {
@@ -572,8 +508,7 @@ fn register_kind(
     let poller = poller();
     let id = poller.next_registration.fetch_add(1, Ordering::Relaxed);
     let registration = Registration { fd, id };
-    let (index, slots) = poller.states.lock_slots(fd)?;
-    let mut state = slots[index].lock();
+    let mut state = poller.states.lock_slots(fd)?;
     // Port of erts/emulator/sys/common/erl_poll.c (concurrent_update_pollset: ADD of fds 0-2
     // returns NVAL, so they live in the fallback set), OTP-29.1.1. A descriptor the owner
     // marked (a regular file, always ready under `select`) goes there as well.
@@ -621,10 +556,9 @@ fn register_kind(
 /// Remove a pending one-shot selection.
 pub(crate) fn deregister(registration: Registration) {
     let poller = poller();
-    let Ok((index, slots)) = poller.states.lock_slots(registration.fd) else {
+    let Ok(mut state) = poller.states.lock_slots(registration.fd) else {
         return;
     };
-    let mut state = slots[index].lock();
     state.watches.retain(|watch| watch.id != registration.id);
     let _ = sync_pollset(registration.fd, &mut state);
 }
@@ -634,10 +568,9 @@ pub(crate) fn deregister(registration: Registration) {
 /// Port of erl_check_io.c (`deselect`), OTP-29.1.1.
 pub(crate) fn deselect_fd(fd: RawFd) {
     let poller = poller();
-    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
+    let Ok(mut state) = poller.states.lock_slots(fd) else {
         return;
     };
-    let mut state = slots[index].lock();
     state.watches.clear();
     if sync_pollset(fd, &mut state).is_err() {
         let _ = erts_poll_control(PollSetKind::Main, fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
@@ -677,10 +610,10 @@ fn poll_loop(mut poll: ErtsPollSet, states: Arc<FdStateTable>) {
 }
 
 fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: PollSetKind) {
-    let Ok((index, slots)) = states.lock_slots(fd) else {
-        return;
+    let mut state = match states.lock_slots(fd) {
+        Ok(state) => state,
+        Err(_) => return,
     };
-    let mut state = slots[index].lock();
     let mut seen = InterestSet {
         readable: event.events & ERTS_POLL_EV_IN != 0,
         writable: event.events & ERTS_POLL_EV_OUT != 0,
@@ -871,35 +804,35 @@ pub(crate) struct DebugInfo {
 /// Snapshot the active descriptors and selection counts exposed by check_io_debug.
 pub(crate) fn debug_info() -> DebugInfo {
     let states = &poller().states;
-    let slots = states.slots.read().unwrap();
     let mut info = DebugInfo {
         used_fds: 0,
         driver_selects: 0,
         nif_selects: 0,
     };
-    for state in slots.iter() {
-        let state = state.lock();
-        // Port of erts/emulator/sys/common/erl_check_io.c (doit_erts_check_io_debug), OTP-29.1.1:
-        // internal wake registrations do not contribute to the used-fd counter.
-        let (driver_dirs, nif_dirs) = arinsal_drv::selection_counts(&state.sel);
-        if driver_dirs + nif_dirs > 0
-            || state
-                .watches
-                .iter()
-                .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
-        {
-            info.used_fds += 1;
-        }
-        info.driver_selects += driver_dirs;
-        info.nif_selects += nif_dirs;
-        for watch in &state.watches {
-            match watch.kind {
-                RegistrationKind::Driver => info.driver_selects += 1,
-                RegistrationKind::Nif => info.nif_selects += 1,
-                RegistrationKind::Internal => {}
+    states.with_all_states(|slots| {
+        for state in slots {
+            // Port of erts/emulator/sys/common/erl_check_io.c (doit_erts_check_io_debug), OTP-29.1.1:
+            // internal wake registrations do not contribute to the used-fd counter.
+            let (driver_dirs, nif_dirs) = arinsal_drv::selection_counts(&state.sel);
+            if driver_dirs + nif_dirs > 0
+                || state
+                    .watches
+                    .iter()
+                    .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
+            {
+                info.used_fds += 1;
+            }
+            info.driver_selects += driver_dirs;
+            info.nif_selects += nif_dirs;
+            for watch in &state.watches {
+                match watch.kind {
+                    RegistrationKind::Driver => info.driver_selects += 1,
+                    RegistrationKind::Nif => info.nif_selects += 1,
+                    RegistrationKind::Internal => {}
+                }
             }
         }
-    }
+    });
     info
 }
 
