@@ -7,7 +7,6 @@ use crate::alloc_util::{
 };
 use crate::ddq::{DdHead, DdStatus, DdTail, node_info};
 use crate::raw::WordView;
-use crossbeam_queue::SegQueue;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -203,12 +202,17 @@ const OWNER_WORK_DD_LIMIT: usize = 20;
 /// Port of `ERTS_ALCU_DD_OPS_LIM_LOW` in erl_alloc_util.c, OTP-29.1.1.
 const DD_OPS_LIM_LOW: usize = 2;
 
-/// Bit of a queued fixed-size block's info word where its size starts; below it is its type.
+/// Bit of a queued block's info word where its size starts; below it is its fixed-size type.
 const FIX_INFO_SHIFT: usize = 8;
+
+/// The type field of a queued block that is not of a fixed-size type: it goes back to its
+/// carrier, not to a fix list (erts `handle_delayed_dealloc` tells the two apart by the
+/// `ERTS_ALC_FIX_TYPE` flag of the block's `type` word).
+const NOT_FIX: usize = (1 << FIX_INFO_SHIFT) - 1;
 
 /// Passes of an explicit full drain: a queue of fixed-size blocks needs three to hand out its
 /// last block (`unref_end` moves, the marker is appended, `unref_end` moves again).
-const DRAIN_PASSES: usize = 3;
+const DRAIN_PASSES: usize = 4;
 
 /// How long a requester waits for its owner before it asks the owner again.
 const OWNER_WAIT_SLICE: Duration = Duration::from_micros(200);
@@ -221,7 +225,10 @@ const OWNER_WAIT_SLICE: Duration = Duration::from_micros(200);
 struct Shared {
     sbct: Arc<AtomicUsize>,
     strategy: Strategy,
-    requests: SegQueue<OwnerRequest>,
+    /// Requests other threads queued for the owner (erts `misc_aux_work` jobs), and their count
+    /// so the owner tests for work without taking the lock.
+    requests: Mutex<std::collections::VecDeque<OwnerRequest>>,
+    request_count: AtomicUsize,
     work_scheduled: AtomicBool,
 }
 
@@ -347,16 +354,6 @@ enum AllocationRoute {
     },
 }
 
-/// An entry of an instance's delayed-dealloc queue.
-///
-/// Port of the two kinds of queue entries `handle_delayed_dealloc` dequeues in erl_alloc_util.c,
-/// OTP-29.1.1: a block another thread freed, and the `HOMECOMING_MBC_BLK_HDR` marker of a carrier
-/// that was sent back to its origin.
-enum Delayed {
-    Block(InstanceAllocation, Allocation),
-    Homecoming(u64),
-}
-
 /// Who owns a block once its route is settled on the instance that holds the lock.
 enum Resolved {
     Owned(Allocation),
@@ -387,12 +384,12 @@ pub struct ThreadSpecificAllocators {
     instances: Vec<Slot>,
     /// Instances `1..=scheduler_instances` belong to scheduler threads and take no lock.
     scheduler_instances: usize,
-    /// Cross-thread frees and carriers sent home. Lock-free so no foreign thread takes the owner's mutex.
-    /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
-    delayed: Vec<SegQueue<Delayed>>,
-    delayed_count: Vec<AtomicUsize>,
-    /// The enqueue side of each instance's delayed-dealloc queue of fixed-size blocks, whose
-    /// nodes are the freed blocks (`allctr->dd.q`); the dequeue side is in the instance.
+    /// Carriers sent back to their origin instance (the `HOMECOMING_MBC_BLK_HDR` entries of
+    /// erts' queue), with their count so the common path tests for them without the lock.
+    homecoming_ids: Vec<Mutex<Vec<u64>>>,
+    homecoming_count: Vec<AtomicUsize>,
+    /// The enqueue side of each instance's delayed-dealloc queue, whose nodes are the freed
+    /// blocks (`allctr->dd.q`); the dequeue side is in the instance.
     /// Never resized: a queue's marker address is its empty value.
     ddq: Vec<DdTail>,
     shared: Vec<Shared>,
@@ -480,7 +477,8 @@ impl ThreadSpecificAllocators {
                 } else {
                     strategy
                 },
-                requests: SegQueue::new(),
+                requests: Mutex::new(std::collections::VecDeque::new()),
+                request_count: AtomicUsize::new(0),
                 work_scheduled: AtomicBool::new(false),
             })
             .collect();
@@ -511,8 +509,8 @@ impl ThreadSpecificAllocators {
                 })
                 .collect(),
             shared,
-            delayed: (0..count).map(|_| SegQueue::new()).collect(),
-            delayed_count: (0..count).map(|_| AtomicUsize::new(0)).collect(),
+            homecoming_ids: (0..count).map(|_| Mutex::new(Vec::new())).collect(),
+            homecoming_count: (0..count).map(|_| AtomicUsize::new(0)).collect(),
             ddq,
             routes: Mutex::new(HashMap::default()),
             routed: AtomicUsize::new(0),
@@ -666,7 +664,7 @@ impl ThreadSpecificAllocators {
         if self.routed.load(Ordering::Acquire) == 0 && current == handle.instance {
             let instance = handle.instance;
             let mut state = self.lock_instance(instance);
-            if self.delayed[instance].is_empty() {
+            if self.homecoming_count[instance].load(Ordering::Relaxed) == 0 {
                 debug_assert!(!state.allocator.has_pending_carriers());
                 let freed = state.allocator.free(handle.allocation);
                 self.publish_transfers(instance, &mut state)?;
@@ -687,7 +685,7 @@ impl ThreadSpecificAllocators {
                 // Port of erl_alloc_util.c:6225-6230 (erts_alcu_free_thr_pref), OTP-29.1.1:
                 // a block freed by another scheduler is queued on the owning instance
                 // without taking that instance's mutex.
-                self.enqueue_delayed(instance, Delayed::Block(handle, allocation));
+                self.enqueue_fix(instance, current, NOT_FIX, allocation);
                 return Ok(());
             }
             let mut state = self.lock_instance(instance);
@@ -808,7 +806,7 @@ impl ThreadSpecificAllocators {
         self.clear_routes(drained);
         self.publish_transfers(instance, &mut state)?;
         drop(state);
-        status.more_work |= !self.delayed[instance].is_empty();
+        status.more_work |= self.homecoming_count[instance].load(Ordering::Relaxed) != 0;
         if status.more_work {
             self.schedule_owner_work(instance);
         }
@@ -819,7 +817,7 @@ impl ThreadSpecificAllocators {
     ///
     /// Does nothing for a scheduler instance the calling thread does not own.
     pub fn run_owner_requests(&self, instance: usize) {
-        if self.shared[instance].requests.is_empty()
+        if self.shared[instance].request_count.load(Ordering::Acquire) == 0
             || (self.lock_free(instance) && thread_alloc_ix() != instance)
         {
             return;
@@ -829,7 +827,15 @@ impl ThreadSpecificAllocators {
     }
 
     fn run_requests_on(&self, instance: usize, state: &mut Instance) {
-        while let Some(request) = self.shared[instance].requests.pop() {
+        let shared = &self.shared[instance];
+        while shared.request_count.load(Ordering::Acquire) != 0 {
+            let request = shared
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            let Some(request) = request else { break };
+            shared.request_count.fetch_sub(1, Ordering::AcqRel);
             request(self, state);
         }
     }
@@ -869,11 +875,15 @@ impl ThreadSpecificAllocators {
                 return work(self, &mut state);
             }
             let work = work.take().expect("work runs once");
-            self.shared[instance]
+            let shared = &self.shared[instance];
+            shared
                 .requests
-                .push(Box::new(move |this, state| {
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(Box::new(move |this, state| {
                     let _ = reply.send(work(this, state));
                 }));
+            shared.request_count.fetch_add(1, Ordering::AcqRel);
         }
         self.schedule_owner_work(instance);
         let own = thread_alloc_ix();
@@ -1126,7 +1136,7 @@ impl ThreadSpecificAllocators {
     /// Returns the number of frees waiting for the instance, fixed-size blocks included.
     #[cfg(test)]
     pub fn pending_deallocations(&self, instance: usize) -> usize {
-        self.delayed[instance].len() + self.ddq[instance].queued()
+        self.homecoming_count[instance].load(Ordering::Relaxed) + self.ddq[instance].queued()
     }
 
     #[cfg(test)]
@@ -1226,7 +1236,7 @@ impl ThreadSpecificAllocators {
     /// delayed-dealloc queue of fixed-size blocks is not idle (`ddq_check_incoming` has a use).
     #[inline(always)]
     fn has_delayed(&self, instance: usize, state: &Instance) -> bool {
-        self.delayed_count[instance].load(Ordering::Relaxed) != 0
+        self.homecoming_count[instance].load(Ordering::Relaxed) != 0
             || self.ddq[instance].pending(&state.ddq)
     }
 
@@ -1241,8 +1251,9 @@ impl ThreadSpecificAllocators {
         self.publish_transfers(instance, state)
     }
 
-    /// Queues a freed block of fixed-size type `fix_ix` on the instance that owns it, using the
-    /// block as the queue node, and wakes the owner when the block went to the end of the queue.
+    /// Queues a freed block on the instance that owns it, using the block as the queue node, and
+    /// wakes the owner when the block went to the end of the queue. `fix_ix` is the block's
+    /// fixed-size type, or [`NOT_FIX`].
     ///
     /// Port of `enqueue_dealloc_other_instance` and `erts_alcu_free_thr_pref`
     /// (erl_alloc_util.c, OTP-29.1.1): `cinit` is the difference of the two instance numbers
@@ -1250,6 +1261,8 @@ impl ThreadSpecificAllocators {
     #[inline(always)]
     fn enqueue_fix(&self, instance: usize, current: usize, fix_ix: usize, allocation: Allocation) {
         debug_assert!(fix_ix < 1 << FIX_INFO_SHIFT);
+        // The block becomes the queue node, its payload holding the `next` and `info` words: a
+        // block is never smaller than `min_block_size`, which holds a free-tree node.
         let info = fix_ix | (allocation.size() << FIX_INFO_SHIFT);
         if self.ddq[instance].enqueue(
             allocation.payload_address(),
@@ -1261,10 +1274,13 @@ impl ThreadSpecificAllocators {
         }
     }
 
-    #[inline(always)]
-    fn enqueue_delayed(&self, instance: usize, item: Delayed) {
-        self.delayed_count[instance].fetch_add(1, Ordering::Relaxed);
-        self.delayed[instance].push(item);
+    /// Queues the carrier `id` for its origin `instance` to take back.
+    fn enqueue_homecoming(&self, instance: usize, id: u64) {
+        self.homecoming_ids[instance]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id);
+        self.homecoming_count[instance].fetch_add(1, Ordering::Release);
     }
 
     /// The instance that owns `handle`'s block now, and the block's allocation there.
@@ -1619,7 +1635,7 @@ impl ThreadSpecificAllocators {
                     .lock()
                     .expect("homecoming lock poisoned")
                     .push(HomecomingCarrier { id, transfer });
-                self.enqueue_delayed(origin, Delayed::Homecoming(id));
+                self.enqueue_homecoming(origin, id);
                 sent_home.push(origin);
             }
         }
@@ -1699,7 +1715,12 @@ impl ThreadSpecificAllocators {
                     return Err(error);
                 }
             };
-            if let Err(error) = fix_free_owned(state, fix_ix, allocation) {
+            let released = if fix_ix == NOT_FIX {
+                state.allocator.free(allocation)
+            } else {
+                fix_free_owned(state, fix_ix, allocation)
+            };
+            if let Err(error) = released {
                 self.enqueue_fix(instance, instance, fix_ix, allocation);
                 return Err(error);
             }
@@ -1712,40 +1733,18 @@ impl ThreadSpecificAllocators {
             let need = state.ddq.check_incoming(tail, progress);
             status.need_thr_progress |= need;
         }
-        let queue = &self.delayed[instance];
-        while ops <= limit
-            && let Some(item) = queue.pop()
-        {
-            self.delayed_count[instance].fetch_sub(1, Ordering::Relaxed);
+        // The carriers sent home, which erts queues as `HOMECOMING_MBC_BLK_HDR` nodes.
+        while ops <= limit && self.homecoming_count[instance].load(Ordering::Acquire) != 0 {
+            let id = self.homecoming_ids[instance]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop();
+            let Some(id) = id else { break };
+            self.homecoming_count[instance].fetch_sub(1, Ordering::AcqRel);
             ops = ops.saturating_add(1);
-            match item {
-                Delayed::Block(handle, allocation) => {
-                    let allocation = match self.resolve_owned(instance, state, handle, allocation) {
-                        Ok(Resolved::Owned(allocation)) => allocation,
-                        Ok(Resolved::Elsewhere(owner, allocation)) => {
-                            self.enqueue_delayed(owner, Delayed::Block(handle, allocation));
-                            continue;
-                        }
-                        Err(error) => {
-                            self.enqueue_delayed(instance, Delayed::Block(handle, allocation));
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = state.allocator.free(allocation) {
-                        self.enqueue_delayed(instance, Delayed::Block(handle, allocation));
-                        return Err(error);
-                    }
-                    freed += 1;
-                    if self.routed.load(Ordering::Acquire) != 0 {
-                        drained.push(handle);
-                    }
-                }
-                Delayed::Homecoming(id) => {
-                    if let Err(error) = self.import_homecoming(instance, state, id) {
-                        self.enqueue_delayed(instance, Delayed::Homecoming(id));
-                        return Err(error);
-                    }
-                }
+            if let Err(error) = self.import_homecoming(instance, state, id) {
+                self.enqueue_homecoming(instance, id);
+                return Err(error);
             }
         }
         Ok((freed, drained, status))
@@ -2640,10 +2639,17 @@ mod tests {
                 let handles: Vec<_> = (0..25).map(|_| allocators.alloc(24).unwrap()).collect();
                 ready_sender.send(handles).unwrap();
                 done.recv().unwrap();
-                let first = allocators.handle_owner_work(1).unwrap().more_work;
-                let left = allocators.pending_deallocations(1);
-                let second = allocators.handle_owner_work(1).unwrap().more_work;
-                (first, left, second, allocators.pending_deallocations(1))
+                // ddq protocol: blocks become dequeueable once `unref_end` passes them, so the
+                // first passes may free nothing; every pass frees at most the limit.
+                let mut passes = Vec::new();
+                let mut left = allocators.pending_deallocations(1);
+                while left != 0 && passes.len() < 16 {
+                    let status = allocators.handle_owner_work(1).unwrap();
+                    let now = allocators.pending_deallocations(1);
+                    passes.push((left - now, status.more_work));
+                    left = now;
+                }
+                (passes, left)
             })
         };
         let handles = ready.recv().unwrap();
@@ -2652,7 +2658,21 @@ mod tests {
         }
         assert_eq!(allocators.pending_deallocations(1), 25);
         done_sender.send(()).unwrap();
-        assert_eq!(owner.join().unwrap(), (true, 5, false, 0));
+        let (passes, left) = owner.join().unwrap();
+        assert_eq!(left, 0, "{passes:?}");
+        assert!(
+            passes
+                .iter()
+                .all(|(freed, _)| *freed <= OWNER_WORK_DD_LIMIT),
+            "{passes:?}"
+        );
+        // A pass that stopped at the limit asked for another one.
+        assert!(
+            passes
+                .iter()
+                .any(|(freed, more)| *freed == OWNER_WORK_DD_LIMIT && *more),
+            "{passes:?}"
+        );
     }
 
     #[test]
