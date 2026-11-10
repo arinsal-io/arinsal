@@ -269,17 +269,31 @@ fn targets() -> &'static Mutex<HashMap<i32, SignalTarget>> {
 /// SIGUSR1 are handled from boot and reported to `erl_signal_server`.
 pub(crate) fn install_boot_signals(runtime: &'static Runtime) -> Result<(), VmError> {
     ensure_signal_reader()?;
-    for signal_num in [libc::SIGTERM, libc::SIGUSR1] {
+    for signal_num in [libc::SIGTERM, libc::SIGUSR1, libc::SIGQUIT] {
         targets()
             .lock()
             .unwrap()
             .insert(signal_num, SignalTarget { runtime });
-        install_disposition(
-            signal_num,
-            signal_handler as *const () as libc::sighandler_t,
-        )?;
+        // SIGQUIT is installed by `init_break_handler` (only without +Bi / +Bd).
+        if signal_num != libc::SIGQUIT {
+            install_disposition(
+                signal_num,
+                signal_handler as *const () as libc::sighandler_t,
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Port of erts/emulator/sys/unix/sys.c (init_break_handler), OTP-29.1.1: SIGQUIT goes to
+/// `generic_signal_handler`, i.e. to `erl_signal_server` as `{notify, sigquit}`.
+pub(crate) fn install_quit_handler() {
+    if ensure_signal_reader().is_ok() {
+        let _ = install_disposition(
+            libc::SIGQUIT,
+            signal_handler as *const () as libc::sighandler_t,
+        );
+    }
 }
 
 fn set_signal(
