@@ -889,11 +889,13 @@ impl SaveTop<'_> {
     }
 }
 
+/// `erts_backtrace_depth`: a plain global int in erts, read without ordering; nothing else is
+/// published with it.
 pub(super) fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
     p.runtime.as_ref().map_or(fallback, |runtime| {
         runtime
             .backtrace_depth
-            .load(std::sync::atomic::Ordering::Acquire)
+            .load(std::sync::atomic::Ordering::Relaxed)
     })
 }
 

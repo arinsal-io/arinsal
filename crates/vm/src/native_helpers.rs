@@ -3415,40 +3415,61 @@ fn call_plain_bif_word(
     }
     let deferred = ctx.take_deferred();
     let error = ctx.take_error();
-    // Port of erts/emulator/beam/bif.c (`raise_3`): when the BIF wrote ftrace and the
-    // primary exception words directly, hand them to handle_error without a slow adapter.
+    // Port of erts/emulator/beam/bif.c (raise_3, error_1, exit_1, throw_1), OTP-29.1.1: the BIF
+    // set `freason`, `fvalue` and (raise/3) `ftrace` itself and returned THE_NON_VALUE. They go
+    // to handle_error as they are: `raise/3` with an immediate stacktrace, or `error/1`,
+    // `exit/1` and `throw/1` with exactly `EXC_ERROR` / `EXC_EXIT` / `EXC_THROWN`.
     if deferred.is_none()
         && error.is_none()
-        && process.heap.abi.exc.ftrace != 0
-        && process.heap.abi.exc.freason
-            & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
-            == 0
-        && !process.heap.gc_after_bif_desired()
+        && (process.heap.abi.exc.ftrace != 0
+            && process.heap.abi.exc.freason
+                & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
+                == 0
+            || export.arity == 1
+                && export.module_atom == arinsal_term::atoms::ERLANG
+                && matches!(
+                    export.function_atom,
+                    arinsal_term::atoms::ERROR
+                        | arinsal_term::atoms::EXIT
+                        | arinsal_term::atoms::THROW
+                )
+                && process.heap.abi.exc.ftrace == 0
+                && matches!(
+                    process.heap.abi.exc.freason,
+                    arinsal_beamasm::exc::EXC_ERROR
+                        | arinsal_beamasm::exc::EXC_EXIT
+                        | arinsal_beamasm::exc::EXC_THROWN
+                ))
     {
-        return 0;
-    }
-    // Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1: these BIFs
-    // return THE_NON_VALUE with `freason` and `fvalue` already set for the shared raise fragment.
-    if deferred.is_none()
-        && error.is_none()
-        && export.arity == 1
-        && export.module_atom == arinsal_term::atoms::ERLANG
-        && matches!(
-            export.function_atom,
-            arinsal_term::atoms::ERROR | arinsal_term::atoms::EXIT | arinsal_term::atoms::THROW
-        )
-        && process.heap.abi.exc.ftrace == 0
-        && matches!(
-            process.heap.abi.exc.freason,
-            arinsal_beamasm::exc::EXC_ERROR
-                | arinsal_beamasm::exc::EXC_EXIT
-                | arinsal_beamasm::exc::EXC_THROWN
-        )
-        && !process.heap.gc_after_bif_desired()
-    {
+        // ERTS_IS_GC_DESIRED_INTERNAL runs before the THE_NON_VALUE test
+        // (instr_bif.cpp:486-523); the failure words stay as the BIF wrote them.
+        if process.heap.gc_after_bif_desired() {
+            return gc_after_raised_bif(process, arity);
+        }
         return 0;
     }
     plain_bif_word_slow(process, registers, identity, export, word, deferred, error)
+}
+
+/// The collection after a BIF that raised with its failure already in `freason`, `fvalue`
+/// and `ftrace`: those are process roots, as are the BIF's argument registers.
+// Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf: a non-value result
+// collects with `arity` live registers), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn gc_after_raised_bif(process: &mut crate::Process, arity: usize) -> u64 {
+    match process.collect_heap_roots(arity, &mut [], 0) {
+        Ok(stats) => {
+            crate::natives::sys::after_collection(
+                process,
+                stats.collections,
+                stats.words_reclaimed,
+            );
+            process.charge_gc_stats(&stats);
+        }
+        Err(_) => crate::native_hooks::set_error(process, "system_limit"),
+    }
+    0
 }
 
 /// The tail of [`call_plain_bif_word`] for a failure, a trap or a due collection, out of line
@@ -4073,6 +4094,10 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         return 0;
     };
     let freason = process.heap.abi.exc.freason;
+    // The scheduler builds the function_clause top frame from the current function arguments.
+    if freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+        return 0;
+    }
     // TRAP and raw re-raises stay on the scheduler. Primary exceptions are `EXC_ERROR`,
     // `EXC_EXIT` and `EXC_THROWN`; expanded errors (`badmatch`, `function_clause`,
     // `case_clause`, ...) use erts' `(index << 10) | EXC_ERROR`.
@@ -4097,10 +4122,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` follows save_stacktrace),
     // OTP-29.1.1.
     let raising_pc = registers.tmp_mem[6] as usize;
-    // The scheduler builds the function_clause top frame from the current function arguments.
-    if process.heap.abi.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
-        return 0;
-    }
     let (class, reason) = if primary || saved_trace {
         let class =
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
@@ -4171,16 +4192,12 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let Some(found) = crate::native_bridge::next_native_catch(process) else {
         return 0;
     };
-    let handler = match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
+    // Port of erts/emulator/beam/beam_common.c:532-570 (handle_error, found catch): the
+    // fragment branches to the handler, so no scheduler resume record is written.
+    match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
         crate::native_bridge::CatchHandler::Native(handler) => handler,
-        crate::native_bridge::CatchHandler::Interpreted => {
-            return 0;
-        }
-    };
-    // The branch below resumes the handler. The scheduler must not treat
-    // the next native exit as a continuation resume.
-    process.native_continuation_resume = false;
-    handler
+        crate::native_bridge::CatchHandler::Interpreted => 0,
+    }
 }
 
 /// Supplies erts' `bif_mfa` input to `save_stacktrace`, with arguments in the live X registers.
