@@ -438,10 +438,11 @@ impl Executor {
                                     return Ok(Flow::Break(Ok(RunState::Yield)));
                                 }
                                 crate::ImportOutcome::Returned(value) => {
-                                    // The applied BIF ran through its export
-                                    // trampoline, which charges the call.
-                                    process.reductions_used =
-                                        process.reductions_used.saturating_add(1);
+                                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp
+                                    // (emit_call_bif_mfa, emit_call_bif_shared) and
+                                    // instr_call.cpp (emit_variable_apply), OTP-29.1.1: the
+                                    // apply and the BIF export trampoline it dispatches to
+                                    // charge nothing; only the BIF's own BUMP_REDS counts.
                                     process.x[0] = value;
                                     if process.native_pc().is_none() {
                                         return Ok(Flow::Break(Ok(RunState::Done(value))));
