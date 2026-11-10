@@ -502,6 +502,7 @@ impl Executor {
                                 // that fails after trapping raises at the original call.
                                 let (resume_pc, call_site_pc) =
                                     process.take_native_retry_site().unwrap_or((0, 0));
+                                crate::beamasm_integration::note_call_retry();
                                 if call_site_pc != 0 {
                                     process.native_error_pc = call_site_pc;
                                 }

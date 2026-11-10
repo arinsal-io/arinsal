@@ -1235,6 +1235,9 @@ static INTERP_SLICES: AtomicU64 = AtomicU64::new(0);
 static INTERP_NATIVE_STARTS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
 static CALL_UNPORTED: AtomicU64 = AtomicU64::new(0);
+/// `CallUnported` exits per target, kept only under `ARINSAL_BEAMASM_STATS`.
+static CALL_UNPORTED_TARGETS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 static PRINTED: AtomicBool = AtomicBool::new(false);
 static NEXT_MODULE_HANDLE: AtomicU64 = AtomicU64::new(1);
 static MODULE_HANDLES: OnceLock<RwLock<HashMap<u64, Weak<CompiledVersion>>>> = OnceLock::new();
@@ -2627,12 +2630,80 @@ pub(crate) fn count_native_yield() {
         NATIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
     }
 }
-pub(crate) fn count_call_unported() {
+/// Marks the next `CallUnported` as the scheduler redoing a parked call, not a native exit.
+pub(crate) fn note_call_retry() {
+    if crate::debug_env::beamasm_stats() {
+        CALL_RETRY.with(|flag| flag.set(true));
+    }
+}
+
+thread_local! {
+    static CALL_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Counts a `CallUnported` exit and attributes it to its target (sentinel kind or export MFA).
+pub(crate) fn count_call_unported(
+    target_pc: usize,
+    trapped: Option<(arinsal_term::Atom, arinsal_term::Atom, usize)>,
+    x0: Term,
+) {
     // Debug statistics only: a counter shared by every scheduler thread is a contended
     // cache line on the scheduling path.
-    if crate::debug_env::beamasm_stats() {
+    if !crate::debug_env::beamasm_stats() {
+        return;
+    }
+    // A redone call after a schedule-in is not a native exit: erts resumes it at `c_p->i`.
+    let retry = CALL_RETRY.with(|flag| flag.replace(false));
+    if !retry {
         CALL_UNPORTED.fetch_add(1, Ordering::Relaxed);
     }
+    use arinsal_beamasm::dispatch as d;
+    let atoms = arinsal_term::global_atoms();
+    let name = match target_pc {
+        d::RETURN_TO_DISPATCH_IDENTITY => "return_to_dispatch".to_owned(),
+        d::DIRTY_NIF_DISPATCH_IDENTITY => "dirty_nif".to_owned(),
+        d::BREAKPOINT_DISPATCH_IDENTITY => "breakpoint".to_owned(),
+        d::SEND_DISPATCH_IDENTITY => "send".to_owned(),
+        d::CALL_FUN_UNPORTED => "call_fun".to_owned(),
+        d::APPLY_FIXED_UNPORTED => "apply_fixed".to_owned(),
+        d::APPLY2_UNPORTED => "apply2".to_owned(),
+        d::APPLY3_UNPORTED => "apply3".to_owned(),
+        pc if d::decode_line_breakpoint_identity(pc).is_some() => "line_breakpoint".to_owned(),
+        pc if pc == crate::bif_traps::bif_export_trap_pc() => match trapped {
+            Some((m, f, a)) => format!(
+                "bif_export_trap {}:{}/{a}",
+                atoms.text(m).unwrap_or("?"),
+                atoms.text(f).unwrap_or("?")
+            ),
+            None => "bif_export_trap ?".to_owned(),
+        },
+        pc => match export_dispatch(pc) {
+            Some(export) => format!(
+                "export {}:{}/{} class={:?} trap_entry={} light={}{}",
+                export.module,
+                export.function,
+                export.arity,
+                export.class,
+                export.trap_entry,
+                export.light_kind,
+                x0.as_atom()
+                    .and_then(|atom| atoms.text(atom))
+                    .filter(|_| export.arity > 0)
+                    .map(|text| format!(" x0={text}"))
+                    .unwrap_or_default()
+            ),
+            None => format!("unknown {pc:#x}"),
+        },
+    };
+    let name = if retry {
+        format!("(retry) {name}")
+    } else {
+        name
+    };
+    let mut table = CALL_UNPORTED_TARGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *table.entry(name).or_insert(0) += 1;
 }
 
 pub(crate) fn print_stats() {
@@ -2649,6 +2720,14 @@ pub(crate) fn print_stats() {
         NATIVE_YIELDS.load(Ordering::Relaxed),
         CALL_UNPORTED.load(Ordering::Relaxed)
     );
+    let table = CALL_UNPORTED_TARGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rows: Vec<_> = table.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1));
+    for (name, count) in rows {
+        eprintln!("ARINSAL_BEAMASM_STATS call_unported {count} {name}");
+    }
 }
 
 /// Offsets from `c_p` of the process fields the light-BIF fragment's collection test reads.

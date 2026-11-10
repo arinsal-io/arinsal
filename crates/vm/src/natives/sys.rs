@@ -406,6 +406,12 @@ pub(crate) fn system_info_light(
     let [selector] = args else {
         return None;
     };
+    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_type), OTP-29.1.1: the
+    // global literal, no allocation, called from the generated code like every BIF.
+    static OS_TYPE: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    if *selector == *OS_TYPE.get_or_init(|| atom("os_type")) {
+        return Some(Ok(arinsal_bifs::os_type()));
+    }
     if *selector != Term::atom(arinsal_term::atoms::PROCESS_COUNT) {
         return None;
     }
