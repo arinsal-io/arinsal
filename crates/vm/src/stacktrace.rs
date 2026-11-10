@@ -1344,11 +1344,7 @@ pub(super) fn is_saved(term: Term) -> bool {
 // `erts_sanitize_freason`, OTP-29.1.1: the class is `StackTrace.freason`, element 1 of the
 // ftrace tuple; the trace itself is not decoded.
 pub(super) fn raw_class(_p: &Process, term: Term) -> Option<Class> {
-    let fields = arinsal_term::term_sequence_small(term)?;
-    if fields.len() != 3 {
-        return None;
-    }
-    fields[0]
+    saved_freason_word(term)?
         .with_bignum_digits_mut(|digits| digits.first().copied())
         .flatten()
         .and_then(class_from_freason)
@@ -1356,8 +1352,19 @@ pub(super) fn raw_class(_p: &Process, term: Term) -> Option<Class> {
 
 /// Args carried by the negative StackTrace used for an explicit `raise/3` trace.
 pub(super) fn raised_args(term: Term) -> Option<Term> {
-    let fields = arinsal_term::term_sequence_small(term)?;
-    (fields.len() == 3 && fields[0].is_negative_bignum()).then(|| fields[1])
+    let tuple = arinsal_term::raw::Tuple::try_from(term).ok()?;
+    (tuple.arity() == 3 && tuple.get(0)?.is_negative_bignum()).then(|| tuple.get(1))?
+}
+
+/// Element 1 of a 3-tuple ftrace: the StackTrace bignum whose first digit is
+/// `StackTrace.freason`. Read in place through the tuple header, as `tuple_val` does.
+#[inline]
+fn saved_freason_word(term: Term) -> Option<Term> {
+    let tuple = arinsal_term::raw::Tuple::try_from(term).ok()?;
+    if tuple.arity() != 3 {
+        return None;
+    }
+    tuple.get(0)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1131-1178 (`get_freason_ptr_from_exc`,
@@ -1366,25 +1373,23 @@ pub(super) fn raised_args(term: Term) -> Option<Term> {
 pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool {
     // raw_raise stores the class in the saved trace after EXF_SAVETRACE is cleared.
     let code = class_to_freason(Some(class)) & !arinsal_beamasm::exc::EXF_SAVETRACE;
-    let Some(fields) = arinsal_term::term_sequence_small(term) else {
+    let Some(word) = saved_freason_word(term) else {
         return false;
     };
-    fields.len() == 3
-        && fields[0]
-            .with_bignum_digits_mut(|digits| {
-                let Some(freason) = digits.first_mut() else {
-                    return false;
-                };
-                *freason = code;
-                if digits
-                    .get(5)
-                    .is_some_and(|flags| flags & STACKTRACE_CURRENT_ARGS_MFA != 0)
-                {
-                    digits[5] |= STACKTRACE_NO_LOCATION;
-                }
-                true
-            })
-            .unwrap_or(false)
+    word.with_bignum_digits_mut(|digits| {
+        let Some(freason) = digits.first_mut() else {
+            return false;
+        };
+        *freason = code;
+        if digits
+            .get(5)
+            .is_some_and(|flags| flags & STACKTRACE_CURRENT_ARGS_MFA != 0)
+        {
+            digits[5] |= STACKTRACE_NO_LOCATION;
+        }
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// What `save_stacktrace` puts in a BIF frame's `error_info`.

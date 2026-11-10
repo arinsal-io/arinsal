@@ -4094,24 +4094,9 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         return 0;
     };
     let freason = process.heap.abi.exc.freason;
-    // The scheduler builds the function_clause top frame from the current function arguments.
-    if freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+    let Some(class) = native_exception_class(freason) else {
         return 0;
-    }
-    // TRAP and raw re-raises stay on the scheduler. Primary exceptions are `EXC_ERROR`,
-    // `EXC_EXIT` and `EXC_THROWN`; expanded errors (`badmatch`, `function_clause`,
-    // `case_clause`, ...) use erts' `(index << 10) | EXC_ERROR`.
-    let primary = is_primary_freason(freason);
-    let expanded = !primary
-        && freason & arinsal_beamasm::exc::EXC_INDEXBITS != 0
-        && freason
-            & !(arinsal_beamasm::exc::EXC_INDEXBITS | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
-            == arinsal_beamasm::exc::EXC_ERROR;
-    // A re-raise of a saved trace: the class code without `EXF_SAVETRACE`.
-    let saved_trace = !primary && !expanded && is_saved_trace_freason(freason);
-    if !primary && !expanded && !saved_trace {
-        return 0;
-    }
+    };
     // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:300-318 (`raise_exception_shared`),
     // OTP-29.1.1. The shared fragment already ran `emit_enter_runtime` and stored HTOP and E
     // into `c_p`. `handle_error` runs once from that entry; it does not enter again.
@@ -4119,66 +4104,36 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) else {
         return 0;
     };
-    // Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` follows save_stacktrace),
-    // OTP-29.1.1.
-    let raising_pc = registers.tmp_mem[6] as usize;
-    let (class, reason) = if primary || saved_trace {
-        let class =
-            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
-        let reason = if freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0 {
-            match expand_error_value(process) {
-                Some(reason) => reason,
-                None => return 0,
-            }
-        } else {
-            crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
-        };
-        (class, reason)
-    } else {
-        match expand_error_value(process) {
-            Some(reason) => (arinsal_bifs::Class::Error, reason),
-            None => {
-                return 0;
-            }
-        }
-    };
-    // The light-BIF fragment and `error_label` spill the raising pc at `tmp_mem[6]`
-    // (erts' `pc` argument to `save_stacktrace`). `p.ip()` is the last interpreter
-    // instruction and names the wrong function while native code is running.
-    // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
-    // `build_stacktrace` resolves it against the active code ranges when the trace is requested.
-    let native_pc = (raising_pc != 0).then_some(raising_pc);
-    // A `raise/3` carries the trace the catch must see, so no top frame is looked for.
-    let explicit = if saved_trace {
-        Some(crate::native_hooks::from_raw(process.heap.abi.exc.ftrace))
-    } else {
-        take_explicit_raise(process)
-    };
-    let top = if explicit.is_some() {
-        None
-    } else {
-        native_bif_top(process, bif_info, &registers.x_reg_array)
-    };
-    // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
-    // A native walk would name `eval_external_handler` instead of that list.
-    let trace = if saved_trace {
-        explicit.expect("saved exception trace")
-    } else if let Some(trace) = explicit {
-        if trace == Term::NIL {
+    // Port of erts/emulator/beam/beam_common.c:449-570 (`handle_error`), OTP-29.1.1, in its
+    // order: save the trace when EXF_SAVETRACE is set, expand the value, write the catch
+    // registers, `next_catch`.
+    let trace = if freason & arinsal_beamasm::exc::EXF_SAVETRACE == 0 {
+        // `raw_raise` already stored the saved trace and cleared EXF_SAVETRACE.
+        crate::native_hooks::from_raw(process.heap.abi.exc.ftrace)
+    } else if let Some(explicit) = take_explicit_raise(process) {
+        // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
+        // A native walk would name `eval_external_handler` instead of that list.
+        if explicit == Term::NIL {
             // `raise(Class, Reason, [])`, which is what `throw/1` compiles to: the empty
             // trace of that class, with nothing saved.
             crate::exceptions::empty_trace_handle(class)
-        } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace, 8) {
+        } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, explicit, 8) {
             trace
         } else {
             return 0;
         }
     } else {
+        // The light-BIF fragment and `error_label` spill the raising pc at `tmp_mem[6]`
+        // (erts' `pc` argument to `save_stacktrace`). `p.ip()` is the last interpreter
+        // instruction and names the wrong function while native code is running. The raw
+        // pc is resolved against the code ranges only if the trace is ever built.
+        let raising_pc = registers.tmp_mem[6] as usize;
+        let top = native_bif_top(process, bif_info, &registers.x_reg_array);
         let input = crate::stacktrace::StackTraceSave {
             class,
             depth: crate::stacktrace::runtime_backtrace_depth(process, 8),
             freason,
-            native_pc,
+            native_pc: (raising_pc != 0).then_some(raising_pc),
             top: top.as_ref().map(crate::stacktrace::SaveTop::Live),
         };
         let Ok(trace) =
@@ -4188,15 +4143,55 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         };
         trace
     };
+    // `save_stacktrace` leaves the trace in `c_p->ftrace`, a root while the value expands.
     process.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
-    let Some(found) = crate::native_bridge::next_native_catch(process) else {
-        return 0;
+    // Port of beam_common.c:742 (`expand_error_value`): only an indexed reason or an
+    // `error_info` value needs expanding; the rest is `fvalue` itself.
+    let reason = if freason
+        & (arinsal_beamasm::exc::EXC_INDEXBITS | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
+        == 0
+    {
+        crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
+    } else {
+        match expand_error_value(process) {
+            Some(reason) => reason,
+            None => return 0,
+        }
     };
-    // Port of erts/emulator/beam/beam_common.c:532-570 (handle_error, found catch): the
-    // fragment branches to the handler, so no scheduler resume record is written.
-    match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
-        crate::native_bridge::CatchHandler::Native(handler) => handler,
-        crate::native_bridge::CatchHandler::Interpreted => 0,
+    let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
+    // The fragment branches to the handler, so no scheduler resume record is written.
+    crate::native_bridge::native_found_catch(process, class, reason, trace).unwrap_or(0)
+}
+
+/// `GET_EXC_CLASS(freason)` for a failure `handle_error` completes in native code, or `None`
+/// for one the scheduler completes.
+///
+/// The scheduler keeps: TRAP; `function_clause` (its top frame is built from the current
+/// function's arguments); re-raise words carrying `EXF_RESTORE_NFUNC` or a class atom;
+/// `error/2,3` failures with `EXF_HAS_EXT_INFO` and no index. The native resolver takes
+/// the generic codes (`EXC_ERROR`, `EXC_EXIT`, `EXC_THROWN`, optionally with
+/// `EXF_ARGLIST`), the indexed errors (`(index << 10) | EXC_ERROR`, optionally with
+/// `EXF_HAS_EXT_INFO`), and a `raw_raise` re-raise (a class code without `EXF_SAVETRACE`).
+#[inline]
+fn native_exception_class(freason: u64) -> Option<arinsal_bifs::Class> {
+    use arinsal_beamasm::exc::{
+        EXC_ERROR, EXC_EXIT, EXC_INDEXBITS, EXC_THROWN, EXF_ARGLIST, EXF_HAS_EXT_INFO,
+        EXF_SAVETRACE,
+    };
+    if freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+        return None;
+    }
+    let handled = if freason & EXC_INDEXBITS != 0 {
+        freason & !(EXC_INDEXBITS | EXF_HAS_EXT_INFO) == EXC_ERROR
+    } else {
+        matches!(freason & !EXF_ARGLIST, EXC_ERROR | EXC_EXIT | EXC_THROWN)
+            || matches!(freason | EXF_SAVETRACE, EXC_ERROR | EXC_EXIT | EXC_THROWN)
+                && freason & EXF_SAVETRACE == 0
+    };
+    if handled {
+        crate::stacktrace::class_from_freason(freason)
+    } else {
+        None
     }
 }
 
@@ -4262,24 +4257,6 @@ fn native_bif_error_info(freason: u64, fvalue: u64) -> crate::stacktrace::BifErr
     } else {
         crate::stacktrace::BifErrorInfo::Cause(value)
     }
-}
-
-/// The class code a re-raise carries once `EXF_SAVETRACE` is cleared.
-fn is_saved_trace_freason(freason: u64) -> bool {
-    use arinsal_beamasm::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN, EXF_SAVETRACE};
-    freason == EXC_ERROR & !EXF_SAVETRACE
-        || freason == EXC_EXIT & !EXF_SAVETRACE
-        || freason == EXC_THROWN & !EXF_SAVETRACE
-}
-
-/// A fresh generic exception: `EXC_ERROR`, `EXC_EXIT` or `EXC_THROWN` with no index and no
-/// re-raise flag.
-pub(crate) fn is_primary_freason(freason: u64) -> bool {
-    use arinsal_beamasm::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN, EXF_ARGLIST};
-    // The whole word must be one of the generic codes: generated code also leaves a class
-    // *atom* in `freason` when it hands a re-raise to the resolver, and an atom word must
-    // never read as a fresh exception.
-    matches!(freason & !EXF_ARGLIST, EXC_ERROR | EXC_EXIT | EXC_THROWN)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:742 (`expand_error_value`), OTP-29.1.1.
