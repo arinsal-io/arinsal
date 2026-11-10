@@ -517,6 +517,39 @@ pub(crate) fn dt_spread_tag_light(
     )
 }
 
+/// `erlang:dt_get_tag/0` and `dt_get_tag_data/0` from the generated code.
+// Port of erts/emulator/beam/bif.c:5957 and :5965 (dt_get_tag_0, dt_get_tag_data_0), OTP-29.1.1:
+// without USE_VM_PROBES both return `undefined`.
+pub(crate) fn dt_get_tag_light(
+    _process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    args.is_empty().then(|| Ok(atom("undefined")))
+}
+
+/// `erlang:dt_put_tag/1` from the generated code.
+// Port of erts/emulator/beam/bif.c:5929 (dt_put_tag_1), OTP-29.1.1: without USE_VM_PROBES the
+// argument is not checked and the result is `undefined`.
+pub(crate) fn dt_put_tag_light(
+    _process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    (args.len() == 1).then(|| Ok(atom("undefined")))
+}
+
+/// `erlang:dt_prepend_vm_tag_data/1` and `dt_append_vm_tag_data/1` from the generated code.
+// Port of erts/emulator/beam/bif.c:5973 and :6001 (dt_prepend_vm_tag_data_1,
+// dt_append_vm_tag_data_1), OTP-29.1.1: without USE_VM_PROBES the argument is returned as is.
+pub(crate) fn dt_vm_tag_data_light(
+    _process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [data] = args else {
+        return None;
+    };
+    Some(Ok(*data))
+}
+
 /// `erlang:dt_restore_tag/1` from the generated code.
 // Port of erts/emulator/beam/bif.c:6066 (dt_restore_tag_1), OTP-29.1.1: without USE_VM_PROBES
 // only `true` is accepted.
@@ -1182,6 +1215,14 @@ pub(crate) fn system_info_process_item(
         Some("allocator") => Some(all_allocator_options(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
         Some("process_count") => Some(non_neg(process, process_count(process) as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:2946, OTP-29.1.1.
+        Some("port_count") => Some(non_neg(
+            process,
+            process
+                .runtime
+                .as_ref()
+                .map_or(1, |runtime| runtime.ports.live_count()) as u64,
+        )),
         // Port of erts/emulator/beam/erl_bif_info.c:3521, OTP-29.1.1.
         Some("atom_count") => Some(non_neg(process, global_atoms().len() as u64)),
         // Port of erts/emulator/beam/erl_gc.c:243-291 (erts_init_gc) and :353-381

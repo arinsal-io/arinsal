@@ -8,7 +8,7 @@ use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(system_info_light).
--export([items/0, errors/0, tags/0, churn/1]).
+-export([items/0, errors/0, tags/0, churn/1, constants/0, shapes/0]).
 items() ->
     Keys = [otp_release, version, wordsize, context_reductions, schedulers, schedulers_total,
             schedulers_online, logical_processors, logical_processors_online,
@@ -29,7 +29,27 @@ errors() ->
 tags() ->
     {erlang:dt_spread_tag(true), erlang:dt_spread_tag(false),
      element(1, catch erlang:dt_spread_tag(other)), erlang:dt_restore_tag(true),
-     element(1, catch erlang:dt_restore_tag(false)), element(1, catch erlang:dt_restore_tag(1))}.
+     element(1, catch erlang:dt_restore_tag(false)), element(1, catch erlang:dt_restore_tag(1)),
+     erlang:dt_get_tag(), erlang:dt_get_tag_data(), erlang:dt_put_tag(<<"tag">>),
+     erlang:dt_put_tag(undefined), erlang:dt_put_tag(not_a_binary),
+     erlang:dt_put_tag([a | b]), erlang:dt_prepend_vm_tag_data(a),
+     erlang:dt_prepend_vm_tag_data(<<"x">>), erlang:dt_append_vm_tag_data([a | b]),
+     erlang:dt_append_vm_tag_data(1)}.
+constants() ->
+    Keys = [start_time, break_ignored, async_dist, eager_check_io, dynamic_trace,
+            dynamic_trace_probes, c_compiler_used, delayed_node_table_gc],
+    End = erlang:system_info(end_time),
+    % A bignum: compared in Erlang, as the OwnedTerm of an i64-sized bignum differs by decoder.
+    [{end_time, End =:= 8646911283000000000, is_integer(End)}
+     | [{K, erlang:system_info(K)} || K <- Keys]].
+shapes() ->
+    Mono = erlang:monotonic_time(),
+    Start = erlang:system_info(start_time),
+    {is_integer(erlang:system_info(atom_count)) andalso erlang:system_info(atom_count) > 1000,
+     erlang:system_info(port_count) =:= length(erlang:ports()),
+     erlang:system_info(port_count) >= 1,
+     is_integer(erlang:system_info(ethread_used_tse)),
+     Mono >= Start andalso Mono - Start < 600000000000}.
 churn(0) -> ok;
 churn(N) ->
     "29" = erlang:system_info(otp_release),
@@ -62,6 +82,16 @@ fn differential(function: &str, args: &[arinsal_etf::OwnedTerm], vm_args: &[arin
 #[test]
 fn system_info_light_items_match_otp() {
     differential("items", &[], &[]);
+}
+
+#[test]
+fn system_info_light_constant_items_match_otp() {
+    differential("constants", &[], &[]);
+}
+
+#[test]
+fn system_info_light_counter_shapes_match_otp() {
+    differential("shapes", &[], &[]);
 }
 
 #[test]

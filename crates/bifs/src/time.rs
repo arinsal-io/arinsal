@@ -150,8 +150,21 @@ pub fn monotonic_time_milliseconds() -> i128 {
 /// Return the same clock value as `erts_get_monotonic_time`, used by
 /// `erlang:monotonic_time/0` in `erts/emulator/beam/erl_time_sup.c`, OTP-29.1.1.
 pub fn monotonic_time_nanos() -> i128 {
-    -(1_i128 << 59) + i128::from(monotonic_time_raw_nanos())
+    i128::from(MONOTONIC_TIME_START_EXTERNAL) + i128::from(monotonic_time_raw_nanos())
 }
+
+/// `ERTS_MONOTONIC_TIME_START_EXTERNAL`: the external monotonic time at VM start, the smallest
+/// immediate rounded up to a whole time unit.
+// Port of erts/emulator/beam/erl_time.h (ERTS_MONOTONIC_TIME_START_EXTERNAL, 64-bit, nanosecond
+// unit), OTP-29.1.1.
+pub const MONOTONIC_TIME_START_EXTERNAL: i64 = (-(1_i64 << 59) / 1_000_000_000) * 1_000_000_000;
+
+/// `ERTS_MONOTONIC_TIME_END_EXTERNAL`: the last external monotonic time before the internal
+/// range ends.
+// Port of erts/emulator/beam/erl_time.h (ERTS_MONOTONIC_TIME_END_EXTERNAL, ERTS_MONOTONIC_BEGIN,
+// ERTS_MONOTONIC_END), OTP-29.1.1.
+pub const MONOTONIC_TIME_END_EXTERNAL: i64 =
+    MONOTONIC_TIME_START_EXTERNAL + ((i64::MAX / 1_000_000_000) * 1_000_000_000 - 1_000_000_000);
 
 /// Return OTP's raw internal monotonic clock value for call_time accounting.
 // Port of erts/emulator/beam/beam_bp.c (get_mtime), OTP-29.1.1. On macOS, OTP's

@@ -46,6 +46,14 @@ fn integer(ctx: &mut Ctx<'_>, value: u64) -> Result<Term, BifError> {
         .int_from_bigint(&num_bigint::BigInt::from(value))
         .map_err(|_| BifError::SystemLimit)
 }
+fn signed(ctx: &mut Ctx<'_>, value: i64) -> Result<Term, BifError> {
+    if let Some(term) = Term::small(value) {
+        return Ok(term);
+    }
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .int_from_bigint(&num_bigint::BigInt::from(value))
+        .map_err(|_| BifError::SystemLimit)
+}
 fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
     let mut tail = Term::NIL;
     for ch in value.chars().rev() {
@@ -69,6 +77,14 @@ pub fn system_info_light_item(ctx: &mut Ctx<'_>, key: Term) -> Option<Result<Ter
             | "system_version"
             | "wordsize"
             | "start_time"
+            | "end_time"
+            | "break_ignored"
+            | "async_dist"
+            | "eager_check_io"
+            | "dynamic_trace"
+            | "dynamic_trace_probes"
+            | "c_compiler_used"
+            | "delayed_node_table_gc"
             | "context_reductions"
             | "logical_processors"
             | "logical_processors_available"
@@ -120,8 +136,31 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
             ),
         ),
         "wordsize" => integer(ctx, std::mem::size_of::<usize>() as u64),
-        // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
-        "start_time" => Term::small(-(1_i64 << 59)).ok_or(BifError::SystemLimit),
+        // Port of erts/emulator/beam/erl_bif_info.c:2855-2858 (start_time, end_time) and
+        // erl_time_sup.c (make_time_val), OTP-29.1.1.
+        "start_time" => signed(ctx, crate::time::MONOTONIC_TIME_START_EXTERNAL),
+        "end_time" => signed(ctx, crate::time::MONOTONIC_TIME_END_EXTERNAL),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1: the defaults of
+        // `ignore_break` (+Bi), `erts_default_spo_flags & SPO_ASYNC_DIST` (+pad) and
+        // `erts_delayed_node_table_gc` (+zdntgc); the emulator flags are not stored yet.
+        "break_ignored" | "async_dist" | "dynamic_trace_probes" => Ok(atom("false")),
+        "eager_check_io" => Ok(atom("true")),
+        // No DTrace, SystemTap or LTTng support is built in (USE_DTRACE, USE_SYSTEMTAP, USE_LTTNG).
+        "dynamic_trace" => Ok(atom("none")),
+        "delayed_node_table_gc" => integer(ctx, 60),
+        // Port of erts/emulator/beam/erl_bif_info.c:2688 (c_compiler_used): the reference build
+        // is compiled by clang, which defines __GNUC__ 4, __GNUC_MINOR__ 2, __GNUC_PATCHLEVEL__ 1.
+        "c_compiler_used" => {
+            let version = tuple_build(
+                ctx,
+                &[
+                    Term::small(4).unwrap(),
+                    Term::small(2).unwrap(),
+                    Term::small(1).unwrap(),
+                ],
+            );
+            Ok(tuple_build(ctx, &[atom("gnuc"), version]))
+        }
         "context_reductions" => integer(ctx, 4000),
         "schedulers" => integer(ctx, cpus),
         "schedulers_online" => integer(ctx, online),
@@ -158,7 +197,9 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
             let mut heap = Heap(&mut ctx.heap);
             arinsal_maps::from_list(&map_items, &mut heap).map_err(|_| BifError::SystemLimit)
         }
-        "atom_count" | "process_count" | "port_count" => integer(ctx, 0),
+        // Port of erts/emulator/beam/erl_bif_info.c:3521 (atom_count), OTP-29.1.1. The process and
+        // port counts need the VM's tables; the VM answers them before this table is consulted.
+        "atom_count" => integer(ctx, global_atoms().len() as u64),
         "machine" => string(ctx, "BEAM"),
         // Port of erts/emulator/beam/erl_bif_info.c:3019-3024 (system_architecture) and
         // erts/emulator/utils/make_version:74 (ERLANG_ARCHITECTURE), OTP-29.1.1: the configure
