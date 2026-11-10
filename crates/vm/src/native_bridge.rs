@@ -824,7 +824,16 @@ pub(crate) fn next_catch(
     if native_only && found.traced != 0 {
         return None;
     }
-    Some(commit_catch(process, found, class, reason, trace))
+    // The scheduler resumes the handler through `run_native`; the native resolver branches to
+    // it directly, so these Rust-side resume records are this caller's, not `found_catch`'s.
+    process.x.ensure_x(4);
+    process.exc_class = Some(class);
+    let handler = commit_catch(process, found, class, reason, trace);
+    if let CatchHandler::Native(_) = handler {
+        process.native_continuation_resume = true;
+        process.set_native_resume_arity(4);
+    }
+    Some(handler)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:650-678 (`found_catch`), OTP-29.1.1.
@@ -843,27 +852,22 @@ pub(crate) fn commit_catch(
     process
         .heap
         .set_stack_pointer(base.wrapping_add(found.resume));
-    process.x.ensure_x(4);
-    // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1:
+    // Port of erts/emulator/beam/beam_common.c:532-570 (handle_error), OTP-29.1.1:
     // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
     process.x[0] = Term::catch(0);
     process.x[1] = reason;
     process.x[2] = trace;
     process.x[3] = exception_class_atom(class);
-    process.exc_class = Some(class);
-    // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1.
-    // The catch registers own the expanded reason and raw trace now, so stale native error
-    // metadata must not survive this transfer.
+    // handle_error clears `fvalue` and `ftrace` once the catch registers own them. Arinsal
+    // also clears `freason`: its native exits read a nonzero `freason` as a pending failure.
     process.heap.abi.exc.freason = 0;
     process.heap.abi.exc.fvalue = Term::NIL.tagged_word();
     process.heap.abi.exc.ftrace = 0;
+    // A BIF that raised through the scheduler's trap record (`signals.rs`, `natives/ets.rs`)
+    // left it beside `freason`; it is consumed with the failure words.
     process.clear_native_failure();
     match found.target {
-        CatchTarget::Native(handler) => {
-            process.native_continuation_resume = true;
-            process.set_native_resume_arity(4);
-            CatchHandler::Native(handler)
-        }
+        CatchTarget::Native(handler) => CatchHandler::Native(handler),
         CatchTarget::Interpreted { module, ip } => {
             process.module = module;
             process.set_ip(ip);
