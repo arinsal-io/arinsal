@@ -156,42 +156,6 @@ impl Vm {
         Ok(())
     }
 
-    /// The code address a process spawned at function entry `ip` of module `module_id` starts at:
-    /// the function's export address when it belongs to that module instance, else the
-    /// function's own code.
-    // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process: I is the export's
-    // address), OTP-29.1.1.
-    pub(crate) fn native_entry_address(&self, module_id: usize, ip: usize) -> Option<usize> {
-        let module = self.code.modules.get(module_id)?;
-        let (_, function, arity) = module.functions.get(module.function_by_entry(ip)?)?;
-        let (function, arity) = (*function, *arity);
-        // The entry belongs to the module instance the process was spawned in; another
-        // loaded version of the same module (old or current) has its own code. A module
-        // loaded for the interpreter only may have native functions registered separately.
-        match self
-            .code
-            .code_meta
-            .get(module_id)
-            .and_then(|meta| meta.as_ref())
-            .and_then(|meta| meta.beamasm.as_ref())
-        {
-            Some(version) => module
-                .function_atom_at(ip)
-                .and_then(|(function, arity)| {
-                    crate::beamasm_integration::export_native_target(
-                        self.code_scope,
-                        module.name_atom,
-                        function,
-                        arity,
-                    )
-                })
-                .filter(|&address| version.contains_code(address))
-                .or_else(|| version.native_function_start(function, arity)),
-            None => crate::native_function_for(self.code_scope, &module.name, function, arity)
-                .map(|native| native.start),
-        }
-    }
-
     /// Enters the native code at the process's code address (`c_p->i`), set by a spawn, an
     /// apply or a trap. A process without one is an error: the JIT flavor runs nothing else.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.

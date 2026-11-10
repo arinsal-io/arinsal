@@ -50,7 +50,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).seq_trace_epoch).write(seq_trace_epoch);
         std::ptr::addr_of_mut!((*process).seq_trace_spawn_pending).write(false);
         std::ptr::addr_of_mut!((*process).module).write(0);
-        std::ptr::addr_of_mut!((*process).initial_call).write(None);
         std::ptr::addr_of_mut!((*process).initial_mfa).write(None);
         std::ptr::addr_of_mut!((*process).native_pc).write(None);
         std::ptr::addr_of_mut!((*process).slow).write(slow);
@@ -138,7 +137,6 @@ fn process_fields_are_initialized(process: Process) {
         seq_trace_epoch,
         seq_trace_spawn_pending,
         module,
-        initial_call,
         initial_mfa,
         native_pc,
         slow,
@@ -211,7 +209,6 @@ fn process_fields_are_initialized(process: Process) {
         seq_trace_epoch,
         seq_trace_spawn_pending,
         module,
-        initial_call,
         initial_mfa,
         native_pc,
         slow,

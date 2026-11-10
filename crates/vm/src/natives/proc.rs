@@ -2084,25 +2084,6 @@ fn initial_call_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom,
     if let Some((module, function, arity)) = process.initial_mfa {
         return Ok((module, function, arity));
     }
-    if let Some((module_index, ip)) = process.initial_call {
-        let resolve = |modules: &[std::sync::Arc<crate::Module>]| {
-            let module = modules.get(module_index)?;
-            let (function, arity) = module
-                .function_atom_at(ip)
-                .unwrap_or((arinsal_term::atoms::UNDEFINED, 0));
-            Some((module.name_atom, function, arity))
-        };
-        if let Some(found) = vm.and_then(|vm| resolve(&vm.code.modules)) {
-            return Ok(found);
-        }
-        if let Some(found) = process
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.with_modules(resolve))
-        {
-            return Ok(found);
-        }
-    }
     resolve_mfa_atoms(vm, process)
 }
 
@@ -2346,18 +2327,7 @@ fn current_stacktrace(
         || vm.map(|vm| vm.backtrace_depth).unwrap_or(8),
         |runtime| runtime.backtrace_depth.load(Ordering::Acquire),
     );
-    if let Some(vm) = vm {
-        return crate::stacktrace::build_for_process_info(
-            &vm.code.modules,
-            process,
-            depth,
-            reserve,
-        );
-    }
-    let runtime = process.runtime.ok_or_else(badarg)?;
-    runtime.with_modules(|modules| {
-        crate::stacktrace::build_for_process_info(modules, process, depth, reserve)
-    })
+    crate::stacktrace::build_for_process_info(process, depth, reserve)
 }
 
 pub(crate) fn live(process: &Process, pid: Pid) -> Result<bool, VmError> {

@@ -582,7 +582,7 @@ pub(super) fn resume(
     p.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
     trap.reason = crate::native_hooks::from_raw(p.heap.abi.exc.fvalue);
     let trace = if trap.raw_rethrow && trap.reason == atom("function_clause")? {
-        let cooked = materialize(Some(vm), p, trace)?;
+        let cooked = materialize(p, trace)?;
         let stripped = strip_top_location(p, cooked)?;
         save_explicit(p, stripped, trap.class, vm.backtrace_depth)?
     } else {
@@ -674,7 +674,7 @@ pub(super) fn resume(
     // local `trace` is not a root (erts keeps it in `c_p->ftrace`).
     let thrown = trap.class == Class::Throw;
     let stack = if trap.class == Class::Error || thrown {
-        let trace = materialize(Some(vm), p, trace)?;
+        let trace = materialize(p, trace)?;
         trap.reason = crate::native_hooks::from_raw(p.heap.abi.exc.fvalue);
         to_owned(trace).map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?
     } else {
@@ -740,7 +740,7 @@ fn save_explicit(
     stacktrace::save_explicit(p, class, trace, backtrace_depth)
 }
 
-pub(super) fn materialize(vm: Option<&Vm>, p: &mut Process, trace: Term) -> Result<Term, VmError> {
+pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {
     if empty_trace_class(trace).is_some() {
         return Ok(Term::NIL);
     }
@@ -753,8 +753,7 @@ pub(super) fn materialize(vm: Option<&Vm>, p: &mut Process, trace: Term) -> Resu
     if let Some(result) = direct {
         return result;
     }
-    let modules = vm.map_or(&[][..], |vm| vm.code.modules.as_slice());
-    let saved = stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw, modules));
+    let saved = stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw));
     match saved {
         Some(result) => result,
         None => Ok(trace),

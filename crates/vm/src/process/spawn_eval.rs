@@ -27,29 +27,13 @@ impl Runtime {
         monitor: Option<crate::proc_create::DistOrigin>,
         parent: Option<&arinsal_etf::OwnedTerm>,
     ) -> Result<Pid, VmError> {
-        let (module_id, ip) = {
-            let code = self.code.active_tables();
-            let module_id = *code
-                .loaded
-                .get(module)
-                .ok_or_else(|| VmError::Unsupported(format!("spawn: {module} not loaded")))?;
-            let ip = code.modules[module_id]
-                .export(function, args.len() as u8)
-                .ok_or_else(|| {
-                    VmError::Unsupported(format!(
-                        "spawn: {module}:{function}/{} not exported",
-                        args.len()
-                    ))
-                })?;
-            (module_id, ip)
-        };
-        let mut child = Process::with_spawn_registers(args.len(), 0);
-        child.module = module_id;
-        // `p->u.initial`: the first run starts at this function's code address.
-        child.initial_call = Some((module_id, ip));
+        let arity = u8::try_from(args.len())
+            .map_err(|_| VmError::Unsupported("spawn: too many arguments".into()))?;
+        let (module_atom, function_atom, _) = mfa_atoms(module, function, arity)
+            .ok_or_else(|| VmError::Unsupported("spawn: bad module or function name".into()))?;
+        let mut child = Process::with_spawn_registers(args.len().max(3), 0);
         child.set_runtime(Some(self));
         child.cold_mut().group_leader = None;
-        child.initial_mfa = mfa_atoms(module, function, args.len() as u8);
         // Port of erts/emulator/beam/erl_process.c:12756-12767 (erl_create_process p->parent),
         // OTP-29.1.1: a remote parent is kept as its external pid.
         if let Some(parent) = parent {
@@ -60,16 +44,26 @@ impl Runtime {
                 .links
                 .insert(crate::proc_create::process_link(linker, false));
         }
-        if let Some(arity) = u8::try_from(args.len()).ok()
-            && (arinsal_bifs::lookup(module, function, arity).is_some()
-                || arinsal_spec::bif_lookup(module, function, arity).is_some())
-        {
-            child.slice_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
-        }
-        for (index, owned) in args.iter().enumerate() {
+        let initial_bif = arinsal_bifs::lookup(module, function, arity).is_some()
+            || arinsal_spec::bif_lookup(module, function, arity).is_some();
+        let mut copied = Vec::with_capacity(args.len());
+        for owned in args {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
-            child.x[index] = arinsal_term::from_owned(owned, &mut heap)
-                .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?;
+            copied.push(
+                arinsal_term::from_owned(owned, &mut heap)
+                    .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?,
+            );
+        }
+        if initial_bif {
+            child.slice_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
+            child.x[..copied.len()].copy_from_slice(&copied);
+            child.module = crate::process::RUN_PROCESS;
+            child.initial_mfa = Some((module_atom, function_atom, arity));
+        } else {
+            let args = arinsal_term::TermBuilder::new(&mut child.heap)
+                .list_from_slice(&copied)
+                .map_err(|_| VmError::Unsupported("spawn argument list".into()))?;
+            child.start_at_run_process(module_atom, function_atom, args, arity);
         }
         let scheduler = self.scheduler()?;
         let Some(monitor) = monitor else {
@@ -134,15 +128,15 @@ impl Vm {
         function: &str,
         priority: arinsal_sched::Priority,
     ) -> Result<Pid, VmError> {
-        let module_id = self.load_named(module)?;
-        let ip = self.code.modules[module_id]
-            .export(function, 0)
-            .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 is not exported")))?;
-        let mut process = Process::with_spawn_registers(0, 0);
-        process.module = module_id;
-        process.initial_call = Some((module_id, ip));
+        // The module is preloaded before the process applies it, as erts preloads system modules.
+        self.load_named(module)?;
+        let (module_atom, function_atom, _) = mfa_atoms(module, function, 0)
+            .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 name")))?;
+        let mut process = Process::with_spawn_registers(3, 0);
         process.set_runtime(Some(runtime));
-        process.initial_mfa = mfa_atoms(module, function, 0);
+        // Port of erts/emulator/beam/erl_init.c:402 (erl_system_process_otp): spawned with `NIL`
+        // arguments through erl_create_process, which starts at beam_run_process.
+        process.start_at_run_process(module_atom, function_atom, Term::NIL, 0);
         if priority != arinsal_sched::Priority::Normal {
             let name = match priority {
                 arinsal_sched::Priority::Max => "max",
@@ -291,13 +285,14 @@ impl Vm {
         if module != "erl_init" {
             let _ = self.load_named("erts_internal");
         }
-        let ip = self.code.modules[module_id]
+        if self.code.modules[module_id]
             .export(function, args.len() as u8)
-            .ok_or_else(|| {
-                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                    "undef",
-                )))
-            })?;
+            .is_none()
+        {
+            return Err(VmError::Trap(crate::exceptions::Trap::error(
+                crate::signals::atom("undef"),
+            )));
+        }
         let (sender, receiver) = mpsc::channel();
         if let Some(runtime) = self.runtime
             && runtime.simulated != simulation_seed.is_some()
@@ -430,22 +425,31 @@ impl Vm {
                 }
             }
             let scheduler = runtime.scheduler()?;
-            let mut process = Process::with_spawn_registers(args.len(), 0);
-            process.module = module_id;
-            process.initial_call = Some((module_id, ip));
+            let mut process = Process::with_spawn_registers(3, 0);
             // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
             // arguments into the new heap), OTP-29.1.1: the first process owns its arguments, so
             // a collection never meets a term outside its heap and the literal areas.
             let literals = arinsal_term::LiteralAreas::current();
-            for (register, &arg) in process.x.iter_mut().zip(args) {
+            let mut copied = Vec::with_capacity(args.len());
+            for &arg in args {
                 let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                *register =
+                copied.push(
                     arinsal_term::copy_term_litopt(arg, &mut heap, &literals).map_err(|error| {
                         VmError::Load(format!("first process arguments: {error:?}"))
-                    })?;
+                    })?,
+                );
             }
+            let arity = u8::try_from(args.len())
+                .map_err(|_| VmError::Load("first process arguments".into()))?;
+            let (module_atom, function_atom, _) = mfa_atoms(module, function, arity)
+                .ok_or_else(|| VmError::Load(format!("{module}:{function} name")))?;
+            let args = arinsal_term::TermBuilder::new(&mut process.heap)
+                .list_from_slice(&copied)
+                .map_err(|error| VmError::Load(format!("first process arguments: {error:?}")))?;
             process.set_runtime(Some(runtime));
-            process.initial_mfa = mfa_atoms(module, function, args.len() as u8);
+            // Port of erts/emulator/beam/erl_init.c:356 (erl_first_process_otp): the first
+            // process is spawned through erl_create_process, which starts at beam_run_process.
+            process.start_at_run_process(module_atom, function_atom, args, arity);
             process.entry = true;
             // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
             // the first process gets the first pid; it runs once the system processes
