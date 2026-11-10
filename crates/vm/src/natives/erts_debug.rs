@@ -2625,11 +2625,32 @@ fn debug_wait_round(
     request: &mut dyn FnMut(Box<dyn Fn(usize) + Send + Sync>),
 ) {
     let remaining = std::sync::atomic::AtomicUsize::new(schedulers);
+    let retry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     request(Box::new(move |worker| {
         if drain_owned {
-            arinsal_alloc::typed::drain_owned_deallocations(worker + 1);
+            let status = arinsal_alloc::typed::flush_owned_deallocations(worker + 1);
+            if status.more_work || status.need_thr_progress {
+                retry.store(true, Ordering::Release);
+            }
         }
         if remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if drain_owned && retry.load(Ordering::Acquire) {
+            debug_wait_round(
+                owner,
+                schedulers,
+                pid,
+                completion.clone(),
+                rounds_left,
+                drain_owned,
+                &mut |work| {
+                    let Ok(scheduler) = owner.scheduler() else {
+                        return;
+                    };
+                    scheduler.request_aux_work_all(work);
+                },
+            );
             return;
         }
         let runtime = owner;
@@ -2744,7 +2765,11 @@ fn internal_state_set(
         }
         let completion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         process.slice_mut().debug_wait_completion = Some(completion.clone());
-        let rounds = if kind == "aux_work" { 1 } else { 4 };
+        let rounds = if kind == "aux_work" || drain_owned {
+            1
+        } else {
+            4
+        };
         debug_wait_round(
             runtime,
             ctx.scheduler_count(),

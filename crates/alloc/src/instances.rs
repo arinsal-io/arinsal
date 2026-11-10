@@ -210,10 +210,6 @@ const FIX_INFO_SHIFT: usize = 8;
 /// `ERTS_ALC_FIX_TYPE` flag of the block's `type` word).
 const NOT_FIX: usize = (1 << FIX_INFO_SHIFT) - 1;
 
-/// Passes of an explicit full drain: a queue of fixed-size blocks needs three to hand out its
-/// last block (`unref_end` moves, the marker is appended, `unref_end` moves again).
-const DRAIN_PASSES: usize = 4;
-
 /// How long a requester waits for its owner before it asks the owner again.
 const OWNER_WAIT_SLICE: Duration = Duration::from_micros(200);
 
@@ -771,16 +767,33 @@ impl ThreadSpecificAllocators {
     /// queues the drain on the owner and waits for it.
     pub fn drain_deallocations(&self, instance: usize) -> Result<usize, AllocError> {
         self.on_owner(instance, move |this, state| {
-            // One erts pass moves the queue one step along its protocol; run passes until one
-            // changes nothing, which a runtime waiting for thread progress reaches at once.
             let mut count = 0;
-            for _ in 0..DRAIN_PASSES {
-                let (freed, drained, _) = this.drain_locked(instance, state)?;
-                this.clear_routes(drained);
+            let progress = crate::sspa::progress_ops();
+            let tail = &this.ddq[instance];
+            loop {
+                let (freed, drained, _) = this.drain_limited(instance, state, usize::MAX, true)?;
                 count += freed;
+                this.clear_routes(drained);
+                if !tail.pending(&state.ddq) || !state.ddq.can_advance(tail, progress) {
+                    break;
+                }
             }
             this.publish_transfers(instance, state)?;
             Ok(count)
+        })
+    }
+
+    /// Runs one unbounded delayed-deallocation pass and reports the follow-up work it needs.
+    ///
+    /// Port of `erts_alcu_check_delayed_dealloc` and `handle_delayed_dealloc` in
+    /// erl_alloc_util.c, OTP-29.1.1. The caller must re-arm owner work after thread progress when
+    /// `need_thr_progress` is set; repeating the pass immediately cannot advance `unref_end`.
+    pub fn flush_deallocations(&self, instance: usize) -> Result<DdStatus, AllocError> {
+        self.on_owner(instance, move |this, state| {
+            let (_, drained, status) = this.drain_limited(instance, state, usize::MAX, true)?;
+            this.clear_routes(drained);
+            this.publish_transfers(instance, state)?;
+            Ok(status)
         })
     }
 
@@ -1645,14 +1658,6 @@ impl ThreadSpecificAllocators {
             self.schedule_owner_work(origin);
         }
         Ok(())
-    }
-
-    fn drain_locked(
-        &self,
-        instance: usize,
-        state: &mut Instance,
-    ) -> Result<(usize, Vec<InstanceAllocation>, DdStatus), AllocError> {
-        self.drain_limited(instance, state, usize::MAX, false)
     }
 
     /// Handles up to `limit` queue entries of `instance`; returns the number and the handles of
