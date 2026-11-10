@@ -600,29 +600,38 @@ pub(super) fn resume(
         // Port of beam_common.c:600-614 (`is_CP`/`erts_inspect_frame`), OTP-29.1.1.
         if let Some(word) = p.heap.stack_get(index) {
             let address = word.tagged_word() as usize;
-            if address == crate::native_bridge::native_trace_return_address() {
-                let (function_pc, actions, frame_words) =
-                    crate::trace::native_frame_actions(p, index + 2);
-                if let Some(function) = crate::native_function_at(function_pc)
-                    && let Some(trace_ctx) = ctx.as_deref_mut()
-                {
-                    let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
-                    crate::trace::native_return_events(
-                        vm,
-                        p,
-                        trace_ctx,
-                        &function,
-                        &actions,
-                        class_reason,
-                        true,
-                    )?;
+            // Port of erts/emulator/beam/beam_common.c:604-635 (next_catch: the trace frame
+            // kinds), OTP-29.1.1.
+            if let Some((frame, frame_words)) = crate::trace::trace_frame_at(&p.heap, index) {
+                match frame {
+                    crate::trace::TraceFrame::Return {
+                        exception: true,
+                        function_pc,
+                        session,
+                    } => {
+                        if let Some(trace_ctx) = ctx.as_deref_mut() {
+                            let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
+                            crate::trace::native_return_event(
+                                vm,
+                                p,
+                                trace_ctx,
+                                function_pc,
+                                session,
+                                class_reason,
+                                true,
+                            )?;
+                        } else {
+                            crate::trace::release_return_frame(p, session);
+                        }
+                    }
+                    crate::trace::TraceFrame::Return { session, .. } => {
+                        crate::trace::release_return_frame(p, session);
+                    }
+                    crate::trace::TraceFrame::ReturnTo { session } => {
+                        return_to_sessions.push(session);
+                    }
+                    crate::trace::TraceFrame::CallAcc => {}
                 }
-                return_to_sessions.extend(
-                    actions
-                        .iter()
-                        .filter(|action| action.return_to)
-                        .map(|action| action.session),
-                );
                 index += frame_words;
                 continue;
             }

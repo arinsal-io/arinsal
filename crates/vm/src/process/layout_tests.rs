@@ -117,17 +117,31 @@ fn post_bif_result_root_survives_collection_in_the_fast_arm() {
 }
 
 #[test]
-fn check_process_code_sees_the_return_address_of_a_native_trace_frame() {
-    // A traced native function leaves its return address on the stack as a small integer;
-    // a purge of the code it returns into has to find it.
+fn trace_frame_kinds_round_trip_through_their_return_addresses() {
+    use crate::trace::TraceFrameKind;
+    for kind in [
+        TraceFrameKind::ReturnTrace,
+        TraceFrameKind::ExceptionTrace,
+        TraceFrameKind::ReturnToTrace,
+        TraceFrameKind::CallTraceReturn,
+    ] {
+        assert_eq!(TraceFrameKind::of(kind.address()), Some(kind));
+        assert_eq!(TraceFrameKind::of(kind.address() + 4), None);
+    }
+}
+
+#[test]
+fn check_process_code_sees_the_function_of_a_return_trace_frame() {
+    // A return trace frame names its traced function by a pc in it (erts `&mfa`); a purge of
+    // that code has to find it.
     let mut process = Process::new();
     let range = (0x4000_usize, 0x5000_usize);
-    let marker = crate::trace::native_trace_marker();
+    let stub = crate::trace::TraceFrameKind::ReturnTrace.address();
     assert!(process.heap.reserve_stack(4));
     let words = [
-        crate::proc_create::native_continuation_term(marker),
-        Term::NIL,
+        crate::proc_create::native_continuation_term(stub),
         Term::small(0x4468).unwrap(),
+        Term::NIL,
         Term::small(0).unwrap(),
     ];
     for (index, word) in words.into_iter().enumerate() {

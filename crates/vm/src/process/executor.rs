@@ -113,40 +113,31 @@ pub(super) struct Executor {
 }
 
 impl Executor {
-    /// Emit the trace events of the native frames a return left, and their return_to events
-    /// for the caller at `resume_pc`.
-    pub(super) fn emit_native_return_frames(
+    /// Emit the trace event a return through a trace frame left for the scheduler.
+    pub(super) fn emit_native_return_event(
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
-        frames: crate::trace::NativeTraceFrames,
-        value: Term,
-        resume_pc: usize,
+        event: crate::trace::NativeReturnEvent,
     ) -> Result<(), VmError> {
-        for (function_pc, actions) in frames {
-            let Some(function) = crate::native_function_at(function_pc) else {
-                continue;
-            };
-            crate::trace::native_return_events(
+        match event {
+            crate::trace::NativeReturnEvent::Return {
+                function_pc,
+                session,
+                value,
+            } => crate::trace::native_return_event(
                 &mut self.vm,
                 process,
                 ctx,
-                &function,
-                &actions,
+                function_pc,
+                session,
                 value,
                 false,
-            )?;
-            for action in actions.iter().filter(|action| action.return_to) {
-                crate::trace::native_return_to_event(
-                    &mut self.vm,
-                    process,
-                    ctx,
-                    action.session,
-                    resume_pc,
-                )?;
+            ),
+            crate::trace::NativeReturnEvent::ReturnTo { session, target } => {
+                crate::trace::native_return_to_event(&mut self.vm, process, ctx, session, target)
             }
         }
-        Ok(())
     }
 
     /// Whether the slice can enter `fast_resume`: a native continuation with none of the rare
@@ -173,7 +164,9 @@ impl Executor {
             && !crate::suspend::ctx_suspended(ctx)
             && !crate::dist::fragment_continuation_pending()
             && !trace_boot_enabled()
-            && process.native_pc() != Some(crate::native_bridge::native_trace_return_address())
+            && !process
+                .native_pc()
+                .is_some_and(|pc| crate::trace::TraceFrameKind::of(pc).is_some())
     }
 
     /// The native entry loop of the full path, for the common slices: enter native code at the

@@ -99,13 +99,13 @@ impl Executor {
                 if target_pc == arinsal_beamasm::dispatch::RETURN_TO_DISPATCH_IDENTITY {
                     // A traced native return: its return_from events are out
                     // and its frame is gone; resume_pc is the caller.
-                    if let Some((frames, value)) = process
+                    if let Some(event) = process
                         .cold_mut()
                         .native_return_events
                         .take()
                         .map(|boxed| *boxed)
                     {
-                        self.emit_native_return_frames(process, ctx, frames, value, resume_pc)?;
+                        self.emit_native_return_event(process, ctx, event)?;
                     }
                     let bridge =
                         arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;

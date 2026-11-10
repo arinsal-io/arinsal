@@ -412,24 +412,30 @@ impl Executor {
                             process.set_force_yield(false);
                             break Ok(RunState::Yield);
                         }
-                        if process.native_pc()
-                            == Some(crate::native_bridge::native_trace_return_address())
+                        if let Some(kind) = process
+                            .native_pc()
+                            .and_then(crate::trace::TraceFrameKind::of)
                         {
-                            // The interpreter returned into a traced native function's return
-                            // frame: finish the frame here, as the stub does for native returns.
-                            // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195,
-                            // OTP-29.1.1.
+                            // The scheduler resumes at a trace frame's return address: return
+                            // through the frame here, as its stub does for native returns.
+                            // Port of erts/emulator/beam/jit/arm/instr_trace.cpp
+                            // (emit_return_trace, emit_i_return_to_trace,
+                            // emit_i_call_trace_return), OTP-29.1.1.
                             process.set_native_pc(None);
-                            let value = process.x[0];
-                            let popped =
-                                crate::trace::pop_native_trace_frames(process, |p, words| {
+                            let returned = crate::trace::return_through_trace_frame(
+                                process,
+                                kind,
+                                |p, words| {
                                     p.heap.release_stack(words);
-                                });
-                            let Some((frames, caller)) = popped else {
+                                },
+                            );
+                            let Some((event, caller)) = returned else {
                                 break Err(VmError::Unsupported("native trace frame".into()));
                             };
+                            if let Some(event) = event {
+                                self.emit_native_return_event(process, ctx, event)?;
+                            }
                             let resume_pc = caller.tagged_word() as usize;
-                            self.emit_native_return_frames(process, ctx, frames, value, resume_pc)?;
                             let bridge = arinsal_beamasm::rt::arinsal_enter_native_return
                                 as *const () as usize;
                             if resume_pc == bridge {

@@ -2381,7 +2381,10 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         // (erts_internal_fun_description_from_pc), OTP-29.1.1: the exit bridge is the
         // return address of a process's first call, erts' `beam_normal_exit`.
         let normal_exit = raw == crate::native_bridge::bridge_return_address();
-        if native_return || normal_exit {
+        // A trace frame's return address is a CP of no function
+        // (erts_internal_fun_description_from_pc).
+        let trace_frame = crate::trace::TraceFrameKind::of(raw).is_some();
+        if native_return || normal_exit || trace_frame {
             let slot = base.wrapping_add(index * 8);
             let description = if normal_exit {
                 "<terminate process normally>".into()
@@ -2398,7 +2401,20 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         let _ = write!(text, "{:<8} ", format!("y({yreg})"));
         yreg += 1;
         if word.classify() == TermKind::Catch {
-            let _ = writeln!(text, "Catch {raw:#018x} ({})", pc_description(word, false));
+            // Port of erts/emulator/beam/erl_process.c:14992-14995 (stack_element_dump), OTP-29.1.1:
+            // the catch's handler pc and its function.
+            let pc = crate::stacktrace::native_catch_address(word).unwrap_or(0);
+            let description = match crate::native_bridge::native_function_at(pc) {
+                Some(function) => format!(
+                    "{}:{}/{} + {}",
+                    function.module,
+                    function.function,
+                    function.arity,
+                    pc - function.start
+                ),
+                None => "unknown function".into(),
+            };
+            let _ = writeln!(text, "Catch {pc:#018x} ({description})");
         } else {
             let _ = writeln!(text, "{}", print(word));
         }

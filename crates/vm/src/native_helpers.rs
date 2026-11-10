@@ -948,71 +948,37 @@ fn undefined_atom() -> Term {
     })
 }
 
-/// Completes a traced native return and resumes its saved caller continuation.
-// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader) -> u64 {
+/// Returns through the trace frame of kind `kind` (passed by its return stub) and resumes at
+/// the caller's return address. A return_trace or return_to event needs the scheduler's
+/// tracer context: the return then leaves native code like a trapped call.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp (emit_return_trace,
+// emit_i_return_to_trace, emit_i_call_trace_return), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_native_trace_return(
+    header: *mut ProcessHeader,
+    kind: u64,
+) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let value = process.x[0];
-    if let Some(pid) = process.self_pid
-        && let Some((saved_caller, action)) =
-            crate::trace::pop_native_call_acc_frame(process, |p, words| {
-                p.heap
-                    .set_stack_pointer(p.heap.abi.stop.wrapping_add(words));
-            })
-        && let Some(acc) = action.acc
-    {
-        crate::trace::call_acc_return(process, pid, action.session, acc.flags, acc.prev);
-        return saved_caller.tagged_word();
-    }
-    let Some((frames, saved_caller)) =
-        crate::trace::pop_native_trace_frames(process, |p, words| {
+    let Some(kind) = crate::trace::TraceFrameKind::from_index(kind) else {
+        return 0;
+    };
+    let Some((event, caller)) =
+        crate::trace::return_through_trace_frame(process, kind, |p, words| {
             p.heap
                 .set_stack_pointer(p.heap.abi.stop.wrapping_add(words));
         })
     else {
-        return process
-            .heap
-            .stack_get(0)
-            .map_or(0, |word| word.tagged_word());
+        return 0;
     };
-    if frames
-        .iter()
-        .all(|(_, actions)| actions.iter().all(|action| action.acc.is_some()))
-        && let Some(pid) = process.self_pid
-    {
-        // Port of erts/emulator/beam/emu/trace_instrs.tab:54-70 (i_call_trace_return calls
-        // erts_call_trace_return), OTP-29.1.1: call time and memory accounting needs no tracer
-        // context, so the return stays in native code.
-        for (_, actions) in &frames {
-            for action in actions.iter().rev() {
-                if let Some(acc) = action.acc {
-                    crate::trace::call_acc_return(
-                        process,
-                        pid,
-                        action.session,
-                        acc.flags,
-                        acc.prev,
-                    );
-                }
-            }
-        }
-        return saved_caller.tagged_word();
-    }
-    if frames.iter().any(|(_, actions)| !actions.is_empty()) {
-        // The return events need the scheduler's tracer context (and the return_to event the
-        // caller), so the return leaves native code like a trapped call and resumes at the
-        // caller.
-        // Port of erts/emulator/beam/emu/trace_instrs.tab:25-105 (return_trace,
-        // i_return_to_trace), OTP-29.1.1.
-        process.cold_mut().native_return_events = Some(Box::new((frames, value)));
+    if let Some(event) = event {
+        process.cold_mut().native_return_events = Some(Box::new(event));
         registers.tmp_mem[0] = arinsal_beamasm::dispatch::RETURN_TO_DISPATCH_IDENTITY as u64;
-        registers.tmp_mem[1] = saved_caller.tagged_word();
+        registers.tmp_mem[1] = caller.tagged_word();
         registers.tmp_mem[3] = 2;
         return arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize as u64;
     }
-    saved_caller.tagged_word()
+    caller.tagged_word()
 }
 
 /// Collects from the native heap and stack cursors published by generated code.

@@ -967,7 +967,7 @@ impl ProcDict {
 }
 /// The traced native functions a return left, innermost first with their trace actions, and the
 /// returned value.
-pub(crate) type NativeReturnEvents = crate::trace::PoppedNativeFrames;
+pub(crate) type NativeReturnEvents = crate::trace::NativeReturnEvent;
 
 /// What both halves of a monitor share and never change. The DOWN tag and the name are rare,
 /// so they live in a separate box, as erts keeps them only in `ErtsMonitorDataExtended` /

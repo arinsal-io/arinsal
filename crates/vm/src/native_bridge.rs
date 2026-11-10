@@ -698,7 +698,6 @@ fn scan_catch(
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
     let mut traced = 0usize;
-    let trace_return_address = native_trace_return_address();
     while let Some((index, word)) = stack.next() {
         let raw = word.tagged_word();
         if raw & 63 == 0x1b
@@ -725,18 +724,13 @@ fn scan_catch(
         }
         // Port of erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
         if arinsal_term::is_cp(raw) {
-            if raw as usize == trace_return_address {
+            // Port of erts/emulator/beam/beam_common.c:604-635 (next_catch), OTP-29.1.1: a
+            // trace frame is a CP followed by its data words. Its events need the scheduler.
+            if let Some(kind) = crate::trace::TraceFrameKind::of(raw as usize) {
                 traced = 1;
-                let actions = heap
-                    .stack_get(index + 3)
-                    .and_then(Term::as_small)
-                    .and_then(|count| usize::try_from(count).ok())
-                    .unwrap_or(0);
-                let words = 4usize.saturating_add(actions.saturating_mul(2));
-                // The whole trace frame sits below the catching frame's Y slots.
-                previous_cp = index + words - arinsal_term::CP_WORDS;
+                previous_cp = index;
                 seen_cp = true;
-                for _ in 1..words {
+                for _ in 0..kind.data_words() {
                     if stack.next().is_none() {
                         break;
                     }
@@ -835,9 +829,16 @@ fn register_bridge_continuation() -> Result<(), &'static str> {
     *REGISTERED.get_or_init(|| {
         let address = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
         arinsal_term::register_native_code_range(address, address + 4)?;
-        let trace_return =
-            arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize;
-        arinsal_term::register_native_code_range(trace_return, trace_return + 4)
+        for kind in [
+            crate::trace::TraceFrameKind::ReturnTrace,
+            crate::trace::TraceFrameKind::ExceptionTrace,
+            crate::trace::TraceFrameKind::ReturnToTrace,
+            crate::trace::TraceFrameKind::CallTraceReturn,
+        ] {
+            let stub = kind.address();
+            arinsal_term::register_native_code_range(stub, stub + 4)?;
+        }
+        Ok(())
     })
 }
 
@@ -845,10 +846,6 @@ fn register_bridge_continuation() -> Result<(), &'static str> {
 /// `beam_normal_exit`.
 pub(crate) fn bridge_return_address() -> usize {
     arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
-}
-
-pub(crate) fn native_trace_return_address() -> usize {
-    arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
 }
 
 /// Register a native code range for GC continuation recognition and stack traces.
@@ -1028,9 +1025,9 @@ pub(crate) fn is_native_function_at(address: usize) -> bool {
 }
 
 /// A word the interpreter returns into by continuing native code: a native return address, or
-/// the stub of a traced native function's return frame.
+/// the return address of a trace frame.
 pub(crate) fn is_native_continuation(address: usize) -> bool {
-    address == native_trace_return_address() || is_native_function_at(address)
+    crate::trace::TraceFrameKind::of(address).is_some() || is_native_function_at(address)
 }
 
 pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> {
