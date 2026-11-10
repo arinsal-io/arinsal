@@ -1115,6 +1115,7 @@ fn create_child(
             init_child,
             so.priority,
             so.scheduler,
+            parent_alloc_ix,
         )
         .map_err(|error| match error {
             arinsal_sched::SpawnInitError::Init(error) => error,

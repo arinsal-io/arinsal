@@ -45,6 +45,7 @@ impl<T: Task> ProcRef<T> {
     /// Port of erts/emulator/beam/erl_process.c (alloc_process: `erts_alloc(ERTS_ALC_T_PROC)`
     /// and `refc` 1), OTP-29.1.1.
     pub(crate) fn new_with<C, R>(
+        alloc_ix: Option<usize>,
         prepare: impl FnOnce() -> Option<C>,
         build: impl FnOnce(&C) -> Process<T>,
         init: impl FnOnce(&mut Process<T>, &C) -> R,
@@ -53,7 +54,9 @@ impl<T: Task> ProcRef<T> {
             std::mem::align_of::<ProcessBlock<T>>() <= std::mem::align_of::<u64>(),
             "allocator blocks are word aligned"
         );
-        let ix = arinsal_alloc::thread_alloc_ix();
+        // erts allocates the Process with the scheduler's own allocator instance (`esdp`); a
+        // caller that knows it passes it, any other caller looks the thread up.
+        let ix = alloc_ix.unwrap_or_else(arinsal_alloc::thread_alloc_ix);
         let payload = fix_alloc_payload_at(
             ix,
             ErtsAlcType::PROC,
