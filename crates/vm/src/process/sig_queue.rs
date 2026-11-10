@@ -452,7 +452,7 @@ impl Process {
                 let was_linked = linked_exit && self.links.remove(from.data()).is_some();
                 let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
-                if reason == crate::signals::atom("kill") && !linked_exit {
+                if reason == Term::atom(arinsal_term::atoms::KILL) && !linked_exit {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
                     // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
                     return Err(VmError::Trap(crate::exceptions::Trap::killed()));
@@ -465,7 +465,8 @@ impl Process {
                     let from = crate::dist::remote_pid_term(self, from)?
                         .or_else(|| from.to_term())
                         .ok_or_else(|| VmError::Unsupported("invalid signal sender pid".into()))?;
-                    let tuple = self.tuple(&[crate::signals::atom("EXIT"), from, reason])?;
+                    let tuple =
+                        self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), from, reason])?;
                     if priority {
                         self.push_priority_message(tuple)?;
                     } else if let Some(token) = seq_token {
@@ -509,11 +510,12 @@ impl Process {
                         return Ok(2);
                     }
                 }
-                if reason == crate::signals::atom("kill") {
+                if reason == Term::atom(arinsal_term::atoms::KILL) {
                     return Err(VmError::Trap(crate::exceptions::Trap::killed()));
                 }
                 if self.trap_exit {
-                    let tuple = self.tuple(&[crate::signals::atom("EXIT"), port, reason])?;
+                    let tuple =
+                        self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), port, reason])?;
                     self.inbox.push_back(tuple);
                     return Ok(1);
                 }
@@ -525,7 +527,11 @@ impl Process {
             }
             arinsal_sched::Signal::MonitorNoproc(reference) => {
                 let queued = self.inbox.len();
-                self.deliver_monitor_down(from, reference, crate::signals::atom("noproc"))?;
+                self.deliver_monitor_down(
+                    from,
+                    reference,
+                    Term::atom(arinsal_term::atoms::NOPROC),
+                )?;
                 self.trace_new_message(ctx, queued, from);
                 // convert_to_down_message (erl_proc_sig_queue.c:4838-5056).
                 8
@@ -756,7 +762,7 @@ impl Process {
                     self.runtime,
                     ctx.pid(),
                     link,
-                    crate::signals::atom("abandoned"),
+                    Term::atom(arinsal_term::atoms::ABANDONED),
                 );
             }
             convert_to_message = false;
@@ -893,9 +899,10 @@ impl Process {
         let mut message = reason;
         let seq_token = message.take_seq_token();
         let reason = message.into_receiver(self)?;
-        if self.trap_exit && (linked || reason != crate::signals::atom("kill")) {
+        if self.trap_exit && (linked || reason != Term::atom(arinsal_term::atoms::KILL)) {
             let from_term = crate::dist::external_pid_term(&mut self.heap, from)?;
-            let tuple = self.tuple(&[crate::signals::atom("EXIT"), from_term, reason])?;
+            let tuple =
+                self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), from_term, reason])?;
             if prio {
                 self.push_priority_message(tuple)?;
             } else if let Some(token) = seq_token {
@@ -909,7 +916,7 @@ impl Process {
             }
             return Ok(1);
         }
-        if !linked && reason == crate::signals::atom("kill") {
+        if !linked && reason == Term::atom(arinsal_term::atoms::KILL) {
             return Err(VmError::Trap(crate::exceptions::Trap::killed()));
         }
         if reason != Term::atom(arinsal_term::atoms::NORMAL) {

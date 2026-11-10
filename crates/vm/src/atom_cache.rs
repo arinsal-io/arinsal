@@ -41,3 +41,12 @@ pub(crate) fn atom(name: &'static str) -> Term {
     slot.key.store(key, Ordering::Release);
     Term::atom(atom)
 }
+
+/// The atom named `name`, created when it does not exist yet.
+///
+/// For names that erts does not predefine: those take an `arinsal_term::atoms` constant
+/// (`am_*`). erts builds the others at run time with `ERTS_MAKE_AM`/`erts_atom_put`.
+// Port of erts/emulator/beam/atom.c (erts_atom_put), OTP-29.1.1.
+pub(crate) fn put(name: &str) -> Term {
+    Term::atom(global_atoms().intern(name).expect("atom table full"))
+}

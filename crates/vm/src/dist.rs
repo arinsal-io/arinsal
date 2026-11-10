@@ -2259,7 +2259,7 @@ pub(crate) fn spawn_reply_message(
     let result = from_owned(&data.result, &mut process.heap).map_err(|_| badarg())?;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
-        .tuple(&[tag, reference, crate::signals::atom(status), result])
+        .tuple(&[tag, reference, crate::atom_cache::put(status), result])
         .map_err(|_| badarg())
 }
 

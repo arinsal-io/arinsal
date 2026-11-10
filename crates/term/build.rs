@@ -53,6 +53,17 @@ fn main() {
                 .unwrap_or(atom);
             if !indices.contains_key(atom) {
                 indices.insert(atom.to_owned(), names.len());
+                // make_tables `save_atoms`: a BIF's module and function atoms that are plain
+                // words get their `am_` constant like the atom.names entries; quoted ones only
+                // an internal alias.
+                if atom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    declarations.push((
+                        atom.to_ascii_uppercase(),
+                        atom.to_owned(),
+                        names.len(),
+                        false,
+                    ));
+                }
                 names.push(atom.to_owned());
             }
         }

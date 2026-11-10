@@ -222,7 +222,8 @@ impl Process {
                 let term = message.into_receiver(self)?;
                 let id = timer_id.or(reference.ref_key()).unwrap_or(reference.id());
                 let reference = crate::signals::reference(self, id)?;
-                let tuple = self.tuple(&[crate::signals::atom("timeout"), reference, term])?;
+                let tuple =
+                    self.tuple(&[Term::atom(arinsal_term::atoms::TIMEOUT), reference, term])?;
                 self.inbox.push_back(tuple);
                 self.trace_converted_signal(ctx, tuple, from);
             }

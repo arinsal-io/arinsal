@@ -2056,7 +2056,7 @@ impl arinsal_drv::PortHost for DrvHost {
             return;
         }
         let runtime = self.runtime;
-        let where_term = where_.map_or_else(|| Term::small(0).unwrap(), crate::signals::atom);
+        let where_term = where_.map_or_else(|| Term::small(0).unwrap(), crate::atom_cache::put);
         crate::trace::emit_port_event(
             runtime,
             port.id(),

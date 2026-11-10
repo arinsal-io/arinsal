@@ -144,48 +144,7 @@ impl Executor {
         } else {
             (|| -> Result<RunState, VmError> {
                 'execution: {
-                    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
-                    // A spawned MFA may name a BIF directly; execute it as the process entry so
-                    // exceptions such as exit/1 retain their BIF class and reason.
-                    let initial_bif = process.take_work(|work| work.initial_bif.take());
                     let dirty_sys_gc = process.slice().is_some_and(|work| work.dirty_sys_gc);
-                    if let Some((module, function, arity)) = initial_bif {
-                        // Both spawn paths (erl_create_process and the distributed spawn) place the
-                        // BIF's arguments in X0..X(arity-1); the entry runs the BIF on them.
-                        let mut args = process.x[..usize::from(arity)].to_vec();
-                        let Some(bif) = arinsal_bifs::lookup(&module, &function, arity) else {
-                            // A BIF implemented by a VM native (process-aware BIFs such as
-                            // erlang:node/1 or register/2) runs through the native table.
-                            let resolved =
-                                crate::natives::classify(&module, &function, arity, true);
-                            match self.vm.dispatch_native(
-                                process,
-                                ctx,
-                                &module,
-                                &function,
-                                usize::from(arity),
-                                resolved,
-                            ) {
-                                Some(Ok(value)) => break 'execution Ok(RunState::Done(value)),
-                                Some(Err(error)) => break 'execution Err(error),
-                                None => {
-                                    break 'execution Err(VmError::Unsupported(format!(
-                                        "spawned BIF entry {module}:{function}/{arity} has no native"
-                                    )));
-                                }
-                            }
-                        };
-                        let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
-                        crate::calls::gc_after_bif(process, &mut args, &mut result)?;
-                        match result {
-                            Ok(value) => break 'execution Ok(RunState::Done(value)),
-                            Err(error) => {
-                                break 'execution Err(crate::exceptions::direct_bif_error(
-                                    process, &module, &function, &args, error,
-                                ));
-                            }
-                        }
-                    }
                     // Port of erts/emulator/beam/erl_process.c:10318-10372 (ERTS_PSFLG_RUNNING_SYS:
                     // handle signals and execute system tasks before Erlang code), OTP-29.1.1.
                     // Port of erts/emulator/beam/erl_process.c:10363-10372 and 11018-11040

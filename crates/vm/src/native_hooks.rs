@@ -182,7 +182,7 @@ pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a 
 pub(crate) fn set_error(process: &mut Process, name: &str) {
     // `am_badarg` and the other built-in error atoms. Interning the reason on
     // every `persistent_term:get/1` miss took the atom-table lock.
-    let term = crate::signals::atom(name);
+    let term = crate::atom_cache::put(name);
     process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
     process.heap.abi.exc.fvalue = term.tagged_word();
 }
@@ -702,7 +702,7 @@ fn set_light_error(process: &mut Process, error: &BifError) {
 
 /// Builds `error:{Tag, Value}` for a guard BIF failure.
 fn tagged_error(process: &mut Process, tag: &str, value: Term) -> BifError {
-    let tag = crate::signals::atom(tag);
+    let tag = crate::atom_cache::put(tag);
     match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[tag, value])
     {

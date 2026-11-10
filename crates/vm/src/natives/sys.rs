@@ -830,20 +830,20 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
         let result = (|| {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let key = copy_term(key, &mut heap).map_err(|_| {
-                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                    "system_limit",
+                VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
                 )))
             })?;
             let pair = TermBuilder::new(&mut heap)
                 .tuple(&[key, value])
                 .map_err(|_| {
-                    VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                        "system_limit",
+                    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
                     )))
                 })?;
             TermBuilder::new(&mut heap).cons(pair, tail).map_err(|_| {
-                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                    "system_limit",
+                VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
                 )))
             })
         })();

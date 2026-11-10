@@ -272,7 +272,7 @@ fn send_monitor_down_noconnection(
         watcher,
         Signal::MonitorDownImmediate {
             reference,
-            reason: crate::signals::atom("noconnection").word(),
+            reason: Term::atom(arinsal_term::atoms::NOCONNECTION).word(),
         },
     );
 }

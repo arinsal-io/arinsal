@@ -92,8 +92,8 @@ fn atom(term: Term, name: &str) -> bool {
         .is_some_and(|s| s == name)
 }
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-        "badarg",
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
     )))
 }
 /// The process's token for `process_info(Pid, sequential_trace_token)`, read without clearing
@@ -213,7 +213,7 @@ pub(crate) fn set_system_tracer(
     } else {
         false
     };
-    if value != crate::signals::atom("false")
+    if value != Term::atom(arinsal_term::atoms::FALSE)
         && Pid::from_term(value).is_none()
         && value.as_port().is_none()
         && !module_state
@@ -229,7 +229,7 @@ pub(crate) fn set_system_tracer(
     {
         return Err(badarg());
     }
-    let next = if value == crate::signals::atom("false") {
+    let next = if value == Term::atom(arinsal_term::atoms::FALSE) {
         OwnedTerm::atom("false")
     } else {
         to_owned(value).map_err(|_| badarg())?
@@ -251,7 +251,7 @@ pub(crate) fn system_tracer_info(process: &mut Process) -> Result<Term, VmError>
     )
     .map_err(|e| VmError::Unsupported(format!("seq tracer info: {e:?}")))?;
     TermBuilder::new(&mut process.heap)
-        .tuple(&[crate::signals::atom("sequential_tracer"), value])
+        .tuple(&[Term::atom(arinsal_term::atoms::SEQUENTIAL_TRACER), value])
         .map_err(|e| VmError::Unsupported(format!("seq tracer info tuple: {e:?}")))
 }
 
@@ -600,7 +600,7 @@ fn emit(
         return;
     };
     let detail = TermBuilder::new(&mut scratch).tuple(&[
-        crate::signals::atom(event.kind),
+        crate::atom_cache::put(event.kind),
         serial,
         sender,
         receiver,
@@ -609,7 +609,11 @@ fn emit(
     let Ok(detail) = detail else {
         return;
     };
-    let mut values = vec![crate::signals::atom("seq_trace"), Term::NIL, detail];
+    let mut values = vec![
+        Term::atom(arinsal_term::atoms::SEQ_TRACE),
+        Term::NIL,
+        detail,
+    ];
     let Ok(label) = from_owned(&token.label, &mut scratch) else {
         return;
     };
@@ -675,7 +679,7 @@ fn emit(
         let Some(tracee) = process.self_pid.and_then(Pid::to_term) else {
             return;
         };
-        let tag = crate::signals::atom("seq_trace");
+        let tag = Term::atom(arinsal_term::atoms::SEQ_TRACE);
         let action = crate::natives::nif::invoke_tracer(
             vm,
             process,
@@ -684,24 +688,24 @@ fn emit(
             None,
             &[tag, state, tracee],
         );
-        if action != Some(crate::signals::atom("trace")) {
+        if action != Some(Term::atom(arinsal_term::atoms::TRACE)) {
             return;
         }
         let mut opts = Vec::new();
         if token.flags & TIMESTAMP != 0 {
             opts.push((
-                crate::signals::atom("timestamp"),
-                crate::signals::atom("timestamp"),
+                Term::atom(arinsal_term::atoms::TIMESTAMP),
+                Term::atom(arinsal_term::atoms::TIMESTAMP),
             ));
         } else if token.flags & STRICT_MONOTONIC != 0 {
             opts.push((
-                crate::signals::atom("timestamp"),
-                crate::signals::atom("strict_monotonic"),
+                Term::atom(arinsal_term::atoms::TIMESTAMP),
+                Term::atom(arinsal_term::atoms::STRICT_MONOTONIC),
             ));
         } else if token.flags & MONOTONIC != 0 {
             opts.push((
-                crate::signals::atom("timestamp"),
-                crate::signals::atom("monotonic"),
+                Term::atom(arinsal_term::atoms::TIMESTAMP),
+                Term::atom(arinsal_term::atoms::MONOTONIC),
             ));
         }
         let Ok(opts) = TermBuilder::new(&mut scratch).flatmap_from_pairs(&opts) else {
@@ -955,16 +959,16 @@ fn print(
     message: Term,
 ) -> Result<Term, VmError> {
     let Some(current) = token(process) else {
-        return Ok(crate::signals::atom("false"));
+        return Ok(Term::atom(arinsal_term::atoms::FALSE));
     };
     if let Some(label) = label
         && to_owned(label).ok().as_ref() != Some(&current.label)
     {
-        return Ok(crate::signals::atom("false"));
+        return Ok(Term::atom(arinsal_term::atoms::FALSE));
     }
     let msg = to_owned(message).map_err(|_| badarg())?;
     let Some(t) = update_serial(process, pid) else {
-        return Ok(crate::signals::atom("false"));
+        return Ok(Term::atom(arinsal_term::atoms::FALSE));
     };
     emit(
         Some(vm),
@@ -979,7 +983,7 @@ fn print(
             info: msg,
         },
     );
-    Ok(crate::signals::atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 #[cfg(test)]
@@ -998,12 +1002,18 @@ mod tests {
         let mut process = Process::new();
         let pid = Pid::new(8101, 1);
         let label = Term::small(99).unwrap();
-        set_component(&mut process, pid, crate::signals::atom("label"), label).unwrap();
         set_component(
             &mut process,
             pid,
-            crate::signals::atom("send"),
-            crate::signals::atom("true"),
+            Term::atom(arinsal_term::atoms::LABEL),
+            label,
+        )
+        .unwrap();
+        set_component(
+            &mut process,
+            pid,
+            Term::atom(arinsal_term::atoms::SEND),
+            Term::atom(arinsal_term::atoms::TRUE),
         )
         .unwrap();
         similar_asserts::assert_eq!(token(&mut process).unwrap().label, OwnedTerm::Int(99));
@@ -1018,7 +1028,7 @@ mod tests {
         set_component(
             &mut process,
             pid,
-            crate::signals::atom("label"),
+            Term::atom(arinsal_term::atoms::LABEL),
             Term::small(7).unwrap(),
         )
         .unwrap();
