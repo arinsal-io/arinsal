@@ -2433,22 +2433,11 @@ fn module_call_enabled(
 
 /// Whether `module:function/arity` is the initial call of the process.
 pub(crate) fn is_initial_call(process: &Process, module: &str, function: &str, arity: u8) -> bool {
+    // Port of erts/emulator/beam/beam_bp.c:1107-1111 (erts_call_trace memory accounting:
+    // `c_p->u.initial` equals the breakpoint's MFA), OTP-29.1.1.
     let names = arinsal_term::global_atoms();
-    if process.initial_mfa.is_some_and(|(m, f, a)| {
+    process.initial_mfa.is_some_and(|(m, f, a)| {
         a == arity && names.text(m) == Some(module) && names.text(f) == Some(function)
-    }) {
-        return true;
-    }
-    // Spawn records the entry as a module id and instruction (`p->u.initial`), not strings.
-    let Some((module_id, ip)) = process.initial_call else {
-        return false;
-    };
-    process.runtime.as_ref().is_some_and(|runtime| {
-        runtime.with_modules(|modules| {
-            modules.get(module_id).is_some_and(|loaded| {
-                loaded.name == module && loaded.function_at(ip) == Some((function, arity))
-            })
-        })
     })
 }
 
@@ -2856,7 +2845,7 @@ fn caller_info(
 fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
     // Reserve one slot beyond OTP's MAX_BACKTRACE_SIZE for the current frame, which is
     // removed before the caller prefixes are built below.
-    let trace = crate::stacktrace::build(&vm.code.modules, process, None, 65)?;
+    let trace = crate::stacktrace::build(process, None, 65)?;
     let owned = to_owned(trace)
         .map_err(|error| VmError::Unsupported(format!("match stacktrace copy: {error:?}")))?;
     let OwnedTerm::List { elems, .. } = &owned else {

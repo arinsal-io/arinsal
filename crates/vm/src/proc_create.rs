@@ -378,7 +378,6 @@ pub struct Process {
     /// erl_process.c:12960-12965 happens when it first runs.
     pub(crate) seq_trace_spawn_pending: bool,
     pub(crate) module: usize,
-    pub(crate) initial_call: Option<(usize, usize)>,
     /// `p->u.initial` (erl_process.c:12693): the MFA the process was spawned with, as atoms.
     pub(crate) initial_mfa: Option<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
     native_pc: Option<usize>,
@@ -2104,7 +2103,6 @@ impl Process {
             seq_trace_epoch: crate::seq_trace::current_epoch(),
             seq_trace_spawn_pending: false,
             module: 0,
-            initial_call: None,
             initial_mfa: None,
             native_pc: None,
             slow: Self::SLOW_NOT_STARTED | Self::SLOW_NO_NATIVE_PC | Self::SLOW_NO_PROBE,
@@ -2859,10 +2857,6 @@ mod layout_report {
             size_of_val(&process.seq_trace_spawn_pending)
         );
         eprintln!("  Process.module {}", size_of_val(&process.module));
-        eprintln!(
-            "  Process.initial_call {}",
-            size_of_val(&process.initial_call)
-        );
         eprintln!(
             "  Process.initial_mfa {}",
             size_of_val(&process.initial_mfa)

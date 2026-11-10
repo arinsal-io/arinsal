@@ -457,16 +457,13 @@ fn frame_in(
     ranges: &[ModuleRange],
     address: usize,
     hint: &AtomicUsize,
-    line_file_terms: Option<&std::collections::HashMap<String, Term>>,
 ) -> Option<NativeStackFrame> {
     let range = find_range_with(ranges, address, hint)?;
     let info = lookup_function_info(range, address, true);
     let function = info.mfa?;
     let loc = info.loc.map(|entry| entry.location).filter(|&loc| loc != 0);
     let file = loc.and_then(|location| info.fname_ptr?.get((location >> 24) as usize));
-    let file_term = file
-        .and_then(|file| file.file_term)
-        .or_else(|| file.and_then(|file| line_file_terms?.get(file.name.as_ref()).copied()));
+    let file_term = file.and_then(|file| file.file_term);
     let location =
         loc.and_then(|location| file_term.map(|file| (file, u64::from(location & 0x00ff_ffff))));
     debug_assert_eq!(info.needed, if location.is_some() { 15 } else { 5 });
@@ -486,18 +483,17 @@ fn frame_in(
 pub(crate) fn stack_frame_in(
     ranges: Option<&[ModuleRange]>,
     address: usize,
-    line_file_terms: Option<&std::collections::HashMap<String, Term>>,
 ) -> Option<NativeStackFrame> {
     let Some(ranges) = ranges else {
         if !arinsal_term::may_be_native_code_pointer(address) {
             return None;
         }
-        return native_frame_at(address, line_file_terms);
+        return native_frame_at(address);
     };
     static HINT: AtomicUsize = AtomicUsize::new(0);
     // Code-index ranges carry the owning module's cached file term on each line entry, like
-    // erts' BeamCodeLineTab. The caller's module table is only available on registry fallback.
-    frame_in(ranges, address, &HINT, None)
+    // erts' BeamCodeLineTab.
+    frame_in(ranges, address, &HINT)
 }
 
 /// Runs `visit` on the function of a registered native module that contains `address`.
@@ -1031,19 +1027,16 @@ pub(crate) fn is_native_continuation(address: usize) -> bool {
 }
 
 pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> {
-    native_frame_at(address, None)
+    native_frame_at(address)
 }
 
 // Port of erts/emulator/beam/beam_ranges.c:245-280 (`erts_lookup_function_info`), OTP-29.1.1.
-fn native_frame_at(
-    address: usize,
-    line_file_terms: Option<&std::collections::HashMap<String, Term>>,
-) -> Option<NativeStackFrame> {
+fn native_frame_at(address: usize) -> Option<NativeStackFrame> {
     static HINT: AtomicUsize = AtomicUsize::new(0);
     if !arinsal_term::may_be_native_code_pointer(address) {
         return None;
     }
-    frame_in(&all_ranges().load(), address, &HINT, line_file_terms)
+    frame_in(&all_ranges().load(), address, &HINT)
 }
 
 /// Every registered native function of `module`, keyed by name and arity, restricted to the
@@ -1085,24 +1078,6 @@ pub(crate) fn native_functions_of(
         }
     }
     scoped
-}
-
-pub(crate) fn native_function_for(
-    scope: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Option<NativeFunction> {
-    let module_atom = arinsal_term::global_atoms().get(module)?;
-    all_ranges()
-        .load()
-        .iter()
-        .filter(|entry| {
-            (entry.scope == scope || entry.scope == 0) && entry.module_atom == module_atom
-        })
-        .flat_map(|entry| entry.functions.iter())
-        .find(|entry| entry.function == function && entry.arity == arity)
-        .cloned()
 }
 
 /// Enter one native function and commit its ABI state before returning to the scheduler.

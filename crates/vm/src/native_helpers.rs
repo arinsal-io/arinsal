@@ -90,7 +90,7 @@ pub extern "C" fn arinsal_beamasm_build_stacktrace(
         return 0;
     };
     let trace = crate::native_hooks::from_raw(trace_raw);
-    match crate::exceptions::materialize(None, process, trace) {
+    match crate::exceptions::materialize(process, trace) {
         Ok(value) => {
             process.x[0] = value;
             crate::native_hooks::raw(value)
@@ -115,7 +115,7 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
     };
     let reason = crate::native_hooks::from_raw(reason_raw);
     let trace = crate::native_hooks::from_raw(trace_raw);
-    let result = crate::exceptions::materialize(None, process, trace).and_then(|stacktrace| {
+    let result = crate::exceptions::materialize(process, trace).and_then(|stacktrace| {
         arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .tuple(&[reason, stacktrace])
             .map_err(|error| crate::VmError::Unsupported(format!("stacktrace tuple {error:?}")))

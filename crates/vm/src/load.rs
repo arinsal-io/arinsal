@@ -803,33 +803,6 @@ impl Vm {
             .find(|record| record.name == name)
     }
 
-    /// Resolve an MFA through the atom-keyed export table, loading a stub's module if needed.
-    pub(crate) fn spawn_export(
-        &mut self,
-        module_atom: Atom,
-        function_atom: Atom,
-        arity: u8,
-    ) -> Result<(usize, usize), VmError> {
-        // Port of erts/emulator/beam/export.c:228-242 (erts_export_get_or_make_stub), OTP-29.1.1.
-        let key = (module_atom, function_atom, arity);
-        if !self.code.exports.entries.contains_key(&key) {
-            self.code_ix.update_active(|tables| {
-                tables.exports.entries.entry(key).or_default();
-            });
-        }
-        let module_name = global_atoms()
-            .text(module_atom)
-            .ok_or_else(|| VmError::Load("invalid module atom".into()))?;
-        let module_id = self.load_named(module_name)?;
-        let module = &self.code.modules[module_id];
-        let Some(export) = module.export_slot_atom(function_atom, arity) else {
-            return Err(VmError::Trap(crate::exceptions::Trap::error(
-                crate::signals::atom("undef"),
-            )));
-        };
-        Ok((module_id, export.target()))
-    }
-
     /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         let otp = std::env::var_os("ARINSAL_OTP_ROOT")

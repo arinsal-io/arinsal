@@ -125,20 +125,13 @@ impl Executor {
                     process.set_native_resume_arity(3);
                 }
                 None => {
-                    self.vm.resolve_run_process(process)?;
+                    return Err(VmError::Unsupported(
+                        "the beam_run_process stub is not built".into(),
+                    ));
                 }
             }
         }
-        let first_run = !process.replace_entry_started(true);
-        // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i`), OTP-29.1.1:
-        // the first run starts at the code address of the spawned function (`p->u.initial`).
-        if first_run
-            && process.native_pc().is_none()
-            && let Some((module_id, entry)) = process.initial_call
-            && let Some(start) = self.vm.native_entry_address(module_id, entry)
-        {
-            process.set_native_pc(Some(start));
-        }
+        process.replace_entry_started(true);
         let need_x = self.vm.code.registers[process.module].0;
         if need_x > crate::proc_create::ATTACHED_X_REGS {
             return Err(VmError::Unsupported(format!(

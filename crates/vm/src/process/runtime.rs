@@ -496,13 +496,4 @@ impl Runtime {
             })
             .is_some_and(|state| state & proc_flags::HIBERNATED != 0)
     }
-
-    /// Run `body` against the module table shared by scheduler processes.
-    pub(crate) fn with_modules<R>(
-        &self,
-        body: impl FnOnce(&[Arc<arinsal_loader::Module>]) -> R,
-    ) -> R {
-        let code = self.code.active_tables();
-        body(&code.modules)
-    }
 }

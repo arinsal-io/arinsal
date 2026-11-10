@@ -535,39 +535,25 @@ pub(crate) fn pid_table_index(pid: Pid) -> u32 {
 /// process spawned but not yet run holds it in `module`; no module has this id.
 pub(crate) const RUN_PROCESS: usize = usize::MAX;
 
-impl Vm {
-    /// First run of a spawned process: erts' apply_only instruction (beam_common.c:1434 `apply`)
-    /// on X0..X2 (module, function, argument list). The export is the target when it exists;
-    /// otherwise the process starts at erlang:apply/3, so an undefined function fails in the
-    /// child with `undef`, as in erts.
-    pub(crate) fn resolve_run_process(&mut self, process: &mut Process) -> Result<bool, VmError> {
-        let module = process.x[0]
-            .as_atom()
-            .ok_or_else(|| VmError::Unsupported("run_process module".into()))?;
-        let function = process.x[1]
-            .as_atom()
-            .ok_or_else(|| VmError::Unsupported("run_process function".into()))?;
-        let args = crate::signals::list(process.x[2])
-            .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
-        let (module_id, ip, apply_operands) =
-            match self.spawn_export(module, function, args.len() as u8) {
-                Ok((module_id, ip)) => {
-                    process.x.ensure_x(args.len());
-                    for (index, term) in args.iter().enumerate() {
-                        process.x[index] = *term;
-                    }
-                    process.gc_live = args.len();
-                    process.heap.abi.arity = args.len().min(usize::from(u8::MAX)) as u8;
-                    (module_id, ip, false)
-                }
-                Err(_) => {
-                    let (module_id, entry) = erlang_apply_entry(self)?;
-                    (module_id, entry, true)
-                }
-            };
-        process.module = module_id;
-        process.initial_call = Some((module_id, ip));
-        Ok(apply_operands)
+impl Process {
+    /// Start the process at beam_run_process: X0..X2 hold the module, the function and the
+    /// argument list, and `p->u.initial` names the MFA (`process_info(initial_call)`).
+    // Port of erts/emulator/beam/erl_process.c:12610-12616 (erl_create_process: `p->u.initial`,
+    // `p->current = &p->u.initial`, `p->i = beam_run_process`, `p->arity = 3`), OTP-29.1.1.
+    pub(crate) fn start_at_run_process(
+        &mut self,
+        module: arinsal_term::Atom,
+        function: arinsal_term::Atom,
+        args: Term,
+        arity: u8,
+    ) {
+        self.module = RUN_PROCESS;
+        self.x[0] = Term::atom(module);
+        self.x[1] = Term::atom(function);
+        self.x[2] = args;
+        self.gc_live = 3;
+        self.heap.abi.arity = 3;
+        self.initial_mfa = Some((module, function, arity));
     }
 }
 

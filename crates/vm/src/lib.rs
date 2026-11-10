@@ -80,7 +80,6 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use calls::ImportOutcome;
 pub(crate) use interp::{RunState, XREG_POISON, gc_stress_enabled, xreg_poison_enabled};
 pub(crate) use load::{CodeMeta, CodeTables};
-pub(crate) use native_bridge::native_function_for;
 pub use native_bridge::{
     NativeFile, NativeFunction, NativeLine, NativeLines, arinsal_native_raise, native_function_at,
     register_native_function, run_native,

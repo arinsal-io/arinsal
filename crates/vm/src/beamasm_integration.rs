@@ -905,22 +905,6 @@ pub(crate) fn stage_dispatch(scope: u64) {
 /// Applies `change` to the exports of `scope` in the staging code index. Outside a load's
 /// staging area the change is staged and committed on its own, like the code changes erts
 /// makes under the code modification permission (delete_module, trace patterns).
-/// Native address of an export in `scope` (erts `ep->dispatch.addresses[code_ix]`).
-pub(crate) fn export_native_target(
-    scope: u64,
-    module: arinsal_term::Atom,
-    function: arinsal_term::Atom,
-    arity: u8,
-) -> Option<usize> {
-    let registry = dispatch_registry().read().ok()?;
-    registry
-        .scopes
-        .get(&scope)?
-        .native_targets
-        .get(&(module, function, arity))
-        .copied()
-}
-
 fn staged(scope: u64, change: impl FnOnce(&mut ScopeExports) -> Vec<Mfa>) {
     let code_ix = crate::code_ix::for_scope(scope);
     let staging = code_ix.start_staging();
@@ -1416,17 +1400,9 @@ impl CompiledVersion {
             .any(|native| native.function == function && native.arity == arity)
     }
 
-    /// Start address of this version's native code for `function/arity`.
     /// Whether `address` lies in this version's generated code.
     pub(crate) fn contains_code(&self, address: usize) -> bool {
         (self.code_start..self.code_end).contains(&address)
-    }
-
-    pub(crate) fn native_function_start(&self, function: &str, arity: u8) -> Option<usize> {
-        self.native_functions
-            .iter()
-            .find(|native| native.function == function && native.arity == arity)
-            .map(|native| native.start)
     }
 
     /// Resolves a native PC to its function in this compiled module version.
