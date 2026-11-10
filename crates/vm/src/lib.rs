@@ -20,6 +20,7 @@ mod dist;
 mod erl_bits;
 mod erl_poll;
 mod exceptions;
+mod export;
 mod interp;
 mod load;
 mod native_bridge;

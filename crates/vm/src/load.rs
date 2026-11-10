@@ -320,7 +320,9 @@ pub(crate) struct ExportIndex {
 
 #[derive(Clone, Copy, Default)]
 struct ExportIndexEntry {
-    dispatch: Option<&'static arinsal_beamasm::bif::ExportEntry>,
+    /// The shared `Export` object of this MFA (erts: the export blob every code index's entry
+    /// points at). Set by `erts_export_put`; an MFA only noted for `module_info` has none yet.
+    dispatch: Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>>,
     /// Module exports in the current version; imported error-handler stubs do not set this.
     // Port of `erts_find_function`'s active export/trampoline check, export.c:154-180.
     current_module_export: bool,
@@ -456,18 +458,33 @@ impl ExportIndex {
         }
     }
 
-    pub(crate) fn bind_dispatch(
+    /// `erts_export_put` on this code index's export table: `export` becomes the entry of
+    /// `key`. Every code index of a node shares one `Export` per MFA, so an existing entry is
+    /// the same object.
+    // Port of erts/emulator/beam/export.c:204-226 (erts_export_put) and erl_code_staged.h
+    // (put: an entry of an object already in another index reuses that object), OTP-29.1.1.
+    pub(crate) fn put_export(
         &mut self,
         key: (Atom, Atom, u8),
-        dispatch: &'static arinsal_beamasm::bif::ExportEntry,
+        export: &'static Arc<arinsal_beamasm::bif::ExportEntry>,
     ) {
-        self.entries.entry(key).or_default().dispatch = Some(dispatch);
+        self.entries.entry(key).or_default().dispatch = Some(export);
     }
 
+    /// `erts_find_export_entry` on this code index's export table.
+    // Port of erts/emulator/beam/export.c:154-169 (erts_find_export_entry), OTP-29.1.1.
     pub(crate) fn dispatch(
         &self,
         key: (Atom, Atom, u8),
     ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+        self.find_arc(key).map(|export| &**export)
+    }
+
+    /// The shared owner of the entry of `key`, for export funs (`Export.lambda`).
+    pub(crate) fn find_arc(
+        &self,
+        key: (Atom, Atom, u8),
+    ) -> Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>> {
         self.entries.get(&key)?.dispatch
     }
 }

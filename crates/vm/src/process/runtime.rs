@@ -202,10 +202,9 @@ impl Runtime {
             .get(target.trap_export_id)
             .expect("trap export table capacity")
             .get_or_init(|| {
-                crate::beamasm_integration::export_get_or_make_stub(self.code_scope, mfa)
-                    .unwrap_or_else(|| {
-                        Arc::new(arinsal_beamasm::bif::ExportEntry::new(mfa.0, mfa.1, mfa.2))
-                    })
+                crate::export::export_get_or_make_stub(self.code_scope, mfa).unwrap_or_else(|| {
+                    Arc::new(arinsal_beamasm::bif::ExportEntry::new(mfa.0, mfa.1, mfa.2))
+                })
             });
         Arc::clone(export)
     }
@@ -242,12 +241,7 @@ impl Runtime {
         mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
         code_ix: usize,
     ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
-        if code_ix >= arinsal_beamasm::bif::ERTS_ADDRESSV_SIZE {
-            return None;
-        }
-        self.code
-            .with_tables_for_code_ix(code_ix, |tables| tables.exports.dispatch(mfa))
-            .flatten()
+        crate::export::find_export_entry(&self.code, mfa, code_ix)
     }
 }
 
