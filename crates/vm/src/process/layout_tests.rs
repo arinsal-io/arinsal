@@ -153,9 +153,7 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
             arinsal_beamasm::exc::EXC_ERROR,
             pc,
             current,
-            trace.len() as u64,
-            trace.len() as u64,
-            0,
+            trace.len() as u64 | ((trace.len() as u64) << 32),
         ];
         digits.extend_from_slice(trace);
         let stack = TermBuilder::new(&mut process.heap)
