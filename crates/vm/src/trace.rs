@@ -2623,9 +2623,10 @@ pub(crate) fn dedupe_return_frames(
     }
     // Only return_to frames need the whole run of trace frames; the rest only the top one.
     let first_only = !actions.iter().any(|action| action.return_to);
-    // A BIF is never tail called: the loader keeps the caller's frame, so the return address
-    // of the call is on top of the stack and no trace frame is.
-    // Port of erts/emulator/beam/ops.tab (call_ext_last/call_ext_only to a BIF), OTP-29.1.1.
+    // Port of erts/emulator/beam/beam_bp.c (fixup_cp_before_trace), OTP-29.1.1: the run of
+    // trace frames above the CP. A BIF reached by a tail apply returns straight into its
+    // caller's trace frames, and a return_to frame of the session already there means no new
+    // one is pushed.
     let mut frames = match scan {
         StackScan::None => Vec::new(),
         StackScan::Top => special_frames(process, first_only, false),
@@ -3266,7 +3267,10 @@ fn caller_mfa_name(
     site: Option<(usize, usize)>,
 ) -> Option<(String, String, u8)> {
     let pc = match site {
-        Some((usize::MAX, pc)) => pc,
+        Some((usize::MAX, pc)) => match process.native_retry_site() {
+            Some((resume_pc, call_site)) if call_site == pc => resume_pc,
+            _ => pc,
+        },
         _ => (process.heap.stack_get(0)?.tagged_word() as usize).checked_sub(1)?,
     };
     let function = crate::native_function_at(pc)?;
