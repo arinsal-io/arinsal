@@ -192,6 +192,11 @@ fn process_send_inner(
     }
 }
 
+/// The running BIF asked to suspend on a busy port; [`take_busy_suspend`] consumes it.
+pub(crate) fn busy_suspend_pending() -> bool {
+    BUSY_SUSPEND.with(Cell::get)
+}
+
 /// True once, when the running BIF asked to suspend on a busy port.
 // Not inlined: inlined into the scheduler loop, the thread-local lookup is hoisted to every
 // slice's entry although only a busy-port failure reads it.

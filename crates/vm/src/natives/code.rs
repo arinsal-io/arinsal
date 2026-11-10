@@ -365,6 +365,29 @@ impl Prepared {
     }
 }
 
+/// `erlang:has_prepared_code_on_load/1`.
+// Port of erts/emulator/beam/beam_bif_load.c (has_prepared_code_on_load_1), OTP-29.1.1.
+pub(crate) fn has_prepared_code_on_load_1(
+    _vm: &mut Vm,
+    _process: &mut Process,
+    _ctx: &mut RunCtx<'_, crate::process::Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    has_prepared_code_on_load(args[0])
+}
+
+/// `erlang:finish_loading/1`.
+// Port of erts/emulator/beam/beam_bif_load.c (finish_loading_1), OTP-29.1.1.
+pub(crate) fn finish_loading_1(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let pid = ctx.pid();
+    finish(vm, process, Some(ctx), Some(pid), args)
+}
+
 fn has_prepared_code_on_load(term: Term) -> Result<Term, VmError> {
     // SAFETY: The caller keeps the argument's heap live during this BIF.
     let prepared = unsafe { term.magic_ref() }
@@ -1558,11 +1581,10 @@ fn call_values(
         ("erts_internal", "beamfile_chunk", 2) => Some(beamfile_chunk(process, args)),
         ("erts_internal", "beamfile_module_md5", 1) => Some(beamfile_module_md5(process, args[0])),
         ("erts_internal", "prepare_loading", 2) => Some(prepare(vm, process, args)),
-        ("erlang", "has_prepared_code_on_load", 1) => Some(has_prepared_code_on_load(args[0])),
-        ("erlang", "finish_loading", 1) => {
-            let pid = ctx.pid();
-            Some(finish(vm, process, Some(ctx), Some(pid), args))
+        ("erlang", "has_prepared_code_on_load", 1) => {
+            Some(has_prepared_code_on_load_1(vm, process, ctx, args))
         }
+        ("erlang", "finish_loading", 1) => Some(finish_loading_1(vm, process, ctx, args)),
         ("erlang", "module_loaded", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             Ok(Term::atom(if vm.code.loaded.contains_key(&name) {

@@ -454,11 +454,19 @@ impl Executor {
                                         .code_ix
                                         .process_code_ix(crate::trace::saves_calls(process))
                                         as u64;
-                                    let native = crate::native_bridge::run_native_resume(
-                                        process,
-                                        &mut self.native_registers,
-                                        code_ptr,
-                                    );
+                                    let native = {
+                                        // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
+                                        // scheduler's data through the process while the slice runs.
+                                        let _slice = super::sched_data::NativeSlice::enter(
+                                            &mut self.vm,
+                                            ctx,
+                                        );
+                                        crate::native_bridge::run_native_resume(
+                                            process,
+                                            &mut self.native_registers,
+                                            code_ptr,
+                                        )
+                                    };
                                     let consumed =
                                         fcalls_before.saturating_sub(process.heap.abi.fcalls);
                                     ctx.consume(u32::try_from(consumed).unwrap_or(0));

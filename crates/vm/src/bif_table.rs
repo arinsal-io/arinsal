@@ -108,6 +108,15 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("lists", "member", 2) => crate::native_helpers::list_member_entry as *const () as usize,
         ("persistent_term", "get", 1) => persistent_term_get_1_light as *const () as usize,
         ("persistent_term", "get", 2) => persistent_term_get_2_light as *const () as usize,
+        ("erlang", "monitor", 2) => sched_entry::<Monitor2>(),
+        ("erlang", "monitor", 3) => sched_entry::<Monitor3>(),
+        ("erlang", "demonitor", 1) => sched_entry::<Demonitor1>(),
+        ("erlang", "demonitor", 2) => sched_entry::<Demonitor2>(),
+        ("erlang", "finish_loading", 1) => sched_entry::<FinishLoading1>(),
+        ("erlang", "has_prepared_code_on_load", 1) => sched_entry::<HasPreparedCodeOnLoad1>(),
+        ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
+        ("os", "getenv", 1) => sched_entry::<Getenv1>(),
+        ("erlang", "nodes", 2) => sched_entry::<Nodes2>(),
         _ => return None,
     };
     Some(func)
@@ -213,6 +222,74 @@ impl arinsal_bifs::BifTableVisitor for Compile {
                 as usize,
         }
     }
+}
+
+/// `bif_table[].f` of a BIF whose body needs its scheduler's data.
+fn sched_entry<B: crate::native_helpers::SchedBif>() -> usize {
+    crate::native_helpers::sched_bif_light::<B> as *const () as usize
+}
+
+/// `erlang:monitor/2`. Port of erts/emulator/beam/bif.c (monitor_2), OTP-29.1.1.
+struct Monitor2;
+impl crate::native_helpers::SchedBif for Monitor2 {
+    const ARITY: usize = 2;
+    const BODY: crate::natives::DirectNative = crate::dist::native_monitor;
+}
+
+/// `erlang:monitor/3`. Port of erts/emulator/beam/bif.c (monitor_3), OTP-29.1.1.
+struct Monitor3;
+impl crate::native_helpers::SchedBif for Monitor3 {
+    const ARITY: usize = 3;
+    const BODY: crate::natives::DirectNative = crate::dist::native_monitor;
+}
+
+/// `erlang:demonitor/1`. Port of erts/emulator/beam/bif.c (demonitor_1), OTP-29.1.1.
+struct Demonitor1;
+impl crate::native_helpers::SchedBif for Demonitor1 {
+    const ARITY: usize = 1;
+    const BODY: crate::natives::DirectNative = crate::dist::native_demonitor;
+}
+
+/// `erlang:demonitor/2`. Port of erts/emulator/beam/bif.c (demonitor_2), OTP-29.1.1.
+struct Demonitor2;
+impl crate::native_helpers::SchedBif for Demonitor2 {
+    const ARITY: usize = 2;
+    const BODY: crate::natives::DirectNative = crate::dist::native_demonitor;
+}
+
+/// `erlang:finish_loading/1`.
+struct FinishLoading1;
+impl crate::native_helpers::SchedBif for FinishLoading1 {
+    const ARITY: usize = 1;
+    const BODY: crate::natives::DirectNative = crate::natives::code::finish_loading_1;
+}
+
+/// `erlang:has_prepared_code_on_load/1`.
+struct HasPreparedCodeOnLoad1;
+impl crate::native_helpers::SchedBif for HasPreparedCodeOnLoad1 {
+    const ARITY: usize = 1;
+    const BODY: crate::natives::DirectNative = crate::natives::code::has_prepared_code_on_load_1;
+}
+
+/// `erlang:load_nif/2`.
+struct LoadNif2;
+impl crate::native_helpers::SchedBif for LoadNif2 {
+    const ARITY: usize = 2;
+    const BODY: crate::natives::DirectNative = crate::natives::nif::load_nif_2;
+}
+
+/// `os:getenv/1`. Port of erts/emulator/beam/erl_bif_os.c (os_getenv_1), OTP-29.1.1.
+struct Getenv1;
+impl crate::native_helpers::SchedBif for Getenv1 {
+    const ARITY: usize = 1;
+    const BODY: crate::natives::DirectNative = crate::natives::env::call_getenv_one;
+}
+
+/// `erlang:nodes/2`. Port of erts/emulator/beam/dist.c (nodes_2), OTP-29.1.1.
+struct Nodes2;
+impl crate::native_helpers::SchedBif for Nodes2 {
+    const ARITY: usize = 2;
+    const BODY: crate::natives::DirectNative = crate::natives::node::call_nodes2;
 }
 
 #[cfg(test)]

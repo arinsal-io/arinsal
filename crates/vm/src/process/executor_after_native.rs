@@ -567,12 +567,21 @@ impl Executor {
                     // by the native BIF table; handle it here like the interpreter does.
                     // erlang:make_fun/3 and fun_info/1,2, fun_info_mfa/1 are implemented
                     // by the VM's call path (funs.rs), not by the native BIF table.
-                    let result = if export.class == arinsal_loader::ImportClass::Fun
+                    // A BIF native code already called left an outcome only the scheduler
+                    // completes: finish the call with it, without calling the BIF again.
+                    let outcome = process
+                        .cold
+                        .as_mut()
+                        .and_then(|cold| cold.bif_outcome.take());
+                    let result = if let Some(outcome) = outcome {
+                        Some(Err(*outcome))
+                    } else if export.class == arinsal_loader::ImportClass::Fun
                         && export.module == "erlang"
                         && matches!(
                             (export.function.as_str(), export.arity),
                             ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1)
-                        ) {
+                        )
+                    {
                         Some(match export.function.as_str() {
                             "make_fun" => {
                                 let args = [process.x[0], process.x[1], process.x[2]];

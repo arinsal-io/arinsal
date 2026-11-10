@@ -111,7 +111,7 @@ fn call_nodes1(
     nodes(process, args[0], None)
 }
 
-fn call_nodes2(
+pub(crate) fn call_nodes2(
     _vm: &mut Vm,
     process: &mut Process,
     _ctx: &mut RunCtx<'_, Message>,

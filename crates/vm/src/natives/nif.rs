@@ -2139,6 +2139,18 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
     }
 }
 
+/// `erlang:load_nif/2`, with the scheduler's NIF hub bound as `nif::call` binds it.
+// Port of erts/emulator/beam/erl_nif.c (load_nif_2), OTP-29.1.1.
+pub(crate) fn load_nif_2(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    install_hub(process, ctx);
+    call_load_nif(vm, process, ctx, args)
+}
+
 fn call_load_nif(
     vm: &mut Vm,
     process: &mut Process,

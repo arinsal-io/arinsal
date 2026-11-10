@@ -3702,29 +3702,7 @@ fn process_bif_result(
     if let Err(trap) = &mut result
         && let Some(export_trap) = trap.export.take()
     {
-        let mut export_trap = *export_trap;
-        // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*) and
-        // jit/arm/beam_asm_global.cpp:145-155 (emit_bif_export_trap), OTP-29.1.1.
-        // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and are the live roots
-        // while the process is parked in `beam_bif_export_trap`.
-        if crate::calls::gc_after_native_parts(process, &mut export_trap.args, None, None).is_err()
-        {
-            crate::native_hooks::set_error(process, "system_limit");
-            return 0;
-        }
-        let arity = export_trap.args.len();
-        process.x.ensure_x(arity);
-        process.x[..arity].copy_from_slice(&export_trap.args);
-        process.gc_live = arity;
-        crate::bif_traps::install_export_trap(
-            process,
-            identity,
-            (export.module_atom, export.function_atom),
-            &export_trap,
-        );
-        crate::bif_traps::arm_export_trap(process);
-        process.heap.abi.exc.freason = 1 << 10;
-        return 0;
+        return bif_trap_export(process, export, *export_trap, identity);
     }
     let collected = process.heap.gc_after_bif_desired();
     if collected {
@@ -3747,6 +3725,132 @@ fn process_bif_result(
         }
         Err(trap) => process_bif_error(process, export, trap),
     }
+}
+
+/// `BIF_TRAP*` to an Erlang export: THE_NON_VALUE with `TRAP`; the fragment context-switches
+/// to `beam_bif_export_trap`.
+// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*) and
+// jit/arm/beam_asm_global.cpp:145-155 (emit_bif_export_trap), OTP-29.1.1.
+fn bif_trap_export(
+    process: &mut crate::Process,
+    export: ExportDispatch,
+    mut export_trap: crate::ExportTrap,
+    identity: usize,
+) -> u64 {
+    // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and are the live roots
+    // while the process is parked in `beam_bif_export_trap`.
+    if crate::calls::gc_after_native_parts(process, &mut export_trap.args, None, None).is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    }
+    let arity = export_trap.args.len();
+    process.x.ensure_x(arity);
+    process.x[..arity].copy_from_slice(&export_trap.args);
+    process.gc_live = arity;
+    crate::bif_traps::install_export_trap(
+        process,
+        identity,
+        (export.module_atom, export.function_atom),
+        &export_trap,
+    );
+    crate::bif_traps::arm_export_trap(process);
+    process.heap.abi.exc.freason = 1 << 10;
+    0
+}
+
+/// The shared BIF epilogue for a BIF body that reports its result as `Result<Term, VmError>`:
+/// a value, `BIF_ERROR`, or `BIF_TRAP*` complete here, in native code, as erts'
+/// `call_light_bif_shared` / `call_bif_shared` complete them; GC after the BIF is
+/// [`process_bif_result`]'s. An outcome only the scheduler completes (ERTS_BIF_YIELD, a dirty
+/// BIF on a normal scheduler, a busy port, hibernation, a VM failure) is THE_NON_VALUE with
+/// `TRAP` to the call itself; the scheduler takes the stored outcome instead of calling the
+/// BIF again.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-536 (call_light_bif_shared,
+// emit_bif_nif_epilogue) and bif.h (BIF_ERROR, BIF_TRAP*, ERTS_BIF_YIELD*), OTP-29.1.1.
+pub(crate) fn bif_return(
+    process: &mut crate::Process,
+    export: ExportDispatch,
+    identity: u64,
+    light_call: bool,
+    result: Result<Term, crate::VmError>,
+) -> u64 {
+    let arity = usize::from(export.arity);
+    let result = match result {
+        Ok(value) => Ok(value),
+        Err(crate::VmError::Trap(trap)) if !crate::port::busy_suspend_pending() => Err(trap),
+        Err(crate::VmError::TrapExport(trap)) => {
+            return bif_trap_export(process, export, trap, identity as usize);
+        }
+        Err(crate::VmError::Exception { reason, frame }) => {
+            match crate::process::legacy_exception_trap(process, &reason, &frame) {
+                Ok(trap) => Err(trap),
+                Err(error) => {
+                    return bif_scheduler_outcome(process, export, identity, light_call, error);
+                }
+            }
+        }
+        Err(error) => return bif_scheduler_outcome(process, export, identity, light_call, error),
+    };
+    process_bif_result(process, export, arity, result, identity as usize)
+}
+
+/// An outcome of a BIF called from native code that the scheduler completes.
+#[cold]
+#[inline(never)]
+fn bif_scheduler_outcome(
+    process: &mut crate::Process,
+    export: ExportDispatch,
+    identity: u64,
+    light_call: bool,
+    error: crate::VmError,
+) -> u64 {
+    process.cold_mut().bif_outcome = Some(Box::new(error));
+    park_executor(process, export, identity, light_call)
+}
+
+/// A BIF body that runs with its scheduler's data: the executor's VM view and the slice
+/// context, reached through the process as erts reaches `esdp` (`erts_proc_sched_data`).
+pub(crate) trait SchedBif {
+    /// Arguments in X0 onwards.
+    const ARITY: usize;
+    /// The body.
+    const BODY: crate::natives::DirectNative;
+}
+
+/// `bif_table[].f` of a [`SchedBif`]: called by `call_light_bif_shared` and the export
+/// trampoline's `call_bif` with `c_p` and the X registers; the result goes through
+/// [`bif_return`].
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared) and
+// 729-776 (call_bif_shared), OTP-29.1.1.
+pub(crate) extern "C" fn sched_bif_light<B: SchedBif>(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    // The light fragment passes the call's entry address `I`; the export trampoline none.
+    let light_call = i != 0;
+    let mut args = [Term::NIL; 4];
+    args[..B::ARITY].copy_from_slice(&registers.x_reg_array[..B::ARITY]);
+    process.gc_live = B::ARITY;
+    // The call site a raising or suspending BIF names (`c_p->i` at the call).
+    process.native_call_pc = registers.tmp_mem[6] as usize;
+    let result = crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
+        // The executor's VM view follows the active code index before a BIF reads it
+        // (function_exported/3, module_loaded/1, ...).
+        vm.refresh_code();
+        (B::BODY)(vm, process, ctx, &args[..B::ARITY])
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    process.native_call_pc = 0;
+    bif_return(process, export, identity, light_call, result)
 }
 
 /// `BIF_ERROR` of a process BIF: `bif_mfa` is the BIF; its arguments stay in the X registers.
