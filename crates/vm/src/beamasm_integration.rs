@@ -343,6 +343,16 @@ impl DispatchRegistry {
                 None
             };
             let target: &'static DispatchTarget = Box::leak(Box::new(leaked));
+            // Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs:
+            // `trampoline.bif.op = op_call_bif_W`), OTP-29.1.1: a BIF, or a native the runtime
+            // implements in place of Erlang code, is called by the trampoline; any other
+            // export's trampoline calls the error handler (export_init).
+            if target.slot.bif_number() != -1 || target.class != arinsal_loader::ImportClass::Remote
+            {
+                target
+                    .slot
+                    .set_trampoline_op(arinsal_term::TRAMPOLINE_CALL_BIF);
+            }
             // Port of erts/emulator/beam/export.h:38-58 (Export), OTP-29.1.1: the slot holds
             // its descriptor's address, which generated code passes to the runtime helpers
             // as a typed reference, like erts passes the Export* itself.
@@ -482,6 +492,8 @@ fn fragments() -> Option<&'static DispatchFragments> {
                             as *const () as usize,
                     },
                     apply3_resolver: crate::native_helpers::arinsal_beamasm_apply3_resolver
+                        as *const () as usize,
+                    call_error_handler: crate::native_helpers::arinsal_beamasm_call_error_handler
                         as *const () as usize,
                 },
             )
