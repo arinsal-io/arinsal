@@ -97,7 +97,6 @@ fn bs_create_bin_helpers_reserve_the_alloc_words() {
             "--nocapture",
         ])
         .env(CHILD, &path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .output()
         .unwrap();

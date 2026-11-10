@@ -1,14 +1,12 @@
 //! Signal order per sender and receiver pair, for the process BIFs that send signals
 //! (monitor, demonitor, link, exit): a later message from the same sender is handled after the
-//! earlier signal, as erts orders them. Compared with erl, under the JIT and `ARINSAL_INTERP=1`.
+//! earlier signal, as erts orders them. Compared with erl.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
 use arinsal_vm::Vm;
-use std::process::Command;
 
-const CHILD: &str = "ARINSAL_PROC_SIG_ORDER_CHILD";
 const MODULE: &str = "proc_sig_order";
 const CASES: &[&str] = &[
     "monitor_then_send",
@@ -209,25 +207,8 @@ trapping_loop(Parent) ->
     end.
 "#;
 
-fn child() -> bool {
-    let Some(beam_path) = std::env::var_os(CHILD) else {
-        return false;
-    };
-    for case in CASES {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&std::fs::read(&beam_path).unwrap()).unwrap();
-        let arg = Term::atom(global_atoms().intern(case).unwrap());
-        let actual = vm.eval_scheduled(MODULE, "run", &[arg], 2, None).unwrap();
-        println!("RESULT:{case}:{:?}", actual.term);
-    }
-    true
-}
-
 #[test]
 fn process_signal_order_matches_erl() {
-    if child() {
-        return;
-    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping signal order test");
         return;
@@ -253,41 +234,6 @@ fn process_signal_order_matches_erl() {
         let actual = vm
             .eval_scheduled(MODULE, "run", &[arg], 2, None)
             .expect("scheduled run");
-        assert_eq!(actual.term, *want, "JIT {MODULE}:run({case})");
-    }
-
-    let dir = std::env::temp_dir().join(format!("arinsal-proc-sig-order-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{MODULE}.beam"));
-    std::fs::write(&path, &beam).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "process_signal_order_matches_erl",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, &path)
-        .env("ARINSAL_INTERP", "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "interpreter child failed: {stdout} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    for (case, want) in &expected {
-        let marker = format!("RESULT:{case}:");
-        let start = stdout
-            .find(&marker)
-            .unwrap_or_else(|| panic!("no interpreter result for {case}: {stdout}"))
-            + marker.len();
-        let line = stdout[start..].lines().next().unwrap_or_default();
-        assert_eq!(
-            line,
-            format!("{want:?}"),
-            "interpreter {MODULE}:run({case}) stdout={stdout}"
-        );
+        assert_eq!(actual.term, *want, "{MODULE}:run({case})");
     }
 }

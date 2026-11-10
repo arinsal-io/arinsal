@@ -1,4 +1,4 @@
-//! The Arinsal CLI boots under `ARINSAL_INTERP=1` as it does under the JIT.
+//! The Arinsal CLI boots cleanly, with and without a shell.
 //!
 //! The kernel starts the `user` process, which loads the line editor (`edlin`, `edlin_key`)
 //! while the system boots. A module that failed to load there left `edlin_key:get_key_map/0`
@@ -19,7 +19,6 @@ fn command(args: &[&str]) -> Command {
     let mut command = Command::new(arinsal());
     command
         .args(args)
-        .env("ARINSAL_INTERP", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -80,28 +79,28 @@ const EVAL: &str =
     "io:format(\"~p ~p~n\",[erlang:system_info(emu_flavor),lists:sum(lists:seq(1,100))]),halt().";
 
 #[test]
-fn halt_boots_under_the_interpreter() {
+fn halt_boots() {
     let (output, stdout, stderr) = run(&["-noshell", "-eval", "halt()."], "");
     assert_clean_boot("halt", &output, &stdout, &stderr);
     assert_eq!(stdout, "");
 }
 
 #[test]
-fn eval_runs_under_the_interpreter() {
+fn eval_runs() {
     let (output, stdout, stderr) = run(&["-noshell", "-eval", EVAL], "");
     assert_clean_boot("eval", &output, &stdout, &stderr);
-    assert_eq!(stdout, "emu 5050\n");
+    assert_eq!(stdout, "jit 5050\n");
 }
 
 #[test]
 fn eval_runs_on_one_scheduler() {
     let (output, stdout, stderr) = run(&["+S1:1", "-noshell", "-eval", EVAL], "");
     assert_clean_boot("one scheduler", &output, &stdout, &stderr);
-    assert_eq!(stdout, "emu 5050\n");
+    assert_eq!(stdout, "jit 5050\n");
 }
 
 #[test]
-fn edlin_key_loads_under_the_interpreter() {
+fn edlin_key_loads() {
     let eval = "io:format(\"~p~n\",[is_map(edlin_key:get_key_map())]),halt().";
     let (output, stdout, stderr) = run(&["-noshell", "-eval", eval], "");
     assert_clean_boot("edlin_key", &output, &stdout, &stderr);
@@ -109,7 +108,7 @@ fn edlin_key_loads_under_the_interpreter() {
 }
 
 #[test]
-fn shell_over_a_pipe_runs_under_the_interpreter() {
+fn shell_over_a_pipe_runs() {
     let (output, stdout, stderr) = run(
         &[],
         "io:format(\"sum=~p~n\",[lists:sum(lists:seq(1,100))]).\nhalt().\n",
@@ -120,7 +119,7 @@ fn shell_over_a_pipe_runs_under_the_interpreter() {
 }
 
 #[test]
-fn shell_with_stdin_closed_boots_under_the_interpreter() {
+fn shell_with_stdin_closed_boots() {
     let (_, stdout, stderr) = run(&[], "");
     assert!(
         !stdout.contains("undef") && !stderr.contains("undef"),

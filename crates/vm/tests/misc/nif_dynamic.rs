@@ -303,31 +303,6 @@ fn tracer_mod_sequential_tracer_matches_erts() {
 }
 
 /// Run `module:run/0` through the CLI with extra environment variables (e.g. the interpreter).
-fn scheduled_cli_env(dir: &Path, module: &str, env: &[(&str, &str)]) -> OwnedTerm {
-    let output = dir.join(format!("{module}.etf"));
-    let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
-    let eval = format!(
-        "ok=file:write_file(\"{}\",term_to_binary({module}:run())), halt().",
-        output.display()
-    );
-    let result = Command::new("timeout")
-        .arg("120")
-        .arg(arinsal)
-        .args(["-noshell", "-pa"])
-        .arg(dir)
-        .args(["-eval", &eval])
-        .envs(env.iter().copied())
-        .output()
-        .expect("timeout arinsal");
-    assert!(
-        result.status.success(),
-        "{module}:run/0 on Arinsal CLI {env:?} failed: {}{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-    arinsal_etf::decode(&std::fs::read(&output).expect("Arinsal ETF output")).unwrap()
-}
-
 /// Dirty flags of function `index` of a wide library: normal, dirty CPU, dirty I/O in turn.
 fn wide_flags(index: usize) -> &'static str {
     match index % 3 {
@@ -426,18 +401,13 @@ fn wide_module(erl: &RefErl, dir: &Path, module: &str, count: usize, tag: i32) {
     );
 }
 
-/// Compare `module:run/0` on erl with Arinsal's BeamAsm and interpreter, each on a booted node.
-fn assert_same_jit_and_interp(dir: &Path, erl: &RefErl, module: &str) {
+/// Compare `module:run/0` on erl with Arinsal on a booted node.
+fn assert_same_as_erl(dir: &Path, erl: &RefErl, module: &str) {
     let expected = normalize(&reference(erl, module));
     similar_asserts::assert_eq!(
-        normalize(&scheduled_cli_env(dir, module, &[("ARINSAL_BEAMASM", "1")])),
+        normalize(&scheduled_cli(dir, module)),
         expected,
-        "{module}:run/0 (BeamAsm)"
-    );
-    similar_asserts::assert_eq!(
-        normalize(&scheduled_cli_env(dir, module, &[("ARINSAL_INTERP", "1")])),
-        expected,
-        "{module}:run/0 (interpreter)"
+        "{module}:run/0"
     );
 }
 
@@ -485,7 +455,7 @@ fn library_with_more_nifs_than_the_old_table_matches_erts() {
         library.display()
     );
     compile_beam(&erl, &dir, "nifdyn_wide", &module_src);
-    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wide");
+    assert_same_as_erl(&dir, &erl, "nifdyn_wide");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -505,7 +475,7 @@ fn library_with_more_nifs_than_the_stopgap_table_matches_erts() {
         wide_calls("nifdyn_wider", COUNT)
     );
     compile_beam(&erl, &dir, "nifdyn_wider_run", &runner);
-    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wider_run");
+    assert_same_as_erl(&dir, &erl, "nifdyn_wider_run");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -544,7 +514,7 @@ fn several_nif_libraries_loaded_at_once_match_erts() {
         mods = modules.join(", ")
     );
     compile_beam(&erl, &dir, "nifdyn_multi_run", &runner);
-    assert_same_jit_and_interp(&dir, &erl, "nifdyn_multi_run");
+    assert_same_as_erl(&dir, &erl, "nifdyn_multi_run");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -605,7 +575,7 @@ fn nif_module_purge_and_load_again_matches_erts() {
     let _ = erl.call("code", "purge", &[OwnedTerm::Atom("nifdyn_cycle".into())]);
     let _ = erl.call("code", "delete", &[OwnedTerm::Atom("nifdyn_cycle".into())]);
     let _ = erl.call("code", "purge", &[OwnedTerm::Atom("nifdyn_cycle".into())]);
-    assert_same_jit_and_interp(&dir, &erl, "nifdyn_cycle_run");
+    assert_same_as_erl(&dir, &erl, "nifdyn_cycle_run");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -753,7 +723,7 @@ fn nif_module_upgrade_matches_erts() {
         v4 = binaries[3],
     );
     compile_beam(&erl, &dir, "nifdyn_upg_run", &runner);
-    assert_same_jit_and_interp(&dir, &erl, "nifdyn_upg_run");
+    assert_same_as_erl(&dir, &erl, "nifdyn_upg_run");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -819,7 +789,7 @@ fn dirty_nifs_of_a_wide_library_match_erts() {
         calls = wide_calls("nifdyn_wide_dirty", COUNT)
     );
     compile_beam(&erl, &dir, "nifdyn_wide_dirty_run", &runner);
-    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wide_dirty_run");
+    assert_same_as_erl(&dir, &erl, "nifdyn_wide_dirty_run");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

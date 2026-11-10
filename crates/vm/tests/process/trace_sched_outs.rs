@@ -1,19 +1,14 @@
 //! A process traced with the `running` flag reports the same `in` and `out` events, with the same
 //! function in each, as in erts: one `out`/`in` pair per slice that is really used up, per
-//! trapped BIF slice and per receive wait, and none for anything else. Compared with erl under the
-//! JIT and under `ARINSAL_INTERP=1`.
+//! trapped BIF slice and per receive wait, and none for anything else. Compared with erl.
 //!
-//! Regressions: the interpreter spent its slice per instruction instead of per function entry, so
-//! a call loop switched out about three times as often; and the first `in` of a spawned process
-//! carried `0` instead of its initial function.
+//! Regression: the first `in` of a spawned process carried `0` instead of its initial function.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
 use arinsal_vm::Vm;
-use std::process::Command;
 
-const CHILD: &str = "ARINSAL_TRACE_SCHED_OUTS_CHILD";
 const MODULE: &str = "trace_sched_outs";
 const CASES: &[&str] = &[
     "empty",
@@ -157,25 +152,8 @@ fn summary(debug: &str) -> String {
     format!("outs={outs} {head:?}")
 }
 
-fn child() -> bool {
-    let Some(beam_path) = std::env::var_os(CHILD) else {
-        return false;
-    };
-    for case in CASES {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&std::fs::read(&beam_path).unwrap()).unwrap();
-        let arg = Term::atom(global_atoms().intern(case).unwrap());
-        let actual = vm.eval_scheduled(MODULE, "run", &[arg], 2, None).unwrap();
-        println!("RESULT:{case}:{:?}", actual.term);
-    }
-    true
-}
-
 #[test]
 fn running_trace_reports_the_erts_in_and_out_events() {
-    if child() {
-        return;
-    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping trace_sched_outs differential test");
         return;
@@ -195,7 +173,6 @@ fn running_trace_reports_the_erts_in_and_out_events() {
         .collect();
 
     let mut failures = Vec::new();
-    // The JIT is the default: run the cases in this process.
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load into arinsal");
     for (case, want) in &expected {
@@ -208,45 +185,6 @@ fn running_trace_reports_the_erts_in_and_out_events() {
                 "JIT {case}: erl {} / arinsal {}",
                 summary(&format!("{want:?}")),
                 summary(&format!("{:?}", actual.term))
-            ));
-        }
-    }
-
-    // The interpreter: the flavour is fixed per process, so the cases run in a child.
-    let dir = std::env::temp_dir().join(format!("arinsal-trace-sched-outs-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{MODULE}.beam"));
-    std::fs::write(&path, &beam).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "running_trace_reports_the_erts_in_and_out_events",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, &path)
-        .env("ARINSAL_INTERP", "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "interpreter child failed: {stdout} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    for (case, want) in &expected {
-        // The result follows the harness's `test ... ` text on the same line, so search for it.
-        let marker = format!("RESULT:{case}:");
-        let start = stdout
-            .find(&marker)
-            .unwrap_or_else(|| panic!("no interpreter result for {case}: {stdout}"))
-            + marker.len();
-        let line = stdout[start..].lines().next().unwrap_or_default();
-        if line != format!("{want:?}") {
-            failures.push(format!(
-                "interpreter {case}: erl {} / arinsal {}",
-                summary(&format!("{want:?}")),
-                summary(line)
             ));
         }
     }

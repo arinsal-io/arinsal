@@ -220,7 +220,7 @@ impl Vm {
                     (function, args.len()),
                     ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2)
                 );
-        if !crate::beamasm_integration::enabled() || direct {
+        if direct {
             return self.eval(module, function, args);
         }
         let scheduled = self.eval_scheduled(module, function, args, 1, None)?;

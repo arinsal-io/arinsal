@@ -1,14 +1,12 @@
 //! BIFs that wait for a signal reply or trap, called in tail position (`call_ext_last` after a
 //! frame, `call_ext_only` without one) on a just-killed process: the continuation must return to
-//! the caller's CP, so the loop result must match erl, under the JIT and `ARINSAL_INTERP=1`.
+//! the caller's CP, so the loop result must match erl.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
 use arinsal_vm::Vm;
-use std::process::Command;
 
-const CHILD: &str = "ARINSAL_TAIL_BIF_CHILD";
 const MODULE: &str = "tail_bif_wait";
 const CASES: &[&str] = &[
     "alive_last",
@@ -84,25 +82,8 @@ pc_only(P) ->
 pc_tail(Port) -> erlang:port_command(Port, <<"y">>).
 "#;
 
-fn child() -> bool {
-    let Some(beam_path) = std::env::var_os(CHILD) else {
-        return false;
-    };
-    for case in CASES {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&std::fs::read(&beam_path).unwrap()).unwrap();
-        let arg = Term::atom(global_atoms().intern(case).unwrap());
-        let actual = vm.eval_scheduled(MODULE, "run", &[arg], 2, None).unwrap();
-        println!("RESULT:{case}:{:?}", actual.term);
-    }
-    true
-}
-
 #[test]
 fn tail_bif_waits_to_erts_internal_and_matches_erl() {
-    if child() {
-        return;
-    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping tail bif wait test");
         return;
@@ -121,7 +102,6 @@ fn tail_bif_waits_to_erts_internal_and_matches_erl() {
         )
         .collect();
 
-    // The JIT is the default: run the cases in this process.
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load into arinsal");
     for (case, want) in &expected {
@@ -129,43 +109,6 @@ fn tail_bif_waits_to_erts_internal_and_matches_erl() {
         let actual = vm
             .eval_scheduled(MODULE, "run", &[arg], 2, None)
             .expect("scheduled run");
-        assert_eq!(actual.term, *want, "JIT {MODULE}:run({case})");
-    }
-
-    // The interpreter: the flavour is fixed per process, so the cases run in a child.
-    let dir = std::env::temp_dir().join(format!("arinsal-tail-bif-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{MODULE}.beam"));
-    std::fs::write(&path, &beam).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "tail_bif_waits_to_erts_internal_and_matches_erl",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, &path)
-        .env("ARINSAL_INTERP", "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "interpreter child failed: {stdout} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    for (case, want) in &expected {
-        // The result follows the harness's `test ... ` text on the same line, so search for it.
-        let marker = format!("RESULT:{case}:");
-        let start = stdout
-            .find(&marker)
-            .unwrap_or_else(|| panic!("no interpreter result for {case}: {stdout}"))
-            + marker.len();
-        let line = stdout[start..].lines().next().unwrap_or_default();
-        assert_eq!(
-            line,
-            format!("{want:?}"),
-            "interpreter {MODULE}:run({case})"
-        );
+        assert_eq!(actual.term, *want, "{MODULE}:run({case})");
     }
 }

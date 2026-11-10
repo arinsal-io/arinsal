@@ -245,9 +245,6 @@ pub struct EmulatorFlags {
     pub debugger_support: bool,
     /// `+Dibpl` selects line breakpoint instrumentation for subsequently loaded modules.
     pub debugger_line_breakpoints: Option<bool>,
-    /// `-emu_flavor emu`: run the interpreter instead of the JIT, as erts' `emu` flavor does.
-    /// `ARINSAL_INTERP=1` is an alias.
-    pub interpreter: bool,
     /// `+A` async thread count.
     pub async_threads: Option<u32>,
     /// `+S`.
@@ -853,11 +850,8 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
                 emu_type = Some(value.clone());
                 saw_emulator_selector = true;
             } else if token == "-emu_flavor" {
-                // Port of erts/etc/common/erlexec.c:532 (-emu_flavor, `smp`, `jit` or `emu`),
-                // OTP-29.1.1: this runtime is one binary holding both flavors.
-                if value == "emu" {
-                    emulator.interpreter = true;
-                }
+                // Port of erts/etc/common/erlexec.c:532 (-emu_flavor), OTP-29.1.1: the flavor
+                // names an emulator file that validate_emulator looks up below.
                 emu_flavor = Some(value.clone());
                 saw_emulator_selector = true;
             }
@@ -1754,11 +1748,6 @@ fn validate_emulator(bindir: &str, emu_type: Option<&str>, flavor: &str) -> Resu
         _ => format!("beam.{flavor}"),
     };
     if Path::new(bindir).join(file).is_file() {
-        return Ok(());
-    }
-    // The interpreter flavor is selected inside this binary. The JIT is the default `smp`
-    // emulator: erl's own build has no `beam.jit` file either.
-    if matches!(emu_type, None | Some("opt")) && flavor == "emu" {
         return Ok(());
     }
     let combos = emulator_combinations(bindir);

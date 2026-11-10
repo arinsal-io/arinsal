@@ -1617,7 +1617,7 @@ fn interpreter_position_used() {
         }
         state => state,
     };
-    if state == 2 && crate::beamasm_integration::enabled() {
+    if state == 2 {
         let at = std::panic::Location::caller();
         eprintln!("IPUSE {}:{}", at.file(), at.line());
     }
@@ -1637,11 +1637,7 @@ impl Process {
     /// and the trapped import alone names the call.
     #[inline]
     pub(crate) fn trap_site(&self) -> (usize, usize) {
-        if crate::beamasm_integration::enabled() {
-            (0, 0)
-        } else {
-            (self.module, self.ip_raw)
-        }
+        (0, 0)
     }
 
     /// Where the process stands, to tell whether a call moved it: its interpreter position and
@@ -2240,9 +2236,6 @@ impl Process {
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
         process.heap.abi.arity = x_registers.min(usize::from(u8::MAX)) as u8;
-        if !crate::beamasm_integration::enabled() {
-            crate::native_bridge::push_exit_bridge(&mut process);
-        }
         process
     }
     pub(crate) fn with_registers_and_min_heap(

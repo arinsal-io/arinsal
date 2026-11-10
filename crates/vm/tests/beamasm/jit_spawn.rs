@@ -71,7 +71,6 @@ fn spawned_processes_start_in_native_code() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["spawned_processes_start_in_native_code", "--nocapture"])
         .env(CHILD, &path)
-        .env_remove("ARINSAL_INTERP")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

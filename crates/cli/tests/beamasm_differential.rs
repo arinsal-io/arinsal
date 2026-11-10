@@ -67,19 +67,6 @@ fn native(dir: &Path, module: &str) -> Output {
         .args(["120", env!("CARGO_BIN_EXE_arinsal"), "-noshell", "-pa"])
         .arg(dir)
         .args(["-eval", &format!("{module}:run(), halt().")])
-        .env("ARINSAL_BEAMASM", "1")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap()
-}
-
-fn interpreted(dir: &Path, module: &str) -> Output {
-    Command::new("timeout")
-        .args(["120", env!("CARGO_BIN_EXE_arinsal"), "-noshell", "-pa"])
-        .arg(dir)
-        .args(["-eval", &format!("{module}:run(), halt().")])
-        .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_INTERP", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap()
@@ -121,17 +108,14 @@ fn compile_far_branch_fixture() -> Option<PathBuf> {
     Some(dir)
 }
 
-fn run_eval(dir: &Path, executable: &str, expression: &str, beamasm: bool) -> Output {
-    let mut command = Command::new("timeout");
-    command
+fn run_eval(dir: &Path, executable: &str, expression: &str) -> Output {
+    Command::new("timeout")
         .args(["120", executable, "-noshell", "-pa"])
         .arg(dir)
         .args(["-eval", expression])
-        .stdin(std::process::Stdio::null());
-    if beamasm {
-        command.env("ARINSAL_BEAMASM", "1");
-    }
-    command.output().unwrap()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -157,24 +141,14 @@ fn native_modules_print_what_erl_prints() {
 }
 
 #[test]
-fn caught_bif_error_stacktrace_matches_jit_interpreter_and_otp() {
+fn caught_bif_error_stacktrace_matches_otp() {
     let Some(dir) = compile_fixtures() else {
         return;
     };
     let expected = reference(&dir, "beamasm_caught_bif_error");
     assert!(expected.status.success(), "erl failed: {expected:?}");
-    let interpreted = interpreted(&dir, "beamasm_caught_bif_error");
-    assert!(
-        interpreted.status.success(),
-        "interpreter failed: {interpreted:?}"
-    );
     let actual = native(&dir, "beamasm_caught_bif_error");
     assert!(actual.status.success(), "BeamAsm failed: {actual:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&interpreted.stdout),
-        String::from_utf8_lossy(&expected.stdout),
-        "interpreter output differs from erl"
-    );
     assert_eq!(
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout),
@@ -189,9 +163,9 @@ fn generated_far_beam_fail_branch_matches_erl() {
         return;
     };
     let expression = "io:format(\"~p~n\",[beamasm_far_branch:run({})]),halt().";
-    let expected = run_eval(&dir, "erl", expression, false);
+    let expected = run_eval(&dir, "erl", expression);
     assert!(expected.status.success(), "erl failed: {expected:?}");
-    let actual = run_eval(&dir, env!("CARGO_BIN_EXE_arinsal"), expression, true);
+    let actual = run_eval(&dir, env!("CARGO_BIN_EXE_arinsal"), expression);
     assert!(actual.status.success(), "BeamAsm failed: {actual:?}");
     assert_eq!(
         String::from_utf8_lossy(&actual.stdout),

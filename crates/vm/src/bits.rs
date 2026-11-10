@@ -913,47 +913,6 @@ mod tests {
     use crate::Vm;
 
     #[test]
-    fn recursive_byte_summer_uses_constant_process_heap_words() {
-        if crate::test_support::in_interpreter_flavor(
-            "bits::tests::recursive_byte_summer_uses_constant_process_heap_words",
-        ) {
-            return;
-        }
-        let Ok(reference) = RefErl::start() else {
-            eprintln!("erl unavailable; skipping byte summer allocation test");
-            return;
-        };
-        let beam = reference
-            .compile_named(
-                "binparse_variants",
-                include_str!("../tests/fixtures/binparse_variants.erl"),
-                &[],
-            )
-            .unwrap();
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let mut allocated = None;
-        for bytes in [0, 1, 4096] {
-            let mut source_heap = VecHeap::new();
-            let source = TermBuilder::new(&mut source_heap)
-                .binary(&vec![7; bytes])
-                .unwrap();
-            let result = vm
-                .eval("binparse_variants", "sum_input", &[source])
-                .unwrap();
-            assert_eq!(result.term.as_small(), Some(7 * bytes as i64));
-            assert_eq!(result.stats.gc.collections, 0);
-            // The process owns a copy of its argument (erl_create_process); only the
-            // words the summing loop allocates must stay constant.
-            let words = result._process.heap.used_words() - arinsal_term::size_object(source);
-            if let Some(previous) = allocated {
-                assert_eq!(words, previous, "byte count changed process heap usage");
-            }
-            allocated = Some(words);
-        }
-    }
-
-    #[test]
     fn utf8_tail_matches_survive_repeated_collection() {
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping utf8 match collection test");

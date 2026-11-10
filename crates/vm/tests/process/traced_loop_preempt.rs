@@ -1,7 +1,5 @@
-//! An interpreted busy loop whose entry carries a local call-trace breakpoint must still be
-//! switched out when its reductions run out, so `exit(Pid, kill)` reaches it. A test of the
-//! interpreter flavor: it re-runs itself in a child started with `-emu_flavor emu` (its
-//! `ARINSAL_INTERP` alias).
+//! A busy loop whose entry carries a local call-trace breakpoint must still be switched out when
+//! its reductions run out, so `exit(Pid, kill)` reaches it.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
@@ -23,21 +21,7 @@ spin() -> spin().
 "#;
 
 #[test]
-fn traced_interpreted_loop_is_preempted() {
-    if std::env::var_os("ARINSAL_INTERP").is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["traced_interpreted_loop_is_preempted", "--nocapture"])
-            .env("ARINSAL_INTERP", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "interpreter flavor child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+fn traced_loop_is_preempted() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping traced loop preemption test");
         return;

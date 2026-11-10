@@ -9,12 +9,6 @@ use crate::pure::{Heap, atom_name, tuple_build};
 use crate::{BifError, Ctx};
 
 static PERF_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-static EMU_FLAVOR_JIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Records whether the VM runs BeamAsm (`jit`) or the interpreter (`emu`).
-pub fn set_emu_flavor_jit(jit: bool) {
-    EMU_FLAVOR_JIT.store(jit, std::sync::atomic::Ordering::Relaxed);
-}
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
     module: &str,
@@ -171,13 +165,8 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
         // triple, fixed when the runtime is built (crates/bifs/build.rs).
         "system_architecture" => string(ctx, env!("ARINSAL_SYSTEM_ARCHITECTURE")),
         // Port of erts/emulator/beam/erl_bif_info.c (system_info emu_flavor), OTP-29.1.1.
-        "emu_flavor" => Ok(atom(
-            if EMU_FLAVOR_JIT.load(std::sync::atomic::Ordering::Relaxed) {
-                "jit"
-            } else {
-                "emu"
-            },
-        )),
+        // The runtime is the JIT build only, as the reference install is.
+        "emu_flavor" => Ok(atom("jit")),
         "build_type" | "emu_type" => Ok(atom("opt")),
         "os_type" => Ok(os_type()),
         "endian" => Ok(atom(if cfg!(target_endian = "little") {

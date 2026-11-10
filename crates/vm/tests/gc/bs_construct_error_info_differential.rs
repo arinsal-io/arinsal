@@ -70,7 +70,6 @@ fn bit_sized_binary_construct_errors_match_otp() {
             .args(["bit_sized_binary_construct_errors_match_otp", "--nocapture"])
             .env(CHILD, &beam_path)
             .env("ARINSAL_BS_ERROR_INFO_BITS", bits.to_string())
-            .env("ARINSAL_BEAMASM", "1")
             .output()
             .expect("run BeamAsm child");
         assert!(
