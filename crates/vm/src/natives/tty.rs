@@ -128,8 +128,8 @@ extern "C" fn sigint_handler(_signum: i32) {
 }
 
 /// Port of erts/emulator/sys/unix/sys.c (init_break_handler), OTP-29.1.1: SIGINT requests a
-/// break. Installed at boot whether or not stdin is a tty. (erts also routes SIGQUIT to
-/// `generic_signal_handler`; Arinsal leaves SIGQUIT at its default, see the report.)
+/// break and SIGQUIT goes to the generic handler. Installed at boot whether or not stdin is a
+/// tty.
 pub(crate) fn init_break_handler() {
     let mut pipe = [-1; 2];
     // SAFETY: pipe creates two fresh descriptors; mark them close-on-exec before
@@ -164,6 +164,7 @@ pub(crate) fn init_break_handler() {
         action.sa_sigaction = sigint_handler as *const () as libc::sighandler_t;
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
     }
+    crate::natives::env::install_quit_handler();
 }
 
 /// Port of erts/emulator/sys/unix/sys.c (erts_replace_intr), OTP-29.1.1: Ctrl-C is disabled on
