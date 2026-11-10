@@ -162,50 +162,34 @@ impl Vm {
         Ok(pid)
     }
 
-    /// Run `module`'s `-on_load` before `user_ip` when this load did not go through `code_server`.
-    fn arm_entry_on_load(
+    /// Finishes a module whose `-on_load` is pending the way `code_server` does it: the
+    /// on_load function runs in its own process, and only after `finish_after_on_load/2`
+    /// the caller's call runs.
+    // Port of lib/kernel/src/code_server.erl (handle_on_load, finish_on_load_1) and
+    // erts/emulator/beam/beam_bif_load.c (call_on_load_function_1,
+    // erts_internal_finish_after_on_load_2), OTP-29.1.1.
+    fn run_pending_on_load(
         &mut self,
-        process: &mut Process,
-        module_id: usize,
-        user_ip: usize,
-        arity: usize,
+        module: &str,
+        workers: usize,
+        simulation_seed: Option<u64>,
+        reductions: u32,
     ) -> Result<(), VmError> {
-        let Some((function, on_arity)) = self
-            .code
-            .code_meta
-            .get(module_id)
-            .and_then(|meta| meta.as_ref())
-            .and_then(|meta| meta.on_load.clone())
-        else {
-            return Ok(());
-        };
-        let Some(on_ip) = Self::on_load_entry(&self.code.modules[module_id], &function, on_arity)
-        else {
-            return Ok(());
-        };
-        if on_ip == user_ip {
-            return Ok(());
-        }
-        let mut heap = arinsal_term::VecHeap::new();
-        let mut saved = Vec::with_capacity(arity);
-        for &arg in &process.x[..arity] {
-            saved.push(
-                arinsal_term::copy_term(arg, &mut heap)
-                    .map_err(|error| VmError::Load(format!("on_load arguments: {error:?}")))?,
-            );
-        }
-        crate::calls::push_continuation(process, module_id, user_ip, 0)?;
-        process.cold_mut().entry_args_after_on_load =
-            Some(Box::new(crate::proc_create::EntryArgsAfterOnLoad {
-                _heap: heap,
-                args: saved,
-                module: module_id,
-                ip: user_ip,
-            }));
-        process.set_native_pc(None);
-        self.set_position(process, module_id, on_ip);
-        self.enter_native_at_jump(process);
-        Ok(())
+        let name = Term::atom(
+            arinsal_term::global_atoms()
+                .intern(module)
+                .map_err(|error| VmError::Load(format!("on_load module name: {error:?}")))?,
+        );
+        let result = self.eval_scheduled_reductions(
+            "erlang",
+            "call_on_load_function",
+            &[name],
+            workers,
+            simulation_seed,
+            reductions,
+        );
+        let keep = matches!(&result, Ok(done) if done.text == "ok");
+        crate::natives::code::finish_after_on_load(self, module, keep)
     }
 
     /// Run an exported function with schedulable BEAM processes.
@@ -276,6 +260,17 @@ impl Vm {
             self.child_setup = Some(crate::child_setup::start().map_err(|error| {
                 VmError::Load(format!("cannot start erl_child_setup: {error}"))
             })?);
+        }
+        self.refresh_code();
+        if !self.code.loaded.contains_key(module)
+            && !self.code.pending_on_load.contains_key(module)
+            && let Err(error) = self.load_named(module)
+            && !self.code.pending_on_load.contains_key(module)
+        {
+            return Err(error);
+        }
+        if self.code.pending_on_load.contains_key(module) {
+            self.run_pending_on_load(module, workers, simulation_seed, reductions)?;
         }
         let module_id = self.load_named(module)?;
         // Port of erts/emulator/beam/erl_init.c:508 (load_preloaded), OTP-29.1.1:
@@ -441,10 +436,6 @@ impl Vm {
             process.set_runtime(Some(runtime));
             process.initial_mfa = mfa_atoms(module, function, args.len() as u8);
             process.entry = true;
-            // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1.
-            // A direct `eval_scheduled` has no `code_server` to run `-on_load` before the call.
-            // The entry process runs that function first and continues only when it returns `ok`.
-            self.arm_entry_on_load(&mut process, module_id, ip, args.len())?;
             // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
             // the first process gets the first pid; it runs once the system processes
             // exist, as erts starts its schedulers only after spawning them.

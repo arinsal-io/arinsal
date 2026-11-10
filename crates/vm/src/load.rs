@@ -1014,9 +1014,8 @@ impl Vm {
     }
 
     /// Whether a module may be loaded without the interpreter form of its code: BeamAsm is
-    /// the engine, nothing patches the code at load (`-on_load`, coverage, debugger lines)
-    /// and the module is no special one. It still needs the interpreter form when BeamAsm
-    /// leaves a function unported, which the caller checks after compiling.
+    /// the engine and nothing patches the code at load (coverage, line counters, debugger
+    /// lines). In the JIT flavor a module BeamAsm cannot compile completely fails to load.
     pub(crate) fn native_only(&self, beam: &BeamFile, meta: &CodeMeta) -> bool {
         // `Vm::eval` interprets: once a process has used it, every module keeps its interpreter
         // form, those it loads for its calls included.
@@ -1030,7 +1029,6 @@ impl Vm {
                 .as_ref()
                 .is_none_or(|lines| lines.flags & 2 == 0)
             && !crate::trace_bp::line_breakpoints_instrumented()
-            && beam.module != "erts_internal"
             && std::env::var_os("ARINSAL_FULL_SPECIALIZE").is_none()
     }
 
@@ -1210,8 +1208,9 @@ impl Vm {
         self.load_current(beam.clone(), None, false, None)
     }
 
-    /// Loads `beam` as the current code of its module unless it already has current code,
-    /// staging it and committing the staging code index.
+    /// Loads `beam` as the current code of its module unless it already has current or
+    /// pending on_load code, staging it and committing the staging code index. A module with
+    /// `-on_load` stays pending until erlang:finish_after_on_load/2.
     fn load_current(
         &mut self,
         beam: BeamFile,
@@ -1221,6 +1220,9 @@ impl Vm {
     ) -> Result<usize, VmError> {
         self.refresh_code();
         if let Some(&id) = self.code.loaded.get(&beam.module) {
+            return Ok(id);
+        }
+        if let Some(&id) = self.code.pending_on_load.get(&beam.module) {
             return Ok(id);
         }
         let module_name = beam.module.clone();
@@ -1264,9 +1266,17 @@ impl Vm {
         }
         let module = Arc::new(module);
         let name = module.name.clone();
+        let on_load = meta.on_load.is_some();
         let id = staging.with(|tables| {
             let id = tables.alloc(module, registers, Some(meta));
-            tables.make_current(&name, id);
+            // Port of erts/emulator/beam/beam_load.c:259-330 (erts_finish_loading), OTP-29.1.1:
+            // a module with `-on_load` is not made current; its code waits in the module's
+            // on_load slot until erlang:finish_after_on_load/2 keeps it.
+            if on_load {
+                tables.pending_on_load.insert(name.clone(), id);
+            } else {
+                tables.make_current(&name, id);
+            }
             if let Some((requested, path)) = file {
                 tables
                     .module_files
@@ -1661,21 +1671,6 @@ impl Vm {
             crate::natives::code::apply_on_load_patterns(self, process, name);
         }
         Ok(id)
-    }
-
-    /// Instruction index of a module's `-on_load` function, exported or local.
-    pub(crate) fn on_load_entry(
-        module: &arinsal_loader::Module,
-        function: &str,
-        arity: u8,
-    ) -> Option<usize> {
-        module.export(function, arity).or_else(|| {
-            module
-                .functions
-                .iter()
-                .find(|(_, name, found)| *name == function && *found == arity)
-                .map(|(start, _, _)| start + 1)
-        })
     }
 
     pub(crate) fn load_named(&mut self, name: &str) -> Result<usize, VmError> {
