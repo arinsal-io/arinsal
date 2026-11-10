@@ -41,12 +41,6 @@ pub enum Instr {
     Breakpoint { index: u32 },
     /// Export entry trampoline installed for a `global` trace pattern.
     ExportBreakpoint { index: u32 },
-    /// Traced function return continuation.
-    ReturnTrace,
-    /// Call-time or call-memory accounting return continuation.
-    ReturnCallAccTrace,
-    /// `return_to` continuation installed by a traced process flag.
-    ReturnToTrace,
     /// Drop a Y frame and immediately return.
     DeallocateReturn { slots: u16 },
     /// Unconditional resolved local jump.

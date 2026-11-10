@@ -452,11 +452,6 @@ impl Process {
             let Some(term) = self.heap.stack_get(index) else {
                 continue;
             };
-            if let Some((false, frame_module, _)) = crate::stacktrace::decode_tag(term)
-                && frame_module == module
-            {
-                return true;
-            }
             let word = term.tagged_word() as usize;
             if in_native(word) {
                 return true;

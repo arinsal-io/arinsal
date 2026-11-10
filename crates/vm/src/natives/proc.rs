@@ -2219,8 +2219,8 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         .ok_or_else(badarg)
 }
 
-/// `module:function/arity + offset` of an interpreter continuation or native address.
-fn pc_description(modules: &[std::sync::Arc<crate::Module>], word: Term, native: bool) -> String {
+/// `module:function/arity + offset` of a native code address.
+fn pc_description(word: Term, native: bool) -> String {
     let address = word.tagged_word() as usize;
     let is_native =
         native || address & 3 == 0 && crate::native_bridge::is_native_function_at(address);
@@ -2232,12 +2232,6 @@ fn pc_description(modules: &[std::sync::Arc<crate::Module>], word: Term, native:
             function.arity,
             address - function.start
         );
-    }
-    if let Some((_, module, ip)) = crate::stacktrace::decode_tag(word)
-        && let Some(code) = modules.get(module)
-        && let Some((start, name, arity)) = code.functions.iter().rev().find(|(s, _, _)| *s <= ip)
-    {
-        return format!("{}:{}/{} + {}", code.name, name, arity, ip - start);
     }
     "unknown function".into()
 }
@@ -2295,7 +2289,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         (process.ip(), format!("{module}:{function}/{arity} + 0"))
     } else {
         match native_pc {
-            Some(pc) => (pc, pc_description(modules, Term::NIL, true)),
+            Some(pc) => (pc, pc_description(Term::NIL, true)),
             None => (process.ip(), String::new()),
         }
     };
@@ -2383,17 +2377,16 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         };
         let raw = word.tagged_word() as usize;
         let native_return = raw & 3 == 0 && crate::native_bridge::is_native_function_at(raw);
-        let continuation = matches!(crate::stacktrace::decode_tag(word), Some((false, _, _)));
         // Port of erts/emulator/beam/erl_process.c:14938-14953
         // (erts_internal_fun_description_from_pc), OTP-29.1.1: the exit bridge is the
         // return address of a process's first call, erts' `beam_normal_exit`.
         let normal_exit = raw == crate::native_bridge::bridge_return_address();
-        if native_return || continuation || normal_exit {
+        if native_return || normal_exit {
             let slot = base.wrapping_add(index * 8);
             let description = if normal_exit {
                 "<terminate process normally>".into()
             } else {
-                pc_description(modules, word, native_return)
+                pc_description(word, native_return)
             };
             let _ = writeln!(
                 text,
@@ -2405,11 +2398,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         let _ = write!(text, "{:<8} ", format!("y({yreg})"));
         yreg += 1;
         if word.classify() == TermKind::Catch {
-            let _ = writeln!(
-                text,
-                "Catch {raw:#018x} ({})",
-                pc_description(modules, word, false)
-            );
+            let _ = writeln!(text, "Catch {raw:#018x} ({})", pc_description(word, false));
         } else {
             let _ = writeln!(text, "{}", print(word));
         }

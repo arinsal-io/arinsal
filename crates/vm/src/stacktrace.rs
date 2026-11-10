@@ -10,17 +10,9 @@ use arinsal_term::{
 use arinsal_term::{ExternalBinary, MagicRef, Node, WritableBinary};
 use std::sync::{Arc, OnceLock};
 
-// The final continuation module index identifies an empty-trace catch immediate.
-const EMPTY_TRACE_PREFIX: u64 = (1 << 26) - 1;
 const CONTINUATION_BIT: u64 = 1 << 57;
 /// Module indexes from here up are not encodable in a continuation.
 const MAX_CONTINUATION_MODULE: u64 = 1 << 21;
-/// Module-field flags of the interpreter's trace frame continuations. A stack walk skips such a
-/// frame without a function lookup: their instruction pointers lie past the module's functions.
-const RETURN_TRACE_FLAG: u64 = 1 << 22;
-const RETURN_TO_TRACE_FLAG: u64 = 1 << 21;
-const RETURN_CALL_ACC_TRACE_FLAG: u64 = 1 << 23;
-const TRACE_FLAGS: u64 = RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG | RETURN_CALL_ACC_TRACE_FLAG;
 /// `struct StackTrace` words after the bignum header: `freason`, `pc`, `current`, and `depth`
 /// with `max_depth` sharing one word (two C `int`s), as in erts/emulator/beam/error.h:222-230.
 const STACKTRACE_HEADER_WORDS: usize = 4;
@@ -511,10 +503,7 @@ pub(super) fn capture(
             push_frame(raw, Continuation::Indexed(module, caller_cp));
         }
     }
-    // OTP starts with the failing instruction as `prev` and compares it with
-    // each continuation after moving that continuation back to its call site.
-    let mut previous = (!trapped).then_some((module, ip));
-    // Native return addresses share erts' single `prev`, so the two trackers reset each other.
+    // erts' single `prev`: the raising pc, compared with each return address.
     let mut previous_native: Option<usize> = None;
     if let Some(pc) = native_pc {
         let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
@@ -526,13 +515,11 @@ pub(super) fn capture(
             let address = pc & !tag;
             raw.native_top = Some(address - 1);
             previous_native = Some(address);
-            previous = None;
         } else {
             raw.native_top = Some(pc);
             // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
             // OTP-29.1.1: the current native PC seeds the same duplicate check as `rp->i`.
             previous_native = Some(pc);
-            previous = None;
         }
     }
     if let Some(return_ip) = trap_return
@@ -541,7 +528,6 @@ pub(super) fn capture(
     {
         // The trap's pc is no function, so nothing seeds `prev`: the BIF call's own return
         // address is the first frame.
-        previous = Some((module, return_ip.saturating_sub(1)));
         push_frame(raw, Continuation::Indexed(module, return_ip));
     }
     let mut index = 0;
@@ -582,40 +568,10 @@ pub(super) fn capture(
             // shape (plus the lock-free native hull); the function is looked up in `build`.
             if previous_native != Some(raw_address) {
                 previous_native = Some(raw_address);
-                previous = None;
                 push_frame(raw, Continuation::Native(raw_address - 1));
             }
             index += 1;
             continue;
-        }
-        let Some((handler, module, ip)) = decode_tag(word) else {
-            index += 1;
-            continue;
-        };
-        if let Some(code) = modules.get(module)
-            && !handler
-            && (ip == code.return_trace_ip
-                || ip == code.return_call_acc_trace_ip
-                || ip == code.return_to_trace_ip)
-        {
-            index += if ip == code.return_trace_ip {
-                6
-            } else if ip == code.return_call_acc_trace_ip {
-                4
-            } else {
-                2
-            };
-            continue;
-        }
-        let call_site = ip.saturating_sub(1);
-        if handler || previous == Some((module, call_site)) {
-            index += 1;
-            continue;
-        }
-        previous = Some((module, call_site));
-        previous_native = None;
-        if modules.get(module).is_some() {
-            push_frame(raw, Continuation::Indexed(module, ip));
         }
         index += 1;
     }
@@ -1375,32 +1331,6 @@ pub(crate) fn native_catch_address(term: Term) -> Option<usize> {
         crate::fun_dispatch::code_scope(),
         u32::try_from(payload).ok()?,
     )
-}
-
-pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
-    if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
-        return None;
-    }
-    // SAFETY: CATCH is an immediate and carries no heap pointer.
-    let payload = unsafe { term.raw_bits() } >> 6;
-    if payload >> 32 == EMPTY_TRACE_PREFIX {
-        // Empty-trace marker, not a continuation.
-        return None;
-    }
-    // Interpreter continuations use an immediate module/IP pair. Catch tags
-    // themselves are process-independent indices into the shared catch table.
-    if payload & CONTINUATION_BIT != 0 {
-        return Some((
-            false,
-            (((payload & !CONTINUATION_BIT) >> 32) & !TRACE_FLAGS) as usize,
-            payload as u32 as usize,
-        ));
-    }
-    if payload >> 32 != 0 {
-        return Some((false, (payload >> 32) as usize, payload as u32 as usize));
-    }
-    // A catch-table index names a native handler, which is not a continuation.
-    None
 }
 
 fn atom(name: &str) -> Result<Term, VmError> {

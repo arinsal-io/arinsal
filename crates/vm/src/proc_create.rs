@@ -1641,14 +1641,6 @@ impl Process {
         self.ip_raw = ip;
     }
 
-    /// Sets the interpreter position.
-    #[track_caller]
-    #[inline]
-    pub(crate) fn set_ip(&mut self, ip: usize) {
-        interpreter_position_used();
-        self.ip_raw = ip;
-    }
-
     /// Enter a tail apply whose caller frame is already deallocated (see `apply_frame_released`).
     /// Returns whether this call set the flag, for `end_tail_apply`.
     pub(crate) fn begin_tail_apply(&mut self, kind: u8) -> bool {

@@ -266,24 +266,6 @@ pub(crate) fn gc_after_native_parts(
     Ok(())
 }
 
-/// Pop a continuation after the callee deallocated its Y slots.
-#[inline]
-pub(super) fn return_to(p: &mut Process) -> Option<Term> {
-    let Some(cp) = p.heap.stack_get(0) else {
-        return Some(p.x[0]);
-    };
-    if cp.classify() != TermKind::Catch {
-        return Some(p.x[0]);
-    }
-    let Some((false, module, ip)) = crate::stacktrace::decode_tag(cp) else {
-        return Some(p.x[0]);
-    };
-    p.module = module;
-    p.set_ip(ip);
-    p.heap.release_stack(1);
-    None
-}
-
 /// How a call made on behalf of native code (an apply, a fun call, a BIF trap) left the
 /// process.
 pub(crate) enum ImportOutcome {
@@ -496,7 +478,10 @@ impl Vm {
                 break;
             }
         }
-        calls::return_to(p)
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (the BIF return paths jump
+        // to the CP), OTP-29.1.1: every CP is a native code address; a stack top that is not
+        // one is a caller entered from the runtime, which takes the value from x0.
+        Some(p.x[0])
     }
 }
 

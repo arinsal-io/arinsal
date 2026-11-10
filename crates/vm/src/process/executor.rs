@@ -512,7 +512,7 @@ pub(super) fn resume_after_native_return(process: &mut Process) -> bool {
         let Some(word) = process.heap.stack_get(0) else {
             return false;
         };
-        // SAFETY: A live stack slot contains a tagged continuation or a raw native CP.
+        // SAFETY: A live stack slot contains a tagged term or a raw native CP.
         let raw = unsafe { word.raw_bits() } as usize;
         if raw == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize {
             process.heap.release_stack(1);
@@ -525,16 +525,7 @@ pub(super) fn resume_after_native_return(process: &mut Process) -> bool {
             process.set_native_pc(Some(raw));
             return true;
         }
-        let Some((handler, module, ip)) = crate::stacktrace::decode_tag(word) else {
-            return false;
-        };
-        if handler {
-            return false;
-        }
-        process.heap.release_stack(1);
-        process.module = module;
-        process.set_ip(ip);
-        return true;
+        return false;
     }
 }
 
