@@ -8,7 +8,7 @@ use arinsal_term::{
     Atom, HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned,
 };
 use arinsal_term::{ExternalBinary, MagicRef, Node, WritableBinary};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 // The final continuation module index identifies an empty-trace catch immediate.
 const EMPTY_TRACE_PREFIX: u64 = (1 << 26) - 1;
@@ -43,14 +43,6 @@ fn stacktrace_depths(word: u64) -> (usize, usize) {
 /// [`STACKTRACE_CURRENT_ARGS_MFA`]).
 fn current_args_mfa(current: u64) -> bool {
     current & (1 << 63) == 0 && current & STACKTRACE_CURRENT_ARGS_MFA != 0
-}
-
-/// A catch handler: the code scope of its runtime, its module index and its code index.
-type CatchKey = (u64, usize, usize);
-
-fn interpreted_catch_ids() -> &'static Mutex<std::collections::HashMap<CatchKey, u32>> {
-    static IDS: OnceLock<Mutex<std::collections::HashMap<CatchKey, u32>>> = OnceLock::new();
-    IDS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Allocator for stack trace terms.
@@ -760,8 +752,6 @@ pub(super) fn save_stacktrace(
         .as_mut()
         .map_or(0, |cold| std::mem::take(&mut cold.apply_frame_released));
     let frame_released = released != 0;
-    // A tail fun call has no apply-site adjustment: the raising BIF's pc is the continuation on
-    // top of the stack, so the failing instruction is that continuation's call site.
     // Native code has no interpreter position: its raise site is the native pc.
     let interpreter_position = |p: &Process| {
         if native_pc.is_some() {
@@ -770,23 +760,16 @@ pub(super) fn save_stacktrace(
             (p.module, p.ip())
         }
     };
-    let site = if released == crate::proc_create::TAIL_FUN_CALL
-        && native_pc.is_none()
-        && !top.is_some_and(SaveTop::is_bif)
-    {
-        top_continuation(p).unwrap_or_else(|| interpreter_position(p))
-    } else {
-        interpreter_position(p)
-    };
-    let (native_top, previous_native, previous) = match native_pc {
+    let site = interpreter_position(p);
+    let (native_top, previous_native) = match native_pc {
         Some(pc) if pc & arinsal_beamasm::module::RETURN_SITE_TAG != 0 => {
             let address = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
-            (Some(address.wrapping_sub(1)), Some(address), None)
+            (Some(address.wrapping_sub(1)), Some(address))
         }
         // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
         // OTP-29.1.1: the raw `pc` seeds the duplicate check before the stack walk.
-        Some(pc) => (Some(pc), Some(pc), None),
-        None => (None, None, Some(site)),
+        Some(pc) => (Some(pc), Some(pc)),
+        None => (None, None),
     };
     // Port of erts/emulator/beam/beam_common.c:880-930 (`save_stacktrace`), OTP-29.1.1:
     // `StackTrace` is the bignum itself and ftrace is its three-element tuple. The current
@@ -849,11 +832,10 @@ pub(super) fn save_stacktrace(
                 offset = 1;
             }
             let end = STACKTRACE_HEADER_WORDS + max_depth;
-            let gathered = gather_continuations(
+            let gathered = gather_native_continuations(
                 p,
                 &mut digits[STACKTRACE_HEADER_WORDS + offset..end],
                 previous_native,
-                previous,
             );
             let depth = offset + gathered;
             digits[3] = stacktrace_depth_word(depth, max_depth);
@@ -961,27 +943,6 @@ fn pack_bif_mfa(module: Atom, function: Atom) -> u64 {
     (u64::from(module.0) << 32) | u64::from(function.0)
 }
 
-/// Writes raw CP words the way `gather_stacktrace` does (beam_common.c:781), OTP-29.1.1.
-/// One pass from `stop` toward the stack start. A continuation pointer is recorded when
-/// it differs from the previous one; every other word is skipped.
-fn gather_continuations(
-    p: &Process,
-    pcs: &mut [u64],
-    previous_native: Option<usize>,
-    previous: Option<(usize, usize)>,
-) -> usize {
-    // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`), OTP-29.1.1.
-    // erts advances one pointer through the live stack; use the equivalent sequential view.
-    // Only a process that ever ran interpreted code can hold interpreter continuations
-    // (catch immediates with the continuation bit); every other stack is erts' layout, where
-    // a non-CP word is skipped after the single `is_CP` test.
-    if p.interpreter_frames {
-        gather_continuations_in(p, pcs, previous_native, previous)
-    } else {
-        gather_native_continuations(p, pcs, previous_native)
-    }
-}
-
 /// `gather_stacktrace` over a stack of native frames only: each word costs the `is_CP` test,
 /// a CP additionally the trace-frame and exit-bridge compares and the duplicate check.
 // Port of erts/emulator/beam/beam_common.c:782-841 (gather_stacktrace), OTP-29.1.1.
@@ -1026,118 +987,6 @@ fn gather_native_continuations(
         }
     }
     count
-}
-
-/// `gather_stacktrace` over a stack that may also hold interpreter continuations.
-fn gather_continuations_in(
-    p: &Process,
-    pcs: &mut [u64],
-    previous_native: Option<usize>,
-    mut previous: Option<(usize, usize)>,
-) -> usize {
-    let limit = pcs.len();
-    if limit == 0 {
-        return 0;
-    }
-    let mut count = 0usize;
-    let trace_return = crate::native_bridge::native_trace_return_address();
-    let bridge = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
-    // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`), OTP-29.1.1: one
-    // forward pass over the live stack words. A plain term costs the `is_CP` test and, for a
-    // catch immediate, one more. `usize::MAX` is "no previous CP" (a CP has its low bits clear).
-    let words = p.heap.stack_raw_words();
-    let mut previous_cp = previous_native.unwrap_or(usize::MAX);
-    let mut index = 0usize;
-    while index < words.len() {
-        let raw_address = words[index] as usize;
-        index += 1;
-        if arinsal_term::is_cp(raw_address as u64) {
-            if raw_address == trace_return {
-                let action_count = p
-                    .heap
-                    .stack_get(index + 2)
-                    .and_then(Term::as_small)
-                    .and_then(|n| usize::try_from(n).ok())
-                    .unwrap_or(0);
-                index = index.saturating_add(3 + action_count.saturating_mul(2));
-            } else if raw_address != bridge && previous_cp != raw_address {
-                previous_cp = raw_address;
-                previous = None;
-                pcs[count] = u64::try_from(raw_address.wrapping_sub(1)).unwrap_or(0);
-                count += 1;
-                if count == limit {
-                    break;
-                }
-            }
-            continue;
-        }
-        if raw_address & 63 != 0x1b {
-            continue;
-        }
-        if let Some((module, ip)) = p.heap.stack_get(index - 1).and_then(continuation_word) {
-            // Port of erts/emulator/beam/beam_common.c:803-815 (gather_stacktrace), OTP-29.1.1:
-            // trace stack frames are skipped.
-            if module as u64 & RETURN_CALL_ACC_TRACE_FLAG != 0 {
-                index += 3;
-                continue;
-            }
-            if module as u64 & RETURN_TRACE_FLAG != 0 {
-                index += 5;
-                continue;
-            }
-            if module as u64 & RETURN_TO_TRACE_FLAG != 0 {
-                index += 1;
-                continue;
-            }
-            let call_site = ip.saturating_sub(1);
-            if previous == Some((module, call_site)) {
-                continue;
-            }
-            previous = Some((module, call_site));
-            previous_cp = usize::MAX;
-            if let Some(packed) = pack_indexed(module, ip) {
-                pcs[count] = packed;
-                count += 1;
-                if count == limit {
-                    break;
-                }
-            }
-        }
-    }
-    count
-}
-
-/// Call site of the continuation on top of the stack: where a tail-called BIF returns to.
-fn top_continuation(p: &Process) -> Option<(usize, usize)> {
-    let mut index = 0;
-    while let Some(word) = p.heap.stack_get(index) {
-        index += 1;
-        if let Some((module, ip)) = continuation_word(word)
-            && module as u64
-                & (RETURN_CALL_ACC_TRACE_FLAG | RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG)
-                == 0
-        {
-            return Some((module, ip.saturating_sub(1)));
-        }
-    }
-    None
-}
-
-/// Interpreter continuation or catch tag carried as a catch immediate.
-/// Catch handlers are not frames. No catch-table lookup: a handler index has
-/// no continuation bit, and `build_stacktrace` is what resolves a real CP.
-fn continuation_word(word: Term) -> Option<(usize, usize)> {
-    if word.tagged_word() & 63 != 0x1b || word.classify() != TermKind::Catch {
-        return None;
-    }
-    let payload = word.tagged_word() >> 6;
-    if payload >> 32 == EMPTY_TRACE_PREFIX || payload & CONTINUATION_BIT == 0 {
-        return None;
-    }
-    Some((
-        ((payload & !CONTINUATION_BIT) >> 32) as usize,
-        payload as u32 as usize,
-    ))
 }
 
 fn pack_indexed(module: usize, ip: usize) -> Option<u64> {
@@ -1496,86 +1345,9 @@ pub(super) enum TopFrame {
     CurrentArgsInfoTerm(Option<Term>, Term),
 }
 
-pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
-    // Per-thread cache in front of the shared table: erts keeps the handler's code pointer in
-    // the stack slot, so `catch` must not take a lock or hash with SipHash.
-    thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<CatchKey, u32, CodeKeyHasher>> =
-            std::cell::RefCell::new(std::collections::HashMap::default());
-    }
-    let key = (crate::fun_dispatch::code_scope(), module, ip);
-    if let Some(index) = CACHE.with(|cache| cache.borrow().get(&key).copied()) {
-        return Ok(Term::catch(u64::from(index)));
-    }
-    let index = handler_tag_shared(key)?;
-    CACHE.with(|cache| cache.borrow_mut().insert(key, index));
-    Ok(Term::catch(u64::from(index)))
-}
-
-/// Multiplicative hasher for `(module, ip)` keys; they are small dense integers.
-#[derive(Default)]
-struct CodeKeyHasher(u64);
-
-impl std::hash::Hasher for CodeKeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_u64(u64::from(*byte));
-        }
-    }
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-}
-
-impl std::hash::BuildHasher for CodeKeyHasher {
-    type Hasher = CodeKeyHasher;
-    fn build_hasher(&self) -> CodeKeyHasher {
-        CodeKeyHasher(0)
-    }
-}
-
-fn handler_tag_shared(key: CatchKey) -> Result<u32, VmError> {
-    let (scope, module, ip) = key;
-    let mut ids = interpreted_catch_ids()
-        .lock()
-        .map_err(|_| VmError::Unsupported("catch table lock".into()))?;
-    let index = if let Some(index) = ids.get(&key) {
-        *index
-    } else {
-        let base = arinsal_beamasm::catch::reserve_catch_indices(1)
-            .map_err(|_| VmError::Unsupported("catch table exhausted".into()))?;
-        crate::native_bridge::register_interpreted_catch(scope, base, module, ip);
-        ids.insert(key, base);
-        base
-    };
-    Ok(index)
-}
-
 /// Encodes an interpreter continuation without colliding with catch-table indices.
 pub(crate) fn continuation_tag(module: usize, ip: usize) -> Result<Term, VmError> {
     continuation_tag_flagged(module, ip, 0)
-}
-
-/// The continuation of an interpreter `return_trace` frame (six words).
-pub(crate) fn return_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
-    continuation_tag_flagged(module, ip, RETURN_TRACE_FLAG)
-}
-
-/// The continuation of an interpreter call-time or call-memory frame (four words).
-// Port of erts/emulator/beam/beam_bp.c:1127-1145 (do_session_breakpoint), OTP-29.1.1.
-pub(crate) fn return_call_acc_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
-    continuation_tag_flagged(module, ip, RETURN_CALL_ACC_TRACE_FLAG)
-}
-
-/// The continuation of an interpreter `return_to` frame (two words).
-pub(crate) fn return_to_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
-    continuation_tag_flagged(module, ip, RETURN_TO_TRACE_FLAG)
 }
 
 fn continuation_tag_flagged(module: usize, ip: usize, flags: u64) -> Result<Term, VmError> {
@@ -1627,10 +1399,8 @@ pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
     if payload >> 32 != 0 {
         return Some((false, (payload >> 32) as usize, payload as u32 as usize));
     }
-    let index = u32::try_from(payload).ok()?;
-    let (module, ip) =
-        crate::native_bridge::interpreted_catch(crate::fun_dispatch::code_scope(), index)?;
-    Some((true, module, ip))
+    // A catch-table index names a native handler, which is not a continuation.
+    None
 }
 
 fn atom(name: &str) -> Result<Term, VmError> {

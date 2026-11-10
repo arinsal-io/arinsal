@@ -204,9 +204,9 @@ impl Vm {
         self.eval_scheduled_reductions(module, function, args, workers, simulation_seed, 4_000)
     }
 
-    /// Executes one exported function in a fresh process of the running flavor: the interpreter
-    /// flavor evaluates it in place ([`Vm::eval`]), the JIT flavor runs it natively under the
-    /// scheduler. The result term lives in a process heap the result retains.
+    /// Executes one exported function in a fresh process: BIFs and the `erlang` fun builtins
+    /// in place ([`Vm::eval`]), Erlang code natively under the scheduler. The result term
+    /// lives in a process heap the result retains.
     pub fn eval_exported(
         &mut self,
         module: &str,
@@ -223,6 +223,17 @@ impl Vm {
         if direct {
             return self.eval(module, function, args);
         }
+        self.eval_in_scheduled_process(module, function, args)
+    }
+
+    /// Runs `module:function(args)` in a scheduled process and copies the result into a
+    /// fresh process heap: Erlang code runs only natively, in a process of its own.
+    pub(crate) fn eval_in_scheduled_process(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &[Term],
+    ) -> Result<crate::EvalResult, VmError> {
         let scheduled = self.eval_scheduled(module, function, args, 1, None)?;
         let mut process = Process::new();
         let term = {

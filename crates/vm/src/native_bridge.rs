@@ -560,14 +560,11 @@ fn native_generation() -> &'static AtomicU64 {
     &GENERATION
 }
 
-/// One catch-table slot. Native handlers are code addresses; interpreted handlers are a
-/// module id and an instruction index. Slots stay in the published table until the module
-/// is purged (`beam_catches_delmod`).
+/// One catch-table slot: the native handler's code address (`bccix[].p[].cp`). Slots stay
+/// in the published table until the module is purged (`beam_catches_delmod`).
+// Port of erts/emulator/beam/beam_catches.c (beam_catch_t), OTP-29.1.1.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum CatchTarget {
-    Native(usize),
-    Interpreted { module: usize, ip: usize },
-}
+pub(crate) struct CatchTarget(usize);
 
 /// Code scope of `process`, or 0 when it has no node.
 pub(crate) fn process_code_scope(process: &Process) -> u64 {
@@ -621,7 +618,7 @@ pub(crate) fn is_native_catch_tag(scope: u64, word: Term) -> bool {
     let raw = word.tagged_word();
     raw & 63 == 0x1b
         && u32::try_from(raw >> 6)
-            .is_ok_and(|index| matches!(catch_slot(scope, index), Some(CatchTarget::Native(_))))
+            .is_ok_and(|index| matches!(catch_slot(scope, index), Some(CatchTarget(_))))
 }
 
 pub(crate) fn register_native_catches(scope: u64, base: u32, handlers: &[*const u8]) -> Vec<u32> {
@@ -633,7 +630,7 @@ pub(crate) fn register_native_catches(scope: u64, base: u32, handlers: &[*const 
     let staging = catch_indexes(scope).staging();
     publish_catches(scope, &[staging], |table| {
         for (&id, handler) in ids.iter().zip(handlers) {
-            place_catch(table, id, CatchTarget::Native(*handler as usize));
+            place_catch(table, id, CatchTarget(*handler as usize));
         }
     });
     ids
@@ -653,36 +650,9 @@ pub(crate) fn unregister_native_catches(scope: u64, ids: &[u32]) {
     });
 }
 
-pub(crate) fn register_interpreted_catch(scope: u64, index: u32, module: usize, ip: usize) {
-    // Interpreter catches are installed while code runs, so the active table has to see
-    // them immediately. An open staging area copied the table at its start and would drop
-    // the slot at commit unless it is published there too.
-    let code = catch_indexes(scope);
-    let active = code.active();
-    let staging = code.staging();
-    publish_catches(scope, &[active, staging], |table| {
-        place_catch(table, index, CatchTarget::Interpreted { module, ip });
-    });
-}
-
-pub(crate) fn interpreted_catch(scope: u64, index: u32) -> Option<(usize, usize)> {
-    match catch_slot(scope, index)? {
-        CatchTarget::Interpreted { module, ip } => Some((module, ip)),
-        CatchTarget::Native(_) => None,
-    }
-}
-
 /// Native handler address of a catch-table index, if it names native code.
 pub(crate) fn native_catch(scope: u64, index: u32) -> Option<usize> {
-    match catch_slot(scope, index)? {
-        CatchTarget::Native(address) => Some(address),
-        CatchTarget::Interpreted { .. } => None,
-    }
-}
-
-pub(crate) enum CatchHandler {
-    Native(usize),
-    Interpreted,
+    catch_slot(scope, index).map(|CatchTarget(address)| address)
 }
 
 /// A catch the scan found. The stack is unchanged until [`commit_catch`].
@@ -703,7 +673,7 @@ pub(crate) struct LocatedCatch {
 /// Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` up to `found_catch`),
 /// OTP-29.1.1. The scan only reads the stack and the active catch table. It does not move
 /// `stop`, so a miss leaves the scheduler's unwind the same stack erts would walk.
-fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch> {
+fn locate_catch(process: &mut Process) -> Option<LocatedCatch> {
     if process.heap.abi.catches == 0 {
         return None;
     }
@@ -714,16 +684,15 @@ fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch
     if let Some(runtime) = process.runtime.as_ref() {
         return runtime
             .code_indexes()
-            .with_active_catches(|table| scan_catch(heap, table, native_only));
+            .with_active_catches(|table| scan_catch(heap, table));
     }
     crate::code_ix::for_scope(process_code_scope(process))
-        .with_active_catches(|table| scan_catch(heap, table, native_only))
+        .with_active_catches(|table| scan_catch(heap, table))
 }
 
 fn scan_catch(
     heap: &arinsal_term::ProcessHeap,
     table: &[Option<CatchTarget>],
-    native_only: bool,
 ) -> Option<LocatedCatch> {
     let mut stack = heap.stack_terms().enumerate();
     let mut previous_cp = 0usize;
@@ -738,11 +707,8 @@ fn scan_catch(
                 .ok()
                 .and_then(|slot| table.get(slot).copied().flatten())
         {
-            if native_only && !matches!(target, CatchTarget::Native(_)) {
-                continue;
-            }
-            // Both native and interpreted frames keep the caller-pushed CP above their Y slots
-            // (a call pushes the CP, `allocate` then reserves the Y slots below it), so the
+            // A frame keeps the caller-pushed CP above its Y slots (a call pushes the CP,
+            // `allocate` then reserves the Y slots below it), so the
             // resumed E is the first Y slot after the last CP below the catch, or the stack top
             // when the catching frame is the topmost one.
             let resume = if seen_cp {
@@ -782,32 +748,16 @@ fn scan_catch(
             for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
                 stack.next();
             }
-            continue;
-        }
-        if raw & 63 == 0x1b && interpreter_continuation(word) {
-            previous_cp = index;
-            seen_cp = true;
-            for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
-                stack.next();
-            }
         }
     }
     None
-}
-
-/// Whether a catch-tagged stack word is an interpreter continuation. Out of line: the thread-local
-/// code scope it reads would otherwise be fetched on every scan.
-#[cold]
-#[inline(never)]
-fn interpreter_continuation(word: Term) -> bool {
-    crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:532-678 (`handle_error` once the trace is saved,
 /// `next_catch`, `found_catch`), OTP-29.1.1, for the native resolver: one scan of the stack,
 /// then `found_catch` writes the catch word, `stop`, x0..x3 and the failure words. Returns the
 /// native handler the fragment branches to. `None` leaves the stack unmoved for the scheduler:
-/// no catch, a catch in interpreted code, or an exception-trace frame above the catch, which
+/// no catch, or an exception-trace frame above the catch, which
 /// erts reports from `next_catch` and Arinsal from the scheduler unwind (`exception_from`).
 #[inline]
 pub(crate) fn native_found_catch(
@@ -816,10 +766,8 @@ pub(crate) fn native_found_catch(
     reason: Term,
     trace: Term,
 ) -> Option<usize> {
-    let found = locate_catch(process, false)?;
-    let CatchTarget::Native(handler) = found.target else {
-        return None;
-    };
+    let found = locate_catch(process)?;
+    let CatchTarget(handler) = found.target;
     if found.traced != 0 {
         return None;
     }
@@ -843,32 +791,17 @@ pub(crate) fn next_catch(
     class: arinsal_bifs::Class,
     reason: Term,
     trace: Term,
-    native_only: bool,
-) -> Option<CatchHandler> {
-    let found = locate_catch(process, native_only)?;
-    // An exception-trace frame above the catch is emitted by the scheduler unwind
-    // (`exception_from`). erts does that inside `next_catch` before `found_catch`.
-    // The native resolver has no trace session, so it leaves the stack unmoved.
-    if native_only && found.traced != 0 {
-        return None;
-    }
+) -> Option<usize> {
+    let found = locate_catch(process)?;
     // The scheduler resumes the handler through `run_native`; the native resolver branches to
     // it directly, so these Rust-side resume records are this caller's, not `found_catch`'s.
     process.x.ensure_x(4);
     process.exc_class = Some(class);
     found_catch(process, found, class, reason, trace);
-    Some(match found.target {
-        CatchTarget::Native(handler) => {
-            process.native_continuation_resume = true;
-            process.set_native_resume_arity(4);
-            CatchHandler::Native(handler)
-        }
-        CatchTarget::Interpreted { module, ip } => {
-            process.module = module;
-            process.set_ip(ip);
-            CatchHandler::Interpreted
-        }
-    })
+    let CatchTarget(handler) = found.target;
+    process.native_continuation_resume = true;
+    process.set_native_resume_arity(4);
+    Some(handler)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:532-570 (`handle_error` register writes) and

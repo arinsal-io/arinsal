@@ -434,10 +434,6 @@ pub struct Process {
     pub(crate) scheduler_ref_state: Option<arinsal_bifs::SchedulerRefState>,
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
-    /// The process has run interpreted code, so its stack may hold interpreter continuations
-    /// (catch immediates) besides native CPs. Sticky: erts has no such frames, and a stack
-    /// walk of a process without them is erts' `is_CP`-only walk.
-    pub(crate) interpreter_frames: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// A native `wait`/`wait_timeout` asked the scheduler to sleep (receive timer position, `None` for
@@ -1542,17 +1538,6 @@ pub(crate) const TAIL_APPLY: u8 = 1;
 /// raising BIF's pc is the continuation on top of the stack.
 pub(crate) const TAIL_FUN_CALL: u8 = 2;
 
-const SAVED_FRAME_WORDS: usize = 16;
-
-/// What a tail call that releases its frame keeps until it knows whether the callee yields.
-pub(crate) struct FrameRelease {
-    saved: [Term; SAVED_FRAME_WORDS],
-    count: usize,
-    dealloc: usize,
-    collections: u64,
-    again: Option<Vec<Term>>,
-}
-
 /// The resumable part of an interrupted BIF call.
 pub(crate) struct BifTrapPending {
     pub(crate) caller_module: usize,
@@ -1716,72 +1701,6 @@ impl Process {
             + self
                 .trap_return_frame()
                 .map_or(0, |_| 1 + self.trap_frame_words().len())
-    }
-    /// Release the frame of a tail call at `module`:`ip` before its callee runs.
-    ///
-    /// A callee that yields makes the instruction run again, with the frame already gone:
-    /// `again` then holds the words the first run released.
-    pub(crate) fn release_tail_frame(
-        &mut self,
-        module: usize,
-        ip: usize,
-        dealloc: usize,
-    ) -> Result<FrameRelease, VmError> {
-        let again = self
-            .cold
-            .as_mut()
-            .and_then(|cold| match cold.ext_last_released.take() {
-                Some(released) if released.module == module && released.ip == ip => {
-                    Some(released.words)
-                }
-                other => {
-                    cold.ext_last_released = other;
-                    None
-                }
-            });
-        let mut release = FrameRelease {
-            saved: [Term::NIL; SAVED_FRAME_WORDS],
-            count: 0,
-            dealloc,
-            collections: self.stats.gc.collections,
-            again,
-        };
-        if release.again.is_none() && dealloc > 0 {
-            if dealloc <= SAVED_FRAME_WORDS {
-                for index in 0..dealloc {
-                    release.saved[index] = self.heap.stack_get(index).unwrap_or(Term::NIL);
-                }
-                release.count = dealloc;
-            }
-            if !self.heap.release_stack(dealloc) {
-                return Err(VmError::Unsupported("stack underflow".into()));
-            }
-        }
-        Ok(release)
-    }
-    /// The callee of a tail call yielded and will run the instruction again.
-    pub(crate) fn note_tail_yield(
-        &mut self,
-        module: usize,
-        ip: usize,
-        release: FrameRelease,
-        kept: bool,
-    ) {
-        let words = match release.again {
-            Some(words) => words,
-            None if release.count == release.dealloc
-                && release.collections == self.stats.gc.collections =>
-            {
-                release.saved[..release.count].to_vec()
-            }
-            None => vec![Term::NIL; release.dealloc],
-        };
-        self.cold_mut().ext_last_released = Some(Box::new(ReleasedFrame {
-            module,
-            ip,
-            kept,
-            words,
-        }));
     }
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.
     pub fn native_header(&mut self) -> &mut ProcessHeader {
@@ -2320,7 +2239,6 @@ impl Process {
             run_key: 0,
             exec_key: 0,
             hibernated: false,
-            interpreter_frames: false,
             signal_probe: None,
             native_wait: None,
             native_wait_timeout: None,
@@ -2489,68 +2407,6 @@ impl Process {
         }
         Ok(gc.reductions)
     }
-    pub(crate) fn read(&self, arg: Arg) -> Result<Term, VmError> {
-        let term = match arg.kind() {
-            Arg::X => self
-                .x
-                .get(arg.value() as usize)
-                .copied()
-                .ok_or_else(|| VmError::Unsupported("X register out of range".into()))?,
-            Arg::Y => self
-                .heap
-                .stack_get(arg.value() as usize)
-                .ok_or_else(|| VmError::Unsupported("Y register out of range".into()))?,
-            Arg::TERM => arg.term(),
-            Arg::U => i64::try_from(arg.value())
-                .ok()
-                .and_then(Term::small)
-                .ok_or_else(|| VmError::Unsupported("large integer operand".into()))?,
-            Arg::INT => Term::small(arg.signed())
-                .ok_or_else(|| VmError::Unsupported("large integer operand".into()))?,
-            Arg::UNSUPPORTED => {
-                return Err(VmError::Unsupported(format!("literal {}", arg.value())));
-            }
-            _ => {
-                return Err(VmError::Unsupported(format!(
-                    "source operand kind {}",
-                    arg.kind()
-                )));
-            }
-        };
-        // g_asan
-        #[cfg(any(feature = "validate-terms", debug_assertions))]
-        arinsal_term::validate::check_if_active(&self.heap, term);
-        Ok(term)
-    }
-    pub(crate) fn write(&mut self, dst: Arg, value: Term) -> Result<(), VmError> {
-        match dst.kind() {
-            Arg::X => {
-                *self
-                    .x
-                    .get_mut(dst.value() as usize)
-                    .ok_or_else(|| VmError::Unsupported("X register out of range".into()))? = value;
-                Ok(())
-            }
-            Arg::Y if self.heap.stack_set(dst.value() as usize, value) => Ok(()),
-            _ => Err(VmError::Unsupported("invalid destination".into())),
-        }
-    }
-    /// The float register file: the scheduler's `f_reg_array` while the registers are
-    /// attached, the process's own otherwise.
-    fn float_file(&mut self) -> &mut [f64] {
-        match self.x.attached_floats() {
-            Some(file) => file,
-            None => &mut self.fr,
-        }
-    }
-    /// The base of the float register file, for the interpreter's register window.
-    pub(crate) fn fr_ptr(&mut self) -> *mut f64 {
-        if self.x.is_attached() {
-            self.x.float_ptr()
-        } else {
-            self.fr.as_mut_ptr()
-        }
-    }
     /// Make `need` float registers addressable. The scheduler's array always is; a process
     /// outside a scheduler slice grows its own.
     pub(crate) fn ensure_fr(&mut self, need: usize) {
@@ -2559,42 +2415,6 @@ impl Process {
             registers.resize(need, 0.0);
             self.fr = registers.into_boxed_slice();
         }
-    }
-    pub(crate) fn float(&mut self, src: Arg) -> Result<f64, VmError> {
-        if src.kind() == Arg::FR {
-            return self
-                .float_file()
-                .get(src.value() as usize)
-                .copied()
-                .ok_or_else(|| VmError::Unsupported("FR register out of range".into()));
-        }
-        let term = self.read(src)?;
-        floats::number(term).ok_or_else(|| VmError::Exception {
-            reason: "badarith".into(),
-            frame: "float conversion".into(),
-        })
-    }
-    pub(crate) fn set_float(&mut self, dst: Arg, value: f64) -> Result<(), VmError> {
-        if !value.is_finite() {
-            return Err(VmError::Exception {
-                reason: "badarith".into(),
-                frame: "float operation".into(),
-            });
-        }
-        if dst.kind() == Arg::FR {
-            *self
-                .float_file()
-                .get_mut(dst.value() as usize)
-                .ok_or_else(|| VmError::Unsupported("FR register out of range".into()))? = value;
-            return Ok(());
-        }
-        if self.heap.free_words() < 2 {
-            self.ensure(2, self.gc_live)?;
-        }
-        let term = TermBuilder::new(&mut self.heap)
-            .float(value)
-            .map_err(|e| VmError::Unsupported(format!("float allocation {e:?}")))?;
-        self.write(dst, term)
     }
     pub(crate) fn tick(&mut self) {
         self.heap.abi.fcalls -= 1;

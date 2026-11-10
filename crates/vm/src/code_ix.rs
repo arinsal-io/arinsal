@@ -948,9 +948,13 @@ pub(crate) fn with_all_scopes(mut visit: impl FnMut(&CodeIndexes)) {
 
 /// Forgets the code indexes of a node whose code is gone.
 pub(crate) fn release_scope(scope: u64) {
-    if let Ok(mut scopes) = scopes().write() {
-        scopes.remove(&scope);
-    }
+    // Dropped after the registry lock: the last reference frees native code, whose
+    // unregistration reads this registry again (`existing_scope`).
+    let released = scopes()
+        .write()
+        .ok()
+        .and_then(|mut scopes| scopes.remove(&scope));
+    drop(released);
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
 //! Single-process BEAM interpreter for OTP 29 generic bytecode.
-mod arith;
 mod atom_cache;
 mod beamasm_integration;
 mod bif_traps;
@@ -12,7 +11,6 @@ mod calls;
 mod check_io;
 mod child_setup;
 mod code_ix;
-mod compare;
 mod ddll;
 mod debug_env;
 #[cfg(feature = "difftest")]
@@ -22,7 +20,6 @@ mod dist;
 mod erl_bits;
 mod erl_poll;
 mod exceptions;
-mod floats;
 mod interp;
 mod load;
 mod native_bridge;
@@ -55,7 +52,6 @@ mod trace;
 mod trace_bp;
 // ---- vm_maps_bits ----
 mod bits;
-mod maps;
 mod native_helpers;
 mod native_hooks;
 mod native_records;
@@ -70,22 +66,14 @@ pub use natives::implemented_natives;
 #[doc(hidden)]
 pub use natives::tty::registered_callers as tty_registered_callers;
 mod stacktrace;
-mod tuples;
 
 use arinsal_beam::BeamFile;
 use arinsal_beamasm::{ExitReason, ProcessHeader, SchedulerRegisters};
 // vm_binparse2
 use arinsal_bifs::Ctx;
 use arinsal_bifs::ProcessHeapHandle;
-use arinsal_bits::MatchOps;
-use arinsal_loader::{
-    Arg, FastBif, GenericOp, ImportClass, ImportFastOp, Instr, Module, SelectTable,
-};
-use arinsal_spec::Opcode;
-use arinsal_term::{
-    GcStats, ProcessHeap, Term, TermBuilder, TermKind, cmp, exact_eq, is_match_context, loose_eq,
-    match_position,
-};
+use arinsal_loader::{ImportClass, Instr, Module};
+use arinsal_term::{GcStats, ProcessHeap, Term, TermBuilder, TermKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -140,11 +128,10 @@ mod boot_loop1_shared_tests {
                 &[],
             )
             .unwrap();
-        let parsed = arinsal_beam::parse(&beam).unwrap();
         let scope = beamasm_integration::new_code_scope();
         let mut first = Vm::shared_replica(scope, &[]);
         let mut second = Vm::shared_replica(scope, &[]);
-        let id = first.load_beam(&parsed).unwrap();
+        let id = first.load_bytes(&beam).unwrap();
         second.sync_module(id);
         assert_eq!(second.code.modules[id].name, "boot_loop1_shared");
         assert_eq!(first.code_ix.active_tables().modules.len(), id + 1);

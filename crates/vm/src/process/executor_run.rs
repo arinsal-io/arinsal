@@ -348,7 +348,7 @@ impl Executor {
                             };
                             match continuation {
                                 crate::ImportOutcome::Advanced => continue,
-                                crate::ImportOutcome::Jump(_) => {
+                                crate::ImportOutcome::Jump => {
                                     self.vm.enter_native_at_jump(process);
                                     continue;
                                 }
@@ -604,18 +604,17 @@ impl Executor {
                                 Err(error) => return Err(error),
                             }
                         }
-                        let remaining = ctx.remaining().min(budget);
                         let result = process.drain(ctx).and_then(|()| {
                             if schedule_in_gc {
                                 schedule_in_gc = false;
                                 collect_on_schedule_in(process)?;
                             }
-                            // Interpreted code keeps no redzone: only a BIF run for a native exit does.
+                            // Only a BIF run for a native exit keeps a redzone.
                             process.heap.clear_native_redzone();
-                            self.vm.run_slice(process, Some(ctx), remaining)
+                            self.vm.enter_native_position(process)
                         });
-                        // erts schedules out only when FCALLS runs out; an interpreted step that
-                        // just hands control to native code continues the slice.
+                        // erts schedules out only when FCALLS runs out; entering the native code
+                        // of the process's position continues the slice.
                         if matches!(&result, Ok(RunState::Yield))
                             && process.native_pc().is_some()
                             && !process.force_yield()

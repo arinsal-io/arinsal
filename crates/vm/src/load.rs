@@ -1194,11 +1194,6 @@ impl Vm {
         let beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
         self.load_current(beam, Some(bytes), compile_native, None)
     }
-    /// Load a parsed module.
-    pub fn load_beam(&mut self, beam: &BeamFile) -> Result<usize, VmError> {
-        self.load_current(beam.clone(), None, false, None)
-    }
-
     /// Loads `beam` as the current code of its module unless it already has current or
     /// pending on_load code, staging it and committing the staging code index. A module with
     /// `-on_load` stays pending until erlang:finish_after_on_load/2.
@@ -1420,23 +1415,6 @@ impl Vm {
     pub(crate) fn sync_module(&mut self, id: usize) {
         if id >= self.code.modules.len() || id >= self.code.registers.len() {
             self.refresh_code();
-        }
-    }
-
-    /// NIF body `index` of a `NativeBody` instruction, borrowed from this VM's cache.
-    pub(crate) fn native_fn(
-        &self,
-        index: usize,
-    ) -> Option<std::borrow::Cow<'_, crate::natives::nif::NativeFn>> {
-        match self.native_fns.get(index) {
-            Some(native) => native.as_ref().map(std::borrow::Cow::Borrowed),
-            None => self
-                .code_ix
-                .native_fns()
-                .get(index)
-                .cloned()
-                .flatten()
-                .map(std::borrow::Cow::Owned),
         }
     }
 

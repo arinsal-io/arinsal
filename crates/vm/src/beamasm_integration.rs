@@ -2618,14 +2618,6 @@ pub(crate) fn count_native_call() {
         NATIVE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 }
-/// Counts an interpreter slice; `at_native_entry` marks one that started at a function entry
-/// which has native code (a process that erts would have started natively).
-pub(crate) fn count_interp_slice(at_native_entry: bool) {
-    INTERP_SLICES.fetch_add(1, Ordering::Relaxed);
-    if at_native_entry {
-        INTERP_NATIVE_STARTS.fetch_add(1, Ordering::Relaxed);
-    }
-}
 
 /// Interpreter slices that began at a function entry with native code.
 pub fn interp_native_starts() -> u64 {

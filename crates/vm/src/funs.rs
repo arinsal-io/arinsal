@@ -1,9 +1,9 @@
 //! Local closures, export funs, and dynamic calls.
 
 use crate::process::Message;
-use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, calls, exceptions};
+use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, exceptions};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
-use arinsal_loader::{Arg, ImportClass, Instr, Module};
+use arinsal_loader::{ImportClass, Module};
 use arinsal_sched::RunCtx;
 use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
 use std::sync::Arc;
@@ -14,40 +14,6 @@ pub(super) fn set_module_uniq(module: &mut Module, uniq: [u8; 16]) {
             entry.uniq = uniq;
         }
     }
-}
-
-#[inline]
-pub(super) fn make_fun(
-    p: &mut Process,
-    module: &Module,
-    index: u32,
-    dst: Arg,
-    env: u32,
-    code_generation: u64,
-) -> Result<(), VmError> {
-    let slot = module
-        .funs
-        .iter()
-        .find(|slot| slot.entry.old_index == index)
-        .ok_or_else(|| VmError::Unsupported(format!("lambda index {index}")))?;
-    let sources = module
-        .lists
-        .get(env as usize)
-        .ok_or_else(|| VmError::Unsupported("lambda environment".into()))?;
-    if sources.len() != slot.num_free {
-        return Err(VmError::Unsupported("lambda environment size".into()));
-    }
-    // Port of erts/emulator/beam/emu/instrs.tab:545 (i_make_fun3), OTP-29.1.1.
-    // This opcode allocates directly; its preceding test_heap is the safepoint.
-    let free = sources
-        .iter()
-        .map(|&src| p.read(src))
-        .collect::<Result<Vec<_>, _>>()?;
-    let value = TermBuilder::new(&mut p.heap)
-        .local_fun(&slot.entry, &free)
-        .map_err(|e| VmError::Unsupported(format!("fun allocation {e:?}")))?;
-    slot.set_dispatch(0, p.module, module.code.as_ptr() as usize, code_generation);
-    p.write(dst, value)
 }
 
 /// Build the Erlang exception reason before the exception handler formats it.
@@ -76,25 +42,6 @@ pub(super) fn call_error_reason(p: &mut Process, fun: Term, arity: usize) -> Res
     builder
         .tuple(&[Term::atom(kind), detail])
         .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))
-}
-
-#[inline]
-pub(super) fn is_function2(p: &Process, src: Arg, arity: Arg) -> Result<bool, VmError> {
-    let fun = p.read(src)?;
-    let requested = if arity.kind() == Arg::U {
-        i64::try_from(arity.value()).ok()
-    } else {
-        p.read(arity)?.as_small()
-    };
-    if !(Some(0)..=Some(255)).contains(&requested) {
-        return Ok(false);
-    }
-    // SAFETY: The source term remains live in this process or a module literal heap.
-    Ok(match unsafe { fun.fun_ref() } {
-        Some(FunRef::Local { entry, .. }) => Some(i64::from(entry.arity)) == requested,
-        Some(FunRef::Export { entry }) => Some(i64::from(entry.arity)) == requested,
-        None => false,
-    })
 }
 
 fn error_handler_module(process: &Process) -> String {
@@ -252,9 +199,13 @@ impl Vm {
                 let value = match function {
                     "apply" => match self.apply_bif(&mut p, arity, true, 0, None) {
                         Ok(ImportOutcome::Returned(value)) => Ok(value),
-                        Ok(ImportOutcome::Jump(_))
+                        Ok(ImportOutcome::Jump)
                         | Ok(ImportOutcome::Advanced)
-                        | Ok(ImportOutcome::Yield) => self.run(&mut p),
+                        | Ok(ImportOutcome::Yield) => {
+                            // The apply resolved to Erlang code: erts runs it in the calling
+                            // process's native code, which here is a scheduled process.
+                            return Some(self.eval_in_scheduled_process("erlang", function, args));
+                        }
                         Err(error) => Err(error),
                     },
                     "make_fun" => self.make_export_fun(&mut p, args),
@@ -287,46 +238,6 @@ impl Vm {
             _ => return None,
         };
         Some(result)
-    }
-
-    pub(super) fn intercept_fun_import(
-        &mut self,
-        p: &mut Process,
-        index: usize,
-        arity: usize,
-        tail: bool,
-        ctx: Option<&mut RunCtx<'_, Message>>,
-    ) -> Result<Option<ImportOutcome>, VmError> {
-        let import = self.code.modules[p.module]
-            .imports
-            .get(index)
-            .ok_or_else(|| VmError::Unsupported(format!("import {index}")))?;
-        if import.module != "erlang" {
-            return Ok(None);
-        }
-        let function = import.function;
-        if function == "apply" && (arity == 2 || arity == 3) {
-            return self.apply_bif(p, arity, tail, 0, ctx).map(Some);
-        }
-        let value = if function == "make_fun" && arity == 3 {
-            let args = [p.x[0], p.x[1], p.x[2]];
-            self.make_export_fun(p, &args)?
-        } else if function == "fun_info" && (arity == 1 || arity == 2) {
-            self.fun_info(p, arity == 2)?
-        } else if function == "fun_info_mfa" && arity == 1 {
-            self.fun_info_mfa(p)? // elixir_loop1
-        } else {
-            return Ok(None);
-        };
-        p.x[0] = value;
-        if tail {
-            return Ok(Some(match Self::ret(p) {
-                Some(value) => ImportOutcome::Returned(value),
-                None => ImportOutcome::Advanced,
-            }));
-        }
-        p.set_ip(p.ip() + 1);
-        Ok(Some(ImportOutcome::Advanced))
     }
 
     // Port of erts/emulator/beam/beam_common.c:1605 (call_fun), OTP-29.1.1.
@@ -377,7 +288,7 @@ impl Vm {
                     // already dispatches it.
                     _ => self.resolve_local_fun(p, entry, arity)?,
                 };
-                let Some((module_id, target, code)) = resolved else {
+                let Some((module_id, target, _)) = resolved else {
                     return self.call_lambda_handler(p, entry.module, arity, tail, false, ctx);
                 };
                 if self.purge_state.pending(module_id) {
@@ -399,14 +310,9 @@ impl Vm {
                     p.x[arity + i] = unsafe { std::mem::transmute::<u64, Term>(word) };
                 }
                 p.gc_live = arity + free_vars.len();
-                if !tail {
-                    calls::push_continuation(p, p.module, p.ip() + 1, p.gc_live)?;
-                }
                 self.set_position(p, module_id, target);
                 p.tick();
-                Ok(ImportOutcome::Jump(
-                    (code as *const Instr).wrapping_add(target),
-                ))
+                Ok(ImportOutcome::Jump)
             }
             FunRef::Export { entry } => {
                 let module = atom_name(Term::atom(entry.module))
@@ -587,17 +493,9 @@ impl Vm {
             p.gc_live = arity;
             p.x.ensure_x(arity);
             p.x[..arity].copy_from_slice(&trap.args);
-            if !tail {
-                calls::push_continuation(p, p.module, p.ip() + 1, arity)?;
-            }
             self.set_position(p, module_id, target);
             p.tick();
-            return Ok(ImportOutcome::Jump(
-                self.code.modules[module_id]
-                    .code
-                    .as_ptr()
-                    .wrapping_add(target),
-            ));
+            return Ok(ImportOutcome::Jump);
         }
         p.x.ensure_x(arity);
         p.x[..arity].copy_from_slice(&trap.args);
@@ -1128,9 +1026,6 @@ impl Vm {
                 frame: format!("{module}:{function}/{arity}"),
             });
         };
-        if !tail {
-            calls::push_continuation(p, p.module, p.ip() + 1, arity)?;
-        }
         // Port of erts/emulator/beam/beam_bp.c:1181-1250 (do_call_trace), OTP-29.1.1:
         // apply resolves an export through its global breakpoint before entering native code.
         // Its native export normally reaches this event via the export trampoline; a
@@ -1155,12 +1050,7 @@ impl Vm {
         }
         self.set_position(p, module_id, target);
         p.tick();
-        Ok(ImportOutcome::Jump(
-            self.code.modules[module_id]
-                .code
-                .as_ptr()
-                .wrapping_add(target),
-        ))
+        Ok(ImportOutcome::Jump)
     }
 
     /// `code_server` is up, so a missing module must go through `error_handler`
@@ -1741,19 +1631,6 @@ fn badfun_reason(p: &mut Process, arity: usize) -> Result<Term, VmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn function_arity_instruction_accepts_unsigned_immediate() {
-        let mut p = Process::new();
-        let module = global_atoms().intern("erlang").unwrap();
-        let function = global_atoms().intern("abs").unwrap();
-        p.x[0] = TermBuilder::new(&mut p.heap)
-            .export_fun(Arc::new(ExportEntry::new(module, function, 1)))
-            .unwrap();
-        let fun = Arg::new(Arg::X, 0);
-        assert!(is_function2(&p, fun, Arg::new(Arg::U, 1)).unwrap());
-        assert!(!is_function2(&p, fun, Arg::new(Arg::U, 2)).unwrap());
-    }
 
     #[test]
     fn make_fun_keeps_arguments_live_under_gc_stress() {
