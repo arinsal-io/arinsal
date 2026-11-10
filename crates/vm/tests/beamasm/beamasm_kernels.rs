@@ -5,10 +5,6 @@ use std::time::Instant;
 
 #[test]
 fn beam_asm_kernels_match_erts() {
-    if std::env::var_os("ARINSAL_BEAMASM").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        eprintln!("set ARINSAL_BEAMASM=1 to run the BeamAsm integration kernels");
-        return;
-    }
     let dir = std::env::temp_dir().join(format!("arinsal-beamasm-kernels-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source =

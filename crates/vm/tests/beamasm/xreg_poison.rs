@@ -59,10 +59,33 @@ fn probe(beam: &[u8]) -> OwnedTerm {
     result.term
 }
 
+const CHILD_MARKER: &str = "ARINSAL_XREG_POISON_TEST_CHILD";
+
+/// The debug-flag cache (`debug_env.rs`) is filled once per process, so the knob must be in the
+/// environment before the first VM starts. Other tests in this binary start VMs first; re-exec
+/// the test binary with the variable set so the result does not depend on test order.
 #[test]
 fn dead_x_register_holds_poison_with_the_knob() {
-    // SAFETY: the only test in this binary; nothing reads the environment concurrently.
-    unsafe { std::env::set_var("ARINSAL_XREG_POISON", "1") };
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dead_x_register_holds_poison_with_the_knob",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ARINSAL_XREG_POISON", "1")
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("re-exec of the test binary");
+        assert!(
+            output.status.success(),
+            "child run failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let mut beam = compile();
     let live = probe(&beam);
     patch_to_dead_register(&mut beam);

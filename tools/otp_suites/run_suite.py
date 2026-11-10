@@ -183,8 +183,6 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
         # configuration flags in order, and a later `-noshell` restores cooked input.
         cmd = [exe, "-noshell", "-noinput", "-pa", str(build), "-pa", str(directory), "-eval", expr]
         env = os.environ.copy()
-        if beamasm:
-            env["ARINSAL_BEAMASM"] = "1"
         result = run(cmd, limit, env=env)
         (logdir / "runner-output.log").write_text(result.stdout, encoding="utf-8", errors="replace")
         keep = os.environ.get("ARINSAL_RUNNER_LOG")
@@ -371,7 +369,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--arinsal", default=None, help="Arinsal binary (default target/release/arinsal, or target/fastrel/arinsal with --fast)")
     parser.add_argument("--fast", action="store_true", help="build and use the fastrel profile (quick incremental builds for iteration; gates use release)")
-    parser.add_argument("--beamasm", action="store_true", help="set ARINSAL_BEAMASM=1 for the Arinsal run and write RESULTS_BEAMASM.md")
+    parser.add_argument("--beamasm", action="store_true", help="write RESULTS_BEAMASM.md instead of RESULTS.md")
     parser.add_argument("--case", default="", help="comma-separated test cases: compare these cases, using cached erl results when available; do not touch RESULTS.md")
     parser.add_argument("--group", default="", help="compare only this group, using cached erl results when available")
     parser.add_argument("--no-erl-cache", action="store_true", help="rerun the erl reference instead of using the cache")
