@@ -238,11 +238,10 @@ impl Executor {
                     process.x[5] = Term::atom(handler_function);
                     process.gc_live = 4;
                     process.native_apply = true;
-                    let result = self.vm.apply_fixed(process, 4, true, 0, Some(ctx));
+                    let result = self.vm.apply_fixed(process, 4, Some(ctx));
                     process.native_apply = false;
                     match result? {
-                        crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
-                        crate::ImportOutcome::Advanced => {}
+                        crate::ImportOutcome::Dispatch => {}
                         crate::ImportOutcome::Yield => {
                             if process.native_pc().is_some()
                                 && native_transfer_continues(process, ctx)
@@ -307,8 +306,7 @@ impl Executor {
                             arity,
                             Some(ctx),
                         )? {
-                            crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
-                            crate::ImportOutcome::Advanced => {}
+                            crate::ImportOutcome::Dispatch => {}
                             crate::ImportOutcome::Yield => {
                                 if process.native_pc().is_some()
                                     && native_transfer_continues(process, ctx)
@@ -395,19 +393,19 @@ impl Executor {
                         arinsal_beamasm::dispatch::CALL_FUN_UNPORTED => {
                             let arity = usize::from(process.heap.abi.arity);
                             let fun = process.x.get(arity).copied().unwrap_or(Term::NIL);
-                            self.vm.call_fun_term(process, fun, arity, true, Some(ctx))
+                            self.vm.call_fun_term(process, fun, arity, Some(ctx))
                         }
                         _ => {
                             process.native_apply = true;
                             let result = match target_pc {
                                 arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED => {
                                     let arity = usize::from(process.heap.abi.arity);
-                                    self.vm.apply_fixed(process, arity, true, 0, Some(ctx))
+                                    self.vm.apply_fixed(process, arity, Some(ctx))
                                 }
                                 arinsal_beamasm::dispatch::APPLY2_UNPORTED => {
-                                    self.vm.apply_bif(process, 2, true, 0, Some(ctx))
+                                    self.vm.apply_bif(process, 2, Some(ctx))
                                 }
-                                _ => self.vm.apply_bif(process, 3, true, 0, Some(ctx)),
+                                _ => self.vm.apply_bif(process, 3, Some(ctx)),
                             };
                             process.native_apply = false;
                             result
@@ -416,8 +414,7 @@ impl Executor {
                     let trap = match result {
                         Ok(outcome) => {
                             match outcome {
-                                crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
-                                crate::ImportOutcome::Advanced => {}
+                                crate::ImportOutcome::Dispatch => {}
                                 crate::ImportOutcome::Yield => {
                                     if process.native_pc().is_some()
                                         && native_transfer_continues(process, ctx)
@@ -667,11 +664,10 @@ impl Executor {
                         // (BIF_TRAP), OTP-29.1.1.
                         Some(Ok(crate::bif_traps::ResumeResult::Export(trap))) => {
                             process.native_apply = true;
-                            let outcome = self.vm.trap_to_export(process, trap, true, Some(ctx));
+                            let outcome = self.vm.trap_to_export(process, trap, Some(ctx));
                             process.native_apply = false;
                             match outcome? {
-                                crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
-                                crate::ImportOutcome::Advanced => {}
+                                crate::ImportOutcome::Dispatch => {}
                                 crate::ImportOutcome::Yield => {
                                     if process.native_pc().is_some()
                                         && native_transfer_continues(process, ctx)
@@ -1007,7 +1003,6 @@ impl Executor {
                                     != (module_before, position_before)
                             {
                                 process.tick();
-                                self.vm.enter_native_at_jump(process);
                                 return Ok(Flow::Continue);
                             }
                             result
@@ -1229,7 +1224,6 @@ impl Executor {
                                     &export.module,
                                     &export.function,
                                     usize::from(export.arity),
-                                    true,
                                 ) {
                                     Ok(outcome) => outcome,
                                     Err(error) => {
@@ -1246,10 +1240,7 @@ impl Executor {
                                     }
                                 };
                                 match outcome {
-                                    crate::ImportOutcome::Jump => {
-                                        self.vm.enter_native_at_jump(process)
-                                    }
-                                    crate::ImportOutcome::Advanced => {}
+                                    crate::ImportOutcome::Dispatch => {}
                                     crate::ImportOutcome::Yield => {
                                         if process.native_pc().is_some()
                                             && native_transfer_continues(process, ctx)
@@ -1333,9 +1324,8 @@ impl Executor {
                 });
                 if let Some(target_ip) = target_ip {
                     process.gc_live = usize::from(export.arity);
-                    self.vm.set_position(process, module_id, target_ip);
+                    self.vm.set_position(process, module_id, target_ip)?;
                     process.tick();
-                    self.vm.enter_native_at_jump(process);
                 } else {
                     let saved = process.x[..usize::from(export.arity)].to_vec();
                     let outcome = match self.vm.call_undefined_function(
@@ -1343,7 +1333,6 @@ impl Executor {
                         &export.module,
                         &export.function,
                         usize::from(export.arity),
-                        true,
                     ) {
                         Ok(outcome) => outcome,
                         Err(error) => {
@@ -1356,8 +1345,7 @@ impl Executor {
                         }
                     };
                     match outcome {
-                        crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
-                        crate::ImportOutcome::Advanced => {}
+                        crate::ImportOutcome::Dispatch => {}
                         crate::ImportOutcome::Yield => {
                             if process.native_pc().is_some()
                                 && native_transfer_continues(process, ctx)

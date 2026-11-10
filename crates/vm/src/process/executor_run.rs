@@ -324,9 +324,7 @@ impl Executor {
                             process.x[..arity].copy_from_slice(&args);
                             process.heap.abi.arity = arity as u8;
                             process.gc_live = arity;
-                            let tail = process.take_dirty_bif_tail().unwrap_or(true);
-                            let continuation =
-                                self.vm.apply_fixed(process, arity, tail, 0, Some(ctx));
+                            let continuation = self.vm.apply_fixed(process, arity, Some(ctx));
                             let continuation = match continuation {
                                 Ok(outcome) => outcome,
                                 Err(VmError::Trap(trap)) => {
@@ -347,11 +345,7 @@ impl Executor {
                                 Err(error) => break Err(error),
                             };
                             match continuation {
-                                crate::ImportOutcome::Advanced => continue,
-                                crate::ImportOutcome::Jump => {
-                                    self.vm.enter_native_at_jump(process);
-                                    continue;
-                                }
+                                crate::ImportOutcome::Dispatch => continue,
                                 crate::ImportOutcome::Yield => break Ok(RunState::Yield),
                                 crate::ImportOutcome::Returned(value) => {
                                     if process.native_pc().is_none() {

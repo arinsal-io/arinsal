@@ -171,12 +171,8 @@ pub(crate) struct CodeTables {
     pub(crate) known_modules: SharedTable<HashSet<String>>,
 }
 
-fn bind_import_targets(module: &mut Module) {
-    bind_import_targets_of(module, &[]);
-}
-
-/// [`bind_import_targets`] for a module whose imports to MFAs the node's export table knows
-/// already (`known`, by import) keep what the table has.
+/// Classifies the imports of a module; those to MFAs the node's export table knows already
+/// (`known`, by import) keep what the table has.
 fn bind_import_targets_of(
     module: &mut Module,
     known: &[Option<(arinsal_loader::ImportClass, usize, bool)>],
@@ -247,31 +243,7 @@ fn static_nif_body(module: &str, function: &str, arity: u8) -> Option<arinsal_bi
     })
 }
 
-fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) {
-    // Classify every import before the module is shared, including modules
-    // that have no static NIF body.
-    bind_import_targets(module);
-    if !static_nif_module(&module.name) {
-        arinsal_loader::specialize_bif_calls(module);
-        return;
-    }
-    for (ordinal, (entry, function, arity)) in module.functions.iter().enumerate() {
-        let Some(native) = static_nif_body(&module.name, function, *arity) else {
-            continue;
-        };
-        let Some(index) = code_ix.push_native_fn(crate::natives::nif::NativeFn::Bif(native)) else {
-            continue;
-        };
-        module.set_nif_body(ordinal, index);
-        if let Some(body) = module.code.get_mut(entry.saturating_add(1)) {
-            *body = Instr::NativeBody { index };
-        }
-    }
-    arinsal_loader::specialize_bif_calls(module);
-}
-
-/// [`bind_static_nifs`] for a module whose functions the emitter has just found: no code to
-/// patch, the NIF bodies only.
+/// Binds the static NIF bodies of a module whose functions the emitter has just found.
 pub(crate) fn bind_native_static_nifs(module: &Module, code_ix: &crate::code_ix::CodeIndexes) {
     if !static_nif_module(&module.name) {
         return;
@@ -290,9 +262,6 @@ pub(crate) struct CodeMeta {
     pub(crate) beam: BeamFile,
     pub(crate) md5: Option<[u8; 16]>,
     pub(crate) on_load: Option<(String, u8)>,
-    /// The loader was given the original BEAM bytes, so this instance can be compiled.
-    /// The bytes themselves are not kept: erts discards the file after `beam_load`.
-    pub(crate) has_beam_bytes: bool,
     pub(crate) beamasm: Option<Arc<beamasm_integration::CompiledVersion>>,
     /// The `DbgB` chunk decoded at load, one `#{frame_size, vars, calls}` map per item.
     // erts keeps it in the code header (`BeamCodeHeader::debug`) after the file is freed.
@@ -330,21 +299,12 @@ pub(crate) fn native_code_contains(
     })
 }
 impl CodeMeta {
-    /// Takes the `-on_load` function from the decoded instructions. OTP encodes -on_load as a
-    /// Code instruction following that function's label. A module that is not decoded learns
-    /// it when it is emitted (`compile_native`).
-    pub(crate) fn note_decoded_on_load(&mut self) {
-        self.on_load = self.beam.code.on_load.and_then(|(name, arity)| {
-            Some((self.beam.atom(name)?.to_owned(), u8::try_from(arity).ok()?))
-        });
-    }
-
     /// The metadata of a module that takes over its parsed file.
-    pub(crate) fn from_beam_owned(beam: BeamFile, bytes: Option<&[u8]>) -> Self {
+    /// The bytes themselves are not kept: erts discards the file after `beam_load`.
+    pub(crate) fn from_beam_owned(beam: BeamFile, bytes: &[u8]) -> Self {
         Self {
-            md5: bytes.and_then(|bytes| arinsal_loader::module_uniq(bytes).ok()),
+            md5: arinsal_loader::module_uniq(bytes).ok(),
             on_load: None,
-            has_beam_bytes: bytes.is_some(),
             beamasm: None,
             debug_table: beam.debug_table(),
             beam,
@@ -1001,47 +961,33 @@ impl Vm {
         self.code_ix.set_coverage_mode(mode);
     }
 
-    /// Prepares a module instance from a parsed BEAM file: loader, fun identities, static NIFs.
-    pub(crate) fn prepare_module(
-        &self,
-        beam: &BeamFile,
-        bytes: Option<&[u8]>,
-    ) -> Result<Module, VmError> {
-        self.prepare_module_with(beam, bytes, None, true)
-    }
-
-    /// Whether a module may be loaded without the interpreter form of its code: BeamAsm is
-    /// the engine. Coverage, line counters and debugger line breakpoints are emitted by
-    /// BeamAsm, as in erts. In the JIT flavor a module BeamAsm cannot compile completely fails to load.
-    pub(crate) fn native_only(&self, meta: &CodeMeta) -> bool {
-        meta.has_beam_bytes
-    }
-
-    /// Whether a module without the interpreter form needs its instructions decoded for the
-    /// coverage table or the debugger line metadata.
+    /// Whether the coverage table or the debugger line metadata need the instructions
+    /// decoded: erts sizes them in beam_load_prepare_emit and fills them while emitting.
     pub(crate) fn native_tables_need_instructions(&self, beam: &BeamFile) -> bool {
         arinsal_loader::coverage_enabled_for(beam, self.coverage_mode())
             || crate::trace_bp::line_breakpoints_instrumented()
     }
 
-    /// [`prepare_module`](Self::prepare_module), optionally leaving the interpreter form of
-    /// the code out (`specialize == false`).
-    pub(crate) fn prepare_module_with(
+    /// Decodes the instructions of `beam` when the coverage table or the debugger lines are
+    /// laid out from them. Nothing else needs them: the emitter reads the code chunk itself.
+    pub(crate) fn decode_for_native_tables(&self, beam: &mut BeamFile) -> Result<(), VmError> {
+        if self.native_tables_need_instructions(beam) {
+            beam.decode_code()
+                .map_err(|e| VmError::Load(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Prepares a module instance for BeamAsm from a parsed BEAM file: its tables, the
+    /// coverage table and debugger lines, the fun identities and the import targets.
+    pub(crate) fn prepare_module(
         &self,
         beam: &BeamFile,
-        bytes: Option<&[u8]>,
+        bytes: &[u8],
         uniq: Option<[u8; 16]>,
-        specialize: bool,
     ) -> Result<Module, VmError> {
-        let mut module = if specialize {
-            arinsal_loader::load_with_options(
-                beam,
-                self.coverage_mode(),
-                crate::trace_bp::line_breakpoints_instrumented(),
-                true,
-            )
-        } else {
-            arinsal_loader::load_native(beam).and_then(|mut module| {
+        let mut module = arinsal_loader::load_native(beam)
+            .and_then(|mut module| {
                 // Port of erts/emulator/beam/jit/asm_load.c:73-135, OTP-29.1.1: the coverage
                 // table the emitted counters update is allocated with the module.
                 module.coverage = arinsal_loader::native_coverage(beam, self.coverage_mode())?;
@@ -1050,26 +996,17 @@ impl Vm {
                 }
                 Ok(module)
             })
-        }
-        .map_err(|e| VmError::Load(e.to_string()))?;
+            .map_err(|e| VmError::Load(e.to_string()))?;
         // The checksum is computed once per file, like erts' beamfile_read does.
-        if let Some(bytes) = bytes {
-            let uniq = match uniq {
-                Some(uniq) => uniq,
-                None => {
-                    arinsal_loader::module_uniq(bytes).map_err(|e| VmError::Load(e.to_string()))?
-                }
-            };
-            funs::set_module_uniq(&mut module, uniq);
-        }
-        if specialize {
-            bind_static_nifs(&mut module, &self.code_ix);
-        } else {
-            // The functions of a module that is not emitted yet are not known: its NIF bodies
-            // are bound after the emitter has found them (`bind_native_static_nifs`).
-            let known = beamasm_integration::known_imports(self.code_scope, &module.imports);
-            bind_import_targets_of(&mut module, &known);
-        }
+        let uniq = match uniq {
+            Some(uniq) => uniq,
+            None => arinsal_loader::module_uniq(bytes).map_err(|e| VmError::Load(e.to_string()))?,
+        };
+        funs::set_module_uniq(&mut module, uniq);
+        // The functions of a module that is not emitted yet are not known: its NIF bodies
+        // are bound after the emitter has found them (`bind_native_static_nifs`).
+        let known = beamasm_integration::known_imports(self.code_scope, &module.imports);
+        bind_import_targets_of(&mut module, &known);
         Ok(module)
     }
 
@@ -1079,18 +1016,10 @@ impl Vm {
         self.code_ix.intern_module_fun_entries(module);
     }
 
-    /// Whether a module with `meta` must have native code: the JIT flavor runs nothing else.
-    pub(crate) fn native_required(&self, meta: &CodeMeta) -> bool {
-        meta.has_beam_bytes
-    }
-
-    /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
+    /// Compiles `module` with BeamAsm into `meta`.
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
     pub(crate) fn compile_native(&self, module: &mut Module, meta: &mut CodeMeta) {
-        if !meta.has_beam_bytes {
-            return;
-        }
         // The BEAM was parsed in prepare_loading. erts does not parse it again here.
         if let Some(native) = beamasm_integration::compile(
             &meta.beam,
@@ -1136,12 +1065,12 @@ impl Vm {
     /// previous old version's slot is reused, so the table does not grow with
     /// every generation.
     pub fn load_next_version(&mut self, bytes: &[u8]) -> Result<(), VmError> {
-        let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        let mut module = self.prepare_module(&beam, Some(bytes))?;
+        let mut beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
+        self.decode_for_native_tables(&mut beam)?;
+        let mut meta = CodeMeta::from_beam_owned(beam, bytes);
+        let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
         let name = module.name.clone();
-        let registers = (beam.code.x_registers, beam.code.float_registers);
-        let mut meta = CodeMeta::from_beam_owned(beam, Some(bytes));
-        meta.note_decoded_on_load();
+        let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
         let staging = self.code_ix.start_staging();
         let mut released = None;
         staging.with(|tables| {
@@ -1156,7 +1085,7 @@ impl Vm {
         }
         let mut module = module;
         self.compile_native(&mut module, &mut meta);
-        if self.native_required(&meta) && meta.beamasm.is_none() {
+        if meta.beamasm.is_none() {
             staging.abort();
             return Err(VmError::Load(format!(
                 "{name}: native code generation failed"
@@ -1186,17 +1115,13 @@ impl Vm {
 
     /// Load bytes without executing module-level code.
     pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
-        self.load_bytes_internal(bytes, true)
+        self.load_bytes_internal(bytes)
     }
-    pub(crate) fn load_bytes_internal(
-        &mut self,
-        bytes: &[u8],
-        compile_native: bool,
-    ) -> Result<usize, VmError> {
-        // Port of erts/emulator/beam/beam_file.c (beamfile_read): the tables; the instructions
-        // are decoded below only for a module the interpreter may run.
+    pub(crate) fn load_bytes_internal(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
+        // Port of erts/emulator/beam/beam_file.c (beamfile_read): the tables, not the
+        // instructions, which BeamAsm emits from the code chunk.
         let beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        self.load_current(beam, Some(bytes), compile_native, None)
+        self.load_current(beam, bytes, None)
     }
     /// Loads `beam` as the current code of its module unless it already has current or
     /// pending on_load code, staging it and committing the staging code index. A module with
@@ -1204,8 +1129,7 @@ impl Vm {
     fn load_current(
         &mut self,
         beam: BeamFile,
-        bytes: Option<&[u8]>,
-        compile_native: bool,
+        bytes: &[u8],
         file: Option<(&str, &Path)>,
     ) -> Result<usize, VmError> {
         self.refresh_code();
@@ -1218,24 +1142,9 @@ impl Vm {
         let module_name = beam.module.clone();
         let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         // erts has no interpreter form of a module: its code goes from the transform straight
-        // to the emitter. Decode the instructions for the interpreter only when it may run
-        // them: a module with `-on_load`, coverage,
-        // debugger lines or the rules of the loader that patch its code at load, or one BeamAsm
-        // does not compile completely.
-        let native_only = compile_native && self.native_only(&meta);
-        if !native_only {
-            meta.beam
-                .decode_code()
-                .map_err(|e| VmError::Load(e.to_string()))?;
-            meta.note_decoded_on_load();
-        } else if self.native_tables_need_instructions(&meta.beam) {
-            // The coverage table and the debugger lines are laid out from the instructions
-            // (erts sizes them in beam_load_prepare_emit and fills them while emitting).
-            meta.beam
-                .decode_code()
-                .map_err(|e| VmError::Load(e.to_string()))?;
-        }
-        let mut module = self.prepare_module_with(&meta.beam, bytes, meta.md5, !native_only)?;
+        // to the emitter.
+        self.decode_for_native_tables(&mut meta.beam)?;
+        let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
         let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
         let staging = self.code_ix.start_staging();
         // Another scheduler may have loaded the module since this one looked.
@@ -1247,19 +1156,17 @@ impl Vm {
         staging.with(|tables| {
             tables.intern_fun_entries(&mut module);
         });
-        if compile_native {
-            self.compile_native(&mut module, &mut meta);
-            if self.native_required(&meta) && meta.beamasm.is_none() {
-                // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT
-                // flavor has no other way to run the module.
-                staging.abort();
-                return Err(VmError::Load(format!(
-                    "{module_name}: native code generation failed"
-                )));
-            }
-            self.release_loaded_tables(&mut module, &mut meta);
-            let _ = self.install_native(&module, &mut meta);
+        self.compile_native(&mut module, &mut meta);
+        if meta.beamasm.is_none() {
+            // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT
+            // flavor has no other way to run the module.
+            staging.abort();
+            return Err(VmError::Load(format!(
+                "{module_name}: native code generation failed"
+            )));
         }
+        self.release_loaded_tables(&mut module, &mut meta);
+        let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
         let name = module.name.clone();
         let on_load = meta.on_load.is_some();
@@ -1674,7 +1581,7 @@ impl Vm {
         // Port of erts/emulator/beam/beam_file.c:beamfile_read: the tables, not the instructions,
         // which a module that runs natively never needs decoded.
         let beam = arinsal_beam::read(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        self.load_current(beam, Some(&bytes), true, Some((name, &path)))?;
+        self.load_current(beam, &bytes, Some((name, &path)))?;
         self.code
             .loaded
             .get(name)

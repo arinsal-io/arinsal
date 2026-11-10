@@ -30,7 +30,6 @@ mod lists;
 mod monitor_link;
 mod process;
 mod register;
-pub use beamasm_integration::{interp_native_starts, interp_slices};
 /// Run the persistent child-setup helper mode selected by the CLI.
 #[doc(hidden)]
 pub use child_setup::run_child_setup;
@@ -72,7 +71,7 @@ use arinsal_beamasm::{ExitReason, ProcessHeader, SchedulerRegisters};
 // vm_binparse2
 use arinsal_bifs::Ctx;
 use arinsal_bifs::ProcessHeapHandle;
-use arinsal_loader::{ImportClass, Instr, Module};
+use arinsal_loader::{ImportClass, Module};
 use arinsal_term::{GcStats, ProcessHeap, Term, TermBuilder, TermKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

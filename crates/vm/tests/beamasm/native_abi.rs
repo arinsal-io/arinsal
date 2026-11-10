@@ -70,7 +70,7 @@ fn no_line_info_module_compiles_fully_native_and_matches_otp() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("native_functions=") && stderr.contains("interp_slices=0 "),
+        stderr.contains("native_functions="),
         "module did not compile all functions natively: {stderr}"
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -138,11 +138,6 @@ fn native_try_end_keeps_success_value_for_fun_call() {
         output.status.success(),
         "native try-end child failed: {}{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -304,11 +299,6 @@ fn native_tail_export_transitions_preserve_cp_only_frames() {
         "native CP transition child failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let actual = stdout
         .lines()
@@ -408,11 +398,6 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let actual = stdout
         .lines()
         .find_map(|line| line.strip_prefix("RESULT:false:"))
@@ -578,11 +563,6 @@ fn native_boolean_bifs_keep_tagged_comparison_results() {
         "native boolean BIF child failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let actual = stdout
         .lines()
@@ -667,11 +647,6 @@ fn inet_udp_open_trace_matches_otp_with_native_open() {
     assert!(
         output.status.success(),
         "native inet_udp trace child failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -761,10 +736,6 @@ fn unaligned_binary_order_matches_otp() {
         );
         if native {
             let stats = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stats.contains("interp_slices=0 "),
-                "the JIT flavor must not run the interpreter: {stats}"
-            );
             assert!(
                 !stats.contains("native_functions=0"),
                 "BeamAsm did not compile any functions: {stats}"
@@ -1342,13 +1313,6 @@ fn native_send_matches_otp_for_names_ports_and_tracing() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        if native {
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-                "native child must compile the tested module with BeamAsm: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         let stdout = String::from_utf8(output.stdout).unwrap();
         stdout
             .lines()
@@ -1415,13 +1379,6 @@ fn native_node_instruction_matches_otp() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        if native {
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-                "the JIT flavor must not run the interpreter: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         String::from_utf8(output.stdout)
             .unwrap()
             .lines()
@@ -1487,13 +1444,6 @@ fn native_build_stacktrace_matches_otp() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        if native {
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-                "the JIT flavor must not run the interpreter: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         String::from_utf8(output.stdout)
             .unwrap()
             .lines()
@@ -1565,11 +1515,6 @@ fn native_spawn_entry_catch_preserves_arguments_after_throw() {
         "native spawned-entry catch failed ({:?}): stdout={} stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1645,10 +1590,6 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("interp_slices=0 "),
-        "the JIT flavor must not run the interpreter: {stderr}"
-    );
-    assert!(
         stderr
             .split_whitespace()
             .find_map(|field| field.strip_prefix("native_functions="))
@@ -1720,11 +1661,6 @@ fn native_large_bif_result_keeps_the_heap_redzone_before_a_fun_call() {
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("interp_slices=0 "),
-        "native heap-redzone module was not compiled: {stderr}"
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let actual = stdout
