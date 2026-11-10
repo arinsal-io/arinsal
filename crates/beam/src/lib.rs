@@ -403,6 +403,8 @@ impl BeamFile {
         self.lines = None;
         self.types = None;
         self.records = Vec::new();
+        // The decoded debug table lives in the code metadata; the raw chunk is not kept.
+        self.other_chunks = Vec::new();
     }
 
     /// The global atom (as its table index) of each atom table entry, in table order. `intern`
@@ -1409,6 +1411,72 @@ pub struct DebugItem {
     pub vars: Vec<(DebugTerm, DebugTerm)>,
     /// Calls reachable from the instrumentation point.
     pub calls: Vec<DebugCall>,
+}
+
+impl BeamFile {
+    /// The decoded `DbgB` chunk as one `#{frame_size, vars, calls}` term per item, with atoms and
+    /// literals resolved so the tables can be released. `None` when the chunk is absent or bad.
+    // Port of erts/emulator/beam/beam_bif_load.c (code_get_debug_info_1), OTP-29.1.1; erts
+    // builds the terms from `BeamDebugTab` in the code header.
+    pub fn debug_table(&self) -> Option<Vec<OwnedTerm>> {
+        let items = self.debug_items()?;
+        let owned = |term: &DebugTerm| -> Option<OwnedTerm> {
+            Some(match term {
+                DebugTerm::Int(value) => OwnedTerm::Int(*value),
+                DebugTerm::Atom(atom) => OwnedTerm::Atom(self.atom(*atom)?.to_owned()),
+                DebugTerm::Nil => OwnedTerm::Nil,
+                DebugTerm::Literal(index) => self.literal(*index).ok()?,
+                DebugTerm::X(_) | DebugTerm::Y(_) => return None,
+            })
+        };
+        let reg = |kind: &str, n: u32| {
+            OwnedTerm::Tuple(vec![
+                OwnedTerm::Atom(kind.into()),
+                OwnedTerm::Int(i64::from(n)),
+            ])
+        };
+        let list = |elems: Vec<OwnedTerm>| OwnedTerm::List {
+            elems,
+            tail: Box::new(OwnedTerm::Nil),
+        };
+        let mut table = Vec::with_capacity(items.len());
+        for item in &items {
+            let frame_size = match item.frame_size {
+                DebugFrameSize::None => OwnedTerm::Atom("none".into()),
+                DebugFrameSize::Entry => OwnedTerm::Atom("entry".into()),
+                DebugFrameSize::Words(words) => OwnedTerm::Int(i64::from(words)),
+            };
+            let mut vars = Vec::new();
+            for (name, value) in &item.vars {
+                let value = match value {
+                    DebugTerm::X(n) => reg("x", *n),
+                    DebugTerm::Y(n) => reg("y", *n),
+                    other => OwnedTerm::Tuple(vec![OwnedTerm::Atom("value".into()), owned(other)?]),
+                };
+                vars.push(OwnedTerm::Tuple(vec![owned(name)?, value]));
+            }
+            let mut calls = Vec::new();
+            for call in &item.calls {
+                calls.push(match call {
+                    DebugCall::Remote(m, f, arity) => OwnedTerm::Tuple(vec![
+                        owned(m)?,
+                        owned(f)?,
+                        OwnedTerm::Int(i64::from(*arity)),
+                    ]),
+                    DebugCall::Local(f, arity) => {
+                        OwnedTerm::Tuple(vec![owned(f)?, OwnedTerm::Int(i64::from(*arity))])
+                    }
+                    DebugCall::Variable(name) => owned(name)?,
+                });
+            }
+            table.push(OwnedTerm::Map(vec![
+                (OwnedTerm::Atom("frame_size".into()), frame_size),
+                (OwnedTerm::Atom("vars".into()), list(vars)),
+                (OwnedTerm::Atom("calls".into()), list(calls)),
+            ]));
+        }
+        Some(table)
+    }
 }
 
 const BEAM_DEBUG_INFO_VERSION: u32 = 1;
