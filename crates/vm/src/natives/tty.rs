@@ -170,17 +170,15 @@ pub(crate) fn init_break_handler() {
 /// Port of erts/emulator/sys/unix/sys.c (erts_replace_intr), OTP-29.1.1: Ctrl-C is disabled on
 /// the tty (VINTR = 0) so `user_drv` can use it.
 pub(crate) fn replace_intr() {
-    // SAFETY: isatty only inspects descriptor 0.
-    if unsafe { libc::isatty(0) } == 0 {
+    use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
         return;
     }
-    // SAFETY: termios is plain data; tcgetattr fills it before it is modified and written back.
-    unsafe {
-        let mut mode: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(0, &mut mode) == 0 {
-            mode.c_cc[libc::VINTR] = 0;
-            libc::tcsetattr(0, libc::TCSANOW, &mode);
-        }
+    if let Ok(mut mode) = tcgetattr(&stdin) {
+        mode.special_codes[SpecialCodeIndex::VINTR] = 0;
+        let _ = tcsetattr(&stdin, OptionalActions::Now, &mode);
     }
 }
 
@@ -222,12 +220,9 @@ fn break_loop(read_fd: RawFd) {
         wake_poll();
         // Port of erts/emulator/beam/break.c (do_break): clear the screen only when stdin and
         // stdout are ttys; erts_printf adds a CR to every LF on stdout (sys.c).
-        // SAFETY: isatty only inspects descriptors 0 and 1.
-        let clear = if unsafe { libc::isatty(0) != 0 && libc::isatty(1) != 0 } {
-            "\u{1b}[J"
-        } else {
-            ""
-        };
+        use std::io::IsTerminal;
+        let on_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let clear = if on_tty { "\u{1b}[J" } else { "" };
         tty_write(
             1,
             format!("\n{clear}{HELP}").replace('\n', "\r\n").as_bytes(),
