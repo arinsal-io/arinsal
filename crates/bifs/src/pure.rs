@@ -2169,25 +2169,22 @@ fn raise(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     })
 }
 
-// Port of erts/emulator/beam/bif.c (raise_3 stacktrace validation), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c (raise_3 stacktrace validation), OTP-29.1.1: each frame
+// is checked in place through its tuple header, as `tuple_val`/`arityval` do.
 fn valid_raise_stacktrace(stacktrace: Term) -> bool {
+    let valid_location = |location: Option<Term>| {
+        location.is_some_and(|l| matches!(l.classify(), TermKind::List | TermKind::Nil))
+    };
+    let is_atom = |term: Option<Term>| term.is_some_and(|t| t.classify() == TermKind::Atom);
     for_each_cons(stacktrace, |frame| {
-        let Some(fields) = tuple_terms(frame) else {
-            return Err(BADARG);
-        };
-        let valid_location =
-            |location: Term| matches!(location.classify(), TermKind::List | TermKind::Nil);
-        let valid = match fields.as_slice() {
-            [fun, _args] if fun.classify() == TermKind::Fun => true,
-            [fun, _args, location] if fun.classify() == TermKind::Fun => valid_location(*location),
-            [module, function, _arity_or_args] => {
-                module.classify() == TermKind::Atom && function.classify() == TermKind::Atom
-            }
-            [module, function, _arity_or_args, location] => {
-                module.classify() == TermKind::Atom
-                    && function.classify() == TermKind::Atom
-                    && valid_location(*location)
-            }
+        let view = tuple_view(&frame)?;
+        let first = view.element(0);
+        let is_fun = first.is_some_and(|t| t.classify() == TermKind::Fun);
+        let valid = match view.len() {
+            2 => is_fun,
+            3 if is_fun => valid_location(view.element(2)),
+            3 => is_atom(first) && is_atom(view.element(1)),
+            4 => is_atom(first) && is_atom(view.element(1)) && valid_location(view.element(3)),
             _ => false,
         };
         if valid { Ok(()) } else { Err(BADARG) }
