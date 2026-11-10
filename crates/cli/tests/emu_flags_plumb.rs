@@ -103,7 +103,7 @@ fn ignore_break_survives_terminal_signals() {
         eprintln!("erl unavailable; skipping emulator flag differential");
         return;
     };
-    let eval = "timer:sleep(2500), halt().";
+    let eval = "io:format(\"ready~n\"), timer:sleep(2500), halt().";
     let mut arinsal = Command::new("timeout");
     arinsal.arg("30").arg(env!("CARGO_BIN_EXE_arinsal"));
     for command in [&mut reference, &mut arinsal] {
@@ -113,13 +113,20 @@ fn ignore_break_survives_terminal_signals() {
             .env("ERL_FLAGS", "")
             .env("ERL_ZFLAGS", "")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
     }
     for (name, command) in [("erl", &mut reference), ("arinsal", &mut arinsal)] {
         let mut child = command.spawn().expect("spawn emulator");
-        // `timeout` forwards signals to its child; erlexec execs the emulator in place.
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // Signal only once the node has booted (and so has applied +Bi); a fixed delay raced
+        // the boot under load. `timeout` forwards signals to its child.
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().expect("stdout")),
+            &mut line,
+        )
+        .expect("read ready");
+        assert_eq!(line.trim(), "ready", "{name}");
         for signal in ["-INT", "-QUIT"] {
             Command::new("kill")
                 .args([signal, &child.id().to_string()])
