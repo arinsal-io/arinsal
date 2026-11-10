@@ -294,6 +294,9 @@ pub(crate) struct CodeMeta {
     /// The bytes themselves are not kept: erts discards the file after `beam_load`.
     pub(crate) has_beam_bytes: bool,
     pub(crate) beamasm: Option<Arc<beamasm_integration::CompiledVersion>>,
+    /// The `DbgB` chunk decoded at load, one `#{frame_size, vars, calls}` map per item.
+    // erts keeps it in the code header (`BeamCodeHeader::debug`) after the file is freed.
+    pub(crate) debug_table: Option<Vec<arinsal_etf::OwnedTerm>>,
 }
 /// Native code range of the module version in slot `id`, when it was compiled by BeamAsm.
 pub(crate) fn native_code_range(
@@ -343,6 +346,7 @@ impl CodeMeta {
             on_load: None,
             has_beam_bytes: bytes.is_some(),
             beamasm: None,
+            debug_table: beam.debug_table(),
             beam,
         }
     }

@@ -594,3 +594,73 @@ spin(A, B, C, N) -> spin(A, B, C, N + 1).
 "#;
     assert_debugger_fixture_matches_otp("erl_debugger_yielded_fixture", source);
 }
+
+#[test]
+fn erl_debugger_get_debug_info_survives_release_and_matches_otp() {
+    let _serial = serial_test();
+    let Ok(reference) = RefErl::start_with_erl_args(&["+D"]) else {
+        eprintln!("erl unavailable; skipping get_debug_info differential test");
+        return;
+    };
+    let module = "erl_debugger_dbgi_fixture";
+    let beam = reference
+        .compile_named(
+            module,
+            "-module(erl_debugger_dbgi_fixture). -export([run/2]). \
+             run(A, B) -> C = A + B, D = lists:reverse([C, <<\"lit\">>]), f(D), {C, D}. \
+             f(L) -> length(L).",
+            &[
+                arinsal_etf::OwnedTerm::Atom("debug_info".into()),
+                arinsal_etf::OwnedTerm::Atom("beam_debug_info".into()),
+            ],
+        )
+        .unwrap();
+    reference.load(module, &beam).unwrap();
+    let expected = reference
+        .eval("code:get_debug_info(erl_debugger_dbgi_fixture)")
+        .unwrap();
+    assert!(matches!(&expected, arinsal_etf::OwnedTerm::List { elems, .. } if !elems.is_empty()));
+
+    let wrapper = "erl_debugger_dbgi_wrapper";
+    let wrapper_beam = reference
+        .compile_named(
+            wrapper,
+            "-module(erl_debugger_dbgi_wrapper). -export([get/1]). get(M) -> code:get_debug_info(M).",
+            &[],
+        )
+        .unwrap();
+    let mut vm = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), true, true);
+    vm.load_bytes(&wrapper_beam).unwrap();
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled(
+            wrapper,
+            "get",
+            &[arinsal_term::Term::atom(
+                arinsal_term::global_atoms().intern(module).unwrap(),
+            )],
+            1,
+            None,
+        )
+        .unwrap()
+        .term;
+    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+    // Flatmap key order follows atom indices, which differ between runtimes; compare as maps.
+    fn sorted(term: &arinsal_etf::OwnedTerm) -> arinsal_etf::OwnedTerm {
+        use arinsal_etf::OwnedTerm as T;
+        match term {
+            T::Map(pairs) => {
+                let mut pairs: Vec<_> = pairs.iter().map(|(k, v)| (sorted(k), sorted(v))).collect();
+                pairs.sort_by_key(|(k, _)| format!("{k:?}"));
+                T::Map(pairs)
+            }
+            T::Tuple(items) => T::Tuple(items.iter().map(sorted).collect()),
+            T::List { elems, tail } => T::List {
+                elems: elems.iter().map(sorted).collect(),
+                tail: Box::new(sorted(tail)),
+            },
+            other => other.clone(),
+        }
+    }
+    similar_asserts::assert_eq!(sorted(&actual), sorted(&expected));
+}
