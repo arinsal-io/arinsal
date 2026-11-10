@@ -129,9 +129,6 @@ pub(crate) enum SchedulerCounterBif {
 #[derive(Clone)]
 #[repr(C)]
 pub(crate) struct DispatchTarget {
-    /// `Export.info.mfa`: `current` points here while an export trampoline runs a BIF.
-    // Port of erts/emulator/beam/export.h (`ErtsCodeInfo.mfa`), OTP-29.1.1.
-    pub(crate) mfa: arinsal_beamasm::bif::ErtsCodeMfa,
     /// The node's export entry; export funs of this MFA hold it too (`Export.lambda`).
     slot: &'static Arc<arinsal_beamasm::bif::ExportEntry>,
     /// Code scope whose code indexes select the slot's address; zero for scope-free slots.
@@ -172,16 +169,6 @@ pub(crate) struct DispatchTarget {
     pub(crate) light_trap_bif: Option<&'static crate::bif_traps::Entry>,
 }
 
-const _: () = assert!(std::mem::offset_of!(DispatchTarget, mfa) == 0);
-
-fn code_mfa(mfa: Mfa) -> arinsal_beamasm::bif::ErtsCodeMfa {
-    arinsal_beamasm::bif::ErtsCodeMfa {
-        module: arinsal_term::Term::atom(mfa.0).word(),
-        function: arinsal_term::Term::atom(mfa.1).word(),
-        arity: u64::from(mfa.2),
-    }
-}
-
 /// Whether `module:function/arity` is a light BIF of the BIF table.
 fn light_kind(module: &str, function: &str, arity: u8) -> bool {
     arinsal_spec::bif_lookup(module, function, arity)
@@ -189,6 +176,11 @@ fn light_kind(module: &str, function: &str, arity: u8) -> bool {
 }
 
 impl DispatchTarget {
+    /// `Export.info.mfa` of this export.
+    pub(crate) fn mfa(&self) -> &'static arinsal_beamasm::bif::ErtsCodeMfa {
+        &self.slot.mfa
+    }
+
     /// The shared owner of this MFA's `Export`, which the code indexes' export tables hold.
     pub(crate) fn export_object(&self) -> &'static Arc<arinsal_beamasm::bif::ExportEntry> {
         self.slot
@@ -623,7 +615,6 @@ pub(crate) fn make_export(
         let bif = arinsal_bifs::lookup(&module, &function, mfa.2);
         let (class, bits) = crate::natives::classify(&module, &function, mfa.2, bif.is_some());
         Some(DispatchTarget {
-            mfa: code_mfa(mfa),
             // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
             slot: new_export_slot(mfa, trampoline, save_calls),
             scope,
@@ -692,7 +683,6 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportE
                 (import.class(), import.native_bits())
             };
             Some(DispatchTarget {
-                mfa: code_mfa(mfa),
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
@@ -743,7 +733,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let bif = arinsal_bifs::lookup(module, function, arity);
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
-            mfa: code_mfa(key),
             slot: new_export_slot(key, trampoline, save_calls),
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
@@ -789,7 +778,6 @@ fn publish_module(
             crate::natives::classify(&module.name, export.function, export.arity, bif.is_some());
         let target = dispatch_entry(scope, mfa, || {
             Some(DispatchTarget {
-                mfa: code_mfa(mfa),
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
@@ -1883,7 +1871,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn plain_bif_mfa(&self, _beam: &BeamFile, index: u32) -> Option<usize> {
         let identity = *self.export_entries.get(index as usize)?;
         let target = target_for_identity(identity)?;
-        Some(std::ptr::addr_of!(target.mfa) as usize)
+        Some(std::ptr::addr_of!(target.slot.mfa) as usize)
     }
     fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
         crate::native_helpers::arinsal_beamasm_bs_match_command

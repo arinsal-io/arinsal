@@ -49,9 +49,13 @@ pub enum ApplyKind {
     Apply2,
 }
 
-/// Resolves `apply/3` (module, function and argument list in X0..X2) to a native entry with
-/// the arguments in the X registers, or to the `apply/3` interpreter fragment.
-pub type Apply3Hook = extern "C" fn(*mut crate::ProcessHeader) -> usize;
+/// Resolves `apply/3` (module, function and argument list in X0..X2), with the arguments
+/// moved into the X registers, to the export's address with the Export* for ARG1, or to the
+/// `apply/3` interpreter fragment.
+///
+/// The return address (non-zero for a tail apply) and stack offset are those of [`ApplyHook`],
+/// for `apply_bif_error_adjustment`.
+pub type Apply3Hook = extern "C" fn(*mut crate::ProcessHeader, u64, u32) -> ApplyResolution;
 
 /// Runtime entry points used by the apply instructions.
 #[derive(Clone, Copy, Debug)]
@@ -144,9 +148,24 @@ fn emit_apply_common(
         }
         // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply),
         // OTP-29.1.1: any number of X registers is live after the call.
-        _ => asm.emit_runtime_hook_with(runtime.apply3_resolver as usize, &[], live, update)?,
+        _ => {
+            let entry = asm.code.new_label();
+            asm.code.bind(entry)?;
+            if tail {
+                asm.code.adr(Gpr::x(9), entry)?;
+            } else {
+                asm.code.emit(|e| e.mov_const(Gpr::x(9), 0))?;
+            }
+            asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
+            asm.emit_runtime_hook_with(
+                runtime.apply3_resolver as usize,
+                &[Gpr::x(9), Gpr::x(10)],
+                live,
+                update,
+            )?;
+        }
     }
-    if matches!(kind, ApplyKind::Fixed(_)) {
+    {
         // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-299 (emit_fixed_apply) and
         // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1: the resolver
         // leaves the Export* in ARG1 (x0; zero for a direct native entry or a fragment)
@@ -156,8 +175,6 @@ fn emit_apply_common(
         asm.branch_error()?;
         asm.code.bind(resolved)?;
         asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(1)))?;
-    } else {
-        asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(0)))?;
     }
     if tail {
         asm.emit_leave_frame()?;

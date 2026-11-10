@@ -58,12 +58,17 @@ pub(crate) fn active_export_entry(scope: u64, mfa: Mfa) -> Option<&'static Arc<E
 /// trampoline (whose call runs the error handler) entered in the export table.
 // Port of erts/emulator/beam/export.c:228-242 (erts_export_get_or_make_stub), OTP-29.1.1.
 pub(crate) fn export_get_or_make_stub(scope: u64, mfa: Mfa) -> Option<Arc<ExportEntry>> {
+    export_entry_or_stub(scope, mfa).map(Arc::clone)
+}
+
+/// [`export_get_or_make_stub`] returning the table's shared owner.
+pub(crate) fn export_entry_or_stub(scope: u64, mfa: Mfa) -> Option<&'static Arc<ExportEntry>> {
     if let Some(export) = active_export_entry(scope, mfa) {
-        return Some(Arc::clone(export));
+        return Some(export);
     }
     let export = crate::beamasm_integration::make_export(scope, mfa)?;
     export_put_all(scope, &[(mfa, export)]);
-    Some(Arc::clone(export))
+    Some(export)
 }
 
 /// The shared `beam_export_trampoline` every export enters while its trampoline is active.

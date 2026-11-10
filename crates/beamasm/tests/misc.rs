@@ -25,8 +25,12 @@ extern "C" fn apply_hook(
     }
 }
 
-extern "C" fn apply3_hook(_: *mut ProcessHeader) -> usize {
-    0
+extern "C" fn apply3_hook(
+    _: *mut ProcessHeader,
+    _: u64,
+    _: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    arinsal_beamasm::misc::ApplyResolution::default()
 }
 
 extern "C" fn fun_hook(_: *mut ProcessHeader, _: u64, _: u32) -> usize {

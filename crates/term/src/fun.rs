@@ -248,6 +248,19 @@ impl FunEntry {
     }
 }
 
+/// OTP's `ErtsCodeMFA` layout (`ErtsCodeInfo.mfa`): what `c_p->current` points at.
+// Port of erts/emulator/beam/code_ix.h:89-99, OTP-29.1.1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ErtsCodeMfa {
+    /// Tagged module atom.
+    pub module: u64,
+    /// Tagged function atom.
+    pub function: u64,
+    /// Word-sized arity.
+    pub arity: u64,
+}
+
 /// Export entry (`Export`): one per MFA and code scope, shared by external calls and by every
 /// `fun M:F/A` of that MFA, whose fun thing points at it.
 // Port of erts/emulator/beam/export.h:39-75 (Export: dispatch first, then the info word and
@@ -286,6 +299,9 @@ pub struct ExportEntry {
     /// this export enters it.
     // Port of erts/emulator/beam/export.h:64-102 (Export.trampoline), OTP-29.1.1.
     pub trampoline: ExportTrampoline,
+    /// `Export.info.mfa`: `current` points here while the export's trampoline runs a BIF.
+    // Port of erts/emulator/beam/export.h:66 (Export.info), OTP-29.1.1.
+    pub mfa: ErtsCodeMfa,
 }
 
 /// `Export.trampoline` of the JIT: the opcode it stands for and its one argument word. BeamAsm
@@ -350,6 +366,11 @@ impl ExportEntry {
             trampoline: ExportTrampoline {
                 op: AtomicUsize::new(TRAMPOLINE_CALL_ERROR_HANDLER),
                 address: AtomicUsize::new(0),
+            },
+            mfa: ErtsCodeMfa {
+                module: Term::atom(module).0,
+                function: Term::atom(function).0,
+                arity: arity as u64,
             },
         }
     }

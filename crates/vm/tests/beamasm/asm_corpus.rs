@@ -237,8 +237,12 @@ impl ModuleEnv for CorpusEnv {
         ) -> arinsal_beamasm::misc::ApplyResolution {
             arinsal_beamasm::misc::ApplyResolution::default()
         }
-        extern "C" fn apply3(_: *mut ProcessHeader) -> usize {
-            0
+        extern "C" fn apply3(
+            _: *mut ProcessHeader,
+            _: u64,
+            _: u32,
+        ) -> arinsal_beamasm::misc::ApplyResolution {
+            arinsal_beamasm::misc::ApplyResolution::default()
         }
         extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
             0

@@ -406,8 +406,12 @@ extern "C" fn unused_apply_resolver(
     arinsal_beamasm::misc::ApplyResolution::default()
 }
 
-extern "C" fn unused_apply3_resolver(_process: *mut ProcessHeader) -> usize {
-    0
+extern "C" fn unused_apply3_resolver(
+    _process: *mut ProcessHeader,
+    _return_ip: u64,
+    _stack_offset: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    arinsal_beamasm::misc::ApplyResolution::default()
 }
 
 extern "C" fn unused_fun_resolver(_process: *mut ProcessHeader, _fun: u64, _arity: u32) -> usize {

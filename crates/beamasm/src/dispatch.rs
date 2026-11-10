@@ -1737,13 +1737,17 @@ fn emit_run_process_fragment(code: &mut CodeBuffer, resolver: usize) -> Result<(
         // The resolver may run Erlang code (traps, error handlers); the caller's x30 is kept in the
         // header, as the module-level apply does (bif.rs emit_bif_runtime_call).
         encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+        // No return address and no stack offset: not a tail apply in module code.
+        encoder.mov_const(Gpr::x(1), 0)?;
+        encoder.mov_const(Gpr::x(2), 0)?;
         encoder.mov_const(Gpr::x(17), resolver as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        encoder.mov_reg(Gpr::x(14), Gpr::x(0))?;
+        // x0 is the Export* (ARG1) of a dispatchable target, x1 the address.
+        encoder.mov_reg(Gpr::x(14), Gpr::x(1))?;
         encoder.br(Gpr::x(14))
     })?;
     Ok(())

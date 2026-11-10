@@ -15,19 +15,7 @@ pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32
 /// terms. Zero means an exception is pending in `freason`.
 pub type BifIdentityHelper = usize;
 
-/// OTP's `ErtsCodeMFA` layout used by arithmetic instructions that raise through the shared
-/// exception fragment.
-// Port of erts/emulator/beam/code_ix.h:89-99, OTP-29.1.1.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ErtsCodeMfa {
-    /// Tagged module atom.
-    pub module: u64,
-    /// Tagged function atom.
-    pub function: u64,
-    /// Word-sized arity.
-    pub arity: u64,
-}
+pub use arinsal_term::ErtsCodeMfa;
 
 /// Static BIF descriptor stored by `emit_int_div_rem_body_shared` before calling its helper.
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:740-875, OTP-29.1.1.
