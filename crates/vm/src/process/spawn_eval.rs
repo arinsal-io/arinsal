@@ -31,7 +31,36 @@ impl Runtime {
             .map_err(|_| VmError::Unsupported("spawn: too many arguments".into()))?;
         let (module_atom, function_atom, _) = mfa_atoms(module, function, arity)
             .ok_or_else(|| VmError::Unsupported("spawn: bad module or function name".into()))?;
-        let mut child = Process::with_spawn_registers(args.len().max(3));
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process: `arg_size =
+        // size_object_litopt(args)`, `heap_need = arg_size + S_RESERVED`, the initial heap
+        // allocated once at `erts_next_heap_size(heap_need)` and `copy_struct_litopt` of the
+        // whole argument list into it), OTP-29.1.1. The decoded request arguments first sit
+        // apart from the child, as the dist message's heap fragment does in dist.c
+        // (DOP_SPAWN_REQUEST), so the child's heap is sized by the copied list.
+        let literals = arinsal_term::LiteralAreas::current();
+        let mut decoded = arinsal_term::ProcessHeap::with_words(0);
+        let owned_args = arinsal_etf::OwnedTerm::List {
+            elems: args.to_vec(),
+            tail: Box::new(arinsal_etf::OwnedTerm::Nil),
+        };
+        let decoded_args = if args.is_empty() {
+            Term::NIL
+        } else {
+            arinsal_term::from_owned(
+                &owned_args,
+                &mut arinsal_bifs::ProcessHeapHandle(&mut decoded),
+            )
+            .map_err(|_| VmError::Unsupported("spawn argument decode failed".into()))?
+        };
+        let arg_size = arinsal_term::size_object_litopt(decoded_args, &literals);
+        let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(Some(self), None, false);
+        let heap_words = arinsal_term::spawned_heap_words(
+            arg_size.saturating_add(arinsal_term::S_RESERVED),
+            min_heap,
+        )
+        .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
+        let mut child =
+            Process::with_spawn_registers_sized(args.len().max(3), heap_words, min_heap);
         child.set_runtime(Some(self));
         child.cold_mut().group_leader = None;
         // Port of erts/emulator/beam/erl_process.c:12756-12767 (erl_create_process p->parent),
@@ -46,23 +75,23 @@ impl Runtime {
         }
         let initial_bif = arinsal_bifs::lookup(module, function, arity).is_some()
             || arinsal_spec::bif_lookup(module, function, arity).is_some();
-        let mut copied = Vec::with_capacity(args.len());
-        for owned in args {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
-            copied.push(
-                arinsal_term::from_owned(owned, &mut heap)
-                    .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?,
-            );
-        }
+        let copied_args = arinsal_term::copy_struct_litopt(
+            decoded_args,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut child.heap),
+            arg_size,
+            &literals,
+        )
+        .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?;
+        drop(decoded);
         if initial_bif {
+            let copied = crate::signals::list(copied_args)
+                .filter(|copied| copied.len() == usize::from(arity))
+                .ok_or_else(|| VmError::Unsupported("spawned BIF argument list".into()))?;
             child.slice_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
             child.x[..copied.len()].copy_from_slice(&copied);
             child.initial_mfa = Some((module_atom, function_atom, arity));
         } else {
-            let args = arinsal_term::TermBuilder::new(&mut child.heap)
-                .list_from_slice(&copied)
-                .map_err(|_| VmError::Unsupported("spawn argument list".into()))?;
-            child.start_at_run_process(module_atom, function_atom, args, arity)?;
+            child.start_at_run_process(module_atom, function_atom, copied_args, arity)?;
         }
         let scheduler = self.scheduler()?;
         let Some(monitor) = monitor else {
