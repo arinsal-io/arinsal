@@ -424,6 +424,18 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "dt_restore_tag" && arity == 1 {
         return Some(sys::dt_restore_tag_light);
     }
+    if module == "erlang" && matches!(function, "dt_get_tag" | "dt_get_tag_data") && arity == 0 {
+        return Some(sys::dt_get_tag_light);
+    }
+    if module == "erlang" && function == "dt_put_tag" && arity == 1 {
+        return Some(sys::dt_put_tag_light);
+    }
+    if module == "erlang"
+        && matches!(function, "dt_prepend_vm_tag_data" | "dt_append_vm_tag_data")
+        && arity == 1
+    {
+        return Some(sys::dt_vm_tag_data_light);
+    }
     if module == "erlang" && function == "nodes" && arity == 0 {
         return Some(node::nodes0_bif);
     }

@@ -600,6 +600,12 @@ impl PortTable {
         }
     }
 
+    /// `erts_ptab_count(&erts_port)`: the live ports plus the standard I/O port that Arinsal keeps
+    /// outside the table.
+    pub(crate) fn live_count(&self) -> usize {
+        self.count.load(Ordering::Relaxed).saturating_add(1)
+    }
+
     /// Ids of the live ports in table order.
     pub(crate) fn ids(&self) -> Vec<u64> {
         self.handles().iter().map(|handle| handle.id).collect()

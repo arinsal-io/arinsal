@@ -140,6 +140,57 @@ fn stable_system_info_matches_otp() {
 }
 
 #[test]
+fn constant_and_time_system_info_items_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping system_info differential test");
+        return;
+    };
+    for key in [
+        "start_time",
+        "end_time",
+        "break_ignored",
+        "async_dist",
+        "eager_check_io",
+        "dynamic_trace",
+        "dynamic_trace_probes",
+        "c_compiler_used",
+        "delayed_node_table_gc",
+    ] {
+        let args = [O::atom(key)];
+        let expected = reference.call("erlang", "system_info", &args);
+        let actual = call("erlang", "system_info", &args);
+        // end_time is a bignum: its OwnedTerm form (Int or BigInt) depends on the decoder.
+        let int_value = |term: &CallResult| match term {
+            CallResult::Ok(O::Int(n)) => Some(i128::from(*n)),
+            CallResult::Ok(O::BigInt(n)) => i128::try_from(n.clone()).ok(),
+            _ => None,
+        };
+        if key == "end_time" {
+            assert_eq!(
+                int_value(&actual),
+                int_value(&expected),
+                "system_info({key})"
+            );
+            assert!(int_value(&actual).is_some());
+        } else {
+            assert_eq!(actual, expected, "system_info({key})");
+        }
+    }
+    // Counters depend on the node: compare the type and a sanity range.
+    for key in ["atom_count", "ethread_used_tse"] {
+        let args = [O::atom(key)];
+        assert!(matches!(
+            reference.call("erlang", "system_info", &args),
+            CallResult::Ok(O::Int(_))
+        ));
+    }
+    assert!(matches!(
+        call("erlang", "system_info", &[O::atom("atom_count")]),
+        CallResult::Ok(O::Int(n)) if n > 0
+    ));
+}
+
+#[test]
 fn os_pid_and_getenv_bifs_match_otp() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping os BIF differential test");
