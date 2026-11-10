@@ -44,7 +44,6 @@ fn runtime() -> ApplyRuntime {
         apply_fun_shared: 0,
         fun_resolver: fun_hook,
         apply2_fragment: 0,
-        apply3_fragment: 0,
     }
 }
 

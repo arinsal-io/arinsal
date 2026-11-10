@@ -2105,6 +2105,33 @@ impl BeamModuleAssembler {
             .map(|_| ())
     }
 
+    /// [`Self::emit_runtime_hook_with`] for a helper whose caller tests its result for a
+    /// raise itself (erts `apply`/`fixed_apply`: a zero export, raised with its own MFA).
+    pub(super) fn emit_runtime_hook_unchecked(
+        &mut self,
+        helper: usize,
+        args: &[Gpr],
+        live: usize,
+        update: crate::Update,
+    ) -> Result<(), ModuleError> {
+        if args.len() > 5 {
+            return Err(ModuleError::InvalidOperand(
+                "runtime hook has too many arguments",
+            ));
+        }
+        crate::emit_enter_runtime(&mut self.code, live, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), C_P)?;
+            for (index, arg) in args.iter().copied().enumerate() {
+                e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
+            }
+            Ok(())
+        })?;
+        self.fragment_call(helper)?;
+        crate::emit_leave_runtime(&mut self.code, live, update)?;
+        Ok(())
+    }
+
     /// Returns the code offset of the fragment call's return address.
     pub(super) fn emit_runtime_fragment_with(
         &mut self,
