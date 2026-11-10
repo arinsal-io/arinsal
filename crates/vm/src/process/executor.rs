@@ -566,7 +566,6 @@ impl Vm {
                 }
             };
         process.module = module_id;
-        process.set_entry_ip(ip);
         process.initial_call = Some((module_id, ip));
         Ok(apply_operands)
     }

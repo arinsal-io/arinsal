@@ -505,7 +505,13 @@ impl Vm {
                     && crate::trace_bp::any_pattern()
                     && arinsal_spec::bif_lookup(module, function, arity as u8).is_some() =>
             {
-                let site = (usize::MAX - 1, p.ip());
+                // The apply's return address names its native call site.
+                let site = (
+                    usize::MAX,
+                    p.heap
+                        .stack_get(0)
+                        .map_or(0, |cp| (cp.tagged_word() as usize).wrapping_sub(1)),
+                );
                 self.trace_native_call_named(
                     p,
                     run,

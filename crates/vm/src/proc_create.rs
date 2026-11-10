@@ -378,8 +378,6 @@ pub struct Process {
     /// erl_process.c:12960-12965 happens when it first runs.
     pub(crate) seq_trace_spawn_pending: bool,
     pub(crate) module: usize,
-    /// The interpreter's position in `module`: only the interpreter flavor uses it.
-    ip_raw: usize,
     pub(crate) initial_call: Option<(usize, usize)>,
     /// `p->u.initial` (erl_process.c:12693): the MFA the process was spawned with, as atoms.
     pub(crate) initial_mfa: Option<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
@@ -1437,11 +1435,6 @@ pub(crate) struct ProcessCold {
     pub(crate) ets_insert: Option<Box<EtsInsert>>,
     /// Progress of a trapped `ets:select/2`, `match/2`, `match_object/2` or `select_count/2`.
     pub(crate) ets_select: Option<Box<EtsSelect>>,
-    /// The frame of a tail call that was already released when its callee yielded, so the
-    /// re-executed instruction does not release it twice. Its words are GC roots.
-    pub(crate) ext_last_released: Option<Box<ReleasedFrame>>,
-    /// The frames a trapped BIF call holds in erts but the interpreter does not push.
-    pub(crate) trap_return: Option<TrapReturn>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
@@ -1504,29 +1497,6 @@ pub(crate) struct PersistentGetAll {
     pub(crate) result: Term,
 }
 
-/// The caller frame of a BIF call that trapped out of the interpreter.
-///
-/// erts calls a BIF as an ordinary call: the return address into the caller is on the stack
-/// while the process waits in the trap, above the caller's frame, which a tail call keeps
-/// until the BIF returns. The interpreter re-executes the call instruction on resume instead,
-/// so this return address is reported to `process_info` and stack traces without being pushed.
-pub(crate) struct TrapReturn {
-    /// Module and instruction the BIF returns to.
-    pub(crate) module: usize,
-    pub(crate) ip: usize,
-}
-
-/// A frame the interpreter released before a tail call whose callee then yielded.
-pub(crate) struct ReleasedFrame {
-    pub(crate) module: usize,
-    pub(crate) ip: usize,
-    /// `true` when erts keeps the frame while a BIF runs (`call_ext_last`, `apply_last`);
-    /// a fun call in tail position releases it before the call.
-    pub(crate) kept: bool,
-    /// The frame's words, as they were before the release.
-    pub(crate) words: Vec<Term>,
-}
-
 /// `apply_frame_released` of a tail `apply/3` or fixed apply: erts passes the apply site `I`
 /// and a BIF failure other than error/exit/throw is attributed to the continuation.
 pub(crate) const TAIL_APPLY: u8 = 1;
@@ -1583,36 +1553,7 @@ impl BifTrapPending {
     }
 }
 
-/// Reports (`ARINSAL_IP_TRACE=1`) every use of the interpreter position by the JIT flavor,
-/// which has none: the JIT flavor's positions are code addresses.
-#[track_caller]
-#[inline]
-fn interpreter_position_used() {
-    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    use std::sync::atomic::Ordering;
-    let state = match STATE.load(Ordering::Relaxed) {
-        0 => {
-            let on = std::env::var_os("ARINSAL_IP_TRACE").is_some() as u8 + 1;
-            STATE.store(on, Ordering::Relaxed);
-            on
-        }
-        state => state,
-    };
-    if state == 2 {
-        let at = std::panic::Location::caller();
-        eprintln!("IPUSE {}:{}", at.file(), at.line());
-    }
-}
-
 impl Process {
-    /// The interpreter position (`p->i` of the emu flavor).
-    #[track_caller]
-    #[inline]
-    pub(crate) fn ip(&self) -> usize {
-        interpreter_position_used();
-        self.ip_raw
-    }
-
     /// The call site a pending BIF trap belongs to: the interpreter's position. The JIT flavor
     /// has no such position (its native code never keeps one), so every site is the same one
     /// and the trapped import alone names the call.
@@ -1621,24 +1562,10 @@ impl Process {
         (0, 0)
     }
 
-    /// Where the process stands, to tell whether a call moved it: its interpreter position and
-    /// its code address.
+    /// Where the process stands, to tell whether a call moved it: its code address (`c_p->i`).
     #[inline]
-    pub(crate) fn position_marker(&self) -> (usize, Option<usize>) {
-        (self.ip_raw, self.native_pc)
-    }
-
-    /// The function entry (an index in the module's code) a process that has not run yet starts
-    /// at. This names a function, not an interpreter position.
-    #[inline]
-    pub(crate) fn entry_ip(&self) -> usize {
-        self.ip_raw
-    }
-
-    /// Sets the function entry a process starts at.
-    #[inline]
-    pub(crate) fn set_entry_ip(&mut self, ip: usize) {
-        self.ip_raw = ip;
+    pub(crate) fn position_marker(&self) -> Option<usize> {
+        self.native_pc
     }
 
     /// Enter a tail apply whose caller frame is already deallocated (see `apply_frame_released`).
@@ -1662,33 +1589,9 @@ impl Process {
             .as_ref()
             .is_some_and(|cold| cold.apply_frame_released != 0)
     }
-    /// The caller frame of the BIF the process waits in, while it is scheduled out in the
-    /// export trap of an interpreter call.
-    pub(crate) fn trap_return_frame(&self) -> Option<&TrapReturn> {
-        if self.heap.abi.i as usize != crate::bif_traps::bif_export_trap_pc() {
-            return None;
-        }
-        self.cold.as_ref()?.trap_return.as_ref()
-    }
-    /// The words of the caller's frame that a trapped `call_ext_last` released and erts keeps.
-    pub(crate) fn trap_frame_words(&self) -> &[Term] {
-        let Some(frame) = self.trap_return_frame() else {
-            return &[];
-        };
-        self.cold
-            .as_ref()
-            .and_then(|cold| cold.ext_last_released.as_ref())
-            .filter(|released| {
-                released.kept && released.module == frame.module && released.ip + 1 == frame.ip
-            })
-            .map_or(&[], |released| &released.words)
-    }
     /// Words of the Erlang stack as erts counts them, with the frames of a trapped call.
     pub(crate) fn observed_stack_words(&self) -> usize {
         self.heap.stack_words()
-            + self
-                .trap_return_frame()
-                .map_or(0, |_| 1 + self.trap_frame_words().len())
     }
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.
     pub fn native_header(&mut self) -> &mut ProcessHeader {
@@ -2201,7 +2104,6 @@ impl Process {
             seq_trace_epoch: crate::seq_trace::current_epoch(),
             seq_trace_spawn_pending: false,
             module: 0,
-            ip_raw: 0,
             initial_call: None,
             initial_mfa: None,
             native_pc: None,
@@ -2957,7 +2859,6 @@ mod layout_report {
             size_of_val(&process.seq_trace_spawn_pending)
         );
         eprintln!("  Process.module {}", size_of_val(&process.module));
-        eprintln!("  Process.ip {}", size_of_val(&process.ip()));
         eprintln!(
             "  Process.initial_call {}",
             size_of_val(&process.initial_call)
@@ -3163,7 +3064,6 @@ mod layout_report {
         );
         field!("trace_flags", (u64, Vec<(u64, u64)>));
         field!("timer_pause", Option<crate::process::TimerPause>);
-        field!("trap_return", Option<TrapReturn>);
         field!("bif_trap", Option<BifTrapPending>);
         field!("delayed_gc", Vec<DelayedGc>);
         field!("dirty_gc", Option<DirtyGc>);

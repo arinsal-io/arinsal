@@ -339,23 +339,18 @@ pub(crate) fn profile_process_event(
     let Some(pid) = ctx.pid().to_term().and_then(|pid| to_owned(pid).ok()) else {
         return;
     };
+    // Port of erts/emulator/beam/erl_trace.c (profile_runnable_proc: `p->current`, else the
+    // function of `p->i`), OTP-29.1.1.
     let where_mfa = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| {
-            runtime.with_modules(|modules| {
-                modules.get(process.module).and_then(|module| {
-                    module.function_at(process.ip()).map(|(function, arity)| {
-                        O::Tuple(vec![
-                            O::Atom(module.name.clone()),
-                            O::Atom(function.to_owned()),
-                            O::Int(arity as i64),
-                        ])
-                    })
-                })
-            })
-        })
-        .unwrap_or(O::Int(0));
+        .native_pc()
+        .and_then(crate::native_bridge::native_function_at)
+        .map_or(O::Int(0), |function| {
+            O::Tuple(vec![
+                O::Atom(function.module.to_owned()),
+                O::Atom(function.function.to_owned()),
+                O::Int(i64::from(function.arity)),
+            ])
+        });
     let message = O::Tuple(vec![
         O::Atom("profile".into()),
         pid,

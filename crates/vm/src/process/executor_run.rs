@@ -67,7 +67,7 @@ impl Executor {
         // ERTS_TRACE_FLAGS(p) before any trace work), OTP-29.1.1: the process flag word has
         // `proc_flags::TRACE` while the trace table holds an entry for this process.
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0 {
-            let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
+            let running = crate::trace::running_mfa(process, ctx.pid())?;
             let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
             crate::trace::emit(
                 Some(&mut self.vm),
@@ -114,9 +114,8 @@ impl Executor {
                 // process meanwhile holds erlang:apply/3 with those arguments, so the stub's
                 // interpreter fallback runs there (native_bridge.rs apply3 resolver).
                 Some((start, _)) => {
-                    let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
+                    let (module_id, _) = erlang_apply_entry(&mut self.vm)?;
                     process.module = module_id;
-                    process.set_entry_ip(entry);
                     process.set_native_pc(Some(start));
                     // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->i =
                     // beam_run_process; p->arity = 3`), OTP-29.1.1: the process starts like any
@@ -131,11 +130,12 @@ impl Executor {
             }
         }
         let first_run = !process.replace_entry_started(true);
+        // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i`), OTP-29.1.1:
+        // the first run starts at the code address of the spawned function (`p->u.initial`).
         if first_run
             && process.native_pc().is_none()
-            && let Some(start) = self
-                .vm
-                .native_entry_address(process.module, process.entry_ip())
+            && let Some((module_id, entry)) = process.initial_call
+            && let Some(start) = self.vm.native_entry_address(module_id, entry)
         {
             process.set_native_pc(Some(start));
         }
@@ -687,10 +687,11 @@ impl Executor {
                                     eprintln!("arinsal boot: exception {reason} at {frame}");
                                 }
                                 let mut trap = crate::exceptions::from_legacy(&reason)?;
-                                let arity = self.vm.code.modules[process.module]
-                                    .function_at(process.ip())
-                                    .map(|(_, arity)| arity)
-                                    .unwrap_or(0);
+                                // The arity of the current function (`c_p->i`).
+                                let arity = process
+                                    .native_pc()
+                                    .and_then(crate::native_bridge::native_function_at)
+                                    .map_or(0, |function| function.arity);
                                 trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
                                     Some(Term::small(i64::from(arity)).expect("arity is small")),
                                     info,
@@ -701,12 +702,10 @@ impl Executor {
                         };
                         if trace_boot_enabled() {
                             eprintln!(
-                                "arinsal boot: process {:?} trap in {} at ip {} line {:?} instruction {:?}: {:?} reason {:?}",
+                                "arinsal boot: process {:?} trap in {} at pc {:?}: {:?} reason {:?}",
                                 ctx.pid(),
                                 self.vm.frame_name(process),
-                                process.ip(),
-                                self.vm.code.modules[process.module].lines.get(process.ip()),
-                                self.vm.code.modules[process.module].code.get(process.ip()),
+                                process.native_pc(),
                                 trap.class,
                                 arinsal_term::to_owned(trap.reason)
                             );
@@ -813,7 +812,7 @@ impl Executor {
             || matches!(result, Err(VmError::Yield | VmError::Dirty(_))))
             && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0
         {
-            let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
+            let running = crate::trace::running_mfa(process, ctx.pid())?;
             // erl_trace.c:752-760 (trace_sched_session): no current function is reported as 0.
             let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
             // Port of erts/emulator/beam/erl_process.c:10556-10560 (trace_schedule_out).

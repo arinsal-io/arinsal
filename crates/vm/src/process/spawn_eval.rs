@@ -45,7 +45,8 @@ impl Runtime {
         };
         let mut child = Process::with_spawn_registers(args.len(), 0);
         child.module = module_id;
-        child.set_entry_ip(ip);
+        // `p->u.initial`: the first run starts at this function's code address.
+        child.initial_call = Some((module_id, ip));
         child.set_runtime(Some(self));
         child.cold_mut().group_leader = None;
         child.initial_mfa = mfa_atoms(module, function, args.len() as u8);
@@ -139,7 +140,6 @@ impl Vm {
             .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 is not exported")))?;
         let mut process = Process::with_spawn_registers(0, 0);
         process.module = module_id;
-        process.set_entry_ip(ip);
         process.initial_call = Some((module_id, ip));
         process.set_runtime(Some(runtime));
         process.initial_mfa = mfa_atoms(module, function, 0);
@@ -432,7 +432,7 @@ impl Vm {
             let scheduler = runtime.scheduler()?;
             let mut process = Process::with_spawn_registers(args.len(), 0);
             process.module = module_id;
-            process.set_entry_ip(ip);
+            process.initial_call = Some((module_id, ip));
             // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
             // arguments into the new heap), OTP-29.1.1: the first process owns its arguments, so
             // a collection never meets a term outside its heap and the literal areas.
