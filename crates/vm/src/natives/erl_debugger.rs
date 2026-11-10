@@ -237,7 +237,8 @@ fn breakpoint(
             .values()
             .iter()
             .flatten()
-            .any(|(_, n)| *n == u64::from(line));
+            .any(|(_, n)| *n == u64::from(line))
+            || crate::beamasm_integration::native_code_has_line(vm.code_scope, &module, line);
         return result_error(
             process,
             O::Tuple(vec![
@@ -312,7 +313,7 @@ fn breakpoints(
         let end = code
             .functions
             .get(index + 1)
-            .map_or(code.code.len(), |next| next.0);
+            .map_or(code_end(code), |next| next.0);
         let lines = code
             .debug_line_points
             .iter()
@@ -338,12 +339,18 @@ fn breakpoints(
     )
 }
 
+/// End of the last function's range: its instruction count, or for a module without the
+/// interpreter form the slot numbering of `Module::finish_native` (two per function).
+fn code_end(code: &arinsal_loader::Module) -> usize {
+    code.code.len().max(2 * code.functions.len())
+}
+
 fn line_map(process: &Process, module_id: usize, code: &arinsal_loader::Module, start: usize) -> O {
     let end = code
         .functions
         .iter()
         .find(|(candidate, _, _)| *candidate > start)
-        .map_or(code.code.len(), |next| next.0);
+        .map_or(code_end(code), |next| next.0);
     let lines = code
         .debug_line_points
         .iter()

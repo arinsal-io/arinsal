@@ -1014,22 +1014,22 @@ impl Vm {
     }
 
     /// Whether a module may be loaded without the interpreter form of its code: BeamAsm is
-    /// the engine and nothing patches the code at load (coverage, line counters, debugger
-    /// lines). In the JIT flavor a module BeamAsm cannot compile completely fails to load.
-    pub(crate) fn native_only(&self, beam: &BeamFile, meta: &CodeMeta) -> bool {
+    /// the engine. Coverage, line counters and debugger line breakpoints are emitted by
+    /// BeamAsm, as in erts. In the JIT flavor a module BeamAsm cannot compile completely fails to load.
+    pub(crate) fn native_only(&self, meta: &CodeMeta) -> bool {
         // `Vm::eval` interprets: once a process has used it, every module keeps its interpreter
         // form, those it loads for its calls included.
         !INTERPRETER_EVAL.load(std::sync::atomic::Ordering::Relaxed)
             && meta.has_beam_bytes
             && beamasm_integration::enabled()
-            && matches!(self.coverage_mode(), arinsal_loader::CoverageMode::None)
-            // erts' asm_load.c overrides the VM mode for BEAMFILE_FORCE_LINE_COUNTERS.
-            && beam
-                .lines
-                .as_ref()
-                .is_none_or(|lines| lines.flags & 2 == 0)
-            && !crate::trace_bp::line_breakpoints_instrumented()
             && std::env::var_os("ARINSAL_FULL_SPECIALIZE").is_none()
+    }
+
+    /// Whether a module without the interpreter form needs its instructions decoded for the
+    /// coverage table or the debugger line metadata.
+    pub(crate) fn native_tables_need_instructions(&self, beam: &BeamFile) -> bool {
+        arinsal_loader::coverage_enabled_for(beam, self.coverage_mode())
+            || crate::trace_bp::line_breakpoints_instrumented()
     }
 
     /// [`prepare_module`](Self::prepare_module), optionally leaving the interpreter form of
@@ -1049,7 +1049,15 @@ impl Vm {
                 true,
             )
         } else {
-            arinsal_loader::load_native(beam)
+            arinsal_loader::load_native(beam).and_then(|mut module| {
+                // Port of erts/emulator/beam/jit/asm_load.c:73-135, OTP-29.1.1: the coverage
+                // table the emitted counters update is allocated with the module.
+                module.coverage = arinsal_loader::native_coverage(beam, self.coverage_mode())?;
+                if crate::trace_bp::line_breakpoints_instrumented() {
+                    arinsal_loader::set_native_debug_lines(&mut module, beam);
+                }
+                Ok(module)
+            })
         }
         .map_err(|e| VmError::Load(e.to_string()))?;
         // The checksum is computed once per file, like erts' beamfile_read does.
@@ -1232,12 +1240,18 @@ impl Vm {
         // them: a module with `-on_load`, coverage,
         // debugger lines or the rules of the loader that patch its code at load, or one BeamAsm
         // does not compile completely.
-        let native_only = compile_native && self.native_only(&meta.beam, &meta);
+        let native_only = compile_native && self.native_only(&meta);
         if !native_only {
             meta.beam
                 .decode_code()
                 .map_err(|e| VmError::Load(e.to_string()))?;
             meta.note_decoded_on_load();
+        } else if self.native_tables_need_instructions(&meta.beam) {
+            // The coverage table and the debugger lines are laid out from the instructions
+            // (erts sizes them in beam_load_prepare_emit and fills them while emitting).
+            meta.beam
+                .decode_code()
+                .map_err(|e| VmError::Load(e.to_string()))?;
         }
         let mut module = self.prepare_module_with(&meta.beam, bytes, meta.md5, !native_only)?;
         let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);

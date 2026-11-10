@@ -42,6 +42,7 @@ fn native_coverage_modes_match_otp() {
             .unwrap();
 
         let mut vm = Vm::new([]);
+        let interpreter_slices_before = arinsal_vm::interp_slices();
         vm.load_bytes(&driver).unwrap();
         let mode_term = Term::atom(global_atoms().intern(mode).unwrap());
         vm.eval_scheduled(DRIVER, "set_mode", &[mode_term], 1, None)
@@ -62,6 +63,12 @@ fn native_coverage_modes_match_otp() {
             .unwrap()
             .term;
 
+        // The counters are BeamAsm code (emit_coverage); the module has no interpreter form.
+        assert_eq!(
+            arinsal_vm::interp_slices(),
+            interpreter_slices_before,
+            "mode={mode}: a cover-instrumented module must run natively"
+        );
         assert_eq!(CallResult::Ok(actual_result), expected_result);
         assert_eq!(actual_coverage, expected_coverage, "mode={mode}");
     }

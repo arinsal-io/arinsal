@@ -135,6 +135,17 @@ impl NativeLines {
         }
     }
 
+    /// Whether a line entry of this window names source line `line`.
+    pub(crate) fn has_line(&self, line: u32) -> bool {
+        self.table.as_deref().is_some_and(|table| {
+            table
+                .get(self.lo as usize..self.hi as usize)
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry.location != 0 && entry.location & 0x00ff_ffff == line)
+        })
+    }
+
     /// The entry at the nearest preceding native PC, like erts' `lookup_loc`
     /// (beam_ranges.c): a branching binary search over the compact PC table.
     #[inline]

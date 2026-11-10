@@ -1370,6 +1370,25 @@ pub(crate) fn is_line_breakpoint_cleanup(address: usize) -> bool {
 /// Enable or disable the native line-breakpoint sites of `line` in `module`.
 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:337-348, OTP-29.1.1: the `b next`
 // that skips the trampoline is rewritten to a NOP when the breakpoint is enabled.
+/// Whether the native line table of `module` has an entry for source line `line`.
+// Port of erts/emulator/beam/beam_ranges.c (erts_find_next_code_for_line: a search of the
+// code header's line table), OTP-29.1.1.
+pub(crate) fn native_code_has_line(scope: u64, module: &str, line: u32) -> bool {
+    let Ok(versions) = compiled_versions().read() else {
+        return false;
+    };
+    versions
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|version| version.scope == scope && version.module == module)
+        .any(|version| {
+            version
+                .native_functions
+                .iter()
+                .any(|function| function.line_table.has_line(line))
+        })
+}
+
 pub(crate) fn patch_native_line_breakpoint(scope: u64, module: &str, line: u32, enabled: bool) {
     let Ok(mut versions) = compiled_versions().write() else {
         return;
@@ -1716,11 +1735,32 @@ impl<'a> VmModuleEnv<'a> {
             send_fragment: fragments.send(),
             module_name: module.name.clone(),
             static_nifs: crate::load::static_nif_module(&module.name),
-            functions: module
-                .functions
-                .iter()
-                .map(|(_, function, arity)| ((*function).to_owned(), *arity))
-                .collect(),
+            functions: if module.awaits_native_functions() {
+                // A module without the interpreter form: its functions in code order, the
+                // indices of its function coverage slots (asm_load.c:757-769).
+                beam.code
+                    .instructions
+                    .iter()
+                    .filter(|instruction| instruction.op == arinsal_spec::Opcode::FuncInfo)
+                    .filter_map(|instruction| {
+                        let name = match instruction.args.get(1)? {
+                            arinsal_beam::Operand::Atom(index) => beam.atom(*index)?,
+                            _ => return None,
+                        };
+                        let arity = match instruction.args.get(2)? {
+                            arinsal_beam::Operand::U(arity) => u8::try_from(*arity).ok()?,
+                            _ => return None,
+                        };
+                        Some((name.to_owned(), arity))
+                    })
+                    .collect()
+            } else {
+                module
+                    .functions
+                    .iter()
+                    .map(|(_, function, arity)| ((*function).to_owned(), *arity))
+                    .collect()
+            },
             coverage: module.coverage.clone(),
             module_handle,
             lambda_targets: std::cell::RefCell::new(HashMap::new()),
