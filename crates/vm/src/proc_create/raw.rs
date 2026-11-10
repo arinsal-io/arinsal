@@ -6,17 +6,12 @@ use std::mem::MaybeUninit;
 pub(crate) fn initialize_spawned(
     slot: &mut MaybeUninit<Process>,
     x_registers: usize,
-    mut heap: ProcessHeap,
+    heap_words: usize,
+    alloc_ix: Option<usize>,
+    min_heap: usize,
 ) -> &mut Process {
     #[cfg(feature = "pf-mem-counters")]
     let started = std::time::Instant::now();
-    #[cfg(feature = "pf-mem-counters")]
-    let min_heap = heap.min_heap_size_words();
-
-    heap.abi.fcalls = crate::process::CONTEXT_REDS;
-    heap.abi.i = std::ptr::null();
-    heap.abi.arity = x_registers.min(usize::from(u8::MAX)) as u8;
-    heap.abi.current = std::ptr::null();
 
     // Construct every owning or fallible value before the first field write. If any of these
     // operations panics, the allocated slot is still wholly uninitialized.
@@ -37,7 +32,16 @@ pub(crate) fn initialize_spawned(
     // reachable. Every field is written exactly once below, and no operation in this write
     // sequence can panic. Any panic while preparing values above leaves the slot unused.
     unsafe {
-        std::ptr::addr_of_mut!((*process).heap).write(heap);
+        // The heap is built in its place in the block (erl_create_process sets p->heap,
+        // p->htop, p->stop ... on the allocated Process), the last value that can fail and
+        // the first field written.
+        std::ptr::addr_of_mut!((*process).heap).write(ProcessHeap::spawned_at(
+            heap_words,
+            alloc_ix,
+            min_heap,
+            crate::process::CONTEXT_REDS,
+            x_registers.min(usize::from(u8::MAX)) as u8,
+        ));
         std::ptr::addr_of_mut!((*process).x).write(x);
         std::ptr::addr_of_mut!((*process).dictionary).write(None);
         std::ptr::addr_of_mut!((*process).seq_trace_token).write(None);

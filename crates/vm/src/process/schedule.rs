@@ -439,7 +439,7 @@ impl Process {
         if heap_limit_kills(self, ctx) {
             let entry_result = self
                 .entry
-                .then(|| Err(VmError::Unsupported("max_heap_size".into())));
+                .then(|| Box::new(Err(VmError::Unsupported("max_heap_size".into()))));
             let runtime = self.runtime_handle();
             return self.exit_with(
                 runtime,
@@ -522,11 +522,11 @@ impl Process {
                     let owned = arinsal_term::to_owned(term).map_err(|error| {
                         VmError::Unsupported(format!("result conversion: {error:?}"))
                     });
-                    owned.map(|term_owned| ScheduledResult {
+                    Box::new(owned.map(|term_owned| ScheduledResult {
                         text: format!("{term_owned}"),
                         term: term_owned,
                         stats: self.stats.snapshot(),
-                    })
+                    }))
                 });
                 let runtime = self.runtime_handle();
                 self.exit_with(
@@ -555,7 +555,7 @@ impl Process {
                 if trace_boot_enabled() {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
-                let entry_result = self.entry.then_some(Err(error));
+                let entry_result = self.entry.then(|| Box::new(Err(error)));
                 let runtime = self.runtime_handle();
                 self.exit_with(runtime, ctx, data, reason, entry_result, 1)
             }

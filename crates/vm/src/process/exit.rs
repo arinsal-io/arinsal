@@ -661,7 +661,7 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         reason: Term,
-        entry_result: Option<Result<ScheduledResult, VmError>>,
+        entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
         code: u64,
     ) -> RunOutcome {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
@@ -793,7 +793,7 @@ impl Process {
         if self.entry
             && let Some(result) = cont.entry_result
         {
-            let _ = runtime.result.lock().unwrap().send(result);
+            let _ = runtime.result.lock().unwrap().send(*result);
         }
         RunOutcome::Exit(cont.code)
     }
