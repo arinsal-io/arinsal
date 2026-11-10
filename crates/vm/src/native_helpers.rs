@@ -780,6 +780,60 @@ pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
     invoke_dispatch_bif(header, identity as usize, 0, export, true).unwrap_or(1)
 }
 
+/// `call_error_handler` of the export trampoline: the export of
+/// `error_handler:undefined_function/3` (the process's error handler module), with X0..X2 set
+/// to the stub's module, function and argument list; zero when there is no such function.
+// Port of erts/emulator/beam/beam_common.c:1294-1345 (call_error_handler), OTP-29.1.1.
+pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
+    header: *mut ProcessHeader,
+    export: Option<ExportDispatch>,
+) -> usize {
+    let Some(stub) = export else {
+        return 0;
+    };
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(runtime) = process.runtime.as_ref() else {
+        return 0;
+    };
+    let handler = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.flags.error_handler)
+        .and_then(Term::as_atom)
+        .unwrap_or(arinsal_term::atoms::ERROR_HANDLER);
+    let Ok(undefined_function) = arinsal_term::global_atoms().intern("undefined_function") else {
+        return 0;
+    };
+    let code_ix = registers.active_code_ix as usize;
+    // erts_find_function: an export whose trampoline is active (and not a breakpoint) is
+    // not loaded.
+    let Some(handler_export) = runtime
+        .export_entry((handler, undefined_function, 3), code_ix)
+        .filter(|ep| {
+            !crate::export::is_export_trampoline_active(ep, code_ix)
+                || crate::export::has_export_breakpoint(ep)
+        })
+    else {
+        return 0;
+    };
+    let arity = usize::from(stub.arity);
+    if process.ensure(arity * 2, arity).is_err() {
+        return 0;
+    }
+    let args: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::from_slice(&process.x[..arity]);
+    let Ok(list) = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+        .list_from_iter(args)
+    else {
+        return 0;
+    };
+    process.x[0] = Term::atom(stub.module_atom);
+    process.x[1] = Term::atom(stub.function_atom);
+    process.x[2] = list;
+    std::ptr::from_ref(handler_export) as usize
+}
+
 /// Records the remote call of a process saving calls (the export entry is `identity`) and
 /// returns the address the call continues with.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:123-148 (emit_dispatch_save_calls_export),
@@ -4579,10 +4633,13 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
         return fallback;
     };
     let target = export.address(code_ix);
-    // The export trampoline (BIFs, stubs, global breakpoints) still runs through the
-    // interpreter fragment: a traced BIF entered from the trampoline in a tail apply misses
-    // its `return_to` event (call_trace_exceptions case 16). See STRUCT_DEVIATIONS.md.
-    if target == crate::beamasm_integration::export_trampoline() {
+    // The export trampoline of a BIF or a global breakpoint still runs through the interpreter
+    // fragment: a traced BIF entered from the trampoline in a tail apply misses its
+    // `return_to` event (call_trace_exceptions case 16). A stub's trampoline calls the error
+    // handler natively (beam_common.c call_error_handler). See STRUCT_DEVIATIONS.md.
+    if target == crate::beamasm_integration::export_trampoline()
+        && export.trampoline_op() != arinsal_term::TRAMPOLINE_CALL_ERROR_HANDLER
+    {
         return fallback;
     }
     let mut list = args;

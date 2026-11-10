@@ -325,6 +325,12 @@ pub const TRAMPOLINE_NONE: usize = 0;
 pub const TRAMPOLINE_CALL_ERROR_HANDLER: usize = 1;
 /// `op_i_generic_breakpoint`.
 pub const TRAMPOLINE_BREAKPOINT: usize = 2;
+/// `op_call_bif_W`: a BIF (or a native the runtime implements) the trampoline calls.
+pub const TRAMPOLINE_CALL_BIF: usize = 3;
+/// Byte offset of `trampoline.common.op` for generated loads.
+pub const EXPORT_TRAMPOLINE_OP_OFFSET: u32 = (core::mem::offset_of!(ExportEntry, trampoline)
+    + core::mem::offset_of!(ExportTrampoline, op))
+    as u32;
 
 /// Byte offset of [`ExportEntry::info`] for generated loads.
 pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;

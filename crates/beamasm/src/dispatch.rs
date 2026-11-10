@@ -109,6 +109,9 @@ pub struct DispatchRuntimeHelpers {
     /// `apply/3` resolver of the run-process stub (`arinsal_beamasm_apply3_resolver`). Zero builds
     /// no stub.
     pub apply3_resolver: usize,
+    /// `call_error_handler` of the export trampoline: `(c_p, Export.info) -> Export*` of
+    /// `error_handler:undefined_function/3` with X0..X2 set up, or zero. Zero builds none.
+    pub call_error_handler: usize,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -220,6 +223,7 @@ impl DispatchFragments {
             compare,
             line_breakpoint: LineBreakpointHelpers::default(),
             apply3_resolver: 0,
+            call_error_handler: 0,
         })
     }
 
@@ -239,6 +243,7 @@ impl DispatchFragments {
             compare,
             line_breakpoint: line_breakpoint_helpers,
             apply3_resolver,
+            call_error_handler,
         } = helpers;
         let mut code = CodeBuffer::new();
         let export = code.new_label();
@@ -268,6 +273,7 @@ impl DispatchFragments {
         emit_export_fragment(
             &mut code,
             export_helper,
+            call_error_handler,
             light_bif_gc_helper,
             light_gc_offsets,
             raise_exception,
@@ -912,11 +918,61 @@ fn emit_gc_desired_test(
 fn emit_export_fragment(
     code: &mut CodeBuffer,
     helper: usize,
+    error_handler_helper: usize,
     gc_helper: usize,
     gc: LightGcOffsets,
     raise_exception: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
     let interpreted = code.new_label();
+    if error_handler_helper != 0 {
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:157-232
+        // (emit_export_trampoline, `error_handler`), OTP-29.1.1: a stub calls
+        // `call_error_handler`, which leaves `error_handler:undefined_function/3`'s
+        // arguments in X0..X2, and the trampoline enters that export like any
+        // dispatchable call. The caller's return address stays in x30.
+        let not_error_handler = code.new_label();
+        code.emit(|encoder| {
+            encoder.ldr_uoff(
+                Gpr::x(9),
+                Gpr::x(0),
+                arinsal_term::EXPORT_TRAMPOLINE_OP_OFFSET,
+            )?;
+            encoder.cmp_imm(
+                Gpr::x(9),
+                arinsal_term::TRAMPOLINE_CALL_ERROR_HANDLER as u16,
+                false,
+            )
+        })?;
+        code.b_cond(Cond::Ne, not_error_handler)?;
+        code.emit(|encoder| {
+            encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
+            encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
+            encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
+            encoder.str_uoff(Gpr::x(0), Gpr::sp(), 16)
+        })?;
+        emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+        code.emit(|encoder| {
+            encoder.ldr_uoff(Gpr::x(1), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+            encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            encoder.mov_const(Gpr::x(17), error_handler_helper as u64)?;
+            encoder.blr(Gpr::x(17))
+        })?;
+        emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+        code.emit(|encoder| {
+            encoder.mov_reg(Gpr::x(9), Gpr::x(0))?;
+            encoder.ldr_uoff(Gpr::x(0), Gpr::sp(), 16)?;
+            encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
+            encoder.ldr_post(Gpr::x(10), Gpr::x(20), 8)
+        })?;
+        // No error handler: the BIF path below reports `undef` with the arguments intact.
+        code.cbz(Gpr::x(9), not_error_handler)?;
+        code.emit(|encoder| {
+            encoder.mov_reg(Gpr::x(0), Gpr::x(9))?;
+            encoder.ldr_regoff(Gpr::x(14), Gpr::x(0), Gpr::x(24), 3)?;
+            encoder.br(Gpr::x(14))
+        })?;
+        code.bind(not_error_handler)?;
+    }
     code.emit(|encoder| {
         // The call site loaded the export into ARG1 (x0) and called through its address, so the
         // pc a raising BIF is attributed to is the return address in x30, tagged as a return
