@@ -531,7 +531,8 @@ impl Process {
                     runtime,
                     ctx,
                     data,
-                    crate::signals::atom("normal"),
+                    // erts passes `am_normal` (beam_common.c, `erts_do_exit_process(c_p, am_normal)`).
+                    Term::atom(arinsal_term::atoms::NORMAL),
                     entry_result,
                     0,
                 )

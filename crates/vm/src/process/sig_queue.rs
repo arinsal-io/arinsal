@@ -1045,7 +1045,9 @@ impl Process {
     /// the collector when it waited for it.
     // Port of erts/emulator/beam/erl_process.c:13480 (delete_process calls erts_unblock_release_literal_area), OTP-29.1.1.
     pub(super) fn unblock_literal_release(&mut self) {
-        let Some(block) = self.slice_mut().rla_block.take() else {
+        // erts releases `trap_state->block_rla_ref` only when it is set; a process that never
+        // blocked a literal area has no cold part to allocate for it.
+        let Some(block) = self.take_work(|work| work.rla_block.take()) else {
             return;
         };
         if let Some(waiter) = self.persistent_terms.unblock_release(block)
