@@ -588,8 +588,6 @@ pub(super) fn resume(
     } else {
         trace
     };
-    let mut frame_start = 0;
-    let mut handler = None;
     let mut index = 0;
     // Sessions with a return_to frame on the unwound stack: the catching function gets their
     // return_to event.
@@ -625,13 +623,11 @@ pub(super) fn resume(
                         .filter(|action| action.return_to)
                         .map(|action| action.session),
                 );
-                frame_start = index + frame_words;
                 index += frame_words;
                 continue;
             }
             // Only CP words (low tag bits 00, erts is_CP) can be native return addresses.
             if address & 3 == 0 && crate::native_bridge::is_native_function_at(address) {
-                frame_start = index + 1;
                 index += 1;
                 continue;
             }
@@ -662,103 +658,7 @@ pub(super) fn resume(
             }
             return Ok(None);
         }
-        let Some((is_handler, module, ip)) = stacktrace::decode_tag(word) else {
-            index += 1;
-            continue;
-        };
-        if !is_handler {
-            let special = vm.code.modules.get(module).and_then(|module| {
-                if ip == module.return_trace_ip {
-                    Some((0, module))
-                } else if ip == module.return_call_acc_trace_ip {
-                    Some((1, module))
-                } else if ip == module.return_to_trace_ip {
-                    Some((2, module))
-                } else {
-                    None
-                }
-            });
-            if let Some((frame_kind, _)) = special {
-                let width = match frame_kind {
-                    0 => 6,
-                    1 => 4,
-                    _ => 2,
-                };
-                if frame_kind == 2
-                    && let Some(session) = p.heap.stack_get(index + 1).and_then(Term::as_small)
-                {
-                    return_to_sessions.push(session as u64);
-                }
-                if frame_kind == 0
-                    && let (
-                        Some(frame_module),
-                        Some(entry),
-                        Some(session_high),
-                        Some(session_low),
-                        Some(exception),
-                    ) = (
-                        p.heap.stack_get(index + 1).and_then(Term::as_small),
-                        p.heap.stack_get(index + 2).and_then(Term::as_small),
-                        p.heap.stack_get(index + 3).and_then(Term::as_small),
-                        p.heap.stack_get(index + 4).and_then(Term::as_small),
-                        p.heap.stack_get(index + 5).and_then(Term::as_small),
-                    )
-                    && exception & 1 != 0
-                    && exception & 2 == 0
-                    && let Some(trace_ctx) = ctx.as_deref_mut()
-                {
-                    let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
-                    crate::trace::return_event(
-                        vm,
-                        p,
-                        trace_ctx,
-                        ((session_high as u64) << 32) | session_low as u32 as u64,
-                        frame_module as usize,
-                        entry as usize,
-                        class_reason,
-                        true,
-                        Some(class_reason),
-                    )?;
-                }
-                frame_start = index + width;
-                index += width;
-                continue;
-            }
-            frame_start = index + 1;
-            index += 1;
-            continue;
-        }
-        handler = Some((index, frame_start, module, ip));
-        break;
-    }
-    if let Some((index, frame_start, module, ip)) = handler {
-        if !p.heap.release_stack(frame_start) {
-            return Err(VmError::Unsupported("exception stack".into()));
-        }
-        p.heap.stack_set(index - frame_start, Term::NIL);
-        p.module = module;
-        p.set_ip(ip);
-        p.x.ensure_x(4);
-        p.x[0] = Term::catch(0);
-        p.x[1] = trap.reason;
-        p.x[2] = trace;
-        p.x[3] = class_term(trap.class)?;
-        // The handler's try_case/catch_end read x0-x3, so a switch-out before it runs
-        // (reductions exhausted by the failing BIF) must root all four.
-        p.gc_live = 4;
-        // mix_loop1: keep the class for a later raise/2. See Opcode::Raise.
-        p.exc_class = Some(trap.class);
-        if !return_to_sessions.is_empty()
-            && let Some(trace_ctx) = ctx
-        {
-            let target = vm.code.modules.get(module).and_then(|loaded| {
-                loaded
-                    .function_at(ip)
-                    .map(|(function, arity)| (loaded.name.clone(), function.to_owned(), arity))
-            });
-            crate::trace::unwound_return_to(vm, p, trace_ctx, &return_to_sessions, target)?;
-        }
-        return Ok(None);
+        index += 1;
     }
     // Port of erts/emulator/beam/beam_common.c (`handle_error`, nocatch): the saved trace is
     // built before `{nocatch, Value}` is allocated, because that allocation can collect and the

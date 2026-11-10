@@ -572,24 +572,7 @@ fn inspect_frames(
             ]));
             continue;
         }
-        if let Some((handler, next_module, next_ip)) = crate::stacktrace::decode_tag(word) {
-            if handler {
-                slots.push(O::Tuple(vec![
-                    O::Atom("catch".into()),
-                    function_info(modules, next_module, next_ip),
-                ]));
-            } else {
-                push_frame(&mut frames, modules, current, &slots, current_is_return);
-                slots.clear();
-                current = FramePc::Interpreted {
-                    module: next_module,
-                    ip: next_ip,
-                };
-                current_is_return = true;
-            }
-        } else {
-            slots.push(limit_term(word, max_size));
-        }
+        slots.push(limit_term(word, max_size));
     }
     push_frame(&mut frames, modules, current, &slots, current_is_return);
     if reached_exit {

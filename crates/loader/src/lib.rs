@@ -456,11 +456,6 @@ pub struct Module {
     pub entry_arity: Box<[u16]>,
     /// Original entry instructions retained while a trace breakpoint is installed.
     pub breakpoint_originals: HashMap<usize, Instr>,
-    /// Instruction indices used by stack continuations for tracing.
-    pub return_trace_ip: usize,
-    /// Call-time and call-memory return continuation.
-    pub return_call_acc_trace_ip: usize,
-    pub return_to_trace_ip: usize,
     /// First per-export global breakpoint trampoline.
     pub export_breakpoint_base: usize,
     /// Original function entry indices parallel to `exports`.
@@ -526,9 +521,6 @@ impl Clone for Module {
             on_entry_fn: self.on_entry_fn.clone(),
             entry_arity: self.entry_arity.clone(),
             breakpoint_originals: self.breakpoint_originals.clone(),
-            return_trace_ip: self.return_trace_ip,
-            return_call_acc_trace_ip: self.return_call_acc_trace_ip,
-            return_to_trace_ip: self.return_to_trace_ip,
             export_breakpoint_base: self.export_breakpoint_base,
             export_entry_targets: self.export_entry_targets.clone(),
             coverage: self.coverage.clone(),
@@ -744,9 +736,6 @@ impl Module {
         self.on_entry_fn = Box::new([]);
         self.entry_arity = Box::new([]);
         self.breakpoint_originals = HashMap::new();
-        self.return_trace_ip = 0;
-        self.return_call_acc_trace_ip = 0;
-        self.return_to_trace_ip = 0;
         self.export_breakpoint_base = 0;
         self.export_entry_targets = Box::new([]);
         self.coverage = None;
@@ -1775,12 +1764,6 @@ pub fn load_with_options(
     // A trailing sentinel makes a fallthrough from the final BEAM opcode safe
     // without checking the instruction pointer on every dispatch.
     code.push(Instr::CodeEnd);
-    let return_trace_ip = code.len();
-    code.push(Instr::ReturnTrace);
-    let return_call_acc_trace_ip = code.len();
-    code.push(Instr::ReturnCallAccTrace);
-    let return_to_trace_ip = code.len();
-    code.push(Instr::ReturnToTrace);
     let breakpoint_originals = HashMap::new();
     let export_entry_targets = exports
         .iter()
@@ -2004,9 +1987,6 @@ pub fn load_with_options(
         on_entry_fn,
         entry_arity,
         breakpoint_originals,
-        return_trace_ip,
-        return_call_acc_trace_ip,
-        return_to_trace_ip,
         export_breakpoint_base,
         export_entry_targets: export_entry_targets.into_boxed_slice(),
         coverage,
@@ -2099,9 +2079,6 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         on_entry_fn: Box::new([]),
         entry_arity: Box::new([]),
         breakpoint_originals: HashMap::new(),
-        return_trace_ip: 0,
-        return_call_acc_trace_ip: 0,
-        return_to_trace_ip: 0,
         export_breakpoint_base: 0,
         export_entry_targets: Box::new([]),
         coverage: None,

@@ -1998,7 +1998,7 @@ pub(crate) fn bif_call_event(
     scan: StackScan,
 ) -> Result<Vec<CallActions>, VmError> {
     let actions = call_event_scope(vm, process, ctx, module, function, args, false, true)?;
-    Ok(dedupe_return_frames(vm, process, actions, scan))
+    Ok(dedupe_return_frames(process, actions, scan))
 }
 
 /// Outcome of running a trace match specification for a call.
@@ -2539,12 +2539,7 @@ pub(crate) enum StackScan {
 
 /// The trace frames on top of the stack, innermost first, up to the first real return address.
 // Port of erts/emulator/beam/beam_bp.c:938-980 (fixup_cp_before_trace), OTP-29.1.1.
-fn special_frames(
-    vm: &Vm,
-    process: &Process,
-    first_only: bool,
-    skip_frame: bool,
-) -> Vec<SpecialFrame> {
+fn special_frames(process: &Process, first_only: bool, skip_frame: bool) -> Vec<SpecialFrame> {
     let trace_stub = crate::native_bridge::native_trace_return_address();
     let bridge = crate::native_bridge::bridge_return_address();
     let mut frames = Vec::new();
@@ -2554,7 +2549,6 @@ fn special_frames(
         while let Some(word) = process.heap.stack_get(index) {
             if word.tagged_word() as usize == trace_stub
                 || word.tagged_word() as usize == bridge
-                || matches!(crate::stacktrace::decode_tag(word), Some((false, _, _)))
                 || crate::native_bridge::is_native_function_at(word.tagged_word() as usize)
             {
                 break;
@@ -2575,25 +2569,7 @@ fn special_frames(
             index += words;
             continue;
         }
-        let Some((false, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
-            break;
-        };
-        let Some(module) = vm.code.modules.get(module_id) else {
-            break;
-        };
-        if ip == module.return_trace_ip {
-            frames.push(SpecialFrame::Trace);
-            index += 6;
-        } else if ip == module.return_call_acc_trace_ip {
-            frames.push(SpecialFrame::Trace);
-            index += 4;
-        } else if ip == module.return_to_trace_ip {
-            let session = process.heap.stack_get(index + 1).and_then(Term::as_small);
-            frames.push(SpecialFrame::ReturnTo(session.unwrap_or(-1) as u64));
-            index += 2;
-        } else {
-            break;
-        }
+        break;
     }
     frames
 }
@@ -2603,7 +2579,6 @@ fn special_frames(
 // Port of erts/emulator/beam/beam_bp.c:1181-1250 (do_call_trace, return_to_trace) and
 // :1119-1150 (do_session_breakpoint, call acc frame), OTP-29.1.1.
 pub(crate) fn dedupe_return_frames(
-    vm: &Vm,
     process: &Process,
     actions: Vec<CallActions>,
     scan: StackScan,
@@ -2618,8 +2593,8 @@ pub(crate) fn dedupe_return_frames(
     // Port of erts/emulator/beam/ops.tab (call_ext_last/call_ext_only to a BIF), OTP-29.1.1.
     let mut frames = match scan {
         StackScan::None => Vec::new(),
-        StackScan::Top => special_frames(vm, process, first_only, false),
-        StackScan::AfterFrame => special_frames(vm, process, first_only, true),
+        StackScan::Top => special_frames(process, first_only, false),
+        StackScan::AfterFrame => special_frames(process, first_only, true),
     };
     let mut actions = actions;
     for action in &mut actions {
@@ -2844,40 +2819,7 @@ fn caller_info(
                 index += 1;
                 continue;
             }
-            let Some((handler, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
-                index += 1;
-                continue;
-            };
-            let Some(module) = vm.code.modules.get(module_id) else {
-                index += 1;
-                continue;
-            };
-            if handler {
-                index += 1;
-                continue;
-            }
-            if ip == module.return_trace_ip {
-                index += 6;
-                continue;
-            }
-            if ip == module.return_call_acc_trace_ip {
-                index += 4;
-                continue;
-            }
-            if ip == module.return_to_trace_ip {
-                index += 2;
-                continue;
-            }
-            let call_site = ip.saturating_sub(1);
-            let Some((function, arity)) = module.function_at(call_site) else {
-                index += 1;
-                continue;
-            };
-            if function.starts_with('-') || function == "module_info" {
-                index += 1;
-                continue;
-            }
-            break (module, function.to_owned(), arity, call_site);
+            index += 1;
         }
     };
     let (module, function, arity, call_site) = caller;
@@ -2974,7 +2916,7 @@ pub(crate) fn executor_native_call_event(
         &args,
         local,
     )?;
-    let actions = dedupe_return_frames(vm, process, actions, StackScan::Top);
+    let actions = dedupe_return_frames(process, actions, StackScan::Top);
     Ok(actions
         .into_iter()
         // Port of erts/emulator/beam/beam_bp.c (do_call_trace: MATCH_SET_RX_TRACE), OTP-29.1.1:
@@ -3210,117 +3152,6 @@ pub(crate) fn native_return_events(
     Ok(())
 }
 
-// Port of erts/emulator/beam/erl_trace.c:1095-1180 (return and exception events), OTP-29.1.1.
-#[allow(clippy::too_many_arguments)] // The special stack frame carries these exact ERTS return fields.
-pub(crate) fn return_event(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    session: u64,
-    module_id: usize,
-    entry_ip: usize,
-    value: Term,
-    exception: bool,
-    exception_class_and_reason: Option<Term>,
-) -> Result<(), VmError> {
-    let result = return_event_inner(
-        vm,
-        process,
-        ctx,
-        session,
-        module_id,
-        entry_ip,
-        value,
-        exception,
-        exception_class_and_reason,
-    );
-    if crate::trace_bp::is_meta_id(session) {
-        crate::trace_bp::release_meta_frame(process, session);
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)] // The special stack frame carries these exact ERTS return fields.
-fn return_event_inner(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    session: u64,
-    module_id: usize,
-    entry_ip: usize,
-    value: Term,
-    exception: bool,
-    exception_class_and_reason: Option<Term>,
-) -> Result<(), VmError> {
-    let meta = if crate::trace_bp::is_meta_id(session) {
-        // Meta trace ignores the process flags, `silent` included.
-        let Some(meta) = crate::trace_bp::meta_tracer_by_id(session) else {
-            return Ok(());
-        };
-        Some(meta)
-    } else {
-        let flags = active_session_flags(process, session, ctx.pid());
-        if flags & CALL == 0 || flags & SILENT != 0 {
-            return Ok(());
-        }
-        None
-    };
-    let Some((module_name, function_name, arity)) =
-        vm.code.modules.get(module_id).and_then(|module| {
-            module
-                .function_at(entry_ip)
-                .map(|(function, arity)| (module.name.clone(), function.to_owned(), arity))
-        })
-    else {
-        return Ok(());
-    };
-    let module = Term::atom(
-        global_atoms()
-            .intern(&module_name)
-            .map_err(|_| VmError::Unsupported("trace return module atom".into()))?,
-    );
-    let function = Term::atom(
-        global_atoms()
-            .intern(&function_name)
-            .map_err(|_| VmError::Unsupported("trace return function atom".into()))?,
-    );
-    let arity = Term::small(i64::from(arity))
-        .ok_or_else(|| VmError::Unsupported("trace return arity".into()))?;
-    let mfa = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-        .tuple(&[module, function, arity])
-        .map_err(|error| VmError::Unsupported(format!("trace return MFA: {error:?}")))?;
-    let fields = if exception {
-        vec![mfa, exception_class_and_reason.unwrap_or(value)]
-    } else {
-        vec![mfa, value]
-    };
-    if let Some(meta) = meta {
-        let name = if exception {
-            "exception_from"
-        } else {
-            "return_from"
-        };
-        emit_meta(vm, process, ctx, &meta, name, &fields, None, false);
-        return Ok(());
-    }
-    emit_filtered(
-        Some(vm),
-        process,
-        ctx,
-        ctx.pid(),
-        CALL,
-        if exception {
-            "exception_from"
-        } else {
-            "return_from"
-        },
-        &fields,
-        Some(session),
-        None,
-    );
-    Ok(())
-}
-
 /// Emit the return or exception events of a traced BIF whose call event ran inline.
 // Port of erts/emulator/beam/emu/trace_instrs.tab:25-70 (return_trace), applied to BIFs as in
 // erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
@@ -3480,12 +3311,12 @@ pub(crate) fn native_return_to_event(
             function.function.to_owned(),
             function.arity,
         )),
-        None => return_to_target(vm, process, 0),
+        None => return_to_target(process, 0),
     };
     emit_return_to(vm, process, ctx, session, target)
 }
 
-fn return_to_target(vm: &Vm, process: &Process, start: usize) -> Option<(String, String, u8)> {
+fn return_to_target(process: &Process, start: usize) -> Option<(String, String, u8)> {
     let trace_stub = arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize;
     let mut index = start;
     loop {
@@ -3509,33 +3340,7 @@ fn return_to_target(vm: &Vm, process: &Process, start: usize) -> Option<(String,
                 function.arity,
             ));
         }
-        let Some((is_handler, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
-            index += 1;
-            continue;
-        };
-        if is_handler {
-            index += 1;
-            continue;
-        }
-        let Some(module) = vm.code.modules.get(module_id) else {
-            index += 1;
-            continue;
-        };
-        if ip == module.return_trace_ip {
-            index += 6;
-            continue;
-        }
-        if ip == module.return_call_acc_trace_ip {
-            index += 4;
-            continue;
-        }
-        if ip == module.return_to_trace_ip {
-            index += 2;
-            continue;
-        }
-        return module
-            .function_at(ip)
-            .map(|(function, arity)| (module.name.clone(), function.to_owned(), arity));
+        index += 1;
     }
 }
 
