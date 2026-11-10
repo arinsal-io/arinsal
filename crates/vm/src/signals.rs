@@ -1104,10 +1104,13 @@ fn create_child(
                     .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))
             },
             |heap_words, slot| {
-                let mut heap =
-                    arinsal_term::ProcessHeap::with_words_at(heap_words, parent_alloc_ix);
-                heap.set_normalized_min_heap_size(min_heap);
-                crate::proc_create::raw::initialize_spawned(slot, 3, heap)
+                crate::proc_create::raw::initialize_spawned(
+                    slot,
+                    3,
+                    heap_words,
+                    parent_alloc_ix,
+                    min_heap,
+                )
             },
             init_child,
             so.priority,

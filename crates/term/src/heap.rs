@@ -1925,6 +1925,74 @@ impl ProcessHeap {
     /// [`ProcessHeap::with_words`] allocating on allocator index `ix` (the creating scheduler's
     /// `esdp->no`, which must be the calling thread's). The heap does not keep the index: it is
     /// set on each run, since the new process may first run on another scheduler.
+    /// The young heap of a process erl_create_process is building: `words` heap words, the
+    /// minimum heap size the spawn options settled (already a heap-size table entry), and the
+    /// native ABI fields of a process that has not run yet.
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process: the heap fields of the
+    // allocated Process are set in place), OTP-29.1.1. Inlined so the caller's write into the
+    // process block constructs the value there.
+    #[inline(always)]
+    pub fn spawned_at(
+        words: usize,
+        ix: Option<usize>,
+        min_heap_size: usize,
+        fcalls: i32,
+        arity: u8,
+    ) -> Self {
+        let words_ix = ix.map_or(NO_ALLOC_IX, |ix| {
+            u16::try_from(ix).map_or(NO_ALLOC_IX, |ix| ix.min(NO_ALLOC_IX - 1))
+        });
+        let block = WordBlock::new_for(words, ErtsAlcType::HEAP, words_ix);
+        let base = block.as_ptr().cast::<u64>().cast_mut();
+        Self {
+            abi: NativeAbi {
+                htop: base,
+                stop: base.wrapping_add(words),
+                heap: base,
+                hend: base.wrapping_add(words),
+                high_water: base,
+                fcalls,
+                arity,
+                ..NativeAbi::default()
+            },
+            words: block,
+            min_heap_size: u32::try_from(min_heap_size).unwrap_or(u32::MAX),
+            alloc_ix: NO_ALLOC_IX,
+            ..Self::empty_fields()
+        }
+    }
+
+    /// The fields of a heap that owns no block, for the constructors.
+    #[inline(always)]
+    fn empty_fields() -> Self {
+        Self {
+            abi: NativeAbi::default(),
+            words: WordBlock::default(),
+            old_words: WordBlock::default(),
+            old_htop: 0,
+            min_heap_size: 233,
+            fullsweep_after: u16::MAX,
+            minor_since_major: 0,
+            alloc_ix: NO_ALLOC_IX,
+            bin_vheap: 0,
+            bin_vheap_size: 46_422,
+            heap_grow: false,
+            native_allocation: false,
+            native_redzone: false,
+            bif_hidden_words: 0,
+            detached: false,
+            abandoned: false,
+            fragments: Vec::new(),
+            mbuf_fast: MbufFast::default(),
+            fragment_words: 0,
+            gc_enabled: true,
+            live_frags_armed: std::cell::Cell::new(false),
+            live_frag_mark: std::cell::Cell::new(0),
+            live_frag_valid: std::cell::Cell::new(false),
+            owners: LazyOwners::default(),
+        }
+    }
+
     pub fn with_words_at(words: usize, ix: Option<usize>) -> Self {
         let words_ix = ix.map_or(NO_ALLOC_IX, |ix| {
             u16::try_from(ix).map_or(NO_ALLOC_IX, |ix| ix.min(NO_ALLOC_IX - 1))
@@ -1952,28 +2020,8 @@ impl ProcessHeap {
                 ..NativeAbi::default()
             },
             words: block,
-            old_words: WordBlock::default(),
-            old_htop: 0,
-            min_heap_size: 233,
-            fullsweep_after: u16::MAX,
-            minor_since_major: 0,
             alloc_ix,
-            bin_vheap: 0,
-            bin_vheap_size: 46_422,
-            heap_grow: false,
-            native_allocation: false,
-            native_redzone: false,
-            bif_hidden_words: 0,
-            detached: false,
-            abandoned: false,
-            fragments: Vec::new(),
-            mbuf_fast: MbufFast::default(),
-            fragment_words: 0,
-            gc_enabled: true,
-            live_frags_armed: std::cell::Cell::new(false),
-            live_frag_mark: std::cell::Cell::new(0),
-            live_frag_valid: std::cell::Cell::new(false),
-            owners: LazyOwners::default(),
+            ..Self::empty_fields()
         }
     }
 

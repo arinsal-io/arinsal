@@ -2456,8 +2456,10 @@ pub(crate) struct ExitCont {
     pub(crate) reason: arinsal_term::Term,
     /// Storage of the owned table whose release was interrupted (`FREE_OWNED_TABLE`).
     pub(crate) garbage: Option<arinsal_ets::Garbage>,
-    /// Result the entry process reports once exit completes, and its exit code.
-    pub(crate) entry_result: Option<Result<crate::ScheduledResult, crate::VmError>>,
+    /// Result the entry process reports once exit completes, and its exit code. Boxed: only
+    /// the runner's entry process has one, and the exit state stays the size of erts'
+    /// `continue_exit_state` for every other process.
+    pub(crate) entry_result: Option<Box<Result<crate::ScheduledResult, crate::VmError>>>,
     pub(crate) code: u64,
     /// The phases up to ERTS_CONTINUE_EXIT_DIST_MONITORS are done; the exit continues at
     /// ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS (erl_process.c:14674), OTP-29.1.1.
