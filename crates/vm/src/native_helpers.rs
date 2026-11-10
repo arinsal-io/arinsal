@@ -629,7 +629,7 @@ fn leave_native_nif(
         Ok(Err(error)) => {
             let args = process.x[..usize::from(arity)].to_vec();
             let bif_mfa = crate::beamasm_integration::export_dispatch(identity)
-                .map_or(0, |export| std::ptr::from_ref(&export.mfa) as usize);
+                .map_or(0, |export| std::ptr::from_ref(export.mfa()) as usize);
             set_native_bif_error(process, bif_mfa, &args, error);
             0
         }
@@ -2476,7 +2476,7 @@ fn invoke_dispatch_bif(
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
             // call_bif_shared stores the export's MFA in c_p->current before the BIF call.
             process.heap.abi.current = if export.bif.is_some() {
-                std::ptr::from_ref(&export.mfa).cast()
+                std::ptr::from_ref(export.mfa()).cast()
             } else {
                 std::ptr::null()
             };
@@ -3056,7 +3056,7 @@ fn call_direct_bif(
     // `freason`/`fvalue` set; the call is not redone. `handle_error` builds the top frame from
     // `bif_mfa` (`c_p->current`) and the arguments still in the X registers.
     if value.is_non_value() {
-        process.heap.abi.current = std::ptr::from_ref(&export.mfa).cast();
+        process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
         // Port of erl_gc.c (erts_gc_after_bif_call_lhf), OTP-29.1.1: the GC-desired test runs
         // before the result is looked at, so a failed BIF collects too, with its arguments live.
         if process.heap.gc_after_bif_desired() {
@@ -3703,7 +3703,7 @@ fn process_bif_error(
     export: ExportDispatch,
     trap: crate::exceptions::Trap,
 ) -> u64 {
-    process.heap.abi.current = std::ptr::from_ref(&export.mfa).cast();
+    process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     bif_error(process, trap)
 }
 
@@ -4006,7 +4006,7 @@ fn set_native_bif_export_error(
     {
         return;
     }
-    set_native_bif_context(process, std::ptr::from_ref(&export.mfa) as usize, args);
+    set_native_bif_context(process, std::ptr::from_ref(export.mfa()) as usize, args);
 }
 
 fn set_native_bif_context(process: &mut crate::Process, bif_mfa: usize, args: &[Term]) {
@@ -4383,6 +4383,49 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
     }
 }
 
+/// A tail apply of error/exit/throw restores the calling function's native CP, so the
+/// stacktrace shows the caller. False when the stack could not grow (`system_limit` set).
+// Port of erts/emulator/beam/beam_common.c:1345-1427 (apply_bif_error_adjustment), OTP-29.1.1.
+fn apply_bif_error_adjustment(
+    process: &mut crate::Process,
+    mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+    return_ip: u64,
+    stack_offset: u32,
+) -> bool {
+    let needs_error_cp = matches!(
+        mfa,
+        (
+            arinsal_term::atoms::ERLANG,
+            arinsal_term::atoms::ERROR,
+            1..=3
+        ) | (arinsal_term::atoms::ERLANG, arinsal_term::atoms::EXIT, 1)
+            | (arinsal_term::atoms::ERLANG, arinsal_term::atoms::THROW, 1)
+    );
+    if return_ip == 0 || !needs_error_cp {
+        return true;
+    }
+    let apply_only = stack_offset == 0;
+    let need = (stack_offset as usize / std::mem::size_of::<u64>()).max(1);
+    if process.ensure(need, usize::from(mfa.2) + 2).is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        return false;
+    }
+    let continuation = crate::proc_create::native_continuation_term(return_ip as usize);
+    // `apply_only` has no frame of its own: the CP goes into a new slot. Otherwise the frame's
+    // CP slot is overwritten before the stack grows.
+    let stored = if apply_only {
+        let reserved = process.heap.reserve_stack(need);
+        reserved && process.heap.stack_set(0, continuation)
+    } else {
+        let set = process.heap.stack_set(0, continuation);
+        set && process.heap.reserve_stack(need)
+    };
+    if !stored {
+        crate::native_hooks::set_error(process, "system_limit");
+    }
+    stored
+}
+
 /// Resolves `apply Arity` to a BIF export (called through its dispatch address with the
 /// Export* in ARG1), a native entry, or the fragment that lets the interpreter apply.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-320 (emit_fixed_apply) and
@@ -4418,19 +4461,16 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
             };
         }
     }
-    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
-        process.heap.abi.arity = arity.min(u8::MAX as usize) as u8;
-        return arinsal_beamasm::misc::ApplyResolution {
-            export: 0,
-            target: fragment as u64,
-        };
-    }
     if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) {
         let code_ix = registers.active_code_ix as usize;
-        let export = process
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.export_entry((module, function, arity as u8), code_ix));
+        // Port of erts/emulator/beam/beam_common.c:1544-1546 (fixed_apply:
+        // erts_export_get_or_make_stub), OTP-29.1.1.
+        let export = process.runtime.as_ref().and_then(|runtime| {
+            let mfa = (module, function, arity as u8);
+            runtime.export_entry(mfa, code_ix).or_else(|| {
+                crate::export::export_entry_or_stub(runtime.code_scope, mfa).map(|export| &**export)
+            })
+        });
         if let Some(export) = export {
             let target = export.address(code_ix);
             // Port of erts/emulator/beam/beam_common.c:1529-1550 (fixed_apply), OTP-29.1.1:
@@ -4438,53 +4478,26 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
             // dispatch address, and passes the Export* in ARG1. Return both words
             // in AAPCS64's x0/x1 result pair for the generated call setup.
             if export.light_bif_func() != 0 {
-                // Port of erts/emulator/beam/beam_common.c:1345-1427
-                // (apply_bif_error_adjustment), OTP-29.1.1. A tail apply of
-                // error/exit/throw restores the calling function's native CP.
-                let bif_name = (module, function, arity as u8);
-                let needs_error_cp = matches!(
-                    bif_name,
-                    (
-                        arinsal_term::atoms::ERLANG,
-                        arinsal_term::atoms::ERROR,
-                        1..=3
-                    ) | (arinsal_term::atoms::ERLANG, arinsal_term::atoms::EXIT, 1)
-                        | (arinsal_term::atoms::ERLANG, arinsal_term::atoms::THROW, 1)
-                );
-                if return_ip != 0 && needs_error_cp {
-                    let apply_only = stack_offset == 0;
-                    let need = (stack_offset as usize / std::mem::size_of::<u64>()).max(1);
-                    if process.ensure(need, arity + 2).is_err() {
-                        crate::native_hooks::set_error(process, "system_limit");
-                        return arinsal_beamasm::misc::ApplyResolution::default();
-                    }
-                    let continuation =
-                        crate::proc_create::native_continuation_term(return_ip as usize);
-                    if apply_only {
-                        if !process.heap.reserve_stack(need)
-                            || !process.heap.stack_set(0, continuation)
-                        {
-                            crate::native_hooks::set_error(process, "system_limit");
-                            return arinsal_beamasm::misc::ApplyResolution::default();
-                        }
-                    } else if !process.heap.stack_set(0, continuation)
-                        || !process.heap.reserve_stack(need)
-                    {
-                        crate::native_hooks::set_error(process, "system_limit");
-                        return arinsal_beamasm::misc::ApplyResolution::default();
-                    }
+                if !apply_bif_error_adjustment(
+                    process,
+                    (module, function, arity as u8),
+                    return_ip,
+                    stack_offset,
+                ) {
+                    return arinsal_beamasm::misc::ApplyResolution::default();
                 }
                 return arinsal_beamasm::misc::ApplyResolution {
                     export: std::ptr::from_ref(export) as u64,
                     target: target as u64,
                 };
             }
-            if target != crate::beamasm_integration::export_trampoline() {
-                return arinsal_beamasm::misc::ApplyResolution {
-                    export: 0,
-                    target: target as u64,
-                };
-            }
+            // Port of erts/emulator/beam/beam_common.c:1529-1550 (fixed_apply), OTP-29.1.1: a
+            // stub (the export trampoline) or a process saving calls (`beam_save_calls_export`)
+            // gets the Export* in ARG1 like any dispatchable call.
+            return arinsal_beamasm::misc::ApplyResolution {
+                export: std::ptr::from_ref(export) as u64,
+                target: target as u64,
+            };
         }
     }
     // Not natively compiled (or invalid): the interpreter applies and raises errors.
@@ -4499,15 +4512,19 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
 /// the fragment that lets the interpreter apply (and raise) with X0..X2 untouched.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply) and
 // erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_apply3_resolver(header: *mut ProcessHeader) -> usize {
+pub extern "C" fn arinsal_beamasm_apply3_resolver(
+    header: *mut ProcessHeader,
+    return_ip: u64,
+    stack_offset: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    use arinsal_beamasm::misc::ApplyResolution;
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
+        return ApplyResolution::default();
     };
-    let fallback = crate::beamasm_integration::apply3_unported_entry();
-    // A process saving calls records the call through the export, which the interpreter does.
-    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
-        return fallback;
-    }
+    let fallback = ApplyResolution {
+        export: 0,
+        target: crate::beamasm_integration::apply3_unported_entry() as u64,
+    };
     let (mut module, mut function, mut args) = (process.x[0], process.x[1], process.x[2]);
     // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
     while module.as_atom() == Some(arinsal_term::atoms::ERLANG)
@@ -4545,11 +4562,26 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(header: *mut ProcessHeader) ->
     let Ok(arity) = u8::try_from(arity) else {
         return fallback;
     };
-    let Some(target) = process.runtime.as_ref().and_then(|runtime| {
-        runtime.export_address((module, function, arity), registers.active_code_ix as usize)
+    // Port of erts/emulator/beam/beam_common.c:1497-1530 (apply: the export of the MFA, whose
+    // `addresses[code_ix]` the JIT calls with the Export* in ARG1; a stub's address is the
+    // export trampoline, a process saving calls enters `beam_save_calls_export`), OTP-29.1.1.
+    let code_ix = registers.active_code_ix as usize;
+    // Port of erts/emulator/beam/beam_common.c:1518-1520, OTP-29.1.1: a function not found
+    // gets a stub entry, which calls the error handler.
+    let Some(export) = process.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .export_entry((module, function, arity), code_ix)
+            .or_else(|| {
+                crate::export::export_entry_or_stub(runtime.code_scope, (module, function, arity))
+                    .map(|export| &**export)
+            })
     }) else {
         return fallback;
     };
+    let target = export.address(code_ix);
+    // The export trampoline (BIFs, stubs, global breakpoints) still runs through the
+    // interpreter fragment: a traced BIF entered from the trampoline in a tail apply misses
+    // its `return_to` event (call_trace_exceptions case 16). See STRUCT_DEVIATIONS.md.
     if target == crate::beamasm_integration::export_trampoline() {
         return fallback;
     }
@@ -4561,7 +4593,13 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(header: *mut ProcessHeader) ->
         *slot = head;
         list = tail;
     }
-    target
+    if !apply_bif_error_adjustment(process, (module, function, arity), return_ip, stack_offset) {
+        return ApplyResolution::default();
+    }
+    ApplyResolution {
+        export: std::ptr::from_ref(export) as u64,
+        target: target as u64,
+    }
 }
 
 /// Builds a map from the staged key/value vector.

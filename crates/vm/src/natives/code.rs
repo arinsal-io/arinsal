@@ -597,16 +597,16 @@ pub(crate) fn function_exported_light(
     let module = module.as_atom()?;
     let function = function.as_atom()?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
-    let exported = process
-        .runtime
-        .as_ref()?
-        .code_indexes()
-        .with_active_tables(|tables| {
-            tables.exports.function_exported((module, function, arity))
-                || (module == atoms::ERLANG
-                    && ((function == atoms::APPLY && matches!(arity, 2 | 3))
-                        || (function == atoms::YIELD && arity == 0)))
-        });
+    let code = process.runtime.as_ref()?.code_indexes();
+    let code_ix = code.active();
+    let exported = code.with_active_tables(|tables| {
+        tables
+            .exports
+            .function_exported((module, function, arity), code_ix)
+            || (module == atoms::ERLANG
+                && ((function == atoms::APPLY && matches!(arity, 2 | 3))
+                    || (function == atoms::YIELD && arity == 0)))
+    });
     Some(Ok(Term::atom(if exported {
         atoms::TRUE
     } else {
@@ -1151,9 +1151,6 @@ fn delete(
             return Outcome::NotPurged;
         }
         if let Some(current) = tables.loaded.remove(name) {
-            tables
-                .exports
-                .set_current_module(&tables.modules[current], false);
             tables.old.insert(name.to_owned(), current);
             crate::load::retract_module_records(tables.code_scope, name);
             tables.deleted.insert(name.to_owned());

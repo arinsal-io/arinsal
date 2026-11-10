@@ -224,17 +224,6 @@ impl Runtime {
         &self.code
     }
 
-    /// Address of an export in the requested active code index.
-    // Port of erts/emulator/beam/beam_common.c:1520-1530 (apply export dispatch), OTP-29.1.1.
-    pub(crate) fn export_address(
-        &self,
-        mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
-        code_ix: usize,
-    ) -> Option<usize> {
-        self.export_entry(mfa, code_ix)
-            .map(|entry| entry.address(code_ix))
-    }
-
     /// Export slot selected by the process-visible code index.
     pub(crate) fn export_entry(
         &self,
