@@ -267,6 +267,12 @@ pub struct EmulatorFlags {
     pub min_binary_heap_size: Option<u64>,
     /// `+zdbbl` in kilobytes.
     pub distribution_buffer_busy_limit: Option<u64>,
+    /// `+Bi` or `+B i`: the break signals (SIGINT, SIGQUIT, SIGTSTP) are ignored.
+    pub ignore_break: bool,
+    /// `+pad`: the default of the `async_dist` process flag (`erts_default_spo_flags`).
+    pub async_dist: Option<bool>,
+    /// `+zdntgc`: the delay before an unused node table entry is deleted.
+    pub delayed_node_table_gc: Option<DelayedNodeTableGc>,
     /// `+C`.
     pub time_warp: Option<TimeWarp>,
     /// `+c`.
@@ -281,6 +287,15 @@ pub struct EmulatorFlags {
     pub ignored: Vec<IgnoredFlag>,
     /// Validated OTP allocator switches, retained in command-line order.
     pub allocator_options: Vec<IgnoredFlag>,
+}
+
+/// `+zdntgc` value, as `node_tab_delete_delay` in seconds or `ERTS_NODE_TAB_DELAY_GC_INFINITY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelayedNodeTableGc {
+    /// Delay in seconds, `0..=ERTS_NODE_TAB_DELAY_GC_MAX`.
+    Seconds(u32),
+    /// Entries are never deleted.
+    Infinity,
 }
 
 /// Scheduler startup options parsed from OTP's scheduler emulator flags.
@@ -1455,6 +1470,10 @@ fn parse_emulator_flag(
             } else {
                 None
             };
+            // Port of erts/emulator/beam/erl_init.c (erl_start, case 'B'), OTP-29.1.1.
+            if v.as_deref() == Some("i") {
+                out.ignore_break = true;
+            }
             out.ignored.push(IgnoredFlag {
                 name: name.into(),
                 value: v,
@@ -1551,6 +1570,42 @@ fn parse_emulator_flag(
                 out.allocator_options.push(IgnoredFlag {
                     name: name.to_owned(),
                     value: v.clone(),
+                });
+            }
+            if name == "+Bi" {
+                // Port of erts/emulator/beam/erl_init.c (erl_start, case 'B'), OTP-29.1.1.
+                out.ignore_break = true;
+            } else if name == "+pad" {
+                // Port of erts/emulator/beam/erl_init.c (erl_start, -pad), OTP-29.1.1.
+                out.async_dist = Some(match v.as_deref().unwrap_or("") {
+                    "true" => true,
+                    "false" => false,
+                    arg => {
+                        return Err(ArgsError::ErlDiagnostic(format!(
+                            "bad async dist value {arg}"
+                        )));
+                    }
+                });
+            } else if name == "+zdntgc" {
+                // Port of erts/emulator/beam/erl_init.c (erl_start, -zdntgc), OTP-29.1.1.
+                let arg = v.as_deref().unwrap_or("");
+                out.delayed_node_table_gc = Some(if arg == "infinity" {
+                    DelayedNodeTableGc::Infinity
+                } else {
+                    // strtol skips leading white space and accepts a sign.
+                    let seconds = arg
+                        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|secs| (0..=100 * 1000 * 1000).contains(secs));
+                    match seconds {
+                        Some(secs) => DelayedNodeTableGc::Seconds(secs as u32),
+                        None => {
+                            return Err(ArgsError::ErlDiagnostic(format!(
+                                "Invalid delayed node table gc: {arg}"
+                            )));
+                        }
+                    }
                 });
             }
             if name != "+A" {

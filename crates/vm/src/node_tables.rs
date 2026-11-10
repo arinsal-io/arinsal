@@ -509,7 +509,12 @@ impl NodeTables {
 
 static TABLES: OnceLock<Mutex<NodeTables>> = OnceLock::new();
 static NEXT_ENTRY_REF: AtomicU64 = AtomicU64::new(1);
-static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(-1);
+/// `node_tab_delete_delay` in milliseconds, negative for "never".
+// Port of erts/emulator/beam/erl_node_tables.c (node_tab_delete_delay), OTP-29.1.1; the initial
+// value is `ERTS_NODE_TAB_DELAY_GC_DEFAULT` (60 s) until `init_node_tab_delete_delay` runs.
+static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(60 * 1000);
+/// `ERTS_NODE_TAB_DELAY_GC_INFINITY` (erl_node_tables.h): `ERTS_NODE_TAB_DELAY_GC_MAX + 1`.
+pub(crate) const NODE_TAB_DELAY_GC_INFINITY: u64 = 100 * 1000 * 1000 + 1;
 static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
 
 /// Number of live [`DistFragmentContinuation`]s over all entries. Exact (each continuation
@@ -1060,6 +1065,29 @@ pub(crate) fn test_remove_dflags(value: Option<u64>) -> u64 {
         TEST_REMOVE_DFLAGS.store(value, Ordering::Release);
     }
     TEST_REMOVE_DFLAGS.load(Ordering::Acquire)
+}
+
+/// Apply `+zdntgc` at boot.
+// Port of erts/emulator/beam/erl_node_tables.c (erts_init_node_tables), OTP-29.1.1.
+pub(crate) fn init_node_tab_delete_delay(flag: Option<arinsal_args::DelayedNodeTableGc>) {
+    use arinsal_args::DelayedNodeTableGc;
+    let milliseconds = match flag {
+        None => 60 * 1000,
+        Some(DelayedNodeTableGc::Infinity) => -1,
+        Some(DelayedNodeTableGc::Seconds(secs)) => i64::from(secs) * 1000,
+    };
+    NODE_TAB_DELETE_DELAY_MS.store(milliseconds, Ordering::Release);
+}
+
+/// The delay in seconds that `system_info(delayed_node_table_gc)` reports, rounded up;
+/// `NODE_TAB_DELAY_GC_INFINITY` for "never".
+// Port of erts/emulator/beam/erl_node_tables.c (erts_delayed_node_table_gc), OTP-29.1.1.
+pub(crate) fn delayed_node_table_gc() -> u64 {
+    match NODE_TAB_DELETE_DELAY_MS.load(Ordering::Acquire) {
+        delay if delay < 0 => NODE_TAB_DELAY_GC_INFINITY,
+        0 => 0,
+        delay => ((delay - 1) / 1000 + 1) as u64,
+    }
 }
 
 /// Set the delayed node table deletion interval used by the internal-state test BIF.

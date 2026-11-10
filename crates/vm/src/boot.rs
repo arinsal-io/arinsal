@@ -43,6 +43,14 @@ pub fn run_with_debugger_flags(
         .max(1) as usize;
     // Port of erts/emulator/beam/erl_init.c:925, 1162-1163 (+A), OTP-29.1.1.
     arinsal_drv::set_async_threads(async_threads);
+    // Port of erts/emulator/beam/erl_init.c:303 (erl_init -> erts_init_node_tables), OTP-29.1.1.
+    crate::node_tables::init_node_tab_delete_delay(
+        arinsal_args::active_emulator_flags().delayed_node_table_gc,
+    );
+    // Port of erts/emulator/beam/erl_init.c (erl_start): `if (ignore_break) erts_set_ignore_break()`.
+    if arinsal_args::active_emulator_flags().ignore_break {
+        crate::natives::env::set_ignore_break();
+    }
     erl_init_atoms()?;
     crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
     // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this

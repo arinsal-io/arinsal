@@ -4094,6 +4094,7 @@ struct LocalSpawn {
     max_heap: Option<crate::process::MaxHeap>,
     priority: Priority,
     fullsweep: Option<u16>,
+    async_dist: bool,
     tag: Term,
     reply_success: bool,
     reply_error: bool,
@@ -4120,6 +4121,7 @@ fn parse_spawn_options(
         max_heap: None,
         priority: Priority::Normal,
         fullsweep: None,
+        async_dist: super::sys::gc_defaults(runtime).async_dist(),
         tag: atom("spawn_reply"),
         reply_success: true,
         reply_error: true,
@@ -4174,6 +4176,8 @@ fn parse_spawn_options(
                 if value != atom("true") && value != atom("false") {
                     parsed.bad = true;
                 }
+                // Port of erts/emulator/beam/erl_process.c:12289 (erts_parse_spawn_opts).
+                parsed.async_dist = value == atom("true");
             } else if key == atom("scheduler") {
                 if value.as_small().is_none_or(|n| n < 0) {
                     parsed.bad = true;
@@ -4266,6 +4270,7 @@ fn spawn_apply(
             fullsweep: options.fullsweep,
             max_heap: options.max_heap,
             off_heap_queue: None,
+            async_dist: options.async_dist,
             scheduler: None,
             priority: options.priority,
             opts: options.opts,
