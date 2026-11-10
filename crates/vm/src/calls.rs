@@ -455,8 +455,10 @@ impl Vm {
         }
     }
 
+    /// Return a BIF's result to its caller's continuation.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif_nif_epilogue: `ret` to the CP with
+    // no reduction test), OTP-29.1.1: the BIF's BUMP_REDS is its whole charge.
     pub(crate) fn ret(p: &mut Process) -> Option<Term> {
-        p.tick();
         while let Some(cp) = p.heap.stack_get(0) {
             if cp.classify() == TermKind::Catch {
                 break;
