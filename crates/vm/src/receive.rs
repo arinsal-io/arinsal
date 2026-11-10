@@ -389,7 +389,8 @@ impl Process {
         // `c_p->sig_qs.cont || c_p->sig_qs.first`.
         let cont = !self.sig_cont_empty();
         if !cont && self.inbox.is_empty() {
-            return Ok(crate::signals::atom("undefined"));
+            // `am_undefined`, a constant, not a name looked up per receive.
+            return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
         }
         // Without a middle queue the marker goes to the end of the message queue; otherwise
         // to the end of the middle queue.
@@ -790,7 +791,7 @@ mod tests {
         let mut process = Process::new();
         assert_eq!(
             process.reserve_receive_marker().unwrap(),
-            crate::signals::atom("undefined")
+            Term::atom(arinsal_term::atoms::UNDEFINED)
         );
         assert!(process.cold.is_none());
         process.inbox.push_back(Term::small(7).unwrap());
