@@ -2019,6 +2019,18 @@ impl Process {
     pub(crate) fn with_spawn_registers(x_registers: usize) -> Self {
         Self::with_spawn_registers_heap(x_registers, Self::initial_heap(233))
     }
+    /// A spawned process whose initial heap of `heap_words` words holds its copied arguments,
+    /// with `min_heap` as its minimum heap size (erl_create_process: `heap_sz` and
+    /// `min_heap_size`).
+    pub(crate) fn with_spawn_registers_sized(
+        x_registers: usize,
+        heap_words: usize,
+        min_heap: usize,
+    ) -> Self {
+        let mut heap = Self::initial_heap(heap_words);
+        heap.set_min_heap_size(min_heap);
+        Self::with_spawn_registers_heap(x_registers, heap)
+    }
     /// [`Self::with_spawn_registers`] with the heap `erl_create_process` sized for the
     /// child: erts allocates the initial heap once, at its final size.
     pub(crate) fn with_spawn_registers_heap(x_registers: usize, heap: ProcessHeap) -> Self {
