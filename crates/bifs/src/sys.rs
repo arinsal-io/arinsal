@@ -140,14 +140,39 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
         // erl_time_sup.c (make_time_val), OTP-29.1.1.
         "start_time" => signed(ctx, crate::time::MONOTONIC_TIME_START_EXTERNAL),
         "end_time" => signed(ctx, crate::time::MONOTONIC_TIME_END_EXTERNAL),
-        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1: the defaults of
-        // `ignore_break` (+Bi), `erts_default_spo_flags & SPO_ASYNC_DIST` (+pad) and
-        // `erts_delayed_node_table_gc` (+zdntgc); the emulator flags are not stored yet.
-        "break_ignored" | "async_dist" | "dynamic_trace_probes" => Ok(atom("false")),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1: break_ignored reads
+        // `ignore_break`, +Bi), OTP-29.1.1.
+        "break_ignored" => Ok(atom(
+            if arinsal_args::active_emulator_flags().ignore_break {
+                "true"
+            } else {
+                "false"
+            },
+        )),
+        // Port of erts/emulator/beam/erl_bif_info.c:2980 (system_info_1: async_dist reads
+        // `erts_default_spo_flags & SPO_ASYNC_DIST`, +pad), OTP-29.1.1.
+        "async_dist" => Ok(atom(
+            if arinsal_args::active_emulator_flags().async_dist == Some(true) {
+                "true"
+            } else {
+                "false"
+            },
+        )),
+        "dynamic_trace_probes" => Ok(atom("false")),
         "eager_check_io" => Ok(atom("true")),
         // No DTrace, SystemTap or LTTng support is built in (USE_DTRACE, USE_SYSTEMTAP, USE_LTTNG).
         "dynamic_trace" => Ok(atom("none")),
-        "delayed_node_table_gc" => integer(ctx, 60),
+        // Port of erts/emulator/beam/erl_bif_info.c:3426 (delayed_node_table_gc, +zdntgc),
+        // OTP-29.1.1. The VM answers it from the live node table delay; this is the boot value.
+        "delayed_node_table_gc" => {
+            match arinsal_args::active_emulator_flags().delayed_node_table_gc {
+                Some(arinsal_args::DelayedNodeTableGc::Infinity) => Ok(atom("infinity")),
+                Some(arinsal_args::DelayedNodeTableGc::Seconds(secs)) => {
+                    integer(ctx, u64::from(secs))
+                }
+                None => integer(ctx, 60),
+            }
+        }
         // Port of erts/emulator/beam/erl_bif_info.c:2688 (c_compiler_used): the reference build
         // is compiled by clang, which defines __GNUC__ 4, __GNUC_MINOR__ 2, __GNUC_PATCHLEVEL__ 1.
         "c_compiler_used" => {

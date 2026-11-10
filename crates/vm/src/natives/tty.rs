@@ -128,6 +128,11 @@ extern "C" fn sigint_handler(_signum: i32) {
 }
 
 fn install_break() {
+    // Port of erts/emulator/beam/erl_init.c (erl_start): with +Bi the break handler is not
+    // installed (`else if (have_break_handler) init_break_handler()`).
+    if arinsal_args::active_emulator_flags().ignore_break {
+        return;
+    }
     // SAFETY: isatty only inspects descriptor 0.
     if unsafe { libc::isatty(0) } == 0 {
         return;

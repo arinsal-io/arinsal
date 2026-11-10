@@ -938,7 +938,7 @@ fn spawn_mfa(
     monitor_alias: Option<crate::proc_create::AliasMode>,
     scheduler_id: Option<usize>,
 ) -> Result<Term, VmError> {
-    let mut opts = default_spawn_options(Term::NIL);
+    let mut opts = default_spawn_options(Term::NIL, parent.runtime);
     opts.link = linked;
     opts.monitor = monitored.then_some(SpawnMonitor {
         id: None,
@@ -988,6 +988,8 @@ pub(crate) struct ErlSpawnOpts {
     pub fullsweep: Option<u16>,
     pub max_heap: Option<crate::process::MaxHeap>,
     pub off_heap_queue: Option<bool>,
+    /// `SPO_ASYNC_DIST`: the child starts with the `async_dist` process flag set.
+    pub async_dist: bool,
     pub scheduler: Option<usize>,
     pub priority: Priority,
     /// The option list as the caller gave it (`so->opts`), reported by the seq_trace spawn request.
@@ -1111,6 +1113,11 @@ fn create_child(
         }
         let fullsweep_after = so.fullsweep.unwrap_or(defaults.fullsweep_after);
         child.heap.set_fullsweep_after(fullsweep_after);
+        // Port of erts/emulator/beam/erl_process.c:12552 (erl_create_process: SPO_ASYNC_DIST
+        // sets F_ASYNC_DIST); an unset field already reads as false.
+        if so.async_dist {
+            child.cold_mut().flags.async_dist = Some(Term::atom(arinsal_term::atoms::TRUE));
+        }
         let max_heap = so.max_heap.unwrap_or(defaults.max_heap_size);
         if !crate::natives::proc::is_default_max_heap(max_heap) {
             child.cold_mut().max_heap = max_heap;
@@ -1412,6 +1419,7 @@ fn spawn_light_default(
     let mfa = (*module, *function, *mfa_args);
     let arity = light_spawn_arity(process, mfa)?;
     let so = ErlSpawnOpts {
+        async_dist: crate::natives::sys::gc_defaults(process.runtime).async_dist(),
         link,
         monitor: None,
         min_heap: None,
@@ -1498,8 +1506,9 @@ fn spawn_light(
 
 // Port of erts/emulator/beam/erl_process.c:12222 (`erts_parse_spawn_opts`), OTP-29.1.1.
 /// Defaults that `erts_parse_spawn_opts` establishes before walking an option list.
-fn default_spawn_options(options: Term) -> ErlSpawnOpts {
+fn default_spawn_options(options: Term, runtime: Option<&Runtime>) -> ErlSpawnOpts {
     ErlSpawnOpts {
+        async_dist: crate::natives::sys::gc_defaults(runtime).async_dist(),
         link: false,
         monitor: None,
         min_heap: None,
@@ -1637,7 +1646,12 @@ fn parse_spawn_option(
                 .and_then(atom_name)
                 .is_some_and(|name| matches!(name.as_str(), "async_dist"))
         {
-            // Accepted; async_dist is applied through process_flag.
+            // Port of erts/emulator/beam/erl_process.c:12289 (erts_parse_spawn_opts, async_dist).
+            opts.async_dist = match tuple.get(1) {
+                Some(value) if value == Term::atom(arinsal_term::atoms::TRUE) => true,
+                Some(value) if value == Term::atom(arinsal_term::atoms::FALSE) => false,
+                _ => return Err(badarg("erlang:spawn_opt")),
+            };
         } else if tuple.len() == 2
             && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::SCHEDULER))
         {
@@ -1661,7 +1675,7 @@ fn parse_spawn_option(
 }
 
 fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<ErlSpawnOpts, VmError> {
-    let mut opts = default_spawn_options(term);
+    let mut opts = default_spawn_options(term, runtime);
     // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1: the option
     // list is walked in place and each option compared with its atom.
     let mut failure = None;

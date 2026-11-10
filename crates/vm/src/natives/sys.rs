@@ -1230,6 +1230,13 @@ pub(crate) fn system_info_process_item(
         Some("heap_sizes") => Some(heap_sizes(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3518 (atom_limit), OTP-29.1.1.
         Some("atom_limit") => Some(non_neg(process, global_atoms().limit() as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3426 (delayed_node_table_gc) and
+        // erl_node_tables.c (erts_delayed_node_table_gc), OTP-29.1.1: the live delay, which
+        // `erts_debug:set_internal_state(node_tab_delayed_delete, _)` changes.
+        Some("delayed_node_table_gc") => Some(match crate::node_tables::delayed_node_table_gc() {
+            crate::node_tables::NODE_TAB_DELAY_GC_INFINITY => Ok(atom("infinity")),
+            secs => non_neg(process, secs),
+        }),
         // Port of erts/emulator/beam/erl_bif_info.c:3524-3529, OTP-29.1.1.
         Some("tolerant_timeofday") => Some(Ok(atom("disabled"))),
         // Port of erts/emulator/beam/erl_bif_info.c:3515, OTP-29.1.1.
@@ -3949,6 +3956,8 @@ pub(crate) struct GcDefaults {
     min_bin_vheap_size: AtomicI64,
     max_gen_gcs: AtomicU32,
     max_heap: AtomicU64,
+    /// `SPO_ASYNC_DIST` of `erts_default_spo_flags`; only `+pad` writes it, before any spawn.
+    async_dist: bool,
 }
 
 const MAX_HEAP_KILL: u64 = 1;
@@ -3977,6 +3986,8 @@ impl GcDefaults {
                     .unwrap_or(u16::MAX),
             )),
             max_heap: AtomicU64::new(0),
+            // Port of erts/emulator/beam/erl_init.c (erl_start, -pad), OTP-29.1.1.
+            async_dist: emulator.async_dist == Some(true),
         };
         defaults.set_max_heap(crate::process::MaxHeap::default());
         defaults
@@ -3988,6 +3999,10 @@ impl GcDefaults {
 
     pub(crate) fn min_bin_vheap_size(&self) -> i64 {
         self.min_bin_vheap_size.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn async_dist(&self) -> bool {
+        self.async_dist
     }
 
     pub(crate) fn max_gen_gcs(&self) -> u16 {

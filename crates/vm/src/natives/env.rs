@@ -340,6 +340,15 @@ fn set_signal(
     Ok(atom("ok"))
 }
 
+/// `+Bi`: ignore the signals a terminal sends for Ctrl+C, Ctrl+Backslash and Ctrl+Z.
+// Port of erts/emulator/sys/unix/sys.c:770 (erts_set_ignore_break), OTP-29.1.1.
+pub(crate) fn set_ignore_break() {
+    for signum in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP] {
+        // Only an invalid signal number fails.
+        let _ = install_disposition(signum, libc::SIG_IGN);
+    }
+}
+
 // Port of erts/emulator/sys/unix/sys.c:437 (sys_signal), OTP-29.1.1.
 fn install_disposition(signum: i32, handler: libc::sighandler_t) -> Result<(), VmError> {
     // SAFETY: zeroed sigaction is the POSIX starting point; sigemptyset and
