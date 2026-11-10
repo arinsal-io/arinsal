@@ -591,9 +591,9 @@ fn notify_busy_port_one(
     };
     let mut heap = arinsal_term::ProcessHeap::with_words(16);
     let Ok(event) = TermBuilder::new(&mut heap).tuple(&[
-        atom("monitor"),
+        Term::atom(arinsal_term::atoms::MONITOR),
         sender.to_term().unwrap_or(Term::NIL),
-        atom("busy_port"),
+        Term::atom(arinsal_term::atoms::BUSY_PORT),
         port,
     ]) else {
         return;
@@ -698,21 +698,24 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "term_type", 1),
 ];
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in atom"))
-}
-
 fn badarg() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 fn badmap(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    tuple(process, &[atom("badmap"), value])
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+    tuple(process, &[Term::atom(arinsal_term::atoms::BADMAP), value]).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 fn undef() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("undef")))
+    VmError::Trap(exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::UNDEF,
+    )))
 }
 
 fn arg_name(term: Term) -> Option<String> {
@@ -724,19 +727,31 @@ fn arg_name(term: Term) -> Option<String> {
 fn int(process: &mut Process, value: usize) -> Result<Term, VmError> {
     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .int_from_i128(value as i128)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })
 }
 
 fn list(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .list_from_iter(values.iter().copied())
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })
 }
 
 fn tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(values)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:377 (erts_debug_instructions_0), OTP-29.1.1.
@@ -753,10 +768,10 @@ fn instructions(process: &mut Process) -> Result<Term, VmError> {
 }
 
 fn scheduler_type_atom(kind: SchedulerType) -> Term {
-    atom(match kind {
-        SchedulerType::Normal => "normal",
-        SchedulerType::DirtyCpu => "dirty_cpu",
-        SchedulerType::DirtyIo => "dirty_io",
+    Term::atom(match kind {
+        SchedulerType::Normal => arinsal_term::atoms::NORMAL,
+        SchedulerType::DirtyCpu => arinsal_term::atoms::DIRTY_CPU,
+        SchedulerType::DirtyIo => arinsal_term::atoms::DIRTY_IO,
     })
 }
 
@@ -813,7 +828,7 @@ fn dirty_test_body(
 ) -> Result<Term, &'static str> {
     let system_limit = |_| "system_limit";
     match arg_name(operation).as_deref() {
-        Some("scheduler") if value == atom("type") => {
+        Some("scheduler") if value == Term::atom(arinsal_term::atoms::TYPE) => {
             Ok(scheduler_type_atom(arinsal_sched::current_scheduler_type()))
         }
         Some("error") => match arg_name(value).as_deref() {
@@ -837,13 +852,13 @@ fn dirty_test_body(
                 .map_err(system_limit)
         }
         Some("send") => {
-            dirty_send_message(env, heap, value, atom("ok"));
-            Ok(atom("ok"))
+            dirty_send_message(env, heap, value, Term::atom(arinsal_term::atoms::OK));
+            Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Some("wait") => {
             let milliseconds = value.as_small().ok_or("badarg")?;
             ms_wait(milliseconds, busy);
-            Ok(atom("ok"))
+            Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Some("reschedule") => {
             let rounds = value
@@ -853,20 +868,20 @@ fn dirty_test_body(
             if rounds % 2 != 0 {
                 return Err("badarg");
             }
-            Ok(atom("ok"))
+            Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Some("ready_wait6_done") => {
-            dirty_send_message(env, heap, value, atom("ready"));
+            dirty_send_message(env, heap, value, crate::atom_cache::put("ready"));
             ms_wait(6_000, false);
-            dirty_send_message(env, heap, value, atom("done"));
-            Ok(atom("ok"))
+            dirty_send_message(env, heap, value, crate::atom_cache::put("done"));
+            Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Some(op @ ("alive_waitexiting" | "alive_waitexitingonly")) => {
             let dirty_io = arinsal_sched::current_scheduler_type() == SchedulerType::DirtyIo;
             if env.exiting.load(Ordering::Acquire) {
                 return Err("badarg");
             }
-            dirty_send_message(env, heap, value, atom("alive"));
+            dirty_send_message(env, heap, value, Term::atom(arinsal_term::atoms::ALIVE));
             // Wait until dead.
             while !env.exiting.load(Ordering::Acquire) {
                 if dirty_io {
@@ -876,7 +891,7 @@ fn dirty_test_body(
                 }
             }
             if op == "alive_waitexitingonly" {
-                return Ok(atom("ok"));
+                return Ok(Term::atom(arinsal_term::atoms::OK));
             }
             ms_wait(1000, false);
             // Should still be able to allocate memory: a 9999-digit bignum of 4711 digits.
@@ -891,7 +906,7 @@ fn dirty_test_body(
             )
             .map_err(system_limit)?;
             TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(heap))
-                .tuple(&[atom("ok"), big])
+                .tuple(&[Term::atom(arinsal_term::atoms::OK), big])
                 .map_err(system_limit)
         }
         _ => Err("badarg"),
@@ -1024,7 +1039,7 @@ fn dirty_test(
 fn dirty_bif_exception(reason: &'static str) -> DirtyBifException {
     DirtyBifException {
         freason: arinsal_term::exc::EXC_ERROR,
-        reason: atom(reason),
+        reason: crate::atom_cache::put(reason),
         stacktrace: None,
     }
 }
@@ -1063,7 +1078,7 @@ fn dirty_reschedule_step(scheduler: &'static str, operation: Term, value: Term) 
         return DirtyBifOutcome::Complete(Err(dirty_bif_exception("badarg")));
     }
     if rounds == 0 {
-        return DirtyBifOutcome::Complete(Ok(atom("ok")));
+        return DirtyBifOutcome::Complete(Ok(Term::atom(arinsal_term::atoms::OK)));
     }
     let next_scheduler = if rounds % 4 != 0 {
         scheduler
@@ -1079,7 +1094,11 @@ fn dirty_reschedule_step(scheduler: &'static str, operation: Term, value: Term) 
     if next_scheduler == "normal" {
         DirtyBifOutcome::Reschedule {
             target: ("erts_debug", "dirty", 3),
-            args: vec![atom("normal"), operation, next_rounds],
+            args: vec![
+                Term::atom(arinsal_term::atoms::NORMAL),
+                operation,
+                next_rounds,
+            ],
         }
     } else {
         DirtyBifOutcome::Reschedule {
@@ -1127,9 +1146,9 @@ fn size_shared(process: &mut Process, value: Term) -> Result<Term, VmError> {
 
 /// Port of erts/emulator/beam/beam_debug.c:170 (erts_debug_copy_shared_2), OTP-29.1.1.
 fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let copy_literals = if args[1] == atom("true") {
+    let copy_literals = if args[1] == Term::atom(arinsal_term::atoms::TRUE) {
         true
-    } else if args[1] == atom("false") {
+    } else if args[1] == Term::atom(arinsal_term::atoms::FALSE) {
         false
     } else {
         return Err(badarg());
@@ -1139,7 +1158,11 @@ fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         copy_literals,
     )
-    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+    .map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3301 (erts_debug_map_info_1), OTP-29.1.1.
@@ -1204,9 +1227,11 @@ fn map_info(process: &mut Process, value: Term) -> Result<Term, VmError> {
                     Term::small(*value as i64).expect("map statistic fits a small integer")
                 })
                 .collect::<Vec<_>>();
-            builder
-                .tuple(&values)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+            builder.tuple(&values).map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })
         };
         (
             small_tuple(&leaves)?,
@@ -1222,28 +1247,53 @@ fn map_info(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let mut result = Term::NIL;
     for (name, count, info) in entries {
         let item = builder
-            .tuple(&[atom(name), Term::small(count as i64).unwrap(), info])
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-        result = builder
-            .cons(item, result)
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            .tuple(&[
+                crate::atom_cache::put(name),
+                Term::small(count as i64).unwrap(),
+                info,
+            ])
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })?;
+        result = builder.cons(item, result).map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })?;
     }
     let arrays_item = builder
         .tuple(&[
-            atom("arrays"),
+            crate::atom_cache::put("arrays"),
             Term::small(arrays as i64).unwrap(),
             Term::NIL,
         ])
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-    result = builder
-        .cons(arrays_item, result)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })?;
+    result = builder.cons(arrays_item, result).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })?;
     let depth_item = builder
-        .tuple(&[atom("depth"), Term::small(max_depth as i64).unwrap()])
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-    builder
-        .cons(depth_item, result)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        .tuple(&[
+            crate::atom_cache::put("depth"),
+            Term::small(max_depth as i64).unwrap(),
+        ])
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })?;
+    builder.cons(depth_item, result).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:101 (erts_debug_unaligned_bitstring_2), OTP-29.1.1.
@@ -1280,12 +1330,16 @@ fn unaligned_bitstring(process: &mut Process, args: &[Term]) -> Result<Term, VmE
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
-    let binary = builder
-        .binary(&target)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-    builder
-        .sub_binary(binary, offset, bit_len)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+    let binary = builder.binary(&target).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })?;
+    builder.sub_binary(binary, offset, bit_len).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3336 (erts_internal_term_type_1), OTP-29.1.1.
@@ -1341,7 +1395,7 @@ fn term_type(value: Term) -> Term {
         TermKind::Catch => "catch",
         TermKind::Invalid => "invalid",
     };
-    atom(name)
+    crate::atom_cache::put(name)
 }
 
 fn build(
@@ -1357,8 +1411,10 @@ fn build(
         ("erts_debug", "copy_shared", 2) => copy_shared(process, args),
         ("erts_debug", "size_shared", 1) => size_shared(process, args[0]),
         ("erts_debug", "interpreter_size", 0) => Ok(Term::small(0).unwrap()),
-        ("erts_debug", "disassemble", 1) => Ok(atom("false")),
-        ("erts_debug", "lcnt_clear", 0) | ("erts_debug", "lcnt_collect", 0) => Ok(atom("error")),
+        ("erts_debug", "disassemble", 1) => Ok(Term::atom(arinsal_term::atoms::FALSE)),
+        ("erts_debug", "lcnt_clear", 0) | ("erts_debug", "lcnt_collect", 0) => {
+            Ok(Term::atom(arinsal_term::atoms::ERROR))
+        }
         ("erts_debug", "lcnt_control", 1 | 2) => Err(badarg()),
         ("erts_debug", "map_info", 1) => map_info(process, args[0]),
         ("erts_debug", "get_internal_state", 1) => internal_state_get(vm, process, ctx, args[0]),
@@ -1472,7 +1528,11 @@ fn gather_allocator_info(
         &fields[5],
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
-    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    .map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })?;
     let message = if carrier {
         // OTP's default ETS allocator has no carrier records on this host.
         tuple(process, &[reference, Term::NIL])?
@@ -1510,7 +1570,11 @@ fn internal_state_tuple_get(
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map(Some)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        });
     }
     let Ok(owned) = to_owned(selector) else {
         return Ok(None);
@@ -1530,7 +1594,7 @@ fn internal_state_tuple_get(
             mode.as_str(),
             "no_time_warp" | "single_time_warp" | "multi_time_warp"
         );
-        return Ok((valid_correction && valid_mode).then(|| atom("true")));
+        return Ok((valid_correction && valid_mode).then(|| Term::atom(arinsal_term::atoms::TRUE)));
     }
     if let [OwnedTerm::Atom(name), term, options] = fields.as_slice()
         && name == "term_to_binary"
@@ -1542,7 +1606,11 @@ fn internal_state_tuple_get(
         return TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .binary(&bytes)
             .map(Some)
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            });
     }
     if let [OwnedTerm::Atom(name), first, second] = fields.as_slice()
         && name == "make_unique_integer"
@@ -1559,7 +1627,11 @@ fn internal_state_tuple_get(
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map(Some)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        });
     }
     if let [OwnedTerm::Atom(name), OwnedTerm::Atom(node)] = fields.as_slice()
         && name == "connection_id"
@@ -1604,7 +1676,11 @@ fn internal_state_tuple_get(
                 value,
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })?;
             let hash = arinsal_term::internal_hash(value);
             let result = OwnedTerm::BigInt(hash.into());
             from_owned(
@@ -1612,7 +1688,11 @@ fn internal_state_tuple_get(
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map(Some)
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })
         }
         ("atom", index) => {
             let Some(index) = owned_uint(index).and_then(|index| usize::try_from(index).ok())
@@ -1620,12 +1700,16 @@ fn internal_state_tuple_get(
                 return Err(badarg());
             };
             if index >= 1_048_576 {
-                return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+                return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                ))));
             }
             while global_atoms().len() <= index {
                 let name = format!("am{:x}", global_atoms().len());
                 if global_atoms().intern(&name).is_err() {
-                    return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+                    return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    ))));
                 }
             }
             let Some(name) = u32::try_from(index)
@@ -1647,7 +1731,7 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid == ctx.pid() {
-                return Ok(Some(atom("running")));
+                return Ok(Some(Term::atom(arinsal_term::atoms::RUNNING)));
             }
             // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_status), OTP-29.1.1.
             let status = process
@@ -1656,9 +1740,9 @@ fn internal_state_tuple_get(
                 .and_then(|runtime| {
                     runtime
                         .process_alive(pid)
-                        .then(|| atom(runtime.remote_status(pid)))
+                        .then(|| crate::atom_cache::put(runtime.remote_status(pid)))
                 })
-                .unwrap_or_else(|| atom("undefined"));
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED));
             Ok(Some(status))
         }
         (
@@ -1674,12 +1758,12 @@ fn internal_state_tuple_get(
             if pid != ctx.pid() {
                 return match remote_relations(ctx, pid)? {
                     Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
-                    None => Ok(Some(atom("undefined"))),
+                    None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
                 };
             }
             match current_relations(process, ctx)? {
                 Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
-                None => Ok(Some(atom("undefined"))),
+                None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
             }
         }
         (
@@ -1700,7 +1784,7 @@ fn internal_state_tuple_get(
                         &relations.monitored_by,
                     )
                     .map(Some),
-                    None => Ok(Some(atom("undefined"))),
+                    None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
                 };
             }
             match current_relations(process, ctx)? {
@@ -1710,7 +1794,7 @@ fn internal_state_tuple_get(
                     &relations.monitored_by,
                 )
                 .map(Some),
-                None => Ok(Some(atom("undefined"))),
+                None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
             }
         }
         ("channel_number", OwnedTerm::Atom(node)) if node == "nonode@nohost" => {
@@ -1726,10 +1810,10 @@ fn internal_state_tuple_get(
                 .map(|entry| entry.connection_id);
             match channel {
                 Some(channel) => int(process, channel as usize).map(Some),
-                None => Ok(Some(atom("undefined"))),
+                None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
             }
         }
-        ("channel_number", _) => Ok(Some(atom("undefined"))),
+        ("channel_number", _) => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
         ("dist_ctrl", OwnedTerm::Atom(node)) => {
             let tables = crate::node_tables::lock();
             let controller = tables
@@ -1745,9 +1829,11 @@ fn internal_state_tuple_get(
                             .or_else(|| state.owner.to_term())
                     })
                 });
-            Ok(Some(controller.unwrap_or_else(|| atom("undefined"))))
+            Ok(Some(controller.unwrap_or_else(|| {
+                Term::atom(arinsal_term::atoms::UNDEFINED)
+            })))
         }
-        ("dist_ctrl", _) => Ok(Some(atom("undefined"))),
+        ("dist_ctrl", _) => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
         ("reader_groups_map", OwnedTerm::Int(groups))
             if *groups > 0 && Term::small(*groups).is_some() =>
         {
@@ -1767,7 +1853,7 @@ fn internal_state_tuple_get(
                     | "unbound"
             ) =>
         {
-            Ok(Some(atom("false")))
+            Ok(Some(Term::atom(arinsal_term::atoms::FALSE)))
         }
         ("atom_out_cache_index", OwnedTerm::Atom(name)) => {
             let Some(index) = global_atoms().get(name).map(|atom| atom.0) else {
@@ -1781,11 +1867,11 @@ fn internal_state_tuple_get(
             }) =>
         {
             let size = int(process, bytes.len())?;
-            let binary_info = tuple(process, &[atom("binary"), size])?;
+            let binary_info = tuple(process, &[Term::atom(arinsal_term::atoms::BINARY), size])?;
             tuple(
                 process,
                 &[
-                    atom("refc_binary"),
+                    crate::atom_cache::put("refc_binary"),
                     size,
                     binary_info,
                     Term::small(0).unwrap(),
@@ -1794,20 +1880,24 @@ fn internal_state_tuple_get(
             .map(Some)
         }
         ("binary_info", OwnedTerm::Binary(_) | OwnedTerm::BitString { .. }) => {
-            Ok(Some(atom("heap_binary")))
+            Ok(Some(crate::atom_cache::put("heap_binary")))
         }
         ("magic_ref", _) => {
             let Some(reference) = selector_value.filter(|term| term.is_magic_ref()) else {
-                return Ok(Some(atom("false")));
+                return Ok(Some(Term::atom(arinsal_term::atoms::FALSE)));
             };
             let Some(owner) = reference.magic_owner() else {
-                return Ok(Some(atom("false")));
+                return Ok(Some(Term::atom(arinsal_term::atoms::FALSE)));
             };
             let address = std::sync::Arc::as_ptr(&owner) as usize;
             let references = std::sync::Arc::strong_count(&owner).saturating_sub(1);
             let address = int(process, address)?;
             let references = int(process, references)?;
-            tuple(process, &[address, references, atom("true")]).map(Some)
+            tuple(
+                process,
+                &[address, references, Term::atom(arinsal_term::atoms::TRUE)],
+            )
+            .map(Some)
         }
         _ => Ok(None),
     }
@@ -1819,21 +1909,28 @@ fn colliding_names(process: &mut Process, name: &str, count: u64) -> Result<Term
     let Some(atom_index) = global_atoms().get(name).map(|atom| atom.0 as u64) else {
         return Err(badarg());
     };
-    let count = usize::try_from(count)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    let count = usize::try_from(count).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })?;
     let mut terms = Vec::new();
-    terms
-        .try_reserve_exact(count)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    terms.try_reserve_exact(count).map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })?;
     let mut index = atom_index & META_NAME_TAB_MASK;
     while terms.len() < count {
         if index != atom_index {
             while global_atoms().len() as u64 <= index {
                 let next = global_atoms().len();
                 let text = format!("am{next:x}");
-                global_atoms()
-                    .intern(&text)
-                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+                global_atoms().intern(&text).map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })?;
             }
             let atom = u32::try_from(index)
                 .ok()
@@ -1842,9 +1939,11 @@ fn colliding_names(process: &mut Process, name: &str, count: u64) -> Result<Term
                 .ok_or_else(badarg)?;
             terms.push(atom);
         }
-        index = index
-            .checked_add(META_NAME_TAB_MASK + 1)
-            .ok_or_else(|| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+        index = index.checked_add(META_NAME_TAB_MASK + 1).ok_or_else(|| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })?;
     }
     terms.reverse();
     list(process, &terms)
@@ -1895,9 +1994,9 @@ fn term_binary_options(options: &OwnedTerm) -> Option<arinsal_etf::EncodeOptions
 
 /// Port of erts_get_node_and_dist_references called by erl_bif_info.c:4354, OTP-29.1.1.
 fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
-    let local_node = atom("nonode@nohost");
-    let system = atom("system");
-    let undefined = atom("undefined");
+    let local_node = Term::atom(arinsal_term::atoms::NONAME);
+    let system = Term::atom(arinsal_term::atoms::SYSTEM);
+    let undefined = Term::atom(arinsal_term::atoms::UNDEFINED);
     let system_reference = tuple(process, &[system, Term::small(1).unwrap()])?;
     let system_owner = tuple(process, &[system, undefined])?;
     let system_references = list(process, &[system_reference])?;
@@ -1957,27 +2056,48 @@ fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
         let mut categories = Vec::new();
         if ets_count > 0 {
             let count_term = int(process, ets_count)?;
-            categories.push(tuple(process, &[atom("ets"), count_term])?);
+            categories.push(tuple(
+                process,
+                &[Term::atom(arinsal_term::atoms::ETS), count_term],
+            )?);
         }
         if binary_count > 0 {
             let count_term = int(process, binary_count)?;
-            categories.push(tuple(process, &[atom("binary"), count_term])?);
+            categories.push(tuple(
+                process,
+                &[Term::atom(arinsal_term::atoms::BINARY), count_term],
+            )?);
         }
         if timer_count > 0 {
             let count_term = int(process, timer_count)?;
-            categories.push(tuple(process, &[atom("timer"), count_term])?);
+            categories.push(tuple(
+                process,
+                &[crate::atom_cache::put("timer"), count_term],
+            )?);
         }
         let count = ets_count + binary_count + timer_count;
         let count_term = int(process, count)?;
         let categories = list(process, &categories)?;
-        let owner_id = tuple(process, &[atom("system"), undefined])?;
+        let owner_id = tuple(
+            process,
+            &[Term::atom(arinsal_term::atoms::SYSTEM), undefined],
+        )?;
         let owner = tuple(process, &[owner_id, categories])?;
         let owners = list(process, &[owner])?;
         node_reference_entries.push(tuple(process, &[node_id, count_term, owners])?);
     }
     let node_references = list(process, &node_reference_entries)?;
-    let node_owner = tuple(process, &[atom("node"), local_reference])?;
-    let node_reference = tuple(process, &[atom("node"), Term::small(1).unwrap()])?;
+    let node_owner = tuple(
+        process,
+        &[Term::atom(arinsal_term::atoms::NODE), local_reference],
+    )?;
+    let node_reference = tuple(
+        process,
+        &[
+            Term::atom(arinsal_term::atoms::NODE),
+            Term::small(1).unwrap(),
+        ],
+    )?;
     let node_owners = list(process, &[node_reference])?;
     let node_entry = tuple(process, &[node_owner, node_owners])?;
     let dist_references = list(process, &[system_entry, node_entry])?;
@@ -1986,8 +2106,14 @@ fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
         &[local_node, Term::small(2).unwrap(), dist_references],
     )?;
     let dist_entries = list(process, &[dist_entry])?;
-    let node_pair = tuple(process, &[atom("node_references"), node_references])?;
-    let dist_pair = tuple(process, &[atom("dist_references"), dist_entries])?;
+    let node_pair = tuple(
+        process,
+        &[crate::atom_cache::put("node_references"), node_references],
+    )?;
+    let dist_pair = tuple(
+        process,
+        &[crate::atom_cache::put("dist_references"), dist_entries],
+    )?;
     tuple(process, &[node_pair, dist_pair])
 }
 
@@ -2031,13 +2157,19 @@ fn internal_link_list_from(
         };
         let id = int(process, pid.number() as usize)?;
         let state = if unlinking {
-            atom("unlinking")
+            crate::atom_cache::put("unlinking")
         } else {
-            atom("linked")
+            crate::atom_cache::put("linked")
         };
         records.push(tuple(
             process,
-            &[atom("erl_link"), atom("process"), pid_term, state, id],
+            &[
+                crate::atom_cache::put("erl_link"),
+                Term::atom(arinsal_term::atoms::PROCESS),
+                pid_term,
+                state,
+                id,
+            ],
         )?);
     }
     list(process, &records)
@@ -2167,9 +2299,9 @@ fn internal_monitor_list_from(
         records.push(tuple(
             process,
             &[
-                atom("erl_monitor"),
-                atom("process"),
-                atom("origin"),
+                crate::atom_cache::put("erl_monitor"),
+                Term::atom(arinsal_term::atoms::PROCESS),
+                crate::atom_cache::put("origin"),
                 reference,
                 pid,
                 tag,
@@ -2185,9 +2317,9 @@ fn internal_monitor_list_from(
         records.push(tuple(
             process,
             &[
-                atom("erl_monitor"),
-                atom("process"),
-                atom("target"),
+                crate::atom_cache::put("erl_monitor"),
+                Term::atom(arinsal_term::atoms::PROCESS),
+                crate::atom_cache::put("target"),
                 reference,
                 pid,
                 extra,
@@ -2210,7 +2342,11 @@ fn monitor_extra_term(process: &mut Process, extra: Option<&OwnedTerm>) -> Resul
                 extra,
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })
         })
         .transpose()
         .map(|extra| extra.unwrap_or(Term::NIL))
@@ -2231,17 +2367,17 @@ fn internal_state_get(
     }
     match arg_name(selector).as_deref() {
         Some("reds_left") => int(process, process.heap.abi.fcalls.max(0) as usize),
-        Some("available_internal_state") => Ok(atom("true")),
+        Some("available_internal_state") => Ok(Term::atom(arinsal_term::atoms::TRUE)),
         Some("force_heap_frags" | "scheduler_dump" | "hashmap_collision_bonanza") => {
-            Ok(atom("false"))
+            Ok(Term::atom(arinsal_term::atoms::FALSE))
         }
-        Some("debugger_support") => Ok(atom(if crate::trace_bp::debugger_supported() {
-            "true"
+        Some("debugger_support") => Ok(Term::atom(if crate::trace_bp::debugger_supported() {
+            arinsal_term::atoms::TRUE
         } else {
-            "false"
+            arinsal_term::atoms::FALSE
         })),
-        Some("lc_graph" | "flxctr_memory_usage") => Ok(atom("notsup")),
-        Some("re_yield_coverage") => Ok(atom("undefined")),
+        Some("lc_graph" | "flxctr_memory_usage") => Ok(Term::atom(arinsal_term::atoms::NOTSUP)),
+        Some("re_yield_coverage") => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         Some("dirty_gc_limit") => Ok(Term::small(131_072).unwrap()),
         Some("max_atom_out_cache_index") => Ok(Term::small(2038).unwrap()),
         Some("process_info_args") => {
@@ -2288,7 +2424,10 @@ fn internal_state_get(
                 "label",
                 "priority_messages",
             ];
-            let names = names.iter().map(|name| atom(name)).collect::<Vec<_>>();
+            let names = names
+                .iter()
+                .map(|name| crate::atom_cache::put(name))
+                .collect::<Vec<_>>();
             list(process, &names)
         }
         Some("DbTable_words") => tuple(
@@ -2307,12 +2446,16 @@ fn internal_state_get(
                 ],
             )
         }
-        Some("mmap") => Ok(atom("undefined")),
+        Some("mmap") => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         Some("stack_check") => Ok(Term::small(1_026_385).unwrap()),
         Some("unique_monotonic_integer_state") => {
             TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(UNIQUE_MONOTONIC_INTEGER_STATE.load(Ordering::Relaxed) as i128)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })
         }
         Some("persistent_term") => {
             let map = OwnedTerm::Map(vec![(OwnedTerm::atom("table"), OwnedTerm::Int(64))]);
@@ -2320,12 +2463,20 @@ fn internal_state_get(
                 &map,
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })
         }
         Some("min_unique_monotonic_integer" | "min_unique_integer") => {
             TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(-576_460_752_303_423_488)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })
         }
         // Port of erts/emulator/beam/erl_process.c:5538 (erts_debug_nbalance),
         // OTP-29.1.1.
@@ -2337,7 +2488,11 @@ fn internal_state_get(
                 .map_or(0, |scheduler| scheduler.balance_checks());
             TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(i128::from(checks))
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })
         }
         Some("monitoring_nodes") => {
             let Some(runtime) = &process.runtime else {
@@ -2377,7 +2532,7 @@ fn internal_state_get(
             let mut entries = Vec::with_capacity(values.len());
             for (name, value) in values {
                 let value = int(process, value as usize)?;
-                entries.push(tuple(process, &[atom(name), value])?);
+                entries.push(tuple(process, &[crate::atom_cache::put(name), value])?);
             }
             list(process, &entries)
         }
@@ -2398,7 +2553,7 @@ fn internal_state_get(
         Some("processes_bif_info") => tuple(
             process,
             &[
-                atom("ptab_list_bif_info"),
+                crate::atom_cache::put("ptab_list_bif_info"),
                 Term::small(40).unwrap(),
                 Term::small(1049).unwrap(),
                 Term::small(1000).unwrap(),
@@ -2420,9 +2575,13 @@ fn internal_state_get(
                 Some(next) => {
                     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .int_from_i128(i128::from(next))
-                        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                        .map_err(|_| {
+                            VmError::Trap(exceptions::Trap::error(Term::atom(
+                                arinsal_term::atoms::SYSTEM_LIMIT,
+                            )))
+                        })
                 }
-                None => Ok(atom("false")),
+                None => Ok(Term::atom(arinsal_term::atoms::FALSE)),
             }
         }
         Some("next_port") => {
@@ -2434,9 +2593,13 @@ fn internal_state_get(
                 Some(next) => {
                     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .int_from_i128(next as i128)
-                        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                        .map_err(|_| {
+                            VmError::Trap(exceptions::Trap::error(Term::atom(
+                                arinsal_term::atoms::SYSTEM_LIMIT,
+                            )))
+                        })
                 }
-                None => Ok(atom("false")),
+                None => Ok(Term::atom(arinsal_term::atoms::FALSE)),
             }
         }
         _ => Err(badarg()),
@@ -2519,12 +2682,21 @@ fn internal_state_set(
     selector: Term,
     value: Term,
 ) -> Result<Term, VmError> {
-    if selector == atom("available_internal_state") {
-        if value != atom("true") && value != atom("false") {
+    if selector == crate::atom_cache::put("available_internal_state") {
+        if value != Term::atom(arinsal_term::atoms::TRUE)
+            && value != Term::atom(arinsal_term::atoms::FALSE)
+        {
             return Err(badarg());
         }
-        let previous = INTERNAL_STATE.swap(value == atom("true"), Ordering::Relaxed);
-        return Ok(atom(if previous { "true" } else { "false" }));
+        let previous = INTERNAL_STATE.swap(
+            value == Term::atom(arinsal_term::atoms::TRUE),
+            Ordering::Relaxed,
+        );
+        return Ok(Term::atom(if previous {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        }));
     }
     if !INTERNAL_STATE.load(Ordering::Relaxed) {
         return Err(undef());
@@ -2555,7 +2727,7 @@ fn internal_state_set(
         if let Some(completion) = pending_wait {
             if !completion.load(Ordering::Acquire) {
                 process.set_force_yield(true);
-                return Ok(atom("ok"));
+                return Ok(Term::atom(arinsal_term::atoms::OK));
             }
             process.slice_mut().debug_wait_completion = None;
         }
@@ -2566,7 +2738,9 @@ fn internal_state_set(
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+            return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            ))));
         }
         let completion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         process.slice_mut().debug_wait_completion = Some(completion.clone());
@@ -2581,7 +2755,7 @@ fn internal_state_set(
             &mut |work| ctx.request_aux_work_all(work),
         );
         process.set_force_yield(true);
-        return Ok(atom("ok"));
+        return Ok(Term::atom(arinsal_term::atoms::OK));
     }
     match arg_name(selector).as_deref() {
         Some("reds_left") => {
@@ -2591,7 +2765,7 @@ fn internal_state_set(
             if (0..=4000).contains(&reductions) {
                 process.heap.abi.fcalls = reductions as i32;
             }
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("block" | "sleep" | "block_scheduler") => {
             let Some(milliseconds) = to_owned(value).ok().and_then(|term| owned_signed(&term))
@@ -2606,25 +2780,28 @@ fn internal_state_set(
                     std::thread::sleep(duration);
                 }
             }
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("test_long_gc_sleep") => {
             let Some(milliseconds) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
                 return Err(badarg());
             };
             TEST_LONG_GC_SLEEP.store(milliseconds, Ordering::Relaxed);
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("multizero_timeout_in_timeout") => {
             let Some(timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
                 return Err(badarg());
             };
             if process.runtime.is_none() {
-                return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+                return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                ))));
             }
             // Port of erts/emulator/beam/erl_bif_info.c:4976-4996,5402-5412, OTP-29.1.1: a
             // timer callback that starts a zero timer callback from within a timer callback.
-            let done = Message::copy_from(atom("multizero_timeout_in_timeout_done"))?;
+            let done =
+                Message::copy_from(crate::atom_cache::put("multizero_timeout_in_timeout_done"))?;
             ctx.start_timer_callback(
                 timeout.max(0) as u64,
                 Box::new(move |timers| {
@@ -2637,8 +2814,12 @@ fn internal_state_set(
                     );
                 }),
             )
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-            return Ok(atom("ok"));
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })?;
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         Some("next_pid") | Some("next_port") => {
             let Some(next) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
@@ -2660,27 +2841,31 @@ fn internal_state_set(
                 Some(result) => {
                     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .int_from_i128(result)
-                        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                        .map_err(|_| {
+                            VmError::Trap(exceptions::Trap::error(Term::atom(
+                                arinsal_term::atoms::SYSTEM_LIMIT,
+                            )))
+                        })
                 }
-                None => Ok(atom("false")),
+                None => Ok(Term::atom(arinsal_term::atoms::FALSE)),
             };
         }
         Some("force_gc") => {
             let Some(pid) = arinsal_sched::Pid::from_term(value) else {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             };
             let found = process
                 .runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.process_alive(pid));
             if !found {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             }
             // Port of erts/emulator/beam/erl_bif_info.c:5124-5133 and
             // erts/emulator/beam/erl_gc.h:146-153, OTP-29.1.1. The target PID is only
             // checked for existence; ERTS_FORCE_GC collects the calling process.
             process.force_gc()?;
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("unique_monotonic_integer_state") => {
             let Some(state) = to_owned(value).ok().and_then(|term| {
@@ -2691,7 +2876,7 @@ fn internal_state_set(
                 return Err(badarg());
             };
             UNIQUE_MONOTONIC_INTEGER_STATE.store(state, Ordering::Relaxed);
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("binary_loop_limit" | "re_loop_limit" | "unicode_loop_limit") => {
             let (limit, default) = match arg_name(selector).as_deref() {
@@ -2699,7 +2884,7 @@ fn internal_state_set(
                 Some("re_loop_limit") => (&RE_LOOP_LIMIT, 64_000),
                 _ => (&UNICODE_LOOP_LIMIT, 40_000),
             };
-            let next = if value == atom("default") {
+            let next = if value == Term::atom(arinsal_term::atoms::DEFAULT) {
                 default
             } else {
                 let Some(value) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
@@ -2710,14 +2895,21 @@ fn internal_state_set(
             let previous = limit.swap(next, Ordering::Relaxed);
             return int(process, previous as usize);
         }
-        Some("gc_state") if value == atom("true") || value == atom("false") => {
-            let previous = process.set_gc_enabled(value == atom("true"));
-            return Ok(atom(if previous { "true" } else { "false" }));
+        Some("gc_state")
+            if value == Term::atom(arinsal_term::atoms::TRUE)
+                || value == Term::atom(arinsal_term::atoms::FALSE) =>
+        {
+            let previous = process.set_gc_enabled(value == Term::atom(arinsal_term::atoms::TRUE));
+            return Ok(Term::atom(if previous {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }));
         }
-        Some("inconsistent_heap") if value == atom("start") => {
+        Some("inconsistent_heap") if value == Term::atom(arinsal_term::atoms::START) => {
             process.set_gc_enabled(false);
             let index = process.heap.used_words();
-            let broken = tuple(process, &[atom("ok")])?;
+            let broken = tuple(process, &[Term::atom(arinsal_term::atoms::OK)])?;
             let base = process.heap.heap_bounds().0 as usize;
             let address = broken.tagged_word() & !7;
             let Some(word_index) = address
@@ -2744,23 +2936,34 @@ fn internal_state_set(
                 return Err(badarg());
             };
             if !process.heap.debug_write_heap_word(word_index, 1 << 6)
-                || !process
-                    .heap
-                    .debug_write_heap_word(word_index + 1, atom("ok").tagged_word())
+                || !process.heap.debug_write_heap_word(
+                    word_index + 1,
+                    Term::atom(arinsal_term::atoms::OK).tagged_word(),
+                )
             {
                 return Err(badarg());
             }
             process.set_gc_enabled(true);
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
-        Some("debugger_support") if value == atom("true") => {
+        Some("debugger_support") if value == Term::atom(arinsal_term::atoms::TRUE) => {
             crate::trace_bp::enable_debugger_support();
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
-        Some("debugger_support") => return Ok(atom("badarg")),
-        Some("jit_asm_dump") if value == atom("true") || value == atom("false") => {
-            let previous = JIT_ASM_DUMP.swap(value == atom("true"), Ordering::Relaxed);
-            return Ok(atom(if previous { "true" } else { "false" }));
+        Some("debugger_support") => return Ok(Term::atom(arinsal_term::atoms::BADARG)),
+        Some("jit_asm_dump")
+            if value == Term::atom(arinsal_term::atoms::TRUE)
+                || value == Term::atom(arinsal_term::atoms::FALSE) =>
+        {
+            let previous = JIT_ASM_DUMP.swap(
+                value == Term::atom(arinsal_term::atoms::TRUE),
+                Ordering::Relaxed,
+            );
+            return Ok(Term::atom(if previous {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }));
         }
         Some("ets_force_split" | "ets_debug_random_split_join") => {
             let Some([table, on]) = super::ets::tuple_items(value)
@@ -2773,7 +2976,7 @@ fn internal_state_set(
                 return Err(badarg());
             };
             let random = arg_name(selector).as_deref() == Some("ets_debug_random_split_join");
-            let enabled = on == atom("true");
+            let enabled = on == Term::atom(arinsal_term::atoms::TRUE);
             let changed = process.runtime.as_ref().is_some_and(|runtime| {
                 runtime
                     .ets
@@ -2782,24 +2985,24 @@ fn internal_state_set(
                     .debug_set_catree_mode(tid, random, enabled)
             });
             return if changed {
-                Ok(atom("ok"))
+                Ok(Term::atom(arinsal_term::atoms::OK))
             } else {
                 Err(badarg())
             };
         }
-        Some("ets_force_trap") => return Ok(atom("notsup")),
-        Some("proc_sig_buffers") if value == atom("true") => {
-            return Ok(atom(
+        Some("ets_force_trap") => return Ok(Term::atom(arinsal_term::atoms::NOTSUP)),
+        Some("proc_sig_buffers") if value == Term::atom(arinsal_term::atoms::TRUE) => {
+            return Ok(Term::atom(
                 if process.message_queue_data() == crate::process::MessageQueueData::OffHeap
                     && ctx.force_parallel_signal_buffers()
                 {
-                    "true"
+                    arinsal_term::atoms::TRUE
                 } else {
-                    "false"
+                    arinsal_term::atoms::FALSE
                 },
             ));
         }
-        Some("proc_sig_buffers") => return Ok(atom("notsup")),
+        Some("proc_sig_buffers") => return Ok(Term::atom(arinsal_term::atoms::NOTSUP)),
         Some("abort") => {
             let reason = to_owned(value).map_err(|_| badarg())?;
             eprintln!("{reason}");
@@ -2812,10 +3015,10 @@ fn internal_state_set(
         }
         Some("kill_dist_connection") => {
             let Some(node) = arg_name(value) else {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             };
             let Some(runtime) = process.runtime.as_ref() else {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             };
             let (port_id, connection_id) = {
                 let tables = crate::node_tables::lock();
@@ -2825,7 +3028,7 @@ fn internal_state_set(
                     .map(|dep| dep.lock())
                     .filter(|entry| entry.connected)
                 else {
-                    return Ok(atom("false"));
+                    return Ok(Term::atom(arinsal_term::atoms::FALSE));
                 };
                 (
                     entry.dist.as_ref().and_then(|state| state.port_id),
@@ -2835,18 +3038,18 @@ fn internal_state_set(
             if let Some(port_id) = port_id {
                 let port = runtime.ports.get(port_id);
                 if !crate::port::close_by_id(process, ctx, port_id)? {
-                    return Ok(atom("false"));
+                    return Ok(Term::atom(arinsal_term::atoms::FALSE));
                 }
                 if let Some(port) = port {
                     crate::dist::port_connection_closed(runtime, &port)?;
                 }
-                return Ok(atom("true"));
+                return Ok(Term::atom(arinsal_term::atoms::TRUE));
             }
-            return Ok(atom(
+            return Ok(Term::atom(
                 if crate::dist::kill_connection(runtime, &node, connection_id)? {
-                    "true"
+                    arinsal_term::atoms::TRUE
                 } else {
-                    "false"
+                    arinsal_term::atoms::FALSE
                 },
             ));
         }
@@ -2858,12 +3061,12 @@ fn internal_state_set(
                 "thread_progress",
             ]
             .iter()
-            .any(|name| value == atom(name)) =>
+            .any(|name| value == crate::atom_cache::put(name)) =>
         {
-            if value == atom("thread_progress") {
+            if value == crate::atom_cache::put("thread_progress") {
                 ctx.block_thread_progress(std::time::Duration::ZERO);
             }
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         Some("colliding_names") => {
             let Ok(owned) = to_owned(value) else {
@@ -2893,22 +3096,29 @@ fn internal_state_set(
             let left = process.heap.words_left();
             if left > 1 {
                 let filler = BigInt::from(1_u8) << ((left - 2) * 64);
-                from_owned(&OwnedTerm::BigInt(filler), &mut process.heap)
-                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+                from_owned(&OwnedTerm::BigInt(filler), &mut process.heap).map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })?;
             }
             if fill_fullsweep {
                 process.heap.set_fullsweep_after(0);
             }
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         Some("mbuf") => {
             return arinsal_term::copy_term(
                 value,
                 &mut arinsal_term::FragmentAlloc::new(&mut process.heap),
             )
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+            .map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            });
         }
-        Some("make") if value == atom("magic_ref") => {
+        Some("make") if value == Term::atom(arinsal_term::atoms::MAGIC_REF) => {
             // Port of erts/emulator/beam/erl_bif_info.c (erts_debug_get_internal_state):
             // this probe creates a zero-payload magic binary.
             let owner = arinsal_term::MagicRef::with_erts_payload_size_and_refn(
@@ -2919,10 +3129,18 @@ fn internal_state_set(
             let address = std::sync::Arc::as_ptr(&owner) as usize;
             let reference = TermBuilder::new(&mut process.heap)
                 .magic_ref(owner)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })?;
             let address = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(address as i128)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })?;
             return tuple(process, &[reference, address]);
         }
         Some("binary") => {
@@ -2930,16 +3148,20 @@ fn internal_state_set(
                 return Err(badarg());
             };
             let Ok(size) = usize::try_from(size) else {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             };
             let mut bytes = Vec::new();
             if bytes.try_reserve_exact(size).is_err() {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             }
             bytes.resize(size, 0);
             return TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .binary(&bytes)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                });
         }
         Some("node_tab_delayed_delete") => {
             let Some(timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
@@ -2947,7 +3169,7 @@ fn internal_state_set(
             };
             ctx.block_thread_progress(std::time::Duration::ZERO);
             crate::node_tables::test_node_tab_delayed_delete(timeout);
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         Some("remove_dflags") => {
             let Some(flags) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
@@ -2957,7 +3179,7 @@ fn internal_state_set(
                 return Err(badarg());
             }
             crate::node_tables::test_remove_dflags(Some(flags));
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         Some("code_mod_permission") => {
             let acquire = match arg_name(value).as_deref() {
@@ -2975,14 +3197,14 @@ fn internal_state_set(
             if let Some(runtime) = &process.runtime {
                 crate::natives::code::release_code_mod_permission(runtime);
             }
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("process_uniq_counter") => {
             let Some(counter) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
                 return Err(badarg());
             };
             process.uniq_counter = counter;
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         Some("proc_sig_block") => {
             let Ok(owned) = to_owned(value) else {
@@ -3011,19 +3233,19 @@ fn internal_state_set(
             }
             let pid = arinsal_sched::Pid::new(*id, *serial);
             let Some(runtime) = process.runtime.as_ref() else {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             };
             if !runtime.process_alive(pid) {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             }
-            return Ok(atom(
+            return Ok(Term::atom(
                 if ctx
                     .signal(pid, arinsal_sched::Signal::ProcSigBlock(milliseconds))
                     .is_ok()
                 {
-                    "true"
+                    arinsal_term::atoms::TRUE
                 } else {
-                    "false"
+                    arinsal_term::atoms::FALSE
                 },
             ));
         }
@@ -3033,8 +3255,8 @@ fn internal_state_set(
 }
 
 fn system_check(selector: Term) -> Result<Term, VmError> {
-    if selector == atom("schedulers") {
-        Ok(atom("ok"))
+    if selector == crate::atom_cache::put("schedulers") {
+        Ok(Term::atom(arinsal_term::atoms::OK))
     } else {
         Err(badarg())
     }
@@ -3043,7 +3265,7 @@ fn system_check(selector: Term) -> Result<Term, VmError> {
 /// Port of erts/emulator/beam/erl_bif_trace.c:3276-3388, OTP-29.1.1.
 fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmError> {
     let runtime = process.runtime.ok_or_else(badarg)?;
-    let state = if session == atom("legacy") {
+    let state = if session == Term::atom(arinsal_term::atoms::LEGACY) {
         runtime.system_monitor.lock().unwrap().clone()
     } else {
         let key = crate::natives::proc::trace_session_id(process, session).ok_or_else(badarg)?;
@@ -3056,7 +3278,7 @@ fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmEr
             .map(|(_, state)| state.clone())
     };
     let Some(state) = state else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     let owned = OwnedTerm::Tuple(vec![
         state.receiver,
@@ -3066,7 +3288,11 @@ fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmEr
         &owned,
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
-    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+    .map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 pub(crate) fn monitor_options_for_trace_info(
@@ -3185,7 +3411,7 @@ fn system_monitor_set(
 ) -> Result<Term, VmError> {
     let runtime = process.runtime.ok_or_else(badarg)?;
     // `None` is the legacy (global) monitor, `Some` the monitor of a dynamic trace session.
-    let key = if args[0] == atom("legacy") {
+    let key = if args[0] == Term::atom(arinsal_term::atoms::LEGACY) {
         None
     } else {
         Some(crate::natives::proc::trace_session_id(process, args[0]).ok_or_else(badarg)?)
@@ -3237,10 +3463,14 @@ fn system_monitor_set(
                     ]),
                     &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                 )
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?,
-                None => atom("undefined"),
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })?,
+                None => Term::atom(arinsal_term::atoms::UNDEFINED),
             };
-            if args[1] == atom("undefined") || entries.is_empty() {
+            if args[1] == Term::atom(arinsal_term::atoms::UNDEFINED) || entries.is_empty() {
                 store(None);
                 return Ok(return_term);
             }
@@ -3253,13 +3483,13 @@ fn system_monitor_set(
         crate::trace::Tracer::Pid(pid) => {
             // New API: the session tracer receives, `args[1]` must be `session` and the
             // list is a diff.
-            if args[1] != atom("session") {
+            if args[1] != Term::atom(arinsal_term::atoms::SESSION) {
                 return Err(badarg());
             }
             (
                 to_owned(pid.to_term().ok_or_else(badarg)?).map_err(|_| badarg())?,
                 prev.map(|state| state.options).unwrap_or_default(),
-                atom("ok"),
+                Term::atom(arinsal_term::atoms::OK),
             )
         }
         // ToDo in erts: ports and NIFs are not supported for system_monitor.

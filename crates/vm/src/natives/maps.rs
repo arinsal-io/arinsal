@@ -4,9 +4,7 @@ use crate::exceptions::Trap;
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::RunCtx;
-use arinsal_term::{
-    HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, atoms, global_atoms,
-};
+use arinsal_term::{HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, atoms};
 
 /// Elements returned on the first `path = 0` hashmap call.
 /// Port of erts/emulator/beam/erl_map.h:96 (MAP_SMALL_MAP_LIMIT), OTP-29.1.1.
@@ -19,10 +17,6 @@ const PATH_ELEMS_PER_DIGIT: usize = 16;
 /// Port of erts/emulator/beam/erl_map.c:3660 (ORDERED_ITER_FACTOR), OTP-29.1.1.
 const ORDERED_ITER_FACTOR: i32 = 32;
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in atom"))
-}
-
 /// The `iterator` and `none` atoms. Both are predefined, so their indices are constants.
 const ITERATOR: Term = Term::atom(atoms::ITERATOR);
 const NONE: Term = Term::atom(atoms::NONE);
@@ -30,13 +24,13 @@ const NONE: Term = Term::atom(atoms::NONE);
 #[cold]
 #[inline(never)]
 fn badarg() -> Trap {
-    Trap::error(atom("badarg"))
+    Trap::error(Term::atom(arinsal_term::atoms::BADARG))
 }
 
 #[cold]
 #[inline(never)]
 fn system_limit() -> Trap {
-    Trap::error(atom("system_limit"))
+    Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
 }
 
 /// `DECLARE_WSTACK` holds 16 words, or four `WSTACK_PUSH4` frames, before growing.

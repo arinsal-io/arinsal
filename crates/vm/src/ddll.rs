@@ -110,12 +110,10 @@ fn table() -> &'static Mutex<Table> {
     })
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("runtime atom"))
-}
-
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 fn build(process: &mut Process, value: &O) -> Result<Term, VmError> {
@@ -464,20 +462,20 @@ fn notice_term(heap: &mut ProcessHeap, notice: &Notice) -> Option<Term> {
         .local_ref(arinsal_bifs::ordinary_ref_words(notice.reference))
         .ok()?;
     let tag = match notice.error {
-        None => atom(notice.tag),
+        None => crate::atom_cache::put(notice.tag),
         Some(code) => {
             let error = from_owned(&load_error(code), heap).ok()?;
             TermBuilder::new(heap)
-                .tuple(&[atom(notice.tag), error])
+                .tuple(&[crate::atom_cache::put(notice.tag), error])
                 .ok()?
         }
     };
     TermBuilder::new(heap)
         .tuple(&[
-            atom(notice.kind),
+            crate::atom_cache::put(notice.kind),
             reference,
-            atom("driver"),
-            atom(&notice.name),
+            Term::atom(arinsal_term::atoms::DRIVER),
+            crate::atom_cache::put(&notice.name),
             tag,
         ])
         .ok()
@@ -615,7 +613,7 @@ pub(crate) fn try_load(
             let ok_term = build(process, &ok_term)?;
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             TermBuilder::new(&mut heap)
-                .tuple(&[atom("ok"), ok_term, reference])
+                .tuple(&[Term::atom(arinsal_term::atoms::OK), ok_term, reference])
                 .map_err(|_| badarg())
         }
         Err(error) => build(process, &ok_or_error("error", error)),
@@ -880,7 +878,7 @@ pub(crate) fn try_unload(
             let ok_term = build(process, &ok_term)?;
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             TermBuilder::new(&mut heap)
-                .tuple(&[atom("ok"), ok_term, reference])
+                .tuple(&[Term::atom(arinsal_term::atoms::OK), ok_term, reference])
                 .map_err(|_| badarg())
         }
         Err(error) => build(process, &ok_or_error("error", error)),
@@ -937,9 +935,19 @@ pub(crate) fn info(process: &mut Process, args: &[Term]) -> Result<Term, VmError
                 return build(process, &value);
             }
             "linked_in_driver" => {
-                return Ok(atom(if handle.is_none() { "true" } else { "false" }));
+                return Ok(Term::atom(if handle.is_none() {
+                    arinsal_term::atoms::TRUE
+                } else {
+                    arinsal_term::atoms::FALSE
+                }));
             }
-            "permanent" => return Ok(atom(if permanent { "true" } else { "false" })),
+            "permanent" => {
+                return Ok(Term::atom(if permanent {
+                    arinsal_term::atoms::TRUE
+                } else {
+                    arinsal_term::atoms::FALSE
+                }));
+            }
             _ => return Err(badarg()),
         };
         match handle {
@@ -998,7 +1006,7 @@ pub(crate) fn monitor(
     args: &[Term],
 ) -> Result<Term, VmError> {
     arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DDLL);
-    if args[0] != atom("driver") {
+    if args[0] != Term::atom(arinsal_term::atoms::DRIVER) {
         return Err(badarg());
     }
     let description = to_owned(args[1]).map_err(|_| badarg())?;
@@ -1044,7 +1052,13 @@ pub(crate) fn monitor(
     let reference = crate::signals::reference(process, arinsal_bifs::next_ref_id())?;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let message = TermBuilder::new(&mut heap)
-        .tuple(&[atom(kind), reference, atom("driver"), name_term, atom(tag)])
+        .tuple(&[
+            crate::atom_cache::put(kind),
+            reference,
+            Term::atom(arinsal_term::atoms::DRIVER),
+            name_term,
+            crate::atom_cache::put(tag),
+        ])
         .map_err(|_| badarg())?;
     ctx.send(pid, Message::copy_from(message)?)
         .map_err(|_| badarg())?;
@@ -1067,7 +1081,7 @@ pub(crate) fn demonitor(ctx: &RunCtx<'_, Message>, reference: Term) -> Result<Te
             break;
         }
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 /// Port of erl_bif_ddll.c:813 (erl_ddll_format_error_int_1).

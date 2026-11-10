@@ -119,7 +119,7 @@ fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
     tuple(
         process,
         vec![
-            atom("erts_dflags"),
+            Term::atom(arinsal_term::atoms::ERTS_DFLAGS),
             integer(node_tables::DFLAG_DIST_DEFAULT & mask),
             integer(node_tables::DFLAG_DIST_MANDATORY & mask),
             integer(node_tables::DFLAG_DIST_ADDABLE & mask),
@@ -133,7 +133,7 @@ fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
 fn get_creation() -> Result<Term, VmError> {
     let creation = node_tables::this_node().1;
     if creation == 0 {
-        Ok(atom("undefined"))
+        Ok(Term::atom(arinsal_term::atoms::UNDEFINED))
     } else {
         Ok(integer(u64::from(creation)))
     }
@@ -331,11 +331,14 @@ fn create_channel(
     }
     send_nodes_monitor_events(process.runtime.as_ref().ok_or_else(badarg)?, nodeup_events)?;
     if let Some(handler) = flush_notify {
-        ctx.send(handler, Message::copy_from(atom("dist_data"))?)
-            .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
+        ctx.send(
+            handler,
+            Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
+        )
+        .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
     }
     let dhandle = dhandle_term(process, conn_id, entry_ref)?;
-    tuple(process, vec![atom("ok"), dhandle])
+    tuple(process, vec![Term::atom(arinsal_term::atoms::OK), dhandle])
 }
 
 fn notify_dist_ctrlr(
@@ -351,7 +354,7 @@ fn notify_dist_ctrlr(
     };
     let msg = TermBuilder::new(&mut process.heap)
         .tuple(&[
-            atom("dist_ctrlr"),
+            Term::atom(arinsal_term::atoms::DIST_CTRLR),
             ctrlr,
             node,
             ctx.pid().to_term().ok_or_else(badarg)?,
@@ -381,7 +384,7 @@ fn get_data(
         Ok(Some((packet, state.get_size)))
     })?;
     let Some((bytes, sized)) = bytes else {
-        return Ok(atom("none"));
+        return Ok(Term::atom(arinsal_term::atoms::NONE));
     };
     let size = bytes.len() as u64;
     let list = from_owned(
@@ -440,7 +443,7 @@ fn put_data(
         Ok((state.handle, decoded))
     })?;
     route_incoming(vm, process, ctx, handle_id, &local_name, decoded)?;
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 fn route_incoming(
@@ -747,8 +750,11 @@ fn queue_remote_control(
     state.notify = false;
     drop(entry);
     if let Some(handler) = notify {
-        ctx.send(handler, Message::copy_from(atom("dist_data"))?)
-            .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
+        ctx.send(
+            handler,
+            Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
+        )
+        .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
     }
     let _ = process;
     Ok(())
@@ -999,10 +1005,11 @@ fn queue_outgoing_with_options(
         state.notify = false;
         drop(entry);
         if let Some(handler) = notify {
-            ctx.send(handler, Message::copy_from(atom("dist_data"))?)
-                .map_err(|error| {
-                    VmError::Unsupported(format!("dist data notification: {error}"))
-                })?;
+            ctx.send(
+                handler,
+                Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
+            )
+            .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
         }
         let _ = process;
         return Ok(DistSendResult::Queued);
@@ -1285,12 +1292,12 @@ fn notify_node_watchers(
     node: &str,
     watchers: Vec<node_tables::NodeMonitor>,
 ) -> Result<(), VmError> {
-    let node_atom = atom(node);
+    let node_atom = crate::atom_cache::put(node);
     let sched = runtime.scheduler()?;
     for watcher in watchers {
         let mut heap = arinsal_term::ProcessHeap::with_words(16);
         let term = TermBuilder::new(&mut heap)
-            .tuple(&[atom("nodedown"), node_atom])
+            .tuple(&[Term::atom(arinsal_term::atoms::NODEDOWN), node_atom])
             .map_err(|_| badarg())?;
         let message = Message::copy_from(term)?;
         let _ = sched.send(watcher.pid, watcher.pid, message);
@@ -1376,7 +1383,12 @@ pub(crate) fn spawn_noconnection_message(
     let tag = from_owned(&down.tag, &mut process.heap).map_err(|_| badarg())?;
     tuple(
         process,
-        vec![tag, reference, atom("error"), atom("noconnection")],
+        vec![
+            tag,
+            reference,
+            Term::atom(arinsal_term::atoms::ERROR),
+            Term::atom(arinsal_term::atoms::NOCONNECTION),
+        ],
     )
     .map(Some)
 }
@@ -2348,7 +2360,7 @@ pub(crate) fn handle_dist_spawn_reply_exiting(
         // erts_proc_exit_handle_link: the link exit carries the actual reason, unless the
         // operation was abandoned.
         let reason = if request.abandoned {
-            atom("abandoned")
+            Term::atom(arinsal_term::atoms::ABANDONED)
         } else {
             reason
         };
@@ -2859,10 +2871,14 @@ pub(crate) fn native_send3(
                     &[args[1], args[0]],
                 );
                 let _ = want_priority;
-                Ok(atom("ok"))
+                Ok(Term::atom(arinsal_term::atoms::OK))
             }
-            RemoteSendOutcome::NotConnected => Ok(atom(if noconnect { "noconnect" } else { "ok" })),
-            RemoteSendOutcome::WouldSuspend => Ok(atom("nosuspend")),
+            RemoteSendOutcome::NotConnected => Ok(Term::atom(if noconnect {
+                arinsal_term::atoms::NOCONNECT
+            } else {
+                arinsal_term::atoms::OK
+            })),
+            RemoteSendOutcome::WouldSuspend => Ok(Term::atom(arinsal_term::atoms::NOSUSPEND)),
             RemoteSendOutcome::NotRemote => Err(badarg()),
         };
     }
@@ -2872,11 +2888,15 @@ pub(crate) fn native_send3(
             process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)
         });
         sent?;
-        return Ok(atom(if busy { "nosuspend" } else { "ok" }));
+        return Ok(Term::atom(if busy {
+            arinsal_term::atoms::NOSUSPEND
+        } else {
+            arinsal_term::atoms::OK
+        }));
     }
     // Local priority delivery needs the process send path (alias + flag).
     process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 /// Route signal BIFs to the distribution controller when the peer is remote.
@@ -2907,7 +2927,7 @@ pub(crate) fn native_signal(
             .map(|_| String::new());
         (remote, 0usize)
     } else if function == "monitor" {
-        if args.len() < 2 || args[0] != atom("process") {
+        if args.len() < 2 || args[0] != Term::atom(arinsal_term::atoms::PROCESS) {
             let handler =
                 crate::signals::handler("erlang", function, args.len() as u8).ok_or_else(badarg)?;
             return handler(vm, process, ctx, crate::natives::NativeArgs::Slice(args))
@@ -2942,7 +2962,7 @@ pub(crate) fn native_signal(
                     None,
                 )?;
             }
-            Ok(atom("true"))
+            Ok(Term::atom(arinsal_term::atoms::TRUE))
         }
         "monitor" => {
             // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
@@ -3034,18 +3054,20 @@ pub(crate) fn native_signal(
                 return Err(badarg());
             }
             match crate::signals::demonitor_origin(process, id) {
-                crate::signals::OriginDemonitor::Alias => Ok(atom("false")),
+                crate::signals::OriginDemonitor::Alias => {
+                    Ok(Term::atom(arinsal_term::atoms::FALSE))
+                }
                 crate::signals::OriginDemonitor::Distributed(origin) => {
                     process.cold_mut().dist_monitors.remove(&id);
                     emon::demonitor_remote(process.runtime, ctx.pid(), origin);
-                    Ok(atom("true"))
+                    Ok(Term::atom(arinsal_term::atoms::TRUE))
                 }
                 _ => {
                     process.cold_mut().dist_monitors.remove(&id);
-                    Ok(atom(if args.len() == 1 || !demonitor_info(args[1]) {
-                        "true"
+                    Ok(Term::atom(if args.len() == 1 || !demonitor_info(args[1]) {
+                        arinsal_term::atoms::TRUE
                     } else {
-                        "false"
+                        arinsal_term::atoms::FALSE
                     }))
                 }
             }
@@ -3831,10 +3853,13 @@ fn get_data_notification(ctx: &mut RunCtx<'_, Message>, handle: Term) -> Result<
         }
     })?;
     if let Some(handler) = handler {
-        ctx.send(handler, Message::copy_from(atom("dist_data"))?)
-            .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
+        ctx.send(
+            handler,
+            Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
+        )
+        .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
     }
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 fn input_handler(
@@ -3847,7 +3872,7 @@ fn input_handler(
         state.input_handler = handler;
         Ok(())
     })?;
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 fn get_opt(ctx: &mut RunCtx<'_, Message>, handle: Term, option: Term) -> Result<Term, VmError> {
@@ -3889,7 +3914,7 @@ fn get_stat(
     tuple(
         process,
         vec![
-            atom("ok"),
+            Term::atom(arinsal_term::atoms::OK),
             integer(read),
             integer(written),
             integer(pending),
@@ -3942,13 +3967,6 @@ fn tuple(process: &mut Process, values: Vec<Term>) -> Result<Term, VmError> {
         .map_err(|_| badarg())
 }
 
-fn atom(name: &str) -> Term {
-    let id = global_atoms()
-        .intern(name)
-        .expect("short distribution atom");
-    Term::atom(id)
-}
-
 fn atom_name(term: Term) -> Option<String> {
     global_atoms()
         .text(term.as_atom()?)
@@ -3956,7 +3974,11 @@ fn atom_name(term: Term) -> Option<String> {
 }
 
 fn boolean(value: bool) -> Term {
-    atom(if value { "true" } else { "false" })
+    Term::atom(if value {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    })
 }
 fn boolean_value(term: Term) -> Option<bool> {
     match atom_name(term)?.as_str() {
@@ -3979,7 +4001,9 @@ fn as_u32(term: &OwnedTerm) -> Option<u32> {
     as_u64(term).and_then(|value| u32::try_from(value).ok())
 }
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 #[cfg(test)]
@@ -4075,9 +4099,15 @@ run() ->
 
     #[test]
     fn dist_get_size_option_accepts_only_booleans() {
-        assert_eq!(boolean_value(atom("true")), Some(true));
-        assert_eq!(boolean_value(atom("false")), Some(false));
-        assert_eq!(boolean_value(atom("ok")), None);
+        assert_eq!(
+            boolean_value(Term::atom(arinsal_term::atoms::TRUE)),
+            Some(true)
+        );
+        assert_eq!(
+            boolean_value(Term::atom(arinsal_term::atoms::FALSE)),
+            Some(false)
+        );
+        assert_eq!(boolean_value(Term::atom(arinsal_term::atoms::OK)), None);
     }
 
     #[test]

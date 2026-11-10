@@ -101,7 +101,7 @@ impl Reply {
     }
 
     fn atom(self, name: &'static str) {
-        self.send(|_| Some(atom(name)));
+        self.send(|_| Some(crate::atom_cache::put(name)));
     }
 }
 
@@ -395,7 +395,7 @@ pub(crate) fn command_light(
         .abi
         .fcalls
         .saturating_sub(i32::try_from(reductions_used).unwrap_or(i32::MAX));
-    Some(Ok(atom("true")))
+    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
 }
 
 // Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
@@ -459,12 +459,12 @@ pub(crate) fn control(
                 let reply = call_driver_control(runtime, drv, caller, op, &bytes);
                 drop(imm);
                 let Some(reply) = reply else {
-                    return Ok(atom("badarg"));
+                    return Ok(Term::atom(arinsal_term::atoms::BADARG));
                 };
                 let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                 return control_term(&mut heap, reply).map_err(|_| badarg());
             }
-            Err(ImmFail::InvalidPort) => return Ok(atom("badarg")),
+            Err(ImmFail::InvalidPort) => return Ok(Term::atom(arinsal_term::atoms::BADARG)),
             Err(_) => {}
         }
     }
@@ -491,7 +491,7 @@ pub(crate) fn control(
             };
             reply.send_sized(words, |heap| match result {
                 Some(result) => control_term(heap, result).ok(),
-                None => Some(atom("badarg")),
+                None => Some(Term::atom(arinsal_term::atoms::BADARG)),
             });
             REDS_CONTROL
         }),
@@ -532,10 +532,13 @@ pub(crate) fn control_light(
     let reply = call_driver_control(runtime, &drv, caller, opcode, &bytes);
     drop(imm);
     let Some(reply) = reply else {
-        return Some(Ok(atom("badarg")));
+        return Some(Ok(Term::atom(arinsal_term::atoms::BADARG)));
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    Some(control_term(&mut heap, reply).map_err(|_| crate::exceptions::Trap::error(atom("badarg"))))
+    Some(
+        control_term(&mut heap, reply)
+            .map_err(|_| crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::BADARG))),
+    )
 }
 
 fn call_driver_control(
@@ -574,7 +577,8 @@ fn call_driver_control(
         };
         let mut trace_heap = VecHeap::new();
         if let Ok(binary) = TermBuilder::new(&mut trace_heap).binary(response)
-            && let Ok(control) = TermBuilder::new(&mut trace_heap).tuple(&[atom("control"), binary])
+            && let Ok(control) = TermBuilder::new(&mut trace_heap)
+                .tuple(&[Term::atom(arinsal_term::atoms::CONTROL), binary])
             && let Ok(message) = TermBuilder::new(&mut trace_heap).tuple(&[port, control])
         {
             trace_port_send(&handle.scheduler, handle.trace_scope(), id, caller, message);
@@ -622,7 +626,13 @@ fn deliver_exit(
     }
     release_io(handle);
     if let Some(to) = closed_to {
-        event_message(scheduler, to, id, handle.trace_scope(), atom("closed"));
+        event_message(
+            scheduler,
+            to,
+            id,
+            handle.trace_scope(),
+            Term::atom(arinsal_term::atoms::CLOSED),
+        );
     }
     // The port's trace state goes last: `{Port, closed}` above is still traced.
     crate::trace::port_closed(runtime, id);
@@ -635,7 +645,9 @@ fn trace_close_receive(runtime: &crate::process::Runtime, id: u64, from: Pid) {
         return;
     };
     let mut heap = VecHeap::new();
-    if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, atom("close")]) {
+    if let Ok(event) =
+        TermBuilder::new(&mut heap).tuple(&[caller, Term::atom(arinsal_term::atoms::CLOSE)])
+    {
         crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
     }
 }
@@ -666,7 +678,8 @@ pub(crate) fn exit(
                 trace_close_receive(runtime, handle.id, from);
             }
             let mut heap = ProcessHeap::with_words(64);
-            let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+            let reason = from_owned(&reason, &mut heap)
+                .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::NORMAL));
             let done = deliver_exit(runtime, handle, bang, from, reason, closed_to);
             drop(imm);
             return if done { Ok(None) } else { Err(badarg()) };
@@ -697,7 +710,8 @@ pub(crate) fn exit(
             trace_close_receive(runtime, task_handle.id, from);
         }
         let mut heap = ProcessHeap::with_words(64);
-        let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+        let reason = from_owned(&reason, &mut heap)
+            .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::NORMAL));
         let ok =
             op == SigOp::Exec && deliver_exit(runtime, &task_handle, bang, from, reason, closed_to);
         if let Some(reply) = reply {
@@ -723,7 +737,8 @@ pub(crate) fn exit_for_halt(
     match drv.try_imm_call(0, true, "close", REDS_EXIT as u32) {
         Ok(imm) => {
             let mut heap = ProcessHeap::with_words(64);
-            let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("killed"));
+            let reason = from_owned(&reason, &mut heap)
+                .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::KILLED));
             deliver_exit(runtime, &handle, false, from, reason, None);
             drop(imm);
         }
@@ -732,7 +747,8 @@ pub(crate) fn exit_for_halt(
             schedule(&drv, from, move |op| {
                 if op == SigOp::Exec {
                     let mut heap = ProcessHeap::with_words(64);
-                    let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("killed"));
+                    let reason = from_owned(&reason, &mut heap)
+                        .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::KILLED));
                     deliver_exit(runtime, &handle, false, from, reason, None);
                 }
                 REDS_EXIT
@@ -759,7 +775,8 @@ pub(crate) fn exit_for_process_termination(
             // OTP-29.1.1: the forced exit breaks the exiting process's port link.
             handle.links.lock().remove(from.data());
             let mut heap = ProcessHeap::with_words(64);
-            let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+            let reason = from_owned(&reason, &mut heap)
+                .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::NORMAL));
             deliver_exit(runtime, &handle, false, from, reason, None);
         }
         REDS_EXIT
@@ -843,9 +860,10 @@ pub(crate) fn link(
                         .lock()
                         .lookup_insert(crate::proc_create::port_peer_link(pid));
                     trace_link(task_runtime, handle.id, pid, "getting_linked");
-                } else if let (Some(port), Ok(reason)) =
-                    (Term::port(handle.id), Message::copy_from(atom("noproc")))
-                    && let Ok(port) = Message::copy_from(port)
+                } else if let (Some(port), Ok(reason)) = (
+                    Term::port(handle.id),
+                    Message::copy_from(Term::atom(arinsal_term::atoms::NOPROC)),
+                ) && let Ok(port) = Message::copy_from(port)
                 {
                     let _ = handle.scheduler.signal(
                         pid,

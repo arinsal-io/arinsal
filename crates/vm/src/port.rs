@@ -743,10 +743,11 @@ fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservatio
     let _ports = runtime.ports.lock();
     // Port exhaustion is the `driver_create_port` failure mapped to `system_limit` in
     // erts/emulator/drivers/common/inet_drv.c:11834-11837, OTP-29.1.1.
-    let id = runtime
-        .port_ids
-        .reserve()
-        .ok_or_else(|| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))?;
+    let id = runtime.port_ids.reserve().ok_or_else(|| {
+        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })?;
     Ok(PortIdReservation {
         runtime,
         id,
@@ -958,15 +959,13 @@ impl PortHandle {
     }
 }
 
-fn atom(s: &'static str) -> Term {
-    crate::atom_cache::atom(s)
-}
-
 fn atom_dyn(s: &str) -> Term {
     Term::atom(global_atoms().intern(s).expect("built-in atom"))
 }
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 fn list(t: Term) -> Option<Vec<Term>> {
     let mut out = Vec::new();
@@ -1263,33 +1262,36 @@ fn options(t: Term) -> Option<PortOptions> {
         },
     };
     for item in list(t)? {
-        if item == atom("binary") {
+        if item == Term::atom(arinsal_term::atoms::BINARY) {
             opts.binary = true;
-        } else if item == atom("exit_status") {
+        } else if item == Term::atom(arinsal_term::atoms::EXIT_STATUS) {
             opts.exit_status = true;
-        } else if item == atom("eof") {
+        } else if item == Term::atom(arinsal_term::atoms::EOF) {
             opts.eof = true;
-        } else if item == atom("line") {
+        } else if item == Term::atom(arinsal_term::atoms::LINE) {
             // Port of erts/emulator/beam/erl_bif_port.c:985, OTP-29.1.1.
             if opts.framing.is_some_and(|(mode, _)| mode != 1) {
                 return None;
             }
             opts.framing = Some((1, 512));
-        } else if item == atom("stream") || item == atom("hide") || item == atom("overlapped_io") {
-        } else if item == atom("use_stdio") {
+        } else if item == Term::atom(arinsal_term::atoms::STREAM)
+            || item == Term::atom(arinsal_term::atoms::HIDE)
+            || item == Term::atom(arinsal_term::atoms::OVERLAPPED_IO)
+        {
+        } else if item == Term::atom(arinsal_term::atoms::USE_STDIO) {
             opts.use_stdio = true;
-        } else if item == atom("nouse_stdio") {
+        } else if item == Term::atom(arinsal_term::atoms::NOUSE_STDIO) {
             opts.use_stdio = false;
-        } else if item == atom("stderr_to_stdout") {
+        } else if item == Term::atom(arinsal_term::atoms::STDERR_TO_STDOUT) {
             opts.stderr_to_stdout = true;
-        } else if item == atom("in") {
+        } else if item == Term::atom(arinsal_term::atoms::IN) {
             opts.rw |= 1;
-        } else if item == atom("out") {
+        } else if item == Term::atom(arinsal_term::atoms::OUT) {
             opts.rw |= 2;
         } else {
             let pair = tuple(item)?;
             if pair.len() == 2
-                && pair[0] == atom("packet")
+                && pair[0] == Term::atom(arinsal_term::atoms::PACKET)
                 && matches!(pair[1].as_small(), Some(1 | 2 | 4))
             {
                 // Port of erts/emulator/beam/erl_bif_port.c (open_port packet 1|2|4), OTP-29.1.1.
@@ -1298,7 +1300,7 @@ fn options(t: Term) -> Option<PortOptions> {
                     return None;
                 }
                 opts.framing = Some((2, n as usize));
-            } else if pair.len() == 2 && pair[0] == atom("line") {
+            } else if pair.len() == 2 && pair[0] == Term::atom(arinsal_term::atoms::LINE) {
                 let n = pair[1].as_small()?;
                 if n <= 0 {
                     return None;
@@ -1307,17 +1309,17 @@ fn options(t: Term) -> Option<PortOptions> {
                     return None;
                 }
                 opts.framing = Some((1, n as usize));
-            } else if pair.len() == 2 && pair[0] == atom("args") {
+            } else if pair.len() == 2 && pair[0] == Term::atom(arinsal_term::atoms::ARGS) {
                 opts.args = list(pair[1])?
                     .into_iter()
                     .map(string_bytes)
                     .collect::<Option<Vec<_>>>()?;
                 opts.args_set = true;
-            } else if pair.len() == 2 && pair[0] == atom("arg0") {
+            } else if pair.len() == 2 && pair[0] == Term::atom(arinsal_term::atoms::ARG0) {
                 opts.arg0 = Some(filename_bytes(pair[1], true, true)?);
-            } else if pair.len() == 2 && pair[0] == atom("cd") {
+            } else if pair.len() == 2 && pair[0] == Term::atom(arinsal_term::atoms::CD) {
                 opts.cwd = Some(filename_bytes(pair[1], false, true)?);
-            } else if pair.len() == 2 && pair[0] == atom("env") {
+            } else if pair.len() == 2 && pair[0] == Term::atom(arinsal_term::atoms::ENV) {
                 opts.env.clear();
                 for entry in list(pair[1])? {
                     let env = tuple(entry)?;
@@ -1328,28 +1330,29 @@ fn options(t: Term) -> Option<PortOptions> {
                     if name.is_empty() || name.contains(&b'=') {
                         return None;
                     }
-                    let value = if env[1] == atom("false") {
+                    let value = if env[1] == Term::atom(arinsal_term::atoms::FALSE) {
                         None
                     } else {
                         Some(bytes(env[1])?)
                     };
                     opts.env.push((name, value));
                 }
-            } else if pair.len() == 2 && pair[0] == atom("parallelism") {
+            } else if pair.len() == 2 && pair[0] == Term::atom(arinsal_term::atoms::PARALLELISM) {
                 // Port of erts/emulator/beam/erl_bif_port.c:913 (open_port parallelism), OTP-29.1.1.
-                if pair[1] == atom("true") {
+                if pair[1] == Term::atom(arinsal_term::atoms::TRUE) {
                     opts.parallelism = true;
-                } else if pair[1] == atom("false") {
+                } else if pair[1] == Term::atom(arinsal_term::atoms::FALSE) {
                     opts.parallelism = false;
                 } else {
                     return None;
                 }
             } else if pair.len() == 2
-                && (pair[0] == atom("busy_limits_port") || pair[0] == atom("busy_limits_msgq"))
+                && (pair[0] == Term::atom(arinsal_term::atoms::BUSY_LIMITS_PORT)
+                    || pair[0] == Term::atom(arinsal_term::atoms::BUSY_LIMITS_MSGQ))
             {
                 // Port of erts/emulator/beam/erl_bif_port.c:920 (busy_limits_port / busy_limits_msgq), OTP-29.1.1.
-                let port_limit = pair[0] == atom("busy_limits_port");
-                let (low, high, enabled) = if pair[1] == atom("disabled") {
+                let port_limit = pair[0] == Term::atom(arinsal_term::atoms::BUSY_LIMITS_PORT);
+                let (low, high, enabled) = if pair[1] == Term::atom(arinsal_term::atoms::DISABLED) {
                     (0, 0, false)
                 } else {
                     let limits = tuple(pair[1])?;
@@ -1422,7 +1425,7 @@ fn output_message(
     let Ok(data) = term_data(&mut heap, bytes, binary) else {
         return;
     };
-    let data = TermBuilder::new(&mut heap).tuple(&[atom("data"), data]);
+    let data = TermBuilder::new(&mut heap).tuple(&[Term::atom(arinsal_term::atoms::DATA), data]);
     let Ok(data) = data else { return };
     let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, data]) else {
         return;
@@ -1469,7 +1472,8 @@ pub(crate) fn static_driver_output_binary(
         for byte in header.iter().rev() {
             data = TermBuilder::new(heap).cons(Term::small(i64::from(*byte)).unwrap(), data)?;
         }
-        let message = TermBuilder::new(heap).tuple(&[atom("data"), data])?;
+        let message =
+            TermBuilder::new(heap).tuple(&[Term::atom(arinsal_term::atoms::DATA), data])?;
         TermBuilder::new(heap).tuple(&[port, message])
     };
     if let Ok(message) = build(&mut heap) {
@@ -1499,11 +1503,17 @@ fn line_message(
     let Ok(data) = term_data(&mut heap, bytes, binary) else {
         return;
     };
-    let kind = if complete { atom("eol") } else { atom("noeol") };
+    let kind = if complete {
+        Term::atom(arinsal_term::atoms::EOL)
+    } else {
+        Term::atom(arinsal_term::atoms::NOEOL)
+    };
     let Ok(line) = TermBuilder::new(&mut heap).tuple(&[kind, data]) else {
         return;
     };
-    let Ok(data) = TermBuilder::new(&mut heap).tuple(&[atom("data"), line]) else {
+    let Ok(data) =
+        TermBuilder::new(&mut heap).tuple(&[Term::atom(arinsal_term::atoms::DATA), line])
+    else {
         return;
     };
     if let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, data]) {
@@ -1538,7 +1548,11 @@ fn event_message(
             trace_scope,
             port_id,
             owner,
-            if event == atom("closed") { event } else { msg },
+            if event == Term::atom(arinsal_term::atoms::CLOSED) {
+                event
+            } else {
+                msg
+            },
         );
         publish(scheduler, owner, port, msg);
     }
@@ -1557,7 +1571,9 @@ fn connected_message(
         return;
     };
     let mut heap = ProcessHeap::with_words(24);
-    let Ok(message) = TermBuilder::new(&mut heap).tuple(&[port, atom("connected")]) else {
+    let Ok(message) =
+        TermBuilder::new(&mut heap).tuple(&[port, Term::atom(arinsal_term::atoms::CONNECTED)])
+    else {
         return;
     };
     trace_port_send(scheduler, trace_scope, port_id, owner, message);
@@ -1614,12 +1630,12 @@ fn start(
     if (parsed_opts.args_set || parsed_opts.arg0.is_some())
         && !spec
             .first()
-            .is_some_and(|kind| *kind == atom("spawn_executable"))
+            .is_some_and(|kind| *kind == Term::atom(arinsal_term::atoms::SPAWN_EXECUTABLE))
     {
         return Err(badarg());
     }
     if let [kind, input, output] = spec.as_slice() {
-        if *kind != atom("fd") {
+        if *kind != Term::atom(arinsal_term::atoms::FD) {
             return Err(badarg());
         }
         let input = input.as_small().filter(|fd| *fd >= 0).ok_or_else(badarg)? as RawFd;
@@ -1643,7 +1659,8 @@ fn start(
         ..
     } = parsed_opts;
     if let [kind, cmd] = spec.as_slice()
-        && (*kind == atom("spawn_driver") || *kind == atom("spawn"))
+        && (*kind == Term::atom(arinsal_term::atoms::SPAWN_DRIVER)
+            || *kind == Term::atom(arinsal_term::atoms::SPAWN))
     {
         // erts_convert_filename_to_encoding also takes an atom name.
         let name = match cmd.as_atom() {
@@ -1675,7 +1692,7 @@ fn start(
                     },
                 );
             }
-            None if *kind == atom("spawn_driver") => return Err(badarg()),
+            None if *kind == Term::atom(arinsal_term::atoms::SPAWN_DRIVER) => return Err(badarg()),
             Some(found) => {
                 if let Some((handle_id, driver)) = found.into_loaded() {
                     if want_status {
@@ -1704,7 +1721,7 @@ fn start(
         }
     }
     let (name, executable, child_program, child_args) = match spec.as_slice() {
-        [kind, path] if *kind == atom("spawn_executable") => {
+        [kind, path] if *kind == Term::atom(arinsal_term::atoms::SPAWN_EXECUTABLE) => {
             let path = filename_bytes(*path, false, true).ok_or_else(badarg)?;
             let name = String::from_utf8_lossy(&path).into_owned();
             let args = args.into_iter().map(OsString::from_vec).collect::<Vec<_>>();
@@ -1717,7 +1734,7 @@ fn start(
             };
             (name, true, executable_path, args)
         }
-        [kind, cmd] if *kind == atom("spawn") => {
+        [kind, cmd] if *kind == Term::atom(arinsal_term::atoms::SPAWN) => {
             let cmd = bytes(*cmd).ok_or_else(badarg)?;
             let name = String::from_utf8(cmd).map_err(|_| badarg())?;
             (
@@ -1988,9 +2005,9 @@ fn start_dyn_driver(
         }
         // Port of erts/emulator/beam/erl_bif_port.c:69-89 (open_port error atoms).
         return Ok(match error {
-            arinsal_drv::StartError::General => atom("einval"),
+            arinsal_drv::StartError::General => Term::atom(arinsal_term::atoms::EINVAL),
             arinsal_drv::StartError::Errno(errno) => atom_dyn(&arinsal_drv::errno_id(errno)),
-            arinsal_drv::StartError::Badarg => atom("badarg"),
+            arinsal_drv::StartError::Badarg => Term::atom(arinsal_term::atoms::BADARG),
         });
     }
     link_opener(process, port_id);
@@ -2115,10 +2132,17 @@ impl arinsal_drv::PortHost for DrvHost {
                 list = TermBuilder::new(heap).cons(Term::small(*byte as i64).unwrap(), list)?;
             }
             if let Some(eol) = line {
-                list = TermBuilder::new(heap)
-                    .tuple(&[atom(if eol { "eol" } else { "noeol" }), list])?;
+                list = TermBuilder::new(heap).tuple(&[
+                    Term::atom(if eol {
+                        arinsal_term::atoms::EOL
+                    } else {
+                        arinsal_term::atoms::NOEOL
+                    }),
+                    list,
+                ])?;
             }
-            let data = TermBuilder::new(heap).tuple(&[atom("data"), list])?;
+            let data =
+                TermBuilder::new(heap).tuple(&[Term::atom(arinsal_term::atoms::DATA), list])?;
             TermBuilder::new(heap).tuple(&[port_term, data])
         };
         if let Ok(message) = build(&mut heap) {
@@ -2140,7 +2164,7 @@ impl arinsal_drv::PortHost for DrvHost {
                 handle.owner_pid(),
                 port.id(),
                 handle.trace_scope(),
-                atom("eof"),
+                Term::atom(arinsal_term::atoms::EOF),
             );
         }
     }
@@ -2148,10 +2172,9 @@ impl arinsal_drv::PortHost for DrvHost {
     fn exit(&self, port: &arinsal_drv::DriverPort, reason: arinsal_drv::ExitReason) {
         let runtime = self.runtime;
         let reason = match reason {
-            arinsal_drv::ExitReason::Normal => atom("normal"),
-            arinsal_drv::ExitReason::Code(code) => {
-                Term::small(i64::from(code)).unwrap_or_else(|| atom("normal"))
-            }
+            arinsal_drv::ExitReason::Normal => Term::atom(arinsal_term::atoms::NORMAL),
+            arinsal_drv::ExitReason::Code(code) => Term::small(i64::from(code))
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::NORMAL)),
             arinsal_drv::ExitReason::Atom(name) => atom_dyn(&name),
         };
         driver_port_exit(runtime, port.id(), reason);
@@ -2195,14 +2218,29 @@ impl arinsal_drv::PortHost for DrvHost {
             let message = builder.string_to_list(text)?;
             let args = builder.list_from_iter([message])?;
             let error_logger = builder.flatmap_from_pairs(&[
-                (atom("emulator"), atom("true")),
-                (atom("tag"), atom("error")),
+                (
+                    Term::atom(arinsal_term::atoms::EMULATOR),
+                    Term::atom(arinsal_term::atoms::TRUE),
+                ),
+                (
+                    Term::atom(arinsal_term::atoms::TAG),
+                    Term::atom(arinsal_term::atoms::ERROR),
+                ),
             ])?;
             let metadata = builder.flatmap_from_pairs(&[
-                (atom("error_logger"), error_logger),
-                (atom("time"), Term::small(timestamp).unwrap_or(Term::NIL)),
+                (Term::atom(arinsal_term::atoms::ERROR_LOGGER), error_logger),
+                (
+                    Term::atom(arinsal_term::atoms::TIME),
+                    Term::small(timestamp).unwrap_or(Term::NIL),
+                ),
             ])?;
-            builder.tuple(&[atom("log"), atom("error"), format, args, metadata])
+            builder.tuple(&[
+                Term::atom(arinsal_term::atoms::LOG),
+                Term::atom(arinsal_term::atoms::ERROR),
+                format,
+                args,
+                metadata,
+            ])
         })();
         if let Ok(event) = event
             && let Ok(message) = Message::copy_from(event)
@@ -2266,7 +2304,8 @@ impl arinsal_drv::PortHost for DrvHost {
             for byte in header.iter().rev() {
                 list = TermBuilder::new(heap).cons(Term::small(i64::from(*byte)).unwrap(), list)?;
             }
-            let data = TermBuilder::new(heap).tuple(&[atom("data"), list])?;
+            let data =
+                TermBuilder::new(heap).tuple(&[Term::atom(arinsal_term::atoms::DATA), list])?;
             TermBuilder::new(heap).tuple(&[port_term, data])
         };
         if let Ok(message) = build(&mut heap) {
@@ -2330,7 +2369,7 @@ impl arinsal_drv::PortHost for DrvHost {
             port.id(),
             crate::trace::RECEIVE,
             "receive",
-            &[atom("timeout")],
+            &[Term::atom(arinsal_term::atoms::TIMEOUT)],
         );
     }
 
@@ -2747,7 +2786,14 @@ fn notify_closed(
     from: Pid,
     skip_owner: bool,
 ) {
-    notify_links_monitors(handle, id, scheduler, from, skip_owner, atom("normal"));
+    notify_links_monitors(
+        handle,
+        id,
+        scheduler,
+        from,
+        skip_owner,
+        Term::atom(arinsal_term::atoms::NORMAL),
+    );
 }
 
 fn notify_exit(
@@ -2821,9 +2867,9 @@ fn notify_links_monitors(
                 continue;
             };
             let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
-                atom("DOWN"),
+                Term::atom(arinsal_term::atoms::DOWN),
                 reference_term,
-                atom("port"),
+                Term::atom(arinsal_term::atoms::PORT),
                 object,
                 reason,
             ]) else {
@@ -2872,7 +2918,7 @@ fn signal_port_exit(handle: &PortHandle, id: u64, reason: Term) {
 }
 
 fn signal_badsig(handle: &PortHandle, id: u64) {
-    signal_port_exit(handle, id, atom("badsig"));
+    signal_port_exit(handle, id, Term::atom(arinsal_term::atoms::BADSIG));
 }
 
 /// Mutual exclusion between descriptor creation and `Command::spawn`.
@@ -3478,9 +3524,10 @@ fn exit_status_message(
     code: i64,
 ) {
     let mut heap = ProcessHeap::with_words(16);
-    if let Ok(event) =
-        TermBuilder::new(&mut heap).tuple(&[atom("exit_status"), Term::small(code).unwrap()])
-    {
+    if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[
+        Term::atom(arinsal_term::atoms::EXIT_STATUS),
+        Term::small(code).unwrap(),
+    ]) {
         event_message(scheduler, owner, id, trace_scope, event);
     }
 }
@@ -3525,7 +3572,13 @@ fn end_of_input(
         data.clear();
     }
     if want_eof {
-        event_message(scheduler, owner, id, handle.trace_scope(), atom("eof"));
+        event_message(
+            scheduler,
+            owner,
+            id,
+            handle.trace_scope(),
+            Term::atom(arinsal_term::atoms::EOF),
+        );
         InputEnd::Reported
     } else {
         InputEnd::Terminate
@@ -3846,7 +3899,13 @@ fn worker(
     handle.state.lock().exit_complete = true;
     handle.finish_halt();
     if !closed && handle.state.lock().send_closed {
-        event_message(&scheduler, owner, id, handle.trace_scope(), atom("closed"));
+        event_message(
+            &scheduler,
+            owner,
+            id,
+            handle.trace_scope(),
+            Term::atom(arinsal_term::atoms::CLOSED),
+        );
     }
     if !closed {
         // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
@@ -3882,7 +3941,7 @@ fn eof_exit(
                 id,
                 crate::trace::PORTS,
                 "closed",
-                &[atom("normal")],
+                &[Term::atom(arinsal_term::atoms::NORMAL)],
             );
             remove_port(runtime, id);
         }
@@ -3903,7 +3962,13 @@ fn eof_exit(
     handle.state.lock().exit_complete = true;
     handle.finish_halt();
     if handle.state.lock().send_closed {
-        event_message(scheduler, owner, id, handle.trace_scope(), atom("closed"));
+        event_message(
+            scheduler,
+            owner,
+            id,
+            handle.trace_scope(),
+            Term::atom(arinsal_term::atoms::CLOSED),
+        );
     }
     notify_closed(handle, id, scheduler, owner, false);
 }
@@ -4131,7 +4196,9 @@ impl crate::natives::ThinProcessBif for PortSetData {
 fn thin_failure(error: VmError) -> Box<crate::exceptions::Trap> {
     match error {
         VmError::Trap(trap) => Box::new(trap),
-        _ => Box::new(crate::exceptions::Trap::error(atom("badarg"))),
+        _ => Box::new(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::BADARG,
+        ))),
     }
 }
 
@@ -4189,7 +4256,7 @@ fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmEr
         return Err(badarg());
     }
     raw::retire_data(old_data, &handle.scheduler);
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 pub(crate) fn family(
@@ -4253,19 +4320,19 @@ fn port_control(
 ) -> Result<Term, VmError> {
     let caller = ctx.pid();
     let Some(id) = port_id(process, port) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     let Some(handle) = process
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.ports.get(id))
     else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     if let Some(drv_port) = handle.driver.as_ref() {
         return driver_control(process, ctx, caller, drv_port, op, data);
     }
-    Ok(atom("badarg"))
+    Ok(Term::atom(arinsal_term::atoms::BADARG))
 }
 
 pub(crate) use drv_sig::command_light as port_command_light;
@@ -4280,48 +4347,49 @@ fn port_call(
     data: Term,
 ) -> Result<Term, VmError> {
     let Some(id) = port_id(process, port) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     let Some(handle) = process
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.ports.get(id))
     else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     let Some(op) = op.as_small().and_then(|n| u32::try_from(n).ok()) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     if let Some(drv_port) = handle.driver.as_ref() {
         // Port of erts/emulator/beam/io.c:4618 (erts_port_call).
         let Ok(owned) = to_owned(data) else {
-            return Ok(atom("badarg"));
+            return Ok(Term::atom(arinsal_term::atoms::BADARG));
         };
         let encoded = arinsal_etf::encode(&owned, arinsal_etf::EncodeOptions::default());
         trace_port_receive_indexed(process, caller, id, "call", op, &encoded);
         let Some(reply) = drv_port.call(op, &encoded, packed_pid(caller)) else {
-            return Ok(atom("badarg"));
+            return Ok(Term::atom(arinsal_term::atoms::BADARG));
         };
         if let Some(port) = Term::port(id) {
             let mut trace_heap = VecHeap::new();
             if let Ok(binary) = TermBuilder::new(&mut trace_heap).binary(&reply)
-                && let Ok(call) = TermBuilder::new(&mut trace_heap).tuple(&[atom("call"), binary])
+                && let Ok(call) = TermBuilder::new(&mut trace_heap)
+                    .tuple(&[Term::atom(arinsal_term::atoms::CALL), binary])
                 && let Ok(message) = TermBuilder::new(&mut trace_heap).tuple(&[port, call])
             {
                 trace_port_send(&handle.scheduler, handle.trace_scope(), id, caller, message);
             }
         }
         let Ok((term, _)) = arinsal_etf::decode_prefix(&reply) else {
-            return Ok(atom("badarg"));
+            return Ok(Term::atom(arinsal_term::atoms::BADARG));
         };
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let term = from_owned(&term, &mut heap).map_err(|_| badarg())?;
         return TermBuilder::new(&mut heap)
-            .tuple(&[atom("ok"), term])
+            .tuple(&[Term::atom(arinsal_term::atoms::OK), term])
             .map_err(|_| badarg());
     }
     // No driver currently implements call; match OTP spawn/inet ports on this machine.
-    Ok(atom("badarg"))
+    Ok(Term::atom(arinsal_term::atoms::BADARG))
 }
 
 const ERL_DRV_FLAG_SOFT_BUSY: i32 = 1 << 1;
@@ -4371,12 +4439,12 @@ fn driver_control(
     data: Term,
 ) -> Result<Term, VmError> {
     let Some(opcode) = op.as_small().and_then(|n| u32::try_from(n).ok()) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     // Port of erts/emulator/beam/io.c:4268 (erts_port_control): the iolist is flattened into one
     // buffer sized by erts_iolist_size.
     let Some(bytes) = control_input(data) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     drv_sig::control(process, ctx, caller, drv_port, opcode, bytes)
 }
@@ -4384,7 +4452,9 @@ fn driver_control(
 /// Next local port id for `open_port`, or `system_limit` when the port table is full.
 // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element), OTP-29.1.1.
 fn notsup() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("notsup")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::NOTSUP,
+    )))
 }
 
 fn port_command(
@@ -4406,9 +4476,9 @@ fn port_command(
     if args.len() == 3 {
         let options = list(args[2]).ok_or_else(badarg)?;
         for option in options {
-            if option == atom("nosuspend") {
+            if option == Term::atom(arinsal_term::atoms::NOSUSPEND) {
                 nosuspend = true;
-            } else if option == atom("force") {
+            } else if option == Term::atom(arinsal_term::atoms::FORCE) {
                 force = true;
                 // tcp_inet sets ERL_DRV_FLAG_SOFT_BUSY (inet_drv.c driver flags).
                 // spawn/fd drivers do not, so `force` is `notsup` there.
@@ -4444,9 +4514,13 @@ fn port_command(
                 flags,
                 true,
             ) {
-                drv_sig::PortOp::Done => return Ok(atom("true")),
-                drv_sig::PortOp::Dropped | drv_sig::PortOp::Badarg => return Ok(atom("badarg")),
-                drv_sig::PortOp::Busy if nosuspend => return Ok(atom("false")),
+                drv_sig::PortOp::Done => return Ok(Term::atom(arinsal_term::atoms::TRUE)),
+                drv_sig::PortOp::Dropped | drv_sig::PortOp::Badarg => {
+                    return Ok(Term::atom(arinsal_term::atoms::BADARG));
+                }
+                drv_sig::PortOp::Busy if nosuspend => {
+                    return Ok(Term::atom(arinsal_term::atoms::FALSE));
+                }
                 drv_sig::PortOp::Busy => {
                     if suspend_on_busy(process, &handle, &drv_port, pid) {
                         BUSY_SUSPEND.with(|flag| flag.set(true));
@@ -4457,7 +4531,7 @@ fn port_command(
                 | drv_sig::PortOp::Scheduled(reference) => {
                     return match reference {
                         Some(reference) => drv_sig::reference_term(process, reference),
-                        None => Ok(atom("true")),
+                        None => Ok(Term::atom(arinsal_term::atoms::TRUE)),
                     };
                 }
             }
@@ -4477,7 +4551,9 @@ fn port_command(
         if result.is_ok() {
             handle.add_bytes_out(bytes_out);
         }
-        return result.map(|()| atom("true")).map_err(|()| badarg());
+        return result
+            .map(|()| Term::atom(arinsal_term::atoms::TRUE))
+            .map_err(|()| badarg());
     }
     if let Some((2, hdr)) = handle.framing() {
         match hdr {
@@ -4512,7 +4588,7 @@ fn port_command(
         // Port of erts/emulator/beam/io.c:1754 (erts_port_output), OTP-29.1.1.
         if st.busy_port || st.busy_msgq {
             if nosuspend {
-                return Ok(atom("false"));
+                return Ok(Term::atom(arinsal_term::atoms::FALSE));
             }
             let busy_port = st.busy_port;
             crate::suspend::suspend_self(process);
@@ -4528,7 +4604,7 @@ fn port_command(
     trace_command_received_data(process, ctx.pid(), id, data, &framed);
     command_bytes(&handle, &framed).map_err(|()| badarg())?;
     handle.add_bytes_out(bytes_out);
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 // Port of erts/emulator/beam/io.c:1508 (trace_port_receive command), OTP-29.1.1.
@@ -4575,7 +4651,9 @@ fn trace_command_received(
         };
         binary
     };
-    let Ok(command) = TermBuilder::new(&mut heap).tuple(&[atom("command"), data]) else {
+    let Ok(command) =
+        TermBuilder::new(&mut heap).tuple(&[Term::atom(arinsal_term::atoms::COMMAND), data])
+    else {
         return;
     };
     let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, command]) else {
@@ -4611,7 +4689,9 @@ fn trace_command_received_data(process: &Process, caller: Pid, id: u64, data: Te
     let (Ok(caller), Ok(data)) = (copy_term(caller, &mut heap), data) else {
         return;
     };
-    let Ok(command) = TermBuilder::new(&mut heap).tuple(&[atom("command"), data]) else {
+    let Ok(command) =
+        TermBuilder::new(&mut heap).tuple(&[Term::atom(arinsal_term::atoms::COMMAND), data])
+    else {
         return;
     };
     let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, command]) else {
@@ -4754,7 +4834,9 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
     let id = port_id(process, term).ok_or_else(badarg)?;
     if trace_receive && let Some(caller) = sender.to_term() {
         let mut heap = VecHeap::new();
-        if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, atom("close")]) {
+        if let Ok(event) =
+            TermBuilder::new(&mut heap).tuple(&[caller, Term::atom(arinsal_term::atoms::CLOSE)])
+        {
             crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
         }
     }
@@ -4763,16 +4845,22 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
         id,
         crate::trace::PORTS,
         "closed",
-        &[atom("normal")],
+        &[Term::atom(arinsal_term::atoms::NORMAL)],
     );
     // Port of erts/emulator/beam/io.c:3698 (terminate_port): links get a port exit signal,
     // monitors a DOWN, both with the port as origin. Removal and notification share one
     // critical section of the port table so `demonitor` cannot slip between them.
-    let removed = remove_and_notify(runtime, id, scheduler, sender, atom("normal"));
+    let removed = remove_and_notify(
+        runtime,
+        id,
+        scheduler,
+        sender,
+        Term::atom(arinsal_term::atoms::NORMAL),
+    );
     if let Some(handle) = removed {
         crate::trace::port_closed(runtime, id);
         release_io(&handle);
-        Ok(atom("true"))
+        Ok(Term::atom(arinsal_term::atoms::TRUE))
     } else {
         Err(badarg())
     }
@@ -4799,11 +4887,11 @@ fn port_close(
             process, ctx, caller, &handle, &drv, false, caller, normal, true,
         ) {
             Ok(Some(reference)) => drv_sig::reference_term(process, reference),
-            Ok(None) => Ok(atom("true")),
+            Ok(None) => Ok(Term::atom(arinsal_term::atoms::TRUE)),
             // The light BIF has no scheduler context to schedule the signal with.
             Err(error @ VmError::Unsupported(_)) => Err(error),
             // erl_bif_port.c:405: a dropped close answers `badarg`.
-            Err(_) => Ok(atom("badarg")),
+            Err(_) => Ok(Term::atom(arinsal_term::atoms::BADARG)),
         };
     }
     close(process, port)
@@ -4816,7 +4904,7 @@ pub(crate) fn close_by_id(
     id: u64,
 ) -> Result<bool, VmError> {
     let term = Term::port(id).ok_or_else(badarg)?;
-    close(process, term).map(|result| result == atom("true"))
+    close(process, term).map(|result| result == Term::atom(arinsal_term::atoms::TRUE))
 }
 
 /// Apply an exit signal to a port and deliver its reason to linked processes.
@@ -4828,8 +4916,8 @@ pub(crate) fn exit_port(
 ) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     // Port of erts/emulator/beam/io.c:3854 (deliver_port_exit): `kill` reaches links as `killed`.
-    let reason = if reason == atom("kill") {
-        atom("killed")
+    let reason = if reason == Term::atom(arinsal_term::atoms::KILL) {
+        Term::atom(arinsal_term::atoms::KILLED)
     } else {
         reason
     };
@@ -4891,7 +4979,7 @@ pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progres
             handle.id,
             crate::trace::PORTS,
             "closed",
-            &[atom("killed")],
+            &[Term::atom(arinsal_term::atoms::KILLED)],
         );
         let scheduler = Arc::clone(&handle.scheduler);
         if let Some(removed) = remove_and_notify(
@@ -4899,7 +4987,7 @@ pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progres
             handle.id,
             &scheduler,
             handle.owner_pid(),
-            atom("killed"),
+            Term::atom(arinsal_term::atoms::KILLED),
         ) {
             crate::trace::port_closed(runtime, handle.id);
             release_io(&removed);
@@ -4941,7 +5029,9 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         && let Some(target) = pid.to_term()
     {
         let mut heap = VecHeap::new();
-        if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom("connect"), target]) {
+        if let Ok(message) =
+            TermBuilder::new(&mut heap).tuple(&[Term::atom(arinsal_term::atoms::CONNECT), target])
+        {
             trace_port_receive_term(process, from, id, message);
         }
     }
@@ -4971,7 +5061,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
             &[port],
         );
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 /// Exit the ports linked to a process when it terminates: the process walks its own links and
@@ -4986,7 +5076,7 @@ pub(crate) fn owner_exit(
     reason: Term,
     port_links: &[u64],
 ) {
-    let abnormal = reason != atom("normal");
+    let abnormal = reason != Term::atom(arinsal_term::atoms::NORMAL);
     let affected = {
         let _ports = runtime.ports.lock();
         port_links
@@ -5316,21 +5406,21 @@ fn output_command(
         match hdr {
             1 => {
                 if data.len() > u8::MAX as usize {
-                    signal_port_exit(handle, id, atom("einval"));
+                    signal_port_exit(handle, id, Term::atom(arinsal_term::atoms::EINVAL));
                     return;
                 }
                 data.insert(0, data.len() as u8);
             }
             2 => {
                 if data.len() > u16::MAX as usize {
-                    signal_port_exit(handle, id, atom("einval"));
+                    signal_port_exit(handle, id, Term::atom(arinsal_term::atoms::EINVAL));
                     return;
                 }
                 data.splice(0..0, (data.len() as u16).to_be_bytes());
             }
             4 => {
                 if data.len() > u32::MAX as usize {
-                    signal_port_exit(handle, id, atom("einval"));
+                    signal_port_exit(handle, id, Term::atom(arinsal_term::atoms::EINVAL));
                     return;
                 }
                 data.splice(0..0, (data.len() as u32).to_be_bytes());
@@ -5454,9 +5544,11 @@ fn send_message_inner(
     let from_connected = handle.owner.get() == from;
     let drv = handle.drv_port();
     if let Some(drv) = &drv
-        && (parts[1] == atom("close")
+        && (parts[1] == Term::atom(arinsal_term::atoms::CLOSE)
             || tuple(parts[1]).is_some_and(|command| {
-                command.len() == 2 && command[0] == atom("connect") && command[1].as_pid().is_some()
+                command.len() == 2
+                    && command[0] == Term::atom(arinsal_term::atoms::CONNECT)
+                    && command[1].as_pid().is_some()
             }))
     {
         // Port of erts/emulator/beam/io.c:3975 (erts_port_command): `close` and `connect`
@@ -5465,7 +5557,7 @@ fn send_message_inner(
         if from_connected {
             trace_port_receive_term(process, from, id, parts[1]);
         }
-        if parts[1] == atom("close") {
+        if parts[1] == Term::atom(arinsal_term::atoms::CLOSE) {
             let normal = OwnedTerm::Atom("normal".into());
             let _ = drv_sig::exit(
                 process,
@@ -5485,7 +5577,7 @@ fn send_message_inner(
         }
         return Ok(sent());
     }
-    if parts[1] == atom("close") {
+    if parts[1] == Term::atom(arinsal_term::atoms::CLOSE) {
         if !from_connected {
             signal_badsig(&handle, id);
             return Ok(sent());
@@ -5498,7 +5590,7 @@ fn send_message_inner(
                 from,
                 id,
                 handle.trace_scope(),
-                atom("closed"),
+                Term::atom(arinsal_term::atoms::CLOSED),
             );
             if close_inner(process, port, false).is_err() {
                 return Ok(sent());
@@ -5521,7 +5613,7 @@ fn send_message_inner(
                 from,
                 id,
                 handle.trace_scope(),
-                atom("closed"),
+                Term::atom(arinsal_term::atoms::CLOSED),
             );
         } else {
             poke(&handle);
@@ -5532,13 +5624,17 @@ fn send_message_inner(
         signal_badsig(&handle, id);
         return Ok(sent());
     };
-    if command.len() == 2 && command[0] == atom("command") && !from_connected && drv.is_none() {
+    if command.len() == 2
+        && command[0] == Term::atom(arinsal_term::atoms::COMMAND)
+        && !from_connected
+        && drv.is_none()
+    {
         // io.c:1887 (erts_port_output, bang op): only the connected process may command.
         signal_badsig(&handle, id);
         return Ok(sent());
     }
     if command.len() == 2
-        && command[0] == atom("command")
+        && command[0] == Term::atom(arinsal_term::atoms::COMMAND)
         && let Some(drv_port) = drv
     {
         // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `Port ! {Pid, {command, D}}`.
@@ -5560,7 +5656,7 @@ fn send_message_inner(
             },
         );
     }
-    if command.len() == 2 && command[0] == atom("command") {
+    if command.len() == 2 && command[0] == Term::atom(arinsal_term::atoms::COMMAND) {
         // Port of erts/emulator/beam/io.c:1715-1754 (erts_port_output), OTP-29.1.1.
         // `SEND_YIELD` leaves an already-busy port command unsent and retries it after resume.
         if drv.is_none() {
@@ -5585,7 +5681,7 @@ fn send_message_inner(
         output_command(runtime, &handle, id, from, command[1], Some(process));
         return Ok(sent());
     }
-    if command.len() == 2 && command[0] == atom("connect") {
+    if command.len() == 2 && command[0] == Term::atom(arinsal_term::atoms::CONNECT) {
         if !from_connected || command[1].as_pid().is_none() {
             signal_badsig(&handle, id);
             return Ok(sent());
@@ -5624,7 +5720,7 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
     let command = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
-            .tuple(&[atom("command"), encoded])
+            .tuple(&[Term::atom(arinsal_term::atoms::COMMAND), encoded])
             .map_err(|_| badarg())?
     };
     let envelope = {
@@ -5672,13 +5768,13 @@ fn forker_port_info(process: &mut Process, item: Option<Term>) -> Result<Term, V
         ("connected", connected),
         ("input", zero),
         ("output", zero),
-        ("os_pid", atom("undefined")),
+        ("os_pid", Term::atom(arinsal_term::atoms::UNDEFINED)),
         ("monitors", Term::NIL),
         ("monitored_by", Term::NIL),
         ("memory", zero),
         ("queue_size", zero),
-        ("locking", atom("driver_level")),
-        ("parallelism", atom("false")),
+        ("locking", crate::atom_cache::put("driver_level")),
+        ("parallelism", Term::atom(arinsal_term::atoms::FALSE)),
     ];
     if let Some(item) = item {
         let key = global_atoms()
@@ -5700,7 +5796,7 @@ fn forker_port_info(process: &mut Process, item: Option<Term>) -> Result<Term, V
         .take(7)
         .map(|(key, value)| {
             TermBuilder::new(&mut heap)
-                .tuple(&[atom(key), value])
+                .tuple(&[crate::atom_cache::put(key), value])
                 .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
         })
         .collect::<Result<_, _>>()?;
@@ -5724,7 +5820,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
                 .as_ref()
                 .and_then(|runtime| runtime.reg.whereis_port(name))
             else {
-                return Ok(atom("undefined"));
+                return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
             };
             id
         }
@@ -5735,7 +5831,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         return if id == 0 {
             forker_port_info(process, item)
         } else {
-            Ok(atom("undefined"))
+            Ok(Term::atom(arinsal_term::atoms::UNDEFINED))
         };
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -5769,7 +5865,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
                 .to_term()
                 .ok_or_else(badarg)?;
             TermBuilder::new(&mut heap)
-                .tuple(&[atom("process"), pid])
+                .tuple(&[Term::atom(arinsal_term::atoms::PROCESS), pid])
                 .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -5791,10 +5887,10 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     // Port of erts/emulator/beam/io.c (port_info os_pid): a driver that never
     // called `erl_drv_set_os_pid` reports `undefined`.
     let os_pid = match drv_port.map(|drv| drv.os_pid()) {
-        Some(pid) if pid < 0 => atom("undefined"),
+        Some(pid) if pid < 0 => Term::atom(arinsal_term::atoms::UNDEFINED),
         Some(pid) => Term::small(pid).unwrap(),
         None => match handle.os_pid.load(Ordering::Acquire) {
-            OS_PID_PENDING => atom("undefined"),
+            OS_PID_PENDING => Term::atom(arinsal_term::atoms::UNDEFINED),
             pid => Term::small(i64::from(pid)).unwrap(),
         },
     };
@@ -5805,7 +5901,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let has_registered_name = registered_atom.is_some();
     let registered_name = registered_atom
         .map(Term::atom)
-        .unwrap_or_else(|| atom("undefined"));
+        .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED));
     let fields = [
         ("registered_name", registered_name),
         ("name", name),
@@ -5819,10 +5915,14 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         ("monitored_by", monitored_by),
         ("memory", Term::small(memory as i64).unwrap()),
         ("queue_size", Term::small(queue_size as i64).unwrap()),
-        ("locking", atom("port_level")),
+        ("locking", crate::atom_cache::put("port_level")),
         (
             "parallelism",
-            atom(if handle.parallelism { "true" } else { "false" }),
+            Term::atom(if handle.parallelism {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }),
         ),
     ];
     if let Some(item) = item {
@@ -5833,7 +5933,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
             .iter()
             .find_map(|(name, value)| (*name == key).then_some(*value))
             .ok_or_else(badarg)?;
-        if key == "registered_name" && value == atom("undefined") {
+        if key == "registered_name" && value == Term::atom(arinsal_term::atoms::UNDEFINED) {
             return Ok(Term::NIL);
         }
         return TermBuilder::new(&mut heap)
@@ -5842,10 +5942,12 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     }
     let tuples: Vec<Term> = fields
         .into_iter()
-        .filter(|(key, value)| *key != "registered_name" || *value != atom("undefined"))
+        .filter(|(key, value)| {
+            *key != "registered_name" || *value != Term::atom(arinsal_term::atoms::UNDEFINED)
+        })
         .take(if has_registered_name { 8 } else { 7 })
         .map(|(key, value)| {
-            let key = atom(key);
+            let key = crate::atom_cache::put(key);
             TermBuilder::new(&mut heap)
                 .tuple(&[key, value])
                 .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))

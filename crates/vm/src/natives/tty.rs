@@ -12,7 +12,7 @@ use crate::{Process, Vm, VmError, exceptions};
 use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx, Scheduler};
-use arinsal_term::{ProcessHeap, Term, TermBuilder, from_owned, global_atoms};
+use arinsal_term::{ProcessHeap, Term, TermBuilder, from_owned};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
@@ -423,16 +423,17 @@ fn deliver(watch: Watch) {
     let _ = scheduler.send(watch.target.pid, watch.target.pid, message);
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in atom"))
-}
-
 fn select_message(tty: &OwnedTerm, reference: &OwnedTerm) -> Option<Message> {
     let mut heap = ProcessHeap::with_words(128);
     let tty = from_owned(tty, &mut heap).ok()?;
     let reference = from_owned(reference, &mut heap).ok()?;
     let term = TermBuilder::new(&mut heap)
-        .tuple(&[atom("select"), tty, reference, atom("ready_input")])
+        .tuple(&[
+            Term::atom(arinsal_term::atoms::SELECT),
+            tty,
+            reference,
+            Term::atom(arinsal_term::atoms::READY_INPUT),
+        ])
         .ok()?;
     Message::copy_from(term).ok()
 }

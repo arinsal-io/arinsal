@@ -1106,7 +1106,7 @@ fn create_child(
             |heap_words, slot| {
                 let mut heap =
                     arinsal_term::ProcessHeap::with_words_at(heap_words, parent_alloc_ix);
-                heap.set_min_heap_size(min_heap);
+                heap.set_normalized_min_heap_size(min_heap);
                 crate::proc_create::raw::initialize_spawned(slot, 3, heap)
             },
             init_child,

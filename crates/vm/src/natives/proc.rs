@@ -8,16 +8,14 @@ use arinsal_term::{
 };
 use std::sync::atomic::Ordering;
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("short built-in atom"))
-}
-
 fn atom_name(term: Term) -> Option<String> {
     Some(global_atoms().text(term.as_atom()?)?.to_string())
 }
 
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 fn term_equal(left: Term, right: Term) -> bool {
@@ -572,63 +570,84 @@ pub(crate) fn group_leader_self_light(
         return None;
     }
     set_group_leader(process, leader).ok()?;
-    Some(Ok(atom("true")))
+    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
 }
 
 fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError> {
     let previous = match name {
         "trap_exit" => {
-            let enabled = if value == atom("true") {
+            let enabled = if value == Term::atom(arinsal_term::atoms::TRUE) {
                 true
-            } else if value == atom("false") {
+            } else if value == Term::atom(arinsal_term::atoms::FALSE) {
                 false
             } else {
                 return Err(badarg());
             };
             let old = process.trap_exit;
             process.trap_exit = enabled;
-            atom(if old { "true" } else { "false" })
+            Term::atom(if old {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            })
         }
         "error_handler" => {
             if value.as_atom().is_none() {
                 return Err(badarg());
             }
-            set_flag(process, name, value).unwrap_or_else(|| atom("error_handler"))
+            set_flag(process, name, value)
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::ERROR_HANDLER))
         }
         "priority" => {
             if !["low", "normal", "high", "max"]
                 .iter()
-                .any(|n| value == atom(n))
+                .any(|n| value == crate::atom_cache::put(n))
             {
                 return Err(badarg());
             }
-            set_flag(process, name, value).unwrap_or_else(|| atom("normal"))
+            set_flag(process, name, value)
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::NORMAL))
         }
         "message_queue_data" => {
-            if value != atom("on_heap") && value != atom("off_heap") {
+            if value != Term::atom(arinsal_term::atoms::ON_HEAP)
+                && value != Term::atom(arinsal_term::atoms::OFF_HEAP)
+            {
                 return Err(badarg());
             }
             // Port of erts/emulator/beam/erl_message.c:1054 (message queue data flag), OTP-29.1.1.
-            let previous = flag_value(process, name).unwrap_or_else(|| atom("on_heap"));
+            let previous = flag_value(process, name)
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::ON_HEAP));
             set_flag(process, name, value);
-            process.cold_mut().off_heap_msgq = value == atom("off_heap");
+            process.cold_mut().off_heap_msgq = value == Term::atom(arinsal_term::atoms::OFF_HEAP);
             previous
         }
         "sensitive" => {
-            if value != atom("true") && value != atom("false") {
+            if value != Term::atom(arinsal_term::atoms::TRUE)
+                && value != Term::atom(arinsal_term::atoms::FALSE)
+            {
                 return Err(badarg());
             }
             // Port of erts/emulator/beam/bif.c:2173 (process_flag sensitive), OTP-29.1.1.
             let pid = process.self_pid.ok_or_else(badarg)?;
-            let old = crate::trace::set_sensitive(process, pid, value == atom("true"));
+            let old = crate::trace::set_sensitive(
+                process,
+                pid,
+                value == Term::atom(arinsal_term::atoms::TRUE),
+            );
             set_flag(process, name, value);
-            atom(if old { "true" } else { "false" })
+            Term::atom(if old {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            })
         }
         "async_dist" => {
-            if value != atom("true") && value != atom("false") {
+            if value != Term::atom(arinsal_term::atoms::TRUE)
+                && value != Term::atom(arinsal_term::atoms::FALSE)
+            {
                 return Err(badarg());
             }
-            set_flag(process, name, value).unwrap_or_else(|| atom("false"))
+            set_flag(process, name, value).unwrap_or_else(|| Term::atom(arinsal_term::atoms::FALSE))
         }
         "save_calls" => return save_calls_flag(process, value).map_err(VmError::Trap),
         "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size" => {
@@ -977,9 +996,11 @@ fn process_info_aux(
             match (rp.runtime.as_ref(), src) {
                 // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
                 // OTP-29.1.1: another process is classified from its state word.
-                (Some(runtime), InfoSource::Other(_)) => atom(runtime.remote_status(pid)),
+                (Some(runtime), InfoSource::Other(_)) => {
+                    crate::atom_cache::put(runtime.remote_status(pid))
+                }
                 (Some(runtime), InfoSource::Caller) if runtime.suspend_active(pid) => {
-                    atom(runtime.remote_status(pid))
+                    crate::atom_cache::put(runtime.remote_status(pid))
                 }
                 _ => status,
             }
@@ -993,16 +1014,16 @@ fn process_info_aux(
         arinsal_term::atoms::MONITORS => process_info_item_monitors(process, pid)?,
         arinsal_term::atoms::MONITORED_BY => process_info_item_monitored_by(process, pid)?,
         // The queue mode is the process's own (erts p->sig_qs.flags FS_OFF_HEAP_MSGQ).
-        arinsal_term::atoms::MESSAGE_QUEUE_DATA => atom(
+        arinsal_term::atoms::MESSAGE_QUEUE_DATA => Term::atom(
             if src
                 .read(process)
                 .cold
                 .as_ref()
                 .is_some_and(|cold| cold.off_heap_msgq)
             {
-                "off_heap"
+                arinsal_term::atoms::OFF_HEAP
             } else {
-                "on_heap"
+                arinsal_term::atoms::ON_HEAP
             },
         ),
         arinsal_term::atoms::PRIORITY
@@ -1048,7 +1069,7 @@ fn process_info_aux(
                     process,
                     &[
                         Term::atom(global_atoms().intern(&module).map_err(|_| badarg())?),
-                        atom(&function),
+                        crate::atom_cache::put(&function),
                         Term::small(i64::from(arity)).ok_or_else(badarg)?,
                     ],
                 )?
@@ -1305,7 +1326,7 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
                     )
                     .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))?,
                 };
-                make_tuple(process, &[atom("process"), object])
+                make_tuple(process, &[Term::atom(arinsal_term::atoms::PROCESS), object])
             })
             .collect::<Result<Vec<_>, _>>()?;
         let _ = pid;
@@ -1342,7 +1363,7 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .chain(port_monitors.into_iter().filter_map(|object| {
                 let object = arinsal_term::from_owned(&object, &mut heap).ok()?;
                 TermBuilder::new(&mut heap)
-                    .tuple(&[atom("port"), object])
+                    .tuple(&[Term::atom(arinsal_term::atoms::PORT), object])
                     .ok()
             }))
             .collect::<Vec<_>>();
@@ -1497,10 +1518,13 @@ fn process_info_item_current_location(
         });
         let location = if let Some((file, line)) = source {
             let file = charlist(process, &file)?;
-            let file = make_tuple(process, &[atom("file"), file])?;
+            let file = make_tuple(process, &[Term::atom(arinsal_term::atoms::FILE), file])?;
             let line = make_tuple(
                 process,
-                &[atom("line"), Term::small(line as i64).ok_or_else(badarg)?],
+                &[
+                    Term::atom(arinsal_term::atoms::LINE),
+                    Term::small(line as i64).ok_or_else(badarg)?,
+                ],
             )?;
             make_list(process, [file, line])?
         } else {
@@ -1510,7 +1534,7 @@ fn process_info_item_current_location(
             process,
             &[
                 Term::atom(global_atoms().intern(&module_name).map_err(|_| badarg())?),
-                atom(&function),
+                crate::atom_cache::put(&function),
                 Term::small(arity as i64).unwrap(),
                 location,
             ],
@@ -1556,7 +1580,7 @@ fn process_info_item_garbage_collection(
             ),
             // Port of DECL_AM(minor_gcs) in erl_bif_info.c's process_info_aux: OTP interns this
             // per item while the other four row keys are predeclared atoms.
-            (atom("minor_gcs"), minor_gcs),
+            (crate::atom_cache::put("minor_gcs"), minor_gcs),
         ]) {
             *row = block.tuple(&[name, value])?;
         }
@@ -1622,7 +1646,7 @@ fn gc_info_atom(name: &'static str) -> Term {
         "bin_vheap_size"
         | "bin_vheap_block_size"
         | "bin_old_vheap_size"
-        | "bin_old_vheap_block_size" => atom(name),
+        | "bin_old_vheap_block_size" => crate::atom_cache::put(name),
         _ => unreachable!("unknown process GC info key"),
     }
 }
@@ -1686,18 +1710,19 @@ fn process_info_item_registered_name(process: &Process, pid: Pid) -> Result<Term
 #[inline(never)]
 fn process_info_item_label(process: &mut Process) -> Result<Term, VmError> {
     Ok({
-        let label_key = atom("$process_label");
+        let label_key = Term::atom(arinsal_term::atoms::DOLLARPROCESSLABEL);
         process
             .dictionary
             .as_ref()
             .and_then(|dictionary| dictionary.get(label_key))
-            .unwrap_or_else(|| atom("undefined"))
+            .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED))
     })
 }
 
 #[inline(never)]
 fn process_info_item_priority_messages(process: &Process) -> Result<Term, VmError> {
-    Ok(flag_value(process, "priority_messages").unwrap_or_else(|| atom("false")))
+    Ok(flag_value(process, "priority_messages")
+        .unwrap_or_else(|| Term::atom(arinsal_term::atoms::FALSE)))
 }
 
 fn charlist(process: &mut Process, value: &str) -> Result<Term, VmError> {
@@ -1839,12 +1864,16 @@ pub(crate) fn fun_info_arity_light(
     if let Err(error) = process.ensure_entry(3, 0) {
         return Some(Err(match error {
             VmError::Trap(trap) => trap,
-            _ => crate::exceptions::Trap::error(atom("system_limit")),
+            _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
         }));
     }
     let arity = Term::small(i64::from(arity)).expect("fun arity fits a small integer");
     let result = TermBuilder::new(&mut process.heap).tuple2(*what, arity);
-    Some(result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit"))))
+    Some(
+        result.map_err(|_| {
+            crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
+        }),
+    )
 }
 
 // Port of erts/emulator/beam/bif.c:4608 (list_to_port_1), OTP-29.1.1.
@@ -1922,10 +1951,17 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
     if let Some(owner) = saved {
         return arinsal_term::TermBuilder::new(&mut heap)
             .magic_ref(owner)
-            .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))));
+            .map_err(|_| {
+                VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            });
     }
-    Term::local_ref(&mut heap, refn)
-        .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))
+    Term::local_ref(&mut heap, refn).map_err(|_| {
+        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 /// Local `#Fun<Module.old_index.old_uniq>`, export `fun Module:Name/Arity`.
@@ -2425,7 +2461,9 @@ pub(crate) fn process_info_light(
         Ok(Some(Err(VmError::Trap(trap)))) => Some(Err(trap)),
         Ok(Some(Err(_))) => None,
         Ok(None) => None,
-        Err(arinsal_sched::SignalFreeError::NoProcess) => Some(Ok(atom("undefined"))),
+        Err(arinsal_sched::SignalFreeError::NoProcess) => {
+            Some(Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
+        }
         Err(arinsal_sched::SignalFreeError::Busy) => None,
     }
 }
@@ -2472,7 +2510,7 @@ pub(crate) fn process_info_1_light(
         )
         .map_err(|error| match error {
             VmError::Trap(trap) => trap,
-            _ => crate::exceptions::Trap::error(atom("system_limit")),
+            _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
         }),
     )
 }
@@ -2545,7 +2583,9 @@ fn process_info_light_single(
         Ok(Some(Err(VmError::Trap(trap)))) => Some(Err(trap)),
         Ok(Some(Err(_))) => None,
         Ok(None) => None,
-        Err(arinsal_sched::SignalFreeError::NoProcess) => Some(Ok(atom("undefined"))),
+        Err(arinsal_sched::SignalFreeError::NoProcess) => {
+            Some(Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
+        }
         Err(arinsal_sched::SignalFreeError::Busy) => None,
     }
 }
@@ -2642,7 +2682,9 @@ fn process_info_call(
         match read {
             Ok(Some(result)) => return result,
             Ok(None) | Err(arinsal_sched::SignalFreeError::Busy) => {}
-            Err(arinsal_sched::SignalFreeError::NoProcess) => return Ok(atom("undefined")),
+            Err(arinsal_sched::SignalFreeError::NoProcess) => {
+                return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
+            }
         }
     }
     let items = match item {
@@ -2666,7 +2708,7 @@ fn process_info_call(
                 vec![reference],
             )))
         }
-        Err(arinsal_sched::Error::NoProcess) => Ok(atom("undefined")),
+        Err(arinsal_sched::Error::NoProcess) => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         Err(error) => Err(VmError::Unsupported(format!(
             "process_info request: {error}"
         ))),
@@ -2726,9 +2768,13 @@ fn gc_message(process: &mut Process, request_id: Term, ok: bool) -> Result<Term,
     make_tuple(
         process,
         &[
-            atom("garbage_collect"),
+            Term::atom(arinsal_term::atoms::GARBAGE_COLLECT),
             request_id,
-            atom(if ok { "true" } else { "false" }),
+            Term::atom(if ok {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }),
         ],
     )
 }
@@ -2796,14 +2842,14 @@ pub(crate) fn fulfill_request(
             // DIRTY_RUNNING_SYS are all `running`, and only a parked process is `waiting`.
             // A process queued on a dirty run queue but not executing is `runnable`
             // (ERTS_PSFLG_DIRTY_ACTIVE_SYS); the running states above take precedence.
-            let status = atom(if ctx.dirty_running() {
-                "running"
+            let status = Term::atom(if ctx.dirty_running() {
+                arinsal_term::atoms::RUNNING
             } else if ctx.dirty_queued() {
-                "runnable"
+                arinsal_term::atoms::RUNNABLE
             } else if crate::signals::is_waiting(process, ctx.pid()) {
-                "waiting"
+                arinsal_term::atoms::WAITING
             } else {
-                "running"
+                arinsal_term::atoms::RUNNING
             });
             let pid = ctx.pid();
             let info = process_info(
@@ -2820,11 +2866,12 @@ pub(crate) fn fulfill_request(
         }
         crate::signals::RemoteOp::GroupLeader { leader } => {
             set_group_leader(process, leader)?;
-            make_tuple(process, &[reference, atom("true")])
+            make_tuple(process, &[reference, Term::atom(arinsal_term::atoms::TRUE)])
         }
         crate::signals::RemoteOp::SaveCalls { value } => {
             let value = value.decode_into(process)?;
-            let previous = save_calls_flag(process, value).unwrap_or_else(|_| atom("badarg"));
+            let previous = save_calls_flag(process, value)
+                .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::BADARG));
             make_tuple(process, &[reference, previous])
         }
         crate::signals::RemoteOp::Collect { .. } => Err(VmError::Unsupported(
@@ -2834,12 +2881,16 @@ pub(crate) fn fulfill_request(
             let request_id = request_id.decode_into(process)?;
             make_tuple(
                 process,
-                &[atom("system_task_test"), request_id, atom("true")],
+                &[
+                    crate::atom_cache::put("system_task_test"),
+                    request_id,
+                    Term::atom(arinsal_term::atoms::TRUE),
+                ],
             )
         }
         crate::signals::RemoteOp::Display => {
             eprintln!("process {:?}: backtrace", ctx.pid());
-            make_tuple(process, &[reference, atom("true")])
+            make_tuple(process, &[reference, Term::atom(arinsal_term::atoms::TRUE)])
         }
         crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
             "priority signal task has no reply".into(),
@@ -2858,14 +2909,25 @@ pub(crate) fn fulfill_request(
                 })
             });
             if kill && references {
-                let reason = Message::copy_from(atom("kill"))?;
+                let reason = Message::copy_from(Term::atom(arinsal_term::atoms::KILL))?;
                 ctx.signal(ctx.pid(), Signal::Exit(Box::new(reason)))
                     .map_err(|error| VmError::Unsupported(format!("CPC kill signal: {error}")))?;
             }
-            let result = atom(if references { "true" } else { "false" });
+            let result = Term::atom(if references {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            });
             if let Some(request) = async_request {
                 let request = request.decode_into(process)?;
-                make_tuple(process, &[atom("check_process_code"), request, result])
+                make_tuple(
+                    process,
+                    &[
+                        Term::atom(arinsal_term::atoms::CHECK_PROCESS_CODE),
+                        request,
+                        result,
+                    ],
+                )
             } else {
                 make_tuple(process, &[reference, result])
             }
@@ -2880,15 +2942,20 @@ pub(crate) fn failure_reply(
 ) -> Result<Term, VmError> {
     let reference = crate::signals::reference(process, id)?;
     match op {
-        crate::signals::RemoteOp::Info { .. } => {
-            make_tuple(process, &[reference, atom("undefined")])
-        }
+        crate::signals::RemoteOp::Info { .. } => make_tuple(
+            process,
+            &[reference, Term::atom(arinsal_term::atoms::UNDEFINED)],
+        ),
         crate::signals::RemoteOp::GroupLeader { .. } | crate::signals::RemoteOp::Display => {
-            make_tuple(process, &[reference, atom("badarg")])
+            make_tuple(
+                process,
+                &[reference, Term::atom(arinsal_term::atoms::BADARG)],
+            )
         }
-        crate::signals::RemoteOp::SaveCalls { .. } => {
-            make_tuple(process, &[reference, atom("badarg")])
-        }
+        crate::signals::RemoteOp::SaveCalls { .. } => make_tuple(
+            process,
+            &[reference, Term::atom(arinsal_term::atoms::BADARG)],
+        ),
         crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
             "priority signal task has no reply".into(),
         )),
@@ -2900,14 +2967,25 @@ pub(crate) fn failure_reply(
             let request_id = request_id.decode_into(process)?;
             make_tuple(
                 process,
-                &[atom("system_task_test"), request_id, atom("false")],
+                &[
+                    crate::atom_cache::put("system_task_test"),
+                    request_id,
+                    Term::atom(arinsal_term::atoms::FALSE),
+                ],
             )
         }
         crate::signals::RemoteOp::CheckProcessCode { async_request, .. } => {
-            let result = atom("false");
+            let result = Term::atom(arinsal_term::atoms::FALSE);
             if let Some(request) = async_request {
                 let request = request.decode_into(process)?;
-                make_tuple(process, &[atom("check_process_code"), request, result])
+                make_tuple(
+                    process,
+                    &[
+                        Term::atom(arinsal_term::atoms::CHECK_PROCESS_CODE),
+                        request,
+                        result,
+                    ],
+                )
             } else {
                 make_tuple(process, &[reference, result])
             }
@@ -2939,30 +3017,33 @@ fn group_leader_call(
     let internal = module == "erts_internal";
     let Some(leader) = Pid::from_term(leader) else {
         return if internal {
-            Ok(atom("badarg"))
+            Ok(Term::atom(arinsal_term::atoms::BADARG))
         } else {
             Err(badarg())
         };
     };
     let Some(pid) = Pid::from_term(target) else {
         return if internal {
-            Ok(atom("badarg"))
+            Ok(Term::atom(arinsal_term::atoms::BADARG))
         } else {
             Err(badarg())
         };
     };
     if pid == ctx.pid() {
         set_group_leader(process, leader)?;
-        return Ok(atom("true"));
+        return Ok(Term::atom(arinsal_term::atoms::TRUE));
     }
     if !live(process, pid)? {
         if let Some(reference) = signal_ref {
-            let reply = make_tuple(process, &[reference, atom("badarg")])?;
+            let reply = make_tuple(
+                process,
+                &[reference, Term::atom(arinsal_term::atoms::BADARG)],
+            )?;
             process.inbox.push_back(reply);
-            return Ok(atom("ok"));
+            return Ok(Term::atom(arinsal_term::atoms::OK));
         }
         return if internal {
-            Ok(atom("badarg"))
+            Ok(Term::atom(arinsal_term::atoms::BADARG))
         } else {
             Err(badarg())
         };
@@ -2970,7 +3051,7 @@ fn group_leader_call(
     // erts_internal:group_leader/2 reports the lock as busy and lets the Erlang wrapper
     // send group_leader/3 and receive the reply itself.
     let Some(reference) = signal_ref else {
-        return Ok(atom("false"));
+        return Ok(Term::atom(arinsal_term::atoms::FALSE));
     };
     // Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3) and
     // erl_proc_sig_queue.c (erts_proc_sig_send_group_leader), OTP-29.1.1.
@@ -2982,12 +3063,15 @@ fn group_leader_call(
     match ctx.signal(pid, signal) {
         Ok(()) => {
             crate::signals::elevate_for_signal_request(process, ctx, pid)?;
-            Ok(atom("ok"))
+            Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Err(arinsal_sched::Error::NoProcess) => {
-            let reply = make_tuple(process, &[reference, atom("badarg")])?;
+            let reply = make_tuple(
+                process,
+                &[reference, Term::atom(arinsal_term::atoms::BADARG)],
+            )?;
             process.inbox.push_back(reply);
-            Ok(atom("ok"))
+            Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Err(error) => Err(VmError::Unsupported(format!(
             "group_leader request: {error}"
@@ -3005,27 +3089,27 @@ fn process_display_call(
     display: Term,
 ) -> Result<Term, VmError> {
     let internal = module == "erts_internal";
-    if display != atom("backtrace") {
+    if display != Term::atom(arinsal_term::atoms::BACKTRACE) {
         return if internal {
-            Ok(atom("badopt"))
+            Ok(Term::atom(arinsal_term::atoms::BADOPT))
         } else {
             Err(badarg())
         };
     }
     let Some(pid) = Pid::from_term(target) else {
         return if internal {
-            Ok(atom("badarg"))
+            Ok(Term::atom(arinsal_term::atoms::BADARG))
         } else {
             Err(badarg())
         };
     };
     if pid == ctx.pid() {
         eprintln!("process {pid:?}: backtrace");
-        return Ok(atom("true"));
+        return Ok(Term::atom(arinsal_term::atoms::TRUE));
     }
     if !live(process, pid)? {
         return if internal {
-            Ok(atom("badarg"))
+            Ok(Term::atom(arinsal_term::atoms::BADARG))
         } else {
             Err(badarg())
         };
@@ -3045,7 +3129,7 @@ fn process_display_call(
         }
         Err(arinsal_sched::Error::NoProcess) => {
             if internal {
-                Ok(atom("badarg"))
+                Ok(Term::atom(arinsal_term::atoms::BADARG))
             } else {
                 Err(badarg())
             }
@@ -3178,7 +3262,11 @@ fn call_values(
                     .runtime
                     .as_ref()
                     .is_some_and(|runtime| runtime.system_processes.lock().unwrap().contains(&pid));
-                Ok(atom(if is_system { "true" } else { "false" }))
+                Ok(Term::atom(if is_system {
+                    arinsal_term::atoms::TRUE
+                } else {
+                    arinsal_term::atoms::FALSE
+                }))
             }
             // Port of erts/emulator/beam/bif.c:4505 (pid_to_list_1), OTP-29.1.1.
             ("pid_to_list", [pid]) if module == "erlang" => {
@@ -3228,13 +3316,13 @@ fn call_values(
             // the process goes to the back of its run queue and returns `true`.
             ("yield", []) if module == "erlang" => {
                 process.set_force_yield(true);
-                Ok(atom("true"))
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             }
             ("process_flag", [name, value]) => {
-                if *name == atom("monitor_nodes") {
+                if *name == Term::atom(arinsal_term::atoms::MONITOR_NODES) {
                     let enabled = match *value {
-                        value if value == atom("true") => true,
-                        value if value == atom("false") => false,
+                        value if value == Term::atom(arinsal_term::atoms::TRUE) => true,
+                        value if value == Term::atom(arinsal_term::atoms::FALSE) => false,
                         _ => return Err(badarg()),
                     };
                     let mut nodes = crate::node_tables::lock();
@@ -3268,8 +3356,8 @@ fn call_values(
                     && parts[0] == arinsal_etf::OwnedTerm::atom("monitor_nodes")
                 {
                     let enabled = match *value {
-                        value if value == atom("true") => true,
-                        value if value == atom("false") => false,
+                        value if value == Term::atom(arinsal_term::atoms::TRUE) => true,
+                        value if value == Term::atom(arinsal_term::atoms::FALSE) => false,
                         _ => return Err(badarg()),
                     };
                     let options = crate::node_tables::parse_nodes_monitor_options(&parts[1])
@@ -3312,16 +3400,22 @@ fn call_values(
                 }
                 let previous = if name == "message_queue_data" {
                     // The queue mode is the process's own (erts p->sig_qs.flags FS_OFF_HEAP_MSGQ).
-                    let off_heap = *value == atom("off_heap");
+                    let off_heap = *value == Term::atom(arinsal_term::atoms::OFF_HEAP);
                     let previous = process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
                     process.cold_mut().off_heap_msgq = off_heap;
-                    atom(if previous { "off_heap" } else { "on_heap" })
+                    Term::atom(if previous {
+                        arinsal_term::atoms::OFF_HEAP
+                    } else {
+                        arinsal_term::atoms::ON_HEAP
+                    })
                 } else {
                     flag(process, &name, *value)?
                 };
                 if name == "message_queue_data" {
                     // Port of erts/emulator/beam/bif.c:process_flag_2, OTP-29.1.1.
-                    ctx.set_parallel_signal_buffers(*value == atom("off_heap"));
+                    ctx.set_parallel_signal_buffers(
+                        *value == Term::atom(arinsal_term::atoms::OFF_HEAP),
+                    );
                 }
                 if name == "priority" {
                     // Port of erts/emulator/beam/erl_process.c (erts_set_process_priority),
@@ -3345,7 +3439,7 @@ fn call_values(
                     return save_calls_flag(process, *value).map_err(VmError::Trap);
                 }
                 let Some(pid) = Pid::from_term(*target) else {
-                    return Ok(atom("badtype"));
+                    return Ok(Term::atom(arinsal_term::atoms::BADTYPE));
                 };
                 if name != "save_calls" {
                     return Err(badarg());
@@ -3361,7 +3455,9 @@ fn call_values(
                         crate::signals::elevate_for_signal_request(process, ctx, pid)?;
                         crate::signals::reference(process, id)
                     }
-                    Err(arinsal_sched::Error::NoProcess) => Ok(atom("badtype")),
+                    Err(arinsal_sched::Error::NoProcess) => {
+                        Ok(Term::atom(arinsal_term::atoms::BADTYPE))
+                    }
                     Err(error) => Err(VmError::Unsupported(format!(
                         "process_flag request: {error}"
                     ))),
@@ -3379,7 +3475,11 @@ fn call_values(
             ("unalias", [reference]) => {
                 let id = crate::signals::ref_id(*reference).ok_or_else(badarg)?;
                 let owned = crate::signals::unalias_origin(process, id);
-                Ok(atom(if owned { "true" } else { "false" }))
+                Ok(Term::atom(if owned {
+                    arinsal_term::atoms::TRUE
+                } else {
+                    arinsal_term::atoms::FALSE
+                }))
             }
             ("hibernate", [module, function, args]) => {
                 hibernate(process, ctx, *module, *function, *args)
@@ -3447,7 +3547,11 @@ fn call_values(
                         crate::trace_bp::clear_session(process, session);
                         vm.refresh_all_trace_breakpoints(process);
                     }
-                    Ok(atom(if destroyed { "true" } else { "false" }))
+                    Ok(Term::atom(if destroyed {
+                        arinsal_term::atoms::TRUE
+                    } else {
+                        arinsal_term::atoms::FALSE
+                    }))
                 })
             }
             // Port of erts/emulator/beam/erl_bif_trace.c:1386-1435 (trace_info_2,
@@ -3493,7 +3597,7 @@ pub(crate) fn process_flag_save_calls_bif(
     let [name, value] = args else {
         return None;
     };
-    if *name != atom("save_calls") {
+    if *name != Term::atom(arinsal_term::atoms::SAVE_CALLS) {
         return None;
     }
     Some(save_calls_flag(process, *value))
@@ -3508,7 +3612,7 @@ pub(crate) fn save_calls_flag(
     let n = value
         .as_small()
         .filter(|n| (0..=10_000).contains(n))
-        .ok_or_else(|| crate::exceptions::Trap::error(atom("badarg")))?;
+        .ok_or_else(|| crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::BADARG)))?;
     let old = crate::trace::set_save_calls(process, n as usize);
     set_flag(
         process,
@@ -3536,7 +3640,8 @@ pub(crate) fn dictionary_bif(function: &str, arity: u8) -> Option<super::Process
 
 /// A list or tuple the dictionary BIFs build on the process heap (`HAlloc` never fails).
 fn dictionary_alloc(result: Result<Term, VmError>) -> Result<Term, crate::exceptions::Trap> {
-    result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit")))
+    result
+        .map_err(|_| crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)))
 }
 
 fn dictionary_put(
@@ -3562,7 +3667,11 @@ fn dictionary_get0(
     let entries = dictionary.entries();
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let result = TermBuilder::new(&mut heap).tuple2_list_from_iter_reversed(len, entries);
-    Some(result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit"))))
+    Some(
+        result.map_err(|_| {
+            crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
+        }),
+    )
 }
 
 fn dictionary_get1(
@@ -3573,7 +3682,7 @@ fn dictionary_get1(
         .dictionary
         .as_ref()
         .and_then(|dictionary| dictionary.get(args[0]))
-        .unwrap_or(atom("undefined"))))
+        .unwrap_or(Term::atom(arinsal_term::atoms::UNDEFINED))))
 }
 
 fn dictionary_get_keys0(
@@ -3657,8 +3766,8 @@ fn hibernate(
     }
     if rest != Term::NIL {
         if arity > 255 {
-            return Err(VmError::Trap(crate::exceptions::Trap::error(atom(
-                "system_limit",
+            return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
             ))));
         }
         return Err(badarg());
@@ -3706,7 +3815,7 @@ fn hibernate_zero(
         .is_some_and(|cont| cont.resume_in_place && !cont.stop)
     {
         process.cold_mut().hibernate = None;
-        return Ok(atom("ok"));
+        return Ok(Term::atom(arinsal_term::atoms::OK));
     }
     // `i_hibernate/0` retains the current MFA. Capture it before the scheduler hands the process
     // off, since the interpreter IP may then describe the process entry trampoline.
@@ -3932,10 +4041,10 @@ fn spawn_request(
     options: Term,
 ) -> Result<Term, VmError> {
     if module.as_atom().is_none() || function.as_atom().is_none() || list(args).is_none() {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     }
     let Some(parsed) = parse_spawn_options(process.runtime, options) else {
-        return Ok(atom("badopt"));
+        return Ok(Term::atom(arinsal_term::atoms::BADOPT));
     };
     process
         .runtime
@@ -3946,7 +4055,12 @@ fn spawn_request(
         if parsed.reply_error {
             let message = make_tuple(
                 process,
-                &[parsed.tag, reference, atom("error"), atom("badopt")],
+                &[
+                    parsed.tag,
+                    reference,
+                    Term::atom(arinsal_term::atoms::ERROR),
+                    Term::atom(arinsal_term::atoms::BADOPT),
+                ],
             )?;
             let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
             process.send_message(self_pid, message)?;
@@ -3998,15 +4112,15 @@ fn dist_spawn_request(
     options: Term,
     kind: Term,
 ) -> Result<Term, VmError> {
-    if node.as_atom().is_none() || node == atom("nonode@nohost") {
-        return Ok(atom("badarg"));
+    if node.as_atom().is_none() || node == Term::atom(arinsal_term::atoms::NONAME) {
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     }
     // SAFETY: The MFA tuple stays rooted in the caller's registers.
     let Some(tuple) = (unsafe { mfa.tuple_ref() }) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
     if tuple.len() != 3 {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     }
     let (module, function, args) = (
         tuple.get(0).ok_or_else(badarg)?,
@@ -4014,34 +4128,34 @@ fn dist_spawn_request(
         tuple.get(2).ok_or_else(badarg)?,
     );
     if module.as_atom().is_none() || function.as_atom().is_none() || list(args).is_none() {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     }
     let Some(items) = list(options) else {
-        return Ok(atom("badarg"));
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
     };
-    let mut tag = atom("spawn_reply");
+    let mut tag = Term::atom(arinsal_term::atoms::SPAWN_REPLY);
     let mut reply_error = true;
     let mut monitor = false;
     let mut bad = false;
     for item in items {
-        if item == atom("monitor") {
+        if item == Term::atom(arinsal_term::atoms::MONITOR) {
             monitor = true;
         } else if let Some((key, value)) = tuple2(item) {
-            if key == atom("reply_tag") {
-                if kind != atom("spawn_request") {
-                    return Ok(atom("badarg"));
+            if key == Term::atom(arinsal_term::atoms::REPLY_TAG) {
+                if kind != Term::atom(arinsal_term::atoms::SPAWN_REQUEST) {
+                    return Ok(Term::atom(arinsal_term::atoms::BADARG));
                 }
                 tag = value;
-            } else if key == atom("reply") {
+            } else if key == Term::atom(arinsal_term::atoms::REPLY) {
                 match reply_mode(value) {
                     Some((success, error)) => {
                         let _ = success;
                         reply_error = error;
                     }
-                    None if kind == atom("spawn_request") => bad = true,
-                    None => return Ok(atom("badarg")),
+                    None if kind == Term::atom(arinsal_term::atoms::SPAWN_REQUEST) => bad = true,
+                    None => return Ok(Term::atom(arinsal_term::atoms::BADARG)),
                 }
-            } else if key == atom("monitor") {
+            } else if key == Term::atom(arinsal_term::atoms::MONITOR) {
                 monitor = true;
             }
         }
@@ -4051,17 +4165,36 @@ fn dist_spawn_request(
         .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
     let id = process.next_ref();
     let reference = crate::signals::reference(process, id)?;
-    let reason = atom(if bad { "badopt" } else { "noconnection" });
+    let reason = Term::atom(if bad {
+        arinsal_term::atoms::BADOPT
+    } else {
+        arinsal_term::atoms::NOCONNECTION
+    });
     if reply_error {
-        let message = make_tuple(process, &[tag, reference, atom("error"), reason])?;
+        let message = make_tuple(
+            process,
+            &[
+                tag,
+                reference,
+                Term::atom(arinsal_term::atoms::ERROR),
+                reason,
+            ],
+        )?;
         let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
         process.send_message(self_pid, message)?;
     }
-    if kind == atom("spawn_opt") {
+    if kind == Term::atom(arinsal_term::atoms::SPAWN_OPT) {
         // Port of erts/emulator/beam/dist.c:6073-6080, OTP-29.1.1.
         make_tuple(
             process,
-            &[reference, atom(if monitor { "true" } else { "false" })],
+            &[
+                reference,
+                Term::atom(if monitor {
+                    arinsal_term::atoms::TRUE
+                } else {
+                    arinsal_term::atoms::FALSE
+                }),
+            ],
         )
     } else {
         Ok(reference)
@@ -4080,7 +4213,11 @@ fn spawn_request_abandon(caller: arinsal_sched::Pid, id: Term) -> Result<Term, V
     let abandoned = id.local_ref_numbers().is_some()
         && crate::signals::ref_id(id)
             .is_some_and(|key| crate::dist::spawn_request_abandon(caller, key));
-    Ok(atom(if abandoned { "true" } else { "false" }))
+    Ok(Term::atom(if abandoned {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    }))
 }
 
 struct LocalSpawn {
@@ -4122,19 +4259,19 @@ fn parse_spawn_options(
         priority: Priority::Normal,
         fullsweep: None,
         async_dist: super::sys::gc_defaults(runtime).async_dist(),
-        tag: atom("spawn_reply"),
+        tag: Term::atom(arinsal_term::atoms::SPAWN_REPLY),
         reply_success: true,
         reply_error: true,
         bad: false,
         monitor_id: None,
     };
     for item in items {
-        if item == atom("link") {
+        if item == Term::atom(arinsal_term::atoms::LINK) {
             parsed.link = true;
-        } else if item == atom("monitor") {
+        } else if item == Term::atom(arinsal_term::atoms::MONITOR) {
             parsed.monitor = true;
         } else if let Some((key, value)) = tuple2(item) {
-            if key == atom("priority") {
+            if key == Term::atom(arinsal_term::atoms::PRIORITY) {
                 parsed.priority = match atom_name(value).as_deref() {
                     Some("max") => Priority::Max,
                     Some("high") => Priority::High,
@@ -4145,12 +4282,12 @@ fn parse_spawn_options(
                         continue;
                     }
                 };
-            } else if key == atom("min_heap_size") {
+            } else if key == Term::atom(arinsal_term::atoms::MIN_HEAP_SIZE) {
                 match value.as_small() {
                     Some(n) if n >= 0 => parsed.min_heap = Some((n as usize).max(233)),
                     _ => parsed.bad = true,
                 }
-            } else if key == atom("max_heap_size") {
+            } else if key == Term::atom(arinsal_term::atoms::MAX_HEAP_SIZE) {
                 match parse_max_heap_from(
                     value,
                     super::sys::gc_spawn_defaults(runtime).max_heap_size,
@@ -4158,31 +4295,35 @@ fn parse_spawn_options(
                     Ok(limit) => parsed.max_heap = Some(limit),
                     Err(()) => parsed.bad = true,
                 }
-            } else if key == atom("min_bin_vheap_size") {
+            } else if key == Term::atom(arinsal_term::atoms::MIN_BIN_VHEAP_SIZE) {
                 match value.as_small() {
                     Some(n) if n >= 0 => parsed.min_bin_vheap = Some(n as usize),
                     _ => parsed.bad = true,
                 }
-            } else if key == atom("fullsweep_after") {
+            } else if key == Term::atom(arinsal_term::atoms::FULLSWEEP_AFTER) {
                 match value.as_small() {
                     Some(n) if n >= 0 => parsed.fullsweep = Some(n.min(u16::MAX as i64) as u16),
                     _ => parsed.bad = true,
                 }
-            } else if key == atom("message_queue_data") {
-                if value != atom("on_heap") && value != atom("off_heap") {
+            } else if key == Term::atom(arinsal_term::atoms::MESSAGE_QUEUE_DATA) {
+                if value != Term::atom(arinsal_term::atoms::ON_HEAP)
+                    && value != Term::atom(arinsal_term::atoms::OFF_HEAP)
+                {
                     parsed.bad = true;
                 }
-            } else if key == atom("async_dist") {
-                if value != atom("true") && value != atom("false") {
+            } else if key == Term::atom(arinsal_term::atoms::ASYNC_DIST) {
+                if value != Term::atom(arinsal_term::atoms::TRUE)
+                    && value != Term::atom(arinsal_term::atoms::FALSE)
+                {
                     parsed.bad = true;
                 }
                 // Port of erts/emulator/beam/erl_process.c:12289 (erts_parse_spawn_opts).
-                parsed.async_dist = value == atom("true");
-            } else if key == atom("scheduler") {
+                parsed.async_dist = value == Term::atom(arinsal_term::atoms::TRUE);
+            } else if key == Term::atom(arinsal_term::atoms::SCHEDULER) {
                 if value.as_small().is_none_or(|n| n < 0) {
                     parsed.bad = true;
                 }
-            } else if key == atom("reply") {
+            } else if key == Term::atom(arinsal_term::atoms::REPLY) {
                 match reply_mode(value) {
                     Some((success, error)) => {
                         parsed.reply_success = success;
@@ -4190,12 +4331,14 @@ fn parse_spawn_options(
                     }
                     None => parsed.bad = true,
                 }
-            } else if key == atom("reply_tag") {
+            } else if key == Term::atom(arinsal_term::atoms::REPLY_TAG) {
                 parsed.tag = value;
-            } else if key == atom("link") || key == atom("monitor") {
+            } else if key == Term::atom(arinsal_term::atoms::LINK)
+                || key == Term::atom(arinsal_term::atoms::MONITOR)
+            {
                 if list(value).is_none() {
                     parsed.bad = true;
-                } else if key == atom("link") {
+                } else if key == Term::atom(arinsal_term::atoms::LINK) {
                     parsed.link = true;
                 } else {
                     match crate::signals::spawn_monitor_options(value) {
@@ -4227,13 +4370,13 @@ fn parse_spawn_options(
 }
 
 fn reply_mode(value: Term) -> Option<(bool, bool)> {
-    if value == atom("yes") {
+    if value == Term::atom(arinsal_term::atoms::YES) {
         Some((true, true))
-    } else if value == atom("no") {
+    } else if value == Term::atom(arinsal_term::atoms::NO) {
         Some((false, false))
-    } else if value == atom("error_only") {
+    } else if value == Term::atom(arinsal_term::atoms::ERROR_ONLY) {
         Some((false, true))
-    } else if value == atom("success_only") {
+    } else if value == Term::atom(arinsal_term::atoms::SUCCESS_ONLY) {
         Some((true, false))
     } else {
         None
@@ -4378,14 +4521,14 @@ pub(crate) fn parse_max_heap_from(
     }
     // SAFETY: The flag map stays rooted in the caller's registers.
     let map = unsafe { value.flatmap_ref() }.ok_or(())?;
-    let size = map.get(atom("size")).ok_or(())?;
+    let size = map.get(Term::atom(arinsal_term::atoms::SIZE)).ok_or(())?;
     let size = size.as_small().filter(|size| *size >= 0).ok_or(())?;
     limit.size = size as u64;
     let boolean = |key: &str| -> Result<Option<bool>, ()> {
-        match map.get(atom(key)) {
+        match map.get(crate::atom_cache::put(key)) {
             None => Ok(None),
-            Some(term) if term == atom("true") => Ok(Some(true)),
-            Some(term) if term == atom("false") => Ok(Some(false)),
+            Some(term) if term == Term::atom(arinsal_term::atoms::TRUE) => Ok(Some(true)),
+            Some(term) if term == Term::atom(arinsal_term::atoms::FALSE) => Ok(Some(false)),
             Some(_) => Err(()),
         }
     };
@@ -4425,16 +4568,18 @@ fn create_alias(
     if options.iter().any(|option| {
         !["explicit_unalias", "reply", "priority"]
             .iter()
-            .any(|name| *option == atom(name))
+            .any(|name| *option == crate::atom_cache::put(name))
     }) {
         return Err(badarg());
     }
-    let priority = options.iter().any(|option| *option == atom("priority"));
+    let priority = options
+        .iter()
+        .any(|option| *option == Term::atom(arinsal_term::atoms::PRIORITY));
     let mut mode = crate::proc_create::AliasMode::ExplicitUnalias;
     for option in options {
-        if *option == atom("reply") {
+        if *option == Term::atom(arinsal_term::atoms::REPLY) {
             mode = crate::proc_create::AliasMode::ReplyDemonitor;
-        } else if *option == atom("explicit_unalias") {
+        } else if *option == Term::atom(arinsal_term::atoms::EXPLICIT_UNALIAS) {
             mode = crate::proc_create::AliasMode::ExplicitUnalias;
         }
     }
@@ -4521,9 +4666,9 @@ fn trace(
 ) -> Result<Term, VmError> {
     // A tracer module may have been loaded by another scheduler just now.
     vm.refresh_code();
-    let on = if how == atom("true") {
+    let on = if how == Term::atom(arinsal_term::atoms::TRUE) {
         true
-    } else if how == atom("false") {
+    } else if how == Term::atom(arinsal_term::atoms::FALSE) {
         false
     } else {
         return Err(badarg());
@@ -4766,7 +4911,7 @@ fn trace_session_create(
     if name.as_atom().is_none() || options != Term::NIL {
         return Err(badarg());
     }
-    let tracer = if tracer_term == atom("undefined") {
+    let tracer = if tracer_term == Term::atom(arinsal_term::atoms::UNDEFINED) {
         crate::trace::Tracer::Default
     } else if let Some(pid) = Pid::from_term(tracer_term) {
         if !live(process, pid)? {
@@ -4887,7 +5032,7 @@ fn trace_session_refs_term(
         .map(|(name, weak_id)| {
             let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
             let weak_id = if weak_id < 0 {
-                atom("default")
+                Term::atom(arinsal_term::atoms::DEFAULT)
             } else {
                 Term::small(weak_id).ok_or_else(badarg)?
             };
@@ -4952,7 +5097,7 @@ fn trace_session_info(
         }
         let (enabled, match_spec) = crate::trace::event_match_spec(process, session, &event);
         let value = if !enabled {
-            atom("false")
+            Term::atom(arinsal_term::atoms::FALSE)
         } else if let Some(match_spec) = match_spec {
             arinsal_term::from_owned(
                 &match_spec,
@@ -4960,7 +5105,7 @@ fn trace_session_info(
             )
             .map_err(|_| badarg())?
         } else {
-            atom("true")
+            Term::atom(arinsal_term::atoms::TRUE)
         };
         return make_tuple(process, &[item, value]);
     }
@@ -4975,7 +5120,7 @@ fn trace_session_info(
             .map(|(name, weak_id)| {
                 let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
                 let weak_id = if weak_id < 0 {
-                    atom("default")
+                    Term::atom(arinsal_term::atoms::DEFAULT)
                 } else {
                     Term::small(weak_id).ok_or_else(badarg)?
                 };
@@ -4997,13 +5142,13 @@ fn trace_session_info(
                 process,
                 process_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
-                    .map(|(name, _)| atom(name)),
+                    .map(|(name, _)| crate::atom_cache::put(name)),
             )?,
             Some("tracer") => crate::trace::new_process_tracer(process, session)
                 .map(|tracer| trace_tracer_term(process, tracer))
                 .transpose()?
                 .unwrap_or(Term::NIL),
-            _ => return Ok(atom("undefined")),
+            _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         };
         return make_tuple(process, &[item, value]);
     }
@@ -5019,13 +5164,13 @@ fn trace_session_info(
                 process,
                 port_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
-                    .map(|(name, _)| atom(name)),
+                    .map(|(name, _)| crate::atom_cache::put(name)),
             )?,
             Some("tracer") => crate::trace::new_port_tracer(process, session)
                 .map(|tracer| trace_tracer_term(process, tracer))
                 .transpose()?
                 .unwrap_or(Term::NIL),
-            _ => return Ok(atom("undefined")),
+            _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         };
         return make_tuple(process, &[item, value]);
     }
@@ -5034,7 +5179,7 @@ fn trace_session_info(
     }
     if let Some(port) = spec.as_port() {
         if port != 0 && !crate::port::is_live(process, port) {
-            return Ok(atom("undefined"));
+            return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
         }
         if session == 0 && atom_name(item).as_deref() == Some("session") {
             let refs = crate::trace::port_session_refs(process, port)
@@ -5042,7 +5187,7 @@ fn trace_session_info(
                 .map(|(name, weak_id)| {
                     let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
                     let weak_id = if weak_id < 0 {
-                        atom("default")
+                        Term::atom(arinsal_term::atoms::DEFAULT)
                     } else {
                         Term::small(weak_id).ok_or_else(badarg)?
                     };
@@ -5058,21 +5203,21 @@ fn trace_session_info(
                 process,
                 port_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
-                    .map(|(name, _)| atom(name)),
+                    .map(|(name, _)| crate::atom_cache::put(name)),
             )?,
             Some("tracer") => crate::trace::port_tracer(process, session, port)
                 .map(|tracer| trace_tracer_term(process, tracer))
                 .transpose()?
                 .unwrap_or(Term::NIL),
-            _ => return Ok(atom("undefined")),
+            _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         };
         return make_tuple(process, &[item, value]);
     }
     let Some(pid) = Pid::from_term(spec) else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     if !live(process, pid)? {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     }
     if session == 0 && atom_name(item).as_deref() == Some("session") {
         let refs = crate::trace::process_session_refs(process, pid);
@@ -5085,17 +5230,17 @@ fn trace_session_info(
             process,
             process_trace_flag_names()
                 .filter(|(_, bit)| flags & bit != 0)
-                .map(|(name, _)| atom(name)),
+                .map(|(name, _)| crate::atom_cache::put(name)),
         )?,
         Some("tracer") => {
             crate::trace::process_tracer(process, session, pid).map_or(Term::NIL, |tracer| {
                 match tracer {
-                    crate::trace::Tracer::Pid(pid) => {
-                        pid.to_term().unwrap_or_else(|| atom("undefined"))
-                    }
+                    crate::trace::Tracer::Pid(pid) => pid
+                        .to_term()
+                        .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED)),
                     crate::trace::Tracer::Default => Term::NIL,
                     crate::trace::Tracer::Port(id) => {
-                        Term::port(id).unwrap_or_else(|| atom("undefined"))
+                        Term::port(id).unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED))
                     }
                     crate::trace::Tracer::Module { module, state, .. } => {
                         let module =
@@ -5104,13 +5249,14 @@ fn trace_session_info(
                             &state,
                             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                         )
-                        .unwrap_or_else(|_| atom("undefined"));
-                        make_tuple(process, &[module, state]).unwrap_or_else(|_| atom("undefined"))
+                        .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::UNDEFINED));
+                        make_tuple(process, &[module, state])
+                            .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::UNDEFINED))
                     }
                 }
             })
         }
-        _ => return Ok(atom("undefined")),
+        _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
     };
     make_tuple(process, &[item, value])
 }
@@ -5133,7 +5279,7 @@ fn trace_info(
         }
         let (enabled, match_spec) = crate::trace::event_match_spec(process, 0, &event);
         let value = if !enabled {
-            atom("false")
+            Term::atom(arinsal_term::atoms::FALSE)
         } else if let Some(match_spec) = match_spec {
             arinsal_term::from_owned(
                 &match_spec,
@@ -5141,7 +5287,7 @@ fn trace_info(
             )
             .map_err(|_| badarg())?
         } else {
-            atom("true")
+            Term::atom(arinsal_term::atoms::TRUE)
         };
         return make_tuple(process, &[item, value]);
     }
@@ -5152,13 +5298,13 @@ fn trace_info(
                 process,
                 process_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
-                    .map(|(name, _)| atom(name)),
+                    .map(|(name, _)| crate::atom_cache::put(name)),
             )?,
             Some("tracer") => crate::trace::new_process_tracer(process, 0)
                 .map(|tracer| trace_tracer_term(process, tracer))
                 .transpose()?
                 .unwrap_or(Term::NIL),
-            _ => return Ok(atom("undefined")),
+            _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         };
         return make_tuple(process, &[item, value]);
     }
@@ -5169,13 +5315,13 @@ fn trace_info(
                 process,
                 port_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
-                    .map(|(name, _)| atom(name)),
+                    .map(|(name, _)| crate::atom_cache::put(name)),
             )?,
             Some("tracer") => crate::trace::new_port_tracer(process, 0)
                 .map(|tracer| trace_tracer_term(process, tracer))
                 .transpose()?
                 .unwrap_or(Term::NIL),
-            _ => return Ok(atom("undefined")),
+            _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         };
         return make_tuple(process, &[item, value]);
     }
@@ -5184,7 +5330,7 @@ fn trace_info(
     }
     if let Some(port) = spec.as_port() {
         if port != 0 && !crate::port::is_live(process, port) {
-            return Ok(atom("undefined"));
+            return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
         }
         if atom_name(item).as_deref() == Some("session") {
             let refs = crate::trace::port_session_refs(process, port)
@@ -5192,7 +5338,7 @@ fn trace_info(
                 .map(|(name, weak_id)| {
                     let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
                     let weak_id = if weak_id < 0 {
-                        atom("default")
+                        Term::atom(arinsal_term::atoms::DEFAULT)
                     } else {
                         Term::small(weak_id).ok_or_else(badarg)?
                     };
@@ -5208,39 +5354,42 @@ fn trace_info(
                 process,
                 port_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
-                    .map(|(name, _)| atom(name)),
+                    .map(|(name, _)| crate::atom_cache::put(name)),
             )?,
             Some("tracer") => crate::trace::port_tracer(process, 0, port)
                 .map(|tracer| trace_tracer_term(process, tracer))
                 .transpose()?
                 .unwrap_or(Term::NIL),
-            _ => return Ok(atom("undefined")),
+            _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
         };
         return make_tuple(process, &[item, value]);
     }
     let Some(pid) = Pid::from_term(spec) else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     if !live(process, pid)? {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     }
     let flags = crate::trace::session_flags(process, 0, pid);
     let value = match atom_name(item).as_deref() {
         Some("flags") => {
             let list = process_trace_flag_names()
                 .filter(|(_, bit)| flags & bit != 0)
-                .map(|(name, _)| atom(name));
+                .map(|(name, _)| crate::atom_cache::put(name));
             let list_term = make_list(process, list)?;
-            make_tuple(process, &[atom("flags"), list_term])?
+            make_tuple(
+                process,
+                &[Term::atom(arinsal_term::atoms::FLAGS), list_term],
+            )?
         }
         Some("tracer") => {
             let tracer = match crate::trace::tracer(process, pid) {
-                Some(crate::trace::Tracer::Pid(pid)) => {
-                    pid.to_term().unwrap_or_else(|| atom("undefined"))
-                }
+                Some(crate::trace::Tracer::Pid(pid)) => pid
+                    .to_term()
+                    .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED)),
                 Some(crate::trace::Tracer::Default) => Term::NIL,
                 Some(crate::trace::Tracer::Port(id)) => {
-                    Term::port(id).unwrap_or_else(|| atom("undefined"))
+                    Term::port(id).unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED))
                 }
                 Some(crate::trace::Tracer::Module { module, state, .. }) => {
                     let module =
@@ -5249,14 +5398,15 @@ fn trace_info(
                         &state,
                         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                     )
-                    .unwrap_or_else(|_| atom("undefined"));
-                    make_tuple(process, &[module, state]).unwrap_or_else(|_| atom("undefined"))
+                    .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::UNDEFINED));
+                    make_tuple(process, &[module, state])
+                        .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::UNDEFINED))
                 }
                 None => Term::NIL,
             };
-            make_tuple(process, &[atom("tracer"), tracer])?
+            make_tuple(process, &[Term::atom(arinsal_term::atoms::TRACER), tracer])?
         }
-        _ => return Ok(atom("undefined")),
+        _ => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
     };
     Ok(value)
 }
@@ -5308,7 +5458,7 @@ fn trace_info_function(
     if key == "session" {
         // Port of erts/emulator/beam/erl_bif_trace.c:2427-2468 (trace_info_sessions), OTP-29.1.1.
         if !function_exists(vm, &module, &function, arity) {
-            return make_tuple(process, &[item, atom("undefined")]);
+            return make_tuple(process, &[item, Term::atom(arinsal_term::atoms::UNDEFINED)]);
         }
         let refs = crate::trace_bp::sessions_for_function(process, &module, &function, arity)
             .into_iter()
@@ -5328,7 +5478,7 @@ fn trace_info_function(
     };
     // A function that does not exist reports `undefined`, an untraced one `false`.
     if !function_exists(vm, &module, &function, arity) {
-        return make_tuple(process, &[item, atom("undefined")]);
+        return make_tuple(process, &[item, Term::atom(arinsal_term::atoms::UNDEFINED)]);
     }
     let mut info =
         crate::trace_bp::function_info(process, session, &module, &function, arity, want, false);
@@ -5377,7 +5527,7 @@ fn trace_info_function(
         }
     }
     if info.got == 0 {
-        return make_tuple(process, &[item, atom("false")]);
+        return make_tuple(process, &[item, Term::atom(arinsal_term::atoms::FALSE)]);
     }
     let owned = |process: &mut Process, term: &arinsal_etf::OwnedTerm| {
         arinsal_term::from_owned(
@@ -5387,22 +5537,25 @@ fn trace_info_function(
         .map_err(|_| badarg())
     };
     let (traced, mut match_spec) = if info.got & GOT_GLOBAL != 0 {
-        (atom("global"), Term::NIL)
+        (Term::atom(arinsal_term::atoms::GLOBAL), Term::NIL)
     } else if info.got & GOT_LOCAL != 0 {
-        (atom("local"), Term::NIL)
+        (Term::atom(arinsal_term::atoms::LOCAL), Term::NIL)
     } else {
-        (atom("false"), atom("false"))
+        (
+            Term::atom(arinsal_term::atoms::FALSE),
+            Term::atom(arinsal_term::atoms::FALSE),
+        )
     };
     if let Some(spec) = &info.local_ms {
         match_spec = owned(process, spec)?;
     }
     let tracer_term = |process: &mut Process, tracer: crate::trace::Tracer| match tracer {
-        crate::trace::Tracer::Default => Ok(atom("false")),
+        crate::trace::Tracer::Default => Ok(Term::atom(arinsal_term::atoms::FALSE)),
         tracer => trace_tracer_term(process, tracer),
     };
     let meta_match_spec = |process: &mut Process| -> Result<Term, VmError> {
         if info.got & GOT_META == 0 {
-            return Ok(atom("false"));
+            return Ok(Term::atom(arinsal_term::atoms::FALSE));
         }
         match &info.meta_ms {
             Some(spec) => owned(process, spec),
@@ -5411,7 +5564,7 @@ fn trace_info_function(
     };
     let call_count = |process: &mut Process| -> Result<Term, VmError> {
         if info.got & GOT_COUNT == 0 {
-            return Ok(atom("false"));
+            return Ok(Term::atom(arinsal_term::atoms::FALSE));
         }
         arinsal_term::TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .int_from_i64(info.count as i64)
@@ -5420,7 +5573,7 @@ fn trace_info_function(
     // Port of erts/emulator/beam/beam_bp.c:1664-1736 (erts_build_timem_info).
     let call_time = |process: &mut Process| -> Result<Term, VmError> {
         let Some(entries) = info.time.as_ref().filter(|_| info.got & GOT_TIME != 0) else {
-            return Ok(atom("false"));
+            return Ok(Term::atom(arinsal_term::atoms::FALSE));
         };
         let mut tuples = Vec::new();
         for (pid, count, nanos) in entries {
@@ -5440,7 +5593,7 @@ fn trace_info_function(
     };
     let call_memory = |process: &mut Process| -> Result<Term, VmError> {
         let Some(entries) = info.memory.as_ref().filter(|_| info.got & GOT_MEMORY != 0) else {
-            return Ok(atom("false"));
+            return Ok(Term::atom(arinsal_term::atoms::FALSE));
         };
         let mut tuples = Vec::new();
         for (pid, count, words) in entries {
@@ -5467,7 +5620,7 @@ fn trace_info_function(
         "meta" => {
             // Backwards compatibility: no meta tracer is `[]`.
             match tracer_term(process, info.meta.clone())? {
-                term if term == atom("false") => Term::NIL,
+                term if term == Term::atom(arinsal_term::atoms::FALSE) => Term::NIL,
                 term => term,
             }
         }
@@ -5492,7 +5645,7 @@ fn trace_info_function(
             ];
             let mut pairs = Vec::new();
             for (key, value) in entries {
-                pairs.push(make_tuple(process, &[atom(key), value])?);
+                pairs.push(make_tuple(process, &[crate::atom_cache::put(key), value])?);
             }
             make_list(process, pairs)?
         }
@@ -5555,9 +5708,11 @@ fn compile_trace_pattern(pattern: Term, event: Option<bool>) -> Result<(), VmErr
     };
     match compiled {
         Ok(_) => Ok(()),
-        Err(arinsal_ets::EtsError::Term(arinsal_term::TermError::SystemLimit)) => Err(
-            VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))),
-        ),
+        Err(arinsal_ets::EtsError::Term(arinsal_term::TermError::SystemLimit)) => {
+            Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            ))))
+        }
         Err(_) => Err(badarg()),
     }
 }
@@ -5566,7 +5721,7 @@ fn compile_trace_pattern(pattern: Term, event: Option<bool>) -> Result<(), VmErr
 // Port of erts/emulator/beam/erl_bif_trace.c:2292-2420 (trace_info_on_load), OTP-29.1.1.
 fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result<Term, VmError> {
     let Some(state) = crate::trace_bp::on_load_pattern(process, session) else {
-        return make_tuple(process, &[item, atom("false")]);
+        return make_tuple(process, &[item, Term::atom(arinsal_term::atoms::FALSE)]);
     };
     let flags = state.flags;
     let owned = |process: &mut Process, term: &Option<arinsal_etf::OwnedTerm>| match term {
@@ -5578,37 +5733,43 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
         None => Ok(Term::NIL),
     };
     let traced = if !flags.breakpoint {
-        atom("global")
+        Term::atom(arinsal_term::atoms::GLOBAL)
     } else if flags.local {
-        atom("local")
+        Term::atom(arinsal_term::atoms::LOCAL)
     } else {
-        atom("false")
+        Term::atom(arinsal_term::atoms::FALSE)
     };
-    let bool_atom = |value: bool| atom(if value { "true" } else { "false" });
+    let bool_atom = |value: bool| {
+        Term::atom(if value {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        })
+    };
     let value = match atom_name(item).as_deref() {
         Some("traced") => traced,
         Some("match_spec") => {
             if !flags.breakpoint || flags.local {
                 owned(process, &state.match_spec)?
             } else {
-                atom("false")
+                Term::atom(arinsal_term::atoms::FALSE)
             }
         }
         Some("meta") => {
             if flags.meta {
                 match state.meta_tracer.clone() {
-                    crate::trace::Tracer::Default => atom("false"),
+                    crate::trace::Tracer::Default => Term::atom(arinsal_term::atoms::FALSE),
                     tracer => trace_tracer_term(process, tracer)?,
                 }
             } else {
-                atom("false")
+                Term::atom(arinsal_term::atoms::FALSE)
             }
         }
         Some("meta_match_spec") => {
             if flags.meta {
                 owned(process, &state.meta_match_spec)?
             } else {
-                atom("false")
+                Term::atom(arinsal_term::atoms::FALSE)
             }
         }
         Some("call_count") => bool_atom(flags.call_count),
@@ -5618,22 +5779,26 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
             let mut match_spec = if flags.local || !flags.breakpoint {
                 Term::NIL
             } else {
-                atom("false")
+                Term::atom(arinsal_term::atoms::FALSE)
             };
             if state.match_spec.is_some() {
                 match_spec = owned(process, &state.match_spec)?;
             }
-            let mut meta_match_spec = if flags.meta { Term::NIL } else { atom("false") };
+            let mut meta_match_spec = if flags.meta {
+                Term::NIL
+            } else {
+                Term::atom(arinsal_term::atoms::FALSE)
+            };
             if state.meta_match_spec.is_some() {
                 meta_match_spec = owned(process, &state.meta_match_spec)?;
             }
             let meta = if flags.meta {
                 match state.meta_tracer.clone() {
-                    crate::trace::Tracer::Default => atom("false"),
+                    crate::trace::Tracer::Default => Term::atom(arinsal_term::atoms::FALSE),
                     tracer => trace_tracer_term(process, tracer)?,
                 }
             } else {
-                atom("false")
+                Term::atom(arinsal_term::atoms::FALSE)
             };
             let entries = [
                 ("traced", traced),
@@ -5644,7 +5809,7 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
             ];
             let mut pairs = Vec::new();
             for (key, value) in entries {
-                pairs.push(make_tuple(process, &[atom(key), value])?);
+                pairs.push(make_tuple(process, &[crate::atom_cache::put(key), value])?);
             }
             make_list(process, pairs)?
         }
@@ -5942,11 +6107,11 @@ fn trace_pattern(
         if !empty_flags {
             return Err(badarg());
         }
-        let (enabled, match_spec) = if pattern == atom("false") {
+        let (enabled, match_spec) = if pattern == Term::atom(arinsal_term::atoms::FALSE) {
             (false, None)
         } else {
             let mut match_spec = None;
-            if pattern != atom("true") && pattern != Term::NIL {
+            if pattern != Term::atom(arinsal_term::atoms::TRUE) && pattern != Term::NIL {
                 compile_trace_pattern(pattern, Some(event == "receive"))?;
                 let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
                 match_spec = Some(owned);
@@ -6003,13 +6168,13 @@ fn trace_pattern(
         call_memory: names.iter().any(|name| name == "call_memory"),
     };
     let mut match_spec = None;
-    let on = if pattern == atom("false") {
+    let on = if pattern == Term::atom(arinsal_term::atoms::FALSE) {
         crate::trace_bp::BreakOp::Nop
-    } else if pattern == atom("true") || pattern == Term::NIL {
+    } else if pattern == Term::atom(arinsal_term::atoms::TRUE) || pattern == Term::NIL {
         crate::trace_bp::BreakOp::Set
-    } else if pattern == atom("restart") {
+    } else if pattern == Term::atom(arinsal_term::atoms::RESTART) {
         crate::trace_bp::BreakOp::Restart
-    } else if pattern == atom("pause") {
+    } else if pattern == Term::atom(arinsal_term::atoms::PAUSE) {
         crate::trace_bp::BreakOp::Pause
     } else {
         compile_trace_pattern(pattern, None)?;
@@ -6197,7 +6362,7 @@ fn processes_next(
         .saturating_add(max_pids.saturating_mul(25))
         .min(arinsal_term::ptab::process_table_layout().max());
     if index == limit && index != 0 {
-        return Ok(atom("none"));
+        return Ok(Term::atom(arinsal_term::atoms::NONE));
     }
     if index > limit {
         return Err(badarg());
@@ -6274,7 +6439,10 @@ pub(crate) fn process_dump(
         "reductions",
         "priority",
     ];
-    let items = names.iter().map(|name| atom(name)).collect::<Vec<_>>();
+    let items = names
+        .iter()
+        .map(|name| crate::atom_cache::put(name))
+        .collect::<Vec<_>>();
     let items = make_list(process, items)?;
     let args = ProcessInfoArgs::parse(Some(items))?;
     let pid = ctx.pid();

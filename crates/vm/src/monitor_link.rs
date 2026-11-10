@@ -691,62 +691,9 @@ impl<H: NodeHandle> MonLnkTree<H> {
         })))
     }
 
-    /// The nodes in the order erts `mon_lnk_rbt_foreach` visits them (`foreach_unordered__`:
-    /// both subtrees before the node).
-    fn nodes(&self) -> smallvec::SmallVec<[NodePtr; 4]> {
-        let mut nodes = smallvec::SmallVec::new();
-        let Some(mut x) = self.root else {
-            return nodes;
-        };
-        'down: loop {
-            loop {
-                while let Some(c) = left(x) {
-                    x = c;
-                }
-                match right(x) {
-                    Some(c) => x = c,
-                    None => break,
-                }
-            }
-            loop {
-                let p = parent(x);
-                nodes.push(x);
-                let Some(p) = p else {
-                    break 'down;
-                };
-                if let Some(c) = right(p).filter(|c| *c != x) {
-                    x = c;
-                    continue 'down;
-                }
-                x = p;
-            }
-        }
-        nodes
-    }
-
     /// Walk the tree in erts' postorder without first materializing its node pointers.
     // Port of erts/emulator/beam/erl_monitor_link.c:1353 (`erts_link_tree_foreach`), OTP-29.1.1.
     fn iter_nodes(&self) -> impl Iterator<Item = NodePtr> {
-        fn first_postorder(mut node: NodePtr) -> NodePtr {
-            loop {
-                while let Some(child) = left(node) {
-                    node = child;
-                }
-                match right(node) {
-                    Some(child) => node = child,
-                    None => return node,
-                }
-            }
-        }
-
-        fn next_postorder(node: NodePtr) -> Option<NodePtr> {
-            let parent = parent(node)?;
-            match right(parent).filter(|child| *child != node) {
-                Some(child) => Some(first_postorder(child)),
-                None => Some(parent),
-            }
-        }
-
         let mut node = self.root.map(first_postorder);
         std::iter::from_fn(move || {
             let current = node?;
@@ -757,23 +704,61 @@ impl<H: NodeHandle> MonLnkTree<H> {
 
     /// `erts_monitor_tree_foreach_delete` / `erts_link_tree_foreach_delete`: empty the tree,
     /// handing out its nodes in foreach order.
-    pub(crate) fn drain(&mut self) -> smallvec::IntoIter<[H; 4]> {
-        if self.root.is_none() {
-            return smallvec::SmallVec::<[H; 4]>::new().into_iter();
+    // Port of erts/emulator/beam/erl_monitor_link.c (mon_lnk_rbt_foreach_delete), OTP-29.1.1:
+    // the tree is detached and walked in place; the next node is found before the current one
+    // is handed out, so the caller may release it.
+    pub(crate) fn drain(&mut self) -> TreeDrain<H> {
+        TreeDrain {
+            next: self.root.take().map(first_postorder),
+            _handles: PhantomData,
         }
-        let nodes = self.nodes();
-        self.root = None;
-        nodes
-            .into_iter()
-            .map(|node| {
-                set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
-                H::from_node(ContainedNode {
-                    node,
-                    _handle: PhantomData,
-                })
-            })
-            .collect::<smallvec::SmallVec<[H; 4]>>()
-            .into_iter()
+    }
+}
+
+fn first_postorder(mut node: NodePtr) -> NodePtr {
+    loop {
+        while let Some(child) = left(node) {
+            node = child;
+        }
+        match right(node) {
+            Some(child) => node = child,
+            None => return node,
+        }
+    }
+}
+
+fn next_postorder(node: NodePtr) -> Option<NodePtr> {
+    let parent = parent(node)?;
+    match right(parent).filter(|child| *child != node) {
+        Some(child) => Some(first_postorder(child)),
+        None => Some(parent),
+    }
+}
+
+/// The nodes of a detached tree in foreach order ([`MonLnkTree::drain`]). Nodes not taken
+/// when it is dropped are released as their handles.
+pub(crate) struct TreeDrain<H: NodeHandle> {
+    next: Option<NodePtr>,
+    _handles: PhantomData<H>,
+}
+
+impl<H: NodeHandle> Iterator for TreeDrain<H> {
+    type Item = H;
+
+    fn next(&mut self) -> Option<H> {
+        let node = self.next?;
+        self.next = next_postorder(node);
+        set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
+        Some(H::from_node(ContainedNode {
+            node,
+            _handle: PhantomData,
+        }))
+    }
+}
+
+impl<H: NodeHandle> Drop for TreeDrain<H> {
+    fn drop(&mut self) {
+        for _ in self.by_ref() {}
     }
 }
 
@@ -910,21 +895,47 @@ impl<I, O, S> MonitorList<I, O, S> {
     }
 
     /// `erts_monitor_list_foreach_delete`: empty the list in list order.
-    pub(crate) fn drain(&mut self) -> smallvec::IntoIter<[Monitor<I, O, S>; 4]> {
-        let nodes = self.nodes();
-        self.first = None;
-        nodes
-            .into_iter()
-            .map(|node| {
-                set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
-                MonitorData::<I, O, S>::from_node(node).set_target_list(0);
-                Monitor::from_node(ContainedNode {
-                    node,
-                    _handle: PhantomData,
-                })
-            })
-            .collect::<smallvec::SmallVec<[Monitor<I, O, S>; 4]>>()
-            .into_iter()
+    // Port of erts/emulator/beam/erl_monitor_link.c (erts_monitor_list_foreach_delete),
+    // OTP-29.1.1: the list is detached and walked in place, the next node read before the
+    // current one is handed out.
+    pub(crate) fn drain(&mut self) -> ListDrain<I, O, S> {
+        ListDrain {
+            next: self.first.take(),
+            first: None,
+            _handles: PhantomData,
+        }
+    }
+}
+
+/// The halves of a detached monitor list in list order ([`MonitorList::drain`]). Halves not
+/// taken when it is dropped are released.
+pub(crate) struct ListDrain<I, O, S = ()> {
+    next: Option<NodePtr>,
+    /// The first node handed out; the walk ends when the circle comes back to it.
+    first: Option<NodePtr>,
+    _handles: PhantomData<Monitor<I, O, S>>,
+}
+
+impl<I, O, S> Iterator for ListDrain<I, O, S> {
+    type Item = Monitor<I, O, S>;
+
+    fn next(&mut self) -> Option<Monitor<I, O, S>> {
+        let node = self.next?;
+        let first = *self.first.get_or_insert(node);
+        let following = list_links(node).next.expect("circular list");
+        self.next = (following != first).then_some(following);
+        set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
+        MonitorData::<I, O, S>::from_node(node).set_target_list(0);
+        Some(Monitor::from_node(ContainedNode {
+            node,
+            _handle: PhantomData,
+        }))
+    }
+}
+
+impl<I, O, S> Drop for ListDrain<I, O, S> {
+    fn drop(&mut self) {
+        for _ in self.by_ref() {}
     }
 }
 
@@ -2538,7 +2549,7 @@ mod tests {
             .map(|link| link.is_external())
             .collect::<Vec<_>>();
         assert_eq!(order.iter().filter(|external| **external).count(), 3);
-        assert_eq!(tree.nodes().len(), 7);
+        assert_eq!(tree.iter_nodes().count(), 7);
         assert!(PidOrder::compare((1 << 63) | 4, external_key(&probe)).is_lt());
         assert!(PidOrder::compare(9, (1 << 63) | 4).is_lt());
         assert!(tree.get(9).is_some_and(|link| !link.is_external()));

@@ -96,7 +96,7 @@ pub(crate) fn nodes0_bif(
         nodes(process, Term::atom(arinsal_term::atoms::VISIBLE), None).map_err(
             |error| match error {
                 VmError::Trap(trap) => trap,
-                _ => crate::exceptions::Trap::error(atom("system_limit")),
+                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
             },
         ),
     )
@@ -143,7 +143,7 @@ fn call_setnode2(
     if !node_tables::set_this_node(name.clone(), creation) {
         return Err(badarg());
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn call_monitor_node2(
@@ -308,11 +308,12 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
             let mut pairs = Vec::new();
             if connection_id {
                 pairs.push((
-                    atom("connection_id"),
+                    Term::atom(arinsal_term::atoms::CONNECTION_ID),
                     cid.map(|value| {
-                        Term::small(i64::from(value)).unwrap_or_else(|| atom("undefined"))
+                        Term::small(i64::from(value))
+                            .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED))
                     })
-                    .unwrap_or_else(|| atom("undefined")),
+                    .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED)),
                 ));
             }
             if node_type {
@@ -322,7 +323,10 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
                     node_tables::NodeKind::Hidden => "hidden",
                     node_tables::NodeKind::Known => "known",
                 };
-                pairs.push((atom("node_type"), atom(value)));
+                pairs.push((
+                    Term::atom(arinsal_term::atoms::NODE_TYPE),
+                    crate::atom_cache::put(value),
+                ));
             }
             let info = builder.flatmap_from_pairs(&pairs).map_err(|_| badarg())?;
             result.push(builder.tuple(&[node, info]).map_err(|_| badarg())?);
@@ -370,12 +374,12 @@ fn monitor_node(
         let mut builder = TermBuilder::new(&mut heap);
         let node = Term::atom(global_atoms().intern(name).unwrap());
         let down = builder
-            .tuple(&[atom("nodedown"), node])
+            .tuple(&[Term::atom(arinsal_term::atoms::NODEDOWN), node])
             .map_err(|_| badarg())?;
         ctx.send(ctx.pid(), Message::copy_from(down)?)
             .map_err(|error| VmError::Unsupported(format!("nodedown delivery: {error}")))?;
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn monitor_options(options: Option<Term>) -> Result<(), VmError> {
@@ -414,12 +418,10 @@ pub(crate) fn node_0_term() -> Term {
     local_node_term()
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).unwrap())
-}
-
 fn error(reason: &str) -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom(reason)))
+    VmError::Trap(crate::exceptions::Trap::error(crate::atom_cache::put(
+        reason,
+    )))
 }
 
 fn halt(

@@ -5,7 +5,7 @@
 //! are exposed through `allocated_areas`; per-allocator carrier statistics
 //! are empty because Arinsal does not use erts_alloc.
 
-use super::{MemorySources, Process, RunCtx, Vm, VmError, atom, badarg};
+use super::{MemorySources, Process, RunCtx, Vm, VmError, badarg};
 use crate::process::Message;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
@@ -63,7 +63,7 @@ pub(super) fn system_info(
         // Arinsal does not use the erts mseg allocator. The call still interns
         // the mseg info atoms (erl_mseg.c:854) on builds where mseg exists.
         super::alloc_atoms::note_mseg();
-        return Some(Ok(atom("false")));
+        return Some(Ok(Term::atom(arinsal_term::atoms::FALSE)));
     }
     if parts.len() != 3 {
         return None;
@@ -131,7 +131,7 @@ fn request_allocators(
             let _ = scheduler.send(target, target, message);
         }
     });
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn validate_request<'a>(

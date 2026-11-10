@@ -91,24 +91,28 @@ pub(crate) fn call(
             );
         }
         let result = match (module, function, args.len()) {
-            ("erlang", "dt_get_tag" | "dt_get_tag_data", 0) => Ok(atom("undefined")),
-            ("erlang", "dt_put_tag", 1) => Ok(atom("undefined")),
+            ("erlang", "dt_get_tag" | "dt_get_tag_data", 0) => {
+                Ok(Term::atom(arinsal_term::atoms::UNDEFINED))
+            }
+            ("erlang", "dt_put_tag", 1) => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
             ("erlang", "dt_append_vm_tag_data" | "dt_prepend_vm_tag_data", 1) => Ok(args[0]),
-            ("error_logger", "warning_map", 0) => Ok(atom("warning")),
+            ("error_logger", "warning_map", 0) => Ok(Term::atom(arinsal_term::atoms::WARNING)),
             ("net_kernel", "dflag_unicode_io", 1) => {
                 if args[0].as_pid().is_some() {
-                    return Some(Ok(atom("true")));
+                    return Some(Ok(Term::atom(arinsal_term::atoms::TRUE)));
                 }
                 let identity = match args[0].identity() {
                     Some(arinsal_term::Identity::Pid { node, .. }) => global_atoms().text(node),
                     _ => return Some(Err(badarg())),
                 };
                 let node = identity.unwrap_or("nonode@nohost");
-                Ok(atom(if crate::node_tables::lock().pid_unicode_io(node) {
-                    "true"
-                } else {
-                    "false"
-                }))
+                Ok(Term::atom(
+                    if crate::node_tables::lock().pid_unicode_io(node) {
+                        arinsal_term::atoms::TRUE
+                    } else {
+                        arinsal_term::atoms::FALSE
+                    },
+                ))
             }
             ("erlang", "system_profile", 0) => profile_get(process),
             ("erlang", "system_profile", 2) => profile_set(process, args),
@@ -132,7 +136,7 @@ fn profile_get(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_trace.c:3725 (system_profile_get), OTP-29.1.1.
     let p = profile().lock().unwrap().clone();
     let Some(target) = p.target else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     let flags = ["exclusive", "scheduler", "runnable_procs", "runnable_ports"]
         .into_iter()
@@ -424,10 +428,22 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
     if owned == O::Nil
         || matches!(&owned, O::List { elems, tail } if elems.is_empty() && **tail == O::Nil)
     {
-        return tuple(process, &[atom("error"), atom("no_float")]);
+        return tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::NO_FLOAT),
+            ],
+        );
     }
     let O::List { elems, tail } = &owned else {
-        return tuple(process, &[atom("error"), atom("not_a_list")]);
+        return tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::NOT_A_LIST),
+            ],
+        );
     };
     if **tail != O::Nil {
         return Err(badarg());
@@ -441,10 +457,22 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
         bytes.push(byte);
     }
     let Some((token, end)) = scan_string_float(&bytes) else {
-        return tuple(process, &[atom("error"), atom("no_float")]);
+        return tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::NO_FLOAT),
+            ],
+        );
     };
     let Ok(number) = arinsal_float::list_to_float(&token) else {
-        return tuple(process, &[atom("error"), atom("no_float")]);
+        return tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::NO_FLOAT),
+            ],
+        );
     };
     let rest = O::list(bytes[end..].iter().map(|b| O::Int(i64::from(*b))).collect());
     let (rest, float) = {
@@ -554,9 +582,8 @@ fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
         .tuple(items)
         .map_err(|_| badarg())
 }
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("runtime atom"))
-}
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
