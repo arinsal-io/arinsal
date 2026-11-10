@@ -1789,6 +1789,20 @@ pub fn drain_owned_deallocations(instance: usize) -> usize {
     total
 }
 
+/// Runs one unbounded delayed-deallocation pass of scheduler instance `instance` and combines
+/// the follow-up work requested by its allocator instances.
+pub fn flush_owned_deallocations(instance: usize) -> crate::DdStatus {
+    let mut total = crate::DdStatus::default();
+    for_each_allocator(|allocators| {
+        if instance < allocators.instance_count() {
+            let status = allocators.flush_deallocations(instance).unwrap_or_default();
+            total.more_work |= status.more_work;
+            total.need_thr_progress |= status.need_thr_progress;
+        }
+    });
+    total
+}
+
 /// Runs the owner work of scheduler instance `instance` for every allocator: queued requests and
 /// a bounded number of delayed frees. The result says whether any allocator still has frees queued
 /// behind the limit, and whether any waits for thread progress.

@@ -274,6 +274,13 @@ impl DdHead {
         true
     }
 
+    /// Whether another pass can move the safety boundary without waiting for more scheduler
+    /// progress or an unmanaged producer to leave the queue.
+    pub(crate) fn can_advance(&self, tail: &DdTail, progress: &ProgressOps) -> bool {
+        (self.next_thr_progress_reached || (progress.has_reached)(0, self.next_thr_progress))
+            && tail.um_refc[self.next_um_refc_ix].load(Ordering::Acquire) == 0
+    }
+
     /// Port of `check_insert_marker`.
     #[allow(unsafe_code)]
     fn check_insert_marker(&mut self, tail: &DdTail, ilast: usize) -> usize {
