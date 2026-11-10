@@ -405,14 +405,10 @@ impl Executor {
 /// module and function (`apply_fixed`) above them, `apply/2` and `apply/3`'s own operands.
 /// `None` for every other call the scheduler redoes: it takes its `arity` registers.
 pub(super) fn retry_operand_count(target_pc: usize, arity: usize) -> Option<usize> {
-    use arinsal_beamasm::dispatch::{
-        APPLY_FIXED_UNPORTED, APPLY2_UNPORTED, APPLY3_UNPORTED, CALL_FUN_UNPORTED,
-    };
+    use arinsal_beamasm::dispatch::{APPLY2_UNPORTED, CALL_FUN_UNPORTED};
     match target_pc {
         CALL_FUN_UNPORTED => Some(arity + 1),
-        APPLY_FIXED_UNPORTED => Some(arity + 2),
         APPLY2_UNPORTED => Some(2),
-        APPLY3_UNPORTED => Some(3),
         _ => None,
     }
 }
@@ -420,14 +416,10 @@ pub(super) fn retry_operand_count(target_pc: usize, arity: usize) -> Option<usiz
 /// The call arity of a redone fun call or apply, from the operand count its switch-out saved
 /// (`retry_operand_count` backwards). `None` for every other call the scheduler redoes.
 pub(super) fn retry_call_arity(target_pc: usize, saved: usize) -> Option<u8> {
-    use arinsal_beamasm::dispatch::{
-        APPLY_FIXED_UNPORTED, APPLY2_UNPORTED, APPLY3_UNPORTED, CALL_FUN_UNPORTED,
-    };
+    use arinsal_beamasm::dispatch::{APPLY2_UNPORTED, CALL_FUN_UNPORTED};
     let arity = match target_pc {
         CALL_FUN_UNPORTED => saved.saturating_sub(1),
-        APPLY_FIXED_UNPORTED => saved.saturating_sub(2),
         APPLY2_UNPORTED => 2,
-        APPLY3_UNPORTED => 3,
         _ => return None,
     };
     u8::try_from(arity).ok()

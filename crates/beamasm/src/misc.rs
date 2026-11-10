@@ -62,7 +62,7 @@ pub type Apply3Hook = extern "C" fn(*mut crate::ProcessHeader, u64, u32) -> Appl
 pub struct ApplyRuntime {
     /// Resolves a fixed-arity apply; returns a native target or the fixed-apply fragment.
     pub resolver: ApplyHook,
-    /// Resolves `apply/3`; returns a native target or `apply3_fragment`.
+    /// Resolves `apply/3`; returns the export to call, or zero after setting the exception.
     pub apply3_resolver: Apply3Hook,
     /// Shared fragment unpacking the `apply/2` argument list (`apply_fun_shared`).
     pub apply_fun_shared: usize,
@@ -70,8 +70,6 @@ pub struct ApplyRuntime {
     pub fun_resolver: crate::fun::FunResolver,
     /// Fragment handing `apply/2` to the interpreter.
     pub apply2_fragment: usize,
-    /// Fragment handing `apply/3` to the interpreter.
-    pub apply3_fragment: usize,
 }
 
 /// Calls the target of an apply form.
@@ -117,8 +115,10 @@ fn emit_apply_common(
     }
     let live = match kind {
         // Port of emit_fixed_apply's `emit_enter_runtime(Arity.get() + 2)`,
-        // erts/emulator/beam/jit/arm/instr_call.cpp:270-274, OTP-29.1.1.
-        ApplyKind::Fixed(arity) => arity as usize + 2,
+        // erts/emulator/beam/jit/arm/instr_call.cpp:270-274, OTP-29.1.1. A failing
+        // `fixed_apply` also writes X0..X2 (module, function, argument list), which the
+        // raise reads from the register cache, so at least three are reloaded.
+        ApplyKind::Fixed(arity) => (arity as usize + 2).max(3),
         _ => 6,
     };
     let update = crate::Update::HEAP_ALLOC
@@ -139,7 +139,7 @@ fn emit_apply_common(
                 asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
             }
             asm.code.emit(|e| e.mov_const(Gpr::x(11), 0))?;
-            asm.emit_runtime_hook_with(
+            asm.emit_runtime_hook_unchecked(
                 runtime.resolver as usize,
                 &[Gpr::x(9), Gpr::x(10), Gpr::x(11)],
                 live,
@@ -157,7 +157,7 @@ fn emit_apply_common(
                 asm.code.emit(|e| e.mov_const(Gpr::x(9), 0))?;
             }
             asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
-            asm.emit_runtime_hook_with(
+            asm.emit_runtime_hook_unchecked(
                 runtime.apply3_resolver as usize,
                 &[Gpr::x(9), Gpr::x(10)],
                 live,
@@ -172,7 +172,17 @@ fn emit_apply_common(
         // and the address to call in x1. Zero there is the exception it set.
         let resolved = asm.code.new_label();
         asm.code.cbnz(Gpr::x(1), resolved)?;
-        asm.branch_error()?;
+        // Port of erts/emulator/beam/jit/arm/instr_call.cpp:220-230,92-96
+        // (emit_raise_exception(entry, &apply3_mfa)), OTP-29.1.1: the resolver set `current`
+        // to erlang:apply/3 and X0..X2 to its operands.
+        asm.code.emit(|e| {
+            e.ldr_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        asm.branch_error_preserving_bif()?;
         asm.code.bind(resolved)?;
         asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(1)))?;
     }

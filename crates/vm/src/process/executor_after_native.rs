@@ -375,9 +375,7 @@ impl Executor {
                 if matches!(
                     target_pc,
                     arinsal_beamasm::dispatch::CALL_FUN_UNPORTED
-                        | arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED
                         | arinsal_beamasm::dispatch::APPLY2_UNPORTED
-                        | arinsal_beamasm::dispatch::APPLY3_UNPORTED
                 ) {
                     // The fragment pushed the native continuation as a CP, so the
                     // interpreter performs these as tail calls.
@@ -397,16 +395,7 @@ impl Executor {
                         }
                         _ => {
                             process.native_apply = true;
-                            let result = match target_pc {
-                                arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED => {
-                                    let arity = usize::from(process.heap.abi.arity);
-                                    self.vm.apply_fixed(process, arity, Some(ctx))
-                                }
-                                arinsal_beamasm::dispatch::APPLY2_UNPORTED => {
-                                    self.vm.apply_bif(process, 2, Some(ctx))
-                                }
-                                _ => self.vm.apply_bif(process, 3, Some(ctx)),
-                            };
+                            let result = self.vm.apply_bif(process, 2, Some(ctx));
                             process.native_apply = false;
                             result
                         }

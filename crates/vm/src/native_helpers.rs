@@ -4386,49 +4386,54 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
             if let Some(target) = entry.fun_code(code_ix) {
                 return target;
             }
-            process.heap.abi.arity = arity.min(u8::MAX as u32) as u8;
-            if let Some(slot) = process.x.get_mut(arity as usize) {
-                *slot = fun;
+            if entry
+                .pend_purge_address
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                // erts_suspend_process_on_pending_purge_lambda: still run by the scheduler.
+                process.heap.abi.arity = arity.min(u8::MAX as u32) as u8;
+                if let Some(slot) = process.x.get_mut(arity as usize) {
+                    *slot = fun;
+                }
+                if unported == 0 {
+                    set_call_fun_error(process, fun, arity);
+                    return 0;
+                }
+                return unported;
             }
-            if unported == 0 {
-                set_call_fun_error(process, fun, arity);
-                return 0;
-            }
-            unported
+            unloaded_fun_error_handler(process, registers, entry.module, fun, arity)
         }
         Some(arinsal_term::FunRef::Export { entry }) => {
             if u32::from(entry.arity) != arity {
                 set_call_fun_error(process, fun, arity);
                 return 0;
             }
-            let Some(_module) = arinsal_term::global_atoms().text(entry.module) else {
-                set_call_fun_error(process, fun, arity);
-                return 0;
-            };
-            let Some(_function) = arinsal_term::global_atoms().text(entry.function) else {
-                set_call_fun_error(process, fun, arity);
-                return 0;
-            };
+            // Port of erts/emulator/beam/jit/arm/instr_fun.cpp (emit_i_call_fun: the export's
+            // `addresses[code_ix]`), OTP-29.1.1: a stub's address is the export trampoline,
+            // which calls the error handler; a process saving calls enters
+            // `beam_save_calls_export`. The fragment passes the Export* in ARG1.
             let code_ix = registers.active_code_ix as usize;
             let export = process.runtime.as_ref().and_then(|runtime| {
-                runtime.export_entry((entry.module, entry.function, entry.arity), code_ix)
+                runtime
+                    .export_entry((entry.module, entry.function, entry.arity), code_ix)
+                    .or_else(|| {
+                        crate::export::export_entry_or_stub(
+                            runtime.code_scope,
+                            (entry.module, entry.function, entry.arity),
+                        )
+                        .map(|export| &**export)
+                    })
             });
-            let target = export.map(|export| export.address(code_ix));
-            if code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX
-                && let Some(target) = target
-                && target != crate::beamasm_integration::export_trampoline()
-            {
-                return target;
+            match export {
+                Some(export) if std::ptr::eq(export, entry) => export.address(code_ix),
+                _ => {
+                    // A fun of another node's (or no node's) export entry: the fragment's ARG1
+                    // is that entry, not this node's, so it cannot be dispatched through.
+                    crate::native_hooks::set_error(process, "undef");
+                    0
+                }
             }
-            process.heap.abi.arity = arity.min(u8::MAX as u32) as u8;
-            if let Some(slot) = process.x.get_mut(arity as usize) {
-                *slot = fun;
-            }
-            if unported == 0 {
-                crate::native_hooks::set_error(process, "undef");
-                return 0;
-            }
-            unported
         }
         None => {
             set_call_fun_error(process, fun, arity);
@@ -4480,6 +4485,81 @@ fn apply_bif_error_adjustment(
     stored
 }
 
+/// A call of a local fun whose module has no current code: `error_handler:undefined_lambda/3`
+/// with X0..X3 set up, `badfun` when the module is loaded without the fun, `undef` without an
+/// error handler.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_handle_unloaded_fun),
+// OTP-29.1.1.
+fn unloaded_fun_error_handler(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    module: arinsal_term::Atom,
+    fun: Term,
+    arity: u32,
+) -> usize {
+    let code_ix = registers.active_code_ix as usize;
+    let Some(runtime) = process.runtime.as_ref() else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    if runtime.with_active_code(|_, tables| tables.loaded.get(&module).is_some()) {
+        // EXC_BADFUN with the fun as its value: the error term is {badfun, Fun}.
+        process.heap.abi.current = std::ptr::null();
+        let reason =
+            arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+                .tuple(&[Term::atom(arinsal_term::atoms::BADFUN), fun]);
+        match reason {
+            Ok(reason) => {
+                process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+                process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
+            }
+            Err(_) => crate::native_hooks::set_error(process, "system_limit"),
+        }
+        return 0;
+    }
+    let handler = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.flags.error_handler)
+        .and_then(Term::as_atom)
+        .unwrap_or(arinsal_term::atoms::ERROR_HANDLER);
+    let Ok(undefined_lambda) = arinsal_term::global_atoms().intern("undefined_lambda") else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    let Some(handler_export) = runtime
+        .export_entry((handler, undefined_lambda, 3), code_ix)
+        .filter(|ep| {
+            !crate::export::is_export_trampoline_active(ep, code_ix)
+                || crate::export::has_export_breakpoint(ep)
+        })
+    else {
+        process.heap.abi.current = std::ptr::null();
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    let arity = arity as usize;
+    // The fun is rooted above the arguments while the list is built.
+    process.x[arity] = fun;
+    if process.ensure(arity * 2, arity + 1).is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    }
+    let fun = process.x[arity];
+    let args: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::from_slice(&process.x[..arity]);
+    let Ok(list) = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+        .list_from_iter(args)
+    else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    };
+    process.x[0] = Term::atom(module);
+    process.x[1] = fun;
+    process.x[2] = list;
+    process.x[3] = Term::NIL;
+    handler_export.address(code_ix)
+}
+
 /// Resolves `apply Arity` to a BIF export (called through its dispatch address with the
 /// Export* in ARG1), a native entry, or the fragment that lets the interpreter apply.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-320 (emit_fixed_apply) and
@@ -4490,76 +4570,115 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     return_ip: u64,
     stack_offset: u32,
 ) -> arinsal_beamasm::misc::ApplyResolution {
+    use arinsal_beamasm::misc::ApplyResolution;
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return arinsal_beamasm::misc::ApplyResolution::default();
+        return ApplyResolution::default();
     };
     let arity = arity as usize;
-    let fragment = crate::beamasm_integration::apply_fixed_unported_entry();
-    if fragment == 0 || arity + 1 >= registers.x_reg_array.len() {
-        crate::native_hooks::set_error(process, "system_limit");
-        return arinsal_beamasm::misc::ApplyResolution::default();
+    if arity + 1 >= registers.x_reg_array.len() {
+        return apply_error(
+            process,
+            Term::NIL,
+            Term::NIL,
+            Term::NIL,
+            arinsal_bifs::BifError::SystemLimit,
+        );
     }
     let module = process.x[arity];
     let function = process.x[arity + 1];
+    let (Some(module_atom), Some(function_atom)) = (module.as_atom(), function.as_atom()) else {
+        // Port of erts/emulator/beam/beam_common.c:1540-1552 (fixed_apply, `error`), OTP-29.1.1.
+        if process.ensure(arity * 2, arity + 2).is_err() {
+            return apply_error(
+                process,
+                module,
+                function,
+                Term::NIL,
+                arinsal_bifs::BifError::SystemLimit,
+            );
+        }
+        let (module, function) = (process.x[arity], process.x[arity + 1]);
+        let args: smallvec::SmallVec<[Term; 8]> =
+            smallvec::SmallVec::from_slice(&process.x[..arity]);
+        let Ok(list) =
+            arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+                .list_from_iter(args)
+        else {
+            return apply_error(
+                process,
+                module,
+                function,
+                Term::NIL,
+                arinsal_bifs::BifError::SystemLimit,
+            );
+        };
+        return apply_error(
+            process,
+            module,
+            function,
+            list,
+            arinsal_bifs::BifError::Badarg { cause: None },
+        );
+    };
     // Port of erts/emulator/beam/beam_common.c:1554-1557 (fixed_apply), OTP-29.1.1: an
     // apply of erlang:apply/3 is a plain apply/3 of its arguments.
     if arity == 3
-        && module.as_atom() == Some(arinsal_term::atoms::ERLANG)
-        && function.as_atom() == Some(arinsal_term::atoms::APPLY)
+        && module_atom == arinsal_term::atoms::ERLANG
+        && function_atom == arinsal_term::atoms::APPLY
     {
-        let apply3 = crate::beamasm_integration::apply3_unported_entry();
-        if apply3 != 0 {
-            return arinsal_beamasm::misc::ApplyResolution {
-                export: 0,
-                target: apply3 as u64,
-            };
-        }
+        return apply3(process, registers, return_ip, stack_offset);
     }
-    if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) {
-        let code_ix = registers.active_code_ix as usize;
-        // Port of erts/emulator/beam/beam_common.c:1544-1546 (fixed_apply:
-        // erts_export_get_or_make_stub), OTP-29.1.1.
-        let export = process.runtime.as_ref().and_then(|runtime| {
-            let mfa = (module, function, arity as u8);
-            runtime.export_entry(mfa, code_ix).or_else(|| {
-                crate::export::export_entry_or_stub(runtime.code_scope, mfa).map(|export| &**export)
-            })
-        });
-        if let Some(export) = export {
-            let target = export.address(code_ix);
-            // Port of erts/emulator/beam/beam_common.c:1529-1550 (fixed_apply), OTP-29.1.1:
-            // `emit_setup_dispatchable_call` receives the Export*, loads its active
-            // dispatch address, and passes the Export* in ARG1. Return both words
-            // in AAPCS64's x0/x1 result pair for the generated call setup.
-            if export.light_bif_func() != 0 {
-                if !apply_bif_error_adjustment(
-                    process,
-                    (module, function, arity as u8),
-                    return_ip,
-                    stack_offset,
-                ) {
-                    return arinsal_beamasm::misc::ApplyResolution::default();
-                }
-                return arinsal_beamasm::misc::ApplyResolution {
-                    export: std::ptr::from_ref(export) as u64,
-                    target: target as u64,
-                };
-            }
-            // Port of erts/emulator/beam/beam_common.c:1529-1550 (fixed_apply), OTP-29.1.1: a
-            // stub (the export trampoline) or a process saving calls (`beam_save_calls_export`)
-            // gets the Export* in ARG1 like any dispatchable call.
-            return arinsal_beamasm::misc::ApplyResolution {
-                export: std::ptr::from_ref(export) as u64,
-                target: target as u64,
-            };
-        }
+    let code_ix = registers.active_code_ix as usize;
+    // Port of erts/emulator/beam/beam_common.c:1559-1566 (fixed_apply:
+    // erts_export_get_or_make_stub, apply_bif_error_adjustment), OTP-29.1.1: the JIT calls
+    // the export's `addresses[code_ix]` with the Export* in ARG1.
+    let mfa = (module_atom, function_atom, arity as u8);
+    let Some(export) = process.runtime.as_ref().and_then(|runtime| {
+        runtime.export_entry(mfa, code_ix).or_else(|| {
+            crate::export::export_entry_or_stub(runtime.code_scope, mfa).map(|export| &**export)
+        })
+    }) else {
+        return apply_error(
+            process,
+            module,
+            function,
+            Term::NIL,
+            arinsal_bifs::BifError::Badarg { cause: None },
+        );
+    };
+    if !apply_bif_error_adjustment(process, mfa, return_ip, stack_offset) {
+        return ApplyResolution::default();
     }
-    // Not natively compiled (or invalid): the interpreter applies and raises errors.
-    process.heap.abi.arity = arity.min(u8::MAX as usize) as u8;
-    arinsal_beamasm::misc::ApplyResolution {
-        export: 0,
-        target: fragment as u64,
+    ApplyResolution {
+        export: std::ptr::from_ref(export) as u64,
+        target: export.address(code_ix) as u64,
     }
+}
+
+/// An apply that raises: the reason, X0..X2 set to its module, function and arguments, and
+/// `current` erlang:apply/3, which the JIT raises with (`emit_raise_exception(&apply3_mfa)`).
+// Port of erts/emulator/beam/beam_common.c:1450-1460 (apply: error, error2) and
+// jit/arm/instr_call.cpp:205-244 (emit_variable_apply), OTP-29.1.1.
+fn apply_error(
+    process: &mut crate::Process,
+    module: Term,
+    function: Term,
+    args: Term,
+    reason: arinsal_bifs::BifError,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    set_light_bif_error(process, &reason);
+    process.x[0] = module;
+    process.x[1] = function;
+    process.x[2] = args;
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:211 (`static ErtsCodeMFA apply3_mfa`).
+    static APPLY3_MFA: std::sync::OnceLock<arinsal_term::ErtsCodeMfa> = std::sync::OnceLock::new();
+    let mfa = APPLY3_MFA.get_or_init(|| arinsal_term::ErtsCodeMfa {
+        module: Term::atom(arinsal_term::atoms::ERLANG).word(),
+        function: Term::atom(arinsal_term::atoms::APPLY).word(),
+        arity: 3,
+    });
+    process.heap.abi.current = std::ptr::from_ref(mfa).cast();
+    arinsal_beamasm::misc::ApplyResolution::default()
 }
 
 /// Resolves `apply/3` to a native entry with the arguments moved into the X registers, or to
@@ -4571,14 +4690,20 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
     return_ip: u64,
     stack_offset: u32,
 ) -> arinsal_beamasm::misc::ApplyResolution {
-    use arinsal_beamasm::misc::ApplyResolution;
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return ApplyResolution::default();
+        return arinsal_beamasm::misc::ApplyResolution::default();
     };
-    let fallback = ApplyResolution {
-        export: 0,
-        target: crate::beamasm_integration::apply3_unported_entry() as u64,
-    };
+    apply3(process, registers, return_ip, stack_offset)
+}
+
+// Port of erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
+fn apply3(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    return_ip: u64,
+    stack_offset: u32,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    use arinsal_beamasm::misc::ApplyResolution;
     let (mut module, mut function, mut args) = (process.x[0], process.x[1], process.x[2]);
     // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
     while module.as_atom() == Some(arinsal_term::atoms::ERLANG)
@@ -4598,24 +4723,49 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
         }
         (module, function, args) = (nested_module, nested_function, nested_args);
     }
-    let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) else {
-        return fallback;
+    let (Some(module_atom), Some(function_atom)) = (module.as_atom(), function.as_atom()) else {
+        return apply_error(
+            process,
+            module,
+            function,
+            args,
+            arinsal_bifs::BifError::Badarg { cause: None },
+        );
     };
     let mut arity = 0_usize;
     let mut list = args;
     while let Some((_, tail)) = crate::lists::split(list) {
         arity += 1;
         if arity >= registers.x_reg_array.len() - 1 {
-            return fallback;
+            return apply_error(
+                process,
+                module,
+                function,
+                args,
+                arinsal_bifs::BifError::SystemLimit,
+            );
         }
         list = tail;
     }
     if list != Term::NIL {
-        return fallback;
+        return apply_error(
+            process,
+            module,
+            function,
+            args,
+            arinsal_bifs::BifError::Badarg { cause: None },
+        );
     }
     let Ok(arity) = u8::try_from(arity) else {
-        return fallback;
+        return apply_error(
+            process,
+            module,
+            function,
+            args,
+            arinsal_bifs::BifError::SystemLimit,
+        );
     };
+    let (module, function) = (module_atom, function_atom);
     // Port of erts/emulator/beam/beam_common.c:1497-1530 (apply: the export of the MFA, whose
     // `addresses[code_ix]` the JIT calls with the Export* in ARG1; a stub's address is the
     // export trampoline, a process saving calls enters `beam_save_calls_export`), OTP-29.1.1.
@@ -4630,7 +4780,13 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
                     .map(|export| &**export)
             })
     }) else {
-        return fallback;
+        return apply_error(
+            process,
+            Term::atom(module),
+            Term::atom(function),
+            args,
+            arinsal_bifs::BifError::Badarg { cause: None },
+        );
     };
     let target = export.address(code_ix);
     let mut list = args;
