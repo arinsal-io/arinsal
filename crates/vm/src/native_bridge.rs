@@ -792,11 +792,28 @@ fn interpreter_continuation(word: Term) -> bool {
     crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler)
 }
 
-/// Find the nearest catch without moving the stack cursor; only native handlers resume here.
-// Port of erts/emulator/beam/beam_common.c (`next_catch`), OTP-29.1.1.
-pub(crate) fn next_native_catch(process: &mut Process) -> Option<LocatedCatch> {
+/// Port of erts/emulator/beam/beam_common.c:532-678 (`handle_error` once the trace is saved,
+/// `next_catch`, `found_catch`), OTP-29.1.1, for the native resolver: one scan of the stack,
+/// then `found_catch` writes the catch word, `stop`, x0..x3 and the failure words. Returns the
+/// native handler the fragment branches to. `None` leaves the stack unmoved for the scheduler:
+/// no catch, a catch in interpreted code, or an exception-trace frame above the catch, which
+/// erts reports from `next_catch` and Arinsal from the scheduler unwind (`exception_from`).
+#[inline]
+pub(crate) fn native_found_catch(
+    process: &mut Process,
+    class: arinsal_bifs::Class,
+    reason: Term,
+    trace: Term,
+) -> Option<usize> {
     let found = locate_catch(process, false)?;
-    (found.traced == 0 && matches!(found.target, CatchTarget::Native(_))).then_some(found)
+    let CatchTarget::Native(handler) = found.target else {
+        return None;
+    };
+    if found.traced != 0 {
+        return None;
+    }
+    found_catch(process, found, class, reason, trace);
+    Some(handler)
 }
 
 fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
@@ -828,31 +845,35 @@ pub(crate) fn next_catch(
     // it directly, so these Rust-side resume records are this caller's, not `found_catch`'s.
     process.x.ensure_x(4);
     process.exc_class = Some(class);
-    let handler = commit_catch(process, found, class, reason, trace);
-    if let CatchHandler::Native(_) = handler {
-        process.native_continuation_resume = true;
-        process.set_native_resume_arity(4);
-    }
-    Some(handler)
+    found_catch(process, found, class, reason, trace);
+    Some(match found.target {
+        CatchTarget::Native(handler) => {
+            process.native_continuation_resume = true;
+            process.set_native_resume_arity(4);
+            CatchHandler::Native(handler)
+        }
+        CatchTarget::Interpreted { module, ip } => {
+            process.module = module;
+            process.set_ip(ip);
+            CatchHandler::Interpreted
+        }
+    })
 }
 
-/// Port of erts/emulator/beam/beam_common.c:650-678 (`found_catch`), OTP-29.1.1.
-/// The stack and catch tag are changed only after the target is known.
-pub(crate) fn commit_catch(
+/// Port of erts/emulator/beam/beam_common.c:532-570 (`handle_error` register writes) and
+/// :650-678 (`found_catch`), OTP-29.1.1. The stack and catch word change only once the scan
+/// found the handler.
+#[inline]
+fn found_catch(
     process: &mut Process,
     found: LocatedCatch,
     class: arinsal_bifs::Class,
     reason: Term,
     trace: Term,
-) -> CatchHandler {
-    // Port of erts/emulator/beam/beam_common.c:650-678 (`found_catch`): `stop` and the catch
-    // word are written only after the handler is known.
+) {
+    // `found_catch` clears the catch word, then `c_p->stop = prev; c_p->stop += CP_SIZE`.
     process.heap.stack_set(found.index, Term::NIL);
-    let base = process.heap.heap_cursor().1;
-    process
-        .heap
-        .set_stack_pointer(base.wrapping_add(found.resume));
-    // Port of erts/emulator/beam/beam_common.c:532-570 (handle_error), OTP-29.1.1:
+    process.heap.release_stack(found.resume);
     // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
     process.x[0] = Term::catch(0);
     process.x[1] = reason;
@@ -866,14 +887,6 @@ pub(crate) fn commit_catch(
     // A BIF that raised through the scheduler's trap record (`signals.rs`, `natives/ets.rs`)
     // left it beside `freason`; it is consumed with the failure words.
     process.clear_native_failure();
-    match found.target {
-        CatchTarget::Native(handler) => CatchHandler::Native(handler),
-        CatchTarget::Interpreted { module, ip } => {
-            process.module = module;
-            process.set_ip(ip);
-            CatchHandler::Interpreted
-        }
-    }
 }
 
 fn register_bridge_continuation() -> Result<(), &'static str> {
