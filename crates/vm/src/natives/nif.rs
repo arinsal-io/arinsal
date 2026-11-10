@@ -1609,6 +1609,7 @@ fn push_continuation(process: &mut Process, module: usize, ip: usize) -> Result<
     }
     let cp = crate::stacktrace::continuation_tag(module as usize, ip as usize)?;
     process.heap.stack_set(0, cp);
+    process.interpreter_frames = true;
     Ok(())
 }
 

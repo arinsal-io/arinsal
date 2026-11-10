@@ -21,9 +21,29 @@ const RETURN_TRACE_FLAG: u64 = 1 << 22;
 const RETURN_TO_TRACE_FLAG: u64 = 1 << 21;
 const RETURN_CALL_ACC_TRACE_FLAG: u64 = 1 << 23;
 const TRACE_FLAGS: u64 = RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG | RETURN_CALL_ACC_TRACE_FLAG;
-const STACKTRACE_HEADER_WORDS: usize = 6;
-const STACKTRACE_NO_LOCATION: u64 = 1;
-const STACKTRACE_CURRENT_ARGS_MFA: u64 = 2;
+/// `struct StackTrace` words after the bignum header: `freason`, `pc`, `current`, and `depth`
+/// with `max_depth` sharing one word (two C `int`s), as in erts/emulator/beam/error.h:222-230.
+const STACKTRACE_HEADER_WORDS: usize = 4;
+/// A `current` of MFA atoms (bit 63 clear) paired with the saved argument list rather than a
+/// BIF MFA: the function-clause top frame. Atom indexes stay below 2^31 (`+t` limit), so bit 31
+/// of the function atom is spare. erts tells the two apart by `GET_EXC_INDEX(freason)`.
+const STACKTRACE_CURRENT_ARGS_MFA: u64 = 1 << 31;
+
+/// `StackTrace.depth` and `StackTrace.max_depth` in one word.
+fn stacktrace_depth_word(depth: usize, max_depth: usize) -> u64 {
+    (depth as u64 & 0xffff_ffff) | ((max_depth as u64) << 32)
+}
+
+/// `(depth, max_depth)` of a `StackTrace` depth word.
+fn stacktrace_depths(word: u64) -> (usize, usize) {
+    ((word as u32) as usize, (word >> 32) as usize)
+}
+
+/// Whether `current` is an MFA paired with its argument list (see
+/// [`STACKTRACE_CURRENT_ARGS_MFA`]).
+fn current_args_mfa(current: u64) -> bool {
+    current & (1 << 63) == 0 && current & STACKTRACE_CURRENT_ARGS_MFA != 0
+}
 
 /// A catch handler: the code scope of its runtime, its module index and its code index.
 type CatchKey = (u64, usize, usize);
@@ -207,7 +227,6 @@ impl StackTrace {
         freason: u64,
         pc: u64,
         current: u64,
-        trace_flags: u64,
     ) -> Result<Term, VmError> {
         let digits = STACKTRACE_HEADER_WORDS
             .checked_add(max_depth)
@@ -215,7 +234,7 @@ impl StackTrace {
         TermBuilder::new(heap)
             .pos_bignum_prefix(
                 digits,
-                [freason, pc, current, 0, max_depth as u64, trace_flags],
+                [freason, pc, current, stacktrace_depth_word(0, max_depth)],
             )
             .map_err(|error| VmError::Unsupported(format!("stacktrace allocation {error:?}")))
     }
@@ -230,12 +249,14 @@ impl StackTrace {
             .checked_add(fields.max_depth)
             .ok_or_else(|| VmError::Unsupported("stacktrace size".into()))?;
         let freason = fields.freason;
-        let pc = fields.pc;
-        let current = fields.current;
-        let no_location = u64::from(fields.no_location);
-        let current_args_mfa = u64::from(fields.current_args_mfa) << 1;
-        let depth = fields.depth as u64;
-        let max_depth = fields.max_depth as u64;
+        // erts: no location is `pc == NULL`.
+        let pc = if fields.no_location { 0 } else { fields.pc };
+        let current = if fields.current_args_mfa {
+            fields.current | STACKTRACE_CURRENT_ARGS_MFA
+        } else {
+            fields.current
+        };
+        let depth = stacktrace_depth_word(fields.depth, fields.max_depth);
         let trace = fields.trace;
         TermBuilder::new(heap)
             .pos_bignum_fill(digits, |index| match index {
@@ -243,8 +264,6 @@ impl StackTrace {
                 1 => pc,
                 2 => current,
                 3 => depth,
-                4 => max_depth,
-                5 => no_location | current_args_mfa,
                 _ => trace
                     .get(index - STACKTRACE_HEADER_WORDS)
                     .copied()
@@ -257,7 +276,9 @@ impl StackTrace {
     /// OTP-29.1.1. A raised stacktrace is already symbolic and lives in `Args`.
     fn allocate_raised(heap: &mut impl HeapAlloc, freason: u64) -> Result<Term, VmError> {
         TermBuilder::new(heap)
-            .neg_bignum_fill(5, |index| if index == 0 { freason } else { 0 })
+            .neg_bignum_fill(STACKTRACE_HEADER_WORDS, |index| {
+                if index == 0 { freason } else { 0 }
+            })
             .map_err(|error| VmError::Unsupported(format!("raised stacktrace {error:?}")))
     }
 }
@@ -775,16 +796,11 @@ pub(super) fn save_stacktrace(
     let current = match top {
         Some(SaveTop::Live(TopFrame::CurrentArgsNoLocation {
             module, function, ..
-        })) => pack_bif_mfa(*module, *function),
+        })) => pack_bif_mfa(*module, *function) | STACKTRACE_CURRENT_ARGS_MFA,
         Some(top) if let Some((module, function)) = top.bif_mfa() => pack_bif_mfa(module, function),
         _ => pack_indexed(site.0, site.1)
             .ok_or_else(|| VmError::Unsupported("stacktrace current address".into()))?,
     };
-    let current_args_mfa = matches!(
-        top,
-        Some(SaveTop::Live(TopFrame::CurrentArgsNoLocation { .. }))
-    );
-    let no_location = false;
     let pc = if bif_top {
         0
     } else {
@@ -804,14 +820,7 @@ pub(super) fn save_stacktrace(
     // separate `HAlloc`s on the process heap (young heap, heap fragment when it is full).
     let (stack_trace, ftrace) = {
         let mut heap = TraceHeap::new(&mut p.heap);
-        let stack_trace = StackTrace::reserve(
-            &mut heap,
-            max_depth,
-            freason,
-            pc,
-            current,
-            u64::from(no_location) | (u64::from(current_args_mfa) << 1),
-        )?;
+        let stack_trace = StackTrace::reserve(&mut heap, max_depth, freason, pc, current)?;
         let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
         let ftrace = Ftrace {
             stack_trace,
@@ -823,7 +832,6 @@ pub(super) fn save_stacktrace(
     };
     stack_trace
         .with_bignum_digits_mut(|digits| {
-            digits[5] = u64::from(no_location) | (u64::from(current_args_mfa) << 1);
             let mut offset = 0;
             if bif_top
                 && max_depth > 0
@@ -848,7 +856,7 @@ pub(super) fn save_stacktrace(
                 previous,
             );
             let depth = offset + gathered;
-            digits[3] = depth as u64;
+            digits[3] = stacktrace_depth_word(depth, max_depth);
             depth
         })
         .ok_or_else(|| VmError::Unsupported("stacktrace bignum".into()))?;
@@ -964,9 +972,63 @@ fn gather_continuations(
 ) -> usize {
     // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`), OTP-29.1.1.
     // erts advances one pointer through the live stack; use the equivalent sequential view.
-    gather_continuations_in(p, pcs, previous_native, previous)
+    // Only a process that ever ran interpreted code can hold interpreter continuations
+    // (catch immediates with the continuation bit); every other stack is erts' layout, where
+    // a non-CP word is skipped after the single `is_CP` test.
+    if p.interpreter_frames {
+        gather_continuations_in(p, pcs, previous_native, previous)
+    } else {
+        gather_native_continuations(p, pcs, previous_native)
+    }
 }
 
+/// `gather_stacktrace` over a stack of native frames only: each word costs the `is_CP` test,
+/// a CP additionally the trace-frame and exit-bridge compares and the duplicate check.
+// Port of erts/emulator/beam/beam_common.c:782-841 (gather_stacktrace), OTP-29.1.1.
+fn gather_native_continuations(
+    p: &Process,
+    pcs: &mut [u64],
+    previous_native: Option<usize>,
+) -> usize {
+    let limit = pcs.len();
+    if limit == 0 {
+        return 0;
+    }
+    let trace_return = crate::native_bridge::native_trace_return_address();
+    // erts records `beam_normal_exit` like any CP and `build_stacktrace` drops it because no
+    // function contains it; the bridge is skipped here instead, which yields the same frames.
+    let bridge = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
+    let words = p.heap.stack_raw_words();
+    let mut previous_cp = previous_native.unwrap_or(usize::MAX);
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while let Some(&word) = words.get(index) {
+        index += 1;
+        if !arinsal_term::is_cp(word) {
+            continue;
+        }
+        let raw_address = word as usize;
+        if raw_address == trace_return {
+            let action_count = p
+                .heap
+                .stack_get(index + 2)
+                .and_then(Term::as_small)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0);
+            index = index.saturating_add(3 + action_count.saturating_mul(2));
+        } else if raw_address != previous_cp && raw_address != bridge {
+            previous_cp = raw_address;
+            pcs[count] = raw_address.wrapping_sub(1) as u64;
+            count += 1;
+            if count == limit {
+                break;
+            }
+        }
+    }
+    count
+}
+
+/// `gather_stacktrace` over a stack that may also hold interpreter continuations.
 fn gather_continuations_in(
     p: &Process,
     pcs: &mut [u64],
@@ -1147,12 +1209,7 @@ fn digits_name_code(digits: &[u64], module: usize, in_native: &impl Fn(usize) ->
     if indexed(digits[1]) || native(digits[1]) || indexed(digits[2]) {
         return true;
     }
-    let Ok(depth) = usize::try_from(digits[3]) else {
-        return false;
-    };
-    let Ok(max_depth) = usize::try_from(digits[4]) else {
-        return false;
-    };
+    let (depth, max_depth) = stacktrace_depths(digits[3]);
     if depth > max_depth {
         return false;
     }
@@ -1182,10 +1239,10 @@ fn raw_no_location(term: Term) -> Option<bool> {
     if fields.len() != 3 {
         return None;
     }
+    // A function-clause trace whose class `raw_raise` rewrote: erts' `pc == NULL` with a
+    // `freason` that no longer names `function_clause`.
     fields[0].with_bignum_digits_mut(|digits| {
-        digits
-            .get(5)
-            .is_some_and(|flags| flags & STACKTRACE_NO_LOCATION != 0)
+        digits.len() >= STACKTRACE_HEADER_WORDS && digits[1] == 0 && current_args_mfa(digits[2])
     })
 }
 
@@ -1197,12 +1254,15 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
     }
     let freason = digits[0];
     let pc = digits[1];
-    let current = digits[2];
-    let count = usize::try_from(digits[3]).ok()?;
-    let max_depth = usize::try_from(digits[4]).ok()?;
-    let trace_flags = digits[5];
-    let no_location = trace_flags & STACKTRACE_NO_LOCATION != 0;
-    let current_args_mfa = trace_flags & STACKTRACE_CURRENT_ARGS_MFA != 0;
+    let current_args_mfa = current_args_mfa(digits[2]);
+    let current = digits[2]
+        & !(if current_args_mfa {
+            STACKTRACE_CURRENT_ARGS_MFA
+        } else {
+            0
+        });
+    let no_location = current_args_mfa && pc == 0;
+    let (count, max_depth) = stacktrace_depths(digits[3]);
     if count > max_depth || digits.len() < STACKTRACE_HEADER_WORDS + count {
         return None;
     }
@@ -1381,11 +1441,10 @@ pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool 
             return false;
         };
         *freason = code;
-        if digits
-            .get(5)
-            .is_some_and(|flags| flags & STACKTRACE_CURRENT_ARGS_MFA != 0)
-        {
-            digits[5] |= STACKTRACE_NO_LOCATION;
+        // erts loses the `function_clause` index here, so `build_stacktrace` stops looking
+        // the location up; the function-clause trace marks that with `pc == NULL`.
+        if digits.len() >= STACKTRACE_HEADER_WORDS && current_args_mfa(digits[2]) {
+            digits[1] = 0;
         }
         true
     })
@@ -1893,14 +1952,10 @@ fn prepare_frames(
     if digits.len() < STACKTRACE_HEADER_WORDS {
         return Ok(FramePrep::Fallback);
     }
-    if digits[5] != 0 {
-        return Ok(FramePrep::Fallback);
-    }
     let pc = digits[1];
     let current = digits[2];
-    let count = usize::try_from(digits[3]).unwrap_or(usize::MAX);
+    let (count, max_depth) = stacktrace_depths(digits[3]);
     let depth = count.saturating_add(1);
-    let max_depth = usize::try_from(digits[4]).unwrap_or(0);
     if count > max_depth || digits.len() < STACKTRACE_HEADER_WORDS + count {
         return Ok(FramePrep::Fallback);
     }
@@ -2011,11 +2066,10 @@ fn prepare_bif_frames(
         return Ok(FramePrep::Fallback);
     }
     let (pc, current) = (digits[1], digits[2]);
-    let count = usize::try_from(digits[3]).unwrap_or(usize::MAX);
-    let max_depth = usize::try_from(digits[4]).unwrap_or(0);
+    let (count, max_depth) = stacktrace_depths(digits[3]);
     if pc != 0
-        || digits[5] != 0
         || current & CURRENT_IS_FUNCTION != 0
+        || current_args_mfa(current)
         || count > max_depth
         || digits.len() < STACKTRACE_HEADER_WORDS + count
     {
@@ -2653,9 +2707,7 @@ mod tests {
                     arinsal_beamasm::exc::EXC_ERROR,
                     0x1000,
                     0,
-                    1,
-                    2,
-                    0,
+                    1 | (2 << 32),
                     0x2000,
                     0,
                 ];

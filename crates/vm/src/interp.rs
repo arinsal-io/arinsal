@@ -1445,6 +1445,7 @@ fn push_trace_frames(
     return_to_ip: usize,
     actions: &[crate::trace::CallActions],
 ) -> Result<(), VmError> {
+    process.interpreter_frames = true;
     let small = |value: usize| {
         Term::small(
             i64::try_from(value)
@@ -1833,6 +1834,8 @@ impl Vm {
         ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
         budget: u32,
     ) -> Result<RunState, VmError> {
+        // Interpreted code pushes its continuations as catch immediates.
+        p.interpreter_frames = true;
         let result = self.run_slice_inner(p, ctx, budget);
         result.map_err(|error| {
             let Some(module) = self.code.modules.get(p.module) else {

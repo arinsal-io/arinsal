@@ -434,6 +434,10 @@ pub struct Process {
     pub(crate) scheduler_ref_state: Option<arinsal_bifs::SchedulerRefState>,
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
+    /// The process has run interpreted code, so its stack may hold interpreter continuations
+    /// (catch immediates) besides native CPs. Sticky: erts has no such frames, and a stack
+    /// walk of a process without them is erts' `is_CP`-only walk.
+    pub(crate) interpreter_frames: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// A native `wait`/`wait_timeout` asked the scheduler to sleep (receive timer position, `None` for
@@ -2381,6 +2385,7 @@ impl Process {
             run_key: 0,
             exec_key: 0,
             hibernated: false,
+            interpreter_frames: false,
             signal_probe: None,
             native_wait: None,
             native_wait_timeout: None,
