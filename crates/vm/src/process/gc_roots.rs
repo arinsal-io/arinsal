@@ -55,7 +55,6 @@ impl Process {
             && self.cold.as_ref().is_none_or(|cold| {
                 cold.persistent_get_all.is_none()
                     && cold.apply_roots.is_empty()
-                    && cold.ext_last_released.is_none()
                     && cold.nif_pending.is_none()
                     && cold
                         .ets_insert
@@ -213,9 +212,6 @@ impl Process {
                 roots.push_term(&mut state.result);
             }
             roots.push(&mut cold.apply_roots);
-            if let Some(released) = cold.ext_last_released.as_mut() {
-                roots.push(&mut released.words);
-            }
             if let Some(pending) = cold.nif_pending.as_mut() {
                 roots.push(pending.roots_mut());
             }

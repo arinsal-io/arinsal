@@ -2103,7 +2103,7 @@ fn run_call_match(
         Vec::new()
     };
     let (caller, caller_line) = if spec.uses_caller {
-        caller_info(process, vm, module, function)?
+        caller_info(process, module, function)?
     } else {
         (None, None)
     };
@@ -2789,27 +2789,15 @@ fn call_mfa_term(
 // OTP-29.1.1.
 fn caller_info(
     process: &mut Process,
-    vm: &Vm,
     target_module: &str,
     target_function: &str,
 ) -> Result<(Option<Term>, Option<Term>), VmError> {
-    let direct_caller = if let Some(module) = vm.code.modules.get(process.module)
-        && let Some((function, arity)) = module.function_at(process.ip())
-        && (module.name != target_module || function != target_function)
-        && !function.starts_with('-')
-        && module.line_term_at(process.ip()).is_some()
+    // The caller is the function of the first return address on the stack (erts
+    // `erts_inspect_frame` + `erts_lookup_function_info` on the CP).
     {
-        Some((module, function.to_owned(), arity, process.ip()))
-    } else {
-        None
-    };
-    let caller = {
         let mut index = 0;
         loop {
             let Some(word) = process.heap.stack_get(index) else {
-                if let Some(caller) = direct_caller {
-                    break caller;
-                }
                 return Ok((None, None));
             };
             let raw_address = word.tagged_word() as usize;
@@ -2862,40 +2850,6 @@ fn caller_info(
             index += 1;
         }
     };
-    let (module, function, arity, call_site) = caller;
-    let mfa = [
-        Term::atom(
-            global_atoms()
-                .intern(&module.name)
-                .map_err(|_| VmError::Unsupported("caller module atom".into()))?,
-        ),
-        Term::atom(
-            global_atoms()
-                .intern(&function)
-                .map_err(|_| VmError::Unsupported("caller function atom".into()))?,
-        ),
-        Term::small(i64::from(arity)).ok_or_else(|| VmError::Unsupported("caller arity".into()))?,
-    ];
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let caller = TermBuilder::new(&mut heap)
-        .tuple(&mfa)
-        .map_err(|error| VmError::Unsupported(format!("caller MFA: {error:?}")))?;
-    let caller_line = if let Some((file, line)) = module.line_term_at(call_site) {
-        let line = Term::small(i64::try_from(line).unwrap_or(i64::MAX))
-            .ok_or_else(|| VmError::Unsupported("caller line".into()))?;
-        let source = TermBuilder::new(&mut heap)
-            .tuple(&[file, line])
-            .map_err(|error| VmError::Unsupported(format!("caller source line: {error:?}")))?;
-        let values = [mfa[0], mfa[1], mfa[2], source];
-        Some(
-            TermBuilder::new(&mut heap)
-                .tuple(&values)
-                .map_err(|error| VmError::Unsupported(format!("caller line: {error:?}")))?,
-        )
-    } else {
-        None
-    };
-    Ok((Some(caller), caller_line))
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:5375-5421 (matchCurrentStacktrace), OTP-29.1.1.
@@ -3302,7 +3256,7 @@ pub(crate) fn bif_return_events(
         if action.return_to && outcome.is_ok() {
             let flags = active_session_flags(process, action.session, pid);
             if flags & RETURN_TO != 0 && flags & SILENT == 0 {
-                let target = caller_mfa_name(vm, process, site);
+                let target = caller_mfa_name(process, site);
                 emit_return_to(vm, process, ctx, action.session, target)?;
             }
         }
@@ -3310,30 +3264,22 @@ pub(crate) fn bif_return_events(
     Ok(())
 }
 
-/// The function a traced BIF call returns to: the one that holds the call site.
+/// The function a traced BIF call returns to: the one that holds the native call site, else
+/// the one of the return address on the stack top (erts `erts_lookup_function_info` on the CP).
 fn caller_mfa_name(
-    vm: &Vm,
     process: &Process,
     site: Option<(usize, usize)>,
 ) -> Option<(String, String, u8)> {
-    let (module_id, ip) = match site {
-        // An interpreted `apply` names its instruction in the running module.
-        Some((id, ip)) if id == usize::MAX - 1 => (process.module, ip),
-        Some(site) => site,
-        None => (process.module, process.ip()),
+    let pc = match site {
+        Some((usize::MAX, pc)) => pc,
+        _ => (process.heap.stack_get(0)?.tagged_word() as usize).checked_sub(1)?,
     };
-    if module_id == usize::MAX {
-        // A native call site: the pc names the caller's native function.
-        let function = crate::native_function_at(ip)?;
-        return Some((
-            function.module.to_owned(),
-            function.function.to_owned(),
-            function.arity,
-        ));
-    }
-    let module = vm.code.modules.get(module_id)?;
-    let (function, arity) = module.function_at(ip)?;
-    Some((module.name.clone(), function.to_owned(), arity))
+    let function = crate::native_function_at(pc)?;
+    Some((
+        function.module.to_owned(),
+        function.function.to_owned(),
+        function.arity,
+    ))
 }
 
 /// The catching function gets the `return_to` event of every session that had a return_to
@@ -3868,11 +3814,7 @@ fn emit_filtered_without_ctx(
 }
 
 /// Return the MFA reported by running-status events, including a trapped BIF's continuation.
-pub(crate) fn running_mfa(
-    process: &mut Process,
-    vm: &Vm,
-    subject: Pid,
-) -> Result<Option<Term>, VmError> {
+pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<Term>, VmError> {
     if flags(process, subject) & RUNNING == 0 {
         return Ok(None);
     }
@@ -3950,13 +3892,7 @@ pub(crate) fn running_mfa(
     } else if let Some(native) = native.as_ref() {
         (native.module, native.function, native.arity)
     } else {
-        let Some(module) = vm.code.modules.get(process.module) else {
-            return Ok(None);
-        };
-        let Some((function, arity)) = module.function_at(process.ip()) else {
-            return Ok(None);
-        };
-        (&*module.name, function, arity)
+        return Ok(None);
     };
     let tuple = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[

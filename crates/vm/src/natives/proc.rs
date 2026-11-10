@@ -1020,7 +1020,7 @@ fn process_info_aux(
                 _ => Term::small(0).unwrap(),
             })
         }
-        arinsal_term::atoms::BACKTRACE => process_info_item_backtrace(vm, process)?,
+        arinsal_term::atoms::BACKTRACE => process_info_item_backtrace(process)?,
         arinsal_term::atoms::BINARY => process_info_item_binary(process)?,
         arinsal_term::atoms::CATCHLEVEL => Term::small(0).unwrap(),
         arinsal_term::atoms::CURRENT_FUNCTION
@@ -1405,9 +1405,9 @@ fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Ter
 }
 
 #[inline(never)]
-fn process_info_item_backtrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {
+fn process_info_item_backtrace(process: &mut Process) -> Result<Term, VmError> {
     Ok({
-        let text = backtrace_text(vm, process)?;
+        let text = backtrace_text(process)?;
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .binary(&text)
@@ -1481,27 +1481,20 @@ fn process_info_item_current_location(
                 .line_at(pc)
                 .map(|(file, line)| (file.to_owned(), u64::from(line)))
         });
-        let source = {
-            native.flatten().or_else(|| {
-                process.runtime.as_ref().and_then(|runtime| {
-                    runtime.with_modules(|modules| {
-                        let module = modules.get(process.module)?;
-                        module
-                            .lines
-                            .get(process.ip())
-                            .and_then(Option::as_ref)
-                            .or_else(|| {
-                                process
-                                    .ip()
-                                    .checked_sub(1)
-                                    .and_then(|ip| module.lines.get(ip))
-                                    .and_then(Option::as_ref)
-                            })
-                            .cloned()
+        // Port of erts/emulator/beam/erl_bif_info.c (current_function, full_info): the
+        // location is the line of `rp->i` when it lies in the current function, else none.
+        let source = native.flatten().or_else(|| {
+            let pc = native_position(process)?;
+            crate::native_bridge::with_native_function_at(pc, |f| {
+                (f.module == module_name && f.function == function && f.arity == arity)
+                    .then(|| {
+                        f.line_at(pc)
+                            .map(|(file, line)| (file.to_owned(), u64::from(line)))
                     })
-                })
+                    .flatten()
             })
-        };
+            .flatten()
+        });
         let location = if let Some((file, line)) = source {
             let file = charlist(process, &file)?;
             let file = make_tuple(process, &[atom("file"), file])?;
@@ -2139,27 +2132,22 @@ fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, 
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module_atom, function.function_atom, function.arity));
     }
-    let native_position = process
-        .native_pc()
-        .or_else(|| Some(process.heap.abi.i as usize).filter(|&pc| pc != 0));
-    if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
+    if let Some(function) =
+        native_position(process).and_then(crate::native_bridge::native_function_at)
+    {
         return Ok((function.module_atom, function.function_atom, function.arity));
     }
-    let resolve = |modules: &[std::sync::Arc<crate::Module>]| {
-        let module = modules.get(process.module)?;
-        let (function, arity) = module
-            .function_atom_at(process.ip())
-            .unwrap_or((arinsal_term::atoms::UNDEFINED, 0));
-        Some((module.name_atom, function, arity))
-    };
-    if let Some(found) = vm.and_then(|vm| resolve(&vm.code.modules)) {
-        return Ok(found);
-    }
+    // Port of erts/emulator/beam/erl_process.c:12614 (`p->current = &p->u.initial`), OTP-29.1.1:
+    // a process that has not run yet is in its initial function.
+    initial_call_atoms(vm, process)
+}
+
+/// The process's code address: erts `c_p->i`. A process woken in native code handles its
+/// signals before the native entry takes `native_pc`; its position is then still in `c_p->i`.
+fn native_position(process: &Process) -> Option<usize> {
     process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.with_modules(resolve))
-        .ok_or_else(badarg)
+        .native_pc()
+        .or_else(|| Some(process.heap.abi.i as usize).filter(|&pc| pc != 0))
 }
 
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
@@ -2190,33 +2178,23 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
             function.arity,
         ));
     }
-    // A process in native code (a receive wait, a yield) is at a native address;
-    // `module`/`ip` only describe its interpreter state.
-    // A process woken in native code handles its signals before the native entry takes
-    // `native_pc`; its position is then still in `c_p->i`, which interpreted slices clear.
-    let native_position = process
-        .native_pc()
-        .or_else(|| Some(process.heap.abi.i as usize).filter(|&pc| pc != 0));
-    if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
+    if let Some(function) =
+        native_position(process).and_then(crate::native_bridge::native_function_at)
+    {
         return Ok((
             function.module.to_owned(),
             function.function.to_owned(),
             function.arity,
         ));
     }
-    if let Some(vm) = vm {
-        let module = vm.code.modules.get(process.module).ok_or_else(badarg)?;
-        let (function, arity) = module.function_at(process.ip()).unwrap_or(("undefined", 0));
-        return Ok((module.name.clone(), function.to_owned(), arity));
-    }
-    let runtime = process.runtime.ok_or_else(badarg)?;
-    runtime
-        .with_modules(|modules| {
-            let module = modules.get(process.module)?;
-            let (function, arity) = module.function_at(process.ip()).unwrap_or(("undefined", 0));
-            Some((module.name.clone(), function.to_owned(), arity))
-        })
-        .ok_or_else(badarg)
+    // erl_process.c:12614 (`p->current = &p->u.initial`): a process that has not run yet.
+    let (module, function, arity) = initial_call_atoms(vm, process)?;
+    let names = global_atoms();
+    Ok((
+        names.text(module).ok_or_else(badarg)?.to_owned(),
+        names.text(function).ok_or_else(badarg)?.to_owned(),
+        arity,
+    ))
 }
 
 /// `module:function/arity + offset` of a native code address.
@@ -2242,23 +2220,17 @@ fn pc_description(word: Term, native: bool) -> String {
 // The `backtrace` item is always answered by the target while it handles the request
 // signal (`ERTS_PI_FLAG_FORCE_SIG_SEND`), so the target is in a running state when
 // `erts_program_counter_info` reads it and prints neither `arity = N` nor the registers.
-fn backtrace_text(vm: Option<&Vm>, process: &mut Process) -> Result<Vec<u8>, VmError> {
+fn backtrace_text(process: &mut Process) -> Result<Vec<u8>, VmError> {
     if process
         .self_pid
         .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
     {
         return Ok(Vec::new());
     }
-    match vm {
-        Some(vm) => Ok(backtrace_with(&vm.code.modules, process)),
-        None => {
-            let runtime = process.runtime.ok_or_else(badarg)?;
-            Ok(runtime.with_modules(|modules| backtrace_with(modules, process)))
-        }
-    }
+    Ok(backtrace_with(process))
 }
 
-fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) -> Vec<u8> {
+fn backtrace_with(process: &Process) -> Vec<u8> {
     use std::fmt::Write as _;
     let print = |word: Term| match arinsal_term::to_owned(word) {
         Ok(owned) => super::sys::print_otp_term(&owned, i32::MAX as usize),
@@ -2283,47 +2255,23 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         .as_ref()
         .and_then(|cold| cold.dirty_bif_mfa)
         .filter(|(_, function, _)| function.starts_with("dirty_bif_"));
+    // Port of erts/emulator/beam/erl_process.c:14956 (print_function_from_pc), OTP-29.1.1.
     let (address, description) = if let Some((module, function, arity)) = dirty_continuation {
-        // erts has already set p->i to the scheduled dirty continuation while it waits to run.
-        // The interpreter position remains at the suspended caller until the scheduler dispatches it.
-        (process.ip(), format!("{module}:{function}/{arity} + 0"))
+        // erts has already set p->i to the scheduled dirty continuation while it waits to run;
+        // that continuation has no code address here.
+        (0, format!("{module}:{function}/{arity} + 0"))
     } else {
         match native_pc {
             Some(pc) => (pc, pc_description(Term::NIL, true)),
-            None => (process.ip(), String::new()),
+            None => (0, "unknown function".to_owned()),
         }
     };
-    let description = if dirty_continuation.is_some() {
-        description
-    } else if native_pc.is_some() {
-        let function = crate::native_bridge::native_function_at(address);
-        function.map_or(description, |f| {
-            format!(
-                "{}:{}/{} + {}",
-                f.module,
-                f.function,
-                f.arity,
-                address - f.start
-            )
-        })
-    } else {
-        modules
-            .get(process.module)
-            .and_then(|code| {
-                let (start, name, arity) = code
-                    .functions
-                    .iter()
-                    .rev()
-                    .find(|(s, _, _)| *s <= process.ip())?;
-                Some(format!(
-                    "{}:{}/{} + {}",
-                    code.name,
-                    name,
-                    arity,
-                    process.ip() - start
-                ))
-            })
-            .unwrap_or_else(|| "invalid".into())
+    let description = match native_pc {
+        Some(pc) if dirty_continuation.is_none() => crate::native_bridge::native_function_at(pc)
+            .map_or(description, |f| {
+                format!("{}:{}/{} + {}", f.module, f.function, f.arity, pc - f.start)
+            }),
+        _ => description,
     };
     if export_trap {
         let _ = writeln!(
@@ -2335,41 +2283,6 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
     }
     let base = process.heap.heap_cursor().1 as usize;
-    if let Some(frame) = process.trap_return_frame()
-        && let Ok(word) = crate::stacktrace::continuation_tag(frame.module, frame.ip)
-    {
-        // The return address of the trapped BIF call, then the caller's frame that a
-        // `call_ext_last` released before the call; the words are not on the stack.
-        let call_site = frame.ip.saturating_sub(1);
-        let description = modules
-            .get(frame.module)
-            .and_then(|code| {
-                let (start, name, arity) = code
-                    .functions
-                    .iter()
-                    .rev()
-                    .find(|(s, _, _)| *s <= call_site)?;
-                Some(format!(
-                    "{}:{}/{} + {}",
-                    code.name,
-                    name,
-                    arity,
-                    frame.ip - start
-                ))
-            })
-            .unwrap_or_else(|| "unknown function".into());
-        let kept = process.trap_frame_words();
-        let slot = base.wrapping_sub((1 + kept.len()) * 8);
-        let _ = writeln!(
-            text,
-            "\n{slot:#018x} Return addr {:#018x} ({description})",
-            word.tagged_word() as usize
-        );
-        for (yreg, word) in kept.iter().enumerate() {
-            let _ = write!(text, "{:<8} ", format!("y({yreg})"));
-            let _ = writeln!(text, "{}", print(*word));
-        }
-    }
     let mut yreg = 0usize;
     for index in 0..process.heap.stack_words() {
         let Some(word) = process.heap.stack_get(index) else {
@@ -6509,7 +6422,7 @@ pub(crate) fn process_dump(
     let _ = writeln!(
         text,
         "Program counter: {:#018x} ({})",
-        process.ip(),
+        native_position(process).unwrap_or(0),
         mfa(values.get("current_function"))
     );
     let _ = writeln!(text);

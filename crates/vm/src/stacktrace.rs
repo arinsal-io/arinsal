@@ -10,9 +10,9 @@ use arinsal_term::{
 use arinsal_term::{ExternalBinary, MagicRef, Node, WritableBinary};
 use std::sync::{Arc, OnceLock};
 
-const CONTINUATION_BIT: u64 = 1 << 57;
-/// Module indexes from here up are not encodable in a continuation.
-const MAX_CONTINUATION_MODULE: u64 = 1 << 21;
+/// A `current` word with bit 63 set: erts `s->current` that is not a BIF MFA; the current
+/// function is looked up from `s->pc` (`erts_lookup_function_info`).
+const CURRENT_FROM_PC: u64 = 1 << 63;
 /// `struct StackTrace` words after the bignum header: `freason`, `pc`, `current`, and `depth`
 /// with `max_depth` sharing one word (two C `int`s), as in erts/emulator/beam/error.h:222-230.
 const STACKTRACE_HEADER_WORDS: usize = 4;
@@ -183,8 +183,6 @@ pub(super) struct RawTrace {
 
 enum Continuation {
     Native(usize),
-    /// Module-table index and instruction pointer, used by a heap-resident raw trace.
-    Indexed(usize, usize),
 }
 
 /// Fields stored in OTP's `struct StackTrace` bignum allocation.
@@ -390,19 +388,12 @@ pub(super) enum StoredTopFrame {
 
 /// Where the exception was raised: erts' `s->pc` (save_stacktrace's `pc`).
 pub(super) struct Current<'a> {
-    /// Last interpreter module and instruction.
-    pub(super) module: usize,
-    pub(super) ip: usize,
     /// Raising pc inside native code, when the process was executing there.
     pub(super) native_pc: Option<usize>,
     /// Current X registers, which carry live arguments for native BIF failures.
     pub(super) registers: &'a [Term],
     /// The process is scheduled out in the export trap of a BIF call.
     pub(super) trapped: bool,
-    /// Return address of that BIF call when it is not on the stack (interpreter calls).
-    pub(super) trap_return: Option<usize>,
-    /// A tail apply released the caller frame: the BIF has no caller continuation to keep.
-    pub(super) frame_released: bool,
 }
 
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
@@ -410,7 +401,6 @@ pub(super) fn capture(
     raw: &mut RawTrace,
     class: Option<Class>,
     top: Option<&TopFrame>,
-    modules: &[Arc<Module>],
     current: Current<'_>,
     heap: &ProcessHeap,
     depth: usize,
@@ -418,13 +408,9 @@ pub(super) fn capture(
     // Port of beam_common.c:600-614 (`erts_inspect_frame`) and beam_common.h:301-315,
     // OTP-29.1.1: continuations are raw CP words resolved back to code metadata.
     let Current {
-        module,
-        ip,
         native_pc,
         registers,
         trapped,
-        trap_return,
-        frame_released,
     } = current;
     raw.class = class;
     let captured_top = top
@@ -486,23 +472,15 @@ pub(super) fn capture(
     }
     raw.no_location = false;
     raw.current_args_mfa = matches!(top, Some(TopFrame::CurrentArgsNoLocation { .. }));
-    raw.module_index = Some(module);
-    raw.module = modules.get(module).cloned();
-    raw.ip = ip;
+    // The current function comes from the raising pc (`erts_lookup_function_info`).
+    raw.module_index = None;
+    raw.module = None;
+    raw.ip = 0;
     raw.depth = depth.max(1);
     raw.continuations.clear();
     raw.continuations.reserve(raw.depth.min(16));
     raw.native_top = None;
     raw.no_current = trapped;
-    if matches!(raw.top, Some(StoredTopFrame::Bif { .. })) && native_pc.is_none() && !frame_released
-    {
-        // Port of beam_common.c:880-930 (`save_stacktrace`), OTP-29.1.1: the BIF owns
-        // `current`; preserve the interpreter caller's CP as the first trace word.
-        let caller_cp = ip.saturating_add(1);
-        if pack_indexed(module, caller_cp).is_some() {
-            push_frame(raw, Continuation::Indexed(module, caller_cp));
-        }
-    }
     // erts' single `prev`: the raising pc, compared with each return address.
     let mut previous_native: Option<usize> = None;
     if let Some(pc) = native_pc {
@@ -521,14 +499,6 @@ pub(super) fn capture(
             // OTP-29.1.1: the current native PC seeds the same duplicate check as `rp->i`.
             previous_native = Some(pc);
         }
-    }
-    if let Some(return_ip) = trap_return
-        && modules.get(module).is_some()
-        && raw.continuations.len() + 1 < raw.depth
-    {
-        // The trap's pc is no function, so nothing seeds `prev`: the BIF call's own return
-        // address is the first frame.
-        push_frame(raw, Continuation::Indexed(module, return_ip));
     }
     let mut index = 0;
     while index < heap.stack_words() {
@@ -698,20 +668,9 @@ pub(super) fn save_stacktrace(
         class_to_freason(Some(class))
     };
     // Consumed here: it describes the one exception being saved.
-    let released = p
-        .cold
-        .as_mut()
-        .map_or(0, |cold| std::mem::take(&mut cold.apply_frame_released));
-    let frame_released = released != 0;
-    // Native code has no interpreter position: its raise site is the native pc.
-    let interpreter_position = |p: &Process| {
-        if native_pc.is_some() {
-            (p.module, 0)
-        } else {
-            (p.module, p.ip())
-        }
-    };
-    let site = interpreter_position(p);
+    if let Some(cold) = p.cold.as_mut() {
+        cold.apply_frame_released = 0;
+    }
     let (native_top, previous_native) = match native_pc {
         Some(pc) if pc & arinsal_beamasm::module::RETURN_SITE_TAG != 0 => {
             let address = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
@@ -732,23 +691,19 @@ pub(super) fn save_stacktrace(
             module, function, ..
         })) => pack_bif_mfa(*module, *function) | STACKTRACE_CURRENT_ARGS_MFA,
         Some(top) if let Some((module, function)) = top.bif_mfa() => pack_bif_mfa(module, function),
-        _ => pack_indexed(site.0, site.1)
-            .ok_or_else(|| VmError::Unsupported("stacktrace current address".into()))?,
+        _ => CURRENT_FROM_PC,
     };
     let pc = if bif_top {
         0
     } else {
         native_top
-            .map_or_else(|| pack_indexed(site.0, site.1), |pc| u64::try_from(pc).ok())
+            .and_then(|pc| u64::try_from(pc).ok())
             .unwrap_or(0)
     };
     let native_top_word = native_top
         .map(u64::try_from)
         .transpose()
         .map_err(|_| VmError::Unsupported("stacktrace pc".into()))?;
-    let interpreter_caller = (bif_top && native_top_word.is_none() && !frame_released)
-        .then(|| pack_indexed(p.module, p.ip().saturating_add(1)))
-        .flatten();
     // Port of erts/emulator/beam/beam_common.c:880-1045 (`save_stacktrace`), OTP-29.1.1: the
     // StackTrace bignum, the optional `error_info` map and arglist, and the ftrace tuple are
     // separate `HAlloc`s on the process heap (young heap, heap fragment when it is full).
@@ -772,14 +727,6 @@ pub(super) fn save_stacktrace(
                 && let Some(pc) = native_top_word
             {
                 digits[STACKTRACE_HEADER_WORDS] = pc;
-                offset = 1;
-            } else if bif_top
-                && max_depth > 0
-                && let Some(caller) = interpreter_caller
-            {
-                // Port of beam_common.c:928-930 (`save_stacktrace`), OTP-29.1.1:
-                // a BIF frame owns current, so preserve its interpreter caller CP.
-                digits[STACKTRACE_HEADER_WORDS] = caller;
                 offset = 1;
             }
             let end = STACKTRACE_HEADER_WORDS + max_depth;
@@ -933,15 +880,6 @@ fn gather_native_continuations(
     count
 }
 
-fn pack_indexed(module: usize, ip: usize) -> Option<u64> {
-    let module = u64::try_from(module).ok()?;
-    let ip = u64::try_from(ip).ok()?;
-    if module >= MAX_CONTINUATION_MODULE || ip >= 1 << 32 {
-        return None;
-    }
-    Some((1 << 63) | (module << 32) | ip)
-}
-
 /// The generic exit code of a class (`EXC_ERROR`, `EXC_EXIT`, `EXC_THROWN`), zero for none.
 // Port of erts/emulator/beam/error.h (EXC_ERROR, EXC_EXIT, EXC_THROWN), OTP-29.1.1.
 pub(crate) fn class_to_freason(class: Option<Class>) -> u64 {
@@ -1059,7 +997,7 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
     if count > max_depth || digits.len() < STACKTRACE_HEADER_WORDS + count {
         return None;
     }
-    let (mut module_index, mut ip, top) = if current_args_mfa {
+    let (module_index, ip, top) = if current_args_mfa {
         if current & (1 << 63) != 0 || !matches!(args.classify(), TermKind::List | TermKind::Nil) {
             return None;
         }
@@ -1082,11 +1020,7 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
         }
         let top = term_error_info_map(error_info)
             .map(|info| StoredTopFrame::CurrentArgsInfoTerm(None, info));
-        (
-            Some(((current & !(1 << 63)) >> 32) as usize),
-            current as u32 as usize,
-            top,
-        )
+        (None, 0, top)
     } else if current & (1 << 63) == 0 {
         let module = Atom((current >> 32) as u32);
         let function = Atom(current as u32);
@@ -1106,8 +1040,6 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
             }),
         )
     } else {
-        let module = ((current & !(1 << 63)) >> 32) as usize;
-        let ip = current as u32 as usize;
         let args = (args != Term::atom(arinsal_term::atoms::TRUE)).then_some(args);
         let info = term_error_info_map(error_info);
         let top = match (args, info) {
@@ -1116,7 +1048,7 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
             (None, Some(info)) => Some(StoredTopFrame::CurrentArgsInfoTerm(None, info)),
             (None, None) => None,
         };
-        (Some(module), ip, top)
+        (None, 0, top)
     };
     let mut trace_start = STACKTRACE_HEADER_WORDS;
     let current_is_bif = matches!(top, Some(StoredTopFrame::Bif { .. }));
@@ -1130,26 +1062,10 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
             trace_start += 1;
             usize::try_from(digits[STACKTRACE_HEADER_WORDS]).ok()
         });
-    let mut bif_caller_interpreted = false;
-    if current_is_bif && pc == 0 && count != 0 && digits[STACKTRACE_HEADER_WORDS] & (1 << 63) != 0 {
-        let payload = digits[STACKTRACE_HEADER_WORDS] & !(1 << 63);
-        module_index = Some((payload >> 32) as usize);
-        ip = payload as u32 as usize;
-        trace_start += 1;
-        bif_caller_interpreted = true;
-    }
     let mut continuations =
         Vec::with_capacity(count.saturating_sub(trace_start - STACKTRACE_HEADER_WORDS));
     for word in &digits[trace_start..STACKTRACE_HEADER_WORDS + count] {
-        if word & (1 << 63) != 0 {
-            let payload = word & !(1 << 63);
-            continuations.push(Continuation::Indexed(
-                (payload >> 32) as usize,
-                payload as u32 as usize,
-            ));
-        } else {
-            continuations.push(Continuation::Native(usize::try_from(*word).ok()?));
-        }
+        continuations.push(Continuation::Native(usize::try_from(*word).ok()?));
     }
     Some(RawTrace {
         class: class_from_freason(freason),
@@ -1159,7 +1075,7 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
         native_top,
         continuations,
         depth: count.saturating_add(1),
-        code_table: !current_is_bif || bif_caller_interpreted,
+        code_table: !current_is_bif,
         no_location,
         current_args_mfa,
         ..RawTrace::default()
@@ -1289,22 +1205,6 @@ pub(super) enum TopFrame {
     CurrentArgsInfoTerm(Option<Term>, Term),
 }
 
-/// Encodes an interpreter continuation without colliding with catch-table indices.
-pub(crate) fn continuation_tag(module: usize, ip: usize) -> Result<Term, VmError> {
-    continuation_tag_flagged(module, ip, 0)
-}
-
-fn continuation_tag_flagged(module: usize, ip: usize, flags: u64) -> Result<Term, VmError> {
-    let module = u64::try_from(module).map_err(|_| VmError::Unsupported("module index".into()))?;
-    let ip = u32::try_from(ip).map_err(|_| VmError::Unsupported("code index".into()))?;
-    if module >= MAX_CONTINUATION_MODULE {
-        return Err(VmError::Unsupported("module index".into()));
-    }
-    Ok(Term::catch(
-        CONTINUATION_BIT | (module | flags) << 32 | u64::from(ip),
-    ))
-}
-
 /// Handler address of a stack word that is a catch tag of native code.
 pub(crate) fn native_catch_address(term: Term) -> Option<usize> {
     if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
@@ -1312,7 +1212,7 @@ pub(crate) fn native_catch_address(term: Term) -> Option<usize> {
     }
     // SAFETY: CATCH is an immediate and carries no heap pointer.
     let payload = unsafe { term.raw_bits() } >> 6;
-    if payload >> 32 != 0 || payload & CONTINUATION_BIT != 0 {
+    if payload >> 32 != 0 {
         return None;
     }
     crate::native_bridge::native_catch(
@@ -1505,8 +1405,8 @@ fn build_with_reserve(
     } else if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
         Some(native_pc)
     } else {
-        // A process suspended inside native code: `p.module`/`p.ip()` still hold the last
-        // interpreter position, so the current function comes from its native resume pc.
+        // A process suspended inside native code: the current function comes from its
+        // code address (`c_p->i`).
         p.native_pc()
             .or_else(|| Some(p.heap.abi.i as usize).filter(|&pc| pc != 0))
             .filter(|&pc| crate::native_bridge::is_native_function_at(pc))
@@ -1516,15 +1416,10 @@ fn build_with_reserve(
         &mut raw,
         None,
         top,
-        modules,
         Current {
-            module: p.module,
-            ip: p.ip(),
             native_pc,
             registers: &p.x,
             trapped,
-            trap_return: p.trap_return_frame().map(|frame| frame.ip),
-            frame_released: p.apply_frame_released(),
         },
         &p.heap,
         depth,
@@ -1603,25 +1498,19 @@ pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, V
     }
     let mut scratch = FrameScratch::new();
     let prepared = match p.runtime.as_ref() {
-        Some(runtime) => runtime.with_active_code(|ranges, tables| {
+        Some(runtime) => runtime.with_active_code(|ranges, _| {
             stack_trace.with_bignum_digits_mut(|digits| {
                 if bif_top {
-                    prepare_bif_frames(
-                        digits,
-                        Some(ranges),
-                        Some(tables),
-                        fields[1],
-                        error_info,
-                        &mut scratch,
-                    )
+                    prepare_bif_frames(digits, Some(ranges), fields[1], error_info, &mut scratch)
                 } else {
-                    prepare_frames(digits, Some(ranges), Some(tables), &mut scratch)
+                    prepare_frames(digits, Some(ranges), &mut scratch)
                 }
             })
         }),
         None if bif_top => None,
-        None => stack_trace
-            .with_bignum_digits_mut(|digits| prepare_frames(digits, None, None, &mut scratch)),
+        None => {
+            stack_trace.with_bignum_digits_mut(|digits| prepare_frames(digits, None, &mut scratch))
+        }
     }?;
     match prepared {
         Ok(FramePrep::Fallback) => None,
@@ -1634,7 +1523,6 @@ pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, V
 fn prepare_frames(
     digits: &[u64],
     ranges: Option<&[crate::native_bridge::ModuleRange]>,
-    tables: Option<&crate::load::CodeTables>,
     block: &mut FrameScratch,
 ) -> Result<FramePrep, VmError> {
     if digits.len() < STACKTRACE_HEADER_WORDS {
@@ -1653,83 +1541,44 @@ fn prepare_frames(
     if pc == 0 {
         return Ok(FramePrep::Fallback);
     }
-    let current_module = ((current & !(1 << 63)) >> 32) as usize;
-    let current_module = tables
-        .and_then(|tables| tables.modules.get(current_module))
-        .map(std::convert::AsRef::as_ref);
     let mut frames = 0usize;
     let mut words = 0usize;
-    let frame = if pc & (1 << 63) != 0 {
-        let payload = pc & !(1 << 63);
-        let module = tables.and_then(|tables| tables.modules.get((payload >> 32) as usize));
-        module.and_then(|module| {
-            let ip = payload as u32 as usize;
-            let (function, arity) = module.function_atom_at(ip)?;
-            Some((module.name_atom, function, arity, module.line_term_at(ip)))
-        })
-    } else {
-        crate::native_bridge::stack_frame_in(
-            ranges,
-            usize::try_from(pc).unwrap_or(0),
-            current_module.map(|module| &module.line_file_terms),
-        )
-        .map(|frame| {
-            let location = frame.location;
-            (
-                frame.module_atom,
-                frame.function_atom,
-                frame.arity,
-                location,
-            )
-        })
-    };
+    let frame =
+        crate::native_bridge::stack_frame_in(ranges, usize::try_from(pc).unwrap_or(0), None).map(
+            |frame| {
+                let location = frame.location;
+                (
+                    frame.module_atom,
+                    frame.function_atom,
+                    frame.arity,
+                    location,
+                )
+            },
+        );
     if let Some((module, function, arity, location)) = frame {
         words += write_frame(block, module, function, arity, location) + 2;
         frames += 1;
     }
-    if pc & (1 << 63) == 0 && frames == 0 {
-        return Ok(FramePrep::Fallback);
-    }
-    if pc & (1 << 63) != 0 && frames == 0 {
+    if frames == 0 {
         return Ok(FramePrep::Fallback);
     }
     for word in &digits[STACKTRACE_HEADER_WORDS..STACKTRACE_HEADER_WORDS + count] {
         if frames >= depth {
             break;
         }
-        if word & (1 << 63) == 0 {
-            let Some(address) = usize::try_from(*word).ok() else {
-                continue;
-            };
-            let Some(resolved) = crate::native_bridge::stack_frame_in(
-                ranges,
-                address,
-                current_module.map(|module| &module.line_file_terms),
-            ) else {
-                continue;
-            };
-            words += write_frame(
-                block,
-                resolved.module_atom,
-                resolved.function_atom,
-                resolved.arity,
-                resolved.location,
-            ) + 2;
-            frames += 1;
-            continue;
-        }
-        let payload = word & !(1 << 63);
-        let Some(module) = tables.and_then(|tables| tables.modules.get((payload >> 32) as usize))
-        else {
+        let Some(address) = usize::try_from(*word).ok() else {
             continue;
         };
-        let ip = payload as u32 as usize;
-        let call_site = ip.saturating_sub(1);
-        let Some((function, arity)) = module.function_atom_at(call_site) else {
+        let Some(resolved) = crate::native_bridge::stack_frame_in(ranges, address, None) else {
             continue;
         };
-        let location = module.line_term_at(call_site);
-        words += write_frame(block, module.name_atom, function, arity, location) + 2;
+        words += write_frame(
+            block,
+            resolved.module_atom,
+            resolved.function_atom,
+            resolved.arity,
+            resolved.location,
+        ) + 2;
         frames += 1;
     }
     Ok(FramePrep::Ready(PreparedFrames {
@@ -1744,19 +1593,17 @@ fn prepare_frames(
 fn prepare_bif_frames(
     digits: &[u64],
     ranges: Option<&[crate::native_bridge::ModuleRange]>,
-    tables: Option<&crate::load::CodeTables>,
     args: Term,
     error_info: Option<Term>,
     block: &mut FrameScratch,
 ) -> Result<FramePrep, VmError> {
-    const CURRENT_IS_FUNCTION: u64 = 1 << 63;
     if digits.len() < STACKTRACE_HEADER_WORDS {
         return Ok(FramePrep::Fallback);
     }
     let (pc, current) = (digits[1], digits[2]);
     let (count, max_depth) = stacktrace_depths(digits[3]);
     if pc != 0
-        || current & CURRENT_IS_FUNCTION != 0
+        || current & CURRENT_FROM_PC != 0
         || current_args_mfa(current)
         || count > max_depth
         || digits.len() < STACKTRACE_HEADER_WORDS + count
@@ -1774,65 +1621,36 @@ fn prepare_bif_frames(
     let mut first_continuation = STACKTRACE_HEADER_WORDS;
     if count > 0 {
         let word = digits[STACKTRACE_HEADER_WORDS];
-        if word & CURRENT_IS_FUNCTION != 0 {
-            let payload = word & !CURRENT_IS_FUNCTION;
-            let module_index = (payload >> 32) as usize;
-            let ip = payload as u32 as usize;
-            let Some(module) = tables.and_then(|tables| tables.modules.get(module_index)) else {
-                return Ok(FramePrep::Fallback);
-            };
-            let Some((function, arity)) = module.function_atom_at(ip) else {
-                return Ok(FramePrep::Fallback);
-            };
-            let location = module.line_term_at(ip);
-            words += write_frame(block, module.name_atom, function, arity, location) + 2;
-        } else {
-            let Some(frame) = usize::try_from(word)
-                .ok()
-                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address, None))
-            else {
-                return Ok(FramePrep::Fallback);
-            };
-            words += write_frame(
-                block,
-                frame.module_atom,
-                frame.function_atom,
-                frame.arity,
-                frame.location,
-            ) + 2;
-        }
+        let Some(frame) = usize::try_from(word)
+            .ok()
+            .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address, None))
+        else {
+            return Ok(FramePrep::Fallback);
+        };
+        words += write_frame(
+            block,
+            frame.module_atom,
+            frame.function_atom,
+            frame.arity,
+            frame.location,
+        ) + 2;
         frames += 1;
         first_continuation += 1;
     }
     for word in &digits[first_continuation..STACKTRACE_HEADER_WORDS + count] {
-        if word & CURRENT_IS_FUNCTION == 0 {
-            let Some(frame) = usize::try_from(*word)
-                .ok()
-                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address, None))
-            else {
-                continue;
-            };
-            words += write_frame(
-                block,
-                frame.module_atom,
-                frame.function_atom,
-                frame.arity,
-                frame.location,
-            ) + 2;
-            frames += 1;
-            continue;
-        }
-        let payload = *word & !CURRENT_IS_FUNCTION;
-        let Some(module) = tables.and_then(|tables| tables.modules.get((payload >> 32) as usize))
+        let Some(frame) = usize::try_from(*word)
+            .ok()
+            .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address, None))
         else {
             continue;
         };
-        let call_site = (payload as u32 as usize).saturating_sub(1);
-        let Some((function, arity)) = module.function_atom_at(call_site) else {
-            continue;
-        };
-        let location = module.line_term_at(call_site);
-        words += write_frame(block, module.name_atom, function, arity, location) + 2;
+        words += write_frame(
+            block,
+            frame.module_atom,
+            frame.function_atom,
+            frame.arity,
+            frame.location,
+        ) + 2;
         frames += 1;
     }
     Ok(FramePrep::Ready(PreparedFrames {
@@ -2145,9 +1963,6 @@ fn build_saved_active(
             )
         })
     };
-    if current_frame.is_none() && !raw.no_current && !matches!(top, Some(TopFrame::Bif { .. })) {
-        return Err(VmError::Unsupported("stacktrace module".into()));
-    }
     // Head-first. `erts_build_mfa_item` writes plain frames; a BIF frame or one
     // carrying `error_info` still goes through `build_frame`.
     struct Plain {
@@ -2191,10 +2006,11 @@ fn build_saved_active(
                 location,
             }));
         }
-    } else if !raw.no_current {
-        let Some((frame_module, function, arity, location)) = current_frame else {
-            return Err(VmError::Unsupported("stacktrace frame".into()));
-        };
+    } else if !raw.no_current
+        // Port of erts/emulator/beam/beam_common.c (build_stacktrace), OTP-29.1.1: a pc of
+        // no function (`fi.mfa == NULL`) adds no current frame.
+        && let Some((frame_module, function, arity, location)) = current_frame
+    {
         let top_args = match top {
             Some(TopFrame::CurrentArgs(args))
             | Some(TopFrame::CurrentArgsWithInfo(Some(args), _))
@@ -2244,7 +2060,8 @@ fn build_saved_active(
         if items.len() >= raw.depth {
             break;
         }
-        if let Continuation::Native(address) = continuation {
+        {
+            let Continuation::Native(address) = continuation;
             // Resolved lazily like erts, which saves raw pcs and decodes them in build_stacktrace.
             let Some(resolved) = ranges.and_then(|ranges| {
                 crate::native_bridge::stack_frame_in(
@@ -2263,28 +2080,6 @@ fn build_saved_active(
             }));
             continue;
         }
-        let (module, ip) = match continuation {
-            Continuation::Native(_) => continue,
-            Continuation::Indexed(index, ip) => {
-                let module = tables
-                    .and_then(|tables| tables.modules.get(*index).cloned())
-                    .or_else(|| fallback_modules.get(*index).cloned());
-                let Some(module) = module else {
-                    continue;
-                };
-                (module, *ip)
-            }
-        };
-        let call_site = ip.saturating_sub(1);
-        let Some((function, arity)) = module.function_atom_at(call_site) else {
-            continue;
-        };
-        items.push(Item::Plain(Plain {
-            module: module.name_atom,
-            function,
-            args: Term::small(i64::from(arity)).expect("arity is small"),
-            location: module.line_term_at(call_site),
-        }));
     }
     let file_atom = Term::atom(trace_atoms().file);
     let line_atom = Term::atom(trace_atoms().line);

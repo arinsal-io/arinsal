@@ -1124,7 +1124,6 @@ fn create_child(
         // starts at the apply_only sentinel; its first run applies X0..X2
         // (Vm::resolve_run_process).
         child.module = crate::process::RUN_PROCESS;
-        child.set_entry_ip(0);
         child.initial_mfa = Some((m, f, arity as u8));
         if initial_bif.is_some() {
             child.slice_mut().initial_bif = initial_bif.clone();

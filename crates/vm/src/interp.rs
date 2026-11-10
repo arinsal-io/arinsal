@@ -89,10 +89,15 @@ impl Vm {
             "Vm::eval runs only BIFs and the erlang fun builtins, not {frame}; use Vm::eval_exported"
         )))
     }
+    /// The function of the process's code address (`c_p->i`), for error texts.
+    // Port of erts/emulator/beam/beam_ranges.c (erts_lookup_function_info), OTP-29.1.1.
     pub(crate) fn frame_name(&self, p: &Process) -> String {
-        let module = &self.code.modules[p.module];
-        let (name, arity) = module.function_at(p.ip()).unwrap_or(("?", 0));
-        format!("{}:{name}/{arity}", module.name)
+        p.native_pc()
+            .and_then(crate::native_bridge::native_function_at)
+            .map_or_else(
+                || "?:?/0".to_owned(),
+                |f| format!("{}:{}/{}", f.module, f.function, f.arity),
+            )
     }
     pub(crate) fn exception(&self, p: &Process, reason: impl Into<String>) -> VmError {
         let reason = reason.into();
@@ -187,10 +192,8 @@ impl Vm {
         }
     }
 
-    /// Enters the native code of the function entry the process is positioned at (`module`
-    /// and `ip`, set by a spawn, an apply or a trap), as erts jumps to that function's code
-    /// address. A position that is not a native function entry is an error: the JIT flavor
-    /// runs nothing else.
+    /// Enters the native code at the process's code address (`c_p->i`), set by a spawn, an
+    /// apply or a trap. A process without one is an error: the JIT flavor runs nothing else.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     pub(crate) fn enter_native_position(&mut self, p: &mut Process) -> Result<RunState, VmError> {
         self.refresh_code();
@@ -210,20 +213,11 @@ impl Vm {
         let (need_x, need_fr) = self.code.registers[module_id];
         p.x.ensure_x(need_x);
         p.ensure_fr(need_fr);
-        let module = &self.code.modules[module_id];
-        let Some(native) = self.beamasm_targets.function_for_target(
-            module_id,
-            module,
-            crate::load::native_code_range(&self.code.code_meta, module_id),
-            p.ip(),
-        ) else {
-            return Err(VmError::Unsupported(format!(
-                "process position {} of {} is not a function entry of its native code",
-                p.ip(),
-                module.name
-            )));
-        };
-        p.set_native_pc(Some(native.start));
+        if p.native_pc().is_none() {
+            return Err(VmError::Unsupported(
+                "process has no code address to continue at".into(),
+            ));
+        }
         p.native_transfer = true;
         Ok(RunState::Yield)
     }
