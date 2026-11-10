@@ -57,6 +57,19 @@ fn stable_system_info_matches_otp() {
         "heap_type",
         "garbage_collection",
         "multi_scheduling",
+        "system_architecture",
+        "emu_type",
+        "logical_processors_available",
+        "ets_limit",
+        "time_correction",
+        "kernel_poll",
+        "time_offset",
+        "time_warp_mode",
+        "smp_support",
+        "constant_pool_support",
+        "hipe_architecture",
+        "ets_realloc_moves",
+        "compat_rel",
     ] {
         let args = [O::atom(key)];
         let expected = reference.call("erlang", "system_info", &args);
@@ -92,19 +105,38 @@ fn stable_system_info_matches_otp() {
                 | "heap_type"
                 | "garbage_collection"
                 | "multi_scheduling"
+                | "system_architecture"
+                | "emu_type"
+                | "ets_limit"
+                | "time_correction"
+                | "kernel_poll"
+                | "time_offset"
+                | "time_warp_mode"
+                | "smp_support"
+                | "constant_pool_support"
+                | "hipe_architecture"
+                | "ets_realloc_moves"
+                | "compat_rel"
         ) {
             assert_eq!(actual, expected, "deterministic system_info({key})");
         }
     }
-    let invalid = [O::atom("definitely_not_a_system_info_key")];
-    assert!(matches!(
-        reference.call("erlang", "system_info", &invalid),
-        CallResult::Exception { .. }
-    ));
-    assert!(matches!(
-        call("erlang", "system_info", &invalid),
-        CallResult::Exception { .. }
-    ));
+    // Not items in erts: badarg on both sides.
+    for key in [
+        "definitely_not_a_system_info_key",
+        "thread_support",
+        "async_threads",
+    ] {
+        let invalid = [O::atom(key)];
+        assert!(matches!(
+            reference.call("erlang", "system_info", &invalid),
+            CallResult::Exception { .. }
+        ));
+        assert!(matches!(
+            call("erlang", "system_info", &invalid),
+            CallResult::Exception { .. }
+        ));
+    }
 }
 
 #[test]

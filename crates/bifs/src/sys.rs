@@ -63,6 +63,51 @@ fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
     Ok(tail)
 }
 
+/// The items of `system_info/1` that this table answers from process-independent state, so the
+/// light BIF path can run them with only the calling process's heap. Port of
+/// erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1, which runs every one of
+/// them inside the plain BIF. `None` for any other selector.
+pub fn system_info_light_item(ctx: &mut Ctx<'_>, key: Term) -> Option<Result<Term, BifError>> {
+    let light = matches!(
+        atom_name(key)?,
+        "otp_release"
+            | "version"
+            | "system_version"
+            | "wordsize"
+            | "start_time"
+            | "context_reductions"
+            | "logical_processors"
+            | "logical_processors_available"
+            | "logical_processors_online"
+            | "outstanding_system_requests_limit"
+            | "process_limit"
+            | "port_limit"
+            | "ets_limit"
+            | "machine"
+            | "system_architecture"
+            | "emu_flavor"
+            | "build_type"
+            | "emu_type"
+            | "os_type"
+            | "os_version"
+            | "endian"
+            | "heap_type"
+            | "time_correction"
+            | "kernel_poll"
+            | "time_offset"
+            | "time_warp_mode"
+            | "os_monotonic_time_source"
+            | "os_system_time_source"
+            | "smp_support"
+            | "constant_pool_support"
+            | "hipe_architecture"
+            | "ets_realloc_moves"
+            | "compat_rel"
+            | "snifs"
+    );
+    light.then(|| system_info_result(ctx, &[key]))
+}
+
 // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
 fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let key = atom_name(args[0]).ok_or(BifError::BADARG)?;
@@ -181,12 +226,15 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
         // Native ticks are nanoseconds, so resolution is 1e9 rather than the raw OS counter.
         "os_monotonic_time_source" => clock_source(ctx, monotonic_clock_id(), true),
         "os_system_time_source" => clock_source(ctx, "CLOCK_REALTIME", false),
-        "os_version" => {
-            let vals = uname_fields().1;
-            Ok(tuple_build(ctx, &vals.map(|n| Term::small(n).unwrap())))
-        }
+        "os_version" => Ok(os_version()),
         "scheduler_bind_type" => Ok(atom("unbound")),
-        "thread_support" | "smp_support" | "async_threads" => Ok(atom("true")),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1: smp_support,
+        // constant_pool_support, hipe_architecture, ets_realloc_moves, compat_rel), OTP-29.1.1.
+        // `thread_support` and `async_threads` are not items in erts.
+        "smp_support" | "constant_pool_support" => Ok(atom("true")),
+        "hipe_architecture" => Ok(atom("undefined")),
+        "ets_realloc_moves" => Ok(atom("false")),
+        "compat_rel" => Ok(Term::small(29).expect("small")),
         // Port of erts/emulator/beam/erl_bif_info.c:2742-2768 (build_snifs_term), OTP-29.1.1.
         "snifs" => {
             let mut list = Term::NIL;
@@ -321,8 +369,6 @@ word_adapters!(system_info => system_info_result, no_aux_work_threads => no_aux_
 crate::word_bif_bodies_in!(word_bodies; system_info, no_aux_work_threads, getenv, getpid,
     perf_counter);
 
-/// `(os_flavor, os_version)` from `uname(2)`.
-// Port of erts/emulator/sys/unix/sys.c (os_flavor, os_version), OTP-29.1.1.
 /// `erlang:system_info(os_type)`: the global literal `os_info_init` builds once.
 // Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_type: ERTS_GLOBAL_LIT_OS_TYPE,
 // os_info_init), OTP-29.1.1.
@@ -335,6 +381,18 @@ pub fn os_type() -> Term {
     })
 }
 
+/// `erlang:system_info(os_version)`: the global literal `os_info_init` builds once.
+// Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_version: ERTS_GLOBAL_LIT_OS_VERSION,
+// os_info_init), OTP-29.1.1.
+pub fn os_version() -> Term {
+    static OS_VERSION: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *OS_VERSION.get_or_init(|| {
+        arinsal_term::global_os_version(uname_fields().1.map(|n| Term::small(n).expect("small")))
+    })
+}
+
+/// `(os_flavor, os_version)` from `uname(2)`.
+// Port of erts/emulator/sys/unix/sys.c (os_flavor, os_version), OTP-29.1.1.
 fn uname_fields() -> (String, [i64; 3]) {
     let uts = rustix::system::uname();
     let flavor = uts.sysname().to_string_lossy().to_ascii_lowercase();
