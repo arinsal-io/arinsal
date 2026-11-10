@@ -1338,27 +1338,6 @@ pub(crate) fn selects(process: &Process, module: &str, function: &str, arity: u8
     })
 }
 
-/// Count a call entering the function's code.
-// Port of erts/emulator/beam/beam_bp.c:1090-1092 (do_session_breakpoint, ERTS_BPF_COUNT_ACTIVE),
-// OTP-29.1.1. Call counters live in the function's code breakpoint, which global (export)
-// breakpoint hits do not reach.
-pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: u8, local: bool) {
-    if !local || !any_pattern() {
-        return;
-    }
-    let ix = bp_node(process).active_bp_ix();
-    with_function_bps(module, function, arity, |bps| {
-        for g in function_bps(bps, scope(process), code_scope(process)) {
-            let bp = &g.data[ix];
-            if bp.flags & BPF_COUNT_ACTIVE != 0
-                && let Some(count) = &bp.count
-            {
-                count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    });
-}
-
 /// What `trace_info` reports about one function of one session.
 pub(crate) struct FunctionInfo {
     /// Breakpoint flags of the session restricted to the ones the key asks for.

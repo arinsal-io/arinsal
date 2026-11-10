@@ -139,18 +139,6 @@ impl Process {
         Ok(())
     }
 
-    pub(crate) fn service_deferred_gc(&mut self) -> Result<(), VmError> {
-        if self.heap.gc_enabled && std::mem::take(&mut self.gc_deferred) {
-            let live = self.gc_live;
-            let stats = self.collect_heap_roots(live, &mut [], 0)?;
-            // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
-            // `esdp->gc_info`), OTP-29.1.1: a collection deferred while GC was disabled
-            // is counted when it actually runs.
-            crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
-        }
-        Ok(())
-    }
-
     /// Emit a `garbage_collection` trace event with the GC info list and `{wordsize, Size}`.
     /// Port of erts/emulator/beam/erl_trace.c:1439 (`trace_gc`), OTP-29.1.1.
     pub(super) fn trace_gc(&mut self, pid: arinsal_sched::Pid, tag: &str, size: usize) {

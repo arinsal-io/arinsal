@@ -180,15 +180,6 @@ impl Process {
         self.send_message_inner(None, target, value)
     }
 
-    pub(crate) fn send_message_with_vm(
-        &mut self,
-        vm: &mut Vm,
-        target: Term,
-        value: Term,
-    ) -> Result<Term, VmError> {
-        self.send_message_inner(Some(vm), target, value)
-    }
-
     fn send_message_inner(
         &mut self,
         vm: Option<&mut Vm>,

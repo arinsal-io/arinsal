@@ -766,12 +766,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     None
 }
 
-/// Record the NIF scheduler hub when it still names another process.
-///
-pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
-    nif::refresh_hub(process, ctx);
-}
-
 /// Dispatch a call to the first family that implements it.
 pub(crate) fn call(
     vm: &mut Vm,

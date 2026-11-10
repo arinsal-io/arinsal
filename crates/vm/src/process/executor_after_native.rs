@@ -241,7 +241,7 @@ impl Executor {
                     let result = self.vm.apply_fixed(process, 4, true, 0, Some(ctx));
                     process.native_apply = false;
                     match result? {
-                        crate::ImportOutcome::Jump(_) => self.vm.enter_native_at_jump(process),
+                        crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
                         crate::ImportOutcome::Advanced => {}
                         crate::ImportOutcome::Yield => {
                             if process.native_pc().is_some()
@@ -307,7 +307,7 @@ impl Executor {
                             arity,
                             Some(ctx),
                         )? {
-                            crate::ImportOutcome::Jump(_) => self.vm.enter_native_at_jump(process),
+                            crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
                             crate::ImportOutcome::Advanced => {}
                             crate::ImportOutcome::Yield => {
                                 if process.native_pc().is_some()
@@ -416,9 +416,7 @@ impl Executor {
                     let trap = match result {
                         Ok(outcome) => {
                             match outcome {
-                                crate::ImportOutcome::Jump(_) => {
-                                    self.vm.enter_native_at_jump(process)
-                                }
+                                crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
                                 crate::ImportOutcome::Advanced => {}
                                 crate::ImportOutcome::Yield => {
                                     if process.native_pc().is_some()
@@ -672,9 +670,7 @@ impl Executor {
                             let outcome = self.vm.trap_to_export(process, trap, true, Some(ctx));
                             process.native_apply = false;
                             match outcome? {
-                                crate::ImportOutcome::Jump(_) => {
-                                    self.vm.enter_native_at_jump(process)
-                                }
+                                crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
                                 crate::ImportOutcome::Advanced => {}
                                 crate::ImportOutcome::Yield => {
                                     if process.native_pc().is_some()
@@ -1250,7 +1246,7 @@ impl Executor {
                                     }
                                 };
                                 match outcome {
-                                    crate::ImportOutcome::Jump(_) => {
+                                    crate::ImportOutcome::Jump => {
                                         self.vm.enter_native_at_jump(process)
                                     }
                                     crate::ImportOutcome::Advanced => {}
@@ -1360,7 +1356,7 @@ impl Executor {
                         }
                     };
                     match outcome {
-                        crate::ImportOutcome::Jump(_) => self.vm.enter_native_at_jump(process),
+                        crate::ImportOutcome::Jump => self.vm.enter_native_at_jump(process),
                         crate::ImportOutcome::Advanced => {}
                         crate::ImportOutcome::Yield => {
                             if process.native_pc().is_some()

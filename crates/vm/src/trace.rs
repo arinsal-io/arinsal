@@ -3432,26 +3432,6 @@ fn caller_mfa_name(
     Some((module.name.clone(), function.to_owned(), arity))
 }
 
-// Port of erts/emulator/beam/beam_bp.c:1242-1268 and
-// erts/emulator/beam/erl_trace.c:1037-1055 (return-to tracing), OTP-29.1.1.
-pub(crate) fn return_to_event(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    session: u64,
-) -> Result<(), VmError> {
-    let flags = active_session_flags(process, session, ctx.pid());
-    if flags & RETURN_TO == 0 || flags & SILENT != 0 {
-        return Ok(());
-    }
-    // The return-to continuation has already transferred control here, leaving
-    // its session word at stack index 0. Match OTP's scan from the end of that
-    // frame: Y slots can precede the next CP, and other trace frames can be
-    // nested between it and the real caller.
-    let target = return_to_target(vm, process, 1);
-    emit_return_to(vm, process, ctx, session, target)
-}
-
 /// The catching function gets the `return_to` event of every session that had a return_to
 /// frame on the unwound stack.
 // Port of erts/emulator/beam/beam_common.c:585-700 (next_catch, have_return_to_trace),

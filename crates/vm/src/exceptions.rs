@@ -3,8 +3,6 @@
 use crate::{Process, Vm, VmError, stacktrace};
 use arinsal_bifs::{BifError, Class, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
-use arinsal_loader::{Arg, Module};
-use arinsal_spec::Opcode;
 use arinsal_term::{Atom, Term, TermBuilder, global_atoms, to_owned};
 use std::fmt;
 
@@ -232,12 +230,6 @@ pub(super) fn tuple(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
         .tuple(values)
         .map_err(|e| VmError::Unsupported(format!("exception tuple {e:?}")))
-}
-
-fn list(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
-        .list_from_iter(values.iter().copied())
-        .map_err(|e| VmError::Unsupported(format!("exception list {e:?}")))
 }
 
 pub(super) fn class_term(class: Class) -> Result<Term, VmError> {
@@ -541,170 +533,6 @@ pub(super) fn direct_bif_error(
     }
 }
 
-pub(super) fn system_flag(
-    process: &crate::Process,
-    depth_limit: &mut usize,
-    key: Term,
-    value: Term,
-) -> Result<Term, VmError> {
-    if key == atom("system_logger")? {
-        return crate::natives::sys::set_system_logger(process, value);
-    }
-    if key != atom("backtrace_depth")? {
-        return Err(VmError::Unsupported("system_flag setting".into()));
-    }
-    let Some(depth) = value.as_small().filter(|depth| *depth >= 0) else {
-        return Err(VmError::Trap(Trap::error(atom("badarg")?)));
-    };
-    let requested = (depth as usize).min(64);
-    let old = process.runtime.as_ref().map_or(*depth_limit, |runtime| {
-        runtime
-            .backtrace_depth
-            .swap(requested, std::sync::atomic::Ordering::AcqRel)
-    });
-    *depth_limit = requested;
-    Ok(Term::small(old as i64).expect("depth is small"))
-}
-
-fn source(p: &Process, arg: Arg) -> Result<Term, VmError> {
-    p.read(arg)
-}
-
-/// Port of erts/emulator/beam/emu/instrs.tab:1170 (catch/try), OTP-29.1.1.
-#[inline]
-pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> Result<(), VmError> {
-    match op {
-        Opcode::Try | Opcode::Catch => {
-            if a.kind() != Arg::Y || b.kind() != Arg::LABEL {
-                return Err(VmError::Unsupported("exception handler operands".into()));
-            }
-            let tag = stacktrace::handler_tag(p.module, b.value() as usize)?;
-            p.write(a, tag)?;
-            p.heap.abi.catches = p.heap.abi.catches.saturating_add(1);
-            p.set_ip(p.ip() + 1);
-        }
-        Opcode::TryEnd | Opcode::TryCase => {
-            p.write(a, Term::NIL)?;
-            p.heap.abi.catches = p.heap.abi.catches.saturating_sub(1);
-            if op == Opcode::TryCase {
-                p.x[0] = p.x[3];
-            }
-            p.set_ip(p.ip() + 1);
-        }
-        Opcode::CatchEnd => {
-            p.write(a, Term::NIL)?;
-            p.heap.abi.catches = p.heap.abi.catches.saturating_sub(1);
-            if p.x[0] == Term::catch(0) {
-                let reason = p.x[1];
-                p.x[0] = match parse_class(p.x[3]) {
-                    Some(Class::Throw) => reason,
-                    Some(Class::Error) => {
-                        let trace = materialize(Some(vm), p, p.x[2])?;
-                        p.x[2] = trace;
-                        let reason_with_trace = tuple(p, &[reason, trace])?;
-                        tuple(p, &[atom("EXIT")?, reason_with_trace])?
-                    }
-                    Some(Class::Exit) => tuple(p, &[atom("EXIT")?, reason])?,
-                    None => return Err(VmError::Unsupported("exception class".into())),
-                };
-            }
-            p.set_ip(p.ip() + 1);
-        }
-        Opcode::Badmatch | Opcode::CaseEnd | Opcode::TryCaseEnd | Opcode::Badrecord => {
-            let key = match op {
-                Opcode::Badmatch => "badmatch",
-                Opcode::CaseEnd => "case_clause",
-                Opcode::TryCaseEnd => "try_clause",
-                Opcode::Badrecord => "badrecord",
-                _ => unreachable!(),
-            };
-            let value = source(p, a)?;
-            let reason = tuple(p, &[atom(key)?, value])?;
-            return Err(VmError::Trap(Trap::error(reason)));
-        }
-        Opcode::IfEnd => return Err(VmError::Trap(Trap::error(atom("if_clause")?))),
-        Opcode::FuncInfo => {
-            let module: &Module = &vm.code.modules[p.module];
-            let (_, arity) = module.function_at(p.ip()).unwrap_or(("?", 0));
-            let args = p.x[..usize::from(arity)].to_vec();
-            let args = list(p, &args)?;
-            return Err(VmError::Trap(Trap {
-                export: None,
-                class: Class::Error,
-                reason: atom("function_clause")?,
-                trace: None,
-                top: Some(stacktrace::TopFrame::CurrentArgs(args)),
-                raw_rethrow: false,
-                untrappable: false,
-            }));
-        }
-        Opcode::Raise | Opcode::RawRaise => {
-            // mix_loop1: `raise/2` is the try/after re-raise. OTP reads the class
-            // from the raw stacktrace's freason (i_raise / erts_sanitize_freason),
-            // which survives the `after` body. X(3) does not: `gen_server` calls
-            // `reply/2` before re-raising. An invalid class must not fall through
-            // into the next basic block (that block's Y frame was already trimmed).
-            let saved_trace = if op == Opcode::Raise {
-                Some(source(p, a)?)
-            } else {
-                None
-            };
-            let class = if op == Opcode::RawRaise {
-                parse_class(p.x[0])
-            } else {
-                saved_trace
-                    .and_then(|trace| {
-                        empty_trace_class(trace).or_else(|| stacktrace::raw_class(p, trace))
-                    })
-                    .or(p.exc_class)
-                    .or_else(|| parse_class(p.x[3]))
-            };
-            let Some(class) = class else {
-                p.x[0] = atom("badarg")?;
-                if op == Opcode::RawRaise {
-                    p.set_ip(p.ip() + 1);
-                    return Ok(());
-                }
-                return Err(VmError::Trap(Trap::error(atom("badarg")?)));
-            };
-            if op == Opcode::RawRaise {
-                let trace = p.x[2];
-                if !stacktrace::set_raw_class(p, trace, class) {
-                    p.x[0] = atom("badarg")?;
-                    p.set_ip(p.ip() + 1);
-                    return Ok(());
-                }
-            }
-            let (reason, trace) = if op == Opcode::Raise {
-                (source(p, b)?, saved_trace.expect("raise trace"))
-            } else {
-                (p.x[1], p.x[2])
-            };
-            return Err(VmError::Trap(Trap {
-                export: None,
-                class,
-                reason,
-                trace: Some(trace),
-                top: None,
-                raw_rethrow: op == Opcode::RawRaise,
-                untrappable: false,
-            }));
-        }
-        Opcode::BuildStacktrace => {
-            // Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
-            p.x[0] = materialize(Some(vm), p, p.x[0])?;
-            p.set_ip(p.ip() + 1);
-        }
-        _ => {
-            return Err(VmError::Unsupported(format!(
-                "exception opcode {}",
-                op.name()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Port of erts/emulator/beam/beam_common.c:449 (handle_error), OTP-29.1.1.
 pub(super) fn resume(
     vm: &mut Vm,
@@ -819,27 +647,16 @@ pub(super) fn resume(
             crate::native_bridge::process_code_scope(p),
             word,
         ) && let Some(handler) =
-            crate::native_bridge::next_catch(p, trap.class, trap.reason, trace, false)
+            crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
         {
-            let target = match handler {
-                crate::native_bridge::CatchHandler::Native(handler) => {
-                    p.set_native_pc(Some(handler));
-                    crate::native_function_at(handler).map(|function| {
-                        (
-                            function.module.to_owned(),
-                            function.function.to_owned(),
-                            function.arity,
-                        )
-                    })
-                }
-                crate::native_bridge::CatchHandler::Interpreted => {
-                    vm.code.modules.get(p.module).and_then(|module| {
-                        module.function_at(p.ip()).map(|(function, arity)| {
-                            (module.name.clone(), function.to_owned(), arity)
-                        })
-                    })
-                }
-            };
+            p.set_native_pc(Some(handler));
+            let target = crate::native_function_at(handler).map(|function| {
+                (
+                    function.module.to_owned(),
+                    function.function.to_owned(),
+                    function.arity,
+                )
+            });
             if let Some(trace_ctx) = ctx.as_deref_mut() {
                 crate::trace::unwound_return_to(vm, p, trace_ctx, &return_to_sessions, target)?;
             }

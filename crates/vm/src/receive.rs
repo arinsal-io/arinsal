@@ -1,7 +1,6 @@
 //! Selective receive state owned by the running process.
 
 use crate::{Process, VmError};
-use arinsal_loader::Arg;
 use arinsal_term::Term;
 use std::sync::atomic::Ordering;
 
@@ -514,21 +513,6 @@ impl Process {
         }
     }
 
-    // Port of erts/emulator/beam/emu/msg_instrs.tab (receive instructions), OTP-29.1.1.
-    pub(crate) fn loop_rec(&mut self, dst: Arg) -> Result<bool, VmError> {
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:9605 (save pointer loop), OTP-29.1.1.
-        // Port of erts/emulator/beam/emu/msg_instrs.tab:59-67, 110 (F_DELAY_GC from loop_rec
-        // until remove_message or wait), OTP-29.1.1.
-        if let Some(&message) = self.inbox.get(self.inbox.save()) {
-            self.delay_gc = true;
-            self.write(dst, message)?;
-            Ok(true)
-        } else {
-            self.delay_gc = false;
-            Ok(false)
-        }
-    }
-
     pub(crate) fn loop_rec_end(&mut self) {
         self.inbox.set_save(self.inbox.save() + 1);
         // Port of erl_proc_sig_queue.c:9360-9454 (continue after priority queue), OTP-29.1.1.
@@ -607,14 +591,6 @@ impl Process {
         ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
     ) -> Result<(), VmError> {
         self.remove_message_inner(None, ctx)
-    }
-
-    pub(crate) fn remove_message_with_vm(
-        &mut self,
-        vm: &mut crate::Vm,
-        ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
-    ) -> Result<(), VmError> {
-        self.remove_message_inner(Some(vm), ctx)
     }
 
     fn remove_message_inner(
