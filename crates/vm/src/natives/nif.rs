@@ -817,12 +817,6 @@ fn error_reason(process: &mut Process, reason: &str, message: &str) -> Result<Te
     tuple(process, &[atom("error"), inner])
 }
 
-fn atom_name(term: Term) -> Option<String> {
-    global_atoms()
-        .text(term.as_atom()?)
-        .map(|text| text.to_string())
-}
-
 fn cons_pair(term: Term) -> Option<(Term, Term)> {
     if term.classify() != TermKind::List {
         return None;
@@ -1597,57 +1591,6 @@ fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<
     Ok(loaded)
 }
 
-fn push_continuation(process: &mut Process, module: usize, ip: usize) -> Result<(), VmError> {
-    let module = u64::try_from(module).map_err(|_| VmError::Unsupported("module index".into()))?;
-    let ip = u32::try_from(ip).map_err(|_| VmError::Unsupported("code index".into()))?;
-    if module >= 1 << 26 {
-        return Err(VmError::Unsupported("module index".into()));
-    }
-    process.ensure(1, 0)?;
-    if !process.heap.reserve_stack(1) {
-        return Err(VmError::Unsupported("continuation stack".into()));
-    }
-    let cp = crate::stacktrace::continuation_tag(module as usize, ip as usize)?;
-    process.heap.stack_set(0, cp);
-    process.interpreter_frames = true;
-    Ok(())
-}
-
-fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term, VmError> {
-    let name = atom_name(module).ok_or_else(badarg)?;
-    // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1: the
-    // function of the code instance being loaded runs, not the still current previous version.
-    vm.refresh_code();
-    let id = match vm.code.pending_on_load.get(&name).copied() {
-        Some(id) => id,
-        None => vm.load_named(&name).map_err(|_| badarg())?,
-    };
-    let entry = vm.code.modules[id]
-        .functions
-        .iter()
-        .find_map(|(entry, function, arity)| {
-            (*function == "on_load" && *arity == 0).then_some(*entry)
-        })
-        .ok_or_else(badarg)?;
-    let caller = process.module;
-    let return_ip = process.ip().saturating_add(1);
-    push_continuation(process, caller, return_ip)?;
-    // `call_import` advances `ip` by one. The BEAM `on_load` opcode is only a
-    // marker; skip that unsupported instruction and land on the real body.
-    let mut landing = entry;
-    if let Some(Instr::Unsupported(reason)) = vm.code.modules[id].code.get(entry + 1)
-        && vm.code.modules[id]
-            .unsupported_reasons
-            .get(*reason as usize)
-            .is_some_and(|text| text.contains("on_load"))
-    {
-        landing = entry + 1;
-    }
-    process.module = id;
-    process.set_ip(landing);
-    Ok(atom("ok"))
-}
-
 fn state_alive(process: &Process, state: Term) -> Option<bool> {
     if let Some(pid) = Pid::from_term(state) {
         let runtime = process.runtime.as_ref()?;
@@ -2187,7 +2130,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "load_nif", 2),
     ("erlang", "nif_error", 1),
     ("erlang", "nif_error", 2),
-    ("erlang", "call_on_load_function", 1),
 ];
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2202,7 +2144,6 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
     match (module, function, arity) {
         ("erlang", "load_nif", 2) => Some(call_load_nif),
         ("erlang", "nif_error", 1 | 2) => Some(call_nif_error),
-        ("erlang", "call_on_load_function", 1) => Some(call_on_load_bif),
         _ => None,
     }
 }
@@ -2224,15 +2165,6 @@ fn call_nif_error(
 ) -> Result<Term, VmError> {
     let reason = args.first().copied().unwrap_or_else(|| atom("badarg"));
     Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
-}
-
-fn call_on_load_bif(
-    vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    call_on_load(vm, process, args[0])
 }
 
 /// Dispatches `load_nif`, dynamic NIF entry, and `erl_tracer` on the scheduler.
