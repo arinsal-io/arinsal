@@ -833,7 +833,9 @@ impl Executor {
                                 &export.function,
                                 usize::from(export.arity),
                                 (usize::MAX, call_site_pc),
-                                crate::trace::StackScan::None,
+                                // The trampoline pushed the CP: a tail apply's is a trace
+                                // frame of its caller (fixup_cp_before_trace).
+                                crate::trace::StackScan::Top,
                             )
                         } else {
                             None
@@ -932,7 +934,9 @@ impl Executor {
                                 &export.function,
                                 usize::from(export.arity),
                                 (usize::MAX, call_site_pc),
-                                crate::trace::StackScan::None,
+                                // The trampoline pushed the CP: a tail apply's is a trace
+                                // frame of its caller (fixup_cp_before_trace).
+                                crate::trace::StackScan::Top,
                             );
                             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp
                             // (call_light_bif_shared), OTP-29.1.1: a light BIF

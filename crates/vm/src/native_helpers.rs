@@ -4633,15 +4633,6 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
         return fallback;
     };
     let target = export.address(code_ix);
-    // The export trampoline of a BIF or a global breakpoint still runs through the interpreter
-    // fragment: a traced BIF entered from the trampoline in a tail apply misses its
-    // `return_to` event (call_trace_exceptions case 16). A stub's trampoline calls the error
-    // handler natively (beam_common.c call_error_handler). See STRUCT_DEVIATIONS.md.
-    if target == crate::beamasm_integration::export_trampoline()
-        && export.trampoline_op() != arinsal_term::TRAMPOLINE_CALL_ERROR_HANDLER
-    {
-        return fallback;
-    }
     let mut list = args;
     for slot in registers.x_reg_array.iter_mut() {
         let Some((head, tail)) = crate::lists::split(list) else {
