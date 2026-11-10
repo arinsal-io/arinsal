@@ -133,10 +133,10 @@ pub(crate) extern "C" fn whereis_light(
     // The error returns `THE_NON_VALUE` from a cold function. Building that
     // `Result` here reserved a 128-byte frame on the success path.
     let Some(name) = arg.as_atom() else {
-        return whereis_not_atom(process, arg);
+        return whereis_not_atom(process);
     };
     let Some(rt) = process.runtime else {
-        return whereis_no_runtime(process, arg);
+        return whereis_no_runtime(process);
     };
     let term = match rt.reg.whereis(name) {
         Some(crate::register::RegId::Proc(pid)) => pid.to_term().unwrap_or_else(undefined_term),
@@ -148,16 +148,15 @@ pub(crate) extern "C" fn whereis_light(
 
 #[cold]
 #[inline(never)]
-fn whereis_not_atom(process: &mut Process, arg: Term) -> u64 {
-    whereis_light_error(process, arg, badarg("whereis/1"))
+fn whereis_not_atom(process: &mut Process) -> u64 {
+    whereis_light_error(process, badarg("whereis/1"))
 }
 
 #[cold]
 #[inline(never)]
-fn whereis_no_runtime(process: &mut Process, arg: Term) -> u64 {
+fn whereis_no_runtime(process: &mut Process) -> u64 {
     whereis_light_error(
         process,
-        arg,
         VmError::Unsupported("process BIF requires a scheduler".into()),
     )
 }
@@ -169,34 +168,14 @@ fn undefined_term() -> Term {
 /// `BIF_ERROR` for `whereis/1`. Cold so the direct call stays the success path.
 #[cold]
 #[inline(never)]
-fn whereis_light_error(process: &mut Process, arg: Term, error: VmError) -> u64 {
-    let mut trap = match error {
+fn whereis_light_error(process: &mut Process, error: VmError) -> u64 {
+    let trap = match error {
         VmError::Trap(trap) => trap,
         _ => crate::exceptions::Trap::error(atom("system_limit")),
     };
-    if trap.class == arinsal_bifs::Class::Error
-        && trap.top.is_none()
-        && trap.trace.is_none()
-        && let Ok(args) = crate::stacktrace::BifArgs::from_terms(&[arg])
-        && let Ok(function) = global_atoms().intern("whereis")
-    {
-        trap.top = Some(crate::stacktrace::TopFrame::Bif {
-            module: arinsal_term::atoms::ERLANG,
-            function,
-            args,
-            info: crate::stacktrace::BifErrorInfo::Plain,
-        });
-    }
-    let freason = crate::stacktrace::class_to_freason(Some(trap.class));
-    let fvalue = crate::native_hooks::raw(trap.reason);
-    process.heap.abi.exc.freason = freason;
-    process.heap.abi.exc.fvalue = fvalue;
-    process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
-        trap,
-        freason,
-        fvalue,
-    }));
-    0
+    // `BIF_ERROR(BIF_P, BADARG)`: the light-BIF fragment stored `bif_mfa` in `c_p->current` and
+    // the argument is still x0, which is all `save_stacktrace` reads.
+    crate::native_helpers::bif_error(process, trap)
 }
 
 /// `is_process_alive_1` as the BIF `call_light_bif_shared` branches to.
