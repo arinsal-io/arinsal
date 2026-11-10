@@ -2193,6 +2193,7 @@ impl<T: Task> ProcessTable<T> {
             },
             priority,
             bound_worker,
+            None,
         )
     }
 
@@ -2207,6 +2208,7 @@ impl<T: Task> ProcessTable<T> {
         init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
         priority: Priority,
         bound_worker: Option<usize>,
+        alloc_ix: Option<usize>,
     ) -> Result<ProcRef<T>, SpawnInitError<E>> {
         self.insert_with_cell_init(
             |pid, cell| {
@@ -2216,6 +2218,7 @@ impl<T: Task> ProcessTable<T> {
             },
             priority,
             bound_worker,
+            alloc_ix,
         )
     }
 
@@ -2225,10 +2228,12 @@ impl<T: Task> ProcessTable<T> {
         init: impl FnOnce(Pid, &mut TaskCell<T>) -> Result<(), E>,
         priority: Priority,
         bound_worker: Option<usize>,
+        alloc_ix: Option<usize>,
     ) -> Result<ProcRef<T>, SpawnInitError<E>> {
         // Port of erts/emulator/beam/erl_process.c (alloc_process), OTP-29.1.1: allocate the
         // Process block before erts_ptab_new_element takes the table lock.
         let Some((process, initialized, context)) = ProcRef::new_with(
+            alloc_ix,
             || {
                 // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
                 let shared = self.lock.read();
@@ -2527,13 +2532,14 @@ impl<T: Task> ProcessTable<T> {
         if old.is_null() {
             return;
         }
-        let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         if let Some(process) = removed {
+            // save_deleted_element: the deletion is stamped with the current interval
+            // (erts_current_interval_nob); only the list BIF steps it, never a delete.
             let entry = PtabListDeleted {
                 index: self.index(pid),
                 id: pid,
                 started_interval: process.started_interval,
-                deleted_interval,
+                deleted_interval: self.interval.load(Ordering::Acquire),
             };
             self.list_deleted.lock().record(entry);
         }
@@ -7376,6 +7382,7 @@ impl<T: Task> Scheduler<T> {
         init: impl FnOnce(Pid, &mut T) -> Result<(), E>,
         priority: Priority,
         scheduler_id: Option<usize>,
+        alloc_ix: Option<usize>,
     ) -> Result<SpawnedProcess<T::Message>, SpawnInitError<E>> {
         let bound = match scheduler_id {
             Some(id) => {
@@ -7390,7 +7397,7 @@ impl<T: Task> Scheduler<T> {
         let process = self
             .inner
             .table
-            .insert_try_prepare_init(prepare, build, init, priority, bound)?;
+            .insert_try_prepare_init(prepare, build, init, priority, bound, alloc_ix)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(SpawnedProcess {
             pid: process.pid,
