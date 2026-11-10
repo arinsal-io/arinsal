@@ -269,6 +269,10 @@ pub struct EmulatorFlags {
     pub distribution_buffer_busy_limit: Option<u64>,
     /// `+Bi` or `+B i`: the break signals (SIGINT, SIGQUIT, SIGTSTP) are ignored.
     pub ignore_break: bool,
+    /// `+Bd`, `+B d` or a bare `+B`: no break handler is installed (`have_break_handler = 0`).
+    pub no_break_handler: bool,
+    /// `+Bc` or `+B c`: Ctrl-C is disabled on the tty so the shell can use it (`replace_intr`).
+    pub replace_intr: bool,
     /// `+pad`: the default of the `async_dist` process flag (`erts_default_spo_flags`).
     pub async_dist: Option<bool>,
     /// `+zdntgc`: the delay before an unused node table entry is deleted.
@@ -1471,8 +1475,10 @@ fn parse_emulator_flag(
                 None
             };
             // Port of erts/emulator/beam/erl_init.c (erl_start, case 'B'), OTP-29.1.1.
-            if v.as_deref() == Some("i") {
-                out.ignore_break = true;
+            match v.as_deref() {
+                Some("i") => out.ignore_break = true,
+                Some("c") => out.replace_intr = true,
+                _ => out.no_break_handler = true,
             }
             out.ignored.push(IgnoredFlag {
                 name: name.into(),
@@ -1575,6 +1581,10 @@ fn parse_emulator_flag(
             if name == "+Bi" {
                 // Port of erts/emulator/beam/erl_init.c (erl_start, case 'B'), OTP-29.1.1.
                 out.ignore_break = true;
+            } else if name == "+Bc" {
+                out.replace_intr = true;
+            } else if name == "+Bd" {
+                out.no_break_handler = true;
             } else if name == "+pad" {
                 // Port of erts/emulator/beam/erl_init.c (erl_start, -pad), OTP-29.1.1.
                 out.async_dist = Some(match v.as_deref().unwrap_or("") {

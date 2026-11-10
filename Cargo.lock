@@ -109,6 +109,7 @@ name = "arinsal-bifs"
 version = "0.0.1"
 dependencies = [
  "arinsal-alloc",
+ "arinsal-args",
  "arinsal-arith",
  "arinsal-difftest",
  "arinsal-etf",

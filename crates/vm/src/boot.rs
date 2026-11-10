@@ -48,8 +48,15 @@ pub fn run_with_debugger_flags(
         arinsal_args::active_emulator_flags().delayed_node_table_gc,
     );
     // Port of erts/emulator/beam/erl_init.c (erl_start): `if (ignore_break) erts_set_ignore_break()`.
-    if arinsal_args::active_emulator_flags().ignore_break {
+    // Restart will not reinstall the break handler.
+    let flags = arinsal_args::active_emulator_flags();
+    if flags.ignore_break {
         crate::natives::env::set_ignore_break();
+    } else if !flags.no_break_handler {
+        crate::natives::tty::init_break_handler();
+    }
+    if flags.replace_intr {
+        crate::natives::tty::replace_intr();
     }
     erl_init_atoms()?;
     crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
