@@ -6,7 +6,6 @@ use std::mem::MaybeUninit;
 pub(crate) fn initialize_spawned(
     slot: &mut MaybeUninit<Process>,
     x_registers: usize,
-    float_registers: usize,
     mut heap: ProcessHeap,
 ) -> &mut Process {
     #[cfg(feature = "pf-mem-counters")]
@@ -22,7 +21,6 @@ pub(crate) fn initialize_spawned(
     // Construct every owning or fallible value before the first field write. If any of these
     // operations panics, the allocated slot is still wholly uninitialized.
     let x = ArgRegs::new(x_registers);
-    let fr = vec![0.0; float_registers].into_boxed_slice();
     let seq_trace_epoch = crate::seq_trace::current_epoch();
     let stats = ProcessStats::default();
     let inbox = process::MessageQueue::default();
@@ -41,7 +39,6 @@ pub(crate) fn initialize_spawned(
     unsafe {
         std::ptr::addr_of_mut!((*process).heap).write(heap);
         std::ptr::addr_of_mut!((*process).x).write(x);
-        std::ptr::addr_of_mut!((*process).fr).write(fr);
         std::ptr::addr_of_mut!((*process).dictionary).write(None);
         std::ptr::addr_of_mut!((*process).seq_trace_token).write(None);
         std::ptr::addr_of_mut!((*process).seq_token_root).write(Term::NIL);
@@ -49,7 +46,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).seq_trace_lastcnt).write(0);
         std::ptr::addr_of_mut!((*process).seq_trace_epoch).write(seq_trace_epoch);
         std::ptr::addr_of_mut!((*process).seq_trace_spawn_pending).write(false);
-        std::ptr::addr_of_mut!((*process).module).write(0);
         std::ptr::addr_of_mut!((*process).initial_mfa).write(None);
         std::ptr::addr_of_mut!((*process).native_pc).write(None);
         std::ptr::addr_of_mut!((*process).slow).write(slow);
@@ -128,7 +124,6 @@ fn process_fields_are_initialized(process: Process) {
     let Process {
         heap,
         x,
-        fr,
         dictionary,
         seq_trace_token,
         seq_token_root,
@@ -136,7 +131,6 @@ fn process_fields_are_initialized(process: Process) {
         seq_trace_lastcnt,
         seq_trace_epoch,
         seq_trace_spawn_pending,
-        module,
         initial_mfa,
         native_pc,
         slow,
@@ -200,7 +194,6 @@ fn process_fields_are_initialized(process: Process) {
     drop((
         heap,
         x,
-        fr,
         dictionary,
         seq_trace_token,
         seq_token_root,
@@ -208,7 +201,6 @@ fn process_fields_are_initialized(process: Process) {
         seq_trace_lastcnt,
         seq_trace_epoch,
         seq_trace_spawn_pending,
-        module,
         initial_mfa,
         native_pc,
         slow,

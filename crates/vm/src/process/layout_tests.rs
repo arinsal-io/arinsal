@@ -182,7 +182,6 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
     }
 
     let mut process = Process::new();
-    process.module = 1;
     install(&mut process, packed(7, 4), 0, &[]);
     assert!(!process.references_code(7, |_| false));
     assert_eq!(process.heap.abi.exc.freason, 0);
@@ -215,14 +214,14 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
         arinsal_beamasm::exc::EXC_ERROR
     );
 
-    // The process itself is in the module: erts returns before looking at ftrace.
-    process.module = 7;
+    // The process itself is in the module (`rp->i`): erts returns before looking at ftrace.
+    process.set_native_pc(Some(0x7000));
     install(&mut process, packed(7, 4), 0, &[]);
     let live = process.heap.abi.exc.ftrace;
-    assert!(process.references_code(7, |_| false));
+    assert!(process.references_code(7, |address| address == 0x7000));
     assert_eq!(process.heap.abi.exc.ftrace, live);
 
-    process.module = 1;
+    process.set_native_pc(None);
     process.heap.abi.exc.ftrace = 0;
     process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
     assert!(!process.references_code(7, |_| false));

@@ -1487,34 +1487,23 @@ fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<
     vm.refresh_code();
     // Port of erts/emulator/beam/erl_nif.c:4744-4772 (erts_load_nif), OTP-29.1.1: the library
     // binds to the module whose code called load_nif (`erts_find_function_from_pc`); a pending
-    // on_load instance takes it, and a call from old code is refused. Native code does not keep
-    // `process.module` current, so its call site names the caller.
-    let (caller, caller_instance) = match crate::natives::proc::native_call_site(process) {
-        Some((function, pc)) => {
-            let instance = [
-                vm.code.pending_on_load.get(function.module),
-                vm.code.loaded.get(function.module),
-                vm.code.old.get(function.module),
-            ]
-            .into_iter()
-            .flatten()
-            .copied()
-            .find(|&id| {
-                crate::load::native_code_range(&vm.code.code_meta, id)
-                    .is_some_and(|(start, end)| (start..end).contains(&pc))
-            });
-            (function.module.to_owned(), instance)
-        }
-        None => {
-            let name = vm
-                .code
-                .modules
-                .get(process.module)
-                .map(|module| module.name.clone())
-                .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
-            (name, Some(process.module))
-        }
-    };
+    // on_load instance takes it, and a call from old code is refused. The call site (`I`) names
+    // the caller.
+    let (function, pc) = crate::natives::proc::native_call_site(process)
+        .ok_or_else(|| VmError::Unsupported("load_nif without a call site".into()))?;
+    let caller_instance = [
+        vm.code.pending_on_load.get(function.module),
+        vm.code.loaded.get(function.module),
+        vm.code.old.get(function.module),
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+    .find(|&id| {
+        crate::load::native_code_range(&vm.code.code_meta, id)
+            .is_some_and(|(start, end)| (start..end).contains(&pc))
+    });
+    let caller = function.module.to_owned();
     if caller_instance.is_some() && caller_instance == vm.code.old.get(&caller).copied() {
         return error_reason(
             process,

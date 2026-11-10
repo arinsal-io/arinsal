@@ -160,11 +160,6 @@ impl Vm {
             ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1) => {
                 // elixir_loop1
                 let mut p = Process::new();
-                let module_id = match self.load_named("erlang") {
-                    Ok(id) => id,
-                    Err(error) => return Some(Err(error)),
-                };
-                p.module = module_id;
                 p.x[..arity].copy_from_slice(args);
                 p.gc_live = arity;
                 let value = match function {
@@ -761,17 +756,9 @@ impl Vm {
         {
             return self.run_apply_bif(p, ctx, module, function, arity, bif);
         }
-        // A trap through `apply` is keyed by the caller's import when it has one, so a
-        // static call and its apply re-execution resume the same continuation.
-        let trap_key = self.code.modules[p.module]
-            .imports
-            .iter()
-            .position(|import| {
-                import.module == module
-                    && import.function == function
-                    && usize::from(import.arity) == arity
-            })
-            .unwrap_or(crate::bif_traps::APPLY_TRAP_KEY);
+        // A trap through `apply` is keyed as an apply: a static call is keyed by its native
+        // call target instead, so the two never resume each other's continuation.
+        let trap_key = crate::bif_traps::APPLY_TRAP_KEY;
         let trap_args = [
             p.x.first().copied().unwrap_or(Term::NIL),
             p.x.get(1).copied().unwrap_or(Term::NIL),
