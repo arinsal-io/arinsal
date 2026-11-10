@@ -108,7 +108,7 @@ fn call_env_all(
     env_all(process)
 }
 
-fn call_getenv_one(
+pub(crate) fn call_getenv_one(
     _vm: &mut Vm,
     process: &mut Process,
     _ctx: &mut RunCtx<'_, Message>,

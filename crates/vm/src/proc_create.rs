@@ -1352,6 +1352,11 @@ impl SliceWork {
 
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// The outcome of a BIF called from native code that only the scheduler completes
+    /// (ERTS_BIF_YIELD, dirty scheduling, a busy port, hibernation): the BIF returned
+    /// THE_NON_VALUE with TRAP to its call, and the scheduler finishes the call with this
+    /// result instead of calling the BIF again.
+    pub(crate) bif_outcome: Option<Box<crate::VmError>>,
     /// The parked `erlang:hibernate` continuation (erts keeps it on the process; `F_HIBERNATE_SCHED`).
     pub(crate) hibernate: Option<crate::process::HibernateCont>,
     /// `p->max_heap_size` (erts erl_process.h:1034): the limit and its flags.
