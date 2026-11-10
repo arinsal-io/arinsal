@@ -5685,7 +5685,6 @@ trait ContextOps<M: SignalMessage> {
     fn thread_progress_later(&self, op: LaterOp);
     fn progress_domain(&self) -> &Progress;
     fn block_thread_progress(&self, duration: Duration);
-    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<M>>;
     fn total_reductions(&self) -> u64;
     fn exact_total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
@@ -5864,8 +5863,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// A handle that tells, without this context, whether signals wait in this process's
     /// shared input queue.
+    // The process reaches its own queue through its own struct, as erts code reaches
+    // `c_p->sig_inq` through `c_p`: no table lookup and no reference count.
     pub fn signal_probe(&mut self) -> Option<SignalProbe<M>> {
-        self.inner.signal_probe(self.proc.pid)
+        Some(SignalProbe::of(self.proc, self.inner.progress_domain()))
     }
     /// Configure the receiver's parallel sender buffers for off heap mailboxes.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
@@ -6823,13 +6824,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn flush(&mut self) {
         self.publish_deferred_monitor();
-    }
-    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<T::Message>> {
-        let process = self.lookup(pid)?;
-        Some(SignalProbe::of(
-            &process,
-            self.inner.progress_domain.clone(),
-        ))
     }
     fn total_reductions(&self) -> u64 {
         if self.inner.sim.is_some() {
