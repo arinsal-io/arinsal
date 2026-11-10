@@ -541,7 +541,8 @@ pub(crate) fn dt_get_tag_light(
     _process: &mut Process,
     args: &[Term],
 ) -> Option<Result<Term, crate::exceptions::Trap>> {
-    args.is_empty().then(|| Ok(atom("undefined")))
+    args.is_empty()
+        .then(|| Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
 }
 
 /// `erlang:dt_put_tag/1` from the generated code.
@@ -551,7 +552,7 @@ pub(crate) fn dt_put_tag_light(
     _process: &mut Process,
     args: &[Term],
 ) -> Option<Result<Term, crate::exceptions::Trap>> {
-    (args.len() == 1).then(|| Ok(atom("undefined")))
+    (args.len() == 1).then(|| Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
 }
 
 /// `erlang:dt_prepend_vm_tag_data/1` and `dt_append_vm_tag_data/1` from the generated code.
@@ -1263,7 +1264,9 @@ pub(crate) fn system_info_process_item(
         // erl_node_tables.c (erts_delayed_node_table_gc), OTP-29.1.1: the live delay, which
         // `erts_debug:set_internal_state(node_tab_delayed_delete, _)` changes.
         Some("delayed_node_table_gc") => Some(match crate::node_tables::delayed_node_table_gc() {
-            crate::node_tables::NODE_TAB_DELAY_GC_INFINITY => Ok(atom("infinity")),
+            crate::node_tables::NODE_TAB_DELAY_GC_INFINITY => {
+                Ok(Term::atom(arinsal_term::atoms::INFINITY))
+            }
             secs => non_neg(process, secs),
         }),
         // Port of erts/emulator/beam/erl_bif_info.c:3524-3529, OTP-29.1.1.
