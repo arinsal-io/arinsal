@@ -156,7 +156,6 @@ pub(crate) struct CodeTables {
     pub(crate) pending_on_load: SharedTable<HashMap<String, usize>>,
     pub(crate) deleted: SharedTable<std::collections::HashSet<String>>,
     pub(crate) code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
-    pub(crate) registers: SharedTable<Vec<(usize, usize)>>,
     pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     // g_code_fix
     pub(crate) exports: SharedTable<ExportIndex>,
@@ -506,29 +505,21 @@ pub(crate) fn path_charlist(path: &Path) -> arinsal_etf::OwnedTerm {
 // g_code_fix
 struct SlotTable<'a> {
     modules: &'a mut Vec<Arc<Module>>,
-    registers: &'a mut Vec<(usize, usize)>,
     code_meta: &'a mut Vec<Option<Arc<CodeMeta>>>,
     live: &'a mut Vec<bool>,
     free_ids: &'a mut Vec<usize>,
 }
 
 // g_code_fix
-fn alloc_slot(
-    table: &mut SlotTable<'_>,
-    stored: Arc<Module>,
-    regs: (usize, usize),
-    meta: Option<CodeMeta>,
-) -> usize {
+fn alloc_slot(table: &mut SlotTable<'_>, stored: Arc<Module>, meta: Option<CodeMeta>) -> usize {
     if let Some(id) = table.free_ids.pop() {
         table.modules[id] = stored;
-        table.registers[id] = regs;
         table.code_meta[id] = meta.map(Arc::new);
         table.live[id] = true;
         id
     } else {
         let id = table.modules.len();
         table.modules.push(stored);
-        table.registers.push(regs);
         table.code_meta.push(meta.map(Arc::new));
         table.live.push(true);
         id
@@ -592,8 +583,7 @@ impl CodeTables {
         let fun_table =
             self.funs.capacity() * (size_of::<FunKey>() + size_of::<Arc<FunEntry>>() + 1);
         let fun_list = self.funs.len() * (ARC + size_of::<FunEntry>());
-        let module_refs = self.code_meta.capacity() * size_of::<Option<Arc<CodeMeta>>>()
-            + self.registers.capacity() * size_of::<(usize, usize)>();
+        let module_refs = self.code_meta.capacity() * size_of::<Option<Arc<CodeMeta>>>();
         let loaded_code: usize = self
             .modules
             .iter()
@@ -625,7 +615,6 @@ impl CodeTables {
             pending_on_load: SharedTable::new(HashMap::new()),
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
-            registers: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
             exports: SharedTable::new(ExportIndex::new()),
             funs: SharedTable::new(HashMap::with_hasher(BuildHasherDefault::default())),
@@ -670,23 +659,16 @@ impl CodeTables {
     }
 
     /// Adds a module instance and returns its id.
-    pub(crate) fn alloc(
-        &mut self,
-        module: Arc<Module>,
-        registers: (usize, usize),
-        meta: Option<CodeMeta>,
-    ) -> usize {
+    pub(crate) fn alloc(&mut self, module: Arc<Module>, meta: Option<CodeMeta>) -> usize {
         self.exports.note_module(&module);
         let id = alloc_slot(
             &mut SlotTable {
                 modules: &mut self.modules,
-                registers: &mut self.registers,
                 code_meta: &mut self.code_meta,
                 live: &mut self.module_live,
                 free_ids: &mut self.free_ids,
             },
             module,
-            registers,
             meta,
         );
         crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
@@ -1043,7 +1025,6 @@ impl Vm {
         let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
         let name = module.name.clone();
-        let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
         let staging = self.code_ix.start_staging();
         let mut released = None;
         staging.with(|tables| {
@@ -1068,7 +1049,7 @@ impl Vm {
         let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
         let id = staging.with(|tables| {
-            let id = tables.alloc(module, registers, Some(meta));
+            let id = tables.alloc(module, Some(meta));
             if let Some(previous) = tables.make_current(&name, id) {
                 tables.old.insert(name.clone(), previous);
             }
@@ -1118,7 +1099,6 @@ impl Vm {
         // to the emitter.
         self.decode_for_native_tables(&mut meta.beam)?;
         let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
-        let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
         let staging = self.code_ix.start_staging();
         // Another scheduler may have loaded the module since this one looked.
         if let Some(id) = staging.with(|tables| tables.loaded.get(&module_name).copied()) {
@@ -1144,7 +1124,7 @@ impl Vm {
         let name = module.name.clone();
         let on_load = meta.on_load.is_some();
         let id = staging.with(|tables| {
-            let id = tables.alloc(module, registers, Some(meta));
+            let id = tables.alloc(module, Some(meta));
             // Port of erts/emulator/beam/beam_load.c:259-330 (erts_finish_loading), OTP-29.1.1:
             // a module with `-on_load` is not made current; its code waits in the module's
             // on_load slot until erlang:finish_after_on_load/2 keeps it.
@@ -1170,11 +1150,11 @@ impl Vm {
     /// returned load commits through [`Vm::commit_staged`] once the loader's code barrier passed.
     pub(crate) fn stage_prepared(
         &mut self,
-        prepared: Vec<(Module, (usize, usize), CodeMeta)>,
+        prepared: Vec<(Module, CodeMeta)>,
     ) -> Result<StagedLoad, (&'static str, Vec<String>)> {
         let names: Vec<_> = prepared
             .iter()
-            .map(|(module, _, _)| module.name.clone())
+            .map(|(module, _)| module.name.clone())
             .collect();
         let mut seen = std::collections::HashSet::new();
         let duplicates: Vec<_> = names
@@ -1185,7 +1165,7 @@ impl Vm {
         if !duplicates.is_empty() {
             return Err(("duplicated", duplicates));
         }
-        if prepared.len() > 1 && prepared.iter().any(|(_, _, meta)| meta.on_load.is_some()) {
+        if prepared.len() > 1 && prepared.iter().any(|(_, meta)| meta.on_load.is_some()) {
             return Err(("system_limit", names));
         }
         // Port of erts/emulator/beam/beam_bif_load.c:422 and 511-548 (finish_loading:
@@ -1206,7 +1186,7 @@ impl Vm {
         }
         let mut on_load = Vec::new();
         let mut ids = Vec::new();
-        for (mut module, registers, mut meta) in prepared {
+        for (mut module, mut meta) in prepared {
             let name = module.name.clone();
             let pending = meta.on_load.is_some();
             staging.with(|tables| {
@@ -1215,7 +1195,7 @@ impl Vm {
             let _ = self.install_native(&module, &mut meta);
             let module = Arc::new(module);
             ids.push(staging.with(|tables| {
-                let id = tables.alloc(module, registers, Some(meta));
+                let id = tables.alloc(module, Some(meta));
                 tables.known_modules.insert(name.clone());
                 if pending {
                     tables.pending_on_load.insert(name.clone(), id);
@@ -1257,19 +1237,6 @@ impl Vm {
         staged.on_load
     }
 
-    /// Whether `address` lies in the native code of module instance `id`.
-    pub(crate) fn native_code_contains(&self, id: usize, address: usize) -> bool {
-        self.code
-            .code_meta
-            .get(id)
-            .and_then(|meta| meta.as_ref())
-            .and_then(|meta| meta.beamasm.as_ref())
-            .is_some_and(|version| {
-                let (start, end) = version.code_range();
-                start <= address && address < end
-            })
-    }
-
     /// Makes this VM read the tables of `erts_active_code_ix()`. This owned snapshot is checked
     /// at schedule-in and before code-sensitive access; raw slot borrows themselves end inside
     /// their lookup closure before the scheduler reaches a thread-progress point.
@@ -1293,13 +1260,6 @@ impl Vm {
     /// Generation of the tables this VM reads; interpreter caches are valid only within it.
     pub(crate) fn code_generation(&self) -> u64 {
         self.code.generation
-    }
-
-    #[inline(always)]
-    pub(crate) fn sync_module(&mut self, id: usize) {
-        if id >= self.code.modules.len() || id >= self.code.registers.len() {
-            self.refresh_code();
-        }
     }
 
     /// Patch the breakpoints of several functions of one module, publishing the module once:

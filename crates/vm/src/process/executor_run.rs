@@ -62,7 +62,6 @@ impl Executor {
         // first (erts_find_function_from_pc reads the active code index).
         // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
         self.vm.refresh_code();
-        self.vm.sync_module(process.module);
         // Port of erts/emulator/beam/erl_process.c:10539-10543 (schedule-in tests
         // ERTS_TRACE_FLAGS(p) before any trace work), OTP-29.1.1: the process flag word has
         // `proc_flags::TRACE` while the trace table holds an entry for this process.
@@ -104,41 +103,14 @@ impl Executor {
             // scanning, and the process never reaches halt.
             process.heap.abi.fcalls = reds;
         }
-        // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
-        // export's code address), OTP-29.1.1: every process starts its function natively on
-        // its first run; later runs continue wherever its interpreted or native continuation is.
-        // erts starts a spawned process at beam_run_process; its first run applies the MFA.
-        if !process.entry_started() && process.module == RUN_PROCESS {
-            match crate::beamasm_integration::run_process_entry() {
-                // The native start is the beam_run_process stub, which applies X0..X2 itself. The
-                // process meanwhile holds erlang:apply/3 with those arguments, so the stub's
-                // interpreter fallback runs there (native_bridge.rs apply3 resolver).
-                Some((start, _)) => {
-                    let (module_id, _) = erlang_apply_entry(&mut self.vm)?;
-                    process.module = module_id;
-                    process.set_native_pc(Some(start));
-                    // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->i =
-                    // beam_run_process; p->arity = 3`), OTP-29.1.1: the process starts like any
-                    // switched-out one, resuming at `c_p->i` with `c_p->arity` live registers.
-                    // The entry needs no registry lookup for the stub's arity.
-                    process.native_continuation_resume = true;
-                    process.set_native_resume_arity(3);
-                }
-                None => {
-                    return Err(VmError::Unsupported(
-                        "the beam_run_process stub is not built".into(),
-                    ));
-                }
-            }
+        // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i =
+        // beam_run_process`), OTP-29.1.1: a spawned process (`p->u.initial` set) enters at the
+        // stub on its first run. It is installed here, not at spawn, because process_info and
+        // trace read `p->current = &p->u.initial` through the absence of a code address.
+        if !process.entry_started() && process.initial_mfa.is_some() {
+            process.set_run_process_entry()?;
         }
         process.replace_entry_started(true);
-        let need_x = self.vm.code.registers[process.module].0;
-        if need_x > crate::proc_create::ATTACHED_X_REGS {
-            return Err(VmError::Unsupported(format!(
-                "module needs {need_x} X registers, the scheduler array has {}",
-                crate::proc_create::ATTACHED_X_REGS
-            )));
-        }
         // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers) and
         // erl_process.c (erts_schedule), OTP-29.1.1: the scheduler's one X register array is
         // the process's file for the slice, loaded with the `c_p->arity` saved registers.
@@ -771,9 +743,8 @@ impl Executor {
             let save_x = live_x;
             if crate::native_bridge::return_trace_enabled() && process.native_pc().is_some() {
                 eprintln!(
-                    "[sched-save-native] live_x={live_x} x0={:#x} module={} native_pc={:?}",
+                    "[sched-save-native] live_x={live_x} x0={:#x} native_pc={:?}",
                     process.x[0].tagged_word(),
-                    self.vm.code.modules[process.module].name,
                     process.native_pc()
                 );
             }

@@ -3846,7 +3846,6 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
     // erl_trace.c:752-760 (trace_sched_session), OTP-29.1.1: a process that has not run yet
     // is at its initial function.
     if !process.entry_started()
-        && process.module == crate::process::RUN_PROCESS
         && let Some((module, function, arity)) = process.initial_mfa
     {
         let tuple = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))

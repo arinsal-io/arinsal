@@ -770,14 +770,6 @@ impl Executor {
                     let saved_arguments: smallvec::SmallVec<[Term; 8]> =
                         smallvec::SmallVec::from_slice(&process.x[..usize::from(export.arity)]);
                     let collections_before = process.stats.gc.collections;
-                    // BIFs such as load_nif/2 identify their caller through
-                    // `process.module`, which native code does not maintain: the
-                    // caller is the native function holding the return address.
-                    let interpreter_module = process.module;
-                    // A module whose on_load is running is not current yet.
-                    if let Some(caller) = native_caller_module(&self.vm, resume_pc) {
-                        process.module = caller;
-                    }
                     // erlang:make_fun/3 is implemented by the VM's call path (funs.rs), not
                     // by the native BIF table; handle it here like the interpreter does.
                     // erlang:make_fun/3 and fun_info/1,2, fun_info_mfa/1 are implemented
@@ -931,8 +923,7 @@ impl Executor {
                             outcome
                         } else {
                             // The BIF runs at the native call site (erts c_p->i).
-                            let (module_before, position_before) =
-                                (process.module, process.position_marker());
+                            let position_before = process.position_marker();
                             process.native_call_pc = call_site_pc;
                             let traced = self.vm.trace_native_call_named(
                                 process,
@@ -1000,8 +991,7 @@ impl Executor {
                             if export.module == "erlang"
                                 && export.function == "call_on_load_function"
                                 && matches!(result, Some(Ok(_)))
-                                && (process.module, process.position_marker())
-                                    != (module_before, position_before)
+                                && process.position_marker() != position_before
                             {
                                 process.tick();
                                 return Ok(Flow::Continue);
@@ -1009,7 +999,6 @@ impl Executor {
                             result
                         }
                     };
-                    process.module = interpreter_module;
                     let result = result.or_else(|| {
                         let (bif, arity) = crate::beamasm_integration::dispatch_bif(target_pc)?;
                         let arity = usize::from(arity);

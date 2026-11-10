@@ -357,10 +357,6 @@ pub struct Process {
     pub heap: ProcessHeap,
     /// X registers. Inline for the erts default of six (`def_arg_reg`).
     pub x: ArgRegs,
-    /// Float registers of a process that runs outside a scheduler slice (an evaluation on its
-    /// own thread). Inside a slice the float file is the scheduler's `f_reg_array`, reached
-    /// through `x`, and this stays empty.
-    pub fr: Box<[f64]>,
     /// The erts process dictionary pointer is part of the hot process structure.
     pub(crate) dictionary: Option<Box<ProcDict>>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
@@ -377,7 +373,6 @@ pub struct Process {
     /// A spawned child whose first action is the spawn reply: the token update of
     /// erl_process.c:12960-12965 happens when it first runs.
     pub(crate) seq_trace_spawn_pending: bool,
-    pub(crate) module: usize,
     /// `p->u.initial` (erl_process.c:12693): the MFA the process was spawned with, as atoms.
     pub(crate) initial_mfa: Option<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
     native_pc: Option<usize>,
@@ -2015,44 +2010,32 @@ impl Process {
 
     /// Construct a process with the erts minimum heap size.
     pub fn new() -> Self {
-        Self::with_registers_and_min_heap(1024, 1024, 233)
+        Self::with_registers_and_min_heap(1024, 233)
     }
     #[cfg(test)]
-    pub(crate) fn with_registers(x_registers: usize, float_registers: usize) -> Self {
-        Self::with_registers_and_min_heap(x_registers, float_registers, 64)
+    pub(crate) fn with_registers(x_registers: usize) -> Self {
+        Self::with_registers_and_min_heap(x_registers, 64)
     }
-    pub(crate) fn with_spawn_registers(x_registers: usize, float_registers: usize) -> Self {
-        Self::with_spawn_registers_heap(x_registers, float_registers, Self::initial_heap(233))
+    pub(crate) fn with_spawn_registers(x_registers: usize) -> Self {
+        Self::with_spawn_registers_heap(x_registers, Self::initial_heap(233))
     }
     /// [`Self::with_spawn_registers`] with the heap `erl_create_process` sized for the
     /// child: erts allocates the initial heap once, at its final size.
-    pub(crate) fn with_spawn_registers_heap(
-        x_registers: usize,
-        float_registers: usize,
-        heap: ProcessHeap,
-    ) -> Self {
-        Self::spawn_registers_and_heap(x_registers, float_registers, heap)
+    pub(crate) fn with_spawn_registers_heap(x_registers: usize, heap: ProcessHeap) -> Self {
+        Self::spawn_registers_and_heap(x_registers, heap)
     }
     /// Build a spawned process after its process slot has been allocated.
     #[inline(always)]
-    pub(crate) fn spawn_registers_and_heap(
-        x_registers: usize,
-        float_registers: usize,
-        heap: ProcessHeap,
-    ) -> Self {
-        let mut process = Self::write_registers_and_heap(x_registers, float_registers, heap);
+    pub(crate) fn spawn_registers_and_heap(x_registers: usize, heap: ProcessHeap) -> Self {
+        let mut process = Self::write_registers_and_heap(x_registers, heap);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
         process.heap.abi.arity = x_registers.min(usize::from(u8::MAX)) as u8;
         process
     }
-    pub(crate) fn with_registers_and_min_heap(
-        x_registers: usize,
-        float_registers: usize,
-        min_heap: usize,
-    ) -> Self {
-        Self::with_registers_and_heap(x_registers, float_registers, Self::initial_heap(min_heap))
+    pub(crate) fn with_registers_and_min_heap(x_registers: usize, min_heap: usize) -> Self {
+        Self::with_registers_and_heap(x_registers, Self::initial_heap(min_heap))
     }
     /// A heap of `min_heap` words with the boot GC defaults; 64 builds the zero-word heap.
     fn initial_heap(min_heap: usize) -> ProcessHeap {
@@ -2069,19 +2052,11 @@ impl Process {
         );
         heap
     }
-    fn with_registers_and_heap(
-        x_registers: usize,
-        float_registers: usize,
-        heap: ProcessHeap,
-    ) -> Self {
-        Self::write_registers_and_heap(x_registers, float_registers, heap)
+    fn with_registers_and_heap(x_registers: usize, heap: ProcessHeap) -> Self {
+        Self::write_registers_and_heap(x_registers, heap)
     }
     #[inline(always)]
-    fn write_registers_and_heap(
-        x_registers: usize,
-        float_registers: usize,
-        heap: ProcessHeap,
-    ) -> Self {
+    fn write_registers_and_heap(x_registers: usize, heap: ProcessHeap) -> Self {
         #[cfg(feature = "pf-mem-counters")]
         let started = std::time::Instant::now();
         #[cfg(feature = "pf-mem-counters")]
@@ -2094,7 +2069,6 @@ impl Process {
             // erts' x_reg_array always has at least X0..X3 for `found_catch` to install
             // the exception registers without growing the process on the raise path.
             x: ArgRegs::new(x_registers.max(4)),
-            fr: vec![0.0; float_registers].into_boxed_slice(),
             dictionary: None,
             seq_trace_token: None,
             seq_token_root: Term::NIL,
@@ -2102,7 +2076,6 @@ impl Process {
             seq_trace_lastcnt: 0,
             seq_trace_epoch: crate::seq_trace::current_epoch(),
             seq_trace_spawn_pending: false,
-            module: 0,
             initial_mfa: None,
             native_pc: None,
             slow: Self::SLOW_NOT_STARTED | Self::SLOW_NO_NATIVE_PC | Self::SLOW_NO_PROBE,
@@ -2294,15 +2267,6 @@ impl Process {
             return Err(VmError::Unsupported("heap exhausted after GC".into()));
         }
         Ok(gc.reductions)
-    }
-    /// Make `need` float registers addressable. The scheduler's array always is; a process
-    /// outside a scheduler slice grows its own.
-    pub(crate) fn ensure_fr(&mut self, need: usize) {
-        if !self.x.is_attached() && self.fr.len() < need {
-            let mut registers = self.fr.to_vec();
-            registers.resize(need, 0.0);
-            self.fr = registers.into_boxed_slice();
-        }
     }
     pub(crate) fn tick(&mut self) {
         self.heap.abi.fcalls -= 1;
@@ -2829,7 +2793,6 @@ mod layout_report {
         eprintln!("Process {}", size_of::<Process>());
         eprintln!("  Process.heap.abi {}", size_of_val(&process.heap.abi));
         eprintln!("  Process.x {}", size_of_val(&process.x));
-        eprintln!("  Process.fr {}", size_of_val(&process.fr));
         eprintln!("  Process.heap {}", size_of_val(&process.heap));
         eprintln!("  Process.dictionary {}", size_of_val(&process.dictionary));
         eprintln!(
@@ -2856,7 +2819,6 @@ mod layout_report {
             "  Process.seq_trace_spawn_pending {}",
             size_of_val(&process.seq_trace_spawn_pending)
         );
-        eprintln!("  Process.module {}", size_of_val(&process.module));
         eprintln!(
             "  Process.initial_mfa {}",
             size_of_val(&process.initial_mfa)

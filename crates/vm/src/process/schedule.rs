@@ -492,9 +492,8 @@ impl Process {
             Ok(RunState::Done(term)) => {
                 if trace_boot_enabled() {
                     eprintln!(
-                        "arinsal boot: process {:?} done module={} pc={:?} value={term:?} {:?}",
+                        "arinsal boot: process {:?} done pc={:?} value={term:?} {:?}",
                         ctx.pid(),
-                        self.module,
                         self.native_pc(),
                         arinsal_term::to_owned(term).ok()
                     );

@@ -415,19 +415,16 @@ impl Process {
     pub(crate) fn verify_dirty_gc_roots(&self, _live: usize, _when: &str) {}
 
     // Port of erts/emulator/beam/beam_bif_load.c:1149 (check_process_code), OTP-29.1.1.
-    // A process suspended in native code is checked by its native resume address and the
-    // native continuation pointers on its stack; `self.module` is only its interpreter module.
+    // A process is checked by its code address (`rp->i`) and the native continuation pointers
+    // on its stack.
     pub(crate) fn references_code(
         &mut self,
         module: usize,
         in_native: impl Fn(usize) -> bool,
     ) -> bool {
-        // While native code runs (a signal handled from a runtime helper), `self.module` is
-        // stale and the running function shows up through the native stack instead.
-        match self.native_pc() {
-            Some(pc) if in_native(pc) => return true,
-            None if self.module == module && !self.heap.native_active() => return true,
-            _ => {}
+        // Port of beam_bif_load.c:1164 (`ErtsInArea(rp->i, mod_start, mod_size)`), OTP-29.1.1.
+        if self.native_pc().is_some_and(&in_native) {
+            return true;
         }
         // Port of erts/emulator/beam/beam_bif_load.c:1171 and erl_nfunc_sched.h:120
         // (erts_check_nfunc_in_area), OTP-29.1.1: a native call that is redone when the process wakes (a parked BIF, a

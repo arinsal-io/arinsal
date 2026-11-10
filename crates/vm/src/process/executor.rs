@@ -450,56 +450,6 @@ pub(crate) fn switched_out_live(process: &Process) -> usize {
     process.saved_arity()
 }
 
-/// Return address, native code generation, code tables generation and the owning module.
-type CallerModuleEntry = (usize, u64, u64, Option<usize>);
-
-thread_local! {
-    /// Direct-mapped memo of `native_caller_module`, keyed by return address and validated
-    /// against the native code generation and the code tables generation.
-    static CALLER_MODULE_CACHE: std::cell::RefCell<[CallerModuleEntry; 256]> =
-        const { std::cell::RefCell::new([(0, 0, 0, None); 256]) };
-}
-
-/// Module that owns the native function holding `resume_pc`; a module whose `-on_load`
-/// is running is not current yet.
-pub(super) fn native_caller_module(vm: &Vm, resume_pc: usize) -> Option<usize> {
-    let generation = crate::native_bridge::native_registry_generation();
-    // A running on_load changes the answer without touching the native code table.
-    let memo = vm.code.pending_on_load.is_empty();
-    let slot = (resume_pc >> 2) & 255;
-    if memo {
-        let hit = CALLER_MODULE_CACHE.with(|cache| {
-            let entry = cache.borrow()[slot];
-            (entry.0 == resume_pc && entry.1 == generation && entry.2 == vm.code_generation())
-                .then_some(entry.3)
-        });
-        if let Some(found) = hit {
-            return found;
-        }
-    }
-    let found = crate::native_bridge::with_native_function_at(resume_pc, |caller| {
-        // The pc names exactly one code instance: the one being loaded, the old one or the
-        // current one (a reload runs the new on_load while the previous code is current).
-        [
-            vm.code.pending_on_load.get(caller.module),
-            vm.code.loaded.get(caller.module),
-            vm.code.old.get(caller.module),
-        ]
-        .into_iter()
-        .flatten()
-        .copied()
-        .find(|id| vm.native_code_contains(*id, resume_pc))
-        .or_else(|| vm.code.loaded.get(caller.module).copied())
-    })
-    .flatten();
-    if memo {
-        CALLER_MODULE_CACHE.with(|cache| {
-            cache.borrow_mut()[slot] = (resume_pc, generation, vm.code_generation(), found);
-        });
-    }
-    found
-}
-
 pub(super) fn resume_after_native_return(process: &mut Process) -> bool {
     loop {
         let Some(word) = process.heap.stack_get(0) else {
@@ -531,11 +481,22 @@ pub(crate) fn pid_table_index(pid: Pid) -> u32 {
     arinsal_term::ptab::process_table_layout().data2pix(pid.data())
 }
 
-/// Module id of the apply_only start point (erts `beam_run_process`, erl_process.c:12616). A
-/// process spawned but not yet run holds it in `module`; no module has this id.
-pub(crate) const RUN_PROCESS: usize = usize::MAX;
-
 impl Process {
+    /// `p->i = beam_run_process; p->arity = 3`: the process starts like any switched-out one,
+    /// resuming at its code address with three live registers.
+    // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process), OTP-29.1.1.
+    pub(crate) fn set_run_process_entry(&mut self) -> Result<(), VmError> {
+        let Some((start, _)) = crate::beamasm_integration::run_process_entry() else {
+            return Err(VmError::Unsupported(
+                "the beam_run_process stub is not built".into(),
+            ));
+        };
+        self.set_native_pc(Some(start));
+        self.native_continuation_resume = true;
+        self.set_native_resume_arity(3);
+        Ok(())
+    }
+
     /// Start the process at beam_run_process: X0..X2 hold the module, the function and the
     /// argument list, and `p->u.initial` names the MFA (`process_info(initial_call)`).
     // Port of erts/emulator/beam/erl_process.c:12610-12616 (erl_create_process: `p->u.initial`,
@@ -546,14 +507,14 @@ impl Process {
         function: arinsal_term::Atom,
         args: Term,
         arity: u8,
-    ) {
-        self.module = RUN_PROCESS;
+    ) -> Result<(), VmError> {
         self.x[0] = Term::atom(module);
         self.x[1] = Term::atom(function);
         self.x[2] = args;
         self.gc_live = 3;
         self.heap.abi.arity = 3;
         self.initial_mfa = Some((module, function, arity));
+        Ok(())
     }
 }
 

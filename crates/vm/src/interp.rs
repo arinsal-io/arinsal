@@ -165,18 +165,6 @@ impl Vm {
         if p.native_retry().is_none() {
             p.set_native_retry_site(None);
         }
-        // A migrated process may already be inside a module this replica has
-        // not copied yet. Sync only when the id is past the local table.
-        self.sync_module(p.module);
-        let module_id = p.module;
-        if module_id >= self.code.modules.len() {
-            return Err(VmError::Unsupported(format!(
-                "process module {module_id} is not loaded on this scheduler"
-            )));
-        }
-        let (need_x, need_fr) = self.code.registers[module_id];
-        p.x.ensure_x(need_x);
-        p.ensure_fr(need_fr);
         if p.native_pc().is_none() {
             return Err(VmError::Unsupported(
                 "process has no code address to continue at".into(),

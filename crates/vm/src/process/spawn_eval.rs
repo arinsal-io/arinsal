@@ -31,7 +31,7 @@ impl Runtime {
             .map_err(|_| VmError::Unsupported("spawn: too many arguments".into()))?;
         let (module_atom, function_atom, _) = mfa_atoms(module, function, arity)
             .ok_or_else(|| VmError::Unsupported("spawn: bad module or function name".into()))?;
-        let mut child = Process::with_spawn_registers(args.len().max(3), 0);
+        let mut child = Process::with_spawn_registers(args.len().max(3));
         child.set_runtime(Some(self));
         child.cold_mut().group_leader = None;
         // Port of erts/emulator/beam/erl_process.c:12756-12767 (erl_create_process p->parent),
@@ -57,13 +57,12 @@ impl Runtime {
         if initial_bif {
             child.slice_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
             child.x[..copied.len()].copy_from_slice(&copied);
-            child.module = crate::process::RUN_PROCESS;
             child.initial_mfa = Some((module_atom, function_atom, arity));
         } else {
             let args = arinsal_term::TermBuilder::new(&mut child.heap)
                 .list_from_slice(&copied)
                 .map_err(|_| VmError::Unsupported("spawn argument list".into()))?;
-            child.start_at_run_process(module_atom, function_atom, args, arity);
+            child.start_at_run_process(module_atom, function_atom, args, arity)?;
         }
         let scheduler = self.scheduler()?;
         let Some(monitor) = monitor else {
@@ -132,11 +131,11 @@ impl Vm {
         self.load_named(module)?;
         let (module_atom, function_atom, _) = mfa_atoms(module, function, 0)
             .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 name")))?;
-        let mut process = Process::with_spawn_registers(3, 0);
+        let mut process = Process::with_spawn_registers(3);
         process.set_runtime(Some(runtime));
         // Port of erts/emulator/beam/erl_init.c:402 (erl_system_process_otp): spawned with `NIL`
         // arguments through erl_create_process, which starts at beam_run_process.
-        process.start_at_run_process(module_atom, function_atom, Term::NIL, 0);
+        process.start_at_run_process(module_atom, function_atom, Term::NIL, 0)?;
         if priority != arinsal_sched::Priority::Normal {
             let name = match priority {
                 arinsal_sched::Priority::Max => "max",
@@ -425,7 +424,7 @@ impl Vm {
                 }
             }
             let scheduler = runtime.scheduler()?;
-            let mut process = Process::with_spawn_registers(3, 0);
+            let mut process = Process::with_spawn_registers(3);
             // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
             // arguments into the new heap), OTP-29.1.1: the first process owns its arguments, so
             // a collection never meets a term outside its heap and the literal areas.
@@ -449,7 +448,7 @@ impl Vm {
             process.set_runtime(Some(runtime));
             // Port of erts/emulator/beam/erl_init.c:356 (erl_first_process_otp): the first
             // process is spawned through erl_create_process, which starts at beam_run_process.
-            process.start_at_run_process(module_atom, function_atom, args, arity);
+            process.start_at_run_process(module_atom, function_atom, args, arity)?;
             process.entry = true;
             // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
             // the first process gets the first pid; it runs once the system processes

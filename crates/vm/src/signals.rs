@@ -1120,10 +1120,8 @@ fn create_child(
         }
         // `p->u.initial` is the spawned MFA, reported by process_info(initial_call); `p->i` is
         // the apply/3 entry the child starts at.
-        // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->i = beam_run_process`): the child
-        // starts at the apply_only sentinel; its first run applies X0..X2
-        // (Vm::resolve_run_process).
-        child.module = crate::process::RUN_PROCESS;
+        // erl_create_process sets `p->i = beam_run_process`; the child's first run installs it
+        // (Executor::run) and applies X0..X2.
         child.initial_mfa = Some((m, f, arity as u8));
         if initial_bif.is_some() {
             child.slice_mut().initial_bif = initial_bif.clone();
@@ -1189,7 +1187,7 @@ fn create_child(
                 let mut heap =
                     arinsal_term::ProcessHeap::with_words_at(heap_words, parent_alloc_ix);
                 heap.set_min_heap_size(min_heap);
-                crate::proc_create::raw::initialize_spawned(slot, 3, 0, heap)
+                crate::proc_create::raw::initialize_spawned(slot, 3, heap)
             },
             init_child,
             so.priority,
@@ -1895,35 +1893,6 @@ fn access_timer_sync(
     )))
 }
 
-fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool {
-    if names.contains(&"erts_dirty_process_signal_handler")
-        && process
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.dirty_signal_handlers.lock().unwrap().contains(&pid))
-    {
-        return true;
-    }
-    let registered = process.runtime.as_ref().is_some_and(|runtime| {
-        runtime
-            .scheduler()
-            .ok()
-            .and_then(|scheduler| scheduler.registered_atom_index(pid))
-            .is_some_and(|index| {
-                names
-                    .iter()
-                    .any(|name| global_atoms().get(name).is_some_and(|atom| atom.0 == index))
-            })
-    });
-    if registered {
-        return true;
-    }
-    vm.code
-        .modules
-        .get(process.module)
-        .is_some_and(|module| names.iter().any(|name| module.name == *name))
-}
-
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
 // (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1.
 fn dirty_process_handle_signals(
@@ -1932,16 +1901,14 @@ fn dirty_process_handle_signals(
     ctx: &mut RunCtx<'_, Message>,
     target: Term,
 ) -> Result<Term, VmError> {
-    if !system_process(
-        vm,
-        process,
-        ctx.pid(),
-        &[
-            "erts_dirty_process_signal_handler",
-            "erts_dirty_process_signal_handler_high",
-            "erts_dirty_process_signal_handler_max",
-        ],
-    ) {
+    // erts compares BIF_P with the three dirty signal handler processes.
+    if !process.runtime.as_ref().is_some_and(|runtime| {
+        runtime
+            .dirty_signal_handlers
+            .lock()
+            .unwrap()
+            .contains(&ctx.pid())
+    }) {
         return Err(VmError::Trap(crate::exceptions::Trap::error(atom(
             "notsup",
         ))));

@@ -95,7 +95,7 @@ mod boot_loop1_shared_tests {
 
     #[test]
     fn collection_roots_only_the_live_registers() {
-        let mut process = Process::with_registers(2, 0);
+        let mut process = Process::with_registers(2);
         process.ensure(2, 0).unwrap();
         let value = TermBuilder::new(&mut process.heap)
             .tuple(&[Term::NIL])
@@ -130,7 +130,7 @@ mod boot_loop1_shared_tests {
         let mut first = Vm::shared_replica(scope, &[]);
         let mut second = Vm::shared_replica(scope, &[]);
         let id = first.load_bytes(&beam).unwrap();
-        second.sync_module(id);
+        second.refresh_code();
         assert_eq!(second.code.modules[id].name, "boot_loop1_shared");
         assert_eq!(first.code_ix.active_tables().modules.len(), id + 1);
         drop((first, second));
