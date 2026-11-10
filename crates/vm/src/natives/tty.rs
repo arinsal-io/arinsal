@@ -47,8 +47,9 @@ fn registry() -> &'static Mutex<HashMap<usize, Target>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+static HUB: std::sync::OnceLock<Hub> = std::sync::OnceLock::new();
+
 fn hub() -> &'static Hub {
-    static HUB: std::sync::OnceLock<Hub> = std::sync::OnceLock::new();
     HUB.get_or_init(|| {
         let mut pipe = [-1; 2];
         // SAFETY: pipe writes two new descriptors on success; mark both before
@@ -101,7 +102,6 @@ fn install() {
         // Touch the hub so the poll thread exists before the first arm.
         let _ = hub();
         arinsal_nif_tty::set_arm_hook(arm_hook);
-        install_break();
     });
 }
 
@@ -127,16 +127,10 @@ extern "C" fn sigint_handler(_signum: i32) {
     }
 }
 
-fn install_break() {
-    // Port of erts/emulator/beam/erl_init.c (erl_start): with +Bi the break handler is not
-    // installed (`else if (have_break_handler) init_break_handler()`).
-    if arinsal_args::active_emulator_flags().ignore_break {
-        return;
-    }
-    // SAFETY: isatty only inspects descriptor 0.
-    if unsafe { libc::isatty(0) } == 0 {
-        return;
-    }
+/// Port of erts/emulator/sys/unix/sys.c (init_break_handler), OTP-29.1.1: SIGINT requests a
+/// break. Installed at boot whether or not stdin is a tty. (erts also routes SIGQUIT to
+/// `generic_signal_handler`; Arinsal leaves SIGQUIT at its default, see the report.)
+pub(crate) fn init_break_handler() {
     let mut pipe = [-1; 2];
     // SAFETY: pipe creates two fresh descriptors; mark them close-on-exec before
     // publishing the write descriptor to the signal handler.
@@ -172,11 +166,33 @@ fn install_break() {
     }
 }
 
+/// Port of erts/emulator/sys/unix/sys.c (erts_replace_intr), OTP-29.1.1: Ctrl-C is disabled on
+/// the tty (VINTR = 0) so `user_drv` can use it.
+pub(crate) fn replace_intr() {
+    // SAFETY: isatty only inspects descriptor 0.
+    if unsafe { libc::isatty(0) } == 0 {
+        return;
+    }
+    // SAFETY: termios is plain data; tcgetattr fills it before it is modified and written back.
+    unsafe {
+        let mut mode: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut mode) == 0 {
+            mode.c_cc[libc::VINTR] = 0;
+            libc::tcsetattr(0, libc::TCSANOW, &mode);
+        }
+    }
+}
+
 fn wake_poll() {
+    // The poll thread exists only once a tty was armed; erts has no such split, the break menu
+    // just reads fd 0 directly.
+    let Some(hub) = HUB.get() else {
+        return;
+    };
     let byte = 1u8;
     // SAFETY: the tty wake write end stays open for the process lifetime.
     unsafe {
-        libc::write(hub().wake_write, std::ptr::from_ref(&byte).cast(), 1);
+        libc::write(hub.wake_write, std::ptr::from_ref(&byte).cast(), 1);
     }
 }
 
@@ -203,7 +219,18 @@ fn break_loop(read_fd: RawFd) {
         }
         // Drop the tty from the poll set before reading the menu key.
         wake_poll();
-        tty_write(1, format!("\n\u{1b}[J{HELP}").as_bytes());
+        // Port of erts/emulator/beam/break.c (do_break): clear the screen only when stdin and
+        // stdout are ttys; erts_printf adds a CR to every LF on stdout (sys.c).
+        // SAFETY: isatty only inspects descriptors 0 and 1.
+        let clear = if unsafe { libc::isatty(0) != 0 && libc::isatty(1) != 0 } {
+            "\u{1b}[J"
+        } else {
+            ""
+        };
+        tty_write(
+            1,
+            format!("\n{clear}{HELP}").replace('\n', "\r\n").as_bytes(),
+        );
         loop {
             let mut key = [0u8; 1];
             // SAFETY: one-byte stack buffer and stdin stays open.

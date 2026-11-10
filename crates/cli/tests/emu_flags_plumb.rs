@@ -130,3 +130,50 @@ fn ignore_break_survives_terminal_signals() {
         assert_eq!(status.code(), Some(0), "{name}");
     }
 }
+
+/// SIGINT to a `-noshell` node with stdin at /dev/null. Without `+Bd` the break handler is
+/// installed at boot whether or not stdin is a tty: the BREAK menu is printed to stdout, stdin
+/// reads EOF and the node exits 0. With `+Bd` no handler is installed, the default action kills
+/// the node. `+Bc` only touches a tty, so off a tty it behaves like the default.
+#[test]
+fn sigint_break_handler_matches_erts_without_tty() {
+    use std::os::unix::process::ExitStatusExt;
+    if arinsal_difftest::reference::erl().is_none() {
+        eprintln!("erl unavailable; skipping emulator flag differential");
+        return;
+    }
+    for flags in [&[][..], &["+Bd"][..], &["+Bc"][..], &["+B"][..]] {
+        let mut results = Vec::new();
+        for arinsal in [false, true] {
+            let mut command = if arinsal {
+                Command::new(env!("CARGO_BIN_EXE_arinsal"))
+            } else {
+                arinsal_difftest::reference::erl().expect("erl")
+            };
+            let child = command
+                .args(flags)
+                .args(["-noshell", "-eval", "timer:sleep(5000), halt(3)."])
+                .env("ERL_AFLAGS", "")
+                .env("ERL_FLAGS", "")
+                .env("ERL_ZFLAGS", "")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn emulator");
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .expect("kill");
+            let out = child.wait_with_output().expect("wait");
+            results.push((
+                out.status.code(),
+                out.status.signal(),
+                out.stdout,
+                out.stderr,
+            ));
+        }
+        assert_eq!(results[0], results[1], "flags {flags:?}: erl vs arinsal");
+    }
+}
