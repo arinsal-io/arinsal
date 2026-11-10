@@ -252,7 +252,6 @@ impl ModuleEnv for CorpusEnv {
             apply3_resolver: apply3,
             apply_fun_shared: 1,
             fun_resolver: fun,
-            apply2_fragment: 1,
         }
     }
 

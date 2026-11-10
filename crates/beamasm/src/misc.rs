@@ -68,8 +68,6 @@ pub struct ApplyRuntime {
     pub apply_fun_shared: usize,
     /// Resolves the fun of an `apply/2` that misses the local fun fast path.
     pub fun_resolver: crate::fun::FunResolver,
-    /// Fragment handing `apply/2` to the interpreter.
-    pub apply2_fragment: usize,
 }
 
 /// Calls the target of an apply form.
@@ -199,7 +197,7 @@ fn emit_apply_common(
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:330-344 (emit_i_apply_fun,
 // emit_i_apply_fun_only), OTP-29.1.1: the shared fragment unpacks the argument list into the
 // X registers and leaves the arity in x2 and the fun in x4 for `call_fun`. A malformed or too
-// long list goes to the interpreter, which raises.
+// long list raises with erlang:apply/2 as the current MFA.
 fn emit_apply_fun(
     asm: &mut BeamModuleAssembler,
     runtime: ApplyRuntime,
@@ -209,26 +207,26 @@ fn emit_apply_fun(
         return Err(ModuleError::InvalidOperand("apply/2 fragment is missing"));
     }
     let unpacked = asm.code.new_label();
-    let done = asm.code.new_label();
     asm.fragment_call(runtime.apply_fun_shared)?;
     asm.code.cbz(Gpr::x(0), unpacked)?;
-    let continuation = asm.code.new_label();
-    if tail {
-        asm.record_call_site()?;
-        asm.code
-            .emit(|e| e.mov_const(Gpr::x(17), runtime.apply2_fragment as u64))?;
-        asm.emit_leave_frame()?;
-        asm.code.emit(|e| e.br(Gpr::x(17)))?;
-    } else {
-        asm.record_return_site(continuation)?;
-        asm.code
-            .emit(|e| e.mov_const(Gpr::x(17), runtime.apply2_fragment as u64))?;
-        asm.code.emit(|e| e.blr(Gpr::x(17)))?;
-        asm.code.bind(continuation)?;
-        asm.code.b(done)?;
-    }
+    // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:300-316 (emit_apply_fun_shared,
+    // `raise_error`: `ARG4 = &apply_mfa`), OTP-29.1.1.
+    static APPLY2_MFA: std::sync::OnceLock<crate::bif::ErtsCodeMfa> = std::sync::OnceLock::new();
+    let mfa = APPLY2_MFA.get_or_init(|| crate::bif::ErtsCodeMfa {
+        module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+        function: arinsal_term::Term::atom(arinsal_term::atoms::APPLY).word(),
+        arity: 2,
+    });
+    asm.code.emit(|e| {
+        e.mov_const(Gpr::x(3), std::ptr::from_ref(mfa) as u64)?;
+        e.str_uoff(
+            Gpr::x(3),
+            Gpr::x(21),
+            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+        )
+    })?;
+    asm.branch_error_preserving_bif()?;
     asm.code.bind(unpacked)?;
     asm.emit_dynamic_fun_call(runtime.fun_resolver, tail, 0)?;
-    asm.code.bind(done)?;
     Ok(())
 }

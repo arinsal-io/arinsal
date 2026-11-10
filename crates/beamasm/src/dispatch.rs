@@ -29,8 +29,6 @@ pub struct DispatchFragments {
     line_breakpoint_offset: usize,
     line_breakpoint_cleanup_offset: usize,
     send_offset: usize,
-    call_fun_unported_offset: usize,
-    apply2_offset: usize,
     /// The beam_run_process stub (erl_process.c:12616): start and end addresses, when built.
     run_process_offsets: Option<(usize, usize)>,
     save_calls_export_offset: usize,
@@ -112,10 +110,6 @@ pub struct DispatchRuntimeHelpers {
     pub call_error_handler: usize,
 }
 
-/// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
-pub const CALL_FUN_UNPORTED: usize = usize::MAX - 0xF0;
-/// Sentinel `CallUnported.target_pc` for `apply/2` (fun and argument list in X0/X1).
-pub const APPLY2_UNPORTED: usize = usize::MAX - 0xF3;
 /// Identity sent through the light-BIF fragment to hand native `send` to the executor.
 pub const SEND_DISPATCH_IDENTITY: usize = usize::MAX - 0xF1;
 /// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
@@ -247,9 +241,7 @@ impl DispatchFragments {
         let breakpoint_helper = code.new_label();
         let line_breakpoint = code.new_label();
         let send = code.new_label();
-        let call_fun_unported = code.new_label();
         let raise_exception = code.new_label();
-        let apply2 = code.new_label();
         let run_process = code.new_label();
         let save_calls_export = code.new_label();
         let apply_fun = code.new_label();
@@ -314,14 +306,6 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_helper_fragment(&mut code, light_bif_helper, 2)
             .map_err(|_| ExecError::InvalidSize("send fragment"))?;
-        code.bind(call_fun_unported)
-            .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_unported_fragment(&mut code, CALL_FUN_UNPORTED)
-            .map_err(|_| ExecError::InvalidSize("call_fun unported fragment"))?;
-        code.bind(apply2)
-            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_unported_fragment(&mut code, APPLY2_UNPORTED)
-            .map_err(|_| ExecError::InvalidSize("apply unported fragment"))?;
         // Port of erts/emulator/beam/beam_emu.c:693-694 (beam_run_process = op_i_apply_only): the
         // start stub applies X0..X2 and branches to the resolved code, as a tail call.
         code.bind(run_process)
@@ -389,7 +373,6 @@ impl DispatchFragments {
                 ("call_light_bif", light_bif),
                 ("call_light_bif_helper", light_bif_without_pointer),
                 ("breakpoint", breakpoint),
-                ("apply2", apply2),
                 ("apply_fun", apply_fun),
                 ("raise_exception", raise_exception),
                 ("bif_is_eq_exact", bif_is_eq_exact),
@@ -418,8 +401,6 @@ impl DispatchFragments {
             line_breakpoint_offset: labels[&line_breakpoint],
             line_breakpoint_cleanup_offset: labels[&line_breakpoint_cleanup],
             send_offset: labels[&send],
-            call_fun_unported_offset: labels[&call_fun_unported],
-            apply2_offset: labels[&apply2],
             run_process_offsets: (apply3_resolver != 0)
                 .then(|| (labels[&run_process], labels[&save_calls_export])),
             save_calls_export_offset: labels[&save_calls_export],
@@ -478,11 +459,6 @@ impl DispatchFragments {
         self.memory.ptr_at(self.send_offset) as usize
     }
 
-    /// Entry that hands `apply/2` to the interpreter.
-    pub fn apply2_unported(&self) -> usize {
-        self.memory.ptr_at(self.apply2_offset) as usize
-    }
-
     /// The beam_run_process stub: `(start, end)` addresses, or `None` when it was not built.
     pub fn run_process(&self) -> Option<(usize, usize)> {
         self.run_process_offsets.map(|(start, end)| {
@@ -496,11 +472,6 @@ impl DispatchFragments {
     /// `apply_fun_shared`: unpacks the `apply/2` argument list in X1 into the X registers.
     pub fn apply_fun_shared(&self) -> usize {
         self.memory.ptr_at(self.apply_fun_offset) as usize
-    }
-
-    /// Entry used when a fun has no native trampoline yet.
-    pub fn call_fun_unported(&self) -> usize {
-        self.memory.ptr_at(self.call_fun_unported_offset) as usize
     }
 
     /// Entry of every code index of a fun entry without loaded code (`beam_unloaded_fun`).
@@ -807,9 +778,9 @@ fn emit_framed_call(
 
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:253-328 (emit_apply_fun_shared), OTP-29.1.1:
 // the fun (X0) goes to x3 and the arity to x2 for `call_fun`; x0 is zero once every argument is
-// in the X registers. A malformed list or one with too many elements returns nonzero with X0
-// and X1 untouched, and the caller hands the apply to the interpreter, which raises
-// badarg/system_limit for erlang:apply/2 like erts' error path.
+// in the X registers. A malformed list or one with too many elements sets BADARG or
+// SYSTEM_LIMIT and returns nonzero with X0 and X1 untouched; the caller raises with
+// `apply_mfa` (erlang:apply/2) as erts' `raise_error` label does.
 fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
     let unpack_next = code.new_label();
     let malformed_list = code.new_label();
@@ -838,9 +809,32 @@ fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
         e.cmp_imm(Gpr::x(2), APPLY_MAX_ARGS, false)
     })?;
     code.b_cond(Cond::Cc, unpack_next)?;
+    // Too many arguments: SYSTEM_LIMIT; anything but a proper list: BADARG. X0 and X1 (the
+    // fun and the list) stay in their cached registers for the raise.
+    let raise_error = code.new_label();
+    let system_limit = (
+        crate::exc::EXC_SYSTEM_LIMIT,
+        arinsal_term::Term::atom(arinsal_term::atoms::SYSTEM_LIMIT).word(),
+    );
+    let badarg = (
+        crate::exc::EXC_BADARG,
+        arinsal_term::Term::atom(arinsal_term::atoms::BADARG).word(),
+    );
+    code.emit(|e| {
+        e.mov_const(Gpr::x(9), system_limit.0)?;
+        e.mov_const(Gpr::x(10), system_limit.1)
+    })?;
+    code.b(raise_error)?;
     code.bind(malformed_list)?;
+    code.emit(|e| {
+        e.mov_const(Gpr::x(9), badarg.0)?;
+        e.mov_const(Gpr::x(10), badarg.1)
+    })?;
+    code.bind(raise_error)?;
     emit_leave_runtime(code, 0, Update::X_REGS)?;
     code.emit(|e| {
+        e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+        e.str_uoff(Gpr::x(10), Gpr::x(21), 48)?;
         e.mov_const(Gpr::x(0), 1)?;
         e.ret(Gpr::x(30))
     })?;
@@ -1795,20 +1789,6 @@ fn emit_run_process_fragment(
         // x0 is the Export* (ARG1) of a dispatchable target, x1 the address.
         encoder.mov_reg(Gpr::x(14), Gpr::x(1))?;
         encoder.br(Gpr::x(14))
-    })?;
-    Ok(())
-}
-
-fn emit_unported_fragment(code: &mut CodeBuffer, sentinel: usize) -> Result<(), BufferError> {
-    code.emit(|encoder| {
-        // Preserve the native continuation as a BEAM CP for the interpreter return path.
-        encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
-        encoder.mov_const(Gpr::x(0), 2)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
-        encoder.mov_const(Gpr::x(1), sentinel as u64)?;
-        encoder.mov_reg(Gpr::x(2), Gpr::xzr())?;
-        encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
-        encoder.br(Gpr::x(17))
     })?;
     Ok(())
 }

@@ -291,7 +291,6 @@ pub trait ModuleEnv {
             apply3_resolver: unused_apply3_resolver,
             apply_fun_shared: 0,
             fun_resolver: unused_fun_resolver,
-            apply2_fragment: 0,
         }
     }
     /// Resolves a fun term to a native entry for `i_call_fun` / `i_call_fun2`.
