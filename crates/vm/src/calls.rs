@@ -53,6 +53,7 @@ pub(super) fn push_continuation(
     }
     let cp = crate::stacktrace::continuation_tag(module as usize, ip as usize)?;
     p.heap.stack_set(0, cp);
+    p.interpreter_frames = true;
     Ok(())
 }
 
