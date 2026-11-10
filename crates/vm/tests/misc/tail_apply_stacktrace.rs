@@ -2,15 +2,12 @@
 //! `apply/3`, fixed `M:F(Args)` apply or tail fun call: the apply deallocates the caller's frame
 //! first (BeamAsm `emit_i_apply_last`, `emit_i_apply_fun_last`), so the caller's function must not
 //! appear in the trace, except for `error`/`exit`/`throw` applied through `apply/3` or a fixed
-//! apply, which erts adjusts (`apply_bif_error_adjustment`). Compared with erl under the JIT and
-//! `ARINSAL_INTERP=1`.
+//! apply, which erts adjusts (`apply_bif_error_adjustment`). Compared with erl.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
-use std::process::Command;
 
-const CHILD: &str = "ARINSAL_TAIL_APPLY_TRACE_CHILD";
 const MODULE: &str = "tail_apply_trace";
 
 const SOURCE: &str = r#"-module(tail_apply_trace).
@@ -63,22 +60,8 @@ fn run_here(beam: &[u8], function: &str) -> String {
     format!("{:?}", actual.term)
 }
 
-fn child() -> bool {
-    let Some(beam_path) = std::env::var_os(CHILD) else {
-        return false;
-    };
-    println!(
-        "RESULT:{}",
-        run_here(&std::fs::read(&beam_path).unwrap(), "run")
-    );
-    true
-}
-
 #[test]
 fn tail_apply_stacktraces_match_erl() {
-    if child() {
-        return;
-    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping tail apply stacktrace test");
         return;
@@ -93,39 +76,11 @@ fn tail_apply_stacktraces_match_erl() {
     };
     let want = format!("{want:?}");
 
-    // The JIT is the default: run in this process.
-    similar_asserts::assert_eq!(run_here(&beam, "run"), want, "JIT {MODULE}:run");
-    // badfun and badarity of the tail fun call itself: the interpreter reports one frame more
-    // than erts (a gap that predates this test), so only the JIT is compared.
+    similar_asserts::assert_eq!(run_here(&beam, "run"), want, "{MODULE}:run");
+    // badfun and badarity of the tail fun call itself.
     let want_jit = match reference.call(MODULE, "run_jit", &[]) {
         CallResult::Ok(term) => format!("{term:?}"),
         other => panic!("{MODULE}:run_jit on erl: {other:?}"),
     };
-    similar_asserts::assert_eq!(run_here(&beam, "run_jit"), want_jit, "JIT {MODULE}:run_jit");
-
-    // The interpreter: the flavour is fixed per process, so run in a child.
-    let dir = std::env::temp_dir().join(format!("arinsal-tail-apply-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{MODULE}.beam"));
-    std::fs::write(&path, &beam).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "tail_apply_stacktraces_match_erl",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, &path)
-        .env("ARINSAL_INTERP", "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success(),
-        "interpreter child failed: {stdout} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    let start = stdout.find("RESULT:").expect("interpreter result") + "RESULT:".len();
-    let line = stdout[start..].lines().next().unwrap_or_default();
-    similar_asserts::assert_eq!(line, want, "interpreter {MODULE}:run");
+    similar_asserts::assert_eq!(run_here(&beam, "run_jit"), want_jit, "{MODULE}:run_jit");
 }

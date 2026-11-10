@@ -1,11 +1,7 @@
-use arinsal_a64::buf::CodeBuffer;
-use arinsal_a64::enc::Gpr;
-use arinsal_a64::exec::CodeMemory;
-use arinsal_beamasm::{ExitReason, SchedulerRegisters};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
-use arinsal_term::{Term, TermBuilder, is_native_code_pointer};
-use arinsal_vm::{NativeFunction, Process, Vm, run_native};
+use arinsal_term::{Term, TermBuilder};
+use arinsal_vm::{Process, Vm};
 use similar_asserts::assert_eq;
 use std::process::Command;
 use std::sync::Mutex;
@@ -62,7 +58,6 @@ fn no_line_info_module_compiles_fully_native_and_matches_otp() {
             "--nocapture",
         ])
         .env(CHILD, &beam_path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -135,7 +130,6 @@ fn native_try_end_keeps_success_value_for_fun_call() {
             "--nocapture",
         ])
         .env(CHILD, &path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -171,7 +165,6 @@ fn native_external_return_preserves_tuple_for_native_guards() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
-            .env("ARINSAL_BEAMASM", "1")
             .status()
             .unwrap();
         assert!(
@@ -404,7 +397,6 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
             "--nocapture",
         ])
         .env(CHILD, &dir)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -436,92 +428,6 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
-    let _serial = NATIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
-    let beam = reference
-        .compile_named(
-            "native_abi_test",
-            "-module(native_abi_test). -export([bridge/0]). bridge() -> 0.",
-            &[],
-        )
-        .unwrap();
-
-    let mut code = CodeBuffer::new();
-    // SAFETY: A small integer is an immediate term with no heap pointer.
-    let result = unsafe { Term::small(42).unwrap().raw_bits() };
-    code.emit(|emitter| {
-        emitter.mov_const(Gpr::x(25), result)?;
-        emitter.mov_const(Gpr::x(0), 0)?;
-        emitter.ret(Gpr::x(30))
-    })
-    .unwrap();
-    let bytes: Vec<u8> = code
-        .finish()
-        .unwrap()
-        .into_iter()
-        .flat_map(u32::to_le_bytes)
-        .collect();
-    let mut memory = CodeMemory::new(4096).unwrap();
-    let offset = memory.alloc(bytes.len()).unwrap();
-    memory.write_bytes(offset, &bytes).unwrap();
-    let entry = memory.ptr_at(offset) as usize;
-    let mut vm = Vm::new([]);
-    vm.register_native_function(NativeFunction {
-        scope: 0,
-        start: entry,
-        end: entry + bytes.len(),
-        module: "native_abi_test",
-        module_atom: arinsal_term::global_atoms()
-            .intern("native_abi_test")
-            .unwrap(),
-        function: "bridge",
-        function_atom: arinsal_term::global_atoms().intern("bridge").unwrap(),
-        arity: 0,
-        line: Some(17),
-        file: Some("native_abi_test.erl".into()),
-        line_table: Default::default(),
-        file_term: None,
-    })
-    .unwrap();
-
-    vm.load_bytes_interpreted(&beam).unwrap();
-    let result = vm
-        .eval_scheduled("native_abi_test", "bridge", &[], 1, None)
-        .unwrap();
-    assert_eq!(result.term, OwnedTerm::Int(42));
-    assert_eq!(
-        arinsal_vm::native_function_at(entry).unwrap().function,
-        "bridge"
-    );
-
-    let mut process = Process::new();
-    process.push_native_continuation(entry).unwrap();
-    assert!(is_native_code_pointer(entry));
-    process.heap.collect(&mut process.x, &mut [], 0).unwrap();
-    // SAFETY: The value is the registered raw CP just pushed above.
-    let continuation = unsafe { process.heap.stack_get(0).unwrap().raw_bits() };
-    assert_eq!(continuation, entry as u64);
-    // A native CP on top of the stack is the continuation a scheduler-made call returns to
-    // (erts' i_apply_only pops it into LR); entered without one, the function returns to
-    // the exit bridge.
-    assert!(process.heap.release_stack(1));
-
-    let mut registers = SchedulerRegisters::default();
-    // SAFETY: `registers` outlives the attachment, which `detach_save` below ends, and nothing
-    // else touches its X array in between.
-    unsafe { process.x.attach(&mut registers) };
-    let exit = run_native(&mut process, &mut registers, entry).unwrap();
-    assert_eq!(exit, ExitReason::Returned);
-    assert_eq!(process.x[0].as_small(), Some(42));
-    process.x.detach_save(1);
-    let _ = Box::leak(Box::new(memory));
-}
-
-#[test]
-#[cfg(target_arch = "aarch64")]
 fn forced_jit_gc_large_append_keeps_native_stack() {
     const CHILD: &str = "ARINSAL_FORCED_JIT_GC_APPEND_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -531,7 +437,6 @@ fn forced_jit_gc_large_append_keeps_native_stack() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
-            .env("ARINSAL_BEAMASM", "1")
             .env("ARINSAL_BEAMASM_STATS", "1")
             .env("ARINSAL_BEAMASM_LIFETIME", "1")
             .status()
@@ -585,7 +490,6 @@ fn native_vm_bif_trap_returns_into_continuation() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
-            .env("ARINSAL_BEAMASM", "1")
             .status()
             .unwrap();
         assert!(
@@ -666,7 +570,6 @@ fn native_boolean_bifs_keep_tagged_comparison_results() {
             "--nocapture",
         ])
         .env(CHILD, &beam_path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -787,7 +690,7 @@ fn inet_udp_open_trace_matches_otp_with_native_open() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn unaligned_binary_order_matches_interpreter_and_beamasm() {
+fn unaligned_binary_order_matches_otp() {
     const CHILD: &str = "ARINSAL_UNALIGNED_ORDER_CHILD";
     const MODULE: &str = "unaligned_literal_order_vm_test";
     if let Some(path) = std::env::var_os(CHILD) {
@@ -837,14 +740,11 @@ fn unaligned_binary_order_matches_interpreter_and_beamasm() {
     std::fs::create_dir_all(&dir).unwrap();
     let beam_path = dir.join(format!("{MODULE}.beam"));
     std::fs::write(&beam_path, beam).unwrap();
-    for native in [false, true] {
+    {
+        let native = true;
         let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "unaligned_binary_order_matches_interpreter_and_beamasm",
-                "--nocapture",
-            ])
+            .args(["unaligned_binary_order_matches_otp", "--nocapture"])
             .env(CHILD, &beam_path)
-            .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1373,7 +1273,7 @@ fn binary_search_bifs_resume_after_budget_exhaustion() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn native_send_matches_interpreter_for_names_ports_and_tracing() {
+fn native_send_matches_otp_for_names_ports_and_tracing() {
     const CHILD: &str = "ARINSAL_NATIVE_SEND_CHILD";
     const MODULE: &str = "native_send_vm_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
@@ -1427,11 +1327,10 @@ fn native_send_matches_interpreter_for_names_ports_and_tracing() {
     let run_child = |native: bool| {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
-                "native_send_matches_interpreter_for_names_ports_and_tracing",
+                "native_send_matches_otp_for_names_ports_and_tracing",
                 "--nocapture",
             ])
             .env(CHILD, &beam_path)
-            .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1457,20 +1356,18 @@ fn native_send_matches_interpreter_for_names_ports_and_tracing() {
             .expect("child prints a result")
             .to_owned()
     };
-    let interpreted = run_child(false);
     let native = run_child(true);
     let expected = match expected {
         CallResult::Ok(term) => format!("{}", term),
         other => panic!("reference call failed: {other:?}"),
     };
-    assert_eq!(interpreted, expected, "interpreter result must match OTP");
-    assert_eq!(native, interpreted, "BeamAsm send must match interpreter");
+    assert_eq!(native, expected, "BeamAsm send must match OTP");
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn native_node_instruction_matches_interpreter_and_otp() {
+fn native_node_instruction_matches_otp() {
     const CHILD: &str = "ARINSAL_NATIVE_NODE_CHILD";
     const MODULE: &str = "native_node_instruction_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
@@ -1505,12 +1402,8 @@ fn native_node_instruction_matches_interpreter_and_otp() {
     std::fs::write(&beam_path, beam).unwrap();
     let run_child = |native: bool| {
         let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "native_node_instruction_matches_interpreter_and_otp",
-                "--nocapture",
-            ])
+            .args(["native_node_instruction_matches_otp", "--nocapture"])
             .env(CHILD, &beam_path)
-            .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1536,19 +1429,14 @@ fn native_node_instruction_matches_interpreter_and_otp() {
             .expect("child prints a result")
             .to_owned()
     };
-    let interpreted = run_child(false);
     let native = run_child(true);
-    assert_eq!(interpreted, expected, "interpreter result must match OTP");
-    assert_eq!(
-        native, interpreted,
-        "BeamAsm node result must match interpreter"
-    );
+    assert_eq!(native, expected, "BeamAsm node result must match OTP");
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn native_build_stacktrace_matches_interpreter_and_otp() {
+fn native_build_stacktrace_matches_otp() {
     const CHILD: &str = "ARINSAL_NATIVE_BUILD_STACKTRACE_CHILD";
     const MODULE: &str = "native_build_stacktrace_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
@@ -1586,12 +1474,8 @@ fn native_build_stacktrace_matches_interpreter_and_otp() {
     std::fs::write(&beam_path, beam).unwrap();
     let run_child = |native: bool| {
         let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "native_build_stacktrace_matches_interpreter_and_otp",
-                "--nocapture",
-            ])
+            .args(["native_build_stacktrace_matches_otp", "--nocapture"])
             .env(CHILD, &beam_path)
-            .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1617,13 +1501,8 @@ fn native_build_stacktrace_matches_interpreter_and_otp() {
             .expect("child prints a result")
             .to_owned()
     };
-    let interpreted = run_child(false);
     let native = run_child(true);
-    assert_eq!(
-        native, interpreted,
-        "BeamAsm stacktrace must match interpreter"
-    );
-    assert_eq!(interpreted, expected, "interpreter result must match OTP");
+    assert_eq!(native, expected, "BeamAsm stacktrace must match OTP");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1678,7 +1557,6 @@ fn native_spawn_entry_catch_preserves_arguments_after_throw() {
             "--nocapture",
         ])
         .env(CHILD, &beam_path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -1754,7 +1632,6 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
             "--nocapture",
         ])
         .env(CHILD, &beam_path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -1833,7 +1710,6 @@ fn native_large_bif_result_keeps_the_heap_redzone_before_a_fun_call() {
             "--nocapture",
         ])
         .env(CHILD, &beam_path)
-        .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()

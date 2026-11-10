@@ -1600,9 +1600,6 @@ impl Vm {
         function: &str,
         args: &[Term],
     ) -> Result<EvalResult, VmError> {
-        if !crate::beamasm_integration::enabled() {
-            crate::load::INTERPRETER_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         // ---- vm_funs ----
         if module == "erlang"
             && let Some(result) = self.eval_erlang_fun_builtin(function, args)
@@ -1642,67 +1639,9 @@ impl Vm {
         if arinsal_spec::bif_lookup(module, function, args.len() as u8).is_some() {
             return Err(VmError::Unsupported(format!("BIF {frame}")));
         }
-        if crate::beamasm_integration::enabled() {
-            return Err(VmError::Unsupported(format!(
-                "Vm::eval cannot run {frame} in the JIT flavor; use Vm::eval_exported, or start the interpreter flavor (-emu_flavor emu)"
-            )));
-        }
-        let module_id = self.load_named(module)?;
-        let ip = self.code.modules[module_id]
-            .export(function, args.len() as u8)
-            .ok_or_else(|| VmError::Exception {
-                reason: "undef".into(),
-                frame: format!("{module}:{function}/{}", args.len()),
-            })?;
-        process.module = module_id;
-        process.set_ip(ip);
-        // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
-        // arguments), OTP-29.1.1: the process owns its arguments, so a collection never
-        // meets a term outside its heap and the literal areas.
-        let literals = arinsal_term::LiteralAreas::current();
-        for (register, &arg) in process.x.iter_mut().zip(args) {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            *register = arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
-                .map_err(|error| VmError::Unsupported(format!("eval argument copy: {error:?}")))?;
-        }
-        // ---- vm_exc ----
-        let result = loop {
-            match self.run(&mut process) {
-                Ok(value) => break value,
-                Err(VmError::Trap(trap)) => {
-                    if let Some(error) = exceptions::resume(self, &mut process, None, trap)? {
-                        return Err(error);
-                    }
-                }
-                Err(VmError::Exception { reason, .. }) => {
-                    let trap = exceptions::from_legacy(&reason)?;
-                    if let Some(error) = exceptions::resume(self, &mut process, None, trap)? {
-                        return Err(error);
-                    }
-                }
-                Err(VmError::ExceptionInfo { reason, info, .. }) => {
-                    let mut trap = exceptions::from_legacy(&reason)?;
-                    let arity = self.code.modules[process.module]
-                        .function_at(process.ip())
-                        .map(|(_, arity)| arity)
-                        .unwrap_or(0);
-                    trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-                        Some(Term::small(i64::from(arity)).expect("arity is small")),
-                        info,
-                    ));
-                    if let Some(error) = exceptions::resume(self, &mut process, None, trap)? {
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        process.stats.heap_words = process.heap.capacity_words();
-        Ok(EvalResult {
-            term: result,
-            stats: process.stats.snapshot(),
-            _process: process,
-        })
+        Err(VmError::Unsupported(format!(
+            "Vm::eval runs only BIFs and the erlang fun builtins, not {frame}; use Vm::eval_exported"
+        )))
     }
     pub(crate) fn frame_name(&self, p: &Process) -> String {
         let module = &self.code.modules[p.module];
@@ -1756,8 +1695,7 @@ impl Vm {
     /// interpreter position otherwise.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     pub(crate) fn set_position(&mut self, p: &mut Process, module_id: usize, target: usize) {
-        if crate::beamasm_integration::enabled()
-            && let Some(module) = self.code.modules.get(module_id)
+        if let Some(module) = self.code.modules.get(module_id)
             && let Some(native) = self.beamasm_targets.function_for_target(
                 module_id,
                 module,
@@ -1812,7 +1750,7 @@ impl Vm {
     /// native code if it has any, as erts jumps to the export's code address.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     pub(crate) fn enter_native_at_jump(&mut self, p: &mut Process) {
-        if !crate::beamasm_integration::enabled() || p.native_pc().is_some() {
+        if p.native_pc().is_some() {
             return;
         }
         let Some(module) = self.code.modules.get(p.module) else {
@@ -1887,7 +1825,7 @@ impl Vm {
         let (need_x, need_fr) = self.code.registers[module_id];
         p.x.ensure_x(need_x);
         p.ensure_fr(need_fr);
-        if crate::beamasm_integration::enabled() {
+        {
             let module = &self.code.modules[module_id];
             let at_native_entry = self
                 .beamasm_targets
@@ -1903,7 +1841,7 @@ impl Vm {
         // A module whose functions all run natively has no interpreter form: a process left at
         // the entry of one of its functions (the return of an `-on_load` prelude, a call from
         // interpreted code) runs that function's native code, as erts jumps to its address.
-        if crate::beamasm_integration::enabled() {
+        {
             let module = &self.code.modules[module_id];
             if let Some(native) = self.beamasm_targets.function_for_target(
                 module_id,

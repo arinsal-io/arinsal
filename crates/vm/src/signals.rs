@@ -1092,9 +1092,6 @@ fn create_child(
     // takes the process struct and its table entry first, and the fields are then initialized
     // in place.
     let init_child = |child_pid: Pid, child: &mut Process| -> Result<(), VmError> {
-        if !crate::beamasm_integration::enabled() {
-            crate::native_bridge::push_exit_bridge(child);
-        }
         child.set_runtime_with_min_bin_vheap_size(Some(runtime), min_bin_vheap as u64);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process initializes both
         // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already

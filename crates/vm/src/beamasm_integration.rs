@@ -1227,7 +1227,6 @@ pub(crate) fn interpreted_target(
         .copied()
 }
 
-static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static MODULES: AtomicU64 = AtomicU64::new(0);
 static NATIVE: AtomicU64 = AtomicU64::new(0);
 static NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1627,28 +1626,6 @@ pub(crate) fn owns_native_address(address: usize) -> bool {
             .upgrade()
             .is_some_and(|version| version.code_start <= address && address < version.code_end)
     })
-}
-
-pub(crate) fn enabled() -> bool {
-    *ENABLED.get_or_init(|| {
-        // `-emu_flavor emu` is the start flag; `ARINSAL_INTERP=1` is an alias of it.
-        let flavor_emu = arinsal_args::active_emulator_flags().interpreter;
-        let enabled = !flavor_emu
-            && beamasm_enabled(
-                std::env::var_os("ARINSAL_INTERP"),
-                std::env::var_os("ARINSAL_BEAMASM"),
-            );
-        arinsal_bifs::set_emu_flavor_jit(enabled);
-        enabled
-    })
-}
-
-fn beamasm_enabled(
-    interp: Option<std::ffi::OsString>,
-    beamasm: Option<std::ffi::OsString>,
-) -> bool {
-    interp.as_deref() != Some(std::ffi::OsStr::new("1"))
-        && beamasm.as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 struct VmModuleEnv<'a> {
@@ -2288,9 +2265,6 @@ pub(crate) fn compile(
     line_breakpoints: bool,
     code_ix: &crate::code_ix::CodeIndexes,
 ) -> Option<Arc<CompiledVersion>> {
-    if !enabled() {
-        return None;
-    }
     if lifetime_trace_enabled() {
         eprintln!(
             "[beamasm-lifetime] compile module={} module_ptr={:p}",
@@ -2781,23 +2755,5 @@ fn light_gc_offsets() -> arinsal_beamasm::dispatch::LightGcOffsets {
         off_heap_overhead: (heap + arinsal_term::ProcessHeap::OFF_HEAP_OVERHEAD_OFFSET) as u32,
         bin_vheap_size: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET) as u32,
         gc_enabled: (heap + arinsal_term::ProcessHeap::GC_ENABLED_OFFSET) as u32,
-    }
-}
-
-#[cfg(test)]
-mod selection_tests {
-    use super::beamasm_enabled;
-    use std::ffi::OsString;
-
-    #[test]
-    fn beamasm_is_the_default_and_interpreter_flags_override_it() {
-        assert!(beamasm_enabled(None, None));
-        assert!(beamasm_enabled(None, Some(OsString::from("1"))));
-        assert!(!beamasm_enabled(Some(OsString::from("1")), None));
-        assert!(!beamasm_enabled(None, Some(OsString::from("0"))));
-        assert!(!beamasm_enabled(
-            Some(OsString::from("1")),
-            Some(OsString::from("1"))
-        ));
     }
 }

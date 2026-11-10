@@ -109,9 +109,7 @@ impl Executor {
         // its first run; later runs continue wherever its interpreted or native continuation is.
         // erts starts a spawned process at beam_run_process; its first run applies the MFA.
         if !process.entry_started() && process.module == RUN_PROCESS {
-            match crate::beamasm_integration::run_process_entry()
-                .filter(|_| crate::beamasm_integration::enabled())
-            {
+            match crate::beamasm_integration::run_process_entry() {
                 // The native start is the beam_run_process stub, which applies X0..X2 itself. The
                 // process meanwhile holds erlang:apply/3 with those arguments, so the stub's
                 // interpreter fallback runs there (native_bridge.rs apply3 resolver).

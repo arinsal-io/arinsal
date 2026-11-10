@@ -1,5 +1,4 @@
-//! Differential regressions for BeamAsm code paths: native results must match the
-//! interpreter and OTP 29.1.1.
+//! Differential regressions for BeamAsm code paths: native results must match OTP 29.1.1.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
@@ -338,20 +337,8 @@ fn run_child_case() -> bool {
     true
 }
 
-/// Compares `module:run/0` under BeamAsm, under the interpreter and under OTP 29.1.1.
+/// Compares `module:run/0` under BeamAsm and under OTP 29.1.1.
 fn assert_native_matches(test: &str, module: &str, source: &str, env: &[(&str, &str)]) {
-    assert_native_matches_with(test, module, source, env, true);
-}
-
-/// Like [`assert_native_matches`]; `compare_interpreter` is false where the interpreter still
-/// diverges from OTP, so only BeamAsm is held to the OTP result.
-fn assert_native_matches_with(
-    test: &str,
-    module: &str,
-    source: &str,
-    env: &[(&str, &str)],
-    compare_interpreter: bool,
-) {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(module, source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
@@ -364,19 +351,18 @@ fn assert_native_matches_with(
     std::fs::create_dir_all(&dir).unwrap();
     let beam_path = dir.join(format!("{module}.beam"));
     std::fs::write(&beam_path, beam).unwrap();
-    let run_child = |beamasm: bool| {
+    let run_child = || {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([test, "--nocapture"])
             .env(CHILD, &beam_path)
             .env(CHILD_MODULE, module)
-            .env("ARINSAL_BEAMASM", if beamasm { "1" } else { "0" })
             .envs(env.iter().copied())
             .output()
             .unwrap();
         assert!(
             output.status.success(),
             "{} child failed ({:?}): stdout={} stderr={}",
-            if beamasm { "native" } else { "interpreter" },
+            "native",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -388,32 +374,18 @@ fn assert_native_matches_with(
             .expect("child prints a result")
             .to_owned()
     };
-    let native = run_child(true);
-    if compare_interpreter {
-        let interpreted = run_child(false);
-        assert_eq!(
-            native, interpreted,
-            "BeamAsm result must match the interpreter"
-        );
-        assert_eq!(interpreted, expected, "interpreter result must match OTP");
-    } else {
-        assert_eq!(native, expected, "BeamAsm result must match OTP");
-    }
+    let native = run_child();
+    assert_eq!(native, expected, "BeamAsm result must match OTP");
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn native_regressions_match_interpreter_and_otp() {
+fn native_regressions_match_otp() {
     if run_child_case() {
         return;
     }
-    assert_native_matches(
-        "native_regressions_match_interpreter_and_otp",
-        MODULE,
-        SOURCE,
-        &[],
-    );
+    assert_native_matches("native_regressions_match_otp", MODULE, SOURCE, &[]);
 }
 
 #[test]
@@ -450,12 +422,11 @@ fn native_bif_error_frames_match_otp() {
     if run_child_case() {
         return;
     }
-    assert_native_matches_with(
+    assert_native_matches(
         "native_bif_error_frames_match_otp",
         FRAMES_MODULE,
         FRAMES_SOURCE,
         &[],
-        false,
     );
 }
 

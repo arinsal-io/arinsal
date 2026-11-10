@@ -823,11 +823,6 @@ pub(crate) struct StagedLoad {
     on_load: Vec<String>,
 }
 
-/// Set by [`Vm::eval`], the interpreter entry point: modules loaded afterwards keep their
-/// interpreter form.
-pub(crate) static INTERPRETER_EVAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 impl Vm {
     /// Resolve a native record definition from the active module version.
     pub(crate) fn native_record_definition(
@@ -873,8 +868,6 @@ impl Vm {
 
     /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        // Fixes the execution mode, which erlang:system_info(emu_flavor) reports.
-        crate::beamasm_integration::enabled();
         let otp = std::env::var_os("ARINSAL_OTP_ROOT")
             .filter(|root| !root.is_empty())
             .map(PathBuf::from)
@@ -1017,12 +1010,7 @@ impl Vm {
     /// the engine. Coverage, line counters and debugger line breakpoints are emitted by
     /// BeamAsm, as in erts. In the JIT flavor a module BeamAsm cannot compile completely fails to load.
     pub(crate) fn native_only(&self, meta: &CodeMeta) -> bool {
-        // `Vm::eval` interprets: once a process has used it, every module keeps its interpreter
-        // form, those it loads for its calls included.
-        !INTERPRETER_EVAL.load(std::sync::atomic::Ordering::Relaxed)
-            && meta.has_beam_bytes
-            && beamasm_integration::enabled()
-            && std::env::var_os("ARINSAL_FULL_SPECIALIZE").is_none()
+        meta.has_beam_bytes
     }
 
     /// Whether a module without the interpreter form needs its instructions decoded for the
@@ -1089,7 +1077,7 @@ impl Vm {
 
     /// Whether a module with `meta` must have native code: the JIT flavor runs nothing else.
     pub(crate) fn native_required(&self, meta: &CodeMeta) -> bool {
-        meta.has_beam_bytes && beamasm_integration::enabled()
+        meta.has_beam_bytes
     }
 
     /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
@@ -1119,7 +1107,7 @@ impl Vm {
     /// Port of beam_load.c (beam_load_finalize): the decoded ops and tables are freed once the
     /// code is in the code area. The interpreter still needs them.
     pub(crate) fn release_loaded_tables(&self, module: &mut Module, meta: &mut CodeMeta) {
-        if meta.beamasm.is_some() && beamasm_integration::enabled() {
+        if meta.beamasm.is_some() {
             module.release_decoded_code();
             meta.beam.release_decoded();
         }
@@ -1195,11 +1183,6 @@ impl Vm {
     /// Load bytes without executing module-level code.
     pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
         self.load_bytes_internal(bytes, true)
-    }
-    /// Load bytes for the interpreter only, without BeamAsm code (native code for its
-    /// functions may be registered separately).
-    pub fn load_bytes_interpreted(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
-        self.load_bytes_internal(bytes, false)
     }
     pub(crate) fn load_bytes_internal(
         &mut self,

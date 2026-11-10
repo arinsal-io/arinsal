@@ -2532,51 +2532,6 @@ mod tests {
     }
 
     #[test]
-    fn local_fun_retains_old_module_version() {
-        // A fun term crosses two evaluations: only the interpreter flavor's in-place
-        // `Vm::eval` keeps it alive between them.
-        if crate::test_support::in_interpreter_flavor(
-            "natives::code::tests::local_fun_retains_old_module_version",
-        ) {
-            return;
-        }
-        let Ok(reference) = RefErl::start() else {
-            eprintln!("erl unavailable; skipping old fun differential test");
-            return;
-        };
-        let v1 = reference
-            .compile_named(
-                "arinsal_hot_fun",
-                "-module(arinsal_hot_fun). -export([make/0]). make() -> fun() -> v1 end.",
-                &[],
-            )
-            .unwrap();
-        let v2 = reference
-            .compile_named(
-                "arinsal_hot_fun",
-                "-module(arinsal_hot_fun). -export([make/0]). make() -> fun() -> v2 end.",
-                &[],
-            )
-            .unwrap();
-        reference.load("arinsal_hot_fun", &v1).unwrap();
-        let fun = match reference.call("arinsal_hot_fun", "make", &[]) {
-            CallResult::Ok(fun) => fun,
-            other => panic!("reference fun: {other:?}"),
-        };
-        reference.load("arinsal_hot_fun", &v2).unwrap();
-        let expected = reference.call("erlang", "apply", &[fun, OwnedTerm::Nil]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&v1).unwrap();
-        let old_fun = vm.eval("arinsal_hot_fun", "make", &[]).unwrap();
-        assert_eq!(loaded(&mut vm, &v2), OwnedTerm::Atom("ok".into()));
-        let applied = vm
-            .eval("erlang", "apply", &[old_fun.term, Term::NIL])
-            .unwrap();
-        let actual = CallResult::Ok(to_owned(applied.term).unwrap());
-        compare(&actual, &expected, CompareMode::Exact).unwrap();
-    }
-
-    #[test]
     fn process_holding_old_fun_allows_soft_purge() {
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping old fun purge differential test");
