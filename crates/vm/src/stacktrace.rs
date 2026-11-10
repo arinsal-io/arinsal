@@ -1340,8 +1340,18 @@ pub(super) fn is_saved(term: Term) -> bool {
 }
 
 /// Exception class saved with a raw trace for a later `raise` instruction.
+// Port of erts/emulator/beam/beam_common.c:1131-1146 (`get_freason_ptr_from_exc`) as read by
+// `erts_sanitize_freason`, OTP-29.1.1: the class is `StackTrace.freason`, element 1 of the
+// ftrace tuple; the trace itself is not decoded.
 pub(super) fn raw_class(_p: &Process, term: Term) -> Option<Class> {
-    with_saved(term, |raw| raw.class).flatten()
+    let fields = arinsal_term::term_sequence_small(term)?;
+    if fields.len() != 3 {
+        return None;
+    }
+    fields[0]
+        .with_bignum_digits_mut(|digits| digits.first().copied())
+        .flatten()
+        .and_then(class_from_freason)
 }
 
 /// Args carried by the negative StackTrace used for an explicit `raise/3` trace.
@@ -1350,12 +1360,16 @@ pub(super) fn raised_args(term: Term) -> Option<Term> {
     (fields.len() == 3 && fields[0].is_negative_bignum()).then(|| fields[1])
 }
 
-/// Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise).
+/// Port of erts/emulator/beam/beam_common.c:1131-1178 (`get_freason_ptr_from_exc`,
+/// `raw_raise`), OTP-29.1.1: the class goes straight into `StackTrace.freason`, found as
+/// element 1 of the ftrace tuple. Anything else (NIL) has no saved class to update.
 pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool {
     // raw_raise stores the class in the saved trace after EXF_SAVETRACE is cleared.
     let code = class_to_freason(Some(class)) & !arinsal_beamasm::exc::EXF_SAVETRACE;
-    if let Some(fields) = arinsal_term::term_sequence(term)
-        && fields.len() == 3
+    let Some(fields) = arinsal_term::term_sequence_small(term) else {
+        return false;
+    };
+    fields.len() == 3
         && fields[0]
             .with_bignum_digits_mut(|digits| {
                 let Some(freason) = digits.first_mut() else {
@@ -1371,10 +1385,6 @@ pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool 
                 true
             })
             .unwrap_or(false)
-    {
-        return true;
-    }
-    with_saved(term, |raw| raw.class = Some(class)).is_some()
 }
 
 /// What `save_stacktrace` puts in a BIF frame's `error_info`.
