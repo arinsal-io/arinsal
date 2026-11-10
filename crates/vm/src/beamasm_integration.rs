@@ -28,16 +28,6 @@ fn existing_mfa(module: &str, function: &str, arity: u8) -> Option<Mfa> {
     Some((atoms.get(module)?, atoms.get(function)?, arity))
 }
 
-/// The export key of `module:function/arity`, interning its names.
-fn interned_mfa(module: &str, function: &str, arity: u8) -> Option<Mfa> {
-    let atoms = global_atoms();
-    Some((
-        atoms.intern(module).ok()?,
-        atoms.intern(function).ok()?,
-        arity,
-    ))
-}
-
 /// Function-indexed BeamAsm target cache, invalidated when native code is published.
 pub(crate) struct NativeTargetCache {
     scope: u64,
@@ -222,9 +212,17 @@ fn new_export_slot(
     address: usize,
     save_calls: usize,
 ) -> &'static Arc<arinsal_beamasm::bif::ExportEntry> {
-    Box::leak(Box::new(Arc::new(
+    let export = Box::leak(Box::new(Arc::new(
         arinsal_beamasm::bif::ExportEntry::with_addresses(mfa.0, mfa.1, mfa.2, address, save_calls),
-    )))
+    )));
+    // Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs: `ep->bif_number = i`
+    // for every BIF table entry), OTP-29.1.1.
+    if let (Some(module), Some(function)) = (global_atoms().text(mfa.0), global_atoms().text(mfa.1))
+        && let Some(bif) = arinsal_spec::bif_lookup(module, function, mfa.2)
+    {
+        export.set_bif_number(i32::from(bif.index));
+    }
+    export
 }
 
 /// One node's export state, like an erts code index: import slots, interpreted and native
@@ -233,11 +231,6 @@ fn new_export_slot(
 struct ScopeExports {
     // One slot per MFA, shared by every import and export in this code scope.
     dispatch: HashMap<Mfa, Arc<DispatchTarget>, ExportHasher>,
-    target_indices: HashMap<Mfa, usize, ExportHasher>,
-    native_targets: HashMap<Mfa, usize, ExportHasher>,
-    // Exports with a global call breakpoint: their callers go through the export
-    // trampoline, whose interpreted export entry is the breakpoint.
-    global_breakpoints: std::collections::HashSet<Mfa, ExportHasher>,
 }
 
 /// Hashes an export key like erts' export table.
@@ -783,6 +776,7 @@ fn publish_module(
     module: &arinsal_loader::Module,
     native: &[(Mfa, usize)],
     imports: &[(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)],
+    deferred: bool,
 ) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
     let save_calls = fragments().map_or(0, DispatchFragments::save_calls_export);
@@ -839,209 +833,7 @@ fn publish_module(
         .iter()
         .map(|(mfa, target)| (*mfa, target.export_object()))
         .collect();
-    crate::export::export_put_all(scope, &exports);
-    crate::export::export_put_all(scope, imports);
-    let staging_ix = crate::code_ix::for_scope(scope).staging();
-    let traced = global_breakpoints_of(scope, native);
-    for (mfa, address) in native {
-        if traced.contains(mfa) {
-            continue;
-        }
-        if let Some((_, export)) = exports.iter().find(|(key, _)| key == mfa) {
-            export.set_address(staging_ix, *address);
-        }
-    }
-    staged(scope, |exports| {
-        let mut affected = publish_module_exports(exports, module, native);
-        // The loader wrote these above; the staged refresh only redirects what this version
-        // no longer exports.
-        affected.retain(|mfa| !native.iter().any(|(key, _)| key == mfa));
-        affected
-    });
-}
-
-/// The MFAs of `native` that have a global call breakpoint in `scope`: their export keeps
-/// entering the breakpoint trampoline.
-fn global_breakpoints_of(scope: u64, native: &[(Mfa, usize)]) -> Vec<Mfa> {
-    let Ok(registry) = dispatch_registry().read() else {
-        return Vec::new();
-    };
-    let Some(exports) = registry.scopes.get(&scope) else {
-        return Vec::new();
-    };
-    native
-        .iter()
-        .map(|(mfa, _)| *mfa)
-        .filter(|mfa| exports.global_breakpoints.contains(mfa))
-        .collect()
-}
-
-fn publish_module_exports(
-    exports: &mut ScopeExports,
-    module: &arinsal_loader::Module,
-    native: &[(Mfa, usize)],
-) -> Vec<Mfa> {
-    let name = module.name_atom;
-    let mut affected = Vec::new();
-    exports
-        .target_indices
-        .retain(|(module, function, arity), _| {
-            if *module == name {
-                affected.push((*module, *function, *arity));
-                false
-            } else {
-                true
-            }
-        });
-    exports
-        .native_targets
-        .retain(|(module, function, arity), _| {
-            if *module == name {
-                affected.push((*module, *function, *arity));
-                false
-            } else {
-                true
-            }
-        });
-    for export in &module.exports {
-        let mfa = (name, export.function_atom, export.arity);
-        exports.target_indices.insert(mfa, export.target());
-        affected.push(mfa);
-    }
-    for (mfa, address) in native {
-        exports.native_targets.insert(*mfa, *address);
-        affected.push(*mfa);
-    }
-    affected
-}
-
-/// Copies every export's active address of `scope` into the staging code index when the
-/// node opens a staging area.
-// Port of erts/emulator/beam/export.c:100-106 (export_stage) and 277-280
-// (export_start_staging), OTP-29.1.1.
-pub(crate) fn stage_dispatch(scope: u64) {
-    let Ok(mut registry) = dispatch_registry().write() else {
-        return;
-    };
-    let exports = registry.scopes.entry(scope).or_default();
-    let code_ix = crate::code_ix::for_scope(scope);
-    let (active, staging) = (code_ix.active(), code_ix.staging());
-    for entry in exports.dispatch.values() {
-        entry.slot.stage(active, staging);
-    }
-}
-
-/// Applies `change` to the exports of `scope` in the staging code index. Outside a load's
-/// staging area the change is staged and committed on its own, like the code changes erts
-/// makes under the code modification permission (delete_module, trace patterns).
-fn staged(scope: u64, change: impl FnOnce(&mut ScopeExports) -> Vec<Mfa>) {
-    let code_ix = crate::code_ix::for_scope(scope);
-    let staging = code_ix.start_staging();
-    let Ok(mut registry) = dispatch_registry().write() else {
-        return;
-    };
-    let exports = registry.scopes.entry(scope).or_default();
-    let affected = change(exports);
-    refresh_import_slots(exports, staging.ix(), &affected);
-    drop(registry);
-    drop(staging);
-}
-
-/// Sends native callers of a deleted module's exports to the export trampoline, whose
-/// interpreted dispatch finds no current module and calls the error handler.
-// Port of erts/emulator/beam/beam_bif_load.c:679-720 (delete_module_1: export addresses
-// point at the error handler stub), OTP-29.1.1.
-pub(crate) fn unpublish_module_exports(scope: u64, name: &str) {
-    if !has_scope(scope) {
-        return;
-    }
-    let Some(name) = global_atoms().get(name) else {
-        return;
-    };
-    staged(scope, |exports| {
-        let mut affected = Vec::new();
-        exports
-            .target_indices
-            .retain(|(module, function, arity), _| {
-                if *module == name {
-                    affected.push((*module, *function, *arity));
-                    false
-                } else {
-                    true
-                }
-            });
-        exports
-            .native_targets
-            .retain(|(module, function, arity), _| {
-                if *module == name {
-                    affected.push((*module, *function, *arity));
-                    false
-                } else {
-                    true
-                }
-            });
-        affected
-    });
-}
-
-fn unpublish_module(scope: u64, native: &[(Mfa, usize)]) {
-    // Only exports still entering this version need a staged change.
-    let current = dispatch_registry().read().is_ok_and(|registry| {
-        registry.scopes.get(&scope).is_some_and(|exports| {
-            native
-                .iter()
-                .any(|(mfa, address)| exports.native_targets.get(mfa) == Some(address))
-        })
-    });
-    if !current {
-        return;
-    }
-    staged(scope, |exports| {
-        let mut affected = Vec::new();
-        for (mfa, address) in native {
-            if exports.native_targets.get(mfa) == Some(address) {
-                exports.native_targets.remove(mfa);
-                affected.push(*mfa);
-            }
-        }
-        affected
-    });
-}
-
-fn has_scope(scope: u64) -> bool {
-    dispatch_registry()
-        .read()
-        .is_ok_and(|registry| registry.scopes.contains_key(&scope))
-}
-
-// Port of erts/emulator/beam/beam_bp.c:1180-1230 (erts_set_trace_pattern: a global
-// breakpoint redirects the export's addresses to its trampoline), OTP-29.1.1.
-fn import_slot_address(exports: &ScopeExports, mfa: &Mfa, trampoline: usize) -> usize {
-    if exports.global_breakpoints.contains(mfa) {
-        return trampoline;
-    }
-    exports
-        .native_targets
-        .get(mfa)
-        .copied()
-        .unwrap_or(trampoline)
-}
-
-/// Writes the address of import slots that call an MFA in `affected` into code index `ix`.
-///
-/// `stage_dispatch` has already copied every slot from the active index, so an export
-/// whose address did not change keeps that copy. erts updates the one `Export` callers
-/// share (`export.c`); each call site here has its own slot, and only those sites change.
-fn refresh_import_slots(exports: &ScopeExports, ix: usize, affected: &[Mfa]) {
-    let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
-    for mfa in affected {
-        let Some(entry) = exports.dispatch.get(mfa) else {
-            continue;
-        };
-        entry
-            .slot
-            .set_address(ix, import_slot_address(exports, mfa, trampoline));
-    }
+    crate::export::finish_loading(scope, module, &exports, imports, native, deferred);
 }
 
 /// The address a process saving calls continues with after recording the call of the export
@@ -1075,68 +867,6 @@ pub(crate) fn set_bif_traced(module: &str, function: &str, arity: u8, traced: bo
     if let Some(target) = registry.bif_mfas.get(&mfa) {
         target.slot.set_bif_traced(traced);
     }
-}
-
-/// Whether `module:function/arity` has a global call breakpoint in code scope `scope`.
-pub(crate) fn is_global_breakpoint(scope: u64, module: &str, function: &str, arity: u8) -> bool {
-    let Some(mfa) = existing_mfa(module, function, arity) else {
-        return false;
-    };
-    dispatch_registry().read().is_ok_and(|registry| {
-        registry
-            .scopes
-            .get(&scope)
-            .is_some_and(|exports| exports.global_breakpoints.contains(&mfa))
-    })
-}
-
-/// Routes native callers of an export through its interpreted entry, `target`, while a
-/// global call breakpoint is set on it.
-pub(crate) fn set_global_breakpoint(
-    scope: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-    target: usize,
-    enabled: bool,
-    bif_traced: bool,
-) {
-    let Some(mfa) = interned_mfa(module, function, arity) else {
-        return;
-    };
-    let set_target = |exports: &mut ScopeExports| {
-        if let Some(index) = exports.target_indices.get_mut(&mfa) {
-            *index = target;
-        }
-    };
-    let routed = dispatch_registry().read().is_ok_and(|registry| {
-        registry
-            .scopes
-            .get(&scope)
-            .is_some_and(|exports| exports.global_breakpoints.contains(&mfa))
-    });
-    if routed == enabled {
-        if let Ok(mut registry) = dispatch_registry().write() {
-            set_target(registry.scopes.entry(scope).or_default());
-        }
-        return;
-    }
-    // Port of erts/emulator/beam/beam_bp.c:1180-1230 (erts_set_trace_pattern), OTP-29.1.1:
-    // rerouting the export's callers is a staged code change.
-    staged(scope, |exports| {
-        if enabled {
-            exports.global_breakpoints.insert(mfa);
-        } else {
-            exports.global_breakpoints.remove(&mfa);
-        }
-        if let Some(target) = exports.dispatch.get(&mfa) {
-            // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1: any
-            // session's local or global trace of a BIF sends its callers through the trace path.
-            target.slot.set_bif_traced(bif_traced);
-        }
-        set_target(exports);
-        vec![mfa]
-    });
 }
 
 /// Descriptor addressed directly by the native export slot.
@@ -1224,22 +954,6 @@ pub(crate) fn dispatch_bif(identity: usize) -> Option<(arinsal_bifs::BifFn, u8)>
     Some((target.bif?, target.arity))
 }
 
-pub(crate) fn interpreted_target(
-    scope: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Option<usize> {
-    dispatch_registry()
-        .read()
-        .ok()?
-        .scopes
-        .get(&scope)?
-        .target_indices
-        .get(&existing_mfa(module, function, arity)?)
-        .copied()
-}
-
 static MODULES: AtomicU64 = AtomicU64::new(0);
 static NATIVE: AtomicU64 = AtomicU64::new(0);
 static NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1306,7 +1020,9 @@ pub(crate) struct CompiledVersion {
     // Coverage pointers embedded in native code remain valid through the code version's lifetime.
     _coverage: Option<arinsal_loader::Coverage>,
     native_functions: crate::native_bridge::FunctionTable,
-    native_targets: Vec<(Mfa, usize)>,
+    /// The code address of each exported function (`beamasm_get_code` of its label), which
+    /// `erts_finish_loading` writes into the export.
+    export_addresses: Vec<(Mfa, usize)>,
     code_start: usize,
     code_end: usize,
     catch_base: u32,
@@ -1482,7 +1198,13 @@ impl CompiledVersion {
     }
 
     // Port of erts/emulator/beam/beam_load.c:258 and jit/asm_load.c:1149-1218, OTP-29.1.1.
-    pub(crate) fn install(self: &Arc<Self>, module: &arinsal_loader::Module) -> bool {
+    /// `deferred` is set for code with an on_load function: its exports are written into
+    /// `trampoline.not_loaded.deferred` until erlang:finish_after_on_load/2.
+    pub(crate) fn install(
+        self: &Arc<Self>,
+        module: &arinsal_loader::Module,
+        deferred: bool,
+    ) -> bool {
         if !self.native_functions.is_empty()
             && crate::native_bridge::register_native_module(
                 &self.native_functions,
@@ -1519,20 +1241,20 @@ impl CompiledVersion {
         publish_module(
             self.scope,
             module,
-            &self.native_targets,
+            &self.export_addresses,
             &self.import_bindings,
+            deferred,
         );
         true
     }
-    /// Sends native callers of this version's exports to the export trampoline and queues the
-    /// version's literals for release. Run when the version is freed explicitly (purge
+    /// Queues the version's literals for release; its exports were redirected by
+    /// `delete_code` when it stopped being current. Run when the version is freed explicitly (purge
     /// `complete`, a load that reclaims it), never from drop: the code is gone at that point
     /// whatever else still holds this value, like the explicit free of the old code header in
     /// erts.
     // Port of erts/emulator/beam/beam_bif_load.c (erts_internal_purge_module_2 complete:
     // erts_queue_release_literals after the code is freed), OTP-29.1.1.
     pub(crate) fn unpublish(&self) {
-        unpublish_module(self.scope, &self.native_targets);
         self.retire_literals();
     }
 
@@ -2433,7 +2155,7 @@ pub(crate) fn compile(
             compiled.name, code_start, code_end
         );
     }
-    let native_targets = runtime_functions
+    let export_addresses = runtime_functions
         .iter()
         .filter_map(|function| {
             // Port of erts/emulator/beam/jit/asm_load.c:185-192, OTP-29.1.1.
@@ -2593,7 +2315,7 @@ pub(crate) fn compile(
         _module_literals: module.literal_area(),
         _coverage: module.coverage.clone(),
         native_functions,
-        native_targets,
+        export_addresses,
         code_start,
         code_end,
         catch_base: compiled.native.catch_base,

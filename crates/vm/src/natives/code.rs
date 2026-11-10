@@ -1176,7 +1176,11 @@ fn delete(
             Ok((Term::atom(arinsal_term::atoms::UNDEFINED), None))
         }
         Outcome::Deleted => {
-            crate::beamasm_integration::unpublish_module_exports(vm.code_scope, name);
+            // Port of erts/emulator/beam/beam_bif_load.c:679-720 (delete_module_1 ->
+            // delete_code), OTP-29.1.1.
+            if let Some(module) = arinsal_term::global_atoms().get(name) {
+                staging.with(|tables| crate::export::delete_code(tables, module, staging.ix()));
+            }
             crate::trace_bp::module_code_changed(process, vm.code_scope, name);
             // Port of erts/emulator/beam/beam_bif_load.c (staging_epilogue), OTP-29.1.1:
             // successful nonblocking deletes commit only after the caller's code barrier.
@@ -1315,9 +1319,14 @@ pub(crate) fn finish_after_on_load(vm: &mut Vm, name: &str, keep: bool) -> Resul
     if !vm.code.pending_on_load.contains_key(name) {
         return Err(badarg());
     }
+    let module = arinsal_term::global_atoms().get(name);
     if keep {
         let staging = vm.code_ix.start_staging();
+        let ix = staging.ix();
         staging.with(|tables| {
+            if let Some(module) = module {
+                crate::export::finish_after_on_load(tables, module, true, ix);
+            }
             if let Some(id) = tables.pending_on_load.remove(name)
                 && let Some(previous) = tables.make_current(name, id)
             {
@@ -1326,6 +1335,9 @@ pub(crate) fn finish_after_on_load(vm: &mut Vm, name: &str, keep: bool) -> Resul
         });
         drop(staging);
         vm.refresh_code();
+    } else if let Some(module) = module {
+        let code = crate::code_ix::for_scope(vm.code_scope);
+        crate::export::finish_after_on_load(&code.active_tables(), module, false, code.active());
     }
     Ok(())
 }

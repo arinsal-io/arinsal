@@ -1259,12 +1259,7 @@ impl Executor {
                 // call through an export with a global call breakpoint reports
                 // the call, then enters the function's code; a traced return
                 // leaves through the native trace stub.
-                if crate::beamasm_integration::is_global_breakpoint(
-                    self.vm.code_scope,
-                    &export.module,
-                    &export.function,
-                    export.arity,
-                ) {
+                if crate::export::has_export_breakpoint(export.export_object()) {
                     let module = Arc::clone(&self.vm.code.modules[module_id]);
                     let function = module
                         .exports
@@ -1301,17 +1296,9 @@ impl Executor {
                         return Ok(Flow::Continue);
                     }
                 }
-                let target_ip = crate::beamasm_integration::interpreted_target(
-                    self.vm.code_scope,
-                    &export.module,
-                    &export.function,
-                    export.arity,
-                )
-                .or_else(|| {
-                    self.vm.code.modules[module_id]
-                        .export_slot(&export.function, export.arity)
-                        .map(arinsal_loader::ExportSlot::target)
-                });
+                let target_ip = self.vm.code.modules[module_id]
+                    .export_slot(&export.function, export.arity)
+                    .map(arinsal_loader::ExportSlot::target);
                 if let Some(target_ip) = target_ip {
                     process.gc_live = usize::from(export.arity);
                     self.vm.set_position(process, module_id, target_ip)?;

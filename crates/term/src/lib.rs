@@ -53,7 +53,8 @@ pub use copy::{
 };
 pub use fun::{
     ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET,
-    ErtsDispatchable, ExportEntry, ExportStubFn, FunEntry, FunEntryStubFn, FunRef,
+    ErtsDispatchable, ExportEntry, ExportStubFn, ExportTrampoline, FunEntry, FunEntryStubFn,
+    FunRef, TRAMPOLINE_BREAKPOINT, TRAMPOLINE_CALL_ERROR_HANDLER, TRAMPOLINE_NONE,
     beam_unloaded_fun, export_get_or_make_stub, set_export_stub_hook, set_fun_dispatch_fragments,
     set_fun_entry_stub_hook,
 };

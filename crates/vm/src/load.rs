@@ -480,6 +480,25 @@ impl ExportIndex {
         self.find_arc(key).map(|export| &**export)
     }
 
+    /// Every export object of this table (`export_list`).
+    pub(crate) fn exports(
+        &self,
+    ) -> impl Iterator<Item = &'static Arc<arinsal_beamasm::bif::ExportEntry>> + '_ {
+        self.entries.values().filter_map(|entry| entry.dispatch)
+    }
+
+    /// The export objects of `module`'s functions (`export_list` filtered on
+    /// `ep->info.mfa.module`).
+    pub(crate) fn exports_of(
+        &self,
+        module: Atom,
+    ) -> impl Iterator<Item = &'static Arc<arinsal_beamasm::bif::ExportEntry>> + '_ {
+        self.entries
+            .iter()
+            .filter(move |(key, _)| key.0 == module)
+            .filter_map(|(_, entry)| entry.dispatch)
+    }
+
     /// The shared owner of the entry of `key`, for export funs (`Export.lambda`).
     pub(crate) fn find_arc(
         &self,
@@ -1005,11 +1024,17 @@ impl Vm {
     }
 
     // Port of erts/emulator/beam/beam_load.c:258 (install only during finish_loading), OTP-29.1.1.
-    pub(crate) fn install_native(&self, module: &Module, meta: &mut CodeMeta) -> bool {
+    /// `on_load` is set when the module is left pending until erlang:finish_after_on_load/2.
+    pub(crate) fn install_native(
+        &self,
+        module: &Module,
+        meta: &mut CodeMeta,
+        on_load: bool,
+    ) -> bool {
         let Some(native) = meta.beamasm.as_ref() else {
             return true;
         };
-        if native.install(module) {
+        if native.install(module, on_load) {
             true
         } else {
             meta.beamasm = None;
@@ -1049,7 +1074,7 @@ impl Vm {
             )));
         }
         self.release_loaded_tables(&mut meta);
-        let _ = self.install_native(&module, &mut meta);
+        let _ = self.install_native(&module, &mut meta, false);
         let module = Arc::new(module);
         let id = staging.with(|tables| {
             let id = tables.alloc(module, Some(meta));
@@ -1122,10 +1147,10 @@ impl Vm {
             )));
         }
         self.release_loaded_tables(&mut meta);
-        let _ = self.install_native(&module, &mut meta);
+        let on_load = meta.on_load.is_some();
+        let _ = self.install_native(&module, &mut meta, on_load);
         let module = Arc::new(module);
         let name = module.name.clone();
-        let on_load = meta.on_load.is_some();
         let id = staging.with(|tables| {
             let id = tables.alloc(module, Some(meta));
             // Port of erts/emulator/beam/beam_load.c:259-330 (erts_finish_loading), OTP-29.1.1:
@@ -1195,7 +1220,7 @@ impl Vm {
             staging.with(|tables| {
                 tables.intern_fun_entries(&mut module);
             });
-            let _ = self.install_native(&module, &mut meta);
+            let _ = self.install_native(&module, &mut meta, pending);
             let module = Arc::new(module);
             ids.push(staging.with(|tables| {
                 let id = tables.alloc(module, Some(meta));
@@ -1316,12 +1341,9 @@ impl Vm {
                 global_patches.get(&(export.function, export.arity))
             {
                 exports_retargeted = true;
-                crate::beamasm_integration::set_global_breakpoint(
+                crate::export::set_export_breakpoint(
                     self.code_scope,
-                    &module.name,
-                    export.function,
-                    export.arity,
-                    export.target(),
+                    (module.name_atom, export.function_atom, export.arity),
                     global,
                     bif_traced,
                 );
