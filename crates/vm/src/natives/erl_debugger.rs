@@ -25,16 +25,16 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_debug", "breakpoint", 2),
 ];
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in debugger atom"))
-}
-
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 fn undef() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("undef")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::UNDEF,
+    )))
 }
 
 fn integer(value: usize) -> O {
@@ -50,7 +50,11 @@ fn from_owned_term(process: &mut Process, value: &O) -> Result<Term, VmError> {
         value,
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
-    .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))
+    .map_err(|_| {
+        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 fn bool_term(value: bool) -> O {
@@ -71,11 +75,13 @@ fn call_impl(
         return Err(undef());
     }
     match (module, function, args) {
-        ("erl_debugger", "supported", []) => Ok(atom(if crate::trace_bp::debugger_supported() {
-            "true"
-        } else {
-            "false"
-        })),
+        ("erl_debugger", "supported", []) => {
+            Ok(Term::atom(if crate::trace_bp::debugger_supported() {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }))
+        }
         ("erl_debugger", "instrumentations", []) => instrumentation_map(process),
         ("erl_debugger", "toggle_instrumentations", [toggles]) => {
             toggle_instrumentations(process, *toggles)
@@ -150,7 +156,7 @@ fn toggle_instrumentations(_process: &mut Process, toggles: Term) -> Result<Term
         line_breakpoints = value == "true";
     }
     crate::trace_bp::set_line_breakpoint_instrumentation(line_breakpoints);
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 // Port of erts/emulator/beam/erl_debugger.c:126-160, OTP-29.1.1.
@@ -180,13 +186,13 @@ fn unregister(process: &Process, term: Term, session: Term) -> Result<Term, VmEr
     let pid = Pid::from_term(term).ok_or_else(badarg)?;
     let session = session.as_small().ok_or_else(badarg)? as u64;
     crate::trace_bp::unregister_debugger(process, pid, session).map_err(|_| badarg())?;
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 // Port of erts/emulator/beam/erl_debugger.c:191-204, OTP-29.1.1.
 fn whereis(process: &Process) -> Result<Term, VmError> {
     let Some(registration) = crate::trace_bp::debugger_registration(process) else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     registration.pid.to_term().ok_or_else(badarg)
 }
@@ -206,7 +212,9 @@ fn breakpoint(
         return Err(badarg());
     }
     let line = line as u32;
-    if enable != atom("true") && enable != atom("false") {
+    if enable != Term::atom(arinsal_term::atoms::TRUE)
+        && enable != Term::atom(arinsal_term::atoms::FALSE)
+    {
         return Err(badarg());
     }
     let Some(&id) = vm.code.loaded.get(&module) else {
@@ -254,14 +262,19 @@ fn breakpoint(
             ]),
         );
     }
-    crate::trace_bp::set_line_breakpoint(process, id, line, enable == atom("true"));
+    crate::trace_bp::set_line_breakpoint(
+        process,
+        id,
+        line,
+        enable == Term::atom(arinsal_term::atoms::TRUE),
+    );
     crate::beamasm_integration::patch_native_line_breakpoint(
         vm.code_scope,
         &module,
         line,
-        enable == atom("true"),
+        enable == Term::atom(arinsal_term::atoms::TRUE),
     );
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 // Port of erts/emulator/beam/erl_debugger.c:447-555, OTP-29.1.1.
@@ -382,7 +395,7 @@ fn stack_frames(process: &mut Process, pid_term: Term, max_size: Term) -> Result
     let Some(frames) = runtime.inspect_suspended(pid, |target, _| {
         inspect_frames(target, max_size, hibernation_arity(target))
     }) else {
-        return Ok(atom("running"));
+        return Ok(Term::atom(arinsal_term::atoms::RUNNING));
     };
     from_owned_term(
         process,
@@ -412,11 +425,11 @@ fn peek_stack_frame_slot(
             .find(|frame_info| frame_number(frame_info) == Some(frame))
             .and_then(|frame| frame_slots(frame).get(slot).cloned())
     }) else {
-        return Ok(atom("running"));
+        return Ok(Term::atom(arinsal_term::atoms::RUNNING));
     };
     match value {
         Some(value) => from_owned_term(process, &value),
-        None => Ok(atom("undefined")),
+        None => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
     }
 }
 
@@ -427,7 +440,7 @@ fn xregs_count(process: &Process, pid_term: Term) -> Result<Term, VmError> {
     let Some(count) =
         runtime.inspect_suspended(pid, |target, _| crate::process::switched_out_live(target))
     else {
-        return Ok(atom("running"));
+        return Ok(Term::atom(arinsal_term::atoms::RUNNING));
     };
     Term::small(count as i64).ok_or_else(badarg)
 }
@@ -448,11 +461,11 @@ fn peek_xreg(
             .then(|| target.x[register])
             .map(|term| limit_term(term, max_size))
     }) else {
-        return Ok(atom("running"));
+        return Ok(Term::atom(arinsal_term::atoms::RUNNING));
     };
     match value {
         Some(value) => from_owned_term(process, &value),
-        None => Ok(atom("undefined")),
+        None => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
     }
 }
 
@@ -755,10 +768,10 @@ fn notify_breakpoint_hit(
         return Err(badarg());
     }
     let Some(registration) = crate::trace_bp::debugger_registration(process) else {
-        return Ok(atom("noproc"));
+        return Ok(Term::atom(arinsal_term::atoms::NOPROC));
     };
     if registration.pid == ctx.pid() {
-        return Ok(atom("abort"));
+        return Ok(Term::atom(arinsal_term::atoms::ABORT));
     }
     let pid = ctx.pid().to_term().ok_or_else(badarg)?;
     let event = O::Tuple(vec![
@@ -779,7 +792,7 @@ fn notify_breakpoint_hit(
     ]);
     let message = from_owned_term(process, &envelope)?;
     process.send_message(registration.pid.to_term().ok_or_else(badarg)?, message)?;
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 // Port of erts/emulator/beam/beam_debug.c:269-335, OTP-29.1.1.
@@ -789,7 +802,9 @@ fn debug_breakpoint(
     pattern: Term,
     enable: Term,
 ) -> Result<Term, VmError> {
-    if enable != atom("true") && enable != atom("false") {
+    if enable != Term::atom(arinsal_term::atoms::TRUE)
+        && enable != Term::atom(arinsal_term::atoms::FALSE)
+    {
         return Err(badarg());
     }
     let owned_pattern = to_owned(pattern).map_err(|_| badarg())?;
@@ -842,7 +857,7 @@ fn debug_breakpoint(
         module.clone(),
         function.clone(),
         arity,
-        enable == atom("true"),
+        enable == Term::atom(arinsal_term::atoms::TRUE),
     );
     vm.refresh_all_trace_breakpoints(process);
     Term::small(matches as i64).ok_or_else(badarg)

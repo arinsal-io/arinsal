@@ -79,7 +79,7 @@ pub(crate) fn copy_literal_area(
     let store = process.persistent_terms;
     let area = store.retired_area(area_id);
     let Some(area) = area else {
-        reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
+        reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))?;
         return Ok(());
     };
 
@@ -93,16 +93,31 @@ pub(crate) fn copy_literal_area(
         // the heap may be inconsistent while GC is disabled, so do not scan it;
         // the collection is requested and delayed until GC is enabled.
         if !process.heap.gc_enabled {
-            reply_literal_area_copy(ctx, request, requester, atom("need_gc"))?;
+            reply_literal_area_copy(
+                ctx,
+                request,
+                requester,
+                Term::atom(arinsal_term::atoms::NEED_GC),
+            )?;
             return Ok(());
         }
         if literal_scan_words(process) > ctx.remaining() as usize * 512 {
-            reply_literal_area_copy(ctx, request, requester, atom("check_gc"))?;
+            reply_literal_area_copy(
+                ctx,
+                request,
+                requester,
+                Term::atom(arinsal_term::atoms::CHECK_GC),
+            )?;
             return Ok(());
         }
         let has_roots = has_literal_area_roots(process, &area);
         if has_roots {
-            reply_literal_area_copy(ctx, request, requester, atom("need_gc"))?;
+            reply_literal_area_copy(
+                ctx,
+                request,
+                requester,
+                Term::atom(arinsal_term::atoms::NEED_GC),
+            )?;
             return Ok(());
         }
         store.acknowledge_copied(area_id, 0);
@@ -129,7 +144,7 @@ pub(crate) fn copy_literal_area(
             store.acknowledge_copied(area_id, 0);
         }
     }
-    reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
+    reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))?;
     Ok(())
 }
 
@@ -197,7 +212,7 @@ pub(crate) fn reply_exiting_literal_area(
     request: Message,
     requester: arinsal_sched::Pid,
 ) -> Result<(), VmError> {
-    reply_literal_area_copy(ctx, request, requester, atom("ok"))
+    reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))
 }
 
 /// Complete a request when the target exited before the scheduler accepted its signal.
@@ -212,7 +227,7 @@ pub(crate) fn reply_failed_literal_area_request(
     // (erts_proc_sig_send_cla_request), OTP-29.1.1: the reply goes back to the requester.
     let request = Message::literal_copy_request(area, how, target)?;
     let requester = ctx.pid();
-    reply_literal_area_copy(ctx, request, requester, atom("ok"))
+    reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))
 }
 
 fn reply_literal_area_copy(
@@ -352,7 +367,7 @@ pub(crate) fn statistics_light(
             let (total, delta) = since(total, &flags.last_exact_reductions);
             Some(pair(process, total, delta).map_err(|error| match error {
                 VmError::Trap(trap) => trap,
-                _ => crate::exceptions::Trap::error(atom("system_limit")),
+                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
             }))
         }
         "reductions" | "context_switches" | "run_queue" => {
@@ -377,7 +392,7 @@ pub(crate) fn statistics_light(
             };
             Some(result.map_err(|error| match error {
                 VmError::Trap(trap) => trap,
-                _ => crate::exceptions::Trap::error(atom("system_limit")),
+                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
             }))
         }
         _ => None,
@@ -426,9 +441,9 @@ pub(crate) fn system_info_light(
         return arinsal_bifs::system_info_light_item(&mut ctx, *selector).map(|item| {
             item.map_err(|error| match error {
                 arinsal_bifs::BifError::SystemLimit => {
-                    crate::exceptions::Trap::error(atom("system_limit"))
+                    crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
                 }
-                _ => crate::exceptions::Trap::error(atom("badarg")),
+                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::BADARG)),
             })
         });
     }
@@ -460,7 +475,7 @@ fn call_bump_reductions(
     process.heap.abi.fcalls -= charged as i32;
     process.reductions_used = process.reductions_used.saturating_add(u64::from(charged));
     ctx.consume(charged);
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn call_garbage_collect(
@@ -512,7 +527,9 @@ pub(crate) fn dt_spread_tag_light(
         {
             Ok(Term::atom(arinsal_term::atoms::TRUE))
         } else {
-            Err(crate::exceptions::Trap::error(atom("badarg")))
+            Err(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::BADARG,
+            )))
         },
     )
 }
@@ -563,7 +580,9 @@ pub(crate) fn dt_restore_tag_light(
     Some(if *flag == Term::atom(arinsal_term::atoms::TRUE) {
         Ok(Term::atom(arinsal_term::atoms::TRUE))
     } else {
-        Err(crate::exceptions::Trap::error(atom("badarg")))
+        Err(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::BADARG,
+        )))
     })
 }
 
@@ -575,10 +594,12 @@ fn call_dt_spread_tag(
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:6032 (dt_spread_tag_1), OTP-29.1.1.
     // Without DTrace the BIF checks the boolean and returns `true`.
-    if args[0] != atom("true") && args[0] != atom("false") {
+    if args[0] != Term::atom(arinsal_term::atoms::TRUE)
+        && args[0] != Term::atom(arinsal_term::atoms::FALSE)
+    {
         return Err(badarg());
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn call_dt_restore_tag(
@@ -589,10 +610,10 @@ fn call_dt_restore_tag(
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:6066 (dt_restore_tag_1), OTP-29.1.1.
     // Without DTrace only `true` is accepted, and the BIF returns `true`.
-    if args[0] != atom("true") {
+    if args[0] != Term::atom(arinsal_term::atoms::TRUE) {
         return Err(badarg());
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 pub(super) fn call(
@@ -688,26 +709,34 @@ fn call_values(
         }
         // Port of erts/emulator/beam/bif.c:5929-6119 (DTrace BIFs without
         // USE_VM_PROBES), OTP-29.1.1.
-        ("erlang", "dt_get_tag" | "dt_get_tag_data", 0) => Some(Ok(atom("undefined"))),
-        ("erlang", "dt_put_tag", 1) => Some(Ok(atom("undefined"))),
-        ("erlang", "dt_spread_tag", 1) => {
-            Some(if args[0] == atom("true") || args[0] == atom("false") {
-                Ok(atom("true"))
+        ("erlang", "dt_get_tag" | "dt_get_tag_data", 0) => {
+            Some(Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
+        }
+        ("erlang", "dt_put_tag", 1) => Some(Ok(Term::atom(arinsal_term::atoms::UNDEFINED))),
+        ("erlang", "dt_spread_tag", 1) => Some(
+            if args[0] == Term::atom(arinsal_term::atoms::TRUE)
+                || args[0] == Term::atom(arinsal_term::atoms::FALSE)
+            {
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
+            } else {
+                Err(badarg())
+            },
+        ),
+        ("erlang", "dt_restore_tag", 1) => {
+            Some(if args[0] == Term::atom(arinsal_term::atoms::TRUE) {
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             } else {
                 Err(badarg())
             })
         }
-        ("erlang", "dt_restore_tag", 1) => Some(if args[0] == atom("true") {
-            Ok(atom("true"))
-        } else {
-            Err(badarg())
-        }),
         ("erlang", "dt_prepend_vm_tag_data" | "dt_append_vm_tag_data", 1) => Some(Ok(args[0])),
         // Port of erts/emulator/beam/dist.c:6670, OTP-29.1.1. Local peers
         // always advertise the Unicode I/O distribution flag.
         ("net_kernel", "dflag_unicode_io", 1) => Some(match args[0].classify() {
-            TermKind::Pid if args[0].as_pid().is_some() => Ok(atom("true")),
-            TermKind::Pid => Ok(atom("false")),
+            TermKind::Pid if args[0].as_pid().is_some() => {
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
+            }
+            TermKind::Pid => Ok(Term::atom(arinsal_term::atoms::FALSE)),
             _ => Err(badarg()),
         }),
         ("erlang", "system_info", 1)
@@ -780,7 +809,7 @@ pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Mes
     else {
         return;
     };
-    if let Ok(message) = Message::copy_from(atom("copy_literals")) {
+    if let Ok(message) = Message::copy_from(Term::atom(arinsal_term::atoms::COPY_LITERALS)) {
         let _ = ctx.send(pid, message);
     }
 }
@@ -1238,7 +1267,7 @@ pub(crate) fn system_info_process_item(
             secs => non_neg(process, secs),
         }),
         // Port of erts/emulator/beam/erl_bif_info.c:3524-3529, OTP-29.1.1.
-        Some("tolerant_timeofday") => Some(Ok(atom("disabled"))),
+        Some("tolerant_timeofday") => Some(Ok(Term::atom(arinsal_term::atoms::DISABLED))),
         // Port of erts/emulator/beam/erl_bif_info.c:3515, OTP-29.1.1.
         Some("ets_count") => Some(non_neg(
             process,
@@ -1278,7 +1307,7 @@ pub(crate) fn system_info_process_item(
             Some(if quota > 0 {
                 non_neg(process, quota as u64)
             } else {
-                Ok(atom("unknown"))
+                Ok(crate::atom_cache::put("unknown"))
             })
         }
         Some("ethread_info") => Some(ethread_info(process)),
@@ -1349,7 +1378,10 @@ pub(crate) fn system_info_process_item(
             let max_heap =
                 Term::small(i64::try_from(defaults.max_heap().size).map_err(|_| badarg())?)
                     .ok_or_else(badarg)?;
-            let max_heap = tuple(process, &[atom("max_heap_size"), max_heap])?;
+            let max_heap = tuple(
+                process,
+                &[Term::atom(arinsal_term::atoms::MAX_HEAP_SIZE), max_heap],
+            )?;
             let bin_vheap = tagged(
                 process,
                 "min_bin_vheap_size",
@@ -1383,9 +1415,10 @@ pub(crate) fn system_info_process_item(
             let value = gc_defaults(process.runtime).max_heap();
             Some(max_heap_map(process, value))
         }
-        Some("multi_scheduling") => Some(Ok(atom(multi_scheduling_state(process, |state| {
-            state.state()
-        })))),
+        Some("multi_scheduling") => Some(Ok(crate::atom_cache::put(multi_scheduling_state(
+            process,
+            |state| state.state(),
+        )))),
         // Port of erts/emulator/beam/erl_bif_info.c:3390 (multi_scheduling_blockers), OTP-29.1.1.
         Some(name @ ("multi_scheduling_blockers" | "normal_multi_scheduling_blockers")) => {
             let normal = name.starts_with("normal");
@@ -1423,7 +1456,7 @@ pub(crate) fn system_info_process_item(
                 "no_spread" | "ns" => "no_spread",
                 _ => "unbound",
             };
-            Some(Ok(atom(atom_name)))
+            Some(Ok(crate::atom_cache::put(atom_name)))
         }
         Some("scheduler_bindings") => Some(read_flags(process, |process, flags| {
             let bindings = process
@@ -1434,20 +1467,25 @@ pub(crate) fn system_info_process_item(
                 .unwrap_or_else(|| vec![None; flags.schedulers_total]);
             let values = bindings
                 .into_iter()
-                .map(|cpu| cpu.map_or_else(|| atom("unbound"), |cpu| small(cpu as i64)))
+                .map(|cpu| {
+                    cpu.map_or_else(
+                        || crate::atom_cache::put("unbound"),
+                        |cpu| small(cpu as i64),
+                    )
+                })
                 .collect::<Vec<_>>();
             tuple(process, &values)
         })),
         // Port of erts/emulator/beam/erl_bif_info.c:3352-3353, OTP-29.1.1.
-        Some("port_parallelism") => Some(Ok(atom(
+        Some("port_parallelism") => Some(Ok(Term::atom(
             if arinsal_args::active_scheduler_options()
                 .0
                 .port_parallelism
                 .unwrap_or(false)
             {
-                "true"
+                arinsal_term::atoms::TRUE
             } else {
-                "false"
+                arinsal_term::atoms::FALSE
             },
         ))),
         Some("sequential_tracer") => Some(crate::seq_trace::system_tracer_info(process)),
@@ -1583,7 +1621,7 @@ pub(crate) fn system_logger(process: &Process) -> Term {
             .and_then(|runtime| runtime.scheduler().ok())
             .is_some_and(|scheduler| !scheduler.lookup(pid))
     {
-        *current = atom("logger");
+        *current = Term::atom(arinsal_term::atoms::LOGGER);
     }
     *current
 }
@@ -2595,7 +2633,7 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
 }
 
 fn atom_term(name: &str) -> Term {
-    atom(name)
+    crate::atom_cache::put(name)
 }
 
 /// Memory Arinsal keeps in its own structures that erts holds in `erts_alloc` blocks: each field
@@ -2837,19 +2875,21 @@ fn system_flag(
         "min_heap_size" => heap_minimum(process, args[1], true),
         "min_bin_vheap_size" => heap_minimum(process, args[1], false),
         "max_heap_size" => max_heap_flag(process, args[1]),
-        "debug_flags" => Ok(atom("true")),
+        "debug_flags" => Ok(Term::atom(arinsal_term::atoms::TRUE)),
         "backtrace_depth" => backtrace_depth(vm, process, args[1]),
         "trace_control_word" => trace_control_word(process, args[1]),
         "sequential_tracer" => crate::seq_trace::set_system_tracer(vm, process, args[1]),
         "reset_seq_trace" => {
             crate::seq_trace::clear_all();
-            Ok(atom("true"))
+            Ok(Term::atom(arinsal_term::atoms::TRUE))
         }
         "scheduler_wall_time" => {
             // Port of erts/emulator/beam/bif.c:5174-5176 (system_flag_2), OTP-29.1.1.
             // The export owns the per-process reference count and calls the erts_internal
             // scheduler-wall-time BIF only when the node-wide reference count changes.
-            if args[1] != atom("true") && args[1] != atom("false") {
+            if args[1] != Term::atom(arinsal_term::atoms::TRUE)
+                && args[1] != Term::atom(arinsal_term::atoms::FALSE)
+            {
                 return Err(badarg());
             }
             Err(VmError::TrapExport(crate::ExportTrap::new(
@@ -2861,7 +2901,9 @@ fn system_flag(
         "microstate_accounting" => set_microstate(process, ctx, args[1]),
         "outstanding_system_requests_limit" => outstanding_limit(process, args[1]),
         "scheduling_statistics" => scheduling_statistics(args[1]),
-        "time_offset" if atom_name(args[1]) == Some("finalize") => Ok(atom("final")),
+        "time_offset" if atom_name(args[1]) == Some("finalize") => {
+            Ok(crate::atom_cache::put("final"))
+        }
         "scheduler_bind_type" => {
             // Port of erts/emulator/beam/bif.c:5284 and
             // erts/emulator/beam/erl_cpu_topology.c:714, OTP-29.1.1.
@@ -2914,7 +2956,7 @@ fn defined_cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map_err(|_| badarg()),
-        None => Ok(atom("undefined")),
+        None => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
     }
 }
 
@@ -2924,7 +2966,7 @@ fn detected_cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
     use arinsal_etf::OwnedTerm as O;
     let entries = arinsal_alloc::cpuinfo::cpu_topology();
     if entries.is_empty() {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     }
     fn level(entry: &arinsal_alloc::cpuinfo::CpuTopologyEntry, depth: usize) -> i32 {
         match depth {
@@ -3005,7 +3047,7 @@ fn set_cpu_topology(
     error_function: &str,
 ) -> Result<Term, VmError> {
     let previous = cpu_topology_info(process)?;
-    let new = if value == atom("undefined") {
+    let new = if value == Term::atom(arinsal_term::atoms::UNDEFINED) {
         None
     } else {
         let owned = arinsal_term::to_owned(value)
@@ -3095,13 +3137,13 @@ fn set_scheduler_bind_type(process: &mut Process, args: &[Term]) -> Result<Term,
             .cpu_bind_order
             .lock()
             .expect("CPU bind order") = Some(stored_name.to_owned());
-        Ok(atom(&old))
+        Ok(crate::atom_cache::put(&old))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = value;
-        if value == atom("unbound") {
-            Ok(atom("unbound"))
+        if value == crate::atom_cache::put("unbound") {
+            Ok(crate::atom_cache::put("unbound"))
         } else {
             Err(bif_error(process, "system_flag", args, "notsup"))
         }
@@ -3652,20 +3694,35 @@ fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>
         let args = builder.list_from_iter([warning]).map_err(|_| badarg())?;
         let error_logger = builder
             .flatmap_from_pairs(&[
-                (atom("emulator"), atom("true")),
-                (atom("tag"), atom("warning_msg")),
+                (
+                    Term::atom(arinsal_term::atoms::EMULATOR),
+                    Term::atom(arinsal_term::atoms::TRUE),
+                ),
+                (
+                    Term::atom(arinsal_term::atoms::TAG),
+                    Term::atom(arinsal_term::atoms::WARNING_MSG),
+                ),
             ])
             .map_err(|_| badarg())?;
         let metadata = builder
             .flatmap_from_pairs(&[
-                (atom("error_logger"), error_logger),
-                (atom("gl"), group_leader),
-                (atom("pid"), pid),
-                (atom("time"), Term::small(timestamp).ok_or_else(badarg)?),
+                (Term::atom(arinsal_term::atoms::ERROR_LOGGER), error_logger),
+                (crate::atom_cache::put("gl"), group_leader),
+                (Term::atom(arinsal_term::atoms::PID), pid),
+                (
+                    Term::atom(arinsal_term::atoms::TIME),
+                    Term::small(timestamp).ok_or_else(badarg)?,
+                ),
             ])
             .map_err(|_| badarg())?;
         builder
-            .tuple(&[atom("log"), atom("warning"), format, args, metadata])
+            .tuple(&[
+                Term::atom(arinsal_term::atoms::LOG),
+                Term::atom(arinsal_term::atoms::WARNING),
+                format,
+                args,
+                metadata,
+            ])
             .map_err(|_| badarg())
     })();
     if let Ok(event) = event
@@ -3692,7 +3749,7 @@ fn warn_deprecated_cpu_topology(process: &mut Process, ctx: &mut RunCtx<'_, Mess
 }
 
 fn bif_error_for(_process: &mut Process, function: &str, args: &[Term], reason: &str) -> VmError {
-    let mut trap = crate::exceptions::Trap::error(atom(reason));
+    let mut trap = crate::exceptions::Trap::error(crate::atom_cache::put(reason));
     trap.top = Some(crate::stacktrace::TopFrame::Bif {
         module: global_atoms().intern("erlang").expect("built-in atom"),
         function: global_atoms().intern(function).expect("system BIF atom"),
@@ -3715,7 +3772,7 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
         bif_error_for(
             process,
             "system_flag",
-            &[atom("erts_alloc"), value],
+            &[crate::atom_cache::put("erts_alloc"), value],
             "badarg",
         )
     })?;
@@ -3723,7 +3780,7 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
         return Err(bif_error_for(
             process,
             "system_flag",
-            &[atom("erts_alloc"), value],
+            &[crate::atom_cache::put("erts_alloc"), value],
             "badarg",
         ));
     };
@@ -3736,7 +3793,7 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
         return Err(bif_error_for(
             process,
             "system_flag",
-            &[atom("erts_alloc"), value],
+            &[crate::atom_cache::put("erts_alloc"), value],
             "badarg",
         ));
     };
@@ -3749,7 +3806,7 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
         return Err(bif_error_for(
             process,
             "system_flag",
-            &[atom("erts_alloc"), value],
+            &[crate::atom_cache::put("erts_alloc"), value],
             "badarg",
         ));
     };
@@ -3771,7 +3828,7 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
         return Err(bif_error_for(
             process,
             "system_flag",
-            &[atom("erts_alloc"), value],
+            &[crate::atom_cache::put("erts_alloc"), value],
             "badarg",
         ));
     }
@@ -3784,19 +3841,19 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
         spec.enabled
     });
     if !enabled || parameter != "sbct" {
-        return Ok(atom("notsup"));
+        return Ok(Term::atom(arinsal_term::atoms::NOTSUP));
     }
     let accepted = usize::try_from(amount)
         .ok()
         .and_then(|amount| arinsal_alloc::typed::try_set_dyn_sbct(allocator, amount));
     if accepted != Some(true) {
-        return Ok(atom("notsup"));
+        return Ok(Term::atom(arinsal_term::atoms::NOTSUP));
     }
     DYN_SBCT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(allocator.clone(), amount);
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 /// Dynamic `sbct` values set through `system_flag(erts_alloc, ...)`, by allocator name.
@@ -3805,7 +3862,10 @@ static DYN_SBCT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<
 
 pub(crate) fn set_system_logger(process: &Process, value: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_trace.c:2486, OTP-29.1.1.
-    if value != atom("logger") && value != atom("undefined") && value.as_pid().is_none() {
+    if value != Term::atom(arinsal_term::atoms::LOGGER)
+        && value != Term::atom(arinsal_term::atoms::UNDEFINED)
+        && value.as_pid().is_none()
+    {
         return Err(badarg());
     }
     let mut current = runtime_state(process)
@@ -3846,7 +3906,11 @@ fn set_scheduler_wall_enabled(
             .unwrap()
             .active_ns = active_ns;
     }
-    Ok(atom(if previous { "true" } else { "false" }))
+    Ok(Term::atom(if previous {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    }))
 }
 
 fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
@@ -3912,7 +3976,7 @@ impl StatisticsState {
             cpu_bind_order: Mutex::new(None),
             sched_wall: Mutex::new(None),
             microstate_base: Mutex::new(None),
-            system_logger: Mutex::new(atom("logger")),
+            system_logger: Mutex::new(Term::atom(arinsal_term::atoms::LOGGER)),
         }
     }
 }
@@ -4258,7 +4322,7 @@ fn multi_scheduling(
     let Some(runtime) = process.runtime else {
         let mut state = crate::process::MultiScheduling::default();
         state.change(pid, action);
-        return Ok(atom(state.state()));
+        return Ok(crate::atom_cache::put(state.state()));
     };
     let mut state = runtime.multi_scheduling.lock().unwrap();
     if state.change(pid, action) {
@@ -4268,7 +4332,7 @@ fn multi_scheduling(
     if let Ok(scheduler) = runtime.scheduler() {
         scheduler.set_scheduling_blocked(state.any_blocked(), ctx.worker_id());
     }
-    Ok(atom(state.state()))
+    Ok(crate::atom_cache::put(state.state()))
 }
 
 /// Release every multi-scheduling block `process` still holds.
@@ -4431,7 +4495,7 @@ fn outstanding_limit(process: &Process, value: Term) -> Result<Term, VmError> {
 
 fn scheduling_statistics(value: Term) -> Result<Term, VmError> {
     match atom_name(value) {
-        Some("enable" | "disable" | "clear") => Ok(atom("true")),
+        Some("enable" | "disable" | "clear") => Ok(Term::atom(arinsal_term::atoms::TRUE)),
         _ => Err(badarg()),
     }
 }
@@ -4476,16 +4540,16 @@ fn parse_system_max_heap(
     // SAFETY: The flag map stays rooted in the caller's registers.
     let map = unsafe { value.flatmap_ref() }.ok_or_else(badarg)?;
     let size = map
-        .get(atom("size"))
+        .get(Term::atom(arinsal_term::atoms::SIZE))
         .and_then(|term| term.as_small())
         .filter(|size| *size >= 0)
         .ok_or_else(badarg)?;
     limit.size = size as u64;
     let boolean = |key: &str| -> Result<Option<bool>, VmError> {
-        match map.get(atom(key)) {
+        match map.get(crate::atom_cache::put(key)) {
             None => Ok(None),
-            Some(term) if term == atom("true") => Ok(Some(true)),
-            Some(term) if term == atom("false") => Ok(Some(false)),
+            Some(term) if term == Term::atom(arinsal_term::atoms::TRUE) => Ok(Some(true)),
+            Some(term) if term == Term::atom(arinsal_term::atoms::FALSE) => Ok(Some(false)),
             Some(_) => Err(badarg()),
         }
     };
@@ -4505,22 +4569,30 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
     let size = Term::small(i64::try_from(limit.size).map_err(|_| badarg())?).ok_or_else(badarg)?;
     let pairs = [
         (
-            atom("error_logger"),
-            atom(if limit.log { "true" } else { "false" }),
-        ),
-        (
-            atom("include_shared_binaries"),
-            atom(if limit.include_shared_binaries {
-                "true"
+            Term::atom(arinsal_term::atoms::ERROR_LOGGER),
+            Term::atom(if limit.log {
+                arinsal_term::atoms::TRUE
             } else {
-                "false"
+                arinsal_term::atoms::FALSE
             }),
         ),
         (
-            atom("kill"),
-            atom(if limit.kill { "true" } else { "false" }),
+            Term::atom(arinsal_term::atoms::INCLUDE_SHARED_BINARIES),
+            Term::atom(if limit.include_shared_binaries {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }),
         ),
-        (atom("size"), size),
+        (
+            Term::atom(arinsal_term::atoms::KILL),
+            Term::atom(if limit.kill {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }),
+        ),
+        (Term::atom(arinsal_term::atoms::SIZE), size),
     ];
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
@@ -4574,7 +4646,11 @@ fn set_microstate(
         _ => return Err(badarg()),
     }
     set_runtime_accounting(process, ctx);
-    Ok(atom(if previous { "true" } else { "false" }))
+    Ok(Term::atom(if previous {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    }))
 }
 
 // Port of erts/emulator/beam/erl_msacc.c:367 (managed scheduler requests), OTP-29.1.1.
@@ -5018,7 +5094,7 @@ fn scheduler_wall(
         .expect("scheduler wall time")
         .clone();
     let Some(base) = base else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     let total_us = u64::try_from(base.started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let stats = scheduler_stats(process, ctx);
@@ -5088,7 +5164,7 @@ fn microstate(
         .expect("microstate baseline")
         .clone();
     let Some((_, baseline, poll_baseline)) = baseline else {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     if let Some(ctx) = ctx.as_deref_mut() {
         ctx.account_gc_total(process.stats.gc.nanoseconds);
@@ -5192,7 +5268,7 @@ fn msacc_entry(
         &[
             ("counters", counters),
             ("id", small(id)),
-            ("type", atom(kind)),
+            ("type", crate::atom_cache::put(kind)),
         ],
     )
 }
@@ -5248,16 +5324,16 @@ fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
             continue;
         }
         let properties = [
-            ("name", atom("erts_poll")),
-            ("primary", atom(primary)),
-            ("kernel_poll", atom(kernel_poll)),
+            ("name", crate::atom_cache::put("erts_poll")),
+            ("primary", crate::atom_cache::put(primary)),
+            ("kernel_poll", crate::atom_cache::put(kernel_poll)),
             ("memory_size", non_neg(process, memory)?),
             ("total_poll_set_size", small(set_size)),
-            ("lazy_updates", atom(lazy)),
+            ("lazy_updates", crate::atom_cache::put(lazy)),
             ("pending_updates", small(0)),
-            ("batch_updates", atom(batch)),
-            ("concurrent_updates", atom(concurrent)),
-            ("fallback", atom(fallback)),
+            ("batch_updates", crate::atom_cache::put(batch)),
+            ("concurrent_updates", crate::atom_cache::put(concurrent)),
+            ("fallback", crate::atom_cache::put(fallback)),
             (
                 "max_fds",
                 non_neg(process, arinsal_alloc::cpuinfo::poll_max_fds() as u64)?,
@@ -5267,15 +5343,11 @@ fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
         ];
         let properties = properties
             .iter()
-            .map(|(key, value)| tuple(process, &[atom(key), *value]))
+            .map(|(key, value)| tuple(process, &[crate::atom_cache::put(key), *value]))
             .collect::<Result<Vec<_>, _>>()?;
         sets.push(cons_list(process, &properties)?);
     }
     cons_list(process, &sets)
-}
-
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("runtime atom"))
 }
 
 fn atom_name(term: Term) -> Option<&'static str> {
@@ -5309,7 +5381,7 @@ fn triple(process: &mut Process, a: u64, b: u64, c: u64) -> Result<Term, VmError
 
 fn tagged(process: &mut Process, name: &str, value: u64) -> Result<Term, VmError> {
     let value = non_neg(process, value)?;
-    tuple(process, &[atom(name), value])
+    tuple(process, &[crate::atom_cache::put(name), value])
 }
 
 fn tuple(process: &mut Process, terms: &[Term]) -> Result<Term, VmError> {
@@ -5349,14 +5421,16 @@ fn int_tuple(process: &mut Process, values: &[u64]) -> Result<Term, VmError> {
 fn map(process: &mut Process, pairs: &[(&str, Term)]) -> Result<Term, VmError> {
     let pairs: Vec<(Term, Term)> = pairs
         .iter()
-        .map(|(key, value)| (atom(key), *value))
+        .map(|(key, value)| (crate::atom_cache::put(key), *value))
         .collect();
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     arinsal_maps::from_list(&pairs, &mut heap).map_err(|_| badarg())
 }
 
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 #[cfg(test)]

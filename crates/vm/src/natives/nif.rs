@@ -783,12 +783,10 @@ pub(crate) fn with_dirty_trace_emission<R>(run: impl FnOnce() -> R) -> Option<R>
     Some(run())
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in atom"))
-}
-
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 fn alloc(error: impl std::fmt::Debug) -> VmError {
@@ -813,8 +811,8 @@ fn charlist(process: &mut Process, text: &str) -> Result<Term, VmError> {
 
 fn error_reason(process: &mut Process, reason: &str, message: &str) -> Result<Term, VmError> {
     let message = charlist(process, message)?;
-    let inner = tuple(process, &[atom(reason), message])?;
-    tuple(process, &[atom("error"), inner])
+    let inner = tuple(process, &[crate::atom_cache::put(reason), message])?;
+    tuple(process, &[Term::atom(arinsal_term::atoms::ERROR), inner])
 }
 
 fn cons_pair(term: Term) -> Option<(Term, Term)> {
@@ -1441,7 +1439,7 @@ fn load_dynamic(
         .and_then(|runtime| runtime.scheduler().ok())
         .map_or_else(Weak::new, Arc::downgrade);
     install_stubs(vm, caller_id, library, &binds, scheduler)?;
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 /// Run the atom side of a static NIF library's `load` callback.
@@ -1557,23 +1555,23 @@ fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<
             {
                 arinsal_nif_socket::load_info(&info);
             }
-            atom("ok")
+            Term::atom(arinsal_term::atoms::OK)
         }
         "erl_tracer" => {
             bind_tracer(vm, caller_id)?;
             intern_load_atoms(&caller)?;
-            atom("ok")
+            Term::atom(arinsal_term::atoms::OK)
         }
         _ => {
             let term = load_dynamic(vm, process, (caller_id, prev_id), &caller, &bytes, info)?;
-            if term != atom("ok") {
+            if term != Term::atom(arinsal_term::atoms::OK) {
                 return Ok(term);
             }
             crate::ddll::add_taint(&caller);
             term
         }
     };
-    if loaded == atom("ok") {
+    if loaded == Term::atom(arinsal_term::atoms::OK) {
         let key = crate::load::nif_key(&caller, caller_id);
         publish(vm, &key);
     }
@@ -1593,18 +1591,22 @@ fn state_alive(process: &Process, state: Term) -> Option<bool> {
 }
 
 fn enabled_term(default_remove: bool, alive: Option<bool>, same: bool) -> Term {
-    let default = atom(if default_remove { "remove" } else { "discard" });
+    let default = Term::atom(if default_remove {
+        arinsal_term::atoms::REMOVE
+    } else {
+        arinsal_term::atoms::DISCARD
+    });
     if alive == Some(true) && !same {
-        atom("trace")
+        Term::atom(arinsal_term::atoms::TRACE)
     } else if alive == Some(true) && same {
-        atom("discard")
+        Term::atom(arinsal_term::atoms::DISCARD)
     } else {
         default
     }
 }
 
 fn tracer_enabled_term(args: &[Term], alive: Option<bool>) -> Term {
-    let default_remove = exact_eq(args[0], atom("trace_status"));
+    let default_remove = exact_eq(args[0], Term::atom(arinsal_term::atoms::TRACE_STATUS));
     let same = exact_eq(args[1], args[2]);
     enabled_term(default_remove, alive, same)
 }
@@ -1640,17 +1642,17 @@ fn monotonic_ns() -> i64 {
 
 fn timestamp_term<H: HeapAlloc>(heap: &mut H, kind: Term) -> Option<Term> {
     let mut builder = TermBuilder::new(heap);
-    if exact_eq(kind, atom("monotonic")) {
+    if exact_eq(kind, Term::atom(arinsal_term::atoms::MONOTONIC)) {
         return Some(small_or_zero(monotonic_ns()));
     }
-    if exact_eq(kind, atom("strict_monotonic")) {
+    if exact_eq(kind, Term::atom(arinsal_term::atoms::STRICT_MONOTONIC)) {
         static UNIQUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
         let unique = UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return builder
             .tuple(&[small_or_zero(monotonic_ns()), small_or_zero(unique)])
             .ok();
     }
-    if exact_eq(kind, atom("timestamp")) {
+    if exact_eq(kind, Term::atom(arinsal_term::atoms::TIMESTAMP)) {
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_micros())
@@ -1666,14 +1668,16 @@ fn timestamp_term<H: HeapAlloc>(heap: &mut H, kind: Term) -> Option<Term> {
             ])
             .ok();
     }
-    if exact_eq(kind, atom("cpu_timestamp")) {
+    if exact_eq(kind, Term::atom(arinsal_term::atoms::CPU_TIMESTAMP)) {
         return Some(small_or_zero(monotonic_ns()));
     }
     None
 }
 
 fn map_value(map: Term, key: &str) -> Option<Term> {
-    arinsal_maps::get(map, atom(key)).ok().flatten()
+    arinsal_maps::get(map, crate::atom_cache::put(key))
+        .ok()
+        .flatten()
 }
 
 /// Build the trace tuple from `erl_tracer_nif.c` `trace/5`. `None` means do not send.
@@ -1684,11 +1688,22 @@ fn build_trace<H: HeapAlloc>(heap: &mut H, args: &[Term]) -> Option<Term> {
     if opts_sz > 0
         && let Some(extra) = map_value(opts, "extra")
     {
-        parts.extend([atom("trace"), args[2], args[0], args[3], extra]);
-    } else if exact_eq(args[0], atom("seq_trace")) {
-        parts.extend([atom("seq_trace"), args[2], args[3]]);
+        parts.extend([
+            Term::atom(arinsal_term::atoms::TRACE),
+            args[2],
+            args[0],
+            args[3],
+            extra,
+        ]);
+    } else if exact_eq(args[0], Term::atom(arinsal_term::atoms::SEQ_TRACE)) {
+        parts.extend([Term::atom(arinsal_term::atoms::SEQ_TRACE), args[2], args[3]]);
     } else {
-        parts.extend([atom("trace"), args[2], args[0], args[3]]);
+        parts.extend([
+            Term::atom(arinsal_term::atoms::TRACE),
+            args[2],
+            args[0],
+            args[3],
+        ]);
     }
     if opts_sz > 0
         && let Some(value) = map_value(opts, "match_spec_result")
@@ -1705,8 +1720,8 @@ fn build_trace<H: HeapAlloc>(heap: &mut H, args: &[Term]) -> Option<Term> {
     {
         let stamp = timestamp_term(heap, kind)?;
         parts.push(stamp);
-        if exact_eq(parts[0], atom("trace")) {
-            parts[0] = atom("trace_ts");
+        if exact_eq(parts[0], Term::atom(arinsal_term::atoms::TRACE)) {
+            parts[0] = crate::atom_cache::put("trace_ts");
         }
     }
     TermBuilder::new(heap).tuple(&parts).ok()
@@ -1757,10 +1772,10 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Err(BifError::BADARG);
     }
     if Pid::from_term(args[1]).is_none() && args[1].as_port().is_none() {
-        return Ok(atom("ok"));
+        return Ok(Term::atom(arinsal_term::atoms::OK));
     }
     let Some(message) = build_trace(&mut HeapAdapter(&mut ctx.heap), args) else {
-        return Ok(atom("ok"));
+        return Ok(Term::atom(arinsal_term::atoms::OK));
     };
     if let Some(pid) = Pid::from_term(args[1])
         && let Some(hub) = thread_hub()
@@ -1769,7 +1784,7 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     {
         let _ = scheduler.send(hub.pid, pid, envelope);
     }
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 #[inline(never)]
@@ -2152,7 +2167,10 @@ fn call_nif_error(
     _ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let reason = args.first().copied().unwrap_or_else(|| atom("badarg"));
+    let reason = args
+        .first()
+        .copied()
+        .unwrap_or_else(|| Term::atom(arinsal_term::atoms::BADARG));
     Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
 }
 
@@ -2183,7 +2201,10 @@ fn call_values(
         return Some(handle(vm, process, ctx, args));
     }
     if module == "erlang" && function == "nif_error" {
-        let reason = args.first().copied().unwrap_or_else(|| atom("badarg"));
+        let reason = args
+            .first()
+            .copied()
+            .unwrap_or_else(|| Term::atom(arinsal_term::atoms::BADARG));
         return Some(Err(VmError::Trap(crate::exceptions::Trap::error(reason))));
     }
     if module == "erl_tracer"
@@ -2198,10 +2219,10 @@ fn call_values(
         }
         if function == "trace" && args.len() == 5 {
             if Pid::from_term(args[1]).is_none() && args[1].as_port().is_none() {
-                return Some(Ok(atom("ok")));
+                return Some(Ok(Term::atom(arinsal_term::atoms::OK)));
             }
             deliver_trace(process, ctx, args);
-            return Some(Ok(atom("ok")));
+            return Some(Ok(Term::atom(arinsal_term::atoms::OK)));
         }
     }
     None

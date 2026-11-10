@@ -1357,6 +1357,15 @@ impl ProcessHeap {
         self.min_heap_size = u32::try_from(normalize_heap_minimum(words)).unwrap_or(u32::MAX);
     }
 
+    /// Set the minimum young heap capacity to `words`, a heap size the caller already took
+    /// from the heap-size table.
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->min_heap_size =
+    // so->min_heap_size`, rounded once by erts_parse_spawn_opts), OTP-29.1.1.
+    pub fn set_normalized_min_heap_size(&mut self, words: usize) {
+        debug_assert_eq!(normalize_heap_minimum(words), words);
+        self.min_heap_size = u32::try_from(words).unwrap_or(u32::MAX);
+    }
+
     /// Number of live stack words.
     pub fn stack_words(&self) -> usize {
         self.words.len() - self.stop_index()

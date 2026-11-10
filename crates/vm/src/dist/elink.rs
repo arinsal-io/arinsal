@@ -5,7 +5,7 @@
 //! (erts_proc_sig_send_dist_*, reply_dist_unlink_ack, erts_proc_sig_send_link_exit_noconnection),
 //! erl_process.c (erts_proc_exit_handle_link) and bif.c (link_opt, unlink_1), OTP-29.1.1.
 
-use super::{atom, badarg, control, local_pid_owned};
+use super::{badarg, control, local_pid_owned};
 use crate::monitor_link::{ExternalPid, Link, node_type};
 use crate::node_tables;
 use crate::process::Message;
@@ -273,7 +273,7 @@ pub(crate) fn send_link_exit_noconnection(runtime: &crate::process::Runtime, dis
     let connection_id = view.external_dist().map_or(!0, |dist| dist.connection_id);
     let to = Pid::from_data(local);
     drop(dist_half);
-    let Ok(reason) = Message::copy_from(atom("noconnection")) else {
+    let Ok(reason) = Message::copy_from(Term::atom(arinsal_term::atoms::NOCONNECTION)) else {
         return;
     };
     if let Ok(scheduler) = runtime.scheduler() {
@@ -438,7 +438,7 @@ pub(super) fn link_external(
             Some(dist_half) => (Some(dist_half), None, None),
             None => {
                 if link.view().unlinking() == 0 {
-                    return Ok(atom("true"));
+                    return Ok(Term::atom(arinsal_term::atoms::TRUE));
                 }
                 let old_connection = link.view().external_dist().map(|dist| dist.connection_id);
                 let prepared = Link::create_external(node_type::LINK_DIST_PROC, me.data(), remote);
@@ -499,7 +499,7 @@ pub(super) fn link_external(
             )?;
         }
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 /// `erts_link_tree_replace` of the proc half keyed by `remote` with `proc_half`, then the
@@ -527,15 +527,15 @@ pub(super) fn unlink_external(
     target: OwnedTerm,
 ) -> Result<Term, crate::VmError> {
     let Some(remote) = external_pid(&target) else {
-        return Ok(atom("true"));
+        return Ok(Term::atom(arinsal_term::atoms::TRUE));
     };
     let id = process.next_ref();
     let connection_id = {
         let Some(mut link) = process.links.get_external_mut(&remote) else {
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         };
         if link.view().unlinking() != 0 {
-            return Ok(atom("true"));
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         link.set_priority(false);
         link.set_unlinking(id);
@@ -567,5 +567,5 @@ pub(super) fn unlink_external(
             None,
         )?;
     }
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }

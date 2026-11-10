@@ -377,16 +377,14 @@ fn has_prepared_code_on_load(term: Term) -> Result<Term, VmError> {
     }))
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("short OTP atom"))
-}
-
 fn badarg() -> VmError {
     VmError::Trap(exceptions::Trap::error(Term::atom(atoms::BADARG)))
 }
 
 fn system_limit() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("system_limit")))
+    VmError::Trap(exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::SYSTEM_LIMIT,
+    )))
 }
 
 fn list(term: Term) -> Option<Vec<Term>> {
@@ -403,13 +401,21 @@ fn make_list(
 ) -> Result<Term, VmError> {
     TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .list_from_iter(values)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })
 }
 
 fn make_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .tuple(values)
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        .map_err(|_| {
+            VmError::Trap(exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::SYSTEM_LIMIT,
+            )))
+        })
 }
 
 fn info_list(
@@ -463,7 +469,10 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                 for (_, function, arity) in &module.functions {
                     functions.push(make_tuple(
                         process,
-                        &[atom(function), Term::small(i64::from(*arity)).unwrap()],
+                        &[
+                            crate::atom_cache::put(function),
+                            Term::small(i64::from(*arity)).unwrap(),
+                        ],
                     )?);
                 }
                 info_list(process, functions)
@@ -478,7 +487,10 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     for (function, arity) in functions {
                         nifs.push(make_tuple(
                             process,
-                            &[atom(&function), Term::small(i64::from(arity)).unwrap()],
+                            &[
+                                crate::atom_cache::put(&function),
+                                Term::small(i64::from(arity)).unwrap(),
+                            ],
                         )?);
                     }
                     return info_list(process, nifs);
@@ -492,7 +504,10 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     if loaded && module.nif_body(ordinal).is_some() {
                         nifs.push(make_tuple(
                             process,
-                            &[atom(function), Term::small(i64::from(*arity)).unwrap()],
+                            &[
+                                crate::atom_cache::put(function),
+                                Term::small(i64::from(*arity)).unwrap(),
+                            ],
                         )?);
                     }
                 }
@@ -534,7 +549,10 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
     // Port of erts/emulator/beam/erl_bif_info.c:5947 (module_info_0), OTP-29.1.1.
     for field in ["module", "exports", "attributes", "compile", "md5"] {
         let field_value = value(field, process)?;
-        pairs.push(make_tuple(process, &[atom(field), field_value])?);
+        pairs.push(make_tuple(
+            process,
+            &[crate::atom_cache::put(field), field_value],
+        )?);
     }
     info_list(process, pairs)
 }
@@ -612,11 +630,23 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     let bytes = std::mem::take(bytes_slot);
     // Port of erts/emulator/beam/beam_file.c:beamfile_read: the tables; the instructions stay bytes.
     let Ok(beam) = arinsal_beam::read(&bytes) else {
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        let error = make_tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::BADFILE),
+            ],
+        )?;
         return Ok(error);
     };
     if beam.module != name {
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        let error = make_tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::BADFILE),
+            ],
+        )?;
         return Ok(error);
     }
     // Port of erts/emulator/beam/jit/asm_load.c:1084-1105 (attribute and compile-info
@@ -626,7 +656,13 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         .flatten()
         .any(|chunk| !chunk.is_empty() && arinsal_etf::decode_ext_size(chunk).is_err())
     {
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        let error = make_tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::BADFILE),
+            ],
+        )?;
         return Ok(error);
     }
     // Port of erts/emulator/beam/beam_bif_load.c:150 (prepare_loading_2) and
@@ -638,11 +674,23 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // erts has no interpreter form of a module: decode the instructions only for the coverage
     // table and the debugger lines, which are laid out from them.
     if vm.decode_for_native_tables(&mut meta.beam).is_err() {
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        let error = make_tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::BADFILE),
+            ],
+        )?;
         return Ok(error);
     }
     let Ok(mut module) = vm.prepare_module(&meta.beam, &bytes, meta.md5) else {
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        let error = make_tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::BADFILE),
+            ],
+        )?;
         return Ok(error);
     };
     vm.intern_prepared_fun_entries(&mut module);
@@ -650,7 +698,13 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     if meta.beamasm.is_none() {
         // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT flavor has
         // no other way to run the module.
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        let error = make_tuple(
+            process,
+            &[
+                Term::atom(arinsal_term::atoms::ERROR),
+                Term::atom(arinsal_term::atoms::BADFILE),
+            ],
+        )?;
         return Ok(error);
     }
     vm.release_loaded_tables(&mut module, &mut meta);
@@ -672,7 +726,11 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         LOADER_STATE_MAGIC_ORIG_SIZE,
         refn,
     ));
-    result.map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+    result.map_err(|_| {
+        VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))
+    })
 }
 
 /// Seizes the code loading permission for the calling process; when another process holds
@@ -772,7 +830,9 @@ fn finish_stage(
             .iter()
             .any(|(_, meta)| meta.on_load.is_some())
     {
-        return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        ))));
     }
     match vm.stage_prepared(prepared_modules) {
         // Port of erts/emulator/beam/beam_bif_load.c:539-571 (staging_epilogue), OTP-29.1.1:
@@ -803,12 +863,15 @@ fn finish_stage(
             }
             Err(VmError::Yield)
         }
-        Err(("system_limit", _)) => {
-            Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
-        }
+        Err(("system_limit", _)) => Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))),
         Err((reason, modules)) => {
-            let names = make_list(process, modules.iter().map(|name| atom(name)))?;
-            make_tuple(process, &[atom(reason), names])
+            let names = make_list(
+                process,
+                modules.iter().map(|name| crate::atom_cache::put(name)),
+            )?;
+            make_tuple(process, &[crate::atom_cache::put(reason), names])
         }
     }
 }
@@ -827,10 +890,13 @@ fn finish_commit(
         apply_on_load_patterns(vm, process, name);
     }
     if on_load.is_empty() {
-        Ok(atom("ok"))
+        Ok(Term::atom(arinsal_term::atoms::OK))
     } else {
-        let names = make_list(process, on_load.iter().map(|name| atom(name)))?;
-        make_tuple(process, &[atom("on_load"), names])
+        let names = make_list(
+            process,
+            on_load.iter().map(|name| crate::atom_cache::put(name)),
+        )?;
+        make_tuple(process, &[Term::atom(arinsal_term::atoms::ON_LOAD), names])
     }
 }
 
@@ -869,12 +935,12 @@ fn check_process_code(vm: &Vm, process: &mut Process, name: &str) -> bool {
 
 // Port of erts/emulator/beam/erl_bif_coverage.c:50-116, OTP-29.1.1.
 fn coverage_mode_atom(mode: CoverageMode) -> Term {
-    atom(match mode {
-        CoverageMode::None => "none",
-        CoverageMode::Function => "function",
-        CoverageMode::FunctionCounters => "function_counters",
-        CoverageMode::Line => "line",
-        CoverageMode::LineCounters => "line_counters",
+    Term::atom(match mode {
+        CoverageMode::None => arinsal_term::atoms::NONE,
+        CoverageMode::Function => arinsal_term::atoms::FUNCTION,
+        CoverageMode::FunctionCounters => arinsal_term::atoms::FUNCTION_COUNTERS,
+        CoverageMode::Line => arinsal_term::atoms::LINE,
+        CoverageMode::LineCounters => arinsal_term::atoms::LINE_COUNTERS,
     })
 }
 
@@ -964,7 +1030,7 @@ fn get_coverage(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         let mfa = make_tuple(
             process,
             &[
-                atom(function),
+                crate::atom_cache::put(function),
                 Term::small(i64::from(*arity)).ok_or_else(badarg)?,
             ],
         )?;
@@ -980,7 +1046,7 @@ fn reset_coverage(vm: &Vm, module: Term) -> Result<Term, VmError> {
         return Err(badarg());
     };
     coverage.reset();
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 fn beamfile_chunk(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
@@ -1012,7 +1078,7 @@ fn beamfile_chunk(process: &mut Process, args: &[Term]) -> Result<Term, VmError>
             let mut heap = ProcessHeapHandle(&mut process.heap);
             from_owned(&OwnedTerm::Binary(chunk), &mut heap).map_err(|_| system_limit())
         }
-        None => Ok(atom("undefined")),
+        None => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
     }
 }
 
@@ -1022,7 +1088,7 @@ fn beamfile_module_md5(process: &mut Process, binary: Term) -> Result<Term, VmEr
         return Err(badarg());
     };
     if arinsal_beam::read(bytes).is_err() {
-        return Ok(atom("undefined"));
+        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     }
     let md5 = arinsal_loader::module_uniq(bytes).map_err(|_| badarg())?;
     let mut heap = ProcessHeapHandle(&mut process.heap);
@@ -1041,7 +1107,7 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
         .as_ref()
         .and_then(|meta| meta.debug_table.as_ref())
     else {
-        return Ok(atom("none"));
+        return Ok(Term::atom(arinsal_term::atoms::NONE));
     };
     let module = &vm.code.modules[id];
     // Items without an `i_debug_line` (never instrumented) have no location and are skipped.
@@ -1107,14 +1173,14 @@ fn delete(
         }
         Outcome::Undefined => {
             staging.abort();
-            Ok((atom("undefined"), None))
+            Ok((Term::atom(arinsal_term::atoms::UNDEFINED), None))
         }
         Outcome::Deleted => {
             crate::beamasm_integration::unpublish_module_exports(vm.code_scope, name);
             crate::trace_bp::module_code_changed(process, vm.code_scope, name);
             // Port of erts/emulator/beam/beam_bif_load.c (staging_epilogue), OTP-29.1.1:
             // successful nonblocking deletes commit only after the caller's code barrier.
-            Ok((atom("true"), staging.end()))
+            Ok((Term::atom(arinsal_term::atoms::TRUE), staging.end()))
         }
     }
 }
@@ -1239,7 +1305,7 @@ fn purge(
 // OTP-29.1.1.
 fn finish_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<Term, VmError> {
     finish_after_on_load(vm, name, keep)?;
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 /// erlang:finish_after_on_load/2 for a caller outside any process (`Vm::eval_scheduled`'s
@@ -1300,7 +1366,9 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 }
 
 fn notsup() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("notsup")))
+    VmError::Trap(exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::NOTSUP,
+    )))
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:1804 (`BIF_P != erts_literal_area_collector`),
@@ -1345,7 +1413,11 @@ fn release_area_switch(
         // finished with the literal snapshot taken before the purge area was set.
         ctx.block_thread_progress(std::time::Duration::ZERO);
     }
-    Ok(atom(if switched { "true" } else { "false" }))
+    Ok(Term::atom(if switched {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    }))
 }
 
 /// Suspend the collector until [`arinsal_pterm::Store::unblock_release`] wakes it, then yield so
@@ -1408,7 +1480,7 @@ fn send_copy_request(
     if signal_result.is_err() {
         super::sys::reply_failed_literal_area_request(process, ctx, args[1], how, target)?;
     }
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 fn dirty_signal_handler(process: &Process, pid: Pid) -> bool {
@@ -1491,7 +1563,12 @@ fn call_values(
             }))
         })()),
         ("erlang", "loaded", 0) => Some({
-            let modules = vm.code.loaded.keys().map(atom).collect::<Vec<_>>();
+            let modules = vm
+                .code
+                .loaded
+                .keys()
+                .map(crate::atom_cache::put)
+                .collect::<Vec<_>>();
             make_list(process, modules)
         }),
         ("erlang", "pre_loaded", 0) => Some(make_list(
@@ -1521,7 +1598,7 @@ fn call_values(
                 "erts_code_purger",
             ]
             .into_iter()
-            .map(atom),
+            .map(crate::atom_cache::put),
         )),
         ("erlang", "function_exported", 3) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
@@ -1600,7 +1677,9 @@ fn call_values(
                 .and_then(|runtime| runtime.reg.whereis_proc_str("erts_code_purger"))
                 == Some(ctx.pid());
             if !allowed {
-                return Err(VmError::Trap(exceptions::Trap::error(atom("notsup"))));
+                return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::NOTSUP,
+                ))));
             }
             let name = module_name(args[0]).ok_or_else(badarg)?;
             let phase = module_name(args[1]).ok_or_else(badarg)?;
@@ -1626,7 +1705,7 @@ fn call_values(
             let pid = Pid::from_term(args[0]).ok_or_else(badarg)?;
             let _name = module_name(args[1]).ok_or_else(badarg)?;
             if pid == ctx.pid() {
-                return Ok(atom("normal"));
+                return Ok(Term::atom(arinsal_term::atoms::NORMAL));
             }
             let known = process
                 .runtime
@@ -1635,7 +1714,7 @@ fn call_values(
             if !known {
                 return Ok(Term::atom(atoms::FALSE));
             }
-            Ok(atom("normal"))
+            Ok(Term::atom(arinsal_term::atoms::NORMAL))
         })()),
         ("erlang", "call_on_load_function", 1) => {
             // A module still waiting on `finish_loading` runs here, on the caller.
@@ -1681,7 +1760,7 @@ fn call_values(
             if let Err(error) = vm.set_position(process, id, target) {
                 return Some(Err(error));
             }
-            Some(Ok(atom("ok")))
+            Some(Ok(Term::atom(arinsal_term::atoms::OK)))
         }
         ("erts_literal_area_collector", "release_area_switch", 0) => {
             Some(release_area_switch(process, ctx))
@@ -1730,7 +1809,12 @@ mod tests {
                 let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(bytes.to_vec()), &mut heap).unwrap()
             };
-            let prepared = prepare(vm, &mut process, &[atom(&beam.module), binary]).unwrap();
+            let prepared = prepare(
+                vm,
+                &mut process,
+                &[crate::atom_cache::put(&beam.module), binary],
+            )
+            .unwrap();
             assert!(process.heap.reserve_stack(1));
             assert!(process.heap.stack_set(0, prepared));
             prepared_count += 1;
@@ -1852,9 +1936,18 @@ mod tests {
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
-        let actual =
-            to_owned(get_coverage(&vm, &mut process, &[atom("function"), atom(module)]).unwrap())
-                .unwrap();
+        let actual = to_owned(
+            get_coverage(
+                &vm,
+                &mut process,
+                &[
+                    Term::atom(arinsal_term::atoms::FUNCTION),
+                    crate::atom_cache::put(module),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
         // BeamAsm native execution currently skips interpreter coverage probes.
         assert_eq!(
             zero_coverage_counts(&actual),
@@ -1890,9 +1983,24 @@ mod tests {
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
-        let line = get_coverage(&vm, &mut process, &[atom("line"), atom(module)]).unwrap();
-        let cover_id =
-            get_coverage(&vm, &mut process, &[atom("cover_id_line"), atom(module)]).unwrap();
+        let line = get_coverage(
+            &vm,
+            &mut process,
+            &[
+                Term::atom(arinsal_term::atoms::LINE),
+                crate::atom_cache::put(module),
+            ],
+        )
+        .unwrap();
+        let cover_id = get_coverage(
+            &vm,
+            &mut process,
+            &[
+                crate::atom_cache::put("cover_id_line"),
+                crate::atom_cache::put(module),
+            ],
+        )
+        .unwrap();
         let actual = to_owned(make_tuple(&mut process, &[line, cover_id]).unwrap()).unwrap();
         // BeamAsm native execution currently skips interpreter coverage probes.
         assert_eq!(
@@ -1900,7 +2008,7 @@ mod tests {
             zero_coverage_counts(&expected)
         );
         assert_eq!(
-            to_owned(reset_coverage(&vm, atom(module)).unwrap()).unwrap(),
+            to_owned(reset_coverage(&vm, crate::atom_cache::put(module)).unwrap()).unwrap(),
             OwnedTerm::Atom("ok".into())
         );
     }
@@ -1925,8 +2033,10 @@ mod tests {
             .unwrap();
         let mut vm = Vm::new([]);
         loaded(&mut vm, &beam);
-        let actual =
-            to_owned(get_debug_info(&vm, &mut Process::new(), atom(module)).unwrap()).unwrap();
+        let actual = to_owned(
+            get_debug_info(&vm, &mut Process::new(), crate::atom_cache::put(module)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(actual, expected);
 
         let debug_module = "code_bifs_debug_chunk";
@@ -1945,9 +2055,15 @@ mod tests {
             .eval("code:get_debug_info(code_bifs_debug_chunk)")
             .unwrap();
         loaded(&mut vm, &debug_beam);
-        let actual =
-            to_owned(get_debug_info(&vm, &mut Process::new(), atom(debug_module)).unwrap())
-                .unwrap();
+        let actual = to_owned(
+            get_debug_info(
+                &vm,
+                &mut Process::new(),
+                crate::atom_cache::put(debug_module),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(actual, expected);
     }
 
@@ -1979,15 +2095,24 @@ mod tests {
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
-        let actual =
-            to_owned(get_coverage(&vm, &mut process, &[atom("function"), atom(module)]).unwrap())
-                .unwrap();
+        let actual = to_owned(
+            get_coverage(
+                &vm,
+                &mut process,
+                &[
+                    Term::atom(arinsal_term::atoms::FUNCTION),
+                    crate::atom_cache::put(module),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
         // BeamAsm native execution currently skips interpreter coverage probes.
         assert_eq!(
             zero_coverage_counts(&actual),
             zero_coverage_counts(&expected)
         );
-        assert!(coverage_mode_from(atom("unknown_mode")).is_none());
+        assert!(coverage_mode_from(crate::atom_cache::put("unknown_mode")).is_none());
     }
 
     #[test]
@@ -2564,7 +2689,7 @@ mod boot_loop1_tests {
             );
             let expected = reference.eval(&expression).unwrap();
             let mut input_heap = VecHeap::new();
-            let name = atom(module);
+            let name = crate::atom_cache::put(module);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
             let mut process = Process::new();
             let prepared = prepare(&Vm::new([]), &mut process, &[name, binary]).unwrap();
@@ -2592,7 +2717,12 @@ mod boot_loop1_tests {
             std::fs::write(&path, &beam).unwrap();
             paths.push(path);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
-            let prepared = prepare(&Vm::new([]), &mut process, &[atom(module), binary]).unwrap();
+            let prepared = prepare(
+                &Vm::new([]),
+                &mut process,
+                &[crate::atom_cache::put(module), binary],
+            )
+            .unwrap();
             assert!(process.heap.reserve_stack(1));
             assert!(process.heap.stack_set(0, prepared));
             prepared_count += 1;

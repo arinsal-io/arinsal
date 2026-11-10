@@ -20,10 +20,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("records", "update", 4),
 ];
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in atom"))
-}
-
 fn atom_name(term: Term) -> Option<String> {
     global_atoms()
         .text(term.as_atom()?)
@@ -31,15 +27,20 @@ fn atom_name(term: Term) -> Option<String> {
 }
 
 fn badarg() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 fn system_limit() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("system_limit")))
+    VmError::Trap(exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::SYSTEM_LIMIT,
+    )))
 }
 
 fn error_with_value(process: &mut Process, reason: &str, value: Term) -> VmError {
-    match TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).tuple(&[atom(reason), value])
+    match TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .tuple(&[crate::atom_cache::put(reason), value])
     {
         Ok(reason) => VmError::Trap(exceptions::Trap::error(reason)),
         Err(_) => system_limit(),
@@ -57,7 +58,7 @@ fn badfield(process: &mut Process, module: Atom, name: Atom, key: Term) -> VmErr
         Ok(value) => value,
         Err(_) => return system_limit(),
     };
-    match builder.tuple(&[atom("badfield"), field_id]) {
+    match builder.tuple(&[Term::atom(arinsal_term::atoms::BADFIELD), field_id]) {
         Ok(reason) => VmError::Trap(exceptions::Trap::error(reason)),
         Err(_) => system_limit(),
     }
@@ -81,10 +82,10 @@ fn create(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     if options.len() != 1 {
         return Err(badarg());
     }
-    let exported = if options[0].0 == atom("is_exported") {
-        if options[0].1 == atom("true") {
+    let exported = if options[0].0 == Term::atom(arinsal_term::atoms::IS_EXPORTED) {
+        if options[0].1 == Term::atom(arinsal_term::atoms::TRUE) {
             true
-        } else if options[0].1 == atom("false") {
+        } else if options[0].1 == Term::atom(arinsal_term::atoms::FALSE) {
             false
         } else {
             return Err(badarg());
@@ -124,7 +125,7 @@ fn update(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let Some(snapshot) = args[0].record_snapshot() else {
         return Err(error_with_value(process, "badrecord", args[0]));
     };
-    let wildcard = atom("_");
+    let wildcard = Term::atom(arinsal_term::atoms::UNDERSCORE);
     if args[2] != wildcard {
         let (Some(module), Some(name)) = (args[1].as_atom(), args[2].as_atom()) else {
             return Err(error_with_value(process, "badrecord", args[2]));
@@ -213,7 +214,7 @@ fn definition(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
     }
     let mut builder = TermBuilder::new(&mut heap);
     let options = builder
-        .flatmap_from_pairs(&[(atom("is_exported"), is_exported)])
+        .flatmap_from_pairs(&[(Term::atom(arinsal_term::atoms::IS_EXPORTED), is_exported)])
         .map_err(|_| system_limit())?;
     let mut fields = Vec::with_capacity(defaults.len());
     for (field, default) in defaults {

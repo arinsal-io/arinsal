@@ -7,7 +7,7 @@
 //! (db_select_continue_tree_common, db_select_chunk_tree_common, ets_select_reverse),
 //! OTP-29.1.1.
 
-use super::{atom, badarg, list, tuple_items};
+use super::{badarg, list, tuple_items};
 use crate::VmError;
 use arinsal_ets::match_spec::MatchProgram;
 use arinsal_ets::{SavedKey, SavedMatches, ScanPosition};
@@ -170,11 +170,11 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
     }
     if kept {
         let pair = TermBuilder::new(heap)
-            .tuple(&[matches, atom("$end_of_table")])
+            .tuple(&[matches, Term::atom(arinsal_term::atoms::EOT)])
             .map_err(|_| badarg())?;
         return Ok(pair);
     }
-    Ok(atom("$end_of_table"))
+    Ok(Term::atom(arinsal_term::atoms::EOT))
 }
 
 /// The continuation an ordered table's chunk returns once `ets:reverse/3` has its results.

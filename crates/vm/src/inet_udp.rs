@@ -93,10 +93,6 @@ const F_OPEN: u32 = 0x0001;
 const F_ACTIVE: u32 = 0x0004;
 const INFINITY: u32 = 0xffff_ffff;
 
-fn atom(name: &'static str) -> Term {
-    crate::atom_cache::atom(name)
-}
-
 /// `driver_flags` of `udp_inet_driver_entry`: `ERL_DRV_FLAG_USE_PORT_LOCKING`.
 const DRIVER_FLAGS: i32 = 1 << 0;
 
@@ -1749,8 +1745,11 @@ fn emit(sock: &Sock, out: Out) {
             with_anc,
         } => {
             let data = passive_data(&mut heap, packet, *binary, *header, *with_anc);
-            let status =
-                data.and_then(|data| TermBuilder::new(&mut heap).tuple(&[atom("ok"), data]).ok());
+            let status = data.and_then(|data| {
+                TermBuilder::new(&mut heap)
+                    .tuple(&[Term::atom(arinsal_term::atoms::OK), data])
+                    .ok()
+            });
             status.and_then(|status| {
                 message_async(&mut heap, port, *aref, status).map(|term| (*caller, term))
             })
@@ -1759,12 +1758,12 @@ fn emit(sock: &Sock, out: Out) {
             let status = if let Some(reason) = error {
                 error_tuple(&mut heap, reason)
             } else {
-                Some(atom("ok"))
+                Some(Term::atom(arinsal_term::atoms::OK))
             };
             let tag = TermBuilder::new(&mut heap).local_ref(*ids).ok();
             match (status, tag) {
                 (Some(status), Some(tag)) => TermBuilder::new(&mut heap)
-                    .tuple(&[atom("inet_reply"), port, status, tag])
+                    .tuple(&[crate::inet_drv::am().inet_reply, port, status, tag])
                     .ok()
                     .map(|term| (*caller, term)),
                 _ => None,
@@ -1779,11 +1778,15 @@ fn emit(sock: &Sock, out: Out) {
         } => active_message(&mut heap, port, packet, *binary, *header, *with_anc)
             .map(|term| (*owner, term)),
         Out::UdpPassive { owner } => TermBuilder::new(&mut heap)
-            .tuple(&[atom("udp_passive"), port])
+            .tuple(&[crate::inet_drv::am().udp_passive, port])
             .ok()
             .map(|term| (*owner, term)),
         Out::UdpError { owner, reason } => TermBuilder::new(&mut heap)
-            .tuple(&[atom("udp_error"), port, atom(reason)])
+            .tuple(&[
+                crate::inet_drv::am().udp_error,
+                port,
+                crate::atom_cache::put(reason),
+            ])
             .ok()
             .map(|term| (*owner, term)),
     };
@@ -1798,7 +1801,7 @@ fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) ->
     // Port of inet_drv.c:2493 (send_async_ok / send_async_error), OTP-29.1.1.
     TermBuilder::new(heap)
         .tuple(&[
-            atom("inet_async"),
+            crate::inet_drv::am().inet_async,
             port,
             Term::small(i64::from(aref)).unwrap(),
             status,
@@ -1808,7 +1811,10 @@ fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) ->
 
 fn error_tuple(heap: &mut ProcessHeap, reason: &'static str) -> Option<Term> {
     TermBuilder::new(heap)
-        .tuple(&[atom("error"), atom(reason)])
+        .tuple(&[
+            Term::atom(arinsal_term::atoms::ERROR),
+            crate::atom_cache::put(reason),
+        ])
         .ok()
 }
 
@@ -1846,11 +1852,11 @@ fn active_message(
     if with_anc {
         let anc = anc_term(heap, &packet.anc)?;
         TermBuilder::new(heap)
-            .tuple(&[atom("udp"), port, ip, udp_port, anc, data])
+            .tuple(&[crate::inet_drv::am().udp, port, ip, udp_port, anc, data])
             .ok()
     } else {
         TermBuilder::new(heap)
-            .tuple(&[atom("udp"), port, ip, udp_port, data])
+            .tuple(&[crate::inet_drv::am().udp, port, ip, udp_port, data])
             .ok()
     }
 }
@@ -1886,7 +1892,9 @@ fn load_address(heap: &mut ProcessHeap, addr: &[u8]) -> Option<(Term, Term)> {
                 return None;
             }
             let path = TermBuilder::new(heap).binary(&addr[2..2 + n]).ok()?;
-            let local = TermBuilder::new(heap).tuple(&[atom("local"), path]).ok()?;
+            let local = TermBuilder::new(heap)
+                .tuple(&[Term::atom(arinsal_term::atoms::LOCAL), path])
+                .ok()?;
             Some((local, Term::small(0)?))
         }
         _ => None,
@@ -1923,7 +1931,7 @@ fn anc_term(heap: &mut ProcessHeap, anc: &[Anc]) -> Option<Term> {
             Anc::Tclass(v) => ("tclass", *v),
         };
         let pair = TermBuilder::new(heap)
-            .tuple(&[atom(name), Term::small(i64::from(val))?])
+            .tuple(&[crate::atom_cache::put(name), Term::small(i64::from(val))?])
             .ok()?;
         items.push(pair);
     }

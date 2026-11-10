@@ -64,12 +64,10 @@ pub(crate) fn seed(vars: &[(String, String)]) {
     }
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("built-in atom"))
-}
-
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
 
 /// `os` environment BIFs this family dispatches. The match below is this table.
@@ -223,7 +221,7 @@ fn getenv_one(process: &mut Process, name: Term) -> Result<Term, VmError> {
         .find(|(key, _)| *key == name)
     {
         Some((_, value)) => string(process, &value.to_string_lossy()),
-        None => Ok(atom("false")),
+        None => Ok(Term::atom(arinsal_term::atoms::FALSE)),
     }
 }
 
@@ -240,7 +238,7 @@ fn putenv(process: &mut Process, name: Term, value: Term) -> Result<Term, VmErro
         env.push((name, value));
     }
     let _ = process;
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn unsetenv(_process: &mut Process, name: Term) -> Result<Term, VmError> {
@@ -249,7 +247,7 @@ fn unsetenv(_process: &mut Process, name: Term) -> Result<Term, VmError> {
         .write()
         .unwrap()
         .retain(|(key, _)| *key != name);
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 /// Runtime that receives a handled signal; the server pid is resolved per delivery.
@@ -324,7 +322,7 @@ fn set_signal(
     };
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let server = SignalTarget { runtime };
-    if action == atom("handle") {
+    if action == Term::atom(arinsal_term::atoms::HANDLE) {
         // POSIX cannot catch SIGSTOP; erts accepts the request and the kernel keeps stopping.
         // Port of erts/emulator/sys/unix/sys.c:754 (erts_set_signal), OTP-29.1.1.
         if signal_num != libc::SIGSTOP {
@@ -335,13 +333,17 @@ fn set_signal(
             )?;
         }
         targets().lock().unwrap().insert(signal_num, server);
-    } else if action == atom("default") || action == atom("ignore") {
+    } else if action == Term::atom(arinsal_term::atoms::DEFAULT)
+        || action == Term::atom(arinsal_term::atoms::IGNORE)
+    {
         targets().lock().unwrap().remove(&signal_num);
         if signal_num != libc::SIGSTOP {
             // erts ignores SIGCHLD safely because erl_child_setup reaps port children; here the
             // VM waits for them itself, and SIG_IGN would auto-reap them (waitpid -> ECHILD).
             // The default disposition of SIGCHLD already discards the signal.
-            let handler = if action == atom("default") || signal_num == libc::SIGCHLD {
+            let handler = if action == Term::atom(arinsal_term::atoms::DEFAULT)
+                || signal_num == libc::SIGCHLD
+            {
                 libc::SIG_DFL
             } else {
                 libc::SIG_IGN
@@ -351,7 +353,7 @@ fn set_signal(
     } else {
         return Err(badarg());
     }
-    Ok(atom("ok"))
+    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 /// `+Bi`: ignore the signals a terminal sends for Ctrl+C, Ctrl+Backslash and Ctrl+Z.
@@ -497,7 +499,10 @@ fn deliver_signal(target: SignalTarget, signal: i32) {
     };
     let mut heap = ProcessHeap::with_words(8);
     let message = TermBuilder::new(&mut heap)
-        .tuple(&[atom("notify"), atom(name)])
+        .tuple(&[
+            Term::atom(arinsal_term::atoms::NOTIFY),
+            crate::atom_cache::put(name),
+        ])
         .ok()
         .and_then(|term| Message::copy_from(term).ok());
     if let Some(message) = message {
