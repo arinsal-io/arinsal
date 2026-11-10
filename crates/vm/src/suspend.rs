@@ -210,7 +210,11 @@ pub(crate) fn send_sync_suspend(
         async_: asynchronous,
     }));
     if send_signal(process, me, target, signal).is_err() {
-        let gone = crate::signals::atom(if asynchronous { "badarg" } else { "exited" });
+        let gone = Term::atom(if asynchronous {
+            arinsal_term::atoms::BADARG
+        } else {
+            arinsal_term::atoms::EXITED
+        });
         let message = process.tuple(&[tag, gone])?;
         // Not a traced `!`: the reply is queued without a send trace (erl_proc_sig_queue.c:3237).
         process.inbox.push_back(message);
@@ -242,7 +246,7 @@ pub(crate) fn sync_reply(
         None
     };
     let result = match atom {
-        Some(name) => crate::signals::atom(name),
+        Some(name) => crate::atom_cache::put(name),
         None => Term::atom(arinsal_term::Atom(reply)),
     };
     let tag = tag.into_receiver(process)?;

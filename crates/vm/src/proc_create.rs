@@ -1301,8 +1301,6 @@ pub(crate) struct SliceWork {
     pub(crate) sys_tasks_deferred: bool,
     /// A process-local BIF trap waiting for its private continuation export.
     pub(crate) bif_trap: Option<BifTrapPending>,
-    /// Spawned MFA entry that resolves to a runtime BIF export.
-    pub(crate) initial_bif: Option<(String, String, u8)>,
     /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
     /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
     pub(crate) delayed_gc: Vec<DelayedGc>,
@@ -1336,7 +1334,6 @@ impl SliceWork {
     #[inline]
     pub(crate) fn any(&self) -> bool {
         self.native_dirty_nif.is_some()
-            || self.initial_bif.is_some()
             || self.dirty_sys_gc
             || self.hibernate_sched
             || self.timer_pause.is_some()
@@ -3038,7 +3035,6 @@ mod layout_report {
         field!("flags", ProcFlags);
         field!("btreeset", std::collections::BTreeSet<u64>);
         field!("suspend_map", std::collections::BTreeMap<arinsal_sched::Pid, std::sync::Arc<crate::suspend::SuspendMonitor>>);
-        field!("initial_bif", Option<(String, String, u8)>);
         field!(
             "native_dirty_nif",
             Option<(usize, usize, arinsal_bifs::SchedulerClass)>

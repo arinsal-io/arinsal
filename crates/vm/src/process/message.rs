@@ -300,10 +300,10 @@ impl Message {
         let request = TermBuilder::new(&mut heap)
             .tuple(&[
                 area,
-                crate::signals::atom(match how {
-                    arinsal_sched::LiteralCopyHow::Init => "init",
-                    arinsal_sched::LiteralCopyHow::CheckGc => "check_gc",
-                    arinsal_sched::LiteralCopyHow::NeedGc => "need_gc",
+                Term::atom(match how {
+                    arinsal_sched::LiteralCopyHow::Init => arinsal_term::atoms::INIT,
+                    arinsal_sched::LiteralCopyHow::CheckGc => arinsal_term::atoms::CHECK_GC,
+                    arinsal_sched::LiteralCopyHow::NeedGc => arinsal_term::atoms::NEED_GC,
                 }),
                 target,
             ])
@@ -336,7 +336,11 @@ impl Message {
             ));
         };
         self.term = TermBuilder::new(heap)
-            .tuple(&[crate::signals::atom("copy_literals"), self.term, result])
+            .tuple(&[
+                Term::atom(arinsal_term::atoms::COPY_LITERALS),
+                self.term,
+                result,
+            ])
             .map_err(|error| VmError::Unsupported(format!("literal-copy reply: {error:?}")))?;
         Ok(self)
     }

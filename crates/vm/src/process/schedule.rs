@@ -201,7 +201,7 @@ impl Task for Process {
                             self.runtime,
                             pid,
                             link,
-                            crate::signals::atom("noproc"),
+                            Term::atom(arinsal_term::atoms::NOPROC),
                         );
                     }
                 }
@@ -239,7 +239,9 @@ impl Task for Process {
                     let arinsal_sched::LiteralAreaCopyRequest {
                         request, requester, ..
                     } = *copy;
-                    if let Ok(reply) = request.literal_copy_reply(crate::signals::atom("ok")) {
+                    if let Ok(reply) =
+                        request.literal_copy_reply(Term::atom(arinsal_term::atoms::OK))
+                    {
                         literal_replies.push((requester, reply));
                     }
                 }
@@ -271,7 +273,7 @@ impl Task for Process {
             let _ = scheduler.signal(pid, requester, Signal::UnlinkAckSignal(id));
         }
         for linker in links {
-            if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
+            if let Ok(reason) = Message::copy_from(Term::atom(arinsal_term::atoms::NOPROC)) {
                 // A link exit (erts_proc_exit_handle_link), so the linker drops its half.
                 let _ = scheduler.signal(pid, linker, Signal::ExitLinked(Box::new(reason)));
             }
@@ -279,7 +281,7 @@ impl Task for Process {
         for (reference, watcher) in monitors {
             let reason = self
                 .final_exit_reason
-                .unwrap_or_else(|| crate::signals::atom("noproc"));
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::NOPROC));
             let Ok(reason) = Message::copy_from(reason) else {
                 continue;
             };
@@ -443,7 +445,7 @@ impl Process {
                 runtime,
                 ctx,
                 data,
-                crate::signals::atom("killed"),
+                Term::atom(arinsal_term::atoms::KILLED),
                 entry_result,
                 1,
             );

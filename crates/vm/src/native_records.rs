@@ -72,7 +72,7 @@ fn report(process: &mut Process, failure: Failure) {
         }
     };
     match value
-        .and_then(|value| crate::exceptions::tuple(process, &[crate::signals::atom(tag), value]))
+        .and_then(|value| crate::exceptions::tuple(process, &[crate::atom_cache::put(tag), value]))
     {
         Ok(reason) => {
             process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;

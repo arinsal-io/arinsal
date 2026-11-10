@@ -1752,9 +1752,9 @@ impl arinsal_ets::match_spec::MatchContext for ProcessMatchContext {
         match name {
             "get_seq_token" => Ok(self.2),
             "is_seq_trace" => Ok(if self.2 == Term::NIL {
-                crate::signals::atom("false")
+                Term::atom(arinsal_term::atoms::FALSE)
             } else {
-                crate::signals::atom("true")
+                Term::atom(arinsal_term::atoms::TRUE)
             }),
             _ => Err(arinsal_ets::EtsError::BadArg),
         }

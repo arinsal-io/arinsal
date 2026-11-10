@@ -331,9 +331,9 @@ impl Process {
             via_prio_alias = want_priority;
             Some(Pid::from_data(pid_data))
         } else if crate::signals::ref_id(target).is_some() {
-            return Err(VmError::Trap(crate::exceptions::Trap::error(
-                crate::signals::atom("badarg"),
-            )));
+            return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::BADARG,
+            ))));
         } else if let Some(name) = target.as_atom() {
             let runtime = self
                 .runtime
@@ -360,8 +360,8 @@ impl Process {
                         return Err(VmError::Unsupported(REMOTE_SEND_NEEDS_CONTEXT.into()));
                     }
                     let port = Term::port(id).ok_or_else(|| {
-                        VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                            "badarg",
+                        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                            arinsal_term::atoms::BADARG,
                         )))
                     })?;
                     if let Some(ctx) = ctx.as_deref_mut() {
@@ -400,13 +400,13 @@ impl Process {
             }
             pid
         } else {
-            return Err(VmError::Trap(crate::exceptions::Trap::error(
-                crate::signals::atom("badarg"),
-            )));
+            return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::BADARG,
+            ))));
         };
         let pid = pid.ok_or_else(|| {
-            VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                "badarg",
+            VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::BADARG,
             )))
         })?;
         // Port of erts/emulator/beam/erl_trace.c:824-832 (trace_send), OTP-29.1.1.

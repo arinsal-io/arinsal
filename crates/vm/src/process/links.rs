@@ -139,7 +139,7 @@ impl Process {
                             self.runtime,
                             ctx.pid(),
                             half,
-                            crate::signals::atom("noproc"),
+                            Term::atom(arinsal_term::atoms::NOPROC),
                         );
                     } else {
                         let _ = ctx.signal(from, Signal::MonitorNoproc(reference));
@@ -162,7 +162,7 @@ impl Process {
                             self.runtime,
                             ctx.pid(),
                             link,
-                            crate::signals::atom("noproc"),
+                            Term::atom(arinsal_term::atoms::NOPROC),
                         );
                     }
                 }
@@ -175,7 +175,8 @@ impl Process {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
                     // (erts_proc_exit_handle_signal), OTP-29.1.1: a link reaching an
                     // exiting process is rejected with `noproc`.
-                    if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
+                    if let Ok(reason) = Message::copy_from(Term::atom(arinsal_term::atoms::NOPROC))
+                    {
                         let _ = ctx.signal(from, Signal::ExitLinked(Box::new(reason)));
                     }
                 }
@@ -330,7 +331,7 @@ impl Process {
             arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         } else {
-            crate::signals::atom("DOWN")
+            Term::atom(arinsal_term::atoms::DOWN)
         };
         let name = info.and_then(|info| info.name().map(str::to_owned));
         let reference = match entry
@@ -354,7 +355,7 @@ impl Process {
                     })?
                 }
             };
-            (crate::signals::atom("port"), object)
+            (Term::atom(arinsal_term::atoms::PORT), object)
         } else if let Some(object) = info.and_then(crate::dist::remote_object) {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c (convert_to_down_message and
             // erts_proc_sig_send_dist_monitor_down), OTP-29.1.1: the external pid, or
@@ -362,13 +363,13 @@ impl Process {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
             let object = arinsal_term::from_owned(&object, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))?;
-            (crate::signals::atom("process"), object)
+            (Term::atom(arinsal_term::atoms::PROCESS), object)
         } else {
             let from = from
                 .to_term()
                 .ok_or_else(|| VmError::Unsupported("invalid monitor sender pid".into()))?;
             (
-                crate::signals::atom("process"),
+                Term::atom(arinsal_term::atoms::PROCESS),
                 crate::signals::monitor_object(self, name.as_deref(), from)?,
             )
         };
@@ -407,7 +408,7 @@ pub(super) fn down_message_on_sender(
             arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         }
-        None => crate::signals::atom("DOWN"),
+        None => Term::atom(arinsal_term::atoms::DOWN),
     };
     let reference_term = match reference_creator {
         Some(owner) => crate::signals::pid_reference(process, reference, Pid::from_data(owner))?,
@@ -423,7 +424,7 @@ pub(super) fn down_message_on_sender(
             .tuple(&[
                 tag,
                 reference_term,
-                crate::signals::atom("process"),
+                Term::atom(arinsal_term::atoms::PROCESS),
                 object,
                 reason,
             ])

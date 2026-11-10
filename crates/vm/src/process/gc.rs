@@ -173,7 +173,7 @@ impl Process {
                 return;
             };
             let Ok(tuple) =
-                TermBuilder::new(&mut scratch).tuple(&[crate::signals::atom(name), value])
+                TermBuilder::new(&mut scratch).tuple(&[crate::atom_cache::put(name), value])
             else {
                 return;
             };

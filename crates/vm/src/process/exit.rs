@@ -14,12 +14,12 @@ pub(super) fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
             } else {
                 let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                 arinsal_term::from_owned(&raised.reason, &mut heap)
-                    .unwrap_or_else(|_| crate::signals::atom("system_limit"))
+                    .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
             }
         }
         // These host-side failures have no BEAM exception value. Keep the process exit term valid
         // while matching the VM's existing generic `error` exit behavior.
-        _ => crate::signals::atom("error"),
+        _ => Term::atom(arinsal_term::atoms::ERROR),
     };
     process.heap.abi.exc.fvalue = value.tagged_word();
     if !matches!(error, VmError::Raised(raised) if raised.class == arinsal_bifs::Class::Error) {
@@ -36,7 +36,7 @@ pub(super) fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
     let stacktrace = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         arinsal_term::from_owned(&raised.stack, &mut heap)
-            .unwrap_or_else(|_| crate::signals::atom("system_limit"))
+            .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
     };
     process.heap.abi.exc.ftrace = stacktrace.tagged_word();
     // Converting the detached stacktrace may collect, so reload rooted terms before building.
@@ -44,7 +44,7 @@ pub(super) fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
     let stacktrace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
     process
         .tuple(&[value, stacktrace])
-        .unwrap_or_else(|_| crate::signals::atom("system_limit"))
+        .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
 }
 
 impl Process {
@@ -276,7 +276,7 @@ impl Process {
                     let message_term = tab.and_then(|tab| {
                         let from = ctx.pid().to_term().ok_or(arinsal_term::TermError::BadArg)?;
                         arinsal_term::TermBuilder::new(&mut heap).tuple(&[
-                            crate::signals::atom("ETS-TRANSFER"),
+                            Term::atom(arinsal_term::atoms::ETS_TRANSFER),
                             tab,
                             from,
                             heir.data,
@@ -553,7 +553,7 @@ pub(super) fn report_process_error(
         return;
     };
     let destination = crate::natives::sys::system_logger(process);
-    let logger = if destination == crate::signals::atom("undefined") {
+    let logger = if destination == Term::atom(arinsal_term::atoms::UNDEFINED) {
         None
     } else if let Some(pid) = Pid::from_term(destination) {
         Some(pid)
@@ -603,10 +603,13 @@ pub(super) fn report_process_error(
         let logger_metadata = builder
             .flatmap_from_pairs(&[
                 (
-                    crate::signals::atom("emulator"),
-                    crate::signals::atom("true"),
+                    Term::atom(arinsal_term::atoms::EMULATOR),
+                    Term::atom(arinsal_term::atoms::TRUE),
                 ),
-                (crate::signals::atom("tag"), crate::signals::atom("error")),
+                (
+                    Term::atom(arinsal_term::atoms::TAG),
+                    Term::atom(arinsal_term::atoms::ERROR),
+                ),
             ])
             .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
         let group_leader = process
@@ -621,16 +624,19 @@ pub(super) fn report_process_error(
             .unwrap_or(Term::NIL);
         let metadata = builder
             .flatmap_from_pairs(&[
-                (crate::signals::atom("error_logger"), logger_metadata),
-                (crate::signals::atom("gl"), group_leader),
-                (crate::signals::atom("pid"), pid),
-                (crate::signals::atom("time"), time),
+                (
+                    Term::atom(arinsal_term::atoms::ERROR_LOGGER),
+                    logger_metadata,
+                ),
+                (crate::atom_cache::put("gl"), group_leader),
+                (Term::atom(arinsal_term::atoms::PID), pid),
+                (Term::atom(arinsal_term::atoms::TIME), time),
             ])
             .map_err(|error| VmError::Unsupported(format!("logger event metadata: {error:?}")))?;
         builder
             .tuple(&[
-                crate::signals::atom("log"),
-                crate::signals::atom("error"),
+                Term::atom(arinsal_term::atoms::LOG),
+                Term::atom(arinsal_term::atoms::ERROR),
                 format,
                 args,
                 metadata,

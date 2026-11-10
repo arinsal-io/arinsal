@@ -754,8 +754,8 @@ impl Process {
             return Ok(None);
         }
         let timeout_value = || {
-            VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                "timeout_value",
+            VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::TIMEOUT_VALUE,
             )))
         };
         // Port of erts/emulator/beam/erl_hl_timer.c:2786-2806 (erts_set_proc_timer_term:

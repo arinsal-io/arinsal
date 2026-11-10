@@ -46,7 +46,8 @@ pub extern "C" fn arinsal_beamasm_raise_class(
         Some(arinsal_bifs::Class::Exit) => reraise | arinsal_beamasm::exc::EXTAG_EXIT,
         Some(arinsal_bifs::Class::Throw) => reraise | arinsal_beamasm::exc::EXTAG_THROWN,
         None => {
-            process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::signals::atom("badarg"));
+            process.heap.abi.exc.fvalue =
+                crate::native_hooks::raw(Term::atom(arinsal_term::atoms::BADARG));
             arinsal_beamasm::exc::EXC_ERROR
         }
     }
@@ -509,7 +510,11 @@ pub(crate) fn static_nif_job(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::calls::call_bif(heap, entry, &args)
             }))
-            .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))))
+            .unwrap_or_else(|_| {
+                Err(arinsal_bifs::BifError::Error(Term::atom(
+                    arinsal_term::atoms::ERROR,
+                )))
+            })
         };
         match pinned_caller {
             Some(caller) => arinsal_nif_zlib::with_caller(caller, run),
@@ -539,7 +544,7 @@ pub(crate) fn run_static_nif(
     });
     let Some((module, function, arity, entry)) = nif else {
         return Err(crate::VmError::Trap(crate::exceptions::Trap::error(
-            crate::signals::atom("undef"),
+            Term::atom(arinsal_term::atoms::UNDEF),
         )));
     };
     crate::natives::nif::refresh_hub_native(process);
@@ -561,7 +566,11 @@ pub(crate) fn run_static_nif(
             Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
             None => crate::calls::call_bif(&mut process.heap, entry, &args),
         }))
-        .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error")))),
+        .unwrap_or_else(|_| {
+            Err(arinsal_bifs::BifError::Error(Term::atom(
+                arinsal_term::atoms::ERROR,
+            )))
+        }),
     };
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
@@ -576,7 +585,7 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
         .and_then(|cold| cold.nif_pending.take().map(|boxed| *boxed))
     else {
         return Err(crate::VmError::Trap(crate::exceptions::Trap::error(
-            crate::signals::atom("undef"),
+            Term::atom(arinsal_term::atoms::UNDEF),
         )));
     };
     let (module, function, arity) = {
@@ -588,7 +597,11 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::natives::nif::resume_pending(&mut process.heap, pending)
     }))
-    .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))));
+    .unwrap_or_else(|_| {
+        Err(arinsal_bifs::BifError::Error(Term::atom(
+            arinsal_term::atoms::ERROR,
+        )))
+    });
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 
@@ -1386,11 +1399,11 @@ fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool)
             .and_then(|handle| handle.access_timer(key, cancel))
     {
         let term = if !info {
-            crate::signals::atom("ok")
+            Term::atom(arinsal_term::atoms::OK)
         } else {
             remaining
                 .and_then(|ms| Term::small(ms as i64))
-                .unwrap_or_else(|| crate::signals::atom("false"))
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::FALSE))
         };
         process.x[0] = term;
         return Some(crate::native_hooks::raw(term));
@@ -3896,7 +3909,7 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
 /// Raises `error:{Tag, Value}` from a native helper.
 fn set_tagged_error(process: &mut crate::Process, tag: &str, value: Term) {
     let tuple = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
-        .tuple(&[crate::signals::atom(tag), value]);
+        .tuple(&[crate::atom_cache::put(tag), value]);
     match tuple {
         Ok(reason) => {
             process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
@@ -3919,7 +3932,7 @@ pub(crate) fn set_native_error_info(
         _ => arinsal_beamasm::exc::EXC_ERROR,
     };
     let Some(info) = info else {
-        process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::signals::atom(reason));
+        process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::atom_cache::put(reason));
         return;
     };
     let Ok(info) = arinsal_term::from_owned(
@@ -4019,13 +4032,17 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
                 } else {
                     0
                 },
-            cause.unwrap_or_else(|| crate::signals::atom("badarg")),
+            cause.unwrap_or_else(|| Term::atom(arinsal_term::atoms::BADARG)),
             0,
         ),
-        BifError::Badarith => (exc::EXC_BADARITH, crate::signals::atom("badarith"), 0),
+        BifError::Badarith => (
+            exc::EXC_BADARITH,
+            Term::atom(arinsal_term::atoms::BADARITH),
+            0,
+        ),
         BifError::SystemLimit => (
             exc::EXC_SYSTEM_LIMIT,
-            crate::signals::atom("system_limit"),
+            Term::atom(arinsal_term::atoms::SYSTEM_LIMIT),
             0,
         ),
         BifError::Error(reason) => (exc::EXC_ERROR, *reason, 0),
@@ -4043,8 +4060,8 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
             *reason,
             stacktrace.map_or(0, Term::word),
         ),
-        BifError::Unsupported(_) => (exc::EXC_UNDEF, crate::signals::atom("undef"), 0),
-        BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup"), 0),
+        BifError::Unsupported(_) => (exc::EXC_UNDEF, Term::atom(arinsal_term::atoms::UNDEF), 0),
+        BifError::Dirty(_) => (exc::EXC_NOTSUP, Term::atom(arinsal_term::atoms::NOTSUP), 0),
         BifError::DirtyTrap => unreachable!("dirty BIF trap is handled by process apply"),
     };
     process.heap.abi.exc.freason = freason;
@@ -4900,7 +4917,7 @@ fn set_bs_append_error(process: &mut crate::Process, detail: &str, reason: &str)
         "system_limit" => arinsal_beamasm::exc::EXC_SYSTEM_LIMIT,
         _ => arinsal_beamasm::exc::EXC_BADARG,
     };
-    process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::signals::atom(detail));
+    process.heap.abi.exc.fvalue = crate::native_hooks::raw(crate::atom_cache::put(detail));
 }
 
 // Port of erts/emulator/beam/erl_bits.c:1725-1917 (`erts_bs_append_checked`), OTP-29.1.1.

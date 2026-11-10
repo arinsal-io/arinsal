@@ -194,7 +194,13 @@ fn report_max_heap(
         return;
     };
     let group_leader = process.group_leader.and_then(Pid::to_term);
-    let bool_atom = |on: bool| crate::signals::atom(if on { "true" } else { "false" });
+    let bool_atom = |on: bool| {
+        Term::atom(if on {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        })
+    };
     let built = (|| -> Result<Term, VmError> {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
@@ -210,7 +216,7 @@ fn report_max_heap(
             Term::small(limit.size as i64).unwrap_or(Term::NIL),
             Term::small(used as i64).unwrap_or(Term::NIL),
             bool_atom(limit.kill),
-            crate::signals::atom("true"),
+            Term::atom(arinsal_term::atoms::TRUE),
             Term::small(process.inbox.len() as i64).unwrap_or(Term::NIL),
             Term::NIL,
             Term::NIL,
@@ -226,30 +232,33 @@ fn report_max_heap(
         let el_tag = builder
             .flatmap_from_pairs(&[
                 (
-                    crate::signals::atom("emulator"),
-                    crate::signals::atom("true"),
+                    Term::atom(arinsal_term::atoms::EMULATOR),
+                    Term::atom(arinsal_term::atoms::TRUE),
                 ),
-                (crate::signals::atom("tag"), crate::signals::atom("error")),
+                (
+                    Term::atom(arinsal_term::atoms::TAG),
+                    Term::atom(arinsal_term::atoms::ERROR),
+                ),
             ])
             .map_err(|error| VmError::Unsupported(format!("logger tag map: {error:?}")))?;
         let mut pairs = vec![
-            (crate::signals::atom("error_logger"), el_tag),
+            (Term::atom(arinsal_term::atoms::ERROR_LOGGER), el_tag),
             (
-                crate::signals::atom("time"),
+                Term::atom(arinsal_term::atoms::TIME),
                 Term::small(micros).unwrap_or(Term::NIL),
             ),
         ];
         if let Some(gl) = group_leader {
-            pairs.push((crate::signals::atom("gl"), gl));
+            pairs.push((crate::atom_cache::put("gl"), gl));
         }
-        pairs.push((crate::signals::atom("pid"), pid));
+        pairs.push((Term::atom(arinsal_term::atoms::PID), pid));
         let meta = builder
             .flatmap_from_pairs(&pairs)
             .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
         builder
             .tuple(&[
-                crate::signals::atom("log"),
-                crate::signals::atom("error"),
+                Term::atom(arinsal_term::atoms::LOG),
+                Term::atom(arinsal_term::atoms::ERROR),
                 format,
                 args,
                 meta,

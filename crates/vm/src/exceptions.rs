@@ -165,7 +165,7 @@ impl Trap {
         Self {
             export: None,
             class: Class::Exit,
-            reason: crate::signals::atom("killed"),
+            reason: Term::atom(arinsal_term::atoms::KILLED),
             trace: None,
             top: None,
             raw_rethrow: false,

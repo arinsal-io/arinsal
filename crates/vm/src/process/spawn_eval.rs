@@ -73,8 +73,6 @@ impl Runtime {
                 .links
                 .insert(crate::proc_create::process_link(linker, false));
         }
-        let initial_bif = arinsal_bifs::lookup(module, function, arity).is_some()
-            || arinsal_spec::bif_lookup(module, function, arity).is_some();
         let copied_args = arinsal_term::copy_struct_litopt(
             decoded_args,
             &mut arinsal_bifs::ProcessHeapHandle(&mut child.heap),
@@ -83,16 +81,9 @@ impl Runtime {
         )
         .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?;
         drop(decoded);
-        if initial_bif {
-            let copied = crate::signals::list(copied_args)
-                .filter(|copied| copied.len() == usize::from(arity))
-                .ok_or_else(|| VmError::Unsupported("spawned BIF argument list".into()))?;
-            child.slice_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
-            child.x[..copied.len()].copy_from_slice(&copied);
-            child.initial_mfa = Some((module_atom, function_atom, arity));
-        } else {
-            child.start_at_run_process(module_atom, function_atom, copied_args, arity)?;
-        }
+        // erl_create_process: every MFA, a BIF's too, starts at beam_run_process, which
+        // applies X0..X2 through the export.
+        child.start_at_run_process(module_atom, function_atom, copied_args, arity)?;
         let scheduler = self.scheduler()?;
         let Some(monitor) = monitor else {
             return scheduler
@@ -172,7 +163,7 @@ impl Vm {
                 arinsal_sched::Priority::Normal => "normal",
                 arinsal_sched::Priority::Low => "low",
             };
-            crate::natives::proc::set_flag(&mut process, "priority", crate::signals::atom(name));
+            crate::natives::proc::set_flag(&mut process, "priority", crate::atom_cache::put(name));
         }
         // erl_init creates system processes on the boot scheduler, before other
         // schedulers have left scheduler_wait. Spreading them wakes those
@@ -317,9 +308,9 @@ impl Vm {
             .export(function, args.len() as u8)
             .is_none()
         {
-            return Err(VmError::Trap(crate::exceptions::Trap::error(
-                crate::signals::atom("undef"),
-            )));
+            return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                arinsal_term::atoms::UNDEF,
+            ))));
         }
         let (sender, receiver) = mpsc::channel();
         if let Some(runtime) = self.runtime
@@ -627,7 +618,7 @@ fn mfa_atoms(
     function: &str,
     arity: u8,
 ) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u8)> {
-    let module = crate::signals::atom(module).as_atom()?;
-    let function = crate::signals::atom(function).as_atom()?;
+    let module = crate::atom_cache::put(module).as_atom()?;
+    let function = crate::atom_cache::put(function).as_atom()?;
     Some((module, function, arity))
 }

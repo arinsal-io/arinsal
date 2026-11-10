@@ -351,7 +351,7 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
                 // Port of erts/emulator/beam/erl_db_util.c:1622-1626 and :4857-4893,
                 // OTP-29.1.1: `message` returns its value to the match runner, while `true`
                 // means no extra trace payload. Later message actions replace earlier ones.
-                if value == crate::signals::atom("true") {
+                if value == Term::atom(arinsal_term::atoms::TRUE) {
                     *self.message.borrow_mut() = None;
                     return Ok(value);
                 }
@@ -371,15 +371,15 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
             }
             "silent" => {
                 match arguments.first().copied() {
-                    Some(value) if value == crate::signals::atom("true") => {
+                    Some(value) if value == Term::atom(arinsal_term::atoms::TRUE) => {
                         self.silent.set(Some(true));
                     }
-                    Some(value) if value == crate::signals::atom("false") => {
+                    Some(value) if value == Term::atom(arinsal_term::atoms::FALSE) => {
                         self.silent.set(Some(false));
                     }
                     _ => {}
                 }
-                Ok(crate::signals::atom("true"))
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             }
             "display" => {
                 // Port of erts/emulator/beam/erl_db_util.c:5091-5115 (dmc_display and
@@ -387,7 +387,7 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
                 let value = *arguments.first().ok_or(arinsal_ets::EtsError::BadArg)?;
                 crate::natives::sys::display_match_spec(value)
                     .map_err(|_| arinsal_ets::EtsError::Unsupported("match-spec display"))?;
-                Ok(crate::signals::atom("true"))
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             }
             "enable_trace" | "disable_trace" | "trace" => {
                 let mut heap = VecHeap::new();
@@ -398,20 +398,20 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
                 self.trace_actions
                     .borrow_mut()
                     .push((name.to_owned(), heap, copied));
-                Ok(crate::signals::atom("true"))
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             }
             // Port of erts/emulator/beam/erl_db_util.c (matchIsSeqTrace, matchGetSeqToken),
             // OTP-29.1.1.
-            "is_seq_trace" => Ok(crate::signals::atom(
+            "is_seq_trace" => Ok(Term::atom(
                 if self
                     .seq
                     .borrow()
                     .as_ref()
                     .is_some_and(|(local, _)| local.has_token())
                 {
-                    "true"
+                    arinsal_term::atoms::TRUE
                 } else {
-                    "false"
+                    arinsal_term::atoms::FALSE
                 },
             )),
             "get_seq_token" => {
@@ -445,10 +445,10 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
             }
             "caller" => Ok(self
                 .caller
-                .unwrap_or_else(|| crate::signals::atom("undefined"))),
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED))),
             "caller_line" => Ok(self
                 .caller_line
-                .unwrap_or_else(|| crate::signals::atom("undefined"))),
+                .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED))),
             "current_stacktrace" => {
                 let depth = arguments
                     .first()
@@ -464,11 +464,11 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
             }
             "return_trace" => {
                 self.return_trace.set(true);
-                Ok(crate::signals::atom("true"))
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             }
             "exception_trace" => {
                 self.exception_trace.set(true);
-                Ok(crate::signals::atom("true"))
+                Ok(Term::atom(arinsal_term::atoms::TRUE))
             }
             "process_dump" => {
                 let dump = self
@@ -1164,10 +1164,10 @@ pub(crate) fn emit_port_event_scoped(
         else {
             continue;
         };
-        values.splice(0..0, [port_term, crate::signals::atom(name)]);
+        values.splice(0..0, [port_term, crate::atom_cache::put(name)]);
         values.insert(
             0,
-            crate::signals::atom(
+            crate::atom_cache::put(
                 if entry.flags & (TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0
                 {
                     "trace_ts"
@@ -1257,9 +1257,9 @@ pub(crate) fn emit_external_process_event(
         let mut heap = VecHeap::new();
         let mut values = Vec::with_capacity(fields.len() + 3);
         values.extend([
-            crate::signals::atom("trace"),
+            Term::atom(arinsal_term::atoms::TRACE),
             subject_term,
-            crate::signals::atom(name),
+            crate::atom_cache::put(name),
         ]);
         let Ok(fields) = fields
             .iter()
@@ -1469,9 +1469,10 @@ fn module_tracer_alive(
         module,
         "enabled",
         None,
-        &[crate::signals::atom("trace_status"), state, tracee],
+        &[Term::atom(arinsal_term::atoms::TRACE_STATUS), state, tracee],
     );
-    result == Some(crate::signals::atom("trace")) || result == Some(crate::signals::atom("discard"))
+    result == Some(Term::atom(arinsal_term::atoms::TRACE))
+        || result == Some(Term::atom(arinsal_term::atoms::DISCARD))
 }
 
 /// `ERTS_P_ALL_TRACE_FLAGS` / tracer identity (erl_process.c:13221). Exit walks trace tables
@@ -2133,7 +2134,8 @@ fn run_call_match(
     // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
     // A false result (`{message,false}`) only drops the call message;
     // {return_trace} and {exception_trace} still apply.
-    let suppress_call = result.is_none_or(|result| result == crate::signals::atom("false"));
+    let suppress_call =
+        result.is_none_or(|result| result == Term::atom(arinsal_term::atoms::FALSE));
     Ok(CallMatch {
         suppress_call,
         return_trace: context.return_trace.get(),
@@ -2415,9 +2417,9 @@ fn module_call_enabled(
         module,
         "enabled",
         None,
-        &[crate::signals::atom("trace_status"), state, tracee],
+        &[Term::atom(arinsal_term::atoms::TRACE_STATUS), state, tracee],
     );
-    if status.is_none_or(|status| status == crate::signals::atom("remove")) {
+    if status.is_none_or(|status| status == Term::atom(arinsal_term::atoms::REMOVE)) {
         return None;
     }
     let call = crate::natives::nif::invoke_tracer(
@@ -2426,9 +2428,9 @@ fn module_call_enabled(
         module,
         "enabled",
         Some("enabled_call"),
-        &[crate::signals::atom("call"), state, tracee],
+        &[Term::atom(arinsal_term::atoms::CALL), state, tracee],
     );
-    Some(call == Some(crate::signals::atom("trace")))
+    Some(call == Some(Term::atom(arinsal_term::atoms::TRACE)))
 }
 
 /// Whether `module:function/arity` is the initial call of the process.
@@ -2521,15 +2523,19 @@ fn emit_meta(
                 module,
                 "enabled",
                 None,
-                &[crate::signals::atom("trace_status"), state, subject_term],
+                &[
+                    Term::atom(arinsal_term::atoms::TRACE_STATUS),
+                    state,
+                    subject_term,
+                ],
             );
-            if status == Some(crate::signals::atom("remove")) {
+            if status == Some(Term::atom(arinsal_term::atoms::REMOVE)) {
                 if remove_dead {
                     meta.clear();
                 }
                 return;
             }
-            if status != Some(crate::signals::atom("trace")) {
+            if status != Some(Term::atom(arinsal_term::atoms::TRACE)) {
                 return;
             }
         }
@@ -3365,7 +3371,7 @@ fn emit_return_to(
             .tuple(&values)
             .map_err(|error| VmError::Unsupported(format!("return_to MFA: {error:?}")))?
     } else {
-        crate::signals::atom("undefined")
+        Term::atom(arinsal_term::atoms::UNDEFINED)
     };
     emit_filtered(
         Some(vm),
@@ -3592,12 +3598,12 @@ pub(crate) fn receive_event(
     // Port of erts/emulator/beam/erl_trace.c:887-895 (trace_receive_session), OTP-29.1.1:
     // a pid `from` is `(node_name, pid)`; an atom `from` (`am_undefined` from `enif_send`
     // with no caller) is passed as the node-name slot and `am_undefined` as the sender.
-    let undefined = crate::signals::atom("undefined");
+    let undefined = Term::atom(arinsal_term::atoms::UNDEFINED);
     let (node, from) = match from
         .filter(|pid| !pid.is_undefined())
         .and_then(Pid::to_term)
     {
-        Some(pid) => (crate::signals::atom("nonode@nohost"), pid),
+        Some(pid) => (Term::atom(arinsal_term::atoms::NONAME), pid),
         None => (undefined, undefined),
     };
     emit_filtered(
@@ -3619,9 +3625,9 @@ pub(crate) fn timeout_event(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) {
-    let node = crate::signals::atom("clock_service");
-    let undefined = crate::signals::atom("undefined");
-    let timeout = crate::signals::atom("timeout");
+    let node = Term::atom(arinsal_term::atoms::CLOCK_SERVICE);
+    let undefined = Term::atom(arinsal_term::atoms::UNDEFINED);
+    let timeout = Term::atom(arinsal_term::atoms::TIMEOUT);
     emit_filtered(
         vm,
         process,
@@ -3748,7 +3754,7 @@ fn emit_filtered_without_ctx(
         }
         let mut values = Vec::with_capacity(3 + fields.len());
         values.extend([
-            crate::signals::atom(
+            crate::atom_cache::put(
                 if entry.flags & (TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0
                 {
                     "trace_ts"
@@ -3757,7 +3763,7 @@ fn emit_filtered_without_ctx(
                 },
             ),
             subject_term,
-            crate::signals::atom(name),
+            crate::atom_cache::put(name),
         ]);
         values.extend_from_slice(fields);
         if let Some(stamp) = timestamp_term(process, entry.flags) {
@@ -4000,7 +4006,7 @@ fn emit_filtered(
                     set_session_silent(process, session, subject, silent);
                 }
                 if !result.is_ok_and(|result| {
-                    result.is_some_and(|value| value != crate::signals::atom("false"))
+                    result.is_some_and(|value| value != Term::atom(arinsal_term::atoms::FALSE))
                 }) || session_flags(process, session, subject) & SILENT != 0
                 {
                     continue;
@@ -4057,7 +4063,7 @@ fn deliver(
     }
     let mut values = Vec::with_capacity(3 + fields.len() + 1);
     values.extend([
-        crate::signals::atom(
+        crate::atom_cache::put(
             if entry.flags & (TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0 {
                 "trace_ts"
             } else {
@@ -4065,7 +4071,7 @@ fn deliver(
             },
         ),
         subject_term,
-        crate::signals::atom(name),
+        crate::atom_cache::put(name),
     ]);
     values.extend_from_slice(fields);
     if let Some(extra) = extra {
@@ -4074,7 +4080,7 @@ fn deliver(
     if entry.flags & SCHEDULER_ID != 0 {
         values.push(
             Term::small(ctx.scheduler_id().unwrap_or(0) as i64)
-                .unwrap_or(crate::signals::atom("undefined")),
+                .unwrap_or(Term::atom(arinsal_term::atoms::UNDEFINED)),
         );
     }
     if let Some(stamp) = timestamp_term(process, entry.flags) {
@@ -4165,7 +4171,7 @@ fn emit_module(
     .ok() else {
         return;
     };
-    let tag = crate::signals::atom(event.name);
+    let tag = crate::atom_cache::put(event.name);
     // Port of erts/emulator/beam/erl_trace.c:1037-1160 (erts_trace_return_to, erts_trace_return,
     // erts_trace_exception), OTP-29.1.1: return events go to trace/5 without asking enabled/3;
     // their call event already did.
@@ -4182,7 +4188,7 @@ fn emit_module(
             tracer_enabled_callback(event.flags),
             &[tag, state, event.tracee],
         );
-        if action != Some(crate::signals::atom("trace")) {
+        if action != Some(Term::atom(arinsal_term::atoms::TRACE)) {
             return;
         }
     }
@@ -4197,31 +4203,31 @@ fn emit_module(
         (event.fields.get(1).copied(), event.extra)
     };
     if let Some(extra) = extra {
-        options.push((crate::signals::atom("extra"), extra));
+        options.push((Term::atom(arinsal_term::atoms::EXTRA), extra));
     }
     if let Some(result) = match_spec_result {
-        options.push((crate::signals::atom("match_spec_result"), result));
+        options.push((Term::atom(arinsal_term::atoms::MATCH_SPEC_RESULT), result));
     }
     // Port of erts/emulator/beam/erl_trace.c:3216-3219 (F_TRACE_SCHED_NO option), OTP-29.1.1.
     if event.flags & SCHEDULER_ID != 0
         && let Some(id) = scheduler_id.and_then(|id| Term::small(id as i64))
     {
-        options.push((crate::signals::atom("scheduler_id"), id));
+        options.push((Term::atom(arinsal_term::atoms::SCHEDULER_ID), id));
     }
     if event.flags & TIMESTAMP != 0 {
         options.push((
-            crate::signals::atom("timestamp"),
-            crate::signals::atom("timestamp"),
+            Term::atom(arinsal_term::atoms::TIMESTAMP),
+            Term::atom(arinsal_term::atoms::TIMESTAMP),
         ));
     } else if event.flags & STRICT_MONOTONIC_TIMESTAMP != 0 {
         options.push((
-            crate::signals::atom("timestamp"),
-            crate::signals::atom("strict_monotonic"),
+            Term::atom(arinsal_term::atoms::TIMESTAMP),
+            Term::atom(arinsal_term::atoms::STRICT_MONOTONIC),
         ));
     } else if event.flags & MONOTONIC_TIMESTAMP != 0 {
         options.push((
-            crate::signals::atom("timestamp"),
-            crate::signals::atom("monotonic"),
+            Term::atom(arinsal_term::atoms::TIMESTAMP),
+            Term::atom(arinsal_term::atoms::MONOTONIC),
         ));
     }
     let Ok(options) = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
