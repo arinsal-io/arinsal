@@ -201,16 +201,8 @@ impl Process {
         cold.dirty_bif_original.take()
     }
 
-    pub(crate) fn take_dirty_bif_tail(&mut self) -> Option<bool> {
-        self.cold.as_deref_mut()?.dirty_bif_tail.take()
-    }
-
     pub(crate) fn take_dirty_bif_exception_trace(&mut self) -> Option<Term> {
         self.cold.as_deref_mut()?.dirty_bif_exception_trace.take()
-    }
-
-    pub(crate) fn set_dirty_bif_tail(&mut self, tail: bool) {
-        self.cold_mut().dirty_bif_tail = Some(tail);
     }
 
     pub(crate) fn set_dirty_bif_original(&mut self, mfa: DirtyBifMfa, args: &[Term]) {

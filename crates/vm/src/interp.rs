@@ -124,24 +124,31 @@ impl Vm {
         Ok(process.inbox.save() >= process.inbox.len())
     }
 
-    /// Puts the process at function entry `target` of module `module_id`: at the function's
-    /// code address in the JIT flavor (as erts jumps to the export's code address), at its
-    /// interpreter position otherwise.
+    /// Puts the process at the code address of function entry `target` of module `module_id`,
+    /// as erts jumps to the export's code address. Every function has native code; a target
+    /// that is not a function entry of it is an error.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
-    pub(crate) fn set_position(&mut self, p: &mut Process, module_id: usize, target: usize) {
-        if let Some(module) = self.code.modules.get(module_id)
-            && let Some(native) = self.beamasm_targets.function_for_target(
+    pub(crate) fn set_position(
+        &mut self,
+        p: &mut Process,
+        module_id: usize,
+        target: usize,
+    ) -> Result<(), VmError> {
+        let native = self.code.modules.get(module_id).and_then(|module| {
+            self.beamasm_targets.function_for_target(
                 module_id,
                 module,
                 crate::load::native_code_range(&self.code.code_meta, module_id),
                 target,
             )
-        {
-            p.set_native_pc(Some(native.start));
-            return;
-        }
-        p.module = module_id;
-        p.set_ip(target);
+        });
+        let Some(native) = native else {
+            return Err(VmError::Unsupported(format!(
+                "position {target} of module {module_id} is not a native function entry"
+            )));
+        };
+        p.set_native_pc(Some(native.start));
+        Ok(())
     }
 
     /// The code address a process spawned at function entry `ip` of module `module_id` starts at:
@@ -177,26 +184,6 @@ impl Vm {
                 .or_else(|| version.native_function_start(function, arity)),
             None => crate::native_function_for(self.code_scope, &module.name, function, arity)
                 .map(|native| native.start),
-        }
-    }
-
-    /// After an apply left the process at an interpreted jump target, enter that function's
-    /// native code if it has any, as erts jumps to the export's code address.
-    // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
-    pub(crate) fn enter_native_at_jump(&mut self, p: &mut Process) {
-        if p.native_pc().is_some() {
-            return;
-        }
-        let Some(module) = self.code.modules.get(p.module) else {
-            return;
-        };
-        if let Some(native) = self.beamasm_targets.function_for_target(
-            p.module,
-            module,
-            crate::load::native_code_range(&self.code.code_meta, p.module),
-            p.ip(),
-        ) {
-            p.set_native_pc(Some(native.start));
         }
     }
 

@@ -635,34 +635,21 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // a malformed module is `{error, badfile}` before finish_loading.
     // Static NIF bodies and import classes are bound here, like erts' loader does for the
     // static NIF table (erl_nif.c erts_load_static_nif at load_nif time).
-    let mut meta = CodeMeta::from_beam_owned(beam, Some(&bytes));
-    // As erts has no interpreter form of a module, decode the instructions for the interpreter
-    // only when it may run them.
-    let native_only = vm.native_only(&meta);
-    if !native_only {
-        // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1: the
-        // generic engine rejects these through its generator; the interpreter form checks here.
-        if meta.beam.decode_code().is_err()
-            || arinsal_loader::validate_bit_matches(&meta.beam).is_err()
-        {
-            let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
-            return Ok(error);
-        }
-        meta.note_decoded_on_load();
-    } else if vm.native_tables_need_instructions(&meta.beam) && meta.beam.decode_code().is_err() {
-        // The coverage table and the debugger lines are laid out from the instructions.
+    let mut meta = CodeMeta::from_beam_owned(beam, &bytes);
+    // erts has no interpreter form of a module: decode the instructions only for the coverage
+    // table and the debugger lines, which are laid out from them.
+    if vm.decode_for_native_tables(&mut meta.beam).is_err() {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     }
     let registers = (meta.beam.code.x_registers, meta.beam.code.float_registers);
-    let Ok(mut module) = vm.prepare_module_with(&meta.beam, Some(&bytes), meta.md5, !native_only)
-    else {
+    let Ok(mut module) = vm.prepare_module(&meta.beam, &bytes, meta.md5) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
     vm.intern_prepared_fun_entries(&mut module);
     vm.compile_native(&mut module, &mut meta);
-    if vm.native_required(&meta) && meta.beamasm.is_none() {
+    if meta.beamasm.is_none() {
         // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT flavor has
         // no other way to run the module.
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
@@ -1701,7 +1688,9 @@ fn call_values(
             // Port of erts/emulator/beam/beam_bif_load.c:793
             // (call_on_load_function_1), OTP-29.1.1. The call dispatcher
             // installs the ordinary continuation and transfers to this entry.
-            vm.set_position(process, id, target);
+            if let Err(error) = vm.set_position(process, id, target) {
+                return Some(Err(error));
+            }
             Some(Ok(atom("ok")))
         }
         ("erts_literal_area_collector", "release_area_switch", 0) => {

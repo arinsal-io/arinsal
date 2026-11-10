@@ -48,10 +48,8 @@ fn child() -> bool {
     };
     let mut vm = Vm::new([]);
     vm.load_bytes(&std::fs::read(beam_path).unwrap()).unwrap();
-    let before = arinsal_vm::interp_native_starts();
     let actual = vm.eval_scheduled(MODULE, "run", &[], 2, None).unwrap();
     println!("RESULT:{}", actual.text);
-    println!("STARTS:{}", arinsal_vm::interp_native_starts() - before);
     true
 }
 
@@ -91,10 +89,5 @@ fn spawned_processes_start_in_native_code() {
         other => panic!("OTP call failed: {other:?}"),
     };
     assert_eq!(field("RESULT:"), expected);
-    assert_eq!(
-        field("STARTS:"),
-        "0",
-        "an interpreter slice began at a native function entry"
-    );
     let _ = std::fs::remove_dir_all(dir);
 }

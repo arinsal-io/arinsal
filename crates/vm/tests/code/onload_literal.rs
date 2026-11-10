@@ -56,7 +56,6 @@ ping() -> persistent_term:get(ol_sched, not_loaded).
     assert_eq!(expected.trim(), "ran");
 
     let mut autoload = Vm::new([dir.clone()]);
-    let interpreter_slices_before = arinsal_vm::interp_slices();
     let autoloaded = autoload
         .eval_scheduled("ol_sched", "ping", &[], 1, None)
         .expect("autoload on_load");
@@ -68,12 +67,6 @@ ping() -> persistent_term:get(ol_sched, not_loaded).
         .eval_scheduled("ol_sched", "ping", &[], 1, None)
         .expect("load_file on_load");
     assert_eq!(from_file.text, "ran", "Vm::load_file then eval_scheduled");
-    // erts runs the on_load function in its own process (code_server's protocol), natively.
-    assert_eq!(
-        arinsal_vm::interp_slices(),
-        interpreter_slices_before,
-        "on_load must not run in the interpreter"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

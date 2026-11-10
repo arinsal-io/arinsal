@@ -713,12 +713,7 @@ impl Process {
         // ERTS_PTMR_CLEAR; F_INSLPQUEUE becomes F_TIMO (`receive_timeout_pos` stays set until
         // `timeout` runs).
         probe.receive_timer().cancel();
-        if next & 1 == 0 {
-            self.set_native_pc(Some(next));
-        } else {
-            self.set_native_pc(None);
-            self.set_ip(next >> 1);
-        }
+        self.set_native_pc(Some(next));
     }
 
     /// `i_wait_timeout`: sets the receive timer once per receive. `Some(0)` takes the

@@ -469,8 +469,7 @@ pub struct Process {
     pub(crate) sig_cont_taken: u64,
     pub(crate) receive_timeout_pos: Option<u64>,
     /// `def_arg_reg[0]` of a receive with a timer: where the process continues when it is
-    /// scheduled in timed out. A native code address, or `(ip << 1) | 1` in the interpreter;
-    /// 0 when unset.
+    /// scheduled in timed out: a native code address, 0 when unset.
     pub(crate) receive_timeout_next: usize,
     /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
     /// re-read the operand (erts/emulator/beam/emu/msg_instrs.tab, wait.src).
@@ -1380,9 +1379,6 @@ pub(crate) struct ProcessCold {
     pub(crate) dirty_bif_original: Option<crate::dirty::DirtyBifCall>,
     /// Native call site of the original dirty BIF (`nep->pc`), where its exception is raised.
     pub(crate) dirty_bif_call_pc: Option<usize>,
-    /// Whether the original BIF call was in tail position, like the saved return state in
-    /// erts' native export wrapper.
-    pub(crate) dirty_bif_tail: Option<bool>,
     /// Saved target export and registers restored by `erts_internal:dirty_bif_trap`.
     pub(crate) dirty_bif_trap_target: Option<crate::dirty::DirtyBifCall>,
     /// Saved `ftrace` restored by `dirty_bif_exception/2` from the dirty shadow process.
@@ -1655,8 +1651,8 @@ impl Process {
 
     /// Enter a tail apply whose caller frame is already deallocated (see `apply_frame_released`).
     /// Returns whether this call set the flag, for `end_tail_apply`.
-    pub(crate) fn begin_tail_apply(&mut self, tail: bool, kind: u8) -> bool {
-        if !tail || self.apply_frame_released() || self.native_apply {
+    pub(crate) fn begin_tail_apply(&mut self, kind: u8) -> bool {
+        if self.apply_frame_released() || self.native_apply {
             return false;
         }
         self.cold_mut().apply_frame_released = kind;

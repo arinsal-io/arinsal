@@ -400,11 +400,10 @@ impl Executor {
             return Err(VmError::Unsupported("hibernate registers".into()));
         }
         let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
-        self.vm.set_position(process, module_id, entry);
+        // erts resumes a hibernated process at the export address of apply/3.
+        self.vm.set_position(process, module_id, entry)?;
         process.inbox.set_save(0);
         process.cancel_receive_timer();
-        // erts resumes a hibernated process at the export address of apply/3 too.
-        self.vm.enter_native_at_jump(process);
         Ok(())
     }
 }
@@ -583,7 +582,7 @@ impl Vm {
                 }
             };
         process.module = module_id;
-        process.set_ip(ip);
+        process.set_entry_ip(ip);
         process.initial_call = Some((module_id, ip));
         Ok(apply_operands)
     }

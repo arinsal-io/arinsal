@@ -284,10 +284,17 @@ pub(super) fn return_to(p: &mut Process) -> Option<Term> {
     None
 }
 
+/// How a call made on behalf of native code (an apply, a fun call, a BIF trap) left the
+/// process.
 pub(crate) enum ImportOutcome {
+    /// The callee returned this value (also in `x0`), and the process continues at its
+    /// native pc when it has one (the caller's continuation popped by `Vm::ret`).
     Returned(Term),
-    Advanced,
-    Jump,
+    /// The process continues at its native pc, the code address of the callee, as erts
+    /// `apply`/`fixed_apply`/`call_fun` return the address the caller jumps to.
+    // Port of erts/emulator/beam/beam_common.c (apply, fixed_apply, call_fun), OTP-29.1.1.
+    Dispatch,
+    /// The process yields.
     Yield,
 }
 
@@ -452,6 +459,20 @@ impl Vm {
         );
     }
 
+    /// Return the BIF result in `x0` to the caller's continuation.
+    pub(crate) fn return_value(p: &mut Process) -> ImportOutcome {
+        Self::ret(p);
+        ImportOutcome::Returned(p.x[0])
+    }
+
+    /// `return_value`, but a dirty scheduler hands a resumed continuation back to a normal one.
+    pub(crate) fn return_value_after_dirty(p: &mut Process) -> ImportOutcome {
+        match Self::ret(p) {
+            Some(value) => ImportOutcome::Returned(value),
+            None => after_dirty(ImportOutcome::Returned(p.x[0])),
+        }
+    }
+
     pub(crate) fn ret(p: &mut Process) -> Option<Term> {
         p.tick();
         while let Some(cp) = p.heap.stack_get(0) {
@@ -485,7 +506,7 @@ impl Vm {
 /// to a normal run queue), OTP-29.1.1.
 pub(crate) fn after_dirty(outcome: ImportOutcome) -> ImportOutcome {
     if arinsal_sched::current_scheduler_type().is_dirty()
-        && matches!(outcome, ImportOutcome::Advanced | ImportOutcome::Jump)
+        && matches!(outcome, ImportOutcome::Returned(_))
     {
         ImportOutcome::Yield
     } else {
