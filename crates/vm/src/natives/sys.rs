@@ -397,8 +397,7 @@ fn current_reductions(process: &Process) -> u64 {
     .unwrap_or(0)
 }
 
-/// `system_info(process_count)` needs only the process table's live count.
-// Port of erts/emulator/beam/erl_bif_info.c:2942 (system_info process_count), OTP-29.1.1.
+/// `erlang:system_info/1` for every item that needs only the calling process.
 pub(crate) fn system_info_light(
     process: &mut Process,
     args: &[Term],
@@ -406,20 +405,34 @@ pub(crate) fn system_info_light(
     let [selector] = args else {
         return None;
     };
-    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_type), OTP-29.1.1: the
-    // global literal, no allocation, called from the generated code like every BIF.
-    static OS_TYPE: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    if *selector == *OS_TYPE.get_or_init(|| atom("os_type")) {
-        return Some(Ok(arinsal_bifs::os_type()));
+    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1: a plain BIF that
+    // answers every item from `c_p` and globals. The same items, in the same order, as the
+    // scheduler path: the process-only ones, then the process-independent table.
+    if let Some(name) = selector
+        .as_atom()
+        .and_then(|atom| global_atoms().text(atom))
+    {
+        if let Some(item) = system_info_process_item(process, name) {
+            // A trap (`cpu_topology` formats in an Erlang function) needs the scheduler path.
+            return match item {
+                Ok(value) => Some(Ok(value)),
+                Err(VmError::Trap(trap)) => Some(Err(trap)),
+                Err(_) => None,
+            };
+        }
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap, &mut state);
+        return arinsal_bifs::system_info_light_item(&mut ctx, *selector).map(|item| {
+            item.map_err(|error| match error {
+                arinsal_bifs::BifError::SystemLimit => {
+                    crate::exceptions::Trap::error(atom("system_limit"))
+                }
+                _ => crate::exceptions::Trap::error(atom("badarg")),
+            })
+        });
     }
-    if *selector != Term::atom(arinsal_term::atoms::PROCESS_COUNT) {
-        return None;
-    }
-    let count = process_count(process) as u64;
-    Some(non_neg(process, count).map_err(|error| match error {
-        VmError::Trap(trap) => trap,
-        _ => crate::exceptions::Trap::error(atom("system_limit")),
-    }))
+    None
 }
 
 fn call_statistics(
@@ -481,6 +494,44 @@ fn call_scheduler_wall_time(
     // Port of erts/emulator/beam/bif.c:5306 (erts_internal_scheduler_wall_time_1), OTP-29.1.1.
     // Any term other than `true` disables accounting. The previous flag is returned.
     set_scheduler_wall_enabled(process, ctx, atom_name(args[0]) == Some("true"))
+}
+
+/// `erlang:dt_spread_tag/1` from the generated code.
+// Port of erts/emulator/beam/bif.c:6032 (dt_spread_tag_1), OTP-29.1.1: without USE_VM_PROBES
+// the BIF only checks the boolean.
+pub(crate) fn dt_spread_tag_light(
+    _process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [flag] = args else {
+        return None;
+    };
+    Some(
+        if *flag == Term::atom(arinsal_term::atoms::TRUE)
+            || *flag == Term::atom(arinsal_term::atoms::FALSE)
+        {
+            Ok(Term::atom(arinsal_term::atoms::TRUE))
+        } else {
+            Err(crate::exceptions::Trap::error(atom("badarg")))
+        },
+    )
+}
+
+/// `erlang:dt_restore_tag/1` from the generated code.
+// Port of erts/emulator/beam/bif.c:6066 (dt_restore_tag_1), OTP-29.1.1: without USE_VM_PROBES
+// only `true` is accepted.
+pub(crate) fn dt_restore_tag_light(
+    _process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [flag] = args else {
+        return None;
+    };
+    Some(if *flag == Term::atom(arinsal_term::atoms::TRUE) {
+        Ok(Term::atom(arinsal_term::atoms::TRUE))
+    } else {
+        Err(crate::exceptions::Trap::error(atom("badarg")))
+    })
 }
 
 fn call_dt_spread_tag(
@@ -1098,7 +1149,35 @@ fn system_info(
     let name = selector
         .as_atom()
         .and_then(|atom| global_atoms().text(atom));
+    if let Some(item) = name.and_then(|name| system_info_process_item(process, name)) {
+        return Some(item);
+    }
     match name {
+        // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
+        Some("info" | "procs" | "loaded" | "dist") => {
+            Some(system_info_dump(vm, process, name.unwrap()))
+        }
+        // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
+        Some("scheduler_id") => Some(
+            ctx.and_then(RunCtx::scheduler_id)
+                .and_then(|id| Term::small(id as i64))
+                .ok_or_else(badarg),
+        ),
+        Some("allocated_areas") => Some(memory_areas(vm, process)),
+        _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
+        _ => None,
+    }
+}
+
+/// The `system_info/1` items that need only the calling process, as erts computes them from
+/// `c_p` and globals: the light BIF path runs them without leaving the generated code.
+/// `None` means the item is not one of them (the scheduler path or the BIF table answers).
+// Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
+pub(crate) fn system_info_process_item(
+    process: &mut Process,
+    name: &str,
+) -> Option<Result<Term, VmError>> {
+    match Some(name) {
         Some("alloc_util_allocators") => Some(allocator_names(process)),
         Some("allocator") => Some(all_allocator_options(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
@@ -1121,10 +1200,6 @@ fn system_info(
                 .map(|runtime| runtime.ets.read().unwrap().table_count())
                 .unwrap_or(0) as u64,
         )),
-        // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
-        Some("info" | "procs" | "loaded" | "dist") => {
-            Some(system_info_dump(vm, process, name.unwrap()))
-        }
         // Port of erts/emulator/beam/erl_bif_info.c:3547-3548, OTP-29.1.1.
         Some("system_logger") => Some(Ok(system_logger(process))),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
@@ -1174,7 +1249,7 @@ fn system_info(
         Some("schedulers_online") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_online as u64)
         })),
-        Some("schedulers") => Some(read_flags(process, |process, flags| {
+        Some("schedulers" | "schedulers_total") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_total as u64)
         })),
         // Port of erts/emulator/beam/erl_bif_info.c:3258-3335 (schedulers_state, schedulers_active),
@@ -1206,12 +1281,6 @@ fn system_info(
         })),
         // Port of erts/emulator/beam/erl_bif_info.c:3283-3324 (`all_schedulers_state`), OTP-29.1.1.
         Some("all_schedulers_state") => Some(all_schedulers_state(process)),
-        // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
-        Some("scheduler_id") => Some(
-            ctx.and_then(RunCtx::scheduler_id)
-                .and_then(|id| Term::small(id as i64))
-                .ok_or_else(badarg),
-        ),
         Some("dirty_cpu_schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_cpu_total as u64)
         })),
@@ -1225,6 +1294,27 @@ fn system_info(
         Some("thread_pool_size") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.thread_pool_size as u64)
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1 garbage_collection), OTP-29.1.1:
+        // the four tuples in the order erts conses them.
+        Some("garbage_collection") => Some((|| {
+            let defaults = gc_defaults(process.runtime);
+            let max_heap =
+                Term::small(i64::try_from(defaults.max_heap().size).map_err(|_| badarg())?)
+                    .ok_or_else(badarg)?;
+            let max_heap = tuple(process, &[atom("max_heap_size"), max_heap])?;
+            let bin_vheap = tagged(
+                process,
+                "min_bin_vheap_size",
+                defaults.min_bin_vheap_size() as u64,
+            )?;
+            let heap = tagged(process, "min_heap_size", defaults.min_heap_size() as u64)?;
+            let sweep = tagged(
+                process,
+                "fullsweep_after",
+                u64::from(defaults.max_gen_gcs()),
+            )?;
+            cons_list(process, &[max_heap, bin_vheap, heap, sweep])
+        })()),
         Some("fullsweep_after") => {
             let value = gc_defaults(process.runtime).max_gen_gcs();
             Some(tagged(process, "fullsweep_after", u64::from(value)))
@@ -1313,8 +1403,6 @@ fn system_info(
             },
         ))),
         Some("sequential_tracer") => Some(crate::seq_trace::system_tracer_info(process)),
-        Some("allocated_areas") => Some(memory_areas(vm, process)),
-        _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
         _ => None,
     }
 }

@@ -45,3 +45,4 @@ mod reds_overcharge_differential;
 mod reds_size_bifs_differential;
 mod reg_table;
 mod small_gaps;
+mod system_info_light;

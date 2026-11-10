@@ -189,6 +189,29 @@ pub fn global_os_type(kind: Atom, flavor: Atom) -> Term {
     Term::from_ptr(chunk.as_ptr(), 2)
 }
 
+/// The global literal `{Major, Minor, Patch}` that `erlang:system_info(os_version)` returns (erts
+/// `ERTS_GLOBAL_LIT_OS_VERSION`), built once in a literal area.
+// Port of erts/emulator/beam/erl_bif_info.c (os_info_init: erts_global_literal_allocate,
+// TUPLE3, erts_global_literal_register), OTP-29.1.1.
+pub fn global_os_version(version: [Term; 3]) -> Term {
+    static TUPLE: std::sync::OnceLock<literal::LiteralChunk> = std::sync::OnceLock::new();
+    let chunk = TUPLE.get_or_init(|| {
+        let mut chunk = literal::allocate_chunk(4).expect("global os_version literal area");
+        let words = [
+            (3 << 6) | ARITY,
+            version[0].bits(),
+            version[1].bits(),
+            version[2].bits(),
+        ];
+        assert!(
+            chunk.write_words(&words),
+            "global os_version literal allocation"
+        );
+        chunk
+    });
+    Term::from_ptr(chunk.as_ptr(), 2)
+}
+
 pub(crate) const POS_BIG: u64 = 0x08;
 pub(crate) const NEG_BIG: u64 = 0x0c;
 pub(crate) const REF: u64 = 0x10;
