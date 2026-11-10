@@ -427,8 +427,8 @@ impl CodeIndexes {
         if !nested {
             let copy = CodeTables::clone(&self.active_tables());
             copy.stage_fun_entries(self.active(), self.staging());
+            crate::export::export_start_staging(&copy, self.active(), self.staging());
             self.lock_permission().work = Some(copy);
-            crate::beamasm_integration::stage_dispatch(self.scope);
             self.stage_code_ranges();
             // Port of erts/emulator/beam/beam_catches.c:89-99 (beam_catches_start_staging),
             // OTP-29.1.1: the staging code index starts as a copy of the active pool.

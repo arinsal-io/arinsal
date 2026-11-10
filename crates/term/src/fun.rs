@@ -279,7 +279,36 @@ pub struct ExportEntry {
     /// OTP-29.1.1. The call site there embeds the pointer; this word is that pointer,
     /// loaded from the export the call site already holds.
     pub light_bif_func: AtomicUsize,
+    /// Index into the BIF table, or -1 when this is not a BIF (`Export.bif_number`).
+    // Port of erts/emulator/beam/export.h:55 (Export.bif_number), OTP-29.1.1.
+    pub bif_number: AtomicI32,
+    /// `Export.trampoline`: what the shared export trampoline stands for while an address of
+    /// this export enters it.
+    // Port of erts/emulator/beam/export.h:64-102 (Export.trampoline), OTP-29.1.1.
+    pub trampoline: ExportTrampoline,
 }
+
+/// `Export.trampoline` of the JIT: the opcode it stands for and its one argument word. BeamAsm
+/// enters one shared `beam_export_trampoline` for every export, which reads these.
+// Port of erts/emulator/beam/export.h:64-102, OTP-29.1.1.
+#[derive(Debug)]
+#[repr(C)]
+pub struct ExportTrampoline {
+    /// [`TRAMPOLINE_NONE`], [`TRAMPOLINE_CALL_ERROR_HANDLER`] or [`TRAMPOLINE_BREAKPOINT`]
+    /// (`trampoline.common.op`).
+    pub op: AtomicUsize,
+    /// `trampoline.breakpoint.address` (the code a global call breakpoint continues to) or
+    /// `trampoline.not_loaded.deferred` (an exported function of code whose on_load function
+    /// has not finished).
+    pub address: AtomicUsize,
+}
+
+/// `trampoline.common.op == 0`.
+pub const TRAMPOLINE_NONE: usize = 0;
+/// `op_call_error_handler`.
+pub const TRAMPOLINE_CALL_ERROR_HANDLER: usize = 1;
+/// `op_i_generic_breakpoint`.
+pub const TRAMPOLINE_BREAKPOINT: usize = 2;
 
 /// Byte offset of [`ExportEntry::info`] for generated loads.
 pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;
@@ -315,7 +344,44 @@ impl ExportEntry {
             arity,
             lambda: OnceLock::new(),
             light_bif_func: AtomicUsize::new(0),
+            bif_number: AtomicI32::new(-1),
+            // Port of erts/emulator/beam/export.c:85-87 (export_init: op_call_error_handler
+            // once the opcodes are initialized), OTP-29.1.1.
+            trampoline: ExportTrampoline {
+                op: AtomicUsize::new(TRAMPOLINE_CALL_ERROR_HANDLER),
+                address: AtomicUsize::new(0),
+            },
         }
+    }
+
+    /// `Export.bif_number`, -1 when this is not a BIF.
+    pub fn bif_number(&self) -> i32 {
+        self.bif_number.load(Ordering::Acquire)
+    }
+
+    /// Sets `Export.bif_number` (`install_bifs`).
+    pub fn set_bif_number(&self, number: i32) {
+        self.bif_number.store(number, Ordering::Release);
+    }
+
+    /// `trampoline.common.op`.
+    pub fn trampoline_op(&self) -> usize {
+        self.trampoline.op.load(Ordering::Acquire)
+    }
+
+    /// `trampoline.breakpoint.address` / `trampoline.not_loaded.deferred`.
+    pub fn trampoline_address(&self) -> usize {
+        self.trampoline.address.load(Ordering::Acquire)
+    }
+
+    /// Sets `trampoline.common.op`.
+    pub fn set_trampoline_op(&self, op: usize) {
+        self.trampoline.op.store(op, Ordering::Release);
+    }
+
+    /// Sets `trampoline.breakpoint.address` / `trampoline.not_loaded.deferred`.
+    pub fn set_trampoline_address(&self, address: usize) {
+        self.trampoline.address.store(address, Ordering::Release);
     }
 
     /// Publishes the direct light-BIF pointer. Zero keeps the shared helper.
