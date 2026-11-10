@@ -50,7 +50,7 @@ const fn case(
 /// `In` is the whole argument list, so `apply(M, F, In)` stays a variable `i_apply` (the
 /// runtime path) and `apply(M, F, [X])` a fixed `apply 1` (the export's native entry).
 // Not asserted yet (open deviations on other paths, see the apply_bif_charge_gc report):
-// length/1 and lists:member/2 through a variable apply/3 (trapping handler path),
+// lists:member/2 through a variable apply/3 (trapping handler path),
 // tuple_to_list/1, setelement/3 and bitstring_to_list/1 (the BIFs' own charges), and
 // list_to_tuple/1 through apply/2 of an export fun.
 const CASES: &[Case] = &[
@@ -71,7 +71,24 @@ const CASES: &[Case] = &[
         "apply(M, F, In)",
         SMALL,
     ),
+    // Variable-arity apply/3 of a trapping BIF: the handler path.
+    case(
+        "length_var",
+        3_000,
+        ("erlang", "length"),
+        "[lists:seq(1, 2000)]",
+        "apply(M, F, In)",
+        BIG,
+    ),
     // Fixed-arity apply, apply/2 of an export fun, and a call of an export fun.
+    case(
+        "list_to_tuple_fixed",
+        4_000,
+        ("erlang", "list_to_tuple"),
+        "lists:seq(1, 64)",
+        "apply(M, F, [In])",
+        SMALL,
+    ),
     case(
         "member_fixed",
         3_000,

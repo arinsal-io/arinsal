@@ -265,8 +265,14 @@ impl DispatchFragments {
         let bif_element_guard = code.new_label();
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_export_fragment(&mut code, export_helper, raise_exception)
-            .map_err(|_| ExecError::InvalidSize("export trampoline"))?;
+        emit_export_fragment(
+            &mut code,
+            export_helper,
+            light_bif_gc_helper,
+            light_gc_offsets,
+            raise_exception,
+        )
+        .map_err(|_| ExecError::InvalidSize("export trampoline"))?;
         code.bind(light_bif)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_call_light_bif_shared(
@@ -869,9 +875,45 @@ fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210, OTP-29.1.1.
+/// Branch to `collect` when a collection is desired after a BIF.
+// Port of erts/emulator/beam/erl_gc.h:132-144 (ERTS_IS_GC_DESIRED_INTERNAL with F_DISABLE_GC)
+// as emitted by erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1: the test reads
+// the live process fields (`F_DISABLE_GC`, `mbuf_sz`, `off_heap.overhead`, `bin_vheap_sz`) and
+// the cached HTOP (x23) and E (x20).
+fn emit_gc_desired_test(
+    code: &mut CodeBuffer,
+    gc: LightGcOffsets,
+    collect: arinsal_a64::buf::Label,
+) -> Result<(), BufferError> {
+    // Same shape as erts' ERTS_IS_GC_DESIRED_INTERNAL: Z is set when collection is
+    // enabled, and each ccmp either compares or forces the flags that make `lt` true.
+    // NZCV constants are erts' NZCV::kCF (C) and NZCV::kVF (V).
+    const NZCV_CF: u8 = 0b0010;
+    const NZCV_VF: u8 = 0b0001;
+    code.emit(|encoder| {
+        encoder.ldrb_uoff(Gpr::w(9), Gpr::x(21), gc.gc_enabled as u16)?;
+        encoder.cmp_imm(Gpr::w(9), 1, false)?;
+        encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.off_heap_overhead)
+    })?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(13), Gpr::x(21), gc.bin_vheap_size)?;
+        // Enabled: overhead against bin_vheap_sz. Disabled: C is set, so the next
+        // condition fails and collection is taken.
+        encoder.ccmp_reg(Gpr::x(12), Gpr::x(13), NZCV_CF, Cond::Eq)?;
+        encoder.sub_reg(Gpr::x(9), Gpr::x(20), Gpr::x(23), Shift::Lsl, 0)?;
+        encoder.asr_imm(Gpr::x(9), Gpr::x(9), 3)?;
+        encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), gc.fragment_words)?;
+        // Unless the binary test said "no collection" (LS), the flags force `lt`.
+        encoder.ccmp_reg(Gpr::x(9), Gpr::x(11), NZCV_VF, Cond::Ls)
+    })?;
+    code.b_cond(Cond::Lt, collect)
+}
+
 fn emit_export_fragment(
     code: &mut CodeBuffer,
     helper: usize,
+    gc_helper: usize,
+    gc: LightGcOffsets,
     raise_exception: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
     let interpreted = code.new_label();
@@ -967,6 +1009,31 @@ fn emit_export_fragment(
     code.bind(direct_done)?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.cbz(Gpr::x(0), direct_non_value)?;
+    if gc_helper != 0 {
+        // Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_call_bif:
+        // ERTS_IS_GC_AFTER_BIF_DESIRED → erts_gc_after_bif_call_lhf), OTP-29.1.1: the export
+        // entry of a BIF goes through call_bif_shared, which collects after the BIF just as
+        // the light fragment does. The result is spilled and the arguments stay live; a
+        // failed collection returns the non-value with its reason set.
+        let gc_after_bif = code.new_label();
+        emit_gc_desired_test(code, gc, gc_after_bif)?;
+        code.b(return_term)?;
+        code.bind(gc_after_bif)?;
+        code.emit(|encoder| encoder.str_uoff(Gpr::x(0), Gpr::sp(), 24))?;
+        emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+        code.emit(|encoder| {
+            encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+            encoder.ldr_uoff(Gpr::x(2), Gpr::sp(), 24)?;
+            encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 16)?;
+            encoder.ldr_uoff(Gpr::x(3), Gpr::x(9), crate::bif::EXPORT_INFO_OFFSET)?;
+            encoder.mov_const(Gpr::x(17), gc_helper as u64)?;
+            encoder.blr(Gpr::x(17))
+        })?;
+        emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+        code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
+        code.b_cond(Cond::Eq, direct_non_value)?;
+    }
     code.b(return_term)?;
     code.bind(direct_non_value)?;
     code.emit(|encoder| {
@@ -1326,28 +1393,7 @@ fn emit_call_light_bif_shared(
     // `off_heap.overhead`, `bin_vheap_sz`) and the header's `htop`/`stop`, as erts does.
     // Without a collection helper no test is emitted (test fragments use zero sizes).
     if gc_helper != 0 {
-        // Same shape as erts' ERTS_IS_GC_DESIRED_INTERNAL: Z is set when collection is
-        // enabled, and each ccmp either compares or forces the flags that make `lt` true.
-        // NZCV constants are erts' NZCV::kCF (C) and NZCV::kVF (V).
-        const NZCV_CF: u8 = 0b0010;
-        const NZCV_VF: u8 = 0b0001;
-        code.emit(|encoder| {
-            encoder.ldrb_uoff(Gpr::w(9), Gpr::x(21), gc.gc_enabled as u16)?;
-            encoder.cmp_imm(Gpr::w(9), 1, false)?;
-            encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.off_heap_overhead)
-        })?;
-        code.emit(|encoder| {
-            encoder.ldr_uoff(Gpr::x(13), Gpr::x(21), gc.bin_vheap_size)?;
-            // Enabled: overhead against bin_vheap_sz. Disabled: C is set, so the next
-            // condition fails and collection is taken.
-            encoder.ccmp_reg(Gpr::x(12), Gpr::x(13), NZCV_CF, Cond::Eq)?;
-            encoder.sub_reg(Gpr::x(9), Gpr::x(20), Gpr::x(23), Shift::Lsl, 0)?;
-            encoder.asr_imm(Gpr::x(9), Gpr::x(9), 3)?;
-            encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), gc.fragment_words)?;
-            // Unless the binary test said "no collection" (LS), the flags force `lt`.
-            encoder.ccmp_reg(Gpr::x(9), Gpr::x(11), NZCV_VF, Cond::Ls)
-        })?;
-        code.b_cond(Cond::Lt, gc_after_bif)?;
+        emit_gc_desired_test(code, gc, gc_after_bif)?;
     }
     code.bind(store)?;
     code.emit(|encoder| {

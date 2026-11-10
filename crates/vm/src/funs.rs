@@ -598,6 +598,13 @@ impl Vm {
             .map_err(|_| {
                 exceptions::bif_error(p, module, function, &args, BifError::SystemLimit)
             })?;
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:676-700 (bif_nif_epilogue: a TRAP
+            // result jumps to context_switch_simplified once), OTP-29.1.1: this Yield is that
+            // switch, so the export trap runs the continuation when the process is next
+            // scheduled instead of scheduling it out a second time.
+            if let Some(pending) = p.bif_trap_mut() {
+                pending.schedule_out = false;
+            }
             crate::bif_traps::arm_export_trap(p);
             return Ok(ImportOutcome::Yield);
         }
