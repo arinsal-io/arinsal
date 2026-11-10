@@ -123,72 +123,117 @@ pub(crate) struct NativeTraceAction {
     pub(crate) acc: Option<CallAcc>,
 }
 
-impl NativeTraceAction {
-    /// The flags word of the action in a native trace frame: bit 0 return_trace, 1
-    /// exception_trace, 2 return_to, 3 call time/memory frame with its breakpoint flags from
-    /// bit 4 and the previous function id plus one from bit 16.
-    fn flags_word(&self) -> i64 {
-        let mut flags = i64::from(self.return_trace)
-            | (i64::from(self.exception_trace) << 1)
-            | (i64::from(self.return_to) << 2);
-        if let Some(acc) = self.acc {
-            flags |= 8
-                | (i64::from(acc.flags) << 4)
-                | (acc.prev.map_or(0, |prev| i64::from(prev) + 1) << 16);
+/// erts `beam_return_trace`, `beam_exception_trace`, `beam_return_to_trace` and
+/// `beam_call_trace_return`: the kind of a trace frame, told by its return address.
+// Port of erts/emulator/beam/beam_code.h (BeamIsReturnTrace, BeamIsReturnToTrace,
+// BeamIsReturnCallAccTrace) and jit/beam_jit_main.cpp:255-270, OTP-29.1.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TraceFrameKind {
+    ReturnTrace,
+    ExceptionTrace,
+    ReturnToTrace,
+    CallTraceReturn,
+}
+
+/// `BEAM_RETURN_TRACE_FRAME_SZ`: `&mfa`, tracer, session weak id.
+pub(crate) const BEAM_RETURN_TRACE_FRAME_SZ: usize = 3;
+/// `BEAM_RETURN_TO_TRACE_FRAME_SZ`: session weak id.
+pub(crate) const BEAM_RETURN_TO_TRACE_FRAME_SZ: usize = 1;
+/// `BEAM_RETURN_CALL_ACC_TRACE_FRAME_SZ`: previous function, breakpoint flags, session weak id.
+pub(crate) const BEAM_RETURN_CALL_ACC_TRACE_FRAME_SZ: usize = 3;
+
+impl TraceFrameKind {
+    /// The kind of the trace frame whose return address is `address`.
+    #[inline]
+    pub(crate) fn of(address: usize) -> Option<Self> {
+        // The four stubs are consecutive `mov x1, #kind; b` pairs (rt.rs), 8 bytes apart.
+        let offset =
+            address.wrapping_sub(arinsal_beamasm::rt::arinsal_return_trace as *const () as usize);
+        if offset > 24 || !offset.is_multiple_of(8) {
+            return None;
         }
-        flags
+        Self::from_index(offset as u64 / 8)
     }
 
-    fn from_words(session: i64, flags: i64) -> Self {
-        Self {
-            session: session as u64,
-            return_trace: flags & 1 != 0,
-            exception_trace: flags & 2 != 0,
-            return_to: flags & 4 != 0,
-            acc: (flags & 8 != 0).then(|| CallAcc {
-                flags: ((flags >> 4) & 0xFFF) as u32,
-                prev: match flags >> 16 {
-                    0 => None,
-                    prev => Some(prev as u32 - 1),
-                },
-            }),
+    /// The kind passed in x1 by its return stub.
+    pub(crate) fn from_index(index: u64) -> Option<Self> {
+        Some(match index {
+            0 => Self::ReturnTrace,
+            1 => Self::ExceptionTrace,
+            2 => Self::ReturnToTrace,
+            3 => Self::CallTraceReturn,
+            _ => return None,
+        })
+    }
+
+    /// The return address that marks this kind of frame.
+    pub(crate) fn address(self) -> usize {
+        use arinsal_beamasm::rt;
+        match self {
+            Self::ReturnTrace => rt::arinsal_return_trace as *const () as usize,
+            Self::ExceptionTrace => rt::arinsal_exception_trace as *const () as usize,
+            Self::ReturnToTrace => rt::arinsal_return_to_trace as *const () as usize,
+            Self::CallTraceReturn => rt::arinsal_call_trace_return as *const () as usize,
+        }
+    }
+
+    /// The data words below the return address.
+    pub(crate) fn data_words(self) -> usize {
+        match self {
+            Self::ReturnTrace | Self::ExceptionTrace => BEAM_RETURN_TRACE_FRAME_SZ,
+            Self::ReturnToTrace => BEAM_RETURN_TO_TRACE_FRAME_SZ,
+            Self::CallTraceReturn => BEAM_RETURN_CALL_ACC_TRACE_FRAME_SZ,
         }
     }
 }
 
-/// The traced function's pc and the actions of the native trace frame whose function pc word
-/// is at stack index `pc_index` (the frame starts two words earlier), with the frame's size.
-type NativeFrameActions = SmallVec<[NativeTraceAction; 1]>;
+/// The decoded data words of a trace frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TraceFrame {
+    /// A return_trace or exception_trace frame of the traced function at `function_pc`.
+    Return {
+        exception: bool,
+        function_pc: usize,
+        session: u64,
+    },
+    /// A return_to frame.
+    ReturnTo { session: u64 },
+    /// A call time/memory frame.
+    CallAcc,
+}
 
-pub(crate) fn native_frame_actions(
-    process: &Process,
-    pc_index: usize,
-) -> (usize, NativeFrameActions, usize) {
-    let function_pc = process
-        .heap
-        .stack_get(pc_index)
-        .and_then(Term::as_small)
-        .unwrap_or(0) as usize;
-    let count = process
-        .heap
-        .stack_get(pc_index + 1)
-        .and_then(Term::as_small)
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-    let actions = (0..count)
-        .filter_map(|action| {
-            let session = process
-                .heap
-                .stack_get(pc_index + 2 + action * 2)?
-                .as_small()?;
-            let flags = process
-                .heap
-                .stack_get(pc_index + 3 + action * 2)?
-                .as_small()?;
-            Some(NativeTraceAction::from_words(session, flags))
-        })
-        .collect();
-    (function_pc, actions, 4 + count * 2)
+/// The trace frame whose return address is at stack index `index`, and its size with the
+/// return address. Port of erts/emulator/beam/beam_common.h (erts_inspect_frame) followed by
+/// the `BeamIsReturn*` tests of its callers, OTP-29.1.1.
+pub(crate) fn trace_frame_at(
+    heap: &arinsal_term::ProcessHeap,
+    index: usize,
+) -> Option<(TraceFrame, usize)> {
+    let kind = TraceFrameKind::of(heap.stack_get(index)?.tagged_word() as usize)?;
+    let data = |offset: usize| heap.stack_get(index + 1 + offset).unwrap_or(Term::NIL);
+    let small = |offset: usize| data(offset).as_small().unwrap_or(0);
+    let frame = match kind {
+        TraceFrameKind::ReturnTrace | TraceFrameKind::ExceptionTrace => TraceFrame::Return {
+            exception: kind == TraceFrameKind::ExceptionTrace,
+            function_pc: small(0) as usize,
+            session: small(2) as u64,
+        },
+        TraceFrameKind::ReturnToTrace => TraceFrame::ReturnTo {
+            session: small(0) as u64,
+        },
+        TraceFrameKind::CallTraceReturn => TraceFrame::CallAcc,
+    };
+    Some((frame, 1 + kind.data_words()))
+}
+
+/// The size, with its return address, of the trace frame at stack index `index`.
+pub(crate) fn trace_frame_words_at(
+    heap: &arinsal_term::ProcessHeap,
+    index: usize,
+) -> Option<usize> {
+    heap.stack_get(index)
+        .and_then(|word| TraceFrameKind::of(word.tagged_word() as usize))
+        .map(|kind| 1 + kind.data_words())
 }
 
 struct CallMatchContext {
@@ -2540,36 +2585,31 @@ pub(crate) enum StackScan {
 /// The trace frames on top of the stack, innermost first, up to the first real return address.
 // Port of erts/emulator/beam/beam_bp.c:938-980 (fixup_cp_before_trace), OTP-29.1.1.
 fn special_frames(process: &Process, first_only: bool, skip_frame: bool) -> Vec<SpecialFrame> {
-    let trace_stub = crate::native_bridge::native_trace_return_address();
     let bridge = crate::native_bridge::bridge_return_address();
     let mut frames = Vec::new();
     let mut index = 0;
     if skip_frame {
         // Skip the Y registers up to the frame's own return address.
         while let Some(word) = process.heap.stack_get(index) {
-            if word.tagged_word() as usize == trace_stub
-                || word.tagged_word() as usize == bridge
-                || crate::native_bridge::is_native_function_at(word.tagged_word() as usize)
+            let raw = word.tagged_word() as usize;
+            if TraceFrameKind::of(raw).is_some()
+                || raw == bridge
+                || crate::native_bridge::is_native_function_at(raw)
             {
                 break;
             }
             index += 1;
         }
     }
-    while let Some(word) = process.heap.stack_get(index) {
+    while let Some((frame, words)) = trace_frame_at(&process.heap, index) {
         if first_only && !frames.is_empty() {
             break;
         }
-        if word.tagged_word() as usize == trace_stub {
-            let (_, actions, words) = native_frame_actions(process, index + 2);
-            frames.push(SpecialFrame::Trace);
-            for action in actions.iter().filter(|action| action.return_to) {
-                frames.push(SpecialFrame::ReturnTo(action.session));
-            }
-            index += words;
-            continue;
-        }
-        break;
+        frames.push(match frame {
+            TraceFrame::ReturnTo { session } => SpecialFrame::ReturnTo(session),
+            TraceFrame::Return { .. } | TraceFrame::CallAcc => SpecialFrame::Trace,
+        });
+        index += words;
     }
     frames
 }
@@ -2931,84 +2971,125 @@ pub(crate) fn executor_native_call_event(
         .collect())
 }
 
-/// The traced native functions a return passes through, innermost first, and the address that
-/// execution continues at.
-/// Frames popped by a native return, with one inline frame and action for the common trace case.
-pub(crate) type NativeTraceFrames = SmallVec<[(usize, NativeFrameActions); 1]>;
-pub(crate) type PoppedNativeFrames = (NativeTraceFrames, Term);
-
-/// Pop the native trace frames a return passes through. The frame's stub word is already
-/// dropped: the saved caller is at stack index 0 and the traced function's pc follows. A caller
-/// that is itself a trace frame returns through it right away; its stub word is the slot that
-/// was just dropped. `drop_words` removes words from the stack.
-// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195, OTP-29.1.1.
-pub(crate) fn pop_native_trace_frames(
-    process: &mut Process,
-    mut drop_words: impl FnMut(&mut Process, usize),
-) -> Option<PoppedNativeFrames> {
-    let trace_stub = crate::native_bridge::native_trace_return_address();
-    let mut frames = SmallVec::new();
-    loop {
-        let saved_caller = process.heap.stack_get(0)?;
-        let (function_pc, actions, _) = native_frame_actions(process, 1);
-        if !crate::native_bridge::is_native_function_at(function_pc) {
-            return if frames.is_empty() {
-                None
-            } else {
-                Some((frames, saved_caller))
-            };
-        }
-        let cleanup = 4usize.saturating_add(actions.len() * 2);
-        drop_words(process, cleanup);
-        frames.push((function_pc, actions));
-        if saved_caller.tagged_word() as usize != trace_stub {
-            return Some((frames, saved_caller));
-        }
-    }
+/// A trace event a return through a trace frame leaves for the scheduler, which owns the
+/// tracer context.
+pub(crate) enum NativeReturnEvent {
+    /// `return_from` of the traced function at `function_pc` (erts `return_trace`).
+    Return {
+        function_pc: usize,
+        session: u64,
+        value: Term,
+    },
+    /// `return_to` of `target`, the function the return continues in (erts
+    /// `beam_jit_return_to_trace`).
+    ReturnTo {
+        session: u64,
+        target: Option<(String, String, u8)>,
+    },
 }
 
-/// Pop the single accounting frame handled by erts' `i_call_trace_return` instruction.
-// Port of erts/emulator/beam/jit/arm/instr_trace.cpp, OTP-29.1.1.
-pub(crate) fn pop_native_call_acc_frame(
+/// Returns through the trace frame of `kind` whose return address was just popped: its data
+/// words are at stack index 0 and the caller's return address follows. A call time/memory frame
+/// is accounted here; the other kinds leave their event for the scheduler. The frame and the
+/// caller's return address are removed with `drop_words`; the return address is returned.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp (emit_return_trace,
+// emit_i_call_trace_return, emit_i_return_to_trace: the runtime call, `emit_deallocate` of the
+// frame, then `emit_return_do`) and jit/beam_jit_common.cpp (beam_jit_return_to_trace),
+// OTP-29.1.1.
+pub(crate) fn return_through_trace_frame(
     process: &mut Process,
+    kind: TraceFrameKind,
     mut drop_words: impl FnMut(&mut Process, usize),
-) -> Option<(Term, NativeTraceAction)> {
-    let (saved_caller, action) = {
-        let mut words = process.heap.stack_terms();
-        let saved_caller = words.next()?;
-        words.next()?;
-        let count = words.next()?.as_small()?;
-        if count != 1 {
-            return None;
-        }
-        let session = words.next()?.as_small()?;
-        let flags = words.next()?.as_small()?;
-        (saved_caller, NativeTraceAction::from_words(session, flags))
+) -> Option<(Option<NativeReturnEvent>, Term)> {
+    let words = kind.data_words();
+    let caller = process.heap.stack_get(words)?;
+    let data = |process: &Process, offset: usize| {
+        process
+            .heap
+            .stack_get(offset)
+            .and_then(Term::as_small)
+            .unwrap_or(0)
     };
-    if action.acc.is_none() || action.return_trace || action.exception_trace || action.return_to {
-        return None;
-    }
-    drop_words(process, 6);
-    Some((saved_caller, action))
+    let event = match kind {
+        TraceFrameKind::ReturnTrace | TraceFrameKind::ExceptionTrace => {
+            Some(NativeReturnEvent::Return {
+                function_pc: data(process, 0) as usize,
+                session: data(process, 2) as u64,
+                value: process.x[0],
+            })
+        }
+        TraceFrameKind::ReturnToTrace => Some(NativeReturnEvent::ReturnTo {
+            session: data(process, 0) as u64,
+            // The frame after this one names the function returned to.
+            target: return_to_target(process, words),
+        }),
+        TraceFrameKind::CallTraceReturn => {
+            let session = data(process, 2) as u64;
+            let flags = data(process, 1) as u32;
+            let prev = process
+                .heap
+                .stack_get(0)
+                .and_then(Term::as_small)
+                .map(|prev| prev as u32);
+            if let Some(pid) = process.self_pid {
+                call_acc_return(process, pid, session, flags, prev);
+            }
+            None
+        }
+    };
+    drop_words(process, words + 1);
+    Some((event, caller))
 }
 
-/// The continuation word that starts a native trace frame on the stack.
-pub(crate) fn native_trace_marker() -> usize {
-    arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
-}
-
-/// Saves native return and exception actions until the traced function exits; `live` is
-/// the traced function's arity, the X registers that are roots if a collection is needed.
+/// Pushes one erts trace frame per action of a traced call, below the caller's return address
+/// on top of the stack; `live` is the traced function's arity, the X registers that are roots
+/// if a collection is needed. `function_pc` is a pc in the traced function (erts `&mfa`).
+// Port of erts/emulator/beam/beam_bp.c:1205-1275 (do_call_trace: the return_to frame, then the
+// return/exception trace frame) and :1119-1150 (do_session_breakpoint: the call acc frame),
+// OTP-29.1.1.
 pub(crate) fn push_native_trace_frame(
     process: &mut Process,
-    return_address: usize,
+    function_pc: usize,
     actions: &[NativeTraceAction],
     live: usize,
 ) -> Result<(), VmError> {
-    if actions.is_empty() {
+    let mut frames: SmallVec<[(TraceFrameKind, [Term; 3]); 2]> = SmallVec::new();
+    let small = |value: u64| Term::small(value as i64).unwrap_or(Term::NIL);
+    for action in actions {
+        if action.return_to {
+            frames.push((
+                TraceFrameKind::ReturnToTrace,
+                [small(action.session), Term::NIL, Term::NIL],
+            ));
+        }
+        if action.return_trace || action.exception_trace {
+            let kind = if action.exception_trace {
+                TraceFrameKind::ExceptionTrace
+            } else {
+                TraceFrameKind::ReturnTrace
+            };
+            // erts keeps a copy of the tracer in the frame; Arinsal resolves the session's
+            // tracer at the return (meta tracers are held by `hold_meta_frame`).
+            frames.push((
+                kind,
+                [small(function_pc as u64), Term::NIL, small(action.session)],
+            ));
+        }
+        if let Some(acc) = action.acc {
+            frames.push((
+                TraceFrameKind::CallTraceReturn,
+                [
+                    acc.prev.map_or(Term::NIL, |prev| small(u64::from(prev))),
+                    small(u64::from(acc.flags)),
+                    small(action.session),
+                ],
+            ));
+        }
+    }
+    if frames.is_empty() {
         return Ok(());
     }
-    let frame_words = 4usize.saturating_add(actions.len().saturating_mul(2));
+    let frame_words: usize = frames.iter().map(|(kind, _)| 1 + kind.data_words()).sum();
     // Port of erts/emulator/beam/beam_bp.c:1206-1219 (erts_generic_breakpoint), OTP-29.1.1:
     // collect with the function's arguments as roots when the trace frames do not fit.
     let needed = frame_words
@@ -3024,130 +3105,122 @@ pub(crate) fn push_native_trace_frame(
     } else {
         process.ensure(frame_words, live)?;
     }
-    let Some(old_cp) = process.heap.stack_get(0) else {
-        return Err(VmError::Unsupported(
-            "native trace continuation missing".into(),
-        ));
-    };
     if !process.heap.reserve_stack(frame_words) {
         return Err(VmError::Unsupported("native trace stack limit".into()));
     }
-    let trace_stub = native_trace_marker();
-    let metadata = [
-        crate::proc_create::native_continuation_term(trace_stub),
-        old_cp,
-        Term::small(return_address as i64).unwrap_or(Term::NIL),
-        Term::small(actions.len() as i64).unwrap_or(Term::NIL),
-    ];
-    for (index, value) in metadata.into_iter().enumerate() {
-        process.heap.stack_set(index, value);
-    }
-    for (index, action) in actions.iter().enumerate() {
+    // The last frame pushed is on top.
+    let mut index = 0;
+    for (kind, data) in frames.iter().rev() {
         process.heap.stack_set(
-            4 + index * 2,
-            Term::small(action.session as i64).unwrap_or(Term::NIL),
+            index,
+            crate::proc_create::native_continuation_term(kind.address()),
         );
-        process.heap.stack_set(
-            5 + index * 2,
-            Term::small(action.flags_word()).unwrap_or(Term::NIL),
-        );
+        for (offset, word) in data.iter().take(kind.data_words()).enumerate() {
+            process.heap.stack_set(index + 1 + offset, *word);
+        }
+        index += 1 + kind.data_words();
     }
-    for action in actions {
-        if crate::trace_bp::is_meta_id(action.session) && action.return_trace {
-            crate::trace_bp::hold_meta_frame(process, action.session);
+    for (kind, data) in &frames {
+        if matches!(
+            kind,
+            TraceFrameKind::ReturnTrace | TraceFrameKind::ExceptionTrace
+        ) && let Some(session) = data[2].as_small()
+            && crate::trace_bp::is_meta_id(session as u64)
+        {
+            crate::trace_bp::hold_meta_frame(process, session as u64);
         }
     }
     Ok(())
 }
 
-/// Emit the trace events of the actions of a native trace frame that is left by a return, or
-/// by an exception when `exception` is set.
-// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195 and
-// erts/emulator/beam/beam_common.c:622-640 (next_catch), OTP-29.1.1.
-pub(crate) fn native_return_events(
+/// Emit the `return_from` event of a return_trace or exception_trace frame left by a return,
+/// or the `exception_from` event of an exception_trace frame left by an exception when
+/// `exception` is set.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp (return_trace -> erts_trace_return) and
+// erts/emulator/beam/beam_common.c:622-640 (next_catch -> erts_trace_exception), OTP-29.1.1.
+pub(crate) fn native_return_event(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    function: &crate::NativeFunction,
-    actions: &[NativeTraceAction],
+    function_pc: usize,
+    session: u64,
     value: Term,
     exception: bool,
 ) -> Result<(), VmError> {
-    let pid = ctx.pid();
-    let mut mfa = None;
-    // The frames pop innermost first: the last action pushed its frames last.
-    for action in actions.iter().rev() {
-        if let Some(acc) = action.acc {
-            // Frames left by an exception do no accounting.
-            if !exception {
-                call_acc_return(process, pid, action.session, acc.flags, acc.prev);
-            }
-            continue;
-        }
-        if (exception && !action.exception_trace) || (!exception && !action.return_trace) {
-            continue;
-        }
-        let meta = if crate::trace_bp::is_meta_id(action.session) {
-            let Some(meta) = crate::trace_bp::meta_tracer_by_id(action.session) else {
-                continue;
-            };
-            Some(meta)
-        } else {
-            let flags = active_session_flags(process, action.session, pid);
-            if flags & CALL == 0 || flags & SILENT != 0 {
-                continue;
-            }
-            None
-        };
-        let mfa =
-            match mfa {
-                Some(mfa) => mfa,
-                None => {
-                    let built =
-                        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                            .tuple(&[
-                                Term::atom(global_atoms().intern(function.module).map_err(
-                                    |_| VmError::Unsupported("trace module atom".into()),
-                                )?),
-                                Term::atom(global_atoms().intern(function.function).map_err(
-                                    |_| VmError::Unsupported("trace function atom".into()),
-                                )?),
-                                Term::small(i64::from(function.arity))
-                                    .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
-                            ])
-                            .map_err(|error| {
-                                VmError::Unsupported(format!("trace MFA: {error:?}"))
-                            })?;
-                    mfa = Some(built);
-                    built
-                }
-            };
-        let name = if exception {
-            "exception_from"
-        } else {
-            "return_from"
-        };
-        if let Some(meta) = meta {
-            emit_meta(vm, process, ctx, &meta, name, &[mfa, value], None, false);
-        } else {
-            emit_filtered(
-                Some(vm),
-                process,
-                ctx,
-                pid,
-                CALL,
-                name,
-                &[mfa, value],
-                Some(action.session),
-                None,
-            );
-        }
+    let result =
+        native_return_event_inner(vm, process, ctx, function_pc, session, value, exception);
+    // The frame is gone: its meta tracer may be freed.
+    release_return_frame(process, session);
+    result
+}
+
+/// A return or exception trace frame of `session` left the stack.
+pub(crate) fn release_return_frame(process: &mut Process, session: u64) {
+    if crate::trace_bp::is_meta_id(session) {
+        crate::trace_bp::release_meta_frame(process, session);
     }
-    // The frame is gone: its meta tracers may be freed.
-    for action in actions {
-        if crate::trace_bp::is_meta_id(action.session) && action.return_trace {
-            crate::trace_bp::release_meta_frame(process, action.session);
+}
+
+fn native_return_event_inner(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    function_pc: usize,
+    session: u64,
+    value: Term,
+    exception: bool,
+) -> Result<(), VmError> {
+    let Some(function) = crate::native_function_at(function_pc) else {
+        return Ok(());
+    };
+    let pid = ctx.pid();
+    let meta = if crate::trace_bp::is_meta_id(session) {
+        let Some(meta) = crate::trace_bp::meta_tracer_by_id(session) else {
+            return Ok(());
+        };
+        Some(meta)
+    } else {
+        let flags = active_session_flags(process, session, pid);
+        if flags & CALL == 0 || flags & SILENT != 0 {
+            return Ok(());
         }
+        None
+    };
+    let mfa = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .tuple(&[
+            Term::atom(
+                global_atoms()
+                    .intern(function.module)
+                    .map_err(|_| VmError::Unsupported("trace module atom".into()))?,
+            ),
+            Term::atom(
+                global_atoms()
+                    .intern(function.function)
+                    .map_err(|_| VmError::Unsupported("trace function atom".into()))?,
+            ),
+            Term::small(i64::from(function.arity))
+                .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
+        ])
+        .map_err(|error| VmError::Unsupported(format!("trace MFA: {error:?}")))?;
+    let name = if exception {
+        "exception_from"
+    } else {
+        "return_from"
+    };
+    if let Some(meta) = meta {
+        emit_meta(vm, process, ctx, &meta, name, &[mfa, value], None, false);
+    } else {
+        emit_filtered(
+            Some(vm),
+            process,
+            ctx,
+            pid,
+            CALL,
+            name,
+            &[mfa, value],
+            Some(session),
+            None,
+        );
     }
     Ok(())
 }
@@ -3290,49 +3363,36 @@ pub(crate) fn unwound_return_to(
     Ok(())
 }
 
-/// Emits the `return_to` event of a traced native return that resumes at `caller`.
-// Port of erts/emulator/beam/emu/trace_instrs.tab:73-105 (i_return_to_trace), OTP-29.1.1.
+/// Emits the `return_to` event of a return_to frame for `target`, the function the return
+/// continues in.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_return_to_trace), OTP-29.1.1.
 pub(crate) fn native_return_to_event(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     session: u64,
-    caller: usize,
+    target: Option<(String, String, u8)>,
 ) -> Result<(), VmError> {
     let flags = flags(process, ctx.pid());
     if flags & RETURN_TO == 0 || flags & SILENT != 0 {
         return Ok(());
     }
-    // The native frame's CP was consumed by the return: a native caller is named by it,
-    // an interpreted one by the continuation the bridge left on the stack.
-    let target = match crate::native_function_at(caller) {
-        Some(function) => Some((
-            function.module.to_owned(),
-            function.function.to_owned(),
-            function.arity,
-        )),
-        None => return_to_target(process, 0),
-    };
     emit_return_to(vm, process, ctx, session, target)
 }
 
+/// The function of the first return address at or after stack index `start` that is not a
+/// trace frame.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_return_to_trace: the
+// erts_inspect_frame loop), OTP-29.1.1.
 fn return_to_target(process: &Process, start: usize) -> Option<(String, String, u8)> {
-    let trace_stub = arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize;
     let mut index = start;
     loop {
-        let word = process.heap.stack_get(index)?;
-        let raw = word.tagged_word() as usize;
-        if raw == trace_stub {
-            // A native return trace frame: stub, caller CP, function pc, count, actions.
-            let count = process
-                .heap
-                .stack_get(index + 3)
-                .and_then(Term::as_small)
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(0);
-            index += 4 + count * 2;
+        if let Some(words) = trace_frame_words_at(&process.heap, index) {
+            index += words;
             continue;
         }
+        let raw = process.heap.stack_get(index)?.tagged_word() as usize;
+        // The exit bridge stands for the caller's continuation beneath it.
         if let Some(function) = crate::native_function_at(raw) {
             return Some((
                 function.module.to_owned(),

@@ -540,15 +540,10 @@ pub(super) fn capture(
             continue;
         };
         let raw_address = word.tagged_word() as usize;
-        if raw_address == crate::native_bridge::native_trace_return_address() {
+        if let Some(kind) = crate::trace::TraceFrameKind::of(raw_address) {
             // Port of erts/emulator/beam/beam_common.c:803-815 (save_stacktrace), OTP-29.1.1:
             // trace frames are skipped; the caller's own continuation follows the frame.
-            let action_count = heap
-                .stack_get(index + 3)
-                .and_then(Term::as_small)
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(0);
-            index += 4usize.saturating_add(action_count.saturating_mul(2));
+            index += 1 + kind.data_words();
             continue;
         }
         if raw_address == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize {
@@ -911,7 +906,6 @@ fn gather_native_continuations(
     if limit == 0 {
         return 0;
     }
-    let trace_return = crate::native_bridge::native_trace_return_address();
     // erts records `beam_normal_exit` like any CP and `build_stacktrace` drops it because no
     // function contains it; the bridge is skipped here instead, which yields the same frames.
     let bridge = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
@@ -925,14 +919,8 @@ fn gather_native_continuations(
             continue;
         }
         let raw_address = word as usize;
-        if raw_address == trace_return {
-            let action_count = p
-                .heap
-                .stack_get(index + 2)
-                .and_then(Term::as_small)
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(0);
-            index = index.saturating_add(3 + action_count.saturating_mul(2));
+        if let Some(kind) = crate::trace::TraceFrameKind::of(raw_address) {
+            index = index.saturating_add(kind.data_words());
         } else if raw_address != previous_cp && raw_address != bridge {
             previous_cp = raw_address;
             pcs[count] = raw_address.wrapping_sub(1) as u64;

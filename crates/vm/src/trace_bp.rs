@@ -1236,7 +1236,7 @@ pub(crate) fn native_breakpoint_accounting(
     let mut frame_on_top = false;
     if any_acc {
         let top = process.heap.stack_get(0)?.tagged_word() as usize;
-        if top == crate::native_bridge::native_trace_return_address() {
+        if crate::trace::TraceFrameKind::of(top).is_some() {
             frame_on_top = true;
         } else if !crate::native_bridge::is_native_function_at(top) {
             return None;

@@ -162,7 +162,14 @@ pub unsafe fn enter_native_raw(
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     pub fn arinsal_enter_native_return();
-    pub fn arinsal_enter_native_trace_return();
+    /// erts `beam_return_trace`: the return address of a return_trace frame.
+    pub fn arinsal_return_trace();
+    /// erts `beam_exception_trace`: the return address of an exception_trace frame.
+    pub fn arinsal_exception_trace();
+    /// erts `beam_return_to_trace`: the return address of a return_to frame.
+    pub fn arinsal_return_to_trace();
+    /// erts `beam_call_trace_return`: the return address of a call time/memory frame.
+    pub fn arinsal_call_trace_return();
     fn arinsal_enter_native(
         header: *mut ProcessHeader,
         regs: *mut SchedulerRegisters,
@@ -205,8 +212,26 @@ macro_rules! asm_load_enter_native_return {
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
-    concat!(".global ", asm_sym!("arinsal_enter_native_trace_return")),
-    concat!(asm_sym!("arinsal_enter_native_trace_return"), ":"),
+    // Port of erts/emulator/beam/jit/beam_jit_main.cpp:255-270 (the `erts_beamasm` trace
+    // return addresses) and jit/arm/instr_trace.cpp (emit_return_trace, emit_i_return_to_trace,
+    // emit_i_call_trace_return), OTP-29.1.1: one return address per trace frame kind. Each
+    // passes its kind (`TRACE_FRAME_*`) to the shared Rust hook in x1.
+    concat!(".global ", asm_sym!("arinsal_return_trace")),
+    concat!(asm_sym!("arinsal_return_trace"), ":"),
+    "mov x1, #0",
+    "b 1f",
+    concat!(".global ", asm_sym!("arinsal_exception_trace")),
+    concat!(asm_sym!("arinsal_exception_trace"), ":"),
+    "mov x1, #1",
+    "b 1f",
+    concat!(".global ", asm_sym!("arinsal_return_to_trace")),
+    concat!(asm_sym!("arinsal_return_to_trace"), ":"),
+    "mov x1, #2",
+    "b 1f",
+    concat!(".global ", asm_sym!("arinsal_call_trace_return")),
+    concat!(asm_sym!("arinsal_call_trace_return"), ":"),
+    "mov x1, #3",
+    "1:",
     // Publish the BEAM cursors and register cache before the Rust trace hook.
     "str x20, [x21, #8]",
     "str x23, [x21, #0]",

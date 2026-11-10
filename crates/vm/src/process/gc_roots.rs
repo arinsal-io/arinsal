@@ -456,16 +456,12 @@ impl Process {
             if in_native(word) {
                 return true;
             }
-            // A native trace frame keeps the traced function's native return address as a small
-            // integer, three words below its marker (see `trace::push_native_trace_frame`); the
-            // process returns into that code once the traced function exits.
-            if word == crate::trace::native_trace_marker()
-                && self
-                    .heap
-                    .stack_get(index + 2)
-                    .and_then(Term::as_small)
-                    .and_then(|address| usize::try_from(address).ok())
-                    .is_some_and(&in_native)
+            // A return or exception trace frame names its traced function (erts `&mfa`) by a
+            // pc in it, kept as a small integer; the process returns into that function's
+            // trace once it exits.
+            if let Some((crate::trace::TraceFrame::Return { function_pc, .. }, _)) =
+                crate::trace::trace_frame_at(&self.heap, index)
+                && in_native(function_pc)
             {
                 return true;
             }

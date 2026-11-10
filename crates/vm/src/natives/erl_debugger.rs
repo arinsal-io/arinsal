@@ -558,7 +558,14 @@ fn inspect_frames(
         let normal_exit = raw == crate::native_bridge::bridge_return_address();
         reached_exit |= normal_exit;
         let breakpoint_cleanup = crate::beamasm_integration::is_line_breakpoint_cleanup(raw);
-        if normal_exit || breakpoint_cleanup || crate::native_bridge::is_native_function_at(raw) {
+        // A trace frame's return address is a CP like any other (erts `is_CP`), of no
+        // function (erts_internal_fun_description_from_pc); its data words are its slots.
+        let trace_frame = crate::trace::TraceFrameKind::of(raw).is_some();
+        if normal_exit
+            || breakpoint_cleanup
+            || trace_frame
+            || crate::native_bridge::is_native_function_at(raw)
+        {
             push_frame(&mut frames, modules, current, &slots, current_is_return);
             slots.clear();
             current = FramePc::Native(raw);
