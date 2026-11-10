@@ -83,7 +83,15 @@ impl Executor {
                 target_pc,
                 resume_pc,
             } => {
-                crate::beamasm_integration::count_call_unported();
+                crate::beamasm_integration::count_call_unported(
+                    target_pc,
+                    process
+                        .cold
+                        .as_ref()
+                        .and_then(|cold| cold.bif_trap.as_ref())
+                        .map(|pending| (pending.callee.0, pending.callee.1, pending.arity)),
+                    process.x[0],
+                );
                 // The native call site names the caller only if the called BIF
                 // raises; any other continuation must not inherit it.
                 let call_site_pc = std::mem::take(&mut process.native_error_pc);

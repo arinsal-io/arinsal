@@ -134,10 +134,7 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
             },
         )),
         "build_type" | "emu_type" => Ok(atom("opt")),
-        "os_type" => {
-            let flavor = uname_fields().0;
-            Ok(tuple_build(ctx, &[atom("unix"), atom(&flavor)]))
-        }
+        "os_type" => Ok(os_type()),
         "endian" => Ok(atom(if cfg!(target_endian = "little") {
             "little"
         } else {
@@ -326,6 +323,18 @@ crate::word_bif_bodies_in!(word_bodies; system_info, no_aux_work_threads, getenv
 
 /// `(os_flavor, os_version)` from `uname(2)`.
 // Port of erts/emulator/sys/unix/sys.c (os_flavor, os_version), OTP-29.1.1.
+/// `erlang:system_info(os_type)`: the global literal `os_info_init` builds once.
+// Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_type: ERTS_GLOBAL_LIT_OS_TYPE,
+// os_info_init), OTP-29.1.1.
+pub fn os_type() -> Term {
+    static OS_TYPE: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *OS_TYPE.get_or_init(|| {
+        let flavor = uname_fields().0;
+        let intern = |name: &str| global_atoms().intern(name).expect("os_type atom");
+        arinsal_term::global_os_type(intern("unix"), intern(&flavor))
+    })
+}
+
 fn uname_fields() -> (String, [i64; 3]) {
     let uts = rustix::system::uname();
     let flavor = uts.sysname().to_string_lossy().to_ascii_lowercase();

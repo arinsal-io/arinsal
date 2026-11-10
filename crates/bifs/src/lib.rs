@@ -74,7 +74,7 @@ pub use unique::{
     next_unique_monotonic_positive, ordinary_ref_key, ordinary_ref_words, scheduler_thr_id,
 };
 
-pub use sys::{set_emu_flavor_jit, sys_perf_counter};
+pub use sys::{os_type, set_emu_flavor_jit, sys_perf_counter};
 pub use time::initialize_time_origin;
 
 /// Exception class, as in `erlang:raise/3`.
