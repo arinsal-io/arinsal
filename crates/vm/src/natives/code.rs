@@ -1311,6 +1311,13 @@ fn purge(
 // Port of erts/emulator/beam/beam_bif_load.c:822-900 (erts_internal_finish_after_on_load_2),
 // OTP-29.1.1.
 fn finish_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<Term, VmError> {
+    finish_after_on_load(vm, name, keep)?;
+    Ok(atom("true"))
+}
+
+/// erlang:finish_after_on_load/2 for a caller outside any process (`Vm::eval_scheduled`'s
+/// `code_server` role); `badarg` when `name` has no pending on_load code.
+pub(crate) fn finish_after_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<(), VmError> {
     vm.refresh_code();
     if !vm.code.pending_on_load.contains_key(name) {
         return Err(badarg());
@@ -1327,7 +1334,7 @@ fn finish_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<Term, VmError> 
         drop(staging);
         vm.refresh_code();
     }
-    Ok(atom("true"))
+    Ok(())
 }
 
 /// Code-loading BIFs. `recognizes` is the same MFA set as the `match` in [`call`].
