@@ -392,37 +392,14 @@ impl Executor {
         if process.x.len() < 3 {
             return Err(VmError::Unsupported("hibernate registers".into()));
         }
-        let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
-        // erts resumes a hibernated process at the export address of apply/3.
-        self.vm.set_position(process, module_id, entry)?;
+        // Port of erts/emulator/beam/bif.c:1426-1427 (hibernate_3: erts_hibernate, then
+        // BIF_TRAP_CODE_PTR(beam_run_process, 3)), OTP-29.1.1: the process wakes in the
+        // beam_run_process stub, which applies X0..X2.
+        process.set_run_process_entry()?;
         process.inbox.set_save(0);
         process.cancel_receive_timer();
         Ok(())
     }
-}
-
-/// Registers a redone fun call or apply reads: the arguments and the fun (`call_fun`) or the
-/// module and function (`apply_fixed`) above them, `apply/2` and `apply/3`'s own operands.
-/// `None` for every other call the scheduler redoes: it takes its `arity` registers.
-pub(super) fn retry_operand_count(target_pc: usize, arity: usize) -> Option<usize> {
-    use arinsal_beamasm::dispatch::{APPLY2_UNPORTED, CALL_FUN_UNPORTED};
-    match target_pc {
-        CALL_FUN_UNPORTED => Some(arity + 1),
-        APPLY2_UNPORTED => Some(2),
-        _ => None,
-    }
-}
-
-/// The call arity of a redone fun call or apply, from the operand count its switch-out saved
-/// (`retry_operand_count` backwards). `None` for every other call the scheduler redoes.
-pub(super) fn retry_call_arity(target_pc: usize, saved: usize) -> Option<u8> {
-    use arinsal_beamasm::dispatch::{APPLY2_UNPORTED, CALL_FUN_UNPORTED};
-    let arity = match target_pc {
-        CALL_FUN_UNPORTED => saved.saturating_sub(1),
-        APPLY2_UNPORTED => 2,
-        _ => return None,
-    };
-    u8::try_from(arity).ok()
 }
 
 /// Exact live X register count of a switched-out process, erts `c_p->arity`. Every
@@ -508,21 +485,6 @@ impl Process {
         self.initial_mfa = Some((module, function, arity));
         Ok(())
     }
-}
-
-pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError> {
-    if let Some(entry) = vm.apply3_entry {
-        return Ok(entry);
-    }
-    let module_id = vm.load_named("erlang")?;
-    let entry = vm.code.modules[module_id]
-        .functions
-        .iter()
-        .find(|(_, name, arity)| *name == "apply" && *arity == 3)
-        .map(|(ip, _, _)| ip + 1)
-        .ok_or_else(|| VmError::Unsupported("erlang:apply/3 is not loaded".into()))?;
-    vm.apply3_entry = Some((module_id, entry));
-    Ok((module_id, entry))
 }
 
 thread_local! {

@@ -4374,7 +4374,6 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
     };
     let fun = crate::native_hooks::from_raw(fun_raw);
     let view = crate::native_hooks::fun_view(fun);
-    let unported = crate::beamasm_integration::call_fun_unported_entry();
     match view {
         Some(arinsal_term::FunRef::Local { entry, .. }) => {
             if u32::from(entry.arity) != arity {
@@ -4383,24 +4382,17 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
             }
             let code_ix =
                 (registers.active_code_ix as usize).min(arinsal_term::ERTS_NUM_CODE_IX - 1);
-            if let Some(target) = entry.fun_code(code_ix) {
-                return target;
-            }
+            // erts tests `fe->pend_purge_address` first: during a purge the entry's address is
+            // `beam_unloaded_fun` even though the old code still exists.
             if entry
                 .pend_purge_address
                 .load(std::sync::atomic::Ordering::Acquire)
                 != 0
             {
-                // erts_suspend_process_on_pending_purge_lambda: still run by the scheduler.
-                process.heap.abi.arity = arity.min(u8::MAX as u32) as u8;
-                if let Some(slot) = process.x.get_mut(arity as usize) {
-                    *slot = fun;
-                }
-                if unported == 0 {
-                    set_call_fun_error(process, fun, arity);
-                    return 0;
-                }
-                return unported;
+                return pending_purge_lambda(process, registers, entry.module, fun, arity);
+            }
+            if let Some(target) = entry.fun_code(code_ix) {
+                return target;
             }
             unloaded_fun_error_handler(process, registers, entry.module, fun, arity)
         }
@@ -4538,6 +4530,66 @@ fn unloaded_fun_error_handler(
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
+    lambda_handler_call(process, handler_export, code_ix, module, fun, arity)
+}
+
+/// The call of a fun in code being purged: the caller suspends until the purge completes or
+/// aborts, then `erts_code_purger:pending_purge_lambda/3` retries the call.
+// Port of erts/emulator/beam/beam_bif_load.c:1977-2008
+// (erts_suspend_process_on_pending_purge_lambda) and jit/beam_jit_common.cpp
+// (beam_jit_handle_unloaded_fun, `fe->pend_purge_address`), OTP-29.1.1.
+fn pending_purge_lambda(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    module: arinsal_term::Atom,
+    fun: Term,
+    arity: u32,
+) -> usize {
+    let code_ix = registers.active_code_ix as usize;
+    let Some(runtime) = process.runtime else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    if let (Some(pid), Some(name)) = (process.self_pid, arinsal_term::global_atoms().text(module))
+        && runtime
+            .code_indexes()
+            .purge_state
+            .suspend_on_pending_lambda(name, pid)
+    {
+        crate::suspend::suspend_self(process);
+        // ERTS_VBUMP_ALL_REDS: the callee's reduction check leaves the scheduler.
+        if process.heap.abi.fcalls > 0 {
+            process.virtual_reds = process
+                .virtual_reds
+                .saturating_add(process.heap.abi.fcalls as u32);
+        }
+        process.heap.abi.fcalls = 0;
+    }
+    let (Ok(purger), Ok(function)) = (
+        arinsal_term::global_atoms().intern("erts_code_purger"),
+        arinsal_term::global_atoms().intern("pending_purge_lambda"),
+    ) else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    let Some(export) = runtime.export_entry((purger, function, 3), code_ix) else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    lambda_handler_call(process, export, code_ix, module, fun, arity)
+}
+
+/// X0..X3 = Module, Fun, Args, [] for `handler(Module, Fun, Args)` and its address.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_handle_unloaded_fun: the
+// argument list and `reg[0..3]`), OTP-29.1.1.
+fn lambda_handler_call(
+    process: &mut crate::Process,
+    handler_export: &arinsal_beamasm::bif::ExportEntry,
+    code_ix: usize,
+    module: arinsal_term::Atom,
+    fun: Term,
+    arity: u32,
+) -> usize {
     let arity = arity as usize;
     // The fun is rooted above the arguments while the list is built.
     process.x[arity] = fun;

@@ -43,7 +43,6 @@ fn runtime() -> ApplyRuntime {
         apply3_resolver: apply3_hook,
         apply_fun_shared: 0,
         fun_resolver: fun_hook,
-        apply2_fragment: 0,
     }
 }
 
@@ -171,7 +170,6 @@ fn apply_fun_module(fragments: &DispatchFragments) -> FinalizedModule {
     let runtime = ApplyRuntime {
         apply_fun_shared: fragments.apply_fun_shared(),
         fun_resolver: apply_fun_hook,
-        apply2_fragment: fragments.apply2_unported(),
         ..runtime()
     };
     let mut asm = BeamModuleAssembler::new();
@@ -226,22 +224,22 @@ fn native_apply_fun_unpacks_arguments() {
     }
 }
 
-// An improper argument list is applied by the interpreter, which raises, with X0/X1 intact.
+// An improper argument list raises badarg with erlang:apply/2 as the current MFA and X0/X1
+// intact (erts emit_apply_fun_shared, `raise_error`).
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn native_apply_fun_improper_list_goes_to_interpreter() {
+fn native_apply_fun_improper_list_raises_badarg() {
     let fragments = DispatchFragments::new(0, light_bif_hook as *const () as usize, 0, 0).unwrap();
     let module = apply_fun_module(&fragments);
     let cells = [tagged(7), tagged(8)];
     let list = cells.as_ptr() as u64 | 1;
-    let (_, regs, outcome) = execute(&module, ProcessHeader::default(), [tagged(1), list, 0]);
-    assert!(matches!(
-        outcome,
-        ExitReason::CallUnported {
-            target_pc: arinsal_beamasm::dispatch::APPLY2_UNPORTED,
-            ..
-        }
-    ));
+    let (header, regs, _) = execute(&module, ProcessHeader::default(), [tagged(1), list, 0]);
+    assert_eq!(header.exc.freason, arinsal_beamasm::exc::EXC_BADARG);
+    let mfa = arinsal_beamasm::bif::static_bif_mfa(header.current as usize as u64);
+    assert_eq!(
+        mfa,
+        Some((arinsal_term::atoms::ERLANG, arinsal_term::atoms::APPLY, 2))
+    );
     assert_eq!(
         regs.x_reg_array[0],
         arinsal_beamasm::rt::fixture_term(tagged(1))

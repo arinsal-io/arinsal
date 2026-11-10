@@ -405,11 +405,6 @@ impl Executor {
                             // the call instruction.
                             let retry = process.take_native_retry();
                             let outcome = if let Some(target_pc) = retry {
-                                if let Some(call_arity) =
-                                    retry_call_arity(target_pc, process.x.saved_arity())
-                                {
-                                    process.heap.abi.arity = call_arity;
-                                }
                                 if process
                                     .cold
                                     .as_ref()
@@ -678,25 +673,13 @@ impl Executor {
             // every reader of the saved file takes.
             let arity_set = process.native_pc().is_some() && process.native_arity_set;
             let call_arity = usize::from(process.heap.abi.arity);
-            let mut live_x = if arity_set {
+            let live_x = if arity_set {
                 call_arity
             } else if process.native_pc().is_some() {
                 process.gc_live.max(call_arity)
             } else {
                 process.gc_live
             };
-            // A fun call or apply the scheduler redoes reads its operands from the saved file:
-            // the arguments and the fun or module and function above them, and nothing else is
-            // live. The saved count is that operand count; the retry takes the call's own arity
-            // back from it (`retry_call_arity`).
-            if !arity_set
-                && process.native_pc().is_some()
-                && let Some(operands) = process
-                    .native_retry()
-                    .and_then(|target| retry_operand_count(target, call_arity))
-            {
-                live_x = operands;
-            }
             process.heap.abi.arity = live_x.min(usize::from(u8::MAX)) as u8;
             process.gc_live = live_x;
             let save_x = live_x;

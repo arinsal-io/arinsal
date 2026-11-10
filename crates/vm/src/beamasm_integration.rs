@@ -934,11 +934,6 @@ pub(crate) fn export_from_info(info: u64) -> Option<ExportDispatch> {
     Some(unsafe { &*(info as *const DispatchTarget) })
 }
 
-/// Shared fragment that exits native code so the scheduler can interpret a fun call.
-pub(crate) fn call_fun_unported_entry() -> usize {
-    fragments().map_or(0, DispatchFragments::call_fun_unported)
-}
-
 pub(crate) fn dispatch_bif(identity: usize) -> Option<(arinsal_bifs::BifFn, u8)> {
     let target = target_for_identity(identity)?;
     Some((target.bif?, target.arity))
@@ -1965,7 +1960,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
             apply3_resolver: crate::native_helpers::arinsal_beamasm_apply3_resolver,
             apply_fun_shared: fragments.map_or(0, DispatchFragments::apply_fun_shared),
             fun_resolver: crate::native_helpers::arinsal_beamasm_fun_resolver,
-            apply2_fragment: fragments.map_or(0, DispatchFragments::apply2_unported),
         }
     }
 }
@@ -2374,8 +2368,6 @@ pub(crate) fn count_call_unported(
         d::DIRTY_NIF_DISPATCH_IDENTITY => "dirty_nif".to_owned(),
         d::BREAKPOINT_DISPATCH_IDENTITY => "breakpoint".to_owned(),
         d::SEND_DISPATCH_IDENTITY => "send".to_owned(),
-        d::CALL_FUN_UNPORTED => "call_fun".to_owned(),
-        d::APPLY2_UNPORTED => "apply2".to_owned(),
         pc if d::decode_line_breakpoint_identity(pc).is_some() => "line_breakpoint".to_owned(),
         pc if pc == crate::bif_traps::bif_export_trap_pc() => match trapped {
             Some((m, f, a)) => format!(
