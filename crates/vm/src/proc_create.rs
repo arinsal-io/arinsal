@@ -1308,9 +1308,6 @@ pub(crate) struct SliceWork {
     /// A system task woke the process while it was executing; it runs at the next scheduling
     /// point instead.
     pub(crate) sys_tasks_deferred: bool,
-    /// A table BIF failure raised from the direct path with its BIF frame already built, as
-    /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
-    pub(crate) native_trap: Option<Box<NativeTrap>>,
     /// A process-local BIF trap waiting for its private continuation export.
     pub(crate) bif_trap: Option<BifTrapPending>,
     /// Spawned MFA entry that resolves to a runtime BIF export.
@@ -1361,7 +1358,6 @@ impl SliceWork {
             || self.rla_block.is_some()
             || self.dirty_pickup.is_some()
             || self.suspend_parked
-            || self.native_trap.is_some()
             || !self.delayed_gc.is_empty()
     }
 }
@@ -2147,15 +2143,6 @@ impl Process {
         self.set_slow(Self::SLOW_COLD, busy);
         taken
     }
-    /// Clears a pending native trap; it is empty while `SLOW_COLD` is clear.
-    #[inline(always)]
-    pub(crate) fn clear_native_failure(&mut self) {
-        if self.slow & Self::SLOW_COLD != 0 {
-            self.update_work(|work| {
-                work.native_trap = None;
-            });
-        }
-    }
     /// Runs `f` on the slice work of the existing cold part, if any.
     #[inline(always)]
     pub(crate) fn update_work(&mut self, f: impl FnOnce(&mut SliceWork)) {
@@ -2685,14 +2672,6 @@ impl Default for Process {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A table BIF exception with its BIF frame built, kept until the native exit raises it.
-pub(crate) struct NativeTrap {
-    pub(crate) trap: crate::exceptions::Trap,
-    /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
-    pub(crate) freason: u64,
-    pub(crate) fvalue: u64,
 }
 
 /// Kind of a collection scheduled on a dirty CPU scheduler.

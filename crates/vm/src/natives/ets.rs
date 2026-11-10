@@ -608,8 +608,8 @@ fn direct_info_2(
     direct_bif::<{ EtsBif::Info as u8 }>(process, args, module, function)
 }
 
-/// Value of a finished direct call, or `Some` dummy with `freason` set after the failure has
-/// been parked for the native exit. Never declines: the call already ran.
+/// Value of a finished direct call, or THE_NON_VALUE with `freason`/`fvalue` set (`BIF_ERROR`).
+/// Never declines: the call already ran.
 fn finish_direct(
     process: &mut Process,
     module: arinsal_term::Atom,
@@ -628,46 +628,11 @@ fn finish_direct(
     match bif_register_frame(module, function, args.len(), result) {
         Ok(value) => Some(value),
         Err(VmError::Trap(trap)) => {
-            let (class, fvalue) = parked_freason_fvalue(&trap);
-            process.heap.abi.exc.freason = class;
-            process.heap.abi.exc.fvalue = fvalue;
-            process.slice_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
-                trap,
-                freason: class,
-                fvalue,
-            }));
-            Some(Term::NIL)
+            crate::native_helpers::bif_error(process, trap);
+            Some(Term::NON_VALUE)
         }
         // Not an Erlang exception (yield, unsupported): redo on the scheduler path.
         Err(_) => None,
-    }
-}
-
-/// `freason` and `fvalue` of a parked BIF failure. Extended BIF error information is carried by
-/// `fvalue` with `EXF_HAS_EXT_INFO`, and must be rebuilt the same way after a collection moved
-/// the parked terms.
-// Port of erts/emulator/beam/beam_common.c:994-1008 (`save_stacktrace`), OTP-29.1.1.
-pub(crate) fn parked_freason_fvalue(trap: &crate::exceptions::Trap) -> (u64, u64) {
-    match trap.top.as_ref() {
-        Some(crate::stacktrace::TopFrame::BifRegisters {
-            info:
-                crate::stacktrace::BifErrorInfo::Cause(cause)
-                | crate::stacktrace::BifErrorInfo::Map(cause),
-            ..
-        })
-        | Some(crate::stacktrace::TopFrame::Bif {
-            info:
-                crate::stacktrace::BifErrorInfo::Cause(cause)
-                | crate::stacktrace::BifErrorInfo::Map(cause),
-            ..
-        }) => (
-            arinsal_beamasm::exc::EXC_BADARG | arinsal_beamasm::exc::EXF_HAS_EXT_INFO,
-            crate::native_hooks::raw(*cause),
-        ),
-        _ => (
-            crate::stacktrace::class_to_freason(Some(trap.class)),
-            crate::native_hooks::raw(trap.reason),
-        ),
     }
 }
 

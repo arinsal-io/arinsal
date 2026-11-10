@@ -884,9 +884,6 @@ fn found_catch(
     process.heap.abi.exc.freason = 0;
     process.heap.abi.exc.fvalue = Term::NIL.tagged_word();
     process.heap.abi.exc.ftrace = 0;
-    // A BIF that raised through the scheduler's trap record (`signals.rs`, `natives/ets.rs`)
-    // left it beside `freason`; it is consumed with the failure words.
-    process.clear_native_failure();
 }
 
 fn register_bridge_continuation() -> Result<(), &'static str> {
@@ -1285,7 +1282,6 @@ pub fn run_native(
     process.native_reds_in = process.heap.abi.fcalls;
     process.heap.abi.i = code_ptr;
     process.heap.abi.arity = arity;
-    process.clear_native_failure();
     registers.tmp_mem[3] = 0;
     process.heap.set_native_allocation(true);
     // The scheduler set `esdp->current_process` when it scheduled the process in
@@ -1412,12 +1408,6 @@ fn native_exit(
             args,
         });
         return Err(VmError::Trap(trap));
-    } else if process.heap.abi.exc.freason != 0
-        && let Some(raised) = process.take_work(|w| w.native_trap.take())
-        && raised.freason == process.heap.abi.exc.freason
-        && raised.fvalue == process.heap.abi.exc.fvalue
-    {
-        return Err(VmError::Trap(raised.trap));
     } else if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
         && process.heap.abi.exc.ftrace != 0
     {
@@ -1579,7 +1569,6 @@ pub fn run_native_resume(
     process.native_reds_in = process.heap.abi.fcalls;
     process.heap.abi.i = code_ptr;
     process.heap.abi.arity = arity;
-    process.clear_native_failure();
     registers.tmp_mem[3] = 0;
     process.heap.set_native_allocation(true);
     // SAFETY: The caller supplies a registered executable function using the BeamAsm ABI.
