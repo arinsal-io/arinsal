@@ -1100,26 +1100,125 @@ pub fn load_with_instrumentations(
     load_with_options(file, requested_mode, debugger_lines, true)
 }
 
-/// Like [`load_with_instrumentations`]; without `specialize` the module has all its tables
-/// (functions, exports, imports, lines, literals, NIF stubs) but its instructions are not
-/// decoded into interpreter form: each stays a `CodeEnd` placeholder at its index. For a
-/// module whose functions all run natively, as erts has no interpreter form of a module.
-pub fn load_with_options(
+/// The coverage table of a module whose code goes to BeamAsm only: the counters the emitted
+/// `emit_coverage` sequences update and the metadata `code:get_coverage/2` reports. `None`
+/// when the module gets no coverage. `file` must have its instructions decoded.
+// Port of erts/emulator/beam/jit/asm_load.c:73-135 (beam_load_prepare_emit: coverage mode and
+// table allocation) and :681-711, :752-769 (the table slots of executable_line / functions),
+// OTP-29.1.1.
+pub fn native_coverage(
     file: &BeamFile,
     requested_mode: CoverageMode,
-    debugger_lines: bool,
-    specialize: bool,
-) -> Result<Module, LoadError> {
-    // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
-    // OTP interns the complete Atom chunk in index order before resolving code.
-    let atom_ids = file_atoms(file)?;
-    let name_atom = Atom(atom_ids[0]);
-    // Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals),
-    // OTP-29.1.1: the literal chunk is decoded in index order right after the
-    // atom chunk, so atoms first seen in literals get erts' table indices.
-    let (mut literals, mut literal_terms) = decode_literals(file)?;
-    // Port of erts/emulator/beam/jit/asm_load.c:79-95, OTP-29.1.1.
-    let coverage_mode = match (file.lines.as_ref(), requested_mode) {
+) -> Result<Option<Coverage>, LoadError> {
+    let CoverageScan {
+        coverage_mode,
+        count,
+        coverage_enabled,
+        function_mode,
+        source_functions,
+        counter_lines,
+        counter_ids,
+        counter_locations,
+        line_probe_mappings,
+        mut function_owners,
+        ..
+    } = scan_coverage(file, requested_mode, false)?;
+    if !coverage_enabled {
+        return Ok(None);
+    }
+    if function_mode {
+        // One slot per function with a body, as the interpreter form's function probes.
+        for (owner, start) in source_functions.iter().enumerate() {
+            if start.saturating_add(1) < count {
+                function_owners.push(owner as u32);
+            }
+        }
+    }
+    let coverage_count = function_owners.len();
+    Ok(Some(Coverage {
+        lines: counter_lines.into_boxed_slice(),
+        cover_ids: counter_ids.into_boxed_slice(),
+        locations: counter_locations.into_boxed_slice(),
+        line_probe_mappings: line_probe_mappings.into_boxed_slice(),
+        function_owners: function_owners.into_boxed_slice(),
+        ..Coverage::new(coverage_mode, coverage_count)
+    }))
+}
+
+/// Installs the debugger line metadata of a module whose code goes to BeamAsm only and was
+/// loaded with line breakpoint instrumentation: whether it supports line breakpoints, its
+/// debug points and the `DbgB` item of each. A point is keyed by the entry slot of its
+/// function in the numbering [`Module::finish_native`] gives (`2 * ordinal + 1`), as the
+/// module has no instruction stream. `file` must have its instructions decoded.
+// Port of erts/emulator/beam/jit/asm_load.c:714-737 (i_debug_line entries of the line table)
+// and erl_debugger.c (the per-function line sets), OTP-29.1.1.
+pub fn set_native_debug_lines(module: &mut Module, file: &BeamFile) {
+    let mut ordinal = None::<usize>;
+    let mut points = Vec::new();
+    let mut items = Vec::new();
+    for instruction in &file.code.instructions {
+        if instruction.op == Opcode::FuncInfo {
+            ordinal = Some(ordinal.map_or(0, |ordinal| ordinal + 1));
+            continue;
+        }
+        if !is_line_debug_instruction(file, instruction) {
+            continue;
+        }
+        let Some(ordinal) = ordinal else { continue };
+        let kind = instruction.args.first().and_then(|operand| match operand {
+            Operand::Atom(index) => file.atom(*index),
+            _ => None,
+        });
+        let line = instruction
+            .args
+            .get(1)
+            .and_then(|operand| match operand {
+                Operand::U(index) => usize::try_from(*index).ok(),
+                _ => None,
+            })
+            .and_then(|index| {
+                file.lines
+                    .as_ref()
+                    .and_then(|table| index.checked_sub(1).and_then(|i| table.items.get(i)))
+            })
+            .and_then(|item| u32::try_from(item.line).ok());
+        let live = instruction.args.get(3).and_then(|operand| match operand {
+            Operand::U(live) => u16::try_from(*live).ok(),
+            _ => None,
+        });
+        if kind == Some("line")
+            && let (Some(line), Some(live)) = (line, live)
+            && line > 0
+        {
+            points.push((2 * ordinal + 1, line, live));
+            if let Some(Operand::U(index)) = instruction.args.get(2)
+                && let Some(index) = index.checked_sub(1)
+            {
+                items.push((index as u32, line));
+            }
+        }
+    }
+    module.line_breakpoints_supported = file
+        .code
+        .instructions
+        .iter()
+        .any(|instruction| is_line_debug_instruction(file, instruction));
+    module.debug_line_points = points;
+    module.debug_line_items = items;
+}
+
+/// Whether a module loaded now gets coverage tables (asm_load.c:79-95 resolves its mode to
+/// something other than none).
+pub fn coverage_enabled_for(file: &BeamFile, requested_mode: CoverageMode) -> bool {
+    !matches!(
+        effective_coverage_mode(file, requested_mode),
+        CoverageMode::None
+    )
+}
+
+// Port of erts/emulator/beam/jit/asm_load.c:79-95, OTP-29.1.1.
+fn effective_coverage_mode(file: &BeamFile, requested_mode: CoverageMode) -> CoverageMode {
+    match (file.lines.as_ref(), requested_mode) {
         (Some(lines), _) if lines.flags & 2 != 0 => CoverageMode::LineCounters,
         (lines, CoverageMode::Line | CoverageMode::LineCounters)
             if lines.is_none_or(|lines| lines.flags & 1 == 0) =>
@@ -1127,7 +1226,32 @@ pub fn load_with_options(
             CoverageMode::None
         }
         (_, mode) => mode,
-    };
+    }
+}
+
+/// What the first pass over the instructions finds: the module's coverage mode and table
+/// layout, and for the interpreter form its label targets and instruction count.
+struct CoverageScan {
+    coverage_mode: CoverageMode,
+    labels: HashMap<u32, usize>,
+    count: usize,
+    coverage_enabled: bool,
+    function_mode: bool,
+    source_functions: Vec<usize>,
+    source_lines: Vec<(usize, u32, u32, u32, u32, usize)>,
+    counter_lines: Vec<u32>,
+    counter_ids: Vec<u32>,
+    counter_locations: Vec<u32>,
+    line_probe_mappings: Vec<(u32, u32, u32)>,
+    function_owners: Vec<u32>,
+}
+
+fn scan_coverage(
+    file: &BeamFile,
+    requested_mode: CoverageMode,
+    debugger_lines: bool,
+) -> Result<CoverageScan, LoadError> {
+    let coverage_mode = effective_coverage_mode(file, requested_mode);
     let mut labels = HashMap::new();
     let mut count = 0_usize;
     let coverage_enabled = matches!(
@@ -1252,6 +1376,54 @@ pub fn load_with_options(
     if count > u32::MAX as usize {
         return Err(LoadError::Limit);
     }
+    Ok(CoverageScan {
+        coverage_mode,
+        labels,
+        count,
+        coverage_enabled,
+        function_mode,
+        source_functions,
+        source_lines,
+        counter_lines,
+        counter_ids,
+        counter_locations,
+        line_probe_mappings,
+        function_owners,
+    })
+}
+
+/// Like [`load_with_instrumentations`]; without `specialize` the module has all its tables
+/// (functions, exports, imports, lines, literals, NIF stubs) but its instructions are not
+/// decoded into interpreter form: each stays a `CodeEnd` placeholder at its index. For a
+/// module whose functions all run natively, as erts has no interpreter form of a module.
+pub fn load_with_options(
+    file: &BeamFile,
+    requested_mode: CoverageMode,
+    debugger_lines: bool,
+    specialize: bool,
+) -> Result<Module, LoadError> {
+    // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
+    // OTP interns the complete Atom chunk in index order before resolving code.
+    let atom_ids = file_atoms(file)?;
+    let name_atom = Atom(atom_ids[0]);
+    // Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals),
+    // OTP-29.1.1: the literal chunk is decoded in index order right after the
+    // atom chunk, so atoms first seen in literals get erts' table indices.
+    let (mut literals, mut literal_terms) = decode_literals(file)?;
+    let CoverageScan {
+        coverage_mode,
+        mut labels,
+        count,
+        coverage_enabled,
+        function_mode,
+        source_functions,
+        source_lines,
+        counter_lines,
+        counter_ids,
+        counter_locations,
+        line_probe_mappings,
+        mut function_owners,
+    } = scan_coverage(file, requested_mode, debugger_lines)?;
     let mut insertions: HashMap<usize, Vec<LineCoverageInsertion>> = HashMap::new();
     if coverage_enabled {
         if function_mode {

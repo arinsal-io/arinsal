@@ -491,12 +491,19 @@ fn assert_debugger_fixture_matches_otp(module: &str, source: &str) {
         panic!("OTP erts_internal object code was not a binary");
     };
     let mut vm = Vm::new_with_debugger_flags([], true, true);
+    let interpreter_slices_before = arinsal_vm::interp_slices();
     vm.load_bytes(preloaded).expect("load breakpoint wrapper");
     vm.load_bytes(&beam).expect("load debugger fixture");
     let actual = vm
         .eval_scheduled(module, "run", &[], 8, None)
         .unwrap_or_else(|error| panic!("run debugger fixture: {error}"));
     let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+    // Line breakpoints are BeamAsm code (emit_i_line_breakpoint_trampoline), as in erts.
+    similar_asserts::assert_eq!(
+        arinsal_vm::interp_slices(),
+        interpreter_slices_before,
+        "an instrumented module must run natively"
+    );
     similar_asserts::assert_eq!(expected, actual.term);
 }
 
