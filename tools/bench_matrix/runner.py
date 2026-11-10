@@ -269,10 +269,6 @@ def run_arinsal(kernel_id: str, expected: int, op_count: int, warmup: int, repea
         str(repeats),
     ])
     env = os.environ.copy()
-    if beamasm:
-        env["ARINSAL_BEAMASM"] = "1"
-    else:
-        env.pop("ARINSAL_BEAMASM", None)
 
     stdout, stderr = run_cmd(cmd, env=env, timeout_sec=300)
     if stdout == "TIMEOUT":
@@ -431,7 +427,7 @@ def main():
         "semantics note",
         "erts ns/op",
         "Arinsal default ns/op",
-        "Arinsal ARINSAL_BEAMASM=1 ns/op",
+        "Arinsal JIT ns/op",
         "Go ns/op",
         "Arinsal/erts",
         "Go/erts",

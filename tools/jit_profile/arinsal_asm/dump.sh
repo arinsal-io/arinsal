@@ -12,7 +12,6 @@ beam_dir=$(cd "$1" && pwd)
 dump_dir=$2
 mkdir -p "$dump_dir"
 
-ARINSAL_BEAMASM=1 \
 ARINSAL_BEAMASM_DUMP="$dump_dir" \
 timeout -s KILL 60 "$repo_root/target/release/arinsal" \
   -noshell -pa "$beam_dir" -eval 'kernels:tail(10), halt().'
