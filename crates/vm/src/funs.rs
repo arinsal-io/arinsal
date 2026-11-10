@@ -581,9 +581,11 @@ impl Vm {
                 .intern(function)
                 .map_err(|error| VmError::Unsupported(format!("BIF function atom: {error:?}")))?;
             let args = p.x[..arity].to_vec();
+            // The BIF's BUMP_REDS already lowered FCALLS; the runtime path between two native
+            // slices hands the same charge to the scheduler and the process count.
             p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
             if let Some(run) = ctx {
-                run.consume(bif_reductions.saturating_add(1));
+                run.consume(bif_reductions);
             }
             crate::bif_traps::install_deferred_trap(
                 p,
@@ -599,7 +601,7 @@ impl Vm {
             crate::bif_traps::arm_export_trap(p);
             return Ok(ImportOutcome::Yield);
         }
-        let bif_args = p.x[..arity].to_vec();
+        let mut bif_args = p.x[..arity].to_vec();
         if matches!(&result, Err(BifError::DirtyTrap)) {
             // Port of erts/emulator/beam/bif.c:5612-5627 (dirty_bif_trap): restore the
             // saved BIF arguments and continue at the export saved by the dirty scheduler.
@@ -630,6 +632,13 @@ impl Vm {
         if module == "erts_internal" && function == "dirty_bif_result" {
             p.take_dirty_bif_original();
         }
+        // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_call_bif:
+        // ERTS_IS_GC_AFTER_BIF_DESIRED → erts_gc_after_bif_call_lhf), OTP-29.1.1: the export's
+        // call_bif_mfa stub an apply reaches collects after the BIF returns, before the
+        // epilogue raises or returns. A value roots only the result; an error roots the
+        // argument registers.
+        let mut result = result;
+        crate::calls::gc_after_bif(p, &mut bif_args, &mut result)?;
         let result = match result {
             Err(error @ BifError::Raise { .. })
                 if module == "erts_internal" && function == "dirty_bif_exception" =>
@@ -670,15 +679,14 @@ impl Vm {
             error => exceptions::bif_error(p, module, function, &bif_args, error),
         })?;
         p.x[0] = result;
-        let charge = bif_reductions.saturating_add(1);
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_bif_shared, bif_nif_epilogue)
+        // and instr_call.cpp (emit_variable_apply, emit_fixed_apply), OTP-29.1.1: neither the
+        // apply nor the BIF stub decrements FCALLS; the BIF's own BUMP_REDS, already taken
+        // from FCALLS, is the whole charge. This runtime step between two native slices passes
+        // it on to the scheduler's quantum and the process count.
         p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
-        p.heap.abi.fcalls = p
-            .heap
-            .abi
-            .fcalls
-            .saturating_sub(charge.min(i32::MAX as u32) as i32);
         if let Some(run) = ctx {
-            run.consume(charge);
+            run.consume(bif_reductions);
         }
         Ok(Self::return_value(p))
     }

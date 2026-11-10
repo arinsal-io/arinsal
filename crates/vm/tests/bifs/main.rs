@@ -41,6 +41,7 @@ mod re_run_yield;
 mod records_bifs;
 mod records_doctest_stack;
 mod reds_after_bif_differential;
+mod reds_apply_bif_differential;
 mod reds_overcharge_differential;
 mod reds_size_bifs_differential;
 mod reg_table;
