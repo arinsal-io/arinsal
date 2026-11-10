@@ -199,7 +199,8 @@ fn light_kind(module: &str, function: &str, arity: u8) -> bool {
 }
 
 impl DispatchTarget {
-    pub(crate) fn export_entry(&self) -> &'static arinsal_beamasm::bif::ExportEntry {
+    /// The shared owner of this MFA's `Export`, which the code indexes' export tables hold.
+    pub(crate) fn export_object(&self) -> &'static Arc<arinsal_beamasm::bif::ExportEntry> {
         self.slot
     }
 
@@ -604,20 +605,22 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
         .as_ref()
 }
 
-/// The export entry of `mfa` in `scope`, creating a stub entry (entering the export
-/// trampoline) when the scope has none. Export funs point at it.
-// Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
-pub(crate) fn export_get_or_make_stub(
+/// The `Export` object of `mfa` in `scope`, allocated (entering the export trampoline) when the
+/// node has none. It is not entered in any code index's export table: [`crate::export`] does
+/// that, as `export_staged_put` / `export_staged_upsert` insert the blob erts allocates here.
+// Port of erts/emulator/beam/export.c:73-98 (export_init) and erl_code_staged.h (the blob
+// allocation of put/upsert), OTP-29.1.1.
+pub(crate) fn make_export(
     scope: u64,
     mfa: Mfa,
-) -> Option<Arc<arinsal_beamasm::bif::ExportEntry>> {
+) -> Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>> {
     if let Ok(registry) = dispatch_registry().read()
         && let Some(entry) = registry
             .scopes
             .get(&scope)
             .and_then(|exports| exports.dispatch.get(&mfa))
     {
-        return Some(Arc::clone(entry.slot));
+        return Some(entry.slot);
     }
     let trampoline = fragments()?.export_trampoline();
     let save_calls = fragments()?.save_calls_export();
@@ -650,10 +653,7 @@ pub(crate) fn export_get_or_make_stub(
             light_trap_bif: None,
         })
     })?;
-    crate::code_ix::for_scope(scope).update_active(|tables| {
-        tables.exports.bind_dispatch(mfa, entry.export_entry());
-    });
-    Some(Arc::clone(entry.slot))
+    Some(entry.export_object())
 }
 
 /// Export descriptor returned by the native line-breakpoint prepare helper.
@@ -669,16 +669,14 @@ pub(crate) fn line_breakpoint_export(
         atoms.intern("breakpoint").ok()?,
         4,
     );
-    crate::code_ix::for_scope(scope)
-        .with_tables_for_code_ix(code_ix, |tables| tables.exports.dispatch(mfa))
-        .flatten()
+    crate::export::find_export_entry(&crate::code_ix::for_scope(scope), mfa, code_ix)
 }
 
 /// The dispatch entry of every import: its identity for the emitter, and its binding for the
 /// export table of the code index, which the install makes.
 type ImportEntries = (
     Vec<usize>,
-    Vec<(Mfa, &'static arinsal_beamasm::bif::ExportEntry)>,
+    Vec<(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)>,
 );
 
 fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportEntries> {
@@ -734,7 +732,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportE
                 light_trap_bif: None,
             })
         })?;
-        bindings.push((mfa, entry.export_entry()));
+        bindings.push((mfa, entry.export_object()));
         identities.push(Arc::as_ptr(entry.slot) as usize);
     }
     Some((identities, bindings))
@@ -784,7 +782,7 @@ fn publish_module(
     scope: u64,
     module: &arinsal_loader::Module,
     native: &[(Mfa, usize)],
-    imports: &[(Mfa, &'static arinsal_beamasm::bif::ExportEntry)],
+    imports: &[(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)],
 ) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
     let save_calls = fragments().map_or(0, DispatchFragments::save_calls_export);
@@ -834,17 +832,48 @@ fn publish_module(
             dispatch_entries.push((mfa, target));
         }
     }
-    crate::code_ix::for_scope(scope).update_active(|tables| {
-        for (mfa, dispatch) in imports {
-            tables.exports.bind_dispatch(*mfa, dispatch);
+    // Port of erts/emulator/beam/jit/asm_load.c:1177-1206 (beam_load_finalize_code: exports
+    // then imports through erts_export_put; each export's code address is written into
+    // `addresses[staging_ix]`), OTP-29.1.1.
+    let exports: Vec<_> = dispatch_entries
+        .iter()
+        .map(|(mfa, target)| (*mfa, target.export_object()))
+        .collect();
+    crate::export::export_put_all(scope, &exports);
+    crate::export::export_put_all(scope, imports);
+    let staging_ix = crate::code_ix::for_scope(scope).staging();
+    let traced = global_breakpoints_of(scope, native);
+    for (mfa, address) in native {
+        if traced.contains(mfa) {
+            continue;
         }
-        for (mfa, target) in &dispatch_entries {
-            tables.exports.bind_dispatch(*mfa, target.export_entry());
+        if let Some((_, export)) = exports.iter().find(|(key, _)| key == mfa) {
+            export.set_address(staging_ix, *address);
         }
-    });
+    }
     staged(scope, |exports| {
-        publish_module_exports(exports, module, native)
+        let mut affected = publish_module_exports(exports, module, native);
+        // The loader wrote these above; the staged refresh only redirects what this version
+        // no longer exports.
+        affected.retain(|mfa| !native.iter().any(|(key, _)| key == mfa));
+        affected
     });
+}
+
+/// The MFAs of `native` that have a global call breakpoint in `scope`: their export keeps
+/// entering the breakpoint trampoline.
+fn global_breakpoints_of(scope: u64, native: &[(Mfa, usize)]) -> Vec<Mfa> {
+    let Ok(registry) = dispatch_registry().read() else {
+        return Vec::new();
+    };
+    let Some(exports) = registry.scopes.get(&scope) else {
+        return Vec::new();
+    };
+    native
+        .iter()
+        .map(|(mfa, _)| *mfa)
+        .filter(|mfa| exports.global_breakpoints.contains(mfa))
+        .collect()
 }
 
 fn publish_module_exports(
@@ -1250,7 +1279,7 @@ pub(crate) struct CompiledVersion {
     pub(crate) on_load: Option<(String, u8)>,
     /// The dispatch entry of each import, put into the export table when the version is
     /// installed (`erts_export_put` of `beam_load_finalize_code`).
-    import_bindings: Vec<(Mfa, &'static arinsal_beamasm::bif::ExportEntry)>,
+    import_bindings: Vec<(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)>,
     /// Functions of the module BeamAsm could not compile: they run in the interpreter.
     scope: u64,
     module_handle: u64,

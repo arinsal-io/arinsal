@@ -1265,8 +1265,7 @@ impl Vm {
         let (module, function) = (module.as_atom()?, function.as_atom()?);
         let arity = u8::try_from(arity.as_small()?).ok()?;
         let scope = process.runtime?.code_scope;
-        let entry =
-            crate::beamasm_integration::export_get_or_make_stub(scope, (module, function, arity))?;
+        let entry = crate::export::export_get_or_make_stub(scope, (module, function, arity))?;
         TermBuilder::new(&mut process.heap)
             .export_fun(entry)
             .ok()
@@ -1290,11 +1289,9 @@ impl Vm {
             .ok_or_else(|| self.exception(p, "badarg"))? as u8;
         // Port of erts/emulator/beam/bif.c (erlang:make_fun/3: erts_export_get_or_make_stub,
         // the fun is the export's lambda), OTP-29.1.1.
-        let entry = crate::beamasm_integration::export_get_or_make_stub(
-            self.code_scope,
-            (module, function, arity),
-        )
-        .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)));
+        let entry =
+            crate::export::export_get_or_make_stub(self.code_scope, (module, function, arity))
+                .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)));
         TermBuilder::new(&mut p.heap)
             .export_fun(entry)
             .map_err(|e| VmError::Unsupported(format!("export fun allocation {e:?}")))

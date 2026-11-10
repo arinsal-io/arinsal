@@ -28,7 +28,7 @@ fn export_stub_hook(module: Atom, function: Atom, arity: u8) -> Option<Arc<Expor
     if scope == 0 {
         return None;
     }
-    crate::beamasm_integration::export_get_or_make_stub(scope, (module, function, arity))
+    crate::export::export_get_or_make_stub(scope, (module, function, arity))
 }
 
 /// Local fun lookup for ETF terms decoded by a process on this node.
