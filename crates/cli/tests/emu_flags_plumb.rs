@@ -104,8 +104,9 @@ fn ignore_break_survives_terminal_signals() {
         return;
     };
     let eval = "io:format(\"ready~n\"), timer:sleep(2500), halt().";
-    let mut arinsal = Command::new("timeout");
-    arinsal.arg("30").arg(env!("CARGO_BIN_EXE_arinsal"));
+    // Signalled directly: a `timeout` wrapper would itself receive SIGQUIT, and how it
+    // handles it depends on which `timeout` is on PATH.
+    let mut arinsal = Command::new(env!("CARGO_BIN_EXE_arinsal"));
     for command in [&mut reference, &mut arinsal] {
         command
             .args(["+Bi", "-noshell", "-eval", eval])
@@ -119,7 +120,7 @@ fn ignore_break_survives_terminal_signals() {
     for (name, command) in [("erl", &mut reference), ("arinsal", &mut arinsal)] {
         let mut child = command.spawn().expect("spawn emulator");
         // Signal only once the node has booted (and so has applied +Bi); a fixed delay raced
-        // the boot under load. `timeout` forwards signals to its child.
+        // the boot under load.
         let mut line = String::new();
         std::io::BufRead::read_line(
             &mut std::io::BufReader::new(child.stdout.as_mut().expect("stdout")),
@@ -133,7 +134,17 @@ fn ignore_break_survives_terminal_signals() {
                 .status()
                 .expect("kill");
         }
-        let status = child.wait().expect("wait");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                break child.wait().expect("wait");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
         assert_eq!(status.code(), Some(0), "{name}");
     }
 }
