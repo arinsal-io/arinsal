@@ -106,7 +106,7 @@ fn bif_timers_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("light_bif_self", "timers", &[], 2, Some(81))
+        .eval_scheduled("light_bif_self", "timers", &[], 2, None)
         .unwrap_or_else(|error| panic!("timers: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }
