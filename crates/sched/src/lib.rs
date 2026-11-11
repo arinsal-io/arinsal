@@ -6139,14 +6139,6 @@ impl<M: SignalMessage> RunCtx<'_, M> {
             .map_err(|_| Error::NoProcess)?;
         Ok(())
     }
-    /// Set this process's user priority; it takes effect when the process is next queued.
-    ///
-    /// Port of erts/emulator/beam/erl_process.c (erts_set_process_priority), OTP-29.1.1.
-    pub fn set_priority(&mut self, priority: Priority) {
-        self.proc
-            .user_priority
-            .store(priority.index() as u8, Ordering::Release);
-    }
     /// Clear the active system-task priority after its queued work has drained.
     ///
     /// Port of erts/emulator/beam/erl_process.c:10737 (`fetch_sys_task`), OTP-29.1.1.

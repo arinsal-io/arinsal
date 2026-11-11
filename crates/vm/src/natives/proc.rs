@@ -508,68 +508,7 @@ pub(crate) fn user_priority(process: &Process) -> Priority {
         .unwrap_or(Priority::Normal)
 }
 
-/// `process_flag/2` for the flags that need no scheduler context, called from native code. The
-/// others (`priority`, `message_queue_data`, `scheduler`, `monitor_nodes`, `max_heap_size`, ...)
-/// take the executor.
-// Port of erts/emulator/beam/bif.c:1955-2250 (process_flag_2), OTP-29.1.1.
-pub(crate) fn process_flag_ctxfree(process: &mut Process, name: Term, value: Term) -> Option<Term> {
-    static ATOMS: std::sync::OnceLock<[arinsal_term::Atom; 5]> = std::sync::OnceLock::new();
-    let [
-        error_handler,
-        async_dist,
-        fullsweep_after,
-        min_heap_size,
-        min_bin_vheap_size,
-    ] = *ATOMS.get_or_init(|| {
-        let intern = |text| global_atoms().intern(text).expect("short built-in atom");
-        [
-            intern("error_handler"),
-            intern("async_dist"),
-            intern("fullsweep_after"),
-            intern("min_heap_size"),
-            intern("min_bin_vheap_size"),
-        ]
-    });
-    let name = name.as_atom()?;
-    if name == error_handler {
-        value.as_atom()?;
-        let previous = process.cold_mut().flags.error_handler.replace(value);
-        return Some(previous.unwrap_or_else(|| Term::atom(error_handler)));
-    }
-    if name == async_dist {
-        if value != Term::atom(arinsal_term::atoms::TRUE)
-            && value != Term::atom(arinsal_term::atoms::FALSE)
-        {
-            return None;
-        }
-        let previous = process.cold_mut().flags.async_dist.replace(value);
-        return Some(previous.unwrap_or(Term::atom(arinsal_term::atoms::FALSE)));
-    }
-    if name == fullsweep_after || name == min_heap_size || name == min_bin_vheap_size {
-        // The remaining flags reuse the checked implementation (heap sizing and previous values).
-        return flag(process, global_atoms().text(name)?, value).ok();
-    }
-    None
-}
-
-/// `erts_internal:group_leader/2` with the caller as target: it sets its own leader.
-// Port of erts/emulator/beam/bif.c:4914 (erts_internal_group_leader_2), OTP-29.1.1.
-pub(crate) fn group_leader_self_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [leader, target] = args else {
-        return None;
-    };
-    let leader = Pid::from_term(*leader)?;
-    if Pid::from_term(*target)? != process.self_pid? {
-        return None;
-    }
-    set_group_leader(process, leader).ok()?;
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError> {
+pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError> {
     let previous = match name {
         "trap_exit" => {
             let enabled = if value == Term::atom(arinsal_term::atoms::TRUE) {
@@ -2039,8 +1978,6 @@ fn format_fun_atom(name: &str) -> String {
 /// `spawn_request` and `dist_spawn_request` are the exception: only the
 /// `erts_internal` entries are BIFs, so the `erlang` wrappers stay in BEAM.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erlang", "group_leader", 0),
-    ("erts_internal", "group_leader", 2),
     ("erts_internal", "group_leader", 3),
     ("erlang", "processes", 0),
     ("erlang", "pid_to_list", 1),  // elixir_loop1
@@ -2052,7 +1989,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "fun_to_list", 1), // mix_loop6
     // `i_yield` is an OTP instruction, not an Erlang wrapper interception.
     ("erlang", "yield", 0),
-    ("erlang", "process_flag", 2),
     ("erts_internal", "process_flag", 3),
     ("erlang", "process_info", 1),
     ("erlang", "process_info", 2),
@@ -2768,7 +2704,7 @@ fn gc_message(process: &mut Process, request_id: Term, ok: bool) -> Result<Term,
     )
 }
 
-fn set_group_leader(process: &mut Process, leader: Pid) -> Result<(), VmError> {
+pub(crate) fn set_group_leader(process: &mut Process, leader: Pid) -> Result<(), VmError> {
     let term = leader.to_term().ok_or_else(badarg)?;
     set_flag(process, "group_leader", term);
     process.group_leader = Some(leader);
@@ -2993,55 +2929,31 @@ fn processes(process: &mut Process) -> Result<Term, VmError> {
     make_list(process, pids)
 }
 
-// Port of erts/emulator/beam/bif.c:4914 (erts_internal_group_leader_2)
-// and erts/preloaded/src/erlang.erl:3328 (group_leader/2), OTP-29.1.1.
-fn group_leader_call(
-    module: &str,
+// Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3), OTP-29.1.1: the
+// caller's own leader is set in place; another process gets the group-leader signal and the
+// caller receives `{Ref, Result}`.
+fn group_leader_3(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     leader: Term,
     target: Term,
-    signal_ref: Option<Term>,
+    reference: Term,
 ) -> Result<Term, VmError> {
-    let internal = module == "erts_internal";
-    let Some(leader) = Pid::from_term(leader) else {
-        return if internal {
-            Ok(Term::atom(arinsal_term::atoms::BADARG))
-        } else {
-            Err(badarg())
-        };
-    };
-    let Some(pid) = Pid::from_term(target) else {
-        return if internal {
-            Ok(Term::atom(arinsal_term::atoms::BADARG))
-        } else {
-            Err(badarg())
-        };
+    let (Some(leader), Some(pid)) = (Pid::from_term(leader), Pid::from_term(target)) else {
+        return Err(badarg());
     };
     if pid == ctx.pid() {
         set_group_leader(process, leader)?;
         return Ok(Term::atom(arinsal_term::atoms::TRUE));
     }
     if !live(process, pid)? {
-        if let Some(reference) = signal_ref {
-            let reply = make_tuple(
-                process,
-                &[reference, Term::atom(arinsal_term::atoms::BADARG)],
-            )?;
-            process.inbox.push_back(reply);
-            return Ok(Term::atom(arinsal_term::atoms::OK));
-        }
-        return if internal {
-            Ok(Term::atom(arinsal_term::atoms::BADARG))
-        } else {
-            Err(badarg())
-        };
+        let reply = make_tuple(
+            process,
+            &[reference, Term::atom(arinsal_term::atoms::BADARG)],
+        )?;
+        process.inbox.push_back(reply);
+        return Ok(Term::atom(arinsal_term::atoms::OK));
     }
-    // erts_internal:group_leader/2 reports the lock as busy and lets the Erlang wrapper
-    // send group_leader/3 and receive the reply itself.
-    let Some(reference) = signal_ref else {
-        return Ok(Term::atom(arinsal_term::atoms::FALSE));
-    };
     // Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3) and
     // erl_proc_sig_queue.c (erts_proc_sig_send_group_leader), OTP-29.1.1.
     let id = crate::signals::ref_id(reference).ok_or_else(badarg)?;
@@ -3171,15 +3083,8 @@ fn call_values(
     }
     let result = (|| -> Result<Term, VmError> {
         match (function, args) {
-            ("group_leader", []) => Ok(process
-                .group_leader_pid(ctx.pid())
-                .to_term()
-                .unwrap_or(Term::NIL)),
-            ("group_leader", [leader, pid]) if module == "erts_internal" => {
-                group_leader_call(module, process, ctx, *leader, *pid, None)
-            }
             ("group_leader", [leader, pid, reference]) if module == "erts_internal" => {
-                group_leader_call(module, process, ctx, *leader, *pid, Some(*reference))
+                group_leader_3(process, ctx, *leader, *pid, *reference)
             }
             ("processes", []) => processes(process),
             // Port of erts/emulator/beam/erl_bif_info.c:4932-4945,
@@ -3245,116 +3150,6 @@ fn call_values(
             ("yield", []) if module == "erlang" => {
                 process.set_force_yield(true);
                 Ok(Term::atom(arinsal_term::atoms::TRUE))
-            }
-            ("process_flag", [name, value]) => {
-                if *name == Term::atom(arinsal_term::atoms::MONITOR_NODES) {
-                    let enabled = match *value {
-                        value if value == Term::atom(arinsal_term::atoms::TRUE) => true,
-                        value if value == Term::atom(arinsal_term::atoms::FALSE) => false,
-                        _ => return Err(badarg()),
-                    };
-                    let mut nodes = crate::node_tables::lock();
-                    let previous = nodes.monitor_nodes(
-                        ctx.pid(),
-                        crate::node_tables::NodeMonitorOptions::default(),
-                        enabled,
-                    );
-                    if enabled
-                        && let Some(runtime) = process.runtime.as_ref()
-                        && !runtime
-                            .publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::NODE_MON)
-                    {
-                        nodes.monitor_nodes(
-                            ctx.pid(),
-                            crate::node_tables::NodeMonitorOptions::default(),
-                            false,
-                        );
-                    }
-                    drop(nodes);
-                    let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
-                    process.cold_mut().monitor_nodes = if enabled {
-                        count.saturating_add(1)
-                    } else {
-                        count.saturating_sub(1)
-                    };
-                    return Term::small(previous as i64).ok_or_else(badarg);
-                }
-                if let Ok(arinsal_etf::OwnedTerm::Tuple(parts)) = &arinsal_term::to_owned(*name)
-                    && parts.len() == 2
-                    && parts[0] == arinsal_etf::OwnedTerm::atom("monitor_nodes")
-                {
-                    let enabled = match *value {
-                        value if value == Term::atom(arinsal_term::atoms::TRUE) => true,
-                        value if value == Term::atom(arinsal_term::atoms::FALSE) => false,
-                        _ => return Err(badarg()),
-                    };
-                    let options = crate::node_tables::parse_nodes_monitor_options(&parts[1])
-                        .map_err(|_| badarg())?;
-                    let mut nodes = crate::node_tables::lock();
-                    let previous = nodes.monitor_nodes(ctx.pid(), options, enabled);
-                    if enabled
-                        && let Some(runtime) = process.runtime.as_ref()
-                        && !runtime
-                            .publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::NODE_MON)
-                    {
-                        nodes.monitor_nodes(ctx.pid(), options, false);
-                    }
-                    drop(nodes);
-                    let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
-                    process.cold_mut().monitor_nodes = if enabled {
-                        count.saturating_add(1)
-                    } else {
-                        count.saturating_sub(1)
-                    };
-                    return Term::small(previous as i64).ok_or_else(badarg);
-                }
-                let name = atom_name(*name).ok_or_else(badarg)?;
-                if name == "max_heap_size" {
-                    return max_heap_flag(process, *value);
-                }
-                if name == "scheduler" {
-                    let scheduler = value
-                        .as_small()
-                        .filter(|&scheduler| {
-                            scheduler >= 0 && scheduler as usize <= ctx.scheduler_count()
-                        })
-                        .ok_or_else(badarg)? as usize;
-                    // Port of erts/emulator/beam/bif.c:2068-2097 (process scheduler binding), OTP-29.1.1.
-                    let (previous, should_yield) = ctx.bind_scheduler(scheduler);
-                    if should_yield {
-                        ctx.consume(ctx.remaining());
-                    }
-                    return Term::small(previous as i64).ok_or_else(badarg);
-                }
-                let previous = if name == "message_queue_data" {
-                    // The queue mode is the process's own (erts p->sig_qs.flags FS_OFF_HEAP_MSGQ).
-                    let off_heap = *value == Term::atom(arinsal_term::atoms::OFF_HEAP);
-                    let previous = process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
-                    process.cold_mut().off_heap_msgq = off_heap;
-                    Term::atom(if previous {
-                        arinsal_term::atoms::OFF_HEAP
-                    } else {
-                        arinsal_term::atoms::ON_HEAP
-                    })
-                } else {
-                    flag(process, &name, *value)?
-                };
-                if name == "message_queue_data" {
-                    // Port of erts/emulator/beam/bif.c:process_flag_2, OTP-29.1.1.
-                    ctx.set_parallel_signal_buffers(
-                        *value == Term::atom(arinsal_term::atoms::OFF_HEAP),
-                    );
-                }
-                if name == "priority" {
-                    // Port of erts/emulator/beam/erl_process.c (erts_set_process_priority),
-                    // OTP-29.1.1: the scheduler queues the process at the new priority.
-                    let priority = atom_name(*value)
-                        .as_deref()
-                        .and_then(scheduler_priority)
-                        .ok_or_else(badarg)?;
-                    ctx.set_priority(priority);
-                }
-                Ok(previous)
             }
             // Port of erts/emulator/beam/bif.c:2262 (erts_internal_process_flag_3): another
             // process gets an RPC request and the caller receives `{Ref, Result}` itself.
@@ -3508,21 +3303,6 @@ fn call_values(
         }
     })();
     Some(result)
-}
-
-/// Runs the `process_flag(save_calls, _)` BIF branch directly from native code.
-// Port of erts/emulator/beam/bif.c:1907-1950 (process_flag save_calls), OTP-29.1.1.
-pub(crate) fn process_flag_save_calls_bif(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [name, value] = args else {
-        return None;
-    };
-    if *name != Term::atom(arinsal_term::atoms::SAVE_CALLS) {
-        return None;
-    }
-    Some(save_calls_flag(process, *value))
 }
 
 /// Replaces the saved-call buffer and returns the previous size.
@@ -4247,7 +4027,7 @@ pub(crate) fn tuple2(term: Term) -> Option<(Term, Term)> {
 
 // Port of erts/emulator/beam/erl_gc.c:3824 (`erts_max_heap_size`) and
 // erl_gc.c:3807 (`erts_max_heap_size_map`), OTP-29.1.1.
-fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
+pub(crate) fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let limit = parse_max_heap(value).map_err(|()| badarg())?;
     // The floor is the process's own min_heap_size (erts p->min_heap_size).
     let floor = process.heap.min_heap_size_words() as u64;

@@ -292,6 +292,9 @@ pub struct SignalProbe<M: SignalMessage> {
     timer: NonNull<crate::ReceiveTimer>,
     /// The thread progress domain the process's signal buffers are read through.
     progress: NonNull<Progress>,
+    /// The process struct itself, for the scheduling fields its own BIFs change
+    /// (`process_flag(priority | scheduler | message_queue_data, _)` on `c_p`).
+    shared: NonNull<crate::ProcShared<M>>,
 }
 
 // SAFETY: the probe only gives shared access to the queue, flags and timer of its own process
@@ -309,7 +312,45 @@ impl<M: SignalMessage> SignalProbe<M> {
             flags: NonNull::from(&process.exit_flags),
             timer: NonNull::from(&process.rtimer),
             progress: NonNull::from(progress),
+            shared: NonNull::from(process),
         }
+    }
+
+    /// Sets the process's user priority; it takes effect when the process is next queued.
+    // Port of erts/emulator/beam/erl_process.c (erts_set_process_priority on `c_p`),
+    // OTP-29.1.1.
+    pub fn set_user_priority(&self, priority: crate::Priority) {
+        self.field(self.shared)
+            .user_priority
+            .store(priority.index() as u8, Ordering::Release);
+    }
+
+    /// Binds the process to the one-based scheduler `scheduler_id` (zero unbinds) and returns
+    /// the previous binding, and whether the process runs on another scheduler than the new
+    /// binding (the BIF then yields so the process moves).
+    // Port of erts/emulator/beam/bif.c (process_flag_2: am_scheduler, erts_bind_runq_proc /
+    // erts_set_runq_proc, `erts_proc_sched_data(BIF_P)->run_queue`), OTP-29.1.1.
+    pub fn bind_scheduler(&self, scheduler_id: usize) -> (usize, bool) {
+        let shared = self.field(self.shared);
+        let target = scheduler_id.checked_sub(1).unwrap_or(crate::UNBOUND_WORKER);
+        let previous = shared.bound_worker.swap(target, Ordering::AcqRel);
+        let previous_id = if previous == crate::UNBOUND_WORKER {
+            0
+        } else {
+            previous + 1
+        };
+        let current = shared.scheduler_id.load(Ordering::Relaxed);
+        (
+            previous_id,
+            target != crate::UNBOUND_WORKER && current != target,
+        )
+    }
+
+    /// Configures the parallel sender buffers of the process's off-heap message queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694
+    // (erts_proc_sig_queue_try_enqueue_to_buffer setup), OTP-29.1.1.
+    pub fn set_parallel_signal_buffers(&self, enabled: bool) {
+        self.input().set_buffers_enabled(enabled);
     }
 
     fn field<U>(&self, field: NonNull<U>) -> &U {

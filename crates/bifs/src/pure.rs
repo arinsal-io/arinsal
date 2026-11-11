@@ -255,7 +255,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "tuple_size", 1) => v.entry::<process_bodies::tuple_size>(),
         ("erlang", "size", 1) => v.entry::<bodies::size>(),
         ("erlang", "node", 0 | 1) => v.entry::<bodies::node>(),
-        ("erlang", "self", 0) => v.entry::<bodies::self_bif>(),
         ("erlang", "min", 2) => v.entry::<bodies::min>(),
         ("erlang", "max", 2) => v.entry::<bodies::max>(),
         ("erlang", "not", 1) => v.entry::<bodies::not>(),
@@ -577,9 +576,6 @@ fn node_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         | arinsal_term::Identity::Ref { node, .. } => node,
     };
     Ok(Term::atom(name))
-}
-fn self_bif_result(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    Err(BifError::Unsupported("self requires the calling process"))
 }
 fn min_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(if cmp(args[0], args[1]) == Ordering::Greater {
@@ -2370,7 +2366,6 @@ word_adapter!(floor, floor_result);
 word_adapter!(size, size_result);
 word_adapter!(tuple_size, tuple_size_result);
 word_adapter!(node, node_result);
-word_adapter!(self_bif, self_bif_result);
 word_adapter!(min, min_result);
 word_adapter!(max, max_result);
 word_adapter!(not, not_result);
@@ -2471,7 +2466,7 @@ fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 }
 
 crate::word_bif_bodies_in!(word_bodies;
-    abs, to_float, trunc, round, ceil, floor, size, tuple_size, node, self_bif,
+    abs, to_float, trunc, round, ceil, floor, size, tuple_size, node,
     min, max, not, and, or, xor, eq, ne, exact_eq_bif, exact_ne, lt, le, gt, ge,
     phash2_bif, phash_bif, make_ref, unique_integer, system_time, time_unit,
     atom_to_binary, binary_to_atom, binary_to_existing_atom, float_to_list,

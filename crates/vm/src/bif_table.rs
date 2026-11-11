@@ -125,11 +125,10 @@ fn function_at(index: usize) -> Option<Bif> {
 
 use crate::native_helpers::{
     atom_to_list_light, binary_part_2_light, binary_part_3_light, bit_size_light, byte_size_light,
-    integer_to_binary_light, make_ref_light, node_light, persistent_term_get_1_light,
-    persistent_term_get_2_light, process_flag_light, self_light, setelement_light,
-    unique_integer_0_light, unique_integer_1_light,
+    integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
+    persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
-use crate::natives::erl_process_dict;
+use crate::natives::{erl_hl_timer, erl_process_dict};
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
 #[derive(Clone, Copy)]
@@ -176,22 +175,6 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "is_process_alive", 1) => {
             bif!(crate::signals::is_process_alive_light)
         }
-        ("erlang", "process_flag", 2) => bif!(process_flag_light),
-        ("erlang", "send_after", 3 | 4) => {
-            bif!(crate::native_helpers::timer_start_light::<true>)
-        }
-        ("erlang", "start_timer", 3 | 4) => {
-            bif!(crate::native_helpers::timer_start_light::<false>)
-        }
-        ("erlang", "cancel_timer", 1 | 2) => {
-            bif!(crate::native_helpers::timer_query_light::<true>)
-        }
-        ("erlang", "read_timer", 1 | 2) => {
-            bif!(crate::native_helpers::timer_query_light::<false>)
-        }
-        ("erlang", "group_leader", 0) => {
-            bif!(crate::native_helpers::group_leader_0_light)
-        }
         ("erlang", "process_info", 2) => {
             bif!(crate::native_helpers::process_info_2_light)
         }
@@ -228,8 +211,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "unique_integer", 0) => bif!(unique_integer_0_light),
         ("erlang", "unique_integer", 1) => bif!(unique_integer_1_light),
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
-        ("erlang", "self", 0) => bif!(self_light),
-        ("erlang", "node", 0) => bif!(node_light),
+        ("erlang", "node", 0) => bif!(crate::dist::node_0),
         ("lists", "member", 2) => bif!(crate::native_helpers::list_member_entry),
         ("persistent_term", "get", 1) => bif!(persistent_term_get_1_light),
         ("persistent_term", "get", 2) => bif!(persistent_term_get_2_light),
@@ -238,6 +220,21 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "monitor", 3) => bif!(crate::natives::bif::monitor_3),
         ("erlang", "demonitor", 1) => bif!(crate::natives::bif::demonitor_1),
         ("erlang", "demonitor", 2) => bif!(crate::natives::bif::demonitor_2),
+        ("erlang", "self", 0) => bif!(crate::natives::bif::self_0),
+        ("erlang", "group_leader", 0) => bif!(crate::natives::bif::group_leader_0),
+        ("erts_internal", "group_leader", 2) => {
+            bif!(crate::natives::bif::erts_internal_group_leader_2)
+        }
+        ("erlang", "process_flag", 2) => bif!(crate::natives::bif::process_flag_2),
+        // erl_hl_timer.c
+        ("erlang", "send_after", 3) => bif!(erl_hl_timer::send_after_3),
+        ("erlang", "send_after", 4) => bif!(erl_hl_timer::send_after_4),
+        ("erlang", "start_timer", 3) => bif!(erl_hl_timer::start_timer_3),
+        ("erlang", "start_timer", 4) => bif!(erl_hl_timer::start_timer_4),
+        ("erlang", "cancel_timer", 1) => bif!(erl_hl_timer::cancel_timer_1),
+        ("erlang", "cancel_timer", 2) => bif!(erl_hl_timer::cancel_timer_2),
+        ("erlang", "read_timer", 1) => bif!(erl_hl_timer::read_timer_1),
+        ("erlang", "read_timer", 2) => bif!(erl_hl_timer::read_timer_2),
         ("erlang", "finish_loading", 1) => sched_entry::<FinishLoading1>(),
         ("erlang", "has_prepared_code_on_load", 1) => sched_entry::<HasPreparedCodeOnLoad1>(),
         ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
@@ -455,7 +452,7 @@ mod tests {
         similar_asserts::assert_eq!(number, i32::from(spec.index));
         similar_asserts::assert_eq!(
             super::function(number),
-            super::bif!(crate::native_helpers::self_light)
+            super::bif!(crate::natives::bif::self_0)
         );
         similar_asserts::assert_eq!(super::function(-1), 0);
         crate::beamasm_integration::release_code_scope(scope);

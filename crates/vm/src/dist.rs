@@ -3927,6 +3927,16 @@ fn badarg() -> VmError {
     )))
 }
 
+/// `node/0`: `erts_this_node->sysname`.
+// Port of erts/emulator/beam/dist.c (node_0), OTP-29.1.1.
+pub(crate) extern "C" fn node_0(
+    _c_p: *mut arinsal_beamasm::ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::native_hooks::raw(crate::natives::node::node_0_term())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
