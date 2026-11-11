@@ -912,36 +912,6 @@ fn scheduler_counter_entry(
     call_light_bif_body(header, identity, site, Some(export))
 }
 
-/// Reads the active process dictionary for native `i_get` / `bif get` instructions.
-// Port of erts/emulator/beam/erl_process_dict.c:463-471 (`erts_pd_hash_get`) and
-// jit/arm/instr_common.cpp:319-329 (`emit_i_get`), OTP-29.1.1.
-// The call is `Spec = 0`: HTOP is not stored, and the lookup does not allocate,
-// so the heap index is left where the last allocating call put it. A boxed key
-// is followed by its own pointer (`EQ`), not by that index.
-pub extern "C" fn arinsal_beamasm_process_dictionary_get(
-    header: *mut ProcessHeader,
-    key: u64,
-) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
-        return 0;
-    };
-    dictionary_get(process, crate::native_hooks::from_raw(key))
-}
-
-/// `erlang:get/1` from the export's function pointer.
-// Port of erts/emulator/beam/erl_process_dict.c:324-330 (`get_1`), OTP-29.1.1.
-pub(crate) extern "C" fn get_1_light(header: *mut ProcessHeader, _regs: *mut u64, _i: u64) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
-        return 0;
-    };
-    // `x1` is the register array. Reading it through the scheduler file avoids a
-    // fresh pointer load: `enter_runtime` would also commit HTOP, which `get_1` does not.
-    let Some(key) = process.x.first().copied() else {
-        return 0;
-    };
-    dictionary_get(process, key)
-}
-
 /// `persistent_term:get/1` from the export's function pointer.
 // Port of erts/emulator/beam/erl_bif_persistent.c:380 (`persistent_term_get_1`), OTP-29.1.1.
 pub(crate) extern "C" fn persistent_term_get_1_light(
@@ -983,26 +953,6 @@ pub(crate) extern "C" fn persistent_term_get_2_light(
     };
     let value = process.persistent_terms.get(key).unwrap_or(default);
     crate::native_hooks::raw(value)
-}
-
-fn dictionary_get(process: &crate::Process, key: Term) -> u64 {
-    let value = process
-        .dictionary
-        .as_ref()
-        .and_then(|dictionary| dictionary.get(key))
-        .unwrap_or_else(undefined_atom);
-    crate::native_hooks::raw(value)
-}
-
-fn undefined_atom() -> Term {
-    static UNDEFINED: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    *UNDEFINED.get_or_init(|| {
-        Term::atom(
-            arinsal_term::global_atoms()
-                .intern("undefined")
-                .expect("built-in atom"),
-        )
-    })
 }
 
 /// Returns through the trace frame of kind `kind` (passed by its return stub) and resumes at
@@ -1580,37 +1530,6 @@ fn bool_atom(value: bool) -> Term {
     } else {
         arinsal_term::atoms::FALSE
     })
-}
-
-/// `put/2` from `call_bif_shared`: the process dictionary, no executor.
-// Port of erts/emulator/beam/erl_process_dict.c:353-360 (put_2), OTP-29.1.1.
-pub(crate) extern "C" fn put_2_light(header: *mut ProcessHeader, regs: *mut u64, _i: u64) -> u64 {
-    if regs.is_null() {
-        return 0;
-    }
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
-        return 0;
-    };
-    let (Some(key), Some(value)) = (process.x.first().copied(), process.x.get(1).copied()) else {
-        return 0;
-    };
-    // The export fragment already subtracted the call from FCALLS.
-    crate::native_hooks::raw(crate::natives::proc::dict_put(process, key, value))
-}
-
-/// `erase/1` from `call_bif_shared`.
-// Port of erts/emulator/beam/erl_process_dict.c:373-379 (erase_1), OTP-29.1.1.
-pub(crate) extern "C" fn erase_1_light(header: *mut ProcessHeader, regs: *mut u64, _i: u64) -> u64 {
-    if regs.is_null() {
-        return 0;
-    }
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
-        return 0;
-    };
-    let Some(key) = process.x.first().copied() else {
-        return 0;
-    };
-    crate::native_hooks::raw(crate::natives::proc::dict_erase(process, key))
 }
 
 /// `atom_to_list/1` as the BIF `call_light_bif_shared` branches to.
@@ -3535,7 +3454,9 @@ fn plain_bif_word_slow(
 /// cleared. `None` when no failure is recorded or it is a `TRAP`.
 // Inverse of `arinsal_bifs`'s `encode_failure`; port of the class and index decoding of
 // erts/emulator/beam/error.h (GET_EXC_CLASS, GET_EXC_INDEX), OTP-29.1.1.
-fn decode_failure(exc: &mut arinsal_term::exc::ExcFields) -> Option<arinsal_bifs::BifError> {
+pub(crate) fn decode_failure(
+    exc: &mut arinsal_term::exc::ExcFields,
+) -> Option<arinsal_bifs::BifError> {
     use arinsal_bifs::BifError;
     use arinsal_term::exc::{EXF_ARGLIST, EXF_HAS_EXT_INFO, TRAP, exc_index};
     let freason = std::mem::take(&mut exc.freason);

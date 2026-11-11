@@ -94,6 +94,15 @@ impl Vm {
                 fun(self, p, ctx, module, function, args)
             }
             Some(natives::NativeEntry::Resolved(fun)) => fun(self, p, ctx, args),
+            // A native BIF without a named entry is its `bif_table` body.
+            None if class == ImportClass::Native => {
+                // `bif_table[].f` reads its arguments from the register array.
+                if let natives::NativeArgs::Slice(values) = args {
+                    p.x.ensure_x(values.len());
+                    p.x[..values.len()].copy_from_slice(values);
+                }
+                crate::bif_table::call_from_executor(p, module, function, args.len())
+            }
             None => None,
         }
     }

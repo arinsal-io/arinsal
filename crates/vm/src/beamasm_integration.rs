@@ -645,8 +645,7 @@ pub(crate) fn make_export(
             trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
             light_kind: light_kind(&module, &function, mfa.2),
             list_slice: false,
-            direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2)
-                .or_else(|| crate::natives::proc::direct_dictionary(&module, &function, mfa.2)),
+            direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2),
             module: module.clone(),
             function: function.clone(),
             module_atom: mfa.0,
@@ -717,14 +716,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportE
                     import.module,
                     import.function,
                     import.arity,
-                )
-                .or_else(|| {
-                    crate::natives::proc::direct_dictionary(
-                        import.module,
-                        import.function,
-                        import.arity,
-                    )
-                }),
+                ),
                 module: import.module.to_owned(),
                 function: import.function.to_owned(),
                 module_atom: import.module_atom,
@@ -762,8 +754,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             trap_entry: crate::bif_traps::traps(module, function, arity),
             light_kind: light_kind(module, function, arity),
             list_slice: false,
-            direct_ets: crate::natives::ets::direct_entry(module, function, arity)
-                .or_else(|| crate::natives::proc::direct_dictionary(module, function, arity)),
+            direct_ets: crate::natives::ets::direct_entry(module, function, arity),
             module: module.to_owned(),
             function: function.to_owned(),
             module_atom,
@@ -812,14 +803,7 @@ fn publish_module(
                     &module.name,
                     export.function,
                     export.arity,
-                )
-                .or_else(|| {
-                    crate::natives::proc::direct_dictionary(
-                        &module.name,
-                        export.function,
-                        export.arity,
-                    )
-                }),
+                ),
                 module: module.name.clone(),
                 function: export.function.to_owned(),
                 module_atom: module.name_atom,
@@ -1685,7 +1669,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn process_dictionary_get_helper(&self) -> usize {
-        crate::native_helpers::arinsal_beamasm_process_dictionary_get as *const () as usize
+        crate::natives::erl_process_dict::erts_pd_hash_get as *const () as usize
     }
 
     fn native_body(&self, name: &str, arity: u8) -> Option<(usize, usize)> {

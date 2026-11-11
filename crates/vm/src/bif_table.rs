@@ -72,12 +72,56 @@ pub(crate) fn current_export(header: *mut ProcessHeader) -> (u64, u64) {
     (info, identity)
 }
 
+/// Runs `bif_table[bif_number].f` for a BIF the executor calls by its MFA (a traced BIF, an
+/// `apply` the executor resolves): the same function the call fragments branch to, with
+/// `(c_p, reg, I)`. `None` when the entry is not a BIF body yet (no entry, or the W1 shim that
+/// parks the call in the executor, whose named native runs it instead).
+// Port of erts/emulator/beam/beam_bp.c (erts_bif_trace: `(*bif)(p, args, I)` through the BIF
+// table), OTP-29.1.1.
+pub(crate) fn call_from_executor(
+    process: &mut crate::Process,
+    module: &str,
+    function: &str,
+    arity: usize,
+) -> Option<Result<arinsal_term::Term, crate::VmError>> {
+    let spec = arinsal_spec::bif_lookup(module, function, u8::try_from(arity).ok()?)?;
+    let func = function_at(usize::from(spec.index))?;
+    process.x.ensure_x(arity.max(1));
+    let reg = std::ptr::from_mut(&mut process.x[0]).cast::<u64>();
+    let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();
+    let raw = func(c_p, reg, 0);
+    if raw != arinsal_term::THE_NON_VALUE {
+        return Some(Ok(crate::native_hooks::from_raw(raw)));
+    }
+    let args = process.x[..arity].to_vec();
+    Some(Err(
+        match crate::native_helpers::decode_failure(&mut process.heap.abi.exc) {
+            Some(error) => crate::exceptions::bif_error(process, module, function, &args, error),
+            None => crate::VmError::Unsupported(format!(
+                "{module}:{function}/{arity}: BIF_TRAP from the executor"
+            )),
+        },
+    ))
+}
+
+/// The [`Bif`] at `bif_table[index]`, unless it is empty or the executor shim.
+fn function_at(index: usize) -> Option<Bif> {
+    let address = BIF_TABLE.get(index)?.load(Ordering::Acquire);
+    if address == 0 || address == bif!(crate::native_helpers::yield_executor_bif) {
+        return None;
+    }
+    // SAFETY: every non-zero entry was stored by `install` from a `bif!` address, which
+    // checks the function against `Bif`.
+    Some(unsafe { std::mem::transmute::<usize, Bif>(address) })
+}
+
 use crate::native_helpers::{
     atom_to_list_light, binary_part_2_light, binary_part_3_light, bit_size_light, byte_size_light,
-    erase_1_light, get_1_light, integer_to_binary_light, make_ref_light, node_light,
-    persistent_term_get_1_light, persistent_term_get_2_light, process_flag_light, put_2_light,
-    self_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
+    integer_to_binary_light, make_ref_light, node_light, persistent_term_get_1_light,
+    persistent_term_get_2_light, process_flag_light, self_light, setelement_light,
+    unique_integer_0_light, unique_integer_1_light,
 };
+use crate::natives::erl_process_dict;
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
 #[derive(Clone, Copy)]
@@ -153,9 +197,14 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "binary_to_term", 1) => {
             bif!(crate::bif_traps::binary_to_term_1_light)
         }
-        ("erlang", "put", 2) => bif!(put_2_light),
-        ("erlang", "get", 1) => bif!(get_1_light),
-        ("erlang", "erase", 1) => bif!(erase_1_light),
+        // erl_process_dict.c
+        ("erlang", "get", 0) => bif!(erl_process_dict::get_0),
+        ("erlang", "get", 1) => bif!(erl_process_dict::get_1),
+        ("erlang", "get_keys", 0) => bif!(erl_process_dict::get_keys_0),
+        ("erlang", "get_keys", 1) => bif!(erl_process_dict::get_keys_1),
+        ("erlang", "put", 2) => bif!(erl_process_dict::put_2),
+        ("erlang", "erase", 0) => bif!(erl_process_dict::erase_0),
+        ("erlang", "erase", 1) => bif!(erl_process_dict::erase_1),
         ("erlang", "atom_to_list", 1) => bif!(atom_to_list_light),
         ("erlang", "integer_to_binary", 1) => bif!(integer_to_binary_light),
         ("erlang", "byte_size", 1) => bif!(byte_size_light),
