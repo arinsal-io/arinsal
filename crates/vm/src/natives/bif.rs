@@ -225,7 +225,10 @@ fn monitor_process(
         process.cold_mut().prio_monitors.insert(id);
     }
     let scheduler = runtime.scheduler()?;
-    if let Some(pid) = pid.filter(|pid| scheduler.lookup_from(*pid, process.on_managed)) {
+    // erts_proc_sig_send_monitor: no lookup here. On a normal scheduler the monitor is held as
+    // `esdp->pending_signal`; a target gone when it is published gets the `noproc` DOWN
+    // (erl_proc_sig_queue.c, proc_queue_signal / erts_proc_sig_send_pending).
+    if let Some(pid) = pid {
         let (origin, target_half) = crate::proc_create::create_monitor_with_reference_at(
             process.heap.alloc_ix(),
             crate::proc_create::monitor_reference(id, alias_mode, priority),

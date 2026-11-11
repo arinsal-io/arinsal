@@ -2332,16 +2332,30 @@ fn finish_demonitor_origin(
     if mode == Some(crate::proc_create::AliasMode::ExplicitUnalias) {
         insert_explicit_unalias(process, id);
     }
-    process.cold_mut().prio_monitors.remove(&id);
-    match entry.state().cloned() {
-        Some(crate::proc_create::OriginMonitor::Process(_)) => OriginDemonitor::Process(entry),
-        Some(crate::proc_create::OriginMonitor::Port { port_id, .. }) => {
-            OriginDemonitor::Port(port_id, Some(entry))
-        }
-        Some(crate::proc_create::OriginMonitor::DistPort { .. }) => {
-            OriginDemonitor::Port(None, None)
-        }
-        _ => OriginDemonitor::Distributed(entry),
+    // `erts_proc_sig_prio_item_deleted` only for a priority monitor.
+    if let Some(cold) = process.cold.as_mut()
+        && !cold.prio_monitors.is_empty()
+    {
+        cold.prio_monitors.remove(&id);
+    }
+    // The type of the deleted node (`ERTS_ML_GET_TYPE(mon)`), read in place.
+    enum Kind {
+        Process,
+        Port(Option<u64>),
+        DistPort,
+        Distributed,
+    }
+    let kind = match entry.state() {
+        Some(crate::proc_create::OriginMonitor::Process(_)) => Kind::Process,
+        Some(crate::proc_create::OriginMonitor::Port { port_id, .. }) => Kind::Port(*port_id),
+        Some(crate::proc_create::OriginMonitor::DistPort { .. }) => Kind::DistPort,
+        _ => Kind::Distributed,
+    };
+    match kind {
+        Kind::Process => OriginDemonitor::Process(entry),
+        Kind::Port(port_id) => OriginDemonitor::Port(port_id, Some(entry)),
+        Kind::DistPort => OriginDemonitor::Port(None, None),
+        Kind::Distributed => OriginDemonitor::Distributed(entry),
     }
 }
 
