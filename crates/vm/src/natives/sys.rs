@@ -271,6 +271,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "scheduler_wall_time", 1),
     ("erlang", "dt_spread_tag", 1),
     ("erlang", "dt_restore_tag", 1),
+    ("erlang", "bif_return_trap", 2),
 ];
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -294,6 +295,7 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
         ("erts_internal", "scheduler_wall_time", 1) => Some(call_scheduler_wall_time),
         ("erlang", "dt_spread_tag", 1) => Some(call_dt_spread_tag),
         ("erlang", "dt_restore_tag", 1) => Some(call_dt_restore_tag),
+        ("erlang", "bif_return_trap", 2) => Some(bif_return_trap_2),
         _ => None,
     }
 }
@@ -647,51 +649,23 @@ fn call_values(
             recognizes(module, function, arity),
             "persistent_term {module}:{function}/{arity} is dispatched but not listed"
         );
-        let updating = matches!(
-            (module, function, arity),
-            ("persistent_term", "put" | "put_new", 2)
-                | ("persistent_term", "erase", 1)
-                | ("erts_internal", "erase_persistent_terms", 0)
-        );
-        let store = process.persistent_terms;
-        if updating {
-            // Port of erts/emulator/beam/erl_bif_persistent.c:533-539 (an updater resumes
-            // after table_updater ran and returns the result it yielded with), OTP-29.1.1.
-            if let Some(result) = process
-                .cold
-                .as_mut()
-                .and_then(|cold| cold.persistent_update_result.take())
-            {
-                store.release_update_permission(persistent_owner(ctx.pid()));
-                return Some(Ok(result));
-            }
-            // Port of erts/emulator/beam/erl_bif_persistent.c:692-694 (ERTS_BIF_YIELD when
-            // another process holds the update permission), OTP-29.1.1.
-            if !store.try_seize_update_permission(persistent_owner(ctx.pid())) {
-                return Some(Err(VmError::Yield));
-            }
+        if let Some(continuation) = persistent_update_export(module, function, arity) {
+            return Some(persistent_update(
+                process,
+                ctx,
+                bif,
+                (module, function, continuation),
+                args,
+            ));
         }
-        let before = PersistentTermUpdate::snapshot(store);
+        // The reading BIFs (get/1,2, info/0) never change the table.
+        let store = process.persistent_terms;
         let result = {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let mut state = arinsal_bifs::BifState::default();
             let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
             bif(store, &mut bif_ctx, args)
         };
-        let published = result.is_ok() && before.published();
-        if result.is_ok() {
-            before.finish(process, ctx);
-        }
-        if updating {
-            if let (true, Ok(value)) = (published, &result) {
-                // Port of erts/emulator/beam/erl_bif_persistent.c:537-539 (suspend_updater
-                // and ERTS_BIF_YIELD_RETURN): the updater keeps the permission until it is
-                // scheduled again after thread progress.
-                process.cold_mut().persistent_update_result = Some(*value);
-                return Some(Err(VmError::Yield));
-            }
-            store.release_update_permission(persistent_owner(ctx.pid()));
-        }
         return Some(result.map_err(|error| {
             crate::exceptions::bif_error(process, module, function, args, error)
         }));
@@ -754,6 +728,161 @@ fn call_values(
     }
 }
 
+/// `erlang:bif_return_trap/2`, the trap export of `ERTS_BIF_YIELD_RETURN`: a BIF that yields
+/// with its result traps here and returns it when the process is scheduled again.
+// Port of erts/emulator/beam/bif.c:5431-5450 (bif_return_trap) and bif.h:454-463
+// (ERTS_BIF_YIELD_RETURN_X), OTP-29.1.1.
+pub(crate) fn bif_return_trap_2(
+    _vm: &mut Vm,
+    process: &mut Process,
+    _ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    if args[1] == crate::atom_cache::put("multi_scheduling") {
+        let state = multi_scheduling_state(process, crate::process::MultiScheduling::state);
+        if state == "enabled" {
+            return Err(VmError::Unsupported(
+                "bif_return_trap: unexpected multi scheduling block state".into(),
+            ));
+        }
+        return Ok(crate::atom_cache::put(state));
+    }
+    Ok(args[0])
+}
+
+/// The continuation of `ERTS_BIF_YIELD_RETURN`.
+pub(crate) const BIF_RETURN_TRAP: &str = "erlang:bif_return_trap/2";
+
+/// The export of a persistent-term BIF that updates the table: it yields to itself while
+/// another process holds the update permission.
+fn persistent_update_export(module: &str, function: &str, arity: u8) -> Option<&'static str> {
+    Some(match (module, function, arity) {
+        ("persistent_term", "put", 2) => "persistent_term:put/2",
+        ("persistent_term", "put_new", 2) => "persistent_term:put_new/2",
+        ("persistent_term", "erase", 1) => "persistent_term:erase/1",
+        ("erts_internal", "erase_persistent_terms", 0) => "erts_internal:erase_persistent_terms/0",
+        _ => return None,
+    })
+}
+
+/// A persistent-term BIF that updates the table: `put/2`, `put_new/2`, `erase/1`,
+/// `erts_internal:erase_persistent_terms/0`.
+// Port of erts/emulator/beam/erl_bif_persistent.c:258-300 (persistent_term_put_2), :420-540
+// (persistent_term_erase_1), :545-575 (erts_internal_erase_persistent_terms_0), OTP-29.1.1.
+fn persistent_update(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    bif: arinsal_pterm::StoreBif,
+    (module, function, continuation): (&str, &str, &'static str),
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let store = process.persistent_terms;
+    let pid = ctx.pid();
+    let owner = persistent_owner(pid);
+    // ERTS_BIF_YIELDn(BIF_TRAP_EXPORT(...)) while another process holds the permission.
+    if !store.try_seize_update_permission(owner) {
+        crate::bif_traps::vbump_all_reds(process);
+        return Err(VmError::TrapExport(crate::ExportTrap::new(
+            process,
+            continuation,
+            args.to_vec(),
+        )));
+    }
+    let before = PersistentTermUpdate::snapshot(store);
+    let result = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
+        bif(store, &mut bif_ctx, args)
+    };
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            store.release_update_permission(owner);
+            return Err(crate::exceptions::bif_error(
+                process, module, function, args, error,
+            ));
+        }
+    };
+    if !before.published() {
+        // Nothing changed: BIF_RET without waiting for thread progress.
+        store.release_update_permission(owner);
+        return Ok(value);
+    }
+    if store.retired_generation() != before.retired {
+        // Port of erts/emulator/beam/beam_bif_load.c:2341 (erts_queue_release_literals),
+        // OTP-29.1.1: every queued area sends `copy_literals` to the collector.
+        wake_literal_collector(process, ctx);
+    }
+    // erts_schedule_thr_prgr_later_op(table_updater, ...), suspend_updater(BIF_P) and
+    // ERTS_BIF_YIELD_RETURN(BIF_P, Result): table_updater frees the old table, releases the
+    // permission and resumes the updater once every scheduler has passed a progress point;
+    // the updater then returns the result through bif_return_trap.
+    let Some(runtime) = process.runtime else {
+        store.reclaim_old_tables();
+        store.release_update_permission(owner);
+        return Ok(value);
+    };
+    crate::suspend::suspend_self(process);
+    ctx.thread_progress_later(move || {
+        store.reclaim_old_tables();
+        store.release_update_permission(owner);
+        crate::natives::code::resume_suspended(runtime, pid);
+    });
+    crate::bif_traps::vbump_all_reds(process);
+    Err(VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        BIF_RETURN_TRAP,
+        vec![value, Term::atom(arinsal_term::atoms::UNDEFINED)],
+    )))
+}
+
+macro_rules! persistent_update_bif {
+    ($(#[$doc:meta])* $name:ident, $module:literal, $function:literal, $arity:literal) => {
+        $(#[$doc])*
+        pub(crate) fn $name(
+            _vm: &mut Vm,
+            process: &mut Process,
+            ctx: &mut RunCtx<'_, Message>,
+            args: &[Term],
+        ) -> Result<Term, VmError> {
+            let bif = arinsal_pterm::lookup_in($module, $function, $arity)
+                .expect("persistent-term BIF of bif.tab");
+            let continuation = persistent_update_export($module, $function, $arity)
+                .expect("updating persistent-term BIF");
+            persistent_update(process, ctx, bif, ($module, $function, continuation), args)
+        }
+    };
+}
+
+persistent_update_bif!(
+    /// `persistent_term:put/2`.
+    persistent_term_put_2, "persistent_term", "put", 2
+);
+persistent_update_bif!(
+    /// `persistent_term:put_new/2`.
+    persistent_term_put_new_2, "persistent_term", "put_new", 2
+);
+persistent_update_bif!(
+    /// `persistent_term:erase/1`.
+    persistent_term_erase_1, "persistent_term", "erase", 1
+);
+persistent_update_bif!(
+    /// `erts_internal:erase_persistent_terms/0`.
+    erase_persistent_terms_0, "erts_internal", "erase_persistent_terms", 0
+);
+
+/// `persistent_term:get/0`.
+// Port of erts/emulator/beam/erl_bif_persistent.c:324 (persistent_term_get_0), OTP-29.1.1.
+pub(crate) fn persistent_term_get_0(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    _args: &[Term],
+) -> Result<Term, VmError> {
+    get_all_step(process, ctx)
+}
+
 /// Persistent-term table counters taken before an updating BIF runs.
 pub(crate) struct PersistentTermUpdate {
     store: &'static arinsal_pterm::Store,
@@ -773,27 +902,6 @@ impl PersistentTermUpdate {
     /// Whether a table update was published since the snapshot.
     pub(crate) fn published(&self) -> bool {
         self.store.table_updates() != self.updates
-    }
-
-    /// Complete an update the way erts' updater does once the new table is published.
-    pub(crate) fn finish(self, process: &Process, ctx: &mut RunCtx<'_, Message>) {
-        let store = self.store;
-        if store.table_updates() != self.updates {
-            // Port of erts/emulator/beam/erl_bif_persistent.c:490,535,737 (table updates go
-            // through erts_schedule_thr_prgr_later_op(table_updater) and the updater stays
-            // suspended until thread progress), OTP-29.1.1. This bounds the update rate the
-            // same way and keeps the collector queue as short as in erts.
-            ctx.block_thread_progress(std::time::Duration::ZERO);
-            // The old table is unreachable once every scheduler has passed a
-            // progress point (`get` does not yield). Port of
-            // erl_bif_persistent.c:1175 (`table_updater`), OTP-29.1.1.
-            store.reclaim_old_tables();
-        }
-        if store.retired_generation() != self.retired {
-            // Port of erts/emulator/beam/beam_bif_load.c:2341 (erts_queue_release_literals),
-            // OTP-29.1.1: every queued area sends `copy_literals` to the collector.
-            wake_literal_collector(process, ctx);
-        }
     }
 }
 

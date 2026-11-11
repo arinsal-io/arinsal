@@ -762,12 +762,9 @@ pub(crate) fn retract_module_records(scope: u64, module: &str) {
 pub(crate) struct StagedLoad {
     /// `None` when the staging area was nested in an outer one, which commits it.
     pub(crate) ended: Option<crate::code_ix::EndedStaging>,
-    /// Set for a scheduler-backed load; its thread-progress callback owns the commit.
-    pub(crate) barrier_passed: Option<Arc<std::sync::atomic::AtomicBool>>,
-    ids: Vec<usize>,
     /// Names of the staged modules.
     pub(crate) names: Vec<String>,
-    on_load: Vec<String>,
+    pub(crate) on_load: Vec<String>,
 }
 
 impl Vm {
@@ -1152,8 +1149,8 @@ impl Vm {
         Ok(id)
     }
 
-    /// Stages the prepared modules of `erlang:finish_loading/1` and ends staging; the
-    /// returned load commits through [`Vm::commit_staged`] once the loader's code barrier passed.
+    /// Stages the prepared modules of `erlang:finish_loading/1` and ends staging; committing
+    /// the returned [`StagedLoad::ended`] makes them current (commit_code_ix).
     pub(crate) fn stage_prepared(
         &mut self,
         prepared: Vec<(Module, CodeMeta)>,
@@ -1191,7 +1188,6 @@ impl Vm {
             return Err(("not_purged", not_purged));
         }
         let mut on_load = Vec::new();
-        let mut ids = Vec::new();
         for (mut module, mut meta) in prepared {
             let name = module.name.clone();
             let pending = meta.on_load.is_some();
@@ -1200,7 +1196,7 @@ impl Vm {
             });
             let _ = self.install_native(&module, &mut meta, pending);
             let module = Arc::new(module);
-            ids.push(staging.with(|tables| {
+            staging.with(|tables| {
                 let id = tables.alloc(module, Some(meta));
                 tables.known_modules.insert(name.clone());
                 if pending {
@@ -1208,39 +1204,16 @@ impl Vm {
                 } else if let Some(previous) = tables.make_current(&name, id) {
                     tables.old.insert(name.clone(), previous);
                 }
-                id
-            }));
+            });
             if pending {
                 on_load.push(name);
             }
         }
         Ok(StagedLoad {
             ended: staging.end(),
-            barrier_passed: None,
-            ids,
             names,
             on_load,
         })
-    }
-
-    /// Commits a load of [`Vm::stage_prepared`] and starts reading the new active code;
-    /// returns the modules with `on_load`.
-    // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
-    pub(crate) fn commit_staged(&mut self, staged: StagedLoad) -> Vec<String> {
-        debug_assert!(
-            staged
-                .barrier_passed
-                .as_ref()
-                .is_none_or(|passed| { passed.load(std::sync::atomic::Ordering::Acquire) })
-        );
-        if let Some(ended) = staged.ended {
-            ended.commit();
-        }
-        self.refresh_code();
-        for id in staged.ids {
-            self.register_native_targets(id);
-        }
-        staged.on_load
     }
 
     /// Makes this VM read the tables of `erts_active_code_ix()`. This owned snapshot is checked

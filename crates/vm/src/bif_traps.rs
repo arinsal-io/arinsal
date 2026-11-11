@@ -4163,7 +4163,7 @@ const BITSTRING_COPY_LOOP_FACTOR: u64 = 64 * 8;
 /// `ERTS_VBUMP_ALL_REDS`: the rest of the slice is given up without being the process's own
 /// work. The scheduler leaves the process at the next reduction check, and `virtual_reds`
 /// keeps the given-up amount out of the process's reduction count.
-fn vbump_all_reds(process: &mut Process) {
+pub(crate) fn vbump_all_reds(process: &mut Process) {
     if process.heap.abi.fcalls > 0 {
         process.virtual_reds = process
             .virtual_reds

@@ -93,26 +93,6 @@ impl Process {
         if resources & proc_flags::CODE_PERM != 0 {
             crate::natives::code::code_mod_permission_process_exit(self, ctx.pid());
         }
-        // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1:
-        // the code barrier of a loader commits and releases the code modification permission
-        // even when the suspended loader exits.
-        if let Some(staged) = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.finish_loading_commit.take().map(|boxed| *boxed))
-        {
-            let barrier_callback = staged.barrier_passed.is_some();
-            let barrier_passed = staged
-                .barrier_passed
-                .as_ref()
-                .is_none_or(|passed| passed.load(std::sync::atomic::Ordering::Acquire));
-            if barrier_passed {
-                vm.commit_staged(staged);
-            }
-            if !barrier_callback && let Some(runtime) = &self.runtime {
-                crate::natives::code::release_code_mod_permission(runtime);
-            }
-        }
         crate::natives::proc::trace_finish_process_exit(vm, self, ctx);
         // erl_process.c:14221: the exit trace is emitted only when F_TRACE_PROCS is set.
         if resources & proc_flags::TRACE != 0 {

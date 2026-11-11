@@ -9,7 +9,7 @@ use arinsal_sched::Pid;
 use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 /// The code modification permission of a node.
@@ -793,24 +793,11 @@ fn finish(
             "finish_loading requires its scheduler context".into(),
         ));
     }
-    // The barrier callback committed the code index and released the permission before waking
-    // the loader; this retry refreshes its VM view and returns (ERTS_BIF_YIELD_RETURN).
-    if let Some(staged) = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.finish_loading_commit.take().map(|boxed| *boxed))
-    {
-        let barrier_callback = staged.barrier_passed.is_some();
-        let result = finish_commit(vm, process, staged);
-        if !barrier_callback {
-            release_code_load_permission(process, pid);
-        }
-        return result;
-    }
     seize_code_load_permission(process, pid)?;
-    let result = finish_stage(vm, process, ctx, pid, args);
-    // A staged load keeps the permission until its commit.
-    if !matches!(result, Err(VmError::Yield)) {
+    let mut barrier = false;
+    let result = finish_stage(vm, process, ctx, pid, args, &mut barrier);
+    // A load waiting for its code barrier keeps the permission; commit_code_ix releases it.
+    if !barrier {
         release_code_load_permission(process, pid);
     }
     result
@@ -824,6 +811,7 @@ fn finish_stage(
     ctx: Option<&mut RunCtx<'_, crate::process::Message>>,
     pid: Option<Pid>,
     args: &[Term],
+    barrier: &mut bool,
 ) -> Result<Term, VmError> {
     let Some(codes) = args.first().and_then(|term| list(*term)) else {
         return Err(badarg());
@@ -866,25 +854,68 @@ fn finish_stage(
             for prepared in prepared_refs {
                 prepared.release();
             }
-            let mut staged = staged;
-            if let (Some(runtime), Some(pid), Some(ctx)) = (process.runtime, pid, ctx) {
-                let ended = staged.ended.take();
-                let barrier_passed = Arc::new(AtomicBool::new(false));
-                staged.barrier_passed = Some(Arc::clone(&barrier_passed));
-                process.cold_mut().finish_loading_commit = Some(Box::new(staged));
-                crate::suspend::suspend_self(process);
-                ctx.thread_progress_later(move || {
-                    if let Some(ended) = ended {
-                        ended.commit();
-                    }
-                    barrier_passed.store(true, Ordering::Release);
-                    release_code_mod_permission(runtime);
-                    resume_suspended(runtime, pid);
-                });
+            // The result is known once the modules are staged (exception_list(am_on_load)).
+            let res = if staged.on_load.is_empty() {
+                Term::atom(arinsal_term::atoms::OK)
             } else {
-                process.cold_mut().finish_loading_commit = Some(Box::new(staged));
-            }
-            Err(VmError::Yield)
+                let names = make_list(
+                    process,
+                    staged
+                        .on_load
+                        .iter()
+                        .map(|name| crate::atom_cache::put(name)),
+                )?;
+                make_tuple(process, &[Term::atom(arinsal_term::atoms::ON_LOAD), names])?
+            };
+            // Port of erts/emulator/beam/beam_bif_load.c:462-472 and 511-528 (finish_loading_1
+            // blocks thread progress when the modules have breakpoints or on_load tracing is
+            // enabled; staging_epilogue then commits at once and sets the on_load trace
+            // patterns), OTP-29.1.1.
+            let blocking = !crate::trace_bp::on_load_patterns_of(process).is_empty()
+                || staged.names.iter().any(|name| {
+                    crate::trace_bp::module_has_breakpoints(process, vm.code_scope, name)
+                });
+            let (Some(runtime), Some(pid), Some(ctx), false) =
+                (process.runtime, pid, ctx, blocking)
+            else {
+                for name in &staged.names {
+                    crate::trace_bp::module_code_changed(process, vm.code_scope, name);
+                }
+                if let Some(ended) = staged.ended {
+                    ended.commit();
+                }
+                vm.refresh_code();
+                for name in staged
+                    .names
+                    .iter()
+                    .filter(|name| !staged.on_load.contains(name))
+                {
+                    apply_on_load_patterns(vm, process, name);
+                }
+                return Ok(res);
+            };
+            // Port of erts/emulator/beam/beam_bif_load.c:539-571 (staging_epilogue) and
+            // 301-320 (commit_code_ix), OTP-29.1.1: after erts_end_staging_code_ix the loader
+            // is suspended until every scheduler passed a code barrier, so processes that were
+            // already runnable keep running the previous code; commit_code_ix then commits,
+            // releases the permission and resumes the loader, which returns `res` through
+            // ERTS_BIF_YIELD_RETURN.
+            let ended = staged.ended;
+            crate::suspend::suspend_self(process);
+            ctx.thread_progress_later(move || {
+                if let Some(ended) = ended {
+                    ended.commit();
+                }
+                release_code_mod_permission(runtime);
+                resume_suspended(runtime, pid);
+            });
+            *barrier = true;
+            crate::bif_traps::vbump_all_reds(process);
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                crate::natives::sys::BIF_RETURN_TRAP,
+                vec![res, Term::atom(arinsal_term::atoms::UNDEFINED)],
+            )))
         }
         Err(("system_limit", _)) => Err(VmError::Trap(exceptions::Trap::error(Term::atom(
             arinsal_term::atoms::SYSTEM_LIMIT,
@@ -896,30 +927,6 @@ fn finish_stage(
             )?;
             make_tuple(process, &[crate::atom_cache::put(reason), names])
         }
-    }
-}
-
-/// The commit half of `finish_loading/1` (beam_bif_load.c:301 commit_code_ix and the result
-/// of staging_epilogue).
-fn finish_commit(
-    vm: &mut Vm,
-    process: &mut Process,
-    staged: crate::load::StagedLoad,
-) -> Result<Term, VmError> {
-    let loaded_names = staged.names.clone();
-    let on_load = vm.commit_staged(staged);
-    for name in &loaded_names {
-        crate::trace_bp::module_code_changed(process, vm.code_scope, name);
-        apply_on_load_patterns(vm, process, name);
-    }
-    if on_load.is_empty() {
-        Ok(Term::atom(arinsal_term::atoms::OK))
-    } else {
-        let names = make_list(
-            process,
-            on_load.iter().map(|name| crate::atom_cache::put(name)),
-        )?;
-        make_tuple(process, &[Term::atom(arinsal_term::atoms::ON_LOAD), names])
     }
 }
 

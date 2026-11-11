@@ -117,6 +117,12 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
         ("os", "getenv", 1) => sched_entry::<Getenv1>(),
         ("erlang", "nodes", 2) => sched_entry::<Nodes2>(),
+        ("erlang", "bif_return_trap", 2) => sched_entry::<BifReturnTrap2>(),
+        ("persistent_term", "put", 2) => sched_entry::<PersistentTermPut2>(),
+        ("persistent_term", "put_new", 2) => sched_entry::<PersistentTermPutNew2>(),
+        ("persistent_term", "erase", 1) => sched_entry::<PersistentTermErase1>(),
+        ("erts_internal", "erase_persistent_terms", 0) => sched_entry::<ErasePersistentTerms0>(),
+        ("persistent_term", "get", 0) => sched_entry::<PersistentTermGet0>(),
         _ => return None,
     };
     Some(func)
@@ -291,6 +297,46 @@ impl crate::native_helpers::SchedBif for Nodes2 {
     const ARITY: usize = 2;
     const BODY: crate::natives::DirectNative = crate::natives::node::call_nodes2;
 }
+
+/// `erlang:bif_return_trap/2`. Port of erts/emulator/beam/bif.c (bif_return_trap), OTP-29.1.1.
+struct BifReturnTrap2;
+impl crate::native_helpers::SchedBif for BifReturnTrap2 {
+    const ARITY: usize = 2;
+    const BODY: crate::natives::DirectNative = crate::natives::sys::bif_return_trap_2;
+}
+
+/// A [`crate::native_helpers::SchedBif`] named by its body.
+macro_rules! sched_bif {
+    ($(#[$doc:meta])* $name:ident, $arity:literal, $body:path) => {
+        $(#[$doc])*
+        struct $name;
+        impl crate::native_helpers::SchedBif for $name {
+            const ARITY: usize = $arity;
+            const BODY: crate::natives::DirectNative = $body;
+        }
+    };
+}
+
+sched_bif!(
+    /// `persistent_term:put/2`. Port of erl_bif_persistent.c (persistent_term_put_2).
+    PersistentTermPut2, 2, crate::natives::sys::persistent_term_put_2
+);
+sched_bif!(
+    /// `persistent_term:put_new/2`. Port of erl_bif_persistent.c (persistent_term_put_new_2).
+    PersistentTermPutNew2, 2, crate::natives::sys::persistent_term_put_new_2
+);
+sched_bif!(
+    /// `persistent_term:erase/1`. Port of erl_bif_persistent.c (persistent_term_erase_1).
+    PersistentTermErase1, 1, crate::natives::sys::persistent_term_erase_1
+);
+sched_bif!(
+    /// `erts_internal:erase_persistent_terms/0`. Port of erl_bif_persistent.c.
+    ErasePersistentTerms0, 0, crate::natives::sys::erase_persistent_terms_0
+);
+sched_bif!(
+    /// `persistent_term:get/0`. Port of erl_bif_persistent.c (persistent_term_get_0).
+    PersistentTermGet0, 0, crate::natives::sys::persistent_term_get_0
+);
 
 #[cfg(test)]
 mod tests {
