@@ -37,7 +37,7 @@ fn badarg_cause(arity: usize, cause: arinsal_term::Atom) -> VmError {
 
 /// `BIF_RET` / `BIF_ERROR` / `BIF_TRAP*` of a body below.
 #[inline(always)]
-fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmError>) -> u64 {
+pub(crate) fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmError>) -> u64 {
     match result {
         Ok(value) => crate::native_hooks::raw(value),
         Err(error) => crate::native_helpers::bif_return_current(c_p, i, error),
@@ -350,4 +350,238 @@ fn demonitor(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
         ));
     }
     Ok(result)
+}
+
+/// `BIF_ERROR(c_p, BADARG | EXF_HAS_EXT_INFO)` with `c_p->fvalue = cause`, for `module:function`.
+pub(crate) fn badarg_ext(
+    module: arinsal_term::Atom,
+    function: &str,
+    arity: usize,
+    cause: Term,
+) -> VmError {
+    let mut trap = crate::exceptions::Trap::error(Term::atom(atoms::BADARG));
+    let function = crate::atom_cache::put(function)
+        .as_atom()
+        .expect("BIF name is an atom");
+    trap.top = Some(crate::stacktrace::TopFrame::BifRegisters {
+        module,
+        function,
+        arity,
+        info: crate::stacktrace::BifErrorInfo::Cause(cause),
+    });
+    VmError::Trap(trap)
+}
+
+/// `self/0`: `c_p->common.id`, already the tagged pid on the header.
+// Port of erts/emulator/beam/bif.c (self_0), OTP-29.1.1.
+pub(crate) extern "C" fn self_0(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.abi.self_pid
+}
+
+/// `group_leader/0`: `BIF_RET(BIF_P->group_leader)`.
+// Port of erts/emulator/beam/bif.c (group_leader_0), OTP-29.1.1.
+pub(crate) extern "C" fn group_leader_0(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = process
+        .self_pid
+        .and_then(|me| process.group_leader_pid(me).to_term())
+        .ok_or_else(badarg);
+    bif_ret(c_p, i, result)
+}
+
+/// `erts_internal:group_leader/2`: sets the group leader of the caller itself, or of another
+/// process whose main lock it would have to take; that one is reported busy (`false`) and the
+/// Erlang wrapper `erlang:group_leader/2` sends the `group_leader/3` signal instead.
+// Port of erts/emulator/beam/bif.c (erts_internal_group_leader_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_group_leader_2(
+    c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (leader, target) = (process.x[0], process.x[1]);
+    let result = group_leader_2(process, leader, target);
+    bif_ret(c_p, i, result)
+}
+
+fn group_leader_2(process: &mut Process, leader: Term, target: Term) -> Result<Term, VmError> {
+    let (Some(leader), Some(pid)) = (Pid::from_term(leader), Pid::from_term(target)) else {
+        return Ok(Term::atom(atoms::BADARG));
+    };
+    if Some(pid) == process.self_pid {
+        crate::natives::proc::set_group_leader(process, leader)?;
+        return Ok(Term::atom(atoms::TRUE));
+    }
+    // erts_try_lock_sig_free_proc: a process that does not exist is `badarg`; any other is
+    // treated as ERTS_PROC_LOCK_BUSY.
+    if !crate::natives::proc::live(process, pid)? {
+        return Ok(Term::atom(atoms::BADARG));
+    }
+    Ok(Term::atom(atoms::FALSE))
+}
+
+/// `process_flag/2`.
+// Port of erts/emulator/beam/bif.c (process_flag_2), OTP-29.1.1.
+pub(crate) extern "C" fn process_flag_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (flag, value) = (process.x[0], process.x[1]);
+    let result = process_flag(process, flag, value);
+    bif_ret(c_p, i, result)
+}
+
+/// The arms of `process_flag_2`, then `process_flag_aux` (`save_calls`). The scheduling arms
+/// change the process struct the scheduler reads (its user priority, run queue binding and
+/// signal buffers) through the process itself, as erts changes them on `BIF_P`.
+// Port of erts/emulator/beam/bif.c (process_flag_2, process_flag_aux), OTP-29.1.1.
+fn process_flag(process: &mut Process, flag: Term, value: Term) -> Result<Term, VmError> {
+    if flag == Term::atom(atoms::MONITOR_NODES) {
+        return monitor_nodes(process, value, None);
+    }
+    // SAFETY: `flag` is a live term of the caller's heap (BIF_ARG_1).
+    if let Some(tuple) = unsafe { flag.tuple_ref() }
+        && tuple.len() == 2
+        && tuple.get(0) == Some(Term::atom(atoms::MONITOR_NODES))
+    {
+        let options = tuple.get(1).expect("2-tuple");
+        return monitor_nodes(process, value, Some(options));
+    }
+    let name = flag
+        .as_atom()
+        .and_then(|atom| arinsal_term::global_atoms().text(atom).map(str::to_owned));
+    let erlang = atoms::ERLANG;
+    match name.as_deref() {
+        Some("scheduler") => {
+            let scheduler_count = process
+                .runtime
+                .ok_or_else(badarg)?
+                .scheduler()?
+                .scheduler_count();
+            let sched = value
+                .as_small()
+                .filter(|&sched| sched >= 0 && sched as usize <= scheduler_count)
+                .ok_or_else(badarg)? as usize;
+            let (old, moves) = process
+                .signal_probe()
+                .map_or((0, false), |probe| probe.bind_scheduler(sched));
+            let old_value = Term::small(old as i64).ok_or_else(badarg)?;
+            if moves {
+                // ERTS_BIF_YIELD_RETURN_X(BIF_P, old_value, am_scheduler).
+                crate::bif_traps::vbump_all_reds(process);
+                return Err(VmError::TrapExport(crate::ExportTrap::new(
+                    process,
+                    crate::natives::sys::BIF_RETURN_TRAP,
+                    vec![old_value, flag],
+                )));
+            }
+            Ok(old_value)
+        }
+        Some("max_heap_size") => crate::natives::proc::max_heap_flag(process, value),
+        Some("message_queue_data") => {
+            // erts_change_message_queue_management.
+            let off_heap = if value == Term::atom(atoms::OFF_HEAP) {
+                true
+            } else if value == Term::atom(atoms::ON_HEAP) {
+                false
+            } else {
+                return Err(badarg());
+            };
+            let previous = process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
+            process.cold_mut().off_heap_msgq = off_heap;
+            if let Some(probe) = process.signal_probe() {
+                probe.set_parallel_signal_buffers(off_heap);
+            }
+            Ok(Term::atom(if previous {
+                atoms::OFF_HEAP
+            } else {
+                atoms::ON_HEAP
+            }))
+        }
+        Some("priority") => {
+            // erts_set_process_priority.
+            let old = crate::natives::proc::flag(process, "priority", value)?;
+            let priority = arinsal_term::global_atoms()
+                .text(value.as_atom().ok_or_else(badarg)?)
+                .and_then(crate::natives::proc::scheduler_priority)
+                .ok_or_else(badarg)?;
+            if let Some(probe) = process.signal_probe() {
+                probe.set_user_priority(priority);
+            }
+            Ok(old)
+        }
+        Some("sensitive") => {
+            let old = crate::natives::proc::flag(process, "sensitive", value)?;
+            // BIF_RET2(old_value, CONTEXT_REDS): rescheduled at once so the setting takes
+            // effect.
+            process.heap.abi.fcalls = (process.heap.abi.fcalls - CONTEXT_REDS).max(0);
+            Ok(old)
+        }
+        Some(
+            name @ ("async_dist" | "error_handler" | "trap_exit" | "fullsweep_after"
+            | "min_heap_size" | "min_bin_vheap_size"),
+        ) => crate::natives::proc::flag(process, name, value),
+        // process_flag_aux: `c_p->fvalue = am_none` for save_calls.
+        Some("save_calls") => crate::natives::proc::save_calls_flag(process, value)
+            .map_err(|_| badarg_ext(erlang, "process_flag", 2, Term::atom(atoms::NONE))),
+        // process_flag_aux: `c_p->fvalue = am_badopt`.
+        _ => Err(badarg_ext(
+            erlang,
+            "process_flag",
+            2,
+            Term::atom(atoms::BADOPT),
+        )),
+    }
+}
+
+/// `CONTEXT_REDS`.
+const CONTEXT_REDS: i32 = 4000;
+
+/// `erts_monitor_nodes(c_p, on, options)`: the previous count of node monitors of the caller.
+// Port of erts/emulator/beam/dist.c (erts_monitor_nodes), OTP-29.1.1.
+fn monitor_nodes(
+    process: &mut Process,
+    value: Term,
+    options: Option<Term>,
+) -> Result<Term, VmError> {
+    let enabled = if value == Term::atom(atoms::TRUE) {
+        true
+    } else if value == Term::atom(atoms::FALSE) {
+        false
+    } else {
+        return Err(badarg());
+    };
+    let options = match options {
+        None => crate::node_tables::NodeMonitorOptions::default(),
+        Some(options) => {
+            let options = arinsal_term::to_owned(options).map_err(|_| badarg())?;
+            crate::node_tables::parse_nodes_monitor_options(&options).map_err(|_| badarg())?
+        }
+    };
+    let me = process.self_pid.ok_or_else(badarg)?;
+    let mut nodes = crate::node_tables::lock();
+    let previous = nodes.monitor_nodes(me, options, enabled);
+    if enabled
+        && let Some(runtime) = process.runtime.as_ref()
+        && !runtime.publish_proc_flag(me, arinsal_sched::proc_flags::NODE_MON)
+    {
+        nodes.monitor_nodes(me, options, false);
+    }
+    drop(nodes);
+    let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
+    process.cold_mut().monitor_nodes = if enabled {
+        count.saturating_add(1)
+    } else {
+        count.saturating_sub(1)
+    };
+    Term::small(previous as i64).ok_or_else(badarg)
 }

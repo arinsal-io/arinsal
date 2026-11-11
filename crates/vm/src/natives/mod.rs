@@ -8,6 +8,7 @@
 pub(crate) mod bif;
 pub(crate) mod env;
 pub(crate) mod erl_debugger;
+pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erts_debug;
 pub(crate) use erts_debug::internal_state_enabled;
@@ -21,14 +22,6 @@ pub(crate) fn listed(table: &[(&str, &str, u8)], module: &str, function: &str, a
         .any(|&(item_module, item_function, item_arity)| {
             item_module == module && item_function == function && item_arity == arity
         })
-}
-
-/// `table` contains `function` at any arity. Name-gated families use this so an
-/// unknown arity still returns the same error as before the list existed.
-pub(crate) fn listed_name(table: &[(&str, &str, u8)], function: &str) -> bool {
-    table
-        .iter()
-        .any(|&(_, item_function, _)| item_function == function)
 }
 
 use crate::process::Message;
@@ -351,9 +344,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erts_internal" && function == "garbage_collect" && arity == 1 {
         return Some(sys::garbage_collect_bif);
     }
-    if module == "erlang" && function == "process_flag" && arity == 2 {
-        return Some(proc::process_flag_save_calls_bif);
-    }
     if module == "erlang" && function == "system_info" && arity == 1 {
         return Some(sys::system_info_light);
     }
@@ -463,9 +453,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     }
     if module == "erlang" && function == "exit" && arity == 2 {
         return Some(crate::signals::exit2_light);
-    }
-    if module == "erts_internal" && function == "group_leader" && arity == 2 {
-        return Some(proc::group_leader_self_light);
     }
     if module == "erlang" {
         match (function, arity) {
@@ -653,7 +640,7 @@ fn is_dynamic(module: &str, function: &str, arity: u8) -> bool {
             && !nif::recognizes(module, function, arity))
 }
 
-fn proc_claims(module: &str, function: &str) -> bool {
+fn proc_claims(module: &str, function: &str, arity: u8) -> bool {
     if module != "erlang" && module != "erts_internal" {
         return false;
     }
@@ -667,7 +654,7 @@ fn proc_claims(module: &str, function: &str) -> bool {
     if function == "fun_info_mfa" && module != "erlang" {
         return false;
     }
-    listed_name(proc::IMPLEMENTED, function)
+    listed(proc::IMPLEMENTED, module, function, arity)
 }
 
 fn sys_extra(module: &str, function: &str, arity: u8) -> bool {
@@ -701,7 +688,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if module == "erlang" {
         match (function, arity) {
-            ("self", 0) => return Some(NativeEntry::Direct(crate::signals::native_self)),
             ("!", 2) => return Some(NativeEntry::Direct(crate::dist::native_send)),
             ("send", 2) => return Some(NativeEntry::Direct(crate::dist::native_send)),
             ("send", 3) => return Some(NativeEntry::Direct(crate::dist::native_send3)),
@@ -755,7 +741,7 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     if let Some(handle) = proc::process_info_handler(module, function, arity) {
         return Some(NativeEntry::Resolved(handle));
     }
-    if proc_claims(module, function) {
+    if proc_claims(module, function, arity) {
         return Some(NativeEntry::DirectFamily(proc::call));
     }
     if tty::recognizes(module, function, arity) {
@@ -818,10 +804,10 @@ mod tests {
         let (class, bits) = classify("lists", "reverse", 2, true);
         assert_eq!(class, ImportClass::Pure);
         assert_eq!(bits, 0);
-        let (class, bits) = classify("erlang", "self", 0, true);
+        // A BIF whose body is its `bif_table` entry has no named native.
+        let (class, bits) = classify("erlang", "self", 0, false);
         assert_eq!(class, ImportClass::Native);
-        assert_ne!(bits, 0);
-        assert!(matches!(unpack_native(bits), Some(NativeEntry::Direct(_))));
+        assert_eq!(bits, 0);
         for (function, arity) in [("!", 2), ("send", 2), ("send", 3), ("is_process_alive", 1)] {
             let (class, bits) = classify("erlang", function, arity, true);
             assert_eq!(class, ImportClass::Native);
@@ -863,8 +849,11 @@ mod tests {
     #[test]
     fn signal_imports_resolve_to_distinct_entries() {
         let direct = [
-            ("erlang", "self", 0),
             ("erlang", "!", 2),
+            ("erlang", "monitor", 2),
+            ("erlang", "monitor", 3),
+            ("erlang", "demonitor", 1),
+            ("erlang", "demonitor", 2),
             ("erlang", "send", 2),
             ("erlang", "send", 3),
             ("erlang", "is_process_alive", 1),

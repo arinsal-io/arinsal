@@ -26,6 +26,7 @@ mod proc_sig_order;
 mod procdict_differential;
 mod process_dictionary_differential;
 mod process_differential;
+mod process_flag_timer_differential;
 mod process_hibernate_differential;
 mod process_info_halloc_differential;
 mod process_info_self_light;
