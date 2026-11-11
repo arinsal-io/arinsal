@@ -450,7 +450,7 @@ impl ThreadSpecificAllocators {
         let count = instance_count.max(1);
         let allocators: Vec<AllocUtil> = (0..count)
             .map(|instance| {
-                AllocUtil::new_for_instance(
+                let mut allocator = AllocUtil::new_for_instance(
                     if thread_specific && instance == 0 {
                         global_strategy
                     } else {
@@ -460,7 +460,16 @@ impl ThreadSpecificAllocators {
                     allocation_type,
                     instance,
                     true,
-                )
+                );
+                // Port of the `ix != 0 || init->mmbc0` condition in `erts_alcu_start`,
+                // erl_alloc_util.c:6927-6944, OTP-29.1.1. `mmbc0` defaults on in
+                // `ERTS_AU_INIT__`; `set_default_ets_alloc_opts` alone clears it (erl_alloc.c:402-412).
+                if instance != 0 || allocation_type != "ets_alloc" {
+                    allocator
+                        .initialize_main_carrier()
+                        .expect("failed to create allocator main carrier");
+                }
+                allocator
             })
             .collect();
         let shared = allocators

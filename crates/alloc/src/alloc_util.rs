@@ -1029,6 +1029,17 @@ impl AllocUtil {
         }
     }
 
+    /// Creates and links the configured main multiblock carrier during allocator startup.
+    ///
+    /// Port of `erts_alcu_start`, `erl_alloc_util.c:6927-6944`, OTP-29.1.1: instances with a
+    /// startup policy creates `main_carrier_size` during startup, then links its initial free block.
+    pub(crate) fn initialize_main_carrier(&mut self) -> Result<(), AllocError> {
+        if self.options.mmbcs != 0 {
+            self.add_mbc(0)?;
+        }
+        Ok(())
+    }
+
     /// Creates OTP's non-thread-specific literal allocator inside its reserved super-carrier.
     ///
     /// Port of `set_default_literal_alloc_opts`, `erl_alloc.c:287-310`, and the literal
@@ -1043,6 +1054,11 @@ impl AllocUtil {
         let mut allocator =
             Self::new_for_type(Strategy::AddressOrderBestFit, options, "literal_alloc");
         allocator.carrier_arena = Some(CarrierArena::new(region));
+        // Port of `set_default_literal_alloc_opts` and `erts_alcu_start`, erl_alloc.c:287-310 and
+        // erl_alloc_util.c:6927-6944, OTP-29.1.1: the default `mmbc0` setting starts this carrier.
+        allocator
+            .initialize_main_carrier()
+            .expect("failed to create literal allocator main carrier");
         allocator
     }
 
