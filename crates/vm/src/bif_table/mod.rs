@@ -124,7 +124,7 @@ use crate::native_helpers::{
     integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
-use crate::natives::{erl_hl_timer, erl_process_dict};
+use crate::natives::{erl_bif_info, erl_hl_timer, erl_process_dict, register};
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
 #[derive(Clone, Copy)]
@@ -167,10 +167,13 @@ pub(crate) fn guard_helper(module: &str, function: &str, arity: u8) -> Option<us
 /// pointer.
 pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> {
     let func = match (module, function, arity) {
-        ("erlang", "whereis", 1) => bif!(crate::signals::whereis_light),
-        ("erlang", "is_process_alive", 1) => {
-            bif!(crate::signals::is_process_alive_light)
-        }
+        // register.c
+        ("erlang", "register", 2) => bif!(register::register_2),
+        ("erlang", "unregister", 1) => bif!(register::unregister_1),
+        ("erlang", "whereis", 1) => bif!(register::whereis_1),
+        ("erlang", "registered", 0) => bif!(register::registered_0),
+        // erl_bif_info.c
+        ("erlang", "is_process_alive", 1) => bif!(erl_bif_info::is_process_alive_1),
         ("erlang", "process_info", 2) => {
             bif!(crate::native_helpers::process_info_2_light)
         }
@@ -225,6 +228,13 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "!", 2) => bif!(crate::natives::bif::ebif_bang_2),
         ("erlang", "send", 2) => bif!(crate::natives::bif::send_2),
         ("erlang", "send", 3) => bif!(crate::natives::bif::send_3),
+        ("erlang", "link", 1) => bif!(crate::natives::bif::link_1),
+        ("erlang", "link", 2) => bif!(crate::natives::bif::link_2),
+        ("erlang", "unlink", 1) => bif!(crate::natives::bif::unlink_1),
+        ("erlang", "exit", 2) => bif!(crate::natives::bif::exit_2),
+        ("erlang", "exit", 3) => bif!(crate::natives::bif::exit_3),
+        ("erlang", "exit_signal", 2) => bif!(crate::natives::bif::exit_signal_2),
+        ("erlang", "exit_signal", 3) => bif!(crate::natives::bif::exit_signal_3),
         // erl_hl_timer.c
         ("erlang", "send_after", 3) => bif!(erl_hl_timer::send_after_3),
         ("erlang", "send_after", 4) => bif!(erl_hl_timer::send_after_4),

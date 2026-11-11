@@ -4913,12 +4913,7 @@ pub(crate) fn close_by_id(
 }
 
 /// Apply an exit signal to a port and deliver its reason to linked processes.
-pub(crate) fn exit_port(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    port: Term,
-    reason: Term,
-) -> Result<(), VmError> {
+pub(crate) fn exit_port(process: &mut Process, port: Term, reason: Term) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     // Port of erts/emulator/beam/io.c:3854 (deliver_port_exit): `kill` reaches links as `killed`.
     let reason = if reason == Term::atom(arinsal_term::atoms::KILL) {
@@ -4934,24 +4929,15 @@ pub(crate) fn exit_port(
         && let Some(drv) = handle.drv_port()
     {
         let reason = to_owned(reason).map_err(|_| badarg())?;
-        let pid = ctx.pid();
+        let pid = process.self_pid.ok_or_else(badarg)?;
         // An exit signal to a port that is gone is dropped (bif.c:1794).
-        let _ = drv_sig::exit(
-            process,
-            Some(ctx),
-            pid,
-            &handle,
-            &drv,
-            false,
-            pid,
-            reason,
-            false,
-        );
+        let _ = drv_sig::exit(process, None, pid, &handle, &drv, false, pid, reason, false);
         return Ok(());
     }
     crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
     let scheduler = runtime.scheduler()?;
-    let Some(removed) = remove_and_notify(runtime, id, scheduler, ctx.pid(), reason) else {
+    let caller = process.self_pid.ok_or_else(badarg)?;
+    let Some(removed) = remove_and_notify(runtime, id, scheduler, caller, reason) else {
         return Ok(());
     };
     crate::trace::port_closed(runtime, id);

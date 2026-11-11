@@ -2831,72 +2831,56 @@ pub(crate) fn forward_link_exit_if_proxy(
     true
 }
 
-/// Route signal BIFs to the distribution controller when the peer is remote.
-pub(crate) fn native_signal(
-    vm: &mut Vm,
+/// The `is_external_pid` arm of `link_opt` for a pid of another node: `erts_dsig_prepare` with
+/// the scheduler's distribution state, then `erts_dsig_send_link`.
+// Port of erts/emulator/beam/bif.c (link_opt: is_external_pid) and dist.c
+// (erts_dsig_send_link), OTP-29.1.1.
+pub(crate) fn link_remote(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-    function: &str,
+    node: &str,
+    target: Term,
 ) -> Result<Term, VmError> {
-    let Some(node) = remote_node(args[0])? else {
-        let handler =
-            crate::signals::handler("erlang", function, args.len() as u8).ok_or_else(badarg)?;
-        return handler(vm, process, ctx, crate::natives::NativeArgs::Slice(args))
-            .ok_or_else(badarg)?;
-    };
-    let target = owned(args[0])?;
-    match function {
-        "link" => elink::link_external(process, ctx, &node, target),
-        "unlink" => elink::unlink_external(process, ctx, &node, target),
-        "exit" => {
-            // Port of erts/emulator/beam/bif.c (exit_signal, external pid): an exit to a node
-            // that is not alive or not connected is dropped.
-            let reason = owned(args[1])?;
-            if let DsigPrepare::Connected { connection_id, .. } = dsig_prepare(process, ctx, &node)?
-            {
-                queue_outgoing_on(
-                    process,
-                    ctx,
-                    &node,
-                    connection_id,
-                    control(8, vec![local_pid_owned(ctx.pid()), target, reason]),
-                    None,
-                )?;
-            }
-            Ok(Term::atom(arinsal_term::atoms::TRUE))
-        }
-        _ => Err(badarg()),
-    }
+    elink::link_external(process, ctx, node, owned(target)?)
 }
 
-// Port of erts/emulator/beam/dist.c:1454 (erts_dsig_send_link), OTP-29.1.1.
-pub(crate) fn native_link(
-    vm: &mut Vm,
-    p: &mut Process,
-    c: &mut RunCtx<'_, Message>,
-    a: &[Term],
+/// The `is_external_pid` arm of `unlink_1` for a pid of another node.
+// Port of erts/emulator/beam/bif.c (unlink_1: is_external_pid) and dist.c
+// (erts_dsig_send_unlink), OTP-29.1.1.
+pub(crate) fn unlink_remote(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    node: &str,
+    target: Term,
 ) -> Result<Term, VmError> {
-    native_signal(vm, p, c, a, "link")
+    elink::unlink_external(process, ctx, node, owned(target)?)
 }
-// Port of erts/emulator/beam/dist.c:1461 (erts_dsig_send_unlink), OTP-29.1.1.
-pub(crate) fn native_unlink(
-    vm: &mut Vm,
-    p: &mut Process,
-    c: &mut RunCtx<'_, Message>,
-    a: &[Term],
+
+/// The `is_external_pid || is_external_ref` arm of `send_exit_signal_bif` for an id of another
+/// node: dropped when the node is not alive or not connected, else `erts_dsig_send_exit2`.
+// Port of erts/emulator/beam/bif.c (send_exit_signal_bif: is_external_pid) and dist.c
+// (erts_dsig_send_exit2), OTP-29.1.1.
+pub(crate) fn exit2_remote(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    node: &str,
+    target: Term,
+    reason: Term,
 ) -> Result<Term, VmError> {
-    native_signal(vm, p, c, a, "unlink")
+    let (target, reason) = (owned(target)?, owned(reason)?);
+    if let DsigPrepare::Connected { connection_id, .. } = dsig_prepare(process, ctx, node)? {
+        queue_outgoing_on(
+            process,
+            ctx,
+            node,
+            connection_id,
+            control(8, vec![local_pid_owned(ctx.pid()), target, reason]),
+            None,
+        )?;
+    }
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
-// Port of erts/emulator/beam/dist.c:1773 (erts_dsig_send_exit), OTP-29.1.1.
-pub(crate) fn native_exit2(
-    vm: &mut Vm,
-    p: &mut Process,
-    c: &mut RunCtx<'_, Message>,
-    a: &[Term],
-) -> Result<Term, VmError> {
-    native_signal(vm, p, c, a, "exit")
-}
+
 /// The `remote_process` arm of `monitor/2,3` (bif.c `monitor`): an external pid or
 /// `{Name, Node}` of another node.
 // Port of erts/emulator/beam/bif.c (monitor: remote_process) and dist.c:1528
