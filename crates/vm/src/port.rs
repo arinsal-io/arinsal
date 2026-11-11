@@ -8,7 +8,6 @@ use arinsal_term::{
     global_atoms, to_owned,
 };
 use parking_lot::Mutex;
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -122,87 +121,20 @@ fn child_setup_payload(
     Ok(request)
 }
 
-thread_local! {
-    /// Set when `port_command` must suspend the caller and retry the call.
-    static BUSY_SUSPEND: Cell<bool> = const { Cell::new(false) };
-}
-
-thread_local! {
-    /// `erlang:send/3` with `[nosuspend]` is sending (`ERTS_PORT_SIG_FLG_NOSUSPEND`).
-    static SEND_NOSUSPEND: Cell<bool> = const { Cell::new(false) };
-    /// A nosuspend send found the port busy: `send/3` returns `nosuspend`.
-    static SEND_BUSY_NOSUSPEND: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Run a send of `erlang:send/3` with `[nosuspend]`; `true` when a port was busy and the
-/// message was not sent.
-pub(crate) fn send_nosuspend<R>(send: impl FnOnce() -> R) -> (R, bool) {
-    SEND_NOSUSPEND.with(|flag| flag.set(true));
-    SEND_BUSY_NOSUSPEND.with(|flag| flag.set(false));
-    let result = send();
-    SEND_NOSUSPEND.with(|flag| flag.set(false));
-    (result, SEND_BUSY_NOSUSPEND.with(|flag| flag.replace(false)))
-}
-
-/// `Port ! Message` from a running process: port of erts/emulator/beam/bif.c:2560
-/// (erts_send to an internal port). A busy port suspends the sender: either the send is
-/// redone after the suspension (nothing sent) or the process yields after it.
+/// `Port ! Message` from a running process: `erts_port_command` of `do_send`'s `port_common`.
+/// `suspend` off is `ERTS_PORT_SIG_FLG_NOSUSPEND`. The result is the `ERTS_PORT_OP_*` code
+/// `do_send` maps to its send result; a busy port with `suspend` on has already suspended the
+/// sender (`erts_suspend` on the port's busy waiter list).
+// Port of erts/emulator/beam/bif.c (do_send: port_common) and io.c (erts_port_command,
+// erts_port_output), OTP-29.1.1.
 pub(crate) fn process_send(
-    process: &mut Process,
-    port: Term,
-    message: Term,
-) -> Result<(), VmError> {
-    process_send_inner(process, None, port, message)
-}
-
-/// `Port ! Message` with its running process scheduler context.
-// Port of erts/emulator/beam/io.c:923-1055 (try_imm_drv_call), OTP-29.1.1.
-pub(crate) fn process_send_in(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    port: Term,
-    message: Term,
-) -> Result<(), VmError> {
-    process_send_inner(process, Some(ctx), port, message)
-}
-
-fn process_send_inner(
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, Message>>,
     port: Term,
     message: Term,
-) -> Result<(), VmError> {
-    let nosuspend = SEND_NOSUSPEND.with(Cell::get);
-    match send_from_process(process, port, message, nosuspend, ctx)? {
-        PortSend::Sent => Ok(()),
-        PortSend::SentSuspended => {
-            // SEND_YIELD_RETURN: the send is done; the process leaves the scheduler.
-            process.set_force_yield(true);
-            Ok(())
-        }
-        PortSend::Busy if nosuspend => {
-            SEND_BUSY_NOSUSPEND.with(|flag| flag.set(true));
-            Ok(())
-        }
-        PortSend::Busy => {
-            // SEND_YIELD: the suspended send is redone when the port is no longer busy.
-            BUSY_SUSPEND.with(|flag| flag.set(true));
-            Err(badarg())
-        }
-    }
-}
-
-/// The running BIF asked to suspend on a busy port; [`take_busy_suspend`] consumes it.
-pub(crate) fn busy_suspend_pending() -> bool {
-    BUSY_SUSPEND.with(Cell::get)
-}
-
-/// True once, when the running BIF asked to suspend on a busy port.
-// Not inlined: inlined into the scheduler loop, the thread-local lookup is hoisted to every
-// slice's entry although only a busy-port failure reads it.
-#[inline(never)]
-pub(crate) fn take_busy_suspend() -> bool {
-    BUSY_SUSPEND.with(|flag| flag.replace(false))
+    suspend: bool,
+) -> Result<PortSend, VmError> {
+    send_from_process(process, port, message, !suspend, ctx)
 }
 
 /// Output-queue and message-queue busy limits from `open_port` options.
@@ -4462,6 +4394,22 @@ fn notsup() -> VmError {
     )))
 }
 
+/// `ERTS_PORT_OP_BUSY` without `nosuspend`, after `erts_suspend(BIF_P, ERTS_PROC_LOCK_MAIN,
+/// prt)`: `ERTS_BIF_YIELD3(BIF_TRAP_EXPORT(BIF_erts_internal_port_command_3), ...)`. The
+/// suspended process redoes the command through its own export once the port is not busy.
+// Port of erts/emulator/beam/erl_bif_port.c (erts_internal_port_command_3: ERTS_PORT_OP_BUSY)
+// and bif.h (ERTS_BIF_YIELD3), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn port_command_yield(process: &mut Process, args: &[Term]) -> VmError {
+    crate::bif_traps::vbump_all_reds(process);
+    VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        "erts_internal:port_command/3",
+        args.to_vec(),
+    ))
+}
+
 fn port_command(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -4528,8 +4476,7 @@ fn port_command(
                 }
                 drv_sig::PortOp::Busy => {
                     if suspend_on_busy(process, &handle, &drv_port, pid) {
-                        BUSY_SUSPEND.with(|flag| flag.set(true));
-                        return Err(badarg());
+                        return Err(port_command_yield(process, args));
                     }
                 }
                 drv_sig::PortOp::BusyScheduled(reference)
@@ -4602,8 +4549,7 @@ fn port_command(
             if busy_port {
                 crate::natives::erts_debug::notify_busy_port(process, ctx.pid(), id);
             }
-            BUSY_SUSPEND.with(|flag| flag.set(true));
-            return Err(badarg());
+            return Err(port_command_yield(process, args));
         }
     }
     trace_command_received_data(process, ctx.pid(), id, data, &framed);
@@ -5490,13 +5436,15 @@ pub(crate) fn send_from_process(
                     return Ok(PortSend::Busy);
                 }
             }
-            (PortSend::SentSuspended, Some((handle, drv))) => {
+            // ERTS_PORT_OP_BUSY_SCHEDULED: sent; only a suspending send waits on the port.
+            (PortSend::SentSuspended, Some((handle, drv))) if !nosuspend => {
                 let pid = process.self_pid.ok_or_else(badarg)?;
                 if suspend_on_busy(process, &handle, &drv, pid) {
                     return Ok(PortSend::SentSuspended);
                 }
                 return Ok(PortSend::Sent);
             }
+            (PortSend::SentSuspended, _) if nosuspend => return Ok(PortSend::Sent),
             (outcome, _) => return Ok(outcome),
         }
     }
@@ -5654,17 +5602,16 @@ fn send_message_inner(
             let mut state = handle.state.lock();
             if state.busy_port || state.busy_msgq {
                 if !nosuspend {
-                    let pid = ctx.as_deref().map_or(from, |ctx| ctx.pid());
-                    if process.self_pid == Some(pid) {
-                        crate::suspend::suspend_self(process);
-                    }
+                    // erts_suspend(c_p, ERTS_PROC_LOCK_MAIN, prt): the sender, not the
+                    // connected process the message names.
+                    let pid = process.self_pid.ok_or_else(badarg)?;
+                    crate::suspend::suspend_self(process);
                     state.suspended.push(pid);
                     let busy_port = state.busy_port;
                     drop(state);
                     if busy_port {
                         crate::natives::erts_debug::notify_busy_port(process, pid, id);
                     }
-                    BUSY_SUSPEND.with(|flag| flag.set(true));
                 }
                 return Ok((PortSend::Busy, None));
             }

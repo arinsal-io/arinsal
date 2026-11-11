@@ -818,18 +818,6 @@ impl Executor {
                     if let Some(result) = result {
                         let value = match result {
                             Ok(value) => value,
-                            // A busy port_command suspends the native
-                            // caller and redoes the call when the port is
-                            // no longer busy, like the interpreter.
-                            Err(VmError::Trap(_)) if crate::port::take_busy_suspend() => {
-                                for (register, value) in process.x.iter_mut().zip(&saved_arguments)
-                                {
-                                    *register = *value;
-                                }
-                                process.set_native_retry(Some(target_pc));
-                                process.set_native_pc(Some(code_ptr));
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
-                            }
                             Err(VmError::Trap(mut trap)) => {
                                 // Port of erts/emulator/beam/beam_common.c
                                 // (save_stacktrace: a failing BIF is the top

@@ -1,4 +1,5 @@
 use super::*;
+use crate::port::PortSend;
 
 /// A term already measured by `size_object_litopt` against `literals`.
 #[derive(Clone, Copy)]
@@ -180,13 +181,15 @@ impl Process {
         self.send_message_inner(None, target, value)
     }
 
+    // `erts_send_message`: its destinations are processes, so no port suspends the sender.
     fn send_message_inner(
         &mut self,
         vm: Option<&mut Vm>,
         target: Term,
         value: Term,
     ) -> Result<Term, VmError> {
-        self.send_message_prio(vm, None, target, value, false)
+        self.send_message_prio(vm, None, target, value, false, false)?;
+        Ok(value)
     }
 
     fn trace_send(
@@ -219,7 +222,9 @@ impl Process {
         }
     }
 
-    /// Send with an optional OTP 28+ `[priority]` request.
+    /// Send with an optional OTP 28+ `[priority]` request. A port destination gives its
+    /// `erts_port_command` outcome (`suspend` off is `ERTS_PORT_SIG_FLG_NOSUSPEND`); every
+    /// other destination is [`PortSend::Sent`] once sent.
     // Port of erts/emulator/beam/erl_message.c / bif.c send with priority, OTP-29.1.1.
     pub(crate) fn send_message_prio(
         &mut self,
@@ -228,8 +233,9 @@ impl Process {
         target: Term,
         value: Term,
         want_priority: bool,
-    ) -> Result<Term, VmError> {
-        self.send_resolved(vm, ctx, target, value, want_priority)
+        suspend: bool,
+    ) -> Result<PortSend, VmError> {
+        self.send_resolved(vm, ctx, target, value, want_priority, suspend)
     }
 
     fn send_resolved(
@@ -239,7 +245,8 @@ impl Process {
         target: Term,
         value: Term,
         want_priority: bool,
-    ) -> Result<Term, VmError> {
+        suspend: bool,
+    ) -> Result<PortSend, VmError> {
         let sender = self
             .self_pid
             .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
@@ -252,12 +259,7 @@ impl Process {
                 "send",
                 &[value, target],
             );
-            if let Some(ctx) = ctx.as_deref_mut() {
-                crate::port::process_send_in(self, ctx, target, value)?;
-            } else {
-                crate::port::process_send(self, target, value)?;
-            }
-            return Ok(value);
+            return crate::port::process_send(self, ctx, target, value, suspend);
         }
         // Port of erts/emulator/beam/bif.c:2469-2480,2511 (do_send), OTP-29.1.1: internal pids
         // and atoms are local destinations and never reach the distribution checks.
@@ -282,7 +284,7 @@ impl Process {
                 "send",
                 &[value, target],
             );
-            return Ok(value);
+            return Ok(PortSend::Sent);
         }
         let local_name = if local_destination {
             None
@@ -338,11 +340,8 @@ impl Process {
                             arinsal_term::atoms::BADARG,
                         )))
                     })?;
-                    if let Some(ctx) = ctx.as_deref_mut() {
-                        crate::port::process_send_in(self, ctx, port, value)?;
-                    } else {
-                        crate::port::process_send(self, port, value)?;
-                    }
+                    let sent =
+                        crate::port::process_send(self, ctx.as_deref_mut(), port, value, suspend)?;
                     crate::trace::emit_process(
                         vm.as_deref_mut(),
                         self,
@@ -351,7 +350,7 @@ impl Process {
                         "send",
                         &[value, target],
                     );
-                    return Ok(value);
+                    return Ok(sent);
                 }
                 _ => None,
             };
@@ -369,7 +368,7 @@ impl Process {
                 // Port of erts/emulator/beam/dist.c (`erts_send` registered-name handling), OTP-29.1.1.
                 // A local {Name, Node} send silently drops the message when Name is absent.
                 if local_name_tuple {
-                    return Ok(value);
+                    return Ok(PortSend::Sent);
                 }
             }
             pid
@@ -436,7 +435,8 @@ impl Process {
                 crate::seq_trace::SeqState::Nil
             },
         };
-        self.send_counted(ctx, sender, pid, value, via_prio_alias, seq_token)
+        self.send_counted(ctx, sender, pid, value, via_prio_alias, seq_token)?;
+        Ok(PortSend::Sent)
     }
 
     /// `Pid ! Msg` from native code for a sender with no trace hooks (see

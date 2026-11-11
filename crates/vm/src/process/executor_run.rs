@@ -568,13 +568,7 @@ impl Executor {
                             break park_suspended(process, ctx);
                         }
                         let trap = match result {
-                            Err(VmError::Trap(trap)) => {
-                                // g_port_fix: busy port_command suspends the sender and retries the call.
-                                if crate::port::take_busy_suspend() {
-                                    break Ok(RunState::Wait { timeout_pos: None });
-                                }
-                                trap
-                            }
+                            Err(VmError::Trap(trap)) => trap,
                             Err(VmError::Exception { reason, frame }) => {
                                 if trace_boot_enabled() {
                                     eprintln!("arinsal boot: exception {reason} at {frame}");
