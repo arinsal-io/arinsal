@@ -3236,7 +3236,7 @@ fn bif_trap_export(
 /// a value, `BIF_ERROR`, or `BIF_TRAP*` complete here, in native code, as erts'
 /// `call_light_bif_shared` / `call_bif_shared` complete them; GC after the BIF is
 /// [`process_bif_result`]'s. An outcome only the scheduler completes (ERTS_BIF_YIELD, a dirty
-/// BIF on a normal scheduler, a busy port, hibernation, a VM failure) is THE_NON_VALUE with
+/// BIF on a normal scheduler, hibernation, a VM failure) is THE_NON_VALUE with
 /// `TRAP` to the call itself; the scheduler takes the stored outcome instead of calling the
 /// BIF again.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-536 (call_light_bif_shared,
@@ -3251,7 +3251,7 @@ pub(crate) fn bif_return(
     let arity = usize::from(export.arity);
     let result = match result {
         Ok(value) => Ok(value),
-        Err(crate::VmError::Trap(trap)) if !crate::port::busy_suspend_pending() => Err(trap),
+        Err(crate::VmError::Trap(trap)) => Err(trap),
         Err(crate::VmError::TrapExport(trap)) => {
             return bif_trap_export(process, export, trap, identity as usize);
         }

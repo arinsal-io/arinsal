@@ -616,8 +616,11 @@ fn erl_send(c_p: *mut ProcessHeader, i: u64) -> u64 {
     let (to, msg) = (process.x[0], process.x[1]);
     let result = match do_send(process, to, msg, SendOptions::default()) {
         Ok(Sent::Done) => send_return(process, msg),
-        // SEND_NOCONNECT, and SEND_YIELD that cannot come without `nosuspend`.
-        Ok(Sent::NoConnect | Sent::Busy) => Ok(msg),
+        Ok(Sent::NoConnect) => Ok(msg),
+        // The sender is suspended on the busy port; the send is redone through the send/2
+        // export once it is resumed.
+        Ok(Sent::Yield) => Err(send_yield(process, "erlang:send/2", vec![to, msg])),
+        Ok(Sent::YieldReturn) => send_yield_return(process, msg),
         Err(error) => Err(error),
     };
     bif_ret(c_p, i, result)
@@ -636,9 +639,13 @@ fn send_return(process: &mut Process, value: Term) -> Result<Term, VmError> {
     send_yield_return(process, value)
 }
 
+/// `ERTS_BIF_PREP_YIELD_RETURN(retval, p, value)`: `ERTS_VBUMP_ALL_REDS`, then the value
+/// through `bif_return_trap/2`.
+// Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_YIELD_RETURN_X), OTP-29.1.1.
 #[cold]
 #[inline(never)]
 fn send_yield_return(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    crate::bif_traps::vbump_all_reds(process);
     Err(VmError::TrapExport(crate::ExportTrap::new(
         process,
         crate::natives::sys::BIF_RETURN_TRAP,
@@ -681,15 +688,8 @@ fn do_send_local(
     msg: Term,
     opts: SendOptions,
 ) -> Result<Sent, VmError> {
-    if opts.nosuspend {
-        let (sent, busy) = crate::port::send_nosuspend(|| {
-            process.send_message_prio(None, None, to, msg, opts.priority)
-        });
-        sent?;
-        return Ok(if busy { Sent::Busy } else { Sent::Done });
-    }
-    process.send_message_prio(None, None, to, msg, opts.priority)?;
-    Ok(Sent::Done)
+    let sent = process.send_message_prio(None, None, to, msg, opts.priority, !opts.nosuspend)?;
+    Ok(Sent::from_port(sent))
 }
 
 /// `do_send` of a sender with trace hooks: `trace_send`, the seq trace token and
@@ -710,15 +710,15 @@ fn do_send_hooked(
         return remote_send(process, to, msg, opts);
     }
     with_sched(process, |vm, process, ctx| {
-        if opts.nosuspend {
-            let (sent, busy) = crate::port::send_nosuspend(|| {
-                process.send_message_prio(Some(vm), Some(ctx), to, msg, opts.priority)
-            });
-            sent?;
-            return Ok(if busy { Sent::Busy } else { Sent::Done });
-        }
-        process.send_message_prio(Some(vm), Some(ctx), to, msg, opts.priority)?;
-        Ok(Sent::Done)
+        let sent = process.send_message_prio(
+            Some(vm),
+            Some(ctx),
+            to,
+            msg,
+            opts.priority,
+            !opts.nosuspend,
+        )?;
+        Ok(Sent::from_port(sent))
     })?
 }
 
@@ -756,7 +756,7 @@ fn remote_send(
                 Ok(Sent::Done)
             }
             RemoteSendOutcome::NotConnected => Ok(Sent::NoConnect),
-            RemoteSendOutcome::WouldSuspend => Ok(Sent::Busy),
+            RemoteSendOutcome::WouldSuspend => Ok(Sent::Yield),
             RemoteSendOutcome::NotRemote => Err(badarg()),
         },
     )?
@@ -769,8 +769,24 @@ enum Sent {
     Done,
     /// `SEND_NOCONNECT`: dropped, the node is not connected.
     NoConnect,
-    /// `SEND_YIELD` with `suspend` off: nothing was sent.
-    Busy,
+    /// `SEND_YIELD`: nothing was sent; with `suspend` on the sender is suspended on the busy
+    /// port (`erts_suspend`).
+    Yield,
+    /// `SEND_YIELD_RETURN`: sent, and the sender is suspended on the busy port.
+    YieldReturn,
+}
+
+impl Sent {
+    /// `port_common`'s mapping of the `erts_port_command` result (`ERTS_PORT_OP_*`).
+    // Port of erts/emulator/beam/bif.c (do_send: port_common), OTP-29.1.1.
+    #[inline(always)]
+    fn from_port(sent: crate::port::PortSend) -> Self {
+        match sent {
+            crate::port::PortSend::Sent => Self::Done,
+            crate::port::PortSend::SentSuspended => Self::YieldReturn,
+            crate::port::PortSend::Busy => Self::Yield,
+        }
+    }
 }
 
 /// `send/3`: the option list, then `do_send` with its `connect`/`suspend`/`prio` flags.
@@ -794,10 +810,25 @@ pub(crate) extern "C" fn send_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64)
         } else {
             atoms::OK
         })),
-        Ok(Sent::Busy) => Ok(Term::atom(atoms::NOSUSPEND)),
+        Ok(Sent::Yield) if opts.nosuspend => Ok(Term::atom(atoms::NOSUSPEND)),
+        Ok(Sent::Yield) => Err(send_yield(process, "erlang:send/3", vec![to, msg, list])),
+        Ok(Sent::YieldReturn) if opts.nosuspend => Ok(Term::atom(atoms::NOSUSPEND)),
+        Ok(Sent::YieldReturn) => send_yield_return(process, ok),
         Err(error) => Err(error),
     };
     bif_ret(c_p, i, result)
+}
+
+/// `ERTS_BIF_PREP_YIELD2(retval, BIF_TRAP_EXPORT(BIF_send_2), p, to, msg)` (`YIELD3` with the
+/// options for `send/3`): `ERTS_VBUMP_ALL_REDS`, then a trap to the BIF's own export, which
+/// the process runs again once the busy port resumes it.
+// Port of erts/emulator/beam/bif.c (erl_send, send_3: SEND_YIELD) and bif.h
+// (ERTS_BIF_PREP_YIELD2, ERTS_BIF_PREP_YIELD3), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn send_yield(process: &mut Process, export: &'static str, args: Vec<Term>) -> VmError {
+    crate::bif_traps::vbump_all_reds(process);
+    VmError::TrapExport(crate::ExportTrap::new(process, export, args))
 }
 
 /// The options `send_3` reads.
