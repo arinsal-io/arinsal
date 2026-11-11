@@ -5818,7 +5818,6 @@ impl Garbage {
 pub struct Registry {
     tables: Vec<TableSlot>,
     free_slots: Vec<usize>,
-    names: HashMap<Atom, Tid>,
     named_tables: Arc<NamedTableIndex>,
     // Port of `ERTS_PSD_ETS_OWNED_TABLES` and the circular
     // `DbTable.common.owned` list in erts/emulator/beam/erl_db.c, OTP-29.1.1.
@@ -6097,7 +6096,6 @@ impl Registry {
                 table: None,
             }],
             free_slots: Vec::new(),
-            names: HashMap::new(),
             named_tables,
             owned_heads: HashMap::new(),
             fixed_tables: HashMap::new(),
@@ -6176,9 +6174,6 @@ impl Registry {
         options: TableOptions,
         refn: Option<[u32; 3]>,
     ) -> Result<Tid, EtsError> {
-        if options.named_table && self.names.contains_key(&options.name) {
-            return Err(EtsError::NameTaken);
-        }
         let index = if let Some(&index) = self.free_slots.last() {
             index
         } else {
@@ -6209,14 +6204,11 @@ impl Registry {
         );
         self.tables[index].table = Some(shared.clone());
         self.insert_owned_table(options.owner, tid)?;
-        if options.named_table {
-            if !self.named_tables.insert(options.name, shared.clone()) {
-                self.remove_owned_table(options.owner, tid);
-                self.tables[index].table = None;
-                self.free_slots.push(index);
-                return Err(EtsError::NameTaken);
-            }
-            self.names.insert(options.name, tid);
+        if options.named_table && !self.named_tables.insert(options.name, shared.clone()) {
+            self.remove_owned_table(options.owner, tid);
+            self.tables[index].table = None;
+            self.free_slots.push(index);
+            return Err(EtsError::NameTaken);
         }
         Ok(tid)
     }
@@ -6274,8 +6266,10 @@ impl Registry {
     }
 
     /// Resolve a registered table name.
+    // Port of erts/emulator/beam/erl_db.c (ets_whereis_1: db_get_table_aux on the name), OTP-29.1.1:
+    // the name index is the only name map.
     pub fn whereis(&self, name: Atom) -> Option<Tid> {
-        self.names.get(&name).copied()
+        self.named_tables.with_table(name, |shared| shared.tid)
     }
 
     /// Enumerate live table identities.
@@ -6343,7 +6337,6 @@ impl Registry {
         let mut table = shared.write();
         table.detached = true;
         if table.options.named_table {
-            self.names.remove(&table.options.name);
             assert!(self.named_tables.remove(table.options.name, &shared));
         }
         let mut fixations = 0;
@@ -6447,16 +6440,11 @@ impl Registry {
         if named {
             // Port of erts/emulator/beam/erl_db.c (insert_named_tab), OTP-29.1.1:
             // any registered name fails, including the table's own.
-            if self.names.contains_key(&name) {
-                return Err(EtsError::NameTaken);
-            }
             let old = table.options.name;
             if !self.named_tables.insert(name, shared.clone()) {
                 return Err(EtsError::NameTaken);
             }
             assert!(self.named_tables.remove(old, &shared));
-            self.names.remove(&old);
-            self.names.insert(name, tid);
         }
         table.options.name = name;
         Ok(())
