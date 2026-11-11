@@ -2068,9 +2068,6 @@ fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, 
     {
         return Ok((intern(module)?, intern(function)?, arity));
     }
-    if process.native_retry() == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
-        return Ok((arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2));
-    }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module_atom, function.function_atom, function.arity));
     }
@@ -2108,10 +2105,6 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         && let Ok(arity) = arity.parse::<u8>()
     {
         return Ok((module.to_owned(), function.to_owned(), arity));
-    }
-    // A send suspended on a busy port yields to the send/2 export (bif.c:2581 SEND_YIELD).
-    if process.native_retry() == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
-        return Ok(("erlang".to_owned(), "send".to_owned(), 2));
     }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((

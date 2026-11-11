@@ -344,34 +344,6 @@ impl Executor {
                     }
                     return Ok(Flow::Continue);
                 }
-                if target_pc == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
-                    let value = match process.send_message_prio(
-                        Some(&mut self.vm),
-                        Some(ctx),
-                        process.x[0],
-                        process.x[1],
-                        false,
-                    ) {
-                        Ok(value) => value,
-                        // Port of erts/emulator/beam/bif.c:2581 (SEND_YIELD): a
-                        // busy port suspended the sender; the send is redone
-                        // when it is resumed.
-                        Err(VmError::Trap(_)) if crate::port::take_busy_suspend() => {
-                            process.set_native_retry(Some(target_pc));
-                            process.set_native_pc(Some(code_ptr));
-                            return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624
-                    // (emit_send, call_light_bif_shared GC test), OTP-29.1.1.
-                    let value = process.gc_after_bif(value)?;
-                    process.x[0] = value;
-                    if !resume_after_native_return(process) {
-                        return Ok(Flow::Break(Ok(RunState::Done(value))));
-                    }
-                    return Ok(Flow::Continue);
-                }
                 if target_pc == crate::bif_traps::bif_export_trap_pc() {
                     // Port of jit/arm/beam_asm_global.cpp:145
                     // (emit_bif_export_trap) and instr_bif.cpp:525-536

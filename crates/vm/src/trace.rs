@@ -705,16 +705,6 @@ pub(crate) fn saved_calls(process: &Process) -> Option<Vec<SavedCall>> {
     )
 }
 
-/// Records the `erlang:send/2` export a process saving calls dispatches `send` through.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-625 (emit_send dispatches through
-// BIF_TRAP_EXPORT(BIF_send_2)), OTP-29.1.1.
-pub(crate) fn save_call_send_export(process: &mut Process) {
-    let atoms = arinsal_term::global_atoms();
-    if let (Ok(m), Ok(f)) = (atoms.intern("erlang"), atoms.intern("send")) {
-        save_call(process, SavedCall::Mfa(m, f, 2));
-    }
-}
-
 /// Whether any process is traced at all.
 pub(crate) fn active() -> bool {
     enabled().load(Ordering::Relaxed)
@@ -3661,27 +3651,6 @@ pub(crate) fn send_hooks_idle(process: &Process) -> bool {
             .is_none_or(|cold| cold.saved_calls.is_none())
         && process.signal_probe().is_some_and(|probe| {
             probe.proc_flags().load(Ordering::Relaxed) & arinsal_sched::proc_flags::TRACE == 0
-        })
-}
-
-/// Whether `process` has send tracing on: its sends then need the scheduler context that
-/// send trace patterns are evaluated with.
-pub(crate) fn traces_sends(process: &Process) -> bool {
-    if !enabled().load(Ordering::Relaxed) {
-        return false;
-    }
-    let Some(pid) = process.self_pid else {
-        return false;
-    };
-    if is_sensitive(process, pid) {
-        return false;
-    }
-    table()
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|((runtime, _sid, subject), entry)| {
-            *runtime == scope(process) && *subject == pid && entry.flags & SEND != 0
         })
 }
 

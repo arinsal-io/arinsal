@@ -321,7 +321,6 @@ pub const FUNC_INFO_BYTES: usize = 40;
 type BsColdEmit = Box<dyn FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
 const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
-const TRAP_RETURN_SLOT: u32 = crate::TRAP_RETURN_OFFSET as u32;
 /// Low bit of a recorded native error pc that is a call's return address (code is 4-aligned).
 pub const RETURN_SITE_TAG: usize = 1;
 
@@ -1005,38 +1004,6 @@ impl BeamModuleAssembler {
         self.code.adr(Gpr::x(2), entry)?;
         // One module-local veneer per fragment. `x30` is the next instruction.
         self.fragment_call(fragment)
-    }
-
-    /// Calls `send/2` synchronously through its process-aware runtime helper.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624, OTP-29.1.1.
-    pub fn dispatch_send(&mut self, fragment: usize, identity: usize) -> Result<(), ModuleError> {
-        let call = self.code.new_label();
-        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        self.code.b_cond(Cond::Gt, call)?;
-        self.code.adr(Gpr::x(8), call)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
-        self.emit_yield_live(2)?;
-        self.code.b(self.yield_label)?;
-        self.code.bind(call)?;
-        let done = self.code.new_label();
-        self.code.adr(Gpr::x(9), done)?;
-        self.code.emit(|e| {
-            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT)?;
-            e.mov_const(Gpr::x(13), identity as u64)
-        })?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), Gpr::x(13))?;
-            // The send identity carries no export descriptor.
-            e.mov_reg(Gpr::x(3), Gpr::xzr())
-        })?;
-        self.fragment_call(fragment)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
-        self.error_if_nonzero(Gpr::x(9))?;
-        self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
-        // A trapping send's target returns here with its result in XREG0.
-        self.code.bind(done)?;
-        Ok(())
     }
 
     /// Reads a process-dictionary value through the process runtime.

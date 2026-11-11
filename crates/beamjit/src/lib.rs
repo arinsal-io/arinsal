@@ -160,9 +160,10 @@ pub trait ModuleEnv {
     fn line_breakpoint_fragment(&self) -> usize {
         0
     }
-    /// Return the two-register shared fragment used by `send/2`.
-    fn send_fragment(&self) -> usize {
-        self.light_bif_fragment()
+    /// The export entry of `erlang:send/2` (`BIF_TRAP_EXPORT(BIF_send_2)`), which the `send`
+    /// instruction calls through `call_light_bif_shared`.
+    fn send_export_entry(&self) -> Result<usize, String> {
+        Err("no send/2 export".to_owned())
     }
     /// Resolve a loader-patched NIF body to its native runtime trampoline.
     fn native_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
@@ -3682,11 +3683,15 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             }
             erts_tables::GENOP_SEND_0 => {
                 count(0)?;
-                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
-                assembler.emit_send(
-                    env.send_fragment(),
-                    arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY,
-                )
+                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send), OTP-29.1.1.
+                let entry = env.send_export_entry().map_err(EmitError::Operand)?;
+                let bif = env.light_bif_func(entry);
+                let fragment = if bif != 0 {
+                    env.light_bif_fragment()
+                } else {
+                    env.light_bif_helper_fragment()
+                };
+                assembler.emit_send(fragment, entry, bif)
             }
             _ => unreachable!(),
         },

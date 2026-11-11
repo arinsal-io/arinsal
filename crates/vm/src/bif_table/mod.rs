@@ -4,6 +4,8 @@
 //! The pointer is chosen once, when the export is created. The call fragment
 //! branches to it with `(c_p, reg, I)`. `invoke_dispatch_bif` is not that pointer.
 
+mod raw;
+
 use arinsal_beamasm::ProcessHeader;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,11 +60,7 @@ pub(crate) fn install(bif_number: i32, f: usize) {
 
 /// `Export.info` of the BIF being called: `c_p->current`, set by the call fragment.
 pub(crate) fn current_info(header: *mut ProcessHeader) -> u64 {
-    if header.is_null() {
-        return 0;
-    }
-    // SAFETY: `header` is the running process's header, passed by the call fragment.
-    unsafe { (*header).current as u64 }
+    raw::header_current(header)
 }
 
 /// `(Export.info, Export*)` of the BIF being called: the call fragment points `c_p->current`
@@ -118,9 +116,7 @@ fn function_at(index: usize) -> Option<Bif> {
     if address == 0 || address == bif!(crate::native_helpers::yield_executor_bif) {
         return None;
     }
-    // SAFETY: every non-zero entry was stored by `install` from a `bif!` address, which
-    // checks the function against `Bif`.
-    Some(unsafe { std::mem::transmute::<usize, Bif>(address) })
+    Some(raw::bif_at(address))
 }
 
 use crate::native_helpers::{
@@ -226,6 +222,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
             bif!(crate::natives::bif::erts_internal_group_leader_2)
         }
         ("erlang", "process_flag", 2) => bif!(crate::natives::bif::process_flag_2),
+        ("erlang", "!", 2) => bif!(crate::natives::bif::ebif_bang_2),
+        ("erlang", "send", 2) => bif!(crate::natives::bif::send_2),
+        ("erlang", "send", 3) => bif!(crate::natives::bif::send_3),
         // erl_hl_timer.c
         ("erlang", "send_after", 3) => bif!(erl_hl_timer::send_after_3),
         ("erlang", "send_after", 4) => bif!(erl_hl_timer::send_after_4),

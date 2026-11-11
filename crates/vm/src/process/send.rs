@@ -189,18 +189,6 @@ impl Process {
         self.send_message_prio(vm, None, target, value, false)
     }
 
-    /// Send from a running process: the scheduler context delivers the message (and its
-    /// trace events) on the sender's worker, like erts' `erts_send_message`.
-    pub(crate) fn send_message_in(
-        &mut self,
-        vm: &mut Vm,
-        ctx: &mut RunCtx<'_, Message>,
-        target: Term,
-        value: Term,
-    ) -> Result<Term, VmError> {
-        self.send_message_prio(Some(vm), Some(ctx), target, value, false)
-    }
-
     fn trace_send(
         &mut self,
         vm: Option<&mut Vm>,
@@ -241,17 +229,7 @@ impl Process {
         value: Term,
         want_priority: bool,
     ) -> Result<Term, VmError> {
-        self.send_resolved(vm, ctx, target, value, want_priority, false)
-    }
-
-    /// `Name ! Msg` from native code. A registered port is redone by the scheduler,
-    /// which can suspend the sender; the name is resolved once either way.
-    pub(crate) fn send_message_native(
-        &mut self,
-        target: Term,
-        value: Term,
-    ) -> Result<Term, VmError> {
-        self.send_resolved(None, None, target, value, false, true)
+        self.send_resolved(vm, ctx, target, value, want_priority)
     }
 
     fn send_resolved(
@@ -261,7 +239,6 @@ impl Process {
         target: Term,
         value: Term,
         want_priority: bool,
-        defer_port: bool,
     ) -> Result<Term, VmError> {
         let sender = self
             .self_pid
@@ -356,9 +333,6 @@ impl Process {
                     Some(pid)
                 }
                 Some(crate::register::RegId::Port(id)) if crate::port::is_live(self, id) => {
-                    if defer_port {
-                        return Err(VmError::Unsupported(REMOTE_SEND_NEEDS_CONTEXT.into()));
-                    }
                     let port = Term::port(id).ok_or_else(|| {
                         VmError::Trap(crate::exceptions::Trap::error(Term::atom(
                             arinsal_term::atoms::BADARG,
