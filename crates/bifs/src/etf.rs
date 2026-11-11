@@ -2894,7 +2894,6 @@ fn finish<H: HeapAlloc>(
                     old_uniq: values[2].as_small().ok_or(BifError::BADARG)? as u32,
                     pid: values[3],
                     dispatch: Default::default(),
-                    dispatch_code: Default::default(),
                     dispatch_epoch: Default::default(),
                 });
                 // Port of erts/emulator/beam/external.c:5162-5168, OTP-29.1.1.
@@ -4349,7 +4348,6 @@ fn decode_direct_step(
                     old_uniq,
                     pid,
                     dispatch: Default::default(),
-                    dispatch_code: Default::default(),
                     dispatch_epoch: Default::default(),
                 });
                 let (term, environment) = ctx

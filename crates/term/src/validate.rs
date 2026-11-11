@@ -2,8 +2,8 @@
 //!
 //! Release builds omit every call unless the `validate-terms` feature is on.
 //! Debug builds consult `ARINSAL_VALIDATE=1` once and otherwise return
-//! immediately. The interpreter publishes `M:F/A opcode` through [`set_context`]
-//! before it reads a term.
+//! immediately. Callers publish a phase label through [`set_context`]
+//! before they read a term.
 
 use crate::{ProcessHeap, Term};
 use std::cell::RefCell;
@@ -20,7 +20,7 @@ thread_local! {
     static CONTEXT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// Whether interpreter and heap reads should check pointer terms.
+/// Whether heap reads should check pointer terms.
 #[inline(always)]
 pub fn active() -> bool {
     #[cfg(feature = "validate-terms")]
@@ -282,10 +282,7 @@ fn accepted(heap: &ProcessHeap, term: Term) -> bool {
         return true;
     }
     let addr = (term.0 & !7) as usize;
-    if heap_contains(heap, addr) || stable_contains(addr) || is_static_empty_tuple(addr) {
-        return true;
-    }
-    crate::is_region_term(term)
+    heap_contains(heap, addr) || stable_contains(addr) || is_static_empty_tuple(addr)
 }
 
 fn describe(heap: &ProcessHeap) -> String {
@@ -347,7 +344,7 @@ pub(crate) fn check_term(heap: &ProcessHeap, term: Term, context: &str) {
     fail(heap, term, context);
 }
 
-/// Check one interpreter load. Immediates and an inactive checker return.
+/// Check one term load. Immediates and an inactive checker return.
 #[inline(always)]
 pub fn check_if_active(heap: &ProcessHeap, term: Term) {
     if !active() || !term.is_pointer() {
@@ -593,7 +590,7 @@ pub fn check_heap_bits_if_active(heap: &ProcessHeap, context: &str) {
 #[cfg(test)]
 mod tests {
     use super::check_term;
-    use crate::{ProcessHeap, Term, TermBuilder, VecHeap, seal_for_send};
+    use crate::{ProcessHeap, Term, TermBuilder, VecHeap};
 
     #[test]
     fn immediates_and_heap_pointers_pass() {
@@ -609,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_fragment_and_region_pointers_pass() {
+    fn literal_and_fragment_pointers_pass() {
         let mut literals = VecHeap::new();
         let literal = TermBuilder::new(&mut literals)
             .tuple(&[Term::small(7).unwrap()])
@@ -626,13 +623,6 @@ mod tests {
         }
         let fragment_term = Term::from_ptr(raw, 1);
         check_term(&owner, fragment_term, "frag:bif/2 move");
-
-        let mut source = ProcessHeap::with_words(64);
-        let local = TermBuilder::new(&mut source)
-            .cons(Term::small(1).unwrap(), Term::NIL)
-            .unwrap();
-        let shared = seal_for_send(local).unwrap();
-        check_term(&heap, shared.term(), "region:send/1 move");
     }
 
     #[test]

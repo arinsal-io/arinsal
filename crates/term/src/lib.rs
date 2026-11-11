@@ -22,7 +22,6 @@ pub mod ptab;
 pub mod raw;
 mod record;
 mod record_table;
-mod region;
 mod rwmutex;
 pub mod stack;
 pub mod validate;
@@ -102,10 +101,6 @@ pub use record::{
 pub use record_table::{
     delete_module_record_definitions, drop_record_scope, find_record_definition_in,
     put_record_definition, set_record_scope,
-};
-pub use region::{
-    BuiltList, DEFAULT_REGION_LIST_CONS, GrowingList, RegionBuilder, RegionRoots,
-    SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,
 };
 pub use rwmutex::{
     FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, current_reader_group,

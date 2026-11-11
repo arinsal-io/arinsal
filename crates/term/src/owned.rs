@@ -192,7 +192,6 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     old_uniq: *old_uniq,
                     pid,
                     dispatch: Default::default(),
-                    dispatch_code: Default::default(),
                     dispatch_epoch: Default::default(),
                 });
                 // Port of erts/emulator/beam/external.c:5162-5168, OTP-29.1.1.

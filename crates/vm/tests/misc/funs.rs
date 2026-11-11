@@ -62,42 +62,6 @@ fn closures_and_dynamic_calls_match_otp() {
     for count in 0..=20 {
         assert!(captures.contains(&count), "missing {count}-capture lambda");
     }
-    let loaded = arinsal_loader::load(&parsed).unwrap();
-    let make_fun_sites = loaded
-        .code
-        .iter()
-        .filter(|instruction| matches!(instruction, arinsal_loader::Instr::MakeFun { .. }))
-        .count();
-    assert!(
-        make_fun_sites >= 20,
-        "only {make_fun_sites} make_fun3 sites"
-    );
-    assert!(
-        loaded
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, arinsal_loader::Instr::CallFun { .. }))
-    );
-    let apply_sites = loaded
-        .code
-        .iter()
-        .filter(|instruction| matches!(instruction, arinsal_loader::Instr::Apply { .. }))
-        .count();
-    assert!(
-        apply_sites >= 2,
-        "both fixed apply forms were not generated"
-    );
-    assert!(
-        loaded.code.iter().any(|instruction| matches!(
-            instruction,
-            arinsal_loader::Instr::Apply { tail: true, .. }
-        ))
-    );
-    assert!(loaded.code.iter().any(|instruction| matches!(
-        instruction,
-        arinsal_loader::Instr::Apply { tail: false, .. }
-    )));
-    eprintln!("{make_fun_sites} make_fun3 sites and {apply_sites} fixed apply sites");
     reference.load("vm_funs_cases", &beam).unwrap();
     let mut vm = Vm::new([]);
     vm.load("vm_funs_cases", &beam).unwrap();

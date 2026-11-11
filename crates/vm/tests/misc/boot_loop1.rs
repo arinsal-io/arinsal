@@ -111,15 +111,6 @@ fn tuple_arity_selection_matches_otp() {
         .compile_named("boot_loop1_select", source, &[])
         .unwrap();
     reference.load("boot_loop1_select", &beam).unwrap();
-    let parsed = arinsal_beam::parse(&beam).unwrap();
-    let module = arinsal_loader::load(&parsed).unwrap();
-    assert!(module.code.iter().any(|instr| matches!(
-        instr,
-        arinsal_loader::Instr::Select {
-            tuple_arity: true,
-            ..
-        }
-    )));
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     for input in [

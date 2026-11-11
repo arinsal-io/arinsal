@@ -174,20 +174,14 @@ pub(crate) struct CodeTables {
 /// (`known`, by import) keep what the table has.
 fn bind_import_targets_of(
     module: &mut Module,
-    known: &[Option<(arinsal_loader::ImportClass, usize, bool)>],
+    known: &[Option<(arinsal_loader::ImportClass, usize)>],
 ) {
     for (index, import) in module.imports.iter_mut().enumerate() {
-        if let Some(&Some((class, bits, traps))) = known.get(index) {
+        if let Some(&Some((class, bits))) = known.get(index) {
             if bits != 0 {
                 import.set_native_bits(bits);
             }
             import.set_class(class);
-            if class == arinsal_loader::ImportClass::Pure
-                && import.fast_op == arinsal_loader::ImportFastOp::None
-                && traps
-            {
-                import.fast_op = arinsal_loader::ImportFastOp::Trapping;
-            }
             continue;
         }
         if import.bif.is_none()
@@ -208,12 +202,6 @@ fn bind_import_targets_of(
             import.set_native_bits(bits);
         }
         import.set_class(class);
-        if class == arinsal_loader::ImportClass::Pure
-            && import.fast_op == arinsal_loader::ImportFastOp::None
-            && crate::bif_traps::traps(import.module, import.function, import.arity)
-        {
-            import.fast_op = arinsal_loader::ImportFastOp::Trapping;
-        }
     }
 }
 
@@ -588,10 +576,8 @@ impl CodeTables {
             .modules
             .iter()
             .map(|module| {
-                let code = std::mem::size_of_val(module.code.as_ref());
-                let generic = std::mem::size_of_val(module.generic.as_slice());
                 let names: usize = module.functions.iter().map(|(_, name, _)| name.len()).sum();
-                code + generic + module.strings.len() + names + module.name.len()
+                module.strings.len() + names + module.name.len()
             })
             .sum();
         CodeTableBytes {
@@ -993,10 +979,9 @@ impl Vm {
     }
 
     /// Port of beam_load.c (beam_load_finalize): the decoded ops and tables are freed once the
-    /// code is in the code area. The interpreter still needs them.
-    pub(crate) fn release_loaded_tables(&self, module: &mut Module, meta: &mut CodeMeta) {
+    /// code is in the code area.
+    pub(crate) fn release_loaded_tables(&self, meta: &mut CodeMeta) {
         if meta.beamasm.is_some() {
-            module.release_decoded_code();
             meta.beam.release_decoded();
         }
     }
@@ -1045,7 +1030,7 @@ impl Vm {
                 "{name}: native code generation failed"
             )));
         }
-        self.release_loaded_tables(&mut module, &mut meta);
+        self.release_loaded_tables(&mut meta);
         let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
         let id = staging.with(|tables| {
@@ -1118,7 +1103,7 @@ impl Vm {
                 "{module_name}: native code generation failed"
             )));
         }
-        self.release_loaded_tables(&mut module, &mut meta);
+        self.release_loaded_tables(&mut meta);
         let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
         let name = module.name.clone();
@@ -1274,7 +1259,6 @@ impl Vm {
         let Some(module) = self.code.modules.get(module_id).cloned() else {
             return;
         };
-        let mut local_patches = Vec::new();
         let mut global_patches = Vec::new();
         let mut native_patches = Vec::new();
         for (entry, function, arity) in targets {
@@ -1291,9 +1275,6 @@ impl Vm {
                 .is_some()
             {
                 native_patches.push((*function, *arity, local));
-            }
-            if module.breakpoint_originals.contains_key(entry) != local {
-                local_patches.push((*entry, local));
             }
             global_patches.push((
                 *function,
@@ -1312,11 +1293,10 @@ impl Vm {
             .into_iter()
             .map(|(function, arity, global, traced)| ((function, arity), (global, traced)))
             .collect::<HashMap<_, _>>();
-        for (index, export) in module.exports.iter().enumerate() {
+        for export in module.exports.iter() {
             if let Some(&(global, bif_traced)) =
                 global_patches.get(&(export.function, export.arity))
             {
-                module.set_global_trace_breakpoint(index, global);
                 exports_retargeted = true;
                 crate::beamasm_integration::set_global_breakpoint(
                     self.code_scope,
@@ -1329,29 +1309,12 @@ impl Vm {
                 );
             }
         }
-        let patched = (!local_patches.is_empty())
-            .then(|| {
-                let mut patched = Module::clone(&module);
-                patched
-                    .set_trace_breakpoints(&local_patches)
-                    .then(|| Arc::new(patched))
-            })
-            .flatten();
-        if patched.is_none() && !exports_retargeted {
+        if !exports_retargeted {
             return;
         }
-        // Breakpoints patch code that every code index shares; the new table generations also
-        // make import caches holding the old export target resolve again.
-        self.code_ix.patch_all(|tables| {
-            if let Some(patched) = &patched
-                && tables
-                    .modules
-                    .get(module_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &module))
-            {
-                tables.modules[module_id] = Arc::clone(patched);
-            }
-        });
+        // The new table generation makes import caches holding the old export target resolve
+        // again.
+        self.code_ix.patch_all(|_| {});
         self.refresh_code();
         self.register_native_targets(module_id);
     }
@@ -1610,7 +1573,6 @@ mod purge_free_tests {
             .expect("native code of the purged version");
         vm.refresh_code();
 
-        assert!(vm.code.modules[id].code.is_empty());
         assert!(vm.code.modules[id].functions.is_empty());
         assert!(!vm.code.modules[id].exports.is_empty());
         assert!(!vm.code.modules[id].funs.is_empty());

@@ -113,12 +113,8 @@ fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
         )
         .expect("compile OTP debug-line fixture");
     let parsed = arinsal_beam::parse(&beam).expect("parse compiled BEAM");
-    let module = arinsal_loader::load_with_instrumentations(
-        &parsed,
-        arinsal_loader::CoverageMode::None,
-        true,
-    )
-    .expect("load debug-line fixture with instrumentation");
+    let mut module = arinsal_loader::load_native(&parsed).expect("load debug-line fixture");
+    arinsal_loader::set_native_debug_lines(&mut module, &parsed);
     assert!(module.line_breakpoints_supported);
     assert!(
         module

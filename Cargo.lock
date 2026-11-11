@@ -229,11 +229,9 @@ version = "0.0.1"
 dependencies = [
  "arinsal-beam",
  "arinsal-bifs",
- "arinsal-etf",
  "arinsal-spec",
  "arinsal-term",
  "md-5",
- "num-bigint",
  "thiserror",
 ]
 

@@ -1,19 +1,13 @@
-//! Resolution of OTP 29 generic BEAM instructions into compact interpreter code.
+//! Module tables of an OTP 29 BEAM file: imports, exports, literals, lambdas, line and debug tables.
 
-use arinsal_beam::{BeamFile, BeamType, Instr as BeamInstr, Operand};
+use arinsal_beam::{BeamFile, Instr as BeamInstr, Operand};
 use arinsal_bifs::BifFn;
 use arinsal_spec::Opcode;
 use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
-use num_bigint::BigInt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-mod specialize;
-// ---- vm_maps_bits ----
-mod maps_bits;
-pub use maps_bits::{BitCommand, BitCommandKind};
-pub use specialize::{GenericOp, Instr, SelectTable, specialize_bif_calls};
 // ---- vm_funs ----
 mod funs;
 pub use funs::{FunSlot, beamfile_chunk, module_uniq};
@@ -22,61 +16,6 @@ fn is_line_debug_instruction(file: &BeamFile, instruction: &BeamInstr) -> bool {
     instruction.op == Opcode::DebugLine
         && matches!(instruction.args.first(), Some(Operand::Atom(index)) if file.atom(*index).is_some_and(|kind| kind != "entry"))
 }
-
-/// A source or destination operand with a 60-bit payload.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Arg(pub u64);
-impl Arg {
-    const PAYLOAD_MASK: u64 = (1_u64 << 60) - 1;
-    /// Missing operand.
-    pub const NONE: Self = Self(0);
-    /// X register.
-    pub const X: u8 = 1;
-    /// Y stack slot.
-    pub const Y: u8 = 2;
-    /// Float register.
-    pub const FR: u8 = 3;
-    /// A raw immediate term.
-    pub const TERM: u8 = 4;
-    /// An unsigned instruction value.
-    pub const U: u8 = 5;
-    /// A resolved code index.
-    pub const LABEL: u8 = 6;
-    /// An out-of-line operand list.
-    pub const LIST: u8 = 7;
-    /// An immediate signed integer.
-    pub const INT: u8 = 8;
-    /// A literal that cannot be represented yet.
-    pub const UNSUPPORTED: u8 = 9;
-    /// Pack an addressing mode and a payload spanning the small-integer range.
-    pub const fn new(kind: u8, payload: u64) -> Self {
-        assert!(kind < 16);
-        if kind != Self::INT {
-            assert!(payload & !Self::PAYLOAD_MASK == 0);
-        }
-        Self(((kind as u64) << 60) | (payload & Self::PAYLOAD_MASK))
-    }
-    /// Addressing mode.
-    pub const fn kind(self) -> u8 {
-        (self.0 >> 60) as u8
-    }
-    /// Unsigned payload.
-    pub const fn value(self) -> u64 {
-        self.0 & Self::PAYLOAD_MASK
-    }
-    /// Sign-extended integer payload.
-    pub const fn signed(self) -> i64 {
-        ((self.value() << 4) as i64) >> 4
-    }
-    /// Decode a tagged term from the literal area or an immediate.
-    pub const fn term(self) -> Term {
-        // SAFETY: Operand construction only stores valid tagged terms here.
-        unsafe { std::mem::transmute::<u64, Term>(self.value()) }
-    }
-}
-
-/// Compatibility name for code consumers moving to [`Instr`].
-pub type Op = Instr;
 
 /// How an import slot is called. Fixed at load and updated when the VM
 /// binds process-aware natives. The hot path loads this tag and makes one
@@ -114,20 +53,11 @@ pub struct Import {
     pub arity: u8,
     /// Bound BIF function when implemented.
     pub bif: Option<BifFn>,
-    /// Small-integer arithmetic recognized during loading.
-    pub fast: FastBif,
-    /// Typed interpreter fast path selected from the import at load time.
-    pub fast_op: ImportFastOp,
     class: AtomicU8,
     /// Packed native entry. Zero when [`ImportClass`] is not [`ImportClass::Native`].
     native: AtomicUsize,
     /// Static NIF pointer when the loader's BIF table had none.
     extra_bif: AtomicUsize,
-    export: AtomicPtr<ExportSlot>,
-    target_module: AtomicUsize,
-    resolved_epoch: AtomicU64,
-    resolved_target: AtomicUsize,
-    resolved_code: AtomicPtr<Instr>,
 }
 impl Clone for Import {
     fn clone(&self) -> Self {
@@ -138,55 +68,13 @@ impl Clone for Import {
             function_atom: self.function_atom,
             arity: self.arity,
             bif: self.bif,
-            fast: self.fast,
-            fast_op: self.fast_op,
             class: AtomicU8::new(self.class.load(Ordering::Acquire)),
             native: AtomicUsize::new(self.native.load(Ordering::Acquire)),
             extra_bif: AtomicUsize::new(self.extra_bif.load(Ordering::Acquire)),
-            export: AtomicPtr::new(self.export.load(Ordering::Acquire)),
-            target_module: AtomicUsize::new(self.target_module.load(Ordering::Acquire)),
-            resolved_epoch: AtomicU64::new(self.resolved_epoch.load(Ordering::Acquire)),
-            resolved_target: AtomicUsize::new(self.resolved_target.load(Ordering::Acquire)),
-            resolved_code: AtomicPtr::new(self.resolved_code.load(Ordering::Acquire)),
         }
     }
 }
 
-/// Import operations with dedicated interpreter implementations.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ImportFastOp {
-    /// No dedicated interpreter implementation.
-    #[default]
-    None,
-    /// `erlang:element/2`.
-    Element,
-    /// `erlang:setelement/3`.
-    SetElement,
-    /// `erlang:rem/2`.
-    Rem,
-    /// Type and tuple-size guard BIFs.
-    IsInteger,
-    IsFloat,
-    IsNumber,
-    IsAtom,
-    IsTuple,
-    IsList,
-    IsMap,
-    IsFunction,
-    TupleSize,
-    /// Comparison guard BIFs.
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    Equal,
-    NotEqual,
-    ExactEqual,
-    ExactNotEqual,
-    /// A BIF that may trap to a continuation. It runs through the trap machinery, not
-    /// through the direct function-pointer call of a pure BIF.
-    Trapping,
-}
 impl Import {
     /// Call classification. [`ImportClass::Fresh`] until the VM binds the slot.
     #[inline]
@@ -230,64 +118,9 @@ impl Import {
         // SAFETY: `set_extra_bif` stores only a `BifFn` function pointer.
         Some(unsafe { std::mem::transmute::<usize, BifFn>(extra) })
     }
-    /// Cached export destination. Epoch mismatch invalidates the code pointer
-    /// before callers can jump through it after a load or purge.
-    pub fn resolved(&self) -> Option<(usize, u64, usize, *const Instr)> {
-        let ptr = self.export.load(Ordering::Acquire);
-        if ptr.is_null() {
-            return None;
-        }
-        Some((
-            self.target_module.load(Ordering::Relaxed),
-            self.resolved_epoch.load(Ordering::Acquire),
-            self.resolved_target.load(Ordering::Relaxed),
-            self.resolved_code.load(Ordering::Relaxed).cast_const(),
-        ))
-    }
-    /// Cache the resolved call destination until the code epoch changes.
-    ///
-    /// # Safety
-    /// The export's Vec allocation must outlive this import entry.
-    // Port of erts/emulator/beam/emu/emu_load.c:701-725, OTP-29.1.1.
-    pub unsafe fn resolve(&self, module: usize, epoch: u64, export: &ExportSlot) {
-        self.resolved_target
-            .store(export.target(), Ordering::Relaxed);
-        self.resolved_code
-            .store(export.code_ptr().cast_mut(), Ordering::Relaxed);
-        self.target_module.store(module, Ordering::Relaxed);
-        self.resolved_epoch.store(epoch, Ordering::Release);
-        self.export.store(
-            export as *const ExportSlot as *mut ExportSlot,
-            Ordering::Release,
-        );
-    }
 }
 
-/// Inlined arithmetic operation for interpreter fast paths.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum FastBif {
-    /// No inline implementation.
-    #[default]
-    None,
-    /// `erlang:'+'/2`.
-    Add,
-    /// `erlang:'-'/2`.
-    Sub,
-    /// `erlang:'*'/2`.
-    Mul,
-    /// `erlang:band/2`.
-    Band,
-    /// `erlang:bor/2`.
-    Bor,
-    /// `erlang:bxor/2`.
-    Bxor,
-    /// `erlang:bsl/2`.
-    Bsl,
-    /// `erlang:bsr/2`.
-    Bsr,
-}
-
-/// A replaceable export target for future hot code loading.
+/// An exported function of a module.
 pub struct ExportSlot {
     /// Module name: the text of `module_atom`.
     pub module: &'static str,
@@ -299,92 +132,12 @@ pub struct ExportSlot {
     pub module_atom: Atom,
     /// Function atom index used by the VM export table.
     pub function_atom: Atom,
-    target_index: AtomicUsize,
-    code_len: AtomicUsize,
-    code_base: AtomicPtr<Instr>,
-    target: AtomicPtr<Instr>,
+    target_index: usize,
 }
-impl ExportSlot {}
 impl ExportSlot {
-    /// Current instruction index.
+    /// Entry offset of the exported function.
     pub fn target(&self) -> usize {
-        self.target_index.load(Ordering::Acquire)
-    }
-    /// Current executable code pointer.
-    pub fn code_ptr(&self) -> *const Instr {
-        self.target.load(Ordering::Acquire)
-    }
-    /// Publish a replacement code index.
-    pub fn replace(&self, target: usize) {
-        assert!(target < self.code_len.load(Ordering::Acquire));
-        let base = self.code_base.load(Ordering::Acquire);
-        if !base.is_null() {
-            // `target < code_len` was asserted above, so the offset stays in this module.
-            self.target
-                .store(base.wrapping_add(target), Ordering::Release);
-        }
-        self.target_index.store(target, Ordering::Release);
-    }
-    fn bind_code(&self, base: *const Instr, len: usize) {
-        let target = self.target();
-        self.code_len.store(len, Ordering::Release);
-        self.code_base.store(base.cast_mut(), Ordering::Release);
-        // `target` was checked against this module's code length.
-        self.target
-            .store(base.wrapping_add(target).cast_mut(), Ordering::Release);
-    }
-}
-
-/// A per-instruction value stored as runs of equal neighbours, the shape of the line table in
-/// erts's `BeamCodeHeader` (offsets of the changes only).
-// Port of erts/emulator/beam/beam_load.c (line table in BeamCodeHeader), OTP-29.1.1.
-#[derive(Clone, Debug)]
-pub struct LineRuns<T> {
-    starts: Vec<u32>,
-    values: Vec<T>,
-    len: usize,
-}
-
-impl<T> Default for LineRuns<T> {
-    fn default() -> Self {
-        Self {
-            starts: Vec::new(),
-            values: Vec::new(),
-            len: 0,
-        }
-    }
-}
-
-impl<T: PartialEq> LineRuns<T> {
-    /// Runs of the per-instruction `slots`, in code order.
-    pub fn from_slots(slots: impl Iterator<Item = T>) -> Self {
-        let mut runs = Self::default();
-        for (index, value) in slots.enumerate() {
-            if runs.values.last() != Some(&value) {
-                runs.starts.push(index as u32);
-                runs.values.push(value);
-            }
-            runs.len = index + 1;
-        }
-        runs.starts.shrink_to_fit();
-        runs.values.shrink_to_fit();
-        runs
-    }
-}
-
-impl<T> LineRuns<T> {
-    /// The distinct runs' values, in code order.
-    pub fn values(&self) -> &[T] {
-        &self.values
-    }
-
-    /// The value at instruction `ip`, like `Vec::get`.
-    pub fn get(&self, ip: usize) -> Option<&T> {
-        if ip >= self.len {
-            return None;
-        }
-        let run = self.starts.partition_point(|start| *start as usize <= ip);
-        self.values.get(run.checked_sub(1)?)
+        self.target_index
     }
 }
 
@@ -398,40 +151,16 @@ pub struct Module {
     pub records: Vec<arinsal_beam::NativeRecord>,
     /// `[Definition | Defaults]` literal of each of `records`, in the module's literal area.
     pub record_defs: Vec<Term>,
-    /// Compact code.
-    pub code: Box<[Instr]>,
-    /// Rare instructions retained in the generic operand format.
-    pub generic: Vec<GenericOp>,
-    /// Decoded select dispatch tables.
-    pub selects: Vec<SelectTable>,
     /// Resolved imports.
     pub imports: Vec<Import>,
     /// Replaceable exports.
     pub exports: Vec<Arc<ExportSlot>>,
     /// Export slots indexed by stable atom identities and arity.
     pub export_atoms: HashMap<(Atom, u8), usize>,
-    /// Out-of-line operand tails.
-    pub tails: Vec<Box<[Arg]>>,
-    /// Extended list operands.
-    pub lists: Vec<Box<[Arg]>>,
-    // vm_binparse2
-    /// Command kinds and boundaries decoded from each list operand.
-    pub bit_commands: Vec<Option<Box<[BitCommand]>>>,
-    // ---- vm_maps_bits ----
     /// Module string table used by bit syntax string segments.
     pub strings: Box<[u8]>,
-    /// Type metadata, indexed by code index and operand position.
-    pub types: Vec<Vec<(usize, BeamType)>>,
-    /// Source line for each instruction.
-    pub lines: LineRuns<Option<(String, u64)>>,
     /// Literal file-name lists indexed by source filename.
     pub line_file_terms: HashMap<String, Term>,
-    /// Per-instruction cached filename terms for exception stack traces.
-    pub line_terms: LineRuns<Option<(Term, u64)>>,
-    /// Opcodes not yet executable, with occurrence counts.
-    pub unsupported: HashMap<String, usize>,
-    /// Reason for each explicit unsupported opcode.
-    pub unsupported_reasons: Vec<String>,
     /// Function names and arities at their `func_info` instruction offsets.
     pub functions: Vec<(usize, &'static str, u8)>,
     /// Function atoms parallel to `functions`.
@@ -442,28 +171,14 @@ pub struct Module {
     pub nif_stubs: Option<Vec<(&'static str, u8)>>,
     /// The NIF body bound to each function of `functions` (an index into the node's native
     /// function table), or [`NO_NIF_BODY`]. Written by the loader for static NIFs and by
-    /// `load_nif`; `Instr::NativeBody` mirrors it for the interpreter flavor.
+    /// `load_nif`.
     // Port of erts/emulator/beam/erl_nif.c (the call_nif code `load_nif_1st_finisher` patches
     // behind a NIF function's prologue), OTP-29.1.1.
     pub nif_bodies: Box<[AtomicU32]>,
-    /// Owning function for `JitHook::on_entry`, or `u32::MAX` when none applies.
-    ///
-    /// Slot `ip` holds the last function whose `func_info` offset is strictly
-    /// below `ip`, matching a binary search on `start < ip` with one load.
-    pub on_entry_fn: Box<[u32]>,
-    /// `arity + 1` at each function entry instruction; `0` when the index is
-    /// not an entry. Tail calls read the callee live count from this table.
-    pub entry_arity: Box<[u16]>,
-    /// Original entry instructions retained while a trace breakpoint is installed.
-    pub breakpoint_originals: HashMap<usize, Instr>,
-    /// First per-export global breakpoint trampoline.
-    pub export_breakpoint_base: usize,
     /// Original function entry indices parallel to `exports`.
     pub export_entry_targets: Box<[usize]>,
     /// Coverage state allocated only when coverage was enabled at load time.
     pub coverage: Option<Coverage>,
-    /// Metadata for each probe instruction.
-    pub coverage_probes: Vec<CoverageProbe>,
     /// Whether this module was loaded with OTP's line breakpoint instrumentation.
     pub line_breakpoints_supported: bool,
     /// Retained compiler debug points as `(instruction, line, live-register-count)`.
@@ -494,22 +209,11 @@ impl Clone for Module {
             name_atom: self.name_atom,
             records: self.records.clone(),
             record_defs: self.record_defs.clone(),
-            code: self.code.clone(),
-            generic: self.generic.clone(),
-            selects: self.selects.iter().map(SelectTable::clone).collect(),
             imports: self.imports.clone(),
             exports: self.exports.clone(),
             export_atoms: self.export_atoms.clone(),
-            tails: self.tails.clone(),
-            lists: self.lists.clone(),
-            bit_commands: self.bit_commands.clone(),
             strings: self.strings.clone(),
-            types: self.types.clone(),
-            lines: self.lines.clone(),
             line_file_terms: self.line_file_terms.clone(),
-            line_terms: self.line_terms.clone(),
-            unsupported: self.unsupported.clone(),
-            unsupported_reasons: self.unsupported_reasons.clone(),
             functions: self.functions.clone(),
             function_atoms: self.function_atoms.clone(),
             nif_stubs: self.nif_stubs.clone(),
@@ -518,13 +222,8 @@ impl Clone for Module {
                 .iter()
                 .map(|body| AtomicU32::new(body.load(Ordering::Acquire)))
                 .collect(),
-            on_entry_fn: self.on_entry_fn.clone(),
-            entry_arity: self.entry_arity.clone(),
-            breakpoint_originals: self.breakpoint_originals.clone(),
-            export_breakpoint_base: self.export_breakpoint_base,
             export_entry_targets: self.export_entry_targets.clone(),
             coverage: self.coverage.clone(),
-            coverage_probes: self.coverage_probes.clone(),
             line_breakpoints_supported: self.line_breakpoints_supported,
             debug_line_points: self.debug_line_points.clone(),
             debug_line_items: self.debug_line_items.clone(),
@@ -575,7 +274,7 @@ pub enum CoverageMode {
     LineCounters,
 }
 
-/// Atomic coverage storage shared by interpreted and BeamAsm execution.
+/// Atomic coverage storage updated by BeamAsm code.
 #[derive(Clone)]
 pub struct Coverage {
     /// Mode selected when the module was loaded.
@@ -697,15 +396,6 @@ impl Coverage {
     }
 }
 
-/// Metadata for an instrumented code location.
-#[derive(Clone, Copy, Debug)]
-pub struct CoverageProbe {
-    /// Counter index.
-    pub counter: u32,
-}
-
-type LineCoverageInsertion = (u32, u32, u32, u32, usize);
-
 impl Module {
     /// Drop code and code-specific metadata after no process can reference this version.
     /// Callers must queue its literal area first; export and lambda entries remain alive.
@@ -714,53 +404,22 @@ impl Module {
     pub fn release_code(&mut self) {
         self.records = Vec::new();
         self.record_defs = Vec::new();
-        self.code = Box::new([]);
-        self.generic = Vec::new();
-        self.selects = Vec::new();
         self.imports = Vec::new();
         self.export_atoms = HashMap::new();
-        self.tails = Vec::new();
-        self.lists = Vec::new();
-        self.bit_commands = Vec::new();
         self.strings = Box::new([]);
-        self.types = Vec::new();
-        self.lines = LineRuns::default();
         self.line_file_terms = HashMap::new();
-        self.line_terms = LineRuns::default();
-        self.unsupported = HashMap::new();
-        self.unsupported_reasons = Vec::new();
         self.functions = Vec::new();
         self.function_atoms = Vec::new();
         self.nif_stubs = None;
         self.nif_bodies = Box::new([]);
-        self.on_entry_fn = Box::new([]);
-        self.entry_arity = Box::new([]);
-        self.breakpoint_originals = HashMap::new();
-        self.export_breakpoint_base = 0;
         self.export_entry_targets = Box::new([]);
         self.coverage = None;
-        self.coverage_probes = Vec::new();
         self.line_breakpoints_supported = false;
         self.debug_line_points = Vec::new();
         self.debug_line_items = Vec::new();
         self.debug_breakpoint_import = 0;
         self.literal_terms = Arc::new(HashMap::new());
         self._literals = LiteralArea::empty();
-    }
-
-    /// Drop the decoded instruction streams of a module that BeamAsm compiled. erts keeps
-    /// only the code header (function table, line table, literal area) and the native code
-    /// after `beam_load_finalize`; the loader state and the decoded ops are freed.
-    // Port of erts/emulator/beam/jit/asm_load.c (beam_load_finalize_code) and
-    // beam_load.c (beam_load_finalize: beam_load_prepared_free), OTP-29.1.1.
-    pub fn release_decoded_code(&mut self) {
-        // The instruction array, the generic ops, select tables, operand lists and bit-syntax
-        // command tables (read by the bs_match helpers) stay: the
-        // interpreter still runs on_load and fallback code of a compiled module, and NIF
-        // binding, fun identities and the debugger address instructions by index.
-        self.types = Vec::new();
-        self.unsupported = HashMap::new();
-        self.unsupported_reasons = Vec::new();
     }
 
     /// Retain this code version's literal heap for process root scanning.
@@ -772,66 +431,6 @@ impl Module {
     /// the module is loaded, as `beamfile_read` does).
     pub fn literal_term(&self, index: u32) -> Option<Term> {
         self.literal_terms.get(&index).copied()
-    }
-
-    /// Patch one interpreted function entry, preserving the instruction to run after tracing.
-    pub fn set_trace_breakpoint(&mut self, entry: usize, enabled: bool) -> bool {
-        self.set_trace_breakpoints(&[(entry, enabled)])
-    }
-
-    /// Patch several entries and rebind the exports once; true when any entry changed.
-    pub fn set_trace_breakpoints(&mut self, entries: &[(usize, bool)]) -> bool {
-        let mut changed = false;
-        for &(entry, enabled) in entries {
-            changed |= self.patch_breakpoint_entry(entry, enabled);
-        }
-        if changed {
-            for export in &self.exports {
-                export.bind_code(self.code.as_ptr(), self.code.len());
-            }
-        }
-        changed
-    }
-
-    fn patch_breakpoint_entry(&mut self, entry: usize, enabled: bool) -> bool {
-        if enabled {
-            if self.breakpoint_originals.contains_key(&entry) {
-                return false;
-            }
-            let Some(instruction) = self.code.get_mut(entry) else {
-                return false;
-            };
-            let Ok(index) = u32::try_from(entry) else {
-                return false;
-            };
-            self.breakpoint_originals.insert(entry, *instruction);
-            *instruction = Instr::Breakpoint { index };
-        } else if let Some(original) = self.breakpoint_originals.remove(&entry) {
-            let Some(instruction) = self.code.get_mut(entry) else {
-                return false;
-            };
-            *instruction = original;
-        } else {
-            return false;
-        }
-        true
-    }
-
-    /// Redirect one exported entry through its generic breakpoint trampoline.
-    pub fn set_global_trace_breakpoint(&self, index: usize, enabled: bool) {
-        // A native-only module has no interpreter entry to redirect: its breakpoints are in
-        // the native code.
-        if self.code.is_empty() {
-            return;
-        }
-        if let Some(export) = self.exports.get(index) {
-            let target = if enabled {
-                self.export_breakpoint_base + index
-            } else {
-                self.export_entry_targets[index]
-            };
-            export.replace(target);
-        }
     }
 
     /// Find an exported function and arity.
@@ -852,16 +451,6 @@ impl Module {
             .get(&(function, arity))
             .and_then(|index| self.exports.get(*index))
             .map(Arc::as_ref)
-    }
-    /// Fetch a resolved argument, including an out-of-line tail.
-    #[inline]
-    pub fn arg(&self, op: &GenericOp, position: usize) -> Arg {
-        let GenericOp { meta, args } = op;
-        if position < 3 {
-            args[position]
-        } else {
-            self.tails[(meta & 0x00ff_ffff) as usize][position - 3]
-        }
     }
     /// Name and arity of the function containing a code offset.
     pub fn function_at(&self, ip: usize) -> Option<(&str, u8)> {
@@ -895,10 +484,6 @@ impl Module {
         let index = index.checked_sub(1)?;
         Some((*self.function_atoms.get(index)?, self.functions[index].2))
     }
-    /// Cached literal filename list and line for a code offset.
-    pub fn line_term_at(&self, ip: usize) -> Option<(Term, u64)> {
-        self.line_terms.get(ip).copied().flatten()
-    }
 }
 
 /// Malformed module or exhausted atom table.
@@ -910,183 +495,9 @@ pub enum LoadError {
     /// Atom table rejected an atom.
     #[error("atom table rejected {0}")]
     Atom(String),
-    /// A bit syntax match list contains an unknown or malformed command.
-    #[error("invalid bit syntax match command list")]
-    InvalidBitMatch,
     /// Module exceeds an internal limit.
     #[error("module exceeds instruction index limit")]
     Limit,
-    /// A `bs_match` command list contains an unknown or malformed command.
-    #[error("bs_match: invalid sub instruction or operands")]
-    BadBitMatch,
-}
-
-struct Decoder<'a> {
-    file: &'a BeamFile,
-    labels: &'a HashMap<u32, usize>,
-    literals: &'a mut VecHeap,
-    literal_terms: &'a mut HashMap<u32, Term>,
-    lists: &'a mut Vec<Box<[Arg]>>,
-    types: &'a mut Vec<(usize, BeamType)>,
-}
-impl Decoder<'_> {
-    fn bigint_arg(&mut self, value: &BigInt) -> Result<Arg, LoadError> {
-        let term = TermBuilder::new(self.literals)
-            .int_from_bigint(value)
-            .map_err(|_| LoadError::Limit)?;
-        // SAFETY: The literal area retains this term.
-        Ok(Arg::new(Arg::TERM, unsafe { term.raw_bits() }))
-    }
-
-    fn arg(&mut self, operand: &Operand, position: usize) -> Result<Arg, LoadError> {
-        Ok(match operand {
-            Operand::X(n) => Arg::new(Arg::X, *n as u64),
-            Operand::Y(n) => Arg::new(Arg::Y, *n as u64),
-            Operand::FR(n) => Arg::new(Arg::FR, *n as u64),
-            Operand::U(n) if *n & !Arg::PAYLOAD_MASK == 0 => Arg::new(Arg::U, *n),
-            Operand::U(n) => self.bigint_arg(&BigInt::from(*n))?,
-            Operand::Label(0) => Arg::new(Arg::LABEL, u32::MAX as u64),
-            Operand::Label(n) => Arg::new(
-                Arg::LABEL,
-                *self.labels.get(n).ok_or(LoadError::Index("label", *n))? as u64,
-            ),
-            Operand::Atom(n) => {
-                let name = self.file.atom(*n).ok_or(LoadError::Index("atom", *n))?;
-                let atom = global_atoms()
-                    .intern(name)
-                    .map_err(|_| LoadError::Atom(name.into()))?;
-                // SAFETY: Tagged atoms contain no heap address.
-                Arg::new(Arg::TERM, unsafe { Term::atom(atom).raw_bits() })
-            }
-            Operand::Nil => {
-                // SAFETY: NIL is an immediate.
-                Arg::new(Arg::TERM, unsafe { Term::NIL.raw_bits() })
-            }
-            Operand::Int(n) if Term::small(*n).is_some() => Arg::new(Arg::INT, *n as u64),
-            Operand::Int(n) => {
-                let term = TermBuilder::new(self.literals)
-                    .int_from_i64(*n)
-                    .map_err(|_| LoadError::Limit)?;
-                // SAFETY: The literal area retains this term.
-                Arg::new(Arg::TERM, unsafe { term.raw_bits() })
-            }
-            Operand::BigInt(n) => self.bigint_arg(n)?,
-            Operand::Char(n) => Arg::new(Arg::INT, *n as u64),
-            Operand::Literal(n) => match self.literal_term(*n)? {
-                Some(term) if term.as_small().is_some() => {
-                    Arg::new(Arg::INT, term.as_small().unwrap() as u64)
-                }
-                Some(term) => {
-                    // SAFETY: The literal area retains this term.
-                    Arg::new(Arg::TERM, unsafe { term.raw_bits() })
-                }
-                None => Arg::new(Arg::UNSUPPORTED, *n as u64),
-            },
-            Operand::List(items) => {
-                let mut list = Vec::with_capacity(items.len());
-                for item in items.iter() {
-                    list.push(self.arg(item, position)?);
-                }
-                let index = self.lists.len();
-                self.lists.push(list.into_boxed_slice());
-                Arg::new(Arg::LIST, index as u64)
-            }
-            Operand::Alloc(items) => {
-                let words: u64 = items
-                    .iter()
-                    .map(|item| {
-                        item.count
-                            * match item.kind {
-                                arinsal_beam::AllocKind::Words => 1,
-                                arinsal_beam::AllocKind::Floats => 2,
-                                arinsal_beam::AllocKind::Funs => 3,
-                            }
-                    })
-                    .sum();
-                Arg::new(Arg::U, words)
-            }
-            Operand::TypedReg { reg, type_index } => {
-                if let Some(table) = &self.file.types
-                    && let Some(ty) = table.entries.get(*type_index as usize)
-                {
-                    self.types.push((position, ty.clone()));
-                }
-                self.arg(reg, position)?
-            }
-        })
-    }
-
-    fn literal_term(&mut self, index: u32) -> Result<Option<Term>, LoadError> {
-        // Port of erts/emulator/beam/beam_file.c:1977-1998, OTP-29.1.1.
-        // BEAM literal indices designate stable terms in the module literal area.
-        if let Some(term) = self.literal_terms.get(&index) {
-            return Ok(Some(*term));
-        }
-        let Ok(owned) = self.file.literal(index) else {
-            return Ok(None);
-        };
-        let term = from_owned(&owned, self.literals).map_err(|_| LoadError::Limit)?;
-        self.literal_terms.insert(index, term);
-        Ok(Some(term))
-    }
-}
-
-/// Resolve one parsed BEAM module without rejecting unknown executable opcodes.
-pub fn load(file: &BeamFile) -> Result<Module, LoadError> {
-    load_with_coverage(file, CoverageMode::None)
-}
-
-/// Reject invalid generic `bs_match` command lists during prepare-loading.
-pub fn validate_bit_matches(file: &BeamFile) -> Result<(), LoadError> {
-    // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1.
-    for instruction in &file.code.instructions {
-        if instruction.op != Opcode::BsMatch {
-            continue;
-        }
-        let commands = instruction.args.iter().find_map(|operand| match operand {
-            Operand::List(items) => Some(items.as_slice()),
-            _ => None,
-        });
-        let Some(commands) = commands else {
-            return Err(LoadError::BadBitMatch);
-        };
-        let mut offset = 0;
-        while offset < commands.len() {
-            let name = match commands[offset] {
-                Operand::Atom(index) => file.atom(index),
-                _ => None,
-            };
-            let width = match name {
-                Some("ensure_at_least") => 3,
-                Some("ensure_exactly" | "skip") => 2,
-                Some("integer" | "binary") => 6,
-                Some("get_tail" | "=:=") => 4,
-                _ => return Err(LoadError::BadBitMatch),
-            };
-            offset = offset.checked_add(width).ok_or(LoadError::BadBitMatch)?;
-            if offset > commands.len() {
-                return Err(LoadError::BadBitMatch);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a module and add coverage probes only when its load-time mode enables them.
-pub fn load_with_coverage(
-    file: &BeamFile,
-    requested_mode: CoverageMode,
-) -> Result<Module, LoadError> {
-    load_with_instrumentations(file, requested_mode, false)
-}
-
-/// Resolve a module with the requested load-time line breakpoint instrumentation.
-pub fn load_with_instrumentations(
-    file: &BeamFile,
-    requested_mode: CoverageMode,
-    debugger_lines: bool,
-) -> Result<Module, LoadError> {
-    load_with_options(file, requested_mode, debugger_lines, true)
 }
 
 /// The coverage table of a module whose code goes to BeamAsm only: the counters the emitted
@@ -1111,12 +522,12 @@ pub fn native_coverage(
         line_probe_mappings,
         mut function_owners,
         ..
-    } = scan_coverage(file, requested_mode, false)?;
+    } = scan_coverage(file, requested_mode)?;
     if !coverage_enabled {
         return Ok(None);
     }
     if function_mode {
-        // One slot per function with a body, as the interpreter form's function probes.
+        // One slot per function that has a body.
         for (owner, start) in source_functions.iter().enumerate() {
             if start.saturating_add(1) < count {
                 function_owners.push(owner as u32);
@@ -1219,15 +630,13 @@ fn effective_coverage_mode(file: &BeamFile, requested_mode: CoverageMode) -> Cov
 }
 
 /// What the first pass over the instructions finds: the module's coverage mode and table
-/// layout, and for the interpreter form its label targets and instruction count.
+/// layout.
 struct CoverageScan {
     coverage_mode: CoverageMode,
-    labels: HashMap<u32, usize>,
     count: usize,
     coverage_enabled: bool,
     function_mode: bool,
     source_functions: Vec<usize>,
-    source_lines: Vec<(usize, u32, u32, u32, u32, usize)>,
     counter_lines: Vec<u32>,
     counter_ids: Vec<u32>,
     counter_locations: Vec<u32>,
@@ -1235,13 +644,8 @@ struct CoverageScan {
     function_owners: Vec<u32>,
 }
 
-fn scan_coverage(
-    file: &BeamFile,
-    requested_mode: CoverageMode,
-    debugger_lines: bool,
-) -> Result<CoverageScan, LoadError> {
+fn scan_coverage(file: &BeamFile, requested_mode: CoverageMode) -> Result<CoverageScan, LoadError> {
     let coverage_mode = effective_coverage_mode(file, requested_mode);
-    let mut labels = HashMap::new();
     let mut count = 0_usize;
     let coverage_enabled = matches!(
         coverage_mode,
@@ -1255,7 +659,6 @@ fn scan_coverage(
         CoverageMode::Function | CoverageMode::FunctionCounters
     );
     let mut source_functions = Vec::new();
-    let mut source_lines = Vec::new();
     let mut counter_lines = Vec::new();
     let mut counter_ids = Vec::new();
     let mut counter_locations = Vec::new();
@@ -1269,9 +672,7 @@ fn scan_coverage(
     );
     for instruction in &file.code.instructions {
         if instruction.op == Opcode::Label {
-            if let Some(Operand::U(n)) = instruction.args.first() {
-                labels.insert(*n as u32, count);
-            }
+            // Labels take no slot of their own.
         } else if instruction.op == Opcode::Line {
             // Port of erts/emulator/beam/jit/asm_load.c:318-348 (add_line_entry), OTP-29.1.1.
             if let Some(Operand::U(location)) = instruction.args.first()
@@ -1290,9 +691,6 @@ fn scan_coverage(
             {
                 previous_line_location = Some(location);
                 previous_line_probe = None;
-            }
-            if debugger_lines && is_line_debug_instruction(file, instruction) {
-                count += 2;
             }
         } else if instruction.op != Opcode::Line && instruction.op != Opcode::NifStart {
             if instruction.op == Opcode::FuncInfo {
@@ -1323,9 +721,9 @@ fn scan_coverage(
                     if let Ok(location) = u32::try_from(location) {
                         // Port of erts/emulator/beam/jit/asm_load.c:681-711: consecutive line
                         // markers for one location share the line table's coverage slot.
-                        let (counter, owner) = if previous_line_location == Some(location) {
+                        let counter = if previous_line_location == Some(location) {
                             if let Some(counter) = previous_line_probe {
-                                (counter, function_owners[counter])
+                                counter
                             } else {
                                 let counter = counter_lines.len();
                                 let owner = source_functions.len().saturating_sub(1) as u32;
@@ -1334,7 +732,7 @@ fn scan_coverage(
                                 counter_locations.push(location);
                                 function_owners.push(owner);
                                 previous_line_probe = Some(counter);
-                                (counter, owner)
+                                counter
                             }
                         } else {
                             let counter = counter_lines.len();
@@ -1345,7 +743,7 @@ fn scan_coverage(
                             function_owners.push(owner);
                             previous_line_location = Some(location);
                             previous_line_probe = Some(counter);
-                            (counter, owner)
+                            counter
                         };
                         if let Some(existing_id) = counter_ids.get_mut(counter) {
                             *existing_id = cover_id;
@@ -1355,7 +753,6 @@ fn scan_coverage(
                             cover_id,
                             u32::try_from(counter).map_err(|_| LoadError::Limit)?,
                         ));
-                        source_lines.push((count, line, cover_id, owner, location, counter));
                     }
                 }
             }
@@ -1367,638 +764,15 @@ fn scan_coverage(
     }
     Ok(CoverageScan {
         coverage_mode,
-        labels,
         count,
         coverage_enabled,
         function_mode,
         source_functions,
-        source_lines,
         counter_lines,
         counter_ids,
         counter_locations,
         line_probe_mappings,
         function_owners,
-    })
-}
-
-/// Like [`load_with_instrumentations`]; without `specialize` the module has all its tables
-/// (functions, exports, imports, lines, literals, NIF stubs) but its instructions are not
-/// decoded into interpreter form: each stays a `CodeEnd` placeholder at its index. For a
-/// module whose functions all run natively, as erts has no interpreter form of a module.
-pub fn load_with_options(
-    file: &BeamFile,
-    requested_mode: CoverageMode,
-    debugger_lines: bool,
-    specialize: bool,
-) -> Result<Module, LoadError> {
-    // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
-    // OTP interns the complete Atom chunk in index order before resolving code.
-    let atom_ids = file_atoms(file)?;
-    let name_atom = Atom(atom_ids[0]);
-    // Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals),
-    // OTP-29.1.1: the literal chunk is decoded in index order right after the
-    // atom chunk, so atoms first seen in literals get erts' table indices.
-    let (mut literals, mut literal_terms) = decode_literals(file)?;
-    let CoverageScan {
-        coverage_mode,
-        mut labels,
-        count,
-        coverage_enabled,
-        function_mode,
-        source_functions,
-        source_lines,
-        counter_lines,
-        counter_ids,
-        counter_locations,
-        line_probe_mappings,
-        mut function_owners,
-    } = scan_coverage(file, requested_mode, debugger_lines)?;
-    let mut insertions: HashMap<usize, Vec<LineCoverageInsertion>> = HashMap::new();
-    if coverage_enabled {
-        if function_mode {
-            for (owner, start) in source_functions.iter().enumerate() {
-                let body = start.saturating_add(1);
-                if body < count {
-                    function_owners.push(owner as u32);
-                    insertions
-                        .entry(body)
-                        .or_default()
-                        .push((0, 0, owner as u32, 0, owner));
-                }
-            }
-        } else {
-            for (ip, line, cover_id, owner, location, counter) in source_lines {
-                insertions
-                    .entry(ip)
-                    .or_default()
-                    .push((line, cover_id, owner, location, counter));
-            }
-        }
-    }
-    let insertion_count = insertions.values().map(Vec::len).sum::<usize>();
-    if count.saturating_add(insertion_count) > u32::MAX as usize {
-        return Err(LoadError::Limit);
-    }
-    let remap = |target: usize| {
-        target
-            + insertions
-                .iter()
-                .filter(|(ip, _)| **ip < target)
-                .map(|(_, probes)| probes.len())
-                .sum::<usize>()
-    };
-    for target in labels.values_mut() {
-        *target = remap(*target);
-    }
-    // ---- vm_funs ----
-    let funs = funs::load_funs(file, Some(&labels))?;
-    let mut imports = build_imports(file)?;
-    let has_debug_line = debugger_lines
-        && file
-            .code
-            .instructions
-            .iter()
-            .any(|instruction| is_line_debug_instruction(file, instruction));
-    let debug_line_import = if has_debug_line {
-        let index = u32::try_from(imports.len()).map_err(|_| LoadError::Limit)?;
-        imports.push(Import {
-            bif: None,
-            fast: FastBif::None,
-            fast_op: ImportFastOp::None,
-            module: "erts_internal",
-            function: "breakpoint",
-            module_atom: global_atoms()
-                .intern("erts_internal")
-                .map_err(|_| LoadError::Atom("erts_internal".into()))?,
-            function_atom: global_atoms()
-                .intern("breakpoint")
-                .map_err(|_| LoadError::Atom("breakpoint".into()))?,
-            arity: 4,
-            class: AtomicU8::new(ImportClass::Fresh as u8),
-            native: AtomicUsize::new(0),
-            extra_bif: AtomicUsize::new(0),
-            export: AtomicPtr::new(std::ptr::null_mut()),
-            target_module: AtomicUsize::new(0),
-            resolved_epoch: AtomicU64::new(0),
-            resolved_target: AtomicUsize::new(0),
-            resolved_code: AtomicPtr::new(std::ptr::null_mut()),
-        });
-        Some(index)
-    } else {
-        None
-    };
-    let debug_breakpoint_import = push_breakpoint_import(&mut imports)?;
-    let exports = build_exports(file, &labels)?;
-    let export_atoms = exports
-        .iter()
-        .enumerate()
-        .map(|(index, export)| ((export.function_atom, export.arity), index))
-        .collect();
-    let mut code = Vec::with_capacity(count);
-    let mut generic = Vec::new();
-    let mut selects = Vec::new();
-    let mut tails = Vec::new();
-    let mut lists = Vec::new();
-    let mut types = Vec::new();
-    let mut lines = Vec::new();
-    let mut current_line = None;
-    let mut unsupported = HashMap::new();
-    let mut unsupported_reasons = Vec::new();
-    let mut functions: Vec<(usize, &'static str, u8)> = Vec::new();
-    let mut nif_stubs: Option<Vec<(&'static str, u8)>> = None;
-    let mut function_atoms = Vec::new();
-    let mut debug_line_points = Vec::new();
-    let mut debug_line_items = Vec::new();
-    let mut notify_breakpoint_stub = None;
-    let mut coverage_probes = Vec::new();
-    let mut source_ip = 0_usize;
-    for instruction in &file.code.instructions {
-        if instruction.op == Opcode::Label {
-            continue;
-        }
-        if instruction.op == Opcode::DebugLine
-            && (!debugger_lines || !is_line_debug_instruction(file, instruction))
-        {
-            continue;
-        }
-        if instruction.op == Opcode::Line {
-            if let Some(Operand::U(n)) = instruction.args.first()
-                && let Some(table) = &file.lines
-                // ---- vm_exc ---- OTP keeps an implicit undefined item at index zero.
-                && let Some(item) = n.checked_sub(1).and_then(|i| table.items.get(i as usize))
-            {
-                let name = if item.name_index == 0 {
-                    format!("{}.erl", file.module)
-                } else {
-                    table
-                        .names
-                        .get(item.name_index as usize - 1)
-                        .cloned()
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| format!("{}.erl", file.module))
-                };
-                current_line =
-                    valid_source_location(item.name_index, item.line).then_some((name, item.line));
-            }
-            continue;
-        }
-        // nif_start only marks a NIF stub's entry; it executes nothing.
-        // Port of erts/emulator/beam/jit/asm_load.c:651-661, OTP-29.1.1.
-        if instruction.op == Opcode::NifStart {
-            let stubs = nif_stubs.get_or_insert_with(Vec::new);
-            if let Some((_, name, arity)) = functions.last() {
-                stubs.push((*name, *arity));
-            }
-            continue;
-        }
-        if file.module == "erts_internal"
-            && instruction.op == Opcode::CallExtOnly
-            && let Some((function_ip, function, 3)) = functions.last()
-            && *function == "notify_breakpoint_hit"
-            && let Some(Operand::U(import_index)) = instruction.args.get(1)
-            && file
-                .imports
-                .get(*import_index as usize)
-                .is_some_and(|import| {
-                    file.atom(import.module_atom) == Some("erlang")
-                        && file.atom(import.function_atom) == Some("nif_error")
-                        && import.arity == 1
-                })
-        {
-            // Port of erts/emulator/beam/erl_debugger.c:411-444, OTP-29.1.1.
-            let import = u32::try_from(imports.len()).map_err(|_| LoadError::Limit)?;
-            imports.push(Import {
-                bif: None,
-                fast: FastBif::None,
-                fast_op: ImportFastOp::None,
-                module: "erts_internal",
-                function: "notify_breakpoint_hit",
-                module_atom: global_atoms()
-                    .intern("erts_internal")
-                    .map_err(|_| LoadError::Atom("erts_internal".into()))?,
-                function_atom: global_atoms()
-                    .intern("notify_breakpoint_hit")
-                    .map_err(|_| LoadError::Atom("notify_breakpoint_hit".into()))?,
-                arity: 3,
-                class: AtomicU8::new(ImportClass::Fresh as u8),
-                native: AtomicUsize::new(0),
-                extra_bif: AtomicUsize::new(0),
-                export: AtomicPtr::new(std::ptr::null_mut()),
-                target_module: AtomicUsize::new(0),
-                resolved_epoch: AtomicU64::new(0),
-                resolved_target: AtomicUsize::new(0),
-                resolved_code: AtomicPtr::new(std::ptr::null_mut()),
-            });
-            notify_breakpoint_stub = Some((*function_ip, import));
-        }
-        if let Some(probes) = insertions.get(&source_ip) {
-            for (_, _, _, _, counter) in probes {
-                let probe = u32::try_from(coverage_probes.len()).map_err(|_| LoadError::Limit)?;
-                let counter = u32::try_from(*counter).map_err(|_| LoadError::Limit)?;
-                coverage_probes.push(CoverageProbe { counter });
-                code.push(Instr::CoverageProbe { index: probe });
-                types.push(Vec::new());
-                lines.push(current_line.clone());
-            }
-        }
-        if !executable(instruction.op) {
-            *unsupported
-                .entry(instruction.op.name().to_owned())
-                .or_insert(0) += 1;
-            let reason = u32::try_from(unsupported_reasons.len()).map_err(|_| LoadError::Limit)?;
-            unsupported_reasons.push(format!("opcode {}", instruction.op.name()));
-            code.push(Instr::Unsupported(reason));
-            types.push(Vec::new());
-            lines.push(current_line.clone());
-            source_ip += 1;
-            continue;
-        }
-        if !specialize && instruction.op != Opcode::FuncInfo && instruction.op != Opcode::DebugLine
-        {
-            code.push(Instr::CodeEnd);
-            types.push(Vec::new());
-            lines.push(current_line.clone());
-            source_ip += 1;
-            continue;
-        }
-        let mut type_meta = Vec::new();
-        let mut decoder = Decoder {
-            file,
-            labels: &labels,
-            literals: &mut literals,
-            literal_terms: &mut literal_terms,
-            lists: &mut lists,
-            types: &mut type_meta,
-        };
-        let mut args = [Arg::NONE; 3];
-        let mut tail = Vec::new();
-        for (index, operand) in instruction.args.iter().enumerate() {
-            let arg = decoder.arg(operand, index)?;
-            if index < 3 {
-                args[index] = arg;
-            } else {
-                tail.push(arg);
-            }
-        }
-        let target_arg = match instruction.op {
-            Opcode::Jump => Some(args[0]),
-            Opcode::Call | Opcode::CallLast | Opcode::CallOnly => Some(args[1]),
-            _ => None,
-        };
-        if let Some(target) = target_arg
-            && (target.kind() != Arg::LABEL
-                || target.value() == u32::MAX as u64
-                || target.value() as usize > count)
-        {
-            return Err(LoadError::Index("label", 0));
-        }
-        let specialized =
-            specialize::specialize(instruction.op, args, &tail, &imports, &lists, &mut selects);
-        let extra = if tail.is_empty() {
-            0x00ff_ffff
-        } else {
-            let index = u32::try_from(tails.len()).map_err(|_| LoadError::Limit)?;
-            if index >= 0x00ff_ffff {
-                return Err(LoadError::Limit);
-            }
-            tails.push(tail.into_boxed_slice());
-            index
-        };
-        if instruction.op == Opcode::FuncInfo {
-            let function_atom = match args[1].term().as_atom() {
-                Some(atom) => atom,
-                None => global_atoms()
-                    .intern("?")
-                    .map_err(|_| LoadError::Atom("?".into()))?,
-            };
-            let name = global_atoms().text(function_atom).unwrap_or("?");
-            functions.push((code.len(), name, args[2].value() as u8));
-            function_atoms.push(function_atom);
-        }
-        let raw = GenericOp::execute(instruction.op, args, extra)?;
-        let debug_line = if instruction.op == Opcode::DebugLine {
-            if let Some(import) = debug_line_import {
-                let kind = instruction.args.first().and_then(|operand| match operand {
-                    Operand::Atom(index) => file.atom(*index),
-                    _ => None,
-                });
-                let loc_index = instruction.args.get(1).and_then(|operand| match operand {
-                    Operand::U(index) => usize::try_from(*index).ok(),
-                    _ => None,
-                });
-                let live = instruction.args.get(3).and_then(|operand| match operand {
-                    Operand::U(live) => u16::try_from(*live).ok(),
-                    _ => None,
-                });
-                if kind == Some("line")
-                    && let (Some(location), Some(live)) = (
-                        loc_index.and_then(|index| {
-                            file.lines
-                                .as_ref()
-                                .and_then(|table| {
-                                    index.checked_sub(1).and_then(|i| table.items.get(i))
-                                })
-                                .and_then(|item| u32::try_from(item.line).ok())
-                        }),
-                        live,
-                    )
-                    && location > 0
-                {
-                    let point_ip = code.len();
-                    debug_line_points.push((point_ip, location, live));
-                    if let Some(Operand::U(index)) = instruction.args.get(2)
-                        && let Some(index) = index.checked_sub(1)
-                    {
-                        debug_line_items.push((index as u32, location));
-                    }
-                    Some((
-                        Instr::DebugLine {
-                            line: location,
-                            live,
-                            import,
-                        },
-                        Instr::DebugLineCleanup { live },
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some((probe, cleanup)) = debug_line {
-            code.push(probe);
-            code.push(cleanup);
-        } else {
-            code.push(if let Some(instr) = specialized {
-                instr
-            // ---- vm_maps_bits ----
-            } else if maps_bits::handles(instruction.op) {
-                let index = u32::try_from(generic.len()).map_err(|_| LoadError::Limit)?;
-                generic.push(raw);
-                Instr::MapsBits(index)
-            } else {
-                let index = u32::try_from(generic.len()).map_err(|_| LoadError::Limit)?;
-                generic.push(raw);
-                Instr::Generic(index)
-            });
-        }
-        types.push(type_meta);
-        lines.push(current_line.clone());
-        source_ip += if instruction.op == Opcode::DebugLine {
-            2
-        } else {
-            1
-        };
-    }
-    if let Some((function_ip, import)) = notify_breakpoint_stub {
-        code[function_ip + 1] = Instr::CallExternal {
-            import,
-            arity: 3,
-            dealloc: 0,
-            tail: true,
-        };
-    }
-    // A trailing sentinel makes a fallthrough from the final BEAM opcode safe
-    // without checking the instruction pointer on every dispatch.
-    code.push(Instr::CodeEnd);
-    let breakpoint_originals = HashMap::new();
-    let export_entry_targets = exports
-        .iter()
-        .map(|export| export.target())
-        .collect::<Vec<_>>();
-    let export_breakpoint_base = code.len();
-    for index in 0..exports.len() {
-        code.push(Instr::ExportBreakpoint {
-            index: u32::try_from(index).map_err(|_| LoadError::Limit)?,
-        });
-    }
-    let entry_points: HashSet<usize> = labels.values().copied().collect();
-    for index in 0..code.len().saturating_sub(1) {
-        if entry_points.contains(&(index + 1)) {
-            continue;
-        }
-        // Port of erts/emulator/beam/jit/arm/ops.tab:868-872 (call_fun + deallocate + return =>
-        // i_call_fun_last), OTP-29.1.1: the caller frame must not stay live during the call.
-        if let (
-            Instr::CallFun {
-                arity,
-                src,
-                dealloc: 0,
-                tail: false,
-            },
-            Some(Instr::Deallocate { slots }),
-            Some(Instr::ReturnInstr),
-        ) = (
-            code[index],
-            code.get(index + 1).copied(),
-            code.get(index + 2).copied(),
-        ) && !entry_points.contains(&(index + 2))
-        {
-            code[index] = Instr::CallFun {
-                arity,
-                src,
-                dealloc: slots,
-                tail: true,
-            };
-            code[index + 1] = Instr::CodeEnd;
-            code[index + 2] = Instr::CodeEnd;
-            continue;
-        }
-        let fused = match (code[index], code[index + 1]) {
-            (Instr::MoveXX { src, dst }, Instr::CallLocal { target }) => {
-                Some(Instr::MoveCallLocal { src, dst, target })
-            }
-            (Instr::Deallocate { slots }, Instr::ReturnInstr) => {
-                Some(Instr::DeallocateReturn { slots })
-            }
-            (Instr::IsLtXC { a, b, fail }, Instr::ReturnInstr) => {
-                Some(Instr::IsLtXCReturn { a, b, fail })
-            }
-            (
-                Instr::GetTupleElementXX { src, index, dst },
-                Instr::FmoveXFr {
-                    src: float_src,
-                    dst: dst_fr,
-                },
-            ) if dst == float_src => Some(Instr::GetTupleFloat {
-                src,
-                index,
-                dst_x: dst,
-                dst_fr,
-            }),
-            (
-                Instr::IsTupleX {
-                    src,
-                    fail: fail_type,
-                },
-                Instr::TestArityX {
-                    src: arity_src,
-                    arity,
-                    fail: fail_arity,
-                },
-            ) if src == arity_src => Some(Instr::IsTupleOfArity {
-                src,
-                arity,
-                fail_type,
-                fail_arity,
-            }),
-            _ => None,
-        };
-        if let Some(instr) = fused {
-            code[index] = instr;
-            code[index + 1] = Instr::CodeEnd;
-        }
-    }
-    // vm_binparse2: specialize bit commands independently of function shape.
-    maps_bits::specialize_bit_commands(&mut code, &generic, &lists, &tails);
-    let coverage_count = function_owners.len();
-    let coverage = if coverage_enabled {
-        Some(Coverage {
-            lines: counter_lines.into_boxed_slice(),
-            cover_ids: counter_ids.into_boxed_slice(),
-            locations: counter_locations.into_boxed_slice(),
-            line_probe_mappings: line_probe_mappings.into_boxed_slice(),
-            function_owners: function_owners.into_boxed_slice(),
-            ..Coverage::new(coverage_mode, coverage_count)
-        })
-    } else {
-        None
-    };
-    // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1.
-    // OTP rejects unknown bs_match commands when loading the module, before execution.
-    for op in &generic {
-        if op.opcode() != Opcode::BsMatch {
-            continue;
-        }
-        let command_list = op.args[2];
-        if command_list.kind() != Arg::LIST
-            || lists
-                .get(command_list.value() as usize)
-                .is_none_or(|commands| {
-                    maps_bits::decode_commands(std::slice::from_ref(commands))[0].is_none()
-                })
-        {
-            return Err(LoadError::BadBitMatch);
-        }
-    }
-    let mut bit_commands = maps_bits::decode_commands(&lists);
-    // Port of erts/emulator/beam/jit/arm/generators.tab:541-577, OTP-29.1.1.
-    // Reject unknown subcommands during loading so they cannot reach execution.
-    for op in &generic {
-        if op.opcode() == Opcode::BsMatch {
-            let commands = op.args[2];
-            if commands.kind() != Arg::LIST
-                || bit_commands
-                    .get(commands.value() as usize)
-                    .is_none_or(Option::is_none)
-            {
-                return Err(LoadError::InvalidBitMatch);
-            }
-        }
-    }
-    // vm_binparse2: drop spare decode capacity before large process binaries arrive.
-    generic.shrink_to_fit();
-    selects.shrink_to_fit();
-    tails.shrink_to_fit();
-    lists.shrink_to_fit();
-    types.iter_mut().for_each(Vec::shrink_to_fit);
-    types.resize_with(code.len(), Vec::new);
-    types.shrink_to_fit();
-    lines.resize(code.len(), None);
-    lines.shrink_to_fit();
-    let mut line_file_terms = HashMap::new();
-    for (file, _) in lines.iter().flatten() {
-        if !line_file_terms.contains_key(file) {
-            let term = TermBuilder::new(&mut literals)
-                .string_to_list(file)
-                .map_err(|_| LoadError::Limit)?;
-            line_file_terms.insert(file.clone(), term);
-        }
-    }
-    let line_terms: LineRuns<Option<(Term, u64)>> =
-        LineRuns::from_slots(lines.iter().map(|line| {
-            line.as_ref().and_then(|(file, number)| {
-                line_file_terms
-                    .get(file)
-                    .copied()
-                    .map(|term| (term, *number))
-            })
-        }));
-    let lines = LineRuns::from_slots(lines.into_iter());
-    functions.shrink_to_fit();
-    unsupported_reasons.shrink_to_fit();
-    bit_commands.shrink_to_fit();
-    let mut on_entry_fn = vec![u32::MAX; code.len()];
-    let mut entry_arity = vec![0_u16; code.len()];
-    let mut owner = u32::MAX;
-    let mut next_fn = 0_usize;
-    for (ip, slot) in on_entry_fn.iter_mut().enumerate() {
-        while next_fn < functions.len() && functions[next_fn].0 < ip {
-            owner = next_fn as u32;
-            next_fn += 1;
-        }
-        *slot = owner;
-    }
-    for (start, _, arity) in &functions {
-        let entry = start.saturating_add(1);
-        if entry < entry_arity.len() {
-            entry_arity[entry] = u16::from(*arity).saturating_add(1);
-        }
-    }
-    let on_entry_fn = on_entry_fn.into_boxed_slice();
-    let entry_arity = entry_arity.into_boxed_slice();
-    let code = code.into_boxed_slice();
-    for export in &exports {
-        export.bind_code(code.as_ptr(), code.len());
-    }
-    // Port of erts/emulator/beam/beam_file.c:1100-1310 (parse_record_chunk): the definition
-    // and default values of every record live in the module's literal area.
-    let record_defs = build_record_defs(file, name_atom, &mut literals)?;
-    let function_count = functions.len();
-    Ok(Module {
-        name: file.module.clone(),
-        name_atom,
-        records: file.records.clone(),
-        record_defs,
-        code,
-        generic,
-        selects,
-        imports,
-        exports,
-        export_atoms,
-        tails,
-        lists,
-        bit_commands,
-        // ---- vm_maps_bits ----
-        strings: file.strings.clone().into_boxed_slice(),
-        types,
-        lines,
-        line_file_terms,
-        line_terms,
-        unsupported,
-        unsupported_reasons,
-        functions,
-        function_atoms,
-        nif_stubs,
-        nif_bodies: unbound_nif_bodies(function_count),
-        on_entry_fn,
-        entry_arity,
-        breakpoint_originals,
-        export_breakpoint_base,
-        export_entry_targets: export_entry_targets.into_boxed_slice(),
-        coverage,
-        coverage_probes,
-        line_breakpoints_supported: has_debug_line,
-        debug_line_points,
-        debug_line_items,
-        debug_breakpoint_import,
-        // ---- vm_funs ----
-        funs,
-        _literals: LiteralArea::new(literals),
-        literal_terms: Arc::new(literal_terms),
     })
 }
 
@@ -2027,7 +801,7 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
     let atom_ids = file_atoms(file)?;
     let name_atom = Atom(atom_ids[0]);
     let (mut literals, literal_terms) = decode_literals(file)?;
-    let funs = funs::load_funs(file, None)?;
+    let funs = funs::load_funs(file)?;
     let mut imports = build_imports(file)?;
     let debug_breakpoint_import = push_breakpoint_import(&mut imports)?;
     // The file names of the line table, as the terms stack traces carry.
@@ -2056,33 +830,17 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         name_atom,
         records: file.records.clone(),
         record_defs,
-        code: Box::new([]),
-        generic: Vec::new(),
-        selects: Vec::new(),
         imports,
         exports: Vec::new(),
         export_atoms: HashMap::new(),
-        tails: Vec::new(),
-        lists: Vec::new(),
-        bit_commands: Vec::new(),
         strings: file.strings.clone().into_boxed_slice(),
-        types: Vec::new(),
-        lines: LineRuns::default(),
         line_file_terms,
-        line_terms: LineRuns::default(),
-        unsupported: HashMap::new(),
-        unsupported_reasons: Vec::new(),
         functions: Vec::new(),
         function_atoms: Vec::new(),
         nif_stubs: None,
         nif_bodies: unbound_nif_bodies(0),
-        on_entry_fn: Box::new([]),
-        entry_arity: Box::new([]),
-        breakpoint_originals: HashMap::new(),
-        export_breakpoint_base: 0,
         export_entry_targets: Box::new([]),
         coverage: None,
-        coverage_probes: Vec::new(),
         line_breakpoints_supported: false,
         debug_line_points: Vec::new(),
         debug_line_items: Vec::new(),
@@ -2097,7 +855,7 @@ impl Module {
     /// Whether this module came from [`load_native`] and still awaits
     /// [`finish_native`](Self::finish_native).
     pub fn awaits_native_functions(&self) -> bool {
-        self.code.is_empty() && self.functions.is_empty()
+        self.functions.is_empty()
     }
 
     /// Completes the module that [`load_native`] began with what the emitter found: the function
@@ -2149,9 +907,6 @@ impl Module {
             .map(|export| export.target())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        for export in &exports {
-            export.bind_code(self.code.as_ptr(), self.code.len());
-        }
         self.exports = exports;
         self.nif_bodies = unbound_nif_bodies(functions.len());
         self.functions = functions;
@@ -2215,51 +970,12 @@ pub(crate) fn build_imports(file: &BeamFile) -> Result<Vec<Import>, LoadError> {
                 bif: arinsal_bifs::lookup(module, function, item.arity as u8),
                 module_atom,
                 function_atom,
-                fast: match (module, function, item.arity) {
-                    ("erlang", "+", 2) => FastBif::Add,
-                    ("erlang", "-", 2) => FastBif::Sub,
-                    ("erlang", "*", 2) => FastBif::Mul,
-                    ("erlang", "band", 2) => FastBif::Band,
-                    ("erlang", "bor", 2) => FastBif::Bor,
-                    ("erlang", "bxor", 2) => FastBif::Bxor,
-                    ("erlang", "bsl", 2) => FastBif::Bsl,
-                    ("erlang", "bsr", 2) => FastBif::Bsr,
-                    _ => FastBif::None,
-                },
-                fast_op: match (module, function, item.arity) {
-                    ("erlang", "element", 2) => ImportFastOp::Element,
-                    ("erlang", "setelement", 3) => ImportFastOp::SetElement,
-                    ("erlang", "rem", 2) => ImportFastOp::Rem,
-                    ("erlang", "is_integer", 1) => ImportFastOp::IsInteger,
-                    ("erlang", "is_float", 1) => ImportFastOp::IsFloat,
-                    ("erlang", "is_number", 1) => ImportFastOp::IsNumber,
-                    ("erlang", "is_atom", 1) => ImportFastOp::IsAtom,
-                    ("erlang", "is_tuple", 1) => ImportFastOp::IsTuple,
-                    ("erlang", "is_list", 1) => ImportFastOp::IsList,
-                    ("erlang", "is_map", 1) => ImportFastOp::IsMap,
-                    ("erlang", "is_function", 1) => ImportFastOp::IsFunction,
-                    ("erlang", "tuple_size", 1) => ImportFastOp::TupleSize,
-                    ("erlang", "<", 2) => ImportFastOp::Less,
-                    ("erlang", "=<", 2) => ImportFastOp::LessEqual,
-                    ("erlang", ">", 2) => ImportFastOp::Greater,
-                    ("erlang", ">=", 2) => ImportFastOp::GreaterEqual,
-                    ("erlang", "==", 2) => ImportFastOp::Equal,
-                    ("erlang", "/=", 2) => ImportFastOp::NotEqual,
-                    ("erlang", "=:=", 2) => ImportFastOp::ExactEqual,
-                    ("erlang", "=/=", 2) => ImportFastOp::ExactNotEqual,
-                    _ => ImportFastOp::None,
-                },
                 module,
                 function,
                 arity: item.arity as u8,
                 class: AtomicU8::new(ImportClass::Fresh as u8),
                 native: AtomicUsize::new(0),
                 extra_bif: AtomicUsize::new(0),
-                export: AtomicPtr::new(std::ptr::null_mut()),
-                target_module: AtomicUsize::new(0),
-                resolved_epoch: AtomicU64::new(0),
-                resolved_target: AtomicUsize::new(0),
-                resolved_code: AtomicPtr::new(std::ptr::null_mut()),
             })
         })
         .collect::<Result<Vec<_>, LoadError>>()
@@ -2270,8 +986,6 @@ pub(crate) fn push_breakpoint_import(imports: &mut Vec<Import>) -> Result<u32, L
     let index = u32::try_from(imports.len()).map_err(|_| LoadError::Limit)?;
     imports.push(Import {
         bif: None,
-        fast: FastBif::None,
-        fast_op: ImportFastOp::None,
         module: "error_handler",
         function: "breakpoint",
         module_atom: global_atoms()
@@ -2284,11 +998,6 @@ pub(crate) fn push_breakpoint_import(imports: &mut Vec<Import>) -> Result<u32, L
         class: AtomicU8::new(ImportClass::Fresh as u8),
         native: AtomicUsize::new(0),
         extra_bif: AtomicUsize::new(0),
-        export: AtomicPtr::new(std::ptr::null_mut()),
-        target_module: AtomicUsize::new(0),
-        resolved_epoch: AtomicU64::new(0),
-        resolved_target: AtomicUsize::new(0),
-        resolved_code: AtomicPtr::new(std::ptr::null_mut()),
     });
     Ok(index)
 }
@@ -2320,10 +1029,7 @@ pub(crate) fn build_exports(
                 arity: item.arity as u8,
                 module_atom,
                 function_atom,
-                target_index: AtomicUsize::new(target),
-                code_len: AtomicUsize::new(0),
-                code_base: AtomicPtr::new(std::ptr::null_mut()),
-                target: AtomicPtr::new(std::ptr::null_mut()),
+                target_index: target,
             }))
         })
         .collect::<Result<Vec<_>, LoadError>>()
@@ -2356,139 +1062,4 @@ pub(crate) fn build_record_defs(
         record_defs.push(cons);
     }
     Ok(record_defs)
-}
-
-// Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION), OTP-29.1.1.
-// The packed source location reserves 24 bits for the line and one byte for the file.
-fn valid_source_location(name_index: u32, line: u64) -> bool {
-    name_index < 255 && line < ((1 << 24) - 1)
-}
-
-fn executable(op: Opcode) -> bool {
-    // ---- vm_maps_bits ----
-    if maps_bits::handles(op) {
-        return true;
-    }
-    matches!(
-        op.name(),
-        "func_info"
-            | "executable_line"
-            // ---- vm_exc ----
-            | "try"
-            | "try_end"
-            | "try_case"
-            | "try_case_end"
-            | "catch"
-            | "catch_end"
-            | "raise"
-            | "raw_raise"
-            | "build_stacktrace"
-            | "badrecord"
-            | "int_code_end"
-            | "move"
-            | "swap"
-            | "return"
-            | "call"
-            | "call_last"
-            | "call_only"
-            | "call_ext"
-            | "call_ext_last"
-            | "call_ext_only"
-            | "allocate"
-            | "allocate_heap"
-            | "deallocate"
-            | "trim"
-            | "test_heap"
-            | "init_yregs"
-            | "jump"
-            | "select_val"
-            | "select_tuple_arity"
-            | "is_lt"
-            | "is_ge"
-            | "is_eq"
-            | "is_ne"
-            | "is_eq_exact"
-            | "is_ne_exact"
-            | "is_tuple"
-            | "test_arity"
-            | "is_nil"
-            | "is_nonempty_list"
-            | "is_list"
-            | "is_integer"
-            | "is_float"
-            | "is_number"
-            | "is_atom"
-            | "is_binary"
-            | "is_map"
-            | "is_pid"
-            | "is_boolean"
-            | "update_record"
-            | "is_port"
-            | "is_reference"
-            | "is_any_native_record"
-            | "is_native_record"
-            | "is_record_accessible"
-            | "get_record_elements"
-            | "get_record_field"
-            | "put_record"
-            | "get_tuple_element"
-            | "put_tuple2"
-            | "put_list"
-            | "get_list"
-            | "get_hd"
-            | "get_tl"
-            | "gc_bif1"
-            | "gc_bif2"
-            | "gc_bif3"
-            | "bif0"
-            | "bif1"
-            | "bif2"
-            | "bif3"
-            | "on_load"
-            | "fmove"
-            | "fconv"
-            | "fadd"
-            | "fsub"
-            | "fmul"
-            | "fdiv"
-            | "fnegate"
-            | "is_function"
-            | "send"
-            | "loop_rec"
-            | "loop_rec_end"
-            | "remove_message"
-            | "wait"
-            | "wait_timeout"
-            | "timeout"
-            | "is_tagged_tuple"
-            | "recv_marker_reserve"
-            | "recv_marker_bind"
-            | "recv_marker_clear"
-            | "recv_marker_use"
-            // ---- vm_funs ----
-            | "make_fun3"
-            | "call_fun"
-            | "call_fun2"
-            | "apply"
-            | "apply_last"
-            | "is_function2"
-            | "badmatch"
-            | "case_end"
-            | "if_end"
-            | "debug_line"
-    )
-}
-
-#[cfg(test)]
-mod line_location_tests {
-    use super::valid_source_location;
-
-    #[test]
-    fn ignores_locations_that_do_not_fit_the_erts_packed_form() {
-        assert!(valid_source_location(0, 1));
-        assert!(valid_source_location(254, (1 << 24) - 2));
-        assert!(!valid_source_location(255, 1));
-        assert!(!valid_source_location(0, (1 << 24) - 1));
-        assert!(!valid_source_location(0, 100_000_003));
-    }
 }

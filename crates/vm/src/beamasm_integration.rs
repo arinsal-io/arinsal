@@ -387,7 +387,7 @@ fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
 pub(crate) fn known_imports(
     scope: u64,
     imports: &[arinsal_loader::Import],
-) -> Vec<Option<(arinsal_loader::ImportClass, usize, bool)>> {
+) -> Vec<Option<(arinsal_loader::ImportClass, usize)>> {
     let Ok(registry) = dispatch_registry().read() else {
         return vec![None; imports.len()];
     };
@@ -401,7 +401,7 @@ pub(crate) fn known_imports(
             exports
                 .dispatch
                 .get(&mfa)
-                .map(|target| (target.class, target.native_bits, target.trap_entry))
+                .map(|target| (target.class, target.native_bits))
         })
         .collect()
 }

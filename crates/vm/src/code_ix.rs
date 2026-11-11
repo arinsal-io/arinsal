@@ -1024,7 +1024,6 @@ mod tests {
             old_index: 31,
             pid: arinsal_term::Term::NIL,
             dispatch: Default::default(),
-            dispatch_code: Default::default(),
             dispatch_epoch: Default::default(),
         });
         let canonical = code.intern_fun_entry(Arc::clone(&candidate));

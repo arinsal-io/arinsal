@@ -707,7 +707,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         )?;
         return Ok(error);
     }
-    vm.release_loaded_tables(&mut module, &mut meta);
+    vm.release_loaded_tables(&mut meta);
     let prepared = Prepared {
         has_on_load: meta.on_load.is_some(),
         bytes: Mutex::new(bytes),
