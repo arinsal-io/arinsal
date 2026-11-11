@@ -7,6 +7,7 @@
 
 pub(crate) mod env;
 pub(crate) mod erl_debugger;
+pub(crate) mod erl_process_dict;
 pub(crate) mod erts_debug;
 pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
@@ -389,11 +390,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "fun_info" && arity == 2 {
         return Some(proc::fun_info_arity_light);
     }
-    if module == "erlang"
-        && let Some(bif) = proc::dictionary_bif(function, arity)
-    {
-        return Some(bif);
-    }
     // Port of erts/emulator/beam/bif.c:2342 (whereis_1), OTP-29.1.1.
     // `ops.tab` already emits `call_light_bif` for every plain `bif`; this is the body.
     if module == "erlang" && function == "whereis" && arity == 1 {
@@ -635,6 +631,11 @@ fn classify_by_name(
         return (ImportClass::Pure, 0);
     }
     if arinsal_spec::bif_lookup(module, function, arity).is_some() {
+        // A BIF whose body is its `bif_table` entry: the executor calls that entry
+        // (`bif_table::call_from_executor`), so it has no named native.
+        if crate::bif_table::special(module, function, arity).is_some() {
+            return (ImportClass::Native, 0);
+        }
         return (ImportClass::Unsupported, 0);
     }
     (ImportClass::Remote, 0)

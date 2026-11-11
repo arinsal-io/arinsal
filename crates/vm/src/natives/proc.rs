@@ -1,4 +1,4 @@
-//! Process configuration, dictionary, and introspection BIFs.
+//! Process configuration and introspection BIFs.
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
@@ -16,10 +16,6 @@ fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(Term::atom(
         arinsal_term::atoms::BADARG,
     )))
-}
-
-fn term_equal(left: Term, right: Term) -> bool {
-    arinsal_term::exact_eq(left, right)
 }
 
 fn flag_value(process: &Process, name: &str) -> Option<Term> {
@@ -2060,13 +2056,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "process_flag", 3),
     ("erlang", "process_info", 1),
     ("erlang", "process_info", 2),
-    ("erlang", "put", 2),
-    ("erlang", "get", 0),
-    ("erlang", "get", 1),
-    ("erlang", "get_keys", 0),
-    ("erlang", "get_keys", 1),
-    ("erlang", "erase", 0),
-    ("erlang", "erase", 1),
     ("erlang", "alias", 1),
     ("erlang", "unalias", 1),
     ("erlang", "hibernate", 3),
@@ -3140,67 +3129,6 @@ fn process_display_call(
     }
 }
 
-/// `erlang:put/2` and `erlang:erase/1` from native code, without trapping to the executor.
-///
-/// erts compiles them as `call_ext` (they are heap BIFs). The generated call otherwise
-/// re-enters the scheduler on every key; these stay in the native helper, like the ETS
-/// direct BIFs. `None` is never returned: both BIFs always produce a term.
-pub(crate) fn direct_dictionary(
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Option<super::ets::DirectEts> {
-    if module != "erlang" {
-        return None;
-    }
-    match (function, arity) {
-        ("put", 2) => Some(direct_put),
-        ("erase", 1) => Some(direct_erase),
-        _ => None,
-    }
-}
-
-fn direct_put(
-    process: &mut Process,
-    args: &[Term],
-    _module: arinsal_term::Atom,
-    _function: arinsal_term::Atom,
-) -> Option<Term> {
-    Some(dict_put(process, args[0], args[1]))
-}
-
-fn direct_erase(
-    process: &mut Process,
-    args: &[Term],
-    _module: arinsal_term::Atom,
-    _function: arinsal_term::Atom,
-) -> Option<Term> {
-    Some(dict_erase(process, args[0]))
-}
-
-fn undefined_atom() -> Term {
-    Term::atom(arinsal_term::atoms::UNDEFINED)
-}
-
-/// `put/2`. A missing key returns `undefined` without interning the name.
-// Port of erts/emulator/beam/erl_process_dict.c:353-360 (put_2), OTP-29.1.1.
-pub(crate) fn dict_put(process: &mut Process, key: Term, value: Term) -> Term {
-    process
-        .dictionary
-        .get_or_insert_with(Box::<crate::proc_create::ProcDict>::default)
-        .put(key, value)
-        .unwrap_or_else(undefined_atom)
-}
-
-/// `erase/1`. An empty dictionary returns `undefined` without walking a table.
-// Port of erts/emulator/beam/erl_process_dict.c:373-394 (erase_1, pd_hash_erase), OTP-29.1.1.
-pub(crate) fn dict_erase(process: &mut Process, key: Term) -> Term {
-    let Some(dictionary) = process.dictionary.as_mut() else {
-        return undefined_atom();
-    };
-    dictionary.erase(key).unwrap_or_else(undefined_atom)
-}
-
 /// Dispatch process-local BIFs that use the scheduler context.
 pub(crate) fn call(
     vm: &mut Vm,
@@ -3465,12 +3393,6 @@ fn call_values(
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
-            ("put" | "get" | "get_keys" | "erase", _) => {
-                let bif = dictionary_bif(function, args.len() as u8).ok_or_else(badarg)?;
-                bif(process, args)
-                    .ok_or_else(badarg)?
-                    .map_err(VmError::Trap)
-            }
             ("alias", [options]) => create_alias(process, ctx, &list(*options).ok_or_else(badarg)?),
             ("unalias", [reference]) => {
                 let id = crate::signals::ref_id(*reference).ok_or_else(badarg)?;
@@ -3620,126 +3542,6 @@ pub(crate) fn save_calls_flag(
         Term::small(n).expect("bounded save_calls size"),
     );
     Ok(Term::small(old as i64).expect("bounded old save_calls size"))
-}
-
-/// The process dictionary BIFs, which need only their process.
-// Port of erts/emulator/beam/erl_process_dict.c (put_2, get_0, get_1, get_keys_0, get_keys_1,
-// erase_0, erase_1), OTP-29.1.1.
-pub(crate) fn dictionary_bif(function: &str, arity: u8) -> Option<super::ProcessBif> {
-    match (function, arity) {
-        ("put", 2) => Some(dictionary_put),
-        ("get", 0) => Some(dictionary_get0),
-        ("get", 1) => Some(dictionary_get1),
-        ("get_keys", 0) => Some(dictionary_get_keys0),
-        ("get_keys", 1) => Some(dictionary_get_keys1),
-        ("erase", 0) => Some(dictionary_erase0),
-        ("erase", 1) => Some(dictionary_erase1),
-        _ => None,
-    }
-}
-
-/// A list or tuple the dictionary BIFs build on the process heap (`HAlloc` never fails).
-fn dictionary_alloc(result: Result<Term, VmError>) -> Result<Term, crate::exceptions::Trap> {
-    result
-        .map_err(|_| crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)))
-}
-
-fn dictionary_put(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    // Port of erts/emulator/beam/erl_process_dict.c (pd_hash_put), OTP-29.1.1.
-    Some(Ok(dict_put(process, args[0], args[1])))
-}
-
-fn dictionary_get0(
-    process: &mut Process,
-    _args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    // Port of erts/emulator/beam/erl_process_dict.c:315 (`get_0`), OTP-29.1.1.
-    let Some(dictionary) = process.dictionary.as_ref() else {
-        return Some(Ok(Term::NIL));
-    };
-    let len = dictionary.len();
-    if len == 0 {
-        return Some(Ok(Term::NIL));
-    }
-    let entries = dictionary.entries();
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let result = TermBuilder::new(&mut heap).tuple2_list_from_iter_reversed(len, entries);
-    Some(
-        result.map_err(|_| {
-            crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
-        }),
-    )
-}
-
-fn dictionary_get1(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    Some(Ok(process
-        .dictionary
-        .as_ref()
-        .and_then(|dictionary| dictionary.get(args[0]))
-        .unwrap_or(Term::atom(arinsal_term::atoms::UNDEFINED))))
-}
-
-fn dictionary_get_keys0(
-    process: &mut Process,
-    _args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let keys = process
-        .dictionary
-        .as_ref()
-        .map_or_else(Vec::new, |dictionary| {
-            dictionary
-                .entries_reversed()
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect()
-        });
-    Some(dictionary_alloc(make_list(process, keys)))
-}
-
-fn dictionary_get_keys1(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let value = args[0];
-    let keys = process
-        .dictionary
-        .as_ref()
-        .map_or_else(Vec::new, |dictionary| {
-            dictionary
-                .entries_reversed()
-                .into_iter()
-                .filter_map(|(key, stored)| term_equal(stored, value).then_some(key))
-                .collect()
-        });
-    Some(dictionary_alloc(make_list(process, keys)))
-}
-
-fn dictionary_erase0(
-    process: &mut Process,
-    _args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let raw = process
-        .dictionary
-        .take()
-        .map_or_else(Vec::new, |dictionary| dictionary.entries_reversed());
-    let entries = raw
-        .into_iter()
-        .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
-        .collect::<Result<Vec<_>, _>>();
-    Some(entries.and_then(|entries| dictionary_alloc(make_list(process, entries))))
-}
-
-fn dictionary_erase1(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    Some(Ok(dict_erase(process, args[0])))
 }
 
 // Port of erts/emulator/beam/bif.c:1366 (`hibernate_3`) and
