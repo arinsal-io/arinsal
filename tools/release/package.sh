@@ -31,15 +31,13 @@ if [ "$host" != "$target" ]; then
     exit 1
 fi
 
-if [ -n "${ARINSAL_OTP_ROOT:-}" ]; then
-    otp_root=$ARINSAL_OTP_ROOT
-else
-    erl_bin=$(command -v erl || true)
-    if [ -z "$erl_bin" ]; then
-        echo "package.sh: set ARINSAL_OTP_ROOT or put OTP 29.1.1 erl on PATH" >&2
-        exit 1
-    fi
-    otp_root=$(timeout 30 "$erl_bin" -noshell -eval 'io:format("~s",[code:root_dir()]), halt().')
+otp_root=${ARINSAL_OTP_ROOT:-${HOME}/.cache/arinsal/otp-29.1.1-wx/lib/erlang}
+if [ ! -d "$otp_root/lib/wx-2.7/ebin" ] || \
+    [ ! -f "$otp_root/lib/wx-2.7/priv/wxe_driver.so" ] || \
+    ! find "$otp_root/lib" -mindepth 1 -maxdepth 1 -type d -name 'observer-*' -print -quit | grep -q .; then
+    echo "package.sh: wx-enabled OTP 29.1.1 is required at $otp_root" >&2
+    echo "package.sh: build it with tools/release/build_otp_wx.sh or set ARINSAL_OTP_ROOT to the OTP root" >&2
+    exit 1
 fi
 
 ARINSAL_RELEASE_VERSION="$version" cargo build --release -p arinsal-cli --target "$target"
@@ -63,6 +61,12 @@ mkdir -p "$prefix/bin"
 cp "$binary" "$prefix/bin/arinsal"
 
 "$repo/tools/release/bundle_otp.sh" "$otp_root" "$prefix"
+bundle="$prefix/lib/arinsal/otp"
+if [ ! -f "$bundle/lib/wx-2.7/priv/wxe_driver.so" ] || \
+    ! find "$bundle/lib" -mindepth 1 -maxdepth 1 -type d -name 'observer-*' -print -quit | grep -q .; then
+    echo "package.sh: wx/observer files are missing from the OTP bundle" >&2
+    exit 1
+fi
 unstripped_binary_bytes=$(wc -c < "$prefix/bin/arinsal" | tr -d '[:space:]')
 
 cat > "$prefix/bin/erl" <<'EOF'
