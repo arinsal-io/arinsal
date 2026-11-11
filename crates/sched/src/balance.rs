@@ -284,7 +284,6 @@ pub(crate) struct Balance<T: Task> {
     no_used_runqs: AtomicUsize,
     /// Published contiguous migration path block (`erts_migration_paths`).
     paths: crate::run_queue::raw::MigrationPaths,
-    progress: Arc<crate::thr_progress::ThrProgress>,
     compact_load: bool,
     /// Run queues whose scheduler declared itself out of work (`no_empty_run_queues`).
     no_empty_run_queues: AtomicI32,
@@ -314,7 +313,6 @@ impl<T: Task> Balance<T> {
             no_active_runqs: AtomicUsize::new(online),
             no_used_runqs: AtomicUsize::new(online),
             paths: crate::run_queue::raw::MigrationPaths::new(schedulers, Arc::clone(&progress)),
-            progress,
             compact_load,
             no_empty_run_queues: AtomicI32::new(0),
         }
@@ -378,11 +376,7 @@ impl<T: Task> Balance<T> {
     }
 
     fn publish(&self, paths: Vec<MigrationPath>) {
-        let old = self.paths.swap(paths);
-        crate::thr_progress::schedule_later_op(
-            &self.progress,
-            crate::thr_progress::LaterOp::Boxed(Box::new(move || drop(old))),
-        );
+        self.paths.swap(paths);
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2930 (sched_waiting) and erl_process.c:2942
@@ -402,47 +396,51 @@ impl<T: Task> Balance<T> {
     pub(crate) fn check_emigration_need(&self, c_rq: usize, prio: usize) -> Option<usize> {
         // Port of erl_process.h (erts_check_emigration_need): the flags and path fields are
         // read from the same ErtsMigrationPaths block, OTP-29.1.1.
-        let (flags, migration) = self.paths.path(c_rq, prio)?;
-        if flags & flg_emigrate(prio) == 0 {
-            return None;
-        }
-        if flags & flg_evacuate(prio) != 0 {
-            return migration.runq;
-        }
-        if flags & FLG_INACTIVE != 0
-            && self.rqs[c_rq].flags.load(Ordering::Acquire) & FLG_INACTIVE != 0
-        {
-            return migration.runq;
-        }
-        if self.rqs[c_rq].len(prio) > migration.limit_here
-            && let Some(n_rq) = migration.runq
-            && self.rqs[n_rq].len(prio) < migration.limit_other
-        {
-            return Some(n_rq);
-        }
-        None
+        self.paths.with_path(c_rq, |path| {
+            let flags = path.flags;
+            let migration = path.prio[prio];
+            if flags & flg_emigrate(prio) == 0 {
+                return None;
+            }
+            if flags & flg_evacuate(prio) != 0 {
+                return migration.runq;
+            }
+            if flags & FLG_INACTIVE != 0
+                && self.rqs[c_rq].flags.load(Ordering::Acquire) & FLG_INACTIVE != 0
+            {
+                return migration.runq;
+            }
+            if self.rqs[c_rq].len(prio) > migration.limit_here
+                && let Some(n_rq) = migration.runq
+                && self.rqs[n_rq].len(prio) < migration.limit_other
+            {
+                return Some(n_rq);
+            }
+            None
+        })?
     }
 
     /// Port of erts/emulator/beam/erl_process.c:4071 (check_immigration_need), OTP-29.1.1.
     pub(crate) fn check_immigration_need(&self, c_rq: usize, prio: usize) -> Option<usize> {
-        let (flags, migration) = self.paths.path(c_rq, prio)?;
-        if flags & flg_immigrate(prio) == 0 {
-            return None;
-        }
-        let f_flags = migration.flags;
-        let f_rq = migration.runq?;
-        if f_flags & flg_evacuate(prio) != 0 {
-            return Some(f_rq);
-        }
-        if self.rqs[f_rq].flags.load(Ordering::Acquire) & FLG_INACTIVE != 0 {
-            return Some(f_rq);
-        }
-        if self.rqs[c_rq].len(prio) < migration.limit_here
-            && self.rqs[f_rq].len(prio) > migration.limit_other
-        {
-            return Some(f_rq);
-        }
-        None
+        self.paths.with_path(c_rq, |path| {
+            let migration = path.prio[prio];
+            if path.flags & flg_immigrate(prio) == 0 {
+                return None;
+            }
+            let f_rq = migration.runq?;
+            if migration.flags & flg_evacuate(prio) != 0 {
+                return Some(f_rq);
+            }
+            if self.rqs[f_rq].flags.load(Ordering::Acquire) & FLG_INACTIVE != 0 {
+                return Some(f_rq);
+            }
+            if self.rqs[c_rq].len(prio) < migration.limit_here
+                && self.rqs[f_rq].len(prio) > migration.limit_other
+            {
+                return Some(f_rq);
+            }
+            None
+        })?
     }
 
     /// Port of erts/emulator/beam/erl_process.c:5476 (change_no_used_runqs), OTP-29.1.1.
@@ -583,8 +581,7 @@ impl<T: Task> Balance<T> {
 
 impl<T: Task> Drop for Balance<T> {
     fn drop(&mut self) {
-        // Inner is dropped only after its scheduler threads have stopped.
-        drop(self.paths.take());
+        // MigrationPaths releases its fixed pool after scheduler threads have stopped.
     }
 }
 

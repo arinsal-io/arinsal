@@ -10,7 +10,9 @@
 //! by the thread that holds the run queue lock, which is the argument of every SAFETY comment
 //! below.
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::alloc::{Layout, alloc, dealloc};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 use crate::proc_ref::ProcRef;
 use crate::{Enqueue, PROC_QUEUES, Scheduled, Task};
@@ -18,48 +20,40 @@ use crate::{Enqueue, PROC_QUEUES, Scheduled, Task};
 /// The published contiguous migration path block (`erts_migration_paths`).
 // Port of erts/emulator/beam/erl_process.c (ErtsMigrationPaths), OTP-29.1.1.
 pub(crate) struct MigrationPaths {
-    current: std::sync::atomic::AtomicPtr<crate::balance::MigrationPath>,
+    current: AtomicPtr<MigrationPathBlock>,
     len: usize,
     progress: std::sync::Arc<crate::thr_progress::ThrProgress>,
+    pool: UnsafeCell<MigrationPathPool>,
+    pool_base: *mut u8,
+    stride: usize,
 }
 
-/// Ownership of a removed block, released when its scheduler readers pass thread progress.
-pub(crate) struct RetiredMigrationPaths {
-    ptr: usize,
-    len: usize,
+// The block header is the intrusive free/retired list node and carries the retirement point,
+// as `ErtsMigrationPaths.next` and `ErtsMigrationPaths.thr_prgr` do in erl_process.c.
+#[repr(C)]
+struct MigrationPathBlock {
+    next: *mut MigrationPathBlock,
+    retired_at: u64,
+    backing: *mut u8,
 }
 
-impl Drop for RetiredMigrationPaths {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            // SAFETY: only `MigrationPaths::swap` and `take` construct this owner, and both
-            // transfer one complete allocation to it.
-            unsafe {
-                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    self.ptr as *mut crate::balance::MigrationPath,
-                    self.len,
-                )));
-            }
-        }
-    }
+struct MigrationPathPool {
+    free: *mut MigrationPathBlock,
+    retired_first: *mut MigrationPathBlock,
+    retired_last: *mut MigrationPathBlock,
 }
+
+// SAFETY: callers mutate the pool only while holding Balance.state; readers only access
+// `current` under scheduler thread progress, and the active pointer is atomic.
+unsafe impl Send for MigrationPathBlock {}
+unsafe impl Send for MigrationPathPool {}
+unsafe impl Send for MigrationPaths {}
+// SAFETY: published blocks are immutable; pool links are serialized by Balance.state.
+unsafe impl Sync for MigrationPaths {}
 
 struct MigrationReadDelay<'a> {
     progress: &'a crate::thr_progress::ThrProgress,
     handle: Option<crate::thr_progress::DelayHandle>,
-}
-
-#[derive(Clone, Copy)]
-enum MigrationReadRequest {
-    Flags(usize),
-    Path(usize, usize),
-    Snapshot,
-}
-
-enum MigrationReadResult {
-    Flags(u32),
-    Path(u32, crate::balance::MigrationPrio),
-    Snapshot(Vec<crate::balance::MigrationPath>),
 }
 
 impl Drop for MigrationReadDelay<'_> {
@@ -76,13 +70,57 @@ impl MigrationPaths {
         len: usize,
         progress: std::sync::Arc<crate::thr_progress::ThrProgress>,
     ) -> Self {
+        let stride = align_up(
+            block_paths_offset() + len * std::mem::size_of::<crate::balance::MigrationPath>(),
+            64,
+        );
+        let layout = Layout::from_size_align(stride * 8, 64).unwrap();
+        // SAFETY: the layout is non-zero and valid; allocation is initialized below.
+        let pool_base = unsafe { alloc(layout) };
+        assert!(
+            !pool_base.is_null(),
+            "migration path pool allocation failed"
+        );
+        let mut free = std::ptr::null_mut();
+        let none = crate::balance::MigrationPath::NONE;
+        for index in 0..8 {
+            // SAFETY: each stride-sized slot belongs to the allocation and is 64-byte aligned.
+            let block = unsafe { pool_base.add(index * stride).cast::<MigrationPathBlock>() };
+            // SAFETY: the block header and path region are within this initialized pool slot.
+            unsafe {
+                block.write(MigrationPathBlock {
+                    next: free,
+                    retired_at: 0,
+                    backing: std::ptr::null_mut(),
+                });
+                std::ptr::write_bytes(
+                    block.cast::<u8>().add(block_paths_offset()),
+                    0,
+                    len * std::mem::size_of::<crate::balance::MigrationPath>(),
+                );
+                for path in 0..len {
+                    block_paths(block).add(path).write(none);
+                }
+            }
+            free = block;
+        }
+        let current = free;
+        // SAFETY: current is the last initialized pool block; remove it from the free list.
+        unsafe {
+            free = (*current).next;
+            (*current).next = std::ptr::null_mut();
+        }
         Self {
-            current: std::sync::atomic::AtomicPtr::new(allocate_migration_paths(vec![
-                crate::balance::MigrationPath::NONE;
-                len
-            ])),
+            current: AtomicPtr::new(current),
             len,
             progress,
+            pool: UnsafeCell::new(MigrationPathPool {
+                free,
+                retired_first: std::ptr::null_mut(),
+                retired_last: std::ptr::null_mut(),
+            }),
+            pool_base,
+            stride,
         }
     }
 
@@ -97,106 +135,174 @@ impl MigrationPaths {
         }
     }
 
-    /// Copy one path's flags while the calling managed thread holds the old block live.
+    /// Read one published path while the calling managed thread holds the block live.
     #[inline]
     pub(crate) fn flags(&self, ix: usize) -> u32 {
-        match self.read(MigrationReadRequest::Flags(ix)) {
-            Some(MigrationReadResult::Flags(flags)) => flags,
-            _ => 0,
-        }
+        self.with_path(ix, |path| path.flags).unwrap_or(0)
     }
 
-    /// Copy the flags and one priority path from the same published generation.
     #[inline]
-    pub(crate) fn path(
+    pub(crate) fn with_path<R>(
         &self,
         ix: usize,
-        prio: usize,
-    ) -> Option<(u32, crate::balance::MigrationPrio)> {
-        match self.read(MigrationReadRequest::Path(ix, prio)) {
-            Some(MigrationReadResult::Path(flags, migration)) => Some((flags, migration)),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn read(&self, request: MigrationReadRequest) -> Option<MigrationReadResult> {
-        let ix = match request {
-            MigrationReadRequest::Flags(ix) | MigrationReadRequest::Path(ix, _) => Some(ix),
-            MigrationReadRequest::Snapshot => None,
-        };
-        if let Some(ix) = ix {
-            assert!(ix < self.len);
-        }
-        if let MigrationReadRequest::Path(_, prio) = request {
-            assert!(prio < crate::balance::PRIO_LEVELS);
-        }
-        let _delay = if matches!(request, MigrationReadRequest::Snapshot) {
-            Some(self.delay_read())
-        } else {
-            None
-        };
-        if !matches!(request, MigrationReadRequest::Snapshot)
-            && !crate::thr_progress::is_managed_thread_of(&self.progress)
-        {
+        f: impl FnOnce(&crate::balance::MigrationPath) -> R,
+    ) -> Option<R> {
+        assert!(ix < self.len);
+        if !crate::thr_progress::is_managed_thread_of(&self.progress) {
             return None;
         }
-        let ptr = self.current.load(std::sync::atomic::Ordering::Acquire);
-        // SAFETY: publishers retire replaced blocks only after managed scheduler threads pass
-        // thread progress, and this method copies its values before returning to the caller.
-        unsafe {
-            match request {
-                MigrationReadRequest::Flags(ix) => {
-                    Some(MigrationReadResult::Flags((*ptr.add(ix)).flags))
-                }
-                MigrationReadRequest::Path(ix, prio) => {
-                    let path = &*ptr.add(ix);
-                    Some(MigrationReadResult::Path(path.flags, path.prio[prio]))
-                }
-                MigrationReadRequest::Snapshot => Some(MigrationReadResult::Snapshot(
-                    std::slice::from_raw_parts(ptr, self.len).to_vec(),
-                )),
-            }
-        }
+        let block = self.current.load(Ordering::Acquire);
+        // SAFETY: a managed scheduler cannot pass thread progress during this scoped read.
+        Some(unsafe { f(&*block_paths(block).add(ix)) })
     }
 
     /// Copy a block for the serialized balance updater, which excludes other publishers.
     pub(crate) fn snapshot(&self) -> Vec<crate::balance::MigrationPath> {
-        match self.read(MigrationReadRequest::Snapshot) {
-            Some(MigrationReadResult::Snapshot(paths)) => paths,
-            _ => unreachable!("a path snapshot is always available"),
-        }
+        let _delay = self.delay_read();
+        let block = self.current.load(Ordering::Acquire);
+        // SAFETY: unmanaged delay prevents retirement while the snapshot is copied.
+        unsafe { std::slice::from_raw_parts(block_paths(block), self.len).to_vec() }
     }
 
-    /// Replace the current block and return ownership of the old one to the caller.
-    pub(crate) fn swap(&self, paths: Vec<crate::balance::MigrationPath>) -> RetiredMigrationPaths {
+    /// Publish a replacement and link the old block into the retired list.
+    pub(crate) fn swap(&self, paths: Vec<crate::balance::MigrationPath>) {
         assert_eq!(paths.len(), self.len);
-        let old = self.current.swap(
-            allocate_migration_paths(paths),
-            std::sync::atomic::Ordering::AcqRel,
-        );
-        RetiredMigrationPaths {
-            ptr: old as usize,
-            len: self.len,
+        // SAFETY: every caller is a balance publisher holding Balance.state, the lock that
+        // serializes OTP's alloc_mpaths and retire_mpaths operations.
+        let pool = unsafe { &mut *self.pool.get() };
+        self.sweep(&mut pool);
+        let new = if pool.free.is_null() {
+            self.allocate_dynamic()
+        } else {
+            let block = pool.free;
+            // SAFETY: free list is exclusively held by Balance.state.
+            unsafe {
+                pool.free = (*block).next;
+                (*block).next = std::ptr::null_mut();
+            }
+            block
+        };
+        // SAFETY: new is exclusively owned by this publisher until the atomic publication.
+        unsafe {
+            std::ptr::copy_nonoverlapping(paths.as_ptr(), block_paths(new), self.len);
+        }
+        let old = self.current.swap(new, Ordering::AcqRel);
+        // Port of erl_process.c (retire_mpaths): the old block itself carries its progress value
+        // and intrusive next link; no closure or per-publication owner is allocated.
+        unsafe {
+            (*old).retired_at = self.progress.later_value();
+            (*old).next = std::ptr::null_mut();
+        }
+        if pool.retired_last.is_null() {
+            pool.retired_first = old;
+        } else {
+            // SAFETY: retired_last is a live retired block protected by Balance.state.
+            unsafe {
+                (*pool.retired_last).next = old;
+            }
+        }
+        pool.retired_last = old;
+    }
+
+    fn sweep(&self, pool: &mut MigrationPathPool) {
+        while !pool.retired_first.is_null() {
+            let block = pool.retired_first;
+            // SAFETY: retired list is exclusively held by Balance.state.
+            let (next, epoch, backing) =
+                unsafe { ((*block).next, (*block).retired_at, (*block).backing) };
+            if !self.progress.reached(epoch) {
+                break;
+            }
+            pool.retired_first = next;
+            if backing.is_null() {
+                // SAFETY: the preallocated block returns to the intrusive freelist.
+                unsafe {
+                    (*block).next = pool.free;
+                }
+                pool.free = block;
+            } else {
+                // SAFETY: dynamically allocated block was allocated with this layout.
+                unsafe {
+                    dealloc(backing, self.block_layout());
+                }
+            }
+        }
+        if pool.retired_first.is_null() {
+            pool.retired_last = std::ptr::null_mut();
         }
     }
 
-    /// Remove the current block when scheduler threads and all readers have stopped.
-    pub(crate) fn take(&self) -> RetiredMigrationPaths {
-        let old = self
-            .current
-            .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
-        RetiredMigrationPaths {
-            ptr: old as usize,
-            len: self.len,
+    fn block_layout(&self) -> Layout {
+        Layout::from_size_align(self.stride, 64).unwrap()
+    }
+
+    fn allocate_dynamic(&self) -> *mut MigrationPathBlock {
+        // SAFETY: layout is valid; allocation is initialized before publication.
+        let backing = unsafe { alloc(self.block_layout()) };
+        assert!(!backing.is_null(), "migration path block allocation failed");
+        let block = backing.cast::<MigrationPathBlock>();
+        // SAFETY: backing is one aligned block allocation with enough trailing path space.
+        unsafe {
+            block.write(MigrationPathBlock {
+                next: std::ptr::null_mut(),
+                retired_at: 0,
+                backing,
+            });
+            for path in 0..self.len {
+                block_paths(block)
+                    .add(path)
+                    .write(crate::balance::MigrationPath::NONE);
+            }
         }
+        block
     }
 }
 
-fn allocate_migration_paths(
-    paths: Vec<crate::balance::MigrationPath>,
-) -> *mut crate::balance::MigrationPath {
-    Box::into_raw(paths.into_boxed_slice()).cast()
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+fn block_paths_offset() -> usize {
+    align_up(
+        std::mem::size_of::<MigrationPathBlock>(),
+        std::mem::align_of::<crate::balance::MigrationPath>(),
+    )
+}
+unsafe fn block_paths(block: *mut MigrationPathBlock) -> *mut crate::balance::MigrationPath {
+    // SAFETY: callers ensure `block` is a live block with trailing path storage.
+    unsafe { block.cast::<u8>().add(block_paths_offset()).cast() }
+}
+
+impl Drop for MigrationPaths {
+    fn drop(&mut self) {
+        let current = self.current.load(Ordering::Relaxed);
+        let dynamic_layout = Layout::from_size_align(self.stride, 64).unwrap();
+        let pool_layout = Layout::from_size_align(self.stride * 8, 64).unwrap();
+        let pool = self.pool.get_mut();
+        // SAFETY: Drop runs after scheduler threads stop; all dynamic blocks are on current or
+        // one of the intrusive lists, and the fixed pool is released as one allocation.
+        unsafe {
+            let mut block = pool.free;
+            while !block.is_null() {
+                let next = (*block).next;
+                if !(*block).backing.is_null() {
+                    dealloc((*block).backing, dynamic_layout);
+                }
+                block = next;
+            }
+            block = pool.retired_first;
+            while !block.is_null() {
+                let next = (*block).next;
+                if !(*block).backing.is_null() {
+                    dealloc((*block).backing, dynamic_layout);
+                }
+                block = next;
+            }
+            if !current.is_null() && !(*current).backing.is_null() {
+                dealloc((*current).backing, dynamic_layout);
+            }
+            dealloc(self.pool_base, pool_layout);
+        }
+    }
 }
 
 /// Tag bit of a node address that names a [`Proxy`].
