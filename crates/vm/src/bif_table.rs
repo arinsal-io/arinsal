@@ -56,16 +56,24 @@ pub(crate) fn install(bif_number: i32, f: usize) {
     }
 }
 
+/// `Export.info` of the BIF being called: `c_p->current`, set by the call fragment.
+pub(crate) fn current_info(header: *mut ProcessHeader) -> u64 {
+    if header.is_null() {
+        return 0;
+    }
+    // SAFETY: `header` is the running process's header, passed by the call fragment.
+    unsafe { (*header).current as u64 }
+}
+
 /// `(Export.info, Export*)` of the BIF being called: the call fragment points `c_p->current`
 /// at the export's info before it calls `bif_table[].f`.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:399-405 (call_light_bif_shared stores
 // `&exp->info.mfa` in `c_p->current`), OTP-29.1.1.
 pub(crate) fn current_export(header: *mut ProcessHeader) -> (u64, u64) {
-    if header.is_null() {
+    let info = current_info(header);
+    if info == 0 {
         return (0, 0);
     }
-    // SAFETY: `header` is the running process's header, passed by the call fragment.
-    let info = unsafe { (*header).current } as u64;
     let identity = crate::beamasm_integration::export_from_info(info).map_or(0, |export| {
         std::sync::Arc::as_ptr(export.export_object()) as u64
     });
@@ -225,10 +233,11 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("lists", "member", 2) => bif!(crate::native_helpers::list_member_entry),
         ("persistent_term", "get", 1) => bif!(persistent_term_get_1_light),
         ("persistent_term", "get", 2) => bif!(persistent_term_get_2_light),
-        ("erlang", "monitor", 2) => sched_entry::<Monitor2>(),
-        ("erlang", "monitor", 3) => sched_entry::<Monitor3>(),
-        ("erlang", "demonitor", 1) => sched_entry::<Demonitor1>(),
-        ("erlang", "demonitor", 2) => sched_entry::<Demonitor2>(),
+        // bif.c
+        ("erlang", "monitor", 2) => bif!(crate::natives::bif::monitor_2),
+        ("erlang", "monitor", 3) => bif!(crate::natives::bif::monitor_3),
+        ("erlang", "demonitor", 1) => bif!(crate::natives::bif::demonitor_1),
+        ("erlang", "demonitor", 2) => bif!(crate::natives::bif::demonitor_2),
         ("erlang", "finish_loading", 1) => sched_entry::<FinishLoading1>(),
         ("erlang", "has_prepared_code_on_load", 1) => sched_entry::<HasPreparedCodeOnLoad1>(),
         ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
@@ -349,34 +358,6 @@ impl arinsal_bifs::BifTableVisitor for Compile {
 /// `bif_table[].f` of a BIF whose body needs its scheduler's data.
 fn sched_entry<B: crate::native_helpers::SchedBif>() -> usize {
     bif!(crate::native_helpers::sched_bif_light::<B>)
-}
-
-/// `erlang:monitor/2`. Port of erts/emulator/beam/bif.c (monitor_2), OTP-29.1.1.
-struct Monitor2;
-impl crate::native_helpers::SchedBif for Monitor2 {
-    const ARITY: usize = 2;
-    const BODY: crate::natives::DirectNative = crate::dist::native_monitor;
-}
-
-/// `erlang:monitor/3`. Port of erts/emulator/beam/bif.c (monitor_3), OTP-29.1.1.
-struct Monitor3;
-impl crate::native_helpers::SchedBif for Monitor3 {
-    const ARITY: usize = 3;
-    const BODY: crate::natives::DirectNative = crate::dist::native_monitor;
-}
-
-/// `erlang:demonitor/1`. Port of erts/emulator/beam/bif.c (demonitor_1), OTP-29.1.1.
-struct Demonitor1;
-impl crate::native_helpers::SchedBif for Demonitor1 {
-    const ARITY: usize = 1;
-    const BODY: crate::natives::DirectNative = crate::dist::native_demonitor;
-}
-
-/// `erlang:demonitor/2`. Port of erts/emulator/beam/bif.c (demonitor_2), OTP-29.1.1.
-struct Demonitor2;
-impl crate::native_helpers::SchedBif for Demonitor2 {
-    const ARITY: usize = 2;
-    const BODY: crate::natives::DirectNative = crate::dist::native_demonitor;
 }
 
 /// `erlang:finish_loading/1`.

@@ -585,7 +585,7 @@ pub(crate) fn list(term: Term) -> Option<Vec<Term>> {
 
 /// `demonitor/2` options, walked in place like `bif.c` `demonitor_2`.
 /// `None` is a bad option list; the full BIF raises `badarg`.
-fn demonitor_flags(term: Term) -> Option<(bool, bool)> {
+pub(crate) fn demonitor_flags(term: Term) -> Option<(bool, bool)> {
     let flush_atom = Term::atom(arinsal_term::atoms::FLUSH);
     let info_atom = Term::atom(arinsal_term::atoms::INFO);
     let mut flush = false;
@@ -603,90 +603,11 @@ fn demonitor_flags(term: Term) -> Option<(bool, bool)> {
     (!bad).then_some((flush, info))
 }
 
-/// Local `monitor`/`demonitor` cases that erts returns from the BIF without a
-/// signal: monitoring oneself, and demonitoring a ref that is not a monitor.
-///
-/// `None` leaves the call to the executor path (another local process, a name,
-/// a remote or port monitor, a bad argument).
-// Port of erts/emulator/beam/bif.c:782-784 (`monitor`, no monitoring of self)
-// and bif.c:437-454 (`demonitor` tree miss), OTP-29.1.1.
-pub(crate) fn light_monitor_bif(
-    process: &mut Process,
-    monitor: bool,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    if monitor {
-        light_monitor_self(process, args)
-    } else {
-        light_demonitor_miss(process, args)
-    }
-}
-
-fn light_monitor_self(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    // monitor/3 options (alias, tag) stay on the full path. monitor/2 of self
-    // is `erts_make_ref` and nothing else.
-    if args.len() != 2 || args[0] != Term::atom(arinsal_term::atoms::PROCESS) {
-        return None;
-    }
-    let self_pid = process.heap.abi.self_pid;
-    if self_pid == 0 || args[1].tagged_word() != self_pid {
-        return None;
-    }
-    Some(light_ref(process))
-}
-
-fn light_ref(process: &mut Process) -> Result<Term, crate::exceptions::Trap> {
-    let words = arinsal_bifs::next_ref_words();
-    match Term::local_ref(&mut process.heap, words) {
-        Ok(term) => Ok(term),
-        Err(_) => {
-            let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            Term::local_ref(&mut fragment, words).map_err(|_| {
-                crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
-            })
-        }
-    }
-}
-
-fn light_demonitor_miss(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let reference = *args.first()?;
-    let ids = reference.local_ref_numbers()?;
-    let id = arinsal_bifs::ordinary_ref_key(ids);
-    if process.monitors.get_state(id).is_some()
-        || process
-            .cold
-            .as_ref()
-            .is_some_and(|cold| cold.dist_monitors.contains(&id))
-    {
-        return None;
-    }
-    let (flush, info) = if args.len() < 2 {
-        (false, false)
-    } else {
-        demonitor_flags(args[1])?
-    };
-    if flush {
-        // The flush needs the receive that the Erlang export performs; the executor path traps.
-        return None;
-    }
-    Some(Ok(Term::atom(if info {
-        arinsal_term::atoms::FALSE
-    } else {
-        arinsal_term::atoms::TRUE
-    })))
-}
-
 /// The trap of `demonitor(Ref, [flush])` when the monitor is already gone: the flush runs as
 /// `erts_internal:flush_monitor_messages(Ref, Multi, Res)`, with `Multi` false for a plain monitor.
 // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2 flush_messages: BIF_TRAP3
 // flush_monitor_messages_trap), OTP-29.1.1.
-fn flush_monitor_trap(process: &Process, reference: Term, result: Term) -> VmError {
+pub(crate) fn flush_monitor_trap(process: &Process, reference: Term, result: Term) -> VmError {
     VmError::TrapExport(crate::ExportTrap::new(
         // This BIF may run without a scheduler runtime in unit-level VM calls; the export entry
         // helper then uses the same unloaded-export stub as `make_fun/3`.
@@ -2135,10 +2056,6 @@ enum SignalBif {
     Link1,
     Link2,
     Unlink1,
-    Monitor2,
-    Monitor3,
-    Demonitor1,
-    Demonitor2,
     Exit2,
     Exit3,
     ExitSignal2,
@@ -2175,38 +2092,6 @@ macro_rules! resolved_signal_handler {
             }))
         }
     };
-}
-
-/// The local arms of `monitor/2,3` (bif.c `monitor`): a local pid, a local name, a port, the
-/// time offset. The distributed arm is `dist::native_monitor`'s.
-pub(crate) fn monitor_local(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    let entry = if args.len() == 3 {
-        SignalBif::Monitor3
-    } else {
-        SignalBif::Monitor2
-    };
-    call_resolved(vm, process, ctx, entry, args)
-}
-
-/// The local arms of `demonitor/1,2` (bif.c `demonitor`); a distributed origin is
-/// `dist::native_demonitor`'s.
-pub(crate) fn demonitor_local(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    let entry = if args.len() == 2 {
-        SignalBif::Demonitor2
-    } else {
-        SignalBif::Demonitor1
-    };
-    call_resolved(vm, process, ctx, entry, args)
 }
 
 resolved_signal_handler!(spawn3, Spawn3);
@@ -2272,102 +2157,6 @@ pub(crate) fn unregister_light(
     }
     drop(table);
     Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-/// `monitor(process, Pid)` called directly from native code (erts `monitor_2`, bif.c:782-784
-/// and the local arm of erts_proc_sig_send_monitor). Only a live local pid with the default
-/// options takes this path; everything else returns `None` before any state changes.
-// Port of erts/emulator/beam/erl_proc_sig_queue.c:1090-1150 (erts_proc_sig_send_monitor),
-// OTP-29.1.1: the monitor is sent through the scheduler's held-monitor slot.
-pub(crate) fn monitor_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    // `monitor/3` with `{alias, Mode}` is what `gen:call` and every `gen_server:call` with a
-    // timeout issue; a custom tag or `priority` takes the executor.
-    let (kind, target, alias_mode) = match args {
-        [kind, target] => (*kind, *target, None),
-        [kind, target, _] => {
-            let (tag, alias_mode, priority) = monitor_options(args).ok()?;
-            if tag != Term::atom(arinsal_term::atoms::DOWN) || priority {
-                return None;
-            }
-            (*kind, *target, alias_mode)
-        }
-        _ => return None,
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let me = process.self_pid?;
-    if kind == Term::atom(arinsal_term::atoms::PORT) {
-        // Only the default tag takes this path; a custom tag or `priority` is the executor's.
-        let (tag, alias_mode, priority) = match args {
-            [_, _] => (Term::atom(arinsal_term::atoms::DOWN), None, false),
-            _ => monitor_options(args).ok()?,
-        };
-        if tag != Term::atom(arinsal_term::atoms::DOWN) || priority {
-            return None;
-        }
-        return Some(match monitor_port(process, me, target, tag, alias_mode) {
-            Ok(term) => Ok(term),
-            Err(VmError::Trap(trap)) => Err(trap),
-            Err(_) => Err(crate::exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::SYSTEM_LIMIT,
-            ))),
-        });
-    }
-    if kind != Term::atom(arinsal_term::atoms::PROCESS) {
-        return None;
-    }
-    let pid = Pid::from_term(target)?;
-    if pid == me {
-        return None;
-    }
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    if !rt_ref(process)?
-        .scheduler()
-        .ok()?
-        .lookup_from(pid, process.on_managed)
-    {
-        return None;
-    }
-    let id = process.next_ref();
-    let ref_term = if alias_mode.is_some() {
-        pid_reference(process, id, me).ok()?
-    } else {
-        reference(process, id).ok()?
-    };
-    // Port of erts/emulator/beam/bif.c (monitor_2, ERTS_MON_TYPE_PROC): one
-    // `erts_monitor_create` for both halves; the origin goes into the tree, the target half is
-    // the monitor signal.
-    let (origin, target) = crate::proc_create::create_monitor_with_reference_at(
-        process.heap.alloc_ix(),
-        crate::proc_create::monitor_reference(id, alias_mode, false),
-        me.data(),
-        pid.data(),
-        crate::proc_create::MonitorInfo::default(),
-        crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf),
-    );
-    process.monitors.insert(origin);
-    if rt_ref(process)?
-        .scheduler()
-        .ok()?
-        .signal_ordered_from(
-            me,
-            pid,
-            arinsal_sched::Signal::Monitor {
-                reference: id,
-                shared: target.into_shared(),
-            },
-            process.on_managed,
-        )
-        .is_err()
-    {
-        process.monitors.remove(id);
-        return None;
-    }
-    Some(Ok(ref_term))
 }
 
 /// `alias/1` called directly from native code. An unknown option takes the executor, which raises
@@ -2554,96 +2343,6 @@ fn finish_demonitor_origin(
         }
         _ => OriginDemonitor::Distributed(entry),
     }
-}
-
-fn demonitor_process_origin(process: &mut Process, id: u64) -> Option<OriginDemonitor> {
-    // Port of erts/emulator/beam/bif.c (demonitor_2), OTP-29.1.1: classify the located origin
-    // monitor and delete it only when it is a local process monitor.
-    let entry = match process.monitors.remove_if(id, |flags| {
-        flags & crate::monitor_link::node_flag::TYPE_MASK
-            == crate::monitor_link::node_type::MONITOR_PROC
-    }) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return Some(OriginDemonitor::Missing),
-        Err(flags)
-            if flags & crate::monitor_link::node_flag::TYPE_MASK
-                == crate::monitor_link::node_type::MONITOR_ALIAS =>
-        {
-            return Some(OriginDemonitor::Alias);
-        }
-        Err(_) => return None,
-    };
-    Some(finish_demonitor_origin(process, id, entry))
-}
-
-/// `demonitor(Ref)` / `demonitor(Ref, Opts)` called directly from native code (erts bif.c:437-454
-/// and the local monitor case). Aliases, port and remote monitors take the executor. A flush
-/// with the monitor already gone traps to `flush_monitor_messages` with its resolved export.
-// Port of erts/emulator/beam/bif.c:437-454 (demonitor), OTP-29.1.1.
-pub(crate) fn demonitor_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let (reference, options) = match args {
-        [reference] => (*reference, Term::NIL),
-        [reference, options] => (*reference, *options),
-        _ => return None,
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let (flush, info) = demonitor_flags(options)?;
-    let id = ref_id(reference)?;
-    if process.cold.as_ref()?.dist_monitors.contains(&id) {
-        return None;
-    }
-    let me = process.self_pid?;
-    let entry = demonitor_process_origin(process, id)?;
-    let (active, origin) = match entry {
-        OriginDemonitor::Process(origin) => {
-            (Some(Pid::from_data(origin.view().other())), Some(origin))
-        }
-        OriginDemonitor::Alias => {
-            return Some(Ok(Term::atom(arinsal_term::atoms::FALSE)));
-        }
-        OriginDemonitor::Missing => (None, None),
-        OriginDemonitor::Distributed(_) | OriginDemonitor::Port(_, _) => unreachable!(),
-    };
-    if active.is_none() && flush {
-        let result = Term::atom(if info {
-            arinsal_term::atoms::FALSE
-        } else {
-            arinsal_term::atoms::TRUE
-        });
-        let trap = crate::ExportTrap::new(
-            process,
-            FLUSH_MONITOR_CONTINUATION,
-            vec![reference, Term::atom(arinsal_term::atoms::FALSE), result],
-        );
-        return Some(Err(crate::exceptions::Trap::export(trap)));
-    }
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let result = if let Some(pid) = active {
-        let origin = origin.expect("active origin monitor carries its half");
-        let scheduler = rt_ref(process)?.scheduler().ok()?;
-        // Port of erts/emulator/beam/bif.c:521 (demonitor, ERTS_MON_TYPE_PROC): the demonitor
-        // always goes through proc_queue_signal, which sends a held monitor first; the signal is
-        // the origin half itself (erts_proc_sig_send_demonitor).
-        let _ = scheduler.signal_ordered_from(
-            me,
-            pid,
-            arinsal_sched::Signal::DemonitorOrigin(origin.into_shared()),
-            process.on_managed,
-        );
-        Term::atom(arinsal_term::atoms::TRUE)
-    } else {
-        Term::atom(if info {
-            arinsal_term::atoms::FALSE
-        } else {
-            arinsal_term::atoms::TRUE
-        })
-    };
-    Some(Ok(result))
 }
 
 /// Port of erts/emulator/beam/bif.c:1231-1248 (unlink_1): after sending the unlink op, mark the node
@@ -2879,10 +2578,6 @@ resolved_signal_handler!(registered0, Registered0);
 resolved_signal_handler!(link1, Link1);
 resolved_signal_handler!(link2, Link2);
 resolved_signal_handler!(unlink1, Unlink1);
-resolved_signal_handler!(monitor2, Monitor2);
-resolved_signal_handler!(monitor3, Monitor3);
-resolved_signal_handler!(demonitor1, Demonitor1);
-resolved_signal_handler!(demonitor2, Demonitor2);
 resolved_signal_handler!(exit2, Exit2);
 resolved_signal_handler!(exit3, Exit3);
 resolved_signal_handler!(exit_signal2, ExitSignal2);
@@ -2921,10 +2616,6 @@ pub(crate) fn handler(
         ("erlang", "link", 1) => link1,
         ("erlang", "link", 2) => link2,
         ("erlang", "unlink", 1) => unlink1,
-        ("erlang", "monitor", 2) => monitor2,
-        ("erlang", "monitor", 3) => monitor3,
-        ("erlang", "demonitor", 1) => demonitor1,
-        ("erlang", "demonitor", 2) => demonitor2,
         ("erlang", "exit", 2) => exit2,
         ("erlang", "exit", 3) => exit3,
         ("erlang", "exit_signal", 2) => exit_signal2,
@@ -2985,16 +2676,16 @@ pub(crate) fn handler_atoms(
                         crate::natives::NativeEntry::Direct(native_send)
                     }
                     (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("monitor")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_monitor)
+                        crate::natives::NativeEntry::Direct(crate::natives::bif::monitor_executor)
                     }
                     (m, f, 3) if m == arinsal_term::atoms::ERLANG && f == atom_id("monitor")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_monitor)
+                        crate::natives::NativeEntry::Direct(crate::natives::bif::monitor_executor)
                     }
                     (m, f, 1) if m == arinsal_term::atoms::ERLANG && f == atom_id("demonitor")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_demonitor)
+                        crate::natives::NativeEntry::Direct(crate::natives::bif::demonitor_executor)
                     }
                     (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("demonitor")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_demonitor)
+                        crate::natives::NativeEntry::Direct(crate::natives::bif::demonitor_executor)
                     }
                     // erts has one link_1/unlink_1/exit_2 for every caller (bif.c); an external
                     // pid reaches the distribution signal from apply as from a static import.
@@ -3045,7 +2736,7 @@ pub(crate) fn call(
 
 /// `monitor(port, Target)`: a port id, a registered name or `{Name, node()}`.
 // Port of erts/emulator/beam/bif.c:895-945 (monitor/3, type `port`), OTP-29.1.1.
-fn monitor_port(
+pub(crate) fn monitor_port(
     process: &mut Process,
     me: Pid,
     target: Term,
@@ -3361,166 +3052,6 @@ fn call_resolved(
                 wake_for_procs_trace(process, pid);
                 Term::atom(arinsal_term::atoms::TRUE)
             })
-        }
-        (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
-            if *kind == Term::atom(arinsal_term::atoms::PROCESS) =>
-        {
-            let (tag, alias_mode, priority) = monitor_options(args)?;
-            let rt = process.runtime.ok_or_else(|| badarg("monitor/2"))?;
-            // boot_loop1: code_server:call/1 monitors its registered name.
-            // Port of erts/emulator/beam/bif.c:1100 (erts_internal_monitor? monitor_2/3
-            // local arm), OTP-29.1.1: `Name` and `{Name, node()}` both monitor by name.
-            let name = match atom_name(*target) {
-                Some(name) => Some(name),
-                None if Pid::from_term(*target).is_none() => {
-                    crate::dist::name_node_tuple(*target)?.map(|(name, _node)| name)
-                }
-                None => None,
-            };
-            let pid = if let Some(pid) = Pid::from_term(*target) {
-                Some(pid)
-            } else if let Some(name) = name.as_ref() {
-                rt.reg.whereis_proc_str(name)
-            } else if matches!(to_owned(*target), Ok(arinsal_etf::OwnedTerm::Pid { .. })) {
-                // A pid of another incarnation of this node never matches a live process.
-                None
-            } else {
-                return Err(badarg("monitor/2"));
-            };
-            let id = process.next_ref();
-            let ref_term = if alias_mode.is_some() {
-                pid_reference(process, id, ctx.pid())?
-            } else {
-                reference(process, id)?
-            };
-            // Port of erts/emulator/beam/bif.c:782-784 (monitor), OTP-29.1.1.
-            // Monitoring oneself creates no monitor and sends no signal.
-            if pid == Some(ctx.pid()) {
-                return Ok(ref_term);
-            }
-            let info = monitor_info_for(tag, name.as_deref())?;
-            if priority {
-                process.cold_mut().prio_monitors.insert(id);
-            }
-            if let Some(pid) = pid.filter(|pid| rt.scheduler().is_ok_and(|s| s.lookup(*pid))) {
-                // One `ErtsMonitorData` for both halves: the origin goes into the tree, the
-                // target half is the monitor signal.
-                let (origin, target_half) = crate::proc_create::create_monitor_with_reference_at(
-                    process.heap.alloc_ix(),
-                    crate::proc_create::monitor_reference(id, alias_mode, priority),
-                    ctx.pid().data(),
-                    pid.data(),
-                    info,
-                    crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf),
-                );
-                process.monitors.insert(origin);
-                let signal = arinsal_sched::Signal::Monitor {
-                    reference: id,
-                    shared: target_half.into_shared(),
-                };
-                if let Err(error) = ctx.signal(pid, signal) {
-                    process.monitors.remove(id);
-                    if error != arinsal_sched::Error::NoProcess {
-                        return Err(VmError::Unsupported(format!("monitor: {error}")));
-                    }
-                    // The target stopped accepting monitor signals before this request.
-                    send_noproc_down(
-                        process,
-                        ctx,
-                        id,
-                        name.as_deref(),
-                        Some(pid),
-                        *target,
-                        tag,
-                        alias_mode,
-                    )?;
-                }
-            } else {
-                send_noproc_down(
-                    process,
-                    ctx,
-                    id,
-                    name.as_deref(),
-                    pid,
-                    *target,
-                    tag,
-                    alias_mode,
-                )?;
-            }
-            Ok(ref_term)
-        }
-        (SignalBif::Monitor2, [kind, target])
-            if *kind == Term::atom(arinsal_term::atoms::TIME_OFFSET) =>
-        {
-            // Port of erts/emulator/beam/erl_time_sup.c:1964-1968
-            // (erts_monitor_time_offset), OTP-29.1.1. There is no clock warp
-            // source in this runtime, but monitor creation still returns a ref.
-            if *target != Term::atom(arinsal_term::atoms::CLOCK_SERVICE) {
-                return Err(badarg("monitor/2"));
-            }
-            process.runtime.ok_or_else(|| badarg("monitor/2"))?;
-            let id = process.next_ref();
-            reference(process, id)
-        }
-        (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
-            if *kind == Term::atom(arinsal_term::atoms::PORT) =>
-        {
-            let (tag, alias_mode, _priority) = monitor_options(args)?;
-            monitor_port(process, ctx.pid(), *target, tag, alias_mode)
-        }
-        (SignalBif::Demonitor1, [reference]) | (SignalBif::Demonitor2, [reference, _]) => {
-            let id = ref_id(*reference).ok_or_else(|| badarg("demonitor/1"))?;
-            // Port of erts/emulator/beam/bif.c (demonitor_2): the option list is walked in
-            // place.
-            let (flush, info) = match args.get(1) {
-                Some(options) => demonitor_flags(*options).ok_or_else(|| badarg("demonitor/2"))?,
-                None => (false, false),
-            };
-            let entry = demonitor_origin(process, id);
-            let (was_alias, process_target, port_target, port_origin, distributed) = match entry {
-                OriginDemonitor::Alias => (true, None, None, None, None),
-                OriginDemonitor::Process(origin) => (false, Some(origin), None, None, None),
-                OriginDemonitor::Port(port_id, origin) => (false, None, port_id, origin, None),
-                OriginDemonitor::Distributed(origin) => (false, None, None, None, Some(origin)),
-                OriginDemonitor::Missing => (false, None, None, None, None),
-            };
-            let mut was_active = false;
-            if let Some(origin) = process_target {
-                // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_demonitor):
-                // the origin half itself is the demonitor signal.
-                let target = Pid::from_data(origin.view().other());
-                let shared = origin.into_shared();
-                let _ = ctx.signal(target, Signal::DemonitorOrigin(shared));
-                was_active = true;
-            }
-            // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT),
-            // OTP-29.1.1: the origin is in this process's monitor tree. The port id
-            // there selects the port; `erts_port_demonitor` sends the demonitor signal.
-            if let (Some(port_id), Some(origin)) = (port_target, port_origin) {
-                crate::port::demonitor_port(process, ctx.pid(), port_id, origin);
-                was_active = true;
-            }
-            if let Some(origin) = distributed {
-                // Port of erts/emulator/beam/bif.c (demonitor, ERTS_MON_TYPE_DIST_PROC).
-                if let Some(cold) = process.cold.as_mut() {
-                    cold.dist_monitors.remove(&id);
-                }
-                crate::dist::demonitor_remote(process.runtime, ctx.pid(), origin);
-                was_active = true;
-            }
-            // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2), OTP-29.1.1.
-            // Flush runs only when the monitor is already gone (`am_false`). An
-            // active process monitor just queues the demonitor signal.
-            let failed = was_alias || (info && !was_active);
-            let result = Term::atom(if failed {
-                arinsal_term::atoms::FALSE
-            } else {
-                arinsal_term::atoms::TRUE
-            });
-            if flush && !was_active {
-                return Err(flush_monitor_trap(process, *reference, result));
-            }
-            Ok(result)
         }
         (SignalBif::Exit2, [target, reason]) => {
             send_exit_signal_bif(process, ctx, *target, *reason, Term::NIL, true)
@@ -4403,9 +3934,9 @@ pub(crate) fn monitor_info_for(
 }
 
 #[allow(clippy::too_many_arguments)] // Keep monitor creation fields aligned with the erts call path.
-fn send_noproc_down(
+pub(crate) fn send_noproc_down(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    me: Pid,
     id: u64,
     name: Option<&str>,
     target_pid: Option<Pid>,
@@ -4414,7 +3945,7 @@ fn send_noproc_down(
     alias_mode: Option<crate::proc_create::AliasMode>,
 ) -> Result<(), VmError> {
     // A named target is reported by name; the signal sender is then irrelevant.
-    let from = target_pid.or_else(|| name.map(|_| ctx.pid()));
+    let from = target_pid.or_else(|| name.map(|_| me));
     if let Some(from) = from
         && let Some(runtime) = process.runtime
     {
@@ -4422,7 +3953,7 @@ fn send_noproc_down(
         let (origin, _target) = crate::proc_create::create_monitor_with_reference_at(
             process.heap.alloc_ix(),
             crate::proc_create::monitor_reference(id, alias_mode, false),
-            ctx.pid().data(),
+            me.data(),
             from.data(),
             info,
             crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf),
@@ -4433,7 +3964,7 @@ fn send_noproc_down(
             .scheduler()?
             .signal(
                 from,
-                ctx.pid(),
+                me,
                 Signal::MonitorDown {
                     reference: id,
                     reason: Box::new(reason),
@@ -4444,7 +3975,7 @@ fn send_noproc_down(
     // A pid of another incarnation of this node: no local sender to report it.
     let object = monitor_object(process, name, target)?;
     let reference = if alias_mode.is_some() {
-        pid_reference(process, id, ctx.pid())?
+        pid_reference(process, id, me)?
     } else {
         reference(process, id)?
     };
