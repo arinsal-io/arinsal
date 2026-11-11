@@ -5,6 +5,7 @@ use arinsal_term::{Term, VecHeap, to_owned};
 
 #[test]
 fn merge_badmap_argument_order_matches_otp() {
+    arinsal_term::init_global_literals();
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this differential test");
     let invalid = OwnedTerm::Int(42);
     let empty = OwnedTerm::Map(Vec::new());

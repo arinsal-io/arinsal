@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 #[test]
 fn tag_roundtrips_and_heap_layouts() {
+    arinsal_term::init_global_literals();
     assert_eq!(std::mem::size_of::<Term>(), 8);
     for n in [MIN_SMALL, MIN_SMALL + 1, -1, 0, 1, MAX_SMALL - 1, MAX_SMALL] {
         assert_eq!(Term::small(n).unwrap().as_small(), Some(n));
@@ -44,6 +45,7 @@ fn tag_roundtrips_and_heap_layouts() {
 
 #[test]
 fn flatmap_update_reuses_keys_and_allocates_header_and_values_only() {
+    arinsal_term::init_global_literals();
     let keys = [
         Term::small(2).unwrap(),
         Term::small(5).unwrap(),
@@ -69,6 +71,7 @@ fn flatmap_update_reuses_keys_and_allocates_header_and_values_only() {
 
 #[test]
 fn process_heap_and_fragment() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(8);
     assert!(heap.reserve_stack(2));
     assert!(heap.alloc(6).is_some());
@@ -78,6 +81,7 @@ fn process_heap_and_fragment() {
 
 #[test]
 fn contiguous_list_builder_prepends_exact_sequence() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);
     let list = builder
@@ -99,6 +103,7 @@ fn contiguous_list_builder_prepends_exact_sequence() {
 
 #[test]
 fn copy_and_owned_roundtrip() {
+    arinsal_term::init_global_literals();
     let original = OwnedTerm::Tuple(vec![
         OwnedTerm::List {
             elems: vec![OwnedTerm::Int(1), OwnedTerm::Atom("ok".into())],
@@ -125,6 +130,7 @@ fn copy_and_owned_roundtrip() {
 
 #[test]
 fn number_equality_and_order() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let mut b = TermBuilder::new(&mut heap);
     let zero = b.float(0.0).unwrap();
@@ -161,6 +167,7 @@ fn number_equality_and_order() {
 
 #[test]
 fn small_arithmetic_boundaries_and_random_pairs() {
+    arinsal_term::init_global_literals();
     let values = [
         MIN_SMALL,
         MIN_SMALL + 1,
@@ -206,6 +213,7 @@ fn small_arithmetic_boundaries_and_random_pairs() {
 
 #[test]
 fn atoms_concurrent_and_limit() {
+    arinsal_term::init_global_literals();
     let table = Arc::new(AtomTable::new(1_048_576));
     let per_thread = if cfg!(miri) { 10 } else { 62_500 };
     std::thread::scope(|scope| {
@@ -276,6 +284,7 @@ fn erl_values_u64(expr: &str) -> Option<Vec<u64>> {
 #[test]
 #[cfg(not(miri))]
 fn differential_hash2_primitives() {
+    arinsal_term::init_global_literals();
     let expression = "L=[0,1,-1,134217727,134217728,-134217728,abc,ok,[],{},[1,2],<<1,2,3>>,0.0,-0.0,#{a=>1,b=>2}], lists:foreach(fun(T)->io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(T),erlang:phash2(T,1),erlang:phash2(T,134217728),erlang:phash2(T,4294967296)]) end,L), halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -319,6 +328,7 @@ fn differential_hash2_primitives() {
 #[test]
 #[cfg(not(miri))]
 fn differential_hash2_improper_byte_list_and_tuple_order() {
+    arinsal_term::init_global_literals();
     let expression = "T=[97,98|tail],U={1,{2,3},4},io:format(\"~w ~w~n\",[erlang:phash2(T,4294967296),erlang:phash2(U,4294967296)]),halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -342,6 +352,7 @@ fn differential_hash2_improper_byte_list_and_tuple_order() {
 #[test]
 #[cfg(not(miri))]
 fn differential_hash2_binary_tail_bytes() {
+    arinsal_term::init_global_literals();
     let expression = "lists:foreach(fun(N)->B=list_to_binary(lists:seq(1,N)),io:format(\"~w \",[erlang:phash2(B,4294967296)]) end,[9,10,11,21,22,23]),halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -361,6 +372,7 @@ fn differential_hash2_binary_tail_bytes() {
 #[test]
 #[ignore = "microbenchmark"]
 fn microbenchmark() {
+    arinsal_term::init_global_literals();
     use std::time::Instant;
     fn measure(name: &str, count: usize, mut operation: impl FnMut()) {
         let start = Instant::now();
@@ -401,6 +413,7 @@ fn microbenchmark() {
 #[test]
 #[cfg(not(miri))]
 fn differential_hash2_ten_thousand_terms() {
+    arinsal_term::init_global_literals();
     let expression = "erts_debug:set_internal_state(available_internal_state,true), F=fun(N)->case N rem 8 of 0->N-5000; 1->(1 bsl (60+N rem 30))+N; 2->(N-5000)/7; 3-><<(N band 255),((N bsr 3) band 255),((N bsr 8) band 255)>>; 4-><<(N band 31):5>>; 5->{N rem 97,N-5000,ok}; 6->[N band 255,(N bsr 8) band 255,N]; 7->#{(N rem 31)=>N,ok=> -N} end end, lists:foreach(fun(N)->T=F(N),io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(T,4294967296),erts_debug:flat_size(T),erlang:phash(T,4294967296),erts_debug:get_internal_state({internal_hash,T})]) end,lists:seq(0,9999)),halt().";
     let Some(reference) = erl_values_u64(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -460,6 +473,7 @@ fn differential_hash2_ten_thousand_terms() {
 
 #[test]
 fn copy_deep_list_and_tuple() {
+    arinsal_term::init_global_literals();
     let mut source = VecHeap::new();
     let mut tail = Term::NIL;
     let list_len = if cfg!(miri) { 1_000 } else { 1_000_000 };
@@ -485,6 +499,7 @@ fn copy_deep_list_and_tuple() {
 
 #[test]
 fn external_identities_and_copy() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{Identity, Node, global_atoms};
     let node = Node::new(global_atoms().intern("remote@host").unwrap(), 7);
     let mut heap = VecHeap::new();
@@ -523,6 +538,7 @@ fn external_identities_and_copy() {
 
 #[test]
 fn external_reference_id_counts_survive_copy_and_compare() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{Identity, Node, exact_eq, global_atoms};
     let node = Node::new(global_atoms().intern("refs@host").unwrap(), 7);
     for ids in [
@@ -549,6 +565,7 @@ fn external_reference_id_counts_survive_copy_and_compare() {
 
 #[test]
 fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{Identity, MagicRef, TermBuilder};
     let mut heap = VecHeap::new();
     let owner = MagicRef::new(7_u32);
@@ -593,6 +610,7 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
 
 #[test]
 fn fun_layout_copy_and_conversion() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{ExportEntry, FunEntry, FunRef, global_atoms};
     let module = global_atoms().intern("erlang").unwrap();
     let function = global_atoms().intern("length").unwrap();
@@ -642,6 +660,7 @@ fn fun_layout_copy_and_conversion() {
 
 #[test]
 fn native_record_layout_order_hash_and_copy() {
+    arinsal_term::init_global_literals();
     use arinsal_term::global_atoms;
     let module = global_atoms().intern("record_module").unwrap();
     let name = global_atoms().intern("record_name").unwrap();
@@ -713,6 +732,7 @@ fn native_record_layout_order_hash_and_copy() {
 #[test]
 #[cfg(not(miri))]
 fn differential_local_identities() {
+    arinsal_term::init_global_literals();
     let expression = "erts_debug:set_internal_state(available_internal_state,true),L=[erlang:list_to_pid(\"<0.42.0>\"),erlang:list_to_port(\"#Port<0.123>\"),erlang:list_to_ref(\"#Ref<0.1.2.3>\")],lists:foreach(fun(T)->io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(T,4294967296),erlang:phash(T,4294967296),erts_debug:get_internal_state({internal_hash,T}),erts_debug:flat_size(T)]) end,L),halt().";
     let Some(expected) = erl_values_u64(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -739,6 +759,7 @@ fn differential_local_identities() {
 #[test]
 #[cfg(not(miri))]
 fn differential_atom_key_map_internal_hash() {
+    arinsal_term::init_global_literals();
     let expression = "erts_debug:set_internal_state(available_internal_state,true),T=#{false=>1,error=>2},io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(T,4294967296),erlang:phash(T,4294967296),erts_debug:get_internal_state({internal_hash,T}),erts_debug:flat_size(T)]),halt().";
     let Some(reference) = erl_values_u64(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -765,6 +786,7 @@ fn differential_atom_key_map_internal_hash() {
 
 #[test]
 fn unaligned_sub_binary_copy() {
+    arinsal_term::init_global_literals();
     let mut source = VecHeap::new();
     let mut builder = TermBuilder::new(&mut source);
     let original = builder.binary(&[0xab, 0xcd, 0xef]).unwrap();
@@ -788,6 +810,7 @@ fn unaligned_sub_binary_copy() {
 
 #[test]
 fn unaligned_sub_binary_orders_against_literal_binary() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);
     let aligned = builder.binary(&[1, 2, 3, 4]).unwrap();
@@ -809,6 +832,7 @@ fn unaligned_sub_binary_orders_against_literal_binary() {
 #[test]
 #[cfg(not(miri))]
 fn differential_binary_flat_size_for_matching_layouts() {
+    arinsal_term::init_global_literals();
     let expression = "erts_debug:set_internal_state(available_internal_state,true),L=[iolist_to_binary([1,2,3]),list_to_binary(lists:duplicate(65,1))],lists:foreach(fun(B)->io:format(\"~w~n\",[erts_debug:flat_size(B)]) end,L),halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -826,6 +850,7 @@ fn differential_binary_flat_size_for_matching_layouts() {
 
 #[test]
 fn offheap_sub_binary_retains_data_after_source_drops() {
+    arinsal_term::init_global_literals();
     let mut source = VecHeap::new();
     let source_binary = TermBuilder::new(&mut source).binary(&[0xab; 128]).unwrap();
     let slice = TermBuilder::new(&mut source)
@@ -853,6 +878,7 @@ fn offheap_sub_binary_retains_data_after_source_drops() {
 #[test]
 #[cfg(not(miri))]
 fn differential_term_order_two_thousand_terms() {
+    arinsal_term::init_global_literals();
     let expression = "F=fun(N)->case N rem 8 of 0->N-1000; 1->(1 bsl (60+N rem 30))+N; 2->(N-1000)/7; 3-><<(N band 255),((N bsr 3) band 255),((N bsr 8) band 255)>>; 4-><<(N band 31):5>>; 5->{N rem 97,N-1000,ok}; 6->[N band 255,(N bsr 8) band 255,N]; 7->#{(N rem 31)=>N,ok=> -N} end end,L=[{F(N),N}||N<-lists:seq(0,1999)],S=lists:sort(fun({A,I},{B,J})->A<B orelse (A==B andalso I=<J) end,L),lists:foreach(fun({_,N})->io:format(\"~w \",[N]) end,S),halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -898,6 +924,7 @@ fn differential_term_order_two_thousand_terms() {
 #[test]
 #[cfg(not(miri))]
 fn differential_native_record_hashes() {
+    arinsal_term::init_global_literals();
     let expression = "erts_debug:set_internal_state(available_internal_state,true),R=records:create(erlang,ok,[{error,9},{false,2}],#{is_exported=>true}),io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(R,4294967296),erlang:phash(R,4294967296),erts_debug:get_internal_state({internal_hash,R}),erts_debug:flat_size(R)]),halt().";
     let Some(reference) = erl_values_u64(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -925,6 +952,7 @@ fn differential_native_record_hashes() {
 #[test]
 #[cfg(not(miri))]
 fn differential_local_fun_hashes() {
+    arinsal_term::init_global_literals();
     let directory = std::env::temp_dir().join(format!("arinsal-term-fun-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let source = format!(
@@ -993,6 +1021,7 @@ fn differential_local_fun_hashes() {
 #[test]
 #[cfg(not(miri))]
 fn differential_number_equality_truth_table() {
+    arinsal_term::init_global_literals();
     let expression = "Pairs=[{0,0.0},{0.0,-0.0},{(1 bsl 53)+1,float((1 bsl 53)+1)},{1 bsl 53,float(1 bsl 53)},{-(1 bsl 60),-1152921504606846976.0},{1,1.5}],lists:foreach(fun({A,B})->io:format(\"~w ~w \",[case A==B of true->1;false->0 end,case A=:=B of true->1;false->0 end]) end,Pairs),halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -1033,6 +1062,7 @@ fn differential_number_equality_truth_table() {
 #[test]
 #[cfg(not(miri))]
 fn differential_integer_float_ordering_boundaries() {
+    arinsal_term::init_global_literals();
     let expression = "Pairs=[{(1 bsl 53)+1,float((1 bsl 53)+1)},{-(1 bsl 53)-1,float(-(1 bsl 53)-1)},{(1 bsl 100)+1,float(1 bsl 100)},{-(1 bsl 100)-1,float(-(1 bsl 100))},{1,1.5},{2,1.5},{0,-0.0},{1,5.0e-324}],lists:foreach(fun({A,B})->io:format(\"~w \",[if A<B->0; A==B->1; true->2 end]) end,Pairs),halt().";
     let Some(reference) = erl_values(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -1082,6 +1112,7 @@ fn differential_integer_float_ordering_boundaries() {
 #[test]
 #[cfg(not(miri))]
 fn differential_hashes_ten_thousand_identities_and_funs() {
+    arinsal_term::init_global_literals();
     let expression = "erts_debug:set_internal_state(available_internal_state,true),F=fun(N)->X=N rem 1000,case N rem 4 of 0->list_to_pid(\"<0.\"++integer_to_list(X)++\".0>\");1->list_to_port(\"#Port<0.\"++integer_to_list(X)++\">\");2->list_to_ref(\"#Ref<0.0.0.\"++integer_to_list(X)++\">\");3->fun erlang:length/1 end end,lists:foreach(fun(N)->T=F(N),io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(T,4294967296),erlang:phash(T,4294967296),erts_debug:get_internal_state({internal_hash,T}),erts_debug:flat_size(T)]) end,lists:seq(0,9999)),halt().";
     let Some(reference) = erl_values_u64(expression) else {
         eprintln!("skipping: erl unavailable");
@@ -1132,6 +1163,7 @@ fn differential_hashes_ten_thousand_identities_and_funs() {
 
 #[test]
 fn magic_reference_uses_erts_ref_thing_header_and_marker() {
+    arinsal_term::init_global_literals();
     // erl_term.h: ErtsMRefThing shares ERTS_REF_THING_HEADER with ErtsORefThing on 64-bit
     // little endian; the ordinary marker in word one tells them apart.
     use arinsal_term::{MagicRef, TermBuilder};
@@ -1154,6 +1186,7 @@ fn magic_reference_uses_erts_ref_thing_header_and_marker() {
 
 #[test]
 fn pid_reference_keeps_its_creator_through_etf_copy() {
+    arinsal_term::init_global_literals();
     use arinsal_term::Identity;
 
     let mut heap = VecHeap::new();
@@ -1188,6 +1221,7 @@ fn pid_reference_keeps_its_creator_through_etf_copy() {
 
 #[test]
 fn to_owned_copies_aligned_unaligned_and_partial_byte_bitstrings() {
+    arinsal_term::init_global_literals();
     let bytes: Vec<u8> = (0..=255).collect();
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);

@@ -107,6 +107,7 @@ fn build(heap: &mut ProcessHeap, variant: u8) -> Vec<Term> {
 #[test]
 #[ignore = "release micro gate"]
 fn eq_shapes_micro_gate() {
+    arinsal_term::init_global_literals();
     let mut left_heap = ProcessHeap::with_words(65_536);
     let mut right_heap = ProcessHeap::with_words(65_536);
     let names = [

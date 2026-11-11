@@ -18,6 +18,7 @@ impl Drop for DropCounter {
 
 #[test]
 fn process_heap_allocator_leaves_the_native_stack_redzone() {
+    arinsal_term::init_global_literals();
     let reserve = S_REDZONE;
     let words = reserve + 16;
     let mut heap = ProcessHeap::with_words(words);
@@ -35,6 +36,7 @@ fn process_heap_allocator_leaves_the_native_stack_redzone() {
 
 #[test]
 fn halloc_reserves_the_stack_redzone_before_using_a_fragment() {
+    arinsal_term::init_global_literals();
     let words = S_REDZONE + 16;
     let mut heap = ProcessHeap::with_words(words);
     assert_eq!(heap.halloc_words_left(), Some(16));
@@ -45,6 +47,7 @@ fn halloc_reserves_the_stack_redzone_before_using_a_fragment() {
 
 #[test]
 fn hrelease_shrinks_and_reuses_the_current_heap_fragment() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(16);
     let block = heap.heap_fragment(16);
     HeapAlloc::release(&mut heap, block.wrapping_add(16), block.wrapping_add(4));
@@ -59,6 +62,7 @@ fn hrelease_shrinks_and_reuses_the_current_heap_fragment() {
 
 #[test]
 fn adopted_message_keeps_term_and_off_heap_owner_through_gc() {
+    arinsal_term::init_global_literals();
     let mut source = VecHeap::new();
     let binary = TermBuilder::new(&mut source).binary(&[0x5a; 100]).unwrap();
     let list = TermBuilder::new(&mut source)
@@ -82,6 +86,7 @@ fn adopted_message_keeps_term_and_off_heap_owner_through_gc() {
 
 #[test]
 fn gc_moves_a_message_built_in_its_node_fragment() {
+    arinsal_term::init_global_literals();
     let payload = vec![0x5a; 100];
     let mut node = arinsal_term::message::OwnedSignal::with_heap_fragment((), 32);
     let message = {
@@ -113,6 +118,7 @@ fn gc_moves_a_message_built_in_its_node_fragment() {
 
 #[test]
 fn a_received_node_fragment_is_collected_with_the_process() {
+    arinsal_term::init_global_literals();
     let mut node = arinsal_term::message::OwnedSignal::with_heap_fragment(7_u32, 16);
     let message = {
         let mut fragment = node.heap_fragment().unwrap();
@@ -134,6 +140,7 @@ fn a_received_node_fragment_is_collected_with_the_process() {
 
 #[test]
 fn gc_rebases_message_binary_chains_before_releasing_fragments() {
+    arinsal_term::init_global_literals();
     let mut message_heap = arinsal_term::message::MessageHeapBlock::with_words(128);
     let payload = vec![0x5a; 100];
     let binary = TermBuilder::new(&mut message_heap)
@@ -165,6 +172,7 @@ fn gc_rebases_message_binary_chains_before_releasing_fragments() {
 
 #[test]
 fn magic_reference_survives_copy_and_gc_then_releases() {
+    arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
     let owner = MagicRef::new(DropCounter(count.clone()));
     let mut source = VecHeap::new();
@@ -189,6 +197,7 @@ fn magic_reference_survives_copy_and_gc_then_releases() {
 
 #[test]
 fn magic_reference_is_freed_with_its_last_reference() {
+    arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
     let mut heap = ProcessHeap::with_words(1 << 16);
     let mut ids = Vec::new();
@@ -206,6 +215,7 @@ fn magic_reference_is_freed_with_its_last_reference() {
 
 #[test]
 fn magic_reference_stays_alive_while_any_heap_holds_it() {
+    arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
     let owner = MagicRef::new(DropCounter(count.clone()));
     let id = owner.id();
@@ -227,6 +237,7 @@ fn magic_reference_stays_alive_while_any_heap_holds_it() {
 
 #[test]
 fn collections_with_many_live_magic_references_stay_linear() {
+    arinsal_term::init_global_literals();
     // A mailbox of messages carrying sockets keeps thousands of magic references live; each
     // collection used to search the owner list once per live reference.
     let count = Arc::new(AtomicUsize::new(0));
@@ -262,6 +273,7 @@ struct ExternalPayload {
 }
 #[test]
 fn external_binary_keeps_resource_through_copy_and_gc() {
+    arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
     let owner = MagicRef::new(ExternalPayload {
         bytes: vec![1, 2, 3].into_boxed_slice(),
@@ -289,6 +301,7 @@ fn external_binary_keeps_resource_through_copy_and_gc() {
 
 #[test]
 fn deep_list_is_iterative() {
+    arinsal_term::init_global_literals();
     let count = if cfg!(miri) { 100 } else { 1_000_000 };
     let mut heap = ProcessHeap::with_words(count * 2 + 128);
     let mut root = Term::NIL;
@@ -312,6 +325,7 @@ fn deep_list_is_iterative() {
 
 #[test]
 fn sharing_and_stack_roots_survive() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let child = TermBuilder::new(&mut heap)
         .cons(Term::small(42).unwrap(), Term::NIL)
@@ -329,6 +343,7 @@ fn sharing_and_stack_roots_survive() {
 
 #[test]
 fn dead_off_heap_binary_is_released() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let _binary = TermBuilder::new(&mut heap).binary(&[7; 100]).unwrap();
     assert_eq!(heap.off_heap_count(), 1);
@@ -338,6 +353,7 @@ fn dead_off_heap_binary_is_released() {
 
 #[test]
 fn reachable_fragment_is_merged() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(64);
     let pointer = heap.gc_fragment(2);
     // SAFETY: The fragment reserves exactly two initialized cons words and stays live until GC.
@@ -356,6 +372,7 @@ fn reachable_fragment_is_merged() {
 
 #[test]
 fn heap_fragment_is_merged() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(64);
     let pointer = heap.heap_fragment(2);
     // SAFETY: the stored fragment reserves two initialized cons words.
@@ -373,6 +390,7 @@ fn heap_fragment_is_merged() {
 
 #[test]
 fn heap_alloc_fills_the_newest_fragment_before_adding_one() {
+    arinsal_term::init_global_literals();
     // erts_heap_alloc (utils.c:135): HAlloc fragments are exact-size, and a request goes
     // to the newest fragment while it has room, as a delayed-GC heap joining mbuf does.
     let mut heap = ProcessHeap::with_words(64);
@@ -389,6 +407,7 @@ fn heap_alloc_fills_the_newest_fragment_before_adding_one() {
 
 #[test]
 fn collection_moves_fragment_terms_and_keeps_the_global_empty_tuple() {
+    arinsal_term::init_global_literals();
     let empty = arinsal_term::global_empty_tuple();
     let mut heap = ProcessHeap::with_words(64);
     let pointer = heap.heap_fragment(3);
@@ -412,6 +431,7 @@ fn collection_moves_fragment_terms_and_keeps_the_global_empty_tuple() {
 
 #[test]
 fn sparse_heap_shrinks_after_full_collection() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(10_000);
     let mut roots = [TermBuilder::new(&mut heap)
         .tuple(&[Term::small(1).unwrap()])
@@ -425,6 +445,7 @@ fn sparse_heap_shrinks_after_full_collection() {
 
 #[test]
 fn random_shared_graphs_survive_repeated_collections() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(2048);
     let mut roots = [Term::NIL; 16];
     let mut seed = 0x1234_5678_u64;
@@ -462,6 +483,7 @@ fn random_shared_graphs_survive_repeated_collections() {
 
 #[test]
 fn hamt_sizes_survive_repeated_collections() {
+    arinsal_term::init_global_literals();
     let sizes: &[usize] = if cfg!(miri) {
         &[33, 48]
     } else {
@@ -496,6 +518,7 @@ fn hamt_sizes_survive_repeated_collections() {
 
 #[test]
 fn match_context_aliases_keep_one_cursor_and_moved_base() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let source = TermBuilder::new(&mut heap).binary(&[0xa5; 32]).unwrap();
     let context = TermBuilder::new(&mut heap).match_context(source).unwrap();
@@ -514,6 +537,7 @@ fn match_context_aliases_keep_one_cursor_and_moved_base() {
 
 #[test]
 fn writable_append_survives_collections_and_releases_dead_owners() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let mut roots = [TermBuilder::new(&mut heap)
         .writable_binary(&[], 0, 1_048_576)
@@ -550,6 +574,7 @@ fn writable_append_survives_collections_and_releases_dead_owners() {
 
 #[test]
 fn external_things_move_their_node_reference_through_collections() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let module = global_atoms().intern("gc_external_node_module").unwrap();
     let node = Node::new(module, 1);
@@ -581,6 +606,7 @@ fn external_things_move_their_node_reference_through_collections() {
 
 #[test]
 fn live_binary_keeps_one_reference_per_binref_through_collections() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let binary = TermBuilder::new(&mut heap).binary(&[7; 100]).unwrap();
     let Some(BinaryOwner::Binary(token)) = binary_owner(binary) else {
@@ -602,6 +628,7 @@ fn live_binary_keeps_one_reference_per_binref_through_collections() {
 
 #[test]
 fn heaps_do_not_count_fun_or_export_entries() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let module = global_atoms().intern("gc_owner_module").unwrap();
     let function = global_atoms().intern("gc_owner_function").unwrap();
@@ -644,6 +671,7 @@ fn heaps_do_not_count_fun_or_export_entries() {
 
 #[test]
 fn fun_entries_survive_heap_owner_drop_and_collection() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let module = global_atoms().intern("gc_permanent_fun_module").unwrap();
     let function = global_atoms().intern("gc_permanent_fun_function").unwrap();
@@ -683,6 +711,7 @@ fn fun_entries_survive_heap_owner_drop_and_collection() {
 
 #[test]
 fn sub_binary_of_writable_owner_shares_the_binref_and_owner_is_released() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let writable = TermBuilder::new(&mut heap)
         .writable_binary(&[5; 100], 800, 1_024)
@@ -706,6 +735,7 @@ fn sub_binary_of_writable_owner_shares_the_binref_and_owner_is_released() {
 
 #[test]
 fn stack_skips_return_addresses_and_catch_markers() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(128);
     assert!(heap.reserve_stack(2));
     // SAFETY: a raw aligned code address is a stack word, never dereferenced here.
@@ -719,6 +749,7 @@ fn stack_skips_return_addresses_and_catch_markers() {
 
 #[test]
 fn mixed_boxed_graph_survives_one_hundred_collections() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(32_768);
     let module = global_atoms().intern("gc_graph_module").unwrap();
     let name = global_atoms().intern("gc_graph_name").unwrap();
@@ -811,6 +842,7 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
 #[test]
 #[ignore = "release-mode throughput measurement"]
 fn gc_throughput() {
+    arinsal_term::init_global_literals();
     arinsal_term::set_gc_clock_for_long_gc(true);
     fn measure(label: &str, mut heap: ProcessHeap, root: Term) {
         heap.set_fullsweep_after(0);
@@ -862,6 +894,7 @@ fn gc_throughput() {
 
 #[test]
 fn promotion_closes_old_graph_without_young_references() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(512);
     let leaf = TermBuilder::new(&mut heap)
         .cons(Term::small(9).unwrap(), Term::NIL)
@@ -897,6 +930,7 @@ fn promotion_closes_old_graph_without_young_references() {
 
 #[test]
 fn fullsweep_after_zero_never_builds_old_generation() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     heap.set_fullsweep_after(0);
     let mut roots = [TermBuilder::new(&mut heap)
@@ -912,6 +946,7 @@ fn fullsweep_after_zero_never_builds_old_generation() {
 
 #[test]
 fn fullsweep_shrinks_heap_with_many_dead_objects() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(12_000);
     heap.set_fullsweep_after(0);
     let mut roots = [TermBuilder::new(&mut heap)
@@ -930,6 +965,7 @@ fn fullsweep_shrinks_heap_with_many_dead_objects() {
 
 #[test]
 fn young_owners_release_on_minor_and_old_owners_on_major() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(1024);
     let mut roots = [TermBuilder::new(&mut heap).binary(&[1; 100]).unwrap()];
     heap.collect(&mut roots, &mut [], 0).unwrap();
@@ -950,6 +986,7 @@ fn young_owners_release_on_minor_and_old_owners_on_major() {
 
 #[test]
 fn trees_like_short_lived_tuples_copy_few_words() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(2048);
     heap.set_min_heap_size(2048);
     let leaves = (0..256)
@@ -993,6 +1030,7 @@ fn trees_like_short_lived_tuples_copy_few_words() {
 
 #[test]
 fn repeated_short_lived_bursts_do_not_expand_young_heap() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(512);
     let mut roots = [TermBuilder::new(&mut heap)
         .tuple(&[Term::small(1).unwrap()])
@@ -1010,6 +1048,7 @@ fn repeated_short_lived_bursts_do_not_expand_young_heap() {
 
 #[test]
 fn high_survival_grows_young_without_oversizing_old() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(512);
     heap.set_min_heap_size(512);
     let values = [Term::small(1).unwrap(); 127];
@@ -1041,6 +1080,7 @@ fn high_survival_grows_young_without_oversizing_old() {
 
 #[test]
 fn minor_gc_shrinks_a_dead_heap_without_a_presizing_walk() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(16_000);
     let bits = TermBuilder::new(&mut heap).binary(&[0xab; 32]).unwrap();
     let off_heap = TermBuilder::new(&mut heap).binary(&[0xcd; 80]).unwrap();

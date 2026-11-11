@@ -20,6 +20,7 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
 
 #[test]
 fn differential_generated_terms_and_etf_roundtrip() {
+    arinsal_term::init_global_literals();
     let expression = "F=fun(N)->case N rem 7 of 0->N-128;1->{N rem 11,[N,N+1],ok};2->lists:seq(N rem 9,N rem 9+5);3->#{(N rem 13)=>N,ok=>[N,N+1]};4-><<(N band 255),((N bsr 2) band 255)>>;5->(N-128)/7;6->(1 bsl (60+N rem 9))+N end end,lists:foreach(fun(N)->T=F(N),U=F((N*37+11) rem 257),C=case T<U of true-> -1;false->case T==U of true->0;false->1 end end,io:format(\"~B ~B ~B ~B ~s ~s~n\",[case T=:=U of true->1;false->0 end,C,erlang:phash2(T,4294967296),erts_debug:flat_size(T),binary:encode_hex(term_to_binary(T)),binary:encode_hex(term_to_binary(U))]) end,lists:seq(0,255)),halt().";
     let output = match Command::new("erl")
         .args(["-noshell", "-eval", expression])
@@ -71,6 +72,7 @@ fn differential_generated_terms_and_etf_roundtrip() {
 
 #[test]
 fn reordered_maps_and_nested_cons_copy() {
+    arinsal_term::init_global_literals();
     let pairs: Vec<_> = (0..64)
         .map(|n| (Term::small(n).unwrap(), Term::small(n * 3).unwrap()))
         .collect();
@@ -104,6 +106,7 @@ fn reordered_maps_and_nested_cons_copy() {
 
 #[test]
 fn arith_red_exact_atom_equality_uses_canonical_atom_ids() {
+    arinsal_term::init_global_literals();
     let table = arinsal_term::global_atoms();
     let first = Term::atom(table.intern("arith_red_atom").unwrap());
     let same = Term::atom(table.intern("arith_red_atom").unwrap());

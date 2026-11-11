@@ -254,6 +254,7 @@ fn differential_5000_mixed_maps() {
 #[test]
 #[cfg(not(miri))]
 fn differential_mixed_hamt_comparison_sizes() {
+    arinsal_term::init_global_literals();
     let sizes = [
         33, 34, 35, 36, 37, 40, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1500, 2000,
     ];
@@ -349,6 +350,7 @@ fn differential_mixed_hamt_comparison_sizes() {
 
 #[test]
 fn nested_hamt_key_and_value() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);
     let inner_pairs = (1..=40)
@@ -414,6 +416,7 @@ fn nested_hamt_key_and_value() {
 
 #[test]
 fn gc_boxed_word_counts_cover_all_subtags() {
+    arinsal_term::init_global_literals();
     let mut object = [0_u64; 32];
     let ordinary = [
         (0x00, 4), // tuple or collision tuple
@@ -457,6 +460,7 @@ fn gc_boxed_word_counts_cover_all_subtags() {
 
 #[test]
 fn flatmap_and_hamt_with_identical_entries_compare_equal() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let pairs = [
         (Term::small(1).unwrap(), Term::small(17).unwrap()),
@@ -483,6 +487,7 @@ fn flatmap_and_hamt_with_identical_entries_compare_equal() {
 #[test]
 #[cfg(not(miri))]
 fn yielding_builder_matches_straight_line_builder() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{HashmapBuild, hashmap_key_hash, hashmap_leaves_hashed};
     for (case, n) in [33, 34, 100, 129, 700, 3_000].into_iter().enumerate() {
         for duplicates in [false, true] {

@@ -25,6 +25,7 @@ fn sign(order: Ordering) -> i8 {
 
 #[test]
 fn compound_term_comparison_matches_erts() {
+    arinsal_term::init_global_literals();
     let expression = r#"
         BasePairs = [
             {{alpha, 1, {nested, [a, 2]}}, {alpha, 1, {nested, [a, 2]}}},

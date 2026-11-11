@@ -59,11 +59,7 @@ pub fn run_with_debugger_flags(
         crate::natives::tty::replace_intr();
     }
     erl_init_atoms()?;
-    // Port of erts/emulator/beam/erl_init.c (erl_init): os_info_init (erts_bif_info_init),
-    // init_dist and beamfile_init each build their global literal.
-    arinsal_bifs::os_info_init();
-    crate::dist::init_dist_dflags_record();
-    arinsal_loader::beamfile_init();
+    erl_init_global_literals();
     crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
     // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this
     // block; it only chooses the loader path before preloaded modules load.
@@ -261,6 +257,19 @@ const OS_FLAVOR: &str = if cfg!(target_os = "macos") {
 } else {
     std::env::consts::OS
 };
+
+/// The global literals the owners' inits build.
+///
+/// Port of erts/emulator/beam/erl_init.c (erl_init): os_info_init (erts_bif_info_init),
+/// init_dist and beamfile_init each build their global literal. A `Vm` built outside `boot`
+/// (an in-process VM of a test or tool) runs it from its constructor, as its `erl_init`; each
+/// step is guarded to run once per process.
+pub(crate) fn erl_init_global_literals() {
+    arinsal_term::init_global_literals();
+    arinsal_bifs::os_info_init();
+    crate::dist::init_dist_dflags_record();
+    arinsal_loader::beamfile_init();
+}
 
 /// Intern the atoms that erts' C initialisation creates after the static atom
 /// table and before the preloaded modules load, in `erl_init()` call order.

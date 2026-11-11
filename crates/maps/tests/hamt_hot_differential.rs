@@ -46,6 +46,7 @@ fn local_pairs(map: Term) -> O {
 
 #[test]
 fn from_list_colliding_paths_duplicates_lookup_and_put_vs_erl() {
+    arinsal_term::init_global_literals();
     // Concentrate keys in one root bitmap slot so lookup and insertion traverse shared HAMT paths.
     let keys = (1..=200_000_i64)
         .filter(|key| internal_hash(small(*key)) & 15 == 7)

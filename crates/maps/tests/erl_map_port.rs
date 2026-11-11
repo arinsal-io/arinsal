@@ -61,6 +61,7 @@ fn local_map(map: Term) -> O {
 
 #[test]
 fn to_list_order_small_vs_erl() {
+    arinsal_term::init_global_literals();
     let expected = erl(
         "M=maps:from_list([{K,K*3}||K<-lists:seq(1,32)]),io:put_chars(binary:encode_hex(term_to_binary(maps:to_list(M)))),halt().",
     );
@@ -74,6 +75,7 @@ fn to_list_order_small_vs_erl() {
 
 #[test]
 fn to_list_order_large_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:764-911, OTP-29.1.1.
     let mut buckets: [Vec<i64>; 16] = std::array::from_fn(|_| Vec::new());
     for key in 0..100_000_i64 {
@@ -107,6 +109,7 @@ fn to_list_order_large_vs_erl() {
 
 #[test]
 fn put_update_remove_sequences_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:2036-2234, OTP-29.1.1.
     let mut state = 0x2a83_9f17_45d1_u64;
     let mut operations = Vec::new();
@@ -148,6 +151,7 @@ fn put_update_remove_sequences_vs_erl() {
 
 #[test]
 fn merge_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:1558-1848, OTP-29.1.1.
     let expected = erl(
         "A=maps:from_list([{K,K}||K<-lists:seq(1,80)]),B=maps:from_list([{K,-K}||K<-lists:seq(41,120)]),io:put_chars(binary:encode_hex(term_to_binary(maps:to_list(maps:merge(A,B))))),halt().",
@@ -169,6 +173,7 @@ fn merge_vs_erl() {
 
 #[test]
 fn from_list_dups_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:3187-3240, OTP-29.1.1.
     let expected = erl(
         "P=[{1,a},{2,b},{1,c},{3,d},{2,e}],io:put_chars(binary:encode_hex(term_to_binary({maps:from_list(P),maps:to_list(maps:from_list(P))}))),halt().",
@@ -203,6 +208,7 @@ fn from_list_dups_vs_erl() {
 
 #[test]
 fn term_to_binary_roundtrip_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:2424-2474, OTP-29.1.1.
     let expected = erl(
         "M=maps:from_list([{K,K*5}||K<-lists:seq(1,200)]),B=term_to_binary(M),R=binary_to_term(B),io:put_chars(binary:encode_hex(term_to_binary({B,term_to_binary(R),maps:to_list(R)}))),halt().",
@@ -237,6 +243,7 @@ fn term_to_binary_roundtrip_vs_erl() {
 
 #[test]
 fn remove_take_without_and_empty_map_sizes_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:1910-2030 (erts_maps_take) and
     // 2881-3184 (hashmap_delete), OTP-29.1.1; maps:without/2 folds maps:remove/2.
     let expected = erl(
@@ -303,6 +310,7 @@ fn remove_take_without_and_empty_map_sizes_vs_erl() {
 
 #[test]
 fn take_and_flatmap_next_vs_erl() {
+    arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:1943-2041 (erts_maps_take) and :3710-3735
     // (erts_internal_map_next_3, flatmap branch), OTP-29.1.1.
     let expected = erl(

@@ -18,6 +18,7 @@ fn erl_stdout(expr: &str) -> Option<String> {
 
 #[test]
 fn atom_hash_low_32_matches_make_hash2() {
+    arinsal_term::init_global_literals();
     let Some(text) = erl_stdout(
         "Names = [false, true, erlang, '', hello_world_atom,
                   list_to_atom(lists:duplicate(40, $x)),
@@ -58,6 +59,7 @@ fn atom_hash_low_32_matches_make_hash2() {
 
 #[test]
 fn latin1_round_trip_and_limits_match_erl() {
+    arinsal_term::init_global_literals();
     let Some(text) = erl_stdout(
         "A = list_to_atom([0, 127, 128, 255]),
          Reason = fun(B) -> element(1, element(2, catch binary_to_atom(B, utf8))) end,

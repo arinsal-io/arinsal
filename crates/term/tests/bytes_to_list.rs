@@ -4,6 +4,7 @@ use arinsal_term::{ProcessHeap, Term, TermBuilder, to_owned};
 
 #[test]
 fn bytes_to_list_matches_list_from_slice() {
+    arinsal_term::init_global_literals();
     for len in [0usize, 1, 2, 7, 255, 1024] {
         let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 256) as u8).collect();
         let mut heap = ProcessHeap::with_words(4096);

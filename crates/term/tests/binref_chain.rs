@@ -6,6 +6,7 @@ use arinsal_term::{ProcessHeap, Term, TermBuilder};
 
 #[test]
 fn live_off_heap_chain_longer_than_one_million_survives_heap_resize() {
+    arinsal_term::init_global_literals();
     const BINARIES: usize = 1_200_000;
     let mut heap = ProcessHeap::with_words(1024);
     let mut roots = [Term::NIL, Term::NIL];

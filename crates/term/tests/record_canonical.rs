@@ -47,6 +47,7 @@ fn register(
 
 #[test]
 fn records_reuse_the_registered_definition() {
+    arinsal_term::init_global_literals();
     let (module, name) = (atom("canon_mod"), atom("point"));
     let (x, y) = (atom("canon_x"), atom("canon_y"));
     let mut area = LiteralArea::new();

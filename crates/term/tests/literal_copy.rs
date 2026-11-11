@@ -38,6 +38,7 @@ fn cons(cell: Term) -> (Term, Term) {
 
 #[test]
 fn litopt_copy_keeps_literal_references() {
+    arinsal_term::init_global_literals();
     let mut area = LiteralArea::new();
     let mut source = VecHeap::new();
     let (literal, outer) = fixture(&mut area, &mut source);
@@ -63,6 +64,7 @@ fn litopt_copy_keeps_literal_references() {
 
 #[test]
 fn purge_area_literals_are_copied() {
+    arinsal_term::init_global_literals();
     let mut area = LiteralArea::new();
     let mut source = VecHeap::new();
     let (literal, outer) = fixture(&mut area, &mut source);
@@ -81,6 +83,7 @@ fn purge_area_literals_are_copied() {
 
 #[test]
 fn copy_shared_honours_copy_literals() {
+    arinsal_term::init_global_literals();
     let mut area = LiteralArea::new();
     let mut source = VecHeap::new();
     let (literal, outer) = fixture(&mut area, &mut source);
@@ -99,6 +102,7 @@ fn copy_shared_honours_copy_literals() {
 
 #[test]
 fn literal_membership_uses_reserved_range_after_drop() {
+    arinsal_term::init_global_literals();
     let mut area = LiteralArea::with_capacity_words(8);
     let literal = area.builder().tuple(&[small(1)]).unwrap();
     assert!(literal.is_literal());
@@ -111,6 +115,7 @@ fn literal_membership_uses_reserved_range_after_drop() {
 /// in one collection reuse earlier copies and must not be resized against a rebuilt set.
 #[test]
 fn shared_copy_cache_reuses_earlier_roots() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{ProcessHeap, SharedCopyCache, copy_term_preserving_sharing_with_cache};
     let mut source = VecHeap::new();
     let mut builder = TermBuilder::new(&mut source);
@@ -134,6 +139,7 @@ fn shared_copy_cache_reuses_earlier_roots() {
 
 #[test]
 fn indexed_ownership_matches_linear_scan() {
+    arinsal_term::init_global_literals();
     use arinsal_term::{FragmentAlloc, FragmentIndex, ProcessHeap};
     let mut heap = ProcessHeap::with_words(64);
     let mut index = FragmentIndex::default();
