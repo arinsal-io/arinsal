@@ -2606,6 +2606,216 @@ fn unfix_table(rt: &crate::process::Runtime, tid: Tid, caller: Term) {
     }
 }
 
+/// The state an `ets:info` call that took a counter snapshot traps with: the counters of the
+/// snapshot and the words of the table structure at that time (erts folds the structure into
+/// the memory counter, Arinsal computes it from the table layout).
+struct InfoSnapshot {
+    state: Arc<arinsal_ets::flxctr::SnapshotState>,
+    structure_words: usize,
+}
+
+impl InfoSnapshot {
+    fn counters(&self) -> arinsal_ets::CounterValues {
+        arinsal_ets::CounterValues {
+            size: self.state.result(arinsal_ets::NITEMS_COUNTER_ID),
+            memory_words: self.structure_words
+                + self.state.result(arinsal_ets::MEM_COUNTER_ID).max(0) as usize,
+        }
+    }
+}
+
+/// `erts_flxctr_is_snapshot_result` and `erts_flxctr_get_snapshot_result_after_trap`.
+fn snapshot_result_of(term: Term) -> Option<arinsal_ets::CounterValues> {
+    term.with_magic_payload::<InfoSnapshot, _>(InfoSnapshot::counters)
+}
+
+/// The process side of `erts_flxctr_snapshot`: records the operation to run after thread
+/// progress. The caller suspends the process and schedules it once the table lock is released.
+#[derive(Default)]
+struct RecordedLater(Option<Box<dyn FnOnce() + Send + 'static>>);
+
+impl arinsal_ets::flxctr::SnapshotHost for RecordedLater {
+    fn suspend_and_run_later(&mut self, op: Box<dyn FnOnce() + Send + 'static>) {
+        self.0 = Some(op);
+    }
+}
+
+/// `erts_suspend(p, ERTS_PROC_LOCK_MAIN, NULL)`, `ERTS_VBUMP_ALL_REDS` and
+/// `erts_schedule_thr_prgr_later_op` of erl_flxctr.c: the process stays suspended until thread
+/// progress, then `op` runs and the process is resumed.
+// Port of erts/emulator/beam/erl_flxctr.c (suspend_until_thr_prg, thr_prg_wake_up_and_count),
+// OTP-29.1.1.
+fn suspend_until_thr_prgr(
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
+    pid: Pid,
+    host: RecordedLater,
+) -> Result<(), VmError> {
+    let (Some(runtime), Some(ctx)) = (process.runtime, ctx) else {
+        return Err(needs_context());
+    };
+    crate::suspend::suspend_self(process);
+    process.set_force_yield(true);
+    let op = host.0;
+    ctx.thread_progress_later(move || {
+        if let Some(op) = op {
+            op();
+        }
+        crate::natives::code::resume_suspended(runtime, pid);
+    });
+    Ok(())
+}
+
+/// `erts_make_integer`.
+fn make_integer(process: &mut Process, value: i128) -> Result<Term, VmError> {
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .int_from_i128(value)
+        .map_err(|_| badarg())
+}
+
+/// `ets:info/1` and the `size` and `memory` items of `ets:info/2`: the table counters are read
+/// as one snapshot. A decentralized table swaps its counter array, suspends the caller until
+/// thread progress and traps with the snapshot (`ets_info_1`/`ets_info_2` of erl_db.c);
+/// `Ok(None)` leaves every other item to the generic path.
+// Port of erts/emulator/beam/erl_db.c (ets_info_1, ets_info_2) and erl_flxctr.c
+// (erts_flxctr_snapshot), OTP-29.1.1.
+fn info_counters(
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
+    caller_pid: Pid,
+    args: &[Term],
+) -> Result<Option<Term>, VmError> {
+    let rt = process.runtime.ok_or_else(badarg)?;
+    let am_memory = ETS_ATOMS.get("memory").copied();
+    let key = match args {
+        [snapshot, key] => {
+            if let Some(counters) = snapshot_result_of(*snapshot) {
+                let value = if key.as_atom() == am_memory {
+                    counters.memory_words as i128
+                } else {
+                    counters.size as i128
+                };
+                return make_integer(process, value).map(Some);
+            }
+            match info_item_name(*key) {
+                Some(name @ ("size" | "memory")) => Some(name),
+                _ => return Ok(None),
+            }
+        }
+        _ => None,
+    };
+    // `ets:info/1` after the trap gets `{Snapshot, Table}`.
+    let (table_arg, mut snapshot) = match args {
+        [table] => {
+            // SAFETY: the argument is in the caller's live process heap.
+            match unsafe { table.tuple_ref() } {
+                Some(pair) if pair.len() == 2 => {
+                    let state = snapshot_result_of(pair.get(0).unwrap());
+                    match state {
+                        Some(counters) => (pair.get(1).unwrap(), Some(counters)),
+                        None => (*table, None),
+                    }
+                }
+                _ => (*table, None),
+            }
+        }
+        [table, _] => (*table, None),
+        _ => return Ok(None),
+    };
+    let registry = RegistryAccess::Shared(rt.ets.read().unwrap());
+    let tid = match resolve(&registry, table_arg) {
+        Ok(tid) => tid,
+        Err(ResolveFail::Missing) => {
+            return Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED)));
+        }
+        Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
+    };
+    let table = table_guard(&registry, tid, true)?;
+    let schedulers = if key == Some("size") {
+        1
+    } else {
+        rt.scheduler()?.scheduler_count()
+    };
+    let mut trap_with = None;
+    if snapshot.is_none() {
+        let counters = table.counters();
+        if ctx.is_none() && counters.is_decentralized() {
+            // The direct call cannot suspend the process: the scheduler path takes the snapshot.
+            return Err(needs_context());
+        }
+        let mut host = RecordedLater::default();
+        match counters.snapshot(&mut host) {
+            arinsal_ets::flxctr::SnapshotResult::Done(values) => {
+                snapshot = Some(arinsal_ets::CounterValues {
+                    size: values[arinsal_ets::NITEMS_COUNTER_ID],
+                    memory_words: table.structure_memory_words_for_schedulers(schedulers)
+                        + values[arinsal_ets::MEM_COUNTER_ID].max(0) as usize,
+                });
+            }
+            arinsal_ets::flxctr::SnapshotResult::TryAgainAfterTrap => {
+                trap_with = Some((host, None));
+            }
+            arinsal_ets::flxctr::SnapshotResult::GetResultAfterTrap(state) => {
+                let structure_words = table.structure_memory_words_for_schedulers(schedulers);
+                trap_with = Some((
+                    host,
+                    Some(InfoSnapshot {
+                        state,
+                        structure_words,
+                    }),
+                ));
+            }
+        }
+    }
+    if let Some((host, state)) = trap_with {
+        // `db_unlock` before the trap.
+        drop(table);
+        drop(registry);
+        let state_term = match state {
+            Some(state) => Some(
+                TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                    .magic_ref(MagicRef::with_erts_payload_size(
+                        state,
+                        std::mem::size_of::<InfoSnapshot>(),
+                    ))
+                    .map_err(|_| badarg())?,
+            ),
+            None => None,
+        };
+        suspend_until_thr_prgr(process, ctx, caller_pid, host)?;
+        let trap_args = if args.len() == 2 {
+            vec![state_term.unwrap_or(args[0]), args[1]]
+        } else if let Some(state) = state_term {
+            let tuple = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                .tuple(&[state, table_arg])
+                .map_err(|_| badarg())?;
+            vec![tuple]
+        } else {
+            vec![table_arg]
+        };
+        let continuation = if args.len() == 2 {
+            "ets:info/2"
+        } else {
+            "ets:info/1"
+        };
+        return Err(VmError::TrapExport(crate::ExportTrap::new(
+            process,
+            continuation,
+            trap_args,
+        )));
+    }
+    let counters = snapshot.expect("the snapshot is complete");
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let node = Term::atom(arinsal_term::atoms::NONAME);
+    let value = match key {
+        Some(key) => {
+            table.info_item_with_counters(key, node, &mut heap, schedulers, Some(counters))
+        }
+        None => table.info_list_with_counters(node, &mut heap, schedulers, Some(counters)),
+    };
+    value.map(Some).map_err(err)
+}
+
 /// Run one ETS BIF. `ctx` is only present on the scheduler path: erts sends messages
 /// (give_away, request_all) and traps (delete) through the process, so those need it; every
 /// other table operation runs from the caller pid alone, as erts runs them from BeamAsm.
@@ -2684,6 +2894,11 @@ fn call_inner(
             1 | 3
         )
     ) && let Some(value) = hash_select(process, ctx.as_deref_mut(), caller_pid, function, args)?
+    {
+        return Ok(value);
+    }
+    if function == EtsBif::Info
+        && let Some(value) = info_counters(process, ctx.as_deref_mut(), caller_pid, args)?
     {
         return Ok(value);
     }
