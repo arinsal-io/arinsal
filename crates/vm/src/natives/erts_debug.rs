@@ -2447,7 +2447,24 @@ fn internal_state_get(
             )
         }
         Some("mmap") => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
-        Some("stack_check") => Ok(Term::small(1_026_385).unwrap()),
+        // Port of erts/emulator/beam/erl_bif_info.c (erts_debug_get_internal_state_1,
+        // stack_check), OTP-29.1.1.
+        Some("stack_check") => {
+            use arinsal_alloc::ethr::stack_marker;
+            let c = stack_marker();
+            let size = if erts_is_above_stack_limit(c) {
+                erts_check_stack_recursion_downwards(c, c)
+            } else {
+                erts_check_stack_recursion_upwards(c, c)
+            };
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                .int_from_i128(size as i128)
+                .map_err(|_| {
+                    VmError::Trap(exceptions::Trap::error(Term::atom(
+                        arinsal_term::atoms::SYSTEM_LIMIT,
+                    )))
+                })
+        }
         Some("unique_monotonic_integer_state") => {
             TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(UNIQUE_MONOTONIC_INTEGER_STATE.load(Ordering::Relaxed) as i128)
@@ -3584,6 +3601,46 @@ pub(crate) fn call(
 #[allow(dead_code)]
 fn _keep_helpers_visible() {
     let _ = arg_name as fn(Term) -> Option<String>;
+}
+
+// Port of erts/emulator/beam/beam_debug.c (erts_check_stack_recursion_downwards), OTP-29.1.1:
+// body recursive on purpose, to measure how deep the native stack reaches before the limit.
+#[inline(never)]
+fn erts_check_stack_recursion_downwards(start_c: usize, prev_c: usize) -> usize {
+    use arinsal_alloc::ethr;
+    let limit = ethr::erts_get_stacklimit();
+    let c = ethr::stack_marker();
+    if prev_c == c {
+        return 0;
+    }
+    if ethr::erts_check_below_limit(c, limit.wrapping_add(1024)) {
+        return start_c - c;
+    }
+    let res = erts_check_stack_recursion_downwards(start_c, c);
+    std::hint::black_box(c);
+    res
+}
+
+// Port of erts/emulator/beam/beam_debug.c (erts_check_stack_recursion_upwards), OTP-29.1.1.
+#[inline(never)]
+fn erts_check_stack_recursion_upwards(start_c: usize, prev_c: usize) -> usize {
+    use arinsal_alloc::ethr;
+    let limit = ethr::erts_get_stacklimit();
+    let c = ethr::stack_marker();
+    if prev_c == c {
+        return 0;
+    }
+    if ethr::erts_check_above_limit(c, limit.wrapping_sub(1024)) {
+        return c - start_c;
+    }
+    let res = erts_check_stack_recursion_upwards(start_c, c);
+    std::hint::black_box(c);
+    res
+}
+
+// Port of erts/emulator/beam/beam_debug.c (erts_is_above_stack_limit), OTP-29.1.1.
+fn erts_is_above_stack_limit(ptr: usize) -> bool {
+    ptr > arinsal_alloc::ethr::erts_get_stacklimit()
 }
 
 #[cfg(test)]

@@ -168,6 +168,7 @@ fn is_implemented(call: &Call, _kind: &str) -> bool {
     let arity = call.arity;
     static_nif(module, name, arity)
         || arinsal_bifs::lookup(module, name, arity).is_some()
+        || arinsal_vm::bif_table_has_function(module, name, arity)
         || arinsal_vm::implemented_natives().iter().any(
             |&(item_module, item_function, item_arity)| {
                 item_module == module && item_function == name && item_arity == arity

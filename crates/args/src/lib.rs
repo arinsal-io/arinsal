@@ -319,6 +319,8 @@ pub struct SchedulerOptions {
     pub port_parallelism: Option<bool>,
     /// `+sbt` scheduler bind type.
     pub bind_type: Option<String>,
+    /// `+sss`, `+sssdcpu`, and `+sssdio` suggested stack sizes in kilo words.
+    pub stack_sizes: [Option<usize>; 3],
 }
 
 static ACTIVE_EMULATOR_FLAGS: OnceLock<Mutex<EmulatorFlags>> = OnceLock::new();
@@ -1288,6 +1290,29 @@ fn parse_emulator_flag(
             };
             out.scheduler.busy_wait[index] = Some(v);
         }
+        // Port of erts/emulator/beam/erl_init.c:2136-2187 (+sssdcpu, +sssdio, +sss),
+        // OTP-29.1.1: atoi of the value, bounded by ERTS_SCHED_THREAD_MIN_STACK_SIZE (20) and
+        // ERTS_SCHED_THREAD_MAX_STACK_SIZE (8192) kilo words.
+        "+sss" | "+sssdcpu" | "+sssdio" => {
+            let v = value(true, &mut consumed)?.unwrap();
+            let size = atoi(&v);
+            if !(20..=8192).contains(&size) {
+                let scheduler = match name {
+                    "+sss" => "scheduler",
+                    "+sssdcpu" => "dirty CPU scheduler",
+                    _ => "dirty IO scheduler",
+                };
+                return Err(scheduler_diagnostic(format!(
+                    "bad stack size for {scheduler} threads {v}"
+                )));
+            }
+            let index = match name {
+                "+sss" => 0,
+                "+sssdcpu" => 1,
+                _ => 2,
+            };
+            out.scheduler.stack_sizes[index] = Some(size as usize);
+        }
         // Port of erts/emulator/beam/erl_init.c:2095-2124 and erl_process.c:5814-5837,
         // OTP-29.1.1.
         "+swt" | "+swtdcpu" | "+swtdio" => {
@@ -1631,6 +1656,9 @@ fn parse_emulator_flag(
 
 fn split_emulator_flag(token: &str) -> (&str, Option<&str>) {
     const SCHEDULER_FLAGS: &[&str] = &[
+        "+sssdcpu",
+        "+sssdio",
+        "+sss",
         "+sbwtdcpu",
         "+sbwtdio",
         "+swtdcpu",
@@ -1716,9 +1744,6 @@ fn ignored_kind(name: &str) -> Option<bool> {
         "+swtdio",
         "+swt",
         "+sws",
-        "+sss",
-        "+sssdcpu",
-        "+sssdio",
         "+spp",
         "+sub",
         "+SP",
@@ -1997,6 +2022,23 @@ fn invalid(flag: &str, value: &str) -> ArgsError {
         flag: flag.into(),
         value: value.into(),
     }
+}
+
+/// C `atoi`: optional leading whitespace and sign, then decimal digits; 0 when none.
+fn atoi(text: &str) -> i64 {
+    let text = text.trim_start();
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let mut value: i64 = 0;
+    for byte in digits.bytes().take_while(u8::is_ascii_digit) {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
+    }
+    if negative { -value } else { value }
 }
 
 fn scheduler_diagnostic(message: String) -> ArgsError {

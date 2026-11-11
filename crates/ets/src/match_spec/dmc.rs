@@ -332,6 +332,8 @@ struct Dmc<'a> {
     guardexpr: &'a [Term],
     bodyexpr: &'a [Term],
     is_prefix: &'a [bool],
+    /// `erts_get_stacklimit()` of the compiling thread.
+    stack_limit: usize,
 }
 
 fn atom_is(term: Term, text: &str) -> bool {
@@ -983,6 +985,9 @@ impl Dmc<'_> {
 
     // Port of erts/emulator/beam/erl_db_util.c:5592 (dmc_expr), OTP-29.1.1.
     fn expr(&mut self, t: Term) -> Result<bool, EtsError> {
+        if super::stack_guard(self.stack_limit) {
+            return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
+        }
         match t.classify() {
             TermKind::List => self.list(t),
             TermKind::Map => self.map(t),
@@ -1293,6 +1298,7 @@ pub(super) fn db_match_compile(
         guardexpr: &guards,
         bodyexpr: &body,
         is_prefix,
+        stack_limit: arinsal_alloc::ethr::erts_get_stacklimit(),
     };
     for current_match in 0..dmc.num_match {
         dmc.current_match = current_match;

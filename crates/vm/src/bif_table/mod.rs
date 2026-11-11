@@ -58,6 +58,12 @@ pub(crate) fn install(bif_number: i32, f: usize) {
     }
 }
 
+/// Whether `bif_table[]` has a body of its own for this BIF, as `install_bifs` would set it.
+// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1.
+pub fn has_function(module: &str, function: &str, arity: u8) -> bool {
+    special(module, function, arity).is_some()
+}
+
 /// `Export.info` of the BIF being called: `c_p->current`, set by the call fragment.
 pub(crate) fn current_info(header: *mut ProcessHeader) -> u64 {
     raw::header_current(header)

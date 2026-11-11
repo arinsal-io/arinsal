@@ -399,6 +399,10 @@ impl Vm {
                     forced_wakeup_interval: scheduler_options.forced_wakeup_interval,
                     port_parallelism: scheduler_options.port_parallelism,
                     scheduler_bind_type: scheduler_options.bind_type,
+                    sched_thread_stack_sizes: std::array::from_fn(|index| {
+                        scheduler_options.stack_sizes[index]
+                            .unwrap_or(arinsal_sched::ERTS_DEFAULT_SCHED_STACK_SIZES[index])
+                    }),
                     max_processes: arinsal_term::ptab::process_table_layout().max(),
                 };
                 // `erts_no_schedulers` is what `system_info(schedulers)` reports; a run with fewer

@@ -201,6 +201,11 @@ fn scheduler_flags_are_parsed_into_runtime_options() {
             "true",
             "+sbt",
             "u",
+            "+sss",
+            "256",
+            "+sssdcpu64",
+            "+sssdio",
+            "80",
         ],
         &environment(),
     )
@@ -227,6 +232,24 @@ fn scheduler_flags_are_parsed_into_runtime_options() {
     assert_eq!(options.forced_wakeup_interval, Some(0));
     assert_eq!(options.port_parallelism, Some(true));
     assert_eq!(options.bind_type.as_deref(), Some("u"));
+    assert_eq!(options.stack_sizes, [Some(256), Some(64), Some(80)]);
+}
+
+#[test]
+fn scheduler_stack_size_outside_erts_bounds_is_rejected() {
+    // erl 29.1.1: "bad stack size for scheduler threads 10" followed by the usage text.
+    for (flag, value, scheduler) in [
+        ("+sss", "10", "scheduler"),
+        ("+sssdcpu", "9000", "dirty CPU scheduler"),
+        ("+sssdio", "x", "dirty IO scheduler"),
+    ] {
+        let error = parse(&["erl", flag, value], &environment()).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("bad stack size for {scheduler} threads {value}")),
+            "{text}"
+        );
+    }
 }
 
 #[test]

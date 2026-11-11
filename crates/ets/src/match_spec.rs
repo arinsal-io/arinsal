@@ -650,7 +650,13 @@ fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
         }
         for (expressions, is_guard) in [(&guards, true), (&body, false)] {
             for expression in expressions {
-                let valid = validate_expr(*expression, is_guard, &bound, trace, 0);
+                let valid = validate_expr(
+                    *expression,
+                    is_guard,
+                    &bound,
+                    trace,
+                    arinsal_alloc::ethr::erts_get_stacklimit(),
+                );
                 if valid == Err(EtsError::Term(arinsal_term::TermError::SystemLimit)) {
                     // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1.
                     messages.push("Excessive nesting; system limit reached.".into());
@@ -668,9 +674,28 @@ fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
     messages
 }
 
-/// Deepest expression nesting a match specification may use before compilation fails with
-/// `system_limit` (erl 29.1.1 on this machine gives up after roughly 1300 levels).
-const MAX_NESTING: usize = 1000;
+/// Stack kept free below the match-spec compiler's deepest frame.
+// Port of erts/emulator/beam/erl_db_util.c (ERTS_DB_STACK_MARGIN), OTP-29.1.1.
+const ERTS_DB_STACK_MARGIN: usize = std::mem::size_of::<usize>() * 1024;
+
+/// Whether the native stack of the current thread is within `ERTS_DB_STACK_MARGIN` of
+/// `limit` (`erts_get_stacklimit()`), at which point the compiler gives up with
+/// `system_limit`.
+// Port of erts/emulator/beam/erl_db_util.c (stack_guard_downwards, stack_guard_upwards and
+// the choice between them in db_initialize_util), OTP-29.1.1.
+#[inline(never)]
+pub(crate) fn stack_guard(limit: usize) -> bool {
+    use arinsal_alloc::ethr;
+    static DOWNWARDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let downwards =
+        *DOWNWARDS.get_or_init(|| ethr::erts_check_if_stack_grows_downwards(ethr::stack_marker()));
+    let c = ethr::stack_marker();
+    if downwards {
+        ethr::erts_check_below_limit(c, limit.wrapping_add(ERTS_DB_STACK_MARGIN))
+    } else {
+        ethr::erts_check_above_limit(c, limit.wrapping_sub(ERTS_DB_STACK_MARGIN))
+    }
+}
 
 // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (guard_tab).
 fn validate_expr(
@@ -678,15 +703,12 @@ fn validate_expr(
     guard: bool,
     bound: &HashSet<usize>,
     trace: bool,
-    depth: usize,
+    stack_limit: usize,
 ) -> Result<(), EtsError> {
     // Port of erts/emulator/beam/erl_db_util.c (dmc_expr stack_guard), OTP-29.1.1.
-    // erts bounds the compiler recursion by the remaining C stack; a fixed nesting bound
-    // keeps the same system_limit outcome without reading the native stack.
-    if depth > MAX_NESTING {
+    if stack_guard(stack_limit) {
         return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
     }
-    let depth = depth + 1;
     if let Some(index) = variable(term) {
         return if bound.contains(&index) {
             Ok(())
@@ -700,10 +722,10 @@ fn validate_expr(
         let mut rest = term;
         while rest.classify() == TermKind::List {
             let (head, tail) = cons(rest).ok_or(EtsError::BadArg)?;
-            validate_expr(head, guard, bound, trace, depth)?;
+            validate_expr(head, guard, bound, trace, stack_limit)?;
             rest = tail;
         }
-        return validate_expr(rest, guard, bound, trace, depth);
+        return validate_expr(rest, guard, bound, trace, stack_limit);
     }
     if term.classify() == TermKind::Map {
         // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_map).
@@ -714,9 +736,9 @@ fn validate_expr(
         let mut heap = VecHeap::new();
         for (key, value) in pairs {
             let key = from_owned(key, &mut heap)?;
-            validate_expr(key, guard, bound, trace, depth)?;
+            validate_expr(key, guard, bound, trace, stack_limit)?;
             let value = from_owned(value, &mut heap)?;
-            validate_expr(value, guard, bound, trace, depth)?;
+            validate_expr(value, guard, bound, trace, stack_limit)?;
         }
         return Ok(());
     }
@@ -729,7 +751,7 @@ fn validate_expr(
     }
     if elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
         // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_tuple).
-        return validate_construct(elements[0], bound, trace, depth);
+        return validate_construct(elements[0], bound, trace, stack_limit);
     }
     let Some(name) = atom_name(elements[0]) else {
         return Err(EtsError::BadArg);
@@ -767,7 +789,7 @@ fn validate_expr(
             arity == 0
         }
         "current_stacktrace" if trace && !guard => {
-            arity == 0 || (arity == 1 && elements[1].as_small().is_some_and(|depth| depth >= 0))
+            arity == 0 || (arity == 1 && elements[1].as_small().is_some_and(|n| n >= 0))
         }
         "enable_trace" | "disable_trace" if trace && !guard => arity == 1 || arity == 2,
         "trace" if trace && !guard => arity == 2 || arity == 3,
@@ -777,7 +799,7 @@ fn validate_expr(
         return Err(EtsError::BadArg);
     }
     for &argument in &elements[1..] {
-        validate_expr(argument, guard, bound, trace, depth)?;
+        validate_expr(argument, guard, bound, trace, stack_limit)?;
     }
     Ok(())
 }
@@ -787,19 +809,19 @@ fn validate_construct(
     term: Term,
     bound: &HashSet<usize>,
     trace: bool,
-    depth: usize,
+    stack_limit: usize,
 ) -> Result<(), EtsError> {
-    if depth > MAX_NESTING {
+    if stack_guard(stack_limit) {
         return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
     }
     if term.classify() == TermKind::Tuple {
         // Port of erts/emulator/beam/erl_db_util.c (dmc_tuple), OTP-29.1.1: each
         // element of a constructed tuple is an expression of its own.
         for element in tuple(term)? {
-            validate_expr(element, false, bound, trace, depth + 1)?;
+            validate_expr(element, false, bound, trace, stack_limit)?;
         }
     } else {
-        validate_expr(term, false, bound, trace, depth)?;
+        validate_expr(term, false, bound, trace, stack_limit)?;
     }
     Ok(())
 }
@@ -931,6 +953,9 @@ impl MatchProgram {
     // Port of erts/emulator/beam/erl_db_util.c (db_match_set_compile), OTP-29.1.1.
     fn compile_in(mut heap: VecHeap, specification: Term, cflags: u32) -> Result<Self, EtsError> {
         let trace = cflags & dmc::DCOMP_TRACE != 0;
+        // Port of erts/emulator/beam/erl_db_util.c (db_match_compile:
+        // context.stack_limit = erts_get_stacklimit()), OTP-29.1.1.
+        let stack_limit = arinsal_alloc::ethr::erts_get_stacklimit();
         let mut clauses = Vec::new();
         let mut matches = Vec::new();
         let mut guard_exprs = Vec::new();
@@ -949,10 +974,10 @@ impl MatchProgram {
             let mut bound = HashSet::new();
             head_variables(triple[0], &mut bound)?;
             for &guard in &guards {
-                validate_expr(guard, true, &bound, trace, 0)?;
+                validate_expr(guard, true, &bound, trace, stack_limit)?;
             }
             for &expr in &body {
-                validate_expr(expr, false, &bound, trace, 0)?;
+                validate_expr(expr, false, &bound, trace, stack_limit)?;
             }
             // When tracing, a list head is converted to a tuple and matched against the
             // argument array; a '_' tail makes it a prefix match.

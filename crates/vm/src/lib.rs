@@ -56,6 +56,7 @@ mod native_helpers;
 mod native_hooks;
 mod native_records;
 mod natives;
+pub use bif_table::has_function as bif_table_has_function;
 pub use calls::call_bif;
 pub use native_bridge::install_crash_dump;
 pub use native_hooks::{

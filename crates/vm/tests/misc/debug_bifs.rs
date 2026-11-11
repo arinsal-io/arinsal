@@ -83,13 +83,18 @@ internal_state_gets() ->
               erts_debug:get_internal_state(unique_monotonic_integer_state),
               erts_debug:get_internal_state(min_unique_monotonic_integer),
               erts_debug:get_internal_state(min_unique_integer),
-              erts_debug:get_internal_state(stack_check),
+              stack_check_in_scheduler_stack(erts_debug:get_internal_state(stack_check)),
               erts_debug:get_internal_state({check_time_config, true, multi_time_warp}),
               erts_debug:get_internal_state(max_atom_out_cache_index),
               erts_debug:get_internal_state(scheduler_dump),
               erts_debug:get_internal_state(lc_graph),
               erts_debug:get_internal_state('flxctr_memory_usage')},
     Result.
+
+%% The free native stack depends on the caller's depth; it stays inside the default 128 kilo
+%% word scheduler stack.
+stack_check_in_scheduler_stack(Size) ->
+    is_integer(Size) andalso Size > 0 andalso Size =< 128 * 1024 * 8.
 
 internal_state_get_tuples() ->
     erts_debug:set_internal_state(available_internal_state, true),
