@@ -1361,7 +1361,6 @@ fn native_exit(
         process.heap.abi.exc.freason = 0;
         let trace = crate::native_hooks::from_raw(native_ftrace);
         return Err(VmError::Trap(exceptions::Trap {
-            export: None,
             class,
             reason: crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
             trace: Some(trace),

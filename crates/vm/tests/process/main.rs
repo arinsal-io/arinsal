@@ -16,6 +16,7 @@ mod group_leader_priority;
 mod initial_call;
 mod link_exit_race;
 mod link_state_differential;
+mod monitor_bif_differential;
 mod monitor_link_race_differential;
 mod proc_bifs;
 mod proc_class_c;

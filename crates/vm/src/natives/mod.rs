@@ -5,6 +5,7 @@
 //! returns `None` for calls it does not implement. Adding a family means adding
 //! its module below and one line to [`FAMILIES`].
 
+pub(crate) mod bif;
 pub(crate) mod env;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_process_dict;
@@ -402,7 +403,7 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "unregister" && arity == 1 {
         return Some(crate::signals::unregister_light);
     }
-    // erts `monitor_2`, `demonitor_1/2`, `unlink_1` and `exit_2` take `c_p` only for a local pid.
+    // erts `unlink_1` and `exit_2` take `c_p` only for a local pid.
     if module == "erts_internal" && function == "suspend_process" && arity == 2 {
         return Some(proc::suspend_process_light);
     }
@@ -441,12 +442,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     }
     if module == "erlang" && function == "spawn_opt" && arity == 4 {
         return Some(crate::signals::spawn_opt_light);
-    }
-    if module == "erlang" && function == "monitor" && (arity == 2 || arity == 3) {
-        return Some(crate::signals::monitor_light);
-    }
-    if module == "erlang" && function == "demonitor" && (arity == 1 || arity == 2) {
-        return Some(crate::signals::demonitor_light);
     }
     if module == "erlang" && function == "alias" && arity == 1 {
         return Some(crate::signals::alias_light);
@@ -713,10 +708,8 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
             ("link", 1) => return Some(NativeEntry::Direct(crate::dist::native_link)),
             ("unlink", 1) => return Some(NativeEntry::Direct(crate::dist::native_unlink)),
             ("exit", 2) => return Some(NativeEntry::Direct(crate::dist::native_exit2)),
-            ("monitor", 2 | 3) => return Some(NativeEntry::Direct(crate::dist::native_monitor)),
-            ("demonitor", 1 | 2) => {
-                return Some(NativeEntry::Direct(crate::dist::native_demonitor));
-            }
+            ("monitor", 2 | 3) => return Some(NativeEntry::Direct(bif::monitor_executor)),
+            ("demonitor", 1 | 2) => return Some(NativeEntry::Direct(bif::demonitor_executor)),
             ("is_process_alive", 1) => {
                 return Some(NativeEntry::Direct(crate::signals::native_is_process_alive));
             }

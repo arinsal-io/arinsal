@@ -9,8 +9,6 @@ use std::fmt;
 /// A BEAM exception before handler dispatch.
 #[derive(Debug)]
 pub struct Trap {
-    /// BIF export trap carried through the existing light-BIF error return channel.
-    pub(crate) export: Option<Box<crate::ExportTrap>>,
     pub(super) class: Class,
     pub(super) reason: Term,
     pub(super) trace: Option<Term>,
@@ -23,18 +21,6 @@ impl Trap {
     /// The trace of this exception is still to be saved from the raising BIF (`save_raw`).
     pub(super) fn is_raw_bif_failure(&self) -> bool {
         self.trace.is_none()
-    }
-
-    pub(crate) fn export(export: crate::ExportTrap) -> Self {
-        Self {
-            export: Some(Box::new(export)),
-            class: Class::Error,
-            reason: Term::NIL,
-            trace: None,
-            top: None,
-            raw_rethrow: false,
-            untrappable: false,
-        }
     }
 }
 
@@ -126,7 +112,6 @@ impl Trap {
     /// An `error`-class exception with `reason` and a stack trace built on dispatch.
     pub(super) fn error(reason: Term) -> Self {
         Self {
-            export: None,
             class: Class::Error,
             reason,
             trace: None,
@@ -137,7 +122,6 @@ impl Trap {
     }
     pub(super) fn exit(reason: Term) -> Self {
         Self {
-            export: None,
             class: Class::Exit,
             reason,
             trace: None,
@@ -150,7 +134,6 @@ impl Trap {
     /// An `exit/2` self-signal that erts handles before returning to BEAM code.
     pub(super) fn untrappable_exit(reason: Term) -> Self {
         Self {
-            export: None,
             class: Class::Exit,
             reason,
             trace: None,
@@ -163,7 +146,6 @@ impl Trap {
     /// An exit signal carrying `kill` cannot be caught by the receiving process.
     pub(super) fn killed() -> Self {
         Self {
-            export: None,
             class: Class::Exit,
             reason: Term::atom(arinsal_term::atoms::KILLED),
             trace: None,
@@ -182,7 +164,6 @@ pub(super) fn native_trap(class: u64, reason: u64) -> Result<Trap, VmError> {
     let class = stacktrace::class_from_freason(class)
         .ok_or_else(|| VmError::Unsupported("native exception class".into()))?;
     Ok(Trap {
-        export: None,
         class,
         reason,
         trace: None,
@@ -325,7 +306,6 @@ pub(crate) fn raise_from_ftrace(
         p.set_gc_enabled(pending.gc_was_enabled);
     }
     VmError::Trap(Trap {
-        export: None,
         class,
         reason,
         trace: Some(trace),
@@ -389,7 +369,6 @@ pub(super) fn bif_error_with_atoms(
                 None
             };
             return Ok(Trap {
-                export: None,
                 class,
                 reason,
                 trace: stacktrace,
@@ -415,7 +394,6 @@ pub(super) fn bif_error_with_atoms(
             }
         };
         Ok(Trap {
-            export: None,
             class: Class::Error,
             reason,
             trace: None,

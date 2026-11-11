@@ -2917,43 +2917,13 @@ pub(crate) fn native_signal(
     args: &[Term],
     function: &str,
 ) -> Result<Term, VmError> {
-    // `monitor(Type, Item [, Opts])` — Item is args[1]; other BIFs take the
-    // destination as args[0].
-    let (remote, target_idx) = if function == "demonitor" {
-        // An internal ref that this process did not use for a remote monitor is
-        // not in any node table. erts looks up only `ERTS_P_MONITORS(c_p)`.
-        let remote = crate::signals::ref_id(args[0])
-            .filter(|id| {
-                process
-                    .cold
-                    .as_ref()
-                    .is_some_and(|cold| cold.dist_monitors.contains(id))
-            })
-            .filter(|id| {
-                process.monitors.get(*id).is_some_and(|monitor| {
-                    !monitor.is_target() && monitor.info().dist_target().is_some()
-                })
-            })
-            .map(|_| String::new());
-        (remote, 0usize)
-    } else if function == "monitor" {
-        if args.len() < 2 || args[0] != Term::atom(arinsal_term::atoms::PROCESS) {
-            let handler =
-                crate::signals::handler("erlang", function, args.len() as u8).ok_or_else(badarg)?;
-            return handler(vm, process, ctx, crate::natives::NativeArgs::Slice(args))
-                .ok_or_else(badarg)?;
-        }
-        (remote_node(args[1])?, 1usize)
-    } else {
-        (remote_node(args[0])?, 0usize)
-    };
-    let Some(node) = remote else {
+    let Some(node) = remote_node(args[0])? else {
         let handler =
             crate::signals::handler("erlang", function, args.len() as u8).ok_or_else(badarg)?;
         return handler(vm, process, ctx, crate::natives::NativeArgs::Slice(args))
             .ok_or_else(badarg)?;
     };
-    let target = owned(args[target_idx])?;
+    let target = owned(args[0])?;
     match function {
         "link" => elink::link_external(process, ctx, &node, target),
         "unlink" => elink::unlink_external(process, ctx, &node, target),
@@ -2974,136 +2944,8 @@ pub(crate) fn native_signal(
             }
             Ok(Term::atom(arinsal_term::atoms::TRUE))
         }
-        "monitor" => {
-            // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
-            let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
-            // bif.c monitor: `{Name, Node}` on a node that is not alive is badarg.
-            if matches!(&target, OwnedTerm::Tuple(parts) if parts.len() == 2)
-                && !node_tables::is_alive()
-            {
-                return Err(badarg());
-            }
-            let id = arinsal_bifs::next_ref_id();
-            let reference = if alias_mode.is_some() {
-                crate::signals::pid_reference(process, id, ctx.pid())?
-            } else {
-                crate::signals::reference(process, id)?
-            };
-            if priority {
-                process.cold_mut().prio_monitors.insert(id);
-            }
-            // DOP_MONITOR_P ToProc is a pid or registered name atom (not {Name,Node}).
-            let wire_target = match &target {
-                OwnedTerm::Tuple(parts)
-                    if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) =>
-                {
-                    parts[0].clone()
-                }
-                _ => target.clone(),
-            };
-            let reference_owned = owned(reference)?;
-            let name = match &target {
-                OwnedTerm::Tuple(parts) if parts.len() == 2 => match &parts[0] {
-                    OwnedTerm::Atom(name) => Some(name.clone()),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let info = crate::signals::monitor_info_for(tag, name.as_deref())?;
-            let prepared = dsig_prepare(process, ctx, &node)?;
-            let dist = match &prepared {
-                DsigPrepare::Connected { mld, .. } => mld.clone(),
-                DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
-                    // bif.c monitor: erts_monitor_set_dead_dist.
-                    let sysname = global_atoms().intern(&node).map_err(|_| badarg())?.0;
-                    std::sync::Arc::new(crate::monitor_link::MonLnkDist::dead(sysname))
-                }
-            };
-            let runtime = process.runtime.ok_or_else(badarg)?;
-            // origin `other.item`: the external pid, or the node of a monitor by name.
-            let remote = if name.is_some() {
-                OwnedTerm::Atom(node.clone())
-            } else {
-                target.clone()
-            };
-            let origin = emon::create_origin_or_down(
-                runtime,
-                process.heap.alloc_ix(),
-                crate::proc_create::monitor_reference(id, alias_mode, priority),
-                ctx.pid(),
-                info,
-                crate::proc_create::DistTarget {
-                    target: remote,
-                    reference: reference_owned.clone(),
-                    dist,
-                },
-            )?;
-            process.monitors.insert(origin);
-            process.cold_mut().dist_monitors.insert(id);
-            if let DsigPrepare::Connected { connection_id, .. } = prepared {
-                queue_outgoing_on(
-                    process,
-                    ctx,
-                    &node,
-                    connection_id,
-                    control(
-                        19,
-                        vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
-                    ),
-                    None,
-                )?;
-            }
-            Ok(reference)
-        }
-        "demonitor" => {
-            let id = crate::signals::ref_id(args[0]).or_else(|| crate::signals::ref_id(args[1]));
-            let Some(id) = id else {
-                return Err(badarg());
-            };
-            if args.len() == 2 && !valid_demonitor_options(args[1]) {
-                return Err(badarg());
-            }
-            match crate::signals::demonitor_origin(process, id) {
-                crate::signals::OriginDemonitor::Alias => {
-                    Ok(Term::atom(arinsal_term::atoms::FALSE))
-                }
-                crate::signals::OriginDemonitor::Distributed(origin) => {
-                    process.cold_mut().dist_monitors.remove(&id);
-                    emon::demonitor_remote(process.runtime, ctx.pid(), origin);
-                    Ok(Term::atom(arinsal_term::atoms::TRUE))
-                }
-                _ => {
-                    process.cold_mut().dist_monitors.remove(&id);
-                    Ok(Term::atom(if args.len() == 1 || !demonitor_info(args[1]) {
-                        arinsal_term::atoms::TRUE
-                    } else {
-                        arinsal_term::atoms::FALSE
-                    }))
-                }
-            }
-        }
         _ => Err(badarg()),
     }
-}
-
-fn valid_demonitor_options(term: Term) -> bool {
-    let Ok(options) = owned(term) else {
-        return false;
-    };
-    match &options {
-        OwnedTerm::Nil => true,
-        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.iter().all(
-            |option| matches!(option, OwnedTerm::Atom(name) if name == "flush" || name == "info"),
-        ),
-        _ => false,
-    }
-}
-
-fn demonitor_info(term: Term) -> bool {
-    let Ok(options) = owned(term) else {
-        return false;
-    };
-    matches!(&options, OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil && elems.iter().any(|option| option == &OwnedTerm::Atom("info".into())))
 }
 
 // Port of erts/emulator/beam/dist.c:1454 (erts_dsig_send_link), OTP-29.1.1.
@@ -3133,60 +2975,95 @@ pub(crate) fn native_exit2(
 ) -> Result<Term, VmError> {
     native_signal(vm, p, c, a, "exit")
 }
-/// `erlang:monitor/2,3`: `bif_table[].f` of both arities and the executor's entry.
-///
-/// erts `monitor()` branches on the target term: an internal pid or an atom (a local name) is a
-/// local monitor; an external pid or `{Name, Node}` goes to the distribution
-/// (erts_dsig_send_monitor). The local branch classifies the target from the term alone.
-// Port of erts/emulator/beam/bif.c (monitor_2, monitor_3, monitor: `is_internal_pid`,
-// `is_atom`, `is_external_pid`, `is_tuple` arms) and dist.c:1528 (erts_dsig_send_monitor),
-// OTP-29.1.1.
-pub(crate) fn native_monitor(
-    vm: &mut Vm,
-    p: &mut Process,
-    c: &mut RunCtx<'_, Message>,
-    a: &[Term],
+/// The `remote_process` arm of `monitor/2,3` (bif.c `monitor`): an external pid or
+/// `{Name, Node}` of another node.
+// Port of erts/emulator/beam/bif.c (monitor: remote_process) and dist.c:1528
+// (erts_dsig_send_monitor), OTP-29.1.1.
+pub(crate) fn monitor_remote(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+    node: String,
 ) -> Result<Term, VmError> {
-    let local = a.len() < 2
-        || a[0] != Term::atom(arinsal_term::atoms::PROCESS)
-        || Pid::from_term(a[1]).is_some()
-        || a[1].as_atom().is_some();
-    if local {
-        return crate::signals::monitor_local(vm, p, c, a);
+    let target = owned(args[1])?;
+    // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
+    let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
+    // bif.c monitor: `{Name, Node}` on a node that is not alive is badarg.
+    if matches!(&target, OwnedTerm::Tuple(parts) if parts.len() == 2) && !node_tables::is_alive() {
+        return Err(badarg());
     }
-    native_signal(vm, p, c, a, "monitor")
+    let id = arinsal_bifs::next_ref_id();
+    let reference = if alias_mode.is_some() {
+        crate::signals::pid_reference(process, id, ctx.pid())?
+    } else {
+        crate::signals::reference(process, id)?
+    };
+    if priority {
+        process.cold_mut().prio_monitors.insert(id);
+    }
+    // DOP_MONITOR_P ToProc is a pid or registered name atom (not {Name,Node}).
+    let wire_target = match &target {
+        OwnedTerm::Tuple(parts) if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) => {
+            parts[0].clone()
+        }
+        _ => target.clone(),
+    };
+    let reference_owned = owned(reference)?;
+    let name = match &target {
+        OwnedTerm::Tuple(parts) if parts.len() == 2 => match &parts[0] {
+            OwnedTerm::Atom(name) => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let info = crate::signals::monitor_info_for(tag, name.as_deref())?;
+    let prepared = dsig_prepare(process, ctx, &node)?;
+    let dist = match &prepared {
+        DsigPrepare::Connected { mld, .. } => mld.clone(),
+        DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
+            // bif.c monitor: erts_monitor_set_dead_dist.
+            let sysname = global_atoms().intern(&node).map_err(|_| badarg())?.0;
+            std::sync::Arc::new(crate::monitor_link::MonLnkDist::dead(sysname))
+        }
+    };
+    let runtime = process.runtime.ok_or_else(badarg)?;
+    // origin `other.item`: the external pid, or the node of a monitor by name.
+    let remote = if name.is_some() {
+        OwnedTerm::Atom(node.clone())
+    } else {
+        target.clone()
+    };
+    let origin = emon::create_origin_or_down(
+        runtime,
+        process.heap.alloc_ix(),
+        crate::proc_create::monitor_reference(id, alias_mode, priority),
+        ctx.pid(),
+        info,
+        crate::proc_create::DistTarget {
+            target: remote,
+            reference: reference_owned.clone(),
+            dist,
+        },
+    )?;
+    process.monitors.insert(origin);
+    process.cold_mut().dist_monitors.insert(id);
+    if let DsigPrepare::Connected { connection_id, .. } = prepared {
+        queue_outgoing_on(
+            process,
+            ctx,
+            &node,
+            connection_id,
+            control(
+                19,
+                vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
+            ),
+            None,
+        )?;
+    }
+    Ok(reference)
 }
 
-/// `erlang:demonitor/1,2`: `bif_table[].f` of both arities and the executor's entry.
-///
-/// erts looks the reference up in `ERTS_P_MONITORS(c_p)` and branches on the monitor type; a
-/// distributed origin goes to the distribution (erts_dsig_send_demonitor).
-// Port of erts/emulator/beam/bif.c (demonitor_1, demonitor_2, demonitor:
-// ERTS_MON_TYPE_DIST_PROC) and dist.c:1554 (erts_dsig_send_demonitor), OTP-29.1.1.
-pub(crate) fn native_demonitor(
-    vm: &mut Vm,
-    p: &mut Process,
-    c: &mut RunCtx<'_, Message>,
-    a: &[Term],
-) -> Result<Term, VmError> {
-    let distributed = a
-        .first()
-        .and_then(|r| crate::signals::ref_id(*r))
-        .is_some_and(|id| {
-            p.cold
-                .as_ref()
-                .is_some_and(|cold| cold.dist_monitors.contains(&id))
-                && p.monitors.get(id).is_some_and(|monitor| {
-                    !monitor.is_target() && monitor.info().dist_target().is_some()
-                })
-        });
-    if distributed {
-        return native_signal(vm, p, c, a, "demonitor");
-    }
-    crate::signals::demonitor_local(vm, p, c, a)
-}
-
-fn remote_node(term: Term) -> Result<Option<String>, VmError> {
+pub(crate) fn remote_node(term: Term) -> Result<Option<String>, VmError> {
     let value = owned(term)?;
     let node = match &value {
         OwnedTerm::Pid { node, .. } | OwnedTerm::Ref { node, .. } => node.clone(),
