@@ -328,6 +328,21 @@ impl ThrProgress {
     fn has_reached(&self, val: u64) -> bool {
         has_reached_this(self.current.load(Ordering::Acquire), val)
     }
+
+    /// Current thread progress value for intrusive retired-block lists.
+    pub(crate) fn current_value(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    /// Progress point two steps beyond the current value, used by erts later operations.
+    pub(crate) fn later_value(&self) -> u64 {
+        current_to_later(self.current_value())
+    }
+
+    /// Whether thread progress has reached a value captured by a retired block.
+    pub(crate) fn reached(&self, val: u64) -> bool {
+        has_reached_this(self.current_value(), val)
+    }
 }
 
 // Port of erl_thr_progress.c:1308 (block_thread), OTP-29.1.1: the managed `prepare_wait`

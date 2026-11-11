@@ -3486,13 +3486,12 @@ impl<T: Task> Inner<T> {
     /// source run queue when check_immigration_need says so.
     fn immigrate(&self, local: &mut Local<T>) {
         let id = local.worker_id;
-        let paths = self.balance.migration_paths();
-        let mp = &paths[id];
+        let flags = self.balance.path_flags(id);
         for prio in 0..balance::PRIO_LEVELS {
-            if mp.flags & balance::flg_immigrate(prio) == 0 {
+            if flags & balance::flg_immigrate(prio) == 0 {
                 continue;
             }
-            let Some(from) = self.balance.check_immigration_need(id, mp, prio) else {
+            let Some(from) = self.balance.check_immigration_need(id, prio) else {
                 continue;
             };
             if from == id || from >= self.run_queues.len() {
@@ -7074,7 +7073,12 @@ impl<T: Task> Scheduler<T> {
             thr_progress::ThrProgress::new(Arc::clone(&parked), Arc::clone(&sleepers))
         });
         thr_progress::install_sspa_progress(Arc::clone(&progress));
-        let balance = Arc::new(balance::Balance::new(workers, workers, config.compact_load));
+        let balance = Arc::new(balance::Balance::new(
+            workers,
+            workers,
+            config.compact_load,
+            Arc::clone(&progress),
+        ));
         let now = clock.now_ms();
         let timer_commands: Vec<_> = (0..workers)
             .map(|_| Arc::new(thr_queue::ThrQueue::new()))
