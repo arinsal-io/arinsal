@@ -12,6 +12,7 @@ mod hamt_yield;
 mod hash;
 mod heap;
 mod identity;
+mod index_table;
 mod internal_hash;
 mod literal;
 mod literal_decode;
