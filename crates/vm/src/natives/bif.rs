@@ -21,7 +21,7 @@ use arinsal_term::{Term, atoms};
 /// data through the process.
 type Sched<'a, 'c> = Option<(&'a mut Vm, &'a mut RunCtx<'c, Message>)>;
 
-fn badarg() -> VmError {
+pub(crate) fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(Term::atom(atoms::BADARG)))
 }
 
@@ -822,7 +822,7 @@ fn send_options(list: Term) -> Option<SendOptions> {
 /// `erts_proc_sched_data(c_p)` for a BIF arm that needs it. The call site a suspending BIF
 /// names (`c_p->i` at the call) is recorded first.
 // Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data), OTP-29.1.1.
-fn with_sched<R>(
+pub(crate) fn with_sched<R>(
     process: &mut Process,
     f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> R,
 ) -> Result<R, VmError> {
@@ -833,4 +833,447 @@ fn with_sched<R>(
         .ok_or_else(|| VmError::Unsupported("BIF: no scheduler data".into()));
     process.native_call_pc = 0;
     result
+}
+
+/// `link/1`.
+// Port of erts/emulator/beam/bif.c (link_1), OTP-29.1.1.
+pub(crate) extern "C" fn link_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let other = process.x[0];
+    let result = link_opt(process, other, Term::NIL, 1);
+    bif_ret(c_p, i, result)
+}
+
+/// `link/2`.
+// Port of erts/emulator/beam/bif.c (link_2), OTP-29.1.1.
+pub(crate) extern "C" fn link_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (other, opts) = (process.x[0], process.x[1]);
+    let result = link_opt(process, other, opts, 2);
+    bif_ret(c_p, i, result)
+}
+
+/// `erts_link_opts`: whether `priority` is in the proper option list, `None` for a bad list.
+// Port of erts/emulator/beam/bif.c (erts_link_opts), OTP-29.1.1.
+fn erts_link_opts(opts: Term) -> Option<bool> {
+    let mut priority = false;
+    let mut bad = false;
+    crate::signals::each_list_item(opts, |opt| {
+        if opt == Term::atom(atoms::PRIORITY) {
+            priority = true;
+        } else {
+            bad = true;
+        }
+    })?;
+    (!bad).then_some(priority)
+}
+
+/// The id kinds `link_opt`, `unlink_1` and `send_exit_signal_bif` tell apart after the internal
+/// pid and port arms.
+enum External {
+    /// `is_external_pid` (or ref) of another node: the distribution.
+    Remote(String),
+    /// An id of an old incarnation of this node (`dep == erts_this_dist_entry`).
+    ThisNode,
+    /// Not an id of this kind.
+    No,
+}
+
+/// `is_external_pid(id)` (`ref` too when `refs`), or `is_external_port(id)` when `port`, with
+/// its dist entry.
+fn external(id: Term, refs: bool, port: bool) -> External {
+    if id.is_immed() {
+        return External::No;
+    }
+    let owned = arinsal_term::to_owned(id);
+    let node = match &owned {
+        Ok(arinsal_etf::OwnedTerm::Pid { node, .. }) => node.clone(),
+        Ok(arinsal_etf::OwnedTerm::Ref { node, .. }) if refs => node.clone(),
+        Ok(arinsal_etf::OwnedTerm::Port { node, .. }) if port => node.clone(),
+        _ => return External::No,
+    };
+    if node == crate::node_tables::this_node().0 || node == "nonode@nohost" {
+        External::ThisNode
+    } else {
+        External::Remote(node)
+    }
+}
+
+/// `link_opt(c_p, other, opts)`.
+// Port of erts/emulator/beam/bif.c (link_opt), OTP-29.1.1.
+fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Result<Term, VmError> {
+    let me = process.self_pid.ok_or_else(badarg)?;
+    if crate::trace::active() {
+        trace_procs(process, me, "link", other);
+    }
+    let Some(priority) = erts_link_opts(opts) else {
+        return Err(badarg_ext(
+            atoms::ERLANG,
+            "link",
+            arity,
+            Term::atom(atoms::BADOPT),
+        ));
+    };
+    let ok = Ok(Term::atom(atoms::TRUE));
+    if let Some(pid) = Pid::from_term(other) {
+        if pid == me {
+            return ok;
+        }
+        let runtime = process.runtime.ok_or_else(badarg)?;
+        let scheduler = runtime.scheduler()?;
+        if !process.trap_exit && !scheduler.lookup_from(pid, process.on_managed) {
+            return link_no_proc(process);
+        }
+        // erts_link_internal_tree_lookup_create; a link that exists and is not unlinking sends
+        // nothing.
+        if !link_node_create(&mut process.links, pid, priority) {
+            return ok;
+        }
+        if crate::trace::active() {
+            send_link_trace_changes(process, me, pid);
+        }
+        let sent = scheduler.signal_ordered_from(
+            me,
+            pid,
+            arinsal_sched::Signal::Link { priority },
+            process.on_managed,
+        );
+        match sent {
+            Ok(()) => {}
+            // erts_proc_sig_send_link_exit(NULL, other, rlnk, am_noproc, NIL): the target is
+            // gone; a `noproc` link exit from it dissolves the link.
+            Err(arinsal_sched::Error::NoProcess) => {
+                let reason = Message::copy_from(Term::atom(atoms::NOPROC))?;
+                scheduler
+                    .signal(pid, me, arinsal_sched::Signal::ExitLinked(Box::new(reason)))
+                    .map_err(|_| badarg())?;
+            }
+            Err(arinsal_sched::Error::Capacity) => {
+                return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                    atoms::SYSTEM_LIMIT,
+                ))));
+            }
+            Err(_) => return Err(badarg()),
+        }
+        if crate::trace::active() {
+            wake_for_procs_trace(process, pid);
+        }
+        return ok;
+    }
+    if let Some(id) = other.as_port() {
+        if !crate::port::is_live(process, id) || !crate::port::link(process, other, me, true)? {
+            if !process.trap_exit {
+                return link_no_proc(process);
+            }
+            // The port is gone: the `noproc` link exit arrives as an `'EXIT'` message.
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let exit = arinsal_term::TermBuilder::new(&mut heap)
+                .tuple(&[Term::atom(atoms::EXIT_2), other, Term::atom(atoms::NOPROC)])
+                .map_err(|_| badarg())?;
+            if priority {
+                process.push_priority_message(exit)?;
+            } else {
+                process.inbox.push_back(exit);
+            }
+        }
+        return ok;
+    }
+    match external(other, false, false) {
+        External::Remote(node) => with_sched(process, |_vm, process, ctx| {
+            crate::dist::link_remote(process, ctx, &node, other)
+        })?,
+        // An old incarnation of this node: `noproc`, or its link exit when trapping exits.
+        External::ThisNode if !process.trap_exit => link_no_proc(process),
+        External::ThisNode => {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let exit = arinsal_term::TermBuilder::new(&mut heap)
+                .tuple(&[Term::atom(atoms::EXIT_2), other, Term::atom(atoms::NOPROC)])
+                .map_err(|_| badarg())?;
+            process.inbox.push_back(exit);
+            ok
+        }
+        External::No => Err(badarg()),
+    }
+}
+
+/// `res_no_proc`: `ERTS_BIF_PREP_ERROR(ret_val, c_p, EXC_NOPROC)`.
+// Port of erts/emulator/beam/bif.c (link_opt: res_no_proc), OTP-29.1.1.
+fn link_no_proc(process: &mut Process) -> Result<Term, VmError> {
+    let reason = Term::atom(atoms::NOPROC);
+    process.heap.abi.exc.fvalue = reason.tagged_word();
+    Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
+}
+
+/// `erts_link_internal_tree_lookup_create` with `link_modify_flags` and the `unlinking` reset
+/// of `link_opt`: whether a link signal must be sent.
+// Port of erts/emulator/beam/bif.c (link_opt: is_internal_pid), OTP-29.1.1.
+fn link_node_create(links: &mut crate::proc_create::LinkTree, pid: Pid, priority: bool) -> bool {
+    match links.get_mut(pid.data()) {
+        Some(mut node) => {
+            node.set_priority(priority);
+            let unlinking = node.view().unlinking();
+            node.set_unlinking(0);
+            unlinking != 0
+        }
+        None => {
+            links.insert(crate::proc_create::process_link(pid, priority));
+            true
+        }
+    }
+}
+
+/// `trace_proc(c_p, ..., am_link | am_unlink, other)` when the caller traces `procs`.
+// Port of erts/emulator/beam/bif.c (link_opt, unlink_1: ERTS_IS_P_TRACED_FL(F_TRACE_PROCS)),
+// OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn trace_procs(process: &mut Process, me: Pid, event: &str, other: Term) {
+    let _ = with_sched(process, |vm, process, ctx| {
+        crate::trace::emit(
+            Some(vm),
+            process,
+            ctx,
+            me,
+            crate::trace::PROCS,
+            event,
+            &[other],
+        );
+    });
+}
+
+/// The `set_on_link` / `set_on_first_link` trace flags the new link passes to the target.
+#[cold]
+#[inline(never)]
+fn send_link_trace_changes(process: &mut Process, me: Pid, pid: Pid) {
+    let Some(scheduler) = process.runtime.and_then(|runtime| runtime.scheduler().ok()) else {
+        return;
+    };
+    for change in crate::trace::linked(process, me) {
+        let signal = arinsal_sched::Signal::TraceChangeState(arinsal_sched::SharedPayload(
+            std::sync::Arc::new(change),
+        ));
+        if scheduler
+            .signal_ordered_from(me, pid, signal, process.on_managed)
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Link and unlink signals are applied lazily, but erts handles them on arrival, which is when a
+/// `procs` trace reports getting_linked/getting_unlinked: wake a receiver that is traced for it.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (getting_unlinked/getting_linked), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn wake_for_procs_trace(process: &Process, target: Pid) {
+    if crate::trace::flags(process, target) & crate::trace::PROCS != 0
+        && let Some(runtime) = process.runtime.as_ref()
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        let _ = scheduler.wake(target);
+    }
+}
+
+/// `unlink/1`.
+// Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
+pub(crate) extern "C" fn unlink_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let other = process.x[0];
+    let result = unlink(process, other);
+    bif_ret(c_p, i, result)
+}
+
+/// The arms of `unlink_1`.
+// Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
+fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
+    let me = process.self_pid.ok_or_else(badarg)?;
+    let ok = Ok(Term::atom(atoms::TRUE));
+    if crate::trace::active() && other.as_port().is_none() {
+        trace_procs(process, me, "unlink", other);
+    }
+    if let Some(pid) = Pid::from_term(other) {
+        // erts_link_tree_lookup; a link already unlinking sends nothing.
+        if !process
+            .links
+            .get(pid.data())
+            .is_some_and(|node| node.unlinking() == 0)
+        {
+            return ok;
+        }
+        let id = process.next_ref();
+        let scheduler = process.runtime.ok_or_else(badarg)?.scheduler()?;
+        let sent = scheduler
+            .signal_ordered_from(
+                me,
+                pid,
+                arinsal_sched::Signal::Unlink(id),
+                process.on_managed,
+            )
+            .is_ok();
+        // unlink_clear_prio, then `ilnk->unlinking = id`, or the link deleted when the target
+        // is gone (erts_proc_sig_send_unlink returned 0).
+        if sent {
+            if let Some(mut node) = process.links.get_mut(pid.data()) {
+                node.set_unlinking(id);
+                node.set_priority(false);
+            }
+        } else {
+            process.links.remove(pid.data());
+        }
+        if crate::trace::active() {
+            wake_for_procs_trace(process, pid);
+        }
+        return ok;
+    }
+    if let Some(id) = other.as_port() {
+        // The port traces `unlink` itself; a port that is gone has its link deleted.
+        if crate::port::is_live(process, id) {
+            crate::port::link(process, other, me, false)?;
+        } else {
+            process.links.remove(crate::proc_create::port_link_key(id));
+        }
+        return ok;
+    }
+    match external(other, false, false) {
+        External::Remote(node) => with_sched(process, |_vm, process, ctx| {
+            crate::dist::unlink_remote(process, ctx, &node, other)
+        })?,
+        External::ThisNode => ok,
+        // is_external_port of this node: the link is released; links to remote ports are not
+        // supported.
+        External::No => match external(other, false, true) {
+            External::ThisNode => ok,
+            _ => Err(badarg()),
+        },
+    }
+}
+
+/// `exit/2`.
+// Port of erts/emulator/beam/bif.c (exit_2), OTP-29.1.1.
+pub(crate) extern "C" fn exit_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, i, 2, true)
+}
+
+/// `exit/3`.
+// Port of erts/emulator/beam/bif.c (exit_3), OTP-29.1.1.
+pub(crate) extern "C" fn exit_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, i, 3, true)
+}
+
+/// `exit_signal/2`.
+// Port of erts/emulator/beam/bif.c (exit_signal_2), OTP-29.1.1.
+pub(crate) extern "C" fn exit_signal_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, i, 2, false)
+}
+
+/// `exit_signal/3`.
+// Port of erts/emulator/beam/bif.c (exit_signal_3), OTP-29.1.1.
+pub(crate) extern "C" fn exit_signal_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, i, 3, false)
+}
+
+#[inline(always)]
+fn exit_signal_bif(c_p: *mut ProcessHeader, i: u64, arity: usize, exit2: bool) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (id, reason) = (process.x[0], process.x[1]);
+    let opts = if arity == 3 { process.x[2] } else { Term::NIL };
+    let result = send_exit_signal_bif(process, id, reason, opts, exit2, arity);
+    bif_ret(c_p, i, result)
+}
+
+/// `send_exit_signal_bif(c_p, id, reason, opts, exit2)`.
+// Port of erts/emulator/beam/bif.c (send_exit_signal_bif), OTP-29.1.1.
+fn send_exit_signal_bif(
+    process: &mut Process,
+    id: Term,
+    reason: Term,
+    opts: Term,
+    exit2: bool,
+    arity: usize,
+) -> Result<Term, VmError> {
+    let Some(prio) = erts_link_opts(opts) else {
+        let function = if exit2 { "exit" } else { "exit_signal" };
+        return Err(badarg_ext(
+            atoms::ERLANG,
+            function,
+            arity,
+            Term::atom(atoms::BADOPT),
+        ));
+    };
+    let ok = Ok(Term::atom(atoms::TRUE));
+    let me = process.self_pid.ok_or_else(badarg)?;
+    // is_internal_pid(id) || is_internal_ref(id): an alias names its creator.
+    let target = if let Some(pid) = Pid::from_term(id) {
+        Some((pid, 0))
+    } else if let (Some(pid_data), Some(alias)) =
+        (id.local_pid_ref_pid_data(), crate::signals::ref_id(id))
+    {
+        Some((Pid::from_data(pid_data), alias))
+    } else if id.local_ref_numbers().is_some() {
+        // An internal reference that is not an alias of a process: no receiver.
+        return ok;
+    } else {
+        None
+    };
+    if let Some((pid, alias)) = target {
+        // "Preserve the very old and *very strange* behaviour of erlang:exit/2": the caller
+        // terminates itself before exit/2 returns, even for `normal`, unless it traps exits.
+        let exit2_suicide = exit2
+            && alias == 0
+            && pid == me
+            && (reason == Term::atom(atoms::KILL) || !process.trap_exit);
+        if exit2_suicide {
+            // The self-signal is handled at once (await_exit_trap); `kill` becomes `killed`.
+            if reason == Term::atom(atoms::KILL) {
+                return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+            }
+            process.heap.abi.exc.fvalue = reason.tagged_word();
+            return Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
+                reason,
+            )));
+        }
+        // erts_proc_sig_send_exit(&c_p->common, c_p->common.id, id, reason, NIL, 0, prio).
+        let mut message = Message::copy_from(reason)?;
+        if alias != 0 {
+            message = message.with_alias(alias);
+            if prio {
+                message = message.with_priority();
+            }
+        }
+        let scheduler = process.runtime.ok_or_else(badarg)?.scheduler()?;
+        let _ = scheduler.signal_ordered_from(
+            me,
+            pid,
+            arinsal_sched::Signal::Exit(Box::new(message)),
+            process.on_managed,
+        );
+        return ok;
+    }
+    if let Some(port_id) = id.as_port() {
+        // An exit signal to a port that is gone is dropped.
+        if crate::port::is_live(process, port_id) {
+            crate::port::exit_port(process, id, reason)?;
+        }
+        return ok;
+    }
+    match external(id, true, false) {
+        External::Remote(node) => with_sched(process, |_vm, process, ctx| {
+            crate::dist::exit2_remote(process, ctx, &node, id, reason)
+        })?,
+        External::ThisNode => ok,
+        // is_external_port: an old incarnation of this node is `true`, another node `badarg`.
+        External::No => match external(id, false, true) {
+            External::ThisNode => ok,
+            _ => Err(badarg()),
+        },
+    }
 }

@@ -2140,10 +2140,9 @@ fn invoke_dispatch_bif(
         && !((bif as usize)
             == (crate::natives::sys::garbage_collect_bif as *const () as usize)
             && process.gc_outer_queue_pending())
+        && let Some(raw) = call_process_bif(process, registers, export, bif, export_call)
     {
-        if let Some(raw) = call_process_bif(process, registers, export, bif, export_call) {
-            return Some(raw);
-        }
+        return Some(raw);
     }
     // The export trampoline has a separate interpreted-call sentinel. Only the light-BIF
     // fragment turns THE_NON_VALUE with TRAP into `context_switch_simplified`.

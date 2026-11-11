@@ -7,12 +7,14 @@
 
 pub(crate) mod bif;
 pub(crate) mod env;
+pub(crate) mod erl_bif_info;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erts_debug;
 pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
+pub(crate) mod register;
 pub(crate) mod sys;
 
 /// `table` contains `module:function/arity`.
@@ -364,9 +366,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "nodes" && arity == 0 {
         return Some(node::nodes0_bif);
     }
-    if module == "erlang" && function == "registered" && arity == 0 {
-        return Some(crate::signals::registered_light);
-    }
     if module == "erlang" && function == "list_to_pid" && arity == 1 {
         return Some(proc::list_to_pid_light);
     }
@@ -376,19 +375,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "fun_info" && arity == 2 {
         return Some(proc::fun_info_arity_light);
     }
-    // Port of erts/emulator/beam/bif.c:2342 (whereis_1), OTP-29.1.1.
-    // `ops.tab` already emits `call_light_bif` for every plain `bif`; this is the body.
-    if module == "erlang" && function == "whereis" && arity == 1 {
-        return Some(crate::signals::whereis_bif);
-    }
-    // erts `register_2` / `unregister_1` are plain BIFs that take `c_p` only (register.c).
-    if module == "erlang" && function == "register" && arity == 2 {
-        return Some(crate::signals::register_light);
-    }
-    if module == "erlang" && function == "unregister" && arity == 1 {
-        return Some(crate::signals::unregister_light);
-    }
-    // erts `unlink_1` and `exit_2` take `c_p` only for a local pid.
     if module == "erts_internal" && function == "suspend_process" && arity == 2 {
         return Some(proc::suspend_process_light);
     }
@@ -433,15 +419,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     }
     if module == "erlang" && function == "unalias" && arity == 1 {
         return Some(crate::signals::unalias_light);
-    }
-    if module == "erlang" && function == "link" && arity == 1 {
-        return Some(crate::signals::link_light);
-    }
-    if module == "erlang" && function == "unlink" && arity == 1 {
-        return Some(crate::signals::unlink_light);
-    }
-    if module == "erlang" && function == "exit" && arity == 2 {
-        return Some(crate::signals::exit2_light);
     }
     if module == "erlang" {
         match (function, arity) {
@@ -677,14 +654,8 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if module == "erlang" {
         match (function, arity) {
-            ("link", 1) => return Some(NativeEntry::Direct(crate::dist::native_link)),
-            ("unlink", 1) => return Some(NativeEntry::Direct(crate::dist::native_unlink)),
-            ("exit", 2) => return Some(NativeEntry::Direct(crate::dist::native_exit2)),
             ("monitor", 2 | 3) => return Some(NativeEntry::Direct(bif::monitor_executor)),
             ("demonitor", 1 | 2) => return Some(NativeEntry::Direct(bif::demonitor_executor)),
-            ("is_process_alive", 1) => {
-                return Some(NativeEntry::Direct(crate::signals::native_is_process_alive));
-            }
             _ => {}
         }
     }
@@ -794,15 +765,26 @@ mod tests {
         let (class, bits) = classify("erlang", "self", 0, false);
         assert_eq!(class, ImportClass::Native);
         assert_eq!(bits, 0);
-        for (function, arity) in [("!", 2), ("send", 2), ("send", 3)] {
+        for (function, arity) in [
+            ("!", 2),
+            ("send", 2),
+            ("send", 3),
+            ("is_process_alive", 1),
+            ("link", 1),
+            ("link", 2),
+            ("unlink", 1),
+            ("exit", 2),
+            ("exit", 3),
+            ("exit_signal", 2),
+            ("exit_signal", 3),
+            ("register", 2),
+            ("unregister", 1),
+            ("whereis", 1),
+            ("registered", 0),
+        ] {
             let (class, bits) = classify("erlang", function, arity, false);
             assert_eq!(class, ImportClass::Native, "erlang:{function}/{arity}");
             assert_eq!(bits, 0, "erlang:{function}/{arity} is its bif_table body");
-        }
-        for (function, arity) in [("is_process_alive", 1)] {
-            let (class, bits) = classify("erlang", function, arity, true);
-            assert_eq!(class, ImportClass::Native);
-            assert!(matches!(unpack_native(bits), Some(NativeEntry::Direct(_))));
         }
         // Plain BIFs with no I/O side effects stay on the pure path.
         for (function, arity) in [("++", 2), ("atom_to_list", 1), ("list_to_atom", 1)] {
@@ -844,7 +826,6 @@ mod tests {
             ("erlang", "monitor", 3),
             ("erlang", "demonitor", 1),
             ("erlang", "demonitor", 2),
-            ("erlang", "is_process_alive", 1),
         ];
         let entries = crate::signals::IMPLEMENTED
             .iter()

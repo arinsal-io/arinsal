@@ -1,9 +1,9 @@
 //! Process-aware BIFs. These use the running process and scheduler context.
 
 use crate::process::{Message, Runtime};
-use crate::{Process, ProcessHeapHandle, Vm, VmError};
+use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{Atom, HeapReservation, Term, TermBuilder, TermKind, global_atoms, to_owned};
+use arinsal_term::{Atom, Term, TermBuilder, TermKind, global_atoms, to_owned};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
@@ -35,183 +35,10 @@ fn system_limit() -> VmError {
     )))
 }
 
-fn rt_ref(process: &Process) -> Option<&Runtime> {
-    process.runtime
-}
-
 fn runtime(process: &Process) -> Result<&Runtime, VmError> {
     process
         .runtime
         .ok_or_else(|| VmError::Unsupported("process BIF requires a scheduler".into()))
-}
-
-/// `whereis/1` from native code. The light-BIF fragment calls this with `c_p`
-/// and the register arguments; it does not trap back into the executor.
-// Port of erts/emulator/beam/bif.c:2342 (whereis_1), OTP-29.1.1.
-pub(crate) fn whereis_bif(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    Some(match whereis_1(process, args[0]) {
-        Ok(term) => Ok(term),
-        Err(VmError::Trap(trap)) => Err(trap),
-        Err(_) => Err(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        ))),
-    })
-}
-
-/// `whereis_1` as the BIF `call_light_bif_shared` branches to.
-///
-/// Port of erts/emulator/beam/bif.c:2342 (`whereis_1`) and
-/// jit/arm/instr_bif.cpp:434-445 (`dynamic_runtime_call<3>`), OTP-29.1.1.
-/// Arguments are `(c_p, reg, I)`. The result is a raw term, or `THE_NON_VALUE`
-/// after `freason` is set.
-pub(crate) extern "C" fn whereis_light(
-    header: *mut arinsal_beamasm::ProcessHeader,
-    regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    if regs.is_null() {
-        return 0;
-    }
-    // reg[0] is BIF_ARG_1. The scheduler file is that array while native code runs.
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
-        return 0;
-    };
-    let Some(arg) = process.x.first().copied() else {
-        return 0;
-    };
-    // The error returns `THE_NON_VALUE` from a cold function. Building that
-    // `Result` here reserved a 128-byte frame on the success path.
-    let Some(name) = arg.as_atom() else {
-        return whereis_not_atom(process);
-    };
-    let Some(rt) = process.runtime else {
-        return whereis_no_runtime(process);
-    };
-    let term = match rt.reg.whereis(name) {
-        Some(crate::register::RegId::Proc(pid)) => pid.to_term().unwrap_or_else(undefined_term),
-        Some(crate::register::RegId::Port(id)) => Term::port(id).unwrap_or_else(undefined_term),
-        None => undefined_term(),
-    };
-    crate::native_hooks::raw(term)
-}
-
-#[cold]
-#[inline(never)]
-fn whereis_not_atom(process: &mut Process) -> u64 {
-    whereis_light_error(process, badarg("whereis/1"))
-}
-
-#[cold]
-#[inline(never)]
-fn whereis_no_runtime(process: &mut Process) -> u64 {
-    whereis_light_error(
-        process,
-        VmError::Unsupported("process BIF requires a scheduler".into()),
-    )
-}
-
-fn undefined_term() -> Term {
-    Term::atom(arinsal_term::atoms::UNDEFINED)
-}
-
-/// `BIF_ERROR` for `whereis/1`. Cold so the direct call stays the success path.
-#[cold]
-#[inline(never)]
-fn whereis_light_error(process: &mut Process, error: VmError) -> u64 {
-    let trap = match error {
-        VmError::Trap(trap) => trap,
-        _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
-    };
-    // `BIF_ERROR(BIF_P, BADARG)`: the light-BIF fragment stored `bif_mfa` in `c_p->current` and
-    // the argument is still x0, which is all `save_stacktrace` reads.
-    crate::native_helpers::bif_error(process, trap)
-}
-
-/// `is_process_alive_1` as the BIF `call_light_bif_shared` branches to.
-///
-/// Port of erts/emulator/beam/erl_bif_info.c:4060-4112 (`is_process_alive_1`) and
-/// jit/arm/instr_bif.cpp:434-445, OTP-29.1.1. The caller compared with
-/// `BIF_P->common.id` returns `true` with no signal poll. Anything else is
-/// `BIF_TRAP1` into the executor, which already runs the alive request.
-pub(crate) extern "C" fn is_process_alive_light(
-    header: *mut arinsal_beamasm::ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (_, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let arg = registers.x_reg_array[0]; // BIF_ARG_1
-    // erts: `if (BIF_ARG_1 == BIF_P->common.id) BIF_RET(am_true)`, before any table access.
-    if arg.is_pid() && arg.tagged_word() == process.heap.abi.self_pid {
-        return crate::native_hooks::raw(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    match alive_fast(process, arg) {
-        Some(result) => crate::native_hooks::raw(Term::atom(result)),
-        None => alive_trap(process, identity),
-    }
-}
-
-/// The part of `is_process_alive_1` that needs no signal: the target is gone or has an idle
-/// signal state, and the caller has no incoming signals to order against.
-// Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1), OTP-29.1.1. Where erts
-// traps out (`is_process_alive_trap`, `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`) this returns `None`
-// and the executor runs the alive request, which orders strictly more than erts does.
-#[inline(always)]
-fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
-    // erts: `if (is_internal_pid(BIF_ARG_1))`; other arguments take the generic path.
-    if !arg.is_pid() {
-        return None;
-    }
-    let scheduler = process.runtime.as_ref()?.scheduler_if_started()?;
-    // erts: `rp = erts_proc_lookup_raw(pid)`; missing is false, an idle state is true, any
-    // signal state traps to `is_process_alive_trap`.
-    let found = if process.on_managed {
-        scheduler.is_quiet_word(arg.tagged_word())
-    } else {
-        scheduler.is_quiet_from(Pid::from_term(arg)?, false)
-    };
-    let result = match found {
-        None => arinsal_term::atoms::FALSE,
-        Some(true) => arinsal_term::atoms::TRUE,
-        Some(false) => return None,
-    };
-    // erts: `if (ERTS_PROC_HAS_INCOMING_SIGNALS(BIF_P))` reads `c_p->state` after the result.
-    let own_quiet = match process.signal_probe() {
-        Some(probe) => probe.is_quiet(),
-        None => scheduler.is_quiet_from(process.self_pid?, process.on_managed) == Some(true),
-    };
-    own_quiet.then_some(result)
-}
-
-/// `BIF_TRAP1(is_process_alive_trap, ...)`: the fragment context-switches to
-/// `c_p->i`, and the scheduler runs the executor body.
-#[cold]
-#[inline(never)]
-fn alive_trap(process: &mut Process, identity: u64) -> u64 {
-    process.heap.abi.i = identity as *const _;
-    process.heap.abi.arity = 1;
-    process.heap.abi.exc.freason = 1 << 10;
-    0
-}
-
-// Port of erts/emulator/beam/bif.c:2342 (whereis_1) and
-// register.c:276 (erts_whereis_name_to_id), OTP-29.1.1:
-// atom check, read lock, one hash fetch, unlock, the pid or port id.
-fn whereis_1(process: &Process, name: Term) -> Result<Term, VmError> {
-    let name = name.as_atom().ok_or_else(|| badarg("whereis/1"))?;
-    let rt = runtime(process)?;
-    Ok(match rt.reg.whereis(name) {
-        Some(crate::register::RegId::Proc(pid)) => pid.to_term().unwrap_or_else(undefined_term),
-        Some(crate::register::RegId::Port(id)) => Term::port(id).unwrap_or_else(undefined_term),
-        None => undefined_term(),
-    })
 }
 
 #[cfg(test)]
@@ -1578,22 +1405,10 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "spawn", 3),
     ("erlang", "spawn_link", 3),
     ("erlang", "spawn_opt", 4),
-    ("erlang", "is_process_alive", 1),
-    ("erlang", "register", 2),
-    ("erlang", "unregister", 1),
-    ("erlang", "whereis", 1),
-    ("erlang", "registered", 0),
-    ("erlang", "link", 1),
-    ("erlang", "link", 2),
-    ("erlang", "unlink", 1),
     ("erlang", "monitor", 2),
     ("erlang", "monitor", 3),
     ("erlang", "demonitor", 1),
     ("erlang", "demonitor", 2),
-    ("erlang", "exit", 2),
-    ("erlang", "exit", 3),
-    ("erlang", "exit_signal", 2),
-    ("erlang", "exit_signal", 3),
     ("erlang", "trace_delivered", 1),
     ("erts_internal", "spawn_system_process", 3),
     ("erts_internal", "dirty_process_handle_signals", 1),
@@ -1614,32 +1429,11 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
         })
 }
 
-/// Direct load-time entry for `is_process_alive/1`.
-pub(crate) fn native_is_process_alive(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    is_process_alive(process, ctx, args[0])
-}
-
 #[derive(Clone, Copy)]
 enum SignalBif {
     Spawn3,
     SpawnLink3,
     SpawnOpt4,
-    Register2,
-    Unregister1,
-    Whereis1,
-    Registered0,
-    Link1,
-    Link2,
-    Unlink1,
-    Exit2,
-    Exit3,
-    ExitSignal2,
-    ExitSignal3,
     TraceDelivered1,
     SpawnSystemProcess3,
     DirtyProcessHandleSignals1,
@@ -1669,68 +1463,6 @@ macro_rules! resolved_signal_handler {
 resolved_signal_handler!(spawn3, Spawn3);
 resolved_signal_handler!(spawn_link3, SpawnLink3);
 resolved_signal_handler!(spawn_opt4, SpawnOpt4);
-/// `register(Name, Pid)` called directly from native code (erts `register_2` with `c_p`).
-/// Only the success path runs here: tracing, ports, and every error return `None` before the
-/// registry is touched, and the executor then runs the full BIF.
-// Port of erts/emulator/beam/register.c:184-240 (erts_register_name), OTP-29.1.1.
-pub(crate) fn register_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [name, id] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let name = name.as_atom()?;
-    if name == arinsal_term::atoms::UNDEFINED {
-        return None;
-    }
-    let pid = Pid::from_term(*id)?;
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let scheduler = rt_ref(process)?.scheduler().ok()?;
-    let mut table = rt_ref(process)?.reg.write();
-    if !scheduler.lookup(pid)
-        || scheduler.registered_atom_index(pid).is_some()
-        || table.contains(name)
-        || !rt_ref(process)?.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
-    {
-        return None;
-    }
-    table.insert_proc(name, pid);
-    scheduler.set_registered_atom_index(pid, name.0);
-    drop(table);
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-/// `unregister(Name)` called directly from native code: a registered process name, with
-/// tracing off. Everything else returns `None` before the registry changes.
-// Port of erts/emulator/beam/register.c:507-519 (erts_unregister_name), OTP-29.1.1.
-pub(crate) fn unregister_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [name] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let name = name.as_atom()?;
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let mut table = rt_ref(process)?.reg.write();
-    let Some(crate::register::RegId::Proc(pid)) = table.fetch(name) else {
-        return None;
-    };
-    let _ = table.erase(name);
-    if let Ok(scheduler) = rt_ref(process)?.scheduler() {
-        scheduler.clear_registered_atom_index(pid, name.0);
-    }
-    drop(table);
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
 /// `alias/1` called directly from native code. An unknown option takes the executor, which raises
 /// `badarg`.
 // Port of erts/emulator/beam/bif.c (alias_1), OTP-29.1.1.
@@ -1931,146 +1663,6 @@ fn finish_demonitor_origin(
     }
 }
 
-/// Port of erts/emulator/beam/bif.c:1231-1248 (unlink_1): after sending the unlink op, mark the node
-/// with its id; a refused send (the peer is gone) deletes the node.
-fn unlink_mark(process: &mut Process, pid: Pid, id: u64, sent: bool) {
-    let links = &mut process.links;
-    if sent {
-        if let Some(mut node) = links.get_mut(pid.data()) {
-            node.set_unlinking(id);
-            node.set_priority(false);
-        }
-    } else {
-        links.remove(pid.data());
-    }
-}
-
-/// `unlink(Pid)` called directly from native code (erts unlink_1 with `c_p`) with tracing off.
-// Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
-pub(crate) fn unlink_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [target] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let pid = Pid::from_term(*target)?;
-    let me = process.self_pid?;
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    if !process
-        .links
-        .get(pid.data())
-        .is_some_and(|node| node.unlinking() == 0)
-    {
-        return Some(Ok(Term::atom(arinsal_term::atoms::TRUE)));
-    }
-    let id = process.next_ref();
-    let sent = rt_ref(process)?
-        .scheduler()
-        .ok()?
-        .signal_ordered_from(
-            me,
-            pid,
-            arinsal_sched::Signal::Unlink(id),
-            process.on_managed,
-        )
-        .is_ok();
-    unlink_mark(process, pid, id, sent);
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-/// `link(Pid)` called directly from native code (erts link_2 with `c_p`) for a live local pid
-/// other than the caller. A dead target, a self link and tracing take the executor.
-// Port of erts/emulator/beam/bif.c:1286 (link_2) and bif.c:180 (link_opt), OTP-29.1.1.
-pub(crate) fn link_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [target] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let pid = Pid::from_term(*target)?;
-    let me = process.self_pid?;
-    if pid == me {
-        return None;
-    }
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    if !rt_ref(process)?
-        .scheduler()
-        .ok()?
-        .lookup_from(pid, process.on_managed)
-    {
-        return None;
-    }
-    // Port of erts/emulator/beam/bif.c:165-183 (link_opt): a link that exists and is not
-    // unlinking sends nothing.
-    if process
-        .links
-        .get(pid.data())
-        .is_some_and(|node| node.unlinking() == 0)
-    {
-        process.links.get_mut(pid.data())?.set_priority(false);
-        return Some(Ok(Term::atom(arinsal_term::atoms::TRUE)));
-    }
-    // A refused signal means the target is gone: leave the link state untouched and let the
-    // executor answer noproc.
-    rt_ref(process)?
-        .scheduler()
-        .ok()?
-        .signal_ordered_from(
-            me,
-            pid,
-            arinsal_sched::Signal::Link { priority: false },
-            process.on_managed,
-        )
-        .ok()?;
-    link_node_create(&mut process.links, pid, false);
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-/// `exit(Pid, Reason)` called directly from native code (erts bif.c:1721 send_exit_signal_bif)
-/// for a local pid other than the caller.
-// Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.
-pub(crate) fn exit2_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [target, reason] = args else {
-        return None;
-    };
-    let pid = Pid::from_term(*target)?;
-    let me = process.self_pid?;
-    if pid == me {
-        return None;
-    }
-    let message = Message::copy_from(*reason).ok()?;
-    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
-    let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered_from(
-        me,
-        pid,
-        arinsal_sched::Signal::Exit(Box::new(message)),
-        process.on_managed,
-    );
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-resolved_signal_handler!(register2, Register2);
-resolved_signal_handler!(unregister1, Unregister1);
-resolved_signal_handler!(whereis1, Whereis1);
-resolved_signal_handler!(registered0, Registered0);
-resolved_signal_handler!(link1, Link1);
-resolved_signal_handler!(link2, Link2);
-resolved_signal_handler!(unlink1, Unlink1);
-resolved_signal_handler!(exit2, Exit2);
-resolved_signal_handler!(exit3, Exit3);
-resolved_signal_handler!(exit_signal2, ExitSignal2);
-resolved_signal_handler!(exit_signal3, ExitSignal3);
 resolved_signal_handler!(trace_delivered1, TraceDelivered1);
 resolved_signal_handler!(spawn_system_process3, SpawnSystemProcess3);
 resolved_signal_handler!(dirty_process_handle_signals1, DirtyProcessHandleSignals1);
@@ -2090,17 +1682,6 @@ pub(crate) fn handler(
         ("erlang", "spawn", 3) => spawn3,
         ("erlang", "spawn_link", 3) => spawn_link3,
         ("erlang", "spawn_opt", 4) => spawn_opt4,
-        ("erlang", "register", 2) => register2,
-        ("erlang", "unregister", 1) => unregister1,
-        ("erlang", "whereis", 1) => whereis1,
-        ("erlang", "registered", 0) => registered0,
-        ("erlang", "link", 1) => link1,
-        ("erlang", "link", 2) => link2,
-        ("erlang", "unlink", 1) => unlink1,
-        ("erlang", "exit", 2) => exit2,
-        ("erlang", "exit", 3) => exit3,
-        ("erlang", "exit_signal", 2) => exit_signal2,
-        ("erlang", "exit_signal", 3) => exit_signal3,
         ("erlang", "trace_delivered", 1) => trace_delivered1,
         ("erts_internal", "spawn_system_process", 3) => spawn_system_process3,
         ("erts_internal", "dirty_process_handle_signals", 1) => dirty_process_handle_signals1,
@@ -2130,12 +1711,6 @@ pub(crate) fn handler_atoms(
                 let module = global_atoms().intern(module).ok()?;
                 let function = global_atoms().intern(function).ok()?;
                 let entry = match (module, function, arity) {
-                    (m, f, 1)
-                        if m == arinsal_term::atoms::ERLANG
-                            && f == atom_id("is_process_alive")? =>
-                    {
-                        crate::natives::NativeEntry::Direct(native_is_process_alive)
-                    }
                     (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("monitor")? => {
                         crate::natives::NativeEntry::Direct(crate::natives::bif::monitor_executor)
                     }
@@ -2147,17 +1722,6 @@ pub(crate) fn handler_atoms(
                     }
                     (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("demonitor")? => {
                         crate::natives::NativeEntry::Direct(crate::natives::bif::demonitor_executor)
-                    }
-                    // erts has one link_1/unlink_1/exit_2 for every caller (bif.c); an external
-                    // pid reaches the distribution signal from apply as from a static import.
-                    (m, f, 1) if m == arinsal_term::atoms::ERLANG && f == atom_id("link")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_link)
-                    }
-                    (m, f, 1) if m == arinsal_term::atoms::ERLANG && f == atom_id("unlink")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_unlink)
-                    }
-                    (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("exit")? => {
-                        crate::natives::NativeEntry::Direct(crate::dist::native_exit2)
                     }
                     _ => crate::natives::NativeEntry::Resolved(handler(
                         global_atoms().text(module)?,
@@ -2353,173 +1917,6 @@ fn call_resolved(
                 spawn_mfa_with_priority(vm, process, ctx, (*module, *function, *args), opts)
             })
         }
-        (SignalBif::Register2, [name, id]) => {
-            let name = name.as_atom().ok_or_else(|| badarg("register/2"))?;
-            // Port of erts/emulator/beam/register.c:184 (erts_register_name): `undefined` is not a name.
-            if name == arinsal_term::atoms::UNDEFINED {
-                return Err(badarg("register/2"));
-            }
-            let rt = process.runtime.ok_or_else(|| badarg("register/2"))?;
-            let scheduler = rt.scheduler()?;
-            if let Some(pid) = Pid::from_term(*id) {
-                let mut table = rt.reg.write();
-                if !scheduler.lookup(pid)
-                    || scheduler.registered_atom_index(pid).is_some()
-                    || table.contains(name)
-                    || !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
-                {
-                    return Err(badarg("register/2"));
-                }
-                table.insert_proc(name, pid);
-                scheduler.set_registered_atom_index(pid, name.0);
-                drop(table);
-                // Port of erts/emulator/beam/register.c:237-240 (erts_register_name), OTP-29.1.1:
-                // the event belongs to the process that gets the name.
-                crate::trace::emit(
-                    Some(vm),
-                    process,
-                    ctx,
-                    pid,
-                    crate::trace::PROCS,
-                    "register",
-                    &[Term::atom(name)],
-                );
-                Ok(Term::atom(arinsal_term::atoms::TRUE))
-            } else if let Some(port_id) = id.as_port() {
-                let handle = {
-                    let _ports = rt.ports.lock().unwrap();
-                    let handle = rt.ports.get(port_id).ok_or_else(|| badarg("register/2"))?;
-                    if handle.exit_complete() {
-                        return Err(badarg("register/2"));
-                    }
-                    handle
-                };
-                let mut table = rt.reg.write();
-                if handle.reg_closing()
-                    || handle.registered_atom().is_some()
-                    || table.contains(name)
-                {
-                    return Err(badarg("register/2"));
-                }
-                table.insert_port(name, port_id, handle.reg_word());
-                handle.set_registered_atom(name);
-                drop(table);
-                crate::trace::emit_port_event(
-                    rt,
-                    port_id,
-                    crate::trace::PORTS,
-                    "register",
-                    &[Term::atom(name)],
-                );
-                Ok(Term::atom(arinsal_term::atoms::TRUE))
-            } else {
-                Err(badarg("register/2"))
-            }
-        }
-        (SignalBif::Unregister1, [name]) => {
-            let name = name.as_atom().ok_or_else(|| badarg("unregister/1"))?;
-            let rt = process.runtime.ok_or_else(|| badarg("unregister/1"))?;
-            let mut table = rt.reg.write();
-            match table.erase(name) {
-                Some(crate::register::RegId::Proc(pid)) => {
-                    if let Ok(scheduler) = rt.scheduler() {
-                        scheduler.clear_registered_atom_index(pid, name.0);
-                    }
-                    drop(table);
-                    // Port of erts/emulator/beam/register.c:507-519 (erts_unregister_name), OTP-29.1.1.
-                    crate::trace::emit(
-                        Some(vm),
-                        process,
-                        ctx,
-                        pid,
-                        crate::trace::PROCS,
-                        "unregister",
-                        &[Term::atom(name)],
-                    );
-                    Ok(Term::atom(arinsal_term::atoms::TRUE))
-                }
-                Some(crate::register::RegId::Port(port_id)) => {
-                    drop(table);
-                    crate::trace::emit_port_event(
-                        rt,
-                        port_id,
-                        crate::trace::PORTS,
-                        "unregister",
-                        &[Term::atom(name)],
-                    );
-                    Ok(Term::atom(arinsal_term::atoms::TRUE))
-                }
-                None => Err(badarg("unregister/1")),
-            }
-        }
-        (SignalBif::Whereis1, [name]) => whereis_1(process, *name),
-        (SignalBif::Registered0, []) => registered_names(process),
-        // Port of erts/emulator/beam/bif.c (link_opt and unlink_1, is_external_pid): one BIF
-        // for every caller, so an applied call reaches the external-link path too.
-        (SignalBif::Link1, [target]) | (SignalBif::Unlink1, [target])
-            if crate::dist::is_remote_target(*target)? =>
-        {
-            let function = if matches!(entry, SignalBif::Link1) {
-                "link"
-            } else {
-                "unlink"
-            };
-            crate::dist::native_signal(vm, process, ctx, args, function)
-        }
-        (SignalBif::Link1, [target]) => link_opt(vm, process, ctx, *target, Term::NIL),
-        (SignalBif::Link2, [target, opts]) => link_opt(vm, process, ctx, *target, *opts),
-        (SignalBif::Unlink1, [port]) if port.as_port().is_some() => {
-            // A dead port has nothing left to unlink from.
-            if port
-                .as_port()
-                .is_some_and(|id| crate::port::is_live(process, id))
-            {
-                crate::port::link(process, *port, ctx.pid(), false)?;
-            }
-            Ok(Term::atom(arinsal_term::atoms::TRUE))
-        }
-        (SignalBif::Unlink1, [pid]) => {
-            let pid = Pid::from_term(*pid).ok_or_else(|| badarg("unlink/1"));
-            pid.map(|pid| {
-                if let Some(pid_term) = pid.to_term() {
-                    crate::trace::emit(
-                        Some(vm),
-                        process,
-                        ctx,
-                        ctx.pid(),
-                        crate::trace::PROCS,
-                        "unlink",
-                        &[pid_term],
-                    );
-                }
-                let should_unlink = process
-                    .links
-                    .get(pid.data())
-                    .is_some_and(|node| node.unlinking() == 0);
-                if should_unlink {
-                    let id = process
-                        .runtime
-                        .as_ref()
-                        .map_or(1, |runtime| runtime.next_ref());
-                    let sent = ctx.signal(pid, Signal::Unlink(id)).is_ok();
-                    unlink_mark(process, pid, id, sent);
-                }
-                wake_for_procs_trace(process, pid);
-                Term::atom(arinsal_term::atoms::TRUE)
-            })
-        }
-        (SignalBif::Exit2, [target, reason]) => {
-            send_exit_signal_bif(process, ctx, *target, *reason, Term::NIL, true)
-        }
-        (SignalBif::Exit3, [target, reason, opts]) => {
-            send_exit_signal_bif(process, ctx, *target, *reason, *opts, true)
-        }
-        (SignalBif::ExitSignal2, [target, reason]) => {
-            send_exit_signal_bif(process, ctx, *target, *reason, Term::NIL, false)
-        }
-        (SignalBif::ExitSignal3, [target, reason, opts]) => {
-            send_exit_signal_bif(process, ctx, *target, *reason, *opts, false)
-        }
         (SignalBif::TraceDelivered1, [target]) => trace_delivered(process, ctx, *target),
         (SignalBif::IsProcessAlive2, [pid, reference]) => {
             is_process_alive_2(process, ctx, *pid, *reference)
@@ -2554,58 +1951,6 @@ fn call_resolved(
         }
         _ => Err(VmError::Unsupported("resolved signal BIF arity".into())),
     }
-}
-
-fn registered_names(process: &mut Process) -> Result<Term, VmError> {
-    let rt = process
-        .runtime
-        .ok_or_else(|| VmError::Unsupported("process BIF requires a scheduler".into()))?;
-    // Port of erts/emulator/beam/register.c:585-599, OTP-29.1.1: count while locked, reserve
-    // the exact young-heap space, then prepend each bucket entry before releasing the read lock.
-    let registry = rt.reg.read();
-    let count = registry.registered_count();
-    if count == 0 {
-        return Ok(Term::NIL);
-    }
-    let words = count.checked_mul(2).ok_or_else(|| {
-        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })?;
-    let mut heap = ProcessHeapHandle(&mut process.heap);
-    let mut block = HeapReservation::with_extra(&mut heap, words, 0).map_err(|_| {
-        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })?;
-    let mut builder = TermBuilder::new(&mut block);
-    let mut tail = Term::NIL;
-    registry
-        .try_for_each_registered_atom(|name| {
-            tail = builder.cons(Term::atom(name), tail)?;
-            Ok::<_, arinsal_term::TermError>(())
-        })
-        .map_err(|_| {
-            VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::SYSTEM_LIMIT,
-            )))
-        })?;
-    Ok(tail)
-}
-
-/// `registered/0` only snapshots the process registry and builds the resulting list.
-// Port of erts/emulator/beam/register.c:567 (`registered_atoms`), OTP-29.1.1.
-pub(crate) fn registered_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    if !args.is_empty() {
-        return None;
-    }
-    Some(registered_names(process).map_err(|error| match error {
-        VmError::Trap(trap) => trap,
-        _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
-    }))
 }
 
 /// Work a target process runs when it next handles signals.
@@ -3353,33 +2698,6 @@ pub(crate) fn port_monitor_object<H: arinsal_term::HeapAlloc + ?Sized>(
         .ok_or_else(|| VmError::Unsupported("port monitor without a port id".into()))
 }
 
-// Port of erts/emulator/beam/erl_proc_sig_queue.c:3027
-// (erts_proc_sig_send_is_alive_request), OTP-29.1.1.
-fn is_process_alive(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    pid: Term,
-) -> Result<Term, VmError> {
-    let pid_term = pid;
-    let pid = Pid::from_term(pid).ok_or_else(|| badarg("is_process_alive/1"))?;
-    if pid == ctx.pid() {
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    if !runtime(process)?.scheduler()?.lookup(pid) {
-        return Ok(Term::atom(arinsal_term::atoms::FALSE));
-    }
-    if let Some(result) = alive_fast(process, pid_term) {
-        return Ok(Term::atom(result));
-    }
-    // Port of erts/emulator/beam/erl_bif_info.c:4090 (BIF_TRAP1(is_process_alive_trap)):
-    // erts_internal:is_process_alive/1 sends the request and receives `{Ref, Res}`.
-    Err(VmError::TrapExport(crate::ExportTrap::new(
-        process,
-        "erts_internal:is_process_alive/1",
-        vec![pid_term],
-    )))
-}
-
 /// The target's answer to an `ERTS_SIG_Q_OP_IS_ALIVE` signal: `{Ref, Alive}` as an ordinary
 /// message to the requester.
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:3625 (is_alive_response), OTP-29.1.1.
@@ -3407,209 +2725,6 @@ pub(crate) fn alive_response(
         Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
         Err(error) => Err(VmError::Unsupported(format!("alive reply: {error}"))),
     }
-}
-
-// Port of erts/emulator/beam/bif.c:136 (link_opt) and bif.c:675 (erts_link_opts), OTP-29.1.1.
-fn link_opt(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    target: Term,
-    opts: Term,
-) -> Result<Term, VmError> {
-    let priority = parse_priority_opts(opts)?;
-    if let Some(id) = target.as_port() {
-        // Port of erts/emulator/beam/bif.c:1286 (link_2): a dead local port answers noproc.
-        if !crate::port::is_live(process, id) {
-            return link_noproc_term(process, target, priority);
-        }
-        if !crate::port::link(process, target, ctx.pid(), true)? {
-            return link_noproc_term(process, target, priority);
-        }
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    let pid = Pid::from_term(target).ok_or_else(|| badarg("link"))?;
-    if pid == ctx.pid() {
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    if !runtime(process)?.scheduler()?.lookup(pid) {
-        return link_noproc(process, pid, priority);
-    }
-    // Port of erts/emulator/beam/bif.c:165-183 (link_opt): one lookup_create on the link tree;
-    // a link that exists and is not unlinking sends nothing.
-    let send = link_node_create(&mut process.links, pid, priority);
-    let trace_changes = if send {
-        crate::trace::linked(process, ctx.pid())
-    } else {
-        Vec::new()
-    };
-    let linked_term = pid.to_term().ok_or_else(|| badarg("link"))?;
-    crate::trace::emit(
-        Some(vm),
-        process,
-        ctx,
-        ctx.pid(),
-        crate::trace::PROCS,
-        "link",
-        &[linked_term],
-    );
-    let mut signal_result = Ok(());
-    if send {
-        for change in trace_changes {
-            signal_result = ctx.signal(
-                pid,
-                Signal::TraceChangeState(arinsal_sched::SharedPayload(std::sync::Arc::new(change))),
-            );
-            if signal_result.is_err() {
-                break;
-            }
-        }
-        if signal_result.is_ok() {
-            signal_result = ctx.signal(pid, Signal::Link { priority });
-        }
-    }
-    match signal_result {
-        // The linked process reports getting_linked when it handles the signal.
-        Ok(()) => {}
-        Err(arinsal_sched::Error::NoProcess) => {
-            // The target exited between the lookup and the signal: like erts, keep the link
-            // and let a `noproc` link exit from the target dissolve it.
-            // Port of erts/emulator/beam/bif.c:180-183 (link_opt), OTP-29.1.1.
-            let reason = Message::copy_from(Term::atom(arinsal_term::atoms::NOPROC))?;
-            runtime(process)?
-                .scheduler()?
-                .signal(pid, ctx.pid(), Signal::ExitLinked(Box::new(reason)))
-                .map_err(|_| badarg("link"))?;
-        }
-        Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
-        Err(_) => return Err(badarg("link")),
-    }
-    wake_for_procs_trace(process, pid);
-    Ok(Term::atom(arinsal_term::atoms::TRUE))
-}
-
-/// `erts_link_internal_tree_lookup_create` plus the `unlinking` reset of `link_opt`
-/// (bif.c:165-183): returns whether a link signal must be sent.
-fn link_node_create(links: &mut crate::proc_create::LinkTree, pid: Pid, priority: bool) -> bool {
-    match links.get_mut(pid.data()) {
-        Some(mut node) => {
-            node.set_priority(priority);
-            let unlinking = node.view().unlinking();
-            node.set_unlinking(0);
-            unlinking != 0
-        }
-        None => {
-            links.insert(crate::proc_create::process_link(pid, priority));
-            true
-        }
-    }
-}
-
-/// Linking to a process that does not exist: an `{'EXIT', Pid, noproc}` message when trapping
-/// exits, else a `noproc` error.
-// Port of erts/emulator/beam/bif.c:675 (erts_link_opts / link noproc arm), OTP-29.1.1.
-fn link_noproc(process: &mut Process, pid: Pid, priority: bool) -> Result<Term, VmError> {
-    let pid_term = pid.to_term().ok_or_else(|| badarg("link"))?;
-    link_noproc_term(process, pid_term, priority)
-}
-
-fn link_noproc_term(process: &mut Process, target: Term, priority: bool) -> Result<Term, VmError> {
-    let reason = Term::atom(arinsal_term::atoms::NOPROC);
-    if process.trap_exit {
-        let pid_term = target;
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let exit = TermBuilder::new(&mut heap)
-            .tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), pid_term, reason])
-            .map_err(|_| system_limit())?;
-        if priority {
-            process.push_priority_message(exit)?;
-        } else {
-            process.inbox.push_back(exit);
-        }
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    process.heap.abi.exc.fvalue = reason.tagged_word();
-    Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
-}
-
-/// Link and unlink signals are applied lazily, but erts handles them on arrival, which is when a
-/// `procs` trace reports getting_linked/getting_unlinked: wake a receiver that is traced for it.
-// Port of erts/emulator/beam/erl_proc_sig_queue.c:8578-8589 (getting_unlinked/getting_linked), OTP-29.1.1.
-fn wake_for_procs_trace(process: &Process, target: Pid) {
-    if crate::trace::flags(process, target) & crate::trace::PROCS != 0
-        && let Some(runtime) = process.runtime.as_ref()
-        && let Ok(scheduler) = runtime.scheduler()
-    {
-        let _ = scheduler.wake(target);
-    }
-}
-
-// Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.
-fn send_exit_signal_bif(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    id: Term,
-    reason: Term,
-    opts: Term,
-    exit2: bool,
-) -> Result<Term, VmError> {
-    let want_priority = parse_priority_opts(opts)?;
-    if let Some(port_id) = id.as_port() {
-        // Port of erts/emulator/beam/bif.c:1721: an exit signal to a dead port is dropped.
-        if crate::port::is_live(process, port_id) {
-            crate::port::exit_port(process, ctx, id, reason)?;
-        }
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    let (pid, alias) = if let Some(pid) = Pid::from_term(id) {
-        (pid, 0)
-    } else if let (Some(pid_data), Some(alias)) = (id.local_pid_ref_pid_data(), ref_id(id)) {
-        // Port of erts_get_pid_of_ref (erl_bif_unique.h), OTP-29.1.1.
-        (Pid::from_data(pid_data), alias)
-    } else {
-        return Err(badarg("exit"));
-    };
-    let suicide = exit2
-        && pid == ctx.pid()
-        && (reason == Term::atom(arinsal_term::atoms::KILL) || !process.trap_exit);
-    if suicide {
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_exit_signal), OTP-29.1.1:
-        // the self-signal is handled like any exit signal, so `kill` becomes `killed`.
-        if reason == Term::atom(arinsal_term::atoms::KILL) {
-            return Err(VmError::Trap(crate::exceptions::Trap::killed()));
-        }
-        process.heap.abi.exc.fvalue = reason.tagged_word();
-        return Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
-            reason,
-        )));
-    }
-    let mut message = Message::copy_from(reason)?;
-    if alias != 0 {
-        message = message.with_alias(alias);
-    }
-    if alias != 0 && want_priority {
-        message = message.with_priority();
-    }
-    let _ = ctx.signal(pid, Signal::Exit(Box::new(message)));
-    Ok(Term::atom(arinsal_term::atoms::TRUE))
-}
-
-fn parse_priority_opts(opts: Term) -> Result<bool, VmError> {
-    let mut priority = false;
-    let mut current = opts;
-    while current.classify() == TermKind::List {
-        // SAFETY: Option list stays rooted for this BIF call.
-        let (head, tail) = unsafe { current.cons_ref() }.ok_or_else(|| badarg("badopt"))?;
-        if head != Term::atom(arinsal_term::atoms::PRIORITY) {
-            return Err(badarg("badopt"));
-        }
-        priority = true;
-        current = tail;
-    }
-    if current != Term::NIL {
-        return Err(badarg("badopt"));
-    }
-    Ok(priority)
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:4049 (erts_internal_is_process_alive_2), OTP-29.1.1.
