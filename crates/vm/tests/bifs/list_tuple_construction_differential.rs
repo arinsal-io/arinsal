@@ -54,13 +54,7 @@ fn call_vm(vm: &mut Vm, function: &str, args: &[O]) -> CallResult {
     let mut heap = VecHeap::new();
     let function = from_owned(&O::atom(function), &mut heap).expect("function atom");
     let args = from_owned(&O::list(args.to_vec()), &mut heap).expect("argument list");
-    match vm.eval_scheduled(
-        "difftest_server",
-        "test_call",
-        &[function, args],
-        1,
-        Some(0xD1FF),
-    ) {
+    match vm.eval_scheduled("difftest_server", "test_call", &[function, args], 1, None) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(error) => CallResult::TransportError(error.to_string()),
     }

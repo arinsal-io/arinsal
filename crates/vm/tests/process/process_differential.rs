@@ -336,6 +336,10 @@ fn process_scenarios_match_otp_29() {
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .map_or_else(|| (0..40).collect::<Vec<_>>(), |category| vec![category]);
+    // One node runs every scenario, as the reference node does: the scenarios run in normal
+    // scheduler processes, where BIF timers live on the caller's scheduler wheel.
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
     let mut count = 0;
     for category in categories {
         let started = std::time::Instant::now();
@@ -345,21 +349,9 @@ fn process_scenarios_match_otp_29() {
                 "scenario",
                 &[OwnedTerm::Int(category), OwnedTerm::Int(n)],
             );
-            let mut vm = Vm::new([]);
-            vm.load_bytes(&beam).unwrap();
             let args = [Term::small(category).unwrap(), Term::small(n).unwrap()];
             let actual = vm
-                .eval_scheduled(
-                    "proc_diff",
-                    "scenario",
-                    &args,
-                    if matches!(category, 25 | 33) { 6 } else { 1 },
-                    if matches!(category, 33..=35) {
-                        None
-                    } else {
-                        Some(17)
-                    },
-                )
+                .eval_scheduled("proc_diff", "scenario", &args, 6, None)
                 .unwrap_or_else(|error| panic!("category {category} n {n}: {error}"));
             assert_eq!(
                 expected,

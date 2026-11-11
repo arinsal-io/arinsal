@@ -159,7 +159,7 @@ fn compare(function: &str) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("native_sig_fetch", function, &[], 2, Some(0x5f37))
+        .eval_scheduled("native_sig_fetch", function, &[], 2, None)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

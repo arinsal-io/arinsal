@@ -189,7 +189,7 @@ fn asynchronous_timer_queries_match_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_timer", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop3_timer", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
