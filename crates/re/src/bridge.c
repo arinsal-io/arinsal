@@ -8,38 +8,48 @@
 #include <string.h>
 #include <pthread.h>
 
-/* Port of erts/emulator/beam/erl_bif_re.c:159-203 (stack_guard), OTP-29.1.1. */
-static int ar_re_stack_guard(uint32_t depth, void *unused) {
-    char marker;
+/* Port of erts/emulator/beam/utils.c (erts_get_stacklimit), OTP-29.1.1: the Rust side
+ * (arinsal-re ar_re_get_stacklimit) returns the ethr stack limit of the calling thread. */
+extern char *ar_re_get_stacklimit(void);
+
+#define ERTS_PCRE_STACK_MARGIN (10*1024)
+
+/* Port of erts/emulator/beam/erl_bif_re.c (stack_guard_downwards, stack_guard_upwards),
+ * OTP-29.1.1. A thread without a limit (not created by ethr_thr_create) has no guard. */
+static int ar_re_stack_guard_downwards(uint32_t depth, void *unused) {
+    char *limit = ar_re_get_stacklimit();
+    char c;
     (void)depth;
     (void)unused;
-#if defined(__APPLE__)
-    char *high = (char *)pthread_get_stackaddr_np(pthread_self());
-    size_t size = pthread_get_stacksize_np(pthread_self());
-    return (uintptr_t)&marker < (uintptr_t)(high - size + 10 * 1024);
-#elif defined(__linux__)
-    pthread_attr_t attr;
-    void *base;
-    size_t size;
-    if (pthread_getattr_np(pthread_self(), &attr) != 0) return depth > 1000;
-    if (pthread_attr_getstack(&attr, &base, &size) != 0) {
-        pthread_attr_destroy(&attr);
-        return depth > 1000;
-    }
-    pthread_attr_destroy(&attr);
-    return (uintptr_t)&marker < (uintptr_t)((char *)base + 10 * 1024);
-#else
-    return depth > 1000;
-#endif
+    return (uintptr_t)&c < (uintptr_t)limit + ERTS_PCRE_STACK_MARGIN;
+}
+
+static int ar_re_stack_guard_upwards(uint32_t depth, void *unused) {
+    char *limit = ar_re_get_stacklimit();
+    char c;
+    (void)depth;
+    (void)unused;
+    return (uintptr_t)&c > (uintptr_t)limit - ERTS_PCRE_STACK_MARGIN;
+}
+
+/* Port of erts/emulator/beam/utils.c (erts_check_if_stack_grows_downwards), OTP-29.1.1. */
+static __attribute__((noinline)) int ar_re_stack_grows_downwards(char *ptr) {
+    char c;
+    return (uintptr_t)&c < (uintptr_t)ptr;
 }
 
 static pcre2_compile_context *ar_re_tmp_compile_ctx;
 static pthread_once_t ar_re_compile_ctx_once = PTHREAD_ONCE_INIT;
 
+/* Port of erts/emulator/beam/erl_bif_re.c (erts_init_bif_re), OTP-29.1.1. */
 static void ar_re_init_compile_context(void) {
+    char c;
+    int (*stack_guard)(uint32_t, void *) = ar_re_stack_grows_downwards(&c)
+        ? ar_re_stack_guard_downwards
+        : ar_re_stack_guard_upwards;
     ar_re_tmp_compile_ctx = pcre2_compile_context_create(NULL);
     if (ar_re_tmp_compile_ctx)
-        pcre2_set_compile_recursion_guard(ar_re_tmp_compile_ctx, ar_re_stack_guard, NULL);
+        pcre2_set_compile_recursion_guard(ar_re_tmp_compile_ctx, stack_guard, NULL);
 }
 
 pcre2_code *ar_re_compile(const uint8_t *pattern, size_t len, uint32_t options,

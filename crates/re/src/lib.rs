@@ -63,6 +63,13 @@ struct MatchSession {
     restart: usize,
 }
 
+/// `erts_get_stacklimit` for the PCRE compile recursion guard in the C bridge.
+// Port of erts/emulator/beam/erl_bif_re.c (ERTS_STACK_LIMIT), OTP-29.1.1.
+#[unsafe(no_mangle)]
+extern "C" fn ar_re_get_stacklimit() -> *mut c_void {
+    std::ptr::without_provenance_mut(arinsal_alloc::ethr::erts_get_stacklimit())
+}
+
 unsafe extern "C" {
     fn ar_re_compile(
         pattern: *const u8,

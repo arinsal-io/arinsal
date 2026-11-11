@@ -74,16 +74,36 @@ fn tagged(value: u64) -> u64 {
     (value << 4) | 15
 }
 
+/// The term `send_2` returns: a tagged small, so the fragment takes its success path.
+const SENT: u64 = (0x789 << 4) | 15;
+
+/// `bif_table[BIF_send_2].f` for the test: `(c_p, reg, I)`.
+extern "C" fn send_2(_: *mut ProcessHeader, _: *mut u64, _: u64) -> u64 {
+    SENT
+}
+
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_send() {
-    const IDENTITY: usize = 0x1234;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send), OTP-29.1.1:
+    // `call_light_bif_shared` with ARG4 = the send/2 export and ARG8 = bif_table[send_2].f.
     let fragments = DispatchFragments::new(0, light_bif_hook as *const () as usize, 0, 0).unwrap();
+    let export = Box::leak(Box::new(arinsal_beamasm::bif::ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::ERLANG,
+        2,
+        0,
+        0,
+    )));
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
-    asm.emit_send(fragments.call_light_bif_helper(), IDENTITY, 0)
-        .unwrap();
+    asm.emit_send(
+        fragments.call_light_bif(),
+        std::ptr::from_ref(export) as usize,
+        send_2 as *const () as usize,
+    )
+    .unwrap();
     asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -91,8 +111,9 @@ fn native_send() {
     })
     .unwrap();
     let module = asm.finalize().unwrap();
-    let (_, _, outcome) = execute(&module, ProcessHeader::default(), [0x123, 0x456, 0]);
+    let (_, regs, outcome) = execute(&module, ProcessHeader::default(), [0x123, 0x456, 0]);
     assert_eq!(outcome, ExitReason::Returned);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(SENT));
 }
 
 #[cfg(target_arch = "aarch64")]

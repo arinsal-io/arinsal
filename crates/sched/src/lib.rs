@@ -1255,7 +1255,16 @@ pub struct Config {
     pub port_parallelism: Option<bool>,
     /// `+sbt` scheduler binding strategy.
     pub scheduler_bind_type: Option<String>,
+    /// Suggested stack sizes in kilo words for normal, dirty CPU, and dirty I/O scheduler
+    /// threads (`+sss`, `+sssdcpu`, `+sssdio`).
+    pub sched_thread_stack_sizes: [usize; 3],
 }
+
+/// Default suggested stack sizes in kilo words of normal, dirty CPU, and dirty I/O scheduler
+/// threads.
+// Port of erts/emulator/beam/erl_init.c (ERTS_DEFAULT_SCHED_STACK_SIZE,
+// ERTS_DEFAULT_DCPU_SCHED_STACK_SIZE, ERTS_DEFAULT_DIO_SCHED_STACK_SIZE), OTP-29.1.1.
+pub const ERTS_DEFAULT_SCHED_STACK_SIZES: [usize; 3] = [128, 40, 40];
 
 impl Default for Config {
     fn default() -> Self {
@@ -1274,6 +1283,7 @@ impl Default for Config {
             forced_wakeup_interval: None,
             port_parallelism: None,
             scheduler_bind_type: None,
+            sched_thread_stack_sizes: ERTS_DEFAULT_SCHED_STACK_SIZES,
         }
     }
 }
@@ -7185,9 +7195,18 @@ impl<T: Task> Scheduler<T> {
         if !simulated {
             for (id, local) in locals.into_iter().enumerate() {
                 let inner = inner.clone();
-                threads.push(thread::spawn(move || {
-                    worker_loop(inner, id, local.into_local())
-                }));
+                // Port of erts/emulator/beam/erl_process.c (erts_start_schedulers,
+                // opts.suggested_stack_size = erts_sched_thread_suggested_stack_size),
+                // OTP-29.1.1.
+                let stack_size = inner.config.sched_thread_stack_sizes[0];
+                threads.push(
+                    arinsal_alloc::ethr::ethr_thr_create(
+                        Some(format!("erts_sched_{}", id + 1)),
+                        Some(stack_size),
+                        move || worker_loop(inner, id, local.into_local()),
+                    )
+                    .expect("spawn scheduler thread"),
+                );
             }
             // Port of erts/emulator/beam/erl_process.c:8890 (erts_start_schedulers, dirty
             // scheduler threads), OTP-29.1.1.
@@ -7198,10 +7217,16 @@ impl<T: Task> Scheduler<T> {
                         DirtyKind::Cpu => format!("{}_dirty_cpu_scheduler", index + 1),
                         DirtyKind::Io => format!("{}_dirty_io_scheduler", index + 1),
                     };
-                    let handle = thread::Builder::new()
-                        .name(name)
-                        .spawn(move || dirty_scheduler_loop(inner, kind, index))
-                        .expect("spawn dirty scheduler thread");
+                    let stack_size = match kind {
+                        DirtyKind::Cpu => inner.config.sched_thread_stack_sizes[1],
+                        DirtyKind::Io => inner.config.sched_thread_stack_sizes[2],
+                    };
+                    let handle = arinsal_alloc::ethr::ethr_thr_create(
+                        Some(name),
+                        Some(stack_size),
+                        move || dirty_scheduler_loop(inner, kind, index),
+                    )
+                    .expect("spawn dirty scheduler thread");
                     threads.push(handle);
                 }
             }
@@ -7213,10 +7238,13 @@ impl<T: Task> Scheduler<T> {
         {
             let inner = inner.clone();
             threads.push(
-                thread::Builder::new()
-                    .name("runq_supervisor".to_owned())
-                    .spawn(move || runq_supervisor(inner, interval))
-                    .expect("spawn run queue supervisor thread"),
+                // erl_process.c gives the supervisor a 16 kilo word stack.
+                arinsal_alloc::ethr::ethr_thr_create(
+                    Some("runq_supervisor".to_owned()),
+                    Some(16),
+                    move || runq_supervisor(inner, interval),
+                )
+                .expect("spawn run queue supervisor thread"),
             );
         }
         Self {

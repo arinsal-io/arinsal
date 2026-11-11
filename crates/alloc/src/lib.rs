@@ -5,6 +5,7 @@ pub mod allocator;
 pub mod cpuinfo;
 #[allow(unsafe_code)]
 pub(crate) mod ddq;
+pub mod ethr;
 pub mod instances;
 pub mod mmap;
 pub mod mseg;
