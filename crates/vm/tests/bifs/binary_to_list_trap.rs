@@ -32,13 +32,13 @@ fn binary_to_list_one_megabyte_matches_otp_and_charges_reductions() {
 
     let expected_values = reference.call(MODULE, "values", &[]);
     let actual_values = vm
-        .eval_scheduled_reductions(MODULE, "values", &[], 1, Some(0xB271), 4_000)
+        .eval_scheduled_reductions(MODULE, "values", &[], 1, None, 4_000)
         .unwrap();
     assert_eq!(expected_values, CallResult::Ok(actual_values.term));
 
     let expected_values3 = reference.call(MODULE, "values3", &[]);
     let actual_values3 = vm
-        .eval_scheduled_reductions(MODULE, "values3", &[], 1, Some(0xB273), 4_000)
+        .eval_scheduled_reductions(MODULE, "values3", &[], 1, None, 4_000)
         .unwrap();
     assert_eq!(expected_values3, CallResult::Ok(actual_values3.term));
 
@@ -47,7 +47,7 @@ fn binary_to_list_one_megabyte_matches_otp_and_charges_reductions() {
         panic!("OTP reductions call did not return a tuple");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "reductions", &[], 1, Some(0xB272), 4_000)
+        .eval_scheduled_reductions(MODULE, "reductions", &[], 1, None, 4_000)
         .unwrap();
     let OwnedTerm::Tuple(ref actual) = actual.term else {
         panic!("Arinsal reductions call did not return a tuple");
@@ -73,7 +73,7 @@ fn binary_to_list_one_megabyte_matches_otp_and_charges_reductions() {
         panic!("OTP range reductions call did not return a tuple");
     };
     let actual3 = vm
-        .eval_scheduled_reductions(MODULE, "reductions3", &[], 1, Some(0xB274), 4_000)
+        .eval_scheduled_reductions(MODULE, "reductions3", &[], 1, None, 4_000)
         .unwrap();
     let OwnedTerm::Tuple(ref actual3) = actual3.term else {
         panic!("Arinsal range reductions call did not return a tuple");
@@ -120,7 +120,7 @@ fn binary_to_list_yield_before_allocation_survives_collection() {
     let expected = reference.call(MODULE, "run", &[]);
     for slice in [1_900u32, 2_500, 3_100, 4_000] {
         let actual = vm
-            .eval_scheduled_reductions(MODULE, "run", &[], 1, Some(0xB275), slice)
+            .eval_scheduled_reductions(MODULE, "run", &[], 1, None, slice)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "slice {slice}");
     }
@@ -168,7 +168,7 @@ fn trap_families_survive_switch_out_collections() {
     let expected = reference.call(MODULE, "run", &[]);
     for slice in [1_900u32, 2_700, 4_000] {
         let actual = vm
-            .eval_scheduled_reductions(MODULE, "run", &[], 1, Some(0xB276), slice)
+            .eval_scheduled_reductions(MODULE, "run", &[], 1, None, slice)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "slice {slice}");
     }

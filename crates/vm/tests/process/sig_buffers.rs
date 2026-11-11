@@ -33,7 +33,7 @@ fn buffered_messages_precede_sender_down_signal_vs_erl() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("sig_buffers_order", "run", &[], 4, Some(0x51_6e_51))
+        .eval_scheduled("sig_buffers_order", "run", &[], 4, None)
         .unwrap_or_else(|error| panic!("parallel signal buffer probe: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

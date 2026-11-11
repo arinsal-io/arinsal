@@ -27,7 +27,7 @@ fn binary_replace_large_subjects_resume_after_search_traps() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "run", &[], 1, Some(0x7C0), 4_000)
+        .eval_scheduled_reductions(MODULE, "run", &[], 1, None, 4_000)
         .unwrap();
     let canonical = arinsal_etf::decode(&arinsal_etf::encode(
         &actual.term,

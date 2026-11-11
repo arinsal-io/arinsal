@@ -67,10 +67,10 @@ rearm() ->
 "#;
 
 fn compare(function: &str) {
-    compare_with(function, None);
+    compare_with(function);
 }
 
-fn compare_with(function: &str, seed: Option<u64>) {
+fn compare_with(function: &str) {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping {function} receive-timeout differential test");
         return;
@@ -83,7 +83,7 @@ fn compare_with(function: &str, seed: Option<u64>) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("recv_timeout_diff", function, &[], 2, seed)
+        .eval_scheduled("recv_timeout_diff", function, &[], 2, None)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }
@@ -120,5 +120,5 @@ fn recv_timeout_priority_message_with_after() {
 
 #[test]
 fn recv_timeout_rearmed_wait_ignores_dead_operand() {
-    compare_with("rearm", None);
+    compare_with("rearm");
 }

@@ -206,7 +206,7 @@ fn calls(function: &str) -> (CallResult, CallResult) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, function, &[], 1, Some(82))
+        .eval_scheduled(MODULE, function, &[], 1, None)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
     (expected, actual)
@@ -262,7 +262,7 @@ fn append_trap_magic_binary_size_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "append_trap_magic_orig_size", &[], 1, Some(83), 20)
+        .eval_scheduled_reductions(MODULE, "append_trap_magic_orig_size", &[], 1, None, 20)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
     assert_eq!(expected, actual, "append trap binary virtual heap size");

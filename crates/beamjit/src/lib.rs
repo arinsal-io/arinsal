@@ -161,10 +161,9 @@ pub trait ModuleEnv {
         0
     }
     /// The export entry of `erlang:send/2` (`BIF_TRAP_EXPORT(BIF_send_2)`), which the `send`
-    /// instruction calls through `call_light_bif_shared`.
-    fn send_export_entry(&self) -> Result<usize, String> {
-        Err("no send/2 export".to_owned())
-    }
+    /// instruction calls through `call_light_bif_shared`. It exists once the BIFs are installed
+    /// (install_bifs), so every environment has one.
+    fn send_export_entry(&self) -> usize;
     /// Resolve a loader-patched NIF body to its native runtime trampoline.
     fn native_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
         None
@@ -3684,7 +3683,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             erts_tables::GENOP_SEND_0 => {
                 count(0)?;
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send), OTP-29.1.1.
-                let entry = env.send_export_entry().map_err(EmitError::Operand)?;
+                let entry = env.send_export_entry();
                 let bif = env.light_bif_func(entry);
                 let fragment = if bif != 0 {
                     env.light_bif_fragment()

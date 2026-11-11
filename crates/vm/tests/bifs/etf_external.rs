@@ -35,7 +35,7 @@ fn binary_to_term_badopt_error_info_matches_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("etf_external_error_info_diff", "badopt", &[], 1, Some(73))
+        .eval_scheduled("etf_external_error_info_diff", "badopt", &[], 1, None)
         .unwrap()
         .term;
     let CallResult::Ok(expected) = expected else {
@@ -132,10 +132,7 @@ fn binary_to_term_borrowed_and_copied_inputs_match_erts() {
     };
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(module, "run", &[], 1, Some(73))
-        .unwrap()
-        .term;
+    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
     assert_eq!(actual, expected);
 }
 
@@ -172,9 +169,6 @@ fn binary_to_term_trapped_list_tail_matches_erts() {
     };
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(module, "run", &[], 1, Some(73))
-        .unwrap()
-        .term;
+    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
     assert_eq!(actual, expected);
 }

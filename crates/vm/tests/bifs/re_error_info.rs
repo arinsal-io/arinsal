@@ -30,7 +30,7 @@ fn invalid_run_options_preserve_badopt_error_info_like_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("re_error_info_diff", "bad_options", &[], 1, Some(73))
+        .eval_scheduled("re_error_info_diff", "bad_options", &[], 1, None)
         .unwrap_or_else(|error| panic!("Arinsal re:run/3 error_info: {error}"));
     let CallResult::Ok(expected) = expected else {
         panic!("reference error_info call failed: {expected:?}");

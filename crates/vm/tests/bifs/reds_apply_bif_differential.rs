@@ -218,12 +218,12 @@ fn apply_bif_reductions_slices_and_gc_match_otp() {
     vm.load_bytes(&beam).unwrap();
     let mut expected_all = Vec::new();
     let mut actual_all = Vec::new();
-    for (index, name) in CASES.iter().map(|case| case.name).enumerate() {
+    for name in CASES.iter().map(|case| case.name) {
         let CallResult::Ok(expected) = reference.call(MODULE, name, &[]) else {
             panic!("OTP {name} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, name, &[], 1, Some(0xA900 + index as u64), 4_000)
+            .eval_scheduled_reductions(MODULE, name, &[], 1, None, 4_000)
             .unwrap();
         let expected = measured(&expected);
         let actual = measured(&actual.term);

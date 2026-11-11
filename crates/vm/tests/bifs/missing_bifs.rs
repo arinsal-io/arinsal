@@ -161,7 +161,7 @@ fn missing_bifs_match_otp_29() {
             "run",
             &[Term::small(scenario).unwrap()],
             1,
-            Some(15),
+            None,
         );
         similar_asserts::assert_eq!(
             expected,

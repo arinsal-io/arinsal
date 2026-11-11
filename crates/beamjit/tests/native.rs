@@ -97,6 +97,11 @@ impl ModuleEnv for TestEnv {
         Ok(0x1000 + 8 * index as usize)
     }
 
+    fn send_export_entry(&self) -> usize {
+        // Like the import exports: compiled, never run.
+        0x0F00
+    }
+
     fn arithmetic_helper(&self) -> arinsal_beamasm::arith::ArithHelper {
         arithmetic_helper
     }

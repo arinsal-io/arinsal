@@ -204,6 +204,11 @@ impl ModuleEnv for CorpusEnv {
         Ok(index as usize + 1)
     }
 
+    fn send_export_entry(&self) -> usize {
+        // Compilation only: an opaque entry, like the import exports above.
+        usize::MAX - 7
+    }
+
     fn lambda_fun_entry(&self, beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
         let _ = beam;
         self.lambda_entries

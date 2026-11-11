@@ -41,7 +41,7 @@ fn bit_sized_binary_construct_errors_match_otp() {
                 "run",
                 &[Term::small(bits).expect("small bit size")],
                 1,
-                Some(0xB17_5EED),
+                None,
             )
             .unwrap_or_else(|error| panic!("run/1 with {bits} bits: {error}"));
         println!("RESULT:{:?}", actual.term);

@@ -65,7 +65,7 @@ fn named_table_name_is_released_and_new_tid_allocated_after_owner_exit() {
             "named_table_recreated_after_owner_exit",
             &[],
             2,
-            Some(91),
+            None,
         )
         .unwrap_or_else(|error| panic!("ETS owner exit: {error}"));
 
@@ -82,13 +82,7 @@ fn exiting_owner_transfers_tables_in_erts_owned_list_order() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(
-            MODULE,
-            "heir_transfer_order_is_newest_first",
-            &[],
-            2,
-            Some(92),
-        )
+        .eval_scheduled(MODULE, "heir_transfer_order_is_newest_first", &[], 2, None)
         .unwrap_or_else(|error| panic!("ETS heir transfer order: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term));

@@ -32,7 +32,7 @@ fn try_after_reraise_keeps_class() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval_scheduled("mix_loop1_reraise", "run", &[arg], 1, Some(79))
+            .eval_scheduled("mix_loop1_reraise", "run", &[arg], 1, None)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "{kind}");
     }
@@ -64,7 +64,7 @@ fn ets_insert_keeps_appended_binary() {
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop1_ets_bin", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop1_ets_bin", "run", &[], 0, Some(79))
+        .eval_scheduled("mix_loop1_ets_bin", "run", &[], 0, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -90,7 +90,7 @@ fn os_env_pairs_match_otp() {
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop1_os_env", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop1_os_env", "run", &[], 1, Some(79))
+        .eval_scheduled("mix_loop1_os_env", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

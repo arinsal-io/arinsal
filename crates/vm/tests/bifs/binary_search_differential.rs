@@ -73,7 +73,7 @@ fn binary_search_large_subject_matches_otp_across_traps() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "large", &[], 1, Some(0xB1F1), 4_000)
+        .eval_scheduled_reductions(MODULE, "large", &[], 1, None, 4_000)
         .unwrap_or_else(|error| panic!("large binary search: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }

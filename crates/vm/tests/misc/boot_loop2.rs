@@ -25,7 +25,7 @@ fn caught_exit_does_not_replace_later_link_reason() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_exit", "run", &[], 1, Some(49))
+        .eval_scheduled("boot_loop2_exit", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -53,7 +53,7 @@ fn boot_term_printing_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_print", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop2_print", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -76,7 +76,7 @@ fn process_info_dictionary_lookup_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_dictionary", "run", &[], 1, Some(47))
+        .eval_scheduled("boot_loop2_dictionary", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -112,7 +112,7 @@ fn flatmap_updates_share_the_key_tuple_like_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_map_keys", "run", &[], 1, Some(49))
+        .eval_scheduled("boot_loop2_map_keys", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -133,7 +133,7 @@ fn local_erts_debug_copy_shared_export_uses_its_native_body() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_copy_shared", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop2_copy_shared", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -162,7 +162,7 @@ fn display_returns_true_like_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_display", "run", &[], 1, Some(67))
+        .eval_scheduled("boot_loop2_display", "run", &[], 1, None)
         .unwrap();
     assert_eq!(actual.term, arinsal_etf::OwnedTerm::Atom("true".into()));
 }

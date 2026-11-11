@@ -48,7 +48,7 @@ fn full_width_integer_operands_match_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_integer", "run", &[], 1, Some(43))
+        .eval_scheduled("boot_loop3_integer", "run", &[], 1, None)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
@@ -91,7 +91,7 @@ fn rand_seed_and_uniform_match_erts_for_each_algorithm() {
         eprintln!("checking rand algorithm {algorithm}");
         let term = Term::atom(global_atoms().intern(algorithm).unwrap());
         let actual = vm
-            .eval_scheduled("boot_loop3_rand", "sample", &[term], 1, Some(47))
+            .eval_scheduled("boot_loop3_rand", "sample", &[term], 1, None)
             .unwrap();
         let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
         assert_eq!(expected, CallResult::Ok(canonical), "{algorithm}");
@@ -123,7 +123,7 @@ fn system_logger_flag_matches_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_logger", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop3_logger", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -150,7 +150,7 @@ fn scheduler_wall_time_toggle_matches_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_wall", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop3_wall", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -218,7 +218,7 @@ fn dtrace_tag_bifs_match_erts_without_probes() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_dt", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop3_dt", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -243,7 +243,7 @@ fn local_unicode_io_flag_matches_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_unicode", "run", &[], 1, Some(53))
+        .eval_scheduled("boot_loop3_unicode", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

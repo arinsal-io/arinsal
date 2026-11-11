@@ -92,7 +92,7 @@ fn save_calls_matches_otp_for_export_fun_bif_and_message_entries() {
         let expected = reference.call("save_calls_differential", function, &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled("save_calls_differential", function, &[], 1, Some(71));
+        let actual = vm.eval_scheduled("save_calls_differential", function, &[], 1, None);
         similar_asserts::assert_eq!(
             expected,
             CallResult::Ok(

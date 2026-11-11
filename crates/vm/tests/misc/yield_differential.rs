@@ -126,7 +126,7 @@ count_out(Pid, Ref, Count) ->
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("trap_lazy_yield", "run", &[], 2, Some(7))
+        .eval_scheduled("trap_lazy_yield", "run", &[], 2, None)
         .unwrap_or_else(|error| panic!("large trapping BIF yields: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term.clone()));

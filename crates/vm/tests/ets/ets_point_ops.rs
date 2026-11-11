@@ -94,7 +94,7 @@ fn run(function: &str, reference: &RefErl, beam: &[u8]) {
     let mut vm = Vm::new([]);
     vm.load_bytes(beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_point_ops_diff", function, &[], 2, Some(91))
+        .eval_scheduled("ets_point_ops_diff", function, &[], 2, None)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

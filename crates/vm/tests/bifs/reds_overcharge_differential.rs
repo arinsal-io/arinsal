@@ -316,7 +316,7 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64) {
     (*reds, *ins, *gcs)
 }
 
-fn check(cases: &[Case], seed: u64) {
+fn check(cases: &[Case]) {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let source = source(cases);
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
@@ -326,10 +326,8 @@ fn check(cases: &[Case], seed: u64) {
 
     let filter = std::env::var("REDS_CASES").ok();
     let mut failures = Vec::new();
-    let mut index = seed;
     for case in cases {
         for &size in case.sizes {
-            index += 1;
             if filter
                 .as_deref()
                 .is_some_and(|f| !f.split(',').any(|c| c == case.name))
@@ -341,7 +339,7 @@ fn check(cases: &[Case], seed: u64) {
                 panic!("OTP {function} failed");
             };
             let actual = vm
-                .eval_scheduled_reductions(MODULE, &function, &[], 1, Some(index), 4_000)
+                .eval_scheduled_reductions(MODULE, &function, &[], 1, None, 4_000)
                 .unwrap();
             let (expected_reds, expected_ins, expected_gcs) = measured(&expected);
             let (actual_reds, actual_ins, actual_gcs) = measured(&actual.term);
@@ -364,27 +362,27 @@ fn check(cases: &[Case], seed: u64) {
 
 #[test]
 fn arith_bifs_charge_like_otp() {
-    check(ARITH_CASES, 0xC000);
+    check(ARITH_CASES);
 }
 
 #[test]
 fn iolist_bifs_charge_like_otp() {
-    check(IOLIST_CASES, 0xC100);
+    check(IOLIST_CASES);
 }
 
 #[test]
 fn t2b_bifs_charge_like_otp() {
-    check(T2B_CASES, 0xC200);
+    check(T2B_CASES);
 }
 
 #[test]
 fn matching_bifs_charge_like_otp() {
-    check(MATCHING_CASES, 0xC300);
+    check(MATCHING_CASES);
 }
 
 #[test]
 fn ets_bifs_charge_like_otp() {
-    check(ETS_CASES, 0xC400);
+    check(ETS_CASES);
 }
 
 #[test]
@@ -422,7 +420,7 @@ size() ->
     for function in ["small", "odd", "large", "tail", "bad_unit", "size"] {
         let expected = reference.call("reds_l2b_values", function, &[]);
         let actual = vm
-            .eval_scheduled("reds_l2b_values", function, &[], 1, Some(7))
+            .eval_scheduled("reds_l2b_values", function, &[], 1, None)
             .unwrap_or_else(|error| panic!("{function}: {}", &format!("{error:?}")[..200]));
         compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact)
             .unwrap_or_else(|error| panic!("{function}: {error:?}"));

@@ -92,7 +92,7 @@ fn sensitive_save_calls_and_stack_scenarios_match_otp_29() {
             "scenario",
             &[Term::small(scenario).unwrap()],
             1,
-            Some(71),
+            None,
         );
         assert_eq!(
             expected,

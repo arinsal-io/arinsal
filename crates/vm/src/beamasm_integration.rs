@@ -1769,8 +1769,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
             )
         })
     }
-    fn send_export_entry(&self) -> Result<usize, String> {
-        Ok(self.send_export)
+    fn send_export_entry(&self) -> usize {
+        self.send_export
     }
 
     fn arithmetic_helper(&self) -> ArithHelper {

@@ -37,7 +37,7 @@ fn list_bif_badarg_error_info_matches_otp_29() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "badargs", &[], 1, Some(0x1157))
+        .eval_scheduled(MODULE, "badargs", &[], 1, None)
         .unwrap_or_else(|error| panic!("badargs: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term));

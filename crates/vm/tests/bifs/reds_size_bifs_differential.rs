@@ -357,7 +357,7 @@ fn trapped_calls_return_what_otp_returns() {
         panic!("OTP semantics failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "semantics", &[], 1, Some(0xB5FF), 4_000)
+        .eval_scheduled_reductions(MODULE, "semantics", &[], 1, None, 4_000)
         .unwrap();
     assert_eq!(expected, actual.term);
 }
@@ -373,7 +373,7 @@ fn size_proportional_bifs_charge_and_yield_like_otp() {
 
     let mut failures = Vec::new();
     let filter = std::env::var("REDS_FILTER").unwrap_or_default();
-    for (index, function) in functions().iter().enumerate() {
+    for function in functions().iter() {
         if !function.contains(&filter) {
             continue;
         }
@@ -381,7 +381,7 @@ fn size_proportional_bifs_charge_and_yield_like_otp() {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, Some(0xB500 + index as u64), 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
             .unwrap();
         let (expected_reds, expected_ins, expected_gcs, expected_value) = measured(&expected);
         let (actual_reds, actual_ins, actual_gcs, actual_value) = measured(&actual.term);

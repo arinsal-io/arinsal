@@ -23,7 +23,7 @@ fn append_integer_matches_erts_for_growth_and_unaligned_sources() {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled(MODULE, function, &[], 1, Some(82))
+            .eval_scheduled(MODULE, function, &[], 1, None)
             .map(|outcome| CallResult::Ok(outcome.term))
             .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
         similar_asserts::assert_eq!(expected, actual, "{function}");

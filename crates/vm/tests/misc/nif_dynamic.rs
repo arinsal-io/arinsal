@@ -71,7 +71,7 @@ fn compile_beam(erl: &RefErl, dir: &Path, module: &str, source: &str) {
 
 fn scheduled(dir: &Path, module: &str) -> OwnedTerm {
     let mut vm = Vm::new([dir.to_path_buf()]);
-    match vm.eval_scheduled(module, "run", &[], 1, Some(1)) {
+    match vm.eval_scheduled(module, "run", &[], 1, None) {
         Ok(result) => result.term,
         Err(error) => panic!("{module}:run/0 failed on Arinsal: {error}"),
     }
