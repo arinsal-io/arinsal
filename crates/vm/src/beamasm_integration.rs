@@ -1349,7 +1349,8 @@ struct VmModuleEnv<'a> {
     light_bif_helper_fragment: usize,
     breakpoint_fragment: usize,
     line_breakpoint_fragment: usize,
-    send_fragment: usize,
+    /// `BIF_TRAP_EXPORT(BIF_send_2)`: the `erlang:send/2` export of the module's code scope.
+    send_export: usize,
     module_name: String,
     /// The module's NIFs are in this runtime (`static_nif_module`).
     static_nifs: bool,
@@ -1369,6 +1370,7 @@ impl<'a> VmModuleEnv<'a> {
         module: &arinsal_loader::Module,
         literal_heap: &'a mut VecHeap,
         export_entries: Vec<usize>,
+        send_export: usize,
         fragments: &DispatchFragments,
         module_handle: u64,
     ) -> Result<Self, String> {
@@ -1415,7 +1417,7 @@ impl<'a> VmModuleEnv<'a> {
             light_bif_helper_fragment: fragments.call_light_bif_helper(),
             breakpoint_fragment: fragments.breakpoint(),
             line_breakpoint_fragment: fragments.line_breakpoint(),
-            send_fragment: fragments.send(),
+            send_export,
             module_name: module.name.clone(),
             static_nifs: crate::load::static_nif_module(&module.name),
             functions: if module.awaits_native_functions() {
@@ -1767,8 +1769,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
             )
         })
     }
-    fn send_fragment(&self) -> usize {
-        self.send_fragment
+    fn send_export_entry(&self) -> Result<usize, String> {
+        Ok(self.send_export)
     }
 
     fn arithmetic_helper(&self) -> ArithHelper {
@@ -1977,6 +1979,12 @@ pub(crate) fn compile(
     let fragments = fragments()?;
     arinsal_loader::file_atoms(beam).ok()?;
     let (export_entries, import_bindings) = import_entries(scope, module)?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send: the `send/2`
+    // export is the one `send` calls), OTP-29.1.1.
+    let send_export = Arc::as_ptr(make_export(
+        scope,
+        (arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2),
+    )?) as usize;
     let module_handle = NEXT_MODULE_HANDLE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handle| {
             handle.checked_add(1)
@@ -1989,6 +1997,7 @@ pub(crate) fn compile(
         module,
         &mut literal_heap,
         export_entries,
+        send_export,
         fragments,
         module_handle,
     )
@@ -2351,7 +2360,6 @@ pub(crate) fn count_call_unported(
         d::RETURN_TO_DISPATCH_IDENTITY => "return_to_dispatch".to_owned(),
         d::DIRTY_NIF_DISPATCH_IDENTITY => "dirty_nif".to_owned(),
         d::BREAKPOINT_DISPATCH_IDENTITY => "breakpoint".to_owned(),
-        d::SEND_DISPATCH_IDENTITY => "send".to_owned(),
         pc if d::decode_line_breakpoint_identity(pc).is_some() => "line_breakpoint".to_owned(),
         pc if pc == crate::bif_traps::bif_export_trap_pc() => match trapped {
             Some((m, f, a)) => format!(

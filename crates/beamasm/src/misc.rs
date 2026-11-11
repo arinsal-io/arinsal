@@ -18,10 +18,15 @@ pub struct ApplyResolution {
 pub type ApplyHook = extern "C" fn(*mut crate::ProcessHeader, u32, u64, u32) -> ApplyResolution;
 
 impl BeamModuleAssembler {
-    /// Sends through the light-BIF trap path so the executor owns the scheduler context.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624, OTP-29.1.1.
-    pub fn emit_send(&mut self, fragment: usize, identity: usize) -> Result<(), ModuleError> {
-        self.dispatch_send(fragment, identity)
+    /// `send`: `call_light_bif_shared` with `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2`.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send), OTP-29.1.1.
+    pub fn emit_send(
+        &mut self,
+        fragment: usize,
+        send_export: usize,
+        send_2: usize,
+    ) -> Result<(), ModuleError> {
+        self.dispatch_light_bif(fragment, send_export, send_2)
     }
 
     /// Restores the saved bit offset in an `ErlSubBits` match context.

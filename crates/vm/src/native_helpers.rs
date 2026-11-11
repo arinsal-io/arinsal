@@ -1047,78 +1047,6 @@ pub(crate) fn vbump_reds(process: &mut crate::Process, reds: i32) {
     }
 }
 
-/// `send` from its own fragment. A traced send, a port id, or a registered port
-/// returns to the scheduler; a local pid or process name is delivered here.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 and bif.c:2458 (do_send), OTP-29.1.1.
-fn dispatch_native_send(process: &mut crate::Process, saving_calls: bool) -> Option<u64> {
-    if saving_calls {
-        crate::trace::save_call_send_export(process);
-    }
-    // A port id may suspend the sender (bif.c:2581). A registered name is resolved
-    // once inside the send; a port name comes back here to be redone by the scheduler.
-    let target = process.x[0];
-    let message = process.x[1];
-    let idle = crate::trace::send_hooks_idle(process);
-    let result = if (!idle && crate::trace::traces_sends(process)) || target.as_port().is_some() {
-        Err(crate::VmError::Unsupported(
-            crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
-        ))
-    } else if target.as_atom().is_some() {
-        process.send_message_native(target, message)
-    } else if idle && let Some(pid) = arinsal_sched::Pid::from_term(target) {
-        process.send_to_pid_idle(pid, message)
-    } else {
-        process.send_message(target, message)
-    };
-    match result {
-        Ok(value) => {
-            // Port of erts/emulator/beam/bif.c:2861-2864 (erl_send: ERTS_VBUMP_REDS(p, 4) after a
-            // completed send) and bif.h:85 (ERTS_VBUMP_REDS), OTP-29.1.1: a send takes four
-            // virtual reductions out of the slice that are not the process's own work, so a
-            // sender yields to the receivers it fed after about a third of the sends.
-            vbump_reds(process, 4);
-            // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send: save_calls(p, &exp_send)),
-            // OTP-29.1.1.
-            if !idle && crate::trace::saves_calls(process) {
-                crate::trace::save_call(process, crate::trace::SavedCall::Send);
-            }
-            let raw = crate::native_hooks::raw(value);
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send jumps into
-            // call_light_bif_shared) and 488-523 (ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1:
-            // a send that left heap fragments or virtual binary heap over its limit collects
-            // with the result as the only root.
-            if process.heap.gc_after_bif_desired() {
-                let mut result = Ok(value);
-                if !gc_after_plain_bif(process, 2, &mut result) {
-                    return Some(0);
-                }
-                let Ok(value) = result else { return Some(0) };
-                let raw = crate::native_hooks::raw(value);
-                process.x[0] = crate::native_hooks::from_raw(raw);
-                return Some(raw);
-            }
-            process.x[0] = value;
-            Some(raw)
-        }
-        Err(crate::VmError::Unsupported(message))
-            if message == crate::process::REMOTE_SEND_NEEDS_CONTEXT =>
-        {
-            if crate::trace::saves_calls(process) {
-                crate::trace::save_call(process, crate::trace::SavedCall::Send);
-            }
-            process.heap.abi.arity = 2;
-            process.heap.abi.i =
-                arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY as *const u8 as *const _;
-            process.heap.abi.exc.freason = 1 << 10;
-            None
-        }
-        Err(_) => {
-            crate::native_hooks::set_error(process, "badarg");
-            Some(0)
-        }
-    }
-}
-
 /// Prepares the live X registers and handler arguments for a native line-breakpoint call.
 // Port of erts/emulator/beam/beam_bp.c:1821-1865
 // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
@@ -2052,35 +1980,6 @@ pub(crate) extern "C" fn process_bif_light(
     }
 }
 
-/// `send_3`'s local fast path returns in registers; only a declined call enters the executor.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
-pub(crate) extern "C" fn send3_bif_light(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let args = &registers.x_reg_array[..3];
-    if crate::signals::send3_light_eligible(process, args) {
-        return match crate::signals::send3_light_call(process, args) {
-            Ok(value) => {
-                process.x[0] = value;
-                crate::native_hooks::raw(value)
-            }
-            Err(trap) => thin_bif_failed(process, registers, descriptor, *trap),
-        };
-    }
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    park_executor(process, export, identity, false)
-}
-
 /// A process BIF whose success path returns in registers: no `Result<Term, Trap>` is moved
 /// unless the BIF fails, and the export is not read unless it does.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1:
@@ -2183,12 +2082,6 @@ fn invoke_dispatch_bif(
     // The BIF reads its arguments from the register array; only the paths that work on
     // `process.x` (send, the direct table BIFs) load it.
     let (process, registers) = crate::native_hooks::enter_runtime(header)?;
-    // `send` is its own fragment (instr_bif.cpp:612), not a failed BIF dispatch.
-    if identity == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
-        let saving_calls = !export_call
-            && registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64;
-        return dispatch_native_send(process, saving_calls);
-    }
     if let Some(export) = export {
         if export_call {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
@@ -2248,11 +2141,7 @@ fn invoke_dispatch_bif(
             == (crate::natives::sys::garbage_collect_bif as *const () as usize)
             && process.gc_outer_queue_pending())
     {
-        if (bif as usize) == (crate::signals::send3_light as *const () as usize) {
-            if let Some(raw) = call_send3_bif_light(process, registers, export) {
-                return Some(raw);
-            }
-        } else if let Some(raw) = call_process_bif(process, registers, export, bif, export_call) {
+        if let Some(raw) = call_process_bif(process, registers, export, bif, export_call) {
             return Some(raw);
         }
     }
@@ -3277,27 +3166,6 @@ fn call_process_bif(
         return Some(crate::native_hooks::raw(value));
     }
     Some(process_bif_result(process, export, arity, result))
-}
-
-/// Run `send_3` from an export entry without materializing its declining `Option<Result<…>>`.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
-#[inline(always)]
-fn call_send3_bif_light(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: ExportDispatch,
-) -> Option<u64> {
-    let args = &registers.x_reg_array[..3];
-    if !crate::signals::send3_light_eligible(process, args) {
-        return None;
-    }
-    Some(match crate::signals::send3_light_call(process, args) {
-        Ok(value) => {
-            process.x[0] = value;
-            crate::native_hooks::raw(value)
-        }
-        Err(trap) => process_bif_result(process, export, 3, Err(*trap)),
-    })
 }
 
 /// A process BIF's exception, or a value after which a collection is desired.

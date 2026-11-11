@@ -28,7 +28,6 @@ pub struct DispatchFragments {
     breakpoint_offset: usize,
     line_breakpoint_offset: usize,
     line_breakpoint_cleanup_offset: usize,
-    send_offset: usize,
     /// The beam_run_process stub (erl_process.c:12616): start and end addresses, when built.
     run_process_offsets: Option<(usize, usize)>,
     save_calls_export_offset: usize,
@@ -112,8 +111,6 @@ pub struct DispatchRuntimeHelpers {
     pub call_error_handler: usize,
 }
 
-/// Identity sent through the light-BIF fragment to hand native `send` to the executor.
-pub const SEND_DISPATCH_IDENTITY: usize = usize::MAX - 0xF1;
 /// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
 /// executor, which owns the VM and run context that tracer modules and meta tracing need.
 pub const BREAKPOINT_DISPATCH_IDENTITY: usize = usize::MAX - 0xF5;
@@ -244,7 +241,6 @@ impl DispatchFragments {
         let breakpoint = code.new_label();
         let breakpoint_helper = code.new_label();
         let line_breakpoint = code.new_label();
-        let send = code.new_label();
         let raise_exception = code.new_label();
         let run_process = code.new_label();
         let save_calls_export = code.new_label();
@@ -307,10 +303,6 @@ impl DispatchFragments {
         let line_breakpoint_cleanup =
             emit_line_breakpoint_shared(&mut code, line_breakpoint_helpers)
                 .map_err(|_| ExecError::InvalidSize("line-breakpoint fragment"))?;
-        code.bind(send)
-            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_helper_fragment(&mut code, light_bif_helper, 2)
-            .map_err(|_| ExecError::InvalidSize("send fragment"))?;
         // Port of erts/emulator/beam/beam_emu.c:693-694 (beam_run_process = op_i_apply_only): the
         // start stub applies X0..X2 and branches to the resolved code, as a tail call.
         code.bind(run_process)
@@ -405,7 +397,6 @@ impl DispatchFragments {
             breakpoint_offset: labels[&breakpoint],
             line_breakpoint_offset: labels[&line_breakpoint],
             line_breakpoint_cleanup_offset: labels[&line_breakpoint_cleanup],
-            send_offset: labels[&send],
             run_process_offsets: (apply3_resolver != 0)
                 .then(|| (labels[&run_process], labels[&save_calls_export])),
             save_calls_export_offset: labels[&save_calls_export],
@@ -457,11 +448,6 @@ impl DispatchFragments {
     /// Return address of the shared breakpoint-handler call's cleanup continuation.
     pub fn line_breakpoint_cleanup(&self) -> usize {
         self.memory.ptr_at(self.line_breakpoint_cleanup_offset) as usize
-    }
-
-    /// Shared `send/2` fragment with only its two live X registers saved.
-    pub fn send(&self) -> usize {
-        self.memory.ptr_at(self.send_offset) as usize
     }
 
     /// The beam_run_process stub: `(start, end)` addresses, or `None` when it was not built.

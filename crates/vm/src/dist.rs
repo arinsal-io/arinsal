@@ -2831,84 +2831,6 @@ pub(crate) fn forward_link_exit_if_proxy(
     true
 }
 
-/// Send directly to a remote pid, preserving `send/2`'s returned message.
-pub(crate) fn native_send(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    send_to(process, ctx, args[0], args[1])?;
-    Ok(args[1])
-}
-
-/// Port of erts/emulator/beam/bif.c:2697-2759 (`send_3`), OTP-29.1.1.
-pub(crate) fn native_send3(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    let mut want_priority = false;
-    let mut noconnect = false;
-    let mut nosuspend = false;
-    let mut bad = false;
-    // Port of erts/emulator/beam/bif.c (erlang:send/3 option loop): the list is walked in
-    // place, no copy of the options.
-    let walked = crate::signals::each_list_item(args[2], |option| {
-        let atoms = arinsal_term::global_atoms();
-        match option.as_atom().and_then(|a| atoms.text(a)) {
-            Some("nosuspend") => nosuspend = true,
-            Some("noconnect") => noconnect = true,
-            Some("priority") => want_priority = true,
-            _ => bad = true,
-        }
-    });
-    if walked.is_none() || bad {
-        return Err(badarg());
-    }
-    if is_remote_target(args[0])? {
-        return match try_remote_send_with_options(
-            process, ctx, args[0], args[1], !noconnect, !nosuspend,
-        )? {
-            RemoteSendOutcome::Sent => {
-                crate::trace::emit_process(
-                    Some(vm),
-                    process,
-                    ctx.pid(),
-                    crate::trace::SEND,
-                    "send",
-                    &[args[1], args[0]],
-                );
-                let _ = want_priority;
-                Ok(Term::atom(arinsal_term::atoms::OK))
-            }
-            RemoteSendOutcome::NotConnected => Ok(Term::atom(if noconnect {
-                arinsal_term::atoms::NOCONNECT
-            } else {
-                arinsal_term::atoms::OK
-            })),
-            RemoteSendOutcome::WouldSuspend => Ok(Term::atom(arinsal_term::atoms::NOSUSPEND)),
-            RemoteSendOutcome::NotRemote => Err(badarg()),
-        };
-    }
-    if nosuspend {
-        // Port of erts/emulator/beam/bif.c:2390 (send_3): a busy port gives `nosuspend`.
-        let (sent, busy) = crate::port::send_nosuspend(|| {
-            process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)
-        });
-        sent?;
-        return Ok(Term::atom(if busy {
-            arinsal_term::atoms::NOSUSPEND
-        } else {
-            arinsal_term::atoms::OK
-        }));
-    }
-    // Local priority delivery needs the process send path (alias + flag).
-    process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;
-    Ok(Term::atom(arinsal_term::atoms::OK))
-}
-
 /// Route signal BIFs to the distribution controller when the peer is remote.
 pub(crate) fn native_signal(
     vm: &mut Vm,
@@ -3720,23 +3642,6 @@ pub(crate) fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, 
     };
     // Port of erts/emulator/beam/bif.c:2614-2626 (`do_send` accepts every arity-two atom tuple as a remote destination), OTP-29.1.1.
     Ok(Some((name.clone(), node.clone())))
-}
-
-fn send_to(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    target: Term,
-    message: Term,
-) -> Result<(), VmError> {
-    // Port of erts/emulator/beam/bif.c:2469-2480,2511 (do_send), OTP-29.1.1: internal pids
-    // and atoms skip the remote-destination checks.
-    let local_destination = target.as_pid_data().is_some() || target.as_atom().is_some();
-    if !local_destination && try_remote_send(process, ctx, target, message)? {
-        return Ok(());
-    }
-    process
-        .send_message_prio(None, Some(ctx), target, message, false)
-        .map(|_| ())
 }
 
 fn local_pid(term: &OwnedTerm, local: &str) -> Option<Pid> {

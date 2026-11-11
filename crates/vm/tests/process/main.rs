@@ -45,6 +45,7 @@ mod select_close_hang;
 mod select_val_differential;
 mod selective_receive_differential;
 mod self_send_differential;
+mod send_bif_differential;
 mod seq_trace_receive_heap;
 mod sig_bifs;
 mod sig_buffers;

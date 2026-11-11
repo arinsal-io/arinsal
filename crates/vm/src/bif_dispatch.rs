@@ -101,6 +101,9 @@ impl Vm {
                     p.x.ensure_x(values.len());
                     p.x[..values.len()].copy_from_slice(values);
                 }
+                // `erts_proc_sched_data(c_p)`: the body reaches this scheduler's data as it
+                // does from native code.
+                let _slice = crate::process::sched_data::NativeSlice::enter(self, ctx);
                 crate::bif_table::call_from_executor(p, module, function, args.len())
             }
             None => None,

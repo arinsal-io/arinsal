@@ -46,7 +46,6 @@ pub(crate) use self::receive::*;
 pub use self::runtime::ScheduledResult;
 pub(crate) use self::runtime::*;
 use self::schedule::*;
-pub(crate) use self::send::*;
 pub(crate) use self::sig_queue::*;
 use self::spawn_eval::*;
 

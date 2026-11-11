@@ -1575,9 +1575,6 @@ fn request_system_task(
 /// [`call`] admits every `erlang` function name in this table at any arity.
 /// `erts_internal:spawn_system_process/3` is `spawn/3` for system processes.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erlang", "!", 2),
-    ("erlang", "send", 2),
-    ("erlang", "send", 3),
     ("erlang", "spawn", 3),
     ("erlang", "spawn_link", 3),
     ("erlang", "spawn_opt", 4),
@@ -1615,26 +1612,6 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
         .any(|&(item_module, item_function, item_arity)| {
             item_module == module && item_function == function && item_arity == arity
         })
-}
-
-/// Direct load-time entry for `send/2`.
-pub(crate) fn native_send(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    process.send_message_in(vm, ctx, args[0], args[1])
-}
-
-/// Direct load-time entry for `send/3`.
-pub(crate) fn native_send3(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    crate::dist::native_send3(vm, process, ctx, args)
 }
 
 /// Direct load-time entry for `is_process_alive/1`.
@@ -2057,103 +2034,6 @@ pub(crate) fn link_light(
     Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
 }
 
-/// `erlang:send(Pid, Msg, Options)` called directly from native code for a local pid, options
-/// without `priority`, and a sender with no trace or seq-trace hooks. Everything else declines
-/// before any state changes and takes the executor.
-// Port of erts/emulator/beam/bif.c:2697-2759 (send_3) and bif.c:2458 (do_send), OTP-29.1.1:
-// `noconnect` and `nosuspend` only matter for a remote destination or a port.
-pub(crate) fn send3_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    if !send3_light_eligible(process, args) {
-        return None;
-    }
-    Some(send3_light_call(process, args).map_err(|trap| *trap))
-}
-
-/// Check whether `send_3` can use the local, untraced process path without changing state.
-pub(crate) fn send3_light_eligible(process: &Process, args: &[Term]) -> bool {
-    let [target, _message, options] = args else {
-        return false;
-    };
-    if Pid::from_term(*target).is_none() {
-        return false;
-    }
-    if !crate::trace::send_hooks_idle(process) {
-        return false;
-    }
-    let atoms = global_atoms();
-    let mut plain = true;
-    let Some(()) = each_list_item(*options, |option| {
-        plain &= option
-            .as_atom()
-            .and_then(|a| atoms.text(a))
-            .is_some_and(|name| name == "noconnect" || name == "nosuspend");
-    }) else {
-        return false;
-    };
-    if !plain {
-        return false;
-    }
-    true
-}
-
-/// Run the successful local `send_3` path with a register-return-compatible error value.
-pub(crate) fn send3_light_call(
-    process: &mut Process,
-    args: &[Term],
-) -> Result<Term, Box<crate::exceptions::Trap>> {
-    let [target, message, _options] = args else {
-        return Err(Box::new(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        ))));
-    };
-    let Some(pid) = Pid::from_term(*target) else {
-        return Err(Box::new(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        ))));
-    };
-    // Port of erts/emulator/beam/bif.c:2742 (send_3: ERTS_VBUMP_REDS(p, 4) after a completed
-    // send), OTP-29.1.1.
-    match process.send_to_pid_idle(pid, *message) {
-        Ok(_) => {
-            crate::native_helpers::vbump_reds(process, 4);
-            Ok(Term::atom(arinsal_term::atoms::OK))
-        }
-        Err(_) => Err(Box::new(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        )))),
-    }
-}
-
-/// `erlang:send(Dest, Msg)` called directly from native code for a local pid and a sender with
-/// no trace or seq-trace hooks. A name, a port, a remote destination and every hook decline
-/// before any state changes and take the executor.
-// Port of erts/emulator/beam/bif.c:2862 (erl_send: ERTS_VBUMP_REDS after a completed send) and
-// bif.c:2458 (do_send), OTP-29.1.1.
-pub(crate) fn send2_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [target, message] = args else {
-        return None;
-    };
-    let pid = Pid::from_term(*target)?;
-    if !crate::trace::send_hooks_idle(process) {
-        return None;
-    }
-    Some(match process.send_to_pid_idle(pid, *message) {
-        Ok(value) => {
-            crate::native_helpers::vbump_reds(process, 4);
-            Ok(value)
-        }
-        Err(_) => Err(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        ))),
-    })
-}
-
 /// `exit(Pid, Reason)` called directly from native code (erts bif.c:1721 send_exit_signal_bif)
 /// for a local pid other than the caller.
 // Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.
@@ -2244,26 +2124,17 @@ pub(crate) fn handler_atoms(
     static HANDLERS: OnceLock<HashMap<(Atom, Atom, u8), crate::natives::NativeEntry>> =
         OnceLock::new();
     let handlers = HANDLERS.get_or_init(|| {
-        let mut handlers: HashMap<_, _> = IMPLEMENTED
+        let handlers: HashMap<_, _> = IMPLEMENTED
             .iter()
             .filter_map(|&(module, function, arity)| {
                 let module = global_atoms().intern(module).ok()?;
                 let function = global_atoms().intern(function).ok()?;
                 let entry = match (module, function, arity) {
-                    (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("send")? => {
-                        crate::natives::NativeEntry::Direct(native_send)
-                    }
-                    (m, f, 3) if m == arinsal_term::atoms::ERLANG && f == atom_id("send")? => {
-                        crate::natives::NativeEntry::Direct(native_send3)
-                    }
                     (m, f, 1)
                         if m == arinsal_term::atoms::ERLANG
                             && f == atom_id("is_process_alive")? =>
                     {
                         crate::natives::NativeEntry::Direct(native_is_process_alive)
-                    }
-                    (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("!")? => {
-                        crate::natives::NativeEntry::Direct(native_send)
                     }
                     (m, f, 2) if m == arinsal_term::atoms::ERLANG && f == atom_id("monitor")? => {
                         crate::natives::NativeEntry::Direct(crate::natives::bif::monitor_executor)
@@ -2297,12 +2168,6 @@ pub(crate) fn handler_atoms(
                 Some(((module, function, arity), entry))
             })
             .collect();
-        if let (Some(module), Some(function)) = (atom_id("erlang"), atom_id("!")) {
-            handlers.insert(
-                (module, function, 2),
-                crate::natives::NativeEntry::Direct(native_send),
-            );
-        }
         handlers
     });
     handlers.get(&(module, function, arity)).copied()

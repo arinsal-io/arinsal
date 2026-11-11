@@ -1,10 +1,12 @@
-//! The monitor BIFs of bif.c.
+//! The process BIFs of bif.c.
 //!
 //! Port of erts/emulator/beam/bif.c (monitor_2, monitor_3, monitor, demonitor_1, demonitor_2,
-//! demonitor), OTP-29.1.1. Each BIF is `bif_table[].f`, called by `call_light_bif_shared` /
-//! `call_bif_shared` with `(c_p, reg, I)`; GC after the BIF is the fragment's. Only the
-//! distributed arm of `monitor` reaches its scheduler's data, as erts reaches `esdp` through
-//! `erts_proc_sched_data(c_p)` only where a BIF needs it.
+//! demonitor, self_0, group_leader_0, erts_internal_group_leader_2, process_flag_2,
+//! ebif_bang_2, send_2, send_3, erl_send), OTP-29.1.1. Each BIF is `bif_table[].f`, called by
+//! `call_light_bif_shared` / `call_bif_shared` with `(c_p, reg, I)`; GC after the BIF is the
+//! fragment's. Only the arms that need it (a distributed monitor, a send that is not to an
+//! internal pid of an untraced sender) reach the scheduler's data, as erts reaches `esdp`
+//! through `erts_proc_sched_data(c_p)` only where a BIF needs it.
 
 use crate::proc_create::{AliasMode, MonitorInfo, OriginMonitor};
 use crate::process::Message;
@@ -584,4 +586,251 @@ fn monitor_nodes(
         count.saturating_sub(1)
     };
     Term::small(previous as i64).ok_or_else(badarg)
+}
+
+/// `erlang:'!'/2` (`ebif_bang_2`): `erl_send`.
+// Port of erts/emulator/beam/bif.c (ebif_bang_2), OTP-29.1.1.
+pub(crate) extern "C" fn ebif_bang_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    erl_send(c_p, i)
+}
+
+/// `send/2`: `erl_send`. The `send` instruction calls it through the `send/2` export
+/// (`emit_send`).
+// Port of erts/emulator/beam/bif.c (send_2) and jit/arm/instr_bif.cpp (emit_send), OTP-29.1.1.
+pub(crate) extern "C" fn send_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    erl_send(c_p, i)
+}
+
+/// `erl_send(c_p, BIF_ARG_1, BIF_ARG_2)`: `do_send`, then `ERTS_VBUMP_REDS(p, 4)` and the
+/// message as the value, or `ERTS_BIF_PREP_YIELD_RETURN` when that used up the slice.
+// Port of erts/emulator/beam/bif.c (erl_send), OTP-29.1.1.
+#[inline(always)]
+fn erl_send(c_p: *mut ProcessHeader, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (to, msg) = (process.x[0], process.x[1]);
+    let result = match do_send(process, to, msg, SendOptions::default()) {
+        Ok(Sent::Done) => send_return(process, msg),
+        // SEND_NOCONNECT, and SEND_YIELD that cannot come without `nosuspend`.
+        Ok(Sent::NoConnect | Sent::Busy) => Ok(msg),
+        Err(error) => Err(error),
+    };
+    bif_ret(c_p, i, result)
+}
+
+/// `result >= 0`: `ERTS_VBUMP_REDS(p, 4)`, then the value, or `ERTS_BIF_PREP_YIELD_RETURN`
+/// (`bif_return_trap/2`) when the send used up the slice (`ERTS_IS_PROC_OUT_OF_REDS`).
+// Port of erts/emulator/beam/bif.c (erl_send, send_3: yield_return) and bif.h
+// (ERTS_VBUMP_REDS, ERTS_IS_PROC_OUT_OF_REDS), OTP-29.1.1.
+#[inline(always)]
+fn send_return(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    crate::native_helpers::vbump_reds(process, 4);
+    if process.heap.abi.fcalls > 0 {
+        return Ok(value);
+    }
+    send_yield_return(process, value)
+}
+
+#[cold]
+#[inline(never)]
+fn send_yield_return(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    Err(VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        crate::natives::sys::BIF_RETURN_TRAP,
+        vec![value, Term::atom(atoms::UNDEFINED)],
+    )))
+}
+
+/// `do_send`: every local destination (internal pid, alias, registered name, `{Name, node()}`,
+/// port) is sent from `c_p`; only `remote_send` reaches the scheduler's distribution state.
+/// A sender with trace hooks (`trace_send`, seq trace, `save_calls`) evaluates them with the
+/// scheduler's data, which Arinsal's trace evaluation needs.
+// Port of erts/emulator/beam/bif.c (do_send, remote_send), OTP-29.1.1.
+#[inline(always)]
+fn do_send(process: &mut Process, to: Term, msg: Term, opts: SendOptions) -> Result<Sent, VmError> {
+    if !crate::trace::send_hooks_idle(process) {
+        return do_send_hooked(process, to, msg, opts);
+    }
+    // is_internal_pid(to): erts_proc_lookup_raw, then erts_send_message.
+    if !opts.priority
+        && let Some(pid) = Pid::from_term(to)
+    {
+        return match process.send_to_pid_idle(pid, msg) {
+            Ok(_) => Ok(Sent::Done),
+            Err(_) => Err(badarg()),
+        };
+    }
+    if crate::dist::is_remote_target(to)? {
+        return remote_send(process, to, msg, opts);
+    }
+    do_send_local(process, to, msg, opts)
+}
+
+/// The local arms of `do_send` other than an internal pid without `priority`: an alias, a
+/// registered name, `{Name, node()}`, a port (`port_common`, with `nosuspend`).
+// Port of erts/emulator/beam/bif.c (do_send: is_internal_ref, is_atom, is_internal_port,
+// is_tuple with `dep == erts_this_dist_entry`, port_common), OTP-29.1.1.
+fn do_send_local(
+    process: &mut Process,
+    to: Term,
+    msg: Term,
+    opts: SendOptions,
+) -> Result<Sent, VmError> {
+    if opts.nosuspend {
+        let (sent, busy) = crate::port::send_nosuspend(|| {
+            process.send_message_prio(None, None, to, msg, opts.priority)
+        });
+        sent?;
+        return Ok(if busy { Sent::Busy } else { Sent::Done });
+    }
+    process.send_message_prio(None, None, to, msg, opts.priority)?;
+    Ok(Sent::Done)
+}
+
+/// `do_send` of a sender with trace hooks: `trace_send`, the seq trace token and
+/// `save_calls(p, &exp_send)`, evaluated with the scheduler's data.
+// Port of erts/emulator/beam/bif.c (do_send: trace_send, save_calls), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn do_send_hooked(
+    process: &mut Process,
+    to: Term,
+    msg: Term,
+    opts: SendOptions,
+) -> Result<Sent, VmError> {
+    if crate::trace::saves_calls(process) {
+        crate::trace::save_call(process, crate::trace::SavedCall::Send);
+    }
+    if crate::dist::is_remote_target(to)? {
+        return remote_send(process, to, msg, opts);
+    }
+    with_sched(process, |vm, process, ctx| {
+        if opts.nosuspend {
+            let (sent, busy) = crate::port::send_nosuspend(|| {
+                process.send_message_prio(Some(vm), Some(ctx), to, msg, opts.priority)
+            });
+            sent?;
+            return Ok(if busy { Sent::Busy } else { Sent::Done });
+        }
+        process.send_message_prio(Some(vm), Some(ctx), to, msg, opts.priority)?;
+        Ok(Sent::Done)
+    })?
+}
+
+/// `remote_send`: the distribution entry is the scheduler's (`erts_dsig_prepare` with
+/// `esdp`). `SEND_NOCONNECT` and a `nosuspend` busy entry come back as errors `send_3` maps.
+// Port of erts/emulator/beam/bif.c (remote_send), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn remote_send(
+    process: &mut Process,
+    to: Term,
+    msg: Term,
+    opts: SendOptions,
+) -> Result<Sent, VmError> {
+    use crate::dist::RemoteSendOutcome;
+    with_sched(
+        process,
+        |vm, process, ctx| match crate::dist::try_remote_send_with_options(
+            process,
+            ctx,
+            to,
+            msg,
+            !opts.noconnect,
+            !opts.nosuspend,
+        )? {
+            RemoteSendOutcome::Sent => {
+                crate::trace::emit_process(
+                    Some(vm),
+                    process,
+                    ctx.pid(),
+                    crate::trace::SEND,
+                    "send",
+                    &[msg, to],
+                );
+                Ok(Sent::Done)
+            }
+            RemoteSendOutcome::NotConnected => Ok(Sent::NoConnect),
+            RemoteSendOutcome::WouldSuspend => Ok(Sent::Busy),
+            RemoteSendOutcome::NotRemote => Err(badarg()),
+        },
+    )?
+}
+
+/// The non-error results of `do_send` (its `Sint` result codes).
+#[derive(Clone, Copy)]
+enum Sent {
+    /// `result >= 0`.
+    Done,
+    /// `SEND_NOCONNECT`: dropped, the node is not connected.
+    NoConnect,
+    /// `SEND_YIELD` with `suspend` off: nothing was sent.
+    Busy,
+}
+
+/// `send/3`: the option list, then `do_send` with its `connect`/`suspend`/`prio` flags.
+// Port of erts/emulator/beam/bif.c (send_3), OTP-29.1.1.
+pub(crate) extern "C" fn send_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (to, msg, list) = (process.x[0], process.x[1], process.x[2]);
+    let Some(opts) = send_options(list) else {
+        // `BIF_P->fvalue = am_badopt; BADARG | EXF_HAS_EXT_INFO`.
+        let error = badarg_ext(atoms::ERLANG, "send", 3, Term::atom(atoms::BADOPT));
+        return bif_ret(c_p, i, Err(error));
+    };
+    let ok = Term::atom(atoms::OK);
+    let result = match do_send(process, to, msg, opts) {
+        Ok(Sent::Done) => send_return(process, ok),
+        Ok(Sent::NoConnect) => Ok(Term::atom(if opts.noconnect {
+            atoms::NOCONNECT
+        } else {
+            atoms::OK
+        })),
+        Ok(Sent::Busy) => Ok(Term::atom(atoms::NOSUSPEND)),
+        Err(error) => Err(error),
+    };
+    bif_ret(c_p, i, result)
+}
+
+/// The options `send_3` reads.
+#[derive(Clone, Copy, Default)]
+struct SendOptions {
+    noconnect: bool,
+    nosuspend: bool,
+    priority: bool,
+}
+
+/// `send_3`'s option loop: a proper list of `noconnect`, `nosuspend` and `priority`.
+// Port of erts/emulator/beam/bif.c (send_3: the option loop), OTP-29.1.1.
+fn send_options(list: Term) -> Option<SendOptions> {
+    let mut options = SendOptions::default();
+    let mut bad = false;
+    crate::signals::each_list_item(list, |option| match option.as_atom() {
+        Some(atom) if atom == atoms::NOCONNECT => options.noconnect = true,
+        Some(atom) if atom == atoms::NOSUSPEND => options.nosuspend = true,
+        Some(atom) if atom == atoms::PRIORITY => options.priority = true,
+        _ => bad = true,
+    })?;
+    (!bad).then_some(options)
+}
+
+/// `erts_proc_sched_data(c_p)` for a BIF arm that needs it. The call site a suspending BIF
+/// names (`c_p->i` at the call) is recorded first.
+// Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data), OTP-29.1.1.
+fn with_sched<R>(
+    process: &mut Process,
+    f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> R,
+) -> Result<R, VmError> {
+    if let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) {
+        process.native_call_pc = registers.tmp_mem[6] as usize;
+    }
+    let result = crate::process::sched_data::with_sched_data(process, f)
+        .ok_or_else(|| VmError::Unsupported("BIF: no scheduler data".into()));
+    process.native_call_pc = 0;
+    result
 }

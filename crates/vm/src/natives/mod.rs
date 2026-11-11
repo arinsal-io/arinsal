@@ -316,11 +316,6 @@ pub(crate) trait ThinProcessBif {
 pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     if module == "erlang" {
         match (function, arity) {
-            ("send", 3) => {
-                return Some(crate::bif_table::bif!(
-                    crate::native_helpers::send3_bif_light
-                ));
-            }
             ("port_get_data", 1) => {
                 return Some(crate::bif_table::bif!(
                     crate::native_helpers::thin_bif_light::<crate::port::PortGetData>
@@ -444,12 +439,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     }
     if module == "erlang" && function == "unlink" && arity == 1 {
         return Some(crate::signals::unlink_light);
-    }
-    if module == "erlang" && function == "send" && arity == 3 {
-        return Some(crate::signals::send3_light);
-    }
-    if module == "erlang" && function == "send" && arity == 2 {
-        return Some(crate::signals::send2_light);
     }
     if module == "erlang" && function == "exit" && arity == 2 {
         return Some(crate::signals::exit2_light);
@@ -688,9 +677,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if module == "erlang" {
         match (function, arity) {
-            ("!", 2) => return Some(NativeEntry::Direct(crate::dist::native_send)),
-            ("send", 2) => return Some(NativeEntry::Direct(crate::dist::native_send)),
-            ("send", 3) => return Some(NativeEntry::Direct(crate::dist::native_send3)),
             ("link", 1) => return Some(NativeEntry::Direct(crate::dist::native_link)),
             ("unlink", 1) => return Some(NativeEntry::Direct(crate::dist::native_unlink)),
             ("exit", 2) => return Some(NativeEntry::Direct(crate::dist::native_exit2)),
@@ -808,7 +794,12 @@ mod tests {
         let (class, bits) = classify("erlang", "self", 0, false);
         assert_eq!(class, ImportClass::Native);
         assert_eq!(bits, 0);
-        for (function, arity) in [("!", 2), ("send", 2), ("send", 3), ("is_process_alive", 1)] {
+        for (function, arity) in [("!", 2), ("send", 2), ("send", 3)] {
+            let (class, bits) = classify("erlang", function, arity, false);
+            assert_eq!(class, ImportClass::Native, "erlang:{function}/{arity}");
+            assert_eq!(bits, 0, "erlang:{function}/{arity} is its bif_table body");
+        }
+        for (function, arity) in [("is_process_alive", 1)] {
             let (class, bits) = classify("erlang", function, arity, true);
             assert_eq!(class, ImportClass::Native);
             assert!(matches!(unpack_native(bits), Some(NativeEntry::Direct(_))));
@@ -849,13 +840,10 @@ mod tests {
     #[test]
     fn signal_imports_resolve_to_distinct_entries() {
         let direct = [
-            ("erlang", "!", 2),
             ("erlang", "monitor", 2),
             ("erlang", "monitor", 3),
             ("erlang", "demonitor", 1),
             ("erlang", "demonitor", 2),
-            ("erlang", "send", 2),
-            ("erlang", "send", 3),
             ("erlang", "is_process_alive", 1),
         ];
         let entries = crate::signals::IMPLEMENTED

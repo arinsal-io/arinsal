@@ -82,7 +82,8 @@ fn native_send() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
-    asm.emit_send(fragments.send(), IDENTITY).unwrap();
+    asm.emit_send(fragments.call_light_bif_helper(), IDENTITY, 0)
+        .unwrap();
     asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
