@@ -10,7 +10,7 @@ use arinsal_ets::{
     TableType, Tid, WriteConcurrency,
 };
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, TermKind, copy_term, global_atoms};
+use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, TermKind, global_atoms};
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -3805,17 +3805,13 @@ fn call_inner(
                 update_list(*operation, parse)
             };
             let values = table
-                .update_counter_big(*key, &operations, default)
+                .update_counter_big(*key, &operations, default, &mut heap)
                 .map_err(err)?;
-            let copied = values
-                .into_iter()
-                .map(|value| copy_term(value, &mut heap).map_err(|_| badarg()))
-                .collect::<Result<Vec<_>, _>>()?;
             if single {
-                copied.first().copied().ok_or_else(badarg)
+                values.first().copied().ok_or_else(badarg)
             } else {
                 TermBuilder::new(&mut heap)
-                    .list_from_iter(copied)
+                    .list_from_iter(values)
                     .map_err(|_| badarg())
             }
         }

@@ -1,6 +1,5 @@
 //! VM-independent ETS storage. The VM owns access checks and process lifecycle.
 
-mod block_cache;
 /// The counters of an `ets:info` snapshot: `ERTS_DB_TABLE_NITEMS_COUNTER_ID` and the memory of
 /// the table in words (`ERTS_DB_TABLE_MEM_COUNTER_ID` counts the stored objects here, the table
 /// structure is added from its layout).
@@ -37,8 +36,8 @@ pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEn
 
 use arinsal_term::{
     Atom, BinaryOwner, ExternalBinary, HeapAlloc, Identity, MagicRef, Node as TermNode, Term,
-    TermBuilder, TermError, TermKind, VecHeap, WritableBinary, binary_owner, cmp, copy_term,
-    exact_eq, global_atoms, internal_hash, term_sequence,
+    TermBuilder, TermError, TermKind, VecHeap, binary_owner, cmp, copy_term, exact_eq,
+    global_atoms, internal_hash, term_sequence,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -902,24 +901,6 @@ pub(crate) struct Compressed {
     pub(crate) bytes: usize,
 }
 
-// `copy_term` asks for one allocation after computing `size_object`. An exact
-// allocation avoids VecHeap's 1024-word minimum for each small ETS object.
-struct ObjectHeap {
-    // One allocation per object in the common case: the inline slot avoids a second malloc for
-    // the vector holding it.
-    words: smallvec::SmallVec<[Box<[u64]>; 1]>,
-    off_heap: Option<Box<OffHeap>>,
-}
-
-impl Drop for ObjectHeap {
-    fn drop(&mut self) {
-        self.off_heap = None;
-        for block in self.words.drain(..) {
-            block_cache::give(block);
-        }
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct OffHeap {
     // Per-object DbTerm.first_oh; dropping its tokens ports db_free_term cleanup.
@@ -928,120 +909,6 @@ pub(crate) struct OffHeap {
     pub(crate) external: Vec<Arc<ExternalBinary>>,
     pub(crate) nodes: Vec<Arc<TermNode>>,
     pub(crate) magic: Vec<Arc<MagicRef>>,
-}
-
-impl ObjectHeap {
-    fn new() -> Self {
-        Self {
-            words: smallvec::SmallVec::new(),
-            off_heap: None,
-        }
-    }
-
-    fn off_heap(&mut self) -> &mut OffHeap {
-        self.off_heap
-            .get_or_insert_with(|| Box::new(OffHeap::default()))
-    }
-
-    /// Link the off-heap object at `address` (three words) at the head of the DbTerm's
-    /// `first_oh` chain.
-    fn chain_first_oh(&mut self, address: usize) -> Result<(), TermError> {
-        let Some((allocation_index, word_index)) =
-            self.words.iter().enumerate().find_map(|(i, allocation)| {
-                let start = allocation.as_ptr() as usize;
-                let end = start.checked_add(allocation.len().checked_mul(8)?)?;
-                (address >= start && address.checked_add(24).is_some_and(|tail| tail <= end))
-                    .then(|| (i, (address - start) / 8))
-            })
-        else {
-            return Err(TermError::BadArg);
-        };
-        let first_oh = self
-            .off_heap
-            .as_ref()
-            .map_or(0, |off_heap| off_heap.first_oh);
-        self.words[allocation_index][word_index + 2] = first_oh as u64;
-        self.off_heap().first_oh = address;
-        Ok(())
-    }
-
-    fn words_for(&self, term: Term) -> Option<&[u64]> {
-        if !term.is_pointer() {
-            return None;
-        }
-        let address = (term.tagged_word() & !7) as usize;
-        let words = arinsal_term::size_object(term);
-        self.words.iter().find_map(|block| {
-            let offset = address.checked_sub(block.as_ptr() as usize)?;
-            (offset % 8 == 0)
-                .then(|| block.get(offset / 8..offset / 8 + words))
-                .flatten()
-        })
-    }
-}
-
-impl HeapAlloc for ObjectHeap {
-    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        let mut allocation = block_cache::take(words);
-        let ptr = allocation.as_mut_ptr();
-        self.words.push(allocation);
-        Some(ptr)
-    }
-
-    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
-        drop(binary);
-    }
-    // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1.
-    fn link_bin_ref(
-        &mut self,
-        bin_ref: *mut u64,
-        _writable: bool,
-        _overhead_words: u64,
-        owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
-        self.chain_first_oh(bin_ref as usize)?;
-        let off_heap = self.off_heap();
-        if let Some(mut owner) = owner {
-            owner.attach_to_bin_ref(bin_ref);
-            off_heap.binary_refs.push(owner);
-        }
-        Ok(())
-    }
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
-        drop(binary);
-        Ok(())
-    }
-    fn supports_writable_binary(&self) -> bool {
-        true
-    }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
-        let _ = self.chain_first_oh(bin_ref as usize);
-        self.off_heap().external.push(binary);
-        Ok(())
-    }
-    fn supports_external_binary(&self) -> bool {
-        true
-    }
-    // The DbTerm's first_oh chain links the thing; the token stands in for the counted
-    // reference the thing holds until db_free_term.
-    fn link_node(&mut self, thing: *mut u64, node: Arc<TermNode>) {
-        let _ = self.chain_first_oh(thing as usize);
-        self.off_heap().nodes.push(node);
-    }
-    // The DbTerm's first_oh chain links the thing; the token stands in for the counted
-    // reference the thing holds until db_free_term.
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
-        self.chain_first_oh(thing as usize)?;
-        self.off_heap().magic.push(owner);
-        Ok(())
-    }
-    fn supports_magic(&self) -> bool {
-        true
-    }
 }
 
 impl StoredTerm {
@@ -1413,17 +1280,19 @@ impl StoredTerm {
 
     /// Replace an equal-sized boxed counter in its existing DbTerm words.
     // Port of erts/emulator/beam/erl_db_util.c (db_do_update_element's self-contained case),
-    // OTP-29.1.1.
-    fn overwrite_boxed_element(&mut self, index: usize, value: &[u64]) -> bool {
+    // OTP-29.1.1: erts memcpys the new bignum over the old one; the value is written there
+    // directly.
+    fn overwrite_boxed_element(&mut self, index: usize, value: &BigInt) -> bool {
         if !self.compressed_elements().is_empty() {
             return false;
         }
         let Some(old) = self.tuple_element(index) else {
             return false;
         };
-        if !old.is_pointer() || arinsal_term::size_object(old) != value.len() {
+        if !old.is_pointer() {
             return false;
         }
+        let old_words = arinsal_term::size_object(old);
         let address = (old.tagged_word() & !7) as usize;
         let words = self.words_mut();
         let base = words.as_ptr() as usize;
@@ -1434,11 +1303,14 @@ impl StoredTerm {
         else {
             return false;
         };
-        let Some(destination) = words.get_mut(offset..offset + value.len()) else {
+        let Some(destination) = words.get_mut(offset..offset + old_words) else {
             return false;
         };
-        destination.copy_from_slice(value);
-        true
+        let mut slot = dbterm::BlockHeap::over(destination);
+        match TermBuilder::new(&mut slot).int_from_bigint(value) {
+            Ok(term) => term.is_pointer() && slot.used_words() == old_words,
+            Err(_) => false,
+        }
     }
 
     fn tuple_element(&self, index: usize) -> Option<Term> {
@@ -1773,9 +1645,19 @@ fn small_counter_step(old: Term, operation: &BigCounterOp) -> Option<i64> {
     Some(next)
 }
 
+/// One updated tuple element: its position, the stored term before the update and the term
+/// after it (built on the process heap, as `do_update_counter` does), plus the value of a boxed
+/// result for the same-size overwrite.
+struct CounterElement {
+    index: usize,
+    original: Term,
+    updated: Term,
+    big: Option<BigInt>,
+}
+
 struct CounterUpdatePlan {
     returned: Vec<Term>,
-    updated: smallvec::SmallVec<[(usize, Term, Term); 4]>,
+    updated: smallvec::SmallVec<[CounterElement; 4]>,
     resize: bool,
 }
 
@@ -1786,7 +1668,6 @@ fn prepare_counter_update<R: HeapAlloc>(
     object: &StoredTerm,
     keypos: usize,
     operations: &[Option<BigCounterOp>],
-    heap: &mut ObjectHeap,
     result_heap: &mut R,
 ) -> Result<CounterUpdatePlan, EtsError> {
     for operation in operations {
@@ -1811,15 +1692,15 @@ fn prepare_counter_update<R: HeapAlloc>(
     }
 
     let mut returned = Vec::with_capacity(operations.len());
-    let mut updated: smallvec::SmallVec<[(usize, Term, Term); 4]> = smallvec::SmallVec::new();
+    let mut updated: smallvec::SmallVec<[CounterElement; 4]> = smallvec::SmallVec::new();
     let mut resize = false;
     for operation in operations.iter().flatten() {
         let index = operation.position - 1;
         let old_term = updated
             .iter()
             .rev()
-            .find(|(at, _, _)| *at == index)
-            .map(|(_, _, value)| *value)
+            .find(|element| element.index == index)
+            .map(|element| element.updated)
             .unwrap_or(object.tuple_element(index).ok_or(EtsError::BadArg)?);
         let old = integer_value(old_term).ok_or(EtsError::BadArg)?;
         let mut next = old + &operation.increment;
@@ -1829,7 +1710,7 @@ fn prepare_counter_update<R: HeapAlloc>(
         {
             next = reset.clone();
         }
-        let next_term = TermBuilder::new(heap).int_from_bigint(&next)?;
+        let next_term = TermBuilder::new(&mut *result_heap).int_from_bigint(&next)?;
         let changes_size = match (old_term.is_pointer(), next_term.is_pointer()) {
             (false, false) => false,
             (true, true) => {
@@ -1838,15 +1719,18 @@ fn prepare_counter_update<R: HeapAlloc>(
             _ => true,
         };
         resize |= changes_size;
-        returned.push(if next_term.is_pointer() {
-            copy_term(next_term, result_heap)?
+        returned.push(next_term);
+        let big = next_term.is_pointer().then_some(next);
+        if let Some(element) = updated.iter_mut().find(|element| element.index == index) {
+            element.updated = next_term;
+            element.big = big;
         } else {
-            next_term
-        });
-        if let Some((_, _, value)) = updated.iter_mut().find(|(at, _, _)| *at == index) {
-            *value = next_term;
-        } else {
-            updated.push((index, old_term, next_term));
+            updated.push(CounterElement {
+                index,
+                original: old_term,
+                updated: next_term,
+                big,
+            });
         }
     }
     Ok(CounterUpdatePlan {
@@ -1864,8 +1748,8 @@ fn updated_counter_values(
     let mut values = (0..object.arity())
         .map(|index| object.tuple_element(index).ok_or(EtsError::BadArg))
         .collect::<Result<Vec<_>, _>>()?;
-    for (index, _, value) in &plan.updated {
-        values[*index] = *value;
+    for element in &plan.updated {
+        values[element.index] = element.updated;
     }
     Ok(values)
 }
@@ -1896,26 +1780,28 @@ fn db_element_size<P: Prefix>(object: &DbTerm<P>, tuple: &[Term], index: usize) 
 fn apply_counter_update_in_place(
     object: &mut StoredTerm,
     plan: &CounterUpdatePlan,
-    heap: &ObjectHeap,
 ) -> Result<(), EtsError> {
-    for (index, original, updated) in &plan.updated {
+    for CounterElement {
+        index,
+        original,
+        updated,
+        ..
+    } in &plan.updated
+    {
         match (original.is_pointer(), updated.is_pointer()) {
             (false, false) => {}
             (true, true)
-                if arinsal_term::size_object(*original) == arinsal_term::size_object(*updated)
-                    && heap.words_for(*updated).is_some() => {}
+                if arinsal_term::size_object(*original) == arinsal_term::size_object(*updated) => {}
             _ => return Err(EtsError::BadArg),
         }
         if object.tuple_element(*index) != Some(*original) {
             return Err(EtsError::BadArg);
         }
     }
-    for (index, _, updated) in &plan.updated {
-        let changed = if updated.is_pointer() {
-            heap.words_for(*updated)
-                .is_some_and(|words| object.overwrite_boxed_element(*index, words))
-        } else {
-            object.set_immediate_element(*index, *updated)
+    for element in &plan.updated {
+        let changed = match &element.big {
+            Some(big) => object.overwrite_boxed_element(element.index, big),
+            None => object.set_immediate_element(element.index, element.updated),
         };
         if !changed {
             return Err(EtsError::BadArg);
@@ -1929,7 +1815,6 @@ fn update_counter_values<H: HeapAlloc>(
     values: &mut [Term],
     keypos: usize,
     operations: &[Option<BigCounterOp>],
-    heap: &mut ObjectHeap,
     result_heap: &mut H,
 ) -> Result<Vec<Term>, EtsError> {
     for operation in operations {
@@ -1957,13 +1842,9 @@ fn update_counter_values<H: HeapAlloc>(
         {
             next = reset.clone();
         }
-        let next = TermBuilder::new(heap).int_from_bigint(&next)?;
+        let next = TermBuilder::new(&mut *result_heap).int_from_bigint(&next)?;
         values[index] = next;
-        returned.push(if next.is_pointer() {
-            copy_term(next, result_heap)?
-        } else {
-            next
-        });
+        returned.push(next);
     }
     Ok(returned)
 }
@@ -2501,7 +2382,6 @@ pub struct Table {
     fixed_monotonic_time: Option<PlainDbTerm>,
     fixed_processes: Vec<(PlainDbTerm, usize)>,
     _heir_data: Option<PlainDbTerm>,
-    counter_results: Option<Box<VecHeap>>,
     /// Set once the registry has detached the table (`ets:delete/1`); cached handles to it
     /// must then fail like a deleted table.
     detached: bool,
@@ -2593,7 +2473,6 @@ impl Table {
             fixed_monotonic_time: None,
             fixed_processes: Vec::new(),
             _heir_data: heir_data,
-            counter_results: None,
             detached: false,
             busy: None,
             busy_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3235,23 +3114,20 @@ impl Table {
             tree.update_counter(key, |found| {
                 if let Some(existing) = found {
                     let old_words = existing.db_size_words();
-                    let mut heap = ObjectHeap::new();
                     let returned = if !compressed && existing.compressed_elements().is_empty() {
-                        let mut plan =
-                            prepare_counter_update(existing, keypos, operations, &mut heap, dst)?;
+                        let mut plan = prepare_counter_update(existing, keypos, operations, dst)?;
                         if plan.resize {
                             let values = updated_counter_values(existing, &plan)?;
                             StoredTerm::overwrite_counter_values(existing, &values, 3)?;
                         } else {
-                            apply_counter_update_in_place(existing, &plan, &heap)?;
+                            apply_counter_update_in_place(existing, &plan)?;
                         }
                         std::mem::take(&mut plan.returned)
                     } else {
-                        let current = existing.term_for_filter(&mut heap)?;
+                        let current = existing.term_for_filter(&mut *dst)?;
                         let mut values = term_sequence(current).ok_or(EtsError::BadArg)?;
-                        let returned =
-                            update_counter_values(&mut values, keypos, operations, &mut heap, dst)?;
-                        let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                        let returned = update_counter_values(&mut values, keypos, operations, dst)?;
+                        let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                         StoredTerm::overwrite_from_input(existing, updated, compressed, keypos, 3)?;
                         returned
                     };
@@ -3262,11 +3138,9 @@ impl Table {
                     let Some(default) = default else {
                         return Err(EtsError::BadArgCause("badkey"));
                     };
-                    let mut heap = ObjectHeap::new();
-                    let mut values = default_object_values(keypos, key, default, &mut heap)?;
-                    let returned =
-                        update_counter_values(&mut values, keypos, operations, &mut heap, dst)?;
-                    let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                    let mut values = default_object_values(keypos, key, default, &mut *dst)?;
+                    let returned = update_counter_values(&mut values, keypos, operations, dst)?;
+                    let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                     let stored =
                         StoredTerm::copy_for_table::<TreePrefix>(updated, compressed, keypos, 3)?;
                     let delta = stored.db_size_words() as isize;
@@ -3292,27 +3166,23 @@ impl Table {
             self.fixed > 0,
             |found| match found {
                 Some(existing) if compressed || !existing.compressed_elements().is_empty() => {
-                    let mut heap = ObjectHeap::new();
-                    let current = existing.term_for_filter(&mut heap)?;
+                    let current = existing.term_for_filter(&mut *dst)?;
                     let mut values = term_sequence(current).ok_or(EtsError::BadArg)?;
-                    let returned =
-                        update_counter_values(&mut values, keypos, operations, &mut heap, dst)?;
-                    let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                    let returned = update_counter_values(&mut values, keypos, operations, dst)?;
+                    let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                     results = Some(returned);
                     StoredTerm::overwrite_from_input(existing, updated, compressed, keypos, 2)?;
                     Ok(StoreOutcome::InPlace)
                 }
                 Some(existing) => {
-                    let mut heap = ObjectHeap::new();
-                    let mut plan =
-                        prepare_counter_update(existing, keypos, operations, &mut heap, dst)?;
+                    let mut plan = prepare_counter_update(existing, keypos, operations, dst)?;
                     if plan.resize {
                         let values = updated_counter_values(existing, &plan)?;
                         StoredTerm::overwrite_counter_values(existing, &values, 2)?;
                         results = Some(std::mem::take(&mut plan.returned));
                         Ok(StoreOutcome::InPlace)
                     } else {
-                        apply_counter_update_in_place(existing, &plan, &heap)?;
+                        apply_counter_update_in_place(existing, &plan)?;
                         results = Some(std::mem::take(&mut plan.returned));
                         Ok(StoreOutcome::InPlace)
                     }
@@ -3321,11 +3191,9 @@ impl Table {
                     let Some(default) = default else {
                         return Err(EtsError::BadArgCause("badkey"));
                     };
-                    let mut heap = ObjectHeap::new();
-                    let mut values = self.default_object(key, default, &mut heap)?;
-                    let returned =
-                        update_counter_values(&mut values, keypos, operations, &mut heap, dst)?;
-                    let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                    let mut values = self.default_object(key, default, &mut *dst)?;
+                    let returned = update_counter_values(&mut values, keypos, operations, dst)?;
+                    let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                     results = Some(returned);
                     Ok(StoreOutcome::New(StoredTerm::copy_for_table::<HashPrefix>(
                         updated, compressed, keypos, 2,
@@ -4748,11 +4616,12 @@ impl Table {
     }
 
     /// Atomically apply counter operations to a set tuple. The VM chooses the return shape.
-    pub fn update_counter(
+    pub fn update_counter<H: HeapAlloc>(
         &mut self,
         key: Term,
         operations: &[CounterOp],
         default: Option<Term>,
+        dst: &mut H,
     ) -> Result<Vec<Term>, EtsError> {
         let operations = operations
             .iter()
@@ -4766,7 +4635,7 @@ impl Table {
                 })
             })
             .collect::<Vec<_>>();
-        self.update_counter_big(key, &operations, default)
+        self.update_counter_big(key, &operations, default, dst)
     }
 
     /// Apply counter operations in place when every operand, counter and result is a small
@@ -4829,11 +4698,12 @@ impl Table {
     /// malformed operation or list tail; it fails without extended error information.
     ///
     /// Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
-    pub fn update_counter_big(
+    pub fn update_counter_big<H: HeapAlloc>(
         &mut self,
         key: Term,
         operations: &[Option<BigCounterOp>],
         default: Option<Term>,
+        dst: &mut H,
     ) -> Result<Vec<Term>, EtsError> {
         if !matches!(
             self.options.table_type,
@@ -4846,7 +4716,6 @@ impl Table {
             let compressed = self.options.compressed;
             let fixed = self.fixed > 0;
             let storage = &mut self.storage;
-            let counter_results = &mut self.counter_results;
             let fast_result = match storage {
                 Storage::Hash(storage) => {
                     let mut results = None;
@@ -4856,17 +4725,10 @@ impl Table {
                         keypos,
                         fixed,
                         |found| {
-                            let mut heap = ObjectHeap::new();
                             if let Some(existing) = found {
-                                let result_heap =
-                                    counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
                                 if !compressed && existing.compressed_elements().is_empty() {
                                     let mut plan = prepare_counter_update(
-                                        existing,
-                                        keypos,
-                                        operations,
-                                        &mut heap,
-                                        result_heap.as_mut(),
+                                        existing, keypos, operations, &mut *dst,
                                     )?;
                                     if plan.resize {
                                         let values = updated_counter_values(existing, &plan)?;
@@ -4874,22 +4736,21 @@ impl Table {
                                         results = Some(std::mem::take(&mut plan.returned));
                                         Ok(StoreOutcome::InPlace)
                                     } else {
-                                        apply_counter_update_in_place(existing, &plan, &heap)?;
+                                        apply_counter_update_in_place(existing, &plan)?;
                                         results = Some(std::mem::take(&mut plan.returned));
                                         Ok(StoreOutcome::InPlace)
                                     }
                                 } else {
-                                    let current = existing.term_for_filter(&mut heap)?;
+                                    let current = existing.term_for_filter(&mut *dst)?;
                                     let mut values =
                                         term_sequence(current).ok_or(EtsError::BadArg)?;
                                     let returned = update_counter_values(
                                         &mut values,
                                         keypos,
                                         operations,
-                                        &mut heap,
-                                        result_heap.as_mut(),
+                                        &mut *dst,
                                     )?;
-                                    let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                                    let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                                     results = Some(returned);
                                     StoredTerm::overwrite_from_input(
                                         existing, updated, compressed, keypos, 2,
@@ -4900,18 +4761,15 @@ impl Table {
                                 let Some(default) = default else {
                                     return Err(EtsError::BadArgCause("badkey"));
                                 };
-                                let result_heap =
-                                    counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
                                 let mut values =
-                                    default_object_values(keypos, key, default, &mut heap)?;
+                                    default_object_values(keypos, key, default, &mut *dst)?;
                                 let returned = update_counter_values(
                                     &mut values,
                                     keypos,
                                     operations,
-                                    &mut heap,
-                                    result_heap.as_mut(),
+                                    &mut *dst,
                                 )?;
-                                let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                                let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                                 results = Some(returned);
                                 Ok(StoreOutcome::New(StoredTerm::copy_for_table::<HashPrefix>(
                                     updated, compressed, keypos, 2,
@@ -4924,36 +4782,28 @@ impl Table {
                 Storage::Ordered(root) => {
                     let mut results = None;
                     root.update_counter(key, keypos, |found| {
-                        let mut heap = ObjectHeap::new();
                         if let Some(existing) = found {
-                            let result_heap =
-                                counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
                             if !compressed && existing.compressed_elements().is_empty() {
                                 let mut plan = prepare_counter_update(
-                                    existing,
-                                    keypos,
-                                    operations,
-                                    &mut heap,
-                                    result_heap.as_mut(),
+                                    existing, keypos, operations, &mut *dst,
                                 )?;
                                 if plan.resize {
                                     let values = updated_counter_values(existing, &plan)?;
                                     StoredTerm::overwrite_counter_values(existing, &values, 3)?;
                                 } else {
-                                    apply_counter_update_in_place(existing, &plan, &heap)?;
+                                    apply_counter_update_in_place(existing, &plan)?;
                                 }
                                 results = Some(std::mem::take(&mut plan.returned));
                             } else {
-                                let current = existing.term_for_filter(&mut heap)?;
+                                let current = existing.term_for_filter(&mut *dst)?;
                                 let mut values = term_sequence(current).ok_or(EtsError::BadArg)?;
                                 let returned = update_counter_values(
                                     &mut values,
                                     keypos,
                                     operations,
-                                    &mut heap,
-                                    result_heap.as_mut(),
+                                    &mut *dst,
                                 )?;
-                                let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                                let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                                 results = Some(returned);
                                 StoredTerm::overwrite_from_input(
                                     existing, updated, compressed, keypos, 3,
@@ -4964,18 +4814,11 @@ impl Table {
                             let Some(default) = default else {
                                 return Err(EtsError::BadArgCause("badkey"));
                             };
-                            let result_heap =
-                                counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
                             let mut values =
-                                default_object_values(keypos, key, default, &mut heap)?;
-                            let returned = update_counter_values(
-                                &mut values,
-                                keypos,
-                                operations,
-                                &mut heap,
-                                result_heap.as_mut(),
-                            )?;
-                            let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                                default_object_values(keypos, key, default, &mut *dst)?;
+                            let returned =
+                                update_counter_values(&mut values, keypos, operations, &mut *dst)?;
+                            let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                             results = Some(returned);
                             Ok(Some(StoredTerm::copy_for_table::<TreePrefix>(
                                 updated, compressed, keypos, 3,
@@ -4989,37 +4832,29 @@ impl Table {
                     tree.update_counter(key, |found| {
                         if let Some(existing) = found {
                             let old_words = existing.db_size_words();
-                            let result_heap =
-                                counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
-                            let mut heap = ObjectHeap::new();
                             let returned = if !compressed
                                 && existing.compressed_elements().is_empty()
                             {
                                 let mut plan = prepare_counter_update(
-                                    existing,
-                                    keypos,
-                                    operations,
-                                    &mut heap,
-                                    result_heap.as_mut(),
+                                    existing, keypos, operations, &mut *dst,
                                 )?;
                                 if plan.resize {
                                     let values = updated_counter_values(existing, &plan)?;
                                     StoredTerm::overwrite_counter_values(existing, &values, 3)?;
                                 } else {
-                                    apply_counter_update_in_place(existing, &plan, &heap)?;
+                                    apply_counter_update_in_place(existing, &plan)?;
                                 }
                                 std::mem::take(&mut plan.returned)
                             } else {
-                                let current = existing.term_for_filter(&mut heap)?;
+                                let current = existing.term_for_filter(&mut *dst)?;
                                 let mut values = term_sequence(current).ok_or(EtsError::BadArg)?;
                                 let returned = update_counter_values(
                                     &mut values,
                                     keypos,
                                     operations,
-                                    &mut heap,
-                                    result_heap.as_mut(),
+                                    &mut *dst,
                                 )?;
-                                let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                                let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                                 StoredTerm::overwrite_from_input(
                                     existing, updated, compressed, keypos, 3,
                                 )?;
@@ -5032,19 +4867,11 @@ impl Table {
                             let Some(default) = default else {
                                 return Err(EtsError::BadArgCause("badkey"));
                             };
-                            let mut heap = ObjectHeap::new();
                             let mut values =
-                                default_object_values(keypos, key, default, &mut heap)?;
-                            let result_heap =
-                                counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
-                            let returned = update_counter_values(
-                                &mut values,
-                                keypos,
-                                operations,
-                                &mut heap,
-                                result_heap.as_mut(),
-                            )?;
-                            let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+                                default_object_values(keypos, key, default, &mut *dst)?;
+                            let returned =
+                                update_counter_values(&mut values, keypos, operations, &mut *dst)?;
+                            let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
                             let stored = StoredTerm::copy_for_table::<TreePrefix>(
                                 updated, compressed, keypos, 3,
                             )?;
@@ -5060,23 +4887,20 @@ impl Table {
                 return Ok(results);
             }
         }
-        // ObjectHeap allocates exactly what is asked; a VecHeap would zero a 1024-word chunk
-        // for every counter bump.
-        let mut heap = ObjectHeap::new();
         let mut stored_values = None;
         self.try_matching_first(key, |found| {
             // erts reads and updates the stored object in place under the write lock
             // (erl_db.c db_lookup_dbterm, erl_db_catree.c). A CA tree hands
             // the visitor a copy that is dropped when the lookup returns, so the elements
             // are copied into the local heap rather than borrowed from `found`.
-            let current = found.term_for_match(&mut heap)?;
+            let current = found.term_for_match(&mut *dst)?;
             // SAFETY: current is owned by the local heap until the replacement is inserted.
             let values = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
             // A CA tree hands out a copy that dies with this call, so the elements move to `heap`.
             stored_values = Some(
                 values
                     .iter()
-                    .map(|value| copy_term(value, &mut heap))
+                    .map(|value| copy_term(value, &mut *dst))
                     .collect::<Result<Vec<_>, _>>()?,
             );
             Ok(())
@@ -5084,7 +4908,7 @@ impl Table {
         let mut values = if let Some(values) = stored_values {
             values
         } else if let Some(default) = default {
-            self.default_object(key, default, &mut heap)?
+            self.default_object(key, default, &mut *dst)?
         } else {
             return Err(EtsError::BadArgCause("badkey"));
         };
@@ -5120,18 +4944,11 @@ impl Table {
             {
                 next = set_value.clone();
             }
-            let next = TermBuilder::new(&mut heap).int_from_bigint(&next)?;
+            let next = TermBuilder::new(&mut *dst).int_from_bigint(&next)?;
             values[operation.position - 1] = next;
-            results.push(if next.is_pointer() {
-                let heap = self
-                    .counter_results
-                    .get_or_insert_with(|| Box::new(VecHeap::new()));
-                copy_term(next, heap.as_mut())?
-            } else {
-                next
-            });
+            results.push(next);
         }
-        let updated = TermBuilder::new(&mut heap).tuple(&values)?;
+        let updated = TermBuilder::new(&mut *dst).tuple(&values)?;
         self.insert(&[updated])?;
         Ok(results)
     }
@@ -7235,10 +7052,9 @@ mod stored_size_tests {
             ])
             .unwrap();
         let stored = StoredTerm::copy_for_table::<()>(object, true, 2, 1).unwrap();
-        let mut out = ObjectHeap::new();
+        let mut out = VecHeap::new();
         let copy = stored.copy_out(&mut out).unwrap();
-        let reserved: usize = out.words.iter().map(|words| words.len()).sum();
-        assert_eq!(reserved, arinsal_term::size_object(copy));
+        assert_eq!(out.used_words(), arinsal_term::size_object(copy));
     }
 
     /// A source term may point into the DbTerm being overwritten. Keep that block readable until
@@ -7258,7 +7074,7 @@ mod stored_size_tests {
         let expected = arinsal_term::size_object(object);
         let own = stored.term();
         StoredTerm::overwrite_from_input(&mut stored, own, false, 1, 1).unwrap();
-        let mut out = ObjectHeap::new();
+        let mut out = VecHeap::new();
         let copy = stored.copy_out(&mut out).unwrap();
         assert_eq!(arinsal_term::size_object(copy), expected);
         assert!(arinsal_term::exact_eq(copy, object));
@@ -7344,10 +7160,13 @@ mod stored_size_tests {
             );
             assert!(exact_eq(copy, object), "{name}: exact equality");
             if shallow {
-                let mut reserved = ObjectHeap::new();
+                let mut reserved = VecHeap::new();
                 stored.copy_out(&mut reserved).unwrap();
-                let words: usize = reserved.words.iter().map(|w| w.len()).sum();
-                assert_eq!(words, stored.term_size_words(), "{name}: reserved words");
+                assert_eq!(
+                    reserved.used_words(),
+                    stored.term_size_words(),
+                    "{name}: reserved words"
+                );
             }
         }
     }
