@@ -1260,6 +1260,12 @@ pub(crate) fn system_info_process_item(
         Some("heap_sizes") => Some(heap_sizes(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3518 (atom_limit), OTP-29.1.1.
         Some("atom_limit") => Some(non_neg(process, global_atoms().limit() as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3418 (dist_buf_busy_limit), OTP-29.1.1:
+        // `erts_dist_buf_busy_limit` in bytes (+zdbbl, set before the node is alive).
+        Some("dist_buf_busy_limit") => {
+            let limit = crate::node_tables::lock().distribution_buffer_busy_limit;
+            Some(non_neg(process, limit))
+        }
         // Port of erts/emulator/beam/erl_bif_info.c:3426 (delayed_node_table_gc) and
         // erl_node_tables.c (erts_delayed_node_table_gc), OTP-29.1.1: the live delay, which
         // `erts_debug:set_internal_state(node_tab_delayed_delete, _)` changes.
