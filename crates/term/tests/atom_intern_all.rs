@@ -4,6 +4,7 @@ use arinsal_term::AtomTable;
 
 #[test]
 fn intern_all_matches_intern_and_keeps_the_order_of_new_atoms() {
+    arinsal_term::init_global_literals();
     let table = AtomTable::new(1 << 16);
     let before = table.intern("already_there").unwrap();
     let names = [
@@ -30,6 +31,7 @@ fn intern_all_matches_intern_and_keeps_the_order_of_new_atoms() {
 
 #[test]
 fn intern_all_reports_the_name_the_table_refuses() {
+    arinsal_term::init_global_literals();
     let table = AtomTable::new(1 << 16);
     let too_long = "a".repeat(300);
     let names = ["fine", too_long.as_str(), "after"];

@@ -6,11 +6,11 @@
 
 use crossbeam_utils::atomic::AtomicCell;
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use crate::Term;
-use crate::heap::{TermBuilder, VecHeap};
+use crate::heap::TermBuilder;
 use crate::rwmutex::FrequentReadRwLock;
 
 /// Stable atom index. Its value matches the OTP preloaded atom order at startup.
@@ -108,9 +108,8 @@ struct AtomRec {
     ord0: i32,
     /// `Atom.u.bin`: the global-literal binary returned by `atom_to_binary`.
     bin: Term,
-    /// UTF-8 name. Same bytes as `bin`. Owned here so lookup does not borrow
-    /// the literal heap: a `'static` slice of that chunk is not a safe view.
-    name: Box<str>,
+    /// `Atom.name`: the UTF-8 bytes inside `bin`.
+    name: &'static str,
 }
 
 // Port of erts/emulator/beam/index.c (index_put_entry) and index.h
@@ -297,7 +296,7 @@ impl AtomTable {
     /// Return immutable atom text for a valid index without taking the table lock.
     // Port of erts/emulator/beam/atom.c:107 (erts_atom_get_name), OTP-29.1.1.
     pub fn text(&self, atom: Atom) -> Option<&str> {
-        self.record(atom).map(|rec| rec.name.as_ref())
+        self.record(atom).map(|rec| rec.name)
     }
 
     /// The global-literal UTF-8 binary (`Atom.u.bin`).
@@ -326,7 +325,7 @@ impl AtomTable {
     #[inline]
     pub fn encoding_info(&self, atom: Atom) -> Option<(&str, Option<usize>)> {
         let rec = self.record(atom)?;
-        Some((rec.name.as_ref(), usize::try_from(rec.latin1_chars).ok()))
+        Some((rec.name, usize::try_from(rec.latin1_chars).ok()))
     }
 
     /// Number of Unicode scalar values in Latin-1 for this atom, or `None` if it is not.
@@ -620,23 +619,21 @@ fn push_new(inner: &mut Inner, bytes: &[u8], latin1_chars: i16) -> u32 {
     id
 }
 
-fn literal_atom(bytes: &[u8]) -> (Term, Box<str>) {
+fn literal_atom(bytes: &[u8]) -> (Term, &'static str) {
     // Port of atom.c:147 (erts_global_literal_allocate / erts_hfact_new_binary_from_data
-    // / erts_global_literal_register), OTP-29.1.1. The heap is process-lifetime:
-    // atom names are never freed (`atom_free` is empty).
-    static HEAP: OnceLock<Mutex<VecHeap>> = OnceLock::new();
-    let heap = HEAP.get_or_init(|| Mutex::new(VecHeap::new_literal()));
-    let mut heap = heap.lock().expect("atom literal heap");
-    let term = TermBuilder::new(&mut *heap)
+    // / erts_global_literal_register), OTP-29.1.1. Atom names are never freed
+    // (`atom_free` is empty), so `Atom.name` points into the global literal binary.
+    // Upper bound of the binary's words: BinRef header plus the on-heap payload.
+    let mut build = crate::global_literal_allocate(16 + bytes.len().div_ceil(8));
+    let term = TermBuilder::new(&mut build)
         .binary(bytes)
         .expect("atom literal binary");
-    // `bytes` is the UTF-8 just stored in that literal binary (ASCII, Latin-1
-    // expanded to UTF-8, or validated UTF-8). Lookup compares `name.as_bytes()`
-    // and does not re-read the heap. The chunk's words are not a safe `'static`
-    // `&[u8]` while later atoms still append to it.
-    let name = std::str::from_utf8(bytes)
-        .expect("atom text is utf-8")
-        .into();
+    let term = build.register(term);
+    // `bytes` is the UTF-8 just stored in that literal binary (ASCII, Latin-1 expanded to
+    // UTF-8, or validated UTF-8).
+    let view = crate::raw::BinRef::try_from(term).expect("atom literal is a binary");
+    let name = std::str::from_utf8(view.bytes().expect("atom literal is a byte string"))
+        .expect("atom text is utf-8");
     (term, name)
 }
 
@@ -898,7 +895,11 @@ pub fn set_atom_table_limit(limit: usize) {
 
 /// The process-wide atom table. The default limit is 1,048,576 entries.
 pub fn global_atoms() -> &'static AtomTable {
-    GLOBAL.get_or_init(|| AtomTable::new(ATOM_TABLE_LIMIT.load(Ordering::Relaxed)))
+    GLOBAL.get_or_init(|| {
+        // Port of erl_init.c:260/285: init_global_literals runs before init_atom_table.
+        crate::init_global_literals();
+        AtomTable::new(ATOM_TABLE_LIMIT.load(Ordering::Relaxed))
+    })
 }
 
 #[cfg(test)]
@@ -925,6 +926,7 @@ mod tests {
 
     #[test]
     fn fresh_table_matches_index_and_hash_shape() {
+        crate::init_global_literals();
         let table = AtomTable::new(DEFAULT_ATOM_TABLE_LIMIT);
         let index = table.index_info();
         let hash = table.hash_info();
@@ -944,6 +946,7 @@ mod tests {
 
     #[test]
     fn grow_and_shrink_follow_load_thresholds() {
+        crate::init_global_literals();
         let table = AtomTable::new(DEFAULT_ATOM_TABLE_LIMIT);
         let start = table.len();
         let need = 6554_usize.saturating_sub(start);
@@ -965,6 +968,7 @@ mod tests {
 
     #[test]
     fn encodings_and_limit() {
+        crate::init_global_literals();
         let table = AtomTable::new(atoms::PREDEFINED.len() + 8);
         let latin = table.put(&[0xe5], AtomEncoding::Latin1, false).unwrap();
         assert_eq!(table.text(latin), Some("å"));

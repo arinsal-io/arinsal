@@ -3,8 +3,8 @@ use crate::FunRef;
 use crate::identity::node_order;
 use crate::stack::{EStack, WStack};
 use crate::{
-    ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FLOAT, FUN, HEAP_BITS,
-    Identity, MAP, NEG_BIG, POS_BIG, RECORD, REF, SUB_BITS, Term, TermKind, global_atoms,
+    ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FLOAT, FUN, HEAP_BITS, Identity,
+    MAP, NEG_BIG, POS_BIG, RECORD, REF, SUB_BITS, Term, TermKind, global_atoms,
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -734,7 +734,7 @@ pub(crate) fn size_object_with_prior(
                 }
             }
         }
-        if term.bits() == ((&EMPTY_TUPLE as *const u64 as u64) | 2) {
+        if term.bits() == crate::global_empty_tuple().bits() {
             continue;
         }
         if let Some(h) = term.header() {

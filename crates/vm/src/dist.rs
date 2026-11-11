@@ -99,22 +99,32 @@ fn dispatch(
     }
 }
 
-/// Port of erts/emulator/beam/dist.c:5543 (erts_internal_get_dflags_0), OTP-29.1.1.
-fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
-    let mask = !node_tables::test_remove_dflags(None);
-    if mask == u64::MAX {
-        return Ok(arinsal_term::global_dflags_record(
-            global_atoms()
-                .intern("erts_dflags")
-                .expect("distribution atom"),
-            [
+/// Build the `erts_dflags` global literal.
+// Port of erts/emulator/beam/dist.c:1155-1185 (init_dist), OTP-29.1.1. Guarded by a `Once`
+// because a VM can boot more than once in one process.
+pub(crate) fn init_dist_dflags_record() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let mut build = arinsal_term::global_literal_allocate(7);
+        let record = arinsal_term::TermBuilder::new(&mut build)
+            .tuple(&[
+                Term::atom(arinsal_term::atoms::ERTS_DFLAGS),
                 integer(node_tables::DFLAG_DIST_DEFAULT),
                 integer(node_tables::DFLAG_DIST_MANDATORY),
                 integer(node_tables::DFLAG_DIST_ADDABLE),
                 integer(node_tables::DFLAG_DIST_REJECTABLE),
                 integer(node_tables::DFLAG_DIST_STRICT_ORDER),
-            ],
-        ));
+            ])
+            .expect("dflags literal");
+        arinsal_term::set_global_dflags_record(build.register(record));
+    });
+}
+
+/// Port of erts/emulator/beam/dist.c:5543 (erts_internal_get_dflags_0), OTP-29.1.1.
+fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
+    let mask = !node_tables::test_remove_dflags(None);
+    if mask == u64::MAX {
+        return Ok(arinsal_term::global_dflags_record());
     }
     tuple(
         process,

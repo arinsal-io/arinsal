@@ -4,9 +4,9 @@ use crate::identity::check_external_ref;
 use crate::record::RecordSnapshot;
 use crate::record_table::RecordLayout;
 use crate::{
-    ARITY, Atom, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry,
-    FLOAT, FunEntry, HEAP_BITS, MAP_HEADER_FLATMAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG,
-    RECORD, SUB_BITS, Term, TermError, TermKind, cmp, exact_eq,
+    ARITY, Atom, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, FLOAT, FunEntry,
+    HEAP_BITS, MAP_HEADER_FLATMAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG, RECORD, SUB_BITS,
+    Term, TermError, TermKind, cmp, exact_eq,
 };
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use num_bigint::{BigInt, Sign};
@@ -3883,7 +3883,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             return Err(TermError::SystemLimit);
         }
         if len == 0 {
-            return Ok(Term::from_ptr((&EMPTY_TUPLE as *const u64).cast_mut(), 2));
+            return Ok(crate::global_empty_tuple());
         }
         let p = self.words(len + 1)?;
         store(p, (len as u64) << 6 | ARITY);
@@ -4187,12 +4187,24 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     }
     /// Build a list from a slice with one reservation of `2 * n` words.
     pub fn list_from_slice(&mut self, values: &[Term]) -> Result<Term, TermError> {
+        self.list_from_slice_with_tail(values, Term::NIL)
+    }
+    /// Build a list of the characters of `text` ending in `tail`.
+    // Port of erts/emulator/beam/atom.c (erts_atom_to_string with a tail), OTP-29.1.1.
+    pub fn string_to_list_with_tail(&mut self, text: &str, tail: Term) -> Result<Term, TermError> {
+        let chars: Vec<Term> = text
+            .chars()
+            .map(|c| Term::small(c as i64).unwrap())
+            .collect();
+        self.list_from_slice_with_tail(&chars, tail)
+    }
+    fn list_from_slice_with_tail(&mut self, values: &[Term], end: Term) -> Result<Term, TermError> {
         if values.is_empty() {
-            return Ok(Term::NIL);
+            return Ok(end);
         }
         let words = values.len().checked_mul(2).ok_or(TermError::SystemLimit)?;
         let run = self.words(words)?;
-        let mut tail = Term::NIL;
+        let mut tail = end;
         for (index, value) in values.iter().enumerate().rev() {
             let cell = run.wrapping_add(2 * index);
             store(cell, value.bits());

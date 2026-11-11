@@ -2,8 +2,8 @@
 use crate::literal::LiteralAreas;
 use crate::ops::{LiteralSkip, size_object_inner, size_object_with_prior};
 use crate::{
-    ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FUN, FunRef, HEAP_BITS,
-    HeapAlloc, MAP, Node, RECORD, REF, SUB_BITS, Term, TermError, size_object,
+    ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FUN, FunRef, HEAP_BITS, HeapAlloc,
+    MAP, Node, RECORD, REF, SUB_BITS, Term, TermError, size_object,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -548,7 +548,7 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                         ARITY => {
                             let n = (hdr >> 6) as usize;
                             if n == 0 {
-                                *argp = (std::ptr::from_ref(&EMPTY_TUPLE) as u64) | 2;
+                                *argp = crate::global_empty_tuple().0;
                                 at = CopyAt::Scan;
                                 continue;
                             }
@@ -835,9 +835,7 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
             crate::heap::store(resp, source.bits());
         } else {
             let source_address = source.bits() & !7;
-            if source.bits() == ((&EMPTY_TUPLE as *const u64 as u64) | 2)
-                || skip.skips(source_address)
-            {
+            if source.bits() == crate::global_empty_tuple().0 || skip.skips(source_address) {
                 crate::heap::store(resp, source.bits());
             } else if preserve_sharing
                 && unshared_literals.is_some_and(|literals| literals.is_literal(source_address))
