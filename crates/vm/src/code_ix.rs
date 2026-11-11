@@ -919,6 +919,10 @@ pub(crate) fn for_scope(scope: u64) -> Arc<CodeIndexes> {
     {
         return indexes;
     }
+    // `CodeIndexes::new` installs the BIF exports (install_bifs), which erts does only after
+    // beamasm_init. Generating the fragments publishes the run-process stub's range into every
+    // node, under the read side of this lock, so it must finish before the write lock is taken.
+    crate::beamasm_integration::beamasm_init();
     let mut scopes = scopes().write().unwrap_or_else(|error| error.into_inner());
     Arc::clone(
         scopes

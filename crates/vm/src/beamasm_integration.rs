@@ -431,10 +431,21 @@ fn dispatch_entry(
     Some(registry.intern_identity(identity, &entry))
 }
 
+/// Generates the shared fragments and the run-process stub once per OS process.
+///
+/// erts runs `beamasm_init` (erl_init.c:292) before `init_emulator` installs the BIF exports
+/// (erl_init.c:296): every export entry starts at the fragments' trampoline, and the stub's
+/// code range is published into every node's range table. A node's code indexes are created
+/// only after this returns, never while the fragments are being generated.
+// Port of erts/emulator/beam/erl_init.c:292-296 (erl_init: beamasm_init before
+// init_emulator) and jit/beam_jit_main.cpp (beamasm_init), OTP-29.1.1.
+pub(crate) fn beamasm_init() {
+    let _ = fragments();
+}
+
 /// Allocates the code scope of a new node.
 pub(crate) fn new_code_scope() -> u64 {
-    // The fun dispatch fragments must exist before the node creates fun entries.
-    let _ = fragments();
+    beamasm_init();
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
