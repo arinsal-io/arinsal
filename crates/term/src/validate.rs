@@ -7,7 +7,9 @@
 
 use crate::{ProcessHeap, Term};
 use std::cell::RefCell;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(debug_assertions)]
+use std::sync::OnceLock;
 
 struct Range {
     start: usize,
@@ -163,123 +165,12 @@ fn heap_contains(heap: &ProcessHeap, addr: usize) -> bool {
     })
 }
 
-fn is_static_empty_tuple(addr: usize) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        macos_zero_word(addr)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-/// Empty maps in `arinsal-maps` point at a second arity-0 static. Any aligned
-/// zero word inside a loaded image is that singleton: heap pointers are not
-/// inside a Mach-O segment, so a dangling heap address still fails.
-#[cfg(target_os = "macos")]
-fn macos_zero_word(addr: usize) -> bool {
-    if !addr.is_multiple_of(8) {
-        return false;
-    }
-    let inside = image_ranges()
-        .iter()
-        .any(|&(start, end)| addr >= start && addr.saturating_add(8) <= end);
-    if !inside {
-        return false;
-    }
-    // SAFETY: `addr` is 8-aligned and lies inside a Mach-O segment mapped for
-    // the life of the process. The load is one word and is not a heap access.
-    unsafe { std::ptr::read(std::ptr::without_provenance::<u64>(addr)) == 0 }
-}
-
-#[cfg(target_os = "macos")]
-fn image_ranges() -> &'static [(usize, usize)] {
-    static RANGES: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
-    RANGES.get_or_init(collect_image_ranges)
-}
-
-#[cfg(target_os = "macos")]
-fn collect_image_ranges() -> Vec<(usize, usize)> {
-    unsafe extern "C" {
-        fn _dyld_image_count() -> u32;
-        fn _dyld_get_image_header(image_index: u32) -> *const u8;
-        fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
-    }
-    let mut ranges = Vec::new();
-    // SAFETY: dyld reports images mapped into this process.
-    let count = unsafe { _dyld_image_count() };
-    for index in 0..count {
-        // SAFETY: `index` is below the count dyld just returned.
-        let header = unsafe { _dyld_get_image_header(index) };
-        if header.is_null() {
-            continue;
-        }
-        // SAFETY: the header pointer is the mapped Mach-O header for `index`.
-        let slide = unsafe { _dyld_get_image_vmaddr_slide(index) };
-        // SAFETY: a non-null dyld header is at least four mapped bytes.
-        let magic = unsafe { std::ptr::read_unaligned(header.cast::<u32>()) };
-        if magic != 0xfeedfacf {
-            continue;
-        }
-        // SAFETY: `MH_MAGIC_64` fixes `ncmds` and `sizeofcmds` at these offsets.
-        let (ncmds, sizeofcmds) = unsafe {
-            (
-                std::ptr::read_unaligned(header.add(16).cast::<u32>()),
-                std::ptr::read_unaligned(header.add(20).cast::<u32>()),
-            )
-        };
-        // SAFETY: a 64-bit Mach-O header is 32 bytes; load commands follow it.
-        let mut command = unsafe { header.add(32) };
-        let mut left = sizeofcmds as usize;
-        for _ in 0..ncmds {
-            if left < 8 {
-                break;
-            }
-            // SAFETY: `left` is the unread tail of the header's load-command blob.
-            let (cmd, cmdsize) = unsafe {
-                (
-                    std::ptr::read_unaligned(command.cast::<u32>()),
-                    std::ptr::read_unaligned(command.add(4).cast::<u32>()) as usize,
-                )
-            };
-            if cmdsize < 8 || cmdsize > left {
-                break;
-            }
-            // LC_SEGMENT_64 is 0x19. vmaddr/vmsize sit at bytes 24/32.
-            // initprot at byte 60; skip segments that are not readable
-            // (`__PAGEZERO` is mapped in the header but faults on load).
-            if cmd == 0x19 && cmdsize >= 72 {
-                // SAFETY: `cmdsize` covers the segment fields read below.
-                let (vmaddr, vmsize, initprot) = unsafe {
-                    (
-                        std::ptr::read_unaligned(command.add(24).cast::<u64>()),
-                        std::ptr::read_unaligned(command.add(32).cast::<u64>()),
-                        std::ptr::read_unaligned(command.add(60).cast::<i32>()),
-                    )
-                };
-                if vmsize > 0 && initprot & 1 != 0 {
-                    let start = (vmaddr as usize).wrapping_add(slide as usize);
-                    let end = start.saturating_add(vmsize as usize);
-                    if end > start {
-                        ranges.push((start, end));
-                    }
-                }
-            }
-            // SAFETY: `cmdsize` was bounded by the remaining load-command bytes.
-            command = unsafe { command.add(cmdsize) };
-            left -= cmdsize;
-        }
-    }
-    ranges
-}
-
 fn accepted(heap: &ProcessHeap, term: Term) -> bool {
     if !term.is_pointer() {
         return true;
     }
     let addr = (term.0 & !7) as usize;
-    heap_contains(heap, addr) || stable_contains(addr) || is_static_empty_tuple(addr)
+    heap_contains(heap, addr) || stable_contains(addr)
 }
 
 fn describe(heap: &ProcessHeap) -> String {
@@ -384,8 +275,6 @@ pub fn check_deep_if_active(heap: &ProcessHeap, term: Term, context: &str) {
             if t.0 & 3 == 1 {
                 stack.push(Term(*ptr));
                 stack.push(Term(*ptr.add(1)));
-            } else if t.0 & 3 == 2 && is_static_empty_tuple(ptr as usize) {
-                continue;
             } else if t.0 & 3 == 2 && *ptr & 63 == crate::ARITY {
                 let n = (*ptr >> 6) as usize;
                 for i in 1..=n {

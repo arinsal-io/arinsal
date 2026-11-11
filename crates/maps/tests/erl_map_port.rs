@@ -309,6 +309,37 @@ fn remove_take_without_and_empty_map_sizes_vs_erl() {
 }
 
 #[test]
+fn empty_map_literal_sharing_and_fill_vs_erl() {
+    arinsal_term::init_global_literals();
+    let expected = erl(
+        "E=#{},F=maps:put(key,value,E),D=#{key=>value},io:put_chars(binary:encode_hex(term_to_binary({erts_debug:size(E),erts_debug:flat_size(E),term_to_binary(E),erts_debug:size(F),erts_debug:flat_size(F),F=:=D,term_to_binary(F),term_to_binary(D)}))),halt().",
+    );
+
+    let mut heap = VecHeap::new();
+    let key = Term::atom(arinsal_term::global_atoms().intern("key").unwrap());
+    let value = Term::atom(arinsal_term::global_atoms().intern("value").unwrap());
+    let empty = arinsal_maps::new(&mut heap).unwrap();
+    let filled = arinsal_maps::put(empty, key, value, &mut heap).unwrap();
+    let direct = from_pairs(&[(key, value)], &mut heap).unwrap();
+    let encode = |map| arinsal_etf::encode(&local_map(map), arinsal_etf::EncodeOptions::default());
+    let actual = O::Tuple(vec![
+        O::Int(arinsal_term::size_object(empty) as i64),
+        O::Int(arinsal_term::flat_size(empty) as i64),
+        O::Binary(encode(empty)),
+        O::Int(arinsal_term::size_object(filled) as i64),
+        O::Int(arinsal_term::flat_size(filled) as i64),
+        O::Atom(if arinsal_term::exact_eq(filled, direct) {
+            "true".into()
+        } else {
+            "false".into()
+        }),
+        O::Binary(encode(filled)),
+        O::Binary(encode(direct)),
+    ]);
+    similar_asserts::assert_eq!(actual, expected);
+}
+
+#[test]
 fn take_and_flatmap_next_vs_erl() {
     arinsal_term::init_global_literals();
     // Port of erts/emulator/beam/erl_map.c:1943-2041 (erts_maps_take) and :3710-3735
