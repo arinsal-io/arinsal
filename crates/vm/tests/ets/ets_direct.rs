@@ -288,7 +288,7 @@ fn assert_same_with_reference(function: &str, reference: &RefErl) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_direct_diff", function, &[], 4, Some(81))
+        .eval_scheduled("ets_direct_diff", function, &[], 4, None)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

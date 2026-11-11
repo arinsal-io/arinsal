@@ -19,9 +19,7 @@ fn compare(source: &str, module: &str, function: &str) {
     let expected = reference.call(module, function, &[]);
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(module, function, &[], 1, Some(47))
-        .unwrap();
+    let actual = vm.eval_scheduled(module, function, &[], 1, None).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }
@@ -109,7 +107,7 @@ fn misc_bifs_ddll_missing_driver_fails_with_formattable_open_error() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("misc_bifs_missing_driver", "run", &[], 1, Some(47))
+        .eval_scheduled("misc_bifs_missing_driver", "run", &[], 1, None)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));

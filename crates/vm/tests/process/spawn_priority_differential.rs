@@ -46,9 +46,7 @@ fn spawn_opt_priority_is_visible_through_spawn_proc_lib_and_gen_server() {
 
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(MODULE, "run", &[], 1, Some(0x5052))
-        .unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
 
     let high = OwnedTerm::Tuple(vec![OwnedTerm::atom("priority"), OwnedTerm::atom("high")]);
     similar_asserts::assert_eq!(

@@ -41,7 +41,7 @@ fn private_append_grow_reads_the_stack_source_again() {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled(MODULE, function, &[], 1, Some(82))
+            .eval_scheduled(MODULE, function, &[], 1, None)
             .map(|outcome| CallResult::Ok(outcome.term))
             .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
         assert_eq!(expected, actual, "{function}");

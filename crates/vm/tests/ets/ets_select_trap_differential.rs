@@ -596,7 +596,7 @@ fn family(chunked: bool) {
         .chain(functions(true))
         .map(|(name, ..)| name)
         .collect();
-    for (index, function) in names.iter().enumerate() {
+    for function in &names {
         if functions(chunked).iter().all(|(name, ..)| name != function) {
             continue;
         }
@@ -607,7 +607,7 @@ fn family(chunked: bool) {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, Some(0xE700 + index as u64), 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
             .unwrap();
         let (expected_reds, expected_ins, expected_gcs, expected_value) = measured(&expected);
         let (actual_reds, actual_ins, actual_gcs, actual_value) = measured(&actual.term);
@@ -636,7 +636,7 @@ fn family(chunked: bool) {
     assert_eq!(Vec::<String>::new(), failures);
 }
 
-fn both(function: &str, workers: usize, seed: Option<u64>) -> (OwnedTerm, OwnedTerm) {
+fn both(function: &str, workers: usize) -> (OwnedTerm, OwnedTerm) {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let source = source();
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
@@ -647,14 +647,14 @@ fn both(function: &str, workers: usize, seed: Option<u64>) -> (OwnedTerm, OwnedT
         panic!("OTP {function} failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, function, &[], workers, seed, 4_000)
+        .eval_scheduled_reductions(MODULE, function, &[], workers, None, 4_000)
         .unwrap();
     (expected, actual.term)
 }
 
 #[test]
 fn result_order_matches_otp() {
-    let (expected, actual) = both("orders", 1, Some(0xE7F4));
+    let (expected, actual) = both("orders", 1);
     if std::env::var("SHOW").is_ok() {
         eprintln!("erl: {expected:?}\narinsal: {actual:?}");
     }
@@ -663,50 +663,50 @@ fn result_order_matches_otp() {
 
 #[test]
 fn ordered_results_match_otp() {
-    let (expected, actual) = both("ordered_results", 1, Some(0xE7F6));
+    let (expected, actual) = both("ordered_results", 1);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn writers_during_a_trapped_ordered_select_behave_like_otp() {
-    let (expected, actual) = both("ordered_writers", 2, None);
+    let (expected, actual) = both("ordered_writers", 2);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn chunk_pages_match_otp() {
-    let (expected, actual) = both("chunk_pages", 1, Some(0xE7F7));
+    let (expected, actual) = both("chunk_pages", 1);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn chunk_errors_and_end_markers_match_otp() {
-    let (expected, actual) = both("chunk_edges", 1, Some(0xE7F8));
+    let (expected, actual) = both("chunk_edges", 1);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn table_shapes_match_otp() {
-    let (expected, actual) = both("shapes", 1, Some(0xE7F3));
+    let (expected, actual) = both("shapes", 1);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn results_survive_a_collection_after_a_trap() {
-    let (expected, actual) = both("gc_after_trap", 1, Some(0xE7F5));
+    let (expected, actual) = both("gc_after_trap", 1);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn trapped_calls_run_as_the_trap_exports() {
-    let (expected, actual) = both("trap_mfa", 1, Some(0xE7F0));
+    let (expected, actual) = both("trap_mfa", 1);
     assert_eq!(expected, actual);
 }
 
 #[test]
 fn writers_during_a_trapped_select_behave_like_otp() {
     for function in ["writers_set", "writers_bag"] {
-        let (expected, actual) = both(function, 2, None);
+        let (expected, actual) = both(function, 2);
         assert_eq!(expected, actual, "{function}");
     }
 }
@@ -714,7 +714,7 @@ fn writers_during_a_trapped_select_behave_like_otp() {
 #[test]
 fn owner_of_a_protected_table_does_not_fix_it_and_a_deleted_table_ends_the_call() {
     for function in ["owner_unfixed", "deleted_while_trapped"] {
-        let (expected, actual) = both(function, 2, None);
+        let (expected, actual) = both(function, 2);
         assert_eq!(expected, actual, "{function}");
     }
 }

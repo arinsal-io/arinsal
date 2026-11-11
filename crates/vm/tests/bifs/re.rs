@@ -38,7 +38,7 @@ fn eval(
     vm.load_bytes(beam)?;
     let mut heap = ProcessHeap::with_words(1024);
     let terms = args_to_terms(values, &mut heap);
-    vm.eval_scheduled("re_vm_diff", function, &terms, 1, Some(41))
+    vm.eval_scheduled("re_vm_diff", function, &terms, 1, None)
 }
 
 #[test]

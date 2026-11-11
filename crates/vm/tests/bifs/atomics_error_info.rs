@@ -29,7 +29,7 @@ fn atomics_error_three_preserves_error_info_in_stacktrace() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("atomics_error_info_diff", "run", &[], 1, Some(73))
+        .eval_scheduled("atomics_error_info_diff", "run", &[], 1, None)
         .unwrap()
         .term;
     let CallResult::Ok(expected) = expected else {

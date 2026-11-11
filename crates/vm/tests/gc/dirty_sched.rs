@@ -113,7 +113,7 @@ ensure_kernel_refc() ->
     end.
 "##;
 
-fn assert_scenario(reference: &RefErl, scenario: i64, simulation: Option<u64>) {
+fn assert_scenario(reference: &RefErl, scenario: i64) {
     let beam = reference
         .compile_named("dirty_sched", SOURCE, &[])
         .expect("compile dirty_sched");
@@ -127,7 +127,7 @@ fn assert_scenario(reference: &RefErl, scenario: i64, simulation: Option<u64>) {
             "run",
             &[Term::small(scenario).unwrap()],
             2,
-            simulation,
+            None,
         )
         .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
@@ -141,7 +141,7 @@ macro_rules! scenario {
                 eprintln!("erl unavailable; skipping {}", stringify!($name));
                 return;
             };
-            assert_scenario(&reference, $index, None);
+            assert_scenario(&reference, $index);
         }
     };
 }
@@ -154,12 +154,3 @@ scenario!(dirty_sched_wait_errors_send, 4);
 scenario!(dirty_sched_cpu_online_flag, 5);
 scenario!(dirty_sched_wall_time_rows, 6);
 scenario!(dirty_sched_msacc_rows, 7);
-
-#[test]
-fn dirty_sched_simulated_scheduler_type() {
-    let Ok(reference) = RefErl::start() else {
-        eprintln!("erl unavailable; skipping dirty_sched_simulated_scheduler_type");
-        return;
-    };
-    assert_scenario(&reference, 0, Some(15));
-}

@@ -49,7 +49,7 @@ fn compare(function: &str) {
     let expected = reference.call("msgq_port", function, &[]);
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled("msgq_port", function, &[], 1, Some(91));
+    let actual = vm.eval_scheduled("msgq_port", function, &[], 1, None);
     assert_eq!(
         expected,
         CallResult::Ok(

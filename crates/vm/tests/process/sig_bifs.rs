@@ -203,7 +203,7 @@ fn assert_scenario(reference: &RefErl, scenario: i64) {
             "run",
             &[Term::small(scenario).unwrap()],
             1,
-            Some(15),
+            None,
         )
         .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");

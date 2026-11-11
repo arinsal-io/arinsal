@@ -112,7 +112,7 @@ fn ets_yield_matches_otp_29() {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("ets_yield_diff", function, &[], 2, Some(81))
+            .eval_scheduled("ets_yield_diff", function, &[], 2, None)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

@@ -44,7 +44,7 @@ run() ->
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop4_down", "run", &[], 4, Some(81))
+        .eval_scheduled("mix_loop4_down", "run", &[], 4, None)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -73,7 +73,7 @@ run() ->
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop4_fun", "run", &[], 2, Some(81))
+        .eval_scheduled("mix_loop4_fun", "run", &[], 2, None)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -113,7 +113,7 @@ run() ->
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop4_mon", "run", &[], 4, Some(81))
+        .eval_scheduled("mix_loop4_mon", "run", &[], 4, None)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

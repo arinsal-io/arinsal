@@ -27,7 +27,7 @@ fn unaligned_sub_binary_phash2_matches_otp_while_trapping() {
         panic!("OTP phash2 failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "hash", &[], 1, Some(0xB5FF), 4_000)
+        .eval_scheduled_reductions(MODULE, "hash", &[], 1, None, 4_000)
         .unwrap();
     assert_eq!(expected, actual.term);
 }

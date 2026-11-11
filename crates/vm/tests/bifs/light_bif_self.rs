@@ -87,7 +87,7 @@ fn self_counters_and_group_leader_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("light_bif_self", "run", &[], 2, Some(81))
+        .eval_scheduled("light_bif_self", "run", &[], 2, None)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }

@@ -67,7 +67,7 @@ fn both(function: &str) -> (CallResult, CallResult) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, function, &[], 2, Some(82))
+        .eval_scheduled(MODULE, function, &[], 2, None)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
     (expected, actual)

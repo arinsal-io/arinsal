@@ -27,7 +27,7 @@ fn spawn_opt_monitor_tag_matches_otp() {
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop2_monitor_tag", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop2_monitor_tag", "run", &[], 2, Some(83))
+        .eval_scheduled("mix_loop2_monitor_tag", "run", &[], 2, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

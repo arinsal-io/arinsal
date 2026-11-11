@@ -78,7 +78,7 @@ plain_child(Parent) ->
 probe(Tag, Want, Fun) ->
     %% A runnable high priority parent always runs before the normal priority
     %% child, so the parent samples the child at a schedule-out whatever the
-    %% order in which the seeded simulation draws among runnable processes.
+    %% order in which the schedulers pick among runnable processes.
     Old = process_flag(priority, high),
     Parent = self(),
     Pid = spawn(trap_cont, child, [Parent, Tag, Fun]),
@@ -169,7 +169,7 @@ fn trap_continuation_stack_matches_erts() {
     // A short quantum makes each trap a real schedule-out the tracer can sample.
     // The frame at that out does not depend on how far the BIF got.
     let actual = vm
-        .eval_scheduled_reductions("trap_cont", "run", &[], 1, Some(0x7C0), 4_000)
+        .eval_scheduled_reductions("trap_cont", "run", &[], 1, None, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -186,7 +186,7 @@ fn trap_frames_of_each_call_shape_match_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, Some(0x7C2), 4_000)
+        .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, None, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -200,13 +200,13 @@ fn apply_of_a_trapping_bif_traps_like_a_direct_call_match_erts() {
     let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
     reference.load("trap_cont", &beam).unwrap();
     let expected = reference.call("trap_cont", "run_apply_traps", &[]);
-    for seed in [0x7C4, 1, 6, 10] {
+    for round in 0..4 {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled_reductions("trap_cont", "run_apply_traps", &[], 1, Some(seed), 4_000)
+            .eval_scheduled_reductions("trap_cont", "run_apply_traps", &[], 1, None, 4_000)
             .unwrap_or_else(|error| panic!("{error}"));
-        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "seed {seed:#x}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "round {round}");
     }
 }
 
@@ -222,7 +222,7 @@ fn trap_frames_of_a_tail_called_export_fun_match_erts() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("trap_cont", "run_fun_shapes", &[], 1, Some(0x7C3), 4_000)
+        .eval_scheduled_reductions("trap_cont", "run_fun_shapes", &[], 1, None, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -247,7 +247,7 @@ run() ->
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("rev_val", "run", &[], 1, Some(0x7C1), 4_000)
+        .eval_scheduled_reductions("rev_val", "run", &[], 1, None, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

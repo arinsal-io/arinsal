@@ -810,7 +810,7 @@ mod tail_apply_exception_stacktrace_matches_otp {
             .iter()
             .map(|arg| from_owned(arg, &mut heap).expect("test argument"))
             .collect::<Vec<Term>>();
-        match vm.eval_scheduled("vm_exc_apply", function, &inputs, 2, Some(0xA991)) {
+        match vm.eval_scheduled("vm_exc_apply", function, &inputs, 2, None) {
             Ok(result) => CallResult::Ok(result.term),
             Err(VmError::Raised(raised)) => CallResult::Exception {
                 class: format!("{:?}", raised.class).to_lowercase(),

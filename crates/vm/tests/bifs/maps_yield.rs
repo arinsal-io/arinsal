@@ -88,7 +88,7 @@ fn yielding_map_bifs_match_otp_29() {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("maps_yield_diff", function, &[], 2, Some(7))
+            .eval_scheduled("maps_yield_diff", function, &[], 2, None)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
@@ -122,7 +122,7 @@ fn yielding_map_bifs_match_otp_29() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("maps_yield_diff", "trap_count", &[], 2, Some(7))
+        .eval_scheduled("maps_yield_diff", "trap_count", &[], 2, None)
         .unwrap_or_else(|error| panic!("trap_count: {error}"));
     let actual_counts = trap_counts(CallResult::Ok(actual.term));
     for index in [0, 1, 2, 4] {

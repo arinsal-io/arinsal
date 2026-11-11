@@ -101,7 +101,7 @@ fn ets_flxctr_matches_otp_29() {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("ets_flxctr_diff", function, &[], 4, Some(81))
+            .eval_scheduled("ets_flxctr_diff", function, &[], 4, None)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

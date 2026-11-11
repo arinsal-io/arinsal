@@ -51,7 +51,7 @@ unloaded() ->
         vm.load_bytes(&handler_beam).unwrap();
         vm.load_bytes(&caller_beam).unwrap();
         let actual = vm
-            .eval_scheduled("mix_loop5_call", function, &[], 2, Some(81))
+            .eval_scheduled("mix_loop5_call", function, &[], 2, None)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

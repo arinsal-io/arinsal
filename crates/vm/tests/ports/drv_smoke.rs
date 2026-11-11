@@ -101,7 +101,7 @@ fn smoke_driver_matches_erl() {
     }
 
     let mut vm = Vm::new([dir.clone()]);
-    let actual = match vm.eval_scheduled("drv_smoke_main", "run", &[], 1, Some(1)) {
+    let actual = match vm.eval_scheduled("drv_smoke_main", "run", &[], 1, None) {
         Ok(result) => result.term,
         Err(error) => panic!("drv_smoke:run/1 on Arinsal: {error}"),
     };

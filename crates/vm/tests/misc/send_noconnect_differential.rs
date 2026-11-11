@@ -24,9 +24,7 @@ fn remote_name_send_with_noconnect_reports_noconnect_without_connecting() {
 
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(MODULE, "run", &[], 1, Some(0x4E43))
-        .unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
 
     let expected_value = OwnedTerm::tuple(vec![
         OwnedTerm::atom("noconnect"),

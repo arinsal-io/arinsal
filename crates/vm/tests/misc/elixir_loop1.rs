@@ -36,7 +36,7 @@ fn pid_to_list_matches_otp_29() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval_scheduled("elixir_loop1_pid", "render", &[arg], 1, Some(79))
+            .eval_scheduled("elixir_loop1_pid", "render", &[arg], 1, None)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "{input:?}");
     }
@@ -67,7 +67,7 @@ fn hibernate_zero_waits_and_resumes_at_the_call_site() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("elixir_loop1_hibernate", "run", &[], 2, Some(83))
+        .eval_scheduled("elixir_loop1_hibernate", "run", &[], 2, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -92,7 +92,7 @@ fn fun_info_mfa_matches_otp_29() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("elixir_loop1_fun", "run", &[], 1, Some(89))
+        .eval_scheduled("elixir_loop1_fun", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
     let args = [
@@ -106,7 +106,7 @@ fn fun_info_mfa_matches_otp_29() {
         .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled("elixir_loop1_fun", "dynamic", &terms, 1, Some(91))
+        .eval_scheduled("elixir_loop1_fun", "dynamic", &terms, 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -139,7 +139,7 @@ fn dynamic_apply_of_re_import_matches_otp_29() {
         .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled("elixir_loop1_re", "run", &terms, 1, Some(97))
+        .eval_scheduled("elixir_loop1_re", "run", &terms, 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

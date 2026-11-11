@@ -33,7 +33,7 @@ fn function_exported_matches_otp_for_exports_bifs_and_stubs() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("prim_lookup_function_exported", "run", &[], 1, Some(41))
+        .eval_scheduled("prim_lookup_function_exported", "run", &[], 1, None)
         .unwrap();
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -60,10 +60,10 @@ fn get_all_matches_otp_for_empty_and_multiple_entries() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual_empty = vm
-        .eval_scheduled("prim_lookup_get_all", "empty", &[], 1, Some(43))
+        .eval_scheduled("prim_lookup_get_all", "empty", &[], 1, None)
         .unwrap();
     let actual = vm
-        .eval_scheduled("prim_lookup_get_all", "run", &[], 1, Some(43))
+        .eval_scheduled("prim_lookup_get_all", "run", &[], 1, None)
         .unwrap();
     similar_asserts::assert_eq!(expected_empty, CallResult::Ok(actual_empty.term));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));

@@ -110,7 +110,7 @@ fn port_trace_event_sequences_match_otp() {
             from_owned(&string_term(driver_dir), &mut heap).unwrap(),
         ];
         let actual = vm
-            .eval_scheduled(MODULE, "run", &args, 1, Some(82))
+            .eval_scheduled(MODULE, "run", &args, 1, None)
             .unwrap_or_else(|error| panic!("{MODULE}:run({case}) on Arinsal: {error}"))
             .term;
         similar_asserts::assert_eq!(

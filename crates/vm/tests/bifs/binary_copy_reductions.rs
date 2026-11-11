@@ -101,12 +101,12 @@ fn binary_copy_reductions_and_slices_match_otp() {
         "copy_loop_limit_unaligned",
         "copy_unaligned_source",
     ];
-    for (index, function) in cases.iter().enumerate() {
+    for function in cases {
         let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, Some(0xB300 + index as u64), 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
             .unwrap();
         let (expected_reds, expected_slices) = measured(&expected);
         let (actual_reds, actual_slices) = measured(&actual.term);

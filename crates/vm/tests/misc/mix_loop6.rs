@@ -8,7 +8,7 @@ fn render(vm: &mut Vm, reference: &RefErl, function: &str, input: &OwnedTerm) ->
     let mut heap = VecHeap::new();
     let arg = from_owned(input, &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop6", function, &[arg], 1, Some(79))
+        .eval_scheduled("mix_loop6", function, &[arg], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term.clone()), "{input:?}");
     actual.term
@@ -67,7 +67,7 @@ fn ref_port_fun_to_list_match_otp_29() {
     for function in ["local", "export", "wide"] {
         let expected = reference.call("mix_loop6", function, &[]);
         let actual = vm
-            .eval_scheduled("mix_loop6", function, &[], 1, Some(79))
+            .eval_scheduled("mix_loop6", function, &[], 1, None)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

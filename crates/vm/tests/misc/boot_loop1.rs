@@ -41,7 +41,7 @@ fn kernel_process_flags_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_flags", "run", &[], 1, Some(31))
+        .eval_scheduled("boot_loop1_flags", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -62,7 +62,7 @@ fn local_node_queries_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_nodes", "run", &[], 1, Some(41))
+        .eval_scheduled("boot_loop1_nodes", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -90,7 +90,7 @@ fn foreign_registered_name_and_stacktrace_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_info", "run", &[], 2, Some(37))
+        .eval_scheduled("boot_loop1_info", "run", &[], 2, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -233,7 +233,7 @@ fn process_priority_flag_previous_value_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_priority", "run", &[], 1, Some(17))
+        .eval_scheduled("boot_loop1_priority", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -258,7 +258,7 @@ fn registered_name_process_info_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_process_info", "run", &[], 1, Some(19))
+        .eval_scheduled("boot_loop1_process_info", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -285,7 +285,7 @@ fn process_dictionary_get_put_erase_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_dictionary", "run", &[], 1, Some(23))
+        .eval_scheduled("boot_loop1_dictionary", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -308,7 +308,7 @@ fn group_leader_self_change_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_group_leader", "run", &[], 1, Some(29))
+        .eval_scheduled("boot_loop1_group_leader", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -336,7 +336,7 @@ fn undef_stacktrace_names_missing_dynamic_target() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_undef", "run", &[], 1, Some(31))
+        .eval_scheduled("boot_loop1_undef", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -406,7 +406,7 @@ fn monitor_registered_name_matches_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_monitor_name", "run", &[], 1, Some(37))
+        .eval_scheduled("boot_loop1_monitor_name", "run", &[], 1, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

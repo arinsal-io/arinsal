@@ -41,7 +41,7 @@ fn trapped_select_results_survive_collections() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_select_gc_diff", "run", &[], 2, Some(81))
+        .eval_scheduled("ets_select_gc_diff", "run", &[], 2, None)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
