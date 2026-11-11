@@ -1354,7 +1354,8 @@ impl ProcessHeap {
     pub fn set_min_heap_size(&mut self, words: usize) {
         // Port of erl_gc.c:345-349 (`next_heap_size`) and bif.c:2120-2129
         // (`min_heap_size`), OTP-29.1.1.
-        self.min_heap_size = u32::try_from(normalize_heap_minimum(words)).unwrap_or(u32::MAX);
+        self.min_heap_size =
+            u32::try_from(erts_next_heap_size(words, 0).unwrap_or(words)).unwrap_or(u32::MAX);
     }
 
     /// Number of live stack words.
@@ -2361,9 +2362,7 @@ fn offset_stack_slots(
 /// Port of erl_gc.c:177-186 (`MAX_HEAP_SIZES`), OTP-29.1.1.
 const HEAP_SIZE_COUNT: usize = if usize::BITS == 64 { 154 } else { 59 };
 
-/// Port of erl_gc.c:265-291 (`heap_sizes[]`), OTP-29.1.1: a static table like erts, so a
-/// lookup reads no lazily initialized state.
-static HEAP_SIZES: [usize; HEAP_SIZE_COUNT] = {
+const fn make_heap_sizes() -> ([usize; HEAP_SIZE_COUNT], usize) {
     let mut sizes = [0usize; HEAP_SIZE_COUNT];
     sizes[0] = 12;
     sizes[1] = 38;
@@ -2372,15 +2371,31 @@ static HEAP_SIZES: [usize; HEAP_SIZE_COUNT] = {
         sizes[index] = sizes[index - 1] + sizes[index - 2] + 1;
         index += 1;
     }
+    let max_heap_size = if usize::BITS < 64 {
+        usize::MAX / 4
+    } else {
+        (1usize << 53) / 8
+    };
+    let mut count = index;
     while index < HEAP_SIZE_COUNT {
-        sizes[index] = sizes[index - 1] + sizes[index - 1] / 5;
+        let previous = sizes[index - 1];
+        let next = previous + previous / 5;
+        if next <= previous || next > max_heap_size {
+            break;
+        }
+        sizes[index] = next;
+        count += 1;
         index += 1;
     }
-    sizes
-};
+    (sizes, count)
+}
+
+/// Port of erl_gc.c:265-291 (`heap_sizes[]`), OTP-29.1.1: the same capped static table.
+const HEAP_SIZES_DATA: ([usize; HEAP_SIZE_COUNT], usize) = make_heap_sizes();
+static HEAP_SIZES: [usize; HEAP_SIZE_COUNT] = HEAP_SIZES_DATA.0;
 
 fn heap_sizes() -> &'static [usize] {
-    &HEAP_SIZES
+    &HEAP_SIZES[..HEAP_SIZES_DATA.1]
 }
 
 /// Words of the initial heap of a spawned process whose arguments and reserved words need
@@ -2395,9 +2410,17 @@ pub fn spawned_heap_words(heap_need: usize, min_heap: usize) -> Result<usize, Te
     }
 }
 
-pub(crate) fn normalize_heap_minimum(minimum: usize) -> usize {
-    let minimum = minimum.max(233);
-    next_heap_size(minimum, 0, 233).unwrap_or(minimum)
+/// Rounds a requested minimum through the process heap size table used by erts.
+///
+/// Port of erts/emulator/beam/erl_gc.c:311-335 (`erts_next_heap_size`), OTP-29.1.1.
+pub fn erts_next_heap_size(size: usize, offset: usize) -> Result<usize, TermError> {
+    next_heap_size(size, offset, 0)
+}
+
+/// Rounds a heap minimum and applies the caller's erts minimum-size floor.
+pub fn normalize_heap_minimum(minimum: usize, floor: usize) -> usize {
+    let minimum = minimum.max(floor);
+    erts_next_heap_size(minimum, 0).unwrap_or(minimum)
 }
 
 /// Select the table size at or above `minimum`, applying OTP's optional offset.
@@ -2463,25 +2486,26 @@ mod tests {
 
     #[test]
     fn next_heap_size_matches_erts_table_bisection() {
+        let sizes = heap_sizes();
         let mut probes: Vec<usize> = (1..5000).collect();
-        for &size in &HEAP_SIZES {
+        for &size in sizes {
             probes.extend([size - 1, size, size + 1]);
         }
         probes.extend([usize::MAX / 2, 1 << 40]);
         for target in probes {
-            let index = HEAP_SIZES.partition_point(|&size| size < target);
-            let expected = HEAP_SIZES.get(index).copied();
+            let index = sizes.partition_point(|&size| size < target);
+            let expected = sizes.get(index).copied();
             assert_eq!(
                 next_heap_size(target, 0, 0).ok(),
                 expected,
                 "target {target}"
             );
-            let expected_offset = if target < HEAP_SIZES[0] {
-                Some(HEAP_SIZES[0])
+            let expected_offset = if target < sizes[0] {
+                Some(sizes[0])
             } else {
                 index
                     .checked_add(1)
-                    .and_then(|next| HEAP_SIZES.get(next).copied())
+                    .and_then(|next| sizes.get(next).copied())
             };
             assert_eq!(
                 next_heap_size(target, 1, 0).ok(),

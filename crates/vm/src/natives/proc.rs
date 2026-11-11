@@ -589,7 +589,11 @@ pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Ter
             let n = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
             let normalized = match name {
                 "fullsweep_after" => n.min(u16::MAX as i64),
-                "min_heap_size" => n.max(233),
+                "min_heap_size" => crate::natives::sys::normalize_spawn_heap_minimum(
+                    process.runtime,
+                    Some(n as usize),
+                    false,
+                ) as i64,
                 "min_bin_vheap_size" => crate::natives::sys::normalize_spawn_heap_minimum(
                     process.runtime,
                     Some(n as usize),
