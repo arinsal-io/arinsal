@@ -37,7 +37,7 @@ tags() ->
      erlang:dt_append_vm_tag_data(1)}.
 constants() ->
     Keys = [start_time, break_ignored, async_dist, eager_check_io, dynamic_trace,
-            dynamic_trace_probes, c_compiler_used, delayed_node_table_gc],
+            dynamic_trace_probes, c_compiler_used, delayed_node_table_gc, dist_buf_busy_limit],
     End = erlang:system_info(end_time),
     % A bignum: compared in Erlang, as the OwnedTerm of an i64-sized bignum differs by decoder.
     [{end_time, End =:= 8646911283000000000, is_integer(End)}
