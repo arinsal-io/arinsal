@@ -370,7 +370,6 @@ dependencies = [
 name = "arinsal-sched"
 version = "0.0.1"
 dependencies = [
- "arc-swap",
  "arinsal-alloc",
  "arinsal-term",
  "libc",

@@ -1,4 +1,4 @@
-//! Intrusive per-priority lists of a run queue: the only `unsafe` of the run queue.
+//! Intrusive per-priority lists and the published migration path block.
 //!
 //! Port of erts/emulator/beam/erl_process.h (`ErtsRunPrioQueue` { first, last } and
 //! `Process.next/prev`) and erl_process.c (`enqueue_process_internal`, `dequeue_process`,
@@ -14,6 +14,190 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::proc_ref::ProcRef;
 use crate::{Enqueue, PROC_QUEUES, Scheduled, Task};
+
+/// The published contiguous migration path block (`erts_migration_paths`).
+// Port of erts/emulator/beam/erl_process.c (ErtsMigrationPaths), OTP-29.1.1.
+pub(crate) struct MigrationPaths {
+    current: std::sync::atomic::AtomicPtr<crate::balance::MigrationPath>,
+    len: usize,
+    progress: std::sync::Arc<crate::thr_progress::ThrProgress>,
+}
+
+/// Ownership of a removed block, released when its scheduler readers pass thread progress.
+pub(crate) struct RetiredMigrationPaths {
+    ptr: usize,
+    len: usize,
+}
+
+impl Drop for RetiredMigrationPaths {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: only `MigrationPaths::swap` and `take` construct this owner, and both
+            // transfer one complete allocation to it.
+            unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    self.ptr as *mut crate::balance::MigrationPath,
+                    self.len,
+                )));
+            }
+        }
+    }
+}
+
+struct MigrationReadDelay<'a> {
+    progress: &'a crate::thr_progress::ThrProgress,
+    handle: Option<crate::thr_progress::DelayHandle>,
+}
+
+#[derive(Clone, Copy)]
+enum MigrationReadRequest {
+    Flags(usize),
+    Path(usize, usize),
+    Snapshot,
+}
+
+enum MigrationReadResult {
+    Flags(u32),
+    Path(u32, crate::balance::MigrationPrio),
+    Snapshot(Vec<crate::balance::MigrationPath>),
+}
+
+impl Drop for MigrationReadDelay<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            crate::thr_progress::unmanaged_continue(self.progress, handle);
+        }
+    }
+}
+
+impl MigrationPaths {
+    /// Install the initial zeroed migration path block.
+    pub(crate) fn new(
+        len: usize,
+        progress: std::sync::Arc<crate::thr_progress::ThrProgress>,
+    ) -> Self {
+        Self {
+            current: std::sync::atomic::AtomicPtr::new(allocate_migration_paths(vec![
+                crate::balance::MigrationPath::NONE;
+                len
+            ])),
+            len,
+            progress,
+        }
+    }
+
+    fn delay_read(&self) -> MigrationReadDelay<'_> {
+        let handle = crate::thr_progress::unmanaged_delay(&self.progress);
+        MigrationReadDelay {
+            progress: &self.progress,
+            handle: match handle {
+                crate::thr_progress::DelayHandle::Managed => None,
+                unmanaged => Some(unmanaged),
+            },
+        }
+    }
+
+    /// Copy one path's flags while the calling managed thread holds the old block live.
+    #[inline]
+    pub(crate) fn flags(&self, ix: usize) -> u32 {
+        match self.read(MigrationReadRequest::Flags(ix)) {
+            Some(MigrationReadResult::Flags(flags)) => flags,
+            _ => 0,
+        }
+    }
+
+    /// Copy the flags and one priority path from the same published generation.
+    #[inline]
+    pub(crate) fn path(
+        &self,
+        ix: usize,
+        prio: usize,
+    ) -> Option<(u32, crate::balance::MigrationPrio)> {
+        match self.read(MigrationReadRequest::Path(ix, prio)) {
+            Some(MigrationReadResult::Path(flags, migration)) => Some((flags, migration)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn read(&self, request: MigrationReadRequest) -> Option<MigrationReadResult> {
+        let ix = match request {
+            MigrationReadRequest::Flags(ix) | MigrationReadRequest::Path(ix, _) => Some(ix),
+            MigrationReadRequest::Snapshot => None,
+        };
+        if let Some(ix) = ix {
+            assert!(ix < self.len);
+        }
+        if let MigrationReadRequest::Path(_, prio) = request {
+            assert!(prio < crate::balance::PRIO_LEVELS);
+        }
+        let _delay = if matches!(request, MigrationReadRequest::Snapshot) {
+            Some(self.delay_read())
+        } else {
+            None
+        };
+        if !matches!(request, MigrationReadRequest::Snapshot)
+            && !crate::thr_progress::is_managed_thread_of(&self.progress)
+        {
+            return None;
+        }
+        let ptr = self.current.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: publishers retire replaced blocks only after managed scheduler threads pass
+        // thread progress, and this method copies its values before returning to the caller.
+        unsafe {
+            match request {
+                MigrationReadRequest::Flags(ix) => {
+                    Some(MigrationReadResult::Flags((*ptr.add(ix)).flags))
+                }
+                MigrationReadRequest::Path(ix, prio) => {
+                    let path = &*ptr.add(ix);
+                    Some(MigrationReadResult::Path(path.flags, path.prio[prio]))
+                }
+                MigrationReadRequest::Snapshot => Some(MigrationReadResult::Snapshot(
+                    std::slice::from_raw_parts(ptr, self.len).to_vec(),
+                )),
+            }
+        }
+    }
+
+    /// Copy a block for the serialized balance updater, which excludes other publishers.
+    pub(crate) fn snapshot(&self) -> Vec<crate::balance::MigrationPath> {
+        match self.read(MigrationReadRequest::Snapshot) {
+            Some(MigrationReadResult::Snapshot(paths)) => paths,
+            _ => unreachable!("a path snapshot is always available"),
+        }
+    }
+
+    /// Replace the current block and return ownership of the old one to the caller.
+    pub(crate) fn swap(&self, paths: Vec<crate::balance::MigrationPath>) -> RetiredMigrationPaths {
+        assert_eq!(paths.len(), self.len);
+        let old = self.current.swap(
+            allocate_migration_paths(paths),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        RetiredMigrationPaths {
+            ptr: old as usize,
+            len: self.len,
+        }
+    }
+
+    /// Remove the current block when scheduler threads and all readers have stopped.
+    pub(crate) fn take(&self) -> RetiredMigrationPaths {
+        let old = self
+            .current
+            .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
+        RetiredMigrationPaths {
+            ptr: old as usize,
+            len: self.len,
+        }
+    }
+}
+
+fn allocate_migration_paths(
+    paths: Vec<crate::balance::MigrationPath>,
+) -> *mut crate::balance::MigrationPath {
+    Box::into_raw(paths.into_boxed_slice()).cast()
+}
 
 /// Tag bit of a node address that names a [`Proxy`].
 const PROXY: usize = 1;

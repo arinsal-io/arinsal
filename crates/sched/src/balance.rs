@@ -179,7 +179,7 @@ pub(crate) struct MigrationPath {
 }
 
 impl MigrationPath {
-    const NONE: Self = Self {
+    pub(super) const NONE: Self = Self {
         flags: 0,
         misc_evac_runq: None,
         prio: [MigrationPrio::NONE; PRIO_LEVELS],
@@ -282,10 +282,9 @@ pub(crate) struct Balance<T: Task> {
     no_active_runqs: AtomicUsize,
     /// Used run queues (`balance_info.no_runqs` used part).
     no_used_runqs: AtomicUsize,
-    /// Published migration paths (`erts_migration_paths`).
-    paths: arc_swap::ArcSwap<Vec<MigrationPath>>,
-    /// `paths[ix].flags`, readable without taking the paths lock.
-    path_flags: Vec<AtomicU32>,
+    /// Published contiguous migration path block (`erts_migration_paths`).
+    paths: crate::run_queue::raw::MigrationPaths,
+    progress: Arc<crate::thr_progress::ThrProgress>,
     compact_load: bool,
     /// Run queues whose scheduler declared itself out of work (`no_empty_run_queues`).
     no_empty_run_queues: AtomicI32,
@@ -294,7 +293,12 @@ pub(crate) struct Balance<T: Task> {
 impl<T: Task> Balance<T> {
     /// Port of erts/emulator/beam/erl_process.c:6330-6343 (balance_info initialization)
     /// and erl_process.c:4797 (init_migration_paths), OTP-29.1.1.
-    pub(crate) fn new(schedulers: usize, online: usize, compact_load: bool) -> Self {
+    pub(crate) fn new(
+        schedulers: usize,
+        online: usize,
+        compact_load: bool,
+        progress: Arc<crate::thr_progress::ThrProgress>,
+    ) -> Self {
         Self {
             rqs: (0..schedulers).map(|_| ProcQueues::new()).collect(),
             checking_balance: AtomicBool::new(false),
@@ -309,8 +313,8 @@ impl<T: Task> Balance<T> {
             n: AtomicU64::new(0),
             no_active_runqs: AtomicUsize::new(online),
             no_used_runqs: AtomicUsize::new(online),
-            paths: arc_swap::ArcSwap::from_pointee(vec![MigrationPath::NONE; schedulers]),
-            path_flags: (0..schedulers).map(|_| AtomicU32::new(0)).collect(),
+            paths: crate::run_queue::raw::MigrationPaths::new(schedulers, Arc::clone(&progress)),
+            progress,
             compact_load,
             no_empty_run_queues: AtomicI32::new(0),
         }
@@ -370,18 +374,15 @@ impl<T: Task> Balance<T> {
     }
 
     pub(crate) fn path_flags(&self, ix: usize) -> u32 {
-        self.path_flags[ix].load(Ordering::Acquire)
-    }
-
-    pub(crate) fn migration_paths(&self) -> Arc<Vec<MigrationPath>> {
-        self.paths.load_full()
+        self.paths.flags(ix)
     }
 
     fn publish(&self, paths: Vec<MigrationPath>) {
-        for (ix, path) in paths.iter().enumerate() {
-            self.path_flags[ix].store(path.flags, Ordering::Release);
-        }
-        self.paths.store(Arc::new(paths));
+        let old = self.paths.swap(paths);
+        crate::thr_progress::schedule_later_op(
+            &self.progress,
+            crate::thr_progress::LaterOp::Boxed(Box::new(move || drop(old))),
+        );
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2930 (sched_waiting) and erl_process.c:2942
@@ -397,28 +398,25 @@ impl<T: Task> Balance<T> {
 
     /// Port of erts/emulator/beam/erl_process.h:2486 (erts_check_emigration_need),
     /// OTP-29.1.1.
+    #[inline]
     pub(crate) fn check_emigration_need(&self, c_rq: usize, prio: usize) -> Option<usize> {
-        if self.path_flags(c_rq) & flg_emigrate(prio) == 0 {
-            return None;
-        }
-        // Port of erts/emulator/beam/erl_process.h:2486 (reads `rq->mpaths` in place), OTP-29.1.1.
-        let paths = self.paths.load();
-        let mp = &paths[c_rq];
-        let flags = mp.flags;
+        // Port of erl_process.h (erts_check_emigration_need): the flags and path fields are
+        // read from the same ErtsMigrationPaths block, OTP-29.1.1.
+        let (flags, migration) = self.paths.path(c_rq, prio)?;
         if flags & flg_emigrate(prio) == 0 {
             return None;
         }
         if flags & flg_evacuate(prio) != 0 {
-            return mp.prio[prio].runq;
+            return migration.runq;
         }
         if flags & FLG_INACTIVE != 0
             && self.rqs[c_rq].flags.load(Ordering::Acquire) & FLG_INACTIVE != 0
         {
-            return mp.prio[prio].runq;
+            return migration.runq;
         }
-        if self.rqs[c_rq].len(prio) > mp.prio[prio].limit_here
-            && let Some(n_rq) = mp.prio[prio].runq
-            && self.rqs[n_rq].len(prio) < mp.prio[prio].limit_other
+        if self.rqs[c_rq].len(prio) > migration.limit_here
+            && let Some(n_rq) = migration.runq
+            && self.rqs[n_rq].len(prio) < migration.limit_other
         {
             return Some(n_rq);
         }
@@ -426,22 +424,21 @@ impl<T: Task> Balance<T> {
     }
 
     /// Port of erts/emulator/beam/erl_process.c:4071 (check_immigration_need), OTP-29.1.1.
-    pub(crate) fn check_immigration_need(
-        &self,
-        c_rq: usize,
-        mp: &MigrationPath,
-        prio: usize,
-    ) -> Option<usize> {
-        let f_flags = mp.prio[prio].flags;
-        let f_rq = mp.prio[prio].runq?;
+    pub(crate) fn check_immigration_need(&self, c_rq: usize, prio: usize) -> Option<usize> {
+        let (flags, migration) = self.paths.path(c_rq, prio)?;
+        if flags & flg_immigrate(prio) == 0 {
+            return None;
+        }
+        let f_flags = migration.flags;
+        let f_rq = migration.runq?;
         if f_flags & flg_evacuate(prio) != 0 {
             return Some(f_rq);
         }
         if self.rqs[f_rq].flags.load(Ordering::Acquire) & FLG_INACTIVE != 0 {
             return Some(f_rq);
         }
-        if self.rqs[c_rq].len(prio) < mp.prio[prio].limit_here
-            && self.rqs[f_rq].len(prio) > mp.prio[prio].limit_other
+        if self.rqs[c_rq].len(prio) < migration.limit_here
+            && self.rqs[f_rq].len(prio) > migration.limit_other
         {
             return Some(f_rq);
         }
@@ -453,7 +450,7 @@ impl<T: Task> Balance<T> {
         let used = used.clamp(1, self.rqs.len());
         let mut state = self.state.lock().unwrap();
         self.no_used_runqs.store(used, Ordering::Release);
-        let old = self.migration_paths();
+        let old = self.paths.snapshot();
         let mut paths = vec![MigrationPath::NONE; self.rqs.len()];
         for (qix, path) in paths.iter_mut().enumerate().take(used) {
             path.flags = old[qix].flags & !MIGRATION_QMASKS;
@@ -547,7 +544,7 @@ impl<T: Task> Balance<T> {
         self.set_no_active_runqs(active);
         state.halftime = true;
         // Keep offline run queues as is.
-        let old = self.migration_paths();
+        let old = self.paths.snapshot();
         let mut paths = plan.paths;
         paths.extend_from_slice(&old[blnc_no_rqs..]);
         let flags: Vec<u32> = paths[..blnc_no_rqs].iter().map(|path| path.flags).collect();
@@ -581,6 +578,13 @@ impl<T: Task> Balance<T> {
     /// Port of erts/emulator/beam/erl_process.c:3825 (set_no_active_runqs), OTP-29.1.1.
     fn set_no_active_runqs(&self, active: usize) {
         self.no_active_runqs.store(active, Ordering::Release);
+    }
+}
+
+impl<T: Task> Drop for Balance<T> {
+    fn drop(&mut self) {
+        // Inner is dropped only after its scheduler threads have stopped.
+        drop(self.paths.take());
     }
 }
 
@@ -925,6 +929,13 @@ fn setup_migration_paths(info: &mut [QueueBalance], pix: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_progress() -> Arc<crate::thr_progress::ThrProgress> {
+        Arc::new(crate::thr_progress::ThrProgress::new(
+            Arc::from([]),
+            Arc::from([]),
+        ))
+    }
     use crate::{RunCtx, RunOutcome};
 
     /// A task type for the run queues the balance tests create.
@@ -1039,7 +1050,7 @@ mod tests {
 
     #[test]
     fn balance_counts_checks_after_halftime() {
-        let balance = Balance::<IdleTask>::new(2, 2, true);
+        let balance = Balance::<IdleTask>::new(2, 2, true, test_progress());
         balance.check_balance(0);
         assert_eq!(balance.checks(), 0);
         balance.check_balance(0);
@@ -1052,11 +1063,12 @@ mod tests {
 
     #[test]
     fn offline_run_queues_evacuate() {
-        let balance = Balance::<IdleTask>::new(4, 4, true);
+        let balance = Balance::<IdleTask>::new(4, 4, true, test_progress());
         balance.change_no_used_runqs(2);
-        let paths = balance.migration_paths();
+        let paths = balance.paths.snapshot();
         assert_eq!(paths[3].prio[PRIORITY_LOW].runq, Some(1));
-        assert_eq!(balance.check_emigration_need(3, 1), Some(1));
+        // erts_get_migration_paths returns null to unmanaged callers.
+        assert_eq!(balance.check_emigration_need(3, 1), None);
         assert_eq!(balance.check_emigration_need(1, 1), None);
     }
 }
