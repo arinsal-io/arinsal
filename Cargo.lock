@@ -151,6 +151,7 @@ dependencies = [
  "arinsal-args",
  "arinsal-beam",
  "arinsal-difftest",
+ "arinsal-drv",
  "arinsal-etf",
  "arinsal-float",
  "arinsal-nif",

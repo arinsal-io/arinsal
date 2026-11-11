@@ -14,6 +14,19 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::mem;
 
+#[cfg(target_os = "macos")]
+mod raw;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn darwin_main_thread_init() -> Result<(), c_int> {
+    raw::initialize()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn darwin_main_thread_park() -> ! {
+    raw::park();
+}
+
 /// Name erts gives to anonymous locks and threads (`no_name`).
 const NO_NAME: &CStr = c"unknown";
 
@@ -562,11 +575,12 @@ pub(crate) fn pdl_dec(handle: *mut PortDataLock) -> isize {
 }
 
 /// The thread `erl_drv_steal_main_thread` started, joined by `erl_drv_stolen_main_thread_join`.
+#[cfg(not(target_os = "macos"))]
 static STOLEN: Mutex<usize> = Mutex::new(0);
 
-/// Port of erl_drv_thread.c:750 (erl_drv_steal_main_thread). erts runs `func` on
-/// the emulator's main thread (macOS only); this runtime keeps no such thread
-/// parked, so `func` runs on a dedicated thread and `*tid` is NULL as in erts.
+/// Port of erl_drv_thread.c:750 (erl_drv_steal_main_thread), OTP-29.1.1.
+/// Darwin submits the callback to the parked process main thread; other platforms use the
+/// existing driver thread implementation because this API's Darwin pipe protocol is unavailable.
 pub(crate) fn steal_main_thread(
     name: *mut c_char,
     tid: *mut *mut c_void,
@@ -574,22 +588,40 @@ pub(crate) fn steal_main_thread(
     arg: *mut c_void,
     opts: *mut c_void,
 ) -> c_int {
-    let mut created: *mut c_void = std::ptr::null_mut();
-    let status = thread_create(name, &mut created, func, arg, opts);
-    if status == 0 {
-        *STOLEN.lock().unwrap() = created as usize;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (name, opts);
+        if let Some(out) = mem::deref_mut(tid) {
+            *out = std::ptr::null_mut();
+        }
+        raw::steal(func, arg)
     }
-    if let Some(out) = mem::deref_mut(tid) {
-        *out = std::ptr::null_mut();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut created: *mut c_void = std::ptr::null_mut();
+        let status = thread_create(name, &mut created, func, arg, opts);
+        if status == 0 {
+            *STOLEN.lock().unwrap() = created as usize;
+        }
+        if let Some(out) = mem::deref_mut(tid) {
+            *out = std::ptr::null_mut();
+        }
+        status
     }
-    status
 }
 
 /// Port of erl_drv_thread.c:737 (erl_drv_stolen_main_thread_join).
 pub(crate) fn stolen_join(_tid: *mut c_void, result: *mut *mut c_void) -> c_int {
-    let stolen = std::mem::take(&mut *STOLEN.lock().unwrap());
-    if stolen == 0 {
-        return libc::EINVAL;
+    #[cfg(target_os = "macos")]
+    {
+        raw::join(result)
     }
-    thread_join(stolen as *mut c_void, result)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stolen = std::mem::take(&mut *STOLEN.lock().unwrap());
+        if stolen == 0 {
+            return libc::EINVAL;
+        }
+        thread_join(stolen as *mut c_void, result)
+    }
 }

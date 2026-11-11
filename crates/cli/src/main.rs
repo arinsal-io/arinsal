@@ -228,7 +228,31 @@ fn erl_launch(args: &[String], detached_child: bool) -> ! {
     seeded.extend(launch.set_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     arinsal_vm::boot::seed_environment(&seeded);
     let root = PathBuf::from(&launch.root_dir);
-    match arinsal_vm::boot::run_with_debugger_flags(
+    #[cfg(target_os = "macos")]
+    {
+        arinsal_drv::darwin_main_thread_init().unwrap_or_else(|error| {
+            eprintln!("arinsal: cannot initialize Darwin main-thread pipes: {error}");
+            std::process::exit(1);
+        });
+        let boot_args = launch.boot_args.clone();
+        let debugger_support = launch.emulator.debugger_support;
+        let line_breakpoints = launch.emulator.debugger_line_breakpoints.unwrap_or(true);
+        let distribution_buffer_busy_limit = launch.emulator.distribution_buffer_busy_limit;
+        std::thread::spawn(move || {
+            finish_vm_result(arinsal_vm::boot::run_with_debugger_flags(
+                &root,
+                &boot_args,
+                &[],
+                workers,
+                debugger_support,
+                line_breakpoints,
+                distribution_buffer_busy_limit,
+            ));
+        });
+        arinsal_drv::darwin_main_thread_park();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let vm_result = arinsal_vm::boot::run_with_debugger_flags(
         &root,
         &launch.boot_args,
         &[],
@@ -236,7 +260,13 @@ fn erl_launch(args: &[String], detached_child: bool) -> ! {
         launch.emulator.debugger_support,
         launch.emulator.debugger_line_breakpoints.unwrap_or(true),
         launch.emulator.distribution_buffer_busy_limit,
-    ) {
+    );
+    #[cfg(not(target_os = "macos"))]
+    finish_vm_result(vm_result)
+}
+
+fn finish_vm_result(vm_result: Result<arinsal_vm::ScheduledResult, arinsal_vm::VmError>) -> ! {
+    match vm_result {
         Ok(_) => std::process::exit(0),
         Err(arinsal_vm::VmError::Unsupported(message)) => {
             // Native gaps are reported at the call site by the VM with the caller frame.
