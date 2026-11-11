@@ -2177,6 +2177,38 @@ macro_rules! resolved_signal_handler {
     };
 }
 
+/// The local arms of `monitor/2,3` (bif.c `monitor`): a local pid, a local name, a port, the
+/// time offset. The distributed arm is `dist::native_monitor`'s.
+pub(crate) fn monitor_local(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let entry = if args.len() == 3 {
+        SignalBif::Monitor3
+    } else {
+        SignalBif::Monitor2
+    };
+    call_resolved(vm, process, ctx, entry, args)
+}
+
+/// The local arms of `demonitor/1,2` (bif.c `demonitor`); a distributed origin is
+/// `dist::native_demonitor`'s.
+pub(crate) fn demonitor_local(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let entry = if args.len() == 2 {
+        SignalBif::Demonitor2
+    } else {
+        SignalBif::Demonitor1
+    };
+    call_resolved(vm, process, ctx, entry, args)
+}
+
 resolved_signal_handler!(spawn3, Spawn3);
 resolved_signal_handler!(spawn_link3, SpawnLink3);
 resolved_signal_handler!(spawn_opt4, SpawnOpt4);
@@ -3438,18 +3470,12 @@ fn call_resolved(
         }
         (SignalBif::Demonitor1, [reference]) | (SignalBif::Demonitor2, [reference, _]) => {
             let id = ref_id(*reference).ok_or_else(|| badarg("demonitor/1"))?;
-            let options = if args.len() == 2 {
-                list(args[1]).ok_or_else(|| badarg("demonitor/2"))?
-            } else {
-                Vec::new()
+            // Port of erts/emulator/beam/bif.c (demonitor_2): the option list is walked in
+            // place.
+            let (flush, info) = match args.get(1) {
+                Some(options) => demonitor_flags(*options).ok_or_else(|| badarg("demonitor/2"))?,
+                None => (false, false),
             };
-            if options.iter().any(|option| {
-                *option != Term::atom(arinsal_term::atoms::FLUSH)
-                    && *option != Term::atom(arinsal_term::atoms::INFO)
-            }) {
-                return Err(badarg("demonitor/2"));
-            }
-            let flush = options.contains(&Term::atom(arinsal_term::atoms::FLUSH));
             let entry = demonitor_origin(process, id);
             let (was_alias, process_target, port_target, port_origin, distributed) = match entry {
                 OriginDemonitor::Alias => (true, None, None, None, None),
@@ -3485,8 +3511,7 @@ fn call_resolved(
             // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2), OTP-29.1.1.
             // Flush runs only when the monitor is already gone (`am_false`). An
             // active process monitor just queues the demonitor signal.
-            let failed = was_alias
-                || (options.contains(&Term::atom(arinsal_term::atoms::INFO)) && !was_active);
+            let failed = was_alias || (info && !was_active);
             let result = Term::atom(if failed {
                 arinsal_term::atoms::FALSE
             } else {

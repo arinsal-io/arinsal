@@ -3133,23 +3133,57 @@ pub(crate) fn native_exit2(
 ) -> Result<Term, VmError> {
     native_signal(vm, p, c, a, "exit")
 }
-// Port of erts/emulator/beam/dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
+/// `erlang:monitor/2,3`: `bif_table[].f` of both arities and the executor's entry.
+///
+/// erts `monitor()` branches on the target term: an internal pid or an atom (a local name) is a
+/// local monitor; an external pid or `{Name, Node}` goes to the distribution
+/// (erts_dsig_send_monitor). The local branch classifies the target from the term alone.
+// Port of erts/emulator/beam/bif.c (monitor_2, monitor_3, monitor: `is_internal_pid`,
+// `is_atom`, `is_external_pid`, `is_tuple` arms) and dist.c:1528 (erts_dsig_send_monitor),
+// OTP-29.1.1.
 pub(crate) fn native_monitor(
     vm: &mut Vm,
     p: &mut Process,
     c: &mut RunCtx<'_, Message>,
     a: &[Term],
 ) -> Result<Term, VmError> {
+    let local = a.len() < 2
+        || a[0] != Term::atom(arinsal_term::atoms::PROCESS)
+        || Pid::from_term(a[1]).is_some()
+        || a[1].as_atom().is_some();
+    if local {
+        return crate::signals::monitor_local(vm, p, c, a);
+    }
     native_signal(vm, p, c, a, "monitor")
 }
-// Port of erts/emulator/beam/dist.c:1554 (erts_dsig_send_demonitor), OTP-29.1.1.
+
+/// `erlang:demonitor/1,2`: `bif_table[].f` of both arities and the executor's entry.
+///
+/// erts looks the reference up in `ERTS_P_MONITORS(c_p)` and branches on the monitor type; a
+/// distributed origin goes to the distribution (erts_dsig_send_demonitor).
+// Port of erts/emulator/beam/bif.c (demonitor_1, demonitor_2, demonitor:
+// ERTS_MON_TYPE_DIST_PROC) and dist.c:1554 (erts_dsig_send_demonitor), OTP-29.1.1.
 pub(crate) fn native_demonitor(
     vm: &mut Vm,
     p: &mut Process,
     c: &mut RunCtx<'_, Message>,
     a: &[Term],
 ) -> Result<Term, VmError> {
-    native_signal(vm, p, c, a, "demonitor")
+    let distributed = a
+        .first()
+        .and_then(|r| crate::signals::ref_id(*r))
+        .is_some_and(|id| {
+            p.cold
+                .as_ref()
+                .is_some_and(|cold| cold.dist_monitors.contains(&id))
+                && p.monitors.get(id).is_some_and(|monitor| {
+                    !monitor.is_target() && monitor.info().dist_target().is_some()
+                })
+        });
+    if distributed {
+        return native_signal(vm, p, c, a, "demonitor");
+    }
+    crate::signals::demonitor_local(vm, p, c, a)
 }
 
 fn remote_node(term: Term) -> Result<Option<String>, VmError> {
