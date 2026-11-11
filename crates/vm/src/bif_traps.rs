@@ -68,8 +68,6 @@ pub(crate) fn trap_gc_policy(continuation: &str, state: &Arc<MagicRef>) -> TrapG
     if continuation == PTAB_LIST_CONTINUATION {
         // BIF_TRAP1 carries the accumulator in X0.
         TrapGc::RootedArgs(1)
-    } else if continuation == REVERSE_CONTINUATION {
-        TrapGc::RootedArgs(2)
     } else if continuation == BINARY_TO_LIST_CONTINUATION
         && state
             .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
@@ -98,12 +96,8 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> boo
     direct
         || any!(
             arinsal_bifs::BinaryToListWalk,
-            arinsal_bifs::AppendCont,
             arinsal_bifs::UnicodeCont,
-            arinsal_bifs::ReverseCont,
-            arinsal_bifs::MemberCont,
             arinsal_bifs::LengthCont,
-            arinsal_bifs::KeyfindCont,
             arinsal_bifs::IolistVecWalk,
             arinsal_bifs::IolistSizeWalk,
             arinsal_bifs::DecodeWalk<'static>,
@@ -111,7 +105,6 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> boo
             arinsal_bifs::BinarySearchWalk,
             TermEncodeState,
             BinaryCopyState,
-            arinsal_bifs::SubtractWalk,
         )
         || state.downcast_ref::<MapsProjectionState>().is_some()
         || state.downcast_ref::<MapsMergeState>().is_some()
@@ -148,9 +141,6 @@ pub(crate) struct Entry {
 }
 
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
-/// The continuation of `lists:reverse/2`: the BIF traps to its own export with the cells
-/// still to walk and the reversed prefix as arguments.
-pub(crate) const REVERSE_CONTINUATION: &str = "lists:reverse/2";
 const IOLIST_CONTINUATION: &str = "erts_internal:list_to_bitstring_continue/1";
 const IOLIST_SIZE_CONTINUATION: &str = "erts_internal:iolist_size_continue/1";
 const IOLIST_TO_IOVEC_CONTINUATION: &str = "erts_internal:iolist_to_iovec_continue/1";
@@ -165,7 +155,6 @@ const MAPS_KEYS_CONTINUATION: &str = "maps:keys/1";
 const MAPS_VALUES_CONTINUATION: &str = "maps:values/1";
 const MAPS_FROM_LIST_CONTINUATION: &str = "maps:from_list/1";
 const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
-const SUBTRACT_CONTINUATION: &str = "erlang:--/2";
 const CONTEXT_REDS: usize = 4000;
 const RE_RUN_CONTINUATION: &str = "erlang:re_run_trap/3";
 const RE_GRUN_CONTINUATION: &str = "re:grun/3";
@@ -173,9 +162,6 @@ const RE_URUN_CONTINUATION: &str = "re:urun/3";
 
 // C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
 // data offset is added by MagicRef::with_erts_payload_size.
-// Port of erts/emulator/beam/erl_bif_lists.c (ErtsAppendContext, ErtsSubtractContext).
-const ERTS_APPEND_CONTEXT_SIZE: usize = 40;
-const ERTS_SUBTRACT_CONTEXT_SIZE: usize = 192;
 // Port of erts/emulator/beam/erl_term_hashing.c (ErtsMakeHash2Context).
 const ERTS_HASH2_CONTEXT_SIZE: usize = 136;
 // Port of erts/emulator/beam/erl_unicode.c (RestartContext).
@@ -300,293 +286,6 @@ fn clear_export_trap(process: &mut Process) {
     if process.heap.abi.i as usize == bif_export_trap_pc() {
         process.heap.abi.i = std::ptr::null();
     }
-}
-
-// Port of erts/emulator/beam/erl_bif_lists.c:1246 (lists_reverse_2), OTP-29.1.1.
-// The fill lives in `arinsal_bifs::lists_reverse` (on-heap, then alloc). This
-// handler only supplies the reduction budget; the trap's arguments are the cells still
-// to walk and the reversed prefix, which a resumed call reads like a first call does.
-fn lists_reverse(
-    process: &mut Process,
-    args: &[Term],
-    _state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    let reds = process.heap.abi.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
-    let max_cells = reds
-        .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
-        .max(1);
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step = arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells);
-    drop(bif_state);
-    let step = step?;
-    Ok(match step {
-        arinsal_bifs::ReverseStep::Done(value) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        arinsal_bifs::ReverseStep::Trap(cont) => HandlerResult::Yield {
-            continuation: REVERSE_CONTINUATION,
-            state: argument_trap_state(Mutex::new(cont)),
-            reductions: 0,
-        },
-    })
-}
-
-/// The arguments `BIF_TRAP2(lists:reverse/2, list, tail)` leaves for the next slice.
-// Port of erts/emulator/beam/erl_bif_lists.c (lists_reverse_alloc and lists_reverse_onheap: BIF_TRAP2 with the remaining
-// list and the reversed prefix), OTP-29.1.1.
-fn reverse_trap_args(state: &Arc<MagicRef>) -> Option<[Term; 2]> {
-    let cont = state
-        .downcast_ref::<Mutex<arinsal_bifs::ReverseCont>>()?
-        .lock()
-        .ok()?;
-    Some([cont.list(), cont.tail()])
-}
-
-fn lists_member_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    let reds = process.heap.abi.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
-    let max_iter = reds.saturating_mul(arinsal_bifs::MEMBER_PER_RED);
-    let (term, list) = if let Some(state) = state {
-        let saved = state
-            .downcast_ref::<Mutex<arinsal_bifs::MemberCont>>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        (saved.term(), saved.list())
-    } else {
-        (args[0], args[1])
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step = match arinsal_bifs::lists_member(&mut ctx, term, list, max_iter) {
-        Ok(step) => step,
-        Err(error) => {
-            drop(bif_state);
-            return Ok(HandlerResult::Failed {
-                error,
-                reductions: 0,
-            });
-        }
-    };
-    drop(bif_state);
-    Ok(match step {
-        arinsal_bifs::MemberStep::Done(found) => HandlerResult::Done {
-            value: bool_atom(found),
-            reductions: 0,
-        },
-        arinsal_bifs::MemberStep::More(cont) => HandlerResult::Yield {
-            continuation: "lists:member/2",
-            state: argument_trap_state(Mutex::new(cont)),
-            reductions: 0,
-        },
-    })
-}
-
-fn lists_key_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    op: arinsal_bifs::KeyOp,
-    continuation: &'static str,
-) -> Result<HandlerResult, BifError> {
-    let (key, pos, list) = if let Some(state) = state {
-        let saved = state
-            .downcast_ref::<Mutex<arinsal_bifs::KeyfindCont>>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        (saved.key(), saved.pos(), saved.list())
-    } else {
-        (args[0], args[1], args[2])
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step =
-        match arinsal_bifs::lists_key(&mut ctx, op, key, pos, list, arinsal_bifs::KEYFIND_MAX_ITER)
-        {
-            Ok(step) => step,
-            Err(error) => {
-                let reductions = ctx.reductions();
-                drop(bif_state);
-                process.reductions_used = process
-                    .reductions_used
-                    .saturating_add(u64::from(reductions));
-                return Ok(HandlerResult::Failed {
-                    error,
-                    reductions: 0,
-                });
-            }
-        };
-    let reductions = ctx.reductions();
-    drop(bif_state);
-    process.reductions_used = process
-        .reductions_used
-        .saturating_add(u64::from(reductions));
-    Ok(match step {
-        arinsal_bifs::KeyOutcome::Done(value) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        arinsal_bifs::KeyOutcome::More(cont) => HandlerResult::Yield {
-            continuation,
-            state: argument_trap_state(Mutex::new(cont)),
-            reductions: 0,
-        },
-    })
-}
-
-fn lists_keyfind(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    lists_key_trap(
-        process,
-        args,
-        state,
-        arinsal_bifs::KeyOp::Find,
-        "lists:keyfind/3",
-    )
-}
-
-fn lists_keymember(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    lists_key_trap(
-        process,
-        args,
-        state,
-        arinsal_bifs::KeyOp::Member,
-        "lists:keymember/3",
-    )
-}
-
-fn lists_keysearch(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    lists_key_trap(
-        process,
-        args,
-        state,
-        arinsal_bifs::KeyOp::Search,
-        "lists:keysearch/3",
-    )
-}
-
-fn erlang_append(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    continuation: &'static str,
-) -> Result<HandlerResult, BifError> {
-    let reds = process.heap.abi.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
-    let cont = if let Some(state) = state {
-        let mut saved = state
-            .downcast_ref::<Mutex<arinsal_bifs::AppendCont>>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        std::mem::replace(
-            &mut *saved,
-            arinsal_bifs::AppendCont::start(Term::NIL, Term::NIL),
-        )
-    } else {
-        arinsal_bifs::AppendCont::start(args[0], args[1])
-    };
-    let (onheap, alloc) = if cont.rhs() == Term::NIL {
-        (reds.saturating_mul(arinsal_bifs::APPEND_EMPTY_PER_RED), 0)
-    } else {
-        (
-            reds.saturating_mul(arinsal_bifs::APPEND_ONHEAP_PER_RED),
-            reds.saturating_mul(arinsal_bifs::APPEND_ALLOC_PER_RED),
-        )
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step = match arinsal_bifs::lists_append(&mut ctx, cont, onheap, alloc) {
-        Ok(step) => step,
-        Err(error) => {
-            let reductions = ctx.reductions();
-            drop(bif_state);
-            process.reductions_used = process
-                .reductions_used
-                .saturating_add(u64::from(reductions));
-            return Ok(HandlerResult::Failed {
-                error,
-                reductions: 0,
-            });
-        }
-    };
-    let reductions = ctx.reductions();
-    drop(bif_state);
-    process.reductions_used = process
-        .reductions_used
-        .saturating_add(u64::from(reductions));
-    Ok(match step {
-        arinsal_bifs::AppendStep::Done(value) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        arinsal_bifs::AppendStep::More(next) => {
-            let state = if let Some(state) = state {
-                let saved = state
-                    .downcast_ref::<Mutex<arinsal_bifs::AppendCont>>()
-                    .ok_or(BifError::BADARG)?;
-                *saved.lock().map_err(|_| BifError::SystemLimit)? = next;
-                Arc::clone(state)
-            } else {
-                magic_binary_state(Mutex::new(next), ERTS_APPEND_CONTEXT_SIZE)
-            };
-            HandlerResult::Yield {
-                continuation,
-                state,
-                reductions: 0,
-            }
-        }
-    })
-}
-
-fn erlang_plusplus(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    erlang_append(process, args, state, "erlang:++/2")
-}
-
-fn erlang_append_bif(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    erlang_append(process, args, state, "erlang:append/2")
 }
 
 fn chksum_trap(
@@ -962,14 +661,6 @@ unicode_trap_entry!(erlang_characters_to_list_trap_2);
 unicode_trap_entry!(erlang_characters_to_list_trap_3);
 unicode_trap_entry!(erlang_characters_to_list_trap_4);
 
-fn bool_atom(value: bool) -> Term {
-    Term::atom(
-        global_atoms()
-            .intern(if value { "true" } else { "false" })
-            .unwrap(),
-    )
-}
-
 const ENTRIES: &[Entry] = &[
     Entry {
         module: "unicode",
@@ -1108,69 +799,6 @@ const ENTRIES: &[Entry] = &[
         arity: 2,
         continuation: "erlang:md5_update/2",
         handler: erlang_md5_update_trap,
-    },
-    Entry {
-        module: "lists",
-        function: "reverse",
-        arity: 2,
-        continuation: REVERSE_CONTINUATION,
-        handler: lists_reverse,
-    },
-    Entry {
-        module: "lists",
-        function: "member",
-        arity: 2,
-        continuation: "lists:member/2",
-        handler: lists_member_trap,
-    },
-    Entry {
-        module: "lists",
-        function: "keyfind",
-        arity: 3,
-        continuation: "lists:keyfind/3",
-        handler: lists_keyfind,
-    },
-    Entry {
-        module: "lists",
-        function: "keymember",
-        arity: 3,
-        continuation: "lists:keymember/3",
-        handler: lists_keymember,
-    },
-    Entry {
-        module: "lists",
-        function: "keysearch",
-        arity: 3,
-        continuation: "lists:keysearch/3",
-        handler: lists_keysearch,
-    },
-    Entry {
-        module: "erlang",
-        function: "++",
-        arity: 2,
-        continuation: "erlang:++/2",
-        handler: erlang_plusplus,
-    },
-    Entry {
-        module: "erlang",
-        function: "append",
-        arity: 2,
-        continuation: "erlang:append/2",
-        handler: erlang_append_bif,
-    },
-    Entry {
-        module: "erlang",
-        function: "--",
-        arity: 2,
-        continuation: SUBTRACT_CONTINUATION,
-        handler: subtract,
-    },
-    Entry {
-        module: "erlang",
-        function: "subtract",
-        arity: 2,
-        continuation: "erlang:subtract/2",
-        handler: subtract_named,
     },
     Entry {
         module: "maps",
@@ -2141,6 +1769,16 @@ pub(crate) fn continuation_target(continuation: &'static str) -> &'static Contin
     target
 }
 
+/// The pending `BIF_TRAP*` to an export as the call the scheduler makes next: the export and
+/// the arguments the trap left in the X registers (erts BIF_TRAPn, reg[0..n]).
+// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*) and beam_common.c, OTP-29.1.1.
+pub(crate) fn take_export_trap(process: &mut Process) -> Option<crate::ExportTrap> {
+    let pending = process.take_work(|w| w.bif_trap.take())?;
+    clear_export_trap(process);
+    let args = process.x[..pending.arity].to_vec();
+    Some(crate::ExportTrap::new(process, pending.continuation, args))
+}
+
 /// Run the trap continuation export. `beam_bif_export_trap` does this on schedule-in:
 /// the continuation is an ordinary call, and only that call may trap again.
 pub(crate) fn run_trapped_export(
@@ -2153,15 +1791,7 @@ pub(crate) fn run_trapped_export(
     // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
     // arguments), OTP-29.1.1.
     if target.entry.is_none() {
-        let pending = process.take_work(|w| w.bif_trap.take())?;
-        clear_export_trap(process);
-        // The arguments are the live X registers the trap left (erts BIF_TRAPn, reg[0..n]).
-        let args = process.x[..pending.arity].to_vec();
-        return Some(Ok(ResumeResult::Export(crate::ExportTrap::new(
-            process,
-            pending.continuation,
-            args,
-        ))));
+        return take_export_trap(process).map(|trap| Ok(ResumeResult::Export(trap)));
     }
     let args = [
         process.x.first().copied().unwrap_or(Term::NIL),
@@ -2515,9 +2145,6 @@ pub(crate) fn execute_named(
                     arity.min(3),
                 )
             };
-            let reverse_args = (continuation == REVERSE_CONTINUATION)
-                .then(|| reverse_trap_args(&state))
-                .flatten();
             process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.trap_site().0,
                 caller_ip: process.trap_site().1,
@@ -2532,9 +2159,7 @@ pub(crate) fn execute_named(
                 arity: trap_arity,
                 callee,
                 root_args,
-                args: if let Some(trap_args) = reverse_args {
-                    [trap_args[0], trap_args[1], Term::NIL, Term::NIL]
-                } else if continuation == PTAB_LIST_CONTINUATION {
+                args: if continuation == PTAB_LIST_CONTINUATION {
                     [process.x[0], Term::NIL, Term::NIL, Term::NIL]
                 } else if resumed {
                     args
@@ -2548,11 +2173,6 @@ pub(crate) fn execute_named(
             charge(process, ctx, reductions);
             // Port of erts/emulator/beam/erl_gc.c (erts_gc_after_bif_call_lhf with a
             // TRAP result collects with the trap's arguments as roots), OTP-29.1.1.
-            if continuation == REVERSE_CONTINUATION
-                && let Err(error) = process.collect_bin_vheap_if_due(0)
-            {
-                return Some(Err(error));
-            }
             Ok(HandlerResult::Yield {
                 continuation,
                 state: process
@@ -3088,11 +2708,6 @@ pub(crate) fn finish_light(
                 // processes/0 or ports/0 call's arity.
                 saved[0] = process.x[0];
             }
-            if continuation == REVERSE_CONTINUATION
-                && let Some(trap_args) = reverse_trap_args(&state)
-            {
-                saved[..2].copy_from_slice(&trap_args);
-            }
             let Ok(state_term) = trap_state_term(process, &state) else {
                 return LightTrap::Returned(Err(BifError::SystemLimit));
             };
@@ -3169,33 +2784,14 @@ pub(crate) fn install_deferred_trap(
     process: &mut Process,
     import: usize,
     callee: (arinsal_term::Atom, arinsal_term::Atom),
-    function: &str,
     args: &[Term],
-    trap: Box<arinsal_bifs::DeferredTrap>,
+    trap: arinsal_bifs::DeferredTrap,
 ) -> Result<(), arinsal_term::TermError> {
     let gc_was_enabled = process.heap.gc_enabled;
-    let (continuation, state) = match *trap {
+    let (continuation, state) = match trap {
         arinsal_bifs::DeferredTrap::BinaryToList(walk) => (
             BINARY_TO_LIST_CONTINUATION,
             magic_binary_state(Mutex::new(walk), ERTS_BINARY_TO_LIST_STATE_SIZE),
-        ),
-        arinsal_bifs::DeferredTrap::Key(cont) => (
-            key_continuation(function),
-            argument_trap_state(Mutex::new(cont)),
-        ),
-        arinsal_bifs::DeferredTrap::Member(cont) => {
-            ("lists:member/2", argument_trap_state(Mutex::new(cont)))
-        }
-        arinsal_bifs::DeferredTrap::Reverse(cont) => {
-            (REVERSE_CONTINUATION, argument_trap_state(Mutex::new(cont)))
-        }
-        arinsal_bifs::DeferredTrap::Append(cont) => (
-            if function == "append" {
-                "erlang:append/2"
-            } else {
-                "erlang:++/2"
-            },
-            magic_binary_state(Mutex::new(cont), ERTS_APPEND_CONTEXT_SIZE),
         ),
         arinsal_bifs::DeferredTrap::Length(cont) => {
             ("erlang:length/3", argument_trap_state(Mutex::new(cont)))
@@ -3211,14 +2807,6 @@ pub(crate) fn install_deferred_trap(
             cont.continuation(),
             magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
         ),
-        arinsal_bifs::DeferredTrap::Subtract(walk) => (
-            if function == "subtract" {
-                "erlang:subtract/2"
-            } else {
-                SUBTRACT_CONTINUATION
-            },
-            magic_binary_state(Mutex::new(walk), ERTS_SUBTRACT_CONTEXT_SIZE),
-        ),
     };
     let state_term = trap_state_term(process, &state)?;
     let gc_policy = trap_gc_policy(continuation, &state);
@@ -3232,11 +2820,6 @@ pub(crate) fn install_deferred_trap(
     let mut saved = [Term::NIL; 4];
     let arity = args.len().min(4);
     saved[..arity].copy_from_slice(&args[..arity]);
-    if continuation == REVERSE_CONTINUATION
-        && let Some(trap_args) = reverse_trap_args(&state)
-    {
-        saved[..2].copy_from_slice(&trap_args);
-    }
     process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.trap_site().0,
         caller_ip: process.trap_site().1,
@@ -3254,14 +2837,6 @@ pub(crate) fn install_deferred_trap(
         args: saved,
     });
     Ok(())
-}
-
-fn key_continuation(function: &str) -> &'static str {
-    match function {
-        "keymember" => "lists:keymember/3",
-        "keysearch" => "lists:keysearch/3",
-        _ => "lists:keyfind/3",
-    }
 }
 
 /// Charges a light trapping BIF's reductions against FCALLS (BUMP_REDS, bif.h); the call site
@@ -3426,82 +3001,6 @@ fn code_permission(
         state: argument_trap_state(acquire),
         reductions: 1,
     })
-}
-
-type SubtractState = Mutex<arinsal_bifs::SubtractWalk>;
-
-// Port of erts/emulator/beam/erl_bif_lists.c:390-1047 (ErtsSubtractContext,
-// subtract_continue, and BIF_TRAP2), OTP-29.1.1. Each continuation gets the
-// scheduler context budget from erl_vm.h:53 (`CONTEXT_REDS`).
-fn subtract(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    pid: Option<arinsal_sched::Pid>,
-    gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    subtract_with(process, args, state, pid, gc_changed, SUBTRACT_CONTINUATION)
-}
-
-fn subtract_named(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    pid: Option<arinsal_sched::Pid>,
-    gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    subtract_with(process, args, state, pid, gc_changed, "erlang:subtract/2")
-}
-
-fn subtract_with(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-    continuation: &'static str,
-) -> Result<HandlerResult, BifError> {
-    let reductions_left = process.heap.abi.fcalls.max(0).min(CONTEXT_REDS as i32) as usize;
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let mut walk = state
-            .downcast_ref::<SubtractState>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        let (result, reductions) = subtract_step(process, &mut walk, reductions_left)?;
-        return Ok(match result {
-            Some(value) => HandlerResult::Done { value, reductions },
-            None => HandlerResult::Yield {
-                continuation,
-                state: Arc::clone(&state),
-                reductions,
-            },
-        });
-    }
-
-    let mut walk = arinsal_bifs::SubtractWalk::new(args[0], args[1])?;
-    let (result, reductions) = subtract_step(process, &mut walk, reductions_left)?;
-    Ok(match result {
-        Some(value) => HandlerResult::Done { value, reductions },
-        None => HandlerResult::Yield {
-            continuation,
-            state: magic_binary_state(Mutex::new(walk), ERTS_SUBTRACT_CONTEXT_SIZE),
-            reductions,
-        },
-    })
-}
-
-fn subtract_step(
-    process: &mut Process,
-    walk: &mut arinsal_bifs::SubtractWalk,
-    reductions_left: usize,
-) -> Result<(Option<Term>, u32), BifError> {
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let result = walk.step(&mut ctx, reductions_left)?;
-    Ok((result, ctx.reductions()))
 }
 
 fn list_to_binary(

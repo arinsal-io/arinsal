@@ -434,16 +434,52 @@ impl Vm {
         {
             // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: set `c_p->i`
             // to the already-resolved export and leave its arguments in X), OTP-29.1.1.
+            // The trap itself costs nothing: a BIF export runs `call_bif_mfa`, which does not
+            // touch FCALLS, and an Erlang export charges its call in its own `i_test_yield`
+            // (jit/arm/ops.tab, int_func_start).
             p.gc_live = arity;
             p.x.ensure_x(arity);
             p.x[..arity].copy_from_slice(&trap.args);
             self.set_position(p, module_id, target)?;
-            p.tick();
             return Ok(ImportOutcome::Dispatch);
         }
         p.x.ensure_x(arity);
         p.x[..arity].copy_from_slice(&trap.args);
+        // A BIF traps to its `bif_trap_export` entry (erl_bif_table.c, erts_init_trap_export),
+        // which has no breakpoint: the continuation is not a traced call of its own.
+        if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
+            let atoms = Some((module_atom, function_atom));
+            return self.call_named_untraced(p, atoms, module, function, arity, ctx);
+        }
         self.call_named_atoms(p, module_atom, function_atom, module, function, arity, ctx)
+    }
+
+    /// `BIF_TRAP*` of a BIF the executor called. A trap to a BIF export (a BIF that traps to
+    /// itself after `BUMP_ALL_REDS`) leaves the process at `beam_bif_export_trap`, which
+    /// context-switches and calls the export on schedule-in, as the native call path does; a
+    /// trap to an Erlang function is called at once.
+    // Port of erts/emulator/beam/bif.h:316-326 (ERTS_BIF_PREP_TRAP: `c_p->i` =
+    // beam_bif_export_trap) and jit/arm/instr_bif.cpp (context_switch_simplified), OTP-29.1.1.
+    fn bif_trap_from_executor(
+        &mut self,
+        p: &mut Process,
+        trap: crate::ExportTrap,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        let target = trap.target;
+        if arinsal_spec::bif_lookup(target.module, target.function, target.arity as u8).is_none() {
+            return self.trap_to_export(p, trap, ctx);
+        }
+        let trap_pc = crate::bif_traps::bif_export_trap_pc();
+        crate::bif_traps::install_export_trap(
+            p,
+            trap_pc,
+            (target.module_atom, target.function_atom),
+            &trap,
+        );
+        crate::bif_traps::arm_export_trap(p);
+        p.set_native_retry(Some(trap_pc));
+        Ok(ImportOutcome::Yield)
     }
 
     #[allow(clippy::too_many_arguments)] // Preserve the call metadata without rebuilding an MFA tuple.
@@ -576,9 +612,8 @@ impl Vm {
                 p,
                 crate::bif_traps::APPLY_TRAP_KEY,
                 (module_atom, function_atom),
-                function,
                 &args,
-                trap,
+                *trap,
             )
             .map_err(|_| {
                 exceptions::bif_error(p, module, function, &args, BifError::SystemLimit)
@@ -718,7 +753,7 @@ impl Vm {
                         // applied BIF that traps (demonitor_2 to flush_monitor_messages/3)
                         // continues in the trap's export, as the same BIF called statically.
                         Err(VmError::TrapExport(trap)) => {
-                            return self.trap_to_export(p, trap, Some(run));
+                            return self.bif_trap_from_executor(p, trap, Some(run));
                         }
                         // Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace),
                         // OTP-29.1.1: BIF_ERROR names the applied BIF as the top frame.
@@ -841,7 +876,7 @@ impl Vm {
             };
             let result = match result {
                 Err(VmError::TrapExport(trap)) => {
-                    return self.trap_to_export(p, trap, Some(run));
+                    return self.bif_trap_from_executor(p, trap, Some(run));
                 }
                 result => result,
             };

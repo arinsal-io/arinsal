@@ -432,9 +432,62 @@ impl Executor {
                             process.native_apply = true;
                             let outcome = self.vm.trap_to_export(process, trap, Some(ctx));
                             process.native_apply = false;
-                            match outcome? {
+                            // The trap export is the same BIF and failed after its trap:
+                            // ERTS_BIF_ERROR_TRAPPED raises it in the process, as below.
+                            // The traced BIF's return or exception event belongs to the
+                            // slice its continuation finishes in, as for a handler above.
+                            if let Some((module, function, arity)) = &trapped_callee {
+                                let traced = match &outcome {
+                                    Ok(crate::ImportOutcome::Returned(value)) => Some(Ok(*value)),
+                                    Err(VmError::Trap(trap)) => {
+                                        crate::exceptions::trace_class_reason(
+                                            process,
+                                            trap.class,
+                                            trap.reason,
+                                        )
+                                        .ok()
+                                        .map(Err)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(traced) = traced {
+                                    let args = vec![Term::NIL; *arity];
+                                    self.vm.trace_native_return_outcome(
+                                        process, ctx, module, function, &args, traced,
+                                    );
+                                }
+                            }
+                            let outcome = match outcome {
+                                Err(VmError::Trap(trap)) => {
+                                    process.native_error_pc = call_site_pc;
+                                    if process.heap.stack_get(0).is_some_and(|word| {
+                                        word.tagged_word() as usize == resume_pc
+                                    }) {
+                                        process.heap.release_stack(1);
+                                    }
+                                    if let Some(error) = crate::exceptions::resume(
+                                        &mut self.vm,
+                                        process,
+                                        Some(ctx),
+                                        trap,
+                                    )? {
+                                        return Ok(Flow::Break(Err(error)));
+                                    }
+                                    process.heap.abi.exc.freason = 0;
+                                    process.heap.abi.exc.fvalue = 0;
+                                    process.heap.abi.exc.ftrace = 0;
+                                    return Ok(Flow::Continue);
+                                }
+                                outcome => outcome?,
+                            };
+                            match outcome {
                                 crate::ImportOutcome::Dispatch => {}
                                 crate::ImportOutcome::Yield => {
+                                    // The trap export BIF_TRAPped again: the process stays at
+                                    // beam_bif_export_trap in this code.
+                                    if process.native_pc().is_none() {
+                                        process.set_native_pc(Some(code_ptr));
+                                    }
                                     if process.native_pc().is_some()
                                         && native_transfer_continues(process, ctx)
                                     {

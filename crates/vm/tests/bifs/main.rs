@@ -25,6 +25,7 @@ mod light_bif_self;
 mod list_halloc_differential;
 mod list_traps;
 mod list_tuple_construction_differential;
+mod lists_bifs_differential;
 mod lists_error_info;
 mod lists_reverse_differential;
 mod map_get_errors_differential;

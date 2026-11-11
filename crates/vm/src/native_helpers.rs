@@ -1131,31 +1131,6 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     if let Some(func) = crate::bif_table::special(&export.module, &export.function, export.arity) {
         return Some(func);
     }
-    // `trap_entry` clears `light_bif`, but keyfind/member/++/-- still run the
-    // plain body and trap only when the slice counter runs out. The export
-    // fragment calls this pointer directly, so the slice check has to be here
-    // rather than only in `invoke_dispatch_bif`.
-    if export.list_slice {
-        if matches!(
-            (
-                export.module.as_str(),
-                export.function.as_str(),
-                export.arity
-            ),
-            ("erlang", "++" | "append", 2)
-        ) && let Some(entry) =
-            crate::bif_table::append_entry(&export.module, &export.function, export.arity)
-        {
-            return Some(entry);
-        }
-        let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
-        if crate::bif_table::never_allocates(&export.module, &export.function, export.arity) {
-            return Some(own.map_or(crate::bif_table::bif!(plain_bif_light), |e| {
-                e.list_slice_nonalloc
-            }));
-        }
-        return Some(own.map_or(crate::bif_table::bif!(plain_bif_light), |e| e.list_slice));
-    }
     // The kind is fixed when the export is created (`bif_table[].f`). The call
     // fragment branches to that pointer; it does not walk `invoke_dispatch_bif`.
     if export.light_bif.is_some() {
@@ -1755,15 +1730,6 @@ pub(crate) extern "C" fn plain_bif_light(
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    // `lists:member/2`, `keyfind/3` and the other slice BIFs are this same body
-    // (`erl_bif_lists.c` `lists_member_2` / `keyfind`). The light entry used to
-    // scan without `ERTS_BIF_REDS_LEFT` and never trap.
-    if export.list_slice
-        && let Some(bif) = export.bif
-    {
-        return call_list_slice_bif(process, registers, identity as usize, export, bif, false)
-            .unwrap_or(0);
-    }
     let Some(bif) = export.light_bif else {
         return park_executor(process, export, identity, false);
     };
@@ -1794,165 +1760,6 @@ pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
         export,
         |process, args| B::call_word(process, args, instruction as usize),
     )
-}
-
-/// `bif_table[].f` of one list BIF that traps on the reduction budget
-/// (`lists_member_2`, `keyfind`, ...).
-// Port of erts/emulator/beam/erl_bif_lists.c:1108,1302 (the BIF runs with
-// `ERTS_BIF_REDS_LEFT` and `BIF_TRAP`s through its export), OTP-29.1.1.
-/// A list BIF that never allocates (`lists:keyfind/3`, `member/2`, `keymember/3`): the common
-/// call reads the arguments and returns without converting the native heap cursors, as erts
-/// reads HTOP and STOP as pointers. A trap, an error or a deferred scan converts them and
-/// takes the full path.
-// Port of erts/emulator/beam/erl_bif_lists.c:1108,1302 (the BIF runs with ERTS_BIF_REDS_LEFT
-// and returns its value), OTP-29.1.1.
-pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    if let Some(raw) = nonalloc_list_fast(process, export, B::call) {
-        return raw;
-    }
-    call_list_slice_bif(
-        process,
-        registers,
-        identity as usize,
-        export,
-        B::call,
-        false,
-    )
-    .unwrap_or(0)
-}
-
-/// `lists:member/2`'s BIF-table entry. The successful call needs no export lookup.
-// Port of erts/emulator/beam/erl_bif_lists.c:1108-1142 and bif.h:71-84, OTP-29.1.1.
-pub(crate) extern "C" fn list_member_entry(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let args = [process.x[0], process.x[1]];
-    let (result, deferred) = {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut call = arinsal_bifs::BifCall::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut call);
-        let result = arinsal_bifs::lists_member_bif(&mut ctx, &args);
-        (result, ctx.take_deferred())
-    };
-    if let Some(trap) = deferred {
-        let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-            return 0;
-        };
-        if crate::bif_traps::install_deferred_trap(
-            process,
-            identity as usize,
-            (export.module_atom, export.function_atom),
-            export.function.as_str(),
-            &args,
-            trap,
-        )
-        .is_err()
-        {
-            crate::native_hooks::set_error(process, "system_limit");
-            return 0;
-        }
-        debug_assert_native_heap(process);
-        crate::bif_traps::arm_export_trap(process);
-        process.heap.abi.exc.freason = 1 << 10;
-        return 0;
-    }
-    match result {
-        Ok(value) => {
-            process.x[0] = value;
-            crate::native_hooks::raw(value)
-        }
-        Err(error) => {
-            let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-                return 0;
-            };
-            plain_bif_result(process, registers, export, 2, Err(error))
-        }
-    }
-}
-
-/// The value of a non-allocating list BIF, or `None` when it traps or fails (the caller then
-/// converts the cursors and runs the full path).
-#[inline(always)]
-fn nonalloc_list_fast(
-    process: &mut crate::Process,
-    export: ExportDispatch,
-    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
-) -> Option<u64> {
-    let arity = usize::from(export.arity);
-    let value = {
-        let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut call = arinsal_bifs::BifCall::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
-        let result = bif(&mut ctx, &process.x[..arity]);
-        if ctx.take_deferred().is_some() {
-            return None;
-        }
-        result.ok()?
-    };
-    process.x[0] = value;
-    Some(crate::native_hooks::raw(value))
-}
-
-pub(crate) extern "C" fn list_slice_bif_entry<B: arinsal_bifs::BifBody>(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    call_list_slice_bif(
-        process,
-        registers,
-        identity as usize,
-        export,
-        B::call,
-        false,
-    )
-    .unwrap_or(0)
-}
-
-/// `erlang:'++'/2`: the on-heap copy runs first, straight on the young heap; everything else
-/// takes the general list BIF entry.
-pub(crate) extern "C" fn list_append_entry<B: arinsal_bifs::BifBody>(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    i: u64,
-) -> u64 {
-    if let Some((process, _)) = crate::native_hooks::enter_runtime(header)
-        && let Some(value) =
-            arinsal_bifs::append_onheap_direct(&mut process.heap, process.x[0], process.x[1])
-    {
-        return crate::native_hooks::raw(value);
-    }
-    list_slice_bif_entry::<B>(header, regs, i)
 }
 
 /// A process BIF (`c_p` plus the register array), chosen when the export was created.
@@ -2097,15 +1904,6 @@ fn invoke_dispatch_bif(
         let export_checks = export_call
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
                 || crate::trace_bp::any_pattern());
-        // trap_entry makes runs_in_executor() true, which clears light_bif. The
-        // list scan still uses export.bif; trap state is built only when its
-        // counter runs out. `list_slice` is one byte set at intern.
-        if export.list_slice
-            && !export_checks
-            && let Some(bif) = export.bif
-        {
-            return call_list_slice_bif(process, registers, identity, export, bif, export_call);
-        }
         if let Some(bif) = export.light_bif
             && !export_checks
             && !export.trap_entry
@@ -2276,98 +2074,6 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
         arity,
     )
     .unwrap_or(0)
-}
-
-/// `lists:reverse/2` as its own light entry. The common call runs the body directly and
-/// returns the list; a partial result (budget spent) takes the handler's yield path.
-// Port of erts/emulator/beam/erl_bif_lists.c:1144-1263 (lists_reverse_2), OTP-29.1.1: the BIF
-// is one function with its own budget, and BIF_TRAP is taken only when the budget runs out.
-pub(crate) extern "C" fn list_reverse_entry(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    // lists_reverse_2: the on-heap loop runs first, straight on the young heap. The fragment
-    // installs the result in X0, so only the return value is produced.
-    if let Some((process, _)) = crate::native_hooks::enter_runtime(header)
-        && let Some(value) =
-            arinsal_bifs::reverse_onheap_direct(&mut process.heap, process.x[0], process.x[1])
-    {
-        return crate::native_hooks::raw(value);
-    }
-    list_reverse_general(header, regs, i, descriptor, identity)
-}
-
-/// The rest of `lists:reverse/2`: trap, error and heap-fragment paths.
-#[inline(never)]
-fn list_reverse_general(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-    descriptor: u64,
-    identity: u64,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    if export.light_trap_bif.is_none() {
-        return park_executor(process, export, identity, false);
-    }
-    let gc_was_enabled = process.heap.gc_enabled;
-    let reds = process.heap.abi.fcalls.clamp(0, 4000) as usize;
-    let max_cells = reds
-        .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
-        .max(1);
-    let args = [process.x[0], process.x[1]];
-    let step = {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut call = arinsal_bifs::BifCall::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut call);
-        arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells)
-    };
-    let result = match step {
-        Ok(arinsal_bifs::ReverseStep::Done(value)) => {
-            process.set_gc_enabled(gc_was_enabled);
-            process.x[0] = value;
-            return crate::native_hooks::raw(value);
-        }
-        Ok(arinsal_bifs::ReverseStep::Trap(cont)) => Ok(crate::bif_traps::HandlerResult::Yield {
-            continuation: "lists:reverse/2",
-            // erts keeps lists:reverse/2's arguments in X registers and allocates no magic bin.
-            state: arinsal_term::MagicRef::with_orig_size(std::sync::Mutex::new(cont), 0),
-            reductions: 0,
-        }),
-        Err(error) => Err(error),
-    };
-    let callee = (export.module_atom, export.function_atom);
-    match crate::bif_traps::finish_light(
-        process,
-        identity as usize,
-        callee,
-        &args,
-        gc_was_enabled,
-        result,
-    ) {
-        crate::bif_traps::LightTrap::Returned(result) => {
-            light_trap_result(process, registers, export, 2, false, result)
-        }
-        crate::bif_traps::LightTrap::Trapped => {
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and erl_gc.c
-            // (erts_gc_after_bif_call_lhf runs before the trap is taken, with the trap's
-            // arguments as the live registers), OTP-29.1.1.
-            if process.collect_bin_vheap_if_due(0).is_err() {
-                crate::native_hooks::set_error(process, "system_limit");
-                return 0;
-            }
-            arm_light_trap(process).unwrap_or(0)
-        }
-    }
 }
 
 /// [`call_trap_bif`] for a body known at compile time: a finished run returns at once.
@@ -2789,59 +2495,6 @@ fn finish_counter_bif(
     )
 }
 
-/// Same return as [`call_plain_bif`] when the slice finishes. `None` when the BIF
-/// deferred a continuation and this call context-switches.
-#[inline(always)]
-fn call_list_slice_bif(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
-    export: ExportDispatch,
-    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
-    export_call: bool,
-) -> Option<u64> {
-    if export_call {
-        charge_bif_reductions(process, 1);
-    }
-    let arity = usize::from(export.arity);
-    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut call = arinsal_bifs::BifCall::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
-    let result = bif(&mut ctx, &process.x[..arity]);
-    if let Some(trap) = ctx.take_deferred() {
-        let mut args = [Term::NIL; 3];
-        args[..arity].copy_from_slice(&process.x[..arity]);
-        if crate::bif_traps::install_deferred_trap(
-            process,
-            identity,
-            (export.module_atom, export.function_atom),
-            export.function.as_str(),
-            &args[..arity],
-            trap,
-        )
-        .is_err()
-        {
-            crate::native_hooks::set_error(process, "system_limit");
-            return Some(0);
-        }
-        debug_assert_native_heap(process);
-        crate::bif_traps::arm_export_trap(process);
-        process.heap.abi.exc.freason = 1 << 10;
-        return None;
-    }
-    if let Ok(value) = &result
-        && (!export_call
-            || (process.heap.stack_index() - process.heap.heap_top_index()
-                >= process.heap.mbuf_size()
-                && !process.heap.bin_vheap_gc_due()))
-    {
-        let value = *value;
-        process.x[0] = value;
-        return Some(crate::native_hooks::raw(value));
-    }
-    Some(plain_bif_result(process, registers, export, arity, result))
-}
-
 /// Calls a BIF that runs on the scheduler straight from native code.
 #[inline(always)]
 fn call_plain_bif(
@@ -2923,7 +2576,7 @@ fn plain_bif_slow(
     if let Some(trap) = deferred {
         let mut args = [Term::NIL; 3];
         args[..arity].copy_from_slice(&process.x[..arity]);
-        return install_deferred_bif_trap(process, identity, export, &args[..arity], trap);
+        return install_deferred_bif_trap(process, identity, export, &args[..arity], *trap);
     }
     plain_bif_result(process, registers, export, arity, result)
 }
@@ -3093,13 +2746,12 @@ fn install_deferred_bif_trap(
     identity: usize,
     export: ExportDispatch,
     args: &[Term],
-    trap: Box<arinsal_bifs::DeferredTrap>,
+    trap: arinsal_bifs::DeferredTrap,
 ) -> u64 {
     if crate::bif_traps::install_deferred_trap(
         process,
         identity,
         (export.module_atom, export.function_atom),
-        export.function.as_str(),
         args,
         trap,
     )

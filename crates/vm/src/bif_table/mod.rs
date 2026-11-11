@@ -98,6 +98,10 @@ pub(crate) fn call_from_executor(
 ) -> Option<Result<arinsal_term::Term, crate::VmError>> {
     let spec = arinsal_spec::bif_lookup(module, function, u8::try_from(arity).ok()?)?;
     let func = function_at(usize::from(spec.index))?;
+    // The executor calls the BIF as its export entry does: the trampoline stores the
+    // export's info word in `c_p->current` first, which BIF_ERROR and BIF_TRAP* name.
+    let export = crate::beamasm_integration::bif_mfa_export(module, function, spec.arity)?;
+    process.heap.abi.current = std::ptr::from_ref(export).cast();
     process.x.ensure_x(arity.max(1));
     let reg = std::ptr::from_mut(&mut process.x[0]).cast::<u64>();
     let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();
@@ -109,9 +113,13 @@ pub(crate) fn call_from_executor(
     Some(Err(
         match crate::native_helpers::decode_failure(&mut process.heap.abi.exc) {
             Some(error) => crate::exceptions::bif_error(process, module, function, &args, error),
-            None => crate::VmError::Unsupported(format!(
-                "{module}:{function}/{arity}: BIF_TRAP from the executor"
-            )),
+            // BIF_TRAP*: the executor makes the trap export's call next.
+            None => match crate::bif_traps::take_export_trap(process) {
+                Some(trap) => crate::VmError::TrapExport(trap),
+                None => crate::VmError::Unsupported(format!(
+                    "{module}:{function}/{arity}: BIF_TRAP from the executor"
+                )),
+            },
         },
     ))
 }
@@ -130,7 +138,7 @@ use crate::native_helpers::{
     integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
-use crate::natives::{erl_bif_info, erl_hl_timer, erl_process_dict, register};
+use crate::natives::{erl_bif_info, erl_bif_lists, erl_hl_timer, erl_process_dict, register};
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
 #[derive(Clone, Copy)]
@@ -193,6 +201,16 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "binary_to_term", 1) => {
             bif!(crate::bif_traps::binary_to_term_1_light)
         }
+        // erl_bif_lists.c
+        ("erlang", "++", 2) => bif!(erl_bif_lists::ebif_plusplus_2),
+        ("erlang", "append", 2) => bif!(erl_bif_lists::append_2),
+        ("erlang", "--", 2) => bif!(erl_bif_lists::ebif_minusminus_2),
+        ("erlang", "subtract", 2) => bif!(erl_bif_lists::subtract_2),
+        ("lists", "member", 2) => bif!(erl_bif_lists::lists_member_2),
+        ("lists", "reverse", 2) => bif!(erl_bif_lists::lists_reverse_2),
+        ("lists", "keymember", 3) => bif!(erl_bif_lists::lists_keymember_3),
+        ("lists", "keysearch", 3) => bif!(erl_bif_lists::lists_keysearch_3),
+        ("lists", "keyfind", 3) => bif!(erl_bif_lists::lists_keyfind_3),
         // erl_process_dict.c
         ("erlang", "get", 0) => bif!(erl_process_dict::get_0),
         ("erlang", "get", 1) => bif!(erl_process_dict::get_1),
@@ -217,7 +235,6 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "unique_integer", 1) => bif!(unique_integer_1_light),
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
         ("erlang", "node", 0) => bif!(crate::dist::node_0),
-        ("lists", "member", 2) => bif!(crate::native_helpers::list_member_entry),
         ("persistent_term", "get", 1) => bif!(persistent_term_get_1_light),
         ("persistent_term", "get", 2) => bif!(persistent_term_get_2_light),
         // bif.c
@@ -304,25 +321,9 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
         ("erlang", "phash2", 1) => bif!(trap_bif_entry::<Phash2<1>>),
         ("erlang", "phash2", 2) => bif!(trap_bif_entry::<Phash2<2>>),
         ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
-        ("lists", "reverse", 2) => bif!(crate::native_helpers::list_reverse_entry),
         _ => return None,
     };
     Some(func)
-}
-
-/// The `++`/2 entry: the direct on-heap copy in front of the general list-slice entry.
-pub(crate) fn append_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    arinsal_bifs::visit_bif(module, function, arity, &mut AppendEntry)
-}
-
-struct AppendEntry;
-
-impl arinsal_bifs::BifTableVisitor for AppendEntry {
-    type Output = usize;
-
-    fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Self::Output {
-        bif!(crate::native_helpers::list_append_entry::<B>)
-    }
 }
 
 struct BinaryToListEntry;
@@ -342,19 +343,6 @@ impl arinsal_bifs::BifTableVisitor for BinaryToListEntry {
 pub(crate) struct Entry {
     /// Called as a plain BIF.
     pub(crate) plain: usize,
-    /// Called as a list BIF that traps on the reduction budget.
-    pub(crate) list_slice: usize,
-    /// Called as a list BIF that never allocates (see `native_helpers::list_slice_nonalloc_entry`).
-    pub(crate) list_slice_nonalloc: usize,
-}
-
-/// Whether `lists:function/arity` never allocates on its common path, so its call needs no
-/// native cursor conversion.
-pub(crate) fn never_allocates(module: &str, function: &str, arity: u8) -> bool {
-    matches!(
-        (module, function, arity),
-        ("lists", "keyfind", 3) | ("lists", "member", 2) | ("lists", "keymember", 3)
-    )
 }
 
 /// The entry compiled for `module:function/arity`, if `arinsal_bifs` has that BIF.
@@ -372,8 +360,6 @@ impl arinsal_bifs::BifTableVisitor for Compile {
     fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Entry {
         Entry {
             plain: bif!(crate::native_helpers::plain_bif_entry::<B>),
-            list_slice: bif!(crate::native_helpers::list_slice_bif_entry::<B>),
-            list_slice_nonalloc: bif!(crate::native_helpers::list_slice_nonalloc_entry::<B>),
         }
     }
 }
@@ -486,16 +472,15 @@ mod tests {
 
     #[test]
     fn every_bif_of_arinsal_bifs_has_its_own_entry() {
-        let keyfind = entry("lists", "keyfind", 3).expect("keyfind");
         let element = entry("erlang", "element", 2).expect("element");
-        assert_ne!(keyfind.plain, element.plain);
-        assert_ne!(keyfind.plain, keyfind.list_slice);
+        let hd = entry("erlang", "hd", 1).expect("hd");
+        assert_ne!(hd.plain, element.plain);
         // Arities that share one body share its entry.
         let node0 = entry("erlang", "node", 0).expect("node/0");
         let node1 = entry("erlang", "node", 1).expect("node/1");
         similar_asserts::assert_eq!(node0.plain, node1.plain);
         assert!(entry("erlang", "no_such_bif", 1).is_none());
-        assert!(entry("lists", "keyfind", 2).is_none());
+        assert!(entry("erlang", "element", 3).is_none());
     }
 
     #[test]
