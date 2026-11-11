@@ -19,6 +19,7 @@ arinsal-beam.workspace = true
 arinsal-etf.workspace = true
 arinsal-term.workspace = true
 arinsal-vm.workspace = true
+arinsal-drv.workspace = true
 arinsal-float.workspace = true
 arinsal-nif.workspace = true
 rustix = { version = "1.1.5", features = ["process"] }

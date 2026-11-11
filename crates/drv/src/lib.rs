@@ -36,6 +36,18 @@ mod queue;
 mod termspec;
 mod threads;
 
+/// Initialize OTP's Darwin main-thread callback pipes before starting the VM worker.
+#[cfg(target_os = "macos")]
+pub fn darwin_main_thread_init() -> Result<(), i32> {
+    threads::darwin_main_thread_init()
+}
+
+/// Park the process main thread and execute callbacks submitted by drivers.
+#[cfg(target_os = "macos")]
+pub fn darwin_main_thread_park() -> ! {
+    threads::darwin_main_thread_park();
+}
+
 /// Layout constants generated from the installed `erl_driver.h`.
 #[allow(non_upper_case_globals, dead_code)]
 pub mod layout {
