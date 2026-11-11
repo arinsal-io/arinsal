@@ -164,6 +164,27 @@ pub struct TableOptions {
     pub compressed: bool,
 }
 
+impl TableOptions {
+    /// Apply the final lock and counter flags chosen by `ets_new_2` after it has parsed options.
+    // Port of erts/emulator/beam/erl_db.c (ets_new_2), OTP-29.1.1: private tables clear both
+    // DB_FINE_LOCKED and DB_FREQ_READ before lock initialization. The counter array is
+    // decentralized only when fine locking is active and the option requested it.
+    pub fn normalize_erts_lock_flags(&mut self) -> Result<(), EtsError> {
+        if self.table_type == TableType::OrderedSet
+            && matches!(self.write_concurrency, WriteConcurrency::Fixed(_))
+        {
+            // ets_new_2 rejects explicit hash lock granularity for either tree method.
+            return Err(EtsError::BadArg);
+        }
+        if self.protection == Protection::Private {
+            self.read_concurrency = false;
+            self.write_concurrency = WriteConcurrency::Disabled;
+        }
+        self.decentralized_counters &= self.write_concurrency != WriteConcurrency::Disabled;
+        Ok(())
+    }
+}
+
 /// Errors to be translated to BIF exceptions by the VM.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EtsError {
@@ -2499,6 +2520,7 @@ impl Table {
         if options.keypos == 0 {
             return Err(EtsError::BadArg);
         }
+        options.normalize_erts_lock_flags()?;
         let storage = if options.table_type == TableType::OrderedSet {
             if options.write_concurrency == WriteConcurrency::Disabled {
                 Storage::Ordered(TreeRoot::new())
@@ -6126,9 +6148,10 @@ impl Registry {
 
     fn create_inner(
         &mut self,
-        options: TableOptions,
+        mut options: TableOptions,
         refn: Option<[u32; 3]>,
     ) -> Result<Tid, EtsError> {
+        options.normalize_erts_lock_flags()?;
         let index = if let Some(&index) = self.free_slots.last() {
             index
         } else {
