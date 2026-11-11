@@ -35,7 +35,7 @@ fn exit_reductions_match_otp() {
         panic!("OTP per_exit failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "per_exit", &[], 1, Some(0xB500), 4_000)
+        .eval_scheduled_reductions(MODULE, "per_exit", &[], 1, None, 4_000)
         .unwrap();
     assert_eq!(expected, actual.term);
     assert!(matches!(expected, OwnedTerm::Int(reds) if reds >= 10));

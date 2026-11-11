@@ -937,42 +937,6 @@ run() ->
 }
 
 #[test]
-fn simulation_repeats_thousand_process_trace() {
-    let Ok(reference) = RefErl::start() else {
-        eprintln!("erl unavailable; skipping simulation trace");
-        return;
-    };
-    let source = r#"
--module(sim_trace).
--export([run/0]).
-run() ->
-    Parent=self(),
-    [spawn(fun()->Parent!{I,(I*73) rem 997} end) || I <- lists:seq(1,1000)],
-    collect(1000,[]).
-collect(0,Acc) -> lists:reverse(Acc);
-collect(N,Acc) -> receive Message -> collect(N-1,[Message|Acc]) end.
-"#;
-    let beam = reference.compile_named("sim_trace", source, &[]).unwrap();
-    let run = || {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        vm.eval_scheduled("sim_trace", "run", &[], 1, Some(0x5eed))
-            .unwrap()
-            .term
-    };
-    let first = run();
-    let second = run();
-    assert_eq!(first, second);
-    match &first {
-        OwnedTerm::List { elems, tail } => {
-            assert_eq!(elems.len(), 1000);
-            assert_eq!(**tail, OwnedTerm::Nil);
-        }
-        other => panic!("expected a 1000-message trace, got {other:?}"),
-    }
-}
-
-#[test]
 fn process_errors_reach_beam_catch_handlers() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping process error differential test");

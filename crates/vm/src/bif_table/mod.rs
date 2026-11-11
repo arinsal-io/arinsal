@@ -235,6 +235,17 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "exit", 3) => bif!(crate::natives::bif::exit_3),
         ("erlang", "exit_signal", 2) => bif!(crate::natives::bif::exit_signal_2),
         ("erlang", "exit_signal", 3) => bif!(crate::natives::bif::exit_signal_3),
+        ("erlang", "spawn", 3) => bif!(crate::natives::bif::spawn_3),
+        ("erlang", "spawn_link", 3) => bif!(crate::natives::bif::spawn_link_3),
+        ("erlang", "spawn_opt", 4) => bif!(crate::natives::bif::spawn_opt_4),
+        ("erts_internal", "spawn_request", 4) => {
+            bif!(crate::natives::bif::erts_internal_spawn_request_4)
+        }
+        ("erlang", "spawn_request_abandon", 1) => {
+            bif!(crate::natives::bif::spawn_request_abandon_1)
+        }
+        ("erlang", "alias", 1) => bif!(crate::natives::bif::alias_1),
+        ("erlang", "unalias", 1) => bif!(crate::natives::bif::unalias_1),
         // erl_hl_timer.c
         ("erlang", "send_after", 3) => bif!(erl_hl_timer::send_after_3),
         ("erlang", "send_after", 4) => bif!(erl_hl_timer::send_after_4),

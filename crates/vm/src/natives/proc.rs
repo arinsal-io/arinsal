@@ -1992,17 +1992,13 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "process_flag", 3),
     ("erlang", "process_info", 1),
     ("erlang", "process_info", 2),
-    ("erlang", "alias", 1),
-    ("erlang", "unalias", 1),
     ("erlang", "hibernate", 3),
     // `i_hibernate` is an OTP instruction, not an Erlang wrapper interception.
     ("erlang", "hibernate", 0),
     ("erts_internal", "suspend_process", 2),
     ("erlang", "resume_process", 1),
     ("erts_internal", "process_display", 2),
-    ("erts_internal", "spawn_request", 4),
     ("erts_internal", "dist_spawn_request", 4),
-    ("erlang", "spawn_request_abandon", 1),
     ("erts_internal", "processes_next", 1),
     ("erts_internal", "trace", 3),
     // `erlang:trace/3` loads the tracer module, then calls `erts_internal:trace/3`.
@@ -3181,16 +3177,6 @@ fn call_values(
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
-            ("alias", [options]) => create_alias(process, ctx, &list(*options).ok_or_else(badarg)?),
-            ("unalias", [reference]) => {
-                let id = crate::signals::ref_id(*reference).ok_or_else(badarg)?;
-                let owned = crate::signals::unalias_origin(process, id);
-                Ok(Term::atom(if owned {
-                    arinsal_term::atoms::TRUE
-                } else {
-                    arinsal_term::atoms::FALSE
-                }))
-            }
             ("hibernate", [module, function, args]) => {
                 hibernate(process, ctx, *module, *function, *args)
             }
@@ -3199,13 +3185,9 @@ fn call_values(
                 suspend_process(process, ctx, *pid, *options)
             }
             ("resume_process", [pid]) => resume_process(process, *pid),
-            ("spawn_request", [module, function, args, options]) => {
-                spawn_request(vm, process, ctx, *module, *function, *args, *options)
-            }
             ("dist_spawn_request", [node, mfa, options, kind]) => {
                 dist_spawn_request(vm, process, ctx, *node, *mfa, *options, *kind)
             }
-            ("spawn_request_abandon", [id]) => spawn_request_abandon(ctx.pid(), *id),
             ("process_display", [target, display]) if module == "erts_internal" => {
                 process_display_call(module, process, ctx, *target, *display)
             }
@@ -3603,54 +3585,6 @@ pub(crate) fn resume_process_light(
     }
 }
 
-// Port of erts/emulator/beam/bif.c:1078 (`erts_internal_spawn_request_4`),
-// erl_process.c:12222 (`erts_parse_spawn_opts`) and
-// erl_process.c:13146 (`erts_send_local_spawn_reply`), OTP-29.1.1.
-fn spawn_request(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: Term,
-    function: Term,
-    args: Term,
-    options: Term,
-) -> Result<Term, VmError> {
-    if module.as_atom().is_none() || function.as_atom().is_none() || list(args).is_none() {
-        return Ok(Term::atom(arinsal_term::atoms::BADARG));
-    }
-    let Some(parsed) = parse_spawn_options(process.runtime, options) else {
-        return Ok(Term::atom(arinsal_term::atoms::BADOPT));
-    };
-    process
-        .runtime
-        .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
-    let id = process.next_ref();
-    let reference = crate::signals::reference(process, id)?;
-    if parsed.bad {
-        if parsed.reply_error {
-            let message = make_tuple(
-                process,
-                &[
-                    parsed.tag,
-                    reference,
-                    Term::atom(arinsal_term::atoms::ERROR),
-                    Term::atom(arinsal_term::atoms::BADOPT),
-                ],
-            )?;
-            let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-            process.send_message(self_pid, message)?;
-        }
-        return Ok(reference);
-    }
-    let mut parsed = parsed;
-    if parsed.monitor {
-        parsed.monitor_id = Some(id);
-    }
-    // Links, the monitor, and the reply are all made by erl_create_process (erl_process.c:12960+).
-    spawn_apply(vm, process, ctx, module, function, args, &parsed, reference)?;
-    Ok(reference)
-}
-
 pub(crate) fn trace_session_id(process: &Process, session: Term) -> Option<u64> {
     let owned = arinsal_term::to_owned(session).ok()?;
     match &owned {
@@ -3776,174 +3710,6 @@ fn dist_spawn_request(
     }
 }
 
-// Port of erts/emulator/beam/bif.c:1166 (`spawn_request_abandon_1`), OTP-29.1.1.
-fn spawn_request_abandon(caller: arinsal_sched::Pid, id: Term) -> Result<Term, VmError> {
-    if id.classify() != TermKind::Ref {
-        return Err(badarg());
-    }
-    // A local request completes before `spawn_request` returns, so it is never still
-    // pending; an external reference is not an outstanding request of this process. Only a
-    // distributed request can be pending (its spawn-pending monitor lives in the
-    // distribution tables).
-    let abandoned = id.local_ref_numbers().is_some()
-        && crate::signals::ref_id(id)
-            .is_some_and(|key| crate::dist::spawn_request_abandon(caller, key));
-    Ok(Term::atom(if abandoned {
-        arinsal_term::atoms::TRUE
-    } else {
-        arinsal_term::atoms::FALSE
-    }))
-}
-
-struct LocalSpawn {
-    link: bool,
-    monitor: bool,
-    monitor_tag: Option<arinsal_etf::OwnedTerm>,
-    monitor_alias: Option<crate::proc_create::AliasMode>,
-    monitor_priority: bool,
-    min_heap: Option<usize>,
-    min_bin_vheap: Option<usize>,
-    max_heap: Option<crate::process::MaxHeap>,
-    priority: Priority,
-    fullsweep: Option<u16>,
-    async_dist: bool,
-    tag: Term,
-    reply_success: bool,
-    reply_error: bool,
-    bad: bool,
-    monitor_id: Option<u64>,
-    /// The option list as the caller gave it (`so->opts`).
-    opts: Term,
-}
-
-fn parse_spawn_options(
-    runtime: Option<&crate::process::Runtime>,
-    options: Term,
-) -> Option<LocalSpawn> {
-    let items = list(options)?;
-    let mut parsed = LocalSpawn {
-        opts: options,
-        link: false,
-        monitor: false,
-        monitor_tag: None,
-        monitor_alias: None,
-        monitor_priority: false,
-        min_heap: None,
-        min_bin_vheap: None,
-        max_heap: None,
-        priority: Priority::Normal,
-        fullsweep: None,
-        async_dist: super::sys::gc_defaults(runtime).async_dist(),
-        tag: Term::atom(arinsal_term::atoms::SPAWN_REPLY),
-        reply_success: true,
-        reply_error: true,
-        bad: false,
-        monitor_id: None,
-    };
-    for item in items {
-        if item == Term::atom(arinsal_term::atoms::LINK) {
-            parsed.link = true;
-        } else if item == Term::atom(arinsal_term::atoms::MONITOR) {
-            parsed.monitor = true;
-        } else if let Some((key, value)) = tuple2(item) {
-            if key == Term::atom(arinsal_term::atoms::PRIORITY) {
-                parsed.priority = match atom_name(value).as_deref() {
-                    Some("max") => Priority::Max,
-                    Some("high") => Priority::High,
-                    Some("normal") => Priority::Normal,
-                    Some("low") => Priority::Low,
-                    _ => {
-                        parsed.bad = true;
-                        continue;
-                    }
-                };
-            } else if key == Term::atom(arinsal_term::atoms::MIN_HEAP_SIZE) {
-                match value.as_small() {
-                    Some(n) if n >= 0 => parsed.min_heap = Some((n as usize).max(233)),
-                    _ => parsed.bad = true,
-                }
-            } else if key == Term::atom(arinsal_term::atoms::MAX_HEAP_SIZE) {
-                match parse_max_heap_from(
-                    value,
-                    super::sys::gc_spawn_defaults(runtime).max_heap_size,
-                ) {
-                    Ok(limit) => parsed.max_heap = Some(limit),
-                    Err(()) => parsed.bad = true,
-                }
-            } else if key == Term::atom(arinsal_term::atoms::MIN_BIN_VHEAP_SIZE) {
-                match value.as_small() {
-                    Some(n) if n >= 0 => parsed.min_bin_vheap = Some(n as usize),
-                    _ => parsed.bad = true,
-                }
-            } else if key == Term::atom(arinsal_term::atoms::FULLSWEEP_AFTER) {
-                match value.as_small() {
-                    Some(n) if n >= 0 => parsed.fullsweep = Some(n.min(u16::MAX as i64) as u16),
-                    _ => parsed.bad = true,
-                }
-            } else if key == Term::atom(arinsal_term::atoms::MESSAGE_QUEUE_DATA) {
-                if value != Term::atom(arinsal_term::atoms::ON_HEAP)
-                    && value != Term::atom(arinsal_term::atoms::OFF_HEAP)
-                {
-                    parsed.bad = true;
-                }
-            } else if key == Term::atom(arinsal_term::atoms::ASYNC_DIST) {
-                if value != Term::atom(arinsal_term::atoms::TRUE)
-                    && value != Term::atom(arinsal_term::atoms::FALSE)
-                {
-                    parsed.bad = true;
-                }
-                // Port of erts/emulator/beam/erl_process.c:12289 (erts_parse_spawn_opts).
-                parsed.async_dist = value == Term::atom(arinsal_term::atoms::TRUE);
-            } else if key == Term::atom(arinsal_term::atoms::SCHEDULER) {
-                if value.as_small().is_none_or(|n| n < 0) {
-                    parsed.bad = true;
-                }
-            } else if key == Term::atom(arinsal_term::atoms::REPLY) {
-                match reply_mode(value) {
-                    Some((success, error)) => {
-                        parsed.reply_success = success;
-                        parsed.reply_error = error;
-                    }
-                    None => parsed.bad = true,
-                }
-            } else if key == Term::atom(arinsal_term::atoms::REPLY_TAG) {
-                parsed.tag = value;
-            } else if key == Term::atom(arinsal_term::atoms::LINK)
-                || key == Term::atom(arinsal_term::atoms::MONITOR)
-            {
-                if list(value).is_none() {
-                    parsed.bad = true;
-                } else if key == Term::atom(arinsal_term::atoms::LINK) {
-                    parsed.link = true;
-                } else {
-                    match crate::signals::spawn_monitor_options(value) {
-                        Some((tag, alias, priority)) => {
-                            parsed.monitor = true;
-                            parsed.monitor_tag = tag;
-                            parsed.monitor_alias = alias;
-                            parsed.monitor_priority = priority;
-                        }
-                        None => parsed.bad = true,
-                    }
-                }
-            } else {
-                parsed.bad = true;
-            }
-        } else {
-            parsed.bad = true;
-        }
-    }
-    let min_heap =
-        crate::natives::sys::normalize_spawn_heap_minimum(runtime, parsed.min_heap, false) as u64;
-    if parsed
-        .max_heap
-        .is_some_and(|limit| limit.size != 0 && limit.size < min_heap)
-    {
-        parsed.bad = true;
-    }
-    Some(parsed)
-}
-
 fn reply_mode(value: Term) -> Option<(bool, bool)> {
     if value == Term::atom(arinsal_term::atoms::YES) {
         Some((true, true))
@@ -3956,49 +3722,6 @@ fn reply_mode(value: Term) -> Option<(bool, bool)> {
     } else {
         None
     }
-}
-
-#[allow(clippy::too_many_arguments)] // spawn_request arguments stay positional.
-fn spawn_apply(
-    vm: &mut Vm,
-    parent: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: Term,
-    function: Term,
-    args: Term,
-    options: &LocalSpawn,
-    reference: Term,
-) -> Result<Pid, VmError> {
-    // spawn_request reaches erl_create_process with the reference it already allocated.
-    let created = crate::signals::erl_create_process(
-        vm,
-        parent,
-        ctx,
-        (module, function, args),
-        crate::signals::ErlSpawnOpts {
-            link: options.link,
-            monitor: options.monitor_id.map(|id| crate::signals::SpawnMonitor {
-                id: Some(id),
-                tag: options.monitor_tag.clone(),
-                alias: options.monitor_alias,
-                priority: options.monitor_priority,
-            }),
-            min_heap: options.min_heap,
-            min_bin_vheap: options.min_bin_vheap,
-            fullsweep: options.fullsweep,
-            max_heap: options.max_heap,
-            off_heap_queue: None,
-            async_dist: options.async_dist,
-            scheduler: None,
-            priority: options.priority,
-            opts: options.opts,
-            reply: options.reply_success.then_some(crate::signals::SpawnReply {
-                tag: options.tag,
-                reference,
-            }),
-        },
-    )?;
-    Ok(created.pid)
 }
 
 /// Whether `limit` is the default `max_heap_size` (the process keeps no field for it).
@@ -4133,43 +3856,6 @@ fn suspending_term(process: &mut Process, _pid: Pid) -> Result<Term, VmError> {
         tuples.push(make_tuple(process, &[target, active, outstanding])?);
     }
     make_list(process, tuples)
-}
-
-fn create_alias(
-    process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
-    options: &[Term],
-) -> Result<Term, VmError> {
-    if options.iter().any(|option| {
-        !["explicit_unalias", "reply", "priority"]
-            .iter()
-            .any(|name| *option == crate::atom_cache::put(name))
-    }) {
-        return Err(badarg());
-    }
-    let priority = options
-        .iter()
-        .any(|option| *option == Term::atom(arinsal_term::atoms::PRIORITY));
-    let mut mode = crate::proc_create::AliasMode::ExplicitUnalias;
-    for option in options {
-        if *option == Term::atom(arinsal_term::atoms::REPLY) {
-            mode = crate::proc_create::AliasMode::ReplyDemonitor;
-        } else if *option == Term::atom(arinsal_term::atoms::EXPLICIT_UNALIAS) {
-            mode = crate::proc_create::AliasMode::ExplicitUnalias;
-        }
-    }
-    let id = process.next_ref();
-    let pid = ctx.pid();
-    let reference = crate::signals::pid_reference(process, id, pid)?;
-    process
-        .monitors
-        .insert(crate::proc_create::origin_monitor_with_reference(
-            crate::proc_create::monitor_reference(id, Some(mode), priority),
-            pid.data(),
-            0,
-            crate::proc_create::OriginMonitor::Alias,
-        ));
-    Ok(reference)
 }
 
 fn trace_mask(process: &Process, pid: Pid) -> u64 {

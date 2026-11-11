@@ -10,6 +10,7 @@ pub(crate) mod env;
 pub(crate) mod erl_bif_info;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
+pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erts_debug;
 pub(crate) use erts_debug::internal_state_enabled;
@@ -404,21 +405,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     }
     if module == "erts_internal" && function == "port_control" && arity == 3 {
         return Some(crate::port::port_control_light);
-    }
-    if module == "erlang" && function == "spawn" && arity == 3 {
-        return Some(crate::signals::spawn_light3);
-    }
-    if module == "erlang" && function == "spawn_link" && arity == 3 {
-        return Some(crate::signals::spawn_link_light3);
-    }
-    if module == "erlang" && function == "spawn_opt" && arity == 4 {
-        return Some(crate::signals::spawn_opt_light);
-    }
-    if module == "erlang" && function == "alias" && arity == 1 {
-        return Some(crate::signals::alias_light);
-    }
-    if module == "erlang" && function == "unalias" && arity == 1 {
-        return Some(crate::signals::unalias_light);
     }
     if module == "erlang" {
         match (function, arity) {

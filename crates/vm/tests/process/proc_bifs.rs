@@ -125,7 +125,7 @@ fn process_bif_scenarios_match_otp_29() {
             "scenario",
             &[Term::small(scenario).unwrap()],
             1,
-            Some(71),
+            None,
         );
         assert_eq!(
             expected,
@@ -169,7 +169,7 @@ collect(Count, Values) -> receive Value -> collect(Count - 1, [Value | Values]) 
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("proc_bifs_backtrace_depth", "run", &[], 8, Some(0xB7D))
+        .eval_scheduled("proc_bifs_backtrace_depth", "run", &[], 8, None)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

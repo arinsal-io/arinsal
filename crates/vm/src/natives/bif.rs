@@ -8,6 +8,9 @@
 //! internal pid of an untraced sender) reach the scheduler's data, as erts reaches `esdp`
 //! through `erts_proc_sched_data(c_p)` only where a BIF needs it.
 
+use crate::natives::erl_process::{
+    CreateError, ErlSpawnOpts, ParseResult, erl_create_process, erts_parse_spawn_opts,
+};
 use crate::proc_create::{AliasMode, MonitorInfo, OriginMonitor};
 use crate::process::Message;
 use crate::signals::OriginDemonitor;
@@ -859,7 +862,7 @@ pub(crate) extern "C" fn link_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64)
 
 /// `erts_link_opts`: whether `priority` is in the proper option list, `None` for a bad list.
 // Port of erts/emulator/beam/bif.c (erts_link_opts), OTP-29.1.1.
-fn erts_link_opts(opts: Term) -> Option<bool> {
+pub(crate) fn erts_link_opts(opts: Term) -> Option<bool> {
     let mut priority = false;
     let mut bad = false;
     crate::signals::each_list_item(opts, |opt| {
@@ -1276,4 +1279,260 @@ fn send_exit_signal_bif(
             _ => Err(badarg()),
         },
     }
+}
+
+/// `spawn/3`.
+// Port of erts/emulator/beam/bif.c (spawn_3), OTP-29.1.1.
+pub(crate) extern "C" fn spawn_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (module, function, args) = (process.x[0], process.x[1], process.x[2]);
+    let mut so = ErlSpawnOpts::new(process.runtime);
+    let result = erl_create_process(process, module, function, args, &mut so)
+        .map_err(CreateError::into_bif_error);
+    bif_ret(c_p, i, result)
+}
+
+/// `spawn_link/3`: `spawn/3` with `SPO_LINK` and `link` in `so.opts`.
+// Port of erts/emulator/beam/bif.c (spawn_link_3), OTP-29.1.1.
+pub(crate) extern "C" fn spawn_link_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (module, function, args) = (process.x[0], process.x[1], process.x[2]);
+    let mut so = ErlSpawnOpts::new(process.runtime);
+    so.link = true;
+    // `so.opts = CONS(&tmp_heap[0], am_link, so.opts)`: only seq_trace reads it.
+    if crate::seq_trace::has_token(process) {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        match arinsal_term::TermBuilder::new(&mut heap).cons(Term::atom(atoms::LINK), so.opts) {
+            Ok(opts) => so.opts = opts,
+            Err(_) => return bif_ret(c_p, i, Err(crate::natives::erl_process::system_limit())),
+        }
+    }
+    let result = erl_create_process(process, module, function, args, &mut so)
+        .map_err(CreateError::into_bif_error);
+    bif_ret(c_p, i, result)
+}
+
+/// `spawn_opt/4`. Fail order: bad types, then bad options; a bad option list is
+/// `badarg` with `cause => badopt` whatever the MFA.
+// Port of erts/emulator/beam/bif.c (spawn_opt_4), OTP-29.1.1.
+pub(crate) extern "C" fn spawn_opt_4(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (module, function, args, opts) = (process.x[0], process.x[1], process.x[2], process.x[3]);
+    let result = spawn_opt(process, module, function, args, opts);
+    bif_ret(c_p, i, result)
+}
+
+fn spawn_opt(
+    process: &mut Process,
+    module: Term,
+    function: Term,
+    args: Term,
+    opts: Term,
+) -> Result<Term, VmError> {
+    let mut so = ErlSpawnOpts::new(process.runtime);
+    if erts_parse_spawn_opts(&mut so, process.runtime, opts, None, false) != ParseResult::Ok {
+        // The arity cannot exceed MAX_SMALL here, so every failure is BADARG with badopt.
+        return Err(badarg_ext(
+            atoms::ERLANG,
+            "spawn_opt",
+            4,
+            Term::atom(atoms::BADOPT),
+        ));
+    }
+    so.opts = opts;
+    so.tag = Term::atom(atoms::SPAWN_REPLY);
+    let pid = erl_create_process(process, module, function, args, &mut so)
+        .map_err(CreateError::into_bif_error)?;
+    if so.monitor.is_none() {
+        return Ok(pid);
+    }
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    arinsal_term::TermBuilder::new(&mut heap)
+        .tuple(&[pid, so.mref])
+        .map_err(|_| crate::natives::erl_process::system_limit())
+}
+
+/// `erts_internal:spawn_request/4`: the reference, or `badarg`/`badopt` as a value. The child
+/// runs `erts_internal:spawn_init({M, F, A})` with `{M, F, length(A)}` as its initial call.
+// Port of erts/emulator/beam/bif.c (erts_internal_spawn_request_4), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_spawn_request_4(
+    c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (module, function, args, opts) = (process.x[0], process.x[1], process.x[2], process.x[3]);
+    let result = spawn_request(process, module, function, args, opts);
+    bif_ret(c_p, i, result)
+}
+
+fn spawn_request(
+    process: &mut Process,
+    module: Term,
+    function: Term,
+    args: Term,
+    opts: Term,
+) -> Result<Term, VmError> {
+    let badarg_atom = Ok(Term::atom(atoms::BADARG));
+    let (Some(m), Some(f)) = (module.as_atom(), function.as_atom()) else {
+        return badarg_atom;
+    };
+    let Some(arity) = crate::signals::list_length(args) else {
+        return badarg_atom;
+    };
+    let mut so = ErlSpawnOpts::new(process.runtime);
+    let mut tag = Term::NIL;
+    let error = match erts_parse_spawn_opts(&mut so, process.runtime, opts, Some(&mut tag), true) {
+        ParseResult::NotList => return Ok(Term::atom(atoms::BADOPT)),
+        ParseResult::BadOpt => atoms::BADOPT,
+        ParseResult::Ok => {
+            // Argument list for erts_internal:spawn_init/1: [{M, F, A}].
+            let init_args = {
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+                let mut builder = arinsal_term::TermBuilder::new(&mut heap);
+                builder
+                    .tuple(&[module, function, args])
+                    .and_then(|mfa| builder.cons(mfa, Term::NIL))
+                    .map_err(|_| crate::natives::erl_process::system_limit())?
+            };
+            so.mfa = Some((m, f, arity));
+            so.r#async = true;
+            so.tag = tag;
+            so.opts = opts;
+            match erl_create_process(
+                process,
+                Term::atom(atoms::ERTS_INTERNAL),
+                Term::atom(atoms::SPAWN_INIT),
+                init_args,
+                &mut so,
+            ) {
+                Ok(_) => return Ok(so.mref),
+                Err(CreateError::SystemLimit) => atoms::SYSTEM_LIMIT,
+                Err(CreateError::Badarg) => {
+                    return Err(VmError::Unsupported(
+                        "unexpected error from erl_create_process()".into(),
+                    ));
+                }
+                Err(CreateError::Vm(error)) => return Err(error),
+            }
+        }
+    };
+    // send_error: `{Tag, Ref, error, Error}` to the caller unless SPO_NO_EMSG.
+    let reference = crate::signals::reference(process, process.next_ref())?;
+    if !so.no_emsg {
+        let me = process.self_pid.and_then(Pid::to_term).ok_or_else(badarg)?;
+        let message = {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            arinsal_term::TermBuilder::new(&mut heap)
+                .tuple(&[tag, reference, Term::atom(atoms::ERROR), Term::atom(error)])
+                .map_err(|_| crate::natives::erl_process::system_limit())?
+        };
+        process.send_message(me, message)?;
+    }
+    Ok(reference)
+}
+
+/// `spawn_request_abandon/1`.
+// Port of erts/emulator/beam/bif.c (spawn_request_abandon_1), OTP-29.1.1.
+pub(crate) extern "C" fn spawn_request_abandon_1(
+    c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let id = process.x[0];
+    let result = if id.local_ref_numbers().is_none() {
+        // is_not_internal_ref: `badarg` for a non-reference, otherwise not an outstanding
+        // spawn_request of this process.
+        if id.classify() == arinsal_term::TermKind::Ref {
+            Ok(Term::atom(atoms::FALSE))
+        } else {
+            Err(badarg())
+        }
+    } else {
+        // A local request has completed when spawn_request returned; only a distributed one
+        // has a spawn-pending monitor (kept in the distribution tables).
+        let me = process.self_pid.ok_or_else(badarg);
+        me.map(|me| {
+            let abandoned = crate::signals::ref_id(id)
+                .is_some_and(|key| crate::dist::spawn_request_abandon(me, key));
+            Term::atom(if abandoned { atoms::TRUE } else { atoms::FALSE })
+        })
+    };
+    bif_ret(c_p, i, result)
+}
+
+/// `alias/1`.
+// Port of erts/emulator/beam/bif.c (alias_1), OTP-29.1.1.
+pub(crate) extern "C" fn alias_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let opts = process.x[0];
+    let result = alias(process, opts);
+    bif_ret(c_p, i, result)
+}
+
+fn alias(process: &mut Process, opts: Term) -> Result<Term, VmError> {
+    let mut mode = AliasMode::ExplicitUnalias;
+    let mut priority = false;
+    let mut bad = false;
+    crate::signals::each_list_item(opts, |option| match option.as_atom() {
+        Some(atom) if atom == atoms::EXPLICIT_UNALIAS => mode = AliasMode::ExplicitUnalias,
+        Some(atom) if atom == atoms::REPLY => mode = AliasMode::ReplyDemonitor,
+        Some(atom) if atom == atoms::PRIORITY => priority = true,
+        _ => bad = true,
+    })
+    .ok_or_else(badarg)?;
+    if bad {
+        return Err(badarg());
+    }
+    let me = process.self_pid.ok_or_else(badarg)?;
+    let id = process.next_ref();
+    let reference = crate::signals::pid_reference(process, id, me)?;
+    process
+        .monitors
+        .insert(crate::proc_create::origin_monitor_with_reference(
+            crate::proc_create::monitor_reference(id, Some(mode), priority),
+            me.data(),
+            0,
+            OriginMonitor::Alias,
+        ));
+    Ok(reference)
+}
+
+/// `unalias/1`.
+// Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
+pub(crate) extern "C" fn unalias_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let reference = process.x[0];
+    // erts_get_pid_of_ref: the pid of a pid reference, `undefined` for another reference.
+    let result = if reference.classify() != arinsal_term::TermKind::Ref {
+        Err(badarg())
+    } else {
+        let mine = reference
+            .local_pid_ref_pid_data()
+            .is_some_and(|pid| Some(pid) == process.self_pid.map(Pid::data));
+        let unaliased = mine
+            && crate::signals::ref_id(reference)
+                .is_some_and(|id| crate::signals::unalias_origin(process, id));
+        Ok(Term::atom(if unaliased {
+            atoms::TRUE
+        } else {
+            atoms::FALSE
+        }))
+    };
+    bif_ret(c_p, i, result)
 }

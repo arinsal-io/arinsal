@@ -210,7 +210,7 @@ fn run_scenarios(scenarios: &[i64]) -> Vec<String> {
             "scenario",
             &[Term::small(scenario).unwrap()],
             1,
-            Some(71),
+            None,
         );
         let actual = CallResult::Ok(
             actual

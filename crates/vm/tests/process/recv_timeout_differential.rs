@@ -67,7 +67,7 @@ rearm() ->
 "#;
 
 fn compare(function: &str) {
-    compare_with(function, Some(0x71e0));
+    compare_with(function, None);
 }
 
 fn compare_with(function: &str, seed: Option<u64>) {

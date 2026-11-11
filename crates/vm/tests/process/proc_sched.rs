@@ -398,7 +398,7 @@ fn proc_sched_matches_otp_29() {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).expect("load");
         let actual = vm
-            .eval_scheduled("proc_sched", function, &[], 1, Some(17))
+            .eval_scheduled("proc_sched", function, &[], 1, None)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

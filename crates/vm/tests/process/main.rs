@@ -53,6 +53,7 @@ mod sig_bifs;
 mod sig_buffers;
 mod signals_exit_infinity_differential;
 mod sigterm_exit;
+mod spawn_alias_bif_differential;
 mod spawn_args_entry;
 mod spawn_entry_version;
 mod spawn_heap_size;
