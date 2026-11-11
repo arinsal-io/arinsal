@@ -617,7 +617,6 @@ fn heaps_do_not_count_fun_or_export_entries() {
         old_uniq: 1,
         pid: Term::pid(1, 0).unwrap(),
         dispatch: Default::default(),
-        dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
     let export = Arc::new(ExportEntry::new(module, function, 0));
@@ -660,7 +659,6 @@ fn fun_entries_survive_heap_owner_drop_and_collection() {
             old_uniq: 2,
             pid: Term::pid(2, 0).unwrap(),
             dispatch: Default::default(),
-            dispatch_code: Default::default(),
             dispatch_epoch: Default::default(),
         });
         TermBuilder::new(&mut heap).local_fun(&entry, &[]).unwrap()
@@ -766,7 +764,6 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
         old_uniq: 7,
         pid: Term::pid(1, 0).unwrap(),
         dispatch: Default::default(),
-        dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
     let fun = TermBuilder::new(&mut heap)

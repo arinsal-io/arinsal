@@ -617,7 +617,6 @@ fn fun_layout_copy_and_conversion() {
         old_index: 2,
         pid: Term::pid(4, 0).unwrap(),
         dispatch: Default::default(),
-        dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
     let local = builder
@@ -981,7 +980,6 @@ fn differential_local_fun_hashes() {
         old_uniq: fields[1] as u32,
         pid: Term::pid(0, 0).unwrap(),
         dispatch: Default::default(),
-        dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
     let fun = TermBuilder::new(&mut heap)

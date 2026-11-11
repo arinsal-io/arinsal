@@ -144,7 +144,6 @@ fn native_i_make_fun3_entry_matches_interpreter_layout() {
         old_index: 0,
         pid: arinsal_term::Term::pid(0, 0).unwrap(),
         dispatch: Default::default(),
-        dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
     let entry_ptr = std::sync::Arc::as_ptr(&entry) as u64;

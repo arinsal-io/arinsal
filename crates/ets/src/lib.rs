@@ -7230,7 +7230,6 @@ mod stored_size_tests {
             old_index: 2,
             pid: Term::pid(4, 0).unwrap(),
             dispatch: Default::default(),
-            dispatch_code: Default::default(),
             dispatch_epoch: Default::default(),
         });
         let key = Term::small(1).unwrap();

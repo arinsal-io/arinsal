@@ -38,13 +38,12 @@ fn otp_and_elixir_corpus_loads() {
         return;
     }
     let start = std::time::Instant::now();
-    let mut unsupported = std::collections::BTreeMap::<String, usize>::new();
     for path in &files {
         let bytes = std::fs::read(path).unwrap();
         let beam =
             arinsal_beam::parse(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let module =
-            arinsal_loader::load(&beam).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let module = arinsal_loader::load_native(&beam)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!(
             arinsal_term::global_atoms().text(module.name_atom),
             Some(module.name.as_str()),
@@ -59,24 +58,11 @@ fn otp_and_elixir_corpus_loads() {
                 path.display()
             );
         }
-        for ip in 0..module.code.len() {
-            let line = module.lines.get(ip).and_then(Option::as_ref);
-            assert_eq!(
-                module.line_term_at(ip).is_some(),
-                line.is_some(),
-                "cached line filename term for {} at {ip}",
-                path.display()
-            );
-        }
-        for (op, count) in module.unsupported {
-            *unsupported.entry(op).or_default() += count;
-        }
     }
     eprintln!(
-        "loaded {} BEAM files in {:.3}s; unsupported {:?}",
+        "loaded {} BEAM files in {:.3}s",
         files.len(),
-        start.elapsed().as_secs_f64(),
-        unsupported
+        start.elapsed().as_secs_f64()
     );
 }
 

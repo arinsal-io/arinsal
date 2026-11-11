@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_bifs::{BifError, BifFn, Ctx, ProcessHeapHandle, SchedulerClass};
-use arinsal_loader::Instr;
 use arinsal_sched::{Pid, RunCtx, Scheduler, SchedulerType};
 use arinsal_term::{
     HeapAlloc, Term, TermBuilder, TermKind, VecHeap, exact_eq, from_owned, global_atoms,
@@ -1089,8 +1088,7 @@ pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
         && tracer_callback(vm, module_name, "trace", 5).is_some()
 }
 
-/// Binds the NIF library `key` to its module instance in the active code index; the patched
-/// `NativeBody` instructions are code shared by every code index.
+/// Binds the NIF library `key` to its module instance in the active code index.
 // Port of erts/emulator/beam/erl_nif.c:4748 (load_nif: `module_p->curr.nif`), OTP-29.1.1.
 fn publish(vm: &mut Vm, key: &str) {
     vm.code_ix.update_active(|tables| {
@@ -1105,17 +1103,6 @@ fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Re
         return Err(VmError::Unsupported("nif entry".into()));
     };
     module.set_nif_body(ordinal, index);
-    // The interpreter flavor runs the stub from its instruction stream.
-    if slot < module.code.len() {
-        let ptr = module.code.as_ptr().cast_mut();
-        // SAFETY: `code` is a boxed slice shared by every `Arc<Module>` clone.
-        // `load_nif` overwrites the Erlang stub with `NativeBody`, matching
-        // `patch_call_nif_early` in erts. `Instr` is `Copy`. This scheduler is
-        // inside `load_nif`, not inside the patched function.
-        unsafe {
-            ptr.add(slot).write(Instr::NativeBody { index });
-        }
-    }
     Ok(())
 }
 

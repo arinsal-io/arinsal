@@ -113,8 +113,6 @@ pub struct FunEntry {
     pub pid: Term,
     /// Resolved BEAM dispatch targets for the two code generations.
     pub dispatch: [AtomicU64; 2],
-    /// Code allocation identities paired with `dispatch`.
-    pub dispatch_code: [AtomicUsize; 2],
     /// Code-table generations paired with `dispatch`.
     pub dispatch_epoch: [AtomicU64; 2],
 }
@@ -137,9 +135,6 @@ impl Clone for FunEntry {
             pid: self.pid,
             dispatch: std::array::from_fn(|index| {
                 AtomicU64::new(self.dispatch[index].load(Ordering::Acquire))
-            }),
-            dispatch_code: std::array::from_fn(|index| {
-                AtomicUsize::new(self.dispatch_code[index].load(Ordering::Acquire))
             }),
             dispatch_epoch: std::array::from_fn(|index| {
                 AtomicU64::new(self.dispatch_epoch[index].load(Ordering::Acquire))
@@ -223,14 +218,7 @@ impl FunEntry {
     }
 
     /// Publish a resolved module and code target for one OTP code index.
-    pub fn set_dispatch(
-        &self,
-        code_index: usize,
-        module_id: usize,
-        target: usize,
-        code: usize,
-        epoch: u64,
-    ) {
+    pub fn set_dispatch(&self, code_index: usize, module_id: usize, target: usize, epoch: u64) {
         let Some(slot) = self.dispatch.get(code_index) else {
             return;
         };
@@ -244,21 +232,19 @@ impl FunEntry {
         let Some(packed) = ((u64::from(module_id) << 32) | u64::from(target)).checked_add(1) else {
             return;
         };
-        self.dispatch_code[code_index].store(code, Ordering::Relaxed);
         self.dispatch_epoch[code_index].store(epoch, Ordering::Relaxed);
         slot.store(packed, Ordering::Release);
     }
 
-    /// Read the resolved target if it still names this module code allocation.
-    pub fn get_dispatch(&self, code_index: usize) -> Option<(usize, usize, usize, u64)> {
+    /// Read the resolved module, target and code-table generation.
+    pub fn get_dispatch(&self, code_index: usize) -> Option<(usize, usize, u64)> {
         let packed = self.dispatch.get(code_index)?.load(Ordering::Acquire);
         if packed == 0 {
             return None;
         }
         let packed = packed - 1;
-        let code = self.dispatch_code[code_index].load(Ordering::Relaxed);
         let epoch = self.dispatch_epoch[code_index].load(Ordering::Relaxed);
-        Some(((packed >> 32) as usize, packed as u32 as usize, code, epoch))
+        Some(((packed >> 32) as usize, packed as u32 as usize, epoch))
     }
 }
 

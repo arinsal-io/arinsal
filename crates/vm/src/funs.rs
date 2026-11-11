@@ -233,17 +233,12 @@ impl Vm {
             FunRef::Local { entry, free_vars } => {
                 // Port of erts/emulator/beam/beam_common.c:1621-1624 (call_fun), OTP-29.1.1.
                 self.refresh_code();
-                let cached = entry
-                    .get_dispatch(0)
-                    .and_then(|(id, target, code, generation)| {
-                        if generation == self.code_generation() {
-                            return Some((id, target, code));
-                        }
-                        let module = self.code.modules.get(id)?;
-                        (self.code.module_live.get(id) == Some(&true)
-                            && module.code.as_ptr() as usize == code)
-                            .then_some((id, target, code))
-                    });
+                let cached = entry.get_dispatch(0).and_then(|(id, target, generation)| {
+                    if generation == self.code_generation() {
+                        return Some((id, target));
+                    }
+                    (self.code.module_live.get(id) == Some(&true)).then_some((id, target))
+                });
                 let resolved = match cached {
                     Some(cached) if !self.purge_state.pending(cached.0) => Some(cached),
                     // A cached target in code pending purge is re-resolved: the fun
@@ -251,7 +246,7 @@ impl Vm {
                     // already dispatches it.
                     _ => self.resolve_local_fun(p, entry, arity)?,
                 };
-                let Some((module_id, target, _)) = resolved else {
+                let Some((module_id, target)) = resolved else {
                     return self.call_lambda_handler(p, entry.module, arity, false, ctx);
                 };
                 if self.purge_state.pending(module_id) {
@@ -367,7 +362,7 @@ impl Vm {
         p: &mut Process,
         entry: &arinsal_term::FunEntry,
         arity: usize,
-    ) -> Result<Option<(usize, usize, usize)>, VmError> {
+    ) -> Result<Option<(usize, usize)>, VmError> {
         let name = atom_name(Term::atom(entry.module))
             .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
         let found = [self.code.loaded.get(&name), self.code.old.get(&name)]
@@ -394,18 +389,8 @@ impl Vm {
             }
             return Ok(None);
         };
-        entry.set_dispatch(
-            0,
-            module_id,
-            target,
-            self.code.modules[module_id].code.as_ptr() as usize,
-            self.code_generation(),
-        );
-        Ok(Some((
-            module_id,
-            target,
-            self.code.modules[module_id].code.as_ptr() as usize,
-        )))
+        entry.set_dispatch(0, module_id, target, self.code_generation());
+        Ok(Some((module_id, target)))
     }
 
     #[inline]

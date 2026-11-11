@@ -64,7 +64,6 @@ fn terms() -> Terms {
         old_index: 1,
         pid,
         dispatch: Default::default(),
-        dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
     let function = b.local_fun(&fun_entry, &[]).unwrap();

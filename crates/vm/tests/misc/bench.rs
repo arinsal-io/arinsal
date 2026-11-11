@@ -3,12 +3,9 @@ use arinsal_vm::Vm;
 use std::process::Command;
 
 #[test]
-fn process_is_send_and_op_is_compact() {
+fn process_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<arinsal_vm::Process>();
-    let size = std::mem::size_of::<arinsal_loader::Instr>();
-    eprintln!("Instr size: {size} bytes");
-    assert!(size <= 24);
 }
 
 #[test]
@@ -29,51 +26,6 @@ fn benchmark_kernels_match_otp_small_cases() {
         compiled.status.success(),
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
-    );
-    let beam = std::fs::read(dir.join("bench.beam")).unwrap();
-    let parsed = arinsal_beam::parse(&beam).unwrap();
-    let loaded = arinsal_loader::load(&parsed).unwrap();
-    let specialized = loaded
-        .code
-        .iter()
-        .filter(|instr| {
-            !matches!(
-                instr,
-                arinsal_loader::Instr::Generic(_) | arinsal_loader::Instr::Unsupported(_)
-            )
-        })
-        .count();
-    eprintln!(
-        "bench.beam specialized {specialized}/{} instructions",
-        loaded.code.len()
-    );
-    let fib_start = loaded.export("fib", 1).unwrap();
-    let fib_end = loaded
-        .functions
-        .iter()
-        .find(|(index, _, _)| *index > fib_start)
-        .unwrap()
-        .0;
-    let fib_code = &loaded.code[fib_start..fib_end];
-    assert!(
-        !fib_code
-            .iter()
-            .any(|instr| matches!(instr, arinsal_loader::Instr::Generic(_)))
-    );
-    assert!(
-        fib_code
-            .iter()
-            .any(|instr| matches!(instr, arinsal_loader::Instr::MoveCallLocal { .. }))
-    );
-    assert!(
-        fib_code
-            .iter()
-            .any(|instr| matches!(instr, arinsal_loader::Instr::DeallocateReturn { .. }))
-    );
-    assert!(
-        fib_code
-            .iter()
-            .any(|instr| matches!(instr, arinsal_loader::Instr::IsLtXCReturn { .. }))
     );
     let mut vm = Vm::new([dir.clone()]);
     for (function, n) in [("fib", 20), ("trees", 12), ("nbody", 100), ("idle", 0)] {
@@ -126,30 +78,6 @@ fn select_tables_match_otp() {
         compiled.status.success(),
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
-    );
-    let beam = std::fs::read(dir.join("select_fast.beam")).unwrap();
-    let parsed = arinsal_beam::parse(&beam).unwrap();
-    let loaded = arinsal_loader::load(&parsed).unwrap();
-    let selects = loaded
-        .code
-        .iter()
-        .filter(|instr| matches!(instr, arinsal_loader::Instr::Select { .. }))
-        .count();
-    assert!(
-        selects >= 2,
-        "compiler emitted only {selects} select instructions"
-    );
-    assert!(
-        loaded
-            .selects
-            .iter()
-            .any(|table| matches!(table, arinsal_loader::SelectTable::Dense { .. }))
-    );
-    assert!(
-        loaded
-            .selects
-            .iter()
-            .any(|table| matches!(table, arinsal_loader::SelectTable::Sorted(_)))
     );
     let mut vm = Vm::new([dir.clone()]);
     for (function, values) in [

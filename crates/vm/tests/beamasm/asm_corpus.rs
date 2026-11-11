@@ -479,7 +479,7 @@ fn otp_and_elixir_corpus_compiles_with_beamasm() {
             std::fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         let beam = arinsal_beam::parse(&bytes)
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let module = arinsal_loader::load(&beam)
+        let module = arinsal_loader::load_native(&beam)
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         let env = CorpusEnv::new(&module);
         match compile_module_with_env(&bytes, &env) {
@@ -545,7 +545,7 @@ fn extended_x_fixtures_compile_with_beamasm() {
         );
         let bytes = std::fs::read(root.join(format!("{module}.beam"))).unwrap();
         let beam = arinsal_beam::parse(&bytes).unwrap();
-        let loaded = arinsal_loader::load(&beam).unwrap();
+        let loaded = arinsal_loader::load_native(&beam).unwrap();
         let env = CorpusEnv::new(&loaded);
         let compiled = compile_module_with_env(&bytes, &env).unwrap();
         assert!(
@@ -604,7 +604,7 @@ fn beamasm_compile_time_per_module() {
         {
             total_raw_ops += beam.code.instructions.len();
         }
-        let loaded = arinsal_loader::load(&beam).unwrap();
+        let loaded = arinsal_loader::load_native(&beam).unwrap();
         let env = CorpusEnv::new(&loaded);
         #[cfg(feature = "bench-alloc-count")]
         let allocation_region = Region::new(GLOBAL_ALLOCATOR);
