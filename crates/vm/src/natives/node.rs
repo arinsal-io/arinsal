@@ -164,17 +164,6 @@ fn call_monitor_node3(
     monitor_node(vm, process, ctx, args[0], args[1], Some(args[2]))
 }
 
-pub(super) fn call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: &[Term],
-) -> Option<Result<Term, VmError>> {
-    handler(module, function, args.len() as u8).map(|handle| handle(vm, process, ctx, args))
-}
-
 pub(crate) fn node(term: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:6217 (node/1), OTP-29.1.1.
     let Some(identity) = term.identity() else {

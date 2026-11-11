@@ -4,6 +4,74 @@
 //! The pointer is chosen once, when the export is created. The call fragment
 //! branches to it with `(c_p, reg, I)`. `invoke_dispatch_bif` is not that pointer.
 
+use arinsal_beamasm::ProcessHeader;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// `BIF_RETTYPE (*)(BIF_ALIST)`: `(c_p, reg, I)`, the term or THE_NON_VALUE (0).
+// Port of erts/emulator/beam/bif.h (BIF_ALIST, BIF_RETTYPE) and erl_bif_table.h (`ErtsBifFunc`),
+// OTP-29.1.1.
+pub(crate) type Bif = extern "C" fn(*mut ProcessHeader, *mut u64, u64) -> u64;
+
+/// A BIF function's address, checked against [`Bif`] where it is taken.
+macro_rules! bif {
+    ($f:expr) => {{
+        let f: $crate::bif_table::Bif = $f;
+        f as usize
+    }};
+}
+pub(crate) use bif;
+
+/// Number of `bif_table` entries: bif.tab plus the dirty continuation BIFs.
+// The five erts_internal:dirty_bif_* continuations follow bif.tab (spec DIRTY_CONTINUATION_BIFS).
+pub(crate) const BIF_SIZE: usize = arinsal_spec::BIFS.len() + 5;
+
+/// `bif_table[bif_number].f`, indexed by `Export.bif_number`. Zero for a BIF whose body is not
+/// reached from native code yet (its export trampoline calls it).
+// Port of erts/emulator/beam/erl_bif_table.c (`bif_table`), OTP-29.1.1. erts generates this
+// array from bif.tab at build time; here each entry is written by `install_bifs` once, as the
+// body each BIF reaches is still chosen per MFA (W2..Wn move bodies to their erts files).
+static BIF_TABLE: [AtomicUsize; BIF_SIZE] = [const { AtomicUsize::new(0) }; BIF_SIZE];
+
+/// Address of `bif_table`, which the call fragments index by `Export.bif_number`.
+pub(crate) fn table_address() -> usize {
+    BIF_TABLE.as_ptr() as usize
+}
+
+/// `bif_table[bif_number].f`, or 0.
+pub(crate) fn function(bif_number: i32) -> usize {
+    usize::try_from(bif_number)
+        .ok()
+        .and_then(|number| BIF_TABLE.get(number))
+        .map_or(0, |f| f.load(Ordering::Acquire))
+}
+
+/// Sets `bif_table[bif_number].f` (install_bifs).
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs), OTP-29.1.1.
+pub(crate) fn install(bif_number: i32, f: usize) {
+    if let Some(entry) = usize::try_from(bif_number)
+        .ok()
+        .and_then(|number| BIF_TABLE.get(number))
+    {
+        entry.store(f, Ordering::Release);
+    }
+}
+
+/// `(Export.info, Export*)` of the BIF being called: the call fragment points `c_p->current`
+/// at the export's info before it calls `bif_table[].f`.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:399-405 (call_light_bif_shared stores
+// `&exp->info.mfa` in `c_p->current`), OTP-29.1.1.
+pub(crate) fn current_export(header: *mut ProcessHeader) -> (u64, u64) {
+    if header.is_null() {
+        return (0, 0);
+    }
+    // SAFETY: `header` is the running process's header, passed by the call fragment.
+    let info = unsafe { (*header).current } as u64;
+    let identity = crate::beamasm_integration::export_from_info(info).map_or(0, |export| {
+        std::sync::Arc::as_ptr(export.export_object()) as u64
+    });
+    (info, identity)
+}
+
 use crate::native_helpers::{
     atom_to_list_light, binary_part_2_light, binary_part_3_light, bit_size_light, byte_size_light,
     erase_1_light, get_1_light, integer_to_binary_light, make_ref_light, node_light,
@@ -52,62 +120,62 @@ pub(crate) fn guard_helper(module: &str, function: &str, arity: u8) -> Option<us
 /// pointer.
 pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> {
     let func = match (module, function, arity) {
-        ("erlang", "whereis", 1) => crate::signals::whereis_light as *const () as usize,
+        ("erlang", "whereis", 1) => bif!(crate::signals::whereis_light),
         ("erlang", "is_process_alive", 1) => {
-            crate::signals::is_process_alive_light as *const () as usize
+            bif!(crate::signals::is_process_alive_light)
         }
-        ("erlang", "process_flag", 2) => process_flag_light as *const () as usize,
+        ("erlang", "process_flag", 2) => bif!(process_flag_light),
         ("erlang", "send_after", 3 | 4) => {
-            crate::native_helpers::timer_start_light::<true> as *const () as usize
+            bif!(crate::native_helpers::timer_start_light::<true>)
         }
         ("erlang", "start_timer", 3 | 4) => {
-            crate::native_helpers::timer_start_light::<false> as *const () as usize
+            bif!(crate::native_helpers::timer_start_light::<false>)
         }
         ("erlang", "cancel_timer", 1 | 2) => {
-            crate::native_helpers::timer_query_light::<true> as *const () as usize
+            bif!(crate::native_helpers::timer_query_light::<true>)
         }
         ("erlang", "read_timer", 1 | 2) => {
-            crate::native_helpers::timer_query_light::<false> as *const () as usize
+            bif!(crate::native_helpers::timer_query_light::<false>)
         }
         ("erlang", "group_leader", 0) => {
-            crate::native_helpers::group_leader_0_light as *const () as usize
+            bif!(crate::native_helpers::group_leader_0_light)
         }
         ("erlang", "process_info", 2) => {
-            crate::native_helpers::process_info_2_light as *const () as usize
+            bif!(crate::native_helpers::process_info_2_light)
         }
         // The C BIFs have direct entries in external.c rather than the generic trap adapter.
         ("erlang", "term_to_binary", 1) => {
-            crate::bif_traps::term_to_binary_1_light as *const () as usize
+            bif!(crate::bif_traps::term_to_binary_1_light)
         }
         ("erlang", "external_size", 1) => {
-            crate::bif_traps::external_size_1_light as *const () as usize
+            bif!(crate::bif_traps::external_size_1_light)
         }
         ("erlang", "binary_to_term", 1) => {
-            crate::bif_traps::binary_to_term_1_light as *const () as usize
+            bif!(crate::bif_traps::binary_to_term_1_light)
         }
-        ("erlang", "put", 2) => put_2_light as *const () as usize,
-        ("erlang", "get", 1) => get_1_light as *const () as usize,
-        ("erlang", "erase", 1) => erase_1_light as *const () as usize,
-        ("erlang", "atom_to_list", 1) => atom_to_list_light as *const () as usize,
-        ("erlang", "integer_to_binary", 1) => integer_to_binary_light as *const () as usize,
-        ("erlang", "byte_size", 1) => byte_size_light as *const () as usize,
-        ("erlang", "bit_size", 1) => bit_size_light as *const () as usize,
+        ("erlang", "put", 2) => bif!(put_2_light),
+        ("erlang", "get", 1) => bif!(get_1_light),
+        ("erlang", "erase", 1) => bif!(erase_1_light),
+        ("erlang", "atom_to_list", 1) => bif!(atom_to_list_light),
+        ("erlang", "integer_to_binary", 1) => bif!(integer_to_binary_light),
+        ("erlang", "byte_size", 1) => bif!(byte_size_light),
+        ("erlang", "bit_size", 1) => bif!(bit_size_light),
         ("erlang", "binary_part", 2) | ("binary", "part", 2) => {
-            binary_part_2_light as *const () as usize
+            bif!(binary_part_2_light)
         }
         ("erlang", "binary_part", 3) | ("binary", "part", 3) => {
-            binary_part_3_light as *const () as usize
+            bif!(binary_part_3_light)
         }
-        ("erlang", "setelement", 3) => setelement_light as *const () as usize,
-        ("erlang", "make_ref", 0) => make_ref_light as *const () as usize,
-        ("erlang", "unique_integer", 0) => unique_integer_0_light as *const () as usize,
-        ("erlang", "unique_integer", 1) => unique_integer_1_light as *const () as usize,
+        ("erlang", "setelement", 3) => bif!(setelement_light),
+        ("erlang", "make_ref", 0) => bif!(make_ref_light),
+        ("erlang", "unique_integer", 0) => bif!(unique_integer_0_light),
+        ("erlang", "unique_integer", 1) => bif!(unique_integer_1_light),
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
-        ("erlang", "self", 0) => self_light as *const () as usize,
-        ("erlang", "node", 0) => node_light as *const () as usize,
-        ("lists", "member", 2) => crate::native_helpers::list_member_entry as *const () as usize,
-        ("persistent_term", "get", 1) => persistent_term_get_1_light as *const () as usize,
-        ("persistent_term", "get", 2) => persistent_term_get_2_light as *const () as usize,
+        ("erlang", "self", 0) => bif!(self_light),
+        ("erlang", "node", 0) => bif!(node_light),
+        ("lists", "member", 2) => bif!(crate::native_helpers::list_member_entry),
+        ("persistent_term", "get", 1) => bif!(persistent_term_get_1_light),
+        ("persistent_term", "get", 2) => bif!(persistent_term_get_2_light),
         ("erlang", "monitor", 2) => sched_entry::<Monitor2>(),
         ("erlang", "monitor", 3) => sched_entry::<Monitor3>(),
         ("erlang", "demonitor", 1) => sched_entry::<Demonitor1>(),
@@ -141,21 +209,21 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
         return arinsal_bifs::visit_bif(module, function, arity, &mut BinaryToListEntry);
     }
     let func = match (module, function, arity) {
-        ("maps", "keys", 1) => trap_bif_entry::<MapsKeys> as *const () as usize,
-        ("maps", "values", 1) => trap_bif_entry::<MapsValues> as *const () as usize,
-        ("maps", "merge", 2) => trap_bif_entry::<MapsMerge> as *const () as usize,
-        ("maps", "from_list", 1) => trap_bif_entry::<MapsFromList> as *const () as usize,
+        ("maps", "keys", 1) => bif!(trap_bif_entry::<MapsKeys>),
+        ("maps", "values", 1) => bif!(trap_bif_entry::<MapsValues>),
+        ("maps", "merge", 2) => bif!(trap_bif_entry::<MapsMerge>),
+        ("maps", "from_list", 1) => bif!(trap_bif_entry::<MapsFromList>),
         ("erlang", "list_to_binary", 1) | ("binary", "list_to_bin", 1) => {
-            trap_bif_entry::<ListToBinary> as *const () as usize
+            bif!(trap_bif_entry::<ListToBinary>)
         }
-        ("erlang", "iolist_to_binary", 1) => trap_bif_entry::<IolistToBinary> as *const () as usize,
-        ("erlang", "iolist_size", 1) => trap_bif_entry::<IolistSize> as *const () as usize,
-        ("erlang", "iolist_to_iovec", 1) => trap_bif_entry::<IolistToIovec> as *const () as usize,
-        ("erlang", "term_to_binary", 1 | 2) => trap_bif_entry::<TermToBinary> as *const () as usize,
-        ("erlang", "phash2", 1) => trap_bif_entry::<Phash2<1>> as *const () as usize,
-        ("erlang", "phash2", 2) => trap_bif_entry::<Phash2<2>> as *const () as usize,
-        ("erlang", "binary_to_term", 1 | 2) => trap_bif_entry::<BinaryToTerm> as *const () as usize,
-        ("lists", "reverse", 2) => crate::native_helpers::list_reverse_entry as *const () as usize,
+        ("erlang", "iolist_to_binary", 1) => bif!(trap_bif_entry::<IolistToBinary>),
+        ("erlang", "iolist_size", 1) => bif!(trap_bif_entry::<IolistSize>),
+        ("erlang", "iolist_to_iovec", 1) => bif!(trap_bif_entry::<IolistToIovec>),
+        ("erlang", "term_to_binary", 1 | 2) => bif!(trap_bif_entry::<TermToBinary>),
+        ("erlang", "phash2", 1) => bif!(trap_bif_entry::<Phash2<1>>),
+        ("erlang", "phash2", 2) => bif!(trap_bif_entry::<Phash2<2>>),
+        ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
+        ("lists", "reverse", 2) => bif!(crate::native_helpers::list_reverse_entry),
         _ => return None,
     };
     Some(func)
@@ -172,7 +240,7 @@ impl arinsal_bifs::BifTableVisitor for AppendEntry {
     type Output = usize;
 
     fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Self::Output {
-        crate::native_helpers::list_append_entry::<B> as *const () as usize
+        bif!(crate::native_helpers::list_append_entry::<B>)
     }
 }
 
@@ -222,17 +290,16 @@ impl arinsal_bifs::BifTableVisitor for Compile {
     type Output = Entry;
     fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Entry {
         Entry {
-            plain: crate::native_helpers::plain_bif_entry::<B> as *const () as usize,
-            list_slice: crate::native_helpers::list_slice_bif_entry::<B> as *const () as usize,
-            list_slice_nonalloc: crate::native_helpers::list_slice_nonalloc_entry::<B> as *const ()
-                as usize,
+            plain: bif!(crate::native_helpers::plain_bif_entry::<B>),
+            list_slice: bif!(crate::native_helpers::list_slice_bif_entry::<B>),
+            list_slice_nonalloc: bif!(crate::native_helpers::list_slice_nonalloc_entry::<B>),
         }
     }
 }
 
 /// `bif_table[].f` of a BIF whose body needs its scheduler's data.
 fn sched_entry<B: crate::native_helpers::SchedBif>() -> usize {
-    crate::native_helpers::sched_bif_light::<B> as *const () as usize
+    bif!(crate::native_helpers::sched_bif_light::<B>)
 }
 
 /// `erlang:monitor/2`. Port of erts/emulator/beam/bif.c (monitor_2), OTP-29.1.1.
@@ -342,6 +409,28 @@ sched_bif!(
 mod tests {
     use super::{entry, special, trap_entry};
 
+    // install_bifs fills `bif_table[ep->bif_number]`; the export itself carries no function.
+    #[test]
+    fn a_bif_export_reaches_its_function_through_bif_number() {
+        let scope = crate::beamasm_integration::new_code_scope();
+        let atoms = arinsal_term::global_atoms();
+        let mfa = (
+            atoms.intern("erlang").expect("atom"),
+            atoms.intern("self").expect("atom"),
+            0,
+        );
+        let export = crate::beamasm_integration::make_export(scope, mfa).expect("export");
+        let number = export.bif_number();
+        let spec = arinsal_spec::bif_lookup("erlang", "self", 0).expect("bif.tab entry");
+        similar_asserts::assert_eq!(number, i32::from(spec.index));
+        similar_asserts::assert_eq!(
+            super::function(number),
+            super::bif!(crate::native_helpers::self_light)
+        );
+        similar_asserts::assert_eq!(super::function(-1), 0);
+        crate::beamasm_integration::release_code_scope(scope);
+    }
+
     #[test]
     fn every_bif_of_arinsal_bifs_has_its_own_entry() {
         let keyfind = entry("lists", "keyfind", 3).expect("keyfind");
@@ -384,15 +473,15 @@ mod tests {
         let direct = [
             (
                 "term_to_binary",
-                crate::bif_traps::term_to_binary_1_light as *const () as usize,
+                bif!(crate::bif_traps::term_to_binary_1_light),
             ),
             (
                 "external_size",
-                crate::bif_traps::external_size_1_light as *const () as usize,
+                bif!(crate::bif_traps::external_size_1_light),
             ),
             (
                 "binary_to_term",
-                crate::bif_traps::binary_to_term_1_light as *const () as usize,
+                bif!(crate::bif_traps::binary_to_term_1_light),
             ),
         ];
         for (function, expected) in direct {

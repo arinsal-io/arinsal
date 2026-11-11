@@ -930,13 +930,7 @@ pub extern "C" fn arinsal_beamasm_process_dictionary_get(
 
 /// `erlang:get/1` from the export's function pointer.
 // Port of erts/emulator/beam/erl_process_dict.c:324-330 (`get_1`), OTP-29.1.1.
-pub(crate) extern "C" fn get_1_light(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-    _entry: u64,
-    _identity: u64,
-) -> u64 {
+pub(crate) extern "C" fn get_1_light(header: *mut ProcessHeader, _regs: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
@@ -954,8 +948,6 @@ pub(crate) extern "C" fn persistent_term_get_1_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    _identity: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
@@ -979,8 +971,6 @@ pub(crate) extern "C" fn persistent_term_get_2_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    _identity: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
@@ -1282,26 +1272,26 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
         }
         let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
         if crate::bif_table::never_allocates(&export.module, &export.function, export.arity) {
-            return Some(own.map_or(plain_bif_light as *const () as usize, |e| {
+            return Some(own.map_or(crate::bif_table::bif!(plain_bif_light), |e| {
                 e.list_slice_nonalloc
             }));
         }
-        return Some(own.map_or(plain_bif_light as *const () as usize, |e| e.list_slice));
+        return Some(own.map_or(crate::bif_table::bif!(plain_bif_light), |e| e.list_slice));
     }
     // The kind is fixed when the export is created (`bif_table[].f`). The call
     // fragment branches to that pointer; it does not walk `invoke_dispatch_bif`.
     if export.light_bif.is_some() {
         let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
-        return Some(own.map_or(plain_bif_light as *const () as usize, |e| e.plain));
+        return Some(own.map_or(crate::bif_table::bif!(plain_bif_light), |e| e.plain));
     }
     if export.light_process_bif.is_some() {
         return Some(
             crate::natives::thin_entry(&export.module, &export.function, export.arity)
-                .unwrap_or(process_bif_light as *const () as usize),
+                .unwrap_or(crate::bif_table::bif!(process_bif_light)),
         );
     }
     if export.direct_ets.is_some() {
-        return Some(direct_bif_light as *const () as usize);
+        return Some(crate::bif_table::bif!(direct_bif_light));
     }
     if export.light_trap_bif.is_some() {
         if let Some(func) =
@@ -1309,7 +1299,7 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
         {
             return Some(func);
         }
-        return Some(trap_bif_light as *const () as usize);
+        return Some(crate::bif_table::bif!(trap_bif_light));
     }
     let bif = export.bif.is_some()
         || matches!(
@@ -1321,7 +1311,7 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
                 | arinsal_loader::ImportClass::Unsupported
         );
     if bif {
-        Some(yield_executor_bif as *const () as usize)
+        Some(crate::bif_table::bif!(yield_executor_bif))
     } else {
         None
     }
@@ -1335,8 +1325,6 @@ pub(crate) extern "C" fn process_flag_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    entry: u64,
-    identity: u64,
 ) -> u64 {
     if let Some(raw) = trap_exit_flag(header, regs) {
         return raw;
@@ -1351,7 +1339,7 @@ pub(crate) extern "C" fn process_flag_light(
     if let Some(raw) = process_flag_ctxfree_light(header) {
         return raw;
     }
-    yield_executor_bif(header, regs, i, entry, identity)
+    yield_executor_bif(header, regs, i)
 }
 
 /// `process_flag/2` for the flags that need no scheduler context.
@@ -1365,13 +1353,7 @@ fn process_flag_ctxfree_light(header: *mut ProcessHeader) -> Option<u64> {
 
 /// `erlang:self/0`. `c_p->common.id`, already the tagged pid on the header.
 // Port of erts/emulator/beam/bif.c (`self_0`), OTP-29.1.1.
-pub(crate) extern "C" fn self_light(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-    _entry: u64,
-    _identity: u64,
-) -> u64 {
+pub(crate) extern "C" fn self_light(header: *mut ProcessHeader, _regs: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
@@ -1387,13 +1369,14 @@ pub(crate) extern "C" fn timer_start_light<const SEND_AFTER: bool>(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _identity) = crate::bif_table::current_export(header);
     if let Some(raw) = timer_start_native(header, descriptor, SEND_AFTER) {
         return raw;
     }
-    yield_executor_bif(header, regs, i, descriptor, identity)
+    yield_executor_bif(header, regs, i)
 }
 
 fn timer_start_native(
@@ -1423,13 +1406,14 @@ pub(crate) extern "C" fn timer_query_light<const CANCEL: bool>(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _identity) = crate::bif_table::current_export(header);
     if let Some(raw) = timer_query_native(header, descriptor, CANCEL) {
         return raw;
     }
-    yield_executor_bif(header, regs, i, descriptor, identity)
+    yield_executor_bif(header, regs, i)
 }
 
 fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool) -> Option<u64> {
@@ -1482,8 +1466,6 @@ pub(crate) extern "C" fn group_leader_0_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
@@ -1493,18 +1475,12 @@ pub(crate) extern "C" fn group_leader_0_light(
     {
         return crate::native_hooks::raw(leader);
     }
-    yield_executor_bif(header, regs, i, descriptor, identity)
+    yield_executor_bif(header, regs, i)
 }
 
 /// `erlang:node/0`.
 // Port of erts/emulator/beam/dist.c:6230 (`node_0`), OTP-29.1.1.
-pub(crate) extern "C" fn node_light(
-    _header: *mut ProcessHeader,
-    _regs: *mut u64,
-    _i: u64,
-    _entry: u64,
-    _identity: u64,
-) -> u64 {
+pub(crate) extern "C" fn node_light(_header: *mut ProcessHeader, _regs: *mut u64, _i: u64) -> u64 {
     crate::native_hooks::raw(crate::natives::node::node_0_term())
 }
 
@@ -1514,9 +1490,10 @@ pub(crate) extern "C" fn yield_executor_bif(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared passes the
     // call's entry address `I`), OTP-29.1.1: the export trampoline passes none.
     let light_call = i != 0;
@@ -1644,9 +1621,10 @@ pub(crate) extern "C" fn atom_to_list_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     if let Some(raw) = atom_to_list_latin1(header) {
         return raw;
     }
@@ -1685,9 +1663,10 @@ pub(crate) extern "C" fn integer_to_binary_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     allocating_bif(header, regs, descriptor, 1, |heap, arg| {
         arinsal_arith::integer_to_binary_decimal(arg, heap).map_err(arith_bif_error)
     })
@@ -1872,9 +1851,10 @@ pub(crate) extern "C" fn byte_size_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     binary_guard_light(
         header,
         descriptor,
@@ -1889,9 +1869,10 @@ pub(crate) extern "C" fn bit_size_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     binary_guard_light(
         header,
         descriptor,
@@ -1906,9 +1887,10 @@ pub(crate) extern "C" fn binary_part_2_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     binary_guard_light(
         header,
         descriptor,
@@ -1923,9 +1905,10 @@ pub(crate) extern "C" fn binary_part_3_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     let Some((process, _)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2012,12 +1995,10 @@ pub(crate) extern "C" fn setelement_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    entry: u64,
-    identity: u64,
 ) -> u64 {
     match setelement_write(header, regs) {
         Some(raw) => raw,
-        None => plain_bif_light(header, regs, i, entry, identity),
+        None => plain_bif_light(header, regs, i),
     }
 }
 
@@ -2067,9 +2048,10 @@ pub(crate) extern "C" fn make_ref_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     if header.is_null() {
         return 0;
     }
@@ -2115,9 +2097,10 @@ pub(crate) extern "C" fn unique_integer_0_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2132,9 +2115,10 @@ pub(crate) extern "C" fn unique_integer_1_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    _identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, _) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2153,9 +2137,10 @@ pub(crate) extern "C" fn plain_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2185,9 +2170,10 @@ pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     instruction: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2217,9 +2203,10 @@ pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2246,9 +2233,10 @@ pub(crate) extern "C" fn list_member_entry(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2323,9 +2311,10 @@ pub(crate) extern "C" fn list_slice_bif_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2349,8 +2338,6 @@ pub(crate) extern "C" fn list_append_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
     if let Some((process, _)) = crate::native_hooks::enter_runtime(header)
         && let Some(value) =
@@ -2358,7 +2345,7 @@ pub(crate) extern "C" fn list_append_entry<B: arinsal_bifs::BifBody>(
     {
         return crate::native_hooks::raw(value);
     }
-    list_slice_bif_entry::<B>(header, regs, i, descriptor, identity)
+    list_slice_bif_entry::<B>(header, regs, i)
 }
 
 /// A process BIF (`c_p` plus the register array), chosen when the export was created.
@@ -2366,9 +2353,10 @@ pub(crate) extern "C" fn process_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2391,9 +2379,10 @@ pub(crate) extern "C" fn send3_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2422,9 +2411,10 @@ pub(crate) extern "C" fn thin_bif_light<B: crate::natives::ThinProcessBif>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2464,9 +2454,10 @@ pub(crate) extern "C" fn direct_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, _)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2487,9 +2478,10 @@ pub(crate) extern "C" fn trap_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2749,9 +2741,10 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     instruction: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -2786,9 +2779,10 @@ pub(crate) extern "C" fn list_reverse_entry(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     // lists_reverse_2: the on-heap loop runs first, straight on the young heap. The fragment
     // installs the result in X0, so only the return value is produced.
     if let Some((process, _)) = crate::native_hooks::enter_runtime(header)
@@ -3826,9 +3820,10 @@ pub(crate) extern "C" fn sched_bif_light<B: SchedBif>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
@@ -5791,13 +5786,11 @@ pub(crate) extern "C" fn process_info_2_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
     if let Some(raw) = process_info_2_self(header) {
         return raw;
     }
-    yield_executor_bif(header, regs, i, descriptor, identity)
+    yield_executor_bif(header, regs, i)
 }
 
 fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {

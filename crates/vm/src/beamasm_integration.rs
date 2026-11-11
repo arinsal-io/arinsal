@@ -359,11 +359,11 @@ impl DispatchRegistry {
             target
                 .slot
                 .set_info(std::ptr::from_ref::<DispatchTarget>(target) as usize);
-            // Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1:
-            // every BIF's export is published with the function `call_light_bif_shared`
-            // branches to. The choice is made once, here, not by the call fragment.
+            // Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs: `bif_table[i].f`
+            // reached through `ep->bif_number = i`), OTP-29.1.1: the call fragments index the
+            // table by the export's bif_number. An export outside bif.tab has no entry.
             if let Some(func) = crate::native_helpers::light_entry(target) {
-                target.slot.set_light_bif_func(func);
+                crate::bif_table::install(target.slot.bif_number(), func);
             }
             target
         })
@@ -477,6 +477,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
                         as usize,
                     light_bif: crate::native_helpers::arinsal_beamasm_call_light_bif_shared
                         as *const () as usize,
+                    bif_table: crate::bif_table::table_address(),
                     light_bif_gc: crate::native_helpers::arinsal_beamasm_light_bif_gc as *const ()
                         as usize,
                     light_gc: light_gc_offsets(),
@@ -1753,8 +1754,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         // SAFETY: `entry` is an export slot address taken from `export_entries`. Slots are
         // leaked when created and never freed, like erts' export entries.
         let slot = unsafe { &*(entry as *const arinsal_beamasm::bif::ExportEntry) };
-        slot.light_bif_func
-            .load(std::sync::atomic::Ordering::Acquire)
+        crate::bif_table::function(slot.bif_number())
     }
     fn breakpoint_fragment(&self) -> usize {
         self.breakpoint_fragment

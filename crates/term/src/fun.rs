@@ -285,13 +285,6 @@ pub struct ExportEntry {
     /// Globally shared zero-environment fun literal for this export.
     // Port of erts/emulator/beam/export.h:62 and export.c:44-56 (Export.lambda), OTP-29.1.1.
     pub(crate) lambda: OnceLock<Term>,
-    /// `extern "C" fn(process, reg, i) -> raw term` for `dynamic_runtime_call` of this BIF.
-    /// Zero means the light-BIF fragment calls the shared helper instead.
-    ///
-    /// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445 (the BIF pointer in ARG8),
-    /// OTP-29.1.1. The call site there embeds the pointer; this word is that pointer,
-    /// loaded from the export the call site already holds.
-    pub light_bif_func: AtomicUsize,
     /// Index into the BIF table, or -1 when this is not a BIF (`Export.bif_number`).
     // Port of erts/emulator/beam/export.h:55 (Export.bif_number), OTP-29.1.1.
     pub bif_number: AtomicI32,
@@ -365,7 +358,6 @@ impl ExportEntry {
             function,
             arity,
             lambda: OnceLock::new(),
-            light_bif_func: AtomicUsize::new(0),
             bif_number: AtomicI32::new(-1),
             // Port of erts/emulator/beam/export.c:85-87 (export_init: op_call_error_handler
             // once the opcodes are initialized), OTP-29.1.1.
@@ -409,16 +401,6 @@ impl ExportEntry {
     /// Sets `trampoline.breakpoint.address` / `trampoline.not_loaded.deferred`.
     pub fn set_trampoline_address(&self, address: usize) {
         self.trampoline.address.store(address, Ordering::Release);
-    }
-
-    /// Publishes the direct light-BIF pointer. Zero keeps the shared helper.
-    pub fn set_light_bif_func(&self, func: usize) {
-        self.light_bif_func.store(func, Ordering::Release);
-    }
-
-    /// Returns the selected native entry for this BIF export, or zero when it has none.
-    pub fn light_bif_func(&self) -> usize {
-        self.light_bif_func.load(Ordering::Acquire)
     }
 
     /// The runtime descriptor word published by [`ExportEntry::set_info`], zero before it.

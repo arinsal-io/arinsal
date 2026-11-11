@@ -4368,15 +4368,3 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<super::
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
     super::listed(IMPLEMENTED, module, function, arity)
 }
-
-pub(crate) fn call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: super::NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    let entry = handler(module, function, u8::try_from(args.len()).ok()?)?;
-    entry(vm, process, ctx, args)
-}

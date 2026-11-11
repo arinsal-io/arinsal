@@ -207,7 +207,11 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64) {
 
 #[test]
 fn apply_bif_reductions_slices_and_gc_match_otp() {
-    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    // The probe runs on one Arinsal scheduler, so the reference runs on one too: with several
+    // schedulers erts' own count of `length_var` varies run to run (381003, 381007, 381011, ...),
+    // while `erl +S 1` gives 381003 every time.
+    let reference =
+        RefErl::start_with_erl_args(&["+S", "1"]).expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, &source(), &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let mut vm = Vm::new([]);

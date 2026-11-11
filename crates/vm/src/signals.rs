@@ -141,9 +141,10 @@ pub(crate) extern "C" fn is_process_alive_light(
     header: *mut arinsal_beamasm::ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (_, identity) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
