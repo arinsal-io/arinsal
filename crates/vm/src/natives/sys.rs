@@ -4278,10 +4278,21 @@ impl GcDefaults {
             min_heap_size: AtomicI64::new(
                 emulator
                     .min_heap_size
-                    .map(|words| next_heap_size(i64::try_from(words).unwrap_or(i64::MAX)))
+                    .map(|words| {
+                        let requested = usize::try_from(words).unwrap_or(usize::MAX);
+                        arinsal_term::erts_next_heap_size(requested, 0).unwrap_or(requested) as i64
+                    })
                     .unwrap_or(233),
             ),
-            min_bin_vheap_size: AtomicI64::new(46_422),
+            min_bin_vheap_size: AtomicI64::new(
+                emulator
+                    .min_binary_heap_size
+                    .map(|words| {
+                        let requested = usize::try_from(words).unwrap_or(usize::MAX);
+                        arinsal_term::erts_next_heap_size(requested, 0).unwrap_or(requested) as i64
+                    })
+                    .unwrap_or(46_422),
+            ),
             // Port of erts/emulator/beam/erl_init.c (erl_start, `ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
             max_gen_gcs: AtomicU32::new(u32::from(
                 std::env::var("ERL_FULLSWEEP_AFTER")
@@ -4373,9 +4384,7 @@ pub(crate) fn normalize_spawn_heap_minimum(
         defaults.min_heap_size()
     } as usize;
     match requested {
-        Some(size) if size > minimum => {
-            next_heap_size(i64::try_from(size).unwrap_or(i64::MAX)) as usize
-        }
+        Some(size) if size > minimum => arinsal_term::normalize_heap_minimum(size, minimum),
         _ => minimum,
     }
 }
@@ -4510,38 +4519,6 @@ fn parse_scheduler_pair(value: &str, cpus: usize) -> Option<(usize, usize)> {
         }),
         cpus,
     )
-}
-
-// Port of erts/emulator/beam/erl_gc.c:265 (heap size table) and :311
-// (erts_next_heap_size), OTP-29.1.1.
-fn next_heap_size(size: i64) -> i64 {
-    static SIZES: OnceLock<Vec<i64>> = OnceLock::new();
-    let sizes = SIZES.get_or_init(|| {
-        let mut sizes = Vec::with_capacity(154);
-        sizes.push(12);
-        sizes.push(38);
-        for index in 2..23 {
-            let next = sizes[index - 1] + sizes[index - 2] + 1;
-            sizes.push(next);
-        }
-        let max = (1i64 << 53) / 8;
-        while sizes.len() < 154 {
-            let prev = *sizes.last().unwrap();
-            let next = prev + prev / 5;
-            if next <= prev || next > max {
-                break;
-            }
-            sizes.push(next);
-        }
-        sizes
-    });
-    if size < sizes[0] {
-        return sizes[0];
-    }
-    match sizes.binary_search(&size) {
-        Ok(index) => sizes[index],
-        Err(index) => sizes.get(index).copied().unwrap_or(*sizes.last().unwrap()),
-    }
 }
 
 fn multi_scheduling(
@@ -4680,7 +4657,8 @@ fn fullsweep_after(process: &Process, value: Term) -> Result<Term, VmError> {
 
 fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
-    let rounded = next_heap_size(requested);
+    let requested = usize::try_from(requested).unwrap_or(usize::MAX);
+    let rounded = arinsal_term::erts_next_heap_size(requested, 0).unwrap_or(requested) as i64;
     let defaults = gc_defaults(process.runtime);
     let slot = if heap {
         &defaults.min_heap_size

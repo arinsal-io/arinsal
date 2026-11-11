@@ -210,8 +210,16 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
         ),
         "ets_limit" => integer(ctx, 8192),
         "fullsweep_after" => tagged_integer(ctx, "fullsweep_after", 65_535),
-        "min_heap_size" => tagged_integer(ctx, "min_heap_size", 233),
-        "min_bin_vheap_size" => tagged_integer(ctx, "min_bin_vheap_size", 46_422),
+        "min_heap_size" => tagged_integer(
+            ctx,
+            "min_heap_size",
+            arinsal_term::erts_next_heap_size(233, 0).unwrap() as i64,
+        ),
+        "min_bin_vheap_size" => tagged_integer(
+            ctx,
+            "min_bin_vheap_size",
+            arinsal_term::erts_next_heap_size(46_422, 0).unwrap() as i64,
+        ),
         "max_heap_size" => {
             let map_items = [
                 (atom("size"), Term::small(0).unwrap()),
@@ -244,8 +252,14 @@ fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
         "garbage_collection" => {
             let entries = [
                 ("max_heap_size", 0),
-                ("min_bin_vheap_size", 46_422),
-                ("min_heap_size", 233),
+                (
+                    "min_bin_vheap_size",
+                    arinsal_term::erts_next_heap_size(46_422, 0).unwrap() as i64,
+                ),
+                (
+                    "min_heap_size",
+                    arinsal_term::erts_next_heap_size(233, 0).unwrap() as i64,
+                ),
                 ("fullsweep_after", 65_535),
             ];
             let mut list = Term::NIL;

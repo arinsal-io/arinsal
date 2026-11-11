@@ -11,7 +11,7 @@ const SOURCE: &str = r#"
 -export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0,
          allocation_gc/0, private_append_info/0, message_binary/0, sub_binary_tails/0,
          match_alias_tails/0, append_trap_magic_orig_size/0, resource_magic_orig_sizes/0,
-         down_split_binary_info/0]).
+         down_split_binary_info/0, heap_minimum_rounding/0]).
 minimum() -> {erlang:system_info(min_bin_vheap_size), process_info(self(), min_bin_vheap_size)}.
 flag() -> Old=process_flag(min_bin_vheap_size, 80000), {Old,process_info(self(), min_bin_vheap_size)}.
 gc_info() ->
@@ -192,6 +192,21 @@ down_split_binary_info() ->
 down_binary_info() ->
     {binary,Binaries}=process_info(self(),binary),
     [{Size,Refc} || {_Address,Size,Refc} <- Binaries].
+heap_minimum_rounding() -> heap_minimum_rounding([1,233,234,1000,100000]).
+heap_minimum_rounding([]) -> [];
+heap_minimum_rounding([N|Ns]) ->
+    Parent=self(),
+    P=spawn_opt(fun() -> Parent!{spawn_info,process_info(self(),[min_heap_size,min_bin_vheap_size])} end,
+                [{min_heap_size,N},{min_bin_vheap_size,N}]),
+    SpawnInfo=receive {spawn_info,I} -> I end,
+    OldHeap=process_flag(min_heap_size,N),
+    OldBin=process_flag(min_bin_vheap_size,N),
+    ProcessInfo=process_info(self(),[min_heap_size,min_bin_vheap_size]),
+    SystemOldHeap=erlang:system_flag(min_heap_size,N),
+    SystemOldBin=erlang:system_flag(min_bin_vheap_size,N),
+    SystemInfo={erlang:system_info(min_heap_size),erlang:system_info(min_bin_vheap_size)},
+    [{N,SpawnInfo,OldHeap,OldBin,ProcessInfo,SystemOldHeap,SystemOldBin,SystemInfo}|
+     heap_minimum_rounding(Ns)].
 alias(<<"FOR1",_/bits>>=C) -> C.
 rest(<<"FOR1",R/bits>>) -> R.
 append_loop(0,Acc) -> Acc;
@@ -230,6 +245,11 @@ fn bin_vheap_system_and_process_minimum_match_otp() {
 #[test]
 fn bin_vheap_process_flag_updates_the_process_minimum() {
     assert_equal("flag");
+}
+
+#[test]
+fn heap_minimum_rounding_matches_otp_for_spawn_process_and_system_flags() {
+    assert_equal("heap_minimum_rounding");
 }
 
 #[test]

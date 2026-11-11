@@ -2980,7 +2980,9 @@ impl ProcessHeap {
 
     /// Set the process minimum used by virtual binary heap growth.
     pub fn set_min_bin_vheap_size(&mut self, words: u64) {
-        let min = words.max(46_422);
+        // Port of bif.c (`process_flag_2`, min_bin_vheap_size), OTP-29.1.1.
+        let requested = usize::try_from(words).unwrap_or(usize::MAX);
+        let min = crate::gc::erts_next_heap_size(requested, 0).unwrap_or(requested) as u64;
         self.bin_vheap_size = self.bin_vheap_size.max(min);
         // erts keeps `min_vheap_size` in the process; the owner box is created only when the
         // value differs from what it already holds (the default for a new process).
