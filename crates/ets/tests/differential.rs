@@ -383,7 +383,9 @@ fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
                         },
                     ],
                 };
-                match table.update_counter(argument, &operations, Some(default)) {
+                let mut counter_heap = VecHeap::new();
+                match table.update_counter(argument, &operations, Some(default), &mut counter_heap)
+                {
                     Ok(values) if name == "counter_list" => list(
                         values
                             .into_iter()
@@ -1093,8 +1095,14 @@ fn counter_variants_against_otp_29() {
         queries.push(tuple(vec![int(key), update]));
         let mut input = VecHeap::new();
         let default = from_owned(&tuple(vec![int(key), int(0)]), &mut input).unwrap();
+        let mut counter_heap = VecHeap::new();
         let result = table
-            .update_counter(Term::small(key).unwrap(), &operations, Some(default))
+            .update_counter(
+                Term::small(key).unwrap(),
+                &operations,
+                Some(default),
+                &mut counter_heap,
+            )
             .unwrap();
         let values = result
             .into_iter()
@@ -1690,6 +1698,7 @@ fn bignum_counters_against_otp_29() {
         .tuple(&[key, big])
         .unwrap();
     table.insert(&[object]).unwrap();
+    let mut counter_heap = VecHeap::new();
     let first = table
         .update_counter(
             key,
@@ -1699,8 +1708,10 @@ fn bignum_counters_against_otp_29() {
                 threshold: None,
             }],
             None,
+            &mut counter_heap,
         )
         .unwrap();
+    let mut counter_heap = VecHeap::new();
     let second = table
         .update_counter(
             key,
@@ -1717,6 +1728,7 @@ fn bignum_counters_against_otp_29() {
                 },
             ],
             None,
+            &mut counter_heap,
         )
         .unwrap();
     let mut output = VecHeap::new();
@@ -1754,6 +1766,7 @@ fn bignum_counter_operands_and_default_key_against_otp_29() {
         .tuple(&[other, Term::small(0).unwrap()])
         .unwrap();
     let big = num_bigint::BigInt::from(1_u8) << 80_usize;
+    let mut counter_heap = VecHeap::new();
     let first = table
         .update_counter_big(
             wanted,
@@ -1763,8 +1776,10 @@ fn bignum_counter_operands_and_default_key_against_otp_29() {
                 threshold: None,
             })],
             Some(default),
+            &mut counter_heap,
         )
         .unwrap();
+    let mut counter_heap = VecHeap::new();
     let second = table
         .update_counter_big(
             wanted,
@@ -1774,6 +1789,7 @@ fn bignum_counter_operands_and_default_key_against_otp_29() {
                 threshold: None,
             })],
             None,
+            &mut counter_heap,
         )
         .unwrap();
     let mut output = VecHeap::new();
@@ -2789,7 +2805,10 @@ fn in_place_counter_update_matches_general_path() {
                         "{kind:?} pair={pair} {operations:?} applied in place"
                     );
                     let mut slow = registry.get_mut(slow_tid).unwrap();
-                    let expected = slow.update_counter(key, operations, None).unwrap();
+                    let mut counter_heap = VecHeap::new();
+                    let expected = slow
+                        .update_counter(key, operations, None, &mut counter_heap)
+                        .unwrap();
                     let slow_rows = slow.lookup(key, &mut output).unwrap();
                     assert_eq!(owned(&values), owned(&expected));
                     assert_eq!(owned(&fast_rows), owned(&slow_rows));
@@ -2848,6 +2867,7 @@ fn single_counter_increment_matches_general_path() {
             .unwrap()
             .update_counter_one_in_place(key, -2)
             .unwrap();
+        let mut counter_heap = VecHeap::new();
         let expected = registry
             .get_mut(slow_tid)
             .unwrap()
@@ -2859,6 +2879,7 @@ fn single_counter_increment_matches_general_path() {
                     threshold: None,
                 }],
                 None,
+                &mut counter_heap,
             )
             .unwrap()[0];
         assert_eq!(actual, expected);

@@ -483,6 +483,20 @@ pub(crate) struct BlockHeap {
 }
 
 impl BlockHeap {
+    /// A heap over `words`, for writing a value over an existing element in place.
+    pub(crate) fn over(words: &mut [u64]) -> Self {
+        Self {
+            base: words.as_mut_ptr(),
+            cap: words.len(),
+            used: 0,
+            off_heap: None,
+        }
+    }
+
+    pub(crate) fn used_words(&self) -> usize {
+        self.used
+    }
+
     fn off_heap(&mut self) -> &mut OffHeap {
         self.off_heap
             .get_or_insert_with(|| Box::new(OffHeap::default()))
