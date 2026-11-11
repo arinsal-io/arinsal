@@ -3050,8 +3050,8 @@ fn call_inner(
                 }
             }
             opts.decentralized_counters = decentralized_counters_option
-                .unwrap_or(opts.decentralized_counters)
-                && opts.write_concurrency != WriteConcurrency::Disabled;
+                .unwrap_or(opts.decentralized_counters);
+            opts.normalize_erts_lock_flags().map_err(err)?;
             // Port of erts/emulator/beam/erl_db.c (ets_new_2), OTP-29.1.1.
             // db_create_table allocates its btid magic binary on this scheduler.
             let tid = registry
