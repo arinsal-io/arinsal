@@ -1905,6 +1905,14 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
                 },
             ]));
             entries.push(option("options", allocator_options(&spec, global)));
+            if let Some(info) = arinsal_alloc::typed::allocator_info(name, index) {
+                entries.push(option("mbcs", allocator_class_info(name, &info.mbcs)));
+                entries.push(option("sbcs", allocator_class_info(name, &info.sbcs)));
+                entries.push(option(
+                    "calls",
+                    allocator_calls_info(name, &info.call_counts),
+                ));
+            }
             O::Tuple(vec![
                 O::Atom("instance".into()),
                 O::Int(index as i64),
@@ -1922,6 +1930,121 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
             tail: Box::new(O::Nil),
         },
     )
+}
+
+/// Builds one carrier-class section returned by `erts_alcu_info`.
+// Port of erts/emulator/beam/erl_alloc_util.c (info_carriers), OTP-29.1.1.
+fn allocator_class_info(
+    allocator: &str,
+    class: &arinsal_alloc::alloc_util::AllocatorClassInfo,
+) -> arinsal_etf::OwnedTerm {
+    use arinsal_etf::OwnedTerm as O;
+
+    let blocks = if class.blocks_max_ever == 0 {
+        O::List {
+            elems: Vec::new(),
+            tail: Box::new(O::Nil),
+        }
+    } else {
+        let entry = |key: &str, now: usize, max: usize, ever: usize| {
+            O::Tuple(vec![
+                O::Atom(key.into()),
+                O::Int(now as i64),
+                O::Int(max as i64),
+                O::Int(ever as i64),
+            ])
+        };
+        O::List {
+            elems: vec![O::Tuple(vec![
+                O::Atom(allocator.into()),
+                O::List {
+                    elems: vec![
+                        entry(
+                            "count",
+                            class.blocks,
+                            class.blocks_max,
+                            class.blocks_max_ever,
+                        ),
+                        entry(
+                            "size",
+                            class.blocks_size,
+                            class.blocks_size_max,
+                            class.blocks_size_max_ever,
+                        ),
+                    ],
+                    tail: Box::new(O::Nil),
+                },
+            ])],
+            tail: Box::new(O::Nil),
+        }
+    };
+    let scalar =
+        |key: &str, value: usize| O::Tuple(vec![O::Atom(key.into()), O::Int(value as i64)]);
+    let series = |key: &str, now: usize, max: usize, ever: usize| {
+        O::Tuple(vec![
+            O::Atom(key.into()),
+            O::Int(now as i64),
+            O::Int(max as i64),
+            O::Int(ever as i64),
+        ])
+    };
+    O::List {
+        elems: vec![
+            O::Tuple(vec![O::Atom("blocks".into()), blocks]),
+            series(
+                "carriers",
+                class.carriers,
+                class.carriers_max,
+                class.carriers_max_ever,
+            ),
+            scalar("mseg_alloc_carriers", class.mseg_alloc_carriers),
+            scalar("sys_alloc_carriers", class.sys_alloc_carriers),
+            series(
+                "carriers_size",
+                class.carriers_size,
+                class.carriers_size_max,
+                class.carriers_size_max_ever,
+            ),
+            scalar("mseg_alloc_carriers_size", class.mseg_alloc_carriers_size),
+            scalar("sys_alloc_carriers_size", class.sys_alloc_carriers_size),
+        ],
+        tail: Box::new(O::Nil),
+    }
+}
+
+/// Builds the allocator call counters returned by `erts_alcu_info`.
+// Port of erts/emulator/beam/erl_alloc_util.c (info_calls), OTP-29.1.1.
+fn allocator_calls_info(
+    allocator: &str,
+    calls: &arinsal_alloc::alloc_util::AllocatorCallCounts,
+) -> arinsal_etf::OwnedTerm {
+    use arinsal_etf::OwnedTerm as O;
+
+    let prefix = allocator.strip_suffix("alloc").unwrap_or(allocator);
+    let entries = [
+        (format!("{prefix}alloc"), calls.alloc),
+        (format!("{prefix}free"), calls.free),
+        (format!("{prefix}realloc"), calls.realloc),
+        ("mseg_alloc".into(), calls.mseg_alloc),
+        ("mseg_dealloc".into(), calls.mseg_dealloc),
+        ("mseg_realloc".into(), calls.mseg_realloc),
+        ("sys_alloc".into(), calls.sys_alloc),
+        ("sys_free".into(), calls.sys_free),
+        ("sys_realloc".into(), calls.sys_realloc),
+    ];
+    O::List {
+        elems: entries
+            .into_iter()
+            .map(|(name, count)| {
+                O::Tuple(vec![
+                    O::Atom(name),
+                    O::Int(count.giga as i64),
+                    O::Int(i64::from(count.count)),
+                ])
+            })
+            .collect(),
+        tail: Box::new(O::Nil),
+    }
 }
 
 fn all_allocator_options(process: &mut Process) -> Result<Term, VmError> {
@@ -6052,10 +6175,99 @@ mod tests {
                         };
                         let selected = elems
                             .iter()
-                            .filter(|item| matches!(item, O::Tuple(parts) if parts.first().is_some_and(|key| matches!(key, O::Atom(name) if name == "options" || name == "versions"))))
-                            .cloned()
+                            .filter_map(|item| {
+                                let O::Tuple(section) = item else {
+                                    return None;
+                                };
+                                let Some(O::Atom(key)) = section.first() else {
+                                    return None;
+                                };
+                                match key.as_str() {
+                                    "options" | "versions" => None,
+                                    "mbcs" | "sbcs" => {
+                                        let O::List { elems, .. } = &section[1] else {
+                                            return None;
+                                        };
+                                        let shape = elems
+                                            .iter()
+                                            .filter_map(|entry| {
+                                                let O::Tuple(parts) = entry else {
+                                                    return None;
+                                                };
+                                                let O::Atom(name) = parts.first()? else {
+                                                    return None;
+                                                };
+                                                let carrier_present = name == "carriers"
+                                                    && matches!(parts.get(1), Some(O::Int(count)) if *count > 0);
+                                                Some(O::Tuple(vec![
+                                                    O::Atom(name.clone()),
+                                                    O::Atom(
+                                                        if carrier_present { "present" } else { "section" }
+                                                            .into(),
+                                                    ),
+                                                ]))
+                                            })
+                                            .collect();
+                                        Some(O::Tuple(vec![
+                                            O::Atom(key.clone()),
+                                            O::List { elems: shape, tail: Box::new(O::Nil) },
+                                        ]))
+                                    }
+                                    "calls" => {
+                                        let O::List { elems, .. } = &section[1] else {
+                                            return None;
+                                        };
+                                        let names = elems
+                                            .iter()
+                                            .filter_map(|entry| match entry {
+                                                O::Tuple(parts) => parts.first().cloned(),
+                                                _ => None,
+                                            })
+                                            .collect();
+                                        Some(O::Tuple(vec![
+                                            O::Atom(key.clone()),
+                                            O::List { elems: names, tail: Box::new(O::Nil) },
+                                        ]))
+                                    }
+                                    _ => None,
+                                }
+                            })
                             .collect();
                         Some(O::Tuple(vec![fields[1].clone(), O::List { elems: selected, tail: Box::new(O::Nil) }]))
+                    })
+                    .collect(),
+                tail: Box::new(O::Nil),
+            }
+        }
+
+        fn project_allocator_options(value: &O) -> O {
+            let O::List { elems, .. } = value else {
+                return value.clone();
+            };
+            O::List {
+                elems: elems
+                    .iter()
+                    .filter_map(|entry| {
+                        let O::Tuple(fields) = entry else {
+                            return None;
+                        };
+                        if fields.len() != 3 {
+                            return None;
+                        }
+                        let O::List { elems, .. } = &fields[2] else {
+                            return None;
+                        };
+                        let sections = elems
+                            .iter()
+                            .filter(|item| {
+                                matches!(item, O::Tuple(parts) if parts.first().is_some_and(|key| matches!(key, O::Atom(name) if name == "options" || name == "versions")))
+                            })
+                            .cloned()
+                            .collect();
+                        Some(O::Tuple(vec![
+                            fields[1].clone(),
+                            O::List { elems: sections, tail: Box::new(O::Nil) },
+                        ]))
                     })
                     .collect(),
                 tail: Box::new(O::Nil),
@@ -6090,6 +6302,11 @@ mod tests {
                 project(&to_owned(actual).unwrap()),
                 project(&default_infos[index]),
                 "{name}"
+            );
+            assert_eq!(
+                project_allocator_options(&to_owned(actual).unwrap()),
+                project_allocator_options(&default_infos[index]),
+                "{name} allocator options"
             );
         }
 
@@ -6182,8 +6399,8 @@ mod tests {
         assert_eq!(actual_infos.len(), expected_infos.len());
         for (actual, expected) in actual_infos.iter().zip(expected_infos) {
             assert_eq!(
-                project(actual),
-                project(expected),
+                project_allocator_options(actual),
+                project_allocator_options(expected),
                 "allocator options with +M switches"
             );
         }
@@ -6210,8 +6427,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            project(&to_owned(actual).unwrap()),
-            project(&flagged_expected[1]),
+            project_allocator_options(&to_owned(actual).unwrap()),
+            project_allocator_options(&flagged_expected[1]),
             "mseg allocator options with +MM switches"
         );
 
@@ -6239,8 +6456,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            project(&to_owned(actual).unwrap()),
-            project(&test_expected),
+            project_allocator_options(&to_owned(actual).unwrap()),
+            project_allocator_options(&test_expected),
             "enabled test allocator options"
         );
         arinsal_args::configure_allocator_options(arinsal_args::ActiveAllocatorOptions::default());
