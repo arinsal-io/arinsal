@@ -4215,7 +4215,6 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
     // Persistent get/0's snapshot retains a table generation and its literals.
     if let Some(cold) = process.cold.as_mut() {
         cold.persistent_get_all = None;
-        cold.persistent_update_result = None;
     }
     // Port of erl_nif.c:2323 (`ERTS_PSFLG_EXITING` on the process).
     let _ =

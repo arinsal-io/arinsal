@@ -1413,12 +1413,6 @@ pub(crate) struct ProcessCold {
     pub(crate) off_heap_msgq: bool,
     /// Stable snapshot and cursor for a trapped `persistent_term:get/0` call.
     pub(crate) persistent_get_all: Option<Box<PersistentGetAll>>,
-    /// Result of a published `persistent_term` update, returned when the yielded
-    /// updater runs again (erts resumes the suspended updater after `table_updater`).
-    pub(crate) persistent_update_result: Option<Term>,
-    /// Modules a suspended `finish_loading/1` staged; the thread-progress callback commits
-    /// them and releases code-load permission before rescheduling the loader.
-    pub(crate) finish_loading_commit: Option<Box<crate::load::StagedLoad>>,
     /// Result of `delete_module/1` retained until its code barrier commits the index.
     pub(crate) delete_module_result: Option<Term>,
     /// Breakpoint update a trace BIF caller finishes between code barriers while it holds

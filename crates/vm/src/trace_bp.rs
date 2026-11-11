@@ -563,6 +563,19 @@ pub(crate) fn module_code_changed(process: &Process, code: u64, module: &str) {
     }
 }
 
+/// Whether functions of `module` in code scope `code` have breakpoints
+/// (`modp->curr.num_breakpoints > 0`).
+pub(crate) fn module_has_breakpoints(process: &Process, code: u64, module: &str) -> bool {
+    let node = bp_node(process);
+    if !node.has_entries() {
+        return false;
+    }
+    let _permission = node.lock();
+    module_cells(module)
+        .iter()
+        .any(|cell| cell.read().iter().any(|g| g.code == code))
+}
+
 /// Port of erts/emulator/beam/beam_bp.c:2145-2295 (set_function_break), OTP-29.1.1, for the
 /// staging copy of one session's breakpoint of one function.
 fn set_function_break(
