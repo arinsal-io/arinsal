@@ -288,6 +288,20 @@ impl Executor {
                             process.cold.as_ref().and_then(|cold| cold.native_dirty_nif)
                             && scheduler_class(ctx.scheduler_type()) == class
                         {
+                            // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif: the
+                            // finished call schedules `dirty_nif_finalizer/1` or
+                            // `dirty_nif_exception/1`), OTP-29.1.1: the dirty scheduler only runs
+                            // the NIF. Its result or exception is taken on the normal scheduler
+                            // the process returns to, so no Erlang code (an exception handler
+                            // included) runs on the dirty scheduler.
+                            if ctx.scheduler_type().is_dirty() && process.dirty_nif_done() {
+                                process.slice_mut().native_dirty_nif = Some((
+                                    identity,
+                                    resume_pc,
+                                    arinsal_bifs::SchedulerClass::Normal,
+                                ));
+                                break Ok(RunState::Yield);
+                            }
                             process.slice_mut().native_dirty_nif = None;
                             match crate::native_helpers::run_static_nif(process, identity) {
                                 Ok(value) => {

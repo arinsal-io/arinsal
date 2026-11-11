@@ -185,6 +185,20 @@ impl Process {
             .is_some_and(|cold| matches!(cold.dirty_bif, Some(DirtyBif::Done(_))))
     }
 
+    /// A dirty NIF job finished: its result or exception waits in the process for the normal
+    /// scheduler (`dirty_nif_finalizer/1` or `dirty_nif_exception/1` scheduled by
+    /// `erts_call_dirty_nif`).
+    // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1.
+    pub(crate) fn dirty_nif_done(&self) -> bool {
+        self.cold.as_ref().is_some_and(|cold| {
+            cold.static_nif_done.is_some()
+                || cold
+                    .nif_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.is_done())
+        })
+    }
+
     pub(crate) fn dirty_bif_scheduled(&self) -> bool {
         self.cold.as_ref().is_some_and(|cold| {
             matches!(cold.dirty_bif, Some(DirtyBif::Job(..) | DirtyBif::Done(_)))
