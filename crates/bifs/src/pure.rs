@@ -2260,6 +2260,17 @@ fn math_result(ctx: &mut Ctx<'_>, result: f64) -> Result<Term, BifError> {
         .float(result)
         .expect("infallible BIF heap"))
 }
+fn math_errno_result(
+    ctx: &mut Ctx<'_>,
+    (result, errno_error): (f64, bool),
+) -> Result<Term, BifError> {
+    if errno_error || !result.is_finite() {
+        return Err(BifError::Badarith);
+    }
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .float(result)
+        .expect("infallible BIF heap"))
+}
 macro_rules! math_unary {
     ($($name:ident => $result:ident => $method:expr),* $(,)?) => {$(
         fn $result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -2267,48 +2278,32 @@ macro_rules! math_unary {
         }
     )*};
 }
-// OTP's math BIFs call the platform libm. These three Rust/libm-crate
-// implementations round differently on macOS, including observable last bits.
-#[link(name = "m")]
-unsafe extern "C" {
-    fn atanh(x: f64) -> f64;
-    fn erf(x: f64) -> f64;
-    fn erfc(x: f64) -> f64;
+fn math_asin_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    math_errno_result(ctx, crate::math::asin_errno(numeric_float(args[0])?))
 }
-fn c_atanh(x: f64) -> f64 {
-    // SAFETY: The C math function accepts and returns a plain IEEE 754 double.
-    unsafe { atanh(x) }
-}
-fn c_erf(x: f64) -> f64 {
-    // SAFETY: The C math function accepts and returns a plain IEEE 754 double.
-    unsafe { erf(x) }
-}
-fn c_erfc(x: f64) -> f64 {
-    // SAFETY: The C math function accepts and returns a plain IEEE 754 double.
-    unsafe { erfc(x) }
+fn math_acos_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    math_errno_result(ctx, crate::math::acos_errno(numeric_float(args[0])?))
 }
 math_unary!(
-    math_cos => math_cos_result => f64::cos,
-    math_cosh => math_cosh_result => f64::cosh,
-    math_sin => math_sin_result => f64::sin,
-    math_sinh => math_sinh_result => f64::sinh,
-    math_tan => math_tan_result => f64::tan,
-    math_tanh => math_tanh_result => f64::tanh,
-    math_acos => math_acos_result => f64::acos,
-    math_acosh => math_acosh_result => f64::acosh,
-    math_asin => math_asin_result => f64::asin,
-    math_asinh => math_asinh_result => f64::asinh,
-    math_atan => math_atan_result => f64::atan,
-    math_atanh => math_atanh_result => c_atanh,
-    math_erf => math_erf_result => c_erf,
-    math_erfc => math_erfc_result => c_erfc,
-    math_exp => math_exp_result => f64::exp,
-    math_log => math_log_result => f64::ln,
-    math_log2 => math_log2_result => f64::log2,
-    math_log10 => math_log10_result => f64::log10,
-    math_sqrt => math_sqrt_result => f64::sqrt,
-    math_floor => math_floor_result => f64::floor,
-    math_ceil => math_ceil_result => f64::ceil,
+    math_cos => math_cos_result => crate::math::cos,
+    math_cosh => math_cosh_result => crate::math::cosh,
+    math_sin => math_sin_result => crate::math::sin,
+    math_sinh => math_sinh_result => crate::math::sinh,
+    math_tan => math_tan_result => crate::math::tan,
+    math_tanh => math_tanh_result => crate::math::tanh,
+    math_acosh => math_acosh_result => crate::math::acosh,
+    math_asinh => math_asinh_result => crate::math::asinh,
+    math_atan => math_atan_result => crate::math::atan,
+    math_atanh => math_atanh_result => crate::math::atanh,
+    math_erf => math_erf_result => crate::math::erf,
+    math_erfc => math_erfc_result => crate::math::erfc,
+    math_exp => math_exp_result => crate::math::exp,
+    math_log => math_log_result => crate::math::log,
+    math_log2 => math_log2_result => crate::math::log2,
+    math_log10 => math_log10_result => crate::math::log10,
+    math_sqrt => math_sqrt_result => crate::math::sqrt,
+    math_floor => math_floor_result => crate::math::floor,
+    math_ceil => math_ceil_result => crate::math::ceil,
 );
 macro_rules! math_binary {
     ($($name:ident => $result:ident => $method:expr),* $(,)?) => {$(
@@ -2318,9 +2313,9 @@ macro_rules! math_binary {
     )*};
 }
 math_binary!(
-    math_atan2 => math_atan2_result => f64::atan2,
-    math_pow => math_pow_result => f64::powf,
-    math_fmod => math_fmod_result => |x: f64, y: f64| x % y,
+    math_atan2 => math_atan2_result => crate::math::atan2,
+    math_pow => math_pow_result => crate::math::pow,
+    math_fmod => math_fmod_result => crate::math::fmod,
 );
 
 macro_rules! word_adapter {

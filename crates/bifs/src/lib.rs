@@ -29,6 +29,7 @@ mod dirty;
 mod etf;
 mod lists;
 mod maps_bifs;
+mod math;
 mod pure;
 mod raw;
 mod sys;
