@@ -2899,8 +2899,7 @@ impl TrapBody for BinaryToTerm {
     }
 }
 
-type NativeBifEntry =
-    extern "C" fn(*mut arinsal_beamasm::ProcessHeader, *mut u64, u64, u64, u64) -> u64;
+type NativeBifEntry = crate::bif_table::Bif;
 
 /// Calls an arity-one external-term BIF without constructing the generic trap-body adapter.
 // Port of erts/emulator/beam/external.c (term_to_binary_1, external_size_1,
@@ -2923,7 +2922,7 @@ where
         return 0;
     };
     if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
-        return fallback(header, regs, instruction, descriptor, identity);
+        return fallback(header, regs, instruction);
     }
     let gc_was_enabled = process.heap.gc_enabled;
     let result = run(process, &registers.x_reg_array[..1], gc_was_enabled);
@@ -2952,9 +2951,10 @@ pub(crate) extern "C" fn term_to_binary_1_light(
     header: *mut arinsal_beamasm::ProcessHeader,
     regs: *mut u64,
     instruction: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     direct_external_term_entry(
         header,
         regs,
@@ -2976,9 +2976,10 @@ pub(crate) extern "C" fn external_size_1_light(
     header: *mut arinsal_beamasm::ProcessHeader,
     regs: *mut u64,
     instruction: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     direct_external_term_entry(
         header,
         regs,
@@ -2996,9 +2997,10 @@ pub(crate) extern "C" fn binary_to_term_1_light(
     header: *mut arinsal_beamasm::ProcessHeader,
     regs: *mut u64,
     instruction: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
+    // finds its export through `c_p->current`, which the call fragment set.
+    let (descriptor, identity) = crate::bif_table::current_export(header);
     direct_external_term_entry(
         header,
         regs,

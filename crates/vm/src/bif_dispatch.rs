@@ -94,7 +94,7 @@ impl Vm {
                 fun(self, p, ctx, module, function, args)
             }
             Some(natives::NativeEntry::Resolved(fun)) => fun(self, p, ctx, args),
-            None => natives::call(self, p, ctx, module, function, args),
+            None => None,
         }
     }
 }

@@ -187,9 +187,10 @@ pub const EXPORT_ARITY_OFFSET: u32 = core::mem::offset_of!(ExportEntry, arity) a
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391, OTP-29.1.1.
 pub const EXPORT_IS_BIF_TRACED_OFFSET: u32 =
     core::mem::offset_of!(ExportEntry, is_bif_traced) as u32;
-/// Byte offset of [`ExportEntry::light_bif_func`].
-pub const EXPORT_LIGHT_BIF_OFFSET: u32 = core::mem::offset_of!(ExportEntry, light_bif_func) as u32;
-const _: () = assert!(EXPORT_LIGHT_BIF_OFFSET.is_multiple_of(8));
+/// Byte offset of [`ExportEntry::bif_number`] (a 32-bit signed index, -1 for a non-BIF).
+// Port of erts/emulator/beam/export.h:55 (Export.bif_number), OTP-29.1.1.
+pub const EXPORT_BIF_NUMBER_OFFSET: u32 = core::mem::offset_of!(ExportEntry, bif_number) as u32;
+const _: () = assert!(EXPORT_BIF_NUMBER_OFFSET.is_multiple_of(4));
 
 // erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
 // BIFs never allocate on the process heap. This port's BIFs may build terms on the heap, so the

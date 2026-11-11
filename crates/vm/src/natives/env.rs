@@ -144,17 +144,6 @@ fn call_set_signal(
     set_signal(process, ctx, args[0], args[1])
 }
 
-pub(super) fn call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: &[Term],
-) -> Option<Result<Term, VmError>> {
-    handler(module, function, args.len() as u8).map(|handle| handle(vm, process, ctx, args))
-}
-
 fn text(term: Term) -> Result<String, VmError> {
     let mut out = String::new();
     let mut cursor = term;

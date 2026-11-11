@@ -85,6 +85,8 @@ pub struct DispatchRuntimeHelpers {
     pub export: usize,
     /// Shared light-BIF helper.
     pub light_bif: usize,
+    /// `bif_table`: one `(c_p, reg, I)` function per `Export.bif_number`, zero for none.
+    pub bif_table: usize,
     /// Collection helper run when a light BIF's result leaves a collection desired
     /// (`erts_gc_after_bif_call_lhf`). Zero disables the inline GC-desired test.
     pub light_bif_gc: usize,
@@ -200,6 +202,7 @@ impl DispatchFragments {
         Self::with_line_breakpoint_helpers(DispatchRuntimeHelpers {
             export: export_helper,
             light_bif: light_bif_helper,
+            bif_table: 0,
             // Without a collection helper the GC-desired test never fires: a test header
             // publishes zero fragment and binary sizes.
             light_bif_gc: 0,
@@ -222,6 +225,7 @@ impl DispatchFragments {
         let DispatchRuntimeHelpers {
             export: export_helper,
             light_bif: light_bif_helper,
+            bif_table,
             light_bif_gc: light_bif_gc_helper,
             light_gc: light_gc_offsets,
             exception_resolver,
@@ -257,6 +261,7 @@ impl DispatchFragments {
         emit_export_fragment(
             &mut code,
             export_helper,
+            bif_table,
             call_error_handler,
             light_bif_gc_helper,
             light_gc_offsets,
@@ -884,6 +889,7 @@ fn emit_gc_desired_test(
 fn emit_export_fragment(
     code: &mut CodeBuffer,
     helper: usize,
+    bif_table: usize,
     error_handler_helper: usize,
     gc_helper: usize,
     gc: LightGcOffsets,
@@ -960,9 +966,14 @@ fn emit_export_fragment(
     let return_term = code.new_label();
     code.emit(|encoder| {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776 (call_bif_shared),
-        // OTP-29.1.1: a BIF export calls `bif_table[].f` directly. The pointer is the
-        // one published on the export; zero stays on the helper (ordinary remote calls).
-        encoder.ldr_uoff(Gpr::x(8), Gpr::x(0), crate::bif::EXPORT_LIGHT_BIF_OFFSET)
+        // OTP-29.1.1: a BIF export calls `bif_table[ep->bif_number].f` directly. A non-BIF
+        // export (bif_number -1) or a table entry without a function stays on the helper.
+        encoder.ldr_uoff(Gpr::w(9), Gpr::x(0), crate::bif::EXPORT_BIF_NUMBER_OFFSET)
+    })?;
+    code.tbnz(Gpr::w(9), 31, helper_call)?;
+    code.emit(|encoder| {
+        encoder.mov_const(Gpr::x(8), bif_table as u64)?;
+        encoder.ldr_regoff(Gpr::x(8), Gpr::x(8), Gpr::x(9), 3)
     })?;
     code.cbz(Gpr::x(8), helper_call)?;
     code.emit(|encoder| {
@@ -984,9 +995,8 @@ fn emit_export_fragment(
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        // c_p->arity from the export, then (c_p, reg, I, Export.info). x4 is the Export*
-        // the call site loaded. `info` is the descriptor, the same word the helper path
-        // loads; the BIF does not look the export up.
+        // c_p->arity from the export, c_p->current = &Export.info, then `(c_p, reg, I)`:
+        // the BIF finds its export through `c_p->current`.
         encoder.ldrb_uoff(Gpr::w(9), Gpr::x(0), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
         encoder.strb_uoff(Gpr::w(9), Gpr::x(21), 80)?;
         encoder.ldr_uoff(Gpr::x(3), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
@@ -997,7 +1007,6 @@ fn emit_export_fragment(
             Gpr::x(21),
             std::mem::offset_of!(crate::ProcessHeader, current) as u32,
         )?;
-        encoder.mov_reg(Gpr::x(4), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
         // No call-site entry address: only `call_light_bif_shared` passes `I`.
@@ -1354,14 +1363,11 @@ fn emit_call_light_bif_shared(
     } else {
         code.emit(|encoder| {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445, OTP-29.1.1:
-            // `dynamic_runtime_call<3>(ARG8)` of the BIF itself. (c_p, reg, I, Export.info).
-            // x19 is the register array and ARG3 the entry the call site loaded. `info` is
-            // the descriptor, the same word the helper path loads; the BIF does not look
-            // the export up, and takes it from x4.
+            // `dynamic_runtime_call<3>(ARG8)` of the BIF itself: `(c_p, reg, I)`. x19 is the
+            // register array and ARG3 the entry the call site loaded; the BIF finds its
+            // export through `c_p->current`, stored above.
             encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
             encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
-            encoder.mov_reg(Gpr::x(4), Gpr::x(3))?;
-            encoder.ldr_uoff(Gpr::x(3), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
             encoder.blr(Gpr::x(7))
         })?;
     }

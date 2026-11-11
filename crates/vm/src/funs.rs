@@ -806,7 +806,7 @@ impl Vm {
                 module,
                 native_function,
                 arity,
-                (ImportClass::Dynamic, 0),
+                crate::natives::native_entry(module, native_function, arity as u8),
             )
         {
             let result = match result {

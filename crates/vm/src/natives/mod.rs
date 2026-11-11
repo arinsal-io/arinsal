@@ -142,68 +142,6 @@ pub(crate) type NativeFamily = fn(
     args: NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>>;
 
-/// Registered families, tried in order.
-pub(crate) const FAMILIES: &[NativeFamily] = &[
-    // One family per line keeps parallel additions conflict-free.
-    code::call,
-    erl_debugger::call,
-    erts_debug::call,
-    dist::call,
-    misc::call,
-    // The ETS family also owns erlang:match_spec_test/3 and erts_internal ETS BIFs.
-    ets::call,
-    crate::seq_trace::call,
-    nif::call,
-    re::call,
-    node_call,
-    port_call,
-    sys::call,
-    env_call,
-    proc::call,
-    tty::call,
-    maps_call,
-    records::call,
-];
-
-fn node_call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    args.with_values(process, |process, values| {
-        node::call(vm, process, ctx, module, function, values)
-    })
-}
-
-fn env_call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    args.with_values(process, |process, values| {
-        env::call(vm, process, ctx, module, function, values)
-    })
-}
-
-fn maps_call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    args.with_values(process, |process, values| {
-        maps::call(vm, process, ctx, module, function, values)
-    })
-}
-
 fn port_call(
     vm: &mut Vm,
     process: &mut Process,
@@ -384,19 +322,19 @@ pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usiz
     if module == "erlang" {
         match (function, arity) {
             ("send", 3) => {
-                return Some(crate::native_helpers::send3_bif_light as *const () as usize);
+                return Some(crate::bif_table::bif!(
+                    crate::native_helpers::send3_bif_light
+                ));
             }
             ("port_get_data", 1) => {
-                return Some(
-                    crate::native_helpers::thin_bif_light::<crate::port::PortGetData> as *const ()
-                        as usize,
-                );
+                return Some(crate::bif_table::bif!(
+                    crate::native_helpers::thin_bif_light::<crate::port::PortGetData>
+                ));
             }
             ("port_set_data", 2) => {
-                return Some(
-                    crate::native_helpers::thin_bif_light::<crate::port::PortSetData> as *const ()
-                        as usize,
-                );
+                return Some(crate::bif_table::bif!(
+                    crate::native_helpers::thin_bif_light::<crate::port::PortSetData>
+                ));
             }
             _ => {}
         }
@@ -616,8 +554,68 @@ pub(crate) fn unpack_native(bits: usize) -> Option<NativeEntry> {
     }
 }
 
-/// Classify an import the way `call_import` used to scan families, once.
+/// `(ImportClass, packed NativeEntry)` of every bif.tab entry, indexed by `bif_number`.
+///
+/// Port of erts/emulator/beam/erl_bif_table.c (`bif_table`, one entry per bif.tab line, found by
+/// `Export.bif_number`), OTP-29.1.1. A call that names a BIF reads its entry here; the per-family
+/// name tables only build it once.
+fn native_table() -> &'static [(arinsal_loader::ImportClass, usize)] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<(arinsal_loader::ImportClass, usize)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = vec![(arinsal_loader::ImportClass::Remote, 0); crate::bif_table::BIF_SIZE];
+        for line in include_str!("../../../../spec/otp-29.1.1/bif.tab").lines() {
+            let Some((module, function, arity)) = crate::load::parse_bif_mfa(line) else {
+                continue;
+            };
+            if let Some(spec) = arinsal_spec::bif_lookup(&module, &function, arity) {
+                let has_bif = arinsal_bifs::lookup(&module, &function, arity).is_some();
+                table[usize::from(spec.index)] =
+                    classify_by_name(&module, &function, arity, has_bif);
+            }
+        }
+        table
+    })
+}
+
+/// The native entry of `module:function/arity`: the BIF table's when it is a BIF, else the
+/// classification of a NIF or Erlang function the runtime implements.
+pub(crate) fn native_entry(
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> (arinsal_loader::ImportClass, usize) {
+    match arinsal_spec::bif_lookup(module, function, arity) {
+        Some(spec) if usize::from(spec.index) < crate::bif_table::BIF_SIZE => {
+            native_table()[usize::from(spec.index)]
+        }
+        _ => classify_by_name(
+            module,
+            function,
+            arity,
+            arinsal_bifs::lookup(module, function, arity).is_some(),
+        ),
+    }
+}
+
+/// Classify an import once, at load.
 pub(crate) fn classify(
+    module: &str,
+    function: &str,
+    arity: u8,
+    has_bif: bool,
+) -> (arinsal_loader::ImportClass, usize) {
+    if let Some(spec) = arinsal_spec::bif_lookup(module, function, arity)
+        && usize::from(spec.index) < crate::bif_table::BIF_SIZE
+    {
+        return native_table()[usize::from(spec.index)];
+    }
+    classify_by_name(module, function, arity, has_bif)
+}
+
+/// Classify an import by name: the generator of [`native_table`], and the lookup of a native
+/// that is not in bif.tab.
+fn classify_by_name(
     module: &str,
     function: &str,
     arity: u8,
@@ -776,20 +774,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
         return Some(NativeEntry::DirectFamily(sys::call));
     }
     None
-}
-
-/// Dispatch a call to the first family that implements it.
-pub(crate) fn call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    FAMILIES
-        .iter()
-        .find_map(|family| family(vm, process, ctx, module, function, args))
 }
 
 #[cfg(test)]

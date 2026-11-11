@@ -619,7 +619,7 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<sup
 /// The light-BIF call site entry for `erts_internal:map_next/3`.
 pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     match (module, function, arity) {
-        ("erts_internal", "map_next", 3) => Some(map_next_light as *const () as usize),
+        ("erts_internal", "map_next", 3) => Some(crate::bif_table::bif!(map_next_light)),
         _ => None,
     }
 }
@@ -635,13 +635,11 @@ extern "C" fn map_next_light(
     header: *mut arinsal_beamasm::ProcessHeader,
     regs: *mut u64,
     i: u64,
-    descriptor: u64,
-    identity: u64,
 ) -> u64 {
     if let Some(raw) = map_next_native(header) {
         return raw;
     }
-    crate::native_helpers::thin_bif_light::<MapNext>(header, regs, i, descriptor, identity)
+    crate::native_helpers::thin_bif_light::<MapNext>(header, regs, i)
 }
 
 /// Run OTP's flatmap iterator branch directly against the native heap top.
@@ -691,15 +689,4 @@ fn call_map_next(
     args: &[Term],
 ) -> Result<Term, VmError> {
     map_next(process, args).map_err(VmError::Trap)
-}
-
-pub(crate) fn call(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    module: &str,
-    function: &str,
-    args: &[Term],
-) -> Option<Result<Term, VmError>> {
-    handler(module, function, args.len() as u8).map(|handle| handle(vm, process, ctx, args))
 }

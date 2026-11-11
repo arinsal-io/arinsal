@@ -492,7 +492,7 @@ impl ExportIndex {
     }
 }
 
-fn parse_bif_mfa(line: &str) -> Option<(String, String, u8)> {
+pub(crate) fn parse_bif_mfa(line: &str) -> Option<(String, String, u8)> {
     let line = line.split('#').next()?.trim();
     let mut parts = line.split_whitespace();
     let kind = parts.next()?;
