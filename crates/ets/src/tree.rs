@@ -4,6 +4,8 @@ use crate::dbterm::{
     DbTreeStack, Link, SlotSearch, StackStorage, join_trees, slot_search, split_tree, tree_insert,
     tree_linkout, tree_put,
 };
+use crate::flxctr::FlxCtr;
+use crate::{MEM_COUNTER_ID, NITEMS_COUNTER_ID};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -34,8 +36,8 @@ impl<T> TreeStack<T> {
 /// the static slot stack (`DbTableTree.static_stack`) the `ets:slot/2` walk keeps between calls.
 pub(super) struct TreeRoot {
     root: Link,
-    nitems: usize,
-    memory_words: isize,
+    /// `DbTableTree.common.counters`. CA-tree base nodes keep none: the CA-tree table counts.
+    counters: Option<FlxCtr>,
     /// Bumped by every change of the tree; the stack is only valid for the version it was made at.
     version: u64,
     stack: parking_lot::Mutex<DbTreeStack>,
@@ -48,15 +50,23 @@ impl Default for TreeRoot {
 }
 
 impl TreeRoot {
+    /// An empty tree table; its centralized counters hold the item count and the object memory
+    /// (`erts_flxctr_init(.., 0, 2, ..)` of `ets:new/2`, a tree table is never decentralized).
     pub(super) fn new() -> Self {
-        Self::from_link(None, 0)
+        let mut tree = Self::from_link(None);
+        tree.counters = Some(FlxCtr::new(false, 2));
+        tree
     }
 
-    pub(super) fn from_link(root: Link, nitems: usize) -> Self {
+    /// An empty CA-tree base node tree.
+    pub(super) fn base() -> Self {
+        Self::from_link(None)
+    }
+
+    pub(super) fn from_link(root: Link) -> Self {
         Self {
             root,
-            nitems,
-            memory_words: 0,
+            counters: None,
             version: 0,
             stack: parking_lot::Mutex::new(DbTreeStack::new()),
         }
@@ -69,7 +79,30 @@ impl TreeRoot {
 
     /// `NITEMS` of a plain tree table. CA-tree base nodes do not keep it.
     pub(super) fn count(&self) -> usize {
-        self.nitems
+        self.counters.as_ref().map_or(0, |counters| {
+            counters.read_centralized(NITEMS_COUNTER_ID) as usize
+        })
+    }
+
+    /// `ERTS_DB_TABLE_NITEMS_COUNTER_ID` update of a plain tree table.
+    fn add_nitems(&self, to_add: isize) {
+        if let Some(counters) = &self.counters {
+            counters.add(NITEMS_COUNTER_ID, to_add);
+        }
+    }
+
+    /// `ERTS_DB_ALC_MEM_UPDATE_` of a plain tree table.
+    fn add_memory(&self, words: isize) {
+        if let Some(counters) = &self.counters {
+            counters.add(MEM_COUNTER_ID, words);
+        }
+    }
+
+    /// The counters of a plain tree table (`DbTableCommon.counters`).
+    pub(super) fn counters(&self) -> &FlxCtr {
+        self.counters
+            .as_ref()
+            .expect("only a plain tree table has counters")
     }
 
     /// Whether the AVL root has fewer than two nodes, as checked before a CA-tree split.
@@ -82,14 +115,20 @@ impl TreeRoot {
 
     /// `ERTS_DB_TABLE_MEM_COUNTER_ID` of a plain tree table (`erl_db.h:167`).
     pub(super) fn object_memory_words(&self) -> isize {
-        self.memory_words
+        self.counters
+            .as_ref()
+            .map_or(0, |counters| counters.read_centralized(MEM_COUNTER_ID))
     }
 
     /// Detach the whole tree.
     pub(super) fn take(&mut self) -> (Link, usize) {
         self.version += 1;
-        self.memory_words = 0;
-        (self.root.take(), std::mem::take(&mut self.nitems))
+        let nitems = self.count();
+        if let Some(counters) = &self.counters {
+            counters.reset(MEM_COUNTER_ID);
+            counters.reset(NITEMS_COUNTER_ID);
+        }
+        (self.root.take(), nitems)
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
@@ -113,11 +152,11 @@ impl TreeRoot {
         let result = tree_insert(&mut self.root, object, key, keypos, key_clash_fail);
         match result {
             InsertResult::Inserted => {
-                self.nitems = self.nitems.wrapping_add(1);
-                self.memory_words += new_words;
+                self.add_nitems(1);
+                self.add_memory(new_words);
             }
             InsertResult::Replaced(old_words) => {
-                self.memory_words += new_words - old_words as isize;
+                self.add_memory(new_words - old_words as isize);
             }
             InsertResult::Exists => {}
         }
@@ -159,11 +198,11 @@ impl TreeRoot {
         )?;
         match result {
             InsertResult::Inserted => {
-                self.nitems = self.nitems.wrapping_add(1);
-                self.memory_words += new_words as isize;
+                self.add_nitems(1);
+                self.add_memory(new_words as isize);
             }
             InsertResult::Replaced(old_words) => {
-                self.memory_words += new_words as isize - old_words as isize;
+                self.add_memory(new_words as isize - old_words as isize);
             }
             InsertResult::Exists => {}
         }
@@ -196,11 +235,11 @@ impl TreeRoot {
         })?;
         match result {
             InsertResult::Inserted => {
-                self.nitems = self.nitems.wrapping_add(1);
-                self.memory_words += new_words;
+                self.add_nitems(1);
+                self.add_memory(new_words);
             }
             InsertResult::Replaced(old_words) => {
-                self.memory_words += new_words - old_words as isize;
+                self.add_memory(new_words - old_words as isize);
             }
             InsertResult::Exists => {}
         }
@@ -224,8 +263,8 @@ impl TreeRoot {
     ) -> Option<TreeDbTerm> {
         let removed = tree_linkout(&mut self.root, key, keypos, &mut matches)?;
         self.version += 1;
-        self.nitems = self.nitems.wrapping_sub(1);
-        self.memory_words -= removed.db_size_words() as isize;
+        self.add_nitems(-1);
+        self.add_memory(-(removed.db_size_words() as isize));
         Some(removed)
     }
 
@@ -263,7 +302,7 @@ impl TreeRoot {
         stack.reset(self.version);
         if last {
             if stack.push_right_spine(&self.root) {
-                stack.set_slot(self.nitems);
+                stack.set_slot(self.count());
             }
         } else if stack.push_left_spine(&self.root) {
             stack.set_slot(1);
@@ -338,16 +377,12 @@ impl TreeRoot {
         let root = self.root.take().expect("non-empty CA-tree base");
         let (left, right, split_key) = split_tree(root, keypos);
         // CA-tree base nodes keep no item count: the table counts (`DbTableCATree` counters).
-        (
-            Self::from_link(left, 0),
-            Self::from_link(right, 0),
-            split_key,
-        )
+        (Self::from_link(left), Self::from_link(right), split_key)
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.
     pub(super) fn join_ordered(left: Self, right: Self) -> Self {
-        Self::from_link(join_trees(left.root, right.root), 0)
+        Self::from_link(join_trees(left.root, right.root))
     }
 }
 

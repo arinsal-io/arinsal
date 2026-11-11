@@ -1,7 +1,11 @@
 //! ETS hash storage with OTP's segmented linear-hash directory.
 
+use crate::flxctr::FlxCtr;
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
-use crate::{EtsError, HashDbTerm, StoredTerm, TableType, WriteConcurrency};
+use crate::{
+    EtsError, HashDbTerm, MEM_COUNTER_ID, NITEMS_COUNTER_ID, StoredTerm, TableType,
+    WriteConcurrency,
+};
 use arinsal_term::{HeapAlloc, Term, global_atoms, internal_hash};
 use parking_lot::RwLock as FastRwLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
@@ -187,8 +191,9 @@ impl std::ops::IndexMut<usize> for SegmentedBuckets {
 
 struct Stripe {
     buckets: StripeBuckets,
+    /// `DbTableHashLockAndCounter.u.lck_ctr.nitems`, kept by the first `NLOCKS_WITH_ITEM_COUNTERS`
+    /// locks of a table with decentralized counters.
     nitems: AtomicIsize,
-    memory_words: AtomicIsize,
 }
 
 enum StripeBuckets {
@@ -266,7 +271,6 @@ impl Stripe {
         Self {
             buckets: StripeBuckets::new(bucket_count, nlocks, fine_grained, frequent_read),
             nitems: AtomicIsize::new(0),
-            memory_words: AtomicIsize::new(0),
         }
     }
 }
@@ -338,13 +342,13 @@ pub(super) struct HashStorage {
     /// `log2(nlocks)`: the lock count is a power of two, so stripe and bucket indexes are a mask
     /// and a shift, as erts' `GET_LOCK_MASK`/`DB_HASH_LOCK_MASK` do.
     lock_shift: u32,
-    pub(super) size: AtomicIsize,
+    /// `tb->common.counters`: the item count and the object memory of the table.
+    counters: FlxCtr,
     pub(super) nactive: AtomicUsize,
     szm: AtomicUsize,
     pub(super) nslots: AtomicUsize,
     initial_slots: usize,
     auto_lock_count: AtomicUsize,
-    decentralized_counters: bool,
     /// erts `tb->is_resizing`: at most one thread grows or shrinks the table at a time, and a
     /// thread that finds it set does not wait.
     is_resizing: AtomicBool,
@@ -407,13 +411,12 @@ impl HashStorage {
                 .collect(),
             nlocks: locks,
             lock_shift: locks.trailing_zeros(),
-            size: AtomicIsize::new(0),
+            counters: FlxCtr::new(decentralized_counters, 2),
             nactive: AtomicUsize::new(FIRST_SEGMENT),
             szm: AtomicUsize::new(FIRST_SEGMENT - 1),
             nslots: AtomicUsize::new(initial_slots),
             initial_slots,
             auto_lock_count: AtomicUsize::new(locks),
-            decentralized_counters,
             is_resizing: AtomicBool::new(false),
             fixdel: parking_lot::Mutex::new(Vec::new()),
         }
@@ -445,51 +448,64 @@ impl HashStorage {
 
     #[inline]
     pub(super) fn size(&self) -> usize {
-        self.size.load(Ordering::Relaxed).max(0) as usize
+        self.counters.read_approx(NITEMS_COUNTER_ID).max(0) as usize
     }
 
-    /// Return the table-owned object words from the decentralized memory counters.
+    /// `DbTable.common.counters`.
+    pub(super) fn counters(&self) -> &FlxCtr {
+        &self.counters
+    }
+
+    /// `IS_DECENTRALIZED_CTRS`.
+    #[inline]
+    fn is_decentralized_ctrs(&self) -> bool {
+        self.counters.is_decentralized()
+    }
+
+    /// Return the table-owned object words from the memory counter.
     pub(super) fn object_memory_words(&self) -> isize {
-        self.stripes
-            .iter()
-            .map(|stripe| stripe.memory_words.load(Ordering::Relaxed))
-            .sum()
+        self.counters.read_approx(MEM_COUNTER_ID)
     }
 
     pub(super) fn reset_object_memory(&self) {
-        for stripe in &self.stripes {
-            stripe.memory_words.store(0, Ordering::Relaxed);
-        }
+        self.counters.reset(MEM_COUNTER_ID);
     }
 
+    /// `RESET_NITEMS`.
+    pub(super) fn reset_nitems(&self) {
+        self.counters.reset(NITEMS_COUNTER_ID);
+    }
+
+    /// `ERTS_DB_ALC_MEM_UPDATE_` of the table.
     #[inline]
-    fn add_object_memory(&self, hvalue: u64, delta: isize) {
+    fn add_object_memory(&self, delta: isize) {
         if delta != 0 {
-            let slot = self.slot_index(hvalue);
-            self.stripes[self.stripe_index(slot)]
-                .memory_words
-                .fetch_add(delta, Ordering::Relaxed);
+            self.counters.add(MEM_COUNTER_ID, delta);
         }
     }
 
+    /// `ADD_NITEMS`.
+    // Port of erts/emulator/beam/erl_db_hash.c (ADD_NITEMS), OTP-29.1.1.
     #[inline]
-    pub(super) fn add_items(&self, hval: u64, delta: isize) -> isize {
-        if self.decentralized_counters {
+    pub(super) fn add_items(&self, hval: u64, delta: isize) {
+        if self.is_decentralized_ctrs() {
             let counter = &self.stripes[hval as usize % NLOCKS_WITH_ITEM_COUNTERS].nitems;
             counter.fetch_add(delta, Ordering::Relaxed);
         }
-        self.size.fetch_add(delta, Ordering::Relaxed) + delta
+        self.counters.add(NITEMS_COUNTER_ID, delta);
     }
 
+    /// `NITEMS_ESTIMATE`.
+    // Port of erts/emulator/beam/erl_db_hash.c (NITEMS_ESTIMATE), OTP-29.1.1.
     #[inline]
     fn estimated_items(&self, hval: u64) -> isize {
-        if self.decentralized_counters {
+        if self.is_decentralized_ctrs() {
             self.stripes[hval as usize % NLOCKS_WITH_ITEM_COUNTERS]
                 .nitems
                 .load(Ordering::Relaxed)
                 * NLOCKS_WITH_ITEM_COUNTERS as isize
         } else {
-            self.size.load(Ordering::Relaxed)
+            self.counters.read_centralized(NITEMS_COUNTER_ID)
         }
     }
 
@@ -551,7 +567,7 @@ impl HashStorage {
             .with_hash_bucket_mut(hvalue, |_slot, bucket| {
                 put_in_bucket(bucket, object, table_type, keypos, new_only)
             });
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if added {
             self.add_items(hash, 1);
             self.grow_after_insert(hash, fixed);
@@ -574,7 +590,7 @@ impl HashStorage {
             .with_hash_bucket_mut(hvalue, |_slot, bucket| {
                 put_term_in_bucket(bucket, term, key, hvalue, options)
             })?;
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if added {
             self.add_items(hash, 1);
             self.grow_after_insert(hash, options.fixed);
@@ -598,7 +614,7 @@ impl HashStorage {
         let bucket = &mut self.stripes[stripe].buckets.get_mut()[slot / locks];
         let (accepted, added, memory_delta, _) =
             put_term_in_bucket(bucket, term, key, hvalue, options)?;
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if added {
             self.add_items(hash, 1);
             self.maybe_grow(options.fixed, options.keypos);
@@ -627,7 +643,7 @@ impl HashStorage {
             keypos,
             new_only,
         );
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if added {
             self.add_items(hash, 1);
             self.maybe_grow(fixed, keypos);
@@ -655,7 +671,7 @@ impl HashStorage {
             keypos,
             new_only,
         );
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if added {
             self.add_items(hash, 1);
             self.maybe_grow(fixed, keypos);
@@ -672,7 +688,7 @@ impl HashStorage {
             }
             erased
         });
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
             if !fixed {
@@ -695,7 +711,7 @@ impl HashStorage {
         if fixed && count != 0 {
             self.add_fixed_deletion(slot);
         }
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
             if !fixed {
@@ -850,7 +866,7 @@ impl HashStorage {
                 self.add_items(hash, 1);
                 Ok((true, true, memory_delta))
             })?;
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if inserted {
             self.grow_after_insert(hash, fixed);
         }
@@ -888,7 +904,7 @@ impl HashStorage {
                 let node = link.as_ref().expect("an in-place update found a node");
                 let delta = node.db_size_words() as isize
                     - old_words.expect("an in-place update found a node") as isize;
-                self.add_object_memory(hvalue, delta);
+                self.add_object_memory(delta);
                 return Ok(true);
             }
             StoreOutcome::New(replacement) => replacement,
@@ -911,7 +927,7 @@ impl HashStorage {
             *link = Some(replacement);
             (true, memory_delta)
         };
-        self.add_object_memory(hvalue, memory_delta);
+        self.add_object_memory(memory_delta);
         if inserted {
             self.add_items(hash, 1);
             self.maybe_grow(fixed, keypos);
@@ -936,7 +952,7 @@ impl HashStorage {
             }
             erased
         });
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
             if !fixed {
@@ -968,7 +984,7 @@ impl HashStorage {
         if fixed && count != 0 {
             self.add_fixed_deletion(slot);
         }
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
             if !fixed {
@@ -994,7 +1010,7 @@ impl HashStorage {
                 }
                 Ok::<_, EtsError>(taken)
             })?;
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
             if !fixed {
@@ -1027,7 +1043,7 @@ impl HashStorage {
         if fixed && count != 0 {
             self.add_fixed_deletion(slot);
         }
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         if count != 0 {
             self.add_items(hash, -count);
             if !fixed {
@@ -1066,7 +1082,7 @@ impl HashStorage {
             }
             Ok((count, memory_delta))
         })?;
-        self.add_object_memory(hash >> 1, memory_delta);
+        self.add_object_memory(memory_delta);
         Ok(count)
     }
 
@@ -1450,7 +1466,6 @@ impl HashStorage {
         for stripe in self.stripes.iter_mut() {
             stripe.buckets.get_mut().reset();
             stripe.nitems.store(0, Ordering::Relaxed);
-            stripe.memory_words.store(0, Ordering::Relaxed);
         }
         self.nactive.store(FIRST_SEGMENT, Ordering::Release);
         self.szm.store(FIRST_SEGMENT - 1, Ordering::Release);
@@ -1528,7 +1543,6 @@ impl HashStorage {
     ) -> Result<usize, EtsError> {
         let mut count = 0;
         for slot in 0..self.nactive() {
-            let stripe_ix = self.stripe_index(slot);
             let mut memory_delta = 0;
             let mut link = &mut self.segment_bucket_mut(slot).head;
             while let Some(current) = link.as_mut() {
@@ -1544,9 +1558,7 @@ impl HashStorage {
                 }
                 link = &mut link.as_mut().unwrap().prefix.next;
             }
-            self.stripes[stripe_ix]
-                .memory_words
-                .fetch_add(memory_delta, Ordering::Relaxed);
+            self.add_object_memory(memory_delta);
         }
         Ok(count)
     }
@@ -1561,10 +1573,9 @@ impl HashStorage {
     ) -> Result<usize, E> {
         let mut removed = 0;
         let mut per_lock = [0isize; NLOCKS_WITH_ITEM_COUNTERS];
-        let mut per_stripe = vec![0isize; self.stripes.len()];
+        let mut memory_delta = 0isize;
         let mut failure = None;
         'slots: for slot in 0..self.nactive() {
-            let stripe_ix = self.stripe_index(slot);
             let mut link = &mut self.segment_bucket_mut(slot).head;
             while let Some(mut node) = link.take() {
                 let selected = if node.prefix.pseudo_deleted() {
@@ -1578,7 +1589,7 @@ impl HashStorage {
                         *link = node.prefix.next.take();
                         removed += 1;
                         per_lock[counter] += 1;
-                        per_stripe[stripe_ix] -= node.db_size_words() as isize;
+                        memory_delta -= node.db_size_words() as isize;
                     }
                     Ok(false) => {
                         *link = Some(node);
@@ -1592,17 +1603,15 @@ impl HashStorage {
                 }
             }
         }
-        self.size.fetch_sub(removed as isize, Ordering::Relaxed);
-        if self.decentralized_counters {
+        self.counters.add(NITEMS_COUNTER_ID, -(removed as isize));
+        if self.is_decentralized_ctrs() {
             for (index, count) in per_lock.into_iter().enumerate() {
                 self.stripes[index]
                     .nitems
                     .fetch_sub(count, Ordering::Relaxed);
             }
         }
-        for (stripe, delta) in self.stripes.iter().zip(per_stripe) {
-            stripe.memory_words.fetch_add(delta, Ordering::Relaxed);
-        }
+        self.add_object_memory(memory_delta);
         match failure {
             Some(error) => Err(error),
             None => Ok(removed),

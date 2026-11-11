@@ -2,13 +2,15 @@
 
 use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, TreeDbTerm, cmp};
 use crate::dbterm::DbTreeStack;
+use crate::flxctr::FlxCtr;
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
 use crate::tree::{InsertResult, Node, TreeRoot};
+use crate::{MEM_COUNTER_ID, NITEMS_COUNTER_ID};
 use arc_swap::ArcSwap;
 use arinsal_term::{TermBuilder, VecHeap};
 use std::cmp::Ordering;
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicIsize, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
+    AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Mutex};
 
@@ -208,9 +210,8 @@ pub(crate) struct CATree {
     gravity_join_count: AtomicUsize,
     force_split: AtomicBool,
     debug_random_split_join: AtomicBool,
-    memory_words: AtomicIsize,
-    /// `tb->common.counters` NITEMS: the table-wide object count.
-    nitems: AtomicIsize,
+    /// `tb->common.counters`: the object count and the object memory of the whole table.
+    counters: FlxCtr,
     /// Bumped by every change of a base node's tree, split and join; the slot stack is only
     /// valid for the version it was made at.
     version: AtomicU64,
@@ -229,13 +230,13 @@ struct SlotWalk {
 
 impl CATree {
     /// Port of erts/emulator/beam/erl_db_catree.c (db_initialize_catree), OTP-29.1.1.
-    pub(crate) fn new(keypos: usize, frequent_read: bool) -> Self {
+    pub(crate) fn new(keypos: usize, frequent_read: bool, decentralized_counters: bool) -> Self {
         Self {
             keypos,
             frequent_read,
             routes: ArcSwap::from_pointee(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
-                base: BaseNode::new(TreeRoot::new(), frequent_read),
+                base: BaseNode::new(TreeRoot::base(), frequent_read),
             }])),
             adaptation: Mutex::new(()),
             split_count: AtomicUsize::new(0),
@@ -244,8 +245,7 @@ impl CATree {
             gravity_join_count: AtomicUsize::new(0),
             force_split: AtomicBool::new(false),
             debug_random_split_join: AtomicBool::new(false),
-            memory_words: AtomicIsize::new(0),
-            nitems: AtomicIsize::new(0),
+            counters: FlxCtr::new(decentralized_counters, 2),
             version: AtomicU64::new(0),
             slot_stack: Mutex::new(SlotWalk {
                 routes: None,
@@ -256,8 +256,13 @@ impl CATree {
         }
     }
 
+    /// `DbTable.common.counters`.
+    pub(crate) fn counters(&self) -> &FlxCtr {
+        &self.counters
+    }
+
     pub(crate) fn object_memory_words(&self) -> isize {
-        self.memory_words.load(AtomicOrdering::Relaxed)
+        self.counters.read_approx(MEM_COUNTER_ID)
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (catree_find_root), OTP-29.1.1.
@@ -289,14 +294,13 @@ impl CATree {
             self.version.fetch_add(1, AtomicOrdering::Release);
             let old_words = match result {
                 crate::tree::InsertResult::Inserted => {
-                    self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.counters.add(NITEMS_COUNTER_ID, 1);
                     0
                 }
                 crate::tree::InsertResult::Replaced(words) => words as isize,
                 crate::tree::InsertResult::Exists => unreachable!("replacement cannot clash"),
             };
-            self.memory_words
-                .fetch_add(new_words - old_words, AtomicOrdering::Relaxed);
+            self.counters.add(MEM_COUNTER_ID, new_words - old_words);
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
             self.adapt(base, stat);
@@ -336,16 +340,13 @@ impl CATree {
             };
             let inserted = match result {
                 crate::tree::InsertResult::Inserted => {
-                    self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
-                    self.memory_words
-                        .fetch_add(new_words as isize, AtomicOrdering::Relaxed);
+                    self.counters.add(NITEMS_COUNTER_ID, 1);
+                    self.counters.add(MEM_COUNTER_ID, new_words as isize);
                     true
                 }
                 crate::tree::InsertResult::Replaced(old_words) => {
-                    self.memory_words.fetch_add(
-                        new_words as isize - old_words as isize,
-                        AtomicOrdering::Relaxed,
-                    );
+                    self.counters
+                        .add(MEM_COUNTER_ID, new_words as isize - old_words as isize);
                     true
                 }
                 crate::tree::InsertResult::Exists => false,
@@ -379,8 +380,8 @@ impl CATree {
             self.version.fetch_add(1, AtomicOrdering::Release);
             let inserted = matches!(result, crate::tree::InsertResult::Inserted);
             if inserted {
-                self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
-                self.memory_words.fetch_add(words, AtomicOrdering::Relaxed);
+                self.counters.add(NITEMS_COUNTER_ID, 1);
+                self.counters.add(MEM_COUNTER_ID, words);
             }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
@@ -450,10 +451,9 @@ impl CATree {
             self.version.fetch_add(1, AtomicOrdering::Release);
             let result = result?;
             if matches!(result, InsertResult::Inserted) {
-                self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
+                self.counters.add(NITEMS_COUNTER_ID, 1);
             }
-            self.memory_words
-                .fetch_add(memory_delta, AtomicOrdering::Relaxed);
+            self.counters.add(MEM_COUNTER_ID, memory_delta);
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
             self.adapt(base, stat);
@@ -632,9 +632,8 @@ impl CATree {
                 root.remove_matching(key, self.keypos, |found| found.exact_eq_input(object));
             if let Some(removed_words) = removed_words {
                 self.version.fetch_add(1, AtomicOrdering::Release);
-                self.nitems.fetch_sub(1, AtomicOrdering::Relaxed);
-                self.memory_words
-                    .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
+                self.counters.add(NITEMS_COUNTER_ID, -1);
+                self.counters.add(MEM_COUNTER_ID, -(removed_words as isize));
             }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
@@ -658,9 +657,8 @@ impl CATree {
             let removed_words = root.remove_matching(key, self.keypos, |_| true);
             if let Some(removed_words) = removed_words {
                 self.version.fetch_add(1, AtomicOrdering::Release);
-                self.nitems.fetch_sub(1, AtomicOrdering::Relaxed);
-                self.memory_words
-                    .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
+                self.counters.add(NITEMS_COUNTER_ID, -1);
+                self.counters.add(MEM_COUNTER_ID, -(removed_words as isize));
             }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
@@ -682,13 +680,13 @@ impl CATree {
                 roots.push(root);
             }
         }
-        self.memory_words.store(0, AtomicOrdering::Relaxed);
-        self.nitems.store(0, AtomicOrdering::Relaxed);
+        self.counters.reset(MEM_COUNTER_ID);
+        self.counters.reset(NITEMS_COUNTER_ID);
         self.version.fetch_add(1, AtomicOrdering::Release);
         self.routes
             .store(Arc::new(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
-                base: BaseNode::new(TreeRoot::new(), self.frequent_read),
+                base: BaseNode::new(TreeRoot::base(), self.frequent_read),
             }])));
         roots
     }
@@ -720,7 +718,7 @@ impl CATree {
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn count(&self) -> usize {
-        self.nitems.load(AtomicOrdering::Relaxed).max(0) as usize
+        self.counters.read_approx(NITEMS_COUNTER_ID).max(0) as usize
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
@@ -1392,10 +1390,10 @@ mod tests {
     /// A stale item count must not make either split caller split an empty AVL base.
     #[test]
     fn split_empty_base_uses_tree_shape_not_item_count() {
-        let tree = CATree::new(1, false);
+        let tree = CATree::new(1, false, false);
         let routes = tree.routes.load_full();
         let base = Arc::clone(&routes[0].base);
-        *base.root.write() = TreeRoot::from_link(None, 2);
+        *base.root.write() = TreeRoot::from_link(None);
 
         let root = base.write_no_stats();
         tree.split_locked(&base, 0, Arc::clone(&routes), root);

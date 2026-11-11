@@ -1,8 +1,24 @@
 //! VM-independent ETS storage. The VM owns access checks and process lifecycle.
 
 mod block_cache;
+/// The counters of an `ets:info` snapshot: `ERTS_DB_TABLE_NITEMS_COUNTER_ID` and the memory of
+/// the table in words (`ERTS_DB_TABLE_MEM_COUNTER_ID` counts the stored objects here, the table
+/// structure is added from its layout).
+#[derive(Clone, Copy, Debug)]
+pub struct CounterValues {
+    /// Number of objects.
+    pub size: isize,
+    /// Words of memory.
+    pub memory_words: usize,
+}
+
+/// `ERTS_DB_TABLE_NITEMS_COUNTER_ID` (erl_db_util.h).
+pub const NITEMS_COUNTER_ID: usize = 0;
+/// `ERTS_DB_TABLE_MEM_COUNTER_ID` (erl_db_util.h).
+pub const MEM_COUNTER_ID: usize = 1;
 mod catree;
 mod dbterm;
+pub mod flxctr;
 mod hash;
 mod hash_select;
 pub mod match_spec;
@@ -2545,7 +2561,11 @@ impl Table {
             if options.write_concurrency == WriteConcurrency::Disabled {
                 Storage::Ordered(TreeRoot::new())
             } else {
-                Storage::CATree(CATree::new(options.keypos, options.read_concurrency))
+                Storage::CATree(CATree::new(
+                    options.keypos,
+                    options.read_concurrency,
+                    options.decentralized_counters,
+                ))
             }
         } else {
             Storage::Hash(HashStorage::new(
@@ -2587,7 +2607,7 @@ impl Table {
             Storage::CATree(tree) => tree.count(),
             // An unsigned view of the signed counter: erts reads it as Uint, so a counter pushed
             // below zero by pseudo-deleted siblings (db_take_hash) wraps.
-            Storage::Hash(storage) => storage.size.load(AtomicOrdering::Relaxed) as usize,
+            Storage::Hash(storage) => storage.counters().read_approx(NITEMS_COUNTER_ID) as usize,
         }
     }
 
@@ -2658,6 +2678,15 @@ impl Table {
             key_count,
             fixed: self.fixed,
             options: self.options,
+        }
+    }
+
+    /// The table's `common.counters` (`DbTable.common.counters`).
+    pub fn counters(&self) -> &flxctr::FlxCtr {
+        match &self.storage {
+            Storage::Ordered(root) => root.counters(),
+            Storage::CATree(tree) => tree.counters(),
+            Storage::Hash(storage) => storage.counters(),
         }
     }
 
@@ -2799,6 +2828,19 @@ impl Table {
         dst: &mut H,
         schedulers: usize,
     ) -> Result<Term, EtsError> {
+        self.info_item_with_counters(key, node, dst, schedulers, None)
+    }
+
+    /// `table_info` of `erl_db.c`, with `size` and `memory` taken from a counter snapshot
+    /// (`ets_info_1/2` read them from `erts_flxctr_snapshot`, not from the table).
+    pub fn info_item_with_counters<H: HeapAlloc>(
+        &self,
+        key: &str,
+        node: Term,
+        dst: &mut H,
+        schedulers: usize,
+        counters: Option<CounterValues>,
+    ) -> Result<Term, EtsError> {
         let atom = |name: &str| -> Term { Term::atom(global_atoms().intern(name).unwrap()) };
         let bool_term = |value: bool| atom(if value { "true" } else { "false" });
         let int_term = |value: usize, dst: &mut H| -> Result<Term, EtsError> {
@@ -2831,8 +2873,14 @@ impl Table {
                 Some(heir) => Ok(copy_term(heir.pid, dst)?),
                 None => Ok(atom("none")),
             },
-            "size" => int_term(self.len(), dst),
-            "memory" => int_term(self.memory_words_for_schedulers(schedulers), dst),
+            "size" => match counters {
+                Some(counters) => int_term(counters.size as usize, dst),
+                None => int_term(self.len(), dst),
+            },
+            "memory" => match counters {
+                Some(counters) => int_term(counters.memory_words, dst),
+                None => int_term(self.memory_words_for_schedulers(schedulers), dst),
+            },
             "node" => Ok(copy_term(node, dst)?),
             "named_table" => Ok(bool_term(self.options.named_table)),
             "read_concurrency" => Ok(bool_term(self.options.read_concurrency)),
@@ -2892,6 +2940,17 @@ impl Table {
         dst: &mut H,
         schedulers: usize,
     ) -> Result<Term, EtsError> {
+        self.info_list_with_counters(node, dst, schedulers, None)
+    }
+
+    /// The `ets:info/1` property list with `size` and `memory` from a counter snapshot.
+    pub fn info_list_with_counters<H: HeapAlloc>(
+        &self,
+        node: Term,
+        dst: &mut H,
+        schedulers: usize,
+        counters: Option<CounterValues>,
+    ) -> Result<Term, EtsError> {
         let names = [
             "id",
             "decentralized_counters",
@@ -2912,7 +2971,7 @@ impl Table {
         let mut items = Vec::with_capacity(names.len());
         for name in names {
             let key = Term::atom(global_atoms().intern(name).unwrap());
-            let value = self.info_item_for_schedulers(name, node, dst, schedulers)?;
+            let value = self.info_item_with_counters(name, node, dst, schedulers, counters)?;
             items.push(TermBuilder::new(dst).tuple(&[key, value])?);
         }
         Ok(TermBuilder::new(dst).list_from_iter(items)?)
@@ -4057,7 +4116,7 @@ impl Table {
                     return Garbage(GarbageKind::Mark { slot: 0 });
                 }
                 let garbage = storage.take_garbage();
-                storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.reset_nitems();
                 storage.reset_object_memory();
                 Garbage(GarbageKind::Hash(garbage))
             }
@@ -4081,13 +4140,13 @@ impl Table {
                     *reds = -1;
                     return false;
                 }
-                storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.reset_nitems();
                 storage.reset_object_memory();
                 *reds = loops.max(0) / LOOPS_PER_REDUCTION;
                 return true;
             }
             let released = storage.take_garbage();
-            storage.size.store(0, AtomicOrdering::Relaxed);
+            storage.reset_nitems();
             garbage.0 = GarbageKind::Hash(released);
         }
         garbage.step(reds)
@@ -4104,7 +4163,7 @@ impl Table {
                 } else {
                     storage.clear_buckets();
                 }
-                storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.reset_nitems();
                 storage.reset_object_memory();
             }
         }
@@ -6677,7 +6736,13 @@ impl ConcurrentTable {
             multi_epoch: AtomicU64::new(0),
             concurrent_catree: (options.table_type == TableType::OrderedSet
                 && options.write_concurrency != WriteConcurrency::Disabled)
-                .then(|| CATree::new(options.keypos, options.read_concurrency)),
+                .then(|| {
+                    CATree::new(
+                        options.keypos,
+                        options.read_concurrency,
+                        options.decentralized_counters,
+                    )
+                }),
             concurrent_hash: (options.table_type != TableType::OrderedSet)
                 .then(|| ConcurrentHashStorage::new(options.write_concurrency)),
             _heir_data: heir_data,
