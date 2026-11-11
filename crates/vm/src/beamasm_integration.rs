@@ -2036,18 +2036,10 @@ pub(crate) fn compile(
         crate::load::bind_native_static_nifs(module, code_ix);
     }
     let module = &*module;
-    let native_body_functions = module
-        .functions
-        .iter()
-        .enumerate()
-        .filter(|(ordinal, _)| module.nif_body(*ordinal).is_some())
-        .map(|(_, (_, name, arity))| (*name, *arity))
-        .collect::<std::collections::HashSet<_>>();
-    let runtime_functions = compiled
-        .functions
-        .iter()
-        .filter(|function| !native_body_functions.contains(&(function.name, function.arity)))
-        .collect::<Vec<_>>();
+    // Port of erts/emulator/beam/jit/asm_load.c:1177-1195 (beam_load_finalize_code), OTP-29.1.1:
+    // every function of the module, a static NIF's call-NIF body included, is native code the
+    // export addresses point at.
+    let runtime_functions = compiled.functions.iter().collect::<Vec<_>>();
     if let Some(directory) = crate::debug_env::beamasm_dump()
         && let Err(error) = arinsal_beamasm::write_global_note(std::path::Path::new(directory))
     {
@@ -2103,9 +2095,6 @@ pub(crate) fn compile(
     drop(env);
     MODULES.fetch_add(1, Ordering::Relaxed);
     NATIVE.fetch_add(runtime_functions.len() as u64, Ordering::Relaxed);
-    // Loader-patched NIF bodies stay out of the export targets (exports run them through the
-    // interpreter's NativeBody), but native local calls still enter their compiled code, so
-    // their ranges must be registered for return addresses, yields and stack walks.
     let mut function_starts = compiled
         .functions
         .iter()

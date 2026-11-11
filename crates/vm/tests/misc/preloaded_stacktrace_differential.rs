@@ -12,13 +12,17 @@ const MODULE: &str = "preloaded_trace";
 
 const SOURCE: &str = r#"
 -module(preloaded_trace).
--export([bif/0, error_call/0, undef/0, prim_loader/0, deep/0]).
+-export([bif/0, error_call/0, undef/0, prim_loader/0, deep/0, nif_exports/0]).
 
 bif() -> try element(5, {a}) catch error:badarg:St -> St end.
 error_call() -> try erlang:error(oops, [1, 2]) catch error:oops:St -> St end.
 undef() -> try preloaded_trace:missing(1) catch error:undef:St -> St end.
 prim_loader() -> try erl_prim_loader:get_file(1) catch C:R:St -> {C, R, St} end.
 deep() -> try lists:foldl(fun(X, _) -> element(X, {a}) end, ok, [1, 2]) catch error:badarg:St -> St end.
+nif_exports() ->
+    {[{M, F, A, erlang:function_exported(M, F, A)}
+      || M <- [prim_buffer, prim_file, zlib, erl_tracer], {F, A} <- M:module_info(exports)],
+     is_reference(prim_buffer:new())}.
 "#;
 
 fn run(program: &Path, dir: &Path, module: &str, function: &str) -> (bool, String) {
@@ -118,4 +122,11 @@ fn preloaded_module_frame_matches_erts() {
 #[test]
 fn trace_through_a_fun_in_lists_matches_erts() {
     compare("deep");
+}
+
+/// The exported NIF functions of the preloaded static-NIF modules (`prim_buffer:new/0`, ...)
+/// are callable through their exports, as every function of a loaded module is.
+#[test]
+fn preloaded_nif_exports_are_callable_like_erts() {
+    compare("nif_exports");
 }
