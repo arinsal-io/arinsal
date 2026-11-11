@@ -220,7 +220,7 @@ fn remote_process_requests_match_otp_29() {
             "run",
             &[Term::small(scenario).unwrap()],
             1,
-            Some(91),
+            None,
         );
         let actual = actual.unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");

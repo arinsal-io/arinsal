@@ -61,7 +61,7 @@ fn removed_process_wrappers_match_otp_29() {
                 "scenario",
                 &[Term::small(scenario).unwrap()],
                 2,
-                Some(97),
+                None,
             )
             .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");

@@ -51,7 +51,7 @@ fn group_leader_remote_update_and_badarg_match_otp() {
     for function in ["run", "saturated", "badarg"] {
         let expected = reference.call("group_leader_priority_diff", function, &[]);
         let actual = vm
-            .eval_scheduled("group_leader_priority_diff", function, &[], 4, Some(0x6a11))
+            .eval_scheduled("group_leader_priority_diff", function, &[], 4, None)
             .unwrap_or_else(|error| panic!("{function}: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

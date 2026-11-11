@@ -154,7 +154,7 @@ fn receive_marker_scenarios_match_otp_29() {
                 "scenario",
                 &[Term::small(scenario).unwrap(), Term::small(n).unwrap()],
                 4,
-                Some(0x5eed),
+                None,
             )
             .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");

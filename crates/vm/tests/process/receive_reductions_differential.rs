@@ -171,12 +171,12 @@ fn receive_and_signal_reductions_match_otp() {
     vm.load_bytes(&beam).unwrap();
 
     let mut mismatches = Vec::new();
-    for (index, function) in CASES.iter().enumerate() {
+    for function in CASES {
         let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, Some(0xB400 + index as u64), 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
             .unwrap();
         let (expected, actual) = (reductions(&expected), reductions(&actual.term));
         if expected != actual {

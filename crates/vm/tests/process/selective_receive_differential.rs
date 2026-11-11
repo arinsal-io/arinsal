@@ -137,7 +137,7 @@ fn selective_receive_scenarios_match_otp_29() {
                     "scenario",
                     &[Term::small(scenario).unwrap(), Term::small(size).unwrap()],
                     4,
-                    Some(0x5eed),
+                    None,
                 )
                 .unwrap_or_else(|error| panic!("scenario {scenario} size {size}: {error}"));
             assert_eq!(

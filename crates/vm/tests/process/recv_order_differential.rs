@@ -111,7 +111,7 @@ fn compare(function: &str) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("recv_order_diff", function, &[], 2, Some(0x0dd5))
+        .eval_scheduled("recv_order_diff", function, &[], 2, None)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

@@ -50,7 +50,7 @@ fn tracer_receiving_a_tokened_message_keeps_its_accumulator() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("seq_trace_receive_heap_diff", "run", &[], 1, Some(74))
+        .eval_scheduled("seq_trace_receive_heap_diff", "run", &[], 1, None)
         .unwrap()
         .term;
     assert_eq!(actual, expected);
