@@ -2123,6 +2123,7 @@ mod tests {
 
     #[test]
     fn bif_arguments_keep_pointer_terms_inline_and_rewrite_gc_roots() {
+        crate::boot::erl_init_global_literals();
         let mut heap = ProcessHeap::new();
         let pointer = TermBuilder::new(&mut heap).tuple(&[]).unwrap();
         assert!(pointer.is_pointer());

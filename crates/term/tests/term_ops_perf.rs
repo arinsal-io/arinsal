@@ -8,6 +8,7 @@ use std::time::Instant;
 #[test]
 #[ignore = "release micro gate; run with --release --ignored --nocapture"]
 fn general_term_micro_gates() {
+    arinsal_term::init_global_literals();
     fn median(mut samples: Vec<f64>) -> f64 {
         samples.sort_by(f64::total_cmp);
         samples[samples.len() / 2]
@@ -106,6 +107,7 @@ fn general_term_micro_gates() {
 #[test]
 #[ignore = "10M alternating term equality and comparison measurements"]
 fn equality_and_comparison_microbench_10m() {
+    arinsal_term::init_global_literals();
     const N: usize = 10_000_000;
     const ROUNDS: usize = 3;
 

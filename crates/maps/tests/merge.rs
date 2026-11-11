@@ -165,6 +165,7 @@ fn erl_cases() -> String {
 
 #[test]
 fn yielding_merge_matches_unbounded_merge() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let left = int_map(&mut heap, 1..=5000, 0);
     let right = int_map(&mut heap, 2500..=7500, 7);
@@ -186,6 +187,7 @@ fn yielding_merge_matches_unbounded_merge() {
 
 #[test]
 fn merge_reuses_shared_hamt_subtrees_like_erts() {
+    arinsal_term::init_global_literals();
     let expected = erl_lines(
         "A=maps:from_list([{K,K}||K<-lists:seq(1,1000)]),B=maps:put(2000,2000,A),M=maps:merge(A,B),io:format(\"~p~n\",[erts_debug:same(M,B)]),halt().",
     );
@@ -204,6 +206,7 @@ type Attempt<'a> = dyn Fn(&mut ProcessHeap) -> Result<Term, MapError> + 'a;
 
 #[test]
 fn finite_heap_returns_heap_full_without_replaying_construction() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let left = int_map(&mut heap, 1..=200, 0);
     let right = int_map(&mut heap, 150..=400, 3);

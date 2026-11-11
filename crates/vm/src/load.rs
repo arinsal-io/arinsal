@@ -807,6 +807,7 @@ impl Vm {
         paths: impl IntoIterator<Item = PathBuf>,
         otp: PathBuf,
     ) -> Self {
+        crate::boot::erl_init_global_literals();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
         paths.push(PathBuf::from("tools/bench/out/ebin"));

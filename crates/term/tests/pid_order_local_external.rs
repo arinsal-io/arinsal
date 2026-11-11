@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 
 #[test]
 fn local_pid_orders_against_external_pids_by_node_name() {
+    arinsal_term::init_global_literals();
     let this = global_atoms().intern("pidorder_m@localhost").unwrap();
     set_this_node(this, 4);
     let before = Node::new(global_atoms().intern("pidorder_a@localhost").unwrap(), 7);

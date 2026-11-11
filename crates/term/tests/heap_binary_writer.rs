@@ -4,6 +4,7 @@ use similar_asserts::assert_eq;
 
 #[test]
 fn every_small_binary_split_preserves_bytes_and_gc_state() {
+    arinsal_term::init_global_literals();
     for len in 0..=64 {
         let bytes = (0..len).map(|i| (i * 137 + 23) as u8).collect::<Vec<_>>();
         for split in 0..=len {
@@ -22,6 +23,7 @@ fn every_small_binary_split_preserves_bytes_and_gc_state() {
 
 #[test]
 fn cancel_partial_binary_releases_the_reservation() {
+    arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(256);
     let available = heap.words_left();
     let mut writer = HeapBinaryWriter::new(&mut heap, 64).unwrap();

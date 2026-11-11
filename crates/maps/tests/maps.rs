@@ -79,6 +79,7 @@ fn map_words(node: Term) -> usize {
 
 #[test]
 fn differential_integer_maps_order_and_size() {
+    arinsal_term::init_global_literals();
     let mut sizes = vec![0, 1, 2, 16, 32, 33, 34, 100, 1000, 2000];
     let mut state = 0x8451_1234_u64;
     for _ in 0..16 {
@@ -106,6 +107,7 @@ fn differential_integer_maps_order_and_size() {
 
 #[test]
 fn mutation_and_heap_full() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let mut map = from_pairs(&pairs(100), &mut heap).unwrap();
     for i in 1..=100 {
@@ -145,6 +147,7 @@ fn mutation_and_heap_full() {
 
 #[test]
 fn no_op_updates_and_empty_merge_preserve_map_identity() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let map = from_pairs(&pairs(4), &mut heap).unwrap();
     let empty = from_pairs(&[], &mut heap).unwrap();
@@ -156,6 +159,7 @@ fn no_op_updates_and_empty_merge_preserve_map_identity() {
 
 #[test]
 fn exact_multi_key_update_reuses_keys_and_allocates_one_flatmap() {
+    arinsal_term::init_global_literals();
     let mut source_heap = VecHeap::new();
     let original = from_pairs(&pairs(3), &mut source_heap).unwrap();
     let keys = original.flatmap_keys_tuple().unwrap();
@@ -177,6 +181,7 @@ fn exact_multi_key_update_reuses_keys_and_allocates_one_flatmap() {
 
 #[test]
 fn merge_reuses_a_containing_map_or_its_key_tuple() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let left = from_pairs(&[(small(1), small(10)), (small(2), small(20))], &mut heap).unwrap();
     let right_subset = from_pairs(&[(small(2), small(22))], &mut heap).unwrap();
@@ -199,6 +204,7 @@ fn merge_reuses_a_containing_map_or_its_key_tuple() {
 
 #[test]
 fn equal_key_merge_mutates_the_heap_map_to_use_literal_keys() {
+    arinsal_term::init_global_literals();
     let source_pairs = [(small(1), small(10)), (small(2), small(20))];
     let mut source_heap = VecHeap::new();
     let source = from_pairs(&source_pairs, &mut source_heap).unwrap();
@@ -217,6 +223,7 @@ fn equal_key_merge_mutates_the_heap_map_to_use_literal_keys() {
 
 #[test]
 fn exact_multi_update_reports_the_first_sorted_missing_key() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let map = from_pairs(&[], &mut heap).unwrap();
     let float = arinsal_term::TermBuilder::new(&mut heap)
@@ -233,6 +240,7 @@ fn exact_multi_update_reports_the_first_sorted_missing_key() {
 
 #[test]
 fn builder_preserves_last_duplicate() {
+    arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let mut builder = arinsal_term::TermBuilder::new(&mut heap);
     let map = builder
@@ -291,6 +299,7 @@ fn reference_terms(eval: &str) -> Option<arinsal_etf::OwnedTerm> {
 
 #[test]
 fn differential_aliases_survive_existing_key_replacement() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     for n in [32, 33, 1000] {
         let eval = format!(
@@ -329,6 +338,7 @@ fn differential_aliases_survive_existing_key_replacement() {
 
 #[test]
 fn differential_mixed_flatmap_keys() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     let eval = "Keys=[list_to_atom(\"zzzz_s15c_unique\"),list_to_atom(\"aaaa_s15c_unique\"),1,1.0,0.0,-0.0,{1},[1],<<1>>],M=maps:from_list(lists:zip(Keys,lists:seq(1,length(Keys)))),io:put_chars(binary:encode_hex(term_to_binary(maps:to_list(M)))),halt().";
     let Some(expected) = reference_terms(eval) else {
@@ -373,6 +383,7 @@ fn differential_mixed_flatmap_keys() {
 
 #[test]
 fn differential_mixed_flatmap_keys_via_put() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     let erl_keys = [
         "kcmp_zeta",
@@ -465,6 +476,7 @@ fn differential_mixed_flatmap_keys_via_put() {
 
 #[test]
 fn differential_random_integer_updates() {
+    arinsal_term::init_global_literals();
     let mut state = 0x1234_5678_u64;
     let mut operations = Vec::new();
     for _ in 0..400 {
@@ -522,6 +534,7 @@ fn differential_random_integer_updates() {
 
 #[test]
 fn iterator_protocol() {
+    arinsal_term::init_global_literals();
     use arinsal_maps::{iterator_term, iterator_term_reversed, next_term};
     for n in [0, 2, 32, 33, 100] {
         let mut heap = VecHeap::new();
@@ -572,6 +585,7 @@ fn iterator_protocol() {
 
 #[test]
 fn differential_mixed_hamt_keys() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     let eval = "Keys=lists:seq(1,40)++[1.0,0.0,-0.0,{1},[1],binary:copy(<<1>>)],M=maps:from_list(lists:zip(Keys,lists:seq(1,length(Keys)))),io:put_chars(binary:encode_hex(term_to_binary({maps:to_list(M),erts_debug:flat_size(M)}))),halt().";
     let Some(expected) = reference_terms(eval) else {
@@ -629,6 +643,7 @@ fn differential_mixed_hamt_keys() {
 
 #[test]
 fn differential_map_keys_500_cases() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
 
     let eval = "Results=[begin L=maps:from_list([{J,I*1000+J}||J<-lists:seq(1,40)]),S=#{case_key=>I},M1=maps:put(L,I,#{}),V1=maps:get(L,M1),M2=maps:put(S,I+1,M1),V2=maps:get(S,M2),M3=maps:remove(L,M2),{V1,V2,maps:to_list(M3),maps:is_key(L,M3)} end||I<-lists:seq(1,500)],io:put_chars(binary:encode_hex(term_to_binary(Results))),halt().";
@@ -679,6 +694,7 @@ fn differential_map_keys_500_cases() {
 
 #[test]
 fn predefined_atom_indices_match_otp_hashes() {
+    arinsal_term::init_global_literals();
     let eval = "erts_debug:set_internal_state(available_internal_state,true),lists:foreach(fun(A)->io:format(\"~B~n\",[erts_debug:get_internal_state({internal_hash,A})]) end,[false,true,error,undefined]),halt().";
     let output = match Command::new("erl")
         .args(["-noshell", "-eval", eval])
@@ -711,6 +727,7 @@ fn predefined_atom_indices_match_otp_hashes() {
 
 #[test]
 fn differential_error_reasons_and_helpers() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     let eval = "Reasons=[try maps:update(9,1,#{}) catch error:R1->R1 end,try maps:get(1,42) catch error:R2->R2 end],io:put_chars(binary:encode_hex(term_to_binary(Reasons))),halt().";
     let Some(reasons) = reference_terms(eval) else {
@@ -764,6 +781,7 @@ fn differential_error_reasons_and_helpers() {
 
 #[test]
 fn differential_flat_iterator_term_shape() {
+    arinsal_term::init_global_literals();
     use arinsal_maps::{iterator_term, next_term};
     let eval = "M=maps:from_list([{1,10},{2,20}]),I=maps:iterator(M),O=maps:iterator(M,ordered),io:put_chars(binary:encode_hex(term_to_binary({I,maps:next(I),O,maps:next(O)}))),halt().";
     let Some(expected) = reference_terms(eval) else {
@@ -786,6 +804,7 @@ fn differential_flat_iterator_term_shape() {
 
 #[test]
 fn differential_predefined_atoms_and_map_key_in_hamt() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     let eval = "Keys=lists:seq(1,40)++[false,true,error,undefined,#{false=>1}],M=maps:from_list(lists:zip(Keys,lists:seq(1,length(Keys)))),io:put_chars(binary:encode_hex(term_to_binary(maps:to_list(M)))),halt().";
     let Some(expected) = reference_terms(eval) else {
@@ -884,6 +903,7 @@ fn differential_generated_flatmaps() {
 
 #[test]
 fn differential_generated_hamt_keys() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     use proptest::strategy::{Strategy, ValueTree};
     let mut runner = proptest::test_runner::TestRunner::deterministic();
@@ -953,6 +973,7 @@ fn differential_generated_hamt_keys() {
 
 #[test]
 fn differential_term_to_binary_integer_maps() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     for n in [0, 32, 33, 100] {
         let eval = format!(
@@ -999,6 +1020,7 @@ fn differential_term_to_binary_integer_maps() {
 
 #[test]
 fn differential_term_to_binary_mixed_hamt() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     let eval = "Keys=lists:seq(1,40)++[1.0,0.0,-0.0,{1},[1],binary:copy(<<1>>)],M=maps:from_list(lists:zip(Keys,lists:seq(1,length(Keys)))),io:put_chars(binary:encode_hex(term_to_binary(M))),halt().";
     let output = match Command::new("erl")
@@ -1091,6 +1113,7 @@ fn instruction_ops(seed: u64, rounds: usize) -> Vec<(bool, Vec<(i64, i64)>)> {
 // sorted vector bodies must give the same maps and flat sizes as `M#{...}` in erl.
 #[test]
 fn differential_instruction_update_bodies() {
+    arinsal_term::init_global_literals();
     let ops = instruction_ops(0x9e37_79b9_7f4a_7c15, 300);
     let source = ops
         .iter()
@@ -1166,6 +1189,7 @@ fn differential_instruction_update_bodies() {
 // reuses the key tuple, and a new key costs a key tuple plus a flatmap.
 #[test]
 fn put_and_update_release_unused_words() {
+    arinsal_term::init_global_literals();
     let mut heap = arinsal_term::ProcessHeap::with_words(4096);
     let map = from_pairs(&pairs(4), &mut heap).unwrap();
     let used = heap.used_words();
