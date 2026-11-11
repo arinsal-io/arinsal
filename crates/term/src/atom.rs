@@ -4,14 +4,16 @@
 //! slots. The name is a global-literal binary (`atom_alloc`). Lookups take the
 //! frequent-read side of `ERTS_ATOM_TABLE_LOCK`; insertion takes the write side.
 
-use crossbeam_utils::atomic::AtomicCell;
 use std::borrow::Cow;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Term;
 use crate::heap::TermBuilder;
-use crate::rwmutex::FrequentReadRwLock;
+use crate::index_table::{
+    HashFunctions, IndexEntry, IndexSlot, IndexTable, alloc_entry, init_entry,
+};
+use arinsal_alloc::typed::ErtsAlcType;
 
 /// Stable atom index. Its value matches the OTP preloaded atom order at startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -85,67 +87,104 @@ pub mod atoms {
 
 const ATOM_TAB: &str = "atom_tab";
 const ATOM_SIZE: i32 = 3000;
-const MAX_SHIFT: i32 = 64; // ERTS_SIZEOF_TERM * 8
-const INDEX_PAGE_SHIFT: usize = 10;
-const INDEX_PAGE_SIZE: usize = 1 << INDEX_PAGE_SHIFT;
-const INDEX_PAGE_MASK: usize = INDEX_PAGE_SIZE - 1;
-const NULL_LINK: u32 = u32::MAX;
 const MAX_ATOM_CHARACTERS: usize = 255;
 const MAX_ATOM_SZ_LIMIT: usize = 4 * MAX_ATOM_CHARACTERS;
-const FIBONACCI: u64 = 11_400_714_819_323_198_485;
 /// Default `ATOM_LIMIT` (`1024 * 1024`).
 pub const DEFAULT_ATOM_TABLE_LIMIT: usize = 1024 * 1024;
 
-// Port of erts/emulator/beam/hash.h:50 (HashBucket) and index.h:34 (IndexSlot)
-// and atom.h:50 (Atom), OTP-29.1.1. `id` is the table slot of this record; erts
-// uses the object pointer as that identity.
+// Port of erts/emulator/beam/atom.h (Atom), OTP-29.1.1: the index slot first, then the name
+// length, the Latin-1 character count, the ordinal of the first bytes and `u.bin`, the
+// global-literal binary that holds the name. The record is allocated by `atom_alloc` from
+// `ERTS_ALC_T_ATOM` and never freed.
+#[repr(C)]
 struct AtomRec {
-    id: u32,
-    next: AtomicU32,
-    hvalue: u64,
-    index: AtomicI32,
+    slot: IndexSlot,
+    len: u16,
     latin1_chars: i16,
     ord0: i32,
     /// `Atom.u.bin`: the global-literal binary returned by `atom_to_binary`.
     bin: Term,
-    /// `Atom.name`: the UTF-8 bytes inside `bin`.
-    name: &'static str,
 }
 
-// Port of erts/emulator/beam/index.c (index_put_entry) and index.h
-// (erts_index_lookup), OTP-29.1.1. AtomicCell keeps each pointer-sized slot safe to
-// publish while preserving the fixed-page layout and permanent record references.
-struct Page {
-    slots: [AtomicCell<Option<&'static AtomRec>>; INDEX_PAGE_SIZE],
-}
-
-impl Page {
-    fn new() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| AtomicCell::new(None)),
-        }
+impl IndexEntry for AtomRec {
+    #[inline(always)]
+    fn slot(&self) -> &IndexSlot {
+        &self.slot
     }
 }
 
-struct Inner {
-    shift: i32,
-    max_shift: i32,
-    shrink_threshold: i32,
-    grow_threshold: i32,
-    nobjs: i32,
-    buckets: Vec<u32>,
-    atoms: Vec<&'static AtomRec>,
-    entries: i32,
-    size: i32,
-    limit: i32,
-    atom_space: u64,
+impl AtomRec {
+    /// Port of atom.c:107 (erts_atom_get_name): the UTF-8 bytes inside `u.bin`.
+    #[inline(always)]
+    fn name(&self) -> &str {
+        let view = crate::raw::BinRef::try_from(self.bin).expect("atom literal is a binary");
+        let bytes = view.bytes().expect("atom literal is a byte string");
+        debug_assert_eq!(bytes.len(), self.len as usize);
+        // SAFETY: `atom_alloc` stored only text that passed `analyze_utf8` (or ASCII, or Latin-1
+        // converted to UTF-8), and the literal binary is immutable.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+
+    #[inline(always)]
+    fn hvalue(&self) -> u64 {
+        self.slot.hvalue()
+    }
+}
+
+/// Template of `erts_atom_put_index`: a stack `Atom` with `len`, `u.name` and `latin1_chars`.
+struct AtomTemplate<'a> {
+    name: &'a [u8],
+    latin1_chars: i16,
+}
+
+/// `HashFunctions` of the atom table (atom.c: atom_hash, atom_cmp, atom_alloc, atom_free).
+/// `atom_space` is the static `atom_space` of atom.c.
+struct AtomFns {
+    atom_space: AtomicU64,
+}
+
+impl HashFunctions for AtomFns {
+    type Entry = AtomRec;
+    type Template<'a> = AtomTemplate<'a>;
+
+    fn hash(&self, tmpl: &AtomTemplate<'_>) -> u64 {
+        atom_hash(tmpl.name)
+    }
+
+    #[inline(always)]
+    fn cmp(&self, tmpl: &AtomTemplate<'_>, obj: &AtomRec) -> bool {
+        // Port of atom.c:119 (atom_cmp).
+        tmpl.name.len() == obj.len as usize && tmpl.name == obj.name().as_bytes()
+    }
+
+    fn alloc(&self, tmpl: &AtomTemplate<'_>) -> *mut AtomRec {
+        // Port of atom.c:130 (atom_alloc).
+        let obj = alloc_entry::<AtomRec>(ErtsAlcType::ATOM);
+        let bin = literal_atom(tmpl.name);
+        init_entry(
+            obj,
+            AtomRec {
+                slot: IndexSlot::new(),
+                len: tmpl.name.len() as u16,
+                latin1_chars: tmpl.latin1_chars,
+                ord0: ord0_of(tmpl.name),
+                bin,
+            },
+        );
+        self.atom_space
+            .fetch_add(tmpl.name.len() as u64, Ordering::Relaxed);
+        obj
+    }
+
+    fn free(&self, _obj: &AtomRec) {
+        // Port of atom.c:170 (atom_free): empty, atom names are never freed.
+    }
 }
 
 /// Global, append-only atom table.
 pub struct AtomTable {
-    inner: FrequentReadRwLock<Inner>,
-    /// Pre-sized pointer table, with fixed 1024-slot pages allocated on demand.
-    seg: Box<[AtomicCell<Option<&'static Page>>]>,
+    /// `erts_atom_table`, with `atom_table_lock` as its lock.
+    index: IndexTable<AtomFns>,
 }
 
 impl AtomTable {
@@ -153,12 +192,19 @@ impl AtomTable {
     ///
     /// `limit` is `erts_atom_table_size` (`+t`). Values above `i32::MAX` clamp to
     /// that maximum, which is `MAX_ATOM_TABLE_SIZE` on this 64-bit build.
+    // Port of atom.c:430 (init_atom_table).
     pub fn new(limit: usize) -> Self {
         let limit = i32::try_from(limit).unwrap_or(i32::MAX);
-        let pages = (limit as usize).div_ceil(INDEX_PAGE_SIZE).max(1);
         let table = Self {
-            inner: FrequentReadRwLock::new(Inner::new(limit)),
-            seg: (0..pages).map(|_| AtomicCell::new(None)).collect(),
+            index: IndexTable::new(
+                ErtsAlcType::ATOM_TABLE,
+                ATOM_TAB,
+                ATOM_SIZE,
+                limit,
+                AtomFns {
+                    atom_space: AtomicU64::new(0),
+                },
+            ),
         };
         for name in atoms::PREDEFINED {
             table.intern(name).expect("predefined atoms fit");
@@ -179,11 +225,14 @@ impl AtomTable {
         let mut atoms = Vec::with_capacity(names.len());
         let mut missing = false;
         {
-            let inner = self.inner.read();
+            let guard = self.index.read();
             for name in names.clone() {
-                let found = find(&inner, name.as_bytes());
-                missing |= found.is_none();
-                atoms.push(Atom(found.unwrap_or(MISSING)));
+                let found = guard.get(&AtomTemplate {
+                    name: name.as_bytes(),
+                    latin1_chars: 0,
+                });
+                missing |= found < 0;
+                atoms.push(Atom(if found < 0 { MISSING } else { found as u32 }));
             }
         }
         if missing {
@@ -296,7 +345,7 @@ impl AtomTable {
     /// Return immutable atom text for a valid index without taking the table lock.
     // Port of erts/emulator/beam/atom.c:107 (erts_atom_get_name), OTP-29.1.1.
     pub fn text(&self, atom: Atom) -> Option<&str> {
-        self.record(atom).map(|rec| rec.name)
+        self.record(atom).map(|rec| rec.name())
     }
 
     /// The global-literal UTF-8 binary (`Atom.u.bin`).
@@ -315,7 +364,7 @@ impl AtomTable {
         if rec.latin1_chars < 0 {
             return None;
         }
-        Some(rec.latin1_chars as usize == rec.name.len())
+        Some(rec.latin1_chars as usize == rec.len as usize)
     }
 
     /// UTF-8 text and Latin-1 character count of `atom` from one record lookup.
@@ -325,7 +374,7 @@ impl AtomTable {
     #[inline]
     pub fn encoding_info(&self, atom: Atom) -> Option<(&str, Option<usize>)> {
         let rec = self.record(atom)?;
-        Some((rec.name, usize::try_from(rec.latin1_chars).ok()))
+        Some((rec.name(), usize::try_from(rec.latin1_chars).ok()))
     }
 
     /// Number of Unicode scalar values in Latin-1 for this atom, or `None` if it is not.
@@ -344,14 +393,14 @@ impl AtomTable {
     // OTP-29.1.1.
     #[inline(always)]
     pub fn hash(&self, atom: Atom) -> Option<u32> {
-        self.record(atom).map(|rec| rec.hvalue as u32)
+        self.record(atom).map(|rec| rec.hvalue() as u32)
     }
 
     /// Full bucket hash (`HashValue`, 64-bit on this build).
     ///
     /// ETS `MAKE_HASH` uses this word for atom keys.
     pub fn hvalue(&self, atom: Atom) -> Option<u64> {
-        self.record(atom).map(|rec| rec.hvalue)
+        self.record(atom).map(|rec| rec.hvalue())
     }
 
     /// Latin-1 bytes of `atom`, or `None` when a character does not fit in Latin-1.
@@ -363,10 +412,10 @@ impl AtomTable {
         if rec.latin1_chars < 0 {
             return None;
         }
-        if rec.latin1_chars as usize == rec.name.len() {
-            return Some(rec.name.as_bytes().to_vec());
+        if rec.latin1_chars as usize == rec.len as usize {
+            return Some(rec.name().as_bytes().to_vec());
         }
-        Some(utf8_to_latin1(rec.name.as_bytes()))
+        Some(utf8_to_latin1(rec.name().as_bytes()))
     }
 
     /// Term order of two atoms. Port of `erl_utils.h:193` (`erts_cmp_atoms`), OTP-29.1.1.
@@ -379,73 +428,58 @@ impl AtomTable {
 
     /// Port of erts/emulator/beam/hash.c:45 (`hash_get_info`), OTP-29.1.1.
     pub fn hash_info(&self) -> HashInfo {
-        let inner = self.inner.read();
-        let mut used = 0;
-        let mut depth = 0;
-        for &head in &inner.buckets {
-            let mut chain = 0;
-            let mut link = head;
-            while link != NULL_LINK {
-                chain += 1;
-                link = inner.atoms[link as usize].next.load(Ordering::Relaxed);
-            }
-            if chain > 0 {
-                used += 1;
-                depth = depth.max(chain);
-            }
-        }
+        let guard = self.index.read();
+        let stats = guard.hash().stats();
         HashInfo {
-            name: ATOM_TAB,
-            size: inner.buckets.len() as i32,
-            used,
-            objs: inner.nobjs,
-            depth,
+            name: self.index.name(),
+            size: stats.size,
+            used: stats.used,
+            objs: stats.objs,
+            depth: stats.depth,
         }
     }
 
     /// Port of erts/emulator/beam/index.c:32 (`index_info`) counters, OTP-29.1.1.
     pub fn index_info(&self) -> IndexInfo {
-        let inner = self.inner.read();
+        let _guard = self.index.read();
+        let (size, limit, entries) = self.index.info();
         IndexInfo {
-            size: inner.size,
-            limit: inner.limit,
-            entries: inner.entries,
+            size,
+            limit,
+            entries,
         }
     }
 
     /// Memory the table holds, split as erts accounts it: the hash and index tables
     /// (`atom_table_sz`), the atom entries, and the atom text (`atom_space`).
     // Port of erts/emulator/beam/atom.c (atom_table_sz, erts_atom_get_text_space_sizes) and
-    // index.c (index_table_sz), OTP-29.1.1, for this table's own layout.
+    // index.c (index_table_sz), OTP-29.1.1.
     pub fn memory(&self) -> AtomMemory {
-        let inner = self.inner.read();
-        let pages = self.seg.iter().filter(|page| page.load().is_some()).count();
-        let table = inner.buckets.capacity() * std::mem::size_of::<u32>()
-            + inner.atoms.capacity() * std::mem::size_of::<&'static AtomRec>()
-            + self.seg.len() * std::mem::size_of::<AtomicCell<Option<&'static Page>>>()
-            + pages * std::mem::size_of::<Page>();
-        // Records are allocated once and never freed, as erts `atom_alloc`.
-        let entries = inner.atoms.len() * std::mem::size_of::<AtomRec>();
+        let guard = self.index.read();
+        let table = guard.hash().bucket_bytes() + self.index.seg_bytes();
+        let entries = self.index.num_entries() as usize * std::mem::size_of::<AtomRec>();
         AtomMemory {
             table: table as u64,
             entries: entries as u64,
-            text: inner.atom_space,
+            text: self.index.fun().atom_space.load(Ordering::Relaxed),
         }
     }
 
     /// Bytes of atom text stored so far (`atom_space` in `atom.c`).
     pub fn text_space(&self) -> u64 {
-        self.inner.read().atom_space
+        let _guard = self.index.read();
+        self.index.fun().atom_space.load(Ordering::Relaxed)
     }
 
     /// Configured maximum, including predefined atoms.
     pub fn limit(&self) -> usize {
-        self.inner.read().limit as usize
+        self.index.info().1 as usize
     }
 
-    /// Number of atoms currently interned.
+    /// Number of atoms currently interned. Port of atom.c:340 (atom_table_size).
     pub fn len(&self) -> usize {
-        self.inner.read().entries as usize
+        let _guard = self.index.read();
+        self.index.num_entries() as usize
     }
 
     /// Whether the table is empty.
@@ -459,247 +493,47 @@ impl AtomTable {
     /// The atom free callback is empty, so the records stay allocated; they leave
     /// the hash and `entries` moves back. The atom table itself never calls this.
     pub fn erase_latest_from(&self, from_ix: usize) {
-        let from_ix = i32::try_from(from_ix).unwrap_or(i32::MAX);
-        let mut inner = self.inner.write();
-        if from_ix >= inner.entries {
-            return;
-        }
-        for ix in from_ix..inner.entries {
-            let Some(rec) = self.published(ix as usize) else {
-                continue;
-            };
-            unlink(&mut inner, rec.id);
-        }
-        inner.entries = from_ix;
+        self.index.write().erase_latest_from(from_ix);
     }
 
+    // Port of atom.c:231 (erts_atom_put_index): `atom_read_lock; index_get; atom_read_unlock`.
     fn lookup(&self, bytes: &[u8]) -> Option<Atom> {
-        let inner = self.inner.read();
-        find(&inner, bytes).map(Atom)
+        let ix = self.index.read().get(&AtomTemplate {
+            name: bytes,
+            latin1_chars: 0,
+        });
+        (ix >= 0).then_some(Atom(ix as u32))
     }
 
+    // Port of atom.c:231 (erts_atom_put_index): `atom_write_lock; index_put; atom_write_unlock`.
     fn insert(&self, bytes: &[u8], latin1_chars: i16) -> Result<Atom, AtomError> {
-        let mut inner = self.inner.write();
-        if let Some(index) = find(&inner, bytes) {
-            return Ok(Atom(index));
-        }
-        // Port of index.c:87: a full index calls erts_exit(ERTS_DUMP_EXIT).
-        // The new name is not published. Character overflow is AtomError::TooLong,
-        // which the BIFs report as system_limit.
-        if inner.entries >= inner.limit {
-            let limit = inner.limit;
-            drop(inner);
-            index_exhausted(limit);
-        }
-        let id = push_new(&mut inner, bytes, latin1_chars);
-        let ix = inner.entries;
-        if ix >= inner.size {
-            // Port of index.c:85-94: allocate the next index page, then advance `size`.
-            inner.size += INDEX_PAGE_SIZE as i32;
-        }
-        let rec = inner.atoms[id as usize];
-        rec.index.store(ix, Ordering::Relaxed);
-        let page_ix = (ix as usize) >> INDEX_PAGE_SHIFT;
-        let page = match self.seg[page_ix].load() {
-            Some(page) => page,
-            None => {
-                let page: &'static Page = Box::leak(Box::new(Page::new()));
-                self.seg[page_ix].store(Some(page));
-                page
-            }
-        };
-        page.slots[(ix as usize) & INDEX_PAGE_MASK].store(Some(rec));
-        inner.entries = ix + 1;
+        let mut guard = self.index.write();
+        let ix = guard
+            .put_entry(&AtomTemplate {
+                name: bytes,
+                latin1_chars,
+            })
+            .slot()
+            .index();
         Ok(Atom(ix as u32))
     }
 
+    #[inline(always)]
     fn record(&self, atom: Atom) -> Option<&AtomRec> {
-        self.published(atom.0 as usize)
-    }
-
-    fn published(&self, ix: usize) -> Option<&AtomRec> {
-        let page = self.seg.get(ix >> INDEX_PAGE_SHIFT)?.load()?;
-        page.slots.get(ix & INDEX_PAGE_MASK)?.load()
+        self.index.lookup(atom.0 as usize)
     }
 }
 
-impl Inner {
-    // Port of erts/emulator/beam/hash.c:121 (hash_init) and index.c:59
-    // (erts_index_init), OTP-29.1.1. The atom table passes `3 * ATOM_SIZE / 4`.
-    fn new(limit: i32) -> Self {
-        let requested = 3 * ATOM_SIZE / 4;
-        let mut pow = 1_i32;
-        while (1_i32 << pow) < requested {
-            pow += 1;
-        }
-        let shift = MAX_SHIFT - pow;
-        let slots = slot_count(shift) as usize;
-        let mut inner = Self {
-            shift,
-            max_shift: shift,
-            shrink_threshold: -1,
-            grow_threshold: 0,
-            nobjs: 0,
-            buckets: vec![NULL_LINK; slots],
-            atoms: Vec::new(),
-            entries: 0,
-            size: 0,
-            limit,
-            atom_space: 0,
-        };
-        set_thresholds(&mut inner);
-        inner
-    }
-}
-
-fn slot_count(shift: i32) -> i32 {
-    // Port of hash.c:41 (hash_get_slots). The shift stays in `1..63` for atom-table sizes.
-    (1_u64 << (MAX_SHIFT - shift)) as i32
-}
-
-fn set_thresholds(inner: &mut Inner) {
-    // Port of hash.c:108 (set_thresholds): grow at 160% load, shrink at 20%,
-    // never below the size `hash_init` chose.
-    let slots = slot_count(inner.shift);
-    inner.grow_threshold = (8 * slots) / 5;
-    inner.shrink_threshold = if inner.shift < inner.max_shift {
-        slots / 5
-    } else {
-        -1
-    };
-}
-
-fn hash_slot(shift: i32, mut hv: u64) -> usize {
-    // Port of hash.h:108 (hash_get_slot), the 64-bit fibonacci mapping.
-    let shift = shift as u32;
-    hv ^= hv >> shift;
-    (FIBONACCI.wrapping_mul(hv) >> shift) as usize
-}
-
-fn find(inner: &Inner, bytes: &[u8]) -> Option<u32> {
-    // Port of hash.h:133 (hash_fetch) and atom.c:119 (atom_cmp).
-    let hvalue = atom_hash(bytes);
-    let mut link = inner.buckets[hash_slot(inner.shift, hvalue)];
-    while link != NULL_LINK {
-        let rec = &inner.atoms[link as usize];
-        if rec.hvalue == hvalue && rec.name.as_bytes() == bytes {
-            let index = rec.index.load(Ordering::Relaxed);
-            if index >= 0 {
-                return Some(index as u32);
-            }
-        }
-        link = rec.next.load(Ordering::Relaxed);
-    }
-    None
-}
-
-fn push_new(inner: &mut Inner, bytes: &[u8], latin1_chars: i16) -> u32 {
-    // Port of hash.c:235 (hash_put) and atom.c:130 (atom_alloc).
-    let hvalue = atom_hash(bytes);
-    let slot = hash_slot(inner.shift, hvalue);
-    let id = inner.atoms.len() as u32;
-    let (bin, name) = literal_atom(bytes);
-    let rec = Box::leak(Box::new(AtomRec {
-        id,
-        next: AtomicU32::new(inner.buckets[slot]),
-        hvalue,
-        index: AtomicI32::new(-1),
-        latin1_chars,
-        ord0: ord0_of(bytes),
-        bin,
-        name,
-    }));
-    inner.buckets[slot] = id;
-    inner.atoms.push(rec);
-    inner.nobjs += 1;
-    inner.atom_space += bytes.len() as u64;
-    if inner.nobjs > inner.grow_threshold {
-        rehash(inner, true);
-    }
-    id
-}
-
-fn literal_atom(bytes: &[u8]) -> (Term, &'static str) {
+fn literal_atom(bytes: &[u8]) -> Term {
     // Port of atom.c:147 (erts_global_literal_allocate / erts_hfact_new_binary_from_data
     // / erts_global_literal_register), OTP-29.1.1. Atom names are never freed
-    // (`atom_free` is empty), so `Atom.name` points into the global literal binary.
+    // (`atom_free` is empty), so `Atom.u.bin` is the global literal binary.
     // Upper bound of the binary's words: BinRef header plus the on-heap payload.
     let mut build = crate::global_literal_allocate(16 + bytes.len().div_ceil(8));
     let term = TermBuilder::new(&mut build)
         .binary(bytes)
         .expect("atom literal binary");
-    let term = build.register(term);
-    // `bytes` is the UTF-8 just stored in that literal binary (ASCII, Latin-1 expanded to
-    // UTF-8, or validated UTF-8).
-    let view = crate::raw::BinRef::try_from(term).expect("atom literal is a binary");
-    let name = std::str::from_utf8(view.bytes().expect("atom literal is a byte string"))
-        .expect("atom text is utf-8");
-    (term, name)
-}
-
-fn index_exhausted(limit: i32) -> ! {
-    // Port of index.c:89 and erl_init.c:2718 (`ERTS_DUMP_EXIT` then exit status 1).
-    // erl_crash_dump.c:509 and :697 print the banner. The dump body is left for
-    // the crash-dump agent; the message and status match erts on this platform
-    // (`erts_fprintf` writes `\r\n`).
-    let message = format!(
-        "no more index entries in atom_tab (max={limit})\r\n\r\nCrash dump is being written to: erl_crash.dump...done\r\n"
-    );
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
-    let _ = std::io::Write::flush(&mut std::io::stderr());
-    std::process::exit(1);
-}
-
-fn unlink(inner: &mut Inner, id: u32) {
-    // Port of hash.c:262 (hash_erase). `atom_free` is empty, so the record stays.
-    let hvalue = inner.atoms[id as usize].hvalue;
-    let slot = hash_slot(inner.shift, hvalue);
-    let mut link = inner.buckets[slot];
-    let mut prev = None;
-    while link != NULL_LINK {
-        let next = inner.atoms[link as usize].next.load(Ordering::Relaxed);
-        if link == id {
-            if let Some(previous) = prev {
-                inner.atoms[previous as usize]
-                    .next
-                    .store(next, Ordering::Relaxed);
-            } else {
-                inner.buckets[slot] = next;
-            }
-            inner.nobjs -= 1;
-            if inner.nobjs < inner.shrink_threshold {
-                rehash(inner, false);
-            }
-            return;
-        }
-        prev = Some(link);
-        link = next;
-    }
-}
-
-fn rehash(inner: &mut Inner, grow: bool) {
-    // Port of hash.c:187 (rehash).
-    if grow {
-        inner.shift -= 1;
-    } else if inner.shift == inner.max_shift {
-        return;
-    } else {
-        inner.shift += 1;
-    }
-    let slots = slot_count(inner.shift) as usize;
-    let old = std::mem::replace(&mut inner.buckets, vec![NULL_LINK; slots]);
-    for mut link in old {
-        while link != NULL_LINK {
-            let next = inner.atoms[link as usize].next.load(Ordering::Relaxed);
-            let slot = hash_slot(inner.shift, inner.atoms[link as usize].hvalue);
-            inner.atoms[link as usize]
-                .next
-                .store(inner.buckets[slot], Ordering::Relaxed);
-            inner.buckets[slot] = link;
-            link = next;
-        }
-    }
-    set_thresholds(inner);
+    build.register(term)
 }
 
 fn ord0_of(name: &[u8]) -> i32 {
@@ -723,8 +557,8 @@ fn cmp_recs(left: &AtomRec, right: &AtomRec) -> std::cmp::Ordering {
             std::cmp::Ordering::Greater
         };
     }
-    let left_bytes = left.name.as_bytes();
-    let right_bytes = right.name.as_bytes();
+    let left_bytes = left.name().as_bytes();
+    let right_bytes = right.name().as_bytes();
     let left_tail = left_bytes.get(3..).unwrap_or(&[]);
     let right_tail = right_bytes.get(3..).unwrap_or(&[]);
     let shared = left_tail.len().min(right_tail.len());
@@ -911,17 +745,6 @@ mod tests {
         assert_eq!(atom_hash(b"false"), 0x6c_8395);
         assert_eq!(atom_hash(b"erlang"), 0x6c9_2847);
         assert_eq!(atom_hash("å".as_bytes()), 0xe5);
-        assert_eq!(hash_slot(52, atom_hash(b"false")), 3389);
-        assert_eq!(hash_slot(52, atom_hash(b"ok")), 3104);
-    }
-
-    #[test]
-    fn atom_index_slots_are_lock_free_pointer_cells() {
-        assert!(AtomicCell::<Option<&'static AtomRec>>::is_lock_free());
-        similar_asserts::assert_eq!(
-            std::mem::size_of::<AtomicCell<Option<&'static AtomRec>>>(),
-            std::mem::size_of::<*const AtomRec>()
-        );
     }
 
     #[test]
@@ -933,8 +756,8 @@ mod tests {
         let entries = atoms::PREDEFINED.len() as i32;
         assert_eq!(index.entries, entries);
         assert_eq!(index.limit, DEFAULT_ATOM_TABLE_LIMIT as i32);
-        let pages = (entries as usize).div_ceil(INDEX_PAGE_SIZE);
-        assert_eq!(index.size, (pages * INDEX_PAGE_SIZE) as i32);
+        let pages = (entries as usize).div_ceil(1024);
+        assert_eq!(index.size, (pages * 1024) as i32);
         assert_eq!(hash.name, "atom_tab");
         assert_eq!(hash.objs, entries);
         assert_eq!(hash.size, 4096);
@@ -953,7 +776,7 @@ mod tests {
         for n in 0..need {
             table.intern(&format!("grow_{n}")).unwrap();
         }
-        for ix in (0..table.len()).step_by(INDEX_PAGE_SIZE) {
+        for ix in (0..table.len()).step_by(1024) {
             assert!(table.text(Atom(ix as u32)).is_some(), "atom index {ix}");
         }
         assert_eq!(table.hash_info().size, 8192);
