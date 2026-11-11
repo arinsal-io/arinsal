@@ -790,6 +790,20 @@ pub struct NativeFunction {
     pub nif_stub: bool,
 }
 
+/// Build `ERTS_GLOBAL_LIT_ERL_FILE_SUFFIX`, the list `".erl"`.
+// Port of erts/emulator/beam/beam_file.c (beamfile_init), OTP-29.1.1. Guarded by a `Once`
+// because a VM can boot more than once in one process.
+pub fn beamfile_init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let mut build = arinsal_term::global_literal_allocate(8);
+        let suffix = TermBuilder::new(&mut build)
+            .string_to_list(".erl")
+            .expect("file suffix literal");
+        arinsal_term::set_global_erl_file_suffix(build.register(suffix));
+    });
+}
+
 /// The tables of a function-only module, before its code is emitted: the atoms, literals,
 /// lambdas, imports and records that `beam_load_prepare_emit` and `beamfile_read` of erts have
 /// built when `load_code` starts. The function table, the exports and the lambda targets come
@@ -808,13 +822,17 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
     let mut line_file_terms = HashMap::new();
     if let Some(table) = &file.lines {
         let default = format!("{}.erl", file.module);
-        let names = std::iter::once(default.as_str()).chain(
-            table
-                .names
-                .iter()
-                .map(String::as_str)
-                .filter(|name| !name.is_empty()),
-        );
+        // Port of beam_file.c (beamfile_read_lines): the implicit entry is the module
+        // name's characters with ERTS_GLOBAL_LIT_ERL_FILE_SUFFIX as the tail.
+        let term = TermBuilder::new(&mut literals)
+            .string_to_list_with_tail(&file.module, arinsal_term::global_erl_file_suffix())
+            .map_err(|_| LoadError::Limit)?;
+        line_file_terms.insert(default.clone(), term);
+        let names = table
+            .names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !name.is_empty());
         for name in names {
             if !line_file_terms.contains_key(name) {
                 let term = TermBuilder::new(&mut literals)

@@ -6,7 +6,7 @@
 //! [`Tuple`], [`boxed_header`]); it is public so that BIF loops outside this crate can walk
 //! lists and tuples with erts-shaped code while staying in safe Rust.
 
-use crate::{ARITY, BIN_REF, EMPTY_TUPLE, HeapAlloc, SUB_BITS, Term, TermError};
+use crate::{ARITY, BIN_REF, HeapAlloc, SUB_BITS, Term, TermError};
 use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
 
@@ -496,7 +496,7 @@ impl ProperList<'_> {
     #[inline(always)]
     pub fn to_tuple<H: HeapAlloc + ?Sized>(self, heap: &mut H) -> Result<Term, TermError> {
         if self.len == 0 {
-            return Ok(Term::from_ptr((&EMPTY_TUPLE as *const u64).cast_mut(), 2));
+            return Ok(crate::global_empty_tuple());
         }
         if self.len > (1 << 24) - 1 {
             return Err(TermError::SystemLimit);

@@ -425,7 +425,7 @@ impl Copier<'_> {
         }
         if self.old.contains(address)
             || self.literals.contains(address)
-            || address == std::ptr::from_ref(&crate::EMPTY_TUPLE) as usize
+            || address == (crate::global_empty_tuple().bits() & !7) as usize
         {
             return false;
         }

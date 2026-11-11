@@ -164,9 +164,6 @@ fn heap_contains(heap: &ProcessHeap, addr: usize) -> bool {
 }
 
 fn is_static_empty_tuple(addr: usize) -> bool {
-    if addr == std::ptr::from_ref(&crate::EMPTY_TUPLE) as usize {
-        return true;
-    }
     #[cfg(target_os = "macos")]
     {
         macos_zero_word(addr)

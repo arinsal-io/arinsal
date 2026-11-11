@@ -424,26 +424,38 @@ word_adapters!(system_info => system_info_result, no_aux_work_threads => no_aux_
 crate::word_bif_bodies_in!(word_bodies; system_info, no_aux_work_threads, getenv, getpid,
     perf_counter);
 
-/// `erlang:system_info(os_type)`: the global literal `os_info_init` builds once.
-// Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_type: ERTS_GLOBAL_LIT_OS_TYPE,
-// os_info_init), OTP-29.1.1.
-pub fn os_type() -> Term {
-    static OS_TYPE: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    *OS_TYPE.get_or_init(|| {
-        let flavor = uname_fields().0;
+/// Build the `os_type` and `os_version` global literals.
+// Port of erts/emulator/beam/erl_bif_info.c (os_info_init), OTP-29.1.1. Guarded by a `Once`
+// because a VM can boot more than once in one process.
+pub fn os_info_init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
         let intern = |name: &str| global_atoms().intern(name).expect("os_type atom");
-        arinsal_term::global_os_type(intern("unix"), intern(&flavor))
-    })
+        let (flavor, version) = uname_fields();
+        // Atoms first: creating one takes the global literal lock the build holds.
+        let elements = [Term::atom(intern("unix")), Term::atom(intern(&flavor))];
+        let mut build = arinsal_term::global_literal_allocate(3);
+        let tuple = arinsal_term::TermBuilder::new(&mut build)
+            .tuple(&elements)
+            .expect("os_type literal");
+        arinsal_term::set_global_os_type(build.register(tuple));
+
+        let mut build = arinsal_term::global_literal_allocate(4);
+        let tuple = arinsal_term::TermBuilder::new(&mut build)
+            .tuple(&version.map(|n| Term::small(n).expect("small")))
+            .expect("os_version literal");
+        arinsal_term::set_global_os_version(build.register(tuple));
+    });
 }
 
-/// `erlang:system_info(os_version)`: the global literal `os_info_init` builds once.
-// Port of erts/emulator/beam/erl_bif_info.c (system_info_1 os_version: ERTS_GLOBAL_LIT_OS_VERSION,
-// os_info_init), OTP-29.1.1.
+/// `erlang:system_info(os_type)`: `ERTS_GLOBAL_LIT_OS_TYPE`.
+pub fn os_type() -> Term {
+    arinsal_term::global_os_type()
+}
+
+/// `erlang:system_info(os_version)`: `ERTS_GLOBAL_LIT_OS_VERSION`.
 pub fn os_version() -> Term {
-    static OS_VERSION: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    *OS_VERSION.get_or_init(|| {
-        arinsal_term::global_os_version(uname_fields().1.map(|n| Term::small(n).expect("small")))
-    })
+    arinsal_term::global_os_version()
 }
 
 /// `(os_flavor, os_version)` from `uname(2)`.

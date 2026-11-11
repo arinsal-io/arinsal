@@ -6,6 +6,8 @@ use support::{call, equivalent};
 
 #[test]
 fn stable_system_info_matches_otp() {
+    arinsal_term::init_global_literals();
+    arinsal_bifs::os_info_init();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping system_info differential test");
         return;

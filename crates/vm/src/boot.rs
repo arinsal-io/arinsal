@@ -59,6 +59,11 @@ pub fn run_with_debugger_flags(
         crate::natives::tty::replace_intr();
     }
     erl_init_atoms()?;
+    // Port of erts/emulator/beam/erl_init.c (erl_init): os_info_init (erts_bif_info_init),
+    // init_dist and beamfile_init each build their global literal.
+    arinsal_bifs::os_info_init();
+    crate::dist::init_dist_dflags_record();
+    arinsal_loader::beamfile_init();
     crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
     // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this
     // block; it only chooses the loader path before preloaded modules load.

@@ -6,6 +6,7 @@ mod copy;
 pub mod exc;
 mod fun;
 mod gc;
+mod global_literals;
 mod hamt;
 mod hamt_yield;
 mod hash;
@@ -58,6 +59,12 @@ pub use fun::{
 pub use gc::{
     FragmentAlloc, FragmentIndex, GcMessageRoot, GcRootSet, GcStats, set_gc_clock_for_long_gc,
     set_gc_clock_for_msacc, spawned_heap_words,
+};
+pub use global_literals::{
+    GlobalLiteralBuild, global_dflags_record, global_empty_tuple, global_erl_file_suffix,
+    global_literal_allocate, global_literal_iterate_area, global_os_type, global_os_version,
+    init_global_literals, set_global_dflags_record, set_global_erl_file_suffix, set_global_os_type,
+    set_global_os_version,
 };
 pub use hamt::{
     HxNode, alloc_terms, boxed_object_words, build_hamt_from_unique, flatmap_keys,
@@ -128,84 +135,6 @@ pub const MAX_SMALL: i64 = (1_i64 << 59) - 1;
 pub const SHARED_SUBTAG: u64 = 0x04;
 
 pub(crate) const ARITY: u64 = 0x00;
-pub(crate) static EMPTY_TUPLE: u64 = 0;
-
-/// The global literal empty tuple (erts `ERTS_GLOBAL_LIT_EMPTY_TUPLE`). Collections treat
-/// it as a literal, so every empty tuple shared outside a heap must be this one.
-// Port of erts/emulator/beam/erl_global_literals.h (ERTS_GLOBAL_LIT_EMPTY_TUPLE), OTP-29.1.1.
-pub fn global_empty_tuple() -> Term {
-    Term::from_ptr(std::ptr::from_ref(&EMPTY_TUPLE).cast_mut(), 2)
-}
-
-/// Return the process independent distribution flag record, backed by static literal words.
-///
-/// Port of erts/emulator/beam/dist.c (`init_dist`), OTP-29.1.1.
-pub fn global_dflags_record(tag: Atom, flags: [Term; 5]) -> Term {
-    static RECORD: std::sync::OnceLock<literal::LiteralChunk> = std::sync::OnceLock::new();
-    let chunk = RECORD.get_or_init(|| {
-        let mut chunk = literal::allocate_chunk(7).expect("global dflags literal area");
-        let words = [
-            (6 << 6) | ARITY,
-            Term::atom(tag).bits(),
-            flags[0].bits(),
-            flags[1].bits(),
-            flags[2].bits(),
-            flags[3].bits(),
-            flags[4].bits(),
-        ];
-        assert!(
-            chunk.write_words(&words),
-            "global dflags literal allocation"
-        );
-        chunk
-    });
-    Term::from_ptr(chunk.as_ptr(), 2)
-}
-
-/// The global literal `{Type, Flavor}` that `erlang:system_info(os_type)` returns (erts
-/// `ERTS_GLOBAL_LIT_OS_TYPE`), built once in a literal area.
-// Port of erts/emulator/beam/erl_bif_info.c (os_info_init: erts_global_literal_allocate,
-// TUPLE2, erts_global_literal_register), OTP-29.1.1.
-pub fn global_os_type(kind: Atom, flavor: Atom) -> Term {
-    static TUPLE: std::sync::OnceLock<literal::LiteralChunk> = std::sync::OnceLock::new();
-    let chunk = TUPLE.get_or_init(|| {
-        let mut chunk = literal::allocate_chunk(3).expect("global os_type literal area");
-        let words = [
-            (2 << 6) | ARITY,
-            Term::atom(kind).bits(),
-            Term::atom(flavor).bits(),
-        ];
-        assert!(
-            chunk.write_words(&words),
-            "global os_type literal allocation"
-        );
-        chunk
-    });
-    Term::from_ptr(chunk.as_ptr(), 2)
-}
-
-/// The global literal `{Major, Minor, Patch}` that `erlang:system_info(os_version)` returns (erts
-/// `ERTS_GLOBAL_LIT_OS_VERSION`), built once in a literal area.
-// Port of erts/emulator/beam/erl_bif_info.c (os_info_init: erts_global_literal_allocate,
-// TUPLE3, erts_global_literal_register), OTP-29.1.1.
-pub fn global_os_version(version: [Term; 3]) -> Term {
-    static TUPLE: std::sync::OnceLock<literal::LiteralChunk> = std::sync::OnceLock::new();
-    let chunk = TUPLE.get_or_init(|| {
-        let mut chunk = literal::allocate_chunk(4).expect("global os_version literal area");
-        let words = [
-            (3 << 6) | ARITY,
-            version[0].bits(),
-            version[1].bits(),
-            version[2].bits(),
-        ];
-        assert!(
-            chunk.write_words(&words),
-            "global os_version literal allocation"
-        );
-        chunk
-    });
-    Term::from_ptr(chunk.as_ptr(), 2)
-}
 
 pub(crate) const POS_BIG: u64 = 0x08;
 pub(crate) const NEG_BIG: u64 = 0x0c;

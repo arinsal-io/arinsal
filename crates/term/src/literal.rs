@@ -100,66 +100,14 @@ impl LiteralChunk {
         self.words
     }
 
+    /// Zero the words `start..end` of the chunk. The chunk's memory is stable and owned by
+    /// its heap, so the writes take no lock (erts hands out `literal_alloc` blocks the same way).
     pub(crate) fn initialize_words(&mut self, start: usize, end: usize) -> bool {
         if start > end || end > self.words {
             return false;
         }
-        let Some(area_start) = LITERAL_AREA_HEADER_WORDS.checked_mul(8) else {
-            return false;
-        };
-        let Some(from) = start
-            .checked_mul(8)
-            .and_then(|offset| area_start.checked_add(offset))
-        else {
-            return false;
-        };
-        let Some(to) = end
-            .checked_mul(8)
-            .and_then(|offset| area_start.checked_add(offset))
-        else {
-            return false;
-        };
-        let Some(arena) = arena() else {
-            return false;
-        };
-        let mut arena = arena.lock().expect("literal arena poisoned");
-        let Ok(bytes) = arena.allocator.allocation_bytes_mut(self.allocation) else {
-            return false;
-        };
-        let Some(range) = bytes.get_mut(from..to) else {
-            return false;
-        };
-        range.fill(0);
-        true
-    }
-
-    pub(crate) fn write_words(&mut self, words: &[u64]) -> bool {
-        if words.len() > self.words {
-            return false;
-        }
-        let Some(from) = LITERAL_AREA_HEADER_WORDS.checked_mul(8) else {
-            return false;
-        };
-        let Some(bytes_len) = words.len().checked_mul(8) else {
-            return false;
-        };
-        let Some(to) = from.checked_add(bytes_len) else {
-            return false;
-        };
-        let Some(arena) = arena() else {
-            return false;
-        };
-        let mut arena = arena.lock().expect("literal arena poisoned");
-        let Ok(bytes) = arena.allocator.allocation_bytes_mut(self.allocation) else {
-            return false;
-        };
-        let Some(range) = bytes.get_mut(from..to) else {
-            return false;
-        };
-        let (chunks, remainder) = range.as_chunks_mut::<8>();
-        debug_assert!(remainder.is_empty());
-        for (chunk, word) in chunks.iter_mut().zip(words) {
-            chunk.copy_from_slice(&word.to_ne_bytes());
+        for index in start..end {
+            crate::heap::store(self.as_ptr().wrapping_add(index), 0);
         }
         true
     }
@@ -249,14 +197,11 @@ pub(crate) fn is_literal_pointer(ptr: *const u64) -> bool {
     is_literal_address(ptr as usize)
 }
 
-/// `erts_is_literal` for an address: the empty tuple or one range comparison.
+/// `erts_is_literal` for an address: one range comparison (the empty tuple lives in the range).
 // Port of erts/emulator/beam/erl_alloc.h:337 (`erts_is_in_literal_range`) and
 // global.h:1572 (`erts_is_literal`), OTP-29.1.1.
 #[inline]
 pub(crate) fn is_literal_address(address: usize) -> bool {
-    if address == std::ptr::from_ref(&crate::EMPTY_TUPLE) as usize {
-        return true;
-    }
     precise(address)
 }
 

@@ -571,6 +571,7 @@ mod tests {
     /// The decoder builds the terms the general decoder builds, for every kind of term.
     #[test]
     fn matches_the_general_decoder() {
+        crate::init_global_literals();
         let samples = vec![
             OwnedTerm::Int(0),
             OwnedTerm::Int(255),
@@ -712,6 +713,7 @@ mod tests {
     /// What erts rejects when it loads the literal chunk is rejected here.
     #[test]
     fn malformed_input_is_an_error() {
+        crate::init_global_literals();
         let mut heap = VecHeap::new_literal();
         let mut bad =
             |bytes: &[u8]| assert!(decode_literal(bytes, &mut heap).is_none(), "{bytes:?}");

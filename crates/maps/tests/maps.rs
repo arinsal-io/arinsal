@@ -827,6 +827,7 @@ fn differential_predefined_atoms_and_map_key_in_hamt() {
 
 #[test]
 fn differential_generated_flatmaps() {
+    arinsal_term::init_global_literals();
     use arinsal_etf::OwnedTerm as O;
     use proptest::strategy::{Strategy, ValueTree};
     let mut runner = proptest::test_runner::TestRunner::deterministic();

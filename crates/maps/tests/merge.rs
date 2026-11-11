@@ -126,6 +126,7 @@ const CASES: &[(i64, i64, i64)] = &[
 
 #[test]
 fn differential_merge_order_and_sharing() {
+    arinsal_term::init_global_literals();
     let eval = format!(
         "lists:foreach(fun({{A,B,Off}}) -> \
            L = maps:from_list([{{K,K}} || K <- lists:seq(1,A)]), \
@@ -227,6 +228,7 @@ fn finite_heap_returns_heap_full_without_replaying_construction() {
 
 #[test]
 fn differential_from_list_and_from_keys() {
+    arinsal_term::init_global_literals();
     let cases: &[(i64, i64)] = &[
         (0, 1),
         (1, 1),

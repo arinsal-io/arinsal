@@ -77,6 +77,7 @@ fn node_shapes(map: Term) -> Vec<(u64, Vec<u8>)> {
 #[test]
 #[cfg(not(miri))]
 fn differential_5000_mixed_maps() {
+    arinsal_term::init_global_literals();
     let expression = r#"erts_debug:set_internal_state(available_internal_state,true),
         F=fun(I)->case I rem 6 of
           0->I+100000; 1->I+0.5; 2->{I}; 3->[I];
