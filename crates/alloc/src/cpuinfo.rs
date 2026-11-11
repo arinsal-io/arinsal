@@ -4,7 +4,7 @@
 //! get_cgroup_path), OTP-29.1.1. `std::thread::available_parallelism` is not used because it
 //! folds the quota into the affinity count, while erts keeps the four numbers apart.
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// One row from `erts_cpu_topology_t`, in the order used by ERTS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,10 +366,27 @@ pub struct CpuInfo {
     pub quota: usize,
 }
 
-/// The processor counts, read once at first use like `erts_pre_early_init_cpu_topology`.
+/// The latest processor counts, initialized at first use and refreshed by [`update_cpu_info`].
 pub fn cpu_info() -> CpuInfo {
-    static INFO: OnceLock<CpuInfo> = OnceLock::new();
-    *INFO.get_or_init(read_cpu_info)
+    *CPU_INFO
+        .get_or_init(|| RwLock::new(read_cpu_info()))
+        .read()
+        .expect("CPU info lock poisoned")
+}
+
+static CPU_INFO: OnceLock<RwLock<CpuInfo>> = OnceLock::new();
+
+/// Re-read CPU properties and report whether the cached values changed.
+// Port of erts/lib_src/common/erl_misc_utils.c (erts_cpu_info_update), OTP-29.1.1.
+pub fn update_cpu_info() -> bool {
+    let mut current = CPU_INFO
+        .get_or_init(|| RwLock::new(read_cpu_info()))
+        .write()
+        .expect("CPU info lock poisoned");
+    let updated = read_cpu_info();
+    let changed = *current != updated;
+    *current = updated;
+    changed
 }
 
 /// Highest file descriptor count the poller supports.

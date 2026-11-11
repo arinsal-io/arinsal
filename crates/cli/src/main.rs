@@ -141,6 +141,16 @@ fn erl_launch(args: &[String], detached_child: bool) -> ! {
         }
     };
     arinsal_args::configure_emulator_flags(launch.emulator.clone());
+    // Port of erts/emulator/beam/erl_init.c:801 and utils.c:3215 (`erts_save_emu_args`), OTP-29.1.1.
+    let mut emu_args = vec![
+        std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("arinsal"))
+            .display()
+            .to_string(),
+        "--".to_owned(),
+    ];
+    emu_args.extend(launch.boot_args.iter().cloned());
+    arinsal_args::configure_emu_args(emu_args);
     let default_dirty_allocators = launch
         .emulator
         .dirty_cpu_schedulers

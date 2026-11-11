@@ -2676,7 +2676,9 @@ impl<T: Task> LocalInit<T> {
     }
 }
 use thr_progress::LaterOp;
-pub use thr_progress::thread_progress_wait;
+pub use thr_progress::{
+    debug_print_state as thread_progress_debug_print_state, thread_progress_wait,
+};
 
 fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
     thr_progress::thread_progress_wait(wait)

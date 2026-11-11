@@ -1398,6 +1398,85 @@ pub(crate) fn system_info_process_item(
         // Port of erts/emulator/beam/erl_bif_info.c:3547-3548, OTP-29.1.1.
         Some("system_logger") => Some(Ok(system_logger(process))),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
+        Some("port_tasks") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
+        Some("io_thread" | "lock_counting") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
+        Some("literal_test") => Some(Ok(crate::atom_cache::put("range"))),
+        Some("reader_groups_map" | "decentralized_counter_groups_map") => {
+            Some(cons_list(process, &[]))
+        }
+        Some("dist_ctrl") => Some(dist_ctrl_info(process)),
+        Some("modified_timing_level") => Some(Ok(arinsal_args::active_emulator_flags()
+            .ignored
+            .iter()
+            .find(|flag| flag.name == "+T")
+            .and_then(|flag| flag.value.as_deref())
+            .and_then(|level| level.parse::<i64>().ok())
+            .and_then(Term::small)
+            .unwrap_or_else(|| crate::atom_cache::put("undefined")))),
+        Some("halt_flush_timeout") => Some(Ok(arinsal_args::active_emulator_flags()
+            .ignored
+            .iter()
+            .find(|flag| flag.name == "+zhft")
+            .and_then(|flag| flag.value.as_deref())
+            .and_then(|timeout| timeout.parse::<i64>().ok())
+            .filter(|timeout| *timeout >= 0)
+            .and_then(Term::small)
+            .unwrap_or_else(|| crate::atom_cache::put("infinity")))),
+        Some("compile_info") => Some(owned_system_info(
+            process,
+            arinsal_etf::OwnedTerm::List {
+                elems: vec![
+                    tagged_text(
+                        "ldflags",
+                        option_env!("CARGO_ENCODED_RUSTFLAGS").unwrap_or(""),
+                    ),
+                    tagged_text("cflags", std::env::consts::ARCH),
+                    tagged_text(
+                        "config_h",
+                        if cfg!(debug_assertions) {
+                            "debug_assertions"
+                        } else {
+                            "optimized"
+                        },
+                    ),
+                ],
+                tail: Box::new(arinsal_etf::OwnedTerm::Nil),
+            },
+        )),
+        Some("embedded_3pps") => Some(owned_system_info(
+            process,
+            arinsal_etf::OwnedTerm::Map(vec![
+                (
+                    arinsal_etf::OwnedTerm::Atom("included".into()),
+                    owned_atom_list(&["ryu", "zstd", "zlib"]),
+                ),
+                (
+                    arinsal_etf::OwnedTerm::Atom("excluded".into()),
+                    owned_atom_list(&["asmjit", "pcre2", "STL"]),
+                ),
+            ]),
+        )),
+        Some("emu_args") => Some(owned_system_info(
+            process,
+            owned_list(
+                arinsal_args::active_emu_args()
+                    .iter()
+                    .map(|value| owned_text(value))
+                    .collect::<Vec<_>>(),
+            ),
+        )),
+        Some("thread_progress") => {
+            arinsal_sched::thread_progress_debug_print_state();
+            Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
+        }
+        Some("update_cpu_info") => Some(Ok(crate::atom_cache::put(
+            if arinsal_alloc::cpuinfo::update_cpu_info() {
+                "changed"
+            } else {
+                "unchanged"
+            },
+        ))),
         // Port of erts/emulator/beam/erl_bif_info.c:3448-3449, OTP-29.1.1.
         // Arinsal's loaded BEAM select instructions use the jump-table dispatch path.
         Some("beam_jump_table") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
@@ -2739,6 +2818,55 @@ fn allocator_options(spec: &AllocatorSystemInfo, global: bool) -> arinsal_etf::O
 
 fn option(name: &str, value: arinsal_etf::OwnedTerm) -> arinsal_etf::OwnedTerm {
     arinsal_etf::OwnedTerm::Tuple(vec![arinsal_etf::OwnedTerm::Atom(name.into()), value])
+}
+
+fn owned_list(elems: Vec<arinsal_etf::OwnedTerm>) -> arinsal_etf::OwnedTerm {
+    arinsal_etf::OwnedTerm::List {
+        elems,
+        tail: Box::new(arinsal_etf::OwnedTerm::Nil),
+    }
+}
+
+fn owned_atom_list<const N: usize>(atoms: &[&str; N]) -> arinsal_etf::OwnedTerm {
+    owned_list(
+        atoms
+            .iter()
+            .map(|atom| arinsal_etf::OwnedTerm::Atom((*atom).into()))
+            .collect(),
+    )
+}
+
+fn owned_text(text: &str) -> arinsal_etf::OwnedTerm {
+    owned_list(
+        text.chars()
+            .map(|ch| arinsal_etf::OwnedTerm::Int(ch as i64))
+            .collect(),
+    )
+}
+
+fn tagged_text(name: &str, text: &str) -> arinsal_etf::OwnedTerm {
+    option(name, owned_text(text))
+}
+
+fn dist_ctrl_info(process: &mut Process) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1 dist_ctrl), OTP-29.1.1:
+    // enumerate the distribution table under its membership lock, then read each entry.
+    let entries = crate::node_tables::lock()
+        .entries
+        .values()
+        .filter_map(|entry| {
+            let state = entry.lock();
+            state
+                .connected
+                .then(|| (state.name.clone(), state.connection_id))
+        })
+        .map(|(node, connection_id)| {
+            let node = crate::atom_cache::put(&node);
+            let connection_id = Term::small(connection_id as i64).ok_or_else(badarg)?;
+            tuple(process, &[node, connection_id])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    cons_list(process, &entries)
 }
 
 fn owned_system_info(
