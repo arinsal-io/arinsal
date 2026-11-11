@@ -46,16 +46,20 @@ struct MigrationPathPool {
 // SAFETY: callers mutate the pool only while holding Balance.state; readers only access
 // `current` under scheduler thread progress, and the active pointer is atomic.
 unsafe impl Send for MigrationPathBlock {}
+// SAFETY: pool links are only accessed while Balance.state is held.
 unsafe impl Send for MigrationPathPool {}
+// SAFETY: MigrationPaths moves with its scheduler-owned Balance and never exposes pool pointers.
 unsafe impl Send for MigrationPaths {}
 // SAFETY: published blocks are immutable; pool links are serialized by Balance.state.
 unsafe impl Sync for MigrationPaths {}
 
+#[cfg(test)]
 struct MigrationReadDelay<'a> {
     progress: &'a crate::thr_progress::ThrProgress,
     handle: Option<crate::thr_progress::DelayHandle>,
 }
 
+#[cfg(test)]
 impl Drop for MigrationReadDelay<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
@@ -124,6 +128,7 @@ impl MigrationPaths {
         }
     }
 
+    #[cfg(test)]
     fn delay_read(&self) -> MigrationReadDelay<'_> {
         let handle = crate::thr_progress::unmanaged_delay(&self.progress);
         MigrationReadDelay {
@@ -157,6 +162,7 @@ impl MigrationPaths {
     }
 
     /// Copy a block for the serialized balance updater, which excludes other publishers.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<crate::balance::MigrationPath> {
         let _delay = self.delay_read();
         let block = self.current.load(Ordering::Acquire);
@@ -164,13 +170,15 @@ impl MigrationPaths {
         unsafe { std::slice::from_raw_parts(block_paths(block), self.len).to_vec() }
     }
 
-    /// Publish a replacement and link the old block into the retired list.
-    pub(crate) fn swap(&self, paths: Vec<crate::balance::MigrationPath>) {
-        assert_eq!(paths.len(), self.len);
+    /// Fill and publish a replacement while the previous block remains readable.
+    pub(crate) fn publish_with(
+        &self,
+        fill: impl FnOnce(&mut [crate::balance::MigrationPath], &[crate::balance::MigrationPath]),
+    ) {
         // SAFETY: every caller is a balance publisher holding Balance.state, the lock that
         // serializes OTP's alloc_mpaths and retire_mpaths operations.
         let pool = unsafe { &mut *self.pool.get() };
-        self.sweep(&mut pool);
+        self.sweep(pool);
         let new = if pool.free.is_null() {
             self.allocate_dynamic()
         } else {
@@ -182,13 +190,19 @@ impl MigrationPaths {
             }
             block
         };
-        // SAFETY: new is exclusively owned by this publisher until the atomic publication.
+        let old = self.current.load(Ordering::Acquire);
+        // SAFETY: new is exclusively owned by this publisher; old remains current because
+        // Balance.state serializes every writer until publication below.
         unsafe {
-            std::ptr::copy_nonoverlapping(paths.as_ptr(), block_paths(new), self.len);
+            fill(
+                std::slice::from_raw_parts_mut(block_paths(new), self.len),
+                std::slice::from_raw_parts(block_paths(old), self.len),
+            );
         }
         let old = self.current.swap(new, Ordering::AcqRel);
         // Port of erl_process.c (retire_mpaths): the old block itself carries its progress value
         // and intrusive next link; no closure or per-publication owner is allocated.
+        // SAFETY: old was the published block and Balance.state serializes its retirement.
         unsafe {
             (*old).retired_at = self.progress.later_value();
             (*old).next = std::ptr::null_mut();

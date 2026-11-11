@@ -257,8 +257,6 @@ struct QueueBalance {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
     pub(crate) active: usize,
-    /// New migration paths of the balanced (used) run queues.
-    pub(crate) paths: Vec<MigrationPath>,
 }
 
 /// Port of erts/emulator/beam/erl_process.c:4760 (ERTS_PERCENT), OTP-29.1.1.
@@ -375,10 +373,6 @@ impl<T: Task> Balance<T> {
         self.paths.flags(ix)
     }
 
-    fn publish(&self, paths: Vec<MigrationPath>) {
-        self.paths.swap(paths);
-    }
-
     /// Port of erts/emulator/beam/erl_process.c:2930 (sched_waiting) and erl_process.c:2942
     /// (sched_active) run queue part, OTP-29.1.1.
     pub(crate) fn set_waiting(&self, ix: usize, waiting: bool) {
@@ -448,20 +442,19 @@ impl<T: Task> Balance<T> {
         let used = used.clamp(1, self.rqs.len());
         let mut state = self.state.lock().unwrap();
         self.no_used_runqs.store(used, Ordering::Release);
-        let old = self.paths.snapshot();
-        let mut paths = vec![MigrationPath::NONE; self.rqs.len()];
-        for (qix, path) in paths.iter_mut().enumerate().take(used) {
-            path.flags = old[qix].flags & !MIGRATION_QMASKS;
-        }
-        for (qix, path) in paths.iter_mut().enumerate().skip(used) {
-            let to_rq = qix % used;
-            path.flags = EMIGRATE_QMASK | EVACUATE_QMASK;
-            path.misc_evac_runq = Some(to_rq);
-            for prio in &mut path.prio {
-                prio.runq = Some(to_rq);
+        self.paths.publish_with(|paths, old| {
+            for (qix, path) in paths.iter_mut().enumerate().take(used) {
+                path.flags = old[qix].flags & !MIGRATION_QMASKS;
             }
-        }
-        self.publish(paths);
+            for (qix, path) in paths.iter_mut().enumerate().skip(used) {
+                let to_rq = qix % used;
+                path.flags = EMIGRATE_QMASK | EVACUATE_QMASK;
+                path.misc_evac_runq = Some(to_rq);
+                for prio in &mut path.prio {
+                    prio.runq = Some(to_rq);
+                }
+            }
+        });
         // Make sure that we balance soon...
         state.forced_check_balance = true;
         drop(state);
@@ -529,32 +522,29 @@ impl<T: Task> Balance<T> {
                 }
             })
             .collect();
-        let freds_hist_ix = state.full_reds_history_index;
-        let (plan, history) = plan(
-            &mut state,
-            &samples,
-            current_active,
-            forced,
-            self.compact_load,
-        );
-        let active = plan.active;
+        let mut active = current_active;
+        self.paths.publish_with(|paths, old| {
+            let plan = plan(
+                &mut state,
+                &samples,
+                current_active,
+                forced,
+                self.compact_load,
+                &mut paths[..blnc_no_rqs],
+            );
+            active = plan.active;
+            paths[blnc_no_rqs..].copy_from_slice(&old[blnc_no_rqs..]);
+        });
         state.last_active_runqs = active;
         self.set_no_active_runqs(active);
         state.halftime = true;
         // Keep offline run queues as is.
-        let old = self.paths.snapshot();
-        let mut paths = plan.paths;
-        paths.extend_from_slice(&old[blnc_no_rqs..]);
-        let flags: Vec<u32> = paths[..blnc_no_rqs].iter().map(|path| path.flags).collect();
-        self.publish(paths);
         // Reset balance statistics in all online queues.
         for (qix, rq) in self.rqs[..blnc_no_rqs].iter().enumerate() {
-            let mut flags = flags[qix];
+            let mut flags = self.paths.with_path(qix, |path| path.flags).unwrap_or(0);
             if rq.waiting.load(Ordering::Acquire) {
                 flags |= FLG_OUT_OF_WORK;
             }
-            state.history[qix].sum = history[qix].0;
-            state.history[qix].entries[freds_hist_ix] = history[qix].1;
             let _ = rq
                 .flags
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
@@ -596,7 +586,8 @@ fn plan(
     current_active: usize,
     forced: bool,
     compact_load: bool,
-) -> (Plan, Vec<(i64, i64)>) {
+    paths: &mut [MigrationPath],
+) -> Plan {
     let blnc_no_rqs = samples.len();
     let freds_hist_ix = state.full_reds_history_index;
     state.full_reds_history_index += 1;
@@ -783,40 +774,36 @@ fn plan(
         }
     }
 
-    let paths = info
-        .iter()
-        .map(|queue| {
-            let flags = queue.flags;
-            let mut path = MigrationPath {
-                flags,
-                misc_evac_runq: None,
-                prio: [MigrationPrio::NONE; PRIO_LEVELS],
+    for (path, queue) in paths.iter_mut().zip(&info) {
+        let flags = queue.flags;
+        *path = MigrationPath {
+            flags,
+            misc_evac_runq: None,
+            prio: [MigrationPrio::NONE; PRIO_LEVELS],
+        };
+        for pix in 0..PRIO_LEVELS {
+            let peer = if flags & flg_emigrate(pix) != 0 {
+                queue.prio[pix].emigrate_to
+            } else if flags & flg_immigrate(pix) != 0 {
+                queue.prio[pix].immigrate_from
+            } else {
+                None
             };
-            for pix in 0..PRIO_LEVELS {
-                let peer = if flags & flg_emigrate(pix) != 0 {
-                    queue.prio[pix].emigrate_to
-                } else if flags & flg_immigrate(pix) != 0 {
-                    queue.prio[pix].immigrate_from
-                } else {
-                    None
+            if let Some(mqix) = peer {
+                path.prio[pix] = MigrationPrio {
+                    limit_here: limit(queue.prio[pix].migration_limit),
+                    limit_other: limit(info[mqix].prio[pix].migration_limit),
+                    runq: Some(mqix),
+                    flags: info[mqix].flags,
                 };
-                if let Some(mqix) = peer {
-                    path.prio[pix] = MigrationPrio {
-                        limit_here: limit(queue.prio[pix].migration_limit),
-                        limit_other: limit(info[mqix].prio[pix].migration_limit),
-                        runq: Some(mqix),
-                        flags: info[mqix].flags,
-                    };
-                }
             }
-            path
-        })
-        .collect();
-    let history = info
-        .iter()
-        .map(|queue| (queue.full_reds_history_sum, queue.full_reds_history_change))
-        .collect();
-    (Plan { active, paths }, history)
+        }
+    }
+    for (history, queue) in state.history.iter_mut().zip(&info) {
+        history.sum = queue.full_reds_history_sum;
+        history.entries[freds_hist_ix] = queue.full_reds_history_change;
+    }
+    Plan { active }
 }
 
 fn limit(value: i64) -> i32 {
@@ -967,14 +954,33 @@ mod tests {
         }
     }
 
+    fn run_plan(
+        state: &mut BalanceState,
+        samples: &[Sample],
+        current_active: usize,
+        forced: bool,
+        compact_load: bool,
+    ) -> (Plan, Vec<MigrationPath>) {
+        let mut paths = vec![MigrationPath::NONE; samples.len()];
+        let plan = plan(
+            state,
+            samples,
+            current_active,
+            forced,
+            compact_load,
+            &mut paths,
+        );
+        (plan, paths)
+    }
+
     #[test]
     fn long_queue_emigrates_to_short_queue() {
         let mut st = state(2);
-        let (planned, _) = plan(&mut st, &[busy(100), busy(10)], 2, false, true);
+        let (planned, paths) = run_plan(&mut st, &[busy(100), busy(10)], 2, false, true);
         assert_eq!(planned.active, 2);
         // Average max length 55 at full availability.
-        let from = planned.paths[0];
-        let to = planned.paths[1];
+        let from = paths[0];
+        let to = paths[1];
         assert_ne!(from.flags & flg_emigrate(PRIORITY_NORMAL), 0);
         assert_ne!(to.flags & flg_immigrate(PRIORITY_NORMAL), 0);
         assert_eq!(from.prio[PRIORITY_NORMAL].runq, Some(1));
@@ -992,9 +998,9 @@ mod tests {
             reds: [0, 0, 0, 0, CHECK_BALANCE_REDS_PER_SCHED],
             total_max_len: max_len,
         };
-        let (planned, _) = plan(&mut st, &[ports(40), ports(0)], 2, false, true);
-        let from = planned.paths[0];
-        let to = planned.paths[1];
+        let (_, paths) = run_plan(&mut st, &[ports(40), ports(0)], 2, false, true);
+        let from = paths[0];
+        let to = paths[1];
         assert_ne!(from.flags & flg_emigrate(PORT_PRIO_LEVEL), 0);
         assert_ne!(to.flags & flg_immigrate(PORT_PRIO_LEVEL), 0);
         assert_eq!(from.prio[PORT_PRIO_LEVEL].runq, Some(1));
@@ -1007,8 +1013,8 @@ mod tests {
     #[test]
     fn balanced_queues_get_no_paths() {
         let mut st = state(2);
-        let (planned, _) = plan(&mut st, &[busy(10), busy(10)], 2, false, true);
-        assert!(planned.paths.iter().all(|path| path.flags == 0));
+        let (_, paths) = run_plan(&mut st, &[busy(10), busy(10)], 2, false, true);
+        assert!(paths.iter().all(|path| path.flags == 0));
     }
 
     #[test]
@@ -1022,25 +1028,25 @@ mod tests {
             reds: [0, 0, 1000, 0, 0],
             ..Sample::default()
         };
-        let (planned, _) = plan(&mut st, &[little, idle, idle, idle], 4, false, true);
+        let (planned, paths) = run_plan(&mut st, &[little, idle, idle, idle], 4, false, true);
         assert_eq!(planned.active, 1);
-        for path in &planned.paths[1..] {
+        for path in &paths[1..] {
             assert_ne!(path.flags & FLG_INACTIVE, 0);
             assert_eq!(path.prio[PRIORITY_NORMAL].runq, Some(0));
         }
         // Without compact load every run queue stays active.
         let mut st = state(4);
-        let (planned, _) = plan(&mut st, &[little, idle, idle, idle], 4, false, false);
+        let (planned, _) = run_plan(&mut st, &[little, idle, idle, idle], 4, false, false);
         assert_eq!(planned.active, 4);
     }
 
     #[test]
     fn full_reds_history_rotates() {
         let mut st = state(2);
-        let (_, history) = plan(&mut st, &[busy(1), busy(1)], 2, false, true);
+        let _ = run_plan(&mut st, &[busy(1), busy(1)], 2, false, true);
         assert_eq!(st.full_reds_history_index, 1);
         assert_eq!(
-            history[0],
+            (st.history[0].sum, st.history[0].entries[0]),
             (FullRedsHistory::new().sum, CHECK_BALANCE_REDS_PER_SCHED)
         );
     }
