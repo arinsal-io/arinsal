@@ -43,8 +43,7 @@ pub use lists::{
     DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,
     LengthStep, MEMBER_PER_RED, MemberCont, MemberStep, REVERSE_CELLS_PER_RED,
     REVERSE_ONHEAP_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, append_onheap_direct,
-    length_slice, lists_append, lists_key, lists_member, lists_member_bif, lists_reverse,
-    reverse_onheap_direct,
+    length_slice, lists_append, lists_key, lists_member, lists_reverse, reverse_onheap_direct,
 };
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};

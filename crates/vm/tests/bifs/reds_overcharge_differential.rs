@@ -219,6 +219,108 @@ const ETS_CASES: &[Case] = &[
     ),
 ];
 
+const LISTS: &[usize] = &[1, 1_000, 100_000, 400_000];
+/// erl_bif_lists.c: short, long (trapping) and improper lists.
+const LIST_CASES: &[Case] = &[
+    case("reverse", LISTS, 4, "seq(N)", "lists:reverse(In, [])"),
+    case(
+        "reverse_improper",
+        LISTS,
+        6,
+        "improper(N)",
+        "catch lists:reverse(In, [])",
+    ),
+    case("member_miss", LISTS, 4, "seq(N)", "lists:member(0, In)"),
+    case(
+        "member_boxed_miss",
+        LISTS,
+        4,
+        "seq(N)",
+        "lists:member({0}, In)",
+    ),
+    case(
+        "member_improper",
+        LISTS,
+        6,
+        "improper(N)",
+        "catch lists:member(0, In)",
+    ),
+    case("keyfind_miss", LISTS, 6, "kv(N)", "lists:keyfind(0, 1, In)"),
+    case(
+        "keyfind_float",
+        LISTS,
+        6,
+        "kv(N)",
+        "lists:keyfind(0.0, 1, In)",
+    ),
+    case(
+        "keymember_miss",
+        LISTS,
+        6,
+        "kv(N)",
+        "lists:keymember(0, 2, In)",
+    ),
+    case(
+        "keysearch_last",
+        LISTS,
+        6,
+        "{kv(N), N}",
+        "lists:keysearch(element(2, In), 1, element(1, In))",
+    ),
+    case(
+        "keyfind_improper",
+        LISTS,
+        8,
+        "kv(N) ++ x",
+        "catch lists:keyfind(0, 1, In)",
+    ),
+    case("plusplus", LISTS, 6, "seq(N)", "In ++ [x]"),
+    case("plusplus_nil", LISTS, 4, "seq(N)", "In ++ []"),
+    case("append", LISTS, 6, "seq(N)", "erlang:append(In, [x])"),
+    case(
+        "plusplus_improper",
+        LISTS,
+        8,
+        "improper(N)",
+        "catch In ++ [x]",
+    ),
+    case(
+        "minusminus_short_rhs",
+        LISTS,
+        6,
+        "seq(N)",
+        "In -- [1, 2, 3]",
+    ),
+    case(
+        "minusminus_short_lhs",
+        LISTS,
+        6,
+        "{[1, 2, 3], seq(N)}",
+        "element(1, In) -- element(2, In)",
+    ),
+    case(
+        "minusminus_set",
+        LISTS,
+        12,
+        "{seq(N), lists:reverse(seq(N))}",
+        "element(1, In) -- element(2, In)",
+    ),
+    case(
+        "subtract_set",
+        LISTS,
+        12,
+        "{seq(N), seq(N div 2)}",
+        "erlang:subtract(element(1, In), element(2, In))",
+    ),
+    case(
+        "minusminus_improper",
+        LISTS,
+        8,
+        "{improper(N), [1]}",
+        "catch element(1, In) -- element(2, In)",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -242,6 +344,8 @@ fn source(cases: &[Case]) -> String {
 -export([{exports}]).
 
 seq(N) -> lists:seq(1, N).
+
+improper(N) -> lists:foldl(fun(I, Acc) -> [I | Acc] end, tail, lists:seq(1, N)).
 
 flat(N) -> [I rem 256 || I <- lists:seq(1, N)].
 
@@ -317,7 +421,13 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64) {
 }
 
 fn check(cases: &[Case]) {
-    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    check_with(cases, &[]);
+}
+
+/// [`check`] against a reference node started with `erl_args`.
+fn check_with(cases: &[Case], erl_args: &[&str]) {
+    let reference =
+        RefErl::start_with_erl_args(erl_args).expect("OTP 29.1.1 is required for this test");
     let source = source(cases);
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
@@ -378,6 +488,13 @@ fn t2b_bifs_charge_like_otp() {
 #[test]
 fn matching_bifs_charge_like_otp() {
     check(MATCHING_CASES);
+}
+
+// The trapping list BIFs yield on the reductions left in the slice; with one scheduler on both
+// sides the slices start at the same budget.
+#[test]
+fn list_bifs_charge_like_otp() {
+    check_with(LIST_CASES, &["+S", "1"]);
 }
 
 #[test]

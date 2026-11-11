@@ -1093,29 +1093,6 @@ fn iolist_to_iovec_preserves_large_binary_segments() {
 }
 
 #[test]
-fn reverse_bulk_cons_matches_otp_29() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    for size in [0, 1, 1_024, 10_000] {
-        let input = O::list((0..size).map(O::Int).collect());
-        let args = [input, atom("tail")];
-        let actual = call("lists", "reverse", &args);
-        let expected = reference.call("lists", "reverse", &args);
-        assert!(equivalent(&actual, &expected), "size={size}: {actual:?}");
-    }
-    let args = [
-        O::List {
-            elems: vec![O::Int(1)],
-            tail: Box::new(atom("improper")),
-        },
-        O::Nil,
-    ];
-    assert!(equivalent(
-        &call("lists", "reverse", &args),
-        &reference.call("lists", "reverse", &args)
-    ));
-}
-
-#[test]
 fn identity_bifs_are_unique_across_threads() {
     let threads = (0..8)
         .map(|_| {
@@ -1418,26 +1395,9 @@ fn cmp_term_uses_exact_numeric_order_inside_containers() {
 
 #[test]
 fn list_bif_loops_match_otp_29() {
+    // The erl_bif_lists.c BIFs are VM bodies (crates/vm/tests/bifs/lists_bifs_differential.rs).
     let reference = RefErl::shared().expect("OTP 29 reference");
     let seq = O::list((1..8).map(O::Int).collect());
-    let tuples = O::list(vec![
-        O::Tuple(vec![O::Float(1.0), atom("a")]),
-        O::Tuple(vec![O::Int(2), atom("b")]),
-        O::Tuple(vec![atom("c"), atom("d")]),
-    ]);
-    let compound_key = O::Tuple(vec![
-        atom("nested_key"),
-        O::Map(vec![(atom("payload"), O::Binary(vec![1, 2, 3]))]),
-    ]);
-    let changed_compound_key = O::Tuple(vec![
-        atom("nested_key"),
-        O::Map(vec![(atom("payload"), O::Binary(vec![1, 2, 4]))]),
-    ]);
-    let compound_member_list = O::list(vec![changed_compound_key.clone(), compound_key.clone()]);
-    let compound_key_tuples = O::list(vec![
-        O::Tuple(vec![O::Int(1), changed_compound_key.clone()]),
-        O::Tuple(vec![O::Int(2), compound_key.clone()]),
-    ]);
     let improper = O::List {
         elems: vec![O::Int(1)],
         tail: Box::new(atom("tail")),
@@ -1446,81 +1406,6 @@ fn list_bif_loops_match_otp_29() {
         ("erlang", "length", vec![O::Nil]),
         ("erlang", "length", vec![seq.clone()]),
         ("erlang", "length", vec![improper.clone()]),
-        ("erlang", "++", vec![O::Nil, atom("rhs")]),
-        ("erlang", "++", vec![seq.clone(), O::Nil]),
-        ("erlang", "++", vec![seq.clone(), O::list(vec![atom("z")])]),
-        ("erlang", "++", vec![improper.clone(), O::Nil]),
-        ("lists", "reverse", vec![O::Nil, atom("tail")]),
-        ("lists", "reverse", vec![seq.clone(), atom("tail")]),
-        ("lists", "reverse", vec![improper.clone(), O::Nil]),
-        ("lists", "member", vec![O::Int(7), seq.clone()]),
-        ("lists", "member", vec![O::Int(9), seq.clone()]),
-        ("lists", "member", vec![O::Float(1.0), seq.clone()]),
-        (
-            "lists",
-            "member",
-            vec![compound_key.clone(), compound_member_list],
-        ),
-        (
-            "lists",
-            "member",
-            vec![compound_key.clone(), O::list(vec![changed_compound_key])],
-        ),
-        (
-            "lists",
-            "member",
-            vec![O::Int(1), O::list(vec![O::Float(1.0)])],
-        ),
-        ("lists", "member", vec![O::Int(1), improper.clone()]),
-        (
-            "lists",
-            "keyfind",
-            vec![O::Int(1), O::Int(1), tuples.clone()],
-        ),
-        (
-            "lists",
-            "keyfind",
-            vec![O::Int(2), O::Int(1), tuples.clone()],
-        ),
-        (
-            "lists",
-            "keyfind",
-            vec![O::Int(1), O::Int(1), tuples.clone()],
-        ),
-        (
-            "lists",
-            "keyfind",
-            vec![compound_key, O::Int(2), compound_key_tuples],
-        ),
-        (
-            "lists",
-            "keyfind",
-            vec![atom("c"), O::Int(1), tuples.clone()],
-        ),
-        (
-            "lists",
-            "keyfind",
-            vec![O::Int(9), O::Int(1), tuples.clone()],
-        ),
-        (
-            "lists",
-            "keyfind",
-            vec![O::Int(1), O::Int(0), tuples.clone()],
-        ),
-        (
-            "lists",
-            "keymember",
-            vec![O::Int(1), O::Int(1), tuples.clone()],
-        ),
-        ("lists", "keysearch", vec![O::Int(2), O::Int(1), tuples]),
-        (
-            "erlang",
-            "--",
-            vec![
-                seq.clone(),
-                O::list(vec![O::Int(2), O::Float(2.0), O::Int(4)]),
-            ],
-        ),
     ];
     for (module, name, args) in cases {
         let actual = call(module, name, args);

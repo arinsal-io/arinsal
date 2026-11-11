@@ -146,11 +146,6 @@ pub(crate) struct DispatchTarget {
     /// The MFA is a light (not heap) BIF in the BIF table (erts `Export.bif_number` with the
     /// light-BIF kind), looked up once at intern.
     pub light_kind: bool,
-    /// `lists:keyfind/3`, `member/2`, `++` and `--`. Set once at intern so the
-    /// light-BIF path does not compare the MFA strings on every call. The scan
-    /// still runs as the plain BIF; trap state is built only when its counter
-    /// runs out.
-    pub list_slice: bool,
     /// Runs the BIF inside native code, without a trap back into the executor.
     /// ETS uses this, and so do `erlang:put/2` and `erlang:erase/1`: those are
     /// heap BIFs in erts (`call_ext`), and trapping once per key dominated the
@@ -293,16 +288,6 @@ impl DispatchRegistry {
     ) -> &'static DispatchTarget {
         self.by_identity.entry(identity).or_insert_with(|| {
             let mut leaked = DispatchTarget::clone(entry);
-            leaked.list_slice = matches!(
-                (
-                    leaked.module.as_str(),
-                    leaked.function.as_str(),
-                    leaked.arity
-                ),
-                ("lists", "keyfind" | "keymember" | "keysearch", 3)
-                    | ("lists", "member", 2)
-                    | ("erlang", "++" | "append" | "--" | "subtract", 2)
-            );
             leaked.light_bif = leaked
                 .bif
                 .filter(|_| leaked.direct_ets.is_none() && !leaked.runs_in_executor());
@@ -644,7 +629,6 @@ pub(crate) fn make_export(
             scope,
             trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
             light_kind: light_kind(&module, &function, mfa.2),
-            list_slice: false,
             direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2),
             module: module.clone(),
             function: function.clone(),
@@ -711,7 +695,6 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportE
                 scope,
                 trap_entry: crate::bif_traps::traps(import.module, import.function, import.arity),
                 light_kind: light_kind(import.module, import.function, import.arity),
-                list_slice: false,
                 direct_ets: crate::natives::ets::direct_entry(
                     import.module,
                     import.function,
@@ -737,6 +720,14 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportE
     Some((identities, bindings))
 }
 
+/// The export the BIF `module:function/arity` runs under when its export entry is called
+/// (`call_bif_mfa`): `c_p->current` while its `bif_table[].f` runs.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:819-838 (call_bif_mfa) and 729-739
+// (call_bif_shared stores `&ep->info.mfa` in `c_p->current`), OTP-29.1.1.
+pub(crate) fn bif_mfa_export(module: &str, function: &str, arity: u8) -> Option<ExportDispatch> {
+    export_dispatch(bif_mfa_entry(module, function, arity)?)
+}
+
 /// Returns the dispatch slot that runs the BIF `module:function/arity` from its stub body.
 fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     let trampoline = fragments()?.export_trampoline();
@@ -753,7 +744,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
             light_kind: light_kind(module, function, arity),
-            list_slice: false,
             direct_ets: crate::natives::ets::direct_entry(module, function, arity),
             module: module.to_owned(),
             function: function.to_owned(),
@@ -798,7 +788,6 @@ fn publish_module(
                 scope,
                 trap_entry: crate::bif_traps::traps(&module.name, export.function, export.arity),
                 light_kind: light_kind(&module.name, export.function, export.arity),
-                list_slice: false,
                 direct_ets: crate::natives::ets::direct_entry(
                     &module.name,
                     export.function,

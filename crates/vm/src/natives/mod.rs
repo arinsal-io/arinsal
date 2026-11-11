@@ -8,6 +8,7 @@
 pub(crate) mod bif;
 pub(crate) mod env;
 pub(crate) mod erl_bif_info;
+pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_process;
@@ -744,7 +745,7 @@ mod tests {
     #[test]
     fn pure_bif_imports_skip_family_dispatch() {
         use arinsal_loader::ImportClass;
-        let (class, bits) = classify("lists", "reverse", 2, true);
+        let (class, bits) = classify("erlang", "element", 2, true);
         assert_eq!(class, ImportClass::Pure);
         assert_eq!(bits, 0);
         // A BIF whose body is its `bif_table` entry has no named native.
@@ -767,13 +768,21 @@ mod tests {
             ("unregister", 1),
             ("whereis", 1),
             ("registered", 0),
+            ("++", 2),
+            ("--", 2),
         ] {
             let (class, bits) = classify("erlang", function, arity, false);
             assert_eq!(class, ImportClass::Native, "erlang:{function}/{arity}");
             assert_eq!(bits, 0, "erlang:{function}/{arity} is its bif_table body");
         }
+        // erl_bif_lists.c
+        for (function, arity) in [("reverse", 2), ("member", 2), ("keyfind", 3)] {
+            let (class, bits) = classify("lists", function, arity, false);
+            assert_eq!(class, ImportClass::Native, "lists:{function}/{arity}");
+            assert_eq!(bits, 0, "lists:{function}/{arity} is its bif_table body");
+        }
         // Plain BIFs with no I/O side effects stay on the pure path.
-        for (function, arity) in [("++", 2), ("atom_to_list", 1), ("list_to_atom", 1)] {
+        for (function, arity) in [("atom_to_list", 1), ("list_to_atom", 1)] {
             let (class, bits) = classify("erlang", function, arity, true);
             assert_eq!(class, ImportClass::Pure, "erlang:{function}/{arity}");
             assert_eq!(bits, 0);
