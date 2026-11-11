@@ -7,7 +7,7 @@ use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(system_info_light).
--export([items/0, errors/0, tags/0, churn/1, constants/0, shapes/0]).
+-export([items/0, errors/0, tags/0, churn/1, constants/0, shapes/0, added_keys/0, added_shapes/0]).
 items() ->
     Keys = [otp_release, version, wordsize, context_reductions, schedulers, schedulers_total,
             schedulers_online, logical_processors, logical_processors_online,
@@ -58,6 +58,20 @@ churn(N) ->
     L = erlang:system_info(system_architecture),
     true = is_list(L) andalso length(L) > 3,
     churn(N - 1).
+added_keys() ->
+    Keys = [io_thread, literal_test, lock_counting, port_tasks,
+            scheduling_statistics, total_scheduling_statistics, thread_progress,
+            update_cpu_info, reader_groups_map, decentralized_counter_groups_map, dist_ctrl,
+            halt_flush_timeout, modified_timing_level],
+    [{K, erlang:system_info(K)} || K <- Keys].
+added_shapes() ->
+    CI = erlang:system_info(compile_info),
+    EP = erlang:system_info(embedded_3pps),
+    Args = erlang:system_info(emu_args),
+    {is_list(CI) andalso [K || {K, _} <- CI] =:= [ldflags, cflags, config_h],
+     is_map(EP) andalso lists:sort(maps:keys(EP)) =:= [excluded, included],
+     is_list(maps:get(included, EP)) andalso is_list(maps:get(excluded, EP)),
+     is_list(Args) andalso lists:all(fun is_list/1, Args)}.
 "#;
 
 fn differential(function: &str, args: &[arinsal_etf::OwnedTerm], vm_args: &[arinsal_term::Term]) {
@@ -101,6 +115,31 @@ fn system_info_light_errors_match_otp() {
 #[test]
 fn system_info_light_dt_tags_match_otp() {
     differential("tags", &[], &[]);
+}
+
+#[test]
+fn system_info_added_keys_match_otp() {
+    differential("added_keys", &[], &[]);
+}
+
+#[test]
+fn system_info_added_metadata_shapes_match_otp() {
+    differential("added_shapes", &[], &[]);
+}
+
+#[test]
+fn system_info_saved_emu_args_keep_root_after_separator() {
+    arinsal_args::configure_emu_args(vec![
+        "arinsal".into(),
+        "--".into(),
+        "-root".into(),
+        "/tmp".into(),
+    ]);
+    assert!(
+        arinsal_args::active_emu_args()
+            .windows(2)
+            .any(|pair| pair == ["--", "-root"])
+    );
 }
 
 #[test]

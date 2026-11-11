@@ -322,6 +322,24 @@ pub struct SchedulerOptions {
 }
 
 static ACTIVE_EMULATOR_FLAGS: OnceLock<Mutex<EmulatorFlags>> = OnceLock::new();
+static ACTIVE_EMU_ARGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+/// Save the emulator argument vector before startup, matching erts' saved argv.
+pub fn configure_emu_args(args: Vec<String>) {
+    *ACTIVE_EMU_ARGS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("emulator args lock poisoned") = args;
+}
+
+/// Return the emulator argument vector saved during CLI startup.
+pub fn active_emu_args() -> Vec<String> {
+    ACTIVE_EMU_ARGS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("emulator args lock poisoned")
+        .clone()
+}
 
 /// Set parsed emulator startup options before the VM starts.
 pub fn configure_emulator_flags(flags: EmulatorFlags) {
@@ -1532,6 +1550,29 @@ fn parse_emulator_flag(
             } else {
                 None
             };
+            if name == "+T" {
+                // Port of erts/emulator/beam/erl_init.c:2232-2246, OTP-29.1.1.
+                let level = v.as_deref().unwrap_or("").parse::<i32>().ok();
+                if !level.is_some_and(|level| (0..10).contains(&level)) {
+                    return Err(ArgsError::ErlDiagnostic(format!(
+                        "bad modified timing level {}",
+                        v.as_deref().unwrap_or("")
+                    )));
+                }
+            } else if name == "+zhft" {
+                // Port of erts/emulator/beam/erl_init.c:2435-2448, OTP-29.1.1.
+                let arg = v.as_deref().unwrap_or("");
+                if arg != "infinity"
+                    && !arg
+                        .parse::<i64>()
+                        .ok()
+                        .is_some_and(|timeout| (0..=i32::MAX as i64).contains(&timeout))
+                {
+                    return Err(ArgsError::ErlDiagnostic(format!(
+                        "Invalid halt flush timeout {arg}"
+                    )));
+                }
+            }
             if name == "+A" {
                 // Port of erts/emulator/beam/erl_init.c:925 (erl_start -A), OTP-29.1.1.
                 let arg = v.as_deref().unwrap_or("");
@@ -1671,8 +1712,9 @@ fn split_emulator_flag(token: &str) -> (&str, Option<&str>) {
         }
     }
     const PREFIXES: &[&str] = &[
-        "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+zdbbl", "+hmbs", "+hms", "+Dibpl", "+D", "+s",
-        "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t", "+C", "+c",
+        "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+zhft", "+zdbbl", "+hmbs", "+hms", "+Dibpl",
+        "+D", "+T", "+s", "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t",
+        "+C", "+c",
     ];
     for prefix in PREFIXES {
         if let Some(rest) = token.strip_prefix(prefix) {

@@ -143,6 +143,32 @@ pub(crate) struct ThrProgress {
 /// The thread progress of the latest runtime, for threads that are not managed threads of it.
 static GLOBAL_PROGRESS: Mutex<Option<Arc<ThrProgress>>> = Mutex::new(None);
 
+/// Print the current thread-progress value and each managed thread's confirmation.
+// Port of erts/emulator/beam/erl_thr_progress.c (erts_thr_progress_dbg_print_state), OTP-29.1.1.
+pub fn debug_print_state() {
+    let progress = GLOBAL_PROGRESS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(progress) = progress else {
+        println!(
+            "--- thread progress ---\ncurrent={}\n-----------------------",
+            std::process::id()
+        );
+        return;
+    };
+    println!("--- thread progress ---\ncurrent={}", std::process::id());
+    for (id, slot) in progress.thr.iter().enumerate() {
+        let value = slot.0.load(Ordering::Acquire);
+        if value == VAL_WAITING {
+            println!("  id={id}, current=WAITING");
+        } else {
+            println!("  id={id}, current={value}");
+        }
+    }
+    println!("-----------------------");
+}
+
 /// Give the allocator pool and the delayed-dealloc queues access to this runtime's existing
 /// thread-progress operations.
 pub(crate) fn install_sspa_progress(progress: Arc<ThrProgress>) {

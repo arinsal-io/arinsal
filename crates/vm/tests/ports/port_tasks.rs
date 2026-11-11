@@ -112,7 +112,7 @@ fn port_tasks_match_erl() {
     );
 
     let actual = vm
-        .eval_scheduled("port_tasks_main", "stats", &[], 4, None)
+        .eval_scheduled("port_tasks_main", "stats", &[], 4)
         .expect("Arinsal port stats")
         .term;
     assert_eq!(
