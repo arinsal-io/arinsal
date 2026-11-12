@@ -964,7 +964,12 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         }
         // erts_link_internal_tree_lookup_create; a link that exists and is not unlinking sends
         // nothing.
-        if !link_node_create(&mut process.links, pid, priority) {
+        if !link_node_create(
+            &mut process.links,
+            pid.data(),
+            || crate::proc_create::process_link(pid, priority),
+            priority,
+        ) {
             return ok;
         }
         if crate::trace::active() {
@@ -1004,18 +1009,21 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         if !live && !process.trap_exit {
             return link_no_proc(process);
         }
-        let linked = live && crate::port::link(process, other, me, true)?;
         // erts_link_internal_tree_lookup_create + link_modify_flags: the link (with its
-        // priority flag) is in the caller's tree whatever the port answers, and an unlink in
-        // progress is cancelled (`ilnk->unlinking = 0`), so its late acknowledgement leaves it.
+        // priority flag) is in the caller's tree whatever the port answers. A link that exists
+        // and is not unlinking sends nothing; an unlink in progress is cancelled
+        // (`ilnk->unlinking = 0`), so its late acknowledgement leaves the link.
         let key = crate::proc_create::port_link_key(id);
-        if !linked && process.links.get(key).is_none() {
-            process.links.insert(crate::proc_create::port_link(id));
+        let send = link_node_create(
+            &mut process.links,
+            key,
+            || crate::proc_create::port_link(id),
+            priority,
+        );
+        if !send {
+            return ok;
         }
-        if let Some(mut node) = process.links.get_mut(key) {
-            node.set_priority(priority);
-            node.set_unlinking(0);
-        }
+        let linked = live && crate::port::link(process, other, me, true)?;
         if !linked {
             // ERTS_PORT_OP_BADARG: erts_proc_sig_send_link_exit(NULL, other, rlnk, am_noproc,
             // NIL). The link exit reaches this process through its signal in-queue, behind a
@@ -1061,21 +1069,26 @@ fn link_no_proc(process: &mut Process) -> Result<Term, VmError> {
 }
 
 /// `erts_link_internal_tree_lookup_create` with `link_modify_flags` and the `unlinking` reset
-/// of `link_opt`: whether a link signal must be sent.
-// Port of erts/emulator/beam/bif.c (link_opt: is_internal_pid), OTP-29.1.1.
-fn link_node_create(links: &mut crate::proc_create::LinkTree, pid: Pid, priority: bool) -> bool {
-    match links.get_mut(pid.data()) {
-        Some(mut node) => {
+/// of `link_opt`: whether a link signal must be sent. `create` builds the half for a new link.
+// Port of erts/emulator/beam/bif.c (link_opt: is_internal_pid, is_internal_port), OTP-29.1.1.
+fn link_node_create(
+    links: &mut crate::proc_create::LinkTree,
+    key: u64,
+    create: impl FnOnce() -> crate::monitor_link::Link,
+    priority: bool,
+) -> bool {
+    if links.get(key).is_none() {
+        links.insert(create());
+        if let Some(mut node) = links.get_mut(key) {
             node.set_priority(priority);
-            let unlinking = node.view().unlinking();
-            node.set_unlinking(0);
-            unlinking != 0
         }
-        None => {
-            links.insert(crate::proc_create::process_link(pid, priority));
-            true
-        }
+        return true;
     }
+    let mut node = links.get_mut(key).expect("link checked");
+    node.set_priority(priority);
+    let unlinking = node.view().unlinking();
+    node.set_unlinking(0);
+    unlinking != 0
 }
 
 /// `trace_proc(c_p, ..., am_link | am_unlink, other)` when the caller traces `procs`.
