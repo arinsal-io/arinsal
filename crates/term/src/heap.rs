@@ -3622,6 +3622,164 @@ impl HeapAlloc for VecHeap {
     }
 }
 
+/// A single fixed-size heap block served by `temp_alloc` and released with its off-heap owners.
+///
+/// Port of `db_alloc_tmp_uncompressed` / `db_free_tmp_uncompressed` in
+/// `erts/emulator/beam/erl_db_util.c`, OTP-29.1.1: one temporary allocation holds the tuple
+/// words, and its independent off-heap chain is cleaned before the allocation is freed.
+pub struct TemporaryHeap {
+    block: AllocBlock,
+    capacity: usize,
+    used: usize,
+    off_heap_first: usize,
+    wrt_bins: usize,
+    overhead: u64,
+}
+
+impl TemporaryHeap {
+    /// Allocate one `ERTS_ALC_T_TMP` block with capacity for `words` heap words.
+    pub fn new(words: usize) -> Result<Self, arinsal_alloc::alloc_util::AllocError> {
+        let allocation_words = words
+            .checked_add(2)
+            .ok_or(arinsal_alloc::alloc_util::AllocError::OutOfBounds)?;
+        let mut block = AllocBlock::new(ErtsAlcType::TMP, allocation_words)?;
+        block.as_mut_slice()[..2].fill(0);
+        block.as_mut_slice()[1] = words as u64;
+        #[cfg(any(feature = "validate-terms", debug_assertions, test))]
+        crate::validate::note_stable_range(block.as_mut_ptr() as usize, allocation_words * 8);
+        Ok(Self {
+            block,
+            capacity: words,
+            used: 0,
+            off_heap_first: 0,
+            wrt_bins: 0,
+            overhead: 0,
+        })
+    }
+
+    /// Number of words reserved from the block.
+    pub fn used_words(&self) -> usize {
+        self.used
+    }
+
+    /// Copy a tuple into this block, copying its key first and other elements in reverse order.
+    ///
+    /// Port of `db_copy_from_comp` in `erts/emulator/beam/erl_db_util.c`, OTP-29.1.1.
+    pub fn tuple_from_fn<E: From<TermError>>(
+        &mut self,
+        arity: usize,
+        keypos: usize,
+        mut copy_element: impl FnMut(usize, &mut Self) -> Result<Term, E>,
+    ) -> Result<Term, E> {
+        let key_index = keypos
+            .checked_sub(1)
+            .filter(|&index| index < arity)
+            .ok_or_else(|| E::from(TermError::BadArg))?;
+        let words = arity
+            .checked_add(1)
+            .ok_or_else(|| E::from(TermError::SystemLimit))?;
+        let start = self
+            .alloc(words)
+            .ok_or_else(|| E::from(TermError::HeapFull))?;
+        store(start, ((arity as u64) << 6) | ARITY);
+        for index in
+            std::iter::once(key_index).chain((0..arity).rev().filter(|&index| index != key_index))
+        {
+            let value = copy_element(index, self)?;
+            store(start.wrapping_add(index + 1), value.bits());
+        }
+        Ok(Term::from_ptr(start, 2))
+    }
+}
+
+impl Drop for TemporaryHeap {
+    fn drop(&mut self) {
+        self.block.as_mut_slice()[0] = self.off_heap_first as u64;
+        crate::gc::release_off_heap_chain(self.off_heap_first);
+        crate::gc::release_off_heap_chain(self.wrt_bins);
+        #[cfg(any(feature = "validate-terms", debug_assertions, test))]
+        crate::validate::forget_stable_range(self.block.as_mut_ptr() as usize);
+    }
+}
+
+impl HeapAlloc for TemporaryHeap {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        let end = self.used.checked_add(words)?;
+        if end > self.capacity {
+            return None;
+        }
+        let ptr = self.block.as_mut_ptr().wrapping_add(2 + self.used);
+        self.used = end;
+        Some(ptr)
+    }
+
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        drop(binary);
+    }
+
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let head = if writable {
+            &mut self.wrt_bins
+        } else {
+            &mut self.off_heap_first
+        };
+        store(bin_ref.wrapping_add(2), *head as u64);
+        *head = bin_ref as usize;
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        self.overhead = self.overhead.saturating_add(overhead_words);
+        Ok(())
+    }
+
+    fn add_bin_vheap(&mut self, _words: u64) {}
+
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        drop(binary);
+        Ok(())
+    }
+
+    fn supports_writable_binary(&self) -> bool {
+        true
+    }
+
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        link_external_bin_ref(&mut self.off_heap_first, bin_ref, binary);
+        Ok(())
+    }
+
+    fn supports_external_binary(&self) -> bool {
+        true
+    }
+
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        link_node_thing(&mut self.off_heap_first, thing, node);
+    }
+
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        link_magic_thing(&mut self.off_heap_first, &mut self.overhead, thing, owner);
+        Ok(())
+    }
+
+    fn supports_magic(&self) -> bool {
+        true
+    }
+}
+
 /// Immutable module literals. Address-range checks avoid consuming a pointer tag bit.
 pub struct LiteralArea {
     heap: VecHeap,

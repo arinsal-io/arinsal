@@ -216,11 +216,12 @@ impl Table {
             after,
             TREE_SELECT_ITERATIONS,
             &mut |object| {
-                let (term, size) = object.term_for_filter_with_size(dst)?;
-                if let Some(result) = runner.run_sized(term, dst, size)? {
-                    results.push(result);
-                }
-                Ok(false)
+                object.with_term_for_filter(self.options.keypos, |term, size| {
+                    if let Some(result) = runner.run_sized(term, dst, size)? {
+                        results.push(result);
+                    }
+                    Ok(false)
+                })
             },
         )?;
         end.finish_resumed(plan, backwards, after.is_some());
@@ -253,12 +254,13 @@ impl Table {
             after,
             TREE_SELECT_ITERATIONS,
             &mut |object| {
-                let (term, size) = object.term_for_filter_with_size(dst)?;
-                if let Some(result) = runner.run_sized(term, dst, size)? {
-                    results.push(result);
-                    held += 1;
-                }
-                Ok(held == chunk)
+                object.with_term_for_filter(self.options.keypos, |term, size| {
+                    if let Some(result) = runner.run_sized(term, dst, size)? {
+                        results.push(result);
+                        held += 1;
+                    }
+                    Ok(held == chunk)
+                })
             },
         )?;
         Ok((end, results, held))
@@ -277,14 +279,15 @@ impl Table {
         let mut runner = program.runner();
         let mut count = 0;
         let mut end = self.tree_scan(plan, true, after, TREE_SELECT_ITERATIONS, &mut |object| {
-            let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
-            if runner
-                .run_sized(term, &mut scratch, size)?
-                .is_some_and(|value| exact_eq(value, true_atom))
-            {
-                count += 1;
-            }
-            Ok(false)
+            object.with_term_for_filter(self.options.keypos, |term, size| {
+                if runner
+                    .run_sized(term, &mut scratch, size)?
+                    .is_some_and(|value| exact_eq(value, true_atom))
+                {
+                    count += 1;
+                }
+                Ok(false)
+            })
         })?;
         end.finish_resumed(plan, true, after.is_some());
         Ok((end, count))

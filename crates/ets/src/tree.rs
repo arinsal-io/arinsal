@@ -584,10 +584,12 @@ impl Node {
             return Ok(());
         }
         if !below && !above {
-            let (term, size) = node.term_for_filter_with_size(state.dst)?;
-            if let Some(result) = state.runner.run_sized(term, state.dst, size)? {
-                state.out.push(result);
-            }
+            node.with_term_for_filter(state.keypos, |term, size| {
+                if let Some(result) = state.runner.run_sized(term, state.dst, size)? {
+                    state.out.push(result);
+                }
+                Ok(())
+            })?;
         }
         if state.out.len() >= state.limit {
             return Ok(());

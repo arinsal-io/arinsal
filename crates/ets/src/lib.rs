@@ -1132,11 +1132,12 @@ impl StoredTerm {
                     compressed_magic_refs.push(None);
                     compressed_magic_copies.push(false);
                 } else {
+                    // Keep the expanded size in DbTerm.size for db_alloc_tmp_uncompressed.
+                    nwords += arinsal_term::size_object(element);
                     let magic = element.is_magic_ref();
                     if magic {
                         // Compressed bytes carry the reference identity, while ETS retains
                         // its magic owner until the stored row is deleted.
-                        nwords += arinsal_term::size_object(element);
                         compressed_magic_refs.push(element.magic_owner());
                     } else {
                         compressed_magic_refs.push(None);
@@ -1475,6 +1476,45 @@ impl StoredTerm {
         Ok(TermBuilder::new(dst).tuple(&elements)?)
     }
 
+    /// Copy one compressed ETS object directly into its contiguous temporary `DbTerm` words.
+    // Port of `db_copy_from_comp` in erts/emulator/beam/erl_db_util.c, OTP-29.1.1: reserve the
+    // tuple first, then copy or decode each element into the same temporary allocation.
+    fn copy_out_temporary(
+        &self,
+        keypos: usize,
+        dst: &mut arinsal_term::TemporaryHeap,
+    ) -> Result<Term, EtsError> {
+        let tuple = term_sequence(self.term()).ok_or(EtsError::BadArg)?;
+        dst.tuple_from_fn(tuple.len(), keypos, |index, dst| {
+            let element = tuple[index];
+            let copied = if let Some(bytes) = self
+                .compressed_elements()
+                .get(index)
+                .and_then(Option::as_ref)
+            {
+                if let Some(owner) = self
+                    .compressed_magic_refs()
+                    .get(index)
+                    .and_then(Option::as_ref)
+                {
+                    TermBuilder::new(dst).magic_ref(owner.clone())?
+                } else if ets_fast_supported(bytes) {
+                    decode_ets_fast(bytes, dst)?
+                } else {
+                    let mut ext = Vec::with_capacity(bytes.len() + 1);
+                    ext.push(131);
+                    ext.extend_from_slice(bytes);
+                    let ext = ets_external_atoms(&ext, false)?;
+                    let owned = arinsal_etf::decode(&ext).map_err(|_| EtsError::BadArg)?;
+                    arinsal_term::from_owned(&owned, dst)?
+                }
+            } else {
+                copy_term(element, dst)?
+            };
+            Ok(copied)
+        })
+    }
+
     /// Copy this shallow DbTerm and its one result-list cell in the same reservation.
     // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash/build_term_list) and
     // erl_db_util.h (db_copy_object_from_ets), OTP-29.1.1.
@@ -1540,6 +1580,25 @@ impl StoredTerm {
             return Ok(self.term_uncompressed_with_size());
         }
         Ok((self.term_for_match(scratch)?, None))
+    }
+
+    /// Run a match operation while a compressed row's decoded tuple is resident in `temp_alloc`.
+    // Port of `db_alloc_tmp_uncompressed` / `db_free_tmp_uncompressed` in erl_db_util.c,
+    // OTP-29.1.1: keep the independent temporary tuple and its off-heap chain alive through
+    // matching, then release both before advancing to the next row.
+    fn with_term_for_filter<R>(
+        &self,
+        keypos: usize,
+        run: impl FnOnce(Term, Option<match_spec::KnownObject<'_>>) -> Result<R, EtsError>,
+    ) -> Result<R, EtsError> {
+        if self.compressed().is_none() {
+            let (term, size) = self.term_uncompressed_with_size();
+            return run(term, size);
+        }
+        let mut temporary = arinsal_term::TemporaryHeap::new(self.alloc_words())
+            .map_err(|_| EtsError::Term(TermError::SystemLimit))?;
+        let term = self.copy_out_temporary(keypos, &mut temporary)?;
+        run(term, None)
     }
 
     /// The object of a table without `compressed`, as `match_traverse` hands it to
@@ -2114,10 +2173,13 @@ mod _obsolete_ordered_treap {
                 return Ok(());
             }
             if !below && !above {
-                let term = node.object.term_for_filter(state.dst)?;
-                if let Some(result) = state.runner.run(term, state.dst)? {
-                    state.out.push(result);
-                }
+                node.object
+                    .with_term_for_filter(self.options.keypos, |term, _size| {
+                        if let Some(result) = state.runner.run(term, state.dst)? {
+                            state.out.push(result);
+                        }
+                        Ok(())
+                    })?;
             }
             if state.out.len() >= state.limit {
                 return Ok(());
@@ -4978,11 +5040,12 @@ impl Table {
             // erl_db_tree.c (db_select_tree_common): match a stored DbTerm under its
             // base-node read lock and copy only the selected result to the process heap.
             tree.scan_where(reverse, &|_| true, |object| {
-                let (term, size) = object.term_for_filter_with_size(dst)?;
-                if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
-                    results.push(result);
-                }
-                Ok(false)
+                object.with_term_for_filter(self.options.keypos, |term, size| {
+                    if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
+                        results.push(result);
+                    }
+                    Ok(false)
+                })
             })?;
             return Ok(results);
         }
@@ -4990,11 +5053,12 @@ impl Table {
             // Port of erts/emulator/beam/erl_db_hash.c (db_select_chunk_hash).
             let mut results = Vec::new();
             storage.try_for_each_value(|object| {
-                let (term, size) = object.term_for_filter_with_size(dst)?;
-                if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
-                    results.push(result);
-                }
-                Ok::<_, EtsError>(())
+                object.with_term_for_filter(self.options.keypos, |term, size| {
+                    if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
+                        results.push(result);
+                    }
+                    Ok(())
+                })
             })?;
             results.reverse();
             return Ok(results);
@@ -5008,13 +5072,14 @@ impl Table {
                     &|_| true,
                     self.options.keypos,
                     &mut |object| {
-                        let (term, size) = object.term_for_filter_with_size(dst)?;
-                        if let Some(result) =
-                            runner.run_with_context_sized(term, dst, context, size)?
-                        {
-                            results.push(result);
-                        }
-                        Ok(false)
+                        object.with_term_for_filter(self.options.keypos, |term, size| {
+                            if let Some(result) =
+                                runner.run_with_context_sized(term, dst, context, size)?
+                            {
+                                results.push(result);
+                            }
+                            Ok(false)
+                        })
                     },
                 )?;
             }
@@ -5163,13 +5228,14 @@ impl Table {
                     &mut |object| {
                         let key = object.key(self.options.keypos);
                         continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                        let (term, size) = object.term_for_filter_with_size(dst)?;
-                        if let Some(result) =
-                            runner.run_with_context_sized(term, dst, context, size)?
-                        {
-                            rows.push(result);
-                        }
-                        Ok(rows.len() == limit)
+                        object.with_term_for_filter(self.options.keypos, |term, size| {
+                            if let Some(result) =
+                                runner.run_with_context_sized(term, dst, context, size)?
+                            {
+                                rows.push(result);
+                            }
+                            Ok(rows.len() == limit)
+                        })
                     },
                 )?;
                 Ok(SelectBatch {
@@ -5182,11 +5248,14 @@ impl Table {
                 tree.scan_after(cursor, continuation.reverse, |object| {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                    let term = object.term_for_filter(dst)?;
-                    if let Some(result) = runner.run_with_context(term, dst, context)? {
-                        rows.push(result);
-                    }
-                    Ok(rows.len() == limit)
+                    object.with_term_for_filter(self.options.keypos, |term, size| {
+                        if let Some(result) =
+                            runner.run_with_context_sized(term, dst, context, size)?
+                        {
+                            rows.push(result);
+                        }
+                        Ok(rows.len() == limit)
+                    })
                 })?;
                 Ok(SelectBatch {
                     continuation: (rows.len() == limit).then_some(continuation),
@@ -5298,11 +5367,12 @@ impl Table {
             let mut results = Vec::new();
             // Port of erts/emulator/beam/erl_db_catree.c (db_select_catree), OTP-29.1.1.
             tree.scan_where(reverse, &|_| true, |object| {
-                let (term, size) = object.term_for_filter_with_size(dst)?;
-                if let Some(result) = runner.run_sized(term, dst, size)? {
-                    results.push(result);
-                }
-                Ok(results.len() >= limit)
+                object.with_term_for_filter(self.options.keypos, |term, size| {
+                    if let Some(result) = runner.run_sized(term, dst, size)? {
+                        results.push(result);
+                    }
+                    Ok(results.len() >= limit)
+                })
             })?;
             return Ok(results);
         }
@@ -5310,11 +5380,12 @@ impl Table {
             // Port of erts/emulator/beam/erl_db_hash.c (db_select_chunk_hash).
             let mut results = Vec::new();
             storage.try_for_each_value_while(|object| {
-                let (candidate, size) = object.term_for_filter_with_size(dst)?;
-                if let Some(result) = runner.run_sized(candidate, dst, size)? {
-                    results.push(result);
-                }
-                Ok::<_, EtsError>(results.len() < limit)
+                object.with_term_for_filter(self.options.keypos, |candidate, size| {
+                    if let Some(result) = runner.run_sized(candidate, dst, size)? {
+                        results.push(result);
+                    }
+                    Ok(results.len() < limit)
+                })
             })?;
             results.reverse();
             return Ok(results);
@@ -5328,11 +5399,12 @@ impl Table {
                     &|_| true,
                     self.options.keypos,
                     &mut |object| {
-                        let (candidate, size) = object.term_for_filter_with_size(dst)?;
-                        if let Some(result) = runner.run_sized(candidate, dst, size)? {
-                            results.push(result);
-                        }
-                        Ok(results.len() >= limit)
+                        object.with_term_for_filter(self.options.keypos, |candidate, size| {
+                            if let Some(result) = runner.run_sized(candidate, dst, size)? {
+                                results.push(result);
+                            }
+                            Ok(results.len() >= limit)
+                        })
                     },
                 )?;
                 Ok(results)
@@ -5389,15 +5461,16 @@ impl Table {
                 Node::scan_after(root, cursor, false, self.options.keypos, &mut |object| {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                    let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
-                    if runner
-                        .run_sized(term, &mut scratch, size)?
-                        .is_some_and(|value| exact_eq(value, true_atom))
-                    {
-                        continuation.total += 1;
-                    }
-                    visited += 1;
-                    Ok(visited >= budget)
+                    object.with_term_for_filter(self.options.keypos, |term, size| {
+                        if runner
+                            .run_sized(term, &mut scratch, size)?
+                            .is_some_and(|value| exact_eq(value, true_atom))
+                        {
+                            continuation.total += 1;
+                        }
+                        visited += 1;
+                        Ok(visited >= budget)
+                    })
                 })?
             }
             Storage::CATree(tree) => {
@@ -5405,15 +5478,16 @@ impl Table {
                 tree.scan_after(cursor, false, |object| {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                    let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
-                    if runner
-                        .run_sized(term, &mut scratch, size)?
-                        .is_some_and(|value| exact_eq(value, true_atom))
-                    {
-                        continuation.total += 1;
-                    }
-                    visited += 1;
-                    Ok(visited >= budget)
+                    object.with_term_for_filter(self.options.keypos, |term, size| {
+                        if runner
+                            .run_sized(term, &mut scratch, size)?
+                            .is_some_and(|value| exact_eq(value, true_atom))
+                        {
+                            continuation.total += 1;
+                        }
+                        visited += 1;
+                        Ok(visited >= budget)
+                    })
                 })?
             }
             Storage::Hash(storage) => {
@@ -5422,15 +5496,16 @@ impl Table {
                 }
                 while continuation.slot < storage.nactive() {
                     storage.try_with_slot_ordered(continuation.slot, false, |object, _| {
-                        let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
-                        if runner
-                            .run_sized(term, &mut scratch, size)?
-                            .is_some_and(|value| exact_eq(value, true_atom))
-                        {
-                            continuation.total += 1;
-                        }
-                        visited += 1;
-                        Ok::<_, EtsError>(())
+                        object.with_term_for_filter(self.options.keypos, |term, size| {
+                            if runner
+                                .run_sized(term, &mut scratch, size)?
+                                .is_some_and(|value| exact_eq(value, true_atom))
+                            {
+                                continuation.total += 1;
+                            }
+                            visited += 1;
+                            Ok(())
+                        })
                     })?;
                     continuation.slot += 1;
                     if visited >= budget {
@@ -5457,14 +5532,15 @@ impl Table {
         let mut count = 0;
         {
             let mut visit = |object: &StoredTerm| -> Result<(), EtsError> {
-                let (term, size) = object.term_for_filter_with_size(&mut heap)?;
-                if runner
-                    .run_sized(term, &mut heap, size)?
-                    .is_some_and(|result| exact_eq(result, true_atom))
-                {
-                    count += 1;
-                }
-                Ok(())
+                object.with_term_for_filter(self.options.keypos, |term, size| {
+                    if runner
+                        .run_sized(term, &mut heap, size)?
+                        .is_some_and(|result| exact_eq(result, true_atom))
+                    {
+                        count += 1;
+                    }
+                    Ok(())
+                })
             };
             if let Some(key) = program.exact_key_pattern(self.options.keypos) {
                 self.try_for_matching(key, &mut visit)?;
@@ -5493,14 +5569,15 @@ impl Table {
         let true_atom = Term::atom(global_true());
         if let Some(key) = program.exact_key_pattern(self.options.keypos) {
             self.try_for_matching(key, |object| {
-                let term = object.term_for_filter(&mut heap)?;
-                if program
-                    .run(term, &mut heap)?
-                    .is_some_and(|result| exact_eq(result, true_atom))
-                {
-                    selected.push(copy_term(term, &mut heap)?);
-                }
-                Ok(())
+                object.with_term_for_filter(self.options.keypos, |term, _size| {
+                    if program
+                        .run(term, &mut heap)?
+                        .is_some_and(|result| exact_eq(result, true_atom))
+                    {
+                        selected.push(copy_term(term, &mut heap)?);
+                    }
+                    Ok(())
+                })
             })?;
             for object in selected.iter().copied() {
                 self.delete_object(object)?;
@@ -5511,12 +5588,11 @@ impl Table {
             && let Storage::Hash(storage) = &mut self.storage
         {
             let removed = storage.delete_where(|object| {
-                let term = object.term_for_filter(&mut heap)?;
-                Ok::<_, EtsError>(
-                    program
+                object.with_term_for_filter(self.options.keypos, |term, _size| {
+                    Ok(program
                         .run(term, &mut heap)?
-                        .is_some_and(|result| exact_eq(result, true_atom)),
-                )
+                        .is_some_and(|result| exact_eq(result, true_atom)))
+                })
             });
             storage.shrink_after_delete(self.options.keypos);
             return removed;
@@ -5524,27 +5600,30 @@ impl Table {
         match &self.storage {
             Storage::Hash(storage) => {
                 storage.try_for_each_value(|object| {
-                    let term = object.term_for_filter(&mut heap)?;
-                    if program
-                        .run(term, &mut heap)?
-                        .is_some_and(|result| exact_eq(result, true_atom))
-                    {
-                        selected.push(copy_term(term, &mut heap)?);
-                    }
-                    Ok::<_, EtsError>(())
+                    object.with_term_for_filter(self.options.keypos, |term, _size| {
+                        if program
+                            .run(term, &mut heap)?
+                            .is_some_and(|result| exact_eq(result, true_atom))
+                        {
+                            selected.push(copy_term(term, &mut heap)?);
+                        }
+                        Ok(())
+                    })
                 })?;
             }
             Storage::Ordered(root) => {
                 let mut objects = Vec::new();
                 Node::walk(root, &mut objects);
                 for object in objects {
-                    let term = object.term_for_filter(&mut heap)?;
-                    if program
-                        .run(term, &mut heap)?
-                        .is_some_and(|result| exact_eq(result, true_atom))
-                    {
-                        selected.push(copy_term(term, &mut heap)?);
-                    }
+                    object.with_term_for_filter(self.options.keypos, |term, _size| {
+                        if program
+                            .run(term, &mut heap)?
+                            .is_some_and(|result| exact_eq(result, true_atom))
+                        {
+                            selected.push(copy_term(term, &mut heap)?);
+                        }
+                        Ok(())
+                    })?;
                 }
             }
             Storage::CATree(tree) => {
