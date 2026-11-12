@@ -2801,8 +2801,17 @@ fn notify_links_monitors(
             let Ok(object) = crate::signals::port_monitor_object(&mut heap, Some(id), name) else {
                 continue;
             };
+            // The monitor's `{tag, Tag}` option replaces 'DOWN', as for process monitors
+            // (erl_proc_sig_queue.c:2836-2900 builds the DOWN from the monitor data).
+            let tag = match monitor.info().tag() {
+                Some(owned) => match from_owned(owned, &mut heap) {
+                    Ok(tag) => tag,
+                    Err(_) => continue,
+                },
+                None => Term::atom(arinsal_term::atoms::DOWN),
+            };
             let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
-                Term::atom(arinsal_term::atoms::DOWN),
+                tag,
                 reference_term,
                 Term::atom(arinsal_term::atoms::PORT),
                 object,
@@ -5127,15 +5136,10 @@ pub(crate) fn link(
             },
         );
         return Ok(true);
-    } else {
-        link_opener(process, id);
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     if let Some(drv) = handle.drv_port() {
         let done = drv_sig::link(runtime, &handle, &drv, pid, linked, 0);
-        if linked && !done {
-            process.links.remove(crate::proc_create::port_link_key(id));
-        }
         return Ok(done || !linked);
     }
     // Termination removes the port from the table and drains `links` in one critical section
@@ -5143,8 +5147,6 @@ pub(crate) fn link(
     // registration either visible to it or refused.
     let ports = runtime.ports.read().unwrap();
     if linked && !runtime.ports.contains(id) {
-        drop(ports);
-        process.links.remove(crate::proc_create::port_link_key(id));
         return Ok(false);
     }
     let mut links = handle.links.lock();

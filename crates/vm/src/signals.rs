@@ -568,7 +568,7 @@ fn request_system_task(
         return Err(badarg("request_system_task"));
     }
     let req_type = tuple.get(0).ok_or_else(|| badarg("request_system_task"))?;
-    let mut req_id = tuple.get(1).ok_or_else(|| badarg("request_system_task"))?;
+    let req_id = tuple.get(1).ok_or_else(|| badarg("request_system_task"))?;
     let arg0 = tuple.get(2);
     let type_name = atom_name(req_type).ok_or_else(|| badarg("request_system_task"))?;
     let alive = crate::natives::proc::live(process, target_pid)?;
@@ -579,21 +579,10 @@ fn request_system_task(
                 Some("minor") => false,
                 _ => return Err(badarg("request_system_task")),
             };
-            if alive && target_pid == ctx.pid() {
-                let mut rooted = [req_id];
-                crate::natives::proc::collect_heap(process, major, &mut rooted)?;
-                req_id = rooted[0];
-                let message = task_tuple(
-                    process,
-                    &[
-                        Term::atom(arinsal_term::atoms::GARBAGE_COLLECT),
-                        req_id,
-                        Term::atom(arinsal_term::atoms::TRUE),
-                    ],
-                )?;
-                deliver(process, ctx, requester, message)?;
-                return Ok(Term::atom(arinsal_term::atoms::OK));
-            }
+            // A request on the caller itself is a system task like any other: erts schedules
+            // it on the process (or sends it as an rpc signal behind pending signals) and the
+            // collection runs when the process executes its system tasks
+            // (erl_process.c:11309 request_system_task, `c_p->common.id == requester`).
             let op = RemoteOp::Collect {
                 request_id: Message::copy_from(req_id)?,
                 major,
@@ -990,10 +979,6 @@ pub(crate) fn monitor_port(
     process.monitors.insert(origin);
     let registered = port_id.and_then(|id| {
         runtime.ports.with_from(id, process.on_managed, |handle| {
-            if tag != Term::atom(arinsal_term::atoms::DOWN) {
-                // Port monitors carry no tag yet (typed gap, see report).
-                return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
-            }
             crate::port::monitor(process, id, handle, target_half, true)
         })
     });
