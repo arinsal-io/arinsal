@@ -3,7 +3,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_select_diff).
--export([selections/0, mutations/0, compiled/0, errors/0, info/0]).
+-export([selections/0, compressed_selects/0, mutations/0, compiled/0, errors/0, info/0]).
 
 collect_select(T, Spec, Limit) ->
   case ets:select(T, Spec, Limit) of
@@ -78,6 +78,25 @@ select_type(Type) ->
   O=lists:sort(collect_objects(T,{'$1','$2'},3)),
   Count=ets:select_count(T,[{{'$1','_'},[],[true]}]),
   ets:delete(T), {A,B,C,M,O,Count}.
+compressed_selects() ->
+  [begin
+     T=ets:new(compressed,[Type,compressed,{keypos,Keypos}]),
+     Rows=case Keypos of 1 -> [{a,1},{b,2},{c,3},{d,4}];
+                        2 -> [{1,a},{2,b},{3,c},{4,d}] end,
+     true=ets:insert(T,Rows),
+     Selected=lists:sort(collect_select(T,[{{'$1','$2'},[],['$_']}],2)),
+     Reverse=lists:sort(collect_reverse(T,[{{'$1','$2'},[],['$_']}],2)),
+     Matched=lists:sort(collect_match(T,{'$1','$2'},2)),
+     Objects=lists:sort(collect_objects(T,{'$1','_'},2)),
+     Count=ets:select_count(T,[{{'$1','_'},[],[true]}]),
+     {DeleteHead,ReplaceHead,ReplaceBody}=case Keypos of
+       1 -> {{b,'_'},{'$1','$2'},[{{'$1',changed}}]};
+       2 -> {{'_',2},{'$1','$2'},[{{changed,'$2'}}]}
+     end,
+     Deleted=ets:select_delete(T,[{DeleteHead,[],[true]}]),
+     Replaced=ets:select_replace(T,[{ReplaceHead,[],ReplaceBody}]),
+     {Selected,Reverse,Matched,Objects,Count,Deleted,Replaced,lists:sort(ets:tab2list(T))}
+   end || {Type,Keypos} <- [{set,1},{ordered_set,1},{set,2},{ordered_set,2}]].
 mutations() ->
   T=ets:new(mut,[set,public]), ets:insert(T,{a,1}),
   U=ets:update_counter(T,missing,2,{missing,40}),
@@ -116,7 +135,13 @@ fn ets_select_family_matches_otp_29() {
         .compile_named("ets_select_diff", SOURCE, &[])
         .unwrap();
     reference.load("ets_select_diff", &beam).unwrap();
-    for function in ["selections", "mutations", "errors", "info"] {
+    for function in [
+        "selections",
+        "compressed_selects",
+        "mutations",
+        "errors",
+        "info",
+    ] {
         let expected = reference.call("ets_select_diff", function, &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();

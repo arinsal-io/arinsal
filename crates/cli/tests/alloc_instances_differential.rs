@@ -66,3 +66,35 @@ fn dirty_allocator_instances_add_to_the_count() {
 fn dirty_allocator_instances_are_limited_to_the_dirty_cpu_schedulers() {
     compare(&["+S", "2", "+SDcpu", "2", "+Mdai", "100"]);
 }
+
+#[test]
+fn temp_alloc_options_match_otp() {
+    const OPTIONS: &str = "io:format(\"~p\", [[{I, proplists:get_value(options, P)} \
+        || {instance, I, P} <- erlang:system_info({allocator, temp_alloc})]]), halt().";
+    let run_options = |runtime: &str| {
+        let mut command = if runtime == "erl" {
+            arinsal_difftest::reference::erl().expect("reference OTP emulator")
+        } else {
+            let mut command = Command::new("timeout");
+            command.arg("30").arg(env!("CARGO_BIN_EXE_arinsal"));
+            command
+        };
+        let output = command
+            .args(["-noshell", "-eval", OPTIONS])
+            .env("ERL_AFLAGS", "")
+            .env("ERL_FLAGS", "")
+            .env("ERL_ZFLAGS", "")
+            .env("ERL_OTP29_FLAGS", "")
+            .env("ERL_CRASH_DUMP", "/dev/null")
+            .output()
+            .expect("run allocator option probe");
+        assert!(
+            output.status.success(),
+            "{runtime} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8 allocator options")
+    };
+    assert_eq!(run_options("arinsal"), run_options("erl"));
+}

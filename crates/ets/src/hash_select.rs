@@ -339,16 +339,22 @@ impl Table {
             HASH_SELECT_ITERATIONS,
             || chunk > 0 && held.get() >= chunk,
             |object| {
-                let (term, size) = if compressed {
-                    object.term_for_filter_with_size(dst)?
+                if compressed {
+                    object.with_term_for_filter(self.options.keypos, |term, size| {
+                        if let Some(result) = runner.run_sized(term, dst, size)? {
+                            results.push(result);
+                            held.set(held.get() + 1);
+                        }
+                        Ok(())
+                    })
                 } else {
-                    object.term_uncompressed_with_size()
-                };
-                if let Some(result) = runner.run_sized(term, dst, size)? {
-                    results.push(result);
-                    held.set(held.get() + 1);
+                    let (term, size) = object.term_uncompressed_with_size();
+                    if let Some(result) = runner.run_sized(term, dst, size)? {
+                        results.push(result);
+                        held.set(held.get() + 1);
+                    }
+                    Ok(())
                 }
-                Ok(())
             },
         )?;
         Ok((end, results, held.get()))
@@ -372,14 +378,15 @@ impl Table {
             HASH_SELECT_ITERATIONS,
             || false,
             |object| {
-                let term = object.term_for_filter(&mut scratch)?;
-                if program
-                    .run(term, &mut scratch)?
-                    .is_some_and(|value| exact_eq(value, true_atom))
-                {
-                    count += 1;
-                }
-                Ok(())
+                object.with_term_for_filter(self.options.keypos, |term, _size| {
+                    if program
+                        .run(term, &mut scratch)?
+                        .is_some_and(|value| exact_eq(value, true_atom))
+                    {
+                        count += 1;
+                    }
+                    Ok(())
+                })
             },
         )?;
         Ok((end, count))
