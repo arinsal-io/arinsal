@@ -27,6 +27,7 @@ mod idle_io_state_differential;
 mod iex_shell;
 mod len_trap;
 mod literal_exit_reason;
+mod logger_differential;
 mod make_fun_light_differential;
 mod mix_loop1;
 mod mix_loop2;

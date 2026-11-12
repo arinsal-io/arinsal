@@ -524,26 +524,13 @@ impl Process {
     }
 }
 
+// Port of erts/emulator/beam/beam_common.c (terminate_proc, EXF_LOG branch), OTP-29.1.1.
 pub(super) fn report_process_error(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     reason: Term,
 ) {
     let Some(runtime) = process.runtime else {
-        return;
-    };
-    let destination = crate::natives::sys::system_logger(process);
-    let logger = if destination == Term::atom(arinsal_term::atoms::UNDEFINED) {
-        None
-    } else if let Some(pid) = Pid::from_term(destination) {
-        Some(pid)
-    } else {
-        runtime
-            .reg
-            .whereis_proc_str("logger")
-            .or_else(|| runtime.reg.whereis_proc_str("error_logger"))
-    };
-    let Some(logger) = logger else {
         return;
     };
     let Some(pid) = ctx.pid().to_term() else {
@@ -553,21 +540,14 @@ pub(super) fn report_process_error(
         let nodes = crate::node_tables::lock();
         nodes.alive.then(|| nodes.local_identity().0.to_owned())
     };
+    let format = if node_name.is_some() {
+        "Error in process ~p on node ~p with exit value:~n~p~n"
+    } else {
+        "Error in process ~p with exit value:~n~p~n"
+    };
     let built = (|| -> Result<Term, VmError> {
-        let format = if node_name.is_some() {
-            "Error in process ~p on node ~p with exit value:~n~p~n"
-        } else {
-            "Error in process ~p with exit value:~n~p~n"
-        };
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
-        let format = builder
-            .list_from_iter(
-                format
-                    .bytes()
-                    .map(|byte| Term::small(i64::from(byte)).unwrap()),
-            )
-            .map_err(|error| VmError::Unsupported(format!("process error format: {error:?}")))?;
         let mut values = vec![pid];
         if let Some(node_name) = node_name {
             values.push(Term::atom(
@@ -577,56 +557,16 @@ pub(super) fn report_process_error(
             ));
         }
         values.push(reason);
-        let args = builder
-            .list_from_iter(values)
-            .map_err(|error| VmError::Unsupported(format!("process error args: {error:?}")))?;
-        let logger_metadata = builder
-            .flatmap_from_pairs(&[
-                (
-                    Term::atom(arinsal_term::atoms::EMULATOR),
-                    Term::atom(arinsal_term::atoms::TRUE),
-                ),
-                (
-                    Term::atom(arinsal_term::atoms::TAG),
-                    Term::atom(arinsal_term::atoms::ERROR),
-                ),
-            ])
-            .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
-        let group_leader = process
-            .group_leader
-            .and_then(Pid::to_term)
-            .unwrap_or(Term::NIL);
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_micros() as i64)
-            .ok()
-            .and_then(Term::small)
-            .unwrap_or(Term::NIL);
-        let metadata = builder
-            .flatmap_from_pairs(&[
-                (
-                    Term::atom(arinsal_term::atoms::ERROR_LOGGER),
-                    logger_metadata,
-                ),
-                (crate::atom_cache::put("gl"), group_leader),
-                (Term::atom(arinsal_term::atoms::PID), pid),
-                (Term::atom(arinsal_term::atoms::TIME), time),
-            ])
-            .map_err(|error| VmError::Unsupported(format!("logger event metadata: {error:?}")))?;
         builder
-            .tuple(&[
-                Term::atom(arinsal_term::atoms::LOG),
-                Term::atom(arinsal_term::atoms::ERROR),
-                format,
-                args,
-                metadata,
-            ])
-            .map_err(|error| VmError::Unsupported(format!("logger event: {error:?}")))
+            .list_from_iter(values)
+            .map_err(|error| VmError::Unsupported(format!("process error args: {error:?}")))
     })();
-    if let Ok(term) = built
-        && let Ok(message) = Message::copy_from(term)
-    {
-        let _ = ctx.send(logger, message);
+    let group_leader = process
+        .group_leader
+        .and_then(Pid::to_term)
+        .unwrap_or(Term::NIL);
+    if let Ok(args) = built {
+        crate::utils::send_error_term_to_logger(runtime, ctx.pid(), group_leader, format, args);
     }
 }
 

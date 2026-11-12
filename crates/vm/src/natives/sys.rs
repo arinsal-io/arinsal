@@ -1725,14 +1725,20 @@ fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Te
 }
 
 pub(crate) fn system_logger(process: &Process) -> Term {
-    let mut current = runtime_state(process)
-        .system_logger
-        .lock()
-        .expect("system logger");
+    system_logger_in(runtime_state(process), process.runtime)
+}
+
+/// `erts_get_system_logger` of `runtime`.
+pub(crate) fn runtime_system_logger(runtime: &crate::process::Runtime) -> Term {
+    system_logger_in(&runtime.statistics, Some(runtime))
+}
+
+// Port of erts/emulator/beam/erl_trace.c (`erts_get_system_logger`; the dispatcher resets a
+// dead logger pid to `logger`), OTP-29.1.1.
+fn system_logger_in(state: &StatisticsState, runtime: Option<&crate::process::Runtime>) -> Term {
+    let mut current = state.system_logger.lock().expect("system logger");
     if let Some(pid) = arinsal_sched::Pid::from_term(*current)
-        && process
-            .runtime
-            .as_ref()
+        && runtime
             .and_then(|runtime| runtime.scheduler().ok())
             .is_some_and(|scheduler| !scheduler.lookup(pid))
     {
@@ -3903,74 +3909,18 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
     )
 }
 
-// Port of erts/emulator/beam/utils.c:919 (`send_warning_to_logger`) and :802
-// (`do_send_logger_message`), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c (system_flag_2: `erts_send_warning_to_logger_str` with
+// the caller's group leader), OTP-29.1.1.
 fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>, text: &str) {
-    let logger = process.runtime.as_ref().and_then(|runtime| {
-        runtime
-            .reg
-            .whereis_proc_str("logger")
-            .or_else(|| runtime.reg.whereis_proc_str("error_logger"))
-    });
-    let Some(logger) = logger else {
+    let Some(runtime) = process.runtime else {
         eprintln!("{text}");
         return;
     };
-    let pid = ctx.pid().to_term().unwrap_or(Term::NIL);
     let group_leader = process
         .group_leader
         .and_then(|leader| leader.to_term())
         .unwrap_or(Term::NIL);
-    let timestamp = runtime_state(process)
-        .wall_origin
-        .elapsed()
-        .as_micros()
-        .try_into()
-        .unwrap_or(i64::MAX);
-    let event = (|| -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut builder = TermBuilder::new(&mut heap);
-        let warning = builder.string_to_list(text).map_err(|_| badarg())?;
-        let format = builder.string_to_list("~s~n").map_err(|_| badarg())?;
-        let args = builder.list_from_iter([warning]).map_err(|_| badarg())?;
-        let error_logger = builder
-            .flatmap_from_pairs(&[
-                (
-                    Term::atom(arinsal_term::atoms::EMULATOR),
-                    Term::atom(arinsal_term::atoms::TRUE),
-                ),
-                (
-                    Term::atom(arinsal_term::atoms::TAG),
-                    Term::atom(arinsal_term::atoms::WARNING_MSG),
-                ),
-            ])
-            .map_err(|_| badarg())?;
-        let metadata = builder
-            .flatmap_from_pairs(&[
-                (Term::atom(arinsal_term::atoms::ERROR_LOGGER), error_logger),
-                (crate::atom_cache::put("gl"), group_leader),
-                (Term::atom(arinsal_term::atoms::PID), pid),
-                (
-                    Term::atom(arinsal_term::atoms::TIME),
-                    Term::small(timestamp).ok_or_else(badarg)?,
-                ),
-            ])
-            .map_err(|_| badarg())?;
-        builder
-            .tuple(&[
-                Term::atom(arinsal_term::atoms::LOG),
-                Term::atom(arinsal_term::atoms::WARNING),
-                format,
-                args,
-                metadata,
-            ])
-            .map_err(|_| badarg())
-    })();
-    if let Ok(event) = event
-        && let Ok(message) = Message::copy_from(event)
-    {
-        let _ = ctx.send(logger, message);
-    }
+    crate::utils::send_warning_to_logger_str(runtime, ctx.pid(), group_leader, text);
 }
 
 fn warn_deprecated_scheduler_bind(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {

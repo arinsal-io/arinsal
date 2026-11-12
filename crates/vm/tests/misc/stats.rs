@@ -7,7 +7,7 @@ use arinsal_etf::OwnedTerm;
 
 const SOURCE: &str = r#"
 -module(stats_diff).
--export([shapes/0, errors/0, enabled/0, toggle/0, gc_snapshot/0, grow/0, retire/0]).
+-export([logger_time/0, shapes/0, errors/0, enabled/0, toggle/0, gc_snapshot/0, grow/0, retire/0]).
 
 shapes() ->
     ensure_kernel_refc(),
@@ -125,6 +125,17 @@ ensure_kernel_refc() ->
         undefined -> {ok, _} = kernel_refc:start_link(), ok;
         _Pid -> ok
     end.
+
+logger_time() ->
+    Old = erlang:system_flag(system_logger, self()),
+    _ = erlang:system_flag(cpu_topology, [{processor, [{core, [{thread, {logical, 0}}]}]}]),
+    Res = receive
+        {log, warning, _Fmt, _Args, #{time := T, error_logger := #{emulator := true}}} ->
+            abs(os:system_time(microsecond) - T) < 60000000
+    after 5000 -> timeout
+    end,
+    erlang:system_flag(system_logger, Old),
+    Res.
 
 retire() ->
     Key = {stats_retire, 1},
@@ -467,5 +478,17 @@ fn sched_acct_replaced_persistent_term_is_freed_after_gc() {
     // The retired-area count is not observable from Erlang in erts (erl_bif_persistent.c keeps
     // it in C only) and the booted peer is another OS process: the observable contract is the
     // value read before the replacement staying valid through the major GC.
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
+}
+
+#[test]
+fn logger_event_time_is_os_system_time() {
+    let _guard = guard();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping logger time test");
+        return;
+    };
+    let (expected, actual) = run(&reference, "logger_time");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::atom("true")));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

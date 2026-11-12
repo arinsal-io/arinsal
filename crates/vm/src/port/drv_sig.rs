@@ -217,7 +217,15 @@ pub(crate) fn output(
         io_pieces(data, &mut pieces).map(|()| CommandData::Pieces(pieces))
     };
     let Some(command) = command else {
-        // io.c:2160 bad_value: bad_port_signal.
+        // io.c:2160 bad_value: bad_port_signal with ERTS_PORT_SIG_FLG_BAD_OUTPUT;
+        // badsig_received logs the bad value and, for a bang operation, signals badsig.
+        if let Some(runtime) = process.runtime.as_ref() {
+            crate::utils::send_error_to_logger_nogl(
+                runtime,
+                process.self_pid,
+                &format!("Bad value on output port '{}'\n", handle.port_name()),
+            );
+        }
         if flags.bang {
             signal_badsig(handle, handle.id);
             return PortOp::Dropped;

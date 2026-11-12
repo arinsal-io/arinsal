@@ -1,0 +1,153 @@
+//! Logger messaging of the emulator.
+//!
+//! Port of erts/emulator/beam/utils.c (`do_allocate_logger_message`, `do_send_logger_message`,
+//! `do_send_to_logger`, `do_send_term_to_logger`, `erts_send_*_to_logger*`) and of
+//! erl_trace.c (`erts_queue_error_logger_message`), OTP-29.1.1.
+
+use crate::natives::sys::runtime_system_logger;
+use crate::process::{Message, Runtime};
+use arinsal_sched::Pid;
+use arinsal_term::{ProcessHeap, Term, TermBuilder, TermError, atoms};
+
+/// Port of utils.c `do_send_logger_message` with `do_allocate_logger_message`:
+/// `{log, Tag, Format, Args, #{error_logger => #{emulator => true, tag => ElTag}, gl => GL,
+/// pid => Pid, time => Us}}`, queued as the system message `erts_queue_error_logger_message`
+/// sends to the `erlang:system_logger/0` destination. `from` is `erts_get_current_pid()`
+/// (`None` outside a process, e.g. a port), `gleader` is NIL when absent. `format` is built
+/// on the message heap; `args` is a term on a live heap that is copied into the message.
+fn do_send_logger_message(
+    runtime: &Runtime,
+    from: Option<Pid>,
+    gleader: Term,
+    tag: Term,
+    format: &str,
+    args: impl FnOnce(&mut TermBuilder<ProcessHeap>) -> Result<Term, TermError>,
+) {
+    // `ts = ERTS_MONOTONIC_TO_USEC(erts_os_system_time())`.
+    let ts: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_micros())
+        .try_into()
+        .unwrap_or(i64::MAX);
+    let mut heap = ProcessHeap::with_words(format.len() * 2 + 512);
+    let event = (|| {
+        let mut builder = TermBuilder::new(&mut heap);
+        let format = builder.string_to_list(format)?;
+        let args = args(&mut builder)?;
+        let time = Term::small(ts).ok_or(TermError::SystemLimit)?;
+        // The backwards compatible `error_logger` tag mapping.
+        let el_tag = if tag == crate::atom_cache::put("info") {
+            crate::atom_cache::put("info_msg")
+        } else if tag == Term::atom(atoms::WARNING) {
+            Term::atom(atoms::WARNING_MSG)
+        } else {
+            Term::atom(atoms::ERROR)
+        };
+        let md = builder.flatmap_from_pairs(&[
+            (Term::atom(atoms::EMULATOR), Term::atom(atoms::TRUE)),
+            (Term::atom(atoms::TAG), el_tag),
+        ])?;
+        let mut pairs = vec![(Term::atom(atoms::ERROR_LOGGER), md)];
+        if gleader != Term::NIL {
+            pairs.push((crate::atom_cache::put("gl"), gleader));
+        }
+        if let Some(pid) = from.and_then(Pid::to_term) {
+            pairs.push((Term::atom(atoms::PID), pid));
+        }
+        pairs.push((Term::atom(atoms::TIME), time));
+        let md = builder.flatmap_from_pairs(&pairs)?;
+        builder.tuple(&[Term::atom(atoms::LOG), tag, format, args, md])
+    })();
+    let Ok(event) = event else {
+        return;
+    };
+    let Ok(message) = Message::copy_from(event) else {
+        return;
+    };
+    queue_error_logger_message(runtime, from, message);
+}
+
+// Port of erts/emulator/beam/erl_trace.c (`erts_queue_error_logger_message` and the
+// SYS_MSG_TYPE_ERRLGR branch of `sys_msg_dispatcher_func`), OTP-29.1.1: `undefined` drops the
+// message, a pid receives it (a dead pid resets the destination to `logger`), and `logger` is the
+// registered process, which never receives its own message.
+fn queue_error_logger_message(runtime: &Runtime, from: Option<Pid>, message: Message) {
+    let destination = runtime_system_logger(runtime);
+    if destination == Term::atom(atoms::UNDEFINED) {
+        return;
+    }
+    let receiver = match Pid::from_term(destination) {
+        Some(pid) => pid,
+        None => {
+            let Some(logger) = runtime.reg.whereis_proc_str("logger") else {
+                return;
+            };
+            // `smqp->from == proc->common.id`: only the registered `logger` path drops it.
+            if from == Some(logger) {
+                return;
+            }
+            logger
+        }
+    };
+    let Ok(scheduler) = runtime.scheduler() else {
+        return;
+    };
+    let _ = scheduler.send(from.unwrap_or(receiver), receiver, message);
+}
+
+/// Port of utils.c `do_send_to_logger`: format `"~s~n"`, args `[Text]`.
+fn do_send_to_logger(runtime: &Runtime, from: Option<Pid>, gleader: Term, tag: Term, text: &str) {
+    if !logger_present(runtime) {
+        // sys_msg_disp_failure: no logger; erts prints the text on stderr.
+        eprint!("{text}");
+        return;
+    }
+    do_send_logger_message(runtime, from, gleader, tag, "~s~n", |builder| {
+        let text = builder.string_to_list(text)?;
+        builder.list_from_iter([text])
+    });
+}
+
+fn logger_present(runtime: &Runtime) -> bool {
+    let destination = runtime_system_logger(runtime);
+    destination == Term::atom(atoms::UNDEFINED)
+        || Pid::from_term(destination).is_some()
+        || runtime.reg.whereis_proc_str("logger").is_some()
+}
+
+/// Port of utils.c `erts_send_warning_to_logger_str`
+/// (`do_send_to_logger` with `erts_error_logger_warnings`, `warning` by default).
+pub(crate) fn send_warning_to_logger_str(runtime: &Runtime, from: Pid, gleader: Term, text: &str) {
+    do_send_to_logger(
+        runtime,
+        Some(from),
+        gleader,
+        Term::atom(atoms::WARNING),
+        text,
+    );
+}
+
+/// Port of utils.c `erts_send_error_to_logger_nogl`: no group leader; `from` is
+/// `erts_get_current_pid()`, `None` when a port or the scheduler runs it.
+pub(crate) fn send_error_to_logger_nogl(runtime: &Runtime, from: Option<Pid>, text: &str) {
+    do_send_to_logger(runtime, from, Term::NIL, Term::atom(atoms::ERROR), text);
+}
+
+/// Port of utils.c `erts_send_error_term_to_logger` (`do_send_term_to_logger`): `format` is
+/// the dsprintf buffer, `args` a list on the caller's live heap.
+pub(crate) fn send_error_term_to_logger(
+    runtime: &Runtime,
+    from: Pid,
+    gleader: Term,
+    format: &str,
+    args: Term,
+) {
+    do_send_logger_message(
+        runtime,
+        Some(from),
+        gleader,
+        Term::atom(atoms::ERROR),
+        format,
+        |_| Ok(args),
+    );
+}

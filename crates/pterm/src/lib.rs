@@ -30,22 +30,6 @@ pub fn global_store() -> &'static Store {
     &GLOBAL
 }
 
-// The most recent retirement of any node's store, for tests that cannot name the node.
-static LAST_TRACE: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
-/// The most recent literal-area retirement trace of any node's store.
-pub fn last_retirement_of_any_store() -> RetirementTrace {
-    RetirementTrace {
-        pending_before: LAST_TRACE[0].load(Ordering::Relaxed) as usize,
-        pending_after: LAST_TRACE[1].load(Ordering::Relaxed) as usize,
-        freed: LAST_TRACE[2].load(Ordering::Relaxed),
-        copied_roots: LAST_TRACE[3].load(Ordering::Relaxed),
-    }
 }
 
 /// A stable table view held across a yielding `persistent_term:get/0` call.
@@ -208,18 +192,6 @@ impl RetiredStorage {
         }
     }
 }
-/// Counters from the latest process collection that owed retired literal areas.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RetirementTrace {
-    /// Areas this process still had to scan.
-    pub pending_before: usize,
-    /// Areas still outstanding after acknowledgement.
-    pub pending_after: usize,
-    /// Areas released because this process was the last waiter.
-    pub freed: u64,
-    /// Live roots copied out of retired areas before the release.
-    pub copied_roots: u64,
-}
 struct Writer {
     /// `release_literal_areas.block_ix` and its counters.
     block_ix: usize,
@@ -273,7 +245,6 @@ pub struct Store {
     /// Exit skips the lock when no literal release is in progress
     /// (erl_process.c:14374, `block_rla_ref` stays 0 for an immediate reason).
     active_set: AtomicBool,
-    last_trace: [AtomicU64; 4],
     /// Areas waiting for process GC. Lock-free so collection can skip the scan.
     retired_len: AtomicUsize,
     retired_generation: AtomicU64,
@@ -305,7 +276,6 @@ impl Store {
             }),
             active_area: RwLock::new(None),
             active_set: AtomicBool::new(false),
-            last_trace: std::array::from_fn(|_| AtomicU64::new(0)),
             retired_len: AtomicUsize::new(0),
             retired_generation: AtomicU64::new(0),
             freed: AtomicU64::new(0),
@@ -328,15 +298,6 @@ impl Store {
     /// Areas released after their last process acknowledged them.
     pub fn freed_literal_areas(&self) -> u64 {
         self.freed.load(Ordering::Relaxed)
-    }
-    /// Latest GC retirement trace. Zero until a collection owed an area.
-    pub fn last_retirement(&self) -> RetirementTrace {
-        RetirementTrace {
-            pending_before: self.last_trace[0].load(Ordering::Relaxed) as usize,
-            pending_after: self.last_trace[1].load(Ordering::Relaxed) as usize,
-            freed: self.last_trace[2].load(Ordering::Relaxed),
-            copied_roots: self.last_trace[3].load(Ordering::Relaxed),
-        }
     }
     /// Return the stored value pointer, with no copy or lock.
     #[inline]
@@ -719,8 +680,6 @@ impl Store {
     fn note_area_freed(&self) {
         self.retired_len.fetch_sub(1, Ordering::AcqRel);
         self.freed.fetch_add(1, Ordering::Relaxed);
-        self.last_trace[2].fetch_add(1, Ordering::Relaxed);
-        LAST_TRACE[2].fetch_add(1, Ordering::Relaxed);
     }
     /// Internal identifier for the area currently being copied by the collector.
     pub fn collector_area(&self) -> Option<u64> {
@@ -758,11 +717,6 @@ impl Store {
         }
         if literal_trace() {
             eprintln!("literal_ack area={area_id} copied={copied_roots}");
-        }
-        // The process owed this one area and owes nothing after the acknowledgement.
-        for (slot, value) in [(0, 1), (1, 0), (3, copied_roots)] {
-            self.last_trace[slot].store(value, Ordering::Relaxed);
-            LAST_TRACE[slot].store(value, Ordering::Relaxed);
         }
         true
     }
