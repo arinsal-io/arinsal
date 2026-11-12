@@ -16,7 +16,7 @@ pub fn run(
 
 /// Seed the VM's OS environment table (erlexec `set_env` for PATH and `-env`).
 pub fn seed_environment(vars: &[(String, String)]) {
-    crate::natives::env::seed(vars);
+    crate::erl_osenv::seed(vars);
 }
 
 /// Start OTP after applying the emulator's debugger startup flags.

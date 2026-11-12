@@ -9,6 +9,7 @@ pub(crate) mod bif;
 pub(crate) mod env;
 pub(crate) mod erl_bif_info;
 pub(crate) mod erl_bif_lists;
+pub(crate) mod erl_bif_os;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_process;
@@ -176,7 +177,6 @@ pub fn implemented_natives() -> &'static [(&'static str, &'static str, u8)] {
             sys::IMPLEMENTED,
             misc::IMPLEMENTED,
             crate::seq_trace::IMPLEMENTED,
-            env::IMPLEMENTED,
             proc::IMPLEMENTED,
             tty::IMPLEMENTED,
             maps::IMPLEMENTED,
@@ -211,7 +211,6 @@ fn family_dispatches(module: &str, function: &str, arity: u8) -> bool {
         || node::recognizes(module, function, arity)
         || sys::recognizes(module, function, arity)
         || crate::seq_trace::recognizes(module, function, arity)
-        || env::recognizes(module, function, arity)
         || proc::recognizes(module, function, arity)
         || tty::recognizes(module, function, arity)
         || maps::recognizes(module, function, arity)
@@ -226,9 +225,6 @@ fn family_dispatches(module: &str, function: &str, arity: u8) -> bool {
 fn handler_agrees(module: &str, function: &str, arity: u8) -> bool {
     if listed(erl_debugger::IMPLEMENTED, module, function, arity) {
         return true;
-    }
-    if env::recognizes(module, function, arity) {
-        return env::handler(module, function, arity).is_some();
     }
     if node::recognizes(module, function, arity) {
         return node::handler(module, function, arity).is_some();
@@ -677,9 +673,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
         return Some(NativeEntry::DirectFamily(sys::call));
     }
     if let Some(handle) = sys::handler(module, function, arity) {
-        return Some(NativeEntry::Direct(handle));
-    }
-    if let Some(handle) = env::handler(module, function, arity) {
         return Some(NativeEntry::Direct(handle));
     }
     if let Some(handle) = proc::process_info_handler(module, function, arity) {
