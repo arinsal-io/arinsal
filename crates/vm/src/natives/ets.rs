@@ -1412,7 +1412,7 @@ fn insert_list(
         .cold
         .as_mut()
         .and_then(|cold| cold.ets_insert.take());
-    let initial = ctx.remaining() as isize;
+    let initial = process.heap.abi.fcalls.max(0) as isize;
     let mut loops = initial * ITERATIONS_PER_RED;
     let done = |process: &mut Process, ctx: &mut RunCtx<'_, Message>, loops: isize, yes: bool| {
         let used = (initial * ITERATIONS_PER_RED - loops) / ITERATIONS_PER_RED;
@@ -1756,11 +1756,8 @@ impl arinsal_ets::match_spec::MatchContext for ProcessMatchContext {
 /// Charge `used` reductions to the process and the scheduler quantum.
 ///
 /// Port of erts/emulator/beam/erl_bif_info.c (BUMP_REDS), OTP-29.1.1.
-fn bump_reds(process: &mut Process, ctx: &mut RunCtx<'_, Message>, used: isize) {
-    let used = used.clamp(0, ctx.remaining() as isize) as u32;
-    process.heap.abi.fcalls -= used as i32;
-    process.reductions_used = process.reductions_used.saturating_add(u64::from(used));
-    ctx.consume(used);
+fn bump_reds(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, used: isize) {
+    bump_direct(process, used);
 }
 
 /// Charge `used` reductions from a BIF that runs from native code, where the live counter is
@@ -1817,7 +1814,7 @@ fn help_busy_table(
         }
     };
     let rt = process.runtime.ok_or_else(badarg)?;
-    let initial = ctx.remaining() as isize;
+    let initial = process.heap.abi.fcalls.max(0) as isize;
     let mut reds = initial;
     {
         let registry = rt.ets.read().unwrap();
@@ -1859,7 +1856,7 @@ fn delete_or_clear(
     caller: Term,
 ) -> Result<Term, VmError> {
     let rt = process.runtime.ok_or_else(badarg)?;
-    let initial = ctx.remaining() as isize;
+    let initial = process.heap.abi.fcalls.max(0) as isize;
     let mut reds = initial;
     let mut state = process.cold.as_mut().and_then(|cold| cold.ets_free.take());
     let done = if let Some(state) = state.as_mut() {
@@ -2654,8 +2651,9 @@ fn suspend_until_thr_prgr(
     let (Some(runtime), Some(ctx)) = (process.runtime, ctx) else {
         return Err(needs_context());
     };
+    // erl_flxctr.c:163-166: erts_suspend, ERTS_VBUMP_ALL_REDS, then the later op.
     crate::suspend::suspend_self(process);
-    process.set_force_yield(true);
+    crate::bif_traps::vbump_all_reds(process);
     let op = host.0;
     ctx.thread_progress_later(move || {
         if let Some(op) = op {

@@ -907,13 +907,13 @@ fn process_info_aux(
         .ok_or_else(badarg)?,
         arinsal_term::atoms::REDUCTIONS => {
             // Port of erts/emulator/beam/beam_common.c:2394 (`erts_current_reductions`)
-            // and erl_bif_info.c:2115, OTP-29.1.1. Only the process inside native code
-            // adds `REDS_IN - fcalls`; a yielded process already folded that into `reds`.
+            // and erl_bif_info.c:2115, OTP-29.1.1: the caller itself adds `REDS_IN - FCALLS`
+            // of the running slice, which the context switch has not folded into `reds` yet.
             let rp = src.read(process);
-            let inflight = if rp.heap.native_active() && rp.self_pid == Some(pid) {
+            let inflight = if matches!(src, InfoSource::Caller) {
                 // `- virtual_reds`: what ERTS_VBUMP_REDS took is not the process's own work.
                 u64::try_from(
-                    rp.native_reds_in
+                    rp.reds_in
                         .saturating_sub(rp.heap.abi.fcalls)
                         .saturating_sub(i32::try_from(rp.virtual_reds).unwrap_or(i32::MAX)),
                 )
@@ -2543,14 +2543,9 @@ fn process_info_single(
 
 /// Charge the reductions of one `process_info` call (erl_bif_info.c:1601 and :1424, BUMP_REDS),
 /// after its values are built, so this call's bump is visible to the next `process_info`.
+// FCALLS is the live counter from native code and from the executor alike (`fold_fcalls`).
 fn charge_info_reductions(process: &mut Process, info_reds: i32) {
-    if process.heap.native_active() {
-        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(info_reds);
-    } else {
-        process.reductions_used = process
-            .reductions_used
-            .saturating_add(u64::try_from(info_reds).unwrap_or(0));
-    }
+    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(info_reds);
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:1555 (process_info_2), OTP-29.1.1.
@@ -3138,8 +3133,9 @@ fn call_values(
             ("list_to_ref", [chars]) if module == "erlang" => list_to_ref(process, *chars),
             // Port of erts/emulator/beam/bif.c:4487 (fun_to_list_1), OTP-29.1.1.
             ("fun_to_list", [fun]) if module == "erlang" => charlist(process, &fun_to_list(*fun)?),
-            // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield), OTP-29.1.1:
-            // the process goes to the back of its run queue and returns `true`.
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3121 (emit_i_yield) and
+            // instr_call.cpp:30 (dispatch_return), OTP-29.1.1: `x0 = true` and an unconditional
+            // context switch with FCALLS untouched; the one forced yield erts has.
             ("yield", []) if module == "erlang" => {
                 process.set_force_yield(true);
                 Ok(Term::atom(arinsal_term::atoms::TRUE))
@@ -5618,11 +5614,12 @@ fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
 // invalidate a scan that is already in progress.
 fn processes_next(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, Message>,
     cursor: Term,
 ) -> Result<Term, VmError> {
     let index = u32::try_from(cursor.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
-    let max_pids = ctx.remaining().max(1);
+    let reds_left = u32::try_from(process.heap.abi.fcalls.max(1)).unwrap_or(1);
+    let max_pids = reds_left;
     let limit = index
         .saturating_add(max_pids.saturating_mul(25))
         .min(arinsal_term::ptab::process_table_layout().max());
@@ -5639,8 +5636,9 @@ fn processes_next(
         .iter()
         .map(|pid| pid.to_term().ok_or_else(badarg))
         .collect::<Result<Vec<_>, _>>()?;
-    let scanned = ((scan_end.saturating_sub(index) / 25) + 1).min(ctx.remaining());
-    ctx.consume(scanned);
+    let scanned = ((scan_end.saturating_sub(index) / 25) + 1).min(reds_left);
+    // BUMP_REDS on FCALLS; the slice folds it (`fold_fcalls`).
+    process.heap.abi.fcalls -= i32::try_from(scanned).unwrap_or(i32::MAX);
     let next = Term::small(i64::from(scan_end)).ok_or_else(badarg)?;
     let batch = make_list(process, pid_terms)?;
     make_tuple(process, &[next, batch])

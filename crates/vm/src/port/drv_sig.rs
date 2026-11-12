@@ -244,9 +244,7 @@ pub(crate) fn output(
         trace_command_received(process, tracer, handle.id, &views, segments);
     }
     if try_call {
-        let reductions_left = ctx
-            .as_deref()
-            .map_or((CONTEXT_REDS / 10) as u32, |ctx| ctx.remaining());
+        let reductions_left = u32::try_from(process.heap.abi.fcalls.max(0)).unwrap_or(0);
         match drv.try_imm_call(invalid_flags, asynchronous, "command", reductions_left) {
             Ok(imm) => {
                 // Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
@@ -256,9 +254,12 @@ pub(crate) fn output(
                 let reductions_used = imm.reductions_used();
                 drop(imm);
                 trace_immediate_process(process, caller, "in");
-                if let Some(ctx) = ctx {
-                    ctx.consume(reductions_used);
-                }
+                // BUMP_REDS on FCALLS; the slice folds it (`fold_fcalls`).
+                process.heap.abi.fcalls = process
+                    .heap
+                    .abi
+                    .fcalls
+                    .saturating_sub(i32::try_from(reductions_used).unwrap_or(i32::MAX));
                 return PortOp::Done;
             }
             Err(ImmFail::InvalidPort) => return PortOp::Dropped,

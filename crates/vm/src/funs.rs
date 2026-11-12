@@ -322,8 +322,8 @@ impl Vm {
                 && self.purge_state.suspend_on_pending_lambda(&name, pid)
             {
                 crate::suspend::suspend_self(p);
-                // ERTS_VBUMP_ALL_REDS: leave the scheduler at the next instruction.
-                p.set_force_yield(true);
+                // erts_suspend + ERTS_VBUMP_ALL_REDS (beam_bif_load.c:2003-2004).
+                crate::bif_traps::vbump_all_reds(p);
             }
             ("erts_code_purger".to_owned(), "pending_purge_lambda")
         } else {
@@ -476,6 +476,8 @@ impl Vm {
             trap_pc,
             (target.module_atom, target.function_atom),
             &trap,
+            // The slice ends here: this yield is the trap's context switch.
+            false,
         );
         crate::bif_traps::arm_export_trap(p);
         p.set_native_retry(Some(trap_pc));
@@ -576,18 +578,13 @@ impl Vm {
         arity: usize,
         bif: arinsal_bifs::BifFn,
     ) -> Result<ImportOutcome, VmError> {
-        let (result, bif_reductions, deferred) = {
+        // The BIF's BUMP_REDS lowers FCALLS, which the context switch reads.
+        let (result, deferred) = {
             let mut heap = ProcessHeapHandle(&mut p.heap);
             let mut state = arinsal_bifs::BifState::default();
             let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bif(&mut bif_ctx, &p.x[..arity])
-            }))
-            .map_err(|_| {
-                VmError::Unsupported(format!("BIF {module}:{function}/{arity} panicked"))
-            })?;
-            let reductions = bif_ctx.reductions();
-            (result, reductions, bif_ctx.take_deferred())
+            let result = bif(&mut bif_ctx, &p.x[..arity]);
+            (result, bif_ctx.take_deferred())
         };
         // Port of erts/emulator/beam/bif.h (BIF_TRAP*) and beam_common.c (fixed_apply returns the
         // BIF's own export dispatch), OTP-29.1.1: a BIF that ran out of reductions returns
@@ -602,12 +599,6 @@ impl Vm {
                 .intern(function)
                 .map_err(|error| VmError::Unsupported(format!("BIF function atom: {error:?}")))?;
             let args = p.x[..arity].to_vec();
-            // The BIF's BUMP_REDS already lowered FCALLS; the runtime path between two native
-            // slices hands the same charge to the scheduler and the process count.
-            p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
-            if let Some(run) = ctx {
-                run.consume(bif_reductions);
-            }
             crate::bif_traps::install_deferred_trap(
                 p,
                 crate::bif_traps::APPLY_TRAP_KEY,
@@ -709,12 +700,7 @@ impl Vm {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_bif_shared, bif_nif_epilogue)
         // and instr_call.cpp (emit_variable_apply, emit_fixed_apply), OTP-29.1.1: neither the
         // apply nor the BIF stub decrements FCALLS; the BIF's own BUMP_REDS, already taken
-        // from FCALLS, is the whole charge. This runtime step between two native slices passes
-        // it on to the scheduler's quantum and the process count.
-        p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
-        if let Some(run) = ctx {
-            run.consume(bif_reductions);
-        }
+        // from FCALLS and folded above, is the whole charge.
         Ok(Self::return_value(p))
     }
 

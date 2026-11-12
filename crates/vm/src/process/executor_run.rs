@@ -12,7 +12,6 @@ impl Executor {
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
-        budget: u32,
     ) -> Result<RunState, VmError> {
         let exec_key = ctx.scheduler_key();
         let cached = exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
@@ -82,26 +81,6 @@ impl Executor {
             if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
                 crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
             }
-        }
-        // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
-        // A normal slice replaces leftover FCALLS so the send after a code-permission
-        // release is not skipped by a reduction check that still sees only a few: that
-        // yield lets the waiter run and send `{Pid, locked}` first.
-        // A 1-reduction quantum is the scheduler budget that splits `loop_rec` from
-        // `wait`. Light BIFs do `subs FCALLS, #1; b.le yield` and resume at the same
-        // entry (instr_bif.cpp:399-400, OTP-29.1.1), so installing FCALLS=1 never
-        // enters the BIF. Leave a positive count alone in that case.
-        let reds = budget.min(i32::MAX as u32) as i32;
-        if process.native_pc().is_some() {
-            if reds > 1 || process.heap.abi.fcalls <= 0 {
-                process.heap.abi.fcalls = reds;
-            }
-        } else if process.heap.abi.fcalls <= 0 && reds > 0 {
-            // Interpreted schedule-in. A trapping BIF charges FCALLS to 0 when it
-            // yields; the continuation (lists:member/2) reads that counter as its
-            // scan budget. Leaving it at 0 makes every resume yield without
-            // scanning, and the process never reaches halt.
-            process.heap.abi.fcalls = reds;
         }
         // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i =
         // beam_run_process`), OTP-29.1.1: a spawned process (`p->u.initial` set) enters at the
@@ -209,7 +188,7 @@ impl Executor {
                         let reentered = std::mem::take(&mut reenter);
                         if !dirty_here && !reentered {
                             // A caught exception re-enters this loop without replenishing its process slice.
-                            if ctx.remaining() == 0 {
+                            if process.heap.abi.fcalls <= 0 {
                                 break Ok(RunState::Yield);
                             }
                             if process.force_yield() {
@@ -443,20 +422,9 @@ impl Executor {
                                 }
                             } else {
                                 // Port of erts/emulator/beam/erl_process.c (schedule: reductions
-                                // used = CONTEXT_REDS - FCALLS), OTP-29.1.1: native code counts down
-                                // FCALLS; the scheduler charges what it used.
-                                // FCALLS and the scheduler budget are one counter in erts. A BIF
-                                // charge can zero the process counter while the slice still
-                                // has reductions; refilling avoids yielding before the next
-                                // instruction (the send after a code-permission release).
+                                // used = REDS_IN - FCALLS), OTP-29.1.1: native code counts down
+                                // FCALLS, the slice's one counter; the context switch charges it.
                                 let native = {
-                                    if process.heap.abi.fcalls <= 0
-                                        && let Ok(remaining) = i32::try_from(ctx.remaining())
-                                        && remaining > 0
-                                    {
-                                        process.heap.abi.fcalls = remaining;
-                                    }
-                                    let fcalls_before = process.heap.abi.fcalls;
                                     // A code change this scheduler committed waits for thread
                                     // progress first: every other scheduler then finishes the slice it
                                     // runs with the previous code index (erts' code barrier).
@@ -481,9 +449,6 @@ impl Executor {
                                             code_ptr,
                                         )
                                     };
-                                    let consumed =
-                                        fcalls_before.saturating_sub(process.heap.abi.fcalls);
-                                    ctx.consume(u32::try_from(consumed).unwrap_or(0));
                                     // Native `timeout` has no scheduler context to send its trace event.
                                     if process.native_exit_kind
                                         != crate::proc_create::NativeExit::None
@@ -495,19 +460,6 @@ impl Executor {
                                             ctx,
                                         );
                                     }
-                                    // Port of erts/emulator/beam/erl_process.c (erts_current_reductions),
-                                    // OTP-29.1.1: the process's reduction count includes what its
-                                    // native code consumed from FCALLS.
-                                    // Reductions the slice gave up with `ERTS_VBUMP_ALL_REDS` ended
-                                    // the slice but are not the process's own.
-                                    let virtual_reds = std::mem::take(&mut process.virtual_reds);
-                                    ctx.add_virtual_reds(virtual_reds);
-                                    process.reductions_used =
-                                        process.reductions_used.saturating_add(
-                                            u64::try_from(consumed)
-                                                .unwrap_or(0)
-                                                .saturating_sub(u64::from(virtual_reds)),
-                                        );
                                     native
                                 };
                                 match native {
@@ -559,7 +511,7 @@ impl Executor {
                         if matches!(&result, Ok(RunState::Yield))
                             && process.native_pc().is_some()
                             && !process.force_yield()
-                            && native_transfer_continues(process, ctx)
+                            && native_transfer_continues(process)
                         {
                             continue;
                         }
@@ -771,7 +723,7 @@ fn schedule_in_signals(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<(), VmError> {
-    let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+    let reds = process.heap.abi.fcalls;
     let mut sig_reds = if process.slice().is_some_and(|work| work.dirty_sys_gc) {
         reds
     } else {
@@ -782,14 +734,10 @@ fn schedule_in_signals(
     }
     let max_reds = sig_reds;
     let handled = process.handle_incoming(ctx, &mut sig_reds, max_reds, false);
-    ctx.consume(u32::try_from(sig_reds).unwrap_or(0));
     // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
     // then `p->fcalls = reds`; the process's reductions are what the slice
     // used), OTP-29.1.1: the signal handling is the process's own work.
-    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(sig_reds.max(0));
-    process.reductions_used = process
-        .reductions_used
-        .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
+    super::executor::bump_fcalls(process, sig_reds);
     let executed = handled.and_then(|_| {
         if ctx.sys_task_run() {
             crate::signals::execute_sys_tasks(process, ctx)

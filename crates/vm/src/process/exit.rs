@@ -661,7 +661,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c:14229 (erts_do_exit_process:
         // `BUMP_REDS(p, 100)`), OTP-29.1.1: the rest of the exit runs on what is left, and the
         // schedulers' wakeup_other, check_balance and check_time counters see this cost.
-        ctx.consume(100);
+        crate::process::bump_fcalls(self, 100);
         self.continue_exit(runtime, ctx, data, false, state)
     }
 
@@ -690,10 +690,12 @@ impl Process {
             });
         }
         if !state.pend_spawn {
-            let initial = ctx.remaining() as isize;
+            // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process: `reds =
+            // ERTS_BIF_REDS_LEFT(p)` ... `BUMP_REDS(p, reds_used)`), OTP-29.1.1.
+            let initial = self.heap.abi.fcalls.max(0) as isize;
             let mut reds = initial;
             let done = self.exit_ets(ctx, &mut reds, &mut state.garbage);
-            ctx.consume((initial - reds).clamp(0, initial) as u32);
+            crate::process::bump_fcalls(self, (initial - reds).clamp(0, initial) as i32);
             if !done {
                 with_executor(data, runtime, |executor| {
                     crate::trace::emit(

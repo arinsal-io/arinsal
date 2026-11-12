@@ -389,7 +389,7 @@ pub struct Process {
     pub(crate) max_heap_peak: usize,
     /// `REDS_IN`: FCALLS at the start of the current native slice.
     /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
-    pub(crate) native_reds_in: i32,
+    pub(crate) reds_in: i32,
     /// FCALLS the last trapping BIF handler spent on its own, before the call's charge.
     pub(crate) trap_work: i32,
     /// `esdp->virtual_reds`: reductions the slice gave up through `ERTS_VBUMP_ALL_REDS` since
@@ -2090,7 +2090,7 @@ impl Process {
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
-            native_reds_in: 4000,
+            reds_in: 4000,
             trap_work: 0,
             virtual_reds: 0,
             reductions_used: 0,
@@ -2187,23 +2187,16 @@ impl Process {
     pub(crate) fn ensure_uncharged(&mut self, words: usize, live: usize) -> Result<u32, VmError> {
         self.ensure_roots_cost(words, live)
     }
-    /// Charge `cost` reductions for a collection.
-    ///
-    /// A process running native code spends its FCALLS counter, which stops at zero. The
-    /// interpreter keeps its slice in the scheduler and counts the work as used reductions.
+    /// Charge `cost` reductions for a collection against FCALLS, which stops at zero.
     // Port of erts/emulator/beam/bif.h (BUMP_REDS) as used by erl_gc.c
     // (`erts_gc_after_bif_call_lhf`, `erts_garbage_collect`), OTP-29.1.1.
     pub(crate) fn bump_gc_reds(&mut self, cost: u32) {
-        if self.heap.native_active() {
-            self.heap.abi.fcalls = self
-                .heap
-                .abi
-                .fcalls
-                .saturating_sub(cost.min(i32::MAX as u32) as i32)
-                .max(0);
-        } else {
-            self.reductions_used = self.reductions_used.saturating_add(u64::from(cost));
-        }
+        self.heap.abi.fcalls = self
+            .heap
+            .abi
+            .fcalls
+            .saturating_sub(cost.min(i32::MAX as u32) as i32)
+            .max(0);
     }
     /// Charge a collection the epilogue of a BIF ran: its cost, or, when erts postponed it, the
     /// rest of the slice.
@@ -2847,10 +2840,7 @@ mod layout_report {
             "  Process.reductions {}",
             size_of_val(&process.heap.abi.fcalls)
         );
-        eprintln!(
-            "  Process.native_reds_in {}",
-            size_of_val(&process.native_reds_in)
-        );
+        eprintln!("  Process.reds_in {}", size_of_val(&process.reds_in));
         eprintln!("  Process.trap_work {}", size_of_val(&process.trap_work));
         eprintln!(
             "  Process.virtual_reds {}",

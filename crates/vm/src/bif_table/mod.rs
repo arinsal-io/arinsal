@@ -138,7 +138,9 @@ use crate::native_helpers::{
     integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
-use crate::natives::{erl_bif_info, erl_bif_lists, erl_hl_timer, erl_process_dict, register};
+use crate::natives::{
+    erl_bif_info, erl_bif_lists, erl_hl_timer, erl_map, erl_process_dict, register,
+};
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
 #[derive(Clone, Copy)]
@@ -211,6 +213,11 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("lists", "keymember", 3) => bif!(erl_bif_lists::lists_keymember_3),
         ("lists", "keysearch", 3) => bif!(erl_bif_lists::lists_keysearch_3),
         ("lists", "keyfind", 3) => bif!(erl_bif_lists::lists_keyfind_3),
+        // erl_map.c
+        ("maps", "from_list", 1) => bif!(erl_map::maps_from_list_1),
+        ("maps", "from_keys", 2) => bif!(erl_map::maps_from_keys_2),
+        ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
+        ("maps", "values", 1) => bif!(erl_map::maps_values_1),
         // erl_process_dict.c
         ("erlang", "get", 0) => bif!(erl_process_dict::get_0),
         ("erlang", "get", 1) => bif!(erl_process_dict::get_1),
@@ -304,18 +311,15 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 // selected BIF body directly; that body leaves the light path only when it traps.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{
-        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsFromList,
-        MapsKeys, MapsMerge, MapsValues, Phash2, TermToBinary,
+        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsMerge, Phash2,
+        TermToBinary,
     };
     use crate::native_helpers::trap_bif_entry;
     if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
         return arinsal_bifs::visit_bif(module, function, arity, &mut BinaryToListEntry);
     }
     let func = match (module, function, arity) {
-        ("maps", "keys", 1) => bif!(trap_bif_entry::<MapsKeys>),
-        ("maps", "values", 1) => bif!(trap_bif_entry::<MapsValues>),
         ("maps", "merge", 2) => bif!(trap_bif_entry::<MapsMerge>),
-        ("maps", "from_list", 1) => bif!(trap_bif_entry::<MapsFromList>),
         ("erlang", "list_to_binary", 1) | ("binary", "list_to_bin", 1) => {
             bif!(trap_bif_entry::<ListToBinary>)
         }

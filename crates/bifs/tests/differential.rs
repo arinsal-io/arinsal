@@ -525,11 +525,6 @@ fn new_bifs_valid_inputs_match_otp() {
     for n in 0..1000 {
         let data = O::Binary((0..n % 197).map(|i| ((i * 37 + n) % 256) as u8).collect());
         let map = O::Map(vec![(O::Int(1), O::Int(n)), (O::Int(2), O::Int(n + 1))]);
-        let keys = list(vec![O::Int(1), O::Int(2), O::Int(1)]);
-        let pairs = list(vec![
-            O::Tuple(vec![O::Int(1), O::Int(n)]),
-            O::Tuple(vec![O::Int(2), O::Int(n + 1)]),
-        ]);
         let positive_cases = [
             ("erlang", "+", vec![O::Int(n), O::Int(n + 1)]),
             ("erlang", "div", vec![O::Int(n), O::Int(7)]),
@@ -537,13 +532,9 @@ fn new_bifs_valid_inputs_match_otp() {
             ("erlang", "crc32", vec![data.clone()]),
             ("erlang", "adler32", vec![data.clone()]),
             ("erlang", "md5", vec![data.clone()]),
-            ("maps", "from_list", vec![pairs]),
-            ("maps", "from_keys", vec![keys, O::Int(n)]),
             ("maps", "find", vec![O::Int(1), map.clone()]),
             ("maps", "get", vec![O::Int(1), map.clone()]),
             ("maps", "is_key", vec![O::Int(1), map.clone()]),
-            ("maps", "keys", vec![map.clone()]),
-            ("maps", "values", vec![map.clone()]),
             ("maps", "put", vec![O::Int(1), O::Int(n + 5), map.clone()]),
             ("maps", "remove", vec![O::Int(1), map.clone()]),
             (
@@ -904,7 +895,6 @@ fn changed_map_bifs_match_otp_for_flatmaps_hamts_and_errors() {
             .map(|key| (O::Int(key), O::Int(key * 10)))
             .collect(),
     );
-    let keys = list((1..=40).map(O::Int).collect());
     let cases = [
         ("find", vec![O::Int(4), flat.clone()]),
         ("find", vec![O::Int(99), hamt.clone()]),
@@ -928,11 +918,6 @@ fn changed_map_bifs_match_otp_for_flatmaps_hamts_and_errors() {
         ("take", vec![O::Int(4), hamt.clone()]),
         ("take", vec![O::Int(99), hamt.clone()]),
         ("take", vec![O::Int(4), atom("not_map")]),
-        ("keys", vec![hamt.clone()]),
-        ("values", vec![hamt]),
-        ("keys", vec![atom("not_map")]),
-        ("values", vec![atom("not_map")]),
-        ("from_keys", vec![keys, O::Int(7)]),
     ];
 
     for (name, input) in cases {
@@ -995,7 +980,13 @@ fn map_projections_walk_collision_nodes() {
     let mut state = arinsal_bifs::BifState::default();
     let mut ctx = Ctx::new(&mut allocator, &mut state);
     for name in ["keys", "values"] {
-        let actual = to_owned(lookup("maps", name, 1).unwrap()(&mut ctx, &[map]).unwrap()).unwrap();
+        // maps_keys_1_helper / maps_values_1_helper over a hashmap: the walk erl_map.rs runs.
+        let keys = name == "keys";
+        let mut walk =
+            arinsal_bifs::MapsProjectionWalk::start_hashmap(&mut ctx, map, keys).unwrap();
+        let mut reds = i64::MAX;
+        while !walk.step(&mut reds) {}
+        let actual = to_owned(walk.finish()).unwrap();
         let expected = reference.call("maps", name, std::slice::from_ref(&expected_map));
         let CallResult::Ok(O::List { elems, tail }) = &expected else {
             panic!("OTP maps:{name} did not return a proper list: {expected:?}");
