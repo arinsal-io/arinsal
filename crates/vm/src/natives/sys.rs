@@ -1728,6 +1728,15 @@ pub(crate) fn system_logger(process: &Process) -> Term {
     system_logger_in(runtime_state(process), process.runtime)
 }
 
+/// `erts_set_system_logger(am_logger)` of the dispatcher after a bad logger pid.
+pub(crate) fn reset_system_logger(runtime: &crate::process::Runtime) {
+    *runtime
+        .statistics
+        .system_logger
+        .lock()
+        .expect("system logger") = Term::atom(arinsal_term::atoms::LOGGER);
+}
+
 /// `erts_get_system_logger` of `runtime`.
 pub(crate) fn runtime_system_logger(runtime: &crate::process::Runtime) -> Term {
     system_logger_in(&runtime.statistics, Some(runtime))

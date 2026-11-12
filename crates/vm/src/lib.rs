@@ -20,6 +20,7 @@ mod dist;
 mod erl_bits;
 mod erl_osenv;
 mod erl_poll;
+mod erl_trace;
 mod exceptions;
 mod export;
 mod interp;
