@@ -163,37 +163,33 @@ pub(super) fn off_heap_binary_words(process: &Process) -> usize {
         .fold(0, |sum, len| sum.saturating_add(len.div_ceil(8)))
 }
 
-// g_proc_sched. Port of erl_gc.c:3756 (error_logger report),
-// utils.c:802 (`do_send_logger_message`) and utils.c:885
-// (`send_error_term_to_logger`), OTP-29.1.1.
+// g_proc_sched. Port of erl_gc.c:3756 (error_logger report in `reached_max_heap_size`),
+// OTP-29.1.1.
 fn report_max_heap(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     limit: MaxHeap,
     used: u64,
 ) {
-    let format = "     Process:            ~p ~n     Context:            maximum heap size reached~n     Max Heap Size:      ~p~n     Total Heap Size:    ~p~n     Kill:               ~p~n     Error Logger:       ~p~n     Message Queue Len:  ~p~n     GC Info:            ~p~n     Stacktrace:         ~p~n";
-    eprintln!(
-        "     Process:            {:?}\n     Context:            maximum heap size reached\n     Max Heap Size:      {}\n     Total Heap Size:    {used}\n     Kill:               {}\n     Error Logger:       true\n     Message Queue Len:  {}\n     GC Info:            []\n     Stacktrace:         []",
-        ctx.pid(),
-        limit.size,
-        limit.kill,
-        process.inbox.len()
-    );
     let Some(runtime) = process.runtime else {
-        return;
-    };
-    let logger = runtime
-        .reg
-        .whereis_proc_str("logger")
-        .or_else(|| runtime.reg.whereis_proc_str("error_logger"));
-    let Some(logger) = logger else {
         return;
     };
     let Some(pid) = ctx.pid().to_term() else {
         return;
     };
-    let group_leader = process.group_leader.and_then(Pid::to_term);
+    let node_name = {
+        let nodes = crate::node_tables::lock();
+        nodes.alive.then(|| nodes.local_identity().0.to_owned())
+    };
+    let mut format = String::from("     Process:            ~p ");
+    if node_name.is_some() {
+        format.push_str("on node ~p");
+    }
+    format.push_str("~n     Context:            maximum heap size reached~n     Max Heap Size:      ~p~n     Total Heap Size:    ~p~n     Kill:               ~p~n     Error Logger:       ~p~n     Message Queue Len:  ~p~n     GC Info:            ~p~n     Stacktrace:         ~p~n");
+    let group_leader = process
+        .group_leader
+        .and_then(Pid::to_term)
+        .unwrap_or(Term::NIL);
     let bool_atom = |on: bool| {
         Term::atom(if on {
             arinsal_term::atoms::TRUE
@@ -204,15 +200,15 @@ fn report_max_heap(
     let built = (|| -> Result<Term, VmError> {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
-        let format = builder
-            .list_from_iter(
-                format
-                    .bytes()
-                    .map(|byte| Term::small(i64::from(byte)).unwrap()),
-            )
-            .map_err(|error| VmError::Unsupported(format!("logger format: {error:?}")))?;
-        let args = [
-            pid,
+        let mut args = vec![pid];
+        if let Some(node_name) = node_name {
+            args.push(Term::atom(
+                arinsal_term::global_atoms()
+                    .intern(&node_name)
+                    .map_err(|error| VmError::Unsupported(format!("node atom: {error:?}")))?,
+            ));
+        }
+        args.extend([
             Term::small(limit.size as i64).unwrap_or(Term::NIL),
             Term::small(used as i64).unwrap_or(Term::NIL),
             bool_atom(limit.kill),
@@ -220,54 +216,12 @@ fn report_max_heap(
             Term::small(process.inbox.len() as i64).unwrap_or(Term::NIL),
             Term::NIL,
             Term::NIL,
-        ];
-        let args = builder
-            .list_from_iter(args)
-            .map_err(|error| VmError::Unsupported(format!("logger args: {error:?}")))?;
-        // Port of erts/emulator/beam/utils.c:773 (`do_send_logger_message`), OTP-29.1.1:
-        // `#{error_logger => #{emulator => true, tag => error}, gl => GL, pid => Pid, time => Us}`.
-        let micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_micros() as i64);
-        let el_tag = builder
-            .flatmap_from_pairs(&[
-                (
-                    Term::atom(arinsal_term::atoms::EMULATOR),
-                    Term::atom(arinsal_term::atoms::TRUE),
-                ),
-                (
-                    Term::atom(arinsal_term::atoms::TAG),
-                    Term::atom(arinsal_term::atoms::ERROR),
-                ),
-            ])
-            .map_err(|error| VmError::Unsupported(format!("logger tag map: {error:?}")))?;
-        let mut pairs = vec![
-            (Term::atom(arinsal_term::atoms::ERROR_LOGGER), el_tag),
-            (
-                Term::atom(arinsal_term::atoms::TIME),
-                Term::small(micros).unwrap_or(Term::NIL),
-            ),
-        ];
-        if let Some(gl) = group_leader {
-            pairs.push((crate::atom_cache::put("gl"), gl));
-        }
-        pairs.push((Term::atom(arinsal_term::atoms::PID), pid));
-        let meta = builder
-            .flatmap_from_pairs(&pairs)
-            .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
+        ]);
         builder
-            .tuple(&[
-                Term::atom(arinsal_term::atoms::LOG),
-                Term::atom(arinsal_term::atoms::ERROR),
-                format,
-                args,
-                meta,
-            ])
-            .map_err(|error| VmError::Unsupported(format!("logger message: {error:?}")))
+            .list_from_iter(args)
+            .map_err(|error| VmError::Unsupported(format!("logger args: {error:?}")))
     })();
-    if let Ok(term) = built
-        && let Ok(message) = Message::copy_from(term)
-    {
-        let _ = ctx.send(logger, message);
+    if let Ok(args) = built {
+        crate::utils::send_error_term_to_logger(runtime, ctx.pid(), group_leader, &format, args);
     }
 }

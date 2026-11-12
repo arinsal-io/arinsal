@@ -51,6 +51,7 @@ mod signals;
 mod suspend;
 mod trace;
 mod trace_bp;
+mod utils;
 // ---- vm_maps_bits ----
 mod bits;
 mod native_helpers;

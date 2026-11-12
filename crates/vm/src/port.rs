@@ -2124,62 +2124,9 @@ impl arinsal_drv::PortHost for DrvHost {
         }
     }
 
-    // Port of erts/emulator/beam/utils.c:802 (do_send_logger_message) for
-    // erts_send_error_to_logger_nogl: an `error_msg` event to the logger process.
+    // Port of erts/emulator/beam/utils.c (erts_send_error_to_logger_nogl), OTP-29.1.1.
     fn log_error(&self, text: &str) {
-        let runtime = self.runtime;
-        let logger = runtime
-            .reg
-            .whereis_proc_str("logger")
-            .or_else(|| runtime.reg.whereis_proc_str("error_logger"));
-        let Some(logger) = logger else {
-            eprint!("{text}");
-            return;
-        };
-        let Ok(scheduler) = runtime.scheduler() else {
-            return;
-        };
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_micros())
-            .try_into()
-            .unwrap_or(i64::MAX);
-        let mut heap = ProcessHeap::with_words(output_heap_words(text.len() * 2 + 64, false, 96));
-        let event = (|| -> Result<Term, arinsal_term::TermError> {
-            let mut builder = TermBuilder::new(&mut heap);
-            let format = builder.string_to_list("~s")?;
-            let message = builder.string_to_list(text)?;
-            let args = builder.list_from_iter([message])?;
-            let error_logger = builder.flatmap_from_pairs(&[
-                (
-                    Term::atom(arinsal_term::atoms::EMULATOR),
-                    Term::atom(arinsal_term::atoms::TRUE),
-                ),
-                (
-                    Term::atom(arinsal_term::atoms::TAG),
-                    Term::atom(arinsal_term::atoms::ERROR),
-                ),
-            ])?;
-            let metadata = builder.flatmap_from_pairs(&[
-                (Term::atom(arinsal_term::atoms::ERROR_LOGGER), error_logger),
-                (
-                    Term::atom(arinsal_term::atoms::TIME),
-                    Term::small(timestamp).unwrap_or(Term::NIL),
-                ),
-            ])?;
-            builder.tuple(&[
-                Term::atom(arinsal_term::atoms::LOG),
-                Term::atom(arinsal_term::atoms::ERROR),
-                format,
-                args,
-                metadata,
-            ])
-        })();
-        if let Ok(event) = event
-            && let Ok(message) = Message::copy_from(event)
-        {
-            let _ = scheduler.send(logger, logger, message);
-        }
+        crate::utils::send_error_to_logger_nogl(self.runtime, None, text);
     }
 
     fn ddll_reference(&self, port: &arinsal_drv::DriverPort) {
@@ -5305,6 +5252,13 @@ fn output_command(
         return;
     }
     let Some(mut data) = iodata(data) else {
+        // io.c:2160 bad_port_signal with ERTS_PORT_SIG_FLG_BAD_OUTPUT: badsig_received logs
+        // the bad value before the badsig exit signal.
+        crate::utils::send_error_to_logger_nogl(
+            runtime,
+            tracer.and_then(|process| process.self_pid),
+            &format!("Bad value on output port '{}'\n", handle.port_name()),
+        );
         signal_badsig(handle, id);
         return;
     };
