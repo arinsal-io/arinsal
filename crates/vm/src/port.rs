@@ -37,7 +37,7 @@ fn child_setup_payload(
     args: &[OsString],
     arg0: Option<&OsStr>,
     cwd: Option<&OsStr>,
-    env: &[(OsString, OsString)],
+    env: &crate::erl_osenv::ErlOsEnv,
     use_stdio: bool,
     read_write: u8,
     exit_status: bool,
@@ -96,11 +96,12 @@ fn child_setup_payload(
         payload.push(0);
     }
     push_i32(&mut payload, env.len())?;
-    for (key, value) in env {
-        let mut entry = key.as_bytes().to_vec();
-        entry.push(b'=');
-        entry.extend_from_slice(value.as_bytes());
-        push_cstring(&mut payload, &entry)?;
+    payload.reserve(env.spawn_block_size());
+    for (key, value) in env.iter() {
+        payload.extend_from_slice(key);
+        payload.push(b'=');
+        payload.extend_from_slice(value);
+        payload.push(0);
     }
     if executable {
         push_i32(&mut payload, args.len() + 1)?;
@@ -1264,13 +1265,17 @@ fn options(t: Term) -> Option<PortOptions> {
                         return None;
                     }
                     let name = bytes(env[0])?;
-                    if name.is_empty() || name.contains(&b'=') {
+                    if name.contains(&b'=') || name.contains(&0) {
                         return None;
                     }
                     let value = if env[1] == Term::atom(arinsal_term::atoms::FALSE) {
                         None
                     } else {
-                        Some(bytes(env[1])?)
+                        let value = bytes(env[1])?;
+                        if value.contains(&0) {
+                            return None;
+                        }
+                        Some(value)
                     };
                     opts.env.push((name, value));
                 }
@@ -1690,7 +1695,7 @@ fn start(
     };
     let child_cwd = cwd.map(OsString::from_vec);
     // Port of erts/emulator/beam/erl_bif_port.c:1024 (default child environment), OTP-29.1.1.
-    let mut child_env = crate::natives::env::snapshot();
+    let mut child_env = crate::erl_osenv::port_env(&env);
     // Keep `erl` child launchers on this VM's selected installation when the port changes cwd.
     if erl_launcher(&name, executable)
         && let Some(root) = process
@@ -1699,25 +1704,11 @@ fn start(
             .and_then(|runtime| runtime.otp_root())
     {
         let mut paths = vec![root.join("bin")];
-        if let Some(path) = child_env
-            .iter()
-            .find_map(|(key, value)| (key == "PATH").then_some(value.clone()))
-        {
-            paths.extend(std::env::split_paths(&path));
+        if let Some(path) = child_env.get(b"PATH") {
+            paths.extend(std::env::split_paths(&crate::erl_osenv::os_string(path)));
         }
         if let Ok(path) = std::env::join_paths(paths) {
-            child_env.retain(|(key, _)| key != "PATH");
-            child_env.push((OsString::from("PATH"), path));
-        }
-    }
-    for (key, value) in env {
-        let key = OsString::from(String::from_utf8(key).map_err(|_| badarg())?);
-        child_env.retain(|(existing, _)| existing != &key);
-        if let Some(value) = value {
-            child_env.push((
-                key,
-                OsString::from(String::from_utf8(value).map_err(|_| badarg())?),
-            ));
+            child_env.put(b"PATH", path.as_os_str().as_bytes());
         }
     }
     let runtime = process.runtime.ok_or_else(badarg)?;
@@ -2563,11 +2554,11 @@ impl arinsal_drv::SystemHooks for VmHooks {
     }
 
     fn getenv(&self, key: &[u8]) -> Option<Vec<u8>> {
-        crate::natives::env::get(key)
+        crate::erl_osenv::get(key)
     }
 
     fn putenv(&self, key: &[u8], value: &[u8]) {
-        crate::natives::env::put(key, value);
+        crate::erl_osenv::put(key, value);
     }
 
     fn async_threads(&self) -> usize {

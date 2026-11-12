@@ -219,6 +219,12 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "put", 2) => bif!(erl_process_dict::put_2),
         ("erlang", "erase", 0) => bif!(erl_process_dict::erase_0),
         ("erlang", "erase", 1) => bif!(erl_process_dict::erase_1),
+        // erl_bif_os.c
+        ("os", "env", 0) => bif!(crate::natives::erl_bif_os::env_0),
+        ("os", "getenv", 1) => bif!(crate::natives::erl_bif_os::getenv_1),
+        ("os", "putenv", 2) => bif!(crate::natives::erl_bif_os::putenv_2),
+        ("os", "unsetenv", 1) => bif!(crate::natives::erl_bif_os::unsetenv_1),
+        ("os", "set_signal", 2) => bif!(crate::natives::erl_bif_os::set_signal_2),
         ("erlang", "atom_to_list", 1) => bif!(atom_to_list_light),
         ("erlang", "integer_to_binary", 1) => bif!(integer_to_binary_light),
         ("erlang", "byte_size", 1) => bif!(byte_size_light),
@@ -281,7 +287,6 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "finish_loading", 1) => sched_entry::<FinishLoading1>(),
         ("erlang", "has_prepared_code_on_load", 1) => sched_entry::<HasPreparedCodeOnLoad1>(),
         ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
-        ("os", "getenv", 1) => sched_entry::<Getenv1>(),
         ("erlang", "nodes", 2) => sched_entry::<Nodes2>(),
         ("erlang", "bif_return_trap", 2) => sched_entry::<BifReturnTrap2>(),
         ("persistent_term", "put", 2) => sched_entry::<PersistentTermPut2>(),
@@ -388,13 +393,6 @@ struct LoadNif2;
 impl crate::native_helpers::SchedBif for LoadNif2 {
     const ARITY: usize = 2;
     const BODY: crate::natives::DirectNative = crate::natives::nif::load_nif_2;
-}
-
-/// `os:getenv/1`. Port of erts/emulator/beam/erl_bif_os.c (os_getenv_1), OTP-29.1.1.
-struct Getenv1;
-impl crate::native_helpers::SchedBif for Getenv1 {
-    const ARITY: usize = 1;
-    const BODY: crate::natives::DirectNative = crate::natives::env::call_getenv_one;
 }
 
 /// `erlang:nodes/2`. Port of erts/emulator/beam/dist.c (nodes_2), OTP-29.1.1.
@@ -527,5 +525,24 @@ mod tests {
         }
         assert!(special("erlang", "term_to_binary", 2).is_none());
         assert!(special("erlang", "binary_to_term", 2).is_none());
+    }
+
+    #[test]
+    fn os_environment_bifs_have_direct_entries() {
+        let entries = [
+            ("env", 0, bif!(crate::natives::erl_bif_os::env_0)),
+            ("getenv", 1, bif!(crate::natives::erl_bif_os::getenv_1)),
+            ("putenv", 2, bif!(crate::natives::erl_bif_os::putenv_2)),
+            ("unsetenv", 1, bif!(crate::natives::erl_bif_os::unsetenv_1)),
+            (
+                "set_signal",
+                2,
+                bif!(crate::natives::erl_bif_os::set_signal_2),
+            ),
+        ];
+        for (function, arity, expected) in entries {
+            similar_asserts::assert_eq!(special("os", function, arity), Some(expected));
+            assert!(super::has_function("os", function, arity));
+        }
     }
 }

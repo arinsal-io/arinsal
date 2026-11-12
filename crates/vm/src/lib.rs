@@ -18,6 +18,7 @@ mod difftest;
 mod dirty;
 mod dist;
 mod erl_bits;
+mod erl_osenv;
 mod erl_poll;
 mod exceptions;
 mod export;
