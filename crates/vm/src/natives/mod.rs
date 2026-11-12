@@ -6,7 +6,6 @@
 //! its module below and one line to [`FAMILIES`].
 
 pub(crate) mod bif;
-pub(crate) mod env;
 pub(crate) mod erl_bif_info;
 pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_os;

@@ -50,6 +50,7 @@ mod receive;
 mod seq_trace;
 mod signals;
 mod suspend;
+mod sys_signals;
 mod trace;
 mod trace_bp;
 mod utils;

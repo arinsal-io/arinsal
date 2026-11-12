@@ -166,7 +166,7 @@ pub(crate) extern "C" fn set_signal_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
         );
         return super::bif::bif_ret(c_p, i, Err(error));
     }
-    match super::env::set_signal(process, signal, action) {
+    match crate::sys_signals::set_signal(process, signal, action) {
         Ok(value) => crate::native_hooks::raw(value),
         Err(error) => super::bif::bif_ret(c_p, i, Err(error)),
     }

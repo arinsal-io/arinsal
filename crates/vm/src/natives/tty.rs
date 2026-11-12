@@ -111,8 +111,8 @@ static BREAK_WRITE: AtomicI32 = AtomicI32::new(-1);
 
 /// Port of erts/emulator/sys/unix/sys.c:626 (`request_break`) and
 /// erts/emulator/beam/break.c:571 (`do_break`), OTP-29.1.1.
-/// The handler only records the request; the menu runs on `arinsal-break`.
-extern "C" fn sigint_handler(_signum: i32) {
+/// The signal dispatcher records the request; the menu runs on `arinsal-break`.
+pub(crate) fn request_break() {
     if BREAKING.swap(true, Ordering::SeqCst) {
         // SAFETY: a second Ctrl-C must leave immediately, without running destructors.
         unsafe { libc::_exit(0) };
@@ -127,10 +127,9 @@ extern "C" fn sigint_handler(_signum: i32) {
     }
 }
 
-/// Port of erts/emulator/sys/unix/sys.c (init_break_handler), OTP-29.1.1: SIGINT requests a
-/// break and SIGQUIT goes to the generic handler. Installed at boot whether or not stdin is a
-/// tty.
-pub(crate) fn init_break_handler() {
+/// Initialize the break menu's wake pipe. `sys_signals` installs the disposition after the
+/// node runtime exists, and its dispatcher calls [`request_break`].
+pub(crate) fn start_break_menu() {
     let mut pipe = [-1; 2];
     // SAFETY: pipe creates two fresh descriptors; mark them close-on-exec before
     // publishing the write descriptor to the signal handler.
@@ -156,15 +155,6 @@ pub(crate) fn init_break_handler() {
         .name("arinsal-break".into())
         .spawn(move || break_loop(read))
         .expect("break thread");
-    // SAFETY: zeroed sigaction is initialized before it is installed.
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = 0;
-        action.sa_sigaction = sigint_handler as *const () as libc::sighandler_t;
-        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
-    }
-    crate::natives::env::install_quit_handler();
 }
 
 /// Port of erts/emulator/sys/unix/sys.c (erts_replace_intr), OTP-29.1.1: Ctrl-C is disabled on

@@ -20,6 +20,7 @@ mod link_state_differential;
 mod monitor_bif_differential;
 mod monitor_link_race_differential;
 mod msgq2_differential;
+mod os_signal_dispositions;
 mod proc_bifs;
 mod proc_class_c;
 mod proc_remote;

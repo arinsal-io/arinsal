@@ -22,6 +22,8 @@ sigchld() ->
         undefined -> ok;
         _ -> true = register(erl_signal_server, Original)
     end,
+    %% Restore the embedded VM's process-wide disposition before RefErl's Child is waited.
+    ok = os:set_signal(sigchld, default),
     {length(Messages), Messages}.
 
 run_kill(Kill, Pid) ->
