@@ -711,7 +711,7 @@ impl Task for ProgressRacer {
             if self.blocker {
                 ctx.block_thread_progress(Duration::ZERO);
             } else {
-                let _ = ctx.scheduler_stats();
+                let _ = ctx.scheduler_stats(0);
             }
         }
         if self.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {

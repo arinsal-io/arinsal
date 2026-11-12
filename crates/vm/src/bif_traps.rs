@@ -106,9 +106,7 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> boo
             TermEncodeState,
             BinaryCopyState,
         )
-        || state.downcast_ref::<MapsProjectionState>().is_some()
         || state.downcast_ref::<MapsMergeState>().is_some()
-        || state.downcast_ref::<MapsBuildState>().is_some()
 }
 
 /// State copied into an ERTS-shaped trap continuation without a shared MagicRef mutex.
@@ -151,10 +149,6 @@ const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
 const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
-const MAPS_KEYS_CONTINUATION: &str = "maps:keys/1";
-const MAPS_VALUES_CONTINUATION: &str = "maps:values/1";
-const MAPS_FROM_LIST_CONTINUATION: &str = "maps:from_list/1";
-const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
 const CONTEXT_REDS: usize = 4000;
 const RE_RUN_CONTINUATION: &str = "erlang:re_run_trap/3";
 const RE_GRUN_CONTINUATION: &str = "re:grun/3";
@@ -172,9 +166,7 @@ const ERTS_REGEX_RESTART_CONTEXT_SIZE: usize = 64;
 // (BinaryFindContext).
 const ERTS_BINARY_TO_LIST_STATE_SIZE: usize = 40;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
-// Port of erts/emulator/beam/utils.c (erts_ycf_trap_driver_state_holder) and erl_map.c
-// (HashmapMergeContext).
-const ERTS_YCF_TRAP_HOLDER_SIZE: usize = 24;
+// Port of erts/emulator/beam/erl_map.c (HashmapMergeContext).
 const ERTS_HASHMAP_MERGE_CONTEXT_SIZE: usize = 56;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
@@ -802,34 +794,6 @@ const ENTRIES: &[Entry] = &[
     },
     Entry {
         module: "maps",
-        function: "from_list",
-        arity: 1,
-        continuation: MAPS_FROM_LIST_CONTINUATION,
-        handler: maps_from_list,
-    },
-    Entry {
-        module: "maps",
-        function: "from_keys",
-        arity: 2,
-        continuation: MAPS_FROM_KEYS_CONTINUATION,
-        handler: maps_from_keys,
-    },
-    Entry {
-        module: "maps",
-        function: "keys",
-        arity: 1,
-        continuation: MAPS_KEYS_CONTINUATION,
-        handler: maps_keys,
-    },
-    Entry {
-        module: "maps",
-        function: "values",
-        arity: 1,
-        continuation: MAPS_VALUES_CONTINUATION,
-        handler: maps_values,
-    },
-    Entry {
-        module: "maps",
         function: "merge",
         arity: 2,
         continuation: MAPS_MERGE_CONTINUATION,
@@ -1369,198 +1333,6 @@ fn finish_binary_search(
 }
 
 type MapsMergeState = Mutex<Option<arinsal_maps::HashmapMergeContext>>;
-type MapsProjectionState = Mutex<Option<arinsal_bifs::MapsProjectionWalk>>;
-type MapsBuildState = Mutex<Option<arinsal_bifs::MapsBuildWalk>>;
-
-fn maps_from_list(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    maps_build(process, args, state, pid, restore_gc, false)
-}
-
-fn maps_from_keys(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    maps_build(process, args, state, pid, restore_gc, true)
-}
-
-/// Reductions a YCF-yielded BIF charges: `BUMP_REDS(p, (init_reds - nr_of_reductions) /
-/// iterations_per_red)` (erts_ycf_trap_driver, utils.c:3736-3790). The counter may end up
-/// negative, so the charge can exceed what was available.
-fn ycf_reductions(initial: i64, left: i64, iterations_per_red: i64) -> u32 {
-    ((initial - left) / iterations_per_red).clamp(0, i64::from(u32::MAX)) as u32
-}
-
-// Port of erts/emulator/beam/erl_map.c:278-366 (from_keys/from_list helpers), :482-591,
-// :622-642 (maps_from_list_1, maps_from_keys_2: 40 iterations per reduction) and
-// utils.c:3730-3810 (erts_ycf_trap_driver), OTP-29.1.1.
-fn maps_build(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _restore_gc: bool,
-    from_keys: bool,
-) -> Result<HandlerResult, BifError> {
-    const ITERATIONS_PER_RED: i64 = 40;
-    let initial = i64::from(process.heap.abi.fcalls.max(0)) * ITERATIONS_PER_RED;
-    let mut reds = initial;
-    let continuation = if from_keys {
-        MAPS_FROM_KEYS_CONTINUATION
-    } else {
-        MAPS_FROM_LIST_CONTINUATION
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    if state.is_none() {
-        // A new call runs on a walk of its own; the magic state is only created when it
-        // yields (erts_ycf_trap_driver allocates its state binary after the first yield).
-        let mut walk = if from_keys {
-            arinsal_bifs::MapsBuildWalk::from_keys(args[0], args[1])
-        } else {
-            arinsal_bifs::MapsBuildWalk::from_list(args[0])
-        };
-        let reductions = |reds| ycf_reductions(initial, reds, ITERATIONS_PER_RED);
-        return Ok(match walk.step(&mut ctx, &mut reds)? {
-            Some(value) => HandlerResult::Done {
-                value,
-                reductions: reductions(reds),
-            },
-            None => HandlerResult::Yield {
-                continuation,
-                state: magic_binary_state(Mutex::new(Some(walk)), ERTS_YCF_TRAP_HOLDER_SIZE),
-                reductions: reductions(reds),
-            },
-        });
-    }
-    let Some(state) = state else {
-        return Err(BifError::BADARG);
-    };
-    let state = Arc::clone(state);
-    let mut guard = state
-        .downcast_ref::<MapsBuildState>()
-        .ok_or(BifError::BADARG)?
-        .lock()
-        .map_err(|_| BifError::SystemLimit)?;
-    let walk = guard.as_mut().ok_or(BifError::BADARG)?;
-    let Some(value) = walk.step(&mut ctx, &mut reds)? else {
-        drop(guard);
-        return Ok(HandlerResult::Yield {
-            continuation,
-            state,
-            reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
-        });
-    };
-    *guard = None;
-    drop(guard);
-    Ok(HandlerResult::Done {
-        value,
-        reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
-    })
-}
-
-// Port of erts/emulator/beam/erl_map.c:1206-1252 (maps_keys_1_helper) and
-// erts/emulator/beam/erl_map.c:2261-2309 (maps_values_1_helper), OTP-29.1.1.
-fn maps_keys(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    maps_projection(process, args, state, pid, restore_gc, true)
-}
-
-fn maps_values(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    maps_projection(process, args, state, pid, restore_gc, false)
-}
-
-fn maps_projection(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _restore_gc: bool,
-    keys: bool,
-) -> Result<HandlerResult, BifError> {
-    const ITERATIONS_PER_RED: i64 = 15;
-    let initial = i64::from(process.heap.abi.fcalls.max(0)) * ITERATIONS_PER_RED;
-    let mut reds = initial;
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let mut guard = state
-            .downcast_ref::<MapsProjectionState>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        let walk = guard.as_mut().ok_or(BifError::BADARG)?;
-        let done = walk.step(&mut reds);
-        let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
-        if !done {
-            drop(guard);
-            return Ok(HandlerResult::Yield {
-                continuation: if keys {
-                    MAPS_KEYS_CONTINUATION
-                } else {
-                    MAPS_VALUES_CONTINUATION
-                },
-                state,
-                reductions,
-            });
-        }
-        let walk = guard.take().ok_or(BifError::BADARG)?;
-        drop(guard);
-        return Ok(HandlerResult::Done {
-            value: walk.finish(),
-            reductions,
-        });
-    }
-
-    // erts maps_keys_1 handles a flatmap before any yielding state exists.
-    let mut walk = {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut bif_state = arinsal_bifs::BifState::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-        if let Some(value) = arinsal_bifs::MapsProjectionWalk::start_flat(&mut ctx, args[0], keys)?
-        {
-            return Ok(HandlerResult::Done {
-                value,
-                reductions: 0,
-            });
-        }
-        arinsal_bifs::MapsProjectionWalk::start_hashmap(&mut ctx, args[0], keys)?
-    };
-    let done = walk.step(&mut reds);
-    let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
-    if !done {
-        return Ok(HandlerResult::Yield {
-            continuation: if keys {
-                MAPS_KEYS_CONTINUATION
-            } else {
-                MAPS_VALUES_CONTINUATION
-            },
-            state: magic_binary_state(Mutex::new(Some(walk)), ERTS_YCF_TRAP_HOLDER_SIZE),
-            reductions,
-        });
-    }
-    let value = walk.finish();
-    Ok(HandlerResult::Done { value, reductions })
-}
 
 // Port of erts/emulator/beam/erl_map.c:1257 (maps_merge_2), 1498 (maps_merge_trap_1) and
 // 1558-1861 (hashmap_merge: MAP_MERGE_LOOP_FACTOR budget, BUMP_REDS, trap), OTP-29.1.1.
@@ -1820,11 +1592,15 @@ pub(crate) fn run_trapped_export(
 /// the export at `beam_bif_export_trap`, the way an export trap of a Rust continuation runs.
 // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: up to four arguments in X0-X3),
 // OTP-29.1.1.
+/// `schedule_out` is whether the context switch of the trap (`context_switch_simplified`) is
+/// still ahead: true when native code returns THE_NON_VALUE and branches to
+/// `beam_bif_export_trap`, false when the executor yields the slice for the trap itself.
 pub(crate) fn install_export_trap(
     process: &mut Process,
     import: usize,
     callee: (arinsal_term::Atom, arinsal_term::Atom),
     trap: &crate::ExportTrap,
+    schedule_out: bool,
 ) {
     let arity = trap.args.len();
     assert!(arity <= 4, "BIF traps pass at most four arguments");
@@ -1837,7 +1613,7 @@ pub(crate) fn install_export_trap(
     process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.trap_site().0,
         caller_ip: process.trap_site().1,
-        schedule_out: true,
+        schedule_out,
         import,
         continuation: trap.target.continuation,
         target: trap.target,
@@ -2270,14 +2046,8 @@ pub(crate) trait TrapBody {
     ) -> Result<HandlerResult, BifError>;
 }
 
-/// `maps:keys/1`.
-pub(crate) struct MapsKeys;
-/// `maps:values/1`.
-pub(crate) struct MapsValues;
 /// `maps:merge/2`.
 pub(crate) struct MapsMerge;
-/// `maps:from_list/1`.
-pub(crate) struct MapsFromList;
 /// `binary_to_list/1,3`.
 pub(crate) struct BinaryToList<B>(std::marker::PhantomData<fn() -> B>);
 /// `list_to_binary/1` and `binary:list_to_bin/1`.
@@ -2288,34 +2058,6 @@ pub(crate) struct IolistToBinary;
 pub(crate) struct IolistSize;
 /// `iolist_to_iovec/1`.
 pub(crate) struct IolistToIovec;
-
-impl TrapBody for MapsKeys {
-    const ARITY: Option<usize> = Some(1);
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        maps_keys(process, args, None, pid, restore_gc)
-    }
-}
-
-impl TrapBody for MapsValues {
-    const ARITY: Option<usize> = Some(1);
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        maps_values(process, args, None, pid, restore_gc)
-    }
-}
 
 impl TrapBody for MapsMerge {
     const ARITY: Option<usize> = Some(2);
@@ -2334,20 +2076,6 @@ impl TrapBody for MapsMerge {
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
         maps_merge(process, args, None, pid, restore_gc)
-    }
-}
-
-impl TrapBody for MapsFromList {
-    const ARITY: Option<usize> = Some(1);
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        maps_from_list(process, args, None, pid, restore_gc)
     }
 }
 
@@ -2872,13 +2600,10 @@ fn call_args(process: &Process, saved: &[Term; 4], arity: usize, resumed: bool) 
 ///
 /// A handler decrements the process counter itself while it works (`BUMP_REDS` through its
 /// `Ctx`), and some also return that work as the charge for `charge` to take again. The call
-/// is billed for the work once, as erts bills `REDS_IN - FCALLS`. A call is billed no more
-/// than the counter held, since `BUMP_REDS` stops at zero, and what the handler gave up
-/// through `ERTS_VBUMP_ALL_REDS` ends the slice without being the process's own work.
+/// is billed for the work once, on FCALLS, which the context switch reads as `REDS_IN -
+/// FCALLS`. A call is billed no more than the counter held, since `BUMP_REDS` stops at zero.
 pub(crate) struct TrapMeter {
     fcalls: i32,
-    used: u64,
-    consumed: u32,
     call_counted: bool,
 }
 
@@ -2886,12 +2611,10 @@ impl TrapMeter {
     /// The call is an instruction that already counted its own reduction.
     pub(crate) fn start(
         process: &Process,
-        ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
+        _ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
     ) -> Self {
         Self {
             fcalls: process.heap.abi.fcalls,
-            used: process.reductions_used,
-            consumed: ctx.map_or(0, |run| run.consumed()),
             call_counted: true,
         }
     }
@@ -2912,36 +2635,27 @@ impl TrapMeter {
     pub(crate) fn finish(
         self,
         process: &mut Process,
-        ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+        _ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
         returned: u32,
     ) {
         let inside = u32::try_from(process.trap_work).unwrap_or(0);
         let held = u32::try_from(self.fcalls.max(1)).unwrap_or(1);
-        let work = inside.max(returned.max(1)).min(held);
-        let virtual_reds = std::mem::take(&mut process.virtual_reds);
+        // The instruction already took the call's own reduction from FCALLS.
+        let work = inside
+            .max(returned.max(1))
+            .min(held)
+            .saturating_sub(u32::from(self.call_counted));
         process.heap.abi.fcalls = self
             .fcalls
             .saturating_sub(i32::try_from(work).unwrap_or(i32::MAX))
             .max(0);
-        let counted_call = u32::from(self.call_counted);
-        let used = process.reductions_used.saturating_sub(self.used);
-        process.reductions_used = process.reductions_used.saturating_add(
-            u64::from(work.saturating_sub(counted_call))
-                .saturating_sub(used)
-                .saturating_sub(u64::from(virtual_reds)),
-        );
-        if let Some(run) = ctx {
-            run.add_virtual_reds(virtual_reds);
-            let counted = run.consumed().saturating_sub(self.consumed);
-            run.consume(work.saturating_sub(counted));
-        }
     }
 }
 
 // Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1.
 fn charge(
     process: &mut Process,
-    ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+    _ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
     reductions: u32,
 ) {
     let charge = reductions.max(1);
@@ -2951,9 +2665,6 @@ fn charge(
         .fcalls
         .saturating_sub(charge.min(i32::MAX as u32) as i32)
         .max(0);
-    if let Some(run) = ctx {
-        let _ = run.consume(charge);
-    }
 }
 
 fn code_permission(
@@ -4863,7 +4574,7 @@ mod export_trap_tests {
             global_atoms().intern("erlang").unwrap(),
             global_atoms().intern("demonitor").unwrap(),
         );
-        install_export_trap(&mut process, 0, callee, &trap);
+        install_export_trap(&mut process, 0, callee, &trap, true);
         assert!(process.heap.gc_enabled, "export traps keep GC enabled");
 
         // A collection while the process is scheduled out: the live X registers are the roots.

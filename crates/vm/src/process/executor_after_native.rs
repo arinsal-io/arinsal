@@ -42,12 +42,9 @@ impl Executor {
                         if process.signal_probe().is_none() {
                             process.set_signal_probe(ctx.signal_probe());
                         }
-                        let fcalls = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+                        let fcalls = process.heap.abi.fcalls;
                         let (used, _) = process.receive_helper(ctx, fcalls)?;
-                        let used = u32::try_from(used).unwrap_or(0);
-                        ctx.consume(used);
-                        process.reductions_used =
-                            process.reductions_used.saturating_add(u64::from(used));
+                        super::executor::bump_fcalls(process, used);
                         return Ok(Flow::Continue);
                     }
                     if exit_kind == crate::proc_create::NativeExit::Wait
@@ -243,9 +240,7 @@ impl Executor {
                     match result? {
                         crate::ImportOutcome::Dispatch => {}
                         crate::ImportOutcome::Yield => {
-                            if process.native_pc().is_some()
-                                && native_transfer_continues(process, ctx)
-                            {
+                            if process.native_pc().is_some() && native_transfer_continues(process) {
                                 return Ok(Flow::Continue);
                             }
                             return Ok(Flow::Break(Ok(RunState::Yield)));
@@ -297,8 +292,7 @@ impl Executor {
                         // (`call_error_handler`), OTP-29.1.1: debug breakpoints
                         // tail-call the process-configured breakpoint handler.
                         process.gc_live = arity;
-                        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(1);
-                        process.reductions_used = process.reductions_used.saturating_add(1);
+                        super::executor::bump_fcalls(process, 1);
                         match self.vm.call_debug_breakpoint_handler(
                             process,
                             function.module,
@@ -309,7 +303,7 @@ impl Executor {
                             crate::ImportOutcome::Dispatch => {}
                             crate::ImportOutcome::Yield => {
                                 if process.native_pc().is_some()
-                                    && native_transfer_continues(process, ctx)
+                                    && native_transfer_continues(process)
                                 {
                                     return Ok(Flow::Continue);
                                 }
@@ -337,9 +331,8 @@ impl Executor {
                     // the budget is used up (erts counts reductions per call).
                     // The breakpoint left native code before its call's reduction was
                     // charged.
-                    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(1);
-                    process.reductions_used = process.reductions_used.saturating_add(1);
-                    if !ctx.consume(1) || process.heap.abi.fcalls <= 0 {
+                    super::executor::bump_fcalls(process, 1);
+                    if process.heap.abi.fcalls <= 0 {
                         return Ok(Flow::Break(Ok(RunState::Yield)));
                     }
                     return Ok(Flow::Continue);
@@ -489,7 +482,7 @@ impl Executor {
                                         process.set_native_pc(Some(code_ptr));
                                     }
                                     if process.native_pc().is_some()
-                                        && native_transfer_continues(process, ctx)
+                                        && native_transfer_continues(process)
                                     {
                                         return Ok(Flow::Continue);
                                     }
@@ -796,8 +789,9 @@ impl Executor {
                             let result = match result {
                                 Some(Err(VmError::TrapExport(trap))) => {
                                     let callee = (export.module_atom, export.function_atom);
+                                    // The yield below is the trap's context switch.
                                     crate::bif_traps::install_export_trap(
-                                        process, target_pc, callee, &trap,
+                                        process, target_pc, callee, &trap, false,
                                     );
                                     crate::bif_traps::arm_export_trap(process);
                                     process.set_native_retry(Some(
@@ -833,7 +827,7 @@ impl Executor {
                     let result = result.or_else(|| {
                         let (bif, arity) = crate::beamasm_integration::dispatch_bif(target_pc)?;
                         let arity = usize::from(arity);
-                        let (result, reductions) = self.vm.call_bif_traced_named(
+                        let result = self.vm.call_bif_traced_named(
                             process,
                             ctx,
                             &export.module,
@@ -841,9 +835,6 @@ impl Executor {
                             bif,
                             arity,
                         );
-                        process.reductions_used = process
-                            .reductions_used
-                            .saturating_add(u64::from(reductions));
                         Some(match result {
                             Ok(value) => Ok(value),
                             Err(error) => {
@@ -1052,7 +1043,7 @@ impl Executor {
                                     crate::ImportOutcome::Dispatch => {}
                                     crate::ImportOutcome::Yield => {
                                         if process.native_pc().is_some()
-                                            && native_transfer_continues(process, ctx)
+                                            && native_transfer_continues(process)
                                         {
                                             return Ok(Flow::Continue);
                                         }
@@ -1143,9 +1134,7 @@ impl Executor {
                     match outcome {
                         crate::ImportOutcome::Dispatch => {}
                         crate::ImportOutcome::Yield => {
-                            if process.native_pc().is_some()
-                                && native_transfer_continues(process, ctx)
-                            {
+                            if process.native_pc().is_some() && native_transfer_continues(process) {
                                 return Ok(Flow::Continue);
                             }
                             return Ok(Flow::Break(Ok(RunState::Yield)));

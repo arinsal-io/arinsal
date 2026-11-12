@@ -32,6 +32,7 @@ mod map_get_errors_differential;
 mod map_update_exact;
 mod maps_bits;
 mod maps_iterator_differential;
+mod maps_ycf_bifs_differential;
 mod maps_yield;
 mod misc_bifs;
 mod missing_bifs;

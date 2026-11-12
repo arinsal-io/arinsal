@@ -49,13 +49,11 @@ pub(crate) fn call_bif_metered(
     heap: &mut arinsal_term::ProcessHeap,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
-) -> (Result<arinsal_term::Term, arinsal_bifs::BifError>, u32) {
+) -> Result<arinsal_term::Term, arinsal_bifs::BifError> {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
     let mut state = arinsal_bifs::BifState::default();
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
-    let result = target(&mut ctx, args);
-    let reductions = ctx.reductions();
-    (result, reductions)
+    target(&mut ctx, args)
 }
 
 /// Collect after a BIF when message-buffer fragments occupy more space than
@@ -294,12 +292,15 @@ impl Vm {
         function: &str,
         bif: arinsal_bifs::BifFn,
         arity: usize,
-    ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
-        let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
+    ) -> Result<Term, arinsal_bifs::BifError> {
+        // The BIF's BUMP_REDS lowers FCALLS, which the context switch reads.
+        let untraced = |p: &mut Process, _: &mut arinsal_sched::RunCtx<'_, process::Message>| {
+            calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity])
+        };
         if !crate::trace_bp::any_pattern()
             || !crate::trace_bp::selects(p, module, function, arity as u8)
         {
-            return untraced(p);
+            return untraced(p, ctx);
         }
         let (module, function) = (module.to_owned(), function.to_owned());
         let args = p.x[..arity].to_vec();
@@ -325,7 +326,7 @@ impl Vm {
             )
             .unwrap_or_default(),
         };
-        let (result, reductions) = untraced(p);
+        let result = untraced(p, ctx);
         let outcome = match result {
             Ok(value) => Some(Ok(value)),
             Err(error) => match exceptions::bif_error(p, &module, &function, &args, error) {
@@ -348,7 +349,7 @@ impl Vm {
                 site,
             );
         }
-        (result, reductions)
+        result
     }
 
     /// `trace_native_call` for a caller that knows the callee name, keyed by its call site.

@@ -54,17 +54,19 @@ pub(crate) fn legacy_exception_trap(
     Ok(trap)
 }
 
+/// `BUMP_REDS` by the executor itself, between two native runs: FCALLS is the slice's one
+/// counter, which the context switch reads.
+// Port of erts/emulator/beam/bif.h (BUMP_REDS) and jit/arm/instr_msg.cpp (i_loop_rec_shared:
+// `FCALLS -= erts_proc_sig_receive_helper(...)`), OTP-29.1.1.
+pub(crate) fn bump_fcalls(process: &mut Process, reds: i32) {
+    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(reds.max(0)).max(0);
+}
+
 /// Whether an interpreted step yielded only to hand control to native code, which
 /// erts does without a scheduling point. Native FCALLS stay within this slice's
 /// quantum so that its reductions are charged to the scheduler.
-pub(super) fn native_transfer_continues(process: &mut Process, ctx: &RunCtx<'_, Message>) -> bool {
-    let transfer = std::mem::take(&mut process.native_transfer);
-    let remaining = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
-    if !transfer || remaining == 0 {
-        return false;
-    }
-    process.heap.abi.fcalls = process.heap.abi.fcalls.min(remaining);
-    true
+pub(super) fn native_transfer_continues(process: &mut Process) -> bool {
+    std::mem::take(&mut process.native_transfer) && process.heap.abi.fcalls > 0
 }
 
 #[inline]
@@ -203,13 +205,6 @@ impl Executor {
             *ran = true;
             process.native_transfer = false;
             process.set_native_pc(None);
-            if process.heap.abi.fcalls <= 0
-                && let Ok(remaining) = i32::try_from(ctx.remaining())
-                && remaining > 0
-            {
-                process.heap.abi.fcalls = remaining;
-            }
-            let fcalls_before = process.heap.abi.fcalls;
             if crate::code_ix::take_code_barrier() {
                 ctx.block_thread_progress(std::time::Duration::ZERO);
             }
@@ -227,21 +222,12 @@ impl Executor {
                     code_ptr,
                 )
             };
-            let consumed = fcalls_before.saturating_sub(process.heap.abi.fcalls);
-            ctx.consume(u32::try_from(consumed).unwrap_or(0));
             // Native `timeout` has no scheduler context to send its trace event.
             if process.native_exit_kind != crate::proc_create::NativeExit::None
                 && process.take_native_timeout_trace()
             {
                 crate::trace::timeout_event(Some(&mut self.vm), process, ctx);
             }
-            let virtual_reds = std::mem::take(&mut process.virtual_reds);
-            ctx.add_virtual_reds(virtual_reds);
-            process.reductions_used = process.reductions_used.saturating_add(
-                u64::try_from(consumed)
-                    .unwrap_or(0)
-                    .saturating_sub(u64::from(virtual_reds)),
-            );
             let outcome = match native {
                 Ok(outcome) => outcome,
                 Err(VmError::Trap(trap)) => {
@@ -305,14 +291,9 @@ impl Executor {
                 crate::proc_create::NativeExit::SignalFetch => {
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    let fcalls = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+                    let fcalls = process.heap.abi.fcalls;
                     match process.receive_helper(ctx, fcalls) {
-                        Ok((used, _)) => {
-                            let used = u32::try_from(used).unwrap_or(0);
-                            ctx.consume(used);
-                            process.reductions_used =
-                                process.reductions_used.saturating_add(u64::from(used));
-                        }
+                        Ok((used, _)) => bump_fcalls(process, used),
                         Err(error) => return Some(Err(error)),
                     }
                     continue;

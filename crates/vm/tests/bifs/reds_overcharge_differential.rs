@@ -321,6 +321,39 @@ const LIST_CASES: &[Case] = &[
     ),
 ];
 
+const MAPS: &[usize] = &[1, 32, 33, 1_000, 100_000];
+/// Flatmap sizes: erts sorts a hashmap's leaves with `erts_qsort`, whose pivot is seeded from
+/// scheduler-local random state (utils.c), so the constructors' charge above 32 keys varies
+/// between OTP runs (from_keys of 1000 keys: 637, 654, 685).
+const FLATMAPS: &[usize] = &[1, 32];
+/// erl_map.c: the YCF-yielding constructors and projections, flat and hashmap.
+const MAP_CASES: &[Case] = &[
+    case("from_list", FLATMAPS, 10, "kv(N)", "maps:from_list(In)"),
+    case("from_keys", FLATMAPS, 8, "seq(N)", "maps:from_keys(In, v)"),
+    case(
+        "from_list_badarg",
+        MAPS,
+        10,
+        "kv(N) ++ [x]",
+        "catch maps:from_list(In)",
+    ),
+    case(
+        "keys",
+        MAPS,
+        8,
+        "maps:from_keys(seq(N), v)",
+        "maps:keys(In)",
+    ),
+    case(
+        "values",
+        MAPS,
+        8,
+        "maps:from_keys(seq(N), v)",
+        "maps:values(In)",
+    ),
+    case("keys_badmap", &[1], 4, "seq(N)", "catch maps:keys(In)"),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -495,6 +528,12 @@ fn matching_bifs_charge_like_otp() {
 #[test]
 fn list_bifs_charge_like_otp() {
     check_with(LIST_CASES, &["+S", "1"]);
+}
+
+// The YCF driver sizes each slice from the reductions left, as the list BIFs do.
+#[test]
+fn map_bifs_charge_like_otp() {
+    check_with(MAP_CASES, &["+S", "1"]);
 }
 
 #[test]

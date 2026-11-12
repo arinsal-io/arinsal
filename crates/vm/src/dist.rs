@@ -3199,10 +3199,12 @@ fn enqueue_port_packets_locked(
                 deferred_count,
             ));
     }
-    if deferred_count != 0 || has_older_continuation {
-        process.set_force_yield(true);
-    }
     process.heap.abi.fcalls = (process.heap.abi.fcalls - (ready_count as i32 * 10)).max(1);
+    // ERTS_BIF_PREP_YIELD of a send that continues later (dist.c erts_dsig_send:
+    // ERTS_DSIG_SEND_CONTINUE): ERTS_VBUMP_ALL_REDS.
+    if deferred_count != 0 || has_older_continuation {
+        crate::bif_traps::vbump_all_reds(process);
+    }
     if state.pending_bytes >= state.busy_limit {
         state.busy = true;
     }
@@ -3218,7 +3220,9 @@ fn finish_port_enqueue(
     if should_suspend {
         let suspended = suspend_dist_sender(process, sender);
         if suspended {
-            process.set_force_yield(true);
+            // erts_suspend + ERTS_BIF_PREP_YIELD on a busy distribution port (dist.c
+            // erts_dsig_send, ERTS_DSIG_SEND_YIELD): ERTS_VBUMP_ALL_REDS.
+            crate::bif_traps::vbump_all_reds(process);
             if let Some(dep) = process
                 .runtime
                 .and_then(|runtime| node_tables::port_dist_entry(runtime, port_id))
@@ -3279,7 +3283,7 @@ pub(crate) fn continue_fragmented_send(
         return Ok(());
     }
     let sender = ctx.pid();
-    let send_count = (ctx.remaining() as usize / 10).max(1);
+    let send_count = (process.heap.abi.fcalls.max(0) as usize / 10).max(1);
     let has_sender = |state: &DistState| {
         state
             .fragment_continuations
@@ -3305,7 +3309,8 @@ pub(crate) fn continue_fragmented_send(
             .front()
             .is_none_or(|continuation| continuation.sender != Some(sender))
         {
-            process.set_force_yield(true);
+            // Another sender's continuation goes first: ERTS_BIF_YIELD (ERTS_VBUMP_ALL_REDS).
+            crate::bif_traps::vbump_all_reds(process);
             return Ok(());
         }
         let count = state
@@ -3356,10 +3361,11 @@ pub(crate) fn continue_fragmented_send(
         }
         (port_id, count, more)
     };
+    // BUMP_REDS on FCALLS, which the context switch reads.
     process.heap.abi.fcalls = (process.heap.abi.fcalls - (packet_count as i32 * 10)).max(1);
-    ctx.consume(packet_count as u32 * 10);
+    // ERTS_DSIG_SEND_CONTINUE: ERTS_BIF_YIELD (ERTS_VBUMP_ALL_REDS).
     if more {
-        process.set_force_yield(true);
+        crate::bif_traps::vbump_all_reds(process);
     }
     let busy = {
         let dep = node_tables::port_dist_entry(process.runtime.ok_or_else(badarg)?, port_id);
@@ -3379,7 +3385,8 @@ pub(crate) fn continue_fragmented_send(
         }
     };
     if busy && suspend_dist_sender(process, sender) {
-        process.set_force_yield(true);
+        // erts_suspend + ERTS_BIF_PREP_YIELD (dist.c erts_dsig_send): ERTS_VBUMP_ALL_REDS.
+        crate::bif_traps::vbump_all_reds(process);
         if let Some(dep) = process
             .runtime
             .and_then(|runtime| node_tables::port_dist_entry(runtime, port_id))

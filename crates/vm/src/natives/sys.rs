@@ -401,13 +401,12 @@ pub(crate) fn statistics_light(
     }
 }
 
+// Port of erts/emulator/beam/beam_common.c (erts_current_reductions: `REDS_IN(c_p) -
+// FCALLS - virtual_reds`), OTP-29.1.1.
 fn current_reductions(process: &Process) -> u64 {
-    if !process.heap.native_active() {
-        return 0;
-    }
     u64::try_from(
         process
-            .native_reds_in
+            .reds_in
             .saturating_sub(process.heap.abi.fcalls)
             .saturating_sub(i32::try_from(process.virtual_reds).unwrap_or(i32::MAX)),
     )
@@ -464,7 +463,7 @@ fn call_statistics(
 fn call_bump_reductions(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:5403 (bump_reductions_1), OTP-29.1.1.
@@ -474,9 +473,8 @@ fn call_bump_reductions(
         .filter(|value| *value >= 0)
         .ok_or_else(badarg)?;
     let charged = reductions.min(QUANTUM as i64) as u32;
+    // FCALLS only: the slice folds it (`fold_fcalls`).
     process.heap.abi.fcalls -= charged as i32;
-    process.reductions_used = process.reductions_used.saturating_add(u64::from(charged));
-    ctx.consume(charged);
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
@@ -642,7 +640,7 @@ fn call_values(
 ) -> Option<Result<Term, VmError>> {
     let arity = args.len() as u8;
     if module == "persistent_term" && function == "get" && arity == 0 {
-        return Some(get_all_step(process, ctx));
+        return Some(get_all_step(process));
     }
     if let Some(bif) = arinsal_pterm::lookup_in(module, function, arity) {
         debug_assert!(
@@ -877,10 +875,10 @@ persistent_update_bif!(
 pub(crate) fn persistent_term_get_0(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, Message>,
     _args: &[Term],
 ) -> Result<Term, VmError> {
-    get_all_step(process, ctx)
+    get_all_step(process)
 }
 
 /// Persistent-term table counters taken before an updating BIF runs.
@@ -925,7 +923,7 @@ pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Mes
 
 // Port of erts/emulator/beam/erl_bif_persistent.c:324 (persistent_term_get_0)
 // and :831 (do_get_all), OTP-29.1.1.
-fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<Term, VmError> {
+fn get_all_step(process: &mut Process) -> Result<Term, VmError> {
     if process
         .cold
         .as_ref()
@@ -944,8 +942,7 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
 
     // OTP's BIF chunk size is `ERTS_BIF_REDS_LEFT(c_p)`, which is also how
     // `erts_debug:set_internal_state(reds_left, ...)` steers this operation.
-    // Keep the scheduler quantum as an upper bound for this Rust call.
-    let budget = (process.heap.abi.fcalls.max(1) as u32).min(ctx.remaining().max(1)) as usize;
+    let budget = process.heap.abi.fcalls.max(1) as usize;
     let mut copied = 0_usize;
     loop {
         let (remaining, next_entry, tail) = process
@@ -1027,7 +1024,8 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
             .expect("persistent get/0 continuation remains live");
         Ok(state.result)
     } else {
-        ctx.consume(copied as u32);
+        // BUMP_REDS on FCALLS; the slice folds it (`fold_fcalls`).
+        process.heap.abi.fcalls -= i32::try_from(copied).unwrap_or(i32::MAX);
         Err(VmError::Yield)
     }
 }
@@ -3035,7 +3033,10 @@ fn statistics(
         }
         "reductions" => {
             let flags = runtime_state(process);
-            let (total, delta) = since(reduction_total(ctx.as_deref()), &flags.last_reductions);
+            let (total, delta) = since(
+                reduction_total(process, ctx.as_deref()),
+                &flags.last_reductions,
+            );
             pair(process, total, delta)
         }
         "exact_reductions" => {
@@ -5142,8 +5143,12 @@ fn push_children(term: Term, out: &mut Vec<Term>) {
     }
 }
 
-fn reduction_total(ctx: Option<&RunCtx<'_, Message>>) -> u64 {
-    ctx.map_or(0, |ctx| ctx.total_reductions() + u64::from(ctx.consumed()))
+// Port of erts/emulator/beam/erl_bif_info.c (statistics(reductions):
+// erts_get_total_reductions plus erts_current_reductions of the caller), OTP-29.1.1.
+fn reduction_total(process: &Process, ctx: Option<&RunCtx<'_, Message>>) -> u64 {
+    ctx.map_or(0, |ctx| {
+        ctx.total_reductions() + current_reductions(process)
+    })
 }
 
 fn since(total: u64, last: &AtomicU64) -> (u64, u64) {
@@ -5182,7 +5187,9 @@ fn scheduler_stats(
     ctx: Option<&RunCtx<'_, Message>>,
 ) -> Option<arinsal_sched::SchedulerStats> {
     if let Some(ctx) = ctx {
-        return Some(ctx.scheduler_stats());
+        return Some(
+            ctx.scheduler_stats(u32::try_from(current_reductions(process)).unwrap_or(u32::MAX)),
+        );
     }
     process
         .runtime

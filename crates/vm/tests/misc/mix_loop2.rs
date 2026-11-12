@@ -66,8 +66,9 @@ fn spawn_opt_monitor_tag_survives_immediate_exit() {
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
-/// A one-reduction quantum yields on `wait` after `loop_rec` saw an empty
-/// mailbox. The message that arrives before that `wait` executes must still
+/// A two-reduction quantum yields on `wait` after `loop_rec` saw an empty
+/// mailbox. (Schedule-in sets FCALLS to the quantum, erl_process.c `p->fcalls = reds`; with one
+/// reduction every `i_test_yield` would yield before its function runs, as in erts.) The message that arrives before that `wait` executes must still
 /// be received. This is the Hex.State `gen:call` alias-reply timeout: the
 /// server slept with `{'$gen_call', ...}` already in its inbox, the caller
 /// demonitored, and `gen:reply` to the alias was dropped.
@@ -113,7 +114,7 @@ fn receive_sees_message_that_arrives_on_the_wait_instruction() {
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop2_wait_yield", "run", &[]);
     let actual = vm
-        .eval_scheduled_reductions("mix_loop2_wait_yield", "run", &[], 2, None, 1)
+        .eval_scheduled_reductions("mix_loop2_wait_yield", "run", &[], 2, None, 2)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

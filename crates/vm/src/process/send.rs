@@ -539,7 +539,7 @@ impl Process {
                 &mut seq_token,
                 native.as_ref(),
             )? {
-                self.bump_send_reds(ctx.as_deref_mut(), pid == sender, words);
+                self.bump_send_reds(pid == sender, words);
                 return Ok(value);
             }
             let node = if let Some(envelope) = on_heap {
@@ -567,7 +567,7 @@ impl Process {
             (node, words)
         };
         let node = envelope;
-        let delivered = match ctx.as_deref_mut() {
+        let delivered = match ctx {
             Some(ctx) => {
                 let shared = on_own_heap && value.is_pointer();
                 let delivered = if pid == sender {
@@ -611,7 +611,7 @@ impl Process {
         };
         match delivered {
             Ok(()) | Err(arinsal_sched::Error::NoProcess) => {
-                self.bump_send_reds(ctx, pid == sender, words);
+                self.bump_send_reds(pid == sender, words);
                 Ok(value)
             }
             Err(error) => Err(VmError::Unsupported(format!("send: {error}"))),
@@ -645,12 +645,7 @@ impl Process {
         self.native.clone()
     }
 
-    fn bump_send_reds(
-        &mut self,
-        ctx: Option<&mut RunCtx<'_, Message>>,
-        to_self: bool,
-        words: usize,
-    ) {
+    fn bump_send_reds(&mut self, to_self: bool, words: usize) {
         if to_self
             && self.message_queue_data() != MessageQueueData::OffHeap
             && !crate::seq_trace::has_token(self)
@@ -662,13 +657,8 @@ impl Process {
         }
         let reds = (words / ERTS_MSG_COPY_WORDS_PER_REDUCTION).min(CONTEXT_REDS as usize) as i32;
         let applied = reds.min(self.heap.abi.fcalls.max(0));
+        // BUMP_REDS on FCALLS only: the slice folds it at the context switch, whether the send
+        // ran from native code or from a BIF the executor called (`fold_fcalls`).
         self.heap.abi.fcalls -= applied;
-        if self.heap.native_active() {
-            return;
-        }
-        self.reductions_used = self.reductions_used.saturating_add(applied as u64);
-        if let Some(ctx) = ctx {
-            ctx.consume(applied as u32);
-        }
     }
 }

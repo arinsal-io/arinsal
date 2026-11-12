@@ -497,7 +497,9 @@ fn dirty_process_handle_signals(
     let Some(pid) = Pid::from_term(target) else {
         return Ok(Term::atom(arinsal_term::atoms::FALSE));
     };
-    let result = ctx.handle_dirty_signals(pid, &mut |task, target_ctx| {
+    // `ERTS_BIF_REDS_LEFT(BIF_P)`: the caller's reductions bound the target's signal handling.
+    let reds = u32::try_from(process.heap.abi.fcalls.max(1)).unwrap_or(1);
+    let result = ctx.handle_dirty_signals(pid, reds, &mut |task, target_ctx| {
         task.downcast_mut::<Process>()
             .is_none_or(|target| target.handle_dirty_signals(vm, target_ctx))
     });
@@ -1885,12 +1887,17 @@ fn is_process_alive_2(
             Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Err(arinsal_sched::Error::NoProcess) => {
-            // Port of erl_proc_sig_queue.c:3065-3070: reply `{Ref, false}` to self.
+            // Port of erl_proc_sig_queue.c:3065-3070: reply `{Ref, false}` to self with
+            // `erts_queue_message`, through this process's signal in-queue. The receive marker
+            // `erts_internal:is_process_alive/1` bound before this call is in that queue too, so
+            // the reply lands after it; put straight into the message queue it lands before the
+            // marker and `receive {Ref, Res}` never sees it.
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let reply = TermBuilder::new(&mut heap)
                 .tuple(&[reference, Term::atom(arinsal_term::atoms::FALSE)])
                 .map_err(|_| system_limit())?;
-            process.inbox.push_back(reply);
+            ctx.send(ctx.pid(), Message::copy_from(reply)?)
+                .map_err(|error| VmError::Unsupported(format!("alive reply: {error}")))?;
             Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Err(error) => Err(VmError::Unsupported(format!("alive request: {error}"))),

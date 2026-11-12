@@ -1756,7 +1756,7 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                return match remote_relations(ctx, pid)? {
+                return match remote_relations(process, ctx, pid)? {
                     Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
                     None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
                 };
@@ -1777,7 +1777,7 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                return match remote_relations(ctx, pid)? {
+                return match remote_relations(process, ctx, pid)? {
                     Some(relations) => internal_monitor_list_from(
                         process,
                         &relations.monitors,
@@ -2239,12 +2239,15 @@ impl Relations {
 /// until all are handled or it is exiting, then reads the relations. A running target holds
 /// the lock, so the BIF yields and retries where erts waits for it.
 fn remote_relations(
+    process: &Process,
     ctx: &mut RunCtx<'_, Message>,
     pid: arinsal_sched::Pid,
 ) -> Result<Option<Relations>, VmError> {
     let mut relations = None;
     let mut signal_error = None;
-    let locked = ctx.with_locked_target(pid, &mut |task, target_ctx| {
+    // The caller's reductions left bound the target's signal handling.
+    let reds = u32::try_from(process.heap.abi.fcalls.max(1)).unwrap_or(1);
+    let locked = ctx.with_locked_target(pid, reds, &mut |task, target_ctx| {
         let Some(target) = task.downcast_mut::<Process>() else {
             return;
         };
@@ -2764,7 +2767,8 @@ fn internal_state_set(
             .and_then(|work| work.debug_wait_completion.clone());
         if let Some(completion) = pending_wait {
             if !completion.load(Ordering::Acquire) {
-                process.set_force_yield(true);
+                // ERTS_BIF_YIELD_RETURN (bif.h): ERTS_VBUMP_ALL_REDS.
+                crate::bif_traps::vbump_all_reds(process);
                 return Ok(Term::atom(arinsal_term::atoms::OK));
             }
             process.slice_mut().debug_wait_completion = None;
@@ -2796,7 +2800,8 @@ fn internal_state_set(
             drain_owned,
             &mut |work| ctx.request_aux_work_all(work),
         );
-        process.set_force_yield(true);
+        // erl_bif_info.c:5260-5261: ERTS_BIF_YIELD_RETURN (ERTS_VBUMP_ALL_REDS).
+        crate::bif_traps::vbump_all_reds(process);
         return Ok(Term::atom(arinsal_term::atoms::OK));
     }
     match arg_name(selector).as_deref() {

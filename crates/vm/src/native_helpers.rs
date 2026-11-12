@@ -2878,6 +2878,7 @@ fn bif_trap_export(
         identity,
         (export.module_atom, export.function_atom),
         &export_trap,
+        true,
     );
     crate::bif_traps::arm_export_trap(process);
     process.heap.abi.exc.freason = 1 << 10;

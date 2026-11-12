@@ -101,7 +101,21 @@ impl Task for Process {
         if self.receive_timeout_pos.is_some() {
             self.receive_timeout_schedule_in();
         }
-        let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
+        // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`) and
+        // jit/arm/process_main.cpp (`def_arg_reg[5] = REDS_IN = FCALLS`), OTP-29.1.1: the
+        // slice's one counter starts at the budget.
+        let reds_in = budget.min(i32::MAX as u32) as i32;
+        self.heap.abi.fcalls = reds_in;
+        self.reds_in = reds_in;
+        // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main: `start_time`),
+        // OTP-29.1.1: a dirty CPU scheduler charges the time from picking the process up.
+        let dirty_start =
+            (ctx.scheduler_type() == arinsal_sched::SchedulerType::DirtyCpu).then(|| {
+                self.take_work(|w| w.dirty_pickup.take())
+                    .unwrap_or_else(std::time::Instant::now)
+            });
+        let outcome = abort_on_worker_panic(|| self.run_task(ctx, data));
+        self.context_switch(ctx, dirty_start);
         self.heap.set_alloc_ix(None);
         self.native = None;
         if matches!(outcome, RunOutcome::Exit(_)) {
@@ -314,13 +328,41 @@ pub(super) fn abort_on_worker_panic(run: impl FnOnce() -> RunOutcome) -> RunOutc
 }
 
 impl Process {
+    /// The context switch's reduction count, taken once per slice: `reds_used` is what the
+    /// slice took from FCALLS, `p->reds` gains it less what `ERTS_VBUMP_REDS` gave up, and
+    /// the scheduler counts it. A dirty scheduler charges by its own rule instead.
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp (context_switch: `reds_used =
+    // REDS_IN - FCALLS`), beam_common.c (erts_dirty_process_main: `reds_used`) and
+    // erl_process.c:9678-9700 (erts_schedule: `actual_reds = calls - esdp->virtual_reds`,
+    // `p->reds += actual_reds`), OTP-29.1.1.
     #[inline(always)]
-    fn run_task(
+    fn context_switch(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
-        data: &mut SchedulerData,
-        budget: u32,
-    ) -> RunOutcome {
+        dirty_start: Option<std::time::Instant>,
+    ) {
+        let virtual_reds = std::mem::take(&mut self.virtual_reds);
+        let reds_used = match ctx.scheduler_type() {
+            arinsal_sched::SchedulerType::Normal => {
+                u32::try_from(self.reds_in.saturating_sub(self.heap.abi.fcalls)).unwrap_or(0)
+            }
+            arinsal_sched::SchedulerType::DirtyIo => virtual_reds.saturating_add(1),
+            arinsal_sched::SchedulerType::DirtyCpu => {
+                let treds = dirty_start.map_or(0, |start| erts_time2reds(start.elapsed()));
+                u32::try_from(treds.saturating_add(u64::from(virtual_reds)))
+                    .unwrap_or(i32::MAX as u32)
+                    .min(i32::MAX as u32)
+            }
+        };
+        ctx.add_virtual_reds(virtual_reds);
+        let _ = ctx.consume(reds_used);
+        self.reductions_used = self
+            .reductions_used
+            .saturating_add(u64::from(reds_used.saturating_sub(virtual_reds)));
+    }
+
+    #[inline(always)]
+    fn run_task(&mut self, ctx: &mut RunCtx<'_, Message>, data: &mut SchedulerData) -> RunOutcome {
         if self.runtime.is_none() {
             return RunOutcome::Exit(1);
         }
@@ -347,7 +389,7 @@ impl Process {
             let runtime = self.runtime_handle();
             return self.continue_exit(runtime, ctx, data, true, state.into_inner());
         }
-        let result = self.run_executor(ctx, data, budget);
+        let result = self.run_executor(ctx, data);
         if self.dirty_exiting() {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // the process already terminated while the job ran; whatever the job returned,
@@ -368,18 +410,7 @@ impl Process {
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
-        budget: u32,
     ) -> Result<RunState, VmError> {
-        // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main), OTP-29.1.1: a
-        // dirty CPU scheduler charges the time between picking the process and scheduling
-        // again, not what the executed code consumed from FCALLS. This covers the dirty GC
-        // system task and dirty CPU NIFs.
-        let dirty_cpu = ctx.scheduler_type() == arinsal_sched::SchedulerType::DirtyCpu;
-        let dirty_start = dirty_cpu.then(|| {
-            self.take_work(|w| w.dirty_pickup.take())
-                .unwrap_or_else(std::time::Instant::now)
-        });
-        let used_before = self.reductions_used;
         let executor = match data.executor {
             Some(ref mut executor) => executor,
             None => {
@@ -387,12 +418,7 @@ impl Process {
                 data.executor.insert(new_executor(runtime))
             }
         };
-        let mut result = executor.run(self, ctx, budget);
-        if let Some(start) = dirty_start {
-            let charged = erts_time2reds(start.elapsed());
-            self.reductions_used = used_before.saturating_add(charged);
-            ctx.consume(u32::try_from(charged).unwrap_or(u32::MAX));
-        }
+        let mut result = executor.run(self, ctx);
         // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export
         // call, so the caller's CP stays on the stack and the backtrace PC is that trap.
         if matches!(result, Ok(RunState::Yield))

@@ -5664,7 +5664,10 @@ pub struct RunCtx<'a, M: SignalMessage> {
     proc: &'a ProcShared<M>,
     /// The constants of the scheduler thread running the slice (`esdp`).
     consts: &'a SliceConsts,
-    remaining: u32,
+    /// `reds_used` as process_main hands it to `erts_schedule` at the context switch
+    /// (`REDS_IN - FCALLS`): the task reports it once when its slice ends.
+    reds_used: u32,
+    /// `REDS_IN`: the reductions the slice was scheduled in with.
     budget: u32,
     /// `esdp->virtual_reds`: part of the consumed budget that is not work.
     virtual_reds: u32,
@@ -5758,13 +5761,13 @@ trait ContextOps<M: SignalMessage> {
     fn handle_dirty_signals(
         &mut self,
         pid: Pid,
-        remaining: u32,
+        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals;
     fn with_locked_target(
         &mut self,
         pid: Pid,
-        remaining: u32,
+        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
     ) -> Result<(), SignalFreeError>;
 }
@@ -5812,10 +5815,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn schedule_spawned(&mut self, spawned: SpawnedProcess<M>) -> Result<(), Error> {
         self.inner.schedule_spawned(spawned)
     }
-    /// Consume reductions; returns false when the quantum is exhausted.
+    /// Report `count` more reductions used by the slice; returns false when the quantum is
+    /// exhausted. A task whose code keeps its own counter (FCALLS) reports once, at the
+    /// context switch.
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp (context_switch: `reds_used`
+    // passed to erts_schedule), OTP-29.1.1.
     pub fn consume(&mut self, count: u32) -> bool {
-        self.remaining = self.remaining.saturating_sub(count);
-        self.remaining != 0
+        self.reds_used = self.reds_used.saturating_add(count);
+        self.reds_used < self.budget
     }
     /// Number of scheduler workers available to this runtime.
     pub fn scheduler_count(&self) -> usize {
@@ -5846,7 +5853,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     #[inline(always)]
     pub fn fast_slice_ok_before_signals(&self) -> bool {
         self.scheduler_key() != 0
-            && self.remaining != 0
+            && self.reds_used < self.budget
             && !self.sys_task_run
             && !self.dirty_running
             && !self.dirty_queued
@@ -5910,16 +5917,18 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         self.dirty_queued
     }
     /// Handle the queued signals of process `pid` while it is in a dirty state, with its
-    /// task cell locked and a context acting as that process.
+    /// task cell locked and a context acting as that process. `reds` is what the caller has
+    /// left (`ERTS_BIF_REDS_LEFT`): the target context's budget.
     ///
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
     /// (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1.
     pub fn handle_dirty_signals(
         &mut self,
         pid: Pid,
+        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals {
-        self.inner.handle_dirty_signals(pid, self.remaining, handle)
+        self.inner.handle_dirty_signals(pid, reds, handle)
     }
     /// Run `body` with `pid`'s main lock held and a context acting as that process, as
     /// `erts_pid2proc(.., ERTS_PROC_LOCK_MAIN, ..)` lets the caller handle another process's
@@ -5930,9 +5939,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn with_locked_target(
         &mut self,
         pid: Pid,
+        reds: u32,
         body: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
     ) -> Result<(), SignalFreeError> {
-        self.inner.with_locked_target(pid, self.remaining, body)
+        self.inner.with_locked_target(pid, reds, body)
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -6019,13 +6029,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn add_virtual_reds(&mut self, reds: u32) {
         self.virtual_reds = self.virtual_reds.saturating_add(reds);
     }
-    /// Remaining reductions in this quantum.
+    /// Reductions of the quantum not yet reported through [`RunCtx::consume`]. A context
+    /// acting as another process (a dirty signal handler) has the caller's reductions left.
     pub fn remaining(&self) -> u32 {
-        self.remaining
+        self.budget.saturating_sub(self.reds_used)
     }
-    /// Reductions consumed in this process turn so far.
+    /// Reductions reported through [`RunCtx::consume`] in this process turn so far.
     pub fn consumed(&self) -> u32 {
-        self.budget.saturating_sub(self.remaining)
+        self.reds_used
     }
     /// Scheduler-wide reductions committed before this process turn.
     pub fn total_reductions(&self) -> u64 {
@@ -6035,12 +6046,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn exact_total_reductions(&self) -> u64 {
         self.inner.exact_total_reductions()
     }
-    /// Scheduler-owned task and timing snapshot including this turn's pending changes.
-    pub fn scheduler_stats(&self) -> SchedulerStats {
+    /// Scheduler-owned task and timing snapshot including this turn's `current` reductions
+    /// (`erts_current_reductions`: what the running slice has used so far, not yet reported).
+    pub fn scheduler_stats(&self, current: u32) -> SchedulerStats {
         let mut stats = self.inner.scheduler_stats();
-        stats.reductions = stats
-            .reductions
-            .saturating_add(u64::from(self.consumed().saturating_sub(self.virtual_reds)));
+        stats.reductions = stats.reductions.saturating_add(u64::from(current));
         stats
     }
     /// Change the current scheduler worker's microstate category.
@@ -6429,7 +6439,7 @@ impl<T: Task> Runner<'_, T> {
         process: &Process<T>,
         cell: &mut TaskCell<T>,
         pid: Pid,
-        remaining: u32,
+        reds: u32,
         handle: &mut TargetHandler<'_, T::Message>,
     ) -> bool {
         debug_assert_eq!(pid, process.pid);
@@ -6444,8 +6454,8 @@ impl<T: Task> Runner<'_, T> {
             inner: self,
             proc: &process.shared,
             consts: &consts,
-            remaining,
-            budget: remaining,
+            reds_used: 0,
+            budget: reds,
             virtual_reds: 0,
             msacc_enabled: false,
             wall_enabled: false,
@@ -6487,7 +6497,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     fn handle_dirty_signals(
         &mut self,
         pid: Pid,
-        remaining: u32,
+        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>) -> bool,
     ) -> DirtySignals {
         let inner = self.inner;
@@ -6519,7 +6529,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Some(result) = state(&process) {
             return result;
         }
-        let handled = self.run_as_target(&process, &mut cell, pid, remaining, handle);
+        let handled = self.run_as_target(&process, &mut cell, pid, reds, handle);
         if handled {
             DirtySignals::Handled
         } else {
@@ -6529,7 +6539,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     fn with_locked_target(
         &mut self,
         pid: Pid,
-        remaining: u32,
+        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>),
     ) -> Result<(), SignalFreeError> {
         let process = self
@@ -6548,7 +6558,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         check(&process)?;
         let mut cell = process.cell.try_lock().ok_or(SignalFreeError::Busy)?;
         check(&process)?;
-        self.run_as_target(&process, &mut cell, pid, remaining, &mut |task, ctx| {
+        self.run_as_target(&process, &mut cell, pid, reds, &mut |task, ctx| {
             handle(task, ctx);
             true
         });
@@ -8607,7 +8617,7 @@ mod msgq_stage_microbench {
             inner: &mut receive_runner,
             proc: &process_ref.shared,
             consts: &consts,
-            remaining: 1_000,
+            reds_used: 0,
             budget: 1_000,
             virtual_reds: 0,
             msacc_enabled: false,
@@ -9354,8 +9364,8 @@ fn run_one<T: Task>(
 struct SliceEnd<T: Task> {
     process: ProcRef<T>,
     outcome: RunOutcome,
-    remaining: u32,
-    budget: u32,
+    /// `reds_used` of the context switch; may exceed the budget (dirty CPU time).
+    reds_used: u32,
     virtual_reds: u32,
     /// Wall time of the slice, only measured when wall accounting is on.
     active_ns: u64,
@@ -9398,8 +9408,7 @@ fn schedule_out<T: Task>(
     let SliceEnd {
         process,
         outcome,
-        remaining,
-        budget,
+        reds_used,
         virtual_reds,
         active_ns,
     } = end;
@@ -9414,11 +9423,7 @@ fn schedule_out<T: Task>(
     // Port of erts/emulator/beam/erl_process.c:9678-9687 and erl_process.h:529
     // (ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1: `actual` leaves out what the slice gave up
     // without working; `reds` is that with the minimum context switch cost.
-    let actual = u64::from(
-        budget
-            .saturating_sub(remaining)
-            .saturating_sub(virtual_reds),
-    );
+    let actual = u64::from(reds_used.saturating_sub(virtual_reds));
     let consumed = actual.max(u64::from(inner.config.reductions / 10));
     if dirty.is_none() {
         // Port of erts/emulator/beam/erl_process.c:10200 (ERTS_PROC_REDUCTIONS_EXECUTED
@@ -9732,7 +9737,7 @@ fn run_slice<T: Task>(
         sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
         simulated: inner.sim.is_some(),
     };
-    let (outcome, remaining, virtual_reds, active_ns) = {
+    let (outcome, reds_used, virtual_reds, active_ns) = {
         let mut runner = Runner {
             inner,
             local: None,
@@ -9744,7 +9749,7 @@ fn run_slice<T: Task>(
                 inner: &mut runner,
                 proc: &process.shared,
                 consts: &consts,
-                remaining: budget,
+                reds_used: 0,
                 virtual_reds: 0,
                 budget,
                 msacc_enabled,
@@ -9777,7 +9782,7 @@ fn run_slice<T: Task>(
             let active_ns = accounting_started.map_or(0, |started| {
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64
             });
-            (outcome, ctx.remaining, ctx.virtual_reds, active_ns)
+            (outcome, ctx.reds_used, ctx.virtual_reds, active_ns)
         };
         runner.flush();
         result
@@ -9792,8 +9797,7 @@ fn run_slice<T: Task>(
         SliceEnd {
             process,
             outcome,
-            remaining,
-            budget,
+            reds_used,
             virtual_reds,
             active_ns,
         },
@@ -9844,13 +9848,13 @@ fn run_process<T: Task>(
         local: Some(local_cell),
         managed: true,
     };
-    let (outcome, remaining, virtual_reds, active_ns) = {
+    let (outcome, reds_used, virtual_reds, active_ns) = {
         let task = cell.task_mut();
         let mut ctx = RunCtx {
             inner: &mut runner,
             proc: &process.shared,
             consts,
-            remaining: budget,
+            reds_used: 0,
             virtual_reds: 0,
             budget,
             msacc_enabled,
@@ -9875,7 +9879,7 @@ fn run_process<T: Task>(
         let active_ns = accounting_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
         });
-        (outcome, ctx.remaining, ctx.virtual_reds, active_ns)
+        (outcome, ctx.reds_used, ctx.virtual_reds, active_ns)
     };
     runner.flush();
     if matches!(outcome, RunOutcome::Exit(_)) {
@@ -9885,8 +9889,7 @@ fn run_process<T: Task>(
     Some(SliceEnd {
         process,
         outcome,
-        remaining,
-        budget,
+        reds_used,
         virtual_reds,
         active_ns,
     })

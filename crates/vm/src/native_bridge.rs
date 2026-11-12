@@ -1178,10 +1178,6 @@ pub fn run_native(
         );
     }
     process.clear_native_resume();
-    // Port of erts/emulator/beam/beam_common.c:2394 (`erts_current_reductions`), OTP-29.1.1:
-    // `REDS_IN` is FCALLS at slice entry. `process_info(reductions)` adds what this
-    // slice has consumed before the scheduler folds it into `reductions_used`.
-    process.native_reds_in = process.heap.abi.fcalls;
     process.heap.abi.i = code_ptr;
     process.heap.abi.arity = arity;
     registers.tmp_mem[3] = 0;
@@ -1467,7 +1463,6 @@ pub fn run_native_resume(
     registers.entry_return = 0;
     let code_ptr = code_address as *const std::ffi::c_void;
     process.clear_native_resume();
-    process.native_reds_in = process.heap.abi.fcalls;
     process.heap.abi.i = code_ptr;
     process.heap.abi.arity = arity;
     registers.tmp_mem[3] = 0;

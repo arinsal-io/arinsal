@@ -18,6 +18,7 @@ impl Vm {
             ))));
         }
         p.x.ensure_x(arity);
+        // The body charges BUMP_REDS on FCALLS, as from native code.
         let mut result = self.dispatch_native_source(
             p,
             ctx,

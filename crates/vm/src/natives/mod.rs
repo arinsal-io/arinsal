@@ -12,6 +12,7 @@ pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_os;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
+pub(crate) mod erl_map;
 pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erts_debug;
@@ -773,6 +774,17 @@ mod tests {
             let (class, bits) = classify("lists", function, arity, false);
             assert_eq!(class, ImportClass::Native, "lists:{function}/{arity}");
             assert_eq!(bits, 0, "lists:{function}/{arity} is its bif_table body");
+        }
+        // erl_map.c
+        for (function, arity) in [
+            ("from_list", 1),
+            ("from_keys", 2),
+            ("keys", 1),
+            ("values", 1),
+        ] {
+            let (class, bits) = classify("maps", function, arity, false);
+            assert_eq!(class, ImportClass::Native, "maps:{function}/{arity}");
+            assert_eq!(bits, 0, "maps:{function}/{arity} is its bif_table body");
         }
         // Plain BIFs with no I/O side effects stay on the pure path.
         for (function, arity) in [("atom_to_list", 1), ("list_to_atom", 1)] {

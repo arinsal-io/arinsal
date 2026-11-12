@@ -22,10 +22,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("maps", "find", 2) => v.entry::<word_bodies::find>(),
         ("maps", "get", 2) => v.entry::<word_bodies::get>(),
         ("maps", "is_key", 2) => v.entry::<word_bodies::is_key>(),
-        ("maps", "from_list", 1) => v.entry::<word_bodies::from_list>(),
-        ("maps", "from_keys", 2) => v.entry::<word_bodies::from_keys>(),
-        ("maps", "keys", 1) => v.entry::<word_bodies::keys>(),
-        ("maps", "values", 1) => v.entry::<word_bodies::values>(),
         ("maps", "merge", 2) => v.entry::<bodies::merge>(),
         ("maps", "put", 3) => v.entry::<word_bodies::put>(),
         ("maps", "remove", 2) => v.entry::<word_bodies::remove>(),
@@ -95,50 +91,6 @@ fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         Err(error) => ctx.fail(error),
     }
 }
-fn from_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    let mut walk = MapsBuildWalk::from_list(args[0]);
-    let mut reds = i64::MAX;
-    match walk.step(ctx, &mut reds) {
-        Ok(Some(value)) => value,
-        Ok(None) => ctx.badarg(),
-        Err(error) => ctx.fail(error),
-    }
-}
-fn from_keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    let mut walk = MapsBuildWalk::from_keys(args[0], args[1]);
-    let mut reds = i64::MAX;
-    match walk.step(ctx, &mut reds) {
-        Ok(Some(value)) => value,
-        Ok(None) => ctx.badarg(),
-        Err(error) => ctx.fail(error),
-    }
-}
-#[inline]
-fn keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match projection(ctx, args[0], true) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-fn values(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match projection(ctx, args[0], false) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-
-#[inline]
-fn projection(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Term, BifError> {
-    match MapsProjectionWalk::start(ctx, map, keys)? {
-        ProjectionStart::Done(value) => Ok(value),
-        ProjectionStart::Walk(mut walk) => {
-            let mut reds = i64::MAX;
-            while !walk.step(&mut reds) {}
-            Ok(walk.finish())
-        }
-    }
-}
-
 /// Resumable `maps:keys/1` / `maps:values/1` over a hashmap.
 ///
 /// Port of erts/emulator/beam/erl_map.c:2801-2880 (hashmap_keys, hashmap_values), OTP-29.1.1:
@@ -149,17 +101,6 @@ pub struct MapsProjectionWalk {
     keys: bool,
     remaining: usize,
     output: arinsal_term::ConsListBuilder,
-}
-
-/// Outcome of starting a projection.
-// Keep the reverse iterator's 16-entry inline stack in the trap state, as OTP does with its
-// stack-local WStack. Boxing this variant would add a heap allocation to every HAMT projection.
-#[allow(clippy::large_enum_variant)]
-pub enum ProjectionStart {
-    /// A flatmap: erts builds its list without yielding.
-    Done(Term),
-    /// A hashmap to walk with [`MapsProjectionWalk::step`].
-    Walk(MapsProjectionWalk),
 }
 
 impl MapsProjectionWalk {
@@ -200,14 +141,6 @@ impl MapsProjectionWalk {
             remaining: checked.size(),
             output,
         })
-    }
-
-    /// Validate the map argument and start (`maps_keys_1_helper`, `maps_values_1_helper`).
-    pub fn start(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<ProjectionStart, BifError> {
-        match Self::start_flat(ctx, map, keys)? {
-            Some(value) => Ok(ProjectionStart::Done(value)),
-            None => Ok(ProjectionStart::Walk(Self::start_hashmap(ctx, map, keys)?)),
-        }
     }
 
     /// Walk entries while `reds` (the YCF reduction counter) stays positive. Returns whether
@@ -633,7 +566,6 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 }
 
 crate::word_bif_bodies_in!(word_bodies;
-    map_size, map_get, is_map_key, find, get, is_key, from_list, from_keys, keys, values,
-    put, remove, update, take,
+    map_size, map_get, is_map_key, find, get, is_key, put, remove, update, take,
 );
 crate::process_bif_bodies!(merge);
