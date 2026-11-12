@@ -416,7 +416,7 @@ impl Vm {
                     }
                 });
                 if module == "erl_init" && function == "start" {
-                    crate::natives::env::install_boot_signals(runtime)?;
+                    crate::sys_signals::install_boot_signals(runtime)?;
                 }
             }
             let scheduler = runtime.scheduler()?;
