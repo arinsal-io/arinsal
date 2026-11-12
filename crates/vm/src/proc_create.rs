@@ -1053,16 +1053,23 @@ impl MonitorInfo {
         self.0.as_ref()?.dist_origin.as_ref()
     }
 
-    pub(crate) fn with_port_name(name: Option<arinsal_term::Atom>) -> Self {
-        name.map_or_else(Self::default, |port_name| {
-            Self(Some(Box::new(MonitorExtension {
-                tag: None,
-                name: None,
-                dist_origin: None,
-                dist_target: None,
-                port_name: Some(port_name),
-            })))
-        })
+    /// The shared part of a port monitor: its DOWN tag (`None` for `'DOWN'`) and the registered
+    /// name it was created with, as `erts_monitor_create(ERTS_MON_TYPE_PORT, .., name, tag)`
+    /// keeps both in `ErtsMonitorDataExtended`.
+    pub(crate) fn with_port_name(
+        tag: Option<arinsal_etf::OwnedTerm>,
+        name: Option<arinsal_term::Atom>,
+    ) -> Self {
+        if tag.is_none() && name.is_none() {
+            return Self::default();
+        }
+        Self(Some(Box::new(MonitorExtension {
+            tag,
+            name: None,
+            dist_origin: None,
+            dist_target: None,
+            port_name: name,
+        })))
     }
 
     pub(crate) fn port_name(&self) -> Option<arinsal_term::Atom> {

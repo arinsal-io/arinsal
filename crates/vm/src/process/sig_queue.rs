@@ -497,26 +497,36 @@ impl Process {
                 let arinsal_sched::PortExitSignal { port, reason } = *exit;
                 let port = port.into_receiver(self)?;
                 let reason = reason.into_receiver(self)?;
-                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_EXIT_LINKED):
-                // an exit arriving after unlink was requested removes the link but is ignored.
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:4674-4720 (handle_exit_signal,
+                // ERTS_SIG_Q_OP_EXIT_LINKED), OTP-29.1.1: a link exit whose link is gone, or
+                // that arrives after unlink was requested, is ignored; the link is removed and a
+                // priority link (ERTS_ML_FLG_PRIO_ML) makes the `'EXIT'` a priority message.
+                let mut prio = false;
                 if let Some(id) = port.as_port() {
                     let key = crate::proc_create::port_link_key(id);
-                    let unlinking = self
+                    let Some((unlinking, link_prio)) = self
                         .links
                         .get(key)
-                        .is_some_and(|link| link.unlinking() != 0);
+                        .map(|link| (link.unlinking() != 0, link.is_priority()))
+                    else {
+                        return Ok(2);
+                    };
                     self.links.remove(key);
                     if unlinking {
                         return Ok(2);
                     }
+                    prio = link_prio;
                 }
-                if reason == Term::atom(arinsal_term::atoms::KILL) {
-                    return Err(VmError::Trap(crate::exceptions::Trap::killed()));
-                }
+                // A link exit is never untrappable: `kill` only kills as an `exit/2` signal
+                // (handle_exit_signal: `!linked && reason == am_kill`).
                 if self.trap_exit {
                     let tuple =
                         self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), port, reason])?;
-                    self.inbox.push_back(tuple);
+                    if prio {
+                        self.push_priority_message(tuple)?;
+                    } else {
+                        self.inbox.push_back(tuple);
+                    }
                     return Ok(1);
                 }
                 if reason != Term::atom(arinsal_term::atoms::NORMAL) {

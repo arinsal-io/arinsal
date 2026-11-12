@@ -2918,8 +2918,8 @@ fn processes(process: &mut Process) -> Result<Term, VmError> {
 }
 
 // Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3), OTP-29.1.1: the
-// caller's own leader is set in place; another process gets the group-leader signal and the
-// caller receives `{Ref, Result}`.
+// target, the caller itself included, gets the group-leader signal and the caller receives
+// `{Ref, Result}` when the target handles it.
 fn group_leader_3(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -2930,18 +2930,6 @@ fn group_leader_3(
     let (Some(leader), Some(pid)) = (Pid::from_term(leader), Pid::from_term(target)) else {
         return Err(badarg());
     };
-    if pid == ctx.pid() {
-        set_group_leader(process, leader)?;
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
-    }
-    if !live(process, pid)? {
-        let reply = make_tuple(
-            process,
-            &[reference, Term::atom(arinsal_term::atoms::BADARG)],
-        )?;
-        process.inbox.push_back(reply);
-        return Ok(Term::atom(arinsal_term::atoms::OK));
-    }
     // Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3) and
     // erl_proc_sig_queue.c (erts_proc_sig_send_group_leader), OTP-29.1.1.
     let id = crate::signals::ref_id(reference).ok_or_else(badarg)?;
@@ -2954,14 +2942,10 @@ fn group_leader_3(
             crate::signals::elevate_for_signal_request(process, ctx, pid)?;
             Ok(Term::atom(arinsal_term::atoms::OK))
         }
-        Err(arinsal_sched::Error::NoProcess) => {
-            let reply = make_tuple(
-                process,
-                &[reference, Term::atom(arinsal_term::atoms::BADARG)],
-            )?;
-            process.inbox.push_back(reply);
-            Ok(Term::atom(arinsal_term::atoms::OK))
-        }
+        // `!res`: destroy_sig_group_leader. A target that is gone (no longer in the process
+        // table) gets no signal and the caller no reply; an exiting target answers `badarg`
+        // from its exit handling (erts_proc_exit_handle_signal, ERTS_SIG_Q_OP_GROUP_LEADER).
+        Err(arinsal_sched::Error::NoProcess) => Ok(Term::atom(arinsal_term::atoms::OK)),
         Err(error) => Err(VmError::Unsupported(format!(
             "group_leader request: {error}"
         ))),
