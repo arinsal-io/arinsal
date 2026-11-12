@@ -2891,11 +2891,12 @@ impl arinsal_sched::RunPort for PortHandle {
         )
     }
 
-    fn execute(&self) -> arinsal_sched::PortExecution {
+    fn execute(&self, scheduler_id: usize) -> arinsal_sched::PortExecution {
         arinsal_sched::RunPort::execute(
             self.driver
                 .as_ref()
                 .expect("only driver ports are run-queued"),
+            scheduler_id,
         )
     }
 }

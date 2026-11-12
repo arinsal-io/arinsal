@@ -37,7 +37,7 @@ impl RunPort for TestPort {
         &self.runq
     }
 
-    fn execute(&self) -> PortExecution {
+    fn execute(&self, _scheduler_id: usize) -> PortExecution {
         self.executions.fetch_add(1, Ordering::SeqCst);
         self.schedulers
             .lock()

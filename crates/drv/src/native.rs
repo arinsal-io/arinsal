@@ -93,14 +93,18 @@ impl DriverPort {
     /// Mark the port as started with `data` as its driver state; no `start` callback
     /// runs (the VM built the state while creating the port).
     pub fn start_native(&self, data: Arc<dyn Any + Send + Sync>) {
-        let _ = self.native_data.set(data);
+        let psd = self
+            .psd
+            .get_or_init(|| Box::new(super::PortSpecificData::new()));
+        let _ = psd.native_data.set(data);
         self.state
             .fetch_or(crate::SFLG_STARTED, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The driver state set by [`DriverPort::start_native`].
     pub fn native_data<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-        Arc::clone(self.native_data.get()?).downcast::<T>().ok()
+        let psd = self.psd.get()?;
+        Arc::clone(psd.native_data.get()?).downcast::<T>().ok()
     }
 
     /// This port as an `Arc`, for APIs that keep a reference (`driver_select`, timers).

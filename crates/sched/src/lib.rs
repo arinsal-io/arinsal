@@ -21,6 +21,9 @@
 //! and probe, the WAITING store, and the sender's claim are SeqCst. Thus a
 //! sender that misses WAITING must have published before the receiver's probe;
 //! a receiver that misses the message leaves WAITING visible to the sender.
+//!
+//! Scheduling-statistics port: `erts/emulator/beam/erl_process.c`
+//! (`erts_sched_stat`, `schedule`, and `erts_sched_stat_modify`), OTP-29.1.1.
 //! The queue itself transfers message ownership with release/acquire ordering.
 //!
 //! Placement follows erts: a woken process joins the run queue it last ran on and only
@@ -59,6 +62,8 @@ mod ports;
 mod proc_ref;
 mod ptab_slot;
 mod run_queue;
+/// Global scheduling statistics corresponding to `erts_sched_stat`.
+pub mod sched_stat;
 mod sig_queue;
 mod thr_progress;
 mod thr_queue;
@@ -1734,6 +1739,14 @@ impl<T: Task> std::ops::Deref for Process<T> {
 }
 
 impl<M: SignalMessage> ProcShared<M> {
+    fn scheduler_worker(&self) -> usize {
+        self.scheduler_id.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
+    fn set_scheduler_worker(&self, worker: usize) {
+        self.scheduler_id.store(worker + 1, Ordering::Relaxed);
+    }
+
     /// Claim priority queue `queue` of the dirty run queue of `kind` for a new entry; `false`
     /// when the process already has one there. A process struct reserved for the entry
     /// (`IN_RUNQ` set by the caller's state change) is released again then.
@@ -3337,10 +3350,7 @@ impl<T: Task> Inner<T> {
                 .min(self.worker_counts.len() - 1);
         }
         let online = self.online_schedulers.load(Ordering::Relaxed).max(1);
-        let home = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.worker_counts.len() - 1);
+        let home = process.scheduler_worker().min(self.worker_counts.len() - 1);
         if home < online { home } else { home % online }
     }
 
@@ -3479,7 +3489,7 @@ impl<T: Task> Inner<T> {
             return false;
         };
         local.set_msacc_state(MsaccState::Port);
-        let PortExecution { active, reds } = port.execute();
+        let PortExecution { active, reds } = port.execute(id);
         local.set_msacc_state(MsaccState::Other);
         if active {
             let runq = self.port_enqueue_run_queue(&*port);
@@ -3672,9 +3682,7 @@ impl<T: Task> Inner<T> {
             .current_worker()
             .unwrap_or_else(|| self.next_queue.fetch_add(1, Ordering::Relaxed))
             % online;
-        item.process
-            .scheduler_id
-            .store(scheduler, Ordering::Relaxed);
+        item.process.set_scheduler_worker(scheduler);
         let scheduler = self.enqueue_run_queue(&item.process);
         self.push_run_queue(scheduler, item, false);
     }
@@ -3684,10 +3692,7 @@ impl<T: Task> Inner<T> {
     /// (`enqueue_process`); this keeps the active-process count of each run queue.
     fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
         let worker = worker.min(self.worker_counts.len() - 1);
-        let previous = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.worker_counts.len() - 1);
+        let previous = process.scheduler_worker().min(self.worker_counts.len() - 1);
         if already_active && previous != worker {
             self.worker_counts[previous]
                 .0
@@ -3696,29 +3701,23 @@ impl<T: Task> Inner<T> {
         } else if !already_active {
             self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
         }
-        process.scheduler_id.store(worker, Ordering::Relaxed);
+        process.set_scheduler_worker(worker);
     }
 
     /// The process runs on `worker`; the active count moves with it.
     fn record_running(&self, process: &Process<T>, worker: usize) {
-        let previous = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.worker_counts.len() - 1);
+        let previous = process.scheduler_worker().min(self.worker_counts.len() - 1);
         if previous != worker {
             self.worker_counts[previous]
                 .0
                 .fetch_sub(1, Ordering::Relaxed);
             self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
         }
-        process.scheduler_id.store(worker, Ordering::Relaxed);
+        process.set_scheduler_worker(worker);
     }
 
     fn record_waiting(&self, process: &Process<T>) {
-        let worker = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.worker_counts.len() - 1);
+        let worker = process.scheduler_worker().min(self.worker_counts.len() - 1);
         self.worker_counts[worker].0.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -5196,40 +5195,30 @@ impl<T: Task> Local<T> {
 
     /// See `Inner::record_queued`; the run queue lengths are counted by the run queue.
     fn record_queued(&mut self, process: &Process<T>, worker: usize, already_active: bool) {
-        process.scheduler_id.store(worker, Ordering::Relaxed);
+        process.set_scheduler_worker(worker);
         if !already_active {
             self.adjust_metric(worker, 1);
         }
     }
 
     fn record_running(&mut self, process: &Process<T>, worker: usize) {
-        let previous = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.metric_deltas.len() - 1);
+        let previous = process.scheduler_worker().min(self.metric_deltas.len() - 1);
         if previous != worker {
             self.adjust_metric(previous, -1);
             self.adjust_metric(worker, 1);
         }
-        process.scheduler_id.store(worker, Ordering::Relaxed);
     }
 
     fn record_waiting(&mut self, process: &Process<T>) {
-        let worker = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.metric_deltas.len() - 1);
+        let worker = process.scheduler_worker().min(self.metric_deltas.len() - 1);
         self.adjust_metric(worker, -1);
     }
 
     fn migrate_queued(&mut self, process: &Process<T>, target: usize) {
-        let previous = process
-            .scheduler_id
-            .load(Ordering::Relaxed)
-            .min(self.metric_deltas.len() - 1);
+        let previous = process.scheduler_worker().min(self.metric_deltas.len() - 1);
         self.adjust_metric(previous, -1);
         self.adjust_metric(target, 1);
-        process.scheduler_id.store(target, Ordering::Relaxed);
+        process.set_scheduler_worker(target);
     }
 
     fn lookup(&mut self, table: &ProcessTable<T>, pid: Pid) -> Option<ProcRef<T>> {
@@ -5468,6 +5457,7 @@ trait ContextOps<M: SignalMessage> {
     fn thread_progress_later(&self, op: LaterOp);
     fn progress_domain(&self) -> &Progress;
     fn block_thread_progress(&self, duration: Duration);
+    fn with_thread_progress_blocked(&mut self, op: &mut dyn FnMut());
     fn total_reductions(&self) -> u64;
     fn exact_total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
@@ -6015,6 +6005,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         self.inner.flush();
         self.inner.block_thread_progress(duration);
     }
+    /// Pause other scheduler threads while `op` changes state that must not race scheduling.
+    // Port of erts/emulator/beam/erl_process.c (erts_sched_stat_modify), OTP-29.1.1.
+    pub fn with_thread_progress_blocked(&mut self, op: impl FnOnce()) {
+        self.inner.flush();
+        let mut op = Some(op);
+        self.inner
+            .with_thread_progress_blocked(&mut || op.take().expect("operation runs once")());
+    }
 }
 
 /// Messages, exits, and DOWNs require the receiver to run. Link, monitor, and
@@ -6248,6 +6246,11 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if !duration.is_zero() {
             thread::sleep(duration);
         }
+        thr_progress::unblock(&self.inner.progress);
+    }
+    fn with_thread_progress_blocked(&mut self, op: &mut dyn FnMut()) {
+        thr_progress::block(&self.inner.progress);
+        op();
         thr_progress::unblock(&self.inner.progress);
     }
     fn process_priority(&self, pid: Pid) -> Option<Priority> {
@@ -7214,7 +7217,7 @@ impl<T: Task> Scheduler<T> {
         process
             .run_state()
             .queue_new(process.priority().index(), Ordering::Release);
-        process.scheduler_id.store(worker, Ordering::Relaxed);
+        process.set_scheduler_worker(worker);
         let item = Scheduled::new(process);
         let scheduler = self.inner.enqueue_run_queue(&item.process);
         self.inner.push_run_queue(scheduler, item, false);
@@ -9159,6 +9162,7 @@ fn run_process<T: Task>(
         return None;
     }
     let sys_task_run = process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
+    record_sched_stat(&process, id);
     {
         let mut local = local_cell.borrow_mut();
         local.record_running(&process, id);
@@ -9223,6 +9227,19 @@ fn run_process<T: Task>(
         virtual_reds,
         active_ns,
     })
+}
+
+/// Update the process's last scheduler and record its selection when statistics are enabled.
+// Port of erts/emulator/beam/erl_process.c:10208-10224 (schedule), OTP-29.1.1.
+fn record_sched_stat<T: Task>(process: &Process<T>, scheduler_id: usize) {
+    let scheduler_id = scheduler_id + 1;
+    let previous_scheduler = process.scheduler_id.swap(scheduler_id, Ordering::Relaxed);
+    if sched_stat::enabled() {
+        sched_stat::record_execution(
+            usize::from(process.user_priority.load(Ordering::Relaxed)),
+            previous_scheduler != 0 && previous_scheduler != scheduler_id,
+        );
+    }
 }
 
 /// Signal operations a task's native code performs on the normal scheduler it runs on.

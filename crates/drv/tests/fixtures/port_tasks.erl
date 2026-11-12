@@ -1,7 +1,7 @@
 %% Port task scheduling scenarios (erl_port_task.c) on sched_drv.so; the result map is
 %% compared with erl 29.1.1.
 -module(port_tasks).
--export([run/1]).
+-export([run/1, stats/1]).
 
 run(Dir) ->
     ok = erl_ddll:load_driver(Dir, "sched_drv"),
@@ -13,6 +13,20 @@ run(Dir) ->
             busy_msgq => timed(fun busy_msgq/0)},
     ok = erl_ddll:unload_driver("sched_drv"),
     Res.
+
+stats(Dir) ->
+    ok = erl_ddll:load_driver(Dir, "io_drv"),
+    true = erlang:system_flag(scheduling_statistics, clear),
+    true = erlang:system_flag(scheduling_statistics, enable),
+    Port = open_port({spawn_driver, "io_drv"}, [binary]),
+    _ = port_control(Port, 1, "0"),
+    true = port_command(Port, <<"z">>),
+    receive {Port, {data, <<"in:z">>}} -> ok after 5000 -> timeout end,
+    true = port_close(Port),
+    Stats = erlang:system_info(total_scheduling_statistics),
+    true = erlang:system_flag(scheduling_statistics, disable),
+    proplists:get_value(port, [{Name, Executed} ||
+                                  {Name, Executed, _Migrated} <- Stats]) > 0.
 
 %% Run a scenario in its own process so a hang reports `timeout` instead of blocking.
 timed(Fun) ->

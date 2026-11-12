@@ -120,7 +120,27 @@ run(11) ->
     Left = lists:sort(ets:tab2list(T)),
     All = ets:internal_select_delete(T, [{'_', [], [true]}]),
     Empty = ets:internal_select_delete(T, []),
-    {N, Left, All, Empty, err(fun() -> ets:internal_select_delete(nope, []) end)}.
+    {N, Left, All, Empty, err(fun() -> ets:internal_select_delete(nope, []) end)};
+run(12) ->
+    Default = zero_stats(erlang:system_info(scheduling_statistics)),
+    true = erlang:system_flag(scheduling_statistics, enable),
+    Parent = self(),
+    Ps = [spawn_opt(fun() ->
+        process_flag(priority, Prio),
+        Parent ! {ready, self()},
+        receive go -> Parent ! {done, self()} end
+    end, [{priority, Prio}]) || Prio <- [max, high, normal, low]],
+    [receive {ready, P} -> P end || _ <- Ps],
+    [P ! go || P <- Ps],
+    [receive {done, P} -> P end || P <- Ps],
+    Interval = priorities_seen(erlang:system_info(scheduling_statistics)),
+    Total = priorities_seen(erlang:system_info(total_scheduling_statistics)),
+    true = erlang:system_flag(scheduling_statistics, clear),
+    Cleared = zero_stats(erlang:system_info(total_scheduling_statistics)),
+    true = erlang:system_flag(scheduling_statistics, disable),
+    {Default, Interval, Total, Cleared}.
+zero_stats(Stats) -> lists:all(fun({_, E, M}) -> E =:= 0 andalso M =:= 0 end, Stats).
+priorities_seen(Stats) -> lists:all(fun({Name, E, _}) -> Name =:= port orelse E > 0 end, Stats).
 member_self(Iter) ->
     case erlang:processes_next(Iter) of
         none -> false;
@@ -153,9 +173,9 @@ fn missing_bifs_match_otp_29() {
     reference.load("missing_bifs", &beam).unwrap();
     let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    for scenario in 0..12 {
+    for scenario in 0..13 {
         let expected = reference.call("missing_bifs", "run", &[OwnedTerm::Int(scenario)]);
-        let actual = if scenario == 6 || scenario == 7 {
+        let actual = if scenario == 6 || scenario == 7 || scenario == 12 {
             CallResult::Ok(crate::common::peer_eval(
                 &[],
                 &[&beam],

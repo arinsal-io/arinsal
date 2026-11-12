@@ -712,6 +712,9 @@ pub struct DriverPort {
     async_open: std::sync::atomic::AtomicBool,
     /// `prt->sched`: the port's task queues and scheduling flags.
     sched: port_task::PortSched,
+    /// `prt->psd` (`ERTS_PRTSD_SCHED_ID`): lazily allocated port-specific data.
+    // Port of erts/emulator/beam/erl_port.h:116-123, OTP-29.1.1.
+    psd: OnceLock<Box<PortSpecificData>>,
     /// `bpq->low` and `bpq->high`: erts allocates the busy queue with the port itself.
     msgq_low: AtomicUsize,
     msgq_high: AtomicUsize,
@@ -723,8 +726,25 @@ pub struct DriverPort {
     me: WeakPortRef,
     /// Registry slot plus one ([`DriverPort::handle`]).
     slot: AtomicUsize,
-    /// State of a [`NativeDriver`] port.
+}
+
+/// `ErtsPrtSD`, allocated only when a port-specific value is first set.
+// Port of erts/emulator/beam/erl_port.h:116-123, OTP-29.1.1.
+struct PortSpecificData {
+    data: [AtomicUsize; 3],
     native_data: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// `ERTS_PRTSD_SCHED_ID`.
+const PRTSD_SCHED_ID: usize = 0;
+
+impl PortSpecificData {
+    fn new() -> Self {
+        Self {
+            data: std::array::from_fn(|_| AtomicUsize::new(0)),
+            native_data: OnceLock::new(),
+        }
+    }
 }
 
 /// The allocation a [`DriverPort`] lives in. erts embeds the driver state in the one `Port`
@@ -914,10 +934,10 @@ impl DriverPort {
             msgq_high: AtomicUsize::new(ext::MSGQ_LIMITS_DEFAULT.high),
             bpq_off: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
+            psd: OnceLock::new(),
             run_queue: arinsal_sched::PortRunQueue::default(),
             me,
             slot: AtomicUsize::new(slot + 1),
-            native_data: OnceLock::new(),
         }
     }
 

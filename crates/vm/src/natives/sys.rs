@@ -1366,6 +1366,9 @@ pub(crate) fn system_info_process_item(
         Some("heap_sizes") => Some(heap_sizes(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3518 (atom_limit), OTP-29.1.1.
         Some("atom_limit") => Some(non_neg(process, global_atoms().limit() as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3408-3411, OTP-29.1.1.
+        Some("scheduling_statistics") => Some(scheduling_statistics_term(process, false)),
+        Some("total_scheduling_statistics") => Some(scheduling_statistics_term(process, true)),
         // Port of erts/emulator/beam/erl_bif_info.c:3418 (dist_buf_busy_limit), OTP-29.1.1:
         // `erts_dist_buf_busy_limit` in bytes (+zdbbl, set before the node is alive).
         Some("dist_buf_busy_limit") => {
@@ -3156,7 +3159,7 @@ fn system_flag(
         }
         "microstate_accounting" => set_microstate(process, ctx, args[1]),
         "outstanding_system_requests_limit" => outstanding_limit(process, args[1]),
-        "scheduling_statistics" => scheduling_statistics(args[1]),
+        "scheduling_statistics" => scheduling_statistics(ctx, args[1]),
         "time_offset" if atom_name(args[1]) == Some("finalize") => {
             Ok(crate::atom_cache::put("final"))
         }
@@ -4665,11 +4668,39 @@ fn outstanding_limit(process: &Process, value: Term) -> Result<Term, VmError> {
     })
 }
 
-fn scheduling_statistics(value: Term) -> Result<Term, VmError> {
-    match atom_name(value) {
-        Some("enable" | "disable" | "clear") => Ok(Term::atom(arinsal_term::atoms::TRUE)),
-        _ => Err(badarg()),
+// Port of erts/emulator/beam/bif.c:5258-5271 (system_flag_2), OTP-29.1.1.
+fn scheduling_statistics(ctx: &mut RunCtx<'_, Message>, value: Term) -> Result<Term, VmError> {
+    let action = atom_name(value)
+        .filter(|value| matches!(*value, "enable" | "disable" | "clear"))
+        .ok_or_else(badarg)?;
+    if matches!(action, "enable" | "disable") {
+        ctx.with_thread_progress_blocked(|| arinsal_sched::sched_stat::modify(action));
+    } else {
+        arinsal_sched::sched_stat::modify(action);
     }
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
+}
+
+// Port of erts/emulator/beam/erl_process.c:11977-12008 (erts_sched_stat_term), OTP-29.1.1.
+fn scheduling_statistics_term(process: &mut Process, total: bool) -> Result<Term, VmError> {
+    let names = [
+        "process_max",
+        "process_high",
+        "process_normal",
+        "process_low",
+        "port",
+    ];
+    let stats = arinsal_sched::sched_stat::snapshot(total);
+    let mut rows = Vec::with_capacity(names.len());
+    for (name, (executed, migrated)) in names.into_iter().zip(stats) {
+        let executed = non_neg(process, executed)?;
+        let migrated = non_neg(process, migrated)?;
+        rows.push(tuple(
+            process,
+            &[crate::atom_cache::put(name), executed, migrated],
+        )?);
+    }
+    cons_list(process, &rows)
 }
 
 fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
