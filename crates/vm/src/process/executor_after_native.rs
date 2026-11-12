@@ -540,6 +540,20 @@ impl Executor {
                             process.heap.abi.exc.ftrace = 0;
                             return Ok(Flow::Continue);
                         }
+                        // The continuation BIF_TRAPped to an export again: that trap is a
+                        // context switch of its own, and this beam_bif_export_trap calls the
+                        // export on the next schedule-in. Port of erts/emulator/beam/bif.h:
+                        // 316-326 and jit/arm/instr_bif.cpp:515-536, OTP-29.1.1.
+                        Some(Err(VmError::TrapExport(trap))) => {
+                            let callee = (trap.target.module_atom, trap.target.function_atom);
+                            crate::bif_traps::install_export_trap(
+                                process, target_pc, callee, &trap, false,
+                            );
+                            crate::bif_traps::arm_export_trap(process);
+                            process.set_native_retry(Some(target_pc));
+                            process.set_native_pc(Some(code_ptr));
+                            return Ok(Flow::Break(Ok(RunState::Yield)));
+                        }
                         Some(Err(error)) => return Err(error),
                         None => {
                             return Ok(Flow::Break(Err(VmError::Unsupported(
@@ -704,6 +718,23 @@ impl Executor {
                                 }
                                 Ok(crate::bif_traps::HandlerResult::Export(_)) => {
                                     unreachable!("resumed BIF handler export")
+                                }
+                                // BIF_TRAP* to an export: context_switch_simplified, and
+                                // beam_bif_export_trap calls the export on schedule-in.
+                                // Port of erts/emulator/beam/bif.h:316-326 and
+                                // jit/arm/instr_bif.cpp:515-536 (call_bif_shared), OTP-29.1.1.
+                                Err(VmError::TrapExport(trap)) => {
+                                    let callee = (export.module_atom, export.function_atom);
+                                    // The yield below is the trap's context switch.
+                                    crate::bif_traps::install_export_trap(
+                                        process, target_pc, callee, &trap, false,
+                                    );
+                                    crate::bif_traps::arm_export_trap(process);
+                                    process.set_native_retry(Some(
+                                        crate::bif_traps::bif_export_trap_pc(),
+                                    ));
+                                    process.set_native_pc(Some(code_ptr));
+                                    return Ok(Flow::Break(Ok(RunState::Yield)));
                                 }
                                 Err(error) => Some(Err(error)),
                             };

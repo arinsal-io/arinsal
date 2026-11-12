@@ -405,9 +405,12 @@ impl Vm {
         self.call_named_resolved(p, None, module, function, arity, ctx)
     }
 
-    /// Make the call a BIF traps to. erts sets `c_p->i` to the export and leaves the trap
-    /// arguments in X, so the export runs as an ordinary call of the BIF.
-    // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1.
+    /// Make the call a BIF trapped to, on the schedule-in after the trap's context switch.
+    /// erts leaves the trap arguments in X and `beam_bif_export_trap` dispatches the export as
+    /// an ordinary call; this is its only caller, so a trap never runs its export in the slice
+    /// that trapped.
+    // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*) and
+    // jit/arm/beam_asm_global.cpp:145-155 (emit_bif_export_trap), OTP-29.1.1.
     pub(crate) fn trap_to_export(
         &mut self,
         p: &mut Process,
@@ -454,22 +457,20 @@ impl Vm {
         self.call_named_atoms(p, module_atom, function_atom, module, function, arity, ctx)
     }
 
-    /// `BIF_TRAP*` of a BIF the executor called. A trap to a BIF export (a BIF that traps to
-    /// itself after `BUMP_ALL_REDS`) leaves the process at `beam_bif_export_trap`, which
-    /// context-switches and calls the export on schedule-in, as the native call path does; a
-    /// trap to an Erlang function is called at once.
+    /// `BIF_TRAP*` of a BIF the executor called. Every trap leaves the process at
+    /// `beam_bif_export_trap`, which context-switches and calls the export on schedule-in, as
+    /// the native call path does, whether the export is a BIF or an Erlang function. The
+    /// export is never called from here, so a BIF that traps again cannot chain slices
+    /// without a context switch.
     // Port of erts/emulator/beam/bif.h:316-326 (ERTS_BIF_PREP_TRAP: `c_p->i` =
-    // beam_bif_export_trap) and jit/arm/instr_bif.cpp (context_switch_simplified), OTP-29.1.1.
+    // beam_bif_export_trap) and jit/arm/instr_bif.cpp:515-536 (call_bif_shared: every
+    // TRAP branches to context_switch_simplified), OTP-29.1.1.
     fn bif_trap_from_executor(
         &mut self,
         p: &mut Process,
         trap: crate::ExportTrap,
-        ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
         let target = trap.target;
-        if arinsal_spec::bif_lookup(target.module, target.function, target.arity as u8).is_none() {
-            return self.trap_to_export(p, trap, ctx);
-        }
         let trap_pc = crate::bif_traps::bif_export_trap_pc();
         crate::bif_traps::install_export_trap(
             p,
@@ -739,7 +740,7 @@ impl Vm {
                         // applied BIF that traps (demonitor_2 to flush_monitor_messages/3)
                         // continues in the trap's export, as the same BIF called statically.
                         Err(VmError::TrapExport(trap)) => {
-                            return self.bif_trap_from_executor(p, trap, Some(run));
+                            return self.bif_trap_from_executor(p, trap);
                         }
                         // Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace),
                         // OTP-29.1.1: BIF_ERROR names the applied BIF as the top frame.
@@ -796,7 +797,11 @@ impl Vm {
             trap_args,
             ctx.as_deref_mut(),
         ) {
-            let result = result?;
+            let result = match result {
+                // BIF_TRAP* to an export: the trap's context switch comes first.
+                Err(VmError::TrapExport(trap)) => return self.bif_trap_from_executor(p, trap),
+                result => result?,
+            };
             meter.finish(p, ctx.as_deref_mut(), result.reductions());
             return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
@@ -862,7 +867,7 @@ impl Vm {
             };
             let result = match result {
                 Err(VmError::TrapExport(trap)) => {
-                    return self.bif_trap_from_executor(p, trap, Some(run));
+                    return self.bif_trap_from_executor(p, trap);
                 }
                 result => result,
             };
