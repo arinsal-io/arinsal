@@ -2111,11 +2111,16 @@ impl arinsal_drv::PortHost for DrvHost {
     fn unlink_connected(&self, port: &arinsal_drv::DriverPort) {
         if let Some(handle) = self.handle(port.id()) {
             let owner = handle.owner_pid();
-            handle.links.lock().remove(owner.data());
-            let _ =
-                handle
-                    .scheduler
-                    .signal(owner, owner, arinsal_sched::Signal::PortUnlink(handle.id));
+            // Port of erts/emulator/beam/io.c:2889 (unlink_proc), OTP-29.1.1: the unlink
+            // signal goes only where the port still has a link; a process that unlinked
+            // already may have linked the port again since.
+            if handle.links.lock().remove(owner.data()).is_some() {
+                let _ = handle.scheduler.signal(
+                    owner,
+                    owner,
+                    arinsal_sched::Signal::PortUnlink(handle.id),
+                );
+            }
         }
     }
 
@@ -2504,12 +2509,14 @@ fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
     let result = match result {
         Ok(()) => port_term,
         Err(errno) => {
-            handle.links.lock().remove(opener.data());
-            let _ = handle.scheduler.signal(
-                opener,
-                opener,
-                arinsal_sched::Signal::PortUnlink(handle.id),
-            );
+            // unlink_proc (io.c:2889): only a link the port still has.
+            if handle.links.lock().remove(opener.data()).is_some() {
+                let _ = handle.scheduler.signal(
+                    opener,
+                    opener,
+                    arinsal_sched::Signal::PortUnlink(handle.id),
+                );
+            }
             errno
         }
     };

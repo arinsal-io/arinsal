@@ -216,8 +216,16 @@ pub(crate) fn send_sync_suspend(
             arinsal_term::atoms::EXITED
         });
         let message = process.tuple(&[tag, gone])?;
-        // Not a traced `!`: the reply is queued without a send trace (erl_proc_sig_queue.c:3237).
-        process.inbox.push_back(message);
+        // Not a traced `!`: `erts_queue_message(c_p, .., am_system)` (erl_proc_sig_queue.c:3237)
+        // queues the reply to the requester itself through its signal in-queue, so it lands
+        // behind a receive marker reserved before the call.
+        process
+            .runtime
+            .as_ref()
+            .ok_or_else(|| VmError::Unsupported("sync suspend reply: no runtime".into()))?
+            .scheduler()?
+            .send(me, me, Message::copy_from(message)?)
+            .map_err(|error| VmError::Unsupported(format!("sync suspend reply: {error}")))?;
     }
     Ok(())
 }

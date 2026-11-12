@@ -326,7 +326,9 @@ impl Process {
             }
             _ => (None, None),
         };
-        let tag = if let Some(owned) = info.and_then(|info| info.tag()) {
+        // The DOWN tag lives in the shared monitor data of every monitor type, ports included
+        // (erts_monitor_create(.., tag); convert_to_down_message reads `mdep->heap`).
+        let tag = if let Some(owned) = entry.as_ref().and_then(|entry| entry.view().info().tag()) {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
             arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?

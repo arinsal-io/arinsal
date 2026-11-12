@@ -294,7 +294,15 @@ fn no_timer_result(
     if info {
         let tag = crate::atom_cache::put(if cancel { "cancel_timer" } else { "read_timer" });
         let message = process.tuple(&[tag, tref, Term::atom(atoms::FALSE)])?;
-        process.inbox.push_back(message);
+        // `erts_queue_message(c_p, .., am_clock_service)`: through the caller's own signal
+        // in-queue, so the answer lands behind a receive marker reserved before the call.
+        let me = process.self_pid.ok_or_else(badarg)?;
+        process
+            .runtime
+            .ok_or_else(badarg)?
+            .scheduler()?
+            .send(me, me, Message::copy_from(message)?)
+            .map_err(|error| VmError::Unsupported(format!("timer answer: {error}")))?;
     }
     Ok(Term::atom(atoms::OK))
 }

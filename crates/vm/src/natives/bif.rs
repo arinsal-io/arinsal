@@ -999,20 +999,38 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         return ok;
     }
     if let Some(id) = other.as_port() {
-        if !crate::port::is_live(process, id) || !crate::port::link(process, other, me, true)? {
-            if !process.trap_exit {
-                return link_no_proc(process);
-            }
-            // The port is gone: the `noproc` link exit arrives as an `'EXIT'` message.
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let exit = arinsal_term::TermBuilder::new(&mut heap)
-                .tuple(&[Term::atom(atoms::EXIT_2), other, Term::atom(atoms::NOPROC)])
+        // `!prt && !(c_p->flags & F_TRAP_EXIT)`: res_no_proc.
+        let live = crate::port::is_live(process, id);
+        if !live && !process.trap_exit {
+            return link_no_proc(process);
+        }
+        let linked = live && crate::port::link(process, other, me, true)?;
+        // erts_link_internal_tree_lookup_create + link_modify_flags: the link (with its
+        // priority flag) is in the caller's tree whatever the port answers, and an unlink in
+        // progress is cancelled (`ilnk->unlinking = 0`), so its late acknowledgement leaves it.
+        let key = crate::proc_create::port_link_key(id);
+        if !linked && process.links.get(key).is_none() {
+            process.links.insert(crate::proc_create::port_link(id));
+        }
+        if let Some(mut node) = process.links.get_mut(key) {
+            node.set_priority(priority);
+            node.set_unlinking(0);
+        }
+        if !linked {
+            // ERTS_PORT_OP_BADARG: erts_proc_sig_send_link_exit(NULL, other, rlnk, am_noproc,
+            // NIL). The link exit reaches this process through its signal in-queue, behind a
+            // receive marker reserved before the call; handling it removes the link and, when
+            // trapping exits, converts it into the `{'EXIT', Port, noproc}` message.
+            let signal = arinsal_sched::Signal::PortExit(Box::new(arinsal_sched::PortExitSignal {
+                port: Message::copy_from(other)?,
+                reason: Message::copy_from(Term::atom(atoms::NOPROC))?,
+            }));
+            process
+                .runtime
+                .ok_or_else(badarg)?
+                .scheduler()?
+                .signal(me, me, signal)
                 .map_err(|_| badarg())?;
-            if priority {
-                process.push_priority_message(exit)?;
-            } else {
-                process.inbox.push_back(exit);
-            }
         }
         return ok;
     }

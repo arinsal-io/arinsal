@@ -519,11 +519,10 @@ fn deliver(
     to: Pid,
     message: Term,
 ) -> Result<(), VmError> {
-    if to == ctx.pid() {
-        process.inbox.push_back(message);
-        return Ok(());
-    }
-    if !crate::natives::proc::live(process, to)? {
+    // Port of erts/emulator/beam/erl_process.c:10574 (notify_sys_task_executed), OTP-29.1.1:
+    // `erts_queue_proc_message` to the requester, the caller itself included, so a reply to
+    // self goes through the signal in-queue like any other message.
+    if to != ctx.pid() && !crate::natives::proc::live(process, to)? {
         return Ok(());
     }
     ctx.send(to, Message::copy_from(message)?)
@@ -959,30 +958,18 @@ pub(crate) fn monitor_port(
         {
             return Err(badarg("monitor/2"));
         }
-        process
-            .monitors
-            .insert(crate::proc_create::origin_monitor_with_reference(
-                crate::proc_create::monitor_reference(reference_id, alias_mode, false),
-                me.data(),
-                0,
-                crate::proc_create::OriginMonitor::DistPort {
-                    object: Box::new(object.clone()),
-                },
-            ));
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let object =
-            arinsal_term::from_owned(&object, &mut heap).map_err(|_| badarg("monitor/2"))?;
-        let down = TermBuilder::new(&mut heap)
-            .tuple(&[
-                tag,
-                reference_term,
-                Term::atom(arinsal_term::atoms::PORT),
-                object,
-                Term::atom(arinsal_term::atoms::NOPROC),
-            ])
-            .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-        process.inbox.push_back(down);
-        let _ = take_origin_monitor_down(process, reference_id);
+        let (origin, _target) = crate::proc_create::create_monitor_with_reference_at(
+            process.heap.alloc_ix(),
+            crate::proc_create::monitor_reference(reference_id, alias_mode, false),
+            me.data(),
+            0,
+            monitor_info_for(tag, None)?,
+            crate::proc_create::OriginMonitor::DistPort {
+                object: Box::new(object),
+            },
+        );
+        process.monitors.insert(origin);
+        send_port_noproc_down(runtime, me, reference_id)?;
         return Ok(reference_term);
     } else {
         return Err(badarg("monitor/2"));
@@ -994,7 +981,10 @@ pub(crate) fn monitor_port(
         crate::proc_create::monitor_reference(reference_id, alias_mode, false),
         me.data(),
         0,
-        crate::proc_create::MonitorInfo::with_port_name(name),
+        crate::proc_create::MonitorInfo::with_port_name(
+            monitor_info_for(tag, None)?.tag().cloned(),
+            name,
+        ),
         crate::proc_create::OriginMonitor::Port { port_id, name },
     );
     process.monitors.insert(origin);
@@ -1007,40 +997,36 @@ pub(crate) fn monitor_port(
             crate::port::monitor(process, id, handle, target_half, true)
         })
     });
-    if let Some(registered) = registered {
-        if !registered? {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let object = port_monitor_object(&mut heap, port_id, name)?;
-            let down = TermBuilder::new(&mut heap)
-                .tuple(&[
-                    tag,
-                    reference_term,
-                    Term::atom(arinsal_term::atoms::PORT),
-                    object,
-                    Term::atom(arinsal_term::atoms::NOPROC),
-                ])
-                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-            process.inbox.push_back(down);
-            let _ = take_origin_monitor_down(process, reference_id);
-        }
-        // Origin stays in this process; the target half is on the port.
-        Ok(reference_term)
-    } else {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let object = port_monitor_object(&mut heap, port_id, name)?;
-        let down = TermBuilder::new(&mut heap)
-            .tuple(&[
-                tag,
-                reference_term,
-                Term::atom(arinsal_term::atoms::PORT),
-                object,
-                Term::atom(arinsal_term::atoms::NOPROC),
-            ])
-            .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-        process.inbox.push_back(down);
-        let _ = take_origin_monitor_down(process, reference_id);
-        Ok(reference_term)
+    // `!prt || erts_port_monitor(..) == ERTS_PORT_OP_DROPPED`: the origin half stays in the
+    // tree and the DOWN goes to this process as a signal.
+    if !registered.transpose()?.unwrap_or(false) {
+        send_port_noproc_down(runtime, me, reference_id)?;
     }
+    Ok(reference_term)
+}
+
+/// The `noproc` DOWN of a port monitor whose port is gone, sent to the monitoring process
+/// itself. It travels through the signal in-queue like any other DOWN, so it is handled (and
+/// becomes a message) after the signals sent before it and after a receive marker reserved
+/// before the `monitor/2` call; the origin half converts it (convert_to_down_message).
+// Port of erts/emulator/beam/bif.c:912,932 (monitor/3, type `port`:
+// erts_proc_sig_send_monitor_down(.., am_noproc)), OTP-29.1.1.
+fn send_port_noproc_down(
+    runtime: &crate::process::Runtime,
+    me: Pid,
+    reference_id: u64,
+) -> Result<(), VmError> {
+    runtime
+        .scheduler()?
+        .signal(
+            me,
+            me,
+            Signal::MonitorDownImmediate {
+                reference: reference_id,
+                reason: Term::atom(arinsal_term::atoms::NOPROC).word(),
+            },
+        )
+        .map_err(|error| VmError::Unsupported(format!("port monitor DOWN: {error}")))
 }
 
 /// `{Name, Node}` with both atoms and `Node` the local node: the by-name port target.
@@ -1804,8 +1790,33 @@ pub(crate) fn send_noproc_down(
             Term::atom(arinsal_term::atoms::NOPROC),
         ])
         .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
-    process.inbox.push_back(down);
-    Ok(())
+    // Port of erts/emulator/beam/bif.c:816-823 (monitor/3, an external pid of this node:
+    // ERTS_MON_TYPE_DIST_PROC origin, then erts_proc_sig_send_monitor_down(.., am_noproc)),
+    // OTP-29.1.1: the origin half goes into the tree and the DOWN reaches this process as a
+    // signal through its in-queue, behind a receive marker reserved before the call.
+    let (origin, _target) = crate::proc_create::create_monitor_with_reference_at(
+        process.heap.alloc_ix(),
+        crate::proc_create::monitor_reference(id, alias_mode, false),
+        me.data(),
+        0,
+        monitor_info_for(tag, name)?,
+        crate::proc_create::OriginMonitor::Distributed,
+    );
+    process.monitors.insert(origin);
+    let message = Message::copy_from(down)?;
+    process
+        .runtime
+        .ok_or_else(|| badarg("monitor/2"))?
+        .scheduler()?
+        .signal(
+            me,
+            me,
+            Signal::MonitorDownMsg {
+                reference: id,
+                message: Box::new(message),
+            },
+        )
+        .map_err(|error| VmError::Unsupported(format!("monitor: {error}")))
 }
 
 pub(crate) fn monitor_object(
