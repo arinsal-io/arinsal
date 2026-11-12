@@ -4,7 +4,6 @@
 //! `do_send_to_logger`, `do_send_term_to_logger`, `erts_send_*_to_logger*`) and of
 //! erl_trace.c (`erts_queue_error_logger_message`), OTP-29.1.1.
 
-use crate::natives::sys::runtime_system_logger;
 use crate::process::{Message, Runtime};
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermError, atoms};
@@ -16,7 +15,7 @@ use arinsal_term::{ProcessHeap, Term, TermBuilder, TermError, atoms};
 /// (`None` outside a process, e.g. a port), `gleader` is NIL when absent. `format` is built
 /// on the message heap; `args` is a term on a live heap that is copied into the message.
 fn do_send_logger_message(
-    runtime: &Runtime,
+    runtime: &'static Runtime,
     from: Option<Pid>,
     gleader: Term,
     tag: Term,
@@ -64,60 +63,31 @@ fn do_send_logger_message(
     let Ok(message) = Message::copy_from(event) else {
         return;
     };
-    queue_error_logger_message(runtime, from, message);
-}
-
-// Port of erts/emulator/beam/erl_trace.c (`erts_queue_error_logger_message` and the
-// SYS_MSG_TYPE_ERRLGR branch of `sys_msg_dispatcher_func`), OTP-29.1.1: `undefined` drops the
-// message, a pid receives it (a dead pid resets the destination to `logger`), and `logger` is the
-// registered process, which never receives its own message.
-fn queue_error_logger_message(runtime: &Runtime, from: Option<Pid>, message: Message) {
-    let destination = runtime_system_logger(runtime);
-    if destination == Term::atom(atoms::UNDEFINED) {
-        return;
-    }
-    let receiver = match Pid::from_term(destination) {
-        Some(pid) => pid,
-        None => {
-            let Some(logger) = runtime.reg.whereis_proc_str("logger") else {
-                return;
-            };
-            // `smqp->from == proc->common.id`: only the registered `logger` path drops it.
-            if from == Some(logger) {
-                return;
-            }
-            logger
-        }
-    };
-    let Ok(scheduler) = runtime.scheduler() else {
-        return;
-    };
-    let _ = scheduler.send(from.unwrap_or(receiver), receiver, message);
+    crate::erl_trace::queue_error_logger_message(runtime, from, message);
 }
 
 /// Port of utils.c `do_send_to_logger`: format `"~s~n"`, args `[Text]`.
-fn do_send_to_logger(runtime: &Runtime, from: Option<Pid>, gleader: Term, tag: Term, text: &str) {
-    if !logger_present(runtime) {
-        // sys_msg_disp_failure: no logger; erts prints the text on stderr.
-        eprint!("{text}");
-        return;
-    }
+fn do_send_to_logger(
+    runtime: &'static Runtime,
+    from: Option<Pid>,
+    gleader: Term,
+    tag: Term,
+    text: &str,
+) {
     do_send_logger_message(runtime, from, gleader, tag, "~s~n", |builder| {
         let text = builder.string_to_list(text)?;
         builder.list_from_iter([text])
     });
 }
 
-fn logger_present(runtime: &Runtime) -> bool {
-    let destination = runtime_system_logger(runtime);
-    destination == Term::atom(atoms::UNDEFINED)
-        || Pid::from_term(destination).is_some()
-        || runtime.reg.whereis_proc_str("logger").is_some()
-}
-
 /// Port of utils.c `erts_send_warning_to_logger_str`
 /// (`do_send_to_logger` with `erts_error_logger_warnings`, `warning` by default).
-pub(crate) fn send_warning_to_logger_str(runtime: &Runtime, from: Pid, gleader: Term, text: &str) {
+pub(crate) fn send_warning_to_logger_str(
+    runtime: &'static Runtime,
+    from: Pid,
+    gleader: Term,
+    text: &str,
+) {
     do_send_to_logger(
         runtime,
         Some(from),
@@ -129,14 +99,14 @@ pub(crate) fn send_warning_to_logger_str(runtime: &Runtime, from: Pid, gleader: 
 
 /// Port of utils.c `erts_send_error_to_logger_nogl`: no group leader; `from` is
 /// `erts_get_current_pid()`, `None` when a port or the scheduler runs it.
-pub(crate) fn send_error_to_logger_nogl(runtime: &Runtime, from: Option<Pid>, text: &str) {
+pub(crate) fn send_error_to_logger_nogl(runtime: &'static Runtime, from: Option<Pid>, text: &str) {
     do_send_to_logger(runtime, from, Term::NIL, Term::atom(atoms::ERROR), text);
 }
 
 /// Port of utils.c `erts_send_error_term_to_logger` (`do_send_term_to_logger`): `format` is
 /// the dsprintf buffer, `args` a list on the caller's live heap.
 pub(crate) fn send_error_term_to_logger(
-    runtime: &Runtime,
+    runtime: &'static Runtime,
     from: Pid,
     gleader: Term,
     format: &str,

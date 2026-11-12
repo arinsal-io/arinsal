@@ -2274,12 +2274,7 @@ impl arinsal_drv::PortHost for DrvHost {
         let Some(handle) = self.handle(port.id()) else {
             return;
         };
-        crate::natives::misc::profile_port_event(
-            &handle.scheduler,
-            handle.owner_pid(),
-            port.id(),
-            active,
-        );
+        crate::natives::misc::profile_port_event(&handle.scheduler, port.id(), active);
     }
 
     // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
@@ -3318,12 +3313,7 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
         }
     }
     if became_inactive {
-        crate::natives::misc::profile_port_event(
-            &handle.scheduler,
-            handle.owner_pid(),
-            handle.id,
-            false,
-        );
+        crate::natives::misc::profile_port_event(&handle.scheduler, handle.id, false);
     }
     woken
 }
@@ -3384,12 +3374,7 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
         became_active
     };
     if became_active {
-        crate::natives::misc::profile_port_event(
-            &handle.scheduler,
-            handle.owner_pid(),
-            handle.id,
-            true,
-        );
+        crate::natives::misc::profile_port_event(&handle.scheduler, handle.id, true);
     }
     poke(handle);
     Ok(())
@@ -5210,7 +5195,7 @@ pub(crate) fn demonitor_port(
 /// Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `{command, Data}`; also
 /// the body of `erts_port_output_async` (`enif_port_command`). Failures signal the port.
 fn output_command(
-    runtime: &crate::process::Runtime,
+    runtime: &'static crate::process::Runtime,
     handle: &Arc<PortHandle>,
     id: u64,
     from: Pid,
@@ -5320,7 +5305,7 @@ fn output_command(
 /// Port of erts/emulator/beam/erl_nif.c:1097 (enif_port_command): `erts_port_output_async`
 /// of `data` on behalf of `from`; `false` when the port is gone.
 pub(crate) fn nif_port_command(
-    runtime: &crate::process::Runtime,
+    runtime: &'static crate::process::Runtime,
     port: Term,
     from: Pid,
     data: Term,

@@ -312,6 +312,9 @@ impl Vm {
         let runtime: &'static Runtime = if let Some(runtime) = self.runtime {
             runtime
         } else {
+            // erl_init.c (erts_init_trace -> init_sys_msg_dispatcher): the dispatcher thread
+            // exists from node start.
+            crate::erl_trace::init_sys_msg_dispatcher();
             let code = Arc::clone(&self.code_ix);
             let port_layout = arinsal_term::ptab::port_table_layout();
             let port_ids = PtabIdRing::new(port_layout.max());

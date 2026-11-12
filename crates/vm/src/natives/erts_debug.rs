@@ -60,6 +60,15 @@ pub(crate) fn monitor_process_exited(process: &Process, pid: arinsal_sched::Pid)
     let Some(runtime) = process.runtime else {
         return;
     };
+    system_monitor_clear_receiver(runtime, pid);
+}
+
+/// `erts_system_monitor_clear` for the monitors whose receiver is `pid`.
+// Port of erts/emulator/beam/erl_trace.c (erts_system_monitor_clear), OTP-29.1.1.
+pub(crate) fn system_monitor_clear_receiver(
+    runtime: &crate::process::Runtime,
+    pid: arinsal_sched::Pid,
+) {
     let Some(owned) = pid.to_term().and_then(|term| to_owned(term).ok()) else {
         return;
     };
@@ -216,25 +225,14 @@ fn after_collection_one(
         return;
     }
     let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
-    let heap_words = process.heap.capacity_words();
-    let total_heap_words = process.heap.total_heap_size_words();
-    let heap_used = process.heap.used_words();
+    let sizes = crate::natives::proc::monitor_heap_sizes(process);
     let mut events = Vec::new();
     if flags & MONITOR_LARGE_HEAP != 0
         && let Some(MonitorOption::Limit(limit)) = state.options.get("large_heap")
-        && total_heap_words as u64 >= *limit
+        // erl_gc.c: `size = HEAP_SIZE(p) + (OLD_HEND(p) - OLD_HEAP(p))`.
+        && (sizes[1].1 + sizes[0].1) as u64 >= *limit
     {
-        events.push((
-            "large_heap",
-            vec![
-                ("old_heap_block_size", 0),
-                ("heap_block_size", heap_words),
-                ("mbuf_size", 0),
-                ("stack_size", 0),
-                ("old_heap_size", process.heap.old_used_words()),
-                ("heap_size", heap_used),
-            ],
-        ));
+        events.push(("large_heap", sizes.to_vec()));
     }
     if flags & MONITOR_LONG_GC != 0 {
         let delay = TEST_LONG_GC_SLEEP.load(Ordering::Relaxed);
@@ -253,18 +251,9 @@ fn after_collection_one(
         && let Some(MonitorOption::Limit(limit)) = state.options.get("long_gc")
         && elapsed_ms > *limit
     {
-        events.push((
-            "long_gc",
-            vec![
-                ("timeout", elapsed_ms as usize),
-                ("old_heap_block_size", 0),
-                ("heap_block_size", heap_words),
-                ("mbuf_size", 0),
-                ("stack_size", 0),
-                ("old_heap_size", process.heap.old_used_words()),
-                ("heap_size", heap_used),
-            ],
-        ));
+        let mut values = vec![("timeout", elapsed_ms as usize)];
+        values.extend(sizes);
+        events.push(("long_gc", values));
     }
     for (kind, values) in events {
         send_system_monitor_event(process, runtime, pid, receiver, kind, values);
@@ -273,20 +262,12 @@ fn after_collection_one(
 
 fn send_system_monitor_event(
     process: &mut Process,
-    runtime: &crate::process::Runtime,
+    runtime: &'static crate::process::Runtime,
     pid: arinsal_sched::Pid,
     receiver: arinsal_sched::Pid,
     kind: &str,
     values: Vec<(&str, usize)>,
 ) {
-    // Port of erts/emulator/beam/erl_trace.c:2756-2765 (sys_msg_dispatcher_func): the monitor
-    // is never told about its own events.
-    if pid == receiver {
-        return;
-    }
-    let Ok(scheduler) = runtime.scheduler() else {
-        return;
-    };
     let fields = values
         .into_iter()
         .map(|(name, value)| {
@@ -309,7 +290,7 @@ fn send_system_monitor_event(
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) && let Ok(message) = Message::copy_from(term)
     {
-        let _ = scheduler.send(pid, receiver, message);
+        enqueue_sysmon(runtime, pid, receiver, message);
     }
 }
 
@@ -386,9 +367,8 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
         &event,
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) && let Ok(message) = Message::copy_from(term)
-        && let Ok(scheduler) = runtime.scheduler()
     {
-        let _ = scheduler.send(pid, receiver, message);
+        enqueue_sysmon(runtime, pid, receiver, message);
     }
 }
 
@@ -400,7 +380,7 @@ pub(crate) fn runtime_long_schedule_monitored(runtime: &crate::process::Runtime)
 }
 
 pub(crate) fn after_port_task(
-    runtime: &crate::process::Runtime,
+    runtime: &'static crate::process::Runtime,
     port: Term,
     from: arinsal_sched::Pid,
     operation: &str,
@@ -409,7 +389,7 @@ pub(crate) fn after_port_task(
     if runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_LONG_SCHEDULE == 0 {
         return;
     }
-    let (Ok(port), Ok(scheduler)) = (to_owned(port), runtime.scheduler()) else {
+    let Ok(port) = to_owned(port) else {
         return;
     };
     for state in monitor_states(runtime) {
@@ -449,7 +429,7 @@ pub(crate) fn after_port_task(
         if let Ok(term) = from_owned(&event, &mut heap)
             && let Ok(message) = Message::copy_from(term)
         {
-            let _ = scheduler.send(from, receiver, message);
+            enqueue_sysmon(runtime, from, receiver, message);
         }
     }
 }
@@ -539,9 +519,8 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
         &event,
         &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) && let Ok(message) = Message::copy_from(term)
-        && let Ok(scheduler) = runtime.scheduler()
     {
-        let _ = scheduler.send(pid, receiver, message);
+        enqueue_sysmon(runtime, pid, receiver, message);
     }
 }
 
@@ -598,10 +577,8 @@ fn notify_busy_port_one(
     ]) else {
         return;
     };
-    if let Ok(message) = Message::copy_from(event)
-        && let Ok(scheduler) = runtime.scheduler()
-    {
-        let _ = scheduler.send(sender, receiver, message);
+    if let Ok(message) = Message::copy_from(event) {
+        enqueue_sysmon(runtime, sender, receiver, message);
     }
 }
 
@@ -664,9 +641,8 @@ fn notify_busy_dist_port_one(
     ]);
     if let Ok(term) = from_owned(&event, &mut arinsal_bifs::ProcessHeapHandle(&mut heap))
         && let Ok(message) = Message::copy_from(term)
-        && let Ok(scheduler) = runtime.scheduler()
     {
-        let _ = scheduler.send(sender, receiver, message);
+        enqueue_sysmon(runtime, sender, receiver, message);
     }
 }
 
@@ -3646,6 +3622,25 @@ fn erts_check_stack_recursion_upwards(start_c: usize, prev_c: usize) -> usize {
 // Port of erts/emulator/beam/beam_debug.c (erts_is_above_stack_limit), OTP-29.1.1.
 fn erts_is_above_stack_limit(ptr: usize) -> bool {
     ptr > arinsal_alloc::ethr::erts_get_stacklimit()
+}
+
+// `enqueue_sys_msg(SYS_MSG_TYPE_SYSMON, from, receiver, ...)` of the monitor senders.
+fn enqueue_sysmon(
+    runtime: &'static crate::process::Runtime,
+    from: arinsal_sched::Pid,
+    receiver: arinsal_sched::Pid,
+    message: Message,
+) {
+    if let (Ok(scheduler), Some(to)) = (runtime.scheduler(), receiver.to_term()) {
+        crate::erl_trace::enqueue_sys_msg(
+            crate::erl_trace::SysMsgType::Sysmon,
+            scheduler,
+            Some(runtime),
+            Some(from),
+            to,
+            message,
+        );
+    }
 }
 
 #[cfg(test)]

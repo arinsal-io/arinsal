@@ -197,6 +197,11 @@ fn report_max_heap(
             arinsal_term::atoms::FALSE
         })
     };
+    // `msg = erts_process_gc_info(...)` and `erts_build_stacktrace(&hfact, p, 0,
+    // erts_backtrace_depth, 1)`.
+    let gc_info = crate::natives::proc::process_gc_info(process).unwrap_or(Term::NIL);
+    let depth = crate::stacktrace::runtime_backtrace_depth(process, 8);
+    let stacktrace = crate::stacktrace::build(process, None, depth).unwrap_or(Term::NIL);
     let built = (|| -> Result<Term, VmError> {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
@@ -214,8 +219,8 @@ fn report_max_heap(
             bool_atom(limit.kill),
             Term::atom(arinsal_term::atoms::TRUE),
             Term::small(process.inbox.len() as i64).unwrap_or(Term::NIL),
-            Term::NIL,
-            Term::NIL,
+            gc_info,
+            stacktrace,
         ]);
         builder
             .list_from_iter(args)

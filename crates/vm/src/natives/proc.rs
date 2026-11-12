@@ -1530,6 +1530,27 @@ fn process_info_item_garbage_collection(
 /// Port of `ERTS_PI_IX_GARBAGE_COLLECTION_INFO` in erts/emulator/beam/erl_bif_info.c
 /// (`process_info_aux`) and `erts_process_gc_info` in erl_gc.c, OTP-29.1.1: the eleven rows
 /// are sized first (`11 * (3 + 2)` words) and built from one factory allocation.
+/// The six sizes `monitor_long_gc_session` and `monitor_large_heap_session` report, in tag order:
+/// `old_heap_block_size`, `heap_block_size`, `mbuf_size`, `stack_size`, `old_heap_size`,
+/// `heap_size`. Port of erts/emulator/beam/erl_trace.c (monitor_large_heap_session,
+/// monitor_long_gc_session), OTP-29.1.1.
+pub(crate) fn monitor_heap_sizes(process: &Process) -> [(&'static str, usize); 6] {
+    let sized = process.heap.gc_info_words();
+    [
+        ("old_heap_block_size", sized.old_heap_block_size),
+        ("heap_block_size", sized.heap_block_size),
+        ("mbuf_size", sized.mbuf_size),
+        ("stack_size", process.observed_stack_words()),
+        ("old_heap_size", sized.old_heap_size),
+        ("heap_size", sized.heap_size),
+    ]
+}
+
+/// `erts_process_gc_info` for the max_heap_size report of `reached_max_heap_size`.
+pub(crate) fn process_gc_info(process: &mut Process) -> Result<Term, VmError> {
+    process_info_item_garbage_collection_info(process, 0)
+}
+
 #[inline(never)]
 fn process_info_item_garbage_collection_info(
     process: &mut Process,

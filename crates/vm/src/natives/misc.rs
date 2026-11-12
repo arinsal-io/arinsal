@@ -132,6 +132,13 @@ pub(crate) fn call(
     })
 }
 
+/// `erts_system_profile_clear`.
+// Port of erts/emulator/beam/erl_trace.c (erts_system_profile_clear), OTP-29.1.1.
+pub(crate) fn system_profile_clear() {
+    PROFILE_FLAGS.store(0, Ordering::Relaxed);
+    *profile().lock().unwrap() = Profile::default();
+}
+
 fn profile_get(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_trace.c:3725 (system_profile_get), OTP-29.1.1.
     let p = profile().lock().unwrap().clone();
@@ -255,8 +262,7 @@ pub(crate) fn profile_ports_enabled() -> bool {
 }
 
 pub(crate) fn profile_port_event(
-    scheduler: &arinsal_sched::Scheduler<Process>,
-    sender: arinsal_sched::Pid,
+    scheduler: &std::sync::Arc<arinsal_sched::Scheduler<Process>>,
     port_id: u64,
     active: bool,
 ) {
@@ -282,8 +288,18 @@ pub(crate) fn profile_port_event(
     let Ok(message) = from_owned(&message, &mut arinsal_bifs::ProcessHeapHandle(&mut heap)) else {
         return;
     };
-    if let Ok(message) = Message::copy_from(message) {
-        let _ = scheduler.send(sender, target, message);
+    if let Ok(message) = Message::copy_from(message)
+        && let Some(to) = target.to_term()
+    {
+        crate::erl_trace::enqueue_sys_msg(
+            crate::erl_trace::SysMsgType::Sysprof,
+            scheduler,
+            None,
+            // erts passes the port identifier as `from`; never the profiler process.
+            None,
+            to,
+            message,
+        );
     }
 }
 
@@ -368,8 +384,19 @@ pub(crate) fn profile_process_event(
     ) else {
         return;
     };
-    if let Ok(message) = Message::copy_from(message) {
-        let _ = ctx.send(target, message);
+    if let Ok(message) = Message::copy_from(message)
+        && let Some(runtime) = process.runtime
+        && let Ok(scheduler) = runtime.scheduler()
+        && let Some(to) = target.to_term()
+    {
+        crate::erl_trace::enqueue_sys_msg(
+            crate::erl_trace::SysMsgType::Sysprof,
+            scheduler,
+            Some(runtime),
+            Some(ctx.pid()),
+            to,
+            message,
+        );
     }
 }
 
