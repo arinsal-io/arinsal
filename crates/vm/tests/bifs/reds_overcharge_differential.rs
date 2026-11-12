@@ -23,6 +23,8 @@ struct Case {
     heap_factor: usize,
     build: &'static str,
     call: &'static str,
+    /// `{M, F, A}` call-traced (local) in the measured process while the call runs.
+    trace: Option<&'static str>,
 }
 
 const fn case(
@@ -38,6 +40,25 @@ const fn case(
         heap_factor,
         build,
         call,
+        trace: None,
+    }
+}
+
+const fn traced_case(
+    name: &'static str,
+    sizes: &'static [usize],
+    heap_factor: usize,
+    build: &'static str,
+    call: &'static str,
+    mfa: &'static str,
+) -> Case {
+    Case {
+        name,
+        sizes,
+        heap_factor,
+        build,
+        call,
+        trace: Some(mfa),
     }
 }
 
@@ -354,6 +375,113 @@ const MAP_CASES: &[Case] = &[
     case("keys_badmap", &[1], 4, "seq(N)", "catch maps:keys(In)"),
 ];
 
+const ONE: &[usize] = &[1];
+const SELECT: &[usize] = &[1, 10_000, 100_000];
+/// Long trap chains: a trap export that ran its own trap at once would recurse per slice.
+const CHAIN: &[usize] = &[1, 100_000, 1_000_000];
+/// bif.h BIF_TRAP*: every trap is a context switch (instr_bif.cpp, context_switch_simplified),
+/// and `beam_bif_export_trap` calls the trap export on schedule-in, whichever way the trapping
+/// BIF was reached (static call, apply, call trace) and whether the export is a BIF that traps
+/// again or an Erlang function.
+const TRAP_CASES: &[Case] = &[
+    case(
+        "demonitor_flush",
+        ONE,
+        4,
+        "make_ref()",
+        "erlang:demonitor(In, [flush])",
+    ),
+    case(
+        "demonitor_flush_apply",
+        ONE,
+        4,
+        "{erlang, make_ref()}",
+        "apply(element(1, In), demonitor, [element(2, In), [flush]])",
+    ),
+    traced_case(
+        "demonitor_flush_traced",
+        ONE,
+        4,
+        "make_ref()",
+        "erlang:demonitor(In, [flush])",
+        "{erlang, demonitor, 2}",
+    ),
+    case(
+        "reverse_apply",
+        CHAIN,
+        4,
+        "{lists, seq(N)}",
+        "apply(element(1, In), reverse, [element(2, In), []])",
+    ),
+    traced_case(
+        "reverse_traced",
+        CHAIN,
+        4,
+        "seq(N)",
+        "lists:reverse(In, [])",
+        "{lists, reverse, 2}",
+    ),
+    case(
+        "re_run_global",
+        STD,
+        8,
+        "begin {match, _} = re:run(<<7>>, <<7>>, [global]), bytes(N) end",
+        "re:run(In, <<7>>, [global])",
+    ),
+    case(
+        "re_run_global_apply",
+        STD,
+        8,
+        "begin {match, _} = re:run(<<7>>, <<7>>, [global]), {re, bytes(N)} end",
+        "apply(element(1, In), run, [element(2, In), <<7>>, [global]])",
+    ),
+    traced_case(
+        "re_run_global_traced",
+        STD,
+        8,
+        "begin {match, _} = re:run(<<7>>, <<7>>, [global]), bytes(N) end",
+        "re:run(In, <<7>>, [global])",
+        "{re, run, 3}",
+    ),
+    traced_case(
+        "demonitor_flush_apply_traced",
+        ONE,
+        4,
+        "{erlang, make_ref()}",
+        "apply(element(1, In), demonitor, [element(2, In), [flush]])",
+        "{erlang, demonitor, 2}",
+    ),
+    case(
+        "ets_select_hash",
+        SELECT,
+        12,
+        "begin T = ets:new(t, [set]), true = ets:insert(T, kv(N)), T end",
+        "ets:select(In, [{'_', [], ['$_']}])",
+    ),
+    case(
+        "ets_select_hash_apply",
+        CHAIN,
+        12,
+        "begin T = ets:new(t, [set]), true = ets:insert(T, kv(N)), {ets, T} end",
+        "apply(element(1, In), select, [element(2, In), [{'_', [], ['$_']}]])",
+    ),
+    case(
+        "ets_select_ordered",
+        SELECT,
+        12,
+        "begin T = ets:new(t, [ordered_set]), true = ets:insert(T, kv(N)), T end",
+        "ets:select(In, [{'_', [], ['$_']}])",
+    ),
+    traced_case(
+        "ets_select_hash_traced",
+        SELECT,
+        12,
+        "begin T = ets:new(t, [set]), true = ets:insert(T, kv(N)), T end",
+        "ets:select(In, [{'_', [], ['$_']}])",
+        "{ets, select, 2}",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -366,8 +494,12 @@ fn source(cases: &[Case]) -> String {
             let function = function_name(case, size);
             exports.push(format!("{function}/0"));
             let words = case.heap_factor * size + 100_000;
+            let (measure, trace) = match case.trace {
+                Some(mfa) => ("measure_traced", format!(", {mfa}")),
+                None => ("measure", String::new()),
+            };
             bodies.push_str(&format!(
-                "{function}() ->\n    measure({size}, {words}, fun(N) -> {} end, fun(In) -> {} end).\n\n",
+                "{function}() ->\n    {measure}({size}, {words}, fun(N) -> {} end, fun(In) -> {} end{trace}).\n\n",
                 case.build, case.call
             ));
         }
@@ -394,6 +526,15 @@ big(N) -> (1 bsl (N * 64)) - 1.
 
 {bodies}
 measure(N, Words, Build, Run) ->
+    measure(N, Words, Build, Run, [running]).
+
+measure_traced(N, Words, Build, Run, MFA) ->
+    erlang:trace_pattern(MFA, true, [local]),
+    Result = measure(N, Words, Build, Run, [running, call]),
+    erlang:trace_pattern(MFA, false, [local]),
+    Result.
+
+measure(N, Words, Build, Run, Flags) ->
     Parent = self(),
     Pid = spawn_opt(fun() ->
         In = Build(N),
@@ -409,7 +550,7 @@ measure(N, Words, Build, Run) ->
         {{garbage_collection, GC}} = process_info(self(), garbage_collection),
         Parent ! {{measured, R1 - R0 - Base, proplists:get_value(minor_gcs, GC)}}
     end, [{{min_heap_size, Words}}, {{min_bin_vheap_size, Words}}]),
-    1 = erlang:trace(Pid, true, [running, {{tracer, Parent}}]),
+    1 = erlang:trace(Pid, true, [{{tracer, Parent}} | Flags]),
     receive ready -> ok after 60000 -> exit(no_ready) end,
     drain(Pid),
     Pid ! go,
@@ -534,6 +675,12 @@ fn list_bifs_charge_like_otp() {
 #[test]
 fn map_bifs_charge_like_otp() {
     check_with(MAP_CASES, &["+S", "1"]);
+}
+
+// Each BIF_TRAP schedules the process out once, on every path to the trapping BIF.
+#[test]
+fn bif_traps_schedule_out_like_otp() {
+    check_with(TRAP_CASES, &["+S", "1"]);
 }
 
 #[test]

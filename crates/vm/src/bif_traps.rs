@@ -2482,7 +2482,10 @@ pub(crate) fn finish_light(
             process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.trap_site().0,
                 caller_ip: process.trap_site().1,
-                schedule_out: false,
+                // BIF_TRAP to an export is a context switch like any other trap
+                // (instr_bif.cpp, call_light_bif_shared: context_switch_simplified);
+                // `beam_bif_export_trap` calls the export on schedule-in.
+                schedule_out: true,
                 import,
                 continuation: trap.target.continuation,
                 target: trap.target,
