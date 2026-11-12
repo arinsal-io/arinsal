@@ -1062,15 +1062,27 @@ impl RunPort for DriverPort {
         &self.run_queue
     }
 
-    fn execute(&self) -> PortExecution {
-        execute(self)
+    fn execute(&self, scheduler_id: usize) -> PortExecution {
+        execute(self, scheduler_id)
     }
 }
 
 /// Port of erts/emulator/beam/erl_port_task.c:1677 (erts_port_task_execute): run the
 /// port's tasks until it runs out of tasks or reductions. The scheduler re-enqueues the
 /// port when it is still active and accounts the returned reductions.
-fn execute(port: &DriverPort) -> PortExecution {
+fn execute(port: &DriverPort, scheduler_id: usize) -> PortExecution {
+    // erts_port_task_execute reads and writes ERTS_PRTSD_SCHED_ID before preparing tasks.
+    if arinsal_sched::sched_stat::enabled() {
+        let psd = port
+            .psd
+            .get_or_init(|| Box::new(super::PortSpecificData::new()));
+        let current_scheduler = scheduler_id + 1;
+        let previous_scheduler =
+            psd.data[super::PRTSD_SCHED_ID].swap(current_scheduler, Ordering::AcqRel);
+        arinsal_sched::sched_stat::record_port_execution(
+            previous_scheduler != 0 && previous_scheduler != current_scheduler,
+        );
+    }
     prepare_exec(port);
     let guard = port.guard();
     port.host.trace_sched_port(port, true, None);

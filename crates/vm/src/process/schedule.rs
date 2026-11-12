@@ -32,6 +32,7 @@ pub(super) fn park_suspended(
 impl Task for Process {
     type Message = Message;
     type SchedulerData = SchedulerData;
+    // Port of erts/emulator/beam/erl_process.c (schedule: process scheduling statistics), OTP-29.1.1.
 
     // Port of erts/emulator/beam/erl_process.c:12723-12727 (erl_create_process), OTP-29.1.1.
     fn init_in_place(&mut self) {

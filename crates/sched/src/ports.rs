@@ -17,11 +17,11 @@ pub trait RunPort: Send + Sync + 'static {
     fn run_queue(&self) -> &PortRunQueue;
 
     /// Execute the port's tasks on the calling scheduler until it runs out of tasks or
-    /// reductions.
+    /// reductions. `scheduler_id` is that normal scheduler's zero-based id.
     ///
     /// Port of erts/emulator/beam/erl_port_task.c:1677 (erts_port_task_execute) from
     /// pop_port up to the re-enqueue decision, OTP-29.1.1.
-    fn execute(&self) -> PortExecution;
+    fn execute(&self, scheduler_id: usize) -> PortExecution;
 }
 
 /// Outcome of [`RunPort::execute`].

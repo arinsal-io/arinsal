@@ -52,6 +52,7 @@ fn port_tasks_match_erl() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     compile_driver(&dir, "sched_drv");
+    compile_driver(&dir, "io_drv");
 
     let erl = RefErl::start().expect("erl reference node");
     let source = std::fs::read_to_string(fixtures().join("port_tasks.erl")).unwrap();
@@ -61,7 +62,8 @@ fn port_tasks_match_erl() {
     std::fs::write(dir.join("port_tasks.beam"), &beam).unwrap();
     erl.load("port_tasks", &beam).unwrap();
     let main = format!(
-        "-module(port_tasks_main).\n-export([run/0]).\nrun() -> port_tasks:run({:?}).\n",
+        "-module(port_tasks_main).\n-export([run/0, stats/0]).\nrun() -> port_tasks:run({:?}).\nstats() -> port_tasks:stats({:?}).\n",
+        dir.to_str().unwrap(),
         dir.to_str().unwrap()
     );
     let main_beam = erl
@@ -80,6 +82,11 @@ fn port_tasks_match_erl() {
         CallResult::Ok(term) => term,
         other => panic!("port_tasks:run/1 on erl: {other:?}"),
     };
+    let expected_stats = match erl.call("port_tasks_main", "stats", &[]) {
+        CallResult::Ok(term) => term,
+        other => panic!("port stats on erl: {other:?}"),
+    };
+    assert_eq!(expected_stats, OwnedTerm::atom("true"));
     drop(erl);
 
     let mut vm = crate::common::node_with_dir(&dir);
@@ -87,7 +94,6 @@ fn port_tasks_match_erl() {
         Ok(result) => result.term,
         Err(error) => panic!("port_tasks:run/1 on Arinsal: {error}"),
     };
-    let _ = std::fs::remove_dir_all(&dir);
     let sorted = |term: &OwnedTerm| match term {
         OwnedTerm::Map(entries) => {
             let mut entries = entries.clone();
@@ -104,4 +110,15 @@ fn port_tasks_match_erl() {
         pretty(&expected),
         pretty(&actual)
     );
+
+    let actual = vm
+        .eval_scheduled("port_tasks_main", "stats", &[], 4, None)
+        .expect("Arinsal port stats")
+        .term;
+    assert_eq!(
+        actual,
+        OwnedTerm::atom("true"),
+        "port row executed should be nonzero"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
