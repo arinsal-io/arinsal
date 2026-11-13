@@ -1,42 +1,18 @@
-//! Scheduler-local timer wheel and long timer index.
+//! The scheduler's timer service on top of its timer wheel.
+//!
+//! Port of erts/emulator/beam/erl_hl_timer.c (the timer service: `ErtsHLTimerService` with its
+//! wheel timers, the time tree of timers too far ahead for the wheel and the service timer that
+//! fires the earliest of them), OTP-29.1.1. The wheel itself is [`crate::twheel`] (time.c).
 
+use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::twheel::{TIMER_WHEEL_MSEC, TWheelTimer, TimerWheel};
 
 use crate::Pid;
 
-const SOON_BITS: u32 = 14;
-const SOON_SIZE: usize = 1 << SOON_BITS;
-const SCNT_BITS: usize = 9;
-const SCNT_RANGES_PER_WHEEL: usize = SOON_SIZE >> SCNT_BITS;
-const SCNT_SIZE: usize = SCNT_RANGES_PER_WHEEL * 2;
-const SOON_MASK: u64 = (SOON_SIZE - 1) as u64;
-const LATER_SHIFT: u32 = SOON_BITS - 1;
-const LATER_SLOT_SIZE: u64 = 1 << LATER_SHIFT;
-const LATER_REVOLUTION: u64 = (SOON_SIZE as u64) * LATER_SLOT_SIZE;
-const SLOT_AT_ONCE: usize = SOON_SIZE * 2;
-const BUMP_YIELD_LIMIT: usize = 10_000;
-const COST_SLOT: usize = 1;
-const COST_SLOT_MOVE: usize = 5;
-const COST_TIMEOUT: usize = 100;
 const NIL: u32 = u32::MAX;
-const TIMER_PENDING: u8 = 0;
-const TIMER_CANCELED: u8 = 1;
-const TIMER_FIRED: u8 = 2;
-
-#[derive(Clone, Copy)]
-enum FastForwardPhase {
-    HighLevel,
-    AtOnce,
-    Soon,
-    Later,
-}
-
-#[derive(Clone, Copy)]
-struct FastForward {
-    phase: FastForwardPhase,
-    slot: usize,
-}
 
 struct TreeNode {
     key: u64,
@@ -551,437 +527,81 @@ pub(crate) struct CanceledTimer {
     pub(crate) id: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WheelKind {
-    Soon,
-    Later,
-    AtOnce,
-    HighLevel,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Yielded {
-    Slot {
-        kind: WheelKind,
-        slot: usize,
-        last: u32,
-    },
-    HighLevel,
-}
-
-#[derive(Clone, Copy)]
-struct Bucket {
-    head: u32,
-}
-
-impl Bucket {
-    fn empty() -> Self {
-        Self { head: NIL }
-    }
-}
-
+/// One timer of the service (`ErtsTWTimer` / `ErtsHLTimer` with its payload): a wheel timer
+/// for timeouts within [`TIMER_WHEEL_MSEC`], a time-tree entry for later ones.
 struct Entry<M> {
+    /// `u.tw_tmr`; boxed so the slab may grow while the wheel links it.
+    tw: Pin<Box<TWheelTimer>>,
     id: u64,
     deadline: u64,
-    kind: WheelKind,
-    slot: usize,
-    in_sentinel: bool,
-    prev: u32,
-    next: u32,
+    /// In the time tree (`ERTS_TMR_ROFLG_HLT`) rather than the wheel.
+    hlt: bool,
     tree_node: u32,
     tree_prev: u32,
     tree_next: u32,
-    state: AtomicU8,
-    payload: TimerPayload<M>,
+    /// `None` while the slab entry is free.
+    payload: Option<TimerPayload<M>>,
 }
 
-/// A timer wheel owned by one scheduler. The scheduler serializes mutations
-/// that cross worker boundaries; this structure itself has no locking.
+/// The `arg` of the service timer (`srv->service_timer`); timer slab indices are below it.
+const SERVICE_TIMER_ARG: usize = u32::MAX as usize;
+
+/// Timeouts the wheel triggered during one bump, in trigger order: slab indices, or
+/// [`SERVICE_TIMER_ARG`] for the service timer.
+struct Triggered(Vec<usize>);
+
+// Port of erts/emulator/beam/erl_hl_timer.c (tw_proc_timeout, tw_bif_timer_timeout,
+// tw_callback_timeout, hlt_service_timeout), OTP-29.1.1: the wheel hands the timeout to the
+// service, which runs it once the bump returns.
+fn timer_timeout(_wheel: &mut TimerWheel, esdp: &mut dyn Any, arg: *mut ()) {
+    esdp.downcast_mut::<Triggered>()
+        .expect("timer service bump context")
+        .0
+        .push(arg.addr());
+}
+
+/// The timer service of one scheduler (`ErtsHLTimerService`) with its timer wheel
+/// (`esdp->timer_wheel`). The scheduler serializes requests from other threads into it.
 pub(crate) struct Wheel<M> {
-    now: u64,
-    soon: Vec<Bucket>,
-    later: Vec<Bucket>,
-    at_once: Bucket,
-    sentinel: Bucket,
-    /// Port of `ErtsTimerWheel.scnt`: occupied 512-slot ranges across both wheels.
-    scnt: [usize; SCNT_SIZE],
-    fast_forward: Option<FastForward>,
-    yielded: Option<Yielded>,
+    /// Declared first: dropping the wheel unlinks the timers before the entries go.
+    tw: TimerWheel,
+    /// `srv->service_timer`: set at the earliest time-tree timeout.
+    service_timer: Pin<Box<TWheelTimer>>,
+    /// `srv->time_tree`: timers too far ahead for the wheel.
     high_level: TimerTree,
+    /// `srv->btm_tree` generalised to every timer id.
     id_index: TimerTree,
-    entries: Vec<Option<Entry<M>>>,
+    /// Timer structures (`tw_timer` / `bif_timer_pre` pre-allocators): reused, never freed.
+    entries: Vec<Entry<M>>,
     free_entries: Vec<u32>,
     entry_count: usize,
+    triggered: Triggered,
+    /// The time of the latest bump; timeouts are measured from it to pick wheel or tree.
+    now: u64,
     /// Link and unlink events for the receivers' bif-timer trees, applied by the scheduler
-    /// after each wheel operation (the wheel itself does not see processes).
+    /// after each operation (the service itself does not see processes).
     link_events: std::collections::VecDeque<LinkEvent<M>>,
-    /// The scheduler that owns this wheel; it is the value of the receivers' tree entries.
+    /// The scheduler that owns this service; it is the value of the receivers' tree entries.
     worker: usize,
-    /// Cached [`Wheel::next_timeout`]; valid until the wheel reaches it or its timers change.
-    next_timeout: Option<u64>,
 }
 
 impl<M> Wheel<M> {
-    // Port of erts/emulator/beam/time.c:1190-1218, OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_hl_timer.c (erts_create_timer_service) and time.c
+    // (erts_create_timer_wheel), OTP-29.1.1. Created on the scheduler's own thread, as
+    // erts_sched_init_time_sup does.
     pub(crate) fn new(now: u64) -> Self {
         Self {
-            now,
-            soon: vec![Bucket::empty(); SOON_SIZE],
-            later: vec![Bucket::empty(); SOON_SIZE],
-            at_once: Bucket::empty(),
-            sentinel: Bucket::empty(),
-            scnt: [0; SCNT_SIZE],
-            fast_forward: None,
-            yielded: None,
+            tw: TimerWheel::new(now as i64),
+            service_timer: Box::pin(TWheelTimer::new()),
             high_level: TimerTree::new(),
             id_index: TimerTree::new(),
             entries: Vec::new(),
             free_entries: Vec::new(),
             entry_count: 0,
+            triggered: Triggered(Vec::new()),
+            now,
             link_events: std::collections::VecDeque::new(),
             worker: 0,
-            next_timeout: None,
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:445-464, OTP-29.1.1.
-    fn soon_slot(deadline: u64) -> usize {
-        (deadline & SOON_MASK) as usize
-    }
-
-    // Port of erts/emulator/beam/time.c:445-464, OTP-29.1.1.
-    fn later_slot(deadline: u64) -> usize {
-        ((deadline >> LATER_SHIFT) as usize) & (SOON_SIZE - 1)
-    }
-
-    fn entry(&self, index: u32) -> &Entry<M> {
-        self.entries[index as usize]
-            .as_ref()
-            .expect("live timer slab entry")
-    }
-
-    fn entry_mut(&mut self, index: u32) -> &mut Entry<M> {
-        self.entries[index as usize]
-            .as_mut()
-            .expect("live timer slab entry")
-    }
-
-    fn index_for_id(&self, id: u64) -> Option<u32> {
-        let node = self.id_index.find(id)?;
-        Some(self.id_index.node(node).head)
-    }
-
-    fn entry_for_id(&self, id: u64) -> Option<&Entry<M>> {
-        self.index_for_id(id).map(|index| self.entry(index))
-    }
-
-    fn bucket(&self, kind: WheelKind, slot: usize) -> Option<&Bucket> {
-        match kind {
-            WheelKind::Soon => Some(&self.soon[slot]),
-            WheelKind::Later => Some(&self.later[slot]),
-            WheelKind::AtOnce => Some(&self.at_once),
-            WheelKind::HighLevel => None,
-        }
-    }
-
-    fn bucket_mut(&mut self, kind: WheelKind, slot: usize) -> Option<&mut Bucket> {
-        match kind {
-            WheelKind::Soon => Some(&mut self.soon[slot]),
-            WheelKind::Later => Some(&mut self.later[slot]),
-            WheelKind::AtOnce => Some(&mut self.at_once),
-            WheelKind::HighLevel => None,
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:647-685, OTP-29.1.1. The slot is a circular intrusive
-    // list; slab indices replace C object pointers without changing the link layout semantics.
-    fn link_slot(&mut self, index: u32, kind: WheelKind, slot: usize) {
-        let bucket = self.bucket(kind, slot).expect("wheel bucket");
-        let head = bucket.head;
-        self.entry_mut(index).kind = kind;
-        self.entry_mut(index).slot = slot;
-        self.entry_mut(index).in_sentinel = false;
-        if matches!(kind, WheelKind::Soon | WheelKind::Later) {
-            self.scnt[Self::scnt_index(kind, slot)] += 1;
-        }
-        if head == NIL {
-            self.entry_mut(index).prev = index;
-            self.entry_mut(index).next = index;
-            self.bucket_mut(kind, slot).unwrap().head = index;
-        } else {
-            let tail = self.entry(head).prev;
-            self.entry_mut(index).prev = tail;
-            self.entry_mut(index).next = head;
-            self.entry_mut(tail).next = index;
-            self.entry_mut(head).prev = index;
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:689-748, OTP-29.1.1.
-    fn unlink_slot(&mut self, index: u32) {
-        let (kind, slot, prev, next) = {
-            let entry = self.entry(index);
-            (entry.kind, entry.slot, entry.prev, entry.next)
-        };
-        let head = if self.entry(index).in_sentinel {
-            self.sentinel.head
-        } else {
-            self.bucket(kind, slot).expect("wheel bucket").head
-        };
-        if matches!(kind, WheelKind::Soon | WheelKind::Later) {
-            self.scnt[Self::scnt_index(kind, slot)] -= 1;
-        }
-        if next == index {
-            debug_assert_eq!(prev, index);
-            if self.entry(index).in_sentinel {
-                self.sentinel.head = NIL;
-            } else {
-                self.bucket_mut(kind, slot).unwrap().head = NIL;
-            }
-        } else {
-            self.entry_mut(prev).next = next;
-            self.entry_mut(next).prev = prev;
-            if head == index {
-                if self.entry(index).in_sentinel {
-                    self.sentinel.head = next;
-                } else {
-                    self.bucket_mut(kind, slot).unwrap().head = next;
-                }
-            }
-        }
-        self.entry_mut(index).in_sentinel = false;
-        self.entry_mut(index).prev = NIL;
-        self.entry_mut(index).next = NIL;
-    }
-
-    // Port of erts/emulator/beam/time.c:956-970 (move slot ring to the firing sentinel), OTP-29.1.1.
-    fn move_slot_to_sentinel(&mut self, kind: WheelKind, slot: usize) {
-        debug_assert_eq!(self.sentinel.head, NIL);
-        let head = self.bucket(kind, slot).expect("wheel bucket").head;
-        if head == NIL {
-            return;
-        }
-        self.bucket_mut(kind, slot).unwrap().head = NIL;
-        self.sentinel.head = head;
-        let mut index = head;
-        loop {
-            self.entry_mut(index).in_sentinel = true;
-            index = self.entry(index).next;
-            if index == head {
-                break;
-            }
-        }
-    }
-
-    fn scnt_index(kind: WheelKind, slot: usize) -> usize {
-        ((if kind == WheelKind::Later {
-            SOON_SIZE
-        } else {
-            0
-        }) + slot)
-            >> SCNT_BITS
-    }
-
-    // Port of erts/emulator/beam/time.c:377-418 (scnt_wheel_next), OTP-29.1.1.
-    fn scnt_wheel_next(&self, slot: &mut usize, left: &mut isize, first: usize, end: usize) {
-        *left -= 1;
-        *slot += 1;
-        if *slot == end {
-            *slot = first;
-        }
-        let mut range = *slot >> SCNT_BITS;
-        while self.scnt[range] == 0 && *left > 0 {
-            let old_slot = *slot;
-            range += 1;
-            *slot = range << SCNT_BITS;
-            let diff = *slot - old_slot;
-            if *left < diff as isize {
-                *slot = old_slot + *left as usize;
-                *left = 0;
-            } else if *slot < end {
-                *left -= diff as isize;
-            } else {
-                *left -= (end - old_slot) as isize;
-                *slot = first;
-                range = first >> SCNT_BITS;
-            }
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:1256-1291, OTP-29.1.1.
-    fn place(&mut self, index: u32) {
-        let deadline = self.entry(index).deadline;
-        self.next_timeout = None;
-        if deadline <= self.now {
-            self.link_slot(index, WheelKind::AtOnce, SLOT_AT_ONCE);
-        } else if deadline - self.now < SOON_SIZE as u64 {
-            self.link_slot(index, WheelKind::Soon, Self::soon_slot(deadline));
-        } else if deadline - self.now < LATER_REVOLUTION {
-            self.link_slot(index, WheelKind::Later, Self::later_slot(deadline));
-        } else {
-            self.insert_long(index);
-        }
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:1219-1323, OTP-29.1.1.
-    fn insert_long(&mut self, index: u32) {
-        let deadline = self.entry(index).deadline;
-        let node = self.high_level.insert_node(deadline);
-        let tail = self.high_level.node(node).tail;
-        let entry = self.entry_mut(index);
-        entry.kind = WheelKind::HighLevel;
-        entry.tree_node = node;
-        entry.tree_prev = tail;
-        entry.tree_next = NIL;
-        if tail == NIL {
-            self.high_level.node_mut(node).head = index;
-        } else {
-            self.entry_mut(tail).tree_next = index;
-        }
-        self.high_level.node_mut(node).tail = index;
-    }
-
-    fn unlink_long(&mut self, index: u32) {
-        let (node, prev, next) = {
-            let entry = self.entry(index);
-            (entry.tree_node, entry.tree_prev, entry.tree_next)
-        };
-        if prev == NIL {
-            self.high_level.node_mut(node).head = next;
-        } else {
-            self.entry_mut(prev).tree_next = next;
-        }
-        if next == NIL {
-            self.high_level.node_mut(node).tail = prev;
-        } else {
-            self.entry_mut(next).tree_prev = prev;
-        }
-        if self.high_level.node(node).head == NIL {
-            self.high_level.delete(node);
-        }
-        let entry = self.entry_mut(index);
-        entry.tree_node = NIL;
-        entry.tree_prev = NIL;
-        entry.tree_next = NIL;
-    }
-
-    fn unlink(&mut self, index: u32) {
-        self.next_timeout = None;
-        if self.entry(index).kind == WheelKind::HighLevel {
-            self.unlink_long(index);
-        } else {
-            self.unlink_slot(index);
-        }
-    }
-
-    fn take_unlinked(&mut self, index: u32) -> Entry<M> {
-        let entry = self.entries[index as usize]
-            .take()
-            .expect("live timer slab entry");
-        let tree = self.id_index.find(entry.id).expect("timer id index");
-        self.id_index.delete(tree);
-        self.free_entries.push(index);
-        self.entry_count -= 1;
-        entry
-    }
-
-    fn detach(&mut self, id: u64) -> Option<Entry<M>> {
-        let index = self.index_for_id(id)?;
-        self.unlink(index);
-        Some(self.take_unlinked(index))
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:2661-2695, OTP-29.1.1.
-    pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
-        if let TimerPayload::Message(target, _, _) = &payload {
-            self.link_events.push_back(LinkEvent::Link(*target, id));
-        }
-        let entry = Entry {
-            id,
-            deadline,
-            kind: WheelKind::AtOnce,
-            slot: SLOT_AT_ONCE,
-            in_sentinel: false,
-            prev: NIL,
-            next: NIL,
-            tree_node: NIL,
-            tree_prev: NIL,
-            tree_next: NIL,
-            state: AtomicU8::new(TIMER_PENDING),
-            payload,
-        };
-        let index = self.free_entries.pop().unwrap_or_else(|| {
-            let index = u32::try_from(self.entries.len()).expect("timer slab index overflow");
-            self.entries.push(None);
-            index
-        });
-        self.entries[index as usize] = Some(entry);
-        let id_node = self.id_index.insert_node(id);
-        assert_eq!(self.id_index.node(id_node).head, NIL, "duplicate timer id");
-        self.id_index.node_mut(id_node).head = index;
-        self.id_index.node_mut(id_node).tail = index;
-        self.entry_count += 1;
-        self.place(index);
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:2210-2248, OTP-29.1.1.
-    #[cfg(test)]
-    pub(crate) fn cancel(&mut self, id: u64) -> Option<(u64, TimerPayload<M>)> {
-        self.cancel_at(id, self.now)
-    }
-
-    pub(crate) fn cancel_at(&mut self, id: u64, now: u64) -> Option<(u64, TimerPayload<M>)> {
-        // Port of erts/emulator/beam/time.c:1311-1324, OTP-29.1.1.
-        let entry = self.detach(id)?;
-        let canceled = entry
-            .state
-            .compare_exchange(
-                TIMER_PENDING,
-                TIMER_CANCELED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
-        self.remove_target_entry(id, &entry.payload);
-        canceled.then(|| (entry.deadline.saturating_sub(now), entry.payload))
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:67-68 and erl_process.c:14300-14304,
-    // OTP-29.1.1. Process exit cancels all BIF timers whose destination is the exiting process;
-    // `ids` are the timers of this wheel in the receiver's bif-timer tree.
-    pub(crate) fn cancel_target(&mut self, ids: &[u64]) -> usize {
-        ids.iter()
-            .filter(|id| self.cancel_at(**id, self.now).is_some())
-            .count()
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1: each
-    // timer leaves the wheel and is stored, with the time it had left, in the receiver's
-    // paused list (create_paused_bif_timer + access_btm cancel).
-    pub(crate) fn pause_target(&mut self, pid: Pid, ids: &[u64], now: u64) {
-        for id in ids {
-            if let Some((remaining, payload)) = self.cancel_at(*id, now) {
-                self.link_events
-                    .push_back(LinkEvent::Stash(pid, remaining, payload));
-            }
-        }
-    }
-
-    /// Messages of the BIF timers (`send_after`, `start_timer`) of this wheel, paused ones
-    /// included, for the debug node-reference accounting.
-    pub(crate) fn bif_timer_messages(&self) -> Vec<&M> {
-        let live = self
-            .entries
-            .iter()
-            .filter_map(Option::as_ref)
-            .filter(|entry| entry.id & REF_KEY_TIMER_BIT != 0)
-            .filter_map(|entry| payload_message(&entry.payload));
-        live.collect()
-    }
-
-    fn remove_target_entry(&mut self, id: u64, payload: &TimerPayload<M>) {
-        if let TimerPayload::Message(target, _, _) = payload {
-            self.link_events.push_back(LinkEvent::Unlink(*target, id));
         }
     }
 
@@ -994,11 +614,216 @@ impl<M> Wheel<M> {
         self.worker
     }
 
-    /// The link changes since the last call; the scheduler applies them to the receivers.
-    /// The oldest unapplied change; the queue keeps its capacity, so creating a timer does not
-    /// allocate for it.
+    fn index_for_id(&self, id: u64) -> Option<u32> {
+        let node = self.id_index.find(id)?;
+        Some(self.id_index.node(node).head)
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c (create_tw_timer, create_hl_timer), OTP-29.1.1:
+    // a timeout below ERTS_TIMER_WHEEL_MSEC goes into the wheel, a later one into the time tree.
+    pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
+        if let TimerPayload::Message(target, _, _) = &payload {
+            self.link_events.push_back(LinkEvent::Link(*target, id));
+        }
+        let index = match self.free_entries.pop() {
+            Some(index) => index,
+            None => {
+                let index = u32::try_from(self.entries.len()).expect("timer slab index overflow");
+                self.entries.push(Entry {
+                    tw: Box::pin(TWheelTimer::new()),
+                    id: 0,
+                    deadline: 0,
+                    hlt: false,
+                    tree_node: NIL,
+                    tree_prev: NIL,
+                    tree_next: NIL,
+                    payload: None,
+                });
+                index
+            }
+        };
+        let hlt = deadline.saturating_sub(self.now) >= TIMER_WHEEL_MSEC as u64;
+        {
+            let entry = &mut self.entries[index as usize];
+            entry.id = id;
+            entry.deadline = deadline;
+            entry.hlt = hlt;
+            entry.payload = Some(payload);
+        }
+        let id_node = self.id_index.insert_node(id);
+        assert_eq!(self.id_index.node(id_node).head, NIL, "duplicate timer id");
+        self.id_index.node_mut(id_node).head = index;
+        self.id_index.node_mut(id_node).tail = index;
+        self.entry_count += 1;
+        if hlt {
+            self.insert_hl_timer(index);
+        } else {
+            let pos = deadline.min(i64::MAX as u64) as i64;
+            self.tw.set_timer(
+                self.entries[index as usize].tw.as_ref(),
+                timer_timeout,
+                std::ptr::without_provenance_mut(index as usize),
+                pos,
+            );
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c (insert_hl_timer: same-time timers are kept in
+    // insertion order; the service timer moves when the timer becomes the earliest), OTP-29.1.1.
+    fn insert_hl_timer(&mut self, index: u32) {
+        let deadline = self.entries[index as usize].deadline;
+        let node = self.high_level.insert_node(deadline);
+        let tail = self.high_level.node(node).tail;
+        {
+            let entry = &mut self.entries[index as usize];
+            entry.tree_node = node;
+            entry.tree_prev = tail;
+            entry.tree_next = NIL;
+        }
+        if tail == NIL {
+            self.high_level.node_mut(node).head = index;
+        } else {
+            self.entries[tail as usize].tree_next = index;
+        }
+        self.high_level.node_mut(node).tail = index;
+        self.set_service_timer();
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c (hlt_delete_timer), OTP-29.1.1.
+    fn remove_hl_timer(&mut self, index: u32) {
+        let (node, prev, next) = {
+            let entry = &self.entries[index as usize];
+            (entry.tree_node, entry.tree_prev, entry.tree_next)
+        };
+        if prev == NIL {
+            self.high_level.node_mut(node).head = next;
+        } else {
+            self.entries[prev as usize].tree_next = next;
+        }
+        if next == NIL {
+            self.high_level.node_mut(node).tail = prev;
+        } else {
+            self.entries[next as usize].tree_prev = prev;
+        }
+        if self.high_level.node(node).head == NIL {
+            self.high_level.delete(node);
+        }
+        let entry = &mut self.entries[index as usize];
+        entry.tree_node = NIL;
+        entry.tree_prev = NIL;
+        entry.tree_next = NIL;
+    }
+
+    /// Sets the service timer at the earliest time-tree timeout (`srv->next_timeout`).
+    fn set_service_timer(&mut self) {
+        let first = self
+            .high_level
+            .first_at_or_before(u64::MAX)
+            .map(|node| self.high_level.node(node).key);
+        let current = self
+            .service_timer
+            .is_active()
+            .then(|| self.service_timer.read_timeout());
+        let wanted = first.map(|key| key.min(i64::MAX as u64) as i64);
+        if current == wanted {
+            return;
+        }
+        self.tw.cancel_timer(self.service_timer.as_ref());
+        if let Some(pos) = wanted {
+            self.tw.set_timer(
+                self.service_timer.as_ref(),
+                timer_timeout,
+                std::ptr::without_provenance_mut(SERVICE_TIMER_ARG),
+                pos,
+            );
+        }
+    }
+
+    /// Unlinks the timer of `index` from the wheel or the time tree and frees its entry.
+    fn take(&mut self, index: u32) -> (u64, u64, TimerPayload<M>) {
+        if self.entries[index as usize].hlt {
+            self.remove_hl_timer(index);
+            self.set_service_timer();
+        } else {
+            self.tw
+                .cancel_timer(self.entries[index as usize].tw.as_ref());
+        }
+        self.free(index)
+    }
+
+    fn free(&mut self, index: u32) -> (u64, u64, TimerPayload<M>) {
+        let entry = &mut self.entries[index as usize];
+        let payload = entry.payload.take().expect("live timer slab entry");
+        let (id, deadline) = (entry.id, entry.deadline);
+        let tree = self.id_index.find(id).expect("timer id index");
+        self.id_index.delete(tree);
+        self.free_entries.push(index);
+        self.entry_count -= 1;
+        (id, deadline, payload)
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:2210-2248, OTP-29.1.1.
+    #[cfg(test)]
+    pub(crate) fn cancel(&mut self, id: u64) -> Option<(u64, TimerPayload<M>)> {
+        self.cancel_at(id, self.now)
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c (cancel_bif_timer, cancel_proc_timer),
+    // OTP-29.1.1: a timer still set is removed and its time left returned.
+    pub(crate) fn cancel_at(&mut self, id: u64, now: u64) -> Option<(u64, TimerPayload<M>)> {
+        let index = self.index_for_id(id)?;
+        let (_, deadline, payload) = self.take(index);
+        self.remove_target_entry(id, &payload);
+        Some((deadline.saturating_sub(now), payload))
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:67-68 and erl_process.c:14300-14304,
+    // OTP-29.1.1. Process exit cancels all BIF timers whose destination is the exiting process;
+    // `ids` are the timers of this wheel in the receiver's bif-timer tree.
+    pub(crate) fn cancel_target(&mut self, ids: &[u64]) -> usize {
+        ids.iter()
+            .filter(|id| self.cancel_at(**id, self.now).is_some())
+            .count()
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1: each
+    // timer leaves the service and is stored, with the time it had left, in the receiver's
+    // paused list (create_paused_bif_timer + access_btm cancel).
+    pub(crate) fn pause_target(&mut self, pid: Pid, ids: &[u64], now: u64) {
+        for id in ids {
+            if let Some((remaining, payload)) = self.cancel_at(*id, now) {
+                self.link_events
+                    .push_back(LinkEvent::Stash(pid, remaining, payload));
+            }
+        }
+    }
+
+    /// Messages of the BIF timers (`send_after`, `start_timer`) of this service, for the
+    /// debug node-reference accounting.
+    pub(crate) fn bif_timer_messages(&self) -> Vec<&M> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.id & REF_KEY_TIMER_BIT != 0)
+            .filter_map(|entry| entry.payload.as_ref().and_then(payload_message))
+            .collect()
+    }
+
+    fn remove_target_entry(&mut self, id: u64, payload: &TimerPayload<M>) {
+        if let TimerPayload::Message(target, _, _) = payload {
+            self.link_events.push_back(LinkEvent::Unlink(*target, id));
+        }
+    }
+
+    /// The oldest unapplied link change; the queue keeps its capacity, so creating a timer
+    /// does not allocate for it.
     pub(crate) fn pop_link_event(&mut self) -> Option<LinkEvent<M>> {
         self.link_events.pop_front()
+    }
+
+    /// Receiver-tree changes recorded since the last [`Wheel::pop_link_event`] drain.
+    #[inline]
+    pub(crate) fn has_link_events(&self) -> bool {
+        !self.link_events.is_empty()
     }
 
     #[cfg(test)]
@@ -1008,366 +833,62 @@ impl<M> Wheel<M> {
 
     pub(crate) fn remaining_at(&self, id: u64, now: u64) -> Option<u64> {
         // Port of erts/emulator/beam/erl_hl_timer.c:2013-2042, OTP-29.1.1.
-        self.entry_for_id(id)
-            .map(|entry| entry.deadline.saturating_sub(now))
+        self.index_for_id(id)
+            .map(|index| self.entries[index as usize].deadline.saturating_sub(now))
     }
 
-    /// Earliest wheel position at which [`Wheel::advance`] has work: a due timer, a later
-    /// wheel slot that moves into the soon wheel, or a long timer that cascades into the
-    /// wheels. `None` when the wheel holds no timers.
-    ///
-    /// Port of erts/emulator/beam/time.c:477 (find_next_timeout), OTP-29.1.1: the soon wheel
-    /// gives an exact timeout; the later wheel and the high-level tree give a pre-timeout.
-    pub(crate) fn next_timeout(&mut self) -> Option<u64> {
-        if self.entry_count == 0 {
-            return None;
-        }
-        if self.yielded.is_some() || self.at_once.head != NIL || self.fast_forward.is_some() {
-            return Some(self.now);
-        }
-        // Removed timers only make the cached position early, never late.
-        if let Some(cached) = self.next_timeout.filter(|&cached| cached > self.now) {
-            return Some(cached);
-        }
-        let mut next = u64::MAX;
-        let mut slot = Self::soon_slot(self.now);
-        let mut slots = (SOON_SIZE - 1) as isize;
-        while slots > 0 {
-            self.scnt_wheel_next(&mut slot, &mut slots, 0, SOON_SIZE);
-            let bucket = self.soon[slot];
-            if bucket.head != NIL {
-                let mut index = bucket.head;
-                loop {
-                    next = next.min(self.entry(index).deadline);
-                    index = self.entry(index).next;
-                    if index == bucket.head {
-                        break;
-                    }
-                }
-                if next == u64::MAX {
-                    let distance = (slot + SOON_SIZE - Self::soon_slot(self.now)) & (SOON_SIZE - 1);
-                    next = self.now + distance as u64;
-                }
-                break;
-            }
-        }
-        // `advance` drains the later slot one ahead of each LATER_SLOT_SIZE boundary; the
-        // slot drained at the current boundary is never refilled.
-        let base = self.now & !(LATER_SLOT_SIZE - 1);
-        for index in 1..SOON_SIZE as u64 {
-            let boundary = base + index * LATER_SLOT_SIZE;
-            if boundary >= next {
-                break;
-            }
-            let slot = (Self::later_slot(boundary) + 1) & (SOON_SIZE - 1);
-            if self.later[slot].head != NIL {
-                next = boundary;
-                break;
-            }
-        }
-        if let Some(node) = self.high_level.first_at_or_before(u64::MAX) {
-            let cascade = self
-                .high_level
-                .node(node)
-                .key
-                .saturating_sub(LATER_REVOLUTION - 1);
-            next = next.min(cascade);
-        }
-        let next = next.max(self.now + 1);
-        self.next_timeout = Some(next);
-        Some(next)
-    }
-
-    /// Receiver-tree changes recorded since the last [`Wheel::pop_link_event`] drain.
-    #[inline]
-    pub(crate) fn has_link_events(&self) -> bool {
-        !self.link_events.is_empty()
-    }
-
-    /// `true` when the cached next timeout lies after both `now` and the wheel's own position
-    /// and nothing is waiting to be bumped, so [`Wheel::advance`] and
-    /// [`Wheel::next_timeout`] have nothing to do.
-    ///
-    /// Port of erts/emulator/beam/erl_process.c (erts_schedule: the timers are bumped only when
-    /// the cached monotonic time has reached erts_next_timeout_time), OTP-29.1.1.
-    #[inline]
-    pub(crate) fn quiet_at(&self, now: u64) -> bool {
-        self.link_events.is_empty()
-            && self.at_once.head == NIL
-            && self.yielded.is_none()
-            && self.fast_forward.is_none()
-            && self
-                .next_timeout
-                .is_some_and(|next| next > now && next > self.now)
-    }
-
-    // Port of erts/emulator/beam/time.c:1270-1291, OTP-29.1.1.
     pub(crate) fn has_timers(&self) -> bool {
         self.entry_count != 0
     }
 
-    // Port of erts/emulator/beam/erl_hl_timer.c:1219-1323, OTP-29.1.1.
-    fn cascade_high_level(&mut self, work: &mut usize) {
-        let limit = self.now.saturating_add(LATER_REVOLUTION - 1);
-        while *work < BUMP_YIELD_LIMIT
-            && let Some(node) = self.high_level.first_at_or_before(limit)
-        {
-            let index = self.high_level.node(node).head;
-            if index == NIL {
-                break;
-            }
-            self.unlink(index);
-            *work += COST_SLOT_MOVE;
-            self.place(index);
-        }
-        if *work >= BUMP_YIELD_LIMIT && self.high_level.first_at_or_before(limit).is_some() {
-            self.yielded = Some(Yielded::HighLevel);
-        }
+    /// The cached next timeout time (`erts_next_timeout_time(esdp->next_tmo_ref)`): the
+    /// scheduler bumps the timers once its time reaches it.
+    #[inline]
+    pub(crate) fn next_timeout_time(&self) -> u64 {
+        self.tw.next_timeout_time().max(0) as u64
     }
 
-    // Port of erts/emulator/beam/time.c:670-738, OTP-29.1.1.
-    fn drain_slot(
-        &mut self,
-        kind: WheelKind,
-        slot: usize,
-        resume_at: Option<u32>,
-        fire: &mut impl FnMut(u64, TimerPayload<M>),
-        work: &mut usize,
-    ) {
-        if self.sentinel.head == NIL {
-            self.move_slot_to_sentinel(kind, slot);
-        }
-        let first = self.sentinel.head;
-        if first == NIL {
-            return;
-        }
-        let last = resume_at.unwrap_or_else(|| self.entry(first).prev);
-        let mut index = first;
-        loop {
-            if *work >= BUMP_YIELD_LIMIT {
-                self.yielded = Some(Yielded::Slot { kind, slot, last });
-                break;
-            }
-            let next = self.entry(index).next;
-            let id = self.entry(index).id;
-            if self.entry(index).deadline <= self.now {
-                self.unlink(index);
-                let entry = self.take_unlinked(index);
-                *work += COST_TIMEOUT;
-                if entry
-                    .state
-                    .compare_exchange(
-                        TIMER_PENDING,
-                        TIMER_FIRED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.remove_target_entry(id, &entry.payload);
-                    fire(id, entry.payload);
-                }
-            } else {
-                self.unlink(index);
-                *work += COST_SLOT_MOVE;
-                self.place(index);
-            }
-            if index == last {
-                break;
-            }
-            index = next;
-        }
+    /// Port of erts/emulator/beam/time.c (erts_check_next_timeout_time), OTP-29.1.1.
+    pub(crate) fn check_next_timeout_time(&mut self, now: impl FnOnce() -> u64) -> u64 {
+        self.tw
+            .check_next_timeout_time(|| now().min(i64::MAX as u64) as i64)
+            .max(0) as u64
     }
 
-    fn drain_fast_forward_slot(
-        &mut self,
-        kind: WheelKind,
-        slot: usize,
-        fire: &mut impl FnMut(u64, TimerPayload<M>),
-        work: &mut usize,
-    ) -> bool {
-        if self.sentinel.head == NIL {
-            self.move_slot_to_sentinel(kind, slot);
-        }
-        let first = self.sentinel.head;
-        if first == NIL {
-            return true;
-        }
-        let last = self.entry(first).prev;
-        let mut index = first;
-        loop {
-            let next = self.entry(index).next;
-            if self.entry(index).deadline <= self.now {
-                if *work >= BUMP_YIELD_LIMIT {
-                    return false;
-                }
-                let id = self.entry(index).id;
-                self.unlink(index);
-                let entry = self.take_unlinked(index);
-                *work += COST_TIMEOUT;
-                if entry
-                    .state
-                    .compare_exchange(
-                        TIMER_PENDING,
-                        TIMER_FIRED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.remove_target_entry(id, &entry.payload);
-                    fire(id, entry.payload);
-                }
-            } else {
-                self.unlink(index);
-                self.place(index);
-            }
-            if index == last {
-                return true;
-            }
-            index = next;
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1. The cursor resumes the current
-    // wheel phase and slot after a yield; timers remain linked in their original slots.
-    fn fast_forward_step(&mut self, fire: &mut impl FnMut(u64, TimerPayload<M>), work: &mut usize) {
-        while *work < BUMP_YIELD_LIMIT {
-            let Some(mut state) = self.fast_forward else {
-                return;
-            };
-            match state.phase {
-                FastForwardPhase::HighLevel => {
-                    self.cascade_high_level(work);
-                    if self.yielded.is_some() {
-                        self.fast_forward = Some(state);
-                        return;
-                    }
-                    state.phase = FastForwardPhase::AtOnce;
-                    state.slot = 0;
-                }
-                FastForwardPhase::AtOnce => {
-                    if self.at_once.head != NIL {
-                        self.drain_slot(WheelKind::AtOnce, SLOT_AT_ONCE, None, fire, work);
-                        if self.yielded.is_some() {
-                            self.fast_forward = Some(state);
-                            return;
-                        }
-                    }
-                    state.phase = FastForwardPhase::Soon;
-                    state.slot = 0;
-                }
-                FastForwardPhase::Soon | FastForwardPhase::Later => {
-                    let kind = if matches!(state.phase, FastForwardPhase::Soon) {
-                        WheelKind::Soon
-                    } else {
-                        WheelKind::Later
-                    };
-                    while state.slot < SOON_SIZE {
-                        if self.sentinel.head != NIL {
-                            if !self.drain_fast_forward_slot(kind, state.slot, fire, work) {
-                                self.fast_forward = Some(state);
-                                return;
-                            }
-                        } else if self.bucket(kind, state.slot).unwrap().head != NIL {
-                            *work += COST_SLOT;
-                            if !self.drain_fast_forward_slot(kind, state.slot, fire, work) {
-                                self.fast_forward = Some(state);
-                                return;
-                            }
-                        } else if self.scnt[Self::scnt_index(kind, state.slot)] == 0 {
-                            state.slot = ((state.slot >> SCNT_BITS) + 1) << SCNT_BITS;
-                            state.slot = state.slot.min(SOON_SIZE);
-                            continue;
-                        }
-                        state.slot += 1;
-                        if *work >= BUMP_YIELD_LIMIT {
-                            self.fast_forward = Some(state);
-                            return;
-                        }
-                    }
-                    if kind == WheelKind::Soon {
-                        state.phase = FastForwardPhase::Later;
-                        state.slot = 0;
-                    } else {
-                        self.fast_forward = None;
-                        return;
-                    }
-                }
-            }
-            self.fast_forward = Some(state);
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1.
-    pub(crate) fn advance(&mut self, to: u64) -> Vec<(u64, TimerPayload<M>)> {
+    /// Port of erts/emulator/beam/time.c (erts_bump_timers) with the service's timeout
+    /// callbacks, OTP-29.1.1: the timers due at `now` in trigger order. A bump that reached
+    /// its yield limit leaves the next timeout time at `now`, so the scheduler bumps again.
+    pub(crate) fn bump_timers(&mut self, now: u64) -> Vec<(u64, TimerPayload<M>)> {
         let mut due = Vec::new();
-        self.advance_with(to, |id, payload| due.push((id, payload)));
+        self.now = self.now.max(now);
+        let mut triggered = std::mem::replace(&mut self.triggered, Triggered(Vec::new()));
+        self.tw
+            .bump_timers(now.min(i64::MAX as u64) as i64, &mut triggered);
+        for arg in triggered.0.drain(..) {
+            if arg == SERVICE_TIMER_ARG {
+                self.hlt_service_timeout(now, &mut due);
+            } else {
+                let (id, _, payload) = self.free(arg as u32);
+                self.remove_target_entry(id, &payload);
+                due.push((id, payload));
+            }
+        }
+        self.triggered = triggered;
         due
     }
 
-    // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1: fire each timeout while the
-    // bump is traversing the active slot, before moving to the next timer or wheel slot.
-    pub(crate) fn advance_with(&mut self, to: u64, mut fire: impl FnMut(u64, TimerPayload<M>)) {
-        let mut work = 0;
-        if let Some(yielded) = self.yielded.take() {
-            match yielded {
-                Yielded::HighLevel => self.cascade_high_level(&mut work),
-                Yielded::Slot { kind, slot, last } => {
-                    self.drain_slot(kind, slot, Some(last), &mut fire, &mut work)
-                }
-            }
+    // Port of erts/emulator/beam/erl_hl_timer.c (hlt_service_timeout), OTP-29.1.1: every
+    // time-tree timer due at `now` times out in timeout order; the service timer moves to the
+    // next one.
+    fn hlt_service_timeout(&mut self, now: u64, due: &mut Vec<(u64, TimerPayload<M>)>) {
+        while let Some(node) = self.high_level.first_at_or_before(now) {
+            let index = self.high_level.node(node).head;
+            self.remove_hl_timer(index);
+            let (id, _, payload) = self.free(index);
+            self.remove_target_entry(id, &payload);
+            due.push((id, payload));
         }
-        if work >= BUMP_YIELD_LIMIT || self.yielded.is_some() {
-            return;
-        }
-        if self.fast_forward.is_some() {
-            self.fast_forward_step(&mut fire, &mut work);
-            return;
-        }
-        if self.at_once.head != NIL {
-            self.drain_slot(WheelKind::AtOnce, SLOT_AT_ONCE, None, &mut fire, &mut work);
-            if self.yielded.is_some() {
-                return;
-            }
-        }
-        if to.saturating_sub(self.now) > SOON_SIZE as u64 {
-            self.now = to;
-            self.fast_forward = Some(FastForward {
-                phase: FastForwardPhase::HighLevel,
-                slot: 0,
-            });
-            self.fast_forward_step(&mut fire, &mut work);
-            return;
-        }
-        self.cascade_high_level(&mut work);
-        if self.yielded.is_some() {
-            return;
-        }
-        while self.now < to && work < BUMP_YIELD_LIMIT {
-            self.now += 1;
-            if self.now.is_multiple_of(LATER_SLOT_SIZE) {
-                work += COST_SLOT;
-                // `later.pos` is one slot ahead of the current clock position.
-                let slot = (Self::later_slot(self.now) + 1) & (SOON_SIZE - 1);
-                self.drain_slot(WheelKind::Later, slot, None, &mut fire, &mut work);
-                if self.yielded.is_some() {
-                    break;
-                }
-            }
-            work += COST_SLOT;
-            let slot = Self::soon_slot(self.now);
-            self.drain_slot(WheelKind::Soon, slot, None, &mut fire, &mut work);
-            if self.yielded.is_some() {
-                break;
-            }
-            if self.now.is_multiple_of(LATER_SLOT_SIZE) {
-                self.cascade_high_level(&mut work);
-                if self.yielded.is_some() {
-                    break;
-                }
-            }
-        }
+        self.set_service_timer();
     }
 }
 
@@ -1402,171 +923,6 @@ mod tests {
             assert_eq!(tree.node(tree.root).parent, NIL);
         }
         walk(tree, tree.root, None, None);
-    }
-
-    fn validate_wheel<M>(wheel: &Wheel<M>) {
-        fn check_bucket<M>(
-            wheel: &Wheel<M>,
-            bucket: &Bucket,
-            kind: WheelKind,
-            slot: usize,
-            seen: &mut [bool],
-            expected_scnt: &mut [usize; SCNT_SIZE],
-        ) {
-            if bucket.head == NIL {
-                return;
-            }
-            let mut index = bucket.head;
-            loop {
-                let entry = wheel.entry(index);
-                assert_eq!(entry.kind, kind);
-                assert_eq!(entry.slot, slot);
-                assert!(!entry.in_sentinel);
-                assert!(!seen[index as usize]);
-                seen[index as usize] = true;
-                assert_eq!(wheel.entry(entry.prev).next, index);
-                assert_eq!(wheel.entry(entry.next).prev, index);
-                if matches!(kind, WheelKind::Soon | WheelKind::Later) {
-                    expected_scnt[Wheel::<M>::scnt_index(kind, slot)] += 1;
-                }
-                index = entry.next;
-                if index == bucket.head {
-                    break;
-                }
-            }
-        }
-        validate_tree(&wheel.id_index);
-        validate_tree(&wheel.high_level);
-        let mut seen = vec![false; wheel.entries.len()];
-        let mut expected_scnt = [0; SCNT_SIZE];
-        for (slot, bucket) in wheel.soon.iter().enumerate() {
-            check_bucket(
-                wheel,
-                bucket,
-                WheelKind::Soon,
-                slot,
-                &mut seen,
-                &mut expected_scnt,
-            );
-        }
-        for (slot, bucket) in wheel.later.iter().enumerate() {
-            check_bucket(
-                wheel,
-                bucket,
-                WheelKind::Later,
-                slot,
-                &mut seen,
-                &mut expected_scnt,
-            );
-        }
-        if wheel.sentinel.head != NIL {
-            let mut index = wheel.sentinel.head;
-            loop {
-                let entry = wheel.entry(index);
-                assert!(entry.in_sentinel);
-                assert!(!seen[index as usize]);
-                seen[index as usize] = true;
-                assert_eq!(wheel.entry(entry.prev).next, index);
-                assert_eq!(wheel.entry(entry.next).prev, index);
-                if matches!(entry.kind, WheelKind::Soon | WheelKind::Later) {
-                    expected_scnt[Wheel::<M>::scnt_index(entry.kind, entry.slot)] += 1;
-                }
-                index = entry.next;
-                if index == wheel.sentinel.head {
-                    break;
-                }
-            }
-        }
-        check_bucket(
-            wheel,
-            &wheel.at_once,
-            WheelKind::AtOnce,
-            SLOT_AT_ONCE,
-            &mut seen,
-            &mut expected_scnt,
-        );
-        assert_eq!(wheel.scnt, expected_scnt);
-        for (tree_index, node) in wheel.high_level.nodes.iter().enumerate() {
-            let Some(node) = node else { continue };
-            let mut index = node.head;
-            let mut previous = NIL;
-            while index != NIL {
-                let entry = wheel.entry(index);
-                assert_eq!(entry.kind, WheelKind::HighLevel);
-                assert_eq!(entry.tree_node, tree_index as u32);
-                assert_eq!(entry.deadline, node.key);
-                assert_eq!(entry.tree_prev, previous);
-                assert!(!seen[index as usize]);
-                seen[index as usize] = true;
-                previous = index;
-                index = entry.tree_next;
-            }
-            assert_eq!(previous, node.tail);
-        }
-        for (index, entry) in wheel.entries.iter().enumerate() {
-            if let Some(entry) = entry {
-                assert!(seen[index]);
-                let node = wheel.id_index.find(entry.id).expect("id-index node");
-                assert_eq!(wheel.id_index.node(node).head, index as u32);
-            } else {
-                assert!(!seen[index]);
-            }
-        }
-        assert_eq!(wheel.entry_count, seen.iter().filter(|seen| **seen).count());
-    }
-
-    #[test]
-    fn intrusive_slots_and_id_slab_survive_cancel_cascade_and_reuse() {
-        let pid = Pid::new(7, 1);
-        let mut wheel = Wheel::<u8>::new(0);
-        let long = LATER_REVOLUTION + 100;
-        wheel.insert(1, 1, TimerPayload::Message(pid, 1, true));
-        wheel.insert(2, 257, TimerPayload::Message(pid, 2, true));
-        wheel.insert(3, 17_000, TimerPayload::Message(pid, 3, true));
-        wheel.insert(4, long, TimerPayload::Message(pid, 4, true));
-        validate_wheel(&wheel);
-
-        assert_eq!(wheel.cancel(2).map(|timer| timer.0), Some(257));
-        validate_wheel(&wheel);
-        assert!(wheel.advance(1).iter().any(|(id, _)| *id == 1));
-        validate_wheel(&wheel);
-        assert!(wheel.advance(16_384).is_empty());
-        validate_wheel(&wheel);
-        assert_eq!(wheel.entry_for_id(3).unwrap().kind, WheelKind::Soon);
-        assert!(wheel.advance(17_000).iter().any(|(id, _)| *id == 3));
-        validate_wheel(&wheel);
-        wheel.insert(5, long, TimerPayload::Message(pid, 5, true));
-        validate_wheel(&wheel);
-        assert!(wheel.advance(long).iter().any(|(id, _)| *id == 4));
-        validate_wheel(&wheel);
-    }
-
-    #[test]
-    fn deadlines_and_cancel() {
-        let pid = Pid::new(0, 0);
-        let mut wheel = Wheel::<u8>::new(0);
-        wheel.insert(1, 1, TimerPayload::Message(pid, 1, true));
-        wheel.insert(2, 257, TimerPayload::Message(pid, 2, true));
-        wheel.insert(3, 65_537, TimerPayload::Message(pid, 3, true));
-        assert_eq!(wheel.cancel(3).map(|x| x.0), Some(65_537));
-        assert_eq!(wheel.advance(1).len(), 1);
-        assert_eq!(wheel.remaining(2), Some(256));
-        assert_eq!(wheel.advance(257).len(), 1);
-    }
-
-    #[test]
-    fn process_exit_cancels_timers_targeting_that_process() {
-        let target = Pid::new(3, 1);
-        let other = Pid::new(4, 1);
-        let mut wheel = Wheel::<u8>::new(0);
-        wheel.insert(1, 10, TimerPayload::Message(target, 1, false));
-        wheel.insert(2, 20, TimerPayload::Message(target, 2, true));
-        wheel.insert(3, 30, TimerPayload::Message(other, 3, false));
-
-        assert_eq!(wheel.cancel_target(&[1, 2]), 2);
-        assert_eq!(wheel.remaining(1), None);
-        assert_eq!(wheel.remaining(2), None);
-        assert_eq!(wheel.remaining(3), Some(30));
     }
 
     #[test]
@@ -1604,70 +960,99 @@ mod tests {
         assert_eq!(tree.root, NIL);
     }
 
+    fn bump(wheel: &mut Wheel<u8>, now: u64) -> Vec<u64> {
+        let mut ids = Vec::new();
+        loop {
+            let due = wheel.bump_timers(now);
+            ids.extend(due.into_iter().map(|(id, _)| id));
+            if wheel.next_timeout_time() > now || !wheel.has_timers() {
+                return ids;
+            }
+        }
+    }
+
     #[test]
-    fn same_deadline_long_timers_keep_insertion_order_after_cancel() {
+    fn deadlines_and_cancel() {
         let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
-        let deadline = LATER_REVOLUTION + 100;
+        wheel.insert(1, 1, TimerPayload::Message(pid, 1, true));
+        wheel.insert(2, 257, TimerPayload::Message(pid, 2, true));
+        wheel.insert(3, 65_537, TimerPayload::Message(pid, 3, true));
+        assert_eq!(wheel.cancel(3).map(|x| x.0), Some(65_537));
+        assert_eq!(bump(&mut wheel, 1), [1]);
+        assert_eq!(wheel.remaining(2), Some(256));
+        assert_eq!(bump(&mut wheel, 256), Vec::<u64>::new());
+        assert_eq!(bump(&mut wheel, 257), [2]);
+    }
+
+    #[test]
+    fn process_exit_cancels_timers_targeting_that_process() {
+        let target = Pid::new(3, 1);
+        let other = Pid::new(4, 1);
+        let mut wheel = Wheel::<u8>::new(0);
+        wheel.insert(1, 10, TimerPayload::Message(target, 1, false));
+        wheel.insert(2, 20, TimerPayload::Message(target, 2, true));
+        wheel.insert(3, 30, TimerPayload::Message(other, 3, false));
+
+        assert_eq!(wheel.cancel_target(&[1, 2]), 2);
+        assert_eq!(wheel.remaining(1), None);
+        assert_eq!(wheel.remaining(2), None);
+        assert_eq!(wheel.remaining(3), Some(30));
+    }
+
+    #[test]
+    fn time_tree_timers_fire_through_the_service_timer_in_order() {
+        let pid = Pid::new(0, 0);
+        let mut wheel = Wheel::<u8>::new(0);
+        let deadline = TIMER_WHEEL_MSEC as u64 + 100;
         for id in 1..=3 {
             wheel.insert(id, deadline, TimerPayload::Message(pid, id as u8, true));
         }
+        wheel.insert(4, deadline + 5, TimerPayload::Message(pid, 4, true));
+        wheel.insert(5, 50, TimerPayload::Message(pid, 5, true));
+        assert!(wheel.entries.iter().filter(|entry| entry.hlt).count() == 4);
         assert_eq!(wheel.cancel(2).map(|timer| timer.0), Some(deadline));
-        let due = wheel.advance(deadline);
-        let ids: Vec<_> = due.into_iter().map(|(id, _)| id).collect();
-        assert_eq!(ids, [1, 3]);
+        assert_eq!(bump(&mut wheel, 50), [5]);
+        assert!(wheel.check_next_timeout_time(|| 50) <= deadline);
+        assert_eq!(bump(&mut wheel, deadline - 1), Vec::<u64>::new());
+        assert_eq!(bump(&mut wheel, deadline), [1, 3]);
+        assert_eq!(wheel.remaining(4), Some(5));
+        assert_eq!(bump(&mut wheel, deadline + 5), [4]);
+        assert!(!wheel.has_timers());
+        assert!(!wheel.service_timer.is_active());
     }
 
     #[test]
-    fn later_slot_cascades_when_soon_window_reaches_it() {
+    fn a_large_bump_yields_and_continues_in_order() {
         let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
-        let deadline = 17_000;
-        wheel.insert(1, deadline, TimerPayload::Message(pid, 1, true));
-        assert_eq!(wheel.entry_for_id(1).unwrap().kind, WheelKind::Later);
-        assert!(wheel.advance(LATER_SLOT_SIZE).is_empty());
-        assert_eq!(wheel.entry_for_id(1).unwrap().kind, WheelKind::Soon);
-    }
-
-    #[test]
-    fn bump_resumes_large_fast_forward_after_limit() {
-        let pid = Pid::new(0, 0);
-        let mut wheel = Wheel::<u8>::new(0);
-        let deadline = SOON_SIZE as u64 + 123;
+        let deadline = 16_384 + 123;
         for id in 1..=20_050 {
             wheel.insert(id, deadline, TimerPayload::Message(pid, 1, true));
         }
-        let first = wheel.advance(deadline);
-        let second = wheel.advance(deadline);
-        assert_eq!(first.len(), BUMP_YIELD_LIMIT / COST_TIMEOUT);
-        assert_eq!(second.len(), BUMP_YIELD_LIMIT / COST_TIMEOUT);
-        assert_eq!(first.first().map(|timer| timer.0), Some(1));
-        let mut total = first.len() + second.len();
-        let mut last = Vec::new();
-        while total < 20_050 {
-            last = wheel.advance(deadline);
-            assert!(!last.is_empty());
-            total += last.len();
-        }
-        assert_eq!(total, 20_050);
-        assert_eq!(last.len(), 50);
-        assert_eq!(last.last().map(|timer| timer.0), Some(20_050));
+        let first = wheel.bump_timers(deadline);
+        assert!(first.len() < 20_050);
+        assert!(wheel.next_timeout_time() <= deadline);
+        let mut ids: Vec<u64> = first.into_iter().map(|(id, _)| id).collect();
+        ids.extend(bump(&mut wheel, deadline));
+        assert_eq!(ids, (1..=20_050).collect::<Vec<_>>());
     }
 
     #[test]
-    fn fast_forward_keeps_future_timer_nodes_in_their_wheel_slots() {
+    fn slab_entries_are_reused_after_timeout_and_cancel() {
         let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
-        wheel.insert(1, 10_000, TimerPayload::Message(pid, 1, true));
-        wheel.insert(2, 100_000, TimerPayload::Message(pid, 2, true));
-
-        let due = wheel.advance(20_000);
-        assert_eq!(due.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1]);
-        assert_eq!(wheel.remaining(2), Some(80_000));
-        validate_wheel(&wheel);
-
-        let due = wheel.advance(100_000);
-        assert_eq!(due.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [2]);
-        validate_wheel(&wheel);
+        for round in 0..10u64 {
+            for id in 0..100 {
+                let id = round * 1000 + id;
+                wheel.insert(id, round * 10 + 5, TimerPayload::Message(pid, 0, true));
+            }
+            for id in 0..50 {
+                wheel.cancel(round * 1000 + id);
+            }
+            assert_eq!(bump(&mut wheel, round * 10 + 5).len(), 50);
+        }
+        assert_eq!(wheel.entries.len(), 100);
+        assert!(!wheel.has_timers());
     }
 }

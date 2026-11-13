@@ -12,15 +12,17 @@
 
 mod raw;
 
+use std::any::Any;
 use std::pin::Pin;
 
 pub use raw::TWheelTimer;
 use raw::{Sentinel, TimerPtr};
 
-/// A timeout callback (`ErlTimeoutProc`). erts callbacks reach their scheduler's wheel through
-/// `erts_get_scheduler_data()`; here the bumping wheel is passed in, so a callback may set or
-/// cancel timers on it.
-pub type TimeoutProc = fn(&mut TimerWheel, *mut ());
+/// A timeout callback (`ErlTimeoutProc`): `(wheel, esdp, arg)`. erts callbacks reach their
+/// scheduler's data, and through it the wheel, with `erts_get_scheduler_data()`; here the
+/// bumping wheel and the scheduler context given to [`TimerWheel::bump_timers`] are passed in,
+/// so a callback may set or cancel timers on the wheel.
+pub type TimeoutProc = fn(&mut TimerWheel, &mut dyn Any, *mut ());
 
 const SOON_WHEEL_BITS: u32 = 14;
 const LATER_WHEEL_BITS: u32 = 14;
@@ -87,8 +89,6 @@ pub struct TimerWheel {
     sentinel: Sentinel,
     true_next_timeout_time: bool,
     next_timeout_pos: i64,
-    /// `erts_get_monotonic_time`, in clock ticks.
-    clock: fn() -> i64,
 }
 
 /// Where a bump enters its loop: from the top, or at the point a yield left it.
@@ -207,10 +207,9 @@ fn later_slot(later_pos: i64) -> i32 {
 }
 
 impl TimerWheel {
-    /// Port of erts/emulator/beam/time.c (erts_create_timer_wheel), OTP-29.1.1. `clock` reads
-    /// the monotonic time in clock ticks.
-    pub fn new(clock: fn() -> i64) -> Self {
-        let pos = clock();
+    /// Port of erts/emulator/beam/time.c (erts_create_timer_wheel), OTP-29.1.1. `pos` is the
+    /// current monotonic time in clock ticks.
+    pub fn new(pos: i64) -> Self {
         Self {
             slots: vec![None; (1 + SOON_WHEEL_SIZE + LATER_WHEEL_SIZE) as usize].into_boxed_slice(),
             scnt: [0; SCNT_SIZE],
@@ -233,7 +232,6 @@ impl TimerWheel {
             sentinel: Sentinel::new(),
             true_next_timeout_time: false,
             next_timeout_pos: pos + CLKTCKS_WEEK,
-            clock,
         }
     }
 
@@ -251,20 +249,21 @@ impl TimerWheel {
         self.next_timeout_pos
     }
 
-    /// Port of erts/emulator/beam/time.c (erts_check_next_timeout_time), OTP-29.1.1.
-    pub fn check_next_timeout_time(&mut self) -> i64 {
+    /// Port of erts/emulator/beam/time.c (erts_check_next_timeout_time), OTP-29.1.1. `clock`
+    /// reads the monotonic time in clock ticks; it is read only when the wheel is empty.
+    pub fn check_next_timeout_time(&mut self, clock: impl FnOnce() -> i64) -> i64 {
         if self.true_next_timeout_time {
             return self.next_timeout_pos;
         }
         if self.next_timeout_pos > self.pos + i64::from(SOON_WHEEL_SIZE) {
             return self.next_timeout_pos;
         }
-        self.find_next_timeout(true)
+        self.find_next_timeout(clock)
     }
 
-    // Port of erts/emulator/beam/time.c (find_next_timeout), OTP-29.1.1. `read_clock` is
-    // erts' non-NULL `esdp`: an empty wheel moves to the current time.
-    fn find_next_timeout(&mut self, read_clock: bool) -> i64 {
+    // Port of erts/emulator/beam/time.c (find_next_timeout), OTP-29.1.1: an empty wheel moves
+    // to the current time, read from `clock`.
+    fn find_next_timeout(&mut self, clock: impl FnOnce() -> i64) -> i64 {
         let mut true_min_timeout = false;
         let mut min_timeout_pos;
         debug_assert_eq!(self.at_once_nto, 0);
@@ -273,7 +272,7 @@ impl TimerWheel {
 
         'done: {
             if self.nto == 0 {
-                let curr = if read_clock { (self.clock)() } else { self.pos };
+                let curr = clock();
                 self.pos = curr;
                 min_timeout_pos = curr;
                 self.later.pos = (curr + i64::from(SOON_WHEEL_SIZE)) & LATER_WHEEL_POS_MASK;
@@ -467,9 +466,9 @@ impl TimerWheel {
     }
 
     // Port of erts/emulator/beam/time.c (timeout_timer), OTP-29.1.1.
-    fn timeout_timer(&mut self, p: TimerPtr) {
+    fn timeout_timer(&mut self, p: TimerPtr, esdp: &mut dyn Any) {
         let (timeout, arg) = p.deactivate();
-        timeout(self, arg);
+        timeout(self, esdp, arg);
     }
 
     /// Moves the circular list of `slot`, minus its head `p`, onto the sentinel; `p` is then
@@ -506,8 +505,8 @@ impl TimerWheel {
 
     /// Port of erts/emulator/beam/time.c (erts_bump_timers), OTP-29.1.1: triggers every timer
     /// due at `curr_time`, yielding after `ERTS_TWHEEL_BUMP_YIELD_LIMIT` work; the next call
-    /// continues where this one stopped.
-    pub fn bump_timers(&mut self, curr_time: i64) {
+    /// continues where this one stopped. `esdp` is handed to every callback.
+    pub fn bump_timers(&mut self, curr_time: i64, esdp: &mut dyn Any) {
         let mut yield_count = BUMP_YIELD_LIMIT;
         let slot = self.yield_slot;
         let mut restarted = slot != SLOT_INACTIVE;
@@ -551,13 +550,13 @@ impl TimerWheel {
                         }
                         if let Some(p) = self.w(SLOT_AT_ONCE) {
                             self.slot_to_sentinel(SLOT_AT_ONCE, p);
-                            if self.trigger_at_once(Some(p), &mut yield_count) {
+                            if self.trigger_at_once(Some(p), &mut yield_count, esdp) {
                                 return;
                             }
                         }
                     }
                     BumpEntry::AtOnce => {
-                        if self.trigger_at_once(None, &mut yield_count) {
+                        if self.trigger_at_once(None, &mut yield_count, esdp) {
                             return;
                         }
                     }
@@ -632,6 +631,7 @@ impl TimerWheel {
                                 scnt_ix,
                                 bump_to,
                                 &mut yield_count,
+                                esdp,
                             ) {
                                 return;
                             }
@@ -650,7 +650,7 @@ impl TimerWheel {
                 // Later wheel.
                 if (matches!(entry, BumpEntry::Later)
                     || self.pos + LATER_WHEEL_SLOT_SIZE >= self.later.pos)
-                    && self.bump_later_wheel(&mut yield_count)
+                    && self.bump_later_wheel(&mut yield_count, esdp)
                 {
                     return;
                 }
@@ -665,7 +665,8 @@ impl TimerWheel {
 
         self.true_next_timeout_time = false;
         debug_assert_eq!(self.next_timeout_pos, bump_to);
-        self.find_next_timeout(false);
+        let pos = self.pos;
+        self.find_next_timeout(|| pos);
     }
 
     // The `empty_wheel` exit of erts_bump_timers.
@@ -678,13 +679,18 @@ impl TimerWheel {
     }
 
     /// The at-once loop of erts_bump_timers; `true` when it yielded.
-    fn trigger_at_once(&mut self, mut p: Option<TimerPtr>, yield_count: &mut i32) -> bool {
+    fn trigger_at_once(
+        &mut self,
+        mut p: Option<TimerPtr>,
+        yield_count: &mut i32,
+        esdp: &mut dyn Any,
+    ) -> bool {
         loop {
             if let Some(timer) = p {
                 debug_assert!(self.nto > 0 && self.at_once_nto > 0);
                 self.nto -= 1;
                 self.at_once_nto -= 1;
-                self.timeout_timer(timer);
+                self.timeout_timer(timer, esdp);
                 *yield_count -= COST_TIMEOUT;
             }
             match self.sentinel_next(*yield_count <= 0) {
@@ -700,6 +706,7 @@ impl TimerWheel {
     }
 
     /// The soon-slot loop of erts_bump_timers; `true` when it yielded.
+    #[allow(clippy::too_many_arguments)]
     fn trigger_soon_slot(
         &mut self,
         mut p: Option<TimerPtr>,
@@ -708,6 +715,7 @@ impl TimerWheel {
         scnt_ix: usize,
         bump_to: i64,
         yield_count: &mut i32,
+        esdp: &mut dyn Any,
     ) -> bool {
         loop {
             if let Some(timer) = p {
@@ -718,7 +726,7 @@ impl TimerWheel {
                 }
                 self.scnt[scnt_ix] -= 1;
                 if timer.timeout_pos() <= bump_to {
-                    self.timeout_timer(timer);
+                    self.timeout_timer(timer, esdp);
                     self.nto -= 1;
                     self.bump_scnt[scnt_ix] -= 1;
                     *yield_count -= COST_TIMEOUT;
@@ -741,7 +749,7 @@ impl TimerWheel {
     }
 
     // Port of erts/emulator/beam/time.c (bump_later_wheel), OTP-29.1.1. `true` when it yielded.
-    fn bump_later_wheel(&mut self, ycount_p: &mut i32) -> bool {
+    fn bump_later_wheel(&mut self, ycount_p: &mut i32, esdp: &mut dyn Any) -> bool {
         let cpos = self.pos;
         let mut later_pos = self.later.pos;
         let mut ycount = *ycount_p;
@@ -814,7 +822,7 @@ impl TimerWheel {
                                 ycount -= COST_SLOT_MOVE;
                             } else {
                                 // Trigger at once.
-                                self.timeout_timer(timer);
+                                self.timeout_timer(timer, esdp);
                                 self.nto -= 1;
                                 ycount -= COST_TIMEOUT;
                             }

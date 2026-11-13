@@ -1,4 +1,5 @@
 use super::*;
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 
 thread_local! {
@@ -13,7 +14,7 @@ fn clock() -> i64 {
     CLOCK.with(Cell::get)
 }
 
-fn record(_wheel: &mut TimerWheel, arg: *mut ()) {
+fn record(_wheel: &mut TimerWheel, _esdp: &mut dyn Any, arg: *mut ()) {
     let now = NOW.with(Cell::get);
     FIRED.with(|f| f.borrow_mut().push((arg.addr(), now)));
 }
@@ -31,7 +32,7 @@ fn wheel_at(pos: i64) -> TimerWheel {
     CLOCK.with(|c| c.set(pos));
     NOW.with(|c| c.set(pos));
     take_fired();
-    TimerWheel::new(clock)
+    TimerWheel::new(clock())
 }
 
 /// Bumps to `to` until the bump no longer yields; returns the number of bump calls.
@@ -39,7 +40,7 @@ fn bump_to(wheel: &mut TimerWheel, to: i64) -> usize {
     NOW.with(|c| c.set(to));
     let mut calls = 0;
     loop {
-        wheel.bump_timers(to);
+        wheel.bump_timers(to, &mut ());
         calls += 1;
         if wheel.yield_slot == SLOT_INACTIVE {
             return calls;
@@ -155,7 +156,7 @@ fn random_set_cancel_and_jumps_match_a_model() {
                         assert!(ts[i].is_active());
                     }
                 }
-                let next = wheel.check_next_timeout_time();
+                let next = wheel.check_next_timeout_time(clock);
                 let min = deadline.iter().flatten().min().copied();
                 if let Some(min) = min {
                     assert!(next <= min, "next timeout {next} after earliest {min}");
@@ -171,15 +172,15 @@ fn random_set_cancel_and_jumps_match_a_model() {
 fn next_timeout_is_exact_in_the_soon_wheel_and_early_for_the_later_wheel() {
     let ts = timers(2);
     let mut wheel = wheel_at(0);
-    assert_eq!(wheel.check_next_timeout_time(), CLKTCKS_WEEK);
+    assert_eq!(wheel.check_next_timeout_time(clock), CLKTCKS_WEEK);
     let later = 3 * i64::from(SOON_WHEEL_SIZE) + 77;
     wheel.set_timer(ts[0].as_ref(), record, id(0), later);
-    let pre = wheel.check_next_timeout_time();
+    let pre = wheel.check_next_timeout_time(clock);
     assert_eq!(pre, (later & LATER_WHEEL_POS_MASK) - LATER_WHEEL_SLOT_SIZE);
     wheel.set_timer(ts[1].as_ref(), record, id(1), 1234);
-    assert_eq!(wheel.check_next_timeout_time(), 1234);
+    assert_eq!(wheel.check_next_timeout_time(clock), 1234);
     wheel.cancel_timer(ts[1].as_ref());
-    assert!(wheel.check_next_timeout_time() <= later);
+    assert!(wheel.check_next_timeout_time(clock) <= later);
     wheel.cancel_timer(ts[0].as_ref());
     assert_eq!(wheel.nto, 0);
 }
@@ -193,7 +194,7 @@ fn bump_yields_after_the_limit_and_resumes_in_the_same_slot() {
         wheel.set_timer(t.as_ref(), record, id(i), 10);
     }
     NOW.with(|c| c.set(10));
-    wheel.bump_timers(10);
+    wheel.bump_timers(10, &mut ());
     let first = take_fired().len();
     assert!(first < n, "first bump fired all {first}");
     assert_ne!(wheel.yield_slot, SLOT_INACTIVE);
@@ -202,15 +203,15 @@ fn bump_yields_after_the_limit_and_resumes_in_the_same_slot() {
     assert_eq!(first + take_fired().len(), n);
 }
 
-fn set_at_once(wheel: &mut TimerWheel, arg: *mut ()) {
-    record(wheel, arg);
+fn set_at_once(wheel: &mut TimerWheel, esdp: &mut dyn Any, arg: *mut ()) {
+    record(wheel, esdp, arg);
     let target = SET_TARGET.with(Cell::take).expect("target");
     let pos = NOW.with(Cell::get);
     wheel.set_timer(target, record, id(100), pos);
 }
 
-fn cancel_other(wheel: &mut TimerWheel, arg: *mut ()) {
-    record(wheel, arg);
+fn cancel_other(wheel: &mut TimerWheel, esdp: &mut dyn Any, arg: *mut ()) {
+    record(wheel, esdp, arg);
     if let Some(target) = CANCEL_TARGET.with(Cell::take) {
         wheel.cancel_timer(target);
     }
@@ -259,7 +260,7 @@ fn dropping_the_wheel_unlinks_its_timers() {
 fn cancelling_through_another_wheel_panics() {
     let t = Box::pin(TWheelTimer::new());
     let mut a = wheel_at(0);
-    let mut b = TimerWheel::new(clock);
+    let mut b = TimerWheel::new(clock());
     a.set_timer(t.as_ref(), record, std::ptr::null_mut(), 100);
     b.cancel_timer(t.as_ref());
 }
