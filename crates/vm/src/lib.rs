@@ -78,7 +78,7 @@ use arinsal_beamasm::{ExitReason, ProcessHeader, SchedulerRegisters};
 use arinsal_bifs::Ctx;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_loader::{ImportClass, Module};
-use arinsal_term::{GcStats, ProcessHeap, Term, TermBuilder, TermKind};
+use arinsal_term::{GcStats, ProcessHeap, Term, TermBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

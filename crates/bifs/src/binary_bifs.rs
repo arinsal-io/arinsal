@@ -24,11 +24,7 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "byte_size", 1) => v.entry::<word_bodies::byte_size>(),
         ("erlang", "bit_size", 1) => v.entry::<word_bodies::bit_size>(),
         ("erlang", "binary_to_list", 1 | 3) => v.entry::<bodies::erlang_binary_to_list>(),
-        ("erlang", "list_to_binary", 1) => v.entry::<bodies::list_to_binary>(),
-        ("erlang", "iolist_to_binary", 1) => v.entry::<bodies::iolist_to_binary>(),
-        ("erlang", "iolist_to_iovec", 1) => v.entry::<bodies::iolist_to_iovec>(),
         ("erlang", "bitstring_to_list", 1) => v.entry::<bodies::bitstring_to_list>(),
-        ("erlang", "list_to_bitstring", 1) => v.entry::<bodies::list_to_bitstring>(),
         ("erlang", "split_binary", 2) => v.entry::<word_bodies::split_binary>(),
         ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => {
             v.entry::<word_bodies::binary_part>()
@@ -46,7 +42,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("binary", "split", 2 | 3) => v.entry::<word_bodies::binary_split>(),
         ("binary", "encode_unsigned", 1 | 2) => v.entry::<word_bodies::encode_unsigned>(),
         ("binary", "decode_unsigned", 1 | 2) => v.entry::<word_bodies::decode_unsigned>(),
-        ("binary", "list_to_bin", 1) => v.entry::<bodies::list_to_binary>(),
         _ => return None,
     };
     Some(bif)
@@ -289,39 +284,6 @@ pub(super) fn with_binary_input<R>(
         let bytes = binary_input(&view)?;
         f(&bytes)
     })?
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:857-935 (list_to_bitstring_bif), OTP-29.1.1.
-fn list_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
-        return Err(BADARG);
-    }
-    if let Some(binary) = singleton_bitstring(args[0], 8)? {
-        return Ok(binary);
-    }
-    iolist_to_binary_result(ctx, args[0])
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:916-927 (iolist_to_binary_1), OTP-29.1.1.
-fn iolist_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if args[0].classify() == TermKind::Bitstring {
-        if !bitstring_bit_len(args[0])?.is_multiple_of(8) {
-            return Err(BADARG);
-        }
-        return Ok(args[0]);
-    }
-    if let Some(binary) = singleton_bitstring(args[0], 8)? {
-        return Ok(binary);
-    }
-    iolist_to_binary_result(ctx, args[0])
-}
-
-fn iolist_to_binary_result(ctx: &mut Ctx<'_>, root: Term) -> Result<Term, BifError> {
-    // ERTS sizes once, allocates the result binary, then copies directly into it.
-    let size = iolist_size_value(root)?;
-    let result = write_binary(ctx, size, |output| copy_iolist(root, output))?;
-    ctx.charge_reductions(size);
-    Ok(result)
 }
 
 /// Finish a small, non-yielding iolist conversion on the direct BIF entry.
@@ -819,107 +781,6 @@ impl IolistVecWalk {
     }
 }
 
-fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if let Some(result) = iolist_to_iovec_shortcut(&mut ctx.heap, args[0])? {
-        return Ok(result);
-    }
-    let mut walk = IolistVecWalk::new(args[0]);
-    let (_, size_used) = walk.size_step(usize::MAX).map_err(|(error, _)| error)?;
-    let (_, copy_used) = walk.copy_step(usize::MAX).map_err(|(error, _)| error)?;
-    ctx.charge_reductions(iolist_yield_reductions(size_used) + iolist_yield_reductions(copy_used));
-    walk.finish(&mut ctx.heap)
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:114-397 (generic_iolist_size), OTP-29.1.1.
-fn iolist_size_value(root: Term) -> Result<usize, BifError> {
-    let mut size = 0_usize;
-    walk_iolist(root, |term, byte_allowed| {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::Bitstring => {
-                let bits = bitstring_bit_len(term)?;
-                if !bits.is_multiple_of(8) {
-                    return Err(BADARG);
-                }
-                add_iolist_size(&mut size, bits)?;
-            }
-            TermKind::Number if byte_allowed => {
-                if !term.as_small().is_some_and(|n| (0..=255).contains(&n)) {
-                    return Err(BADARG);
-                }
-                add_iolist_size(&mut size, 8)?;
-            }
-            _ => return Err(BADARG),
-        }
-        Ok(())
-    })?;
-    Ok(size / 8)
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:114-397 (generic_iolist_size) and
-// 419-620 (generic_iolist_copy), OTP-29.1.1. ERTS follows each list tail and
-// saves only outer tails when descending into a nested head.
-fn walk_iolist(
-    root: Term,
-    mut visit: impl FnMut(Term, bool) -> Result<(), BifError>,
-) -> Result<(), BifError> {
-    let mut pending = arinsal_term::EStack::<8>::new();
-    let mut current = root;
-    loop {
-        while current.classify() == TermKind::List {
-            let (head, tail) = iolist_cons(current)?;
-            if head.classify() == TermKind::List {
-                pending.push(tail);
-                current = head;
-            } else {
-                visit(head, true)?;
-                current = tail;
-            }
-        }
-        visit(current, false)?;
-        match pending.pop() {
-            Some(tail) => current = tail,
-            None => return Ok(()),
-        }
-    }
-}
-
-fn copy_iolist(root: Term, output: &mut [u8]) -> Result<(), BifError> {
-    let mut offset = 0_usize;
-    walk_iolist(root, |term, byte_allowed| {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::Bitstring => {
-                with_binary_input(term, |bytes| {
-                    let end = offset
-                        .checked_add(bytes.len())
-                        .ok_or(BifError::SystemLimit)?;
-                    output
-                        .get_mut(offset..end)
-                        .ok_or(BifError::SystemLimit)?
-                        .copy_from_slice(bytes);
-                    offset = end;
-                    Ok(())
-                })?;
-            }
-            TermKind::Number if byte_allowed => {
-                let byte = term
-                    .as_small()
-                    .and_then(|n| u8::try_from(n).ok())
-                    .ok_or(BADARG)?;
-                *output.get_mut(offset).ok_or(BifError::SystemLimit)? = byte;
-                offset += 1;
-            }
-            _ => return Err(BADARG),
-        }
-        Ok(())
-    })?;
-    if offset != output.len() {
-        return Err(BifError::SystemLimit);
-    }
-    Ok(())
-}
-
 /// Resumable second pass of `list_to_binary` and `iolist_to_binary`.
 // Port of erts/emulator/beam/erl_iolist.c:294-620 (generic_iolist_copy), OTP-29.1.1.
 pub struct IolistCopyWalk {
@@ -1381,12 +1242,6 @@ pub(crate) fn write_binary(
     Ok(result)
 }
 
-// Port of erts/emulator/beam/erl_iolist.c:139-191 (generic_iolist_size), OTP-29.1.1.
-fn add_iolist_size(size: &mut usize, amount: usize) -> Result<(), BifError> {
-    *size = size.checked_add(amount).ok_or(BifError::SystemLimit)?;
-    Ok(())
-}
-
 // Port of erts/emulator/beam/binary.c:413-474 (bitstring_to_list_1), OTP-29.1.1.
 fn bitstring_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // SAFETY: The source bitstring and owner remain live.
@@ -1415,41 +1270,6 @@ fn bitstring_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         );
     }
     Ok(make_list(ctx, values, Term::NIL))
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:857-935 (list_to_bitstring_bif), OTP-29.1.1.
-fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
-        return Err(BADARG);
-    }
-    if let Some(bitstring) = singleton_bitstring(args[0], 1)? {
-        return Ok(bitstring);
-    }
-    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
-    let mut data = SmallVec::<[u8; 64]>::new();
-    let mut bits = 0_usize;
-    while let Some((term, byte_allowed)) = work.pop() {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::List => {
-                let (head, tail) = iolist_cons(term)?;
-                work.push((tail, false));
-                work.push((head, true));
-            }
-            TermKind::Number if byte_allowed && term.as_small().is_some() => {
-                let byte = u8::try_from(term.as_small().expect("checked")).map_err(|_| BADARG)?;
-                for bit in 0..8 {
-                    append_bit(&mut data, &mut bits, (byte >> (7 - bit)) & 1);
-                }
-            }
-            TermKind::Bitstring => append_term_bitstring(&mut data, &mut bits, term)?,
-            _ => return Err(BADARG),
-        }
-    }
-    ctx.charge_reductions(data.len());
-    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .bitstring(&data, bits)
-        .expect("infallible BIF heap"))
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (erts_binary_part), OTP-29.1.1.
@@ -2104,11 +1924,4 @@ crate::word_bif_bodies_in!(word_bodies;
     decode_unsigned,
 );
 
-crate::bif_bodies!(
-    erlang_binary_to_list,
-    list_to_binary,
-    iolist_to_binary,
-    iolist_to_iovec,
-    bitstring_to_list,
-    list_to_bitstring,
-);
+crate::bif_bodies!(erlang_binary_to_list, bitstring_to_list,);

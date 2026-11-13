@@ -394,8 +394,7 @@ impl Executor {
                     }
                     match trapped {
                         Some(Ok(crate::bif_traps::ResumeResult::Handler(
-                            crate::bif_traps::HandlerResult::Yield { .. }
-                            | crate::bif_traps::HandlerResult::YieldDirect { .. },
+                            crate::bif_traps::HandlerResult::Yield { .. },
                         ))) => {
                             if let Some(pending) = process.bif_trap_mut() {
                                 pending.schedule_out = false;
@@ -679,10 +678,7 @@ impl Executor {
                                 meter.finish(process, Some(ctx), result.reductions());
                             }
                             let outcome = match trapped {
-                                Ok(
-                                    crate::bif_traps::HandlerResult::Yield { .. }
-                                    | crate::bif_traps::HandlerResult::YieldDirect { .. },
-                                ) => {
+                                Ok(crate::bif_traps::HandlerResult::Yield { .. }) => {
                                     // The continuation export runs on the next
                                     // schedule-in. This call site is not redone.
                                     if let Some(pending) = process.bif_trap_mut() {

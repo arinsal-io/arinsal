@@ -227,10 +227,7 @@ impl Process {
                     !self.heap.gc_enabled
                         || trap.root_args_len() != 0
                         || trap.target.entry.is_none()
-                        || !crate::bif_traps::state_holds_heap_terms(
-                            &trap.state,
-                            trap.direct_state.is_some()
-                        ),
+                        || !crate::bif_traps::state_holds_heap_terms(&trap.state),
                     "collection with an unrooted heap term in the trap state of {}",
                     trap.continuation
                 );

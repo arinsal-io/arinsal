@@ -127,19 +127,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             bytes: vec![1, 2, ((n % 8) as u8) << 5],
             bits: 3,
         }],
-        ("erlang", "list_to_bitstring", 1) => vec![list(vec![
-            O::Int((n % 255) as i64),
-            O::BitString {
-                bytes: vec![0b1010_0000],
-                bits: 3,
-            },
-            O::Binary(vec![2, 3]),
-        ])],
-        ("erlang", "list_to_binary" | "iolist_to_binary" | "iolist_size", 1) => vec![list(vec![
-            O::Int(1),
-            O::Binary(vec![2, 3]),
-            list(vec![O::Int((n % 255) as i64)]),
-        ])],
         ("erlang", "split_binary", 2) => vec![bin, O::Int((n % 5) as i64)],
         ("erlang" | "binary", "binary_part" | "part", 2) => {
             vec![bin, O::Tuple(vec![O::Int(1), O::Int(2)])]
@@ -378,20 +365,11 @@ fn compiled_patterns_match_plain_patterns() {
 #[test]
 fn bitstring_and_iolist_edges() {
     let reference = RefErl::shared().expect("OTP 29 reference");
-    let improper = O::List {
-        elems: vec![O::Int(1)],
-        tail: Box::new(O::Int(2)),
-    };
     let partial = O::BitString {
         bytes: vec![0b1010_0000],
         bits: 3,
     };
     for (name, value) in [
-        ("list_to_binary", O::Binary(vec![1])),
-        ("list_to_binary", improper.clone()),
-        ("iolist_to_binary", improper.clone()),
-        ("iolist_to_binary", O::Binary(vec![1])),
-        ("iolist_size", improper),
         ("size", partial.clone()),
         ("byte_size", partial.clone()),
         ("bitstring_to_list", partial),
@@ -994,27 +972,6 @@ fn is_builtin_includes_instruction_implemented_exports() {
         assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
         assert_eq!(actual, CallResult::Ok(atom("true")));
     }
-}
-
-#[test]
-fn iolist_to_iovec_preserves_large_binary_segments() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let input = O::List {
-        elems: vec![
-            O::Binary(vec![1]),
-            O::Binary(vec![2; 1012]),
-            O::Binary(vec![3; 1012]),
-        ],
-        tail: Box::new(O::Nil),
-    };
-    let expected = reference.call("erlang", "iolist_to_iovec", std::slice::from_ref(&input));
-    let actual = call("erlang", "iolist_to_iovec", &[input]);
-    assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
-    let CallResult::Ok(O::List { elems, tail }) = &actual else {
-        panic!("unexpected iovec result: {actual:?}");
-    };
-    assert_eq!(elems.len(), 3);
-    assert_eq!(tail.as_ref(), &O::Nil);
 }
 
 #[test]
