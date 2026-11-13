@@ -17,12 +17,12 @@ struct PriorityStat {
 
 struct SchedStat {
     enabled: AtomicBool,
-    lock: raw::SpinLock<[PriorityStat; PRIORITY_COUNT]>,
+    lock: raw::LockedValue<[PriorityStat; PRIORITY_COUNT]>,
 }
 
 static SCHED_STAT: SchedStat = SchedStat {
     enabled: AtomicBool::new(false),
-    lock: raw::SpinLock::new([
+    lock: raw::LockedValue::new([
         PriorityStat {
             total_executed: 0,
             executed: 0,
