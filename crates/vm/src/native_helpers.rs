@@ -1016,15 +1016,11 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
-    // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
-    // returns the reductions left), OTP-29.1.1: FCALLS runs out and the process yields at
-    // its next reduction check.
-    if process.force_yield() {
-        return fcalls.max(0);
-    }
     // Port of erts/emulator/beam/erl_gc.c (erts_garbage_collect_nobump), OTP-29.1.1:
     // the collection's cost, at most the reductions left, is what the generated code
-    // subtracts from FCALLS.
+    // subtracts from FCALLS. A delayed collection costs all the reductions left
+    // (erl_gc.c:588-597, delay_garbage_collection), so the process yields at its next
+    // reduction check.
     i32::try_from(result.unwrap_or(0))
         .unwrap_or(i32::MAX)
         .min(fcalls.max(0))
@@ -2794,13 +2790,6 @@ fn call_process_bif(
         return Some(match result {
             Ok(value) => {
                 process.x[0] = value;
-                // A collection handed to a dirty scheduler must leave this one before
-                // the next call. `leave_runtime` reloads FCALLS, and the next
-                // `call_light_bif` yields when it is exhausted.
-                // Port of erl_gc.c:588-597 (`force_reschedule`), OTP-29.1.1.
-                if process.force_yield() {
-                    process.heap.abi.fcalls = 0;
-                }
                 crate::native_hooks::raw(value)
             }
             Err(error) => process_bif_result(process, export, arity, Err(error)),

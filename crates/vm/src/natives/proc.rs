@@ -2012,8 +2012,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "list_to_port", 1),
     ("erlang", "list_to_ref", 1),
     ("erlang", "fun_to_list", 1), // mix_loop6
-    // `i_yield` is an OTP instruction, not an Erlang wrapper interception.
-    ("erlang", "yield", 0),
     ("erts_internal", "process_flag", 3),
     ("erlang", "process_info", 1),
     ("erlang", "process_info", 2),
@@ -3138,13 +3136,6 @@ fn call_values(
             ("list_to_ref", [chars]) if module == "erlang" => list_to_ref(process, *chars),
             // Port of erts/emulator/beam/bif.c:4487 (fun_to_list_1), OTP-29.1.1.
             ("fun_to_list", [fun]) if module == "erlang" => charlist(process, &fun_to_list(*fun)?),
-            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3121 (emit_i_yield) and
-            // instr_call.cpp:30 (dispatch_return), OTP-29.1.1: `x0 = true` and an unconditional
-            // context switch with FCALLS untouched; the one forced yield erts has.
-            ("yield", []) if module == "erlang" => {
-                process.set_force_yield(true);
-                Ok(Term::atom(arinsal_term::atoms::TRUE))
-            }
             // Port of erts/emulator/beam/bif.c:2262 (erts_internal_process_flag_3): another
             // process gets an RPC request and the caller receives `{Ref, Result}` itself.
             ("process_flag", [target, name, value]) if module == "erts_internal" => {

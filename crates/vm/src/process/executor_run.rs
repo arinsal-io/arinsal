@@ -190,10 +190,6 @@ impl Executor {
                             if process.heap.abi.fcalls <= 0 {
                                 break Ok(RunState::Yield);
                             }
-                            if process.force_yield() {
-                                process.set_force_yield(false);
-                                break Ok(RunState::Yield);
-                            }
                             // g_proc_sched: a suspended process is not scheduled; a hibernating
                             // one stays waiting until a message arrives, then continues at apply/3.
                             if let Some(wait) = self.sched_preempt(process, ctx)? {
@@ -322,10 +318,6 @@ impl Executor {
                                 }
                                 Err(error) => break Err(error),
                             }
-                        }
-                        if process.force_yield() {
-                            process.set_force_yield(false);
-                            break Ok(RunState::Yield);
                         }
                         if let Some(kind) = process
                             .native_pc()
@@ -508,7 +500,6 @@ impl Executor {
                         // of the process's position continues the slice.
                         if matches!(&result, Ok(RunState::Yield))
                             && process.native_pc().is_some()
-                            && !process.force_yield()
                             && native_transfer_continues(process)
                         {
                             continue;

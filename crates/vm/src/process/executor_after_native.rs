@@ -67,11 +67,6 @@ impl Executor {
                         return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos })));
                     }
                 }
-                // A native `i_yield` is a scheduler boundary even when the
-                // interpreter left a deferred yield request in the process.
-                // Port of erts/emulator/beam/erl_process.c:10550
-                // (trace_schedule_out), OTP-29.1.1.
-                process.set_force_yield(false);
                 return Ok(Flow::Break(Ok(RunState::Yield)));
             }
             arinsal_beamasm::ExitReason::CallUnported {

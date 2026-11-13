@@ -261,7 +261,6 @@ impl Executor {
                 crate::proc_create::NativeExit::None => {
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    process.set_force_yield(false);
                     return Some(Ok(RunState::Yield));
                 }
                 crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {
