@@ -696,10 +696,9 @@ macro_rules! resolved_signal_handler {
 // Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
 pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
     let mut remove = false;
-    let node_alias = process
-        .monitors
-        .get(id)
-        .is_some_and(|entry| entry.alias_mode().is_some());
+    let (node_alias, prio) = process.monitors.get(id).map_or((false, false), |entry| {
+        (entry.alias_mode().is_some(), entry.alias_priority())
+    });
     let owned = {
         match process.monitors.get_state_mut(id) {
             Some(crate::proc_create::OriginMonitor::Process(_)) => node_alias,
@@ -717,6 +716,9 @@ pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
     };
     if owned && remove {
         process.monitors.remove(id);
+    }
+    if owned && prio {
+        process.prio_item_deleted(crate::receive::PrioItemType::Alias);
     }
     owned
 }
@@ -746,7 +748,6 @@ pub(crate) fn take_origin_monitor_down(
         ) => {}
         None => {}
     }
-    process.cold_mut().prio_monitors.remove(&id);
     Some(entry)
 }
 
@@ -801,11 +802,9 @@ fn finish_demonitor_origin(
     if mode == Some(crate::proc_create::AliasMode::ExplicitUnalias) {
         insert_explicit_unalias(process, id);
     }
-    // `erts_proc_sig_prio_item_deleted` only for a priority monitor.
-    if let Some(cold) = process.cold.as_mut()
-        && !cold.prio_monitors.is_empty()
-    {
-        cold.prio_monitors.remove(&id);
+    // bif.c demonitor: `erts_proc_sig_prio_item_deleted` only for a priority monitor.
+    if entry.view().prio_ml() {
+        process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
     }
     // The type of the deleted node (`ERTS_ML_GET_TYPE(mon)`), read in place.
     enum Kind {
@@ -1729,6 +1728,7 @@ pub(crate) fn send_noproc_down(
     target: Term,
     tag: Term,
     alias_mode: Option<crate::proc_create::AliasMode>,
+    priority: bool,
 ) -> Result<(), VmError> {
     // A named target is reported by name; the signal sender is then irrelevant.
     let from = target_pid.or_else(|| name.map(|_| me));
@@ -1738,13 +1738,20 @@ pub(crate) fn send_noproc_down(
         let info = monitor_info_for(tag, name)?;
         let (origin, _target) = crate::proc_create::create_monitor_with_reference_at(
             process.heap.alloc_ix(),
-            crate::proc_create::monitor_reference(id, alias_mode, false),
+            crate::natives::bif::prio_ml(
+                crate::proc_create::monitor_reference(id, alias_mode, false),
+                priority,
+            ),
             me.data(),
             from.data(),
             info,
             crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf),
         );
         process.monitors.insert(origin);
+        // bif.c monitor `done:`: a priority monitor is a priority item until its DOWN.
+        if priority {
+            process.prio_item_added(crate::receive::PrioItemType::Monitor);
+        }
         let reason = Message::copy_from(Term::atom(arinsal_term::atoms::NOPROC))?;
         return runtime
             .scheduler()?
@@ -1781,13 +1788,19 @@ pub(crate) fn send_noproc_down(
     // signal through its in-queue, behind a receive marker reserved before the call.
     let (origin, _target) = crate::proc_create::create_monitor_with_reference_at(
         process.heap.alloc_ix(),
-        crate::proc_create::monitor_reference(id, alias_mode, false),
+        crate::natives::bif::prio_ml(
+            crate::proc_create::monitor_reference(id, alias_mode, false),
+            priority,
+        ),
         me.data(),
         0,
         monitor_info_for(tag, name)?,
         crate::proc_create::OriginMonitor::Distributed,
     );
     process.monitors.insert(origin);
+    if priority {
+        process.prio_item_added(crate::receive::PrioItemType::Monitor);
+    }
     let message = Message::copy_from(down)?;
     process
         .runtime

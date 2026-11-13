@@ -105,6 +105,7 @@ impl Process {
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
     ) -> Vec<arinsal_sched::SharedPayload> {
+        self.destroy_prio_q_info_terminating();
         let mut spawn_replies = Vec::new();
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
         // OTP-29.1.1: the signals left in the inner queue come before the outer queue's.
@@ -176,7 +177,7 @@ impl Process {
                         crate::dist::reply_dist_unlink_ack(runtime, &op);
                     }
                 }
-                Payload::Signal(Signal::Link { .. }) => {
+                Payload::Signal(Signal::Link) => {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
                     // (erts_proc_exit_handle_signal), OTP-29.1.1: a link reaching an
                     // exiting process is rejected with `noproc`.
@@ -265,6 +266,9 @@ impl Process {
     ) -> Result<(), VmError> {
         let origin = crate::signals::take_origin_monitor_down(self, reference);
         let active = origin.is_some();
+        let priority = origin
+            .as_ref()
+            .is_some_and(|origin| origin.view().prio_ml());
         // erl_proc_sig_queue.c (ERTS_SIG_Q_OP_MONITOR_DOWN): a monitor of a remote process
         // takes its target half out of the connection (erts_monitor_dist_delete).
         if let Some(origin) = origin
@@ -272,16 +276,15 @@ impl Process {
         {
             crate::dist::release_origin(origin);
         }
-        let priority = self
-            .cold
-            .as_mut()
-            .is_some_and(|cold| cold.prio_monitors.remove(&reference));
         if !active {
             return Ok(());
         }
         let tuple = message.into_receiver(self)?;
         if priority {
             self.push_priority_message(tuple)?;
+            // erl_proc_sig_queue.c:6496-6504: deleted after the message is inserted, so the
+            // prio queue is still installed for it.
+            self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
         } else {
             self.inbox.push_back(tuple);
         }
@@ -311,10 +314,7 @@ impl Process {
         // raced with the target's exit) is dropped instead of becoming a message.
         let entry = crate::signals::take_origin_monitor_down(self, reference);
         let active = entry.is_some();
-        let priority = self
-            .cold
-            .as_mut()
-            .is_some_and(|cold| cold.prio_monitors.remove(&reference));
+        let priority = entry.as_ref().is_some_and(|entry| entry.view().prio_ml());
         if !active {
             return Ok(());
         }
@@ -389,6 +389,8 @@ impl Process {
         }
         if priority {
             self.push_priority_message(tuple)?;
+            // erl_proc_sig_queue.c:6496-6504: deleted after the message is inserted.
+            self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
         } else {
             self.inbox.push_back(tuple);
         }

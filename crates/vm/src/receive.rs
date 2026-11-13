@@ -136,6 +136,8 @@ impl ReceiveMarkers {
 /// `sig_qs.flags` bits of the prio queue (erl_process.h:1675-1677).
 pub(crate) const FS_PRIO_MQ_SAVE: u8 = 1 << 0;
 pub(crate) const FS_PRIO_MQ_END_MARK: u8 = 1 << 1;
+/// `FS_PRIO_MQ`: the prio queue is installed (priority items exist).
+pub(crate) const FS_PRIO_MQ: u8 = 1 << 4;
 /// The save info of `sig_qs.flags` (erl_process.h:1705-1710): how the save pointer was set.
 const FS_SET_SAVE_INFO_MASK: u8 = 3 << 2;
 const FS_SET_SAVE_INFO_FIRST: u8 = 0;
@@ -146,12 +148,26 @@ const FS_SET_SAVE_INFO_LAST: u8 = 3 << 2;
 const PRIO_Q_MARK_END: usize = 0;
 const PRIO_Q_MARK_CONT: usize = 1;
 
-/// `ErtsPrioQInfo`: the end marker of the prio queue and the marker where a receive
-/// continues once it passed the prio queue.
+/// `ErtsPrioItemType`: the kinds of priority items that keep the prio queue installed.
+// Port of erts/emulator/beam/erl_proc_sig_queue.h:1838-1842 (ErtsPrioItemType), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrioItemType {
+    Alias,
+    Link,
+    Monitor,
+}
+
+/// `ErtsPrioQInfo`: the end marker of the prio queue, the marker where a receive continues
+/// once it passed the prio queue, and the count of priority items (aliases, links, monitors)
+/// that keep the prio queue installed.
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:247-258 (ErtsPrioQInfo) and 9005
 // (create_prio_q_info), OTP-29.1.1.
 pub(crate) struct PrioQInfo {
     saved_save_info: u8,
+    refc: isize,
+    /// The per-type counts erts keeps under `DEBUG`.
+    #[cfg(debug_assertions)]
+    items: [isize; 3],
     marker: [Marker; 2],
 }
 
@@ -159,6 +175,9 @@ impl PrioQInfo {
     fn new() -> Box<Self> {
         let mut pq = Box::new(Self {
             saved_save_info: 0,
+            refc: 0,
+            #[cfg(debug_assertions)]
+            items: [0; 3],
             marker: Default::default(),
         });
         pq.marker[PRIO_Q_MARK_END].mark_type = RECV_MARKER_TYPE_PRIO_Q_END;
@@ -295,9 +314,14 @@ impl Process {
         pq.marker[which].in_sigq = 0;
     }
 
-    /// `destroy_prio_q_info`: the prio queue markers leave the message queue.
+    /// `destroy_prio_q_info`: the prio queue markers leave the message queue and the info is
+    /// freed; outside process termination only once no priority item and no prio queue
+    /// end marker is left.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:9065 (destroy_prio_q_info), OTP-29.1.1.
-    fn destroy_prio_q_info(&mut self, markers: &mut Markers) {
+    fn destroy_prio_q_info(&mut self, markers: &mut Markers, terminating: bool) {
+        debug_assert!(terminating || self.inbox.flags & FS_PRIO_MQ_SAVE == 0);
+        debug_assert!(terminating || self.inbox.flags & FS_PRIO_MQ_END_MARK == 0);
+        debug_assert!(terminating || markers.pq.as_ref().is_some_and(|pq| pq.refc == 0));
         if let Some(mut pq) = markers.pq.take() {
             for which in [PRIO_Q_MARK_END, PRIO_Q_MARK_CONT] {
                 if pq.marker[which].in_msgq != 0 {
@@ -353,9 +377,15 @@ impl Process {
                 }
                 WhichMarker::PrioEnd => {
                     if leading && self.save_info() == FS_SET_SAVE_INFO_FIRST {
-                        // Empty prio queue; remove the end marker.
+                        // Empty prio queue; remove the end marker. The info stays while
+                        // priority items keep the prio queue installed.
                         self.inbox.flags &= !(FS_PRIO_MQ_SAVE | FS_PRIO_MQ_END_MARK);
-                        self.destroy_prio_q_info(markers);
+                        if self.inbox.flags & FS_PRIO_MQ != 0 {
+                            let pq = markers.pq.as_mut().expect("prio queue info");
+                            self.remove_prio_q_marker(pq, PRIO_Q_MARK_END);
+                        } else {
+                            self.destroy_prio_q_info(markers, false);
+                        }
                     } else {
                         self.inbox.flags &= !FS_PRIO_MQ_SAVE;
                         if self.save_info() != FS_SET_SAVE_INFO_FIRST {
@@ -499,7 +529,11 @@ impl Process {
                 }
             }
         }
-        let mut pq = markers.pq.take().unwrap_or_else(PrioQInfo::new);
+        debug_assert!(self.inbox.flags & FS_PRIO_MQ != 0);
+        let mut pq = markers
+            .pq
+            .take()
+            .expect("a priority message needs an installed prio queue");
         if self.inbox.flags & FS_PRIO_MQ_SAVE == 0 {
             let set_save = match self.save_info() {
                 FS_SET_SAVE_INFO_FIRST => true,
@@ -541,6 +575,71 @@ impl Process {
             .insert_before_marker(&mut pq.marker[PRIO_Q_MARK_END], node);
         markers.pq = Some(pq);
         Ok(())
+    }
+
+    /// `erts_proc_sig_prio_item_added`: a priority alias, link or monitor was created; the
+    /// first one installs the prio queue (its info is created unless a prio queue end marker
+    /// still holds it).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:9543 (erts_proc_sig_prio_item_added),
+    // OTP-29.1.1.
+    pub(crate) fn prio_item_added(&mut self, item: PrioItemType) {
+        if self.inbox.flags & FS_PRIO_MQ == 0 {
+            self.inbox.flags |= FS_PRIO_MQ;
+            if self.inbox.flags & FS_PRIO_MQ_END_MARK == 0 {
+                let previous = self.cold_mut().prio_q.replace(PrioQInfo::new());
+                debug_assert!(previous.is_none());
+            }
+        }
+        let pq = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.prio_q.as_mut())
+            .expect("prio queue info");
+        pq.refc += 1;
+        #[cfg(debug_assertions)]
+        {
+            pq.items[item as usize] += 1;
+            debug_assert_eq!(pq.refc, pq.items.iter().sum::<isize>());
+        }
+        let _ = item;
+    }
+
+    /// `erts_proc_sig_prio_item_deleted`: a priority alias, link or monitor is gone; the last
+    /// one uninstalls the prio queue. Its info is destroyed at once when the prio queue is
+    /// empty, otherwise when a receive reaches the end marker of the empty prio queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:9502 (erts_proc_sig_prio_item_deleted),
+    // OTP-29.1.1.
+    pub(crate) fn prio_item_deleted(&mut self, item: PrioItemType) {
+        debug_assert!(self.inbox.flags & FS_PRIO_MQ != 0);
+        let pq = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.prio_q.as_mut())
+            .expect("prio queue info");
+        pq.refc -= 1;
+        #[cfg(debug_assertions)]
+        {
+            pq.items[item as usize] -= 1;
+            debug_assert!(pq.refc >= 0 && pq.items.iter().all(|n| *n >= 0));
+            debug_assert_eq!(pq.refc, pq.items.iter().sum::<isize>());
+        }
+        let _ = item;
+        if pq.refc == 0 {
+            self.inbox.flags &= !FS_PRIO_MQ;
+            if self.inbox.flags & FS_PRIO_MQ_END_MARK == 0 {
+                self.with_markers(|process, markers| process.destroy_prio_q_info(markers, false));
+            }
+        }
+    }
+
+    /// The prio queue info of a terminating process goes away first
+    /// (`erts_proc_sig_handle_exit`); priority items deleted while exiting do not count down.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7270-7271 (erts_proc_sig_handle_exit),
+    // OTP-29.1.1.
+    pub(crate) fn destroy_prio_q_info_terminating(&mut self) {
+        if self.inbox.flags & (FS_PRIO_MQ | FS_PRIO_MQ_END_MARK) != 0 {
+            self.with_markers(|process, markers| process.destroy_prio_q_info(markers, true));
+        }
     }
 
     /// Allocate a marker for `uniq`: a free one, or the least recently allocated (preferably

@@ -468,9 +468,9 @@ impl arinsal_sched::SignalMessage for Message {
         signal: arinsal_sched::Signal<Self>,
     ) -> arinsal_sched::OwnedSignal<Event<Self>> {
         use crate::proc_create::ProcessMonitorData;
-        if let arinsal_sched::Signal::Link { priority } = signal {
+        if let arinsal_sched::Signal::Link = signal {
             return ProcessMonitorData::link_signal(
-                crate::proc_create::process_link(from, priority),
+                crate::proc_create::process_link(from, false),
                 arinsal_sched::lazy_link_meta(from),
             );
         }
@@ -564,11 +564,10 @@ impl
         let link = crate::monitor_link::Link::from_signal_header(header);
         let view = link.view();
         let from = Pid::from_data(view.other());
-        let priority = view.is_priority();
         drop(link);
         Event {
             from,
-            payload: Payload::Signal(arinsal_sched::Signal::Link { priority }),
+            payload: Payload::Signal(arinsal_sched::Signal::Link),
         }
     }
 
