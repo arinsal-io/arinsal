@@ -103,7 +103,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).trap_exit).write(false);
         std::ptr::addr_of_mut!((*process).exc_class).write(None);
         std::ptr::addr_of_mut!((*process).entry).write(false);
-        std::ptr::addr_of_mut!((*process).force_yield).write(false);
         std::ptr::addr_of_mut!((*process).native_continuation_resume).write(false);
         std::ptr::addr_of_mut!((*process).native_arity_set).write(false);
         std::ptr::addr_of_mut!((*process).native_error_pc).write(0);
@@ -187,7 +186,6 @@ fn process_fields_are_initialized(process: Process) {
         trap_exit,
         exc_class,
         entry,
-        force_yield,
         native_continuation_resume,
         native_arity_set,
         native_error_pc,
@@ -256,7 +254,6 @@ fn process_fields_are_initialized(process: Process) {
         trap_exit,
         exc_class,
         entry,
-        force_yield,
         native_continuation_resume,
         native_arity_set,
         native_error_pc,

@@ -35,8 +35,11 @@ impl Process {
             self.heap.delay_collection(min_free);
             return Ok(arinsal_term::GcStats::default());
         }
-        if !hibernate && self.delay_for_dirty_gc(min_free) {
-            return Ok(arinsal_term::GcStats::default());
+        if !hibernate && let Some(reds_left) = self.delay_for_dirty_gc(min_free) {
+            return Ok(arinsal_term::GcStats {
+                reductions: reds_left,
+                ..arinsal_term::GcStats::default()
+            });
         }
         // An on-heap message installed while this process was queued lives only in
         // the outer signal queue until this fetch. Scanning without it would
@@ -303,14 +306,15 @@ impl Process {
     }
 
     /// Hand a potentially long collection to a dirty CPU scheduler: satisfy `need` without
-    /// collecting and make the process leave its scheduler at the next reduction check.
-    /// Returns whether the collection was delayed.
+    /// collecting. Returns the reductions left in the slice when the collection was delayed:
+    /// the caller bumps FCALLS by them, so the process leaves its scheduler at its next
+    /// reduction check (`i_test_yield`, a light BIF entry, a call).
     // Port of erts/emulator/beam/erl_gc.c:780-792 (garbage_collect), 688-715
     // (check_for_possibly_long_gc) and 500-603 (delay_garbage_collection), OTP-29.1.1.
-    fn delay_for_dirty_gc(&mut self, need: usize) -> bool {
+    fn delay_for_dirty_gc(&mut self, need: usize) -> Option<u32> {
         // Only a scheduled process can move to a dirty scheduler; a dirty scheduler collects.
         if self.runtime.is_none() || arinsal_sched::current_scheduler_type().is_dirty() {
-            return false;
+            return None;
         }
         // erl_gc.h:26 (ERTS_POTENTIALLY_LONG_GC_HSIZE).
         const DEFAULT_LIMIT: usize = 128 * 1024;
@@ -330,7 +334,7 @@ impl Process {
         // The old generation only counts for a major collection, so a young generation
         // plus old heap below the limit is below it whichever collection runs.
         if size.saturating_add(self.heap.old_used_words()) < long_gc_hsize {
-            return false;
+            return None;
         }
         // A collection that starts as minor is checked on its young generation alone. If
         // that is already long, the dirty scheduler runs the minor attempt and any major
@@ -345,7 +349,7 @@ impl Process {
             size = size.saturating_add(self.heap.old_used_words());
         }
         if size < long_gc_hsize {
-            return false;
+            return None;
         }
         if failed_minor {
             let traced = self
@@ -367,16 +371,15 @@ impl Process {
         // when it leaves this one.
         self.delay_heap_collection(need);
         // erl_gc.c, delay_garbage_collection (force_reschedule): the remaining reductions
-        // are spent, and all but ERTS_ABANDON_HEAP_COST of them are not the process's own
-        // work. The interpreter keeps its slice in the scheduler and never charges the rest
-        // of it.
-        if self.heap.native_active() && self.heap.abi.fcalls > ABANDON_HEAP_COST {
+        // are returned for the caller's BUMP_REDS, and all but ERTS_ABANDON_HEAP_COST of
+        // them are not the process's own work.
+        let reds_left = self.heap.abi.fcalls.max(0);
+        if reds_left > ABANDON_HEAP_COST {
             self.virtual_reds = self
                 .virtual_reds
-                .saturating_add((self.heap.abi.fcalls - ABANDON_HEAP_COST) as u32);
+                .saturating_add((reds_left - ABANDON_HEAP_COST) as u32);
         }
-        self.set_force_yield(true);
-        true
+        Some(reds_left as u32)
     }
 
     /// Run the collection a normal scheduler delayed, on the dirty CPU scheduler.

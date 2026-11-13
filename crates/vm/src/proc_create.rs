@@ -492,8 +492,6 @@ pub struct Process {
     /// mix_loop1. Port of the freason kept across `i_raise` (beam_emu), OTP-29.1.1.
     pub(crate) exc_class: Option<arinsal_bifs::Class>,
     pub(crate) entry: bool,
-    /// A dist send that suspended must yield even if the queue drains before return.
-    force_yield: bool,
     /// The next native entry resumes a raw continuation already on the stack.
     pub(crate) native_continuation_resume: bool,
     /// `header.arity` already holds the live X register count of the resumed native
@@ -1716,8 +1714,6 @@ impl Process {
     pub(crate) const SLOW_COLD: u32 = 1 << 0;
     /// `exit_cont` holds a suspended exit.
     pub(crate) const SLOW_EXIT_CONT: u32 = 1 << 1;
-    /// `force_yield` is set.
-    pub(crate) const SLOW_FORCE_YIELD: u32 = 1 << 2;
     /// The entry process has not run yet.
     pub(crate) const SLOW_NOT_STARTED: u32 = 1 << 3;
     /// The middle signal queue is not empty.
@@ -1737,9 +1733,6 @@ impl Process {
         }
         if self.exit_cont.is_some() {
             slow |= Self::SLOW_EXIT_CONT;
-        }
-        if self.force_yield {
-            slow |= Self::SLOW_FORCE_YIELD;
         }
         if !self.entry_started {
             slow |= Self::SLOW_NOT_STARTED;
@@ -1794,15 +1787,6 @@ impl Process {
         let previous = std::mem::replace(&mut self.entry_started, started);
         self.set_slow(Self::SLOW_NOT_STARTED, !started);
         previous
-    }
-    #[inline(always)]
-    pub(crate) fn force_yield(&self) -> bool {
-        self.force_yield
-    }
-    #[inline(always)]
-    pub(crate) fn set_force_yield(&mut self, yield_now: bool) {
-        self.force_yield = yield_now;
-        self.set_slow(Self::SLOW_FORCE_YIELD, yield_now);
     }
     #[inline(always)]
     pub(crate) fn has_exit_cont(&self) -> bool {
@@ -2141,7 +2125,6 @@ impl Process {
             trap_exit: false,
             exc_class: None,
             entry: false,
-            force_yield: false,
             native_continuation_resume: false,
             native_arity_set: false,
             native_error_pc: 0,
@@ -2950,10 +2933,6 @@ mod layout_report {
         eprintln!("  Process.trap_exit {}", size_of_val(&process.trap_exit));
         eprintln!("  Process.exc_class {}", size_of_val(&process.exc_class));
         eprintln!("  Process.entry {}", size_of_val(&process.entry));
-        eprintln!(
-            "  Process.force_yield {}",
-            size_of_val(&process.force_yield)
-        );
         eprintln!(
             "  Process.native_continuation_resume {}",
             size_of_val(&process.native_continuation_resume)
