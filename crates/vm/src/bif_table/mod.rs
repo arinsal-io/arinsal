@@ -139,7 +139,8 @@ use crate::native_helpers::{
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    erl_bif_info, erl_bif_lists, erl_hl_timer, erl_map, erl_process_dict, register,
+    bif_phash2, erl_bif_chksum, erl_bif_info, erl_bif_lists, erl_hl_timer, erl_map,
+    erl_process_dict, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -213,6 +214,20 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("lists", "keymember", 3) => bif!(erl_bif_lists::lists_keymember_3),
         ("lists", "keysearch", 3) => bif!(erl_bif_lists::lists_keysearch_3),
         ("lists", "keyfind", 3) => bif!(erl_bif_lists::lists_keyfind_3),
+        // erl_bif_chksum.c
+        ("erlang", "crc32", 1) => bif!(erl_bif_chksum::crc32_1),
+        ("erlang", "crc32", 2) => bif!(erl_bif_chksum::crc32_2),
+        ("erlang", "crc32_combine", 3) => bif!(erl_bif_chksum::crc32_combine_3),
+        ("erlang", "adler32", 1) => bif!(erl_bif_chksum::adler32_1),
+        ("erlang", "adler32", 2) => bif!(erl_bif_chksum::adler32_2),
+        ("erlang", "adler32_combine", 3) => bif!(erl_bif_chksum::adler32_combine_3),
+        ("erlang", "md5", 1) => bif!(erl_bif_chksum::md5_1),
+        ("erlang", "md5_init", 0) => bif!(erl_bif_chksum::md5_init_0),
+        ("erlang", "md5_update", 2) => bif!(erl_bif_chksum::md5_update_2),
+        ("erlang", "md5_final", 1) => bif!(erl_bif_chksum::md5_final_1),
+        // bif.c
+        ("erlang", "phash2", 1) => bif!(bif_phash2::phash2_1),
+        ("erlang", "phash2", 2) => bif!(bif_phash2::phash2_2),
         // erl_map.c
         ("maps", "from_list", 1) => bif!(erl_map::maps_from_list_1),
         ("maps", "from_keys", 2) => bif!(erl_map::maps_from_keys_2),
@@ -311,7 +326,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 // selected BIF body directly; that body leaves the light path only when it traps.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{
-        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsMerge, Phash2,
+        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsMerge,
         TermToBinary,
     };
     use crate::native_helpers::trap_bif_entry;
@@ -327,8 +342,6 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
         ("erlang", "iolist_size", 1) => bif!(trap_bif_entry::<IolistSize>),
         ("erlang", "iolist_to_iovec", 1) => bif!(trap_bif_entry::<IolistToIovec>),
         ("erlang", "term_to_binary", 1 | 2) => bif!(trap_bif_entry::<TermToBinary>),
-        ("erlang", "phash2", 1) => bif!(trap_bif_entry::<Phash2<1>>),
-        ("erlang", "phash2", 2) => bif!(trap_bif_entry::<Phash2<2>>),
         ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
         _ => return None,
     };

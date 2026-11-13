@@ -33,14 +33,18 @@ fn is_list(term: Term) -> bool {
 /// `ERTS_BIF_REDS_LEFT(c_p)`.
 // Port of erts/emulator/beam/bif.h (ERTS_BIF_REDS_LEFT), OTP-29.1.1.
 #[inline(always)]
-fn bif_reds_left(process: &crate::Process) -> usize {
+pub(crate) fn bif_reds_left(process: &crate::Process) -> usize {
     process.heap.abi.fcalls.max(0) as usize
 }
 
 /// `BIF_TRAPn(BIF_TRAP_EXPORT(bif), c_p, args...)`.
 #[cold]
 #[inline(never)]
-fn bif_trap(process: &mut crate::Process, export: &'static str, args: Vec<Term>) -> VmError {
+pub(crate) fn bif_trap(
+    process: &mut crate::Process,
+    export: &'static str,
+    args: Vec<Term>,
+) -> VmError {
     VmError::TrapExport(crate::ExportTrap::new(process, export, args))
 }
 
@@ -182,7 +186,7 @@ fn append_continue(
 /// `erts_create_magic_binary` + `erts_mk_magic_ref` of a trap context.
 // Port of erts/emulator/beam/erl_bif_lists.c (append_create_trap_state,
 // subtract_create_trap_state), OTP-29.1.1.
-fn create_trap_state<T: std::any::Any + Send>(
+pub(crate) fn create_trap_state<T: std::any::Any + Send>(
     process: &mut crate::Process,
     context: T,
     c_size: usize,

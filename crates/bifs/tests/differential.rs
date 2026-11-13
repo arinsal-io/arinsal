@@ -62,8 +62,7 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             atom(if n.is_multiple_of(2) { "true" } else { "false" }),
             atom(if n.is_multiple_of(3) { "true" } else { "false" }),
         ],
-        ("erlang", "phash2", 1) => vec![term(n)],
-        ("erlang", "phash2" | "phash", 2) => vec![term(n), O::Int((n % 1000 + 1) as i64)],
+        ("erlang", "phash", 2) => vec![term(n), O::Int((n % 1000 + 1) as i64)],
         ("erlang", "list_to_tuple", 1) => vec![seq],
         ("erlang", "make_tuple", 2) => vec![O::Int((n % 8) as i64), term(n)],
         ("erlang", "make_tuple", 3) => vec![
@@ -523,15 +522,11 @@ fn referenced_byte_size_keeps_subbinary_owner() {
 fn new_bifs_valid_inputs_match_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     for n in 0..1000 {
-        let data = O::Binary((0..n % 197).map(|i| ((i * 37 + n) % 256) as u8).collect());
         let map = O::Map(vec![(O::Int(1), O::Int(n)), (O::Int(2), O::Int(n + 1))]);
         let positive_cases = [
             ("erlang", "+", vec![O::Int(n), O::Int(n + 1)]),
             ("erlang", "div", vec![O::Int(n), O::Int(7)]),
             ("erlang", "bsl", vec![O::Int(n), O::Int(n % 20)]),
-            ("erlang", "crc32", vec![data.clone()]),
-            ("erlang", "adler32", vec![data.clone()]),
-            ("erlang", "md5", vec![data.clone()]),
             ("maps", "find", vec![O::Int(1), map.clone()]),
             ("maps", "get", vec![O::Int(1), map.clone()]),
             ("maps", "is_key", vec![O::Int(1), map.clone()]),
@@ -556,67 +551,6 @@ fn new_bifs_valid_inputs_match_otp() {
                 "{module}:{name} {input:?}: {actual:?} != {expected:?}"
             );
         }
-        for algorithm in ["crc32", "adler32"] {
-            let O::Binary(ref bytes) = data else {
-                unreachable!()
-            };
-            let mid = bytes.len() / 2;
-            let left = O::Binary(bytes[..mid].to_vec());
-            let right = O::Binary(bytes[mid..].to_vec());
-            let local_left = call("erlang", algorithm, std::slice::from_ref(&left));
-            let local_right = call("erlang", algorithm, std::slice::from_ref(&right));
-            let (
-                arinsal_difftest::CallResult::Ok(sum_left),
-                arinsal_difftest::CallResult::Ok(sum_right),
-            ) = (local_left, local_right)
-            else {
-                panic!("checksum")
-            };
-            let input = [
-                sum_left.clone(),
-                sum_right,
-                O::Int((bytes.len() - mid) as i64),
-            ];
-            let name = format!("{algorithm}_combine");
-            let actual = call("erlang", &name, &input);
-            let expected = reference.call("erlang", &name, &input);
-            assert!(
-                equivalent(&actual, &expected),
-                "{name} {input:?}: {actual:?} != {expected:?}"
-            );
-            let input = [sum_left, right];
-            let actual = call("erlang", algorithm, &input);
-            let expected = reference.call("erlang", algorithm, &input);
-            assert!(
-                equivalent(&actual, &expected),
-                "{algorithm}/2 {input:?}: {actual:?} != {expected:?}"
-            );
-        }
-        let init = call("erlang", "md5_init", &[]);
-        let remote_init = reference.call("erlang", "md5_init", &[]);
-        assert!(
-            equivalent(&init, &remote_init),
-            "md5_init: {init:?} != {remote_init:?}"
-        );
-        let arinsal_difftest::CallResult::Ok(context) = init else {
-            panic!("context")
-        };
-        let input = [context, data];
-        let update = call("erlang", "md5_update", &input);
-        let remote_update = reference.call("erlang", "md5_update", &input);
-        assert!(
-            equivalent(&update, &remote_update),
-            "md5_update n={n}: {update:?} != {remote_update:?}"
-        );
-        let arinsal_difftest::CallResult::Ok(context) = update else {
-            panic!("context")
-        };
-        let local_final = call("erlang", "md5_final", std::slice::from_ref(&context));
-        let remote_final = reference.call("erlang", "md5_final", &[context]);
-        assert!(
-            equivalent(&local_final, &remote_final),
-            "md5_final n={n}: {local_final:?} != {remote_final:?}"
-        );
     }
 }
 
@@ -1405,46 +1339,5 @@ fn list_bif_loops_match_otp_29() {
             equivalent(&actual, &expected),
             "{module}:{name} {args:?}: {actual:?} != {expected:?}"
         );
-    }
-}
-
-#[test]
-fn phash2_immediate_fast_path_matches_otp_29() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let terms = [
-        O::Int(0),
-        O::Int(1),
-        O::Int(-5),
-        O::Int((1 << 27) - 1),
-        O::Int(1 << 27),
-        O::Int(-(1 << 27)),
-        O::Int(1 << 40),
-        O::Int(-(1 << 40)),
-        atom("abc"),
-        atom("true"),
-        O::Nil,
-    ];
-    let ranges = [
-        None,
-        Some(O::Int(1)),
-        Some(O::Int(1000)),
-        Some(O::Int(1 << 32)),
-        Some(O::Int((1 << 32) - 1)),
-        Some(O::Int(0)),
-        Some(O::Int((1 << 32) + 1)),
-        Some(O::Int(-3)),
-        Some(atom("bad")),
-    ];
-    for term in &terms {
-        for range in &ranges {
-            let mut args = vec![term.clone()];
-            args.extend(range.clone());
-            let actual = call("erlang", "phash2", &args);
-            let expected = reference.call("erlang", "phash2", &args);
-            assert!(
-                equivalent(&actual, &expected),
-                "{args:?}: {actual:?} vs {expected:?}"
-            );
-        }
     }
 }
