@@ -585,6 +585,9 @@ impl Process {
         code: u64,
     ) -> RunOutcome {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
+        // erts finishes a parked fragmented send in ERTS_CONTINUE_EXIT_DIST_SEND, before the
+        // distribution links and monitors are signalled; here that is before any exit work.
+        crate::bif_traps::finish_parked_dsend(self, ctx.pid());
         with_executor(data, runtime, |executor| {
             self.exit_stage1(&mut executor.vm, ctx, reason)
         });

@@ -151,8 +151,9 @@ pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
 const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
 /// `dsend_continue_trap_export`.
 pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
-// sizeof(ErtsDSigSendContext) on macOS arm64 (dist.h), the magic binary payload of a parked send.
-const ERTS_DSIG_SEND_CONTEXT_SIZE: usize = 256;
+// sizeof(ErtsDSigSendContext) (dist.h), measured with a C probe against the configured OTP-29.1.1
+// aarch64-apple-darwin tree: the magic binary payload of a parked send.
+const ERTS_DSIG_SEND_CONTEXT_SIZE: usize = 536;
 const CONTEXT_REDS: usize = 4000;
 const RE_RUN_CONTINUATION: &str = "erlang:re_run_trap/3";
 const RE_GRUN_CONTINUATION: &str = "re:grun/3";
@@ -1621,6 +1622,9 @@ pub(crate) fn install_export_trap(
     process.x[..arity].copy_from_slice(&trap.args);
     process.gc_live = arity;
     let gc_was_enabled = process.heap.gc_enabled;
+    if trap.gc_disabled {
+        process.set_gc_enabled(false);
+    }
     process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.trap_site().0,
         caller_ip: process.trap_site().1,
@@ -4565,25 +4569,23 @@ fn scan_port_table(list: &mut PortPtabListState, table_max: u32, reds_left: u32)
 }
 
 /// `erts_dsend_export_trap_context`: the magic binary of a parked distributed send, as the
-/// `BIF_TRAP1` argument of `dsend_continue_trap/1`. The return term travels as the second
-/// trap argument, a live register the collector updates, where erts disables garbage
-/// collection (`erts_set_gc_state(c_p, 0)`) so that the term stays in the context.
+/// `BIF_TRAP1` argument of `dsend_continue_trap/1`. The context keeps the return term, so
+/// garbage collection is disabled while the send is parked (`erts_set_gc_state(c_p, 0)`).
 // Port of erts/emulator/beam/bif.c (erts_dsend_export_trap_context, ERTS_BIF_PREP_TRAP1 of
 // dsend_continue_trap_export), OTP-29.1.1.
 pub(crate) fn dsend_export_trap(
     process: &mut Process,
-    ctx: crate::dist::DsigSendContext,
+    mut ctx: crate::dist::DsigSendContext,
     return_term: Term,
 ) -> Result<crate::ExportTrap, BifError> {
+    ctx.set_return_term(return_term);
     let state = magic_binary_state(Mutex::new(ctx), ERTS_DSIG_SEND_CONTEXT_SIZE);
     let state_term = trap_state_term(process, &state)
         .map_err(|_| BifError::SystemLimit)?
         .ok_or(BifError::SystemLimit)?;
-    Ok(crate::ExportTrap::new(
-        process,
-        DSEND_CONTINUE_CONTINUATION,
-        vec![state_term, return_term],
-    ))
+    let mut trap = crate::ExportTrap::new(process, DSEND_CONTINUE_CONTINUATION, vec![state_term]);
+    trap.gc_disabled = true;
+    Ok(trap)
 }
 
 /// `dsend_continue_trap_1`: restore the reductions and resume `erts_dsig_send` on the context,
@@ -4596,17 +4598,20 @@ fn dsend_continue_trap_1(
     pid: Option<arinsal_sched::Pid>,
     _gc_was_enabled: bool,
 ) -> Result<HandlerResult, BifError> {
-    let (Some(sender), [context, return_term]) = (pid, args) else {
+    let (Some(sender), [context]) = (pid, args) else {
         return Err(BifError::BADARG);
     };
-    let (context, return_term) = (*context, *return_term);
-    let result = context
+    let context = *context;
+    let (result, return_term) = context
         .with_magic_payload::<Mutex<crate::dist::DsigSendContext>, _>(|ctx| {
             let mut ctx = ctx.lock().map_err(|_| BifError::SystemLimit)?;
-            crate::dist::dsend_continue(process, &mut ctx, sender).map_err(|_| BifError::BADARG)
+            let result = crate::dist::dsend_continue(process, &mut ctx, sender)
+                .map_err(|_| BifError::BADARG)?;
+            Ok::<_, BifError>((result, ctx.return_term()))
         })
         .ok_or(BifError::BADARG)??;
     Ok(match result {
+        // erts_set_gc_state(BIF_P, 1) is the restore of the trap's GC state on completion.
         crate::dist::DsendContinue::Done => HandlerResult::Done {
             value: return_term,
             reductions: 0,
@@ -4627,13 +4632,32 @@ fn dsend_continue_trap_1(
         crate::dist::DsendContinue::Continue => {
             // BUMP_ALL_REDS(BIF_P); BIF_TRAP1(&dsend_continue_trap_export, BIF_P, BIF_ARG_1).
             process.heap.abi.fcalls = 0;
-            HandlerResult::Export(crate::ExportTrap::new(
-                process,
-                DSEND_CONTINUE_CONTINUATION,
-                vec![context, return_term],
-            ))
+            let mut trap =
+                crate::ExportTrap::new(process, DSEND_CONTINUE_CONTINUATION, vec![context]);
+            trap.gc_disabled = true;
+            HandlerResult::Export(trap)
         }
     })
+}
+
+/// A process that exits while parked in `dsend_continue_trap/1` finishes its fragmented send
+/// first (`F_FRAGMENTED_SEND`: `pectxt.dist_state = p->arg_reg[0]`).
+// Port of erts/emulator/beam/erl_process.c:14525-14532 (erts_continue_exit_process), OTP-29.1.1.
+pub(crate) fn finish_parked_dsend(process: &mut Process, sender: arinsal_sched::Pid) {
+    let Some(context) = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .filter(|pending| pending.continuation == DSEND_CONTINUE_CONTINUATION)
+        .map(|pending| pending.args[0])
+    else {
+        return;
+    };
+    let _ = context.with_magic_payload::<Mutex<crate::dist::DsigSendContext>, _>(|ctx| {
+        if let Ok(mut ctx) = ctx.lock() {
+            crate::dist::dsend_exit(process, &mut ctx, sender);
+        }
+    });
 }
 
 #[cfg(test)]

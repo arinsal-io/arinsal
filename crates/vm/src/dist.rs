@@ -1015,6 +1015,7 @@ fn queue_outgoing_with_options(
                 port_id,
                 fragments: packets.into(),
                 no_suspend: false,
+                return_term: Term::NIL,
             };
             drop(entry);
             return Ok(match dsig_send(process, &mut send_ctx, ctx.pid(), !trap)? {
@@ -3205,6 +3206,32 @@ pub(crate) struct DsigSendContext {
     fragments: VecDeque<Vec<u8>>,
     /// `ctx->no_suspend`.
     no_suspend: bool,
+    /// `ctx->return_term`: a process-heap term, kept valid by disabling garbage collection
+    /// while the send is parked.
+    return_term: Term,
+}
+
+impl DsigSendContext {
+    /// `ctx->return_term = ...` of `erts_dsend_export_trap_context`.
+    pub(crate) fn set_return_term(&mut self, term: Term) {
+        self.return_term = term;
+    }
+
+    /// `ctx->return_term`.
+    pub(crate) fn return_term(&self) -> Term {
+        self.return_term
+    }
+}
+
+/// Finish the fragmented send a process left parked in `dsend_continue_trap/1` when it exits,
+/// so that no incomplete fragmented signal stays queued at the receiver. The remaining
+/// fragments are queued at once without suspending the exiting process.
+// Port of erts/emulator/beam/erl_process.c:14525-14532, 14602-14633
+// (erts_continue_exit_process, F_FRAGMENTED_SEND / ERTS_CONTINUE_EXIT_DIST_SEND), OTP-29.1.1.
+pub(crate) fn dsend_exit(process: &mut Process, ctx: &mut DsigSendContext, sender: Pid) {
+    ctx.no_suspend = true;
+    // An error here is a vanished runtime; nothing is left to send to.
+    let _ = dsig_send(process, ctx, sender, true);
 }
 
 impl std::fmt::Debug for DsigSendContext {
