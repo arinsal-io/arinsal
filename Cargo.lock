@@ -376,6 +376,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "rustix",
+ "similar-asserts",
 ]
 
 [[package]]
