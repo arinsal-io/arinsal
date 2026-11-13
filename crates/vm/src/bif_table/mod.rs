@@ -249,6 +249,10 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "phash2", 1) => bif!(bif_phash2::phash2_1),
         ("erlang", "phash2", 2) => bif!(bif_phash2::phash2_2),
         // erl_map.c
+        ("maps", "put", 3) => bif!(erl_map::maps_put_3),
+        ("maps", "update", 3) => bif!(erl_map::maps_update_3),
+        ("maps", "remove", 2) => bif!(erl_map::maps_remove_2),
+        ("maps", "take", 2) => bif!(erl_map::maps_take_2),
         ("maps", "from_list", 1) => bif!(erl_map::maps_from_list_1),
         ("maps", "from_keys", 2) => bif!(erl_map::maps_from_keys_2),
         ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
