@@ -20,6 +20,7 @@ mod magic;
 pub mod message;
 mod ops;
 mod owned;
+pub mod printf_term;
 pub mod ptab;
 pub mod raw;
 mod record;

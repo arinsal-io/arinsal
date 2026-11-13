@@ -22,7 +22,7 @@ struct enif_environment_t {
 
 extern ERL_NIF_TERM arinsal_nif_tuple(ErlNifEnv *, const ERL_NIF_TERM *, unsigned);
 extern ERL_NIF_TERM arinsal_nif_list(ErlNifEnv *, const ERL_NIF_TERM *, unsigned);
-extern char *arinsal_nif_format_term(ERL_NIF_TERM);
+extern char *arinsal_nif_format_term(ERL_NIF_TERM, int);
 extern void arinsal_nif_free_formatted(char *);
 
 typedef struct {
@@ -167,8 +167,12 @@ static int nif_format(char *buffer, size_t size, const char *format, va_list arg
         memcpy(spec, start, spec_len); spec[spec_len] = 0;
         int n;
         if (conversion == 'T') {
+            int precision = -1;
+            const char *dot = strchr(spec, '.');
+            if (dot && dot[1] == '*') precision = va_arg(args, int);
+            else if (dot) precision = atoi(dot + 1);
             ERL_NIF_TERM value = va_arg(args, ERL_NIF_TERM);
-            char *rendered = arinsal_nif_format_term(value);
+            char *rendered = arinsal_nif_format_term(value, precision);
             if (!rendered) goto error;
             n = (int)strlen(rendered);
             if (!nif_append(&result, &len, &cap, rendered, (size_t)n)) { arinsal_nif_free_formatted(rendered); goto error; }

@@ -1038,190 +1038,41 @@ fn display(term: Term) -> Result<Term, VmError> {
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
+/// `erts_dsprintf(dsbufp, "%.*T", precision, term)`: the term printed into a buffer.
+// Port of erts/emulator/beam/erl_printf_term.c (erts_printf_term) through erl_printf.c
+// (erts_dsprintf), OTP-29.1.1.
+pub(crate) fn printf_t(term: Term, precision: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    arinsal_term::printf_term::erts_printf_t(&mut out, term, precision);
+    out
+}
+
+/// `erts_printf("%.*T\n", INT_MAX, term)`: `write_f_add_cr` ends the line with CR LF.
 pub(crate) fn display_match_spec(term: Term) -> Result<(), VmError> {
-    let owned = arinsal_term::to_owned(term).map_err(|_| badarg())?;
-    let rendered = print_otp_term(&owned, i32::MAX as usize);
-    write!(std::io::stdout().lock(), "{rendered}\r\n")
+    let mut rendered = printf_t(term, i32::MAX);
+    rendered.extend_from_slice(b"\r\n");
+    std::io::stdout()
+        .lock()
+        .write_all(&rendered)
         .map_err(|error| VmError::Unsupported(format!("display write: {error}")))
 }
 
 fn term_to_string(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let limit = if atom_name(args[1]) == Some("undefined") {
-        i32::MAX as usize
+        i32::MAX
     } else {
-        usize::try_from(args[1].as_small().ok_or_else(badarg)?)
+        i32::try_from(args[1].as_small().ok_or_else(badarg)?)
             .ok()
-            .filter(|limit| *limit > 1 && *limit < i32::MAX as usize)
+            .filter(|limit| *limit > 1 && *limit < i32::MAX)
             .ok_or_else(badarg)?
     };
-    let owned = arinsal_term::to_owned(args[0]).map_err(|_| badarg())?;
-    let rendered = print_otp_term(&owned, limit);
+    let rendered = printf_t(args[0], limit);
     let bytes = rendered
-        .bytes()
-        .map(|byte| Term::small(i64::from(byte)).unwrap());
+        .iter()
+        .map(|byte| Term::small(i64::from(*byte)).unwrap());
     TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .list_from_iter(bytes)
         .map_err(|error| VmError::Unsupported(format!("term_to_string allocation: {error:?}")))
-}
-
-pub(crate) fn print_otp_term(term: &arinsal_etf::OwnedTerm, limit: usize) -> String {
-    use arinsal_etf::OwnedTerm;
-
-    fn printable_string(items: &[OwnedTerm]) -> Option<String> {
-        if items.is_empty() {
-            return None;
-        }
-        let mut text = String::with_capacity(items.len());
-        for item in items {
-            let OwnedTerm::Int(code) = item else {
-                return None;
-            };
-            let Ok(byte) = u8::try_from(*code) else {
-                return None;
-            };
-            if byte < b' ' && !matches!(byte, b'\n' | b'\r' | b'\t') || byte == 127 {
-                return None;
-            }
-            text.push(char::from(byte));
-        }
-        Some(text)
-    }
-
-    fn render(term: &OwnedTerm, remaining: &mut usize, out: &mut String) -> bool {
-        if *remaining == 0 {
-            return false;
-        }
-        *remaining -= 1;
-        match term {
-            OwnedTerm::Tuple(items) => {
-                out.push('{');
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    if !render(item, remaining, out) {
-                        return false;
-                    }
-                }
-                out.push('}');
-            }
-            OwnedTerm::List { elems, tail } => {
-                if matches!(tail.as_ref(), OwnedTerm::Nil)
-                    && let Some(text) = printable_string(elems)
-                {
-                    out.push('"');
-                    for byte in text.bytes() {
-                        if *remaining == 0 {
-                            return false;
-                        }
-                        *remaining -= 1;
-                        match byte {
-                            b'\n' => out.push_str("\\n"),
-                            b'"' => out.push_str("\\\""),
-                            _ => out.push(char::from(byte)),
-                        }
-                    }
-                    out.push('"');
-                } else {
-                    out.push('[');
-                    for (index, item) in elems.iter().enumerate() {
-                        if index > 0 {
-                            out.push(',');
-                        }
-                        if !render(item, remaining, out) {
-                            return false;
-                        }
-                    }
-                    if !matches!(tail.as_ref(), OwnedTerm::Nil) {
-                        out.push('|');
-                        if !render(tail, remaining, out) {
-                            return false;
-                        }
-                    }
-                    out.push(']');
-                }
-            }
-            OwnedTerm::Map(pairs) => {
-                out.push_str("#{");
-                for (index, (key, value)) in pairs.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    if !render(key, remaining, out) {
-                        return false;
-                    }
-                    out.push_str("=>");
-                    if !render(value, remaining, out) {
-                        return false;
-                    }
-                }
-                out.push('}');
-            }
-            OwnedTerm::Binary(bytes)
-                if !bytes.is_empty() && bytes.iter().all(|byte| (32..127).contains(byte)) =>
-            {
-                out.push_str("<<\"");
-                for byte in bytes {
-                    if *remaining == 0 {
-                        return false;
-                    }
-                    *remaining -= 1;
-                    if *byte == b'"' {
-                        out.push('\\');
-                    }
-                    out.push(char::from(*byte));
-                }
-                out.push_str("\">>");
-            }
-            OwnedTerm::Binary(bytes) => {
-                out.push_str("<<");
-                for (index, byte) in bytes.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    if *remaining == 0 {
-                        return false;
-                    }
-                    *remaining -= 1;
-                    out.push_str(&byte.to_string());
-                }
-                out.push_str(">>");
-            }
-            OwnedTerm::Float(value) => {
-                let formatted = format!("{value:.6e}");
-                let (mantissa, exponent) = formatted.split_once('e').unwrap();
-                let exponent = exponent.parse::<i32>().unwrap_or(0);
-                out.push_str(&format!("{mantissa}e{exponent:+03}"));
-            }
-            // Port of erts/emulator/beam/erl_printf_term.c:508-524 (PID_DEF/PORT_DEF), OTP-29.1.1.
-            OwnedTerm::Pid {
-                node, id, serial, ..
-            } => {
-                let node = if node == "nonode@nohost" { "0" } else { node };
-                out.push_str(&format!("<{node}.{id}.{serial}>"));
-            }
-            OwnedTerm::Port { node, id, .. } => {
-                let node = if node == "nonode@nohost" { "0" } else { node };
-                out.push_str(&format!("#Port<{node}.{id}>"));
-            }
-            OwnedTerm::Atom(name) => {
-                out.push_str(&term.to_string());
-                *remaining = remaining.saturating_sub(name.len());
-                if *remaining == 0 {
-                    return false;
-                }
-            }
-            _ => out.push_str(&term.to_string()),
-        }
-        true
-    }
-
-    let mut out = String::new();
-    let mut remaining = limit;
-    if !render(term, &mut remaining, &mut out) || remaining == 0 {
-        out.push_str("... ");
-    }
-    out
 }
 
 // Port of erts/emulator/beam/bif.c:4192 (display_string_2), OTP-29.1.1.

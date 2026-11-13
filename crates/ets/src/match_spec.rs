@@ -13,7 +13,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 mod dmc;
 mod pam;
-mod printf_term;
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 

@@ -6,12 +6,13 @@
 //! thread delivers them in order. `SYS_MSG_TYPE_PROC_MSG` is sent by `erts_send_sys_msg_proc`.
 
 use crate::Process;
-use crate::natives::sys::{print_otp_term, reset_system_logger};
+use crate::natives::sys::{printf_t, reset_system_logger};
 use crate::process::{Message, Runtime};
-use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Scheduler};
-use arinsal_term::{Term, atoms, to_owned};
+use arinsal_term::raw::{Cons, Tuple};
+use arinsal_term::{Term, atoms};
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// `SYS_MSG_TYPE_*`.
@@ -185,43 +186,34 @@ fn disp_failure(smqp: &SysMsgQ, receiver: Term, node: &NodeHandle) {
         SysMsgType::Errlgr => {
             // erts_fprintf(stderr, ...) of an erl node ends the line with CR LF.
             const NO_LOGGER: &str = "(no logger present)";
-            let Ok(msg) = to_owned(smqp.msg.term()) else {
-                return;
-            };
+            let msg = smqp.msg.term();
             let tag_and_args = (|| {
-                let OwnedTerm::Tuple(outer) = &msg else {
-                    return None;
-                };
-                if outer.len() != 2 {
-                    return None;
-                }
-                let OwnedTerm::Tuple(inner) = &outer[1] else {
-                    return None;
-                };
-                if inner.len() != 3 {
-                    return None;
-                }
-                let OwnedTerm::Tuple(third) = &inner[2] else {
-                    return None;
-                };
-                if third.len() != 3 {
-                    return None;
-                }
-                let OwnedTerm::List { elems, .. } = &third[2] else {
-                    return None;
-                };
-                Some((inner[0].clone(), elems.first()?.clone()))
+                let outer = Tuple::try_from(msg).ok().filter(|t| t.arity() == 2)?;
+                let inner = Tuple::try_from(outer.get(1)?)
+                    .ok()
+                    .filter(|t| t.arity() == 3)?;
+                let third = Tuple::try_from(inner.get(2)?)
+                    .ok()
+                    .filter(|t| t.arity() == 3)?;
+                let args = Cons::try_from(third.get(2)?).ok()?;
+                Some((inner.get(0)?, args.head()))
             })();
+            // erts_fprintf's `%T` has no precision: the default print budget.
             match tag_and_args {
-                Some((tag, first)) => eprint!(
-                    "{NO_LOGGER} {}: {}\r\n",
-                    print_otp_term(&tag, usize::MAX),
-                    print_otp_term(&first, usize::MAX)
-                ),
-                None => eprint!(
-                    "{NO_LOGGER} unexpected logger message: {}\r\n",
-                    print_otp_term(&msg, usize::MAX)
-                ),
+                Some((tag, first)) => {
+                    let mut line = format!("{NO_LOGGER} ").into_bytes();
+                    line.extend(printf_t(tag, -1));
+                    line.extend_from_slice(b": ");
+                    line.extend(printf_t(first, -1));
+                    line.extend_from_slice(b"\r\n");
+                    let _ = std::io::stderr().write_all(&line);
+                }
+                None => {
+                    let mut line = format!("{NO_LOGGER} unexpected logger message: ").into_bytes();
+                    line.extend(printf_t(msg, -1));
+                    line.extend_from_slice(b"\r\n");
+                    let _ = std::io::stderr().write_all(&line);
+                }
             }
         }
     }

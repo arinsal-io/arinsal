@@ -1125,138 +1125,14 @@ pub(crate) fn retain_exports() {
     black_box(exports);
 }
 
-fn render_term(t: Term, out: &mut String, depth: usize) {
-    use std::fmt::Write;
-    if depth > 64 {
-        out.push_str("...");
-        return;
-    }
-    if let Some(n) = integer(t) {
-        let _ = write!(out, "{n}");
-        return;
-    }
-    if let Some(a) = atom_text(t) {
-        out.push_str(a);
-        return;
-    }
-    // Port of erts/emulator/beam/erl_printf_term.c:146-168, 480-600 (print_term): pids, ports
-    // and floats as erts prints them.
-    if let Some((number, serial)) = t.as_pid() {
-        let _ = write!(out, "<0.{number}.{serial}>");
-        return;
-    }
-    if let Some(number) = t.as_port() {
-        let _ = write!(out, "#Port<0.{number}>");
-        return;
-    }
-    // SAFETY: the NIF callback retains this term's heap while formatting.
-    if let Some(float) = float_view(t) {
-        let formatted = format!("{:.6e}", float.get());
-        let (mantissa, exponent) = formatted.split_once('e').unwrap_or((&formatted, "0"));
-        let exponent: i32 = exponent.parse().unwrap_or(0);
-        let _ = write!(
-            out,
-            "{mantissa}e{}{:02}",
-            if exponent < 0 { '-' } else { '+' },
-            exponent.abs()
-        );
-        return;
-    }
-    if t.classify() == TermKind::List {
-        // SAFETY: the NIF callback retains this list's heap while formatting.
-        let mut iter = list_iter(t);
-        let mut text = String::new();
-        let mut printable = true;
-        for item in iter.by_ref() {
-            match integer(item) {
-                Some(c) if (0..=255).contains(&c) => {
-                    let c = c as u8;
-                    // IS_CNTRL(c) && !IS_SPACE(c) is not printable.
-                    if (c < 32 || c == 127) && !matches!(c, 9..=13) {
-                        printable = false;
-                        break;
-                    }
-                    match c {
-                        b'\n' => text.push_str("\\n"),
-                        b'"' => text.push_str("\\\""),
-                        _ => text.push(c as char),
-                    }
-                }
-                _ => {
-                    printable = false;
-                    break;
-                }
-            }
-        }
-        if printable && iter.tail() == Term::NIL {
-            out.push('"');
-            out.push_str(&text);
-            out.push('"');
-            return;
-        }
-    }
-    match t.classify() {
-        TermKind::Nil => out.push_str("[]"),
-        TermKind::Tuple => {
-            out.push('{');
-            // SAFETY: the NIF callback retains this tuple's heap while formatting.
-            if let Some(v) = tuple_view(t) {
-                for (i, item) in v.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',')
-                    };
-                    render_term(item, out, depth + 1);
-                }
-            }
-            out.push('}');
-        }
-        TermKind::List => {
-            out.push('[');
-            // SAFETY: the NIF callback retains this list's heap while formatting.
-            let mut iter = list_iter(t);
-            let mut i = 0;
-            for item in iter.by_ref() {
-                if i > 0 {
-                    out.push(',')
-                };
-                render_term(item, out, depth + 1);
-                i += 1;
-                if i >= 1024 {
-                    out.push_str(",...");
-                    break;
-                }
-            }
-            if iter.tail() != Term::NIL {
-                out.push('|');
-                render_term(iter.tail(), out, depth + 1)
-            }
-            out.push(']');
-        }
-        TermKind::Bitstring => {
-            if let Some(b) = binary_bytes(t) {
-                out.push_str("<<");
-                for (i, byte) in b.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',')
-                    };
-                    let _ = write!(out, "{byte}");
-                }
-                out.push_str(">>")
-            } else {
-                out.push_str("<<...>>")
-            }
-        }
-        _ => {
-            let _ = write!(out, "{t:?}");
-        }
-    }
-}
-/// Format a live term for the C shim's `%T` conversion.
+/// Format a live term for the C shim's `%T` conversion with the printf precision.
+// Port of erts/emulator/beam/erl_printf_term.c (erts_printf_term) as reached through
+// erts_vsnprintf in erl_nif.c (enif_vsnprintf), OTP-29.1.1.
 #[unsafe(no_mangle)]
-pub extern "C" fn arinsal_nif_format_term(t: Term) -> *mut c_char {
-    let mut s = String::new();
-    render_term(t, &mut s, 0);
-    std::ffi::CString::new(s).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+pub extern "C" fn arinsal_nif_format_term(t: Term, precision: c_int) -> *mut c_char {
+    let mut bytes = Vec::new();
+    arinsal_term::printf_term::erts_printf_t(&mut bytes, t, precision);
+    std::ffi::CString::new(bytes).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
 }
 /// Release a `%T` formatted string returned to the C shim.
 #[unsafe(no_mangle)]

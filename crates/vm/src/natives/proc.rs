@@ -4,7 +4,7 @@ use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{
-    Atom, FunRef, HeapReservation, Identity, Term, TermBuilder, TermError, TermKind, global_atoms,
+    Atom, FunRef, HeapReservation, Term, TermBuilder, TermError, TermKind, global_atoms,
 };
 use std::sync::atomic::Ordering;
 
@@ -1692,33 +1692,15 @@ fn charlist(process: &mut Process, value: &str) -> Result<Term, VmError> {
         .map_err(|error| VmError::Unsupported(format!("charlist allocation: {error:?}")))
 }
 
-/// `#Ref<0.ids reversed>`. OTP's first number is the distribution channel.
-/// This node has no distribution table, so every ref prints channel 0.
-fn ref_to_list(term: Term) -> Result<String, VmError> {
-    let Some(Identity::Ref { ids, .. }) = term.identity() else {
-        return Err(badarg());
-    };
-    // Port of erts/emulator/beam/bif.c (ref_to_list_1), OTP-29.1.1.
-    term.save_magic_ref();
-    let numbers: Vec<u32> = ids.to_vec();
-    let mut text = String::from("#Ref<0");
-    for id in numbers.iter().rev() {
-        text.push('.');
-        text.push_str(&id.to_string());
-    }
-    text.push('>');
-    Ok(text)
-}
-
-/// `#Port<channel.id>`. Local ports use channel 0, matching `pid_to_list`.
-fn port_to_list(term: Term) -> Result<String, VmError> {
-    if let Some(id) = term.as_port() {
-        return Ok(format!("#Port<0.{id}>"));
-    }
-    match term.identity() {
-        Some(Identity::Port { id, .. }) => Ok(format!("#Port<0.{id}>")),
-        _ => Err(badarg()),
-    }
+/// `term2list_dsprintf`: the term printed with `%T` into a list of bytes.
+// Port of erts/emulator/beam/bif.c (term2list_dsprintf), OTP-29.1.1.
+fn term2list_dsprintf(process: &mut Process, term: Term) -> Result<Term, VmError> {
+    let bytes = super::sys::printf_t(term, -1)
+        .into_iter()
+        .map(|byte| Term::small(i64::from(byte)).unwrap());
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .list_from_iter(bytes)
+        .map_err(|error| VmError::Unsupported(format!("term2list_dsprintf allocation: {error:?}")))
 }
 
 /// Latin-1 integer list to bytes; `None` when longer than `max` or not a proper list.
@@ -1924,80 +1906,6 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
     })
 }
 
-/// Local `#Fun<Module.old_index.old_uniq>`, export `fun Module:Name/Arity`.
-fn fun_to_list(term: Term) -> Result<String, VmError> {
-    // SAFETY: the fun remains in the caller heap for this BIF.
-    let view = unsafe { term.fun_ref() }.ok_or_else(badarg)?;
-    let text = match view {
-        FunRef::Local { entry, .. } => {
-            let module = global_atoms()
-                .text(entry.module)
-                .ok_or_else(|| VmError::Unsupported("fun module atom".into()))?;
-            // OTP prints these fields as signed words (erl_printf_term.c FUN_DEF).
-            format!(
-                "#Fun<{}.{}.{}>",
-                module, entry.old_index as i32, entry.old_uniq as i32
-            )
-        }
-        FunRef::Export { entry } => {
-            let module = global_atoms()
-                .text(entry.module)
-                .ok_or_else(|| VmError::Unsupported("fun module atom".into()))?;
-            let function = global_atoms()
-                .text(entry.function)
-                .ok_or_else(|| VmError::Unsupported("fun name atom".into()))?;
-            format!(
-                "fun {}:{}/{}",
-                format_fun_atom(module),
-                format_fun_atom(function),
-                entry.arity
-            )
-        }
-    };
-    Ok(text)
-}
-
-// Port of erts/emulator/beam/erl_printf_term.c atom printing used by `~p`, OTP-29.1.1.
-fn format_fun_atom(name: &str) -> String {
-    let bare = name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'@'))
-        && !matches!(
-            name,
-            "after"
-                | "begin"
-                | "case"
-                | "try"
-                | "receive"
-                | "when"
-                | "end"
-                | "of"
-                | "catch"
-                | "if"
-                | "maybe"
-                | "else"
-        );
-    if bare {
-        return name.to_owned();
-    }
-    let mut quoted = String::with_capacity(name.len() + 2);
-    quoted.push('\'');
-    for ch in name.chars() {
-        match ch {
-            '\\' => quoted.push_str("\\\\"),
-            '\'' => quoted.push_str("\\'"),
-            ch if ch.is_control() => {
-                use std::fmt::Write;
-                let _ = write!(quoted, "\\x{{{:x}}}", ch as u32);
-            }
-            ch => quoted.push(ch),
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 /// Process and dictionary BIF entry points for `erlang` and `erts_internal`.
 /// Erlang wrappers with neighboring arities must fall through to the loaded BEAM.
 /// `spawn_request` and `dist_spawn_request` are the exception: only the
@@ -2185,12 +2093,8 @@ fn backtrace_text(process: &mut Process) -> Result<Vec<u8>, VmError> {
 }
 
 fn backtrace_with(process: &Process) -> Vec<u8> {
-    use std::fmt::Write as _;
-    let print = |word: Term| match arinsal_term::to_owned(word) {
-        Ok(owned) => super::sys::print_otp_term(&owned, i32::MAX as usize),
-        Err(_) => "<unprintable>".into(),
-    };
-    let mut text = String::new();
+    use std::io::Write as _;
+    let mut text: Vec<u8> = Vec::new();
     // Port of erts/emulator/beam/erl_process.c:14916 (erts_program_counter_info prints p->i)
     // and bif.h:322 (`p->i = beam_bif_export_trap`), OTP-29.1.1. A trapped BIF is not inside
     // the caller's native function; the PC is the export-trap entry.
@@ -2283,10 +2187,12 @@ fn backtrace_with(process: &Process) -> Vec<u8> {
             };
             let _ = writeln!(text, "Catch {pc:#018x} ({description})");
         } else {
-            let _ = writeln!(text, "{}", print(word));
+            // stack_element_dump: `%T\n` with the default print budget.
+            text.extend(super::sys::printf_t(word, -1));
+            text.push(b'\n');
         }
     }
-    text.into_bytes()
+    text
 }
 
 fn current_stacktrace(
@@ -3097,36 +3003,22 @@ fn call_values(
                 if pid.classify() != TermKind::Pid {
                     return Err(badarg());
                 }
-                let Some(Identity::Pid {
-                    node,
-                    index,
-                    serial,
-                    ..
-                }) = pid.identity()
-                else {
-                    return Err(badarg());
-                };
-                let node = if node == arinsal_term::atoms::NONAME {
-                    "0".to_owned()
-                } else {
-                    global_atoms().text(node).ok_or_else(badarg)?.to_string()
-                };
-                let value = format!("<{node}.{index}.{serial}>");
-                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                TermBuilder::new(&mut heap)
-                    .string_to_list(&value)
-                    .map_err(|error| {
-                        VmError::Unsupported(format!("pid_to_list allocation: {error:?}"))
-                    })
+                term2list_dsprintf(process, *pid)
             }
             // Port of erts/emulator/beam/bif.c:4459 (ref_to_list_1), OTP-29.1.1.
-            // Print is erl_printf_term.c REF_DEF: `#Ref<channel.n[k]...n[0]>`.
             ("ref_to_list", [reference]) if module == "erlang" => {
-                charlist(process, &ref_to_list(*reference)?)
+                if reference.classify() != TermKind::Ref {
+                    return Err(badarg());
+                }
+                reference.save_magic_ref();
+                term2list_dsprintf(process, *reference)
             }
             // Port of erts/emulator/beam/bif.c:4512 (port_to_list_1), OTP-29.1.1.
             ("port_to_list", [port]) if module == "erlang" => {
-                charlist(process, &port_to_list(*port)?)
+                if port.classify() != TermKind::Port {
+                    return Err(badarg());
+                }
+                term2list_dsprintf(process, *port)
             }
             // Port of erts/emulator/beam/bif.c:4525 (list_to_pid_1), OTP-29.1.1.
             ("list_to_pid", [chars]) if module == "erlang" => list_to_pid(process, *chars),
@@ -3135,7 +3027,12 @@ fn call_values(
             // Port of erts/emulator/beam/bif.c:4705 (list_to_ref_1), OTP-29.1.1.
             ("list_to_ref", [chars]) if module == "erlang" => list_to_ref(process, *chars),
             // Port of erts/emulator/beam/bif.c:4487 (fun_to_list_1), OTP-29.1.1.
-            ("fun_to_list", [fun]) if module == "erlang" => charlist(process, &fun_to_list(*fun)?),
+            ("fun_to_list", [fun]) if module == "erlang" => {
+                if fun.classify() != TermKind::Fun {
+                    return Err(badarg());
+                }
+                term2list_dsprintf(process, *fun)
+            }
             // Port of erts/emulator/beam/bif.c:2262 (erts_internal_process_flag_3): another
             // process gets an RPC request and the caller receives `{Ref, Result}` itself.
             ("process_flag", [target, name, value]) if module == "erts_internal" => {
@@ -5698,8 +5595,8 @@ pub(crate) fn process_dump(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<Vec<u8>, VmError> {
-    use arinsal_etf::OwnedTerm;
-    use std::fmt::Write as _;
+    use arinsal_term::raw::{Cons, Tuple};
+    use std::io::Write as _;
     let names = [
         "registered_name",
         "current_function",
@@ -5726,60 +5623,63 @@ pub(crate) fn process_dump(
         Term::atom(arinsal_term::atoms::RUNNING),
         false,
     )?;
-    let info = arinsal_term::to_owned(info).map_err(|_| badarg())?;
+    // The values of `process_info` stay on the process heap, like the terms break.c prints.
     let mut values = std::collections::HashMap::new();
-    if let OwnedTerm::List { elems, .. } = &info {
-        for pair in elems {
-            if let OwnedTerm::Tuple(fields) = pair
-                && let [OwnedTerm::Atom(key), value] = fields.as_slice()
-            {
-                values.insert(key.to_string(), value.clone());
+    let mut rest = info;
+    while let Ok(cell) = Cons::try_from(rest) {
+        if let Ok(pair) = Tuple::try_from(cell.head())
+            && pair.arity() == 2
+            && let Some(key) = pair.get(0).and_then(Term::as_atom)
+            && let Some(name) = global_atoms().text(key)
+            && let Some(value) = pair.get(1)
+        {
+            values.insert(name.to_string(), value);
+        }
+        rest = cell.tail();
+    }
+    // erts_print `%T` has no precision: the default print budget.
+    let print = |term: Term| super::sys::printf_t(term, -1);
+    let pid = print(ctx.pid().to_term().ok_or_else(badarg)?);
+    let mfa = |term: Option<&Term>| -> Vec<u8> {
+        match term.and_then(|term| Tuple::try_from(*term).ok()) {
+            Some(fields) if fields.arity() == 3 => {
+                let mut text = print(fields.get(0).unwrap_or(Term::NIL));
+                text.push(b':');
+                text.extend(print(fields.get(1).unwrap_or(Term::NIL)));
+                text.push(b'/');
+                text.extend(print(fields.get(2).unwrap_or(Term::NIL)));
+                text
             }
+            _ => Vec::new(),
         }
-    }
-    let own = ctx
-        .pid()
-        .to_term()
-        .and_then(|pid| arinsal_term::to_owned(pid).ok());
-    let local_node = match &own {
-        Some(OwnedTerm::Pid { node, .. }) => node.clone(),
-        _ => String::new(),
     };
-    // erts_printf `%T` writes local identifiers with node index 0.
-    let print = |term: &OwnedTerm| match term {
-        OwnedTerm::Pid {
-            node, id, serial, ..
-        } if *node == local_node => format!("<0.{id}.{serial}>"),
-        _ => super::sys::print_otp_term(term, i32::MAX as usize),
-    };
-    let pid = own.as_ref().map(print).unwrap_or_default();
-    let mfa = |term: Option<&OwnedTerm>| match term {
-        Some(OwnedTerm::Tuple(fields)) if fields.len() == 3 => {
-            format!(
-                "{}:{}/{}",
-                print(&fields[0]),
-                print(&fields[1]),
-                print(&fields[2])
-            )
-        }
-        _ => String::new(),
-    };
-    let mut text = String::new();
+    let mut text: Vec<u8> = Vec::new();
     // The process dumps itself while it runs.
-    let _ = writeln!(text, "=proc:{pid}");
+    text.extend_from_slice(b"=proc:");
+    text.extend(&pid);
+    text.push(b'\n');
     let _ = writeln!(text, "State: Running");
-    if let Some(name @ OwnedTerm::Atom(_)) = values.get("registered_name") {
-        let _ = writeln!(text, "Name: {}", print(name));
+    if let Some(name) = values.get("registered_name")
+        && name.as_atom().is_some()
+    {
+        text.extend_from_slice(b"Name: ");
+        text.extend(print(*name));
+        text.push(b'\n');
     }
-    let _ = writeln!(text, "Spawned as: {}", mfa(values.get("current_function")));
+    text.extend_from_slice(b"Spawned as: ");
+    text.extend(mfa(values.get("current_function")));
+    text.push(b'\n');
     // `process_info(parent)` reports `undefined`, which erts prints as `[]`.
     let parent = "[]";
     let _ = writeln!(text, "Spawned by: {parent}");
-    let queue = values
-        .get("message_queue_len")
-        .map(print)
-        .unwrap_or_default();
-    let _ = writeln!(text, "Message queue length: {queue}");
+    text.extend_from_slice(b"Message queue length: ");
+    text.extend(
+        values
+            .get("message_queue_len")
+            .map(|t| print(*t))
+            .unwrap_or_default(),
+    );
+    text.push(b'\n');
     let _ = writeln!(
         text,
         "Number of heap fragments: {}",
@@ -5790,19 +5690,37 @@ pub(crate) fn process_dump(
         "Heap fragment data: {}",
         process.heap.fragment_words()
     );
-    if let Some(OwnedTerm::List { elems, .. }) = values.get("links")
-        && !elems.is_empty()
+    if let Some(links) = values.get("links")
+        && Cons::try_from(*links).is_ok()
     {
-        let links = elems.iter().map(print).collect::<Vec<_>>().join(", ");
-        let _ = writeln!(text, "Link list: [{links}]");
+        text.extend_from_slice(b"Link list: [");
+        let mut rest = *links;
+        let mut first = true;
+        while let Ok(cell) = Cons::try_from(rest) {
+            if !first {
+                text.extend_from_slice(b", ");
+            }
+            first = false;
+            text.extend(print(cell.head()));
+            rest = cell.tail();
+        }
+        text.extend_from_slice(b"]\n");
     }
     if let Some(dictionary) = values.get("dictionary")
-        && !matches!(dictionary, OwnedTerm::Nil)
+        && *dictionary != Term::NIL
     {
-        let _ = writeln!(text, "Dictionary: {}", print(dictionary));
+        text.extend_from_slice(b"Dictionary: ");
+        text.extend(print(*dictionary));
+        text.push(b'\n');
     }
-    let reductions = values.get("reductions").map(print).unwrap_or_default();
-    let _ = writeln!(text, "Reductions: {reductions}");
+    text.extend_from_slice(b"Reductions: ");
+    text.extend(
+        values
+            .get("reductions")
+            .map(|t| print(*t))
+            .unwrap_or_default(),
+    );
+    text.push(b'\n');
     let heap = process.heap.heap_size_words();
     let old_heap = process.heap.old_heap_words();
     let _ = writeln!(text, "Stack+heap: {heap}");
@@ -5832,22 +5750,26 @@ pub(crate) fn process_dump(
             .map_or(0, |dictionary| dictionary.memory_bytes());
     let _ = writeln!(text, "Memory: {memory}");
     let _ = writeln!(text, "Stack dump:");
-    let _ = writeln!(
+    let _ = write!(
         text,
-        "Program counter: {:#018x} ({})",
-        native_position(process).unwrap_or(0),
-        mfa(values.get("current_function"))
+        "Program counter: {:#018x} (",
+        native_position(process).unwrap_or(0)
     );
-    let _ = writeln!(text);
-    let priority = match values.get("priority") {
-        Some(OwnedTerm::Atom(priority)) => priority.to_uppercase(),
-        _ => "NORMAL".into(),
+    text.extend(mfa(values.get("current_function")));
+    text.extend_from_slice(b")\n\n");
+    let priority = match values
+        .get("priority")
+        .and_then(|priority| priority.as_atom())
+        .and_then(|priority| global_atoms().text(priority))
+    {
+        Some(priority) => priority.to_uppercase(),
+        None => "NORMAL".into(),
     };
     let _ = writeln!(
         text,
         "Internal State: ACT_PRIO_{priority} | USR_PRIO_{priority} | PRQ_PRIO_{priority} | ACTIVE | RUNNING"
     );
-    Ok(text.into_bytes())
+    Ok(text)
 }
 
 #[cfg(test)]
