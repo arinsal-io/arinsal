@@ -636,8 +636,25 @@ impl Tuple2<'_> {
 pub struct MapListValidator<'h> {
     root: Term,
     cursor: Term,
-    pending: Option<Cons<'h>>,
     heap: PhantomData<&'h ()>,
+}
+
+/// A current validated-list cursor that can advance only its originating validator.
+pub struct CurrentMapListCell<'v, 'h> {
+    validator: &'v mut MapListValidator<'h>,
+    cons: Cons<'h>,
+}
+
+impl CurrentMapListCell<'_, '_> {
+    /// Validate this cell's head as a two-tuple and move its validator to the tail.
+    ///
+    /// Port of the tuple check and `CDR` advance in `maps_from_list_1_helper`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn advance(self) -> Result<(), WrongShape> {
+        let _tuple = Tuple2::try_from(self.cons.head())?;
+        self.validator.cursor = self.cons.tail();
+        Ok(())
+    }
 }
 
 impl<'h> MapListValidator<'h> {
@@ -647,7 +664,6 @@ impl<'h> MapListValidator<'h> {
         Self {
             root: list,
             cursor: list,
-            pending: None,
             heap: PhantomData,
         }
     }
@@ -656,28 +672,17 @@ impl<'h> MapListValidator<'h> {
     ///
     /// Port of the `is_list` validation in `maps_from_list_1_helper`, OTP-29.1.1.
     #[inline(always)]
-    pub fn current(&mut self) -> Result<Option<Cons<'h>>, WrongShape> {
-        if let Some(cons) = self.pending {
-            return Ok(Some(cons));
-        }
+    pub fn current(&mut self) -> Result<Option<CurrentMapListCell<'_, 'h>>, WrongShape> {
         if self.cursor == Term::NIL {
             Ok(None)
         } else {
-            let cons = Cons::try_from(self.cursor)?;
-            self.pending = Some(cons);
-            Ok(Some(cons))
+            Cons::try_from(self.cursor).map(|cons| {
+                Some(CurrentMapListCell {
+                    validator: self,
+                    cons,
+                })
+            })
         }
-    }
-
-    /// Validate the current cell's head as a two-tuple and advance the list cursor.
-    ///
-    /// Port of the tuple validation in `maps_from_list_1_helper`, OTP-29.1.1.
-    #[inline(always)]
-    pub fn advance(&mut self) -> Result<(), WrongShape> {
-        let cons = self.pending.take().ok_or(WrongShape)?;
-        let _tuple = Tuple2::try_from(cons.head())?;
-        self.cursor = cons.tail();
-        Ok(())
     }
 
     /// Finish after the cursor reaches nil.
@@ -685,7 +690,7 @@ impl<'h> MapListValidator<'h> {
     /// Port of the validated-list handoff to `flatmap_from_validated_list`, OTP-29.1.1.
     #[inline(always)]
     pub fn finish(self) -> Result<ValidatedMapList<'h>, WrongShape> {
-        if self.cursor != Term::NIL || self.pending.is_some() {
+        if self.cursor != Term::NIL {
             return Err(WrongShape);
         }
         Ok(ValidatedMapList {

@@ -300,7 +300,7 @@ impl MapsBuildWalk {
                             .expect("from_list validation state")
                             .current()
                             .map_err(|_| BifError::BADARG)?;
-                        let Some(_) = cons else {
+                        let Some(cons) = cons else {
                             break;
                         };
                         remaining_reds -= 1;
@@ -311,11 +311,7 @@ impl MapsBuildWalk {
                             *reds = remaining_reds;
                             return Ok(None);
                         }
-                        self.validator
-                            .as_mut()
-                            .expect("from_list validation state")
-                            .advance()
-                            .map_err(|_| BifError::BADARG)?;
+                        cons.advance().map_err(|_| BifError::BADARG)?;
                         size += 1;
                     }
                 }
@@ -475,11 +471,14 @@ impl MapsBuildWalk {
                     if self.fill.is_some() {
                         self.cursor = Self::cell(self.cursor)?.1;
                     } else {
-                        self.validator
+                        let cons = self
+                            .validator
                             .as_mut()
                             .expect("from_list validation state")
-                            .advance()
-                            .map_err(|_| BifError::BADARG)?;
+                            .current()
+                            .map_err(|_| BifError::BADARG)?
+                            .expect("validation body has a current list cell");
+                        cons.advance().map_err(|_| BifError::BADARG)?;
                     }
                     self.size += 1;
                     self.phase = BuildPhase::Validate;
