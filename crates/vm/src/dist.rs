@@ -9,6 +9,8 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::{DistributionHeader, OwnedTerm};
 use arinsal_sched::{Event, Payload, Pid, RunCtx, Signal};
 use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 mod elink;
@@ -825,9 +827,12 @@ pub(crate) fn queue_outgoing(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
-    match queue_outgoing_with_options(process, ctx, node, control, message, true, true, None)? {
+    match queue_outgoing_with_options(
+        process, ctx, node, control, message, true, true, false, None,
+    )? {
         DistSendResult::Queued => Ok(()),
         DistSendResult::NotConnected | DistSendResult::WouldSuspend => Err(badarg()),
+        DistSendResult::Continue(_) => unreachable!("a no_trap send never leaves fragments"),
     }
 }
 
@@ -912,18 +917,22 @@ pub(crate) fn queue_outgoing_on(
         message,
         false,
         true,
+        false,
         Some(connection_id),
     )? {
         DistSendResult::Queued | DistSendResult::NotConnected => Ok(()),
         DistSendResult::WouldSuspend => Err(badarg()),
+        DistSendResult::Continue(_) => unreachable!("a no_trap send never leaves fragments"),
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum DistSendResult {
     Queued,
     NotConnected,
     WouldSuspend,
+    /// `ERTS_DSIG_SEND_CONTINUE`: the context holds the fragments still to send.
+    Continue(DsigSendContext),
 }
 
 // Port of erts/emulator/beam/dist.c:3216-3280 (erts_dsig_prepare), OTP-29.1.1.
@@ -936,6 +945,7 @@ fn queue_outgoing_with_options(
     message: Option<OwnedTerm>,
     connect: bool,
     suspend: bool,
+    trap: bool,
     expect_connection: Option<u32>,
 ) -> Result<DistSendResult, VmError> {
     if !node_tables::is_alive() {
@@ -993,19 +1003,24 @@ fn queue_outgoing_with_options(
         if let Some(port_id) = state.port_id {
             let packets = state.encode_term(control, message).map_err(|_| badarg())?;
             state.written = state.written.saturating_add(1);
-            let should_suspend = if suspend {
-                enqueue_port_packets_locked(process, state, ctx.pid(), packets)
-            } else {
+            if !suspend {
                 enqueue_port_output_no_suspend_locked(state, packets);
-                false
+                drop(entry);
+                flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
+                return Ok(DistSendResult::Queued);
+            }
+            let mut send_ctx = DsigSendContext {
+                dep: dep.clone(),
+                connection_id: conn_id,
+                port_id,
+                fragments: packets.into(),
+                no_suspend: false,
             };
             drop(entry);
-            if suspend {
-                finish_port_enqueue(process, ctx.pid(), port_id, should_suspend)?;
-            } else {
-                flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
-            }
-            return Ok(DistSendResult::Queued);
+            return Ok(match dsig_send(process, &mut send_ctx, ctx.pid(), !trap)? {
+                DsigSend::Continue => DistSendResult::Continue(send_ctx),
+                DsigSend::Ok | DsigSend::Yield => DistSendResult::Queued,
+            });
         }
         state.queue_term(control, message).map_err(|_| badarg())?;
         if state.pending_bytes >= state.busy_limit {
@@ -3040,19 +3055,22 @@ pub(crate) fn try_remote_send(
     message: Term,
 ) -> Result<bool, VmError> {
     Ok(!matches!(
-        try_remote_send_with_options(process, ctx, target, message, true, true)?,
+        try_remote_send_with_options(process, ctx, target, message, true, true, false)?,
         RemoteSendOutcome::NotRemote
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum RemoteSendOutcome {
     NotRemote,
     Sent,
     NotConnected,
     WouldSuspend,
+    /// `SEND_YIELD_CONTINUE`: the send traps to `dsend_continue_trap/1` with this context.
+    Continue(DsigSendContext),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_remote_send(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -3061,17 +3079,19 @@ fn queue_remote_send(
     message: Option<OwnedTerm>,
     connect: bool,
     suspend: bool,
+    trap: bool,
 ) -> Result<RemoteSendOutcome, VmError> {
     if !node_tables::is_alive() {
         return Ok(RemoteSendOutcome::NotConnected);
     }
     Ok(
         match queue_outgoing_with_options(
-            process, ctx, node, control, message, connect, suspend, None,
+            process, ctx, node, control, message, connect, suspend, trap, None,
         )? {
             DistSendResult::Queued => RemoteSendOutcome::Sent,
             DistSendResult::NotConnected => RemoteSendOutcome::NotConnected,
             DistSendResult::WouldSuspend => RemoteSendOutcome::WouldSuspend,
+            DistSendResult::Continue(send_ctx) => RemoteSendOutcome::Continue(send_ctx),
         },
     )
 }
@@ -3084,6 +3104,7 @@ pub(crate) fn try_remote_send_with_options(
     message: Term,
     connect: bool,
     suspend: bool,
+    trap: bool,
 ) -> Result<RemoteSendOutcome, VmError> {
     // {Name, Node} — registered send on a (possibly remote) node.
     if let Some((name, node)) = name_node_tuple(target)? {
@@ -3110,6 +3131,7 @@ pub(crate) fn try_remote_send_with_options(
             Some(owned(message)?),
             connect,
             suspend,
+            trap,
         );
     }
     let target_owned = owned(target)?;
@@ -3129,6 +3151,7 @@ pub(crate) fn try_remote_send_with_options(
             Some(owned(message)?),
             connect,
             suspend,
+            trap,
         );
     }
     let OwnedTerm::Pid {
@@ -3163,62 +3186,168 @@ pub(crate) fn try_remote_send_with_options(
         Some(owned(message)?),
         connect,
         suspend,
+        trap,
     )
 }
 
-// Port of erts/emulator/beam/dist.c:3629-3773 (distribution output queue busy state), OTP-29.1.1.
-fn enqueue_port_packets_locked(
+/// The part of `ErtsDSigSendContext` that outlives the encode: the fragments not yet in the
+/// distribution output queue, and the connection they belong to. It is the payload of the
+/// magic binary a trapped send keeps in its `dsend_continue_trap/1` argument.
+// Port of erts/emulator/beam/dist.h (ErtsDSigSendContext: dep, connection_id, obuf, fragments,
+// no_suspend), OTP-29.1.1.
+pub(crate) struct DsigSendContext {
+    /// `ctx->dep`, kept referenced while the send is parked.
+    dep: Arc<node_tables::DistEntry>,
+    /// `ctx->connection_id`: the connection the signal was encoded for.
+    connection_id: u32,
+    port_id: u64,
+    /// `ctx->obuf[0..ctx->fragments]`: the encoded fragments still to be enqueued, in order.
+    fragments: VecDeque<Vec<u8>>,
+    /// `ctx->no_suspend`.
+    no_suspend: bool,
+}
+
+impl std::fmt::Debug for DsigSendContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DsigSendContext")
+            .field("fragments", &self.fragments.len())
+            .finish()
+    }
+}
+
+/// The result codes of `erts_dsig_send` that a sender acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DsigSend {
+    /// `ERTS_DSIG_SEND_OK`.
+    Ok,
+    /// `ERTS_DSIG_SEND_YIELD`: everything is queued and the sender was suspended on the busy
+    /// distribution entry.
+    Yield,
+    /// `ERTS_DSIG_SEND_CONTINUE`: fragments are left in the context.
+    Continue,
+}
+
+/// `ERTS_DSIG_SEND_PHASE_SEND`: verify that the connection still exists, enqueue as many
+/// fragments as the reductions and the busy limit allow, and suspend the sender when the
+/// queue is busy.
+// Port of erts/emulator/beam/dist.c:3594-3760 (erts_dsig_send, ERTS_DSIG_SEND_PHASE_SEND),
+// OTP-29.1.1. `no_trap` is `ctx->no_trap`: every fragment is queued whatever the reductions.
+fn dsig_send(
     process: &mut Process,
-    state: &mut node_tables::DistState,
+    ctx: &mut DsigSendContext,
     sender: Pid,
-    packets: Vec<Vec<u8>>,
-) -> bool {
-    let packet_count = packets.len();
-    let send_count = (process.heap.abi.fcalls.max(10) as usize / 10)
-        .max(1)
-        .min(packet_count);
-    let packet_bytes: Vec<u64> = packets.iter().map(|packet| packet.len() as u64).collect();
-    let has_older_continuation = !state.fragment_continuations.is_empty();
-    let ready_count = if has_older_continuation {
-        0
-    } else {
-        send_count
+    no_trap: bool,
+) -> Result<DsigSend, VmError> {
+    // ERTS_BIF_REDS_LEFT * TERM_TO_BINARY_LOOP_FACTOR.
+    let initial_reds = i64::from(process.heap.abi.fcalls.max(0)) * DSIG_LOOP_FACTOR;
+    let mut reds = initial_reds;
+    let dep = ctx.dep.clone();
+    let mut entry = dep.lock();
+    let connection_ok = entry.state != node_tables::ConnState::Exiting
+        && entry.state != node_tables::ConnState::Idle
+        && entry.connection_id == ctx.connection_id;
+    let Some(state) = entry
+        .dist
+        .as_mut()
+        .filter(|state| connection_ok && state.port_id == Some(ctx.port_id))
+    else {
+        // Not the same connection as when we started; drop message.
+        ctx.fragments.clear();
+        return Ok(DsigSend::Ok);
     };
-    let ready_bytes: u64 = packet_bytes.iter().take(ready_count).sum();
-    let deferred_count = packet_count - ready_count;
-    state.pending_bytes = state
-        .pending_bytes
-        .saturating_sub(packet_bytes.iter().sum::<u64>() - ready_bytes);
-    state.output.extend(packets);
-    state.output_ready_packets += ready_count;
-    if deferred_count != 0 {
-        state
-            .fragment_continuations
-            .push_back(node_tables::DistFragmentContinuation::new(
-                Some(sender),
-                deferred_count,
-            ));
+    let mut fragments = 0;
+    let mut obsz = 0u64;
+    while fragments < ctx.fragments.len()
+        && ((reds > 0 && state.pending_bytes + obsz < state.busy_limit)
+            || no_trap
+            || ctx.no_suspend)
+    {
+        if !no_trap && !ctx.no_suspend {
+            reds -= DSIG_FRAGMENT_REDS;
+        }
+        obsz += ctx.fragments[fragments].len() as u64;
+        fragments += 1;
     }
-    process.heap.abi.fcalls = (process.heap.abi.fcalls - (ready_count as i32 * 10)).max(1);
-    // ERTS_BIF_PREP_YIELD of a send that continues later (dist.c erts_dsig_send:
-    // ERTS_DSIG_SEND_CONTINUE): ERTS_VBUMP_ALL_REDS.
-    if deferred_count != 0 || has_older_continuation {
-        crate::bif_traps::vbump_all_reds(process);
-    }
+    state.pending_bytes += obsz;
     if state.pending_bytes >= state.busy_limit {
         state.busy = true;
     }
-    state.pending_bytes >= state.busy_limit
+    state.output.extend(ctx.fragments.drain(..fragments));
+    let busy = state.busy && !ctx.no_suspend;
+    drop(entry);
+    // BUMP_REDS(c_p, (initial_reds - ctx->reds) / TERM_TO_BINARY_LOOP_FACTOR).
+    let bump = ((initial_reds - reds) / DSIG_LOOP_FACTOR) as i32;
+    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(bump).max(0);
+    let suspended = finish_port_enqueue(process, sender, ctx.port_id, busy)?;
+    Ok(if !ctx.fragments.is_empty() {
+        DsigSend::Continue
+    } else if suspended {
+        DsigSend::Yield
+    } else {
+        DsigSend::Ok
+    })
 }
 
+/// `TERM_TO_BINARY_LOOP_FACTOR`: the loop units one reduction buys `erts_dsig_send`.
+const DSIG_LOOP_FACTOR: i64 = 32;
+/// The loop units `erts_dsig_send` charges per fragment it enqueues.
+const DSIG_FRAGMENT_REDS: i64 = 10;
+
+/// The outcome of `dsend_continue_trap/1`, mapped to what the trap does.
+pub(crate) enum DsendContinue {
+    /// `ERTS_DSIG_SEND_OK`: return the context's return term.
+    Done,
+    /// `ERTS_DSIG_SEND_YIELD`: `nosuspend` or `ERTS_BIF_YIELD_RETURN`.
+    Yield { no_suspend: bool },
+    /// `ERTS_DSIG_SEND_CONTINUE`: trap again.
+    Continue,
+}
+
+/// `dsend_continue_trap_1`: resume `erts_dsig_send` on the context of a parked send.
+// Port of erts/emulator/beam/bif.c:2806-2840 (dsend_continue_trap_1), OTP-29.1.1.
+pub(crate) fn dsend_continue(
+    process: &mut Process,
+    ctx: &mut DsigSendContext,
+    sender: Pid,
+) -> Result<DsendContinue, VmError> {
+    Ok(match dsig_send(process, ctx, sender, false)? {
+        DsigSend::Ok => DsendContinue::Done,
+        DsigSend::Yield => DsendContinue::Yield {
+            no_suspend: ctx.no_suspend,
+        },
+        DsigSend::Continue => DsendContinue::Continue,
+    })
+}
+
+/// Enqueue encoded signals that never trap and never suspend the caller (`ctx->no_trap` and
+/// `ctx->no_suspend` of controller and exit paths): every fragment goes into the queue.
+// Port of erts/emulator/beam/dist.c:3645-3653 (`ctx->no_suspend`), OTP-29.1.1.
+fn enqueue_port_output_no_suspend_locked(
+    state: &mut node_tables::DistState,
+    packets: Vec<Vec<u8>>,
+) {
+    state.pending_bytes += packets
+        .iter()
+        .map(|packet| packet.len() as u64)
+        .sum::<u64>();
+    state.output.extend(packets);
+    if state.pending_bytes >= state.busy_limit {
+        state.busy = true;
+    }
+}
+
+/// Suspend the sender on a busy entry (`erts_suspend` and the suspended list of
+/// `ERTS_DSIG_SEND_PHASE_SEND`), then schedule the dist command. Returns whether the sender
+/// was suspended.
 fn finish_port_enqueue(
     process: &mut Process,
     sender: Pid,
     port_id: u64,
     should_suspend: bool,
-) -> Result<(), VmError> {
+) -> Result<bool, VmError> {
+    let mut suspended = false;
     if should_suspend {
-        let suspended = suspend_dist_sender(process, sender);
+        suspended = suspend_dist_sender(process, sender);
         if suspended {
             // erts_suspend + ERTS_BIF_PREP_YIELD on a busy distribution port (dist.c
             // erts_dsig_send, ERTS_DSIG_SEND_YIELD): ERTS_VBUMP_ALL_REDS.
@@ -3237,170 +3366,8 @@ fn finish_port_enqueue(
             crate::natives::erts_debug::notify_busy_dist_port(process, sender, port_id);
         }
     }
-    flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)
-}
-
-/// Queue distribution signals sent from port/controller paths that cannot suspend a process.
-// Port of erts/emulator/beam/dist.c:3645-3653 (`ctx->no_suspend`), OTP-29.1.1.
-fn enqueue_port_output_no_suspend_locked(
-    state: &mut node_tables::DistState,
-    packets: Vec<Vec<u8>>,
-) {
-    let packet_bytes: u64 = packets.iter().map(|packet| packet.len() as u64).sum();
-    if state.fragment_continuations.is_empty() {
-        state.output_ready_packets += packets.len();
-    } else {
-        state.pending_bytes = state.pending_bytes.saturating_sub(packet_bytes);
-        state
-            .fragment_continuations
-            .push_back(node_tables::DistFragmentContinuation::new(
-                None,
-                packets.len(),
-            ));
-    }
-    state.output.extend(packets);
-    if state.pending_bytes >= state.busy_limit {
-        state.busy = true;
-    }
-}
-
-/// Continue a fragmented dist send at the start of the sender's next slice.
-// Port of erts/emulator/beam/dist.c:3749-3753 (fragmented-send continuation), OTP-29.1.1.
-/// Whether any distribution entry has a deferred fragmented send, so a slice must visit
-/// [`continue_fragmented_send`].
-#[inline]
-pub(crate) fn fragment_continuation_pending() -> bool {
-    node_tables::FRAGMENT_CONTINUATIONS.load(std::sync::atomic::Ordering::Acquire) != 0
-}
-
-pub(crate) fn continue_fragmented_send(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-) -> Result<(), VmError> {
-    // Called every scheduling iteration: skip the global node-table lock while no
-    // distribution entry has a deferred fragmented send (erts keeps this per process).
-    if !fragment_continuation_pending() {
-        return Ok(());
-    }
-    let sender = ctx.pid();
-    let send_count = (process.heap.abi.fcalls.max(0) as usize / 10).max(1);
-    let has_sender = |state: &DistState| {
-        state
-            .fragment_continuations
-            .iter()
-            .any(|continuation| continuation.sender == Some(sender))
-    };
-    let Some(dep) = node_tables::lock()
-        .entries
-        .values()
-        .find(|dep| dep.lock().dist.as_ref().is_some_and(has_sender))
-        .cloned()
-    else {
-        return Ok(());
-    };
-    let (port_id, packet_count, more) = {
-        let mut entry = dep.lock();
-        let Some(state) = entry.dist.as_mut().filter(|state| has_sender(state)) else {
-            return Ok(());
-        };
-        let port_id = state.port_id.ok_or_else(badarg)?;
-        if state
-            .fragment_continuations
-            .front()
-            .is_none_or(|continuation| continuation.sender != Some(sender))
-        {
-            // Another sender's continuation goes first: ERTS_BIF_YIELD (ERTS_VBUMP_ALL_REDS).
-            crate::bif_traps::vbump_all_reds(process);
-            return Ok(());
-        }
-        let count = state
-            .fragment_continuations
-            .front()
-            .map(|continuation| continuation.remaining_packets.min(send_count))
-            .unwrap_or(0);
-        let start = state.output_ready_packets;
-        let queued_bytes: u64 = state
-            .output
-            .iter()
-            .skip(start)
-            .take(count)
-            .map(|packet| packet.len() as u64)
-            .sum();
-        state.pending_bytes = state.pending_bytes.saturating_add(queued_bytes);
-        state.output_ready_packets += count;
-        let continuation = state
-            .fragment_continuations
-            .front_mut()
-            .ok_or_else(badarg)?;
-        continuation.remaining_packets -= count;
-        let more = continuation.remaining_packets != 0;
-        if !more {
-            state.fragment_continuations.pop_front();
-        }
-        while state
-            .fragment_continuations
-            .front()
-            .is_some_and(|continuation| continuation.sender.is_none())
-        {
-            let count = state
-                .fragment_continuations
-                .front()
-                .map(|continuation| continuation.remaining_packets)
-                .unwrap_or(0);
-            let start = state.output_ready_packets;
-            let queued_bytes: u64 = state
-                .output
-                .iter()
-                .skip(start)
-                .take(count)
-                .map(|packet| packet.len() as u64)
-                .sum();
-            state.pending_bytes = state.pending_bytes.saturating_add(queued_bytes);
-            state.output_ready_packets += count;
-            state.fragment_continuations.pop_front();
-        }
-        (port_id, count, more)
-    };
-    // BUMP_REDS on FCALLS, which the context switch reads.
-    process.heap.abi.fcalls = (process.heap.abi.fcalls - (packet_count as i32 * 10)).max(1);
-    // ERTS_DSIG_SEND_CONTINUE: ERTS_BIF_YIELD (ERTS_VBUMP_ALL_REDS).
-    if more {
-        crate::bif_traps::vbump_all_reds(process);
-    }
-    let busy = {
-        let dep = node_tables::port_dist_entry(process.runtime.ok_or_else(badarg)?, port_id);
-        let mut entry = dep.as_ref().map(|dep| dep.lock());
-        let Some(state) = entry
-            .as_mut()
-            .and_then(|entry| entry.dist.as_mut())
-            .filter(|state| state.port_id == Some(port_id))
-        else {
-            return Err(badarg());
-        };
-        if state.pending_bytes >= state.busy_limit {
-            state.busy = true;
-            true
-        } else {
-            false
-        }
-    };
-    if busy && suspend_dist_sender(process, sender) {
-        // erts_suspend + ERTS_BIF_PREP_YIELD (dist.c erts_dsig_send): ERTS_VBUMP_ALL_REDS.
-        crate::bif_traps::vbump_all_reds(process);
-        if let Some(dep) = process
-            .runtime
-            .and_then(|runtime| node_tables::port_dist_entry(runtime, port_id))
-            && let Some(state) = dep
-                .lock()
-                .dist
-                .as_mut()
-                .filter(|state| state.port_id == Some(port_id))
-        {
-            state.suspended_senders.push(sender);
-        }
-        crate::natives::erts_debug::notify_busy_dist_port(process, sender, port_id);
-    }
-    flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)
+    flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
+    Ok(suspended)
 }
 
 /// Schedule the dist command task that drains the entry's queued buffers into its port.
@@ -3418,7 +3385,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         else {
             return Ok(());
         };
-        if state.port_busy || state.flushing_output || state.output_ready_packets == 0 {
+        if state.port_busy || state.flushing_output || state.output.is_empty() {
             false
         } else {
             state.flushing_output = true;
@@ -3478,7 +3445,7 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
                     .dist
                     .as_ref()
                     .filter(|state| state.port_id == Some(port_id))
-                    .is_some_and(|state| !state.port_busy && state.output_ready_packets != 0)
+                    .is_some_and(|state| !state.port_busy && !state.output.is_empty())
             });
             dist_cmd_done(runtime, port_id);
             if again {
@@ -3496,7 +3463,7 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
             else {
                 return 0;
             };
-            if state.port_busy || state.output_ready_packets == 0 {
+            if state.port_busy || state.output.is_empty() {
                 state.flushing_output = false;
                 None
             } else {
@@ -3527,7 +3494,6 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
                 return 0;
             };
             state.pending_bytes = state.pending_bytes.saturating_sub(packet.len() as u64);
-            state.output_ready_packets = state.output_ready_packets.saturating_sub(1);
             state.port_busy = port_busy;
             if port_busy {
                 state.flushing_output = false;
@@ -3594,7 +3560,7 @@ pub(crate) fn distribution_port_state_changed(
         } else {
             Vec::new()
         };
-        (senders, !port_busy && state.output_ready_packets != 0)
+        (senders, !port_busy && !state.output.is_empty())
     };
     if needs_flush {
         let _ = flush_port_output(runtime, port_id);
