@@ -11,7 +11,10 @@ run(Case, DriverDir) ->
         open_close -> open_close();
         send_term -> send_term();
         set_timer -> set_timer();
-        unlink -> unlink_trace()
+        unlink -> unlink_trace();
+        unlink_spawn -> unlink_spawn_trace();
+        link_unlink -> link_unlink_trace(driver);
+        link_unlink_spawn -> link_unlink_trace(spawn)
     end,
     erlang:trace(new_ports, false, [all]),
     Trace = collect(),
@@ -109,8 +112,31 @@ set_timer() ->
 unlink_trace() ->
     process_flag(trap_exit, true),
     P = open(),
-    1 = erlang:trace(P, true, [ports, running_ports]),
-    1 = erlang:trace(self(), true, [procs, running]),
+    1 = erlang:trace(P, true, [ports]),
+    1 = erlang:trace(self(), true, [procs]),
+    true = unlink(P),
+    true = erlang:port_close(P),
+    {true, collect()}.
+
+unlink_spawn_trace() ->
+    process_flag(trap_exit, true),
+    P = erlang:open_port({spawn, "cat"}, []),
+    1 = erlang:trace(P, true, [ports]),
+    1 = erlang:trace(self(), true, [procs]),
+    true = unlink(P),
+    true = erlang:port_close(P),
+    {true, collect()}.
+
+link_unlink_trace(Kind) ->
+    process_flag(trap_exit, true),
+    P = case Kind of
+        driver -> open();
+        spawn -> erlang:open_port({spawn, "cat"}, [])
+    end,
+    1 = erlang:trace(P, true, [ports]),
+    1 = erlang:trace(self(), true, [procs]),
+    true = unlink(P),
+    true = link(P),
     true = unlink(P),
     true = erlang:port_close(P),
     {true, collect()}.

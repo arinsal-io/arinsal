@@ -6,9 +6,12 @@ use arinsal_etf::OwnedTerm;
 use arinsal_term::{ProcessHeap, from_owned};
 
 const MODULE: &str = "port_trace7_repro";
-const CASES: [&str; 8] = [
+const CASES: [&str; 11] = [
     "set_timer",
     "unlink",
+    "unlink_spawn",
+    "link_unlink",
+    "link_unlink_spawn",
     "command",
     "connect",
     "driver_remote_send_term",

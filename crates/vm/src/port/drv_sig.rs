@@ -887,10 +887,14 @@ pub(crate) fn link(
             } else {
                 // Port of erts/emulator/beam/io.c:2507 (port_sig_unlink), OTP-29.1.1.
                 if live {
-                    let removed = handle.links.lock().remove(pid.data()).is_some();
-                    if removed {
+                    let mut links = handle.links.lock();
+                    let has_link = links
+                        .get(pid.data())
+                        .is_some_and(|link| link.unlinking() == 0);
+                    if has_link {
                         trace_link(task_runtime, handle.id, pid, "getting_unlinked");
                     }
+                    links.remove(pid.data());
                 }
                 // `port_sig_unlink` acknowledges both execution and abort; the caller's link
                 // remains pending until this id-matched process signal is handled.
