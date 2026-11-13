@@ -50,7 +50,7 @@ fn is_selected(st: &State) -> bool {
 /// `esock_stop_handle_current`: the current requestor never gets a select message, so
 /// it is told that the socket is gone.
 fn stop_handle_current(h: &Handle, requestor: &Requestor) {
-    demonitor_process(&requestor.pid, requestor.mon);
+    demonitor_process(h, &requestor.pid, requestor.mon);
     send_abort_msg(h, requestor, &atom("closed"));
 }
 
@@ -58,7 +58,7 @@ fn stop_handle_current(h: &Handle, requestor: &Requestor) {
 fn inform_waiting_procs(h: &Handle, queue: &mut VecDeque<Requestor>, reason: &O) {
     for requestor in queue.drain(..) {
         send_abort_msg(h, &requestor, reason);
-        demonitor_process(&requestor.pid, requestor.mon);
+        demonitor_process(h, &requestor.pid, requestor.mon);
     }
 }
 
@@ -153,9 +153,9 @@ pub(super) fn finalize_close(value: &O) -> Result<O, BifError> {
         return Err(raise_invalid("state"));
     }
     st.closer = None;
-    demonitor_process(&me, st.closer_mon.take());
+    demonitor_process(&h, &me, st.closer_mon.take());
     if let Some(owner) = h.owner.lock().unwrap().take() {
-        demonitor_process(&owner, st.ctrl_mon.take());
+        demonitor_process(&h, &owner, st.ctrl_mon.take());
     }
     let socket = guard.take();
     if let Some(socket) = socket.as_ref() {
@@ -177,7 +177,7 @@ fn send_close_msg(h: &Handle, closer: &O, close_ref: O) {
     if let Some(reactor) = active_reactor() {
         let message = O::tuple(vec![
             atom("$socket"),
-            pair(atom("$socket"), h.reference().clone()),
+            pair(atom("$socket"), h.reference()),
             atom("close"),
             close_ref,
         ]);
@@ -285,7 +285,7 @@ fn down_requestor(h: &Handle, st: &mut State, fd: Option<i32>, kind: Kind, pid: 
             *st.current(kind) = None;
         }
     } else {
-        st.unqueue(kind, None, pid);
+        st.unqueue(h, kind, None, pid);
     }
 }
 
@@ -308,10 +308,10 @@ pub(super) fn dtor(h: &Handle) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
     {
-        demonitor_process(&owner, st.ctrl_mon.take());
+        demonitor_process(h, &owner, st.ctrl_mon.take());
     }
     if let Some(closer) = st.closer.clone() {
-        demonitor_process(&closer, st.closer_mon.take());
+        demonitor_process(h, &closer, st.closer_mon.take());
     }
     let current = [
         st.connector.take(),
@@ -320,7 +320,7 @@ pub(super) fn dtor(h: &Handle) {
         st.current_acceptor.take(),
     ];
     for requestor in current.into_iter().flatten() {
-        demonitor_process(&requestor.pid, requestor.mon);
+        demonitor_process(h, &requestor.pid, requestor.mon);
     }
     let queued = [
         std::mem::take(&mut st.readers_q),
@@ -328,7 +328,7 @@ pub(super) fn dtor(h: &Handle) {
         std::mem::take(&mut st.acceptors_q),
     ];
     for requestor in queued.into_iter().flatten() {
-        demonitor_process(&requestor.pid, requestor.mon);
+        demonitor_process(h, &requestor.pid, requestor.mon);
     }
     h.sendfile_fd
         .lock()
@@ -382,7 +382,7 @@ fn cancel_connect(h: &Handle, op_ref: &O) -> Result<O, BifError> {
                 || atom("not_found"),
                 |s| cancel_write_select(s.as_raw_fd(), op_ref),
             );
-            requestor_release(&mut st.connector);
+            requestor_release(h, &mut st.connector);
             st.write_state &= !state_bits::CONNECTING;
             Ok(result)
         }
@@ -409,7 +409,7 @@ fn cancel_requestor(h: &Handle, kind: Kind, op_ref: &O) -> Result<O, BifError> {
         return Err(BifError::BADARG);
     };
     if me != current.pid {
-        return Ok(if st.unqueue(kind, Some(op_ref), &me) {
+        return Ok(if st.unqueue(h, kind, Some(op_ref), &me) {
             atom("ok")
         } else {
             atom("not_found")
@@ -421,7 +421,7 @@ fn cancel_requestor(h: &Handle, kind: Kind, op_ref: &O) -> Result<O, BifError> {
     let Some(fd) = guard.as_ref().map(AsRawFd::as_raw_fd) else {
         return Ok(atom("not_found"));
     };
-    demonitor_process(&current.pid, current.mon);
+    demonitor_process(h, &current.pid, current.mon);
     let result = if kind == Kind::Writer {
         cancel_write_select(fd, &current.reference)
     } else {

@@ -297,6 +297,7 @@ dependencies = [
  "arinsal-bifs",
  "arinsal-drv",
  "arinsal-etf",
+ "arinsal-nif",
  "arinsal-nif-file",
  "arinsal-term",
  "libc",

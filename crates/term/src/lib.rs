@@ -95,7 +95,7 @@ pub use identity::Identity;
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use literal_decode::decode_literal;
-pub use magic::{magic_handle, magic_handle_owner, magic_handle_weak};
+pub use magic::{magic_handle, magic_handle_owner};
 pub use native_code::{
     is_cp, is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
     unregister_native_code_range,

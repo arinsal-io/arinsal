@@ -13,34 +13,107 @@ use crate::resources::{self, Resource};
 use arinsal_term::{MagicBin, MagicRef, Term};
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Target half of a resource monitor (the `ERTS_MON_TYPE_RESOURCE` entry in the monitored
 /// process's monitor tree).
 pub struct ResourceMonitor {
-    target: Target,
+    /// `tmon->other.ptr`: the resource's binary. The monitor owns no count of it; its share of
+    /// `ErtsResourceMonitors.refc` keeps the memory until this target half is released.
+    bin: NonNull<MagicRef>,
+    /// The `ErtsResourceMonitors` inside the binary's data.
+    monitors_of: MonitorsOf,
+    /// `type->fn.down`, called with a counted reference to the live resource.
+    down: DownFn,
     id: u64,
 }
 
-/// What the exit of the monitored process notifies.
-enum Target {
-    /// A resource of a dynamically loaded NIF library: `tmon->other.ptr`, the resource's
-    /// binary. The monitor does not own a count; its share of `ErtsResourceMonitors.refc`
-    /// keeps the memory until this target half is released.
-    Resource(NonNull<MagicRef>),
-    /// A resource of a built-in NIF: the resource, which the monitor does not own, and its
-    /// `down` callback, called with the exiting pid and the monitor.
-    Native(arinsal_term::MagicWeak, NativeDown),
-}
+/// Locates the `ErtsResourceMonitors` of a resource binary.
+/// The result borrows the binary's data, which the caller keeps (a monitor count or a
+/// counted reference).
+pub type MonitorsOf = fn(NonNull<MagicRef>) -> &'static ResourceMonitors;
+/// The `down` callback of a resource type: the resource, the exiting pid and the monitor.
+pub type DownFn = fn(&MagicBin, Term, u64);
 
 // SAFETY: the raw binary is only touched under the resource's monitor lock or after
 // `erts_refc_inc_unless` gave a count.
-unsafe impl Send for Target {}
+unsafe impl Send for ResourceMonitor {}
 // SAFETY: as above.
-unsafe impl Sync for Target {}
+unsafe impl Sync for ResourceMonitor {}
 
-/// The `down` callback of a built-in NIF resource.
-pub type NativeDown = Arc<dyn Fn(Term, u64) + Send + Sync>;
+/// `ErtsResourceMonitors`: the origin halves of the process monitors a resource holds.
+// Port of erts/emulator/beam/global.h (ErtsResourceMonitors), OTP-29.1.1.
+pub struct ResourceMonitors {
+    /// `lock` with `root`, `refc` and the dying flag it protects.
+    lock: Mutex<MonitorState>,
+}
+
+/// The state behind `ErtsResourceMonitors.lock`.
+#[derive(Default)]
+struct MonitorState {
+    /// `root`: target pid and monitor reference of each active monitor.
+    root: Vec<(Term, u64)>,
+    /// `rmon_refc`: target halves still referring to this resource's memory.
+    refc: usize,
+    /// `rmon_is_dying`: the resource's count reached zero and its destructor started.
+    dying: bool,
+}
+
+impl Default for ResourceMonitors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResourceMonitors {
+    /// `erts_mtx_init` + `root = NULL`, `refc = 0` in `enif_alloc_resource`.
+    pub fn new() -> Self {
+        Self {
+            lock: Mutex::new(MonitorState::default()),
+        }
+    }
+
+    /// Insert the origin half of a new monitor and take its monitor count, before the
+    /// monitor signal is sent (`enif_monitor_process`).
+    pub fn add(&self, target: Term, id: u64) {
+        let mut state = self.lock.lock().unwrap();
+        state.root.push((target, id));
+        state.refc += 1;
+    }
+
+    /// Remove the origin half `id` (`enif_demonitor_process`, or a monitor signal that could
+    /// not be delivered). `None` when it is not active or the resource is dying.
+    pub fn remove(&self, id: u64) -> Option<Term> {
+        let mut state = self.lock.lock().unwrap();
+        if state.dying {
+            return None;
+        }
+        let index = state.root.iter().position(|(_, held)| *held == id)?;
+        Some(state.root.remove(index).0)
+    }
+
+    /// The first part of `run_resource_dtor`: mark the resource dying, demonitor every
+    /// monitored process with `demonitor`, and tell whether the memory may go now (no target
+    /// half refers to it any more). When `false`, the last target half released calls
+    /// `erts_bin_free` again.
+    // Port of erts/emulator/beam/erl_nif.c (run_resource_dtor), OTP-29.1.1.
+    pub fn dtor_prologue(&self, demonitor: impl Fn(Term, u64)) -> bool {
+        let (root, refc) = {
+            let mut state = self.lock.lock().unwrap();
+            let root = if state.dying {
+                Vec::new()
+            } else {
+                state.dying = true;
+                std::mem::take(&mut state.root)
+            };
+            (root, state.refc)
+        };
+        for (target, id) in root {
+            demonitor(target, id);
+        }
+        refc == 0
+    }
+}
 
 fn handle(id: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -48,21 +121,24 @@ fn handle(id: u64) -> [u8; 32] {
     bytes
 }
 
-/// The monitors of the resource in `bin`, whose memory the caller keeps.
-fn monitors<'a>(bin: NonNull<MagicRef>) -> &'a resources::ResourceMonitors {
-    // SAFETY: a monitor's share of the monitor count keeps the payload until it is released.
-    let resource = unsafe { MagicRef::payload_of::<Resource>(bin) };
-    resource
-        .monitors
-        .as_ref()
-        .expect("a monitored resource has monitors")
-}
-
 impl ResourceMonitor {
-    /// The target half of a monitor held by a built-in NIF resource.
-    pub fn native(id: u64, resource: arinsal_term::MagicWeak, down: NativeDown) -> Self {
+    /// The target half of monitor `id` held by the resource in `bin`. The caller has added
+    /// the origin half with [`ResourceMonitors::add`], which took the monitor count this
+    /// target half gives back when it is dropped.
+    ///
+    /// # Safety
+    /// `bin` is a live resource binary whose `ErtsResourceMonitors` `monitors_of` finds, and
+    /// its destructor follows the [`ResourceMonitors::dtor_prologue`] protocol.
+    pub unsafe fn new(
+        id: u64,
+        bin: NonNull<MagicRef>,
+        monitors_of: MonitorsOf,
+        down: DownFn,
+    ) -> Self {
         Self {
-            target: Target::Native(resource, down),
+            bin,
+            monitors_of,
+            down,
             id,
         }
     }
@@ -72,69 +148,73 @@ impl ResourceMonitor {
         self.id
     }
 
+    fn monitors(&self) -> &ResourceMonitors {
+        (self.monitors_of)(self.bin)
+    }
+
     /// The monitoring resource as a magic reference, for `process_info(_, monitored_by)`.
     pub fn resource_ref(&self) -> Option<MagicBin> {
-        match &self.target {
-            Target::Resource(bin) => {
-                let state = monitors(*bin).lock.lock().unwrap();
-                if state.dying {
-                    return None;
-                }
-                // SAFETY: the monitor count keeps the memory; the lock orders against the
-                // destructor setting `dying`.
-                unsafe { MagicBin::retain_unless_dead(*bin) }
-            }
-            Target::Native(resource, _) => resource.upgrade(),
+        let state = self.monitors().lock.lock().unwrap();
+        if state.dying {
+            return None;
         }
+        // SAFETY: the monitor count keeps the memory; the lock orders against the destructor
+        // setting `dying`.
+        unsafe { MagicBin::retain_unless_dead(self.bin) }
     }
 
     /// The monitored process `pid` exits: run the `down` callback of a live resource.
     // Port of erts/emulator/beam/erl_nif.c (erts_fire_nif_monitor), OTP-29.1.1. The monitor
     // count is given back when this target half is released ([`Drop`]).
     pub fn fire(&self, pid: Term) {
-        let bin = match &self.target {
-            Target::Resource(bin) => *bin,
-            Target::Native(_, down) => {
-                down(pid, self.id);
-                return;
-            }
-        };
         let counted = {
-            let mut state = monitors(bin).lock.lock().unwrap();
+            let mut state = self.monitors().lock.lock().unwrap();
             let active = !state.dying && state.root.iter().any(|(_, id)| *id == self.id);
             if !active {
                 return;
             }
             state.root.retain(|(_, id)| *id != self.id);
             // SAFETY: the monitor count keeps the memory while the lock is held.
-            unsafe { MagicBin::retain_unless_dead(bin) }
+            unsafe { MagicBin::retain_unless_dead(self.bin) }
         };
         if let Some(counted) = counted {
-            resources::call_down(&counted, pid, &handle(self.id));
+            (self.down)(&counted, pid, self.id);
         }
     }
 }
 
 impl Drop for ResourceMonitor {
-    /// The target half is released (fired or demonitored): give back its monitor count; the
-    /// last one of a dying resource frees it.
+    /// The target half is released (fired, demonitored or undelivered): give back its monitor
+    /// count; the last one of a dying resource frees it.
     // Port of erts/emulator/beam/erl_nif.c (erts_nif_demonitored and the `!active` arm of
     // erts_fire_nif_monitor), OTP-29.1.1.
     fn drop(&mut self) {
-        let Target::Resource(bin) = self.target else {
-            return;
-        };
         let free_me = {
-            let mut state = monitors(bin).lock.lock().unwrap();
+            let mut state = self.monitors().lock.lock().unwrap();
             state.refc -= 1;
             state.refc == 0 && state.dying
         };
         if free_me {
             // SAFETY: the count is zero and the destructor handed the free to the last
             // monitor reference.
-            unsafe { MagicBin::bin_free(bin) };
+            unsafe { MagicBin::bin_free(self.bin) };
         }
     }
+}
+
+/// `ErtsResourceMonitors` of a dynamic NIF resource binary.
+fn nif_resource_monitors(bin: NonNull<MagicRef>) -> &'static ResourceMonitors {
+    // SAFETY: a monitor's share of the monitor count keeps the payload until it is released.
+    let resource = unsafe { MagicRef::payload_of::<Resource>(bin) };
+    resource
+        .monitors
+        .as_ref()
+        .expect("a monitored resource has monitors")
+}
+
+/// `type->fn.down` of a dynamic NIF resource.
+fn nif_resource_down(bin: &MagicBin, pid: Term, id: u64) {
+    resources::call_down(bin, pid, &handle(id));
 }
 
 /// `enif_monitor_process`: 0 on success, 1 when the process is not alive, -1 when the
@@ -167,22 +247,18 @@ pub extern "C" fn enif_monitor_process(
     if let Some(out) = unsafe { monitor.as_mut() } {
         *out = handle(id);
     }
-    {
-        let mut state = rm.lock.lock().unwrap();
-        state.root.push((target, id));
-        state.refc += 1;
-    }
+    rm.add(target, id);
     let send = hooks().lock().unwrap().resource_monitor;
-    let monitor = Arc::new(ResourceMonitor {
-        target: Target::Resource(bin),
-        id,
+    // SAFETY: a resource binary follows the dtor_prologue protocol in run_resource_dtor.
+    let monitor = Arc::new(unsafe {
+        ResourceMonitor::new(id, bin, nif_resource_monitors, nif_resource_down)
     });
     // erts_proc_sig_send_monitor: a process that cannot receive the signal is not alive; the
     // undelivered target half gives its monitor count back when it is dropped.
     if send.is_some_and(|send| send(target, id, monitor)) {
         0
     } else {
-        rm.lock.lock().unwrap().root.retain(|(_, held)| *held != id);
+        rm.remove(id);
         1
     }
 }
@@ -205,15 +281,8 @@ pub extern "C" fn enif_demonitor_process(
     // SAFETY: the NIF passes the monitor it got from enif_monitor_process.
     let bytes: [u8; 32] = unsafe { *monitor };
     let id = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
-    let target = {
-        let mut state = rm.lock.lock().unwrap();
-        if state.dying {
-            return 1;
-        }
-        let Some(index) = state.root.iter().position(|(_, held)| *held == id) else {
-            return 1;
-        };
-        state.root.remove(index).0
+    let Some(target) = rm.remove(id) else {
+        return 1;
     };
     send_demonitor(target, id);
     0

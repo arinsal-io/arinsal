@@ -140,7 +140,7 @@ impl Handle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if selector.is_none() {
-            *selector = owner_of(self.reference());
+            *selector = owner_of(&self.reference());
         }
     }
 
@@ -154,11 +154,13 @@ impl Handle {
         drop(selector);
     }
 
-    /// The socket reference term.
-    pub(crate) fn reference(&self) -> &O {
-        self.reference
-            .get()
-            .expect("the socket reference is set on creation")
+    /// The socket reference term, made on demand like `enif_make_resource(env, descP)`.
+    pub(crate) fn reference(&self) -> O {
+        // SAFETY: a `&Handle` is only reached through a counted reference to its binary (a
+        // `Sock` or a reference term held by the caller), never while its destructor runs.
+        O::MagicRef(arinsal_term::magic_handle(unsafe {
+            MagicBin::from_payload(self)
+        }))
     }
 }
 
@@ -188,13 +190,58 @@ pub(crate) fn release_created(mark: usize) {
     drop(created);
 }
 
-// prim_socket_nif.c: esock_dtor is the destructor of socket descriptor resources.
-arinsal_term::magic_payload!(Handle => esock_dtor);
+// SAFETY: `esock_dtor_prologue` is defined once, for `Handle` only; it drops the payload
+// exactly once and frees the block itself (it returns 0, like the NIF resource destructor).
+unsafe impl arinsal_term::MagicPayload for Handle {
+    const DESTRUCTOR: arinsal_term::MagicDestructor = esock_dtor_prologue;
+}
+
+/// `NIF_RESOURCE_DTOR` of a socket descriptor: demonitor, wait for the monitor references,
+/// then run `esock_dtor` (the `Drop` of [`Handle`]) and free the binary.
+// Port of erts/emulator/beam/erl_nif.c (nif_resource_dtor_prologue, run_resource_dtor),
+// OTP-29.1.1, for the resource type of prim_socket_nif.c.
+#[inline(never)]
+unsafe fn esock_dtor_prologue(bin: std::ptr::NonNull<arinsal_term::MagicRef>) -> bool {
+    // SAFETY: the count is zero and the payload is live until it is dropped below.
+    let h = unsafe { arinsal_term::MagicRef::payload_of::<Handle>(bin) };
+    if !h.monitors.dtor_prologue(|pid, id| {
+        if let (Ok(pid), Some(reactor)) = (arinsal_term::to_owned(pid), active_reactor()) {
+            reactor.demonitor(&pid, id);
+        }
+    }) {
+        return false;
+    }
+    // SAFETY: the payload is dropped once and the block is ours to free.
+    unsafe {
+        arinsal_term::raw::magic_bin::drop_payload::<Handle>(bin);
+        MagicBin::magic_binary_free(bin);
+    }
+    false
+}
+
+/// `resource->monitors` of a socket descriptor binary.
+fn socket_monitors(
+    bin: std::ptr::NonNull<arinsal_term::MagicRef>,
+) -> &'static arinsal_nif::ResourceMonitors {
+    // SAFETY: a monitor's share of the monitor count keeps the payload until it is released.
+    &unsafe { arinsal_term::MagicRef::payload_of::<Handle>(bin) }.monitors
+}
+
+/// `esock_down`, the `down` callback of the socket resource type.
+fn socket_down(bin: &MagicBin, pid: arinsal_term::Term, monitor: u64) {
+    if let Ok(pid) = arinsal_term::to_owned(pid) {
+        down(
+            &O::MagicRef(arinsal_term::magic_handle(bin.clone())),
+            &pid,
+            monitor,
+        );
+    }
+}
 
 pub(crate) struct Handle {
     socket: Mutex<Option<Socket>>,
-    /// The socket reference term, set once the magic reference has its identity.
-    reference: OnceLock<O>,
+    /// `resource->monitors`: the process monitors this descriptor holds.
+    monitors: arinsal_nif::ResourceMonitors,
     /// The reference the select machinery holds from the first selection until the stop
     /// callback (`enif_select` keeps the resource).
     selector: Mutex<Option<MagicBin>>,
@@ -370,7 +417,7 @@ fn reference(
     let magic = MagicBin::with_orig_size_and_refn(
         Handle {
             socket: Mutex::new(Some(socket)),
-            reference: OnceLock::new(),
+            monitors: arinsal_nif::ResourceMonitors::new(),
             selector: Mutex::new(None),
             owner: Mutex::new(owner.clone()),
             state: Mutex::new(State::default()),
@@ -385,14 +432,8 @@ fn reference(
         SOCKET_MAGIC_ORIG_SIZE,
         arinsal_bifs::next_ref_words(),
     );
-    let id = magic.id();
     let reference = O::MagicRef(arinsal_term::magic_handle(magic.clone()));
     let h = Sock(magic);
-    // The descriptor names itself by a weak handle: a counted one would keep it alive forever.
-    let _ = h.reference.set(O::MagicRef(arinsal_term::magic_handle_weak(
-        id,
-        MagicBin::downgrade(&h.0),
-    )));
     CREATED.with(|created| created.borrow_mut().push(h.clone()));
     if let Some(pid) = owner.as_ref() {
         let mon = monitor_process(&h, pid);
@@ -442,7 +483,7 @@ fn send_reg_msg(tag: &str, h: &Handle) {
         let message = O::tuple(vec![
             atom("$socket"),
             atom(tag),
-            pair(atom("$socket"), h.reference().clone()),
+            pair(atom("$socket"), h.reference()),
         ]);
         reactor.send(&registry, &message);
     }
@@ -472,7 +513,7 @@ pub(super) fn set_owner(value: &O, pid: O) -> Result<(), BifError> {
     let mut st = h.state.lock().unwrap();
     if previous.as_ref() != Some(&pid) {
         if let Some(previous) = previous.as_ref() {
-            demonitor_process(previous, st.ctrl_mon.take());
+            demonitor_process(&h, previous, st.ctrl_mon.take());
         }
         st.ctrl_mon = monitor_process(&h, &pid);
     }
@@ -498,7 +539,7 @@ pub(crate) fn select_read(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) -
     let Some(pid) = pid.cloned().or_else(|| reactor.self_pid()) else {
         return select_failed();
     };
-    let result = reactor.register_read(fd, &pid, h.reference(), reference);
+    let result = reactor.register_read(fd, &pid, &h.reference(), reference);
     if result >= 0 {
         h.keep_for_select();
     }
@@ -512,7 +553,7 @@ pub(crate) fn select_write(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) 
     let Some(pid) = pid.cloned().or_else(|| reactor.self_pid()) else {
         return select_failed();
     };
-    let result = reactor.register_write(fd, &pid, h.reference(), reference);
+    let result = reactor.register_write(fd, &pid, &h.reference(), reference);
     if result >= 0 {
         h.keep_for_select();
     }
@@ -570,7 +611,7 @@ pub(crate) fn raise_invalid(what: &str) -> BifError {
 /// `esock_send_abort_msg`: `{'$socket', Socket, abort, {Ref, Reason}}` to the requestor.
 pub(crate) fn send_abort_msg(h: &Handle, req: &Requestor, reason: &O) {
     if let Some(reactor) = active_reactor() {
-        let message = crate::abort_message(h.reference(), &req.reference, reason);
+        let message = crate::abort_message(&h.reference(), &req.reference, reason);
         reactor.send(&req.pid, &message);
     }
 }
@@ -580,7 +621,7 @@ pub(crate) fn send_simple_abort_msg(h: &Handle, pid: &O, reason: &O) {
     if let Some(reactor) = active_reactor() {
         let message = O::tuple(vec![
             atom("$socket"),
-            pair(atom("$socket"), h.reference().clone()),
+            pair(atom("$socket"), h.reference()),
             atom("abort"),
             reason.clone(),
         ]);
@@ -588,12 +629,43 @@ pub(crate) fn send_simple_abort_msg(h: &Handle, pid: &O, reason: &O) {
     }
 }
 /// `MONP`: monitor `pid` for the socket.
+// Port of erts/emulator/beam/erl_nif.c (enif_monitor_process), OTP-29.1.1: the origin half
+// goes into `resource->monitors` with its monitor count before the signal is sent.
 pub(crate) fn monitor_process(h: &Handle, pid: &O) -> Option<u64> {
-    active_reactor().and_then(|reactor| reactor.monitor(pid, h.reference()))
+    let reactor = active_reactor()?;
+    let O::Pid { id, serial, .. } = pid else {
+        return None;
+    };
+    let target = arinsal_term::Term::pid(*id, *serial)?;
+    let mut taken = None;
+    let result = reactor.monitor(pid, &mut |monitor| {
+        taken = Some(monitor);
+        h.monitors.add(target, monitor);
+        // SAFETY: `h` is the payload of a live descriptor binary, whose destructor follows
+        // the dtor_prologue protocol in `esock_dtor_prologue`.
+        unsafe {
+            arinsal_nif::ResourceMonitor::new(
+                monitor,
+                MagicBin::block_of_payload(h),
+                socket_monitors,
+                socket_down,
+            )
+        }
+    });
+    if result.is_none()
+        && let Some(monitor) = taken
+    {
+        h.monitors.remove(monitor);
+    }
+    result
 }
-/// `DEMONP`.
-pub(crate) fn demonitor_process(pid: &O, monitor: Option<u64>) {
-    if let (Some(monitor), Some(reactor)) = (monitor, active_reactor()) {
+/// `DEMONP`: `enif_demonitor_process(env, descP, &mon)`.
+// Port of erts/emulator/beam/erl_nif.c (enif_demonitor_process), OTP-29.1.1.
+pub(crate) fn demonitor_process(h: &Handle, pid: &O, monitor: Option<u64>) {
+    if let Some(monitor) = monitor
+        && h.monitors.remove(monitor).is_some()
+        && let Some(reactor) = active_reactor()
+    {
         reactor.demonitor(pid, monitor);
     }
 }
@@ -634,7 +706,13 @@ impl State {
     }
     /// `esock_{acceptor,writer,reader}_unqueue`: remove the element of `pid`, and when
     /// `reference` is given only if it matches.
-    pub(crate) fn unqueue(&mut self, kind: Kind, reference: Option<&O>, pid: &O) -> bool {
+    pub(crate) fn unqueue(
+        &mut self,
+        h: &Handle,
+        kind: Kind,
+        reference: Option<&O>,
+        pid: &O,
+    ) -> bool {
         let queue = self.queue(kind);
         let Some(index) = queue.iter().position(|req| &req.pid == pid) else {
             return false;
@@ -644,15 +722,15 @@ impl State {
         }
         let removed = queue.remove(index);
         if let Some(req) = removed {
-            demonitor_process(&req.pid, req.mon);
+            demonitor_process(h, &req.pid, req.mon);
         }
         true
     }
 }
 /// `esock_requestor_release`.
-pub(crate) fn requestor_release(requestor: &mut Option<Requestor>) {
+pub(crate) fn requestor_release(h: &Handle, requestor: &mut Option<Requestor>) {
     if let Some(req) = requestor.take() {
-        demonitor_process(&req.pid, req.mon);
+        demonitor_process(h, &req.pid, req.mon);
     }
 }
 /// `esock_activate_next_{acceptor,writer,reader}`: pop the queue and select for the
@@ -673,7 +751,7 @@ pub(crate) fn activate_next(h: &Handle, st: &mut State, fd: i32, kind: Kind) -> 
         if sres < 0 {
             let reason = pair(atom("select_failed"), O::Int(sres.into()));
             send_abort_msg(h, &req, &reason);
-            demonitor_process(&req.pid, req.mon);
+            demonitor_process(h, &req.pid, req.mon);
             *st.current(kind) = None;
         } else {
             match kind {
@@ -1010,7 +1088,7 @@ fn connect(args: &[O]) -> Result<O, BifError> {
                 Err(raise_invalid("state"))
             };
         }
-        requestor_release(&mut st.connector);
+        requestor_release(&h, &mut st.connector);
         st.write_state &= !state_bits::CONNECTING;
         let result = verify_is_connected(s);
         if result == atom("ok") {
@@ -1165,7 +1243,7 @@ fn accept_busy_retry(
     let sres = select_read(h, fd, pid, reference);
     if sres < 0 {
         if let Some(current) = st.current_acceptor.as_ref() {
-            demonitor_process(&current.pid, current.mon);
+            demonitor_process(h, &current.pid, current.mon);
         }
         if !activate_next(h, st, fd, Kind::Acceptor) {
             st.read_state &= !state_bits::ACCEPTING;
@@ -1190,7 +1268,7 @@ fn accept_accepting_current(
                 return Err(BifError::BADARG);
             };
             let result = accepted(h, socket, &current.pid);
-            demonitor_process(&current.pid, current.mon);
+            demonitor_process(h, &current.pid, current.mon);
             if !activate_next(h, st, fd, Kind::Acceptor) {
                 st.read_state &= !state_bits::ACCEPTING;
                 st.current_acceptor = None;
@@ -1214,13 +1292,13 @@ fn accept_accepting_current(
         }
         Err(e) => {
             h.counters.lock().unwrap().acc_fails += 1;
-            requestor_release(&mut st.current_acceptor);
+            requestor_release(h, &mut st.current_acceptor);
             let result = fail(&e);
             let reason = errno_reason(&e);
             while st.pop(Kind::Acceptor) {
                 if let Some(request) = st.current_acceptor.take() {
                     send_abort_msg(h, &request, &reason);
-                    demonitor_process(&request.pid, request.mon);
+                    demonitor_process(h, &request.pid, request.mon);
                 }
             }
             st.current_acceptor = None;
@@ -1610,7 +1688,7 @@ fn send_check_ok(h: &Handle, st: &mut State, fd: i32, written: usize) -> O {
         counters.write_pkg_max_cnt = 0;
     }
     if let Some(current) = st.current_writer.as_ref() {
-        demonitor_process(&current.pid, current.mon);
+        demonitor_process(h, &current.pid, current.mon);
     }
     if !activate_next(h, st, fd, Kind::Writer) {
         st.current_writer = None;
@@ -1622,7 +1700,7 @@ fn send_check_fail(h: &Handle, st: &mut State, e: &io::Error) -> O {
     h.counters.lock().unwrap().write_fails += 1;
     let reason = errno_reason(e);
     if e.raw_os_error() != Some(libc::EINVAL) && st.current_writer.is_some() {
-        requestor_release(&mut st.current_writer);
+        requestor_release(h, &mut st.current_writer);
         send_error_waiting_writers(h, st, &reason);
         st.current_writer = None;
     }
@@ -1633,7 +1711,7 @@ fn send_error_waiting_writers(h: &Handle, st: &mut State, reason: &O) {
     while st.pop(Kind::Writer) {
         if let Some(request) = st.current_writer.take() {
             send_abort_msg(h, &request, reason);
-            demonitor_process(&request.pid, request.mon);
+            demonitor_process(h, &request.pid, request.mon);
         }
     }
 }
@@ -1658,7 +1736,7 @@ fn send_check_retry(
                 counters.write_byte += written as u64;
             }
             if let Some(current) = st.current_writer.as_ref() {
-                demonitor_process(&current.pid, current.mon);
+                demonitor_process(h, &current.pid, current.mon);
             }
             if !activate_next(h, st, fd, Kind::Writer) {
                 st.current_writer = None;
@@ -1689,10 +1767,10 @@ fn send_check_retry(
     let sres = select_write(h, fd, None, send_ref);
     if sres < 0 {
         if let Some(current) = st.current_writer.as_ref() {
-            demonitor_process(&current.pid, current.mon);
+            demonitor_process(h, &current.pid, current.mon);
         }
         let reason = pair(atom("select_write"), O::Int(sres.into()));
-        requestor_release(&mut st.current_writer);
+        requestor_release(h, &mut st.current_writer);
         send_error_waiting_writers(h, st, &reason);
         st.current_writer = None;
         return Err(raise_select("select_write", sres));
@@ -2335,7 +2413,7 @@ impl Receiver<'_> {
     /// `recv_update_current_reader`: demonitor the current reader and activate the next one.
     fn update_current_reader(&self, st: &mut State) {
         if let Some(current) = st.current_reader.as_ref() {
-            demonitor_process(&current.pid, current.mon);
+            demonitor_process(self.h, &current.pid, current.mon);
             if !activate_next(self.h, st, self.fd, Kind::Reader) {
                 st.current_reader = None;
             }
@@ -2345,11 +2423,11 @@ impl Receiver<'_> {
     /// `recv_error_current_reader`: abort every waiting reader with `reason`.
     fn error_current_reader(&self, st: &mut State, reason: &O) {
         if st.current_reader.is_some() {
-            requestor_release(&mut st.current_reader);
+            requestor_release(self.h, &mut st.current_reader);
             while st.pop(Kind::Reader) {
                 if let Some(request) = st.current_reader.take() {
                     send_abort_msg(self.h, &request, reason);
-                    demonitor_process(&request.pid, request.mon);
+                    demonitor_process(self.h, &request.pid, request.mon);
                 }
             }
             st.current_reader = None;
@@ -4050,7 +4128,7 @@ mod tests {
         }
         let sent = reactor.sent();
         for (who, reference) in [(pid(6), 2), (pid(7), 3)] {
-            let message = crate::abort_message(h.reference(), &test_ref(reference), &reason);
+            let message = crate::abort_message(&h.reference(), &test_ref(reference), &reason);
             assert!(sent.contains(&(who, message)), "{sent:?}");
         }
     }

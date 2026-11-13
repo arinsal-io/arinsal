@@ -15,7 +15,7 @@ mod terms;
 pub use extras::{
     SelectMessage, SelectRequest, SendHook, SentMessage, VmHooks, set_vm_hooks, take_test_messages,
 };
-pub use res_monitor::ResourceMonitor;
+pub use res_monitor::{DownFn, MonitorsOf, ResourceMonitor, ResourceMonitors};
 pub use resources::{
     LibraryRefs, enif_keep_resource, enif_release_resource, resource_down, resource_stop,
     resource_stop_data, resource_type_name,

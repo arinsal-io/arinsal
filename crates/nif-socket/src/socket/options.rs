@@ -338,7 +338,7 @@ fn setopt_otp_ctrl_proc(h: &Handle, st: &mut State, value: &O) -> O {
     if node != "nonode@nohost" {
         return invalid_value();
     }
-    demonitor_process(&me, st.ctrl_mon.take());
+    demonitor_process(h, &me, st.ctrl_mon.take());
     *h.owner.lock().unwrap() = Some(value.clone());
     match monitor_process(h, value) {
         Some(monitor) => st.ctrl_mon = Some(monitor),

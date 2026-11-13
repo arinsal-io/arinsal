@@ -701,8 +701,10 @@ fn a_selected_socket_lives_until_its_stop_callback_releases_it() {
     assert_eq!(reactor.monitored().len(), 2);
     let closed = call("nif_close", std::slice::from_ref(&sock));
     assert!(matches!(closed, O::Atom(_) | O::Tuple(_)));
-    // The test's own term is a counted pointer, as a term on a heap would be.
+    // The test's own term is a counted pointer, as a term on a heap would be; so is the
+    // socket in a close message, until its receiver consumes it.
     drop(sock);
+    drop(reactor.take_sent());
     assert!(weak.upgrade().is_none(), "the stop callback released it");
     assert!(reactor.monitored().is_empty());
     set_reactor(None);
@@ -725,10 +727,14 @@ fn a_selected_socket_with_a_scheduled_stop_lives_until_the_callback_runs() {
     );
     let owner = owner_of(&sock).unwrap();
     let weak = arinsal_term::MagicBin::downgrade(&owner);
-    let name = O::MagicRef(arinsal_term::magic_handle_weak(owner.id(), weak.clone()));
-    drop((sock, owner));
+    let name = O::MagicRef(arinsal_term::magic_handle(owner));
+    drop(sock);
     assert!(handle(&name).is_ok());
     crate::stop(&name);
+    // The stop callback gave back the selection's count: the name and the messages naming
+    // the socket are the last references.
+    drop(name);
+    drop(reactor.take_sent());
     assert!(weak.upgrade().is_none());
     set_reactor(None);
 }
@@ -848,4 +854,37 @@ fn commands_validate_their_data() {
         ),
         pair(atom("invalid"), pair(atom("command"), atom("bogus")))
     );
+}
+
+#[test]
+fn a_monitor_target_half_keeps_the_descriptor_until_it_is_released() {
+    // erl_nif.c run_resource_dtor: the destructor demonitors, but the memory (and the
+    // descriptor's own destructor) waits for every target half to give back its monitor count.
+    let (_lock, reactor) = reactor_for(31);
+    let sock = open("inet", "stream", 6);
+    crate::socket::release_created(0);
+    assert_eq!(
+        reactor.monitored().len(),
+        1,
+        "the controlling process is monitored"
+    );
+    let fd = number(&ok_value(&getopt_otp(&sock, 1008))).unwrap() as i32;
+    reactor.defer_demonitors();
+    let weak = arinsal_term::MagicBin::downgrade(&owner_of(&sock).unwrap());
+    drop(sock);
+    assert!(weak.upgrade().is_none(), "the last count is gone");
+    assert!(
+        reactor.monitored().is_empty(),
+        "the destructor demonitored the owner"
+    );
+    assert_ne!(fd_flags(fd), -1, "esock_dtor waits");
+    reactor.handle_demonitors();
+    assert_eq!(fd_flags(fd), -1, "esock_dtor closed the fd");
+    set_reactor(None);
+}
+
+/// `fcntl(fd, F_GETFD)`: -1 once the descriptor is closed.
+fn fd_flags(fd: i32) -> i32 {
+    // SAFETY: F_GETFD only reads the descriptor flags of an integer fd.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) }
 }

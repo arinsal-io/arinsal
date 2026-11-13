@@ -59,10 +59,15 @@ pub trait Reactor: Send + Sync {
     fn stop(&self, fd: i32) -> i32;
     /// `enif_send(env, pid, NULL, msg)`. Returns whether the message was sent.
     fn send(&self, pid: &O, message: &O) -> bool;
-    /// `enif_monitor_process(env, obj, pid, &mon)`. Returns a monitor handle, or
-    /// `None` when `pid` is not a live local process. When the process exits the
-    /// runtime calls [`down`] with the handle, the pid and the monitor handle.
-    fn monitor(&self, _pid: &O, _handle: &O) -> Option<u64> {
+    /// `erts_proc_sig_send_monitor` for `enif_monitor_process(env, obj, pid, &mon)`: pick a
+    /// monitor reference, let `target` build the target half for it and deliver that to
+    /// `pid`. Returns the reference, or `None` when `pid` is not a live local process (the
+    /// target half is then dropped, giving back its monitor count).
+    fn monitor(
+        &self,
+        _pid: &O,
+        _target: &mut dyn FnMut(u64) -> arinsal_nif::ResourceMonitor,
+    ) -> Option<u64> {
         None
     }
     /// `enif_demonitor_process(env, obj, &mon)`; `pid` is the process it was taken on.
@@ -83,8 +88,12 @@ pub struct BlockingReactor {
     pending: Mutex<Vec<BlockingSelection>>,
     caller: Mutex<Option<O>>,
     sent: Mutex<Vec<(O, O)>>,
-    monitors: Mutex<Vec<(u64, O, O)>>,
+    /// Target halves of the monitors taken on each process, as the monitored process's
+    /// monitor tree would hold them.
+    monitors: Mutex<Vec<(u64, O, arinsal_nif::ResourceMonitor)>>,
     next_monitor: AtomicU64,
+    /// Target halves whose demonitor signal is not handled yet, while the test defers them.
+    deferred_demonitors: Mutex<Option<Vec<arinsal_nif::ResourceMonitor>>>,
     dead: Mutex<Vec<O>>,
     scheduled_stop: AtomicBool,
 }
@@ -98,6 +107,18 @@ impl BlockingReactor {
     /// Make [`Reactor::stop`] report a scheduled stop, which the test completes with [`stop`].
     pub fn set_scheduled_stop(&self, scheduled: bool) {
         self.scheduled_stop.store(scheduled, Ordering::Relaxed);
+    }
+
+    /// Keep the target halves of later demonitors, like processes that have not handled the
+    /// demonitor signal yet.
+    pub fn defer_demonitors(&self) {
+        *self.deferred_demonitors.lock().unwrap() = Some(Vec::new());
+    }
+
+    /// The deferred demonitor signals are handled: their target halves are released.
+    pub fn handle_demonitors(&self) {
+        let released = self.deferred_demonitors.lock().unwrap().take();
+        drop(released);
     }
 
     /// Processes that [`Reactor::monitor`] reports as not alive.
@@ -118,22 +139,30 @@ impl BlockingReactor {
     /// The process `pid` exits: every monitor of it fires [`down`].
     pub fn exit(&self, pid: &O) {
         self.dead.lock().unwrap().push(pid.clone());
-        let fired: Vec<(u64, O)> = {
+        let fired: Vec<arinsal_nif::ResourceMonitor> = {
             let mut monitors = self.monitors.lock().unwrap();
-            let mut fired = Vec::new();
-            monitors.retain(|(id, monitored, handle)| {
-                if monitored == pid {
-                    fired.push((*id, handle.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
-            fired
+            let (fired, kept) = std::mem::take(&mut *monitors)
+                .into_iter()
+                .partition(|(_, monitored, _)| monitored == pid);
+            *monitors = kept;
+            fired.into_iter().map(|(_, _, monitor)| monitor).collect()
         };
-        for (id, handle) in fired {
-            down(&handle, pid, id);
+        let O::Pid { id, serial, .. } = pid else {
+            return;
+        };
+        let Some(exiting) = arinsal_term::Term::pid(*id, *serial) else {
+            return;
+        };
+        // erts_fire_nif_monitor, then the target half is released.
+        for monitor in fired {
+            monitor.fire(exiting);
         }
+    }
+
+    /// Remove and return the sent messages, as their receivers consuming them would; a
+    /// message naming a socket keeps the socket alive until then.
+    pub fn take_sent(&self) -> Vec<(O, O)> {
+        std::mem::take(&mut *self.sent.lock().unwrap())
     }
 
     /// Messages sent through [`Reactor::send`], with their destination.
@@ -233,22 +262,36 @@ impl Reactor for BlockingReactor {
             .push((pid.clone(), message.clone()));
         true
     }
-    fn monitor(&self, pid: &O, handle: &O) -> Option<u64> {
+    fn monitor(
+        &self,
+        pid: &O,
+        target: &mut dyn FnMut(u64) -> arinsal_nif::ResourceMonitor,
+    ) -> Option<u64> {
+        let id = self.next_monitor.fetch_add(1, Ordering::Relaxed) + 1;
+        let monitor = target(id);
         if self.dead.lock().unwrap().contains(pid) {
             return None;
         }
-        let id = self.next_monitor.fetch_add(1, Ordering::Relaxed) + 1;
         self.monitors
             .lock()
             .unwrap()
-            .push((id, pid.clone(), handle.clone()));
+            .push((id, pid.clone(), monitor));
         Some(id)
     }
     fn demonitor(&self, _pid: &O, monitor: u64) {
-        self.monitors
-            .lock()
-            .unwrap()
-            .retain(|(id, _, _)| *id != monitor);
+        let removed: Vec<arinsal_nif::ResourceMonitor> = {
+            let mut monitors = self.monitors.lock().unwrap();
+            let (removed, kept) = std::mem::take(&mut *monitors)
+                .into_iter()
+                .partition(|(id, _, _)| *id == monitor);
+            *monitors = kept;
+            removed.into_iter().map(|(_, _, target)| target).collect()
+        };
+        match self.deferred_demonitors.lock().unwrap().as_mut() {
+            Some(deferred) => deferred.extend(removed),
+            // The target half is released outside the reactor's locks.
+            None => drop(removed),
+        }
     }
 }
 

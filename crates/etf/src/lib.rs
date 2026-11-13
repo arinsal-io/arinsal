@@ -13,8 +13,8 @@ use flate2::Compression;
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
-/// The owner of a magic reference inside an [`OwnedTerm`]: an opaque owner (a counted or,
-/// for a resource naming itself, a weak magic binary reference) plus the reference identity.
+/// The owner of a magic reference inside an [`OwnedTerm`]: an opaque counted owner (the
+/// magic binary) plus the reference identity.
 #[derive(Clone)]
 pub struct MagicHandle {
     id: u64,

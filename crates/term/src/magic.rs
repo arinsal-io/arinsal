@@ -51,17 +51,7 @@ pub fn magic_handle(owner: MagicBin) -> arinsal_etf::MagicHandle {
     arinsal_etf::MagicHandle::new(owner.id(), std::sync::Arc::new(owner))
 }
 
-/// An [`arinsal_etf::MagicHandle`] that does not keep the binary alive, for a resource's
-/// reference to itself.
-pub fn magic_handle_weak(id: u64, owner: crate::MagicWeak) -> arinsal_etf::MagicHandle {
-    arinsal_etf::MagicHandle::new(id, std::sync::Arc::new(owner))
-}
-
-/// The magic binary an [`arinsal_etf::MagicHandle`] names, unless a weak handle outlived it.
+/// The magic binary an [`arinsal_etf::MagicHandle`] names.
 pub fn magic_handle_owner(handle: &arinsal_etf::MagicHandle) -> Option<MagicBin> {
-    let owner = handle.owner();
-    if let Some(strong) = owner.downcast_ref::<MagicBin>() {
-        return Some(strong.clone());
-    }
-    owner.downcast_ref::<crate::MagicWeak>()?.upgrade()
+    handle.owner().downcast_ref::<MagicBin>().cloned()
 }

@@ -14,6 +14,7 @@ arinsal-bifs.workspace = true
 arinsal-drv.workspace = true
 arinsal-etf.workspace = true
 arinsal-nif-file.workspace = true
+arinsal-nif = { path = "../nif" }
 arinsal-term.workspace = true
 libc = "0.2.175"
 rustix = "1.1.5"

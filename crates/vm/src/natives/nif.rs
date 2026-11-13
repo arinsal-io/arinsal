@@ -576,23 +576,13 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
     fn monitor(
         &self,
         pid: &arinsal_etf::OwnedTerm,
-        handle: &arinsal_etf::OwnedTerm,
+        make_target: &mut dyn FnMut(u64) -> arinsal_nif::ResourceMonitor,
     ) -> Option<u64> {
+        let id = arinsal_bifs::next_ref_id();
+        let monitor = Arc::new(make_target(id));
         let target = owned_local_pid(pid)?;
         let hub = hub_for_pid(target)?;
         let scheduler = hub.scheduler.upgrade()?;
-        let id = arinsal_bifs::next_ref_id();
-        let resource = arinsal_term::MagicBin::downgrade(&arinsal_nif_socket::resource(handle)?);
-        let handle = handle.clone();
-        let monitor = Arc::new(arinsal_nif::ResourceMonitor::native(
-            id,
-            resource,
-            Arc::new(move |exiting, id| {
-                if let Ok(exiting) = arinsal_term::to_owned(exiting) {
-                    arinsal_nif_socket::down(&handle, &exiting, id);
-                }
-            }),
-        ));
         let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
         scheduler
             .signal(

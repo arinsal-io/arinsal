@@ -167,26 +167,9 @@ pub(crate) struct Resource {
     /// `type`: the resource holds one reference to its type (`erts_refc_inc(&type->refc)`).
     kind: Arc<ResourceType>,
     /// `monitors`: present when the type has a `down` callback.
-    pub(crate) monitors: Option<ResourceMonitors>,
+    pub(crate) monitors: Option<crate::res_monitor::ResourceMonitors>,
     /// `monitors->user_data_sz`, kept for every type here.
     size: usize,
-}
-
-/// `ErtsResourceMonitors`: the origin halves of the process monitors a resource holds.
-pub(crate) struct ResourceMonitors {
-    /// `lock` with `root`, `refc` and the dying flag it protects.
-    pub(crate) lock: Mutex<MonitorState>,
-}
-
-/// The state behind `ErtsResourceMonitors.lock`.
-#[derive(Default)]
-pub(crate) struct MonitorState {
-    /// `root`: target pid and monitor reference of each active monitor.
-    pub(crate) root: Vec<(Term, u64)>,
-    /// `rmon_refc`: target halves still referring to this resource's memory.
-    pub(crate) refc: usize,
-    /// `rmon_is_dying`: the resource's count reached zero and its destructor started.
-    pub(crate) dying: bool,
 }
 
 // SAFETY: `nif_resource_dtor_prologue` is defined once, for `Resource` only; it drops the
@@ -214,24 +197,10 @@ unsafe fn nif_resource_dtor_prologue(bin: NonNull<arinsal_term::MagicRef>) -> bo
 unsafe fn run_resource_dtor(bin: NonNull<arinsal_term::MagicRef>) {
     // SAFETY: the payload is not dropped before the end of this function.
     let resource = unsafe { arinsal_term::MagicRef::payload_of::<Resource>(bin) };
-    if let Some(rm) = &resource.monitors {
-        let (root, refc) = {
-            let mut state = rm.lock.lock().unwrap();
-            let root = if state.dying {
-                Vec::new()
-            } else {
-                state.dying = true;
-                std::mem::take(&mut state.root)
-            };
-            (root, state.refc)
-        };
-        for (target, id) in root {
-            crate::res_monitor::send_demonitor(target, id);
-        }
-        // Outstanding monitor references call `erts_bin_free` again when the last goes away.
-        if refc != 0 {
-            return;
-        }
+    if let Some(rm) = &resource.monitors
+        && !rm.dtor_prologue(crate::res_monitor::send_demonitor)
+    {
+        return;
     }
     let kind = &resource.kind;
     if let Some(dtor) = kind.callbacks().dtor {
@@ -554,9 +523,7 @@ pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_
     let bin = MagicBin::with_trailing_and_refn(
         Resource {
             kind,
-            monitors: has_down.then(|| ResourceMonitors {
-                lock: Mutex::new(MonitorState::default()),
-            }),
+            monitors: has_down.then(crate::res_monitor::ResourceMonitors::new),
             size,
         },
         size.max(1),

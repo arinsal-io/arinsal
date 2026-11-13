@@ -306,6 +306,31 @@ impl MagicBin {
         Self(block)
     }
 
+    /// The block whose payload is `payload` (`ERTS_MAGIC_BIN_FROM_DATA`).
+    ///
+    /// # Safety
+    /// `payload` must be the payload of a magic binary block, not a value outside one.
+    pub unsafe fn block_of_payload<T: MagicPayload>(payload: &T) -> NonNull<MagicRef> {
+        // SAFETY: by contract the payload lies `data_offset::<T>()` bytes into a block.
+        let raw = unsafe {
+            std::ptr::from_ref(payload)
+                .cast::<u8>()
+                .sub(data_offset::<T>())
+        };
+        NonNull::new(raw.cast_mut().cast::<MagicRef>()).expect("magic payload")
+    }
+
+    /// `enif_make_resource` from the resource data itself: a new count on the binary whose
+    /// payload is `payload`.
+    ///
+    /// # Safety
+    /// `payload` must be the payload of a live magic binary with a count held for the call
+    /// (borrowed from a [`MagicBin`] or a reference term), never inside its destructor.
+    pub unsafe fn from_payload<T: MagicPayload>(payload: &T) -> Self {
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::retain_raw_block(Self::block_of_payload(payload)) }
+    }
+
     /// `erts_refc_inc_unless(&bin->intern.refc, 0, 0)`: a new count unless the binary is dead.
     ///
     /// # Safety
