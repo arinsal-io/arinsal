@@ -270,25 +270,36 @@ fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
 }
 
 fn otp_eval(cookie: &str, expression: &str) -> String {
+    otp_eval_with_dist_buffer(cookie, expression, None)
+}
+
+fn otp_eval_with_dist_buffer(
+    cookie: &str,
+    expression: &str,
+    busy_limit_kb: Option<&str>,
+) -> String {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
     let node = format!("dm_o{}", unique_suffix(id));
     let local_node = format!("{node}@localhost");
-    let output = Command::new("timeout")
-        .args([
-            "--kill-after=3",
-            "30",
-            "erl",
-            "-noshell",
-            "-sname",
-            &local_node,
-            "-kernel",
-            "inet_dist_use_interface",
-            "{127,0,0,1}",
-            "-setcookie",
-            cookie,
-            "-eval",
-            &format!("{expression}, halt()."),
-        ])
+    let mut command = Command::new("timeout");
+    command.args([
+        "--kill-after=3",
+        "30",
+        "erl",
+        "-noshell",
+        "-sname",
+        &local_node,
+        "-kernel",
+        "inet_dist_use_interface",
+        "{127,0,0,1}",
+        "-setcookie",
+        cookie,
+    ]);
+    if let Some(limit) = busy_limit_kb {
+        command.args(["+zdbbl", limit]);
+    }
+    let output = command
+        .args(["-eval", &format!("{expression}, halt().")])
         .process_group(0)
         .stdin(Stdio::null())
         .output()
@@ -375,14 +386,15 @@ fn dist_mixed_arinsal_fragmented_alias_send() {
     let _serial = serial_test();
     let (_erl, node, cookie, host) = start_erl();
     let n = node_literal(&node);
-    arinsal_eval_with_dist_buffer(
-        &cookie,
-        &host,
-        &format!(
-            "erlang:system_monitor(self(),[{{busy_dist_port,true}}]), N={n}, pong=net_adm:ping(N), {{echo,N}} ! {{get_alias,self()}}, Alias=receive {{remote_alias,A}} -> A after 10000 -> exit(no_alias) end, Big=binary:copy(<<11>>,30000000), Alias ! {{alias_roundtrip,self(),Big}}, receive {{alias_ack,Big}} -> ok after 10000 -> exit(no_alias_reply) end, receive {{monitor,_,busy_dist_port,_}} -> ok after 10000 -> exit(no_busy_dist_port) end, io:format(\"DIST_MIXED_OK fragmented_alias~n\")"
-        ),
-        Some("1"),
+    let expression = format!(
+        "Parent=self(), Monitor=spawn(fun() -> receive {{monitor,_,busy_dist_port,_}}=Event -> Parent ! Event end end), erlang:system_monitor(Monitor,[{{busy_dist_port,true}}]), N={n}, pong=net_adm:ping(N), {{echo,N}} ! {{get_alias,self()}}, Alias=receive {{remote_alias,A}} -> A after 10000 -> exit(no_alias) end, Big=binary:copy(<<11>>,30000000), Alias ! {{alias_roundtrip,self(),Big}}, receive {{alias_ack,Big}} -> ok after 10000 -> exit(no_alias_reply) end, receive {{monitor,_,busy_dist_port,_}} -> ok after 10000 -> exit(no_busy_dist_port) end, io:format(\"DIST_MIXED_OK fragmented_alias~n\")"
     );
+    let otp_output = otp_eval_with_dist_buffer(&cookie, &expression, Some("1"));
+    assert!(
+        otp_output.contains("DIST_MIXED_OK fragmented_alias"),
+        "{otp_output}"
+    );
+    arinsal_eval_with_dist_buffer(&cookie, &host, &expression, Some("1"));
 }
 
 #[test]
