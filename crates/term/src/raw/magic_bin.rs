@@ -17,16 +17,20 @@ use std::sync::{OnceLock, RwLock};
 /// payload size.
 pub const MAGIC_BIN_DATA_OFFSET: usize = 24;
 
-/// `int (*destructor)(Binary *)`: finalizes the payload in place before the block is freed.
+/// `int (*destructor)(Binary *)`: finalizes the payload when the last count is released.
 /// Each payload type has its own named destructor, and the destructor identifies the type.
-pub type MagicDestructor = unsafe fn(NonNull<MagicRef>);
+/// `true` (erts 1) lets [`MagicBin`] free the block now; `false` (erts 0) means the destructor
+/// took control of the deallocation and calls [`MagicBin::magic_binary_free`] itself later.
+pub type MagicDestructor = unsafe fn(NonNull<MagicRef>) -> bool;
 
 /// A type that can be the data of a magic binary.
 ///
 /// # Safety
 /// `DESTRUCTOR` must be a function that no other type uses (it identifies the payload type in
-/// [`MagicRef::downcast_ref`]) and that only calls [`drop_payload`] for `Self`. Implement it
-/// with [`crate::magic_payload!`], which defines a distinct non-inlined destructor per type.
+/// [`MagicRef::downcast_ref`]), that drops the payload exactly once with [`drop_payload`]
+/// before the block is freed, and that returns `false` only when it frees the block itself.
+/// [`crate::magic_payload!`] defines a distinct non-inlined destructor per type; a type whose
+/// destructor takes control of the deallocation implements the trait by hand.
 pub unsafe trait MagicPayload: Send + Sync + Sized + 'static {
     /// `ERTS_MAGIC_BIN_DESTRUCTOR` of binaries holding a `Self`.
     const DESTRUCTOR: MagicDestructor;
@@ -45,12 +49,13 @@ macro_rules! magic_payload {
         unsafe impl $crate::MagicPayload for $ty {
             const DESTRUCTOR: $crate::MagicDestructor = {
                 #[inline(never)]
-                unsafe fn $name(mb: ::std::ptr::NonNull<$crate::MagicRef>) {
+                unsafe fn $name(mb: ::std::ptr::NonNull<$crate::MagicRef>) -> bool {
                     static MARKER: ::std::sync::atomic::AtomicU8 =
                         ::std::sync::atomic::AtomicU8::new(0);
                     ::std::hint::black_box(&MARKER);
                     // SAFETY: called by `erts_bin_free` once for a block holding this type.
-                    unsafe { $crate::raw::magic_bin::drop_payload::<$ty>(mb) }
+                    unsafe { $crate::raw::magic_bin::drop_payload::<$ty>(mb) };
+                    true
                 }
                 $name
             };
@@ -77,6 +82,12 @@ pub struct MagicRef {
     /// `alloc_type`: the layout the block was allocated with.
     alloc_size: usize,
     alloc_align: usize,
+}
+
+/// Offset of the trailing bytes that follow a `T` payload.
+const fn trailing_offset<T>(align: usize) -> usize {
+    let end = data_offset::<T>() + size_of::<T>();
+    (end + align - 1) & !(align - 1)
 }
 
 /// `ERTS_MAGIC_BIN_DATA`: offset of a `T` payload from the start of the block.
@@ -127,6 +138,35 @@ impl MagicRef {
                 .add(data_offset::<T>())
                 .cast::<T>()
         })
+    }
+
+    /// The trailing bytes after a `T` payload (`ErtsResource.data`), if the payload is a `T`.
+    pub fn trailing_ptr<T: MagicPayload>(&self, trailing_align: usize) -> Option<*mut u8> {
+        self.downcast_ref::<T>()?;
+        // SAFETY: the block was created with trailing bytes at this offset; writes through
+        // the pointer are the C owner's business, as with `ERTS_MAGIC_BIN_UNALIGNED_DATA`.
+        Some(unsafe {
+            std::ptr::from_ref(self)
+                .cast::<u8>()
+                .cast_mut()
+                .add(trailing_offset::<T>(trailing_align))
+        })
+    }
+
+    /// The `T` payload of a block whose count may be zero (inside its destructor, or under a
+    /// protocol that keeps the memory, like a resource's monitor count).
+    ///
+    /// # Safety
+    /// The block holds a live `T` payload (not yet dropped) for the lifetime `'a`.
+    pub unsafe fn payload_of<'a, T: MagicPayload>(block: NonNull<MagicRef>) -> &'a T {
+        // SAFETY: by contract the payload is live at this offset.
+        unsafe {
+            &*block
+                .cast::<u8>()
+                .as_ptr()
+                .add(data_offset::<T>())
+                .cast::<T>()
+        }
     }
 
     /// Current `intern.refc`, for `erts_debug` introspection.
@@ -186,8 +226,33 @@ impl MagicBin {
     // Port of erts/emulator/beam/erl_binary.h (erts_create_magic_binary_x), OTP-29.1.1: one
     // allocation, header then aligned payload; the creator holds the first count.
     fn create<T: MagicPayload>(payload: T, orig_size: usize, refn: [u32; 3]) -> Self {
-        let align = align_of::<MagicRef>().max(align_of::<T>());
-        let size = data_offset::<T>() + size_of::<T>();
+        Self::create_x(payload, 0, 1, orig_size, refn)
+    }
+
+    /// `erts_create_magic_binary_x(size, ...)` for a payload followed by `trailing` zeroed bytes
+    /// aligned to `trailing_align` (an `ErtsResource` head and its user data).
+    pub fn with_trailing_and_refn<T: MagicPayload>(
+        payload: T,
+        trailing: usize,
+        trailing_align: usize,
+        orig_size: usize,
+        mut refn: [u32; 3],
+    ) -> Self {
+        refn[1] |= 1 << 17;
+        Self::create_x(payload, trailing, trailing_align, orig_size, refn)
+    }
+
+    fn create_x<T: MagicPayload>(
+        payload: T,
+        trailing: usize,
+        trailing_align: usize,
+        orig_size: usize,
+        refn: [u32; 3],
+    ) -> Self {
+        let align = align_of::<MagicRef>()
+            .max(align_of::<T>())
+            .max(trailing_align);
+        let size = trailing_offset::<T>(trailing_align) + trailing;
         let layout = Layout::from_size_align(size, align).expect("magic binary layout");
         // SAFETY: the layout has a non-zero size (the header is never empty).
         let raw = unsafe { alloc(layout) };
@@ -208,8 +273,91 @@ impl MagicBin {
                 alloc_align: align,
             });
             raw.add(data_offset::<T>()).cast::<T>().write(payload);
+            let tail = trailing_offset::<T>(trailing_align);
+            raw.add(tail).write_bytes(0, size - tail);
         }
         Self(block)
+    }
+
+    /// The block, keeping this count (`Binary *` handed to a C owner).
+    pub fn into_raw_block(this: Self) -> NonNull<MagicRef> {
+        let block = this.0;
+        std::mem::forget(this);
+        block
+    }
+
+    /// Adopt a count previously given up with [`MagicBin::into_raw_block`].
+    ///
+    /// # Safety
+    /// `block` must be a live block and the caller must own one of its counts.
+    pub unsafe fn from_raw_block(block: NonNull<MagicRef>) -> Self {
+        Self(block)
+    }
+
+    /// `erts_refc_inc(&bin->intern.refc, 2)` on a block that has a count elsewhere.
+    ///
+    /// # Safety
+    /// `block` must be live with a non-zero count held by someone for the call.
+    pub unsafe fn retain_raw_block(block: NonNull<MagicRef>) -> Self {
+        // SAFETY: by contract the block is live.
+        unsafe { block.as_ref() }
+            .refc
+            .fetch_add(1, Ordering::Relaxed);
+        Self(block)
+    }
+
+    /// `erts_refc_inc_unless(&bin->intern.refc, 0, 0)`: a new count unless the binary is dead.
+    ///
+    /// # Safety
+    /// The block memory must stay valid for the call (its owner frees it only after the
+    /// caller's protocol allows, e.g. a resource's monitor count).
+    pub unsafe fn retain_unless_dead(block: NonNull<MagicRef>) -> Option<Self> {
+        // SAFETY: forwarded caller contract.
+        unsafe { retain_unless_dead(block) }
+    }
+
+    /// `ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA`: the block whose trailing bytes start at `data`.
+    ///
+    /// # Safety
+    /// `data` must be the trailing data of a live block created by
+    /// [`MagicBin::with_trailing_and_refn`] with payload `T` and this alignment.
+    pub unsafe fn block_from_trailing<T: MagicPayload>(
+        data: *mut u8,
+        trailing_align: usize,
+    ) -> NonNull<MagicRef> {
+        // SAFETY: by contract `data` lies `trailing_offset` bytes into the block.
+        let raw = unsafe { data.sub(trailing_offset::<T>(trailing_align)) };
+        NonNull::new(raw.cast::<MagicRef>()).expect("magic binary data")
+    }
+
+    /// `erts_bin_free`: run the destructor of a block whose count reached zero and free it
+    /// unless the destructor took control of the deallocation.
+    ///
+    /// # Safety
+    /// `block`'s count is zero, and the caller is the one entitled to free it (the destructor
+    /// handed the deallocation to it).
+    pub unsafe fn bin_free(block: NonNull<MagicRef>) {
+        // SAFETY: by contract nobody else uses the payload.
+        let header = unsafe { block.as_ref() };
+        // SAFETY: the destructor matches the payload written at creation.
+        if unsafe { (header.destructor)(block) } {
+            // SAFETY: the destructor returned 1: the block is ours to free.
+            unsafe { Self::magic_binary_free(block) };
+        }
+    }
+
+    /// `erts_magic_binary_free`: remove the block from the magic ref table and free it. The
+    /// payload must already have been dropped by the destructor.
+    ///
+    /// # Safety
+    /// The count is zero, the payload is dropped, and no other code frees this block.
+    pub unsafe fn magic_binary_free(block: NonNull<MagicRef>) {
+        // SAFETY: by contract the header memory is still allocated.
+        let header = unsafe { block.as_ref() };
+        if header.saved.load(Ordering::Acquire) {
+            magic_ref_remove_bin(header.id());
+        }
+        release_weak(block);
     }
 
     /// Whether two references name the same magic binary.
@@ -254,15 +402,8 @@ impl MagicBin {
     // erts_magic_binary_free), OTP-29.1.1.
     #[cold]
     fn free(block: NonNull<MagicRef>) {
-        // SAFETY: refc reached zero, so this is the only access to the payload; the memory
-        // stays valid until the last weak count below is released.
-        let header = unsafe { block.as_ref() };
-        // SAFETY: the destructor matches the payload written at creation.
-        unsafe { (header.destructor)(block) };
-        if header.saved.load(Ordering::Acquire) {
-            magic_ref_remove_bin(header.id());
-        }
-        release_weak(block);
+        // SAFETY: refc reached zero in `drop`, so this release is the one that frees.
+        unsafe { Self::bin_free(block) }
     }
 }
 

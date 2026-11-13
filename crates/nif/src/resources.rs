@@ -3,11 +3,10 @@ use crate::Library;
 use crate::raw::{cstr, deref, deref_mut};
 use crate::{ErlNifEnv, ErlNifResourceTypeInit, put, terms};
 use arinsal_term::{ExternalBinary, MagicBin, Term, TermBuilder};
-use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::hint::black_box;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
@@ -157,44 +156,122 @@ pub(crate) fn unload_types(owner: &Arc<ResourceOwner>) {
     drop(removed);
 }
 
-/// The data of a resource's magic binary.
-pub(crate) struct MagicResource(pub(crate) Arc<Resource>);
-// erl_nif.c: NIF_RESOURCE_DTOR is the destructor of every resource magic binary.
-arinsal_term::magic_payload!(MagicResource => nif_resource_dtor);
+/// Alignment of a resource's user data (`ErtsResource.data`).
+const DATA_ALIGN: usize = 16;
 
+/// `ErtsResource`: the head of a resource's magic binary data. The user data follows it in the
+/// same block (the trailing bytes of the magic binary), so `obj` pointers handed to C map back
+/// to the binary by address (`DATA_TO_RESOURCE`, `ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA`).
+// Port of erts/emulator/beam/global.h (ErtsResource, ErtsResourceMonitors), OTP-29.1.1.
 pub(crate) struct Resource {
+    /// `type`: the resource holds one reference to its type (`erts_refc_inc(&type->refc)`).
     kind: Arc<ResourceType>,
-    data: *mut u8,
+    /// `monitors`: present when the type has a `down` callback.
+    pub(crate) monitors: Option<ResourceMonitors>,
+    /// `monitors->user_data_sz`, kept for every type here.
     size: usize,
-    /// Identity shared by every term of this resource while one is alive (erts: all
-    /// magic refs point at the same magic binary). Weak: the payload owns the resource.
-    magic: Mutex<arinsal_term::MagicWeak>,
-    /// Process monitors this resource holds (`ErtsResourceMonitors`): target pid and monitor.
-    pub(crate) monitors: Mutex<Vec<(Term, u64)>>,
 }
-impl Resource {
-    pub(crate) fn magic_ref(self: &Arc<Self>) -> MagicBin {
-        let mut slot = self.magic.lock().unwrap();
-        if let Some(magic) = slot.upgrade() {
-            return magic;
-        }
-        let magic = MagicBin::with_orig_size_and_refn(
-            MagicResource(Arc::clone(self)),
-            self.magic_orig_size(),
-            arinsal_bifs::next_ref_words(),
-        );
-        *slot = MagicBin::downgrade(&magic);
-        magic
-    }
 
-    /// `mb->orig_size` of the magic binary `enif_alloc_resource` creates for this resource:
-    /// the unaligned magic data offset plus `offsetof(ErtsResource, data)` and the user data,
-    /// followed by an aligned `ErtsResourceMonitors` when the type has a `down` callback.
-    // Port of erts/emulator/beam/erl_nif.c (enif_alloc_resource) and erl_binary.h
-    // (erts_create_magic_binary_x, ERTS_MAGIC_BIN_UNALIGNED_ORIG_SIZE), OTP-29.1.1, 64-bit.
-    fn magic_orig_size(&self) -> usize {
-        resource_magic_orig_size(self.size, self.kind.callbacks().down.is_some())
+/// `ErtsResourceMonitors`: the origin halves of the process monitors a resource holds.
+pub(crate) struct ResourceMonitors {
+    /// `lock` with `root`, `refc` and the dying flag it protects.
+    pub(crate) lock: Mutex<MonitorState>,
+}
+
+/// The state behind `ErtsResourceMonitors.lock`.
+#[derive(Default)]
+pub(crate) struct MonitorState {
+    /// `root`: target pid and monitor reference of each active monitor.
+    pub(crate) root: Vec<(Term, u64)>,
+    /// `rmon_refc`: target halves still referring to this resource's memory.
+    pub(crate) refc: usize,
+    /// `rmon_is_dying`: the resource's count reached zero and its destructor started.
+    pub(crate) dying: bool,
+}
+
+// SAFETY: `nif_resource_dtor_prologue` is defined once, for `Resource` only; it drops the
+// payload exactly once and frees the block itself (it returns 0, like erts).
+unsafe impl arinsal_term::MagicPayload for Resource {
+    const DESTRUCTOR: arinsal_term::MagicDestructor = nif_resource_dtor_prologue;
+}
+
+/// `NIF_RESOURCE_DTOR`: the last count of a resource's magic binary is gone.
+// Port of erts/emulator/beam/erl_nif.c (nif_resource_dtor_prologue), OTP-29.1.1. erts
+// schedules `run_resource_dtor` as misc aux work; here it runs in the releasing thread.
+#[inline(never)]
+unsafe fn nif_resource_dtor_prologue(bin: NonNull<arinsal_term::MagicRef>) -> bool {
+    // SAFETY: the count is zero and the payload is live until `run_resource_dtor` frees it.
+    unsafe { run_resource_dtor(bin) };
+    false
+}
+
+/// Port of erts/emulator/beam/erl_nif.c (run_resource_dtor), OTP-29.1.1: demonitor every
+/// monitored process, wait for outstanding monitor references, run the type's destructor,
+/// release the type and free the binary.
+///
+/// # Safety
+/// `bin` is a resource binary whose count is zero.
+unsafe fn run_resource_dtor(bin: NonNull<arinsal_term::MagicRef>) {
+    // SAFETY: the payload is not dropped before the end of this function.
+    let resource = unsafe { arinsal_term::MagicRef::payload_of::<Resource>(bin) };
+    if let Some(rm) = &resource.monitors {
+        let (root, refc) = {
+            let mut state = rm.lock.lock().unwrap();
+            let root = if state.dying {
+                Vec::new()
+            } else {
+                state.dying = true;
+                std::mem::take(&mut state.root)
+            };
+            (root, state.refc)
+        };
+        for (target, id) in root {
+            crate::res_monitor::send_demonitor(target, id);
+        }
+        // Outstanding monitor references call `erts_bin_free` again when the last goes away.
+        if refc != 0 {
+            return;
+        }
     }
+    let kind = &resource.kind;
+    if let Some(dtor) = kind.callbacks().dtor {
+        let mut env = kind.env();
+        // SAFETY: the user data is live until the block is freed below.
+        unsafe { dtor(&mut env, resource_data(bin).cast()) };
+    }
+    // SAFETY: the payload (and with it the type reference, erl_nif.c:3022-3029) is dropped
+    // once, and the block is ours to free since the prologue returned 0.
+    unsafe {
+        arinsal_term::raw::magic_bin::drop_payload::<Resource>(bin);
+        MagicBin::magic_binary_free(bin);
+    }
+}
+
+/// `resource->data` of a resource binary.
+fn resource_data(bin: NonNull<arinsal_term::MagicRef>) -> *mut u8 {
+    // SAFETY: a resource binary always has its user data after the `Resource` head.
+    unsafe { bin.as_ref() }
+        .trailing_ptr::<Resource>(DATA_ALIGN)
+        .expect("a resource binary")
+}
+
+/// `DATA_TO_RESOURCE` + `ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA`: the binary of the resource whose
+/// user data is at `obj`.
+///
+/// # Safety
+/// `obj` was returned by `enif_alloc_resource` and the resource is still referenced.
+pub(crate) unsafe fn resource_bin(obj: *mut c_void) -> NonNull<arinsal_term::MagicRef> {
+    // SAFETY: forwarded caller contract.
+    unsafe { MagicBin::block_from_trailing::<Resource>(obj.cast(), DATA_ALIGN) }
+}
+
+/// The `Resource` head of the resource whose user data is at `obj`.
+///
+/// # Safety
+/// As for [`resource_bin`]; the borrow must not outlive the caller's reference.
+pub(crate) unsafe fn resource_at<'a>(obj: *mut c_void) -> &'a Resource {
+    // SAFETY: forwarded caller contract.
+    unsafe { arinsal_term::MagicRef::payload_of::<Resource>(resource_bin(obj)) }
 }
 
 /// `mb->orig_size` for a resource of `size` user bytes, with the monitors block that a type
@@ -217,138 +294,82 @@ pub(crate) fn resource_magic_orig_size(size: usize, has_down: bool) -> usize {
     }
 }
 
-fn from_reference(reference: Term) -> Option<Arc<Resource>> {
-    // SAFETY: the caller retains the reference term and its heap during the callback.
-    let magic = unsafe { reference.magic_ref() }?;
-    magic
-        .downcast_ref::<MagicResource>()
-        .map(|r| Arc::clone(&r.0))
+/// The resource binary a reference term names, as `enif_get_resource` reads it.
+fn from_reference(reference: Term) -> Option<MagicBin> {
+    reference
+        .magic_owner()
+        .filter(|bin| bin.downcast_ref::<Resource>().is_some())
 }
 /// Deliver a monitored process exit to a live resource's down callback.
 pub fn resource_down(reference: Term, pid: Term, monitor: &[u8; 32]) -> bool {
-    let Some(owner) = from_reference(reference) else {
+    let Some(bin) = from_reference(reference) else {
         return false;
     };
-    let kind = &owner.kind;
-    let Some(callback) = kind.callbacks().down else {
-        return false;
-    };
-    let mut env = kind.env();
-    let mut pid = pid;
-    // SAFETY: the NIF callback sees live environment, resource, pid, and monitor storage.
-    unsafe {
-        callback(
-            &mut env,
-            owner.data.cast(),
-            (&mut pid as *mut Term).cast(),
-            monitor.as_ptr().cast_mut().cast(),
-        )
-    };
-    true
+    call_down(&bin, pid, monitor)
 }
 /// Deliver a reactor stop event to a live resource's stop callback.
 pub fn resource_stop(reference: Term, event: i32, direct: bool) -> bool {
-    let Some(owner) = from_reference(reference) else {
+    let Some(bin) = from_reference(reference) else {
         return false;
     };
-    let kind = &owner.kind;
-    let Some(callback) = kind.callbacks().stop else {
-        return false;
-    };
-    let mut env = kind.env();
-    // SAFETY: the NIF callback sees a live environment and resource allocation.
-    unsafe { callback(&mut env, owner.data.cast(), event, i32::from(direct)) };
-    true
+    erts_resource_stop(&bin, event, direct)
 }
 /// The resource at `data` as a magic reference term on `heap`.
 pub(crate) fn resource_term(data: *mut c_void, heap: &mut arinsal_term::VecHeap) -> Option<Term> {
-    let owner = owner_for(data)?;
-    TermBuilder::new(heap).magic_ref(owner.magic_ref()).ok()
+    // SAFETY: a selected resource is kept by its select entry while a message is prepared.
+    let bin = unsafe { MagicBin::retain_raw_block(resource_bin(data)) };
+    TermBuilder::new(heap).magic_ref(bin).ok()
 }
 /// `Module:Name` of the type of the resource at `data`.
 pub fn resource_type_name(data: usize) -> String {
-    let Some(owner) = owner_for(data as *mut c_void) else {
-        return String::new();
-    };
+    // SAFETY: the check-io entry asking keeps the resource.
+    let resource = unsafe { resource_at(data as *mut c_void) };
     types()
         .lock()
         .unwrap()
         .iter()
-        .find(|(_, candidate)| Arc::ptr_eq(candidate, &owner.kind))
+        .find(|(_, candidate)| Arc::ptr_eq(candidate, &resource.kind))
         .map(|(name, _)| name.clone())
         .unwrap_or_default()
 }
 /// Port of erts/emulator/beam/erl_nif.c:1318 (erts_resource_stop) for the resource at
 /// `data`; `false` when its type has no stop callback.
 pub fn resource_stop_data(data: usize, event: i32, direct: bool) -> bool {
-    let Some(owner) = owner_for(data as *mut c_void) else {
-        return false;
-    };
-    let kind = &owner.kind;
+    // SAFETY: the check-io entry stopping it keeps the resource.
+    let bin = unsafe { MagicBin::retain_raw_block(resource_bin(data as *mut c_void)) };
+    erts_resource_stop(&bin, event, direct)
+}
+// Port of erts/emulator/beam/erl_nif.c (erts_resource_stop), OTP-29.1.1.
+fn erts_resource_stop(bin: &MagicBin, event: i32, direct: bool) -> bool {
+    let resource = bin.downcast_ref::<Resource>().expect("a resource binary");
+    let kind = &resource.kind;
     let Some(callback) = kind.callbacks().stop else {
         return false;
     };
     let mut env = kind.env();
     // SAFETY: the NIF callback sees a live environment and resource allocation.
-    unsafe { callback(&mut env, owner.data.cast(), event, i32::from(direct)) };
+    unsafe {
+        callback(
+            &mut env,
+            resource_data(into_block(bin)).cast(),
+            event,
+            i32::from(direct),
+        )
+    };
     true
 }
-// SAFETY: the native resource contract requires consumers to synchronize access.
+fn into_block(bin: &MagicBin) -> NonNull<arinsal_term::MagicRef> {
+    NonNull::from(&**bin)
+}
+// SAFETY: the user data is the C owner's to synchronize; the head is immutable apart from the
+// monitor state behind its lock.
 unsafe impl Send for Resource {}
-// SAFETY: the native resource contract requires consumers to synchronize access.
+// SAFETY: as above.
 unsafe impl Sync for Resource {}
 
-fn literal_trace() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ARINSAL_LITERAL_TRACE").is_some())
-}
-
-impl Drop for Resource {
-    fn drop(&mut self) {
-        if literal_trace() {
-            eprintln!("resource_drop data={:p}", self.data);
-        }
-        // Port of erts/emulator/beam/erl_nif.c:2960-3010 (nif_resource_dtor_prologue): the
-        // monitors the resource holds are removed before its destructor runs.
-        crate::res_monitor::demonitor_all(self);
-        let kind = &self.kind;
-        if let Some(dtor) = kind.callbacks().dtor {
-            let mut env = kind.env();
-            // SAFETY: the data is live until this drop ends.
-            unsafe { dtor(&mut env, self.data.cast()) };
-        }
-        // The `kind` reference is released after this body: the last resource of an unlisted
-        // type frees the type (erl_nif.c:3022-3029).
-        owners().lock().unwrap().remove(&(self.data as usize));
-        // SAFETY: the last owner has gone away and the original layout is unchanged.
-        unsafe {
-            dealloc(
-                self.data,
-                Layout::from_size_align_unchecked(self.size.max(1), 16),
-            );
-        }
-    }
-}
-struct Kept {
-    _owner: Arc<Resource>,
-    count: usize,
-}
 static TYPES: OnceLock<Mutex<HashMap<String, Arc<ResourceType>>>> = OnceLock::new();
-static KEPT: OnceLock<Mutex<HashMap<usize, Kept>>> = OnceLock::new();
-/// Live resources by data address: the resource and its size (still readable while its dtor runs).
-type OwnerMap = HashMap<usize, (Weak<Resource>, usize)>;
-static OWNERS: OnceLock<Mutex<OwnerMap>> = OnceLock::new();
 fn types() -> &'static Mutex<HashMap<String, Arc<ResourceType>>> {
     TYPES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn kept() -> &'static Mutex<HashMap<usize, Kept>> {
-    KEPT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn owners() -> &'static Mutex<OwnerMap> {
-    OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-pub(crate) fn owner_for(data: *mut c_void) -> Option<Arc<Resource>> {
-    owners().lock().unwrap().get(&(data as usize))?.0.upgrade()
 }
 fn name(p: *const c_char) -> Option<String> {
     if p.is_null() {
@@ -520,92 +541,64 @@ fn open_type_op(
     });
     (op, address)
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_alloc_resource), OTP-29.1.1: one magic binary
+/// holds the `ErtsResource` head, the user data and the monitors; the caller owns the first
+/// count until `enif_release_resource`.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_void {
     let Some(kind) = type_for(kind) else {
         return ptr::null_mut();
     };
-    let Ok(layout) = Layout::from_size_align(size.max(1), 16) else {
-        return ptr::null_mut();
-    };
-    // SAFETY: layout is valid; the returned allocation is exclusively owned.
-    let data = unsafe { alloc_zeroed(layout) };
-    if data.is_null() {
-        return ptr::null_mut();
-    };
-    let owner = Arc::new(Resource {
-        kind,
-        data,
-        size,
-        magic: Mutex::new(arinsal_term::MagicWeak::new()),
-        monitors: Mutex::new(Vec::new()),
-    });
-    owners()
-        .lock()
-        .unwrap()
-        .insert(data as usize, (Arc::downgrade(&owner), size));
-    kept().lock().unwrap().insert(
-        data as usize,
-        Kept {
-            _owner: owner,
-            count: 1,
+    let has_down = kind.callbacks().down.is_some();
+    let orig_size = resource_magic_orig_size(size, has_down);
+    let bin = MagicBin::with_trailing_and_refn(
+        Resource {
+            kind,
+            monitors: has_down.then(|| ResourceMonitors {
+                lock: Mutex::new(MonitorState::default()),
+            }),
+            size,
         },
+        size.max(1),
+        DATA_ALIGN,
+        orig_size,
+        arinsal_bifs::next_ref_words(),
     );
+    let data = resource_data(into_block(&bin));
+    let _ = MagicBin::into_raw_block(bin);
     data.cast()
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_keep_resource): `erts_refc_inc`.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_keep_resource(data: *mut c_void) {
-    let Some(owner) = owner_for(data) else { return };
-    let mut map = kept().lock().unwrap();
-    if let Some(k) = map.get_mut(&(data as usize)) {
-        k.count += 1;
-    } else {
-        map.insert(
-            data as usize,
-            Kept {
-                _owner: owner,
-                count: 1,
-            },
-        );
-    }
+    // SAFETY: the NIF holds a reference to the resource it keeps.
+    let _ = MagicBin::into_raw_block(unsafe { MagicBin::retain_raw_block(resource_bin(data)) });
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_release_resource): `erts_bin_release`.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_release_resource(data: *mut c_void) {
-    let mut map = kept().lock().unwrap();
-    let removed = if let Some(k) = map.get_mut(&(data as usize)) {
-        k.count -= 1;
-        if k.count == 0 {
-            map.remove(&(data as usize))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    drop(map);
-    drop(removed)
+    // SAFETY: the NIF gives back a count it holds (from alloc or keep).
+    drop(unsafe { MagicBin::from_raw_block(resource_bin(data)) });
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_sizeof_resource).
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_sizeof_resource(data: *mut c_void) -> usize {
-    owners()
-        .lock()
-        .unwrap()
-        .get(&(data as usize))
-        .map_or(0, |entry| entry.1)
+    // SAFETY: the NIF holds a reference to the resource.
+    unsafe { resource_at(data) }.size
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_make_resource): `erts_mk_magic_ref`.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_resource(e: *mut ErlNifEnv, data: *mut c_void) -> Term {
-    let owner = owner_for(data);
-    let Some(owner) = owner else {
-        return terms::enif_make_badarg(e);
-    };
-    let magic = owner.magic_ref();
+    // SAFETY: the NIF holds a reference to the resource.
+    let bin = unsafe { MagicBin::retain_raw_block(resource_bin(data)) };
     // SAFETY: the host passes a live environment to this callback.
     let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
-        .magic_ref(magic)
+        .magic_ref(bin)
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_get_resource): the destructor and the type
+/// identify the resource.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_get_resource(
     _: *mut ErlNifEnv,
@@ -620,17 +613,18 @@ pub extern "C" fn enif_get_resource(
     }) else {
         return 0;
     };
-    let Some(MagicResource(owner)) = magic.downcast_ref::<MagicResource>() else {
+    let Some(resource) = magic.downcast_ref::<Resource>() else {
         return 0;
     };
-    if type_address(&owner.kind) != kind {
+    if type_address(&resource.kind) != kind {
         return 0;
     };
     if !out.is_null() {
-        put(out, owner.data.cast())
+        put(out, resource_data(NonNull::from(magic)).cast())
     };
     1
 }
+/// Port of erts/emulator/beam/erl_nif.c (enif_make_resource_binary).
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_resource_binary(
     e: *mut ErlNifEnv,
@@ -638,15 +632,13 @@ pub extern "C" fn enif_make_resource_binary(
     bytes: *const c_void,
     size: usize,
 ) -> Term {
-    let owner = owner_for(data);
-    let Some(owner) = owner else {
-        return terms::enif_make_badarg(e);
-    };
     if bytes.is_null() && size > 0 {
         return terms::enif_make_badarg(e);
     };
-    // SAFETY: the magic owner retains the native resource containing these bytes.
-    let external = unsafe { ExternalBinary::new(bytes.cast::<u8>(), size, owner.magic_ref()) };
+    // SAFETY: the NIF holds a reference to the resource.
+    let bin = unsafe { MagicBin::retain_raw_block(resource_bin(data)) };
+    // SAFETY: the magic binary retains the native resource containing these bytes.
+    let external = unsafe { ExternalBinary::new(bytes.cast::<u8>(), size, bin) };
     // SAFETY: The resource allocation and callback remain live during this access.
     let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
@@ -700,12 +692,14 @@ pub(crate) fn retain_exports() {
     black_box(exports);
 }
 
-/// Run the `down` callback of `resource`'s type for the exit of monitored process `pid`.
-// Port of erts/emulator/beam/erl_nif.c:3086-3110 (erts_fire_nif_monitor), OTP-29.1.1.
-pub(crate) fn call_down(resource: &Arc<Resource>, pid: Term, monitor: &[u8; 32]) {
+/// Run the `down` callback of the resource in `bin` for the exit of monitored process `pid`;
+/// `false` when its type has none.
+// Port of erts/emulator/beam/erl_nif.c (erts_fire_nif_monitor: the `fn.down` call), OTP-29.1.1.
+pub(crate) fn call_down(bin: &MagicBin, pid: Term, monitor: &[u8; 32]) -> bool {
+    let resource = bin.downcast_ref::<Resource>().expect("a resource binary");
     let kind = &resource.kind;
     let Some(callback) = kind.callbacks().down else {
-        return;
+        return false;
     };
     let mut env = kind.env();
     let mut pid = pid;
@@ -713,15 +707,12 @@ pub(crate) fn call_down(resource: &Arc<Resource>, pid: Term, monitor: &[u8; 32])
     unsafe {
         callback(
             &mut env,
-            resource.data.cast(),
+            resource_data(into_block(bin)).cast(),
             (&mut pid as *mut Term).cast(),
             monitor.as_ptr().cast_mut().cast(),
         )
     };
-}
-/// Whether the type of `resource` has a `down` callback.
-pub(crate) fn has_down(resource: &Resource) -> bool {
-    resource.kind.callbacks().down.is_some()
+    true
 }
 
 #[cfg(test)]
