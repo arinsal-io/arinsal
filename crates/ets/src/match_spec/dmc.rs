@@ -5,9 +5,10 @@
 //! variant per `matchXxx` opcode; label operands are indices into that vector instead of
 //! word offsets.
 
+use super::printf_term::format_term;
 use super::{cons, is_float_term, tuple_view, variable};
 use crate::EtsError;
-use arinsal_term::{Term, TermBuilder, TermKind, VecHeap, global_atoms};
+use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError, TermKind, VecHeap, global_atoms};
 
 /// `DCOMP_TABLE`: ETS and dets.
 pub(super) const DCOMP_TABLE: u32 = 1;
@@ -29,6 +30,141 @@ const DBIF_TABLE_BODY: u32 = 1 << (DCOMP_TABLE + DBIF_BODY);
 const DBIF_TRACE_GUARD: u32 = 1 << (DCOMP_TRACE + DBIF_GUARD);
 const DBIF_TRACE_BODY: u32 = 1 << (DCOMP_TRACE + DBIF_BODY);
 const DBIF_ALL: u32 = DBIF_TABLE_GUARD | DBIF_TABLE_BODY | DBIF_TRACE_GUARD | DBIF_TRACE_BODY;
+
+/// `DMCRet` without `retOk`.
+// Port of erts/emulator/beam/erl_db_util.c (DMCRet), OTP-29.1.1.
+#[derive(Debug)]
+pub(super) enum DmcFail {
+    /// `retFail`.
+    Fail,
+    /// `retRestart`: a variable number outside the variable table; compile again compacted.
+    Restart,
+}
+
+/// `DMCRet`, with `Ok` for `retOk`.
+type DmcResult<T> = Result<T, DmcFail>;
+
+impl From<EtsError> for DmcFail {
+    fn from(_: EtsError) -> Self {
+        Self::Fail
+    }
+}
+
+impl From<TermError> for DmcFail {
+    fn from(_: TermError) -> Self {
+        Self::Fail
+    }
+}
+
+/// `DMC_ERR_STR_LEN`: `vsnprintf` into the error buffer keeps one byte less.
+const DMC_ERR_STR_LEN: usize = 100;
+
+/// `DMCError`. The `WARNING`, `VAR_WARNING` and `TERM_WARNING` macros that would add a
+/// `dmcWarning` are never used in OTP-29.1.1, so every entry is an error.
+struct DmcError {
+    /// Variable number the message is about, `-1` for none.
+    variable: i32,
+    /// The formatted string; `%d` stands for the variable number.
+    error_string: Vec<u8>,
+}
+
+/// Error list of one compilation (`DMCErrInfo`), in the order the errors were added.
+// Port of erts/emulator/beam/erl_db_util.c (DMCErrInfo, db_new_dmc_err_info), OTP-29.1.1;
+// erts links the errors in reverse to ease the formatting, a vector in order does the same.
+#[derive(Default)]
+pub(super) struct DmcErrInfo {
+    /// `var_trans`: original variable numbers by compacted number.
+    var_trans: Option<Vec<usize>>,
+    error_added: bool,
+    errors: Vec<DmcError>,
+}
+
+impl DmcErrInfo {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    // Port of erts/emulator/beam/erl_db_util.c (vadd_dmc_err), OTP-29.1.1.
+    fn add(&mut self, variable: i32, mut text: Vec<u8>) {
+        text.truncate(DMC_ERR_STR_LEN - 1);
+        self.errors.push(DmcError {
+            variable,
+            error_string: text,
+        });
+        self.error_added = true;
+    }
+
+    /// Port of erts/emulator/beam/erl_db_util.c (add_dmc_err with `dmcError`) for the
+    /// shape errors of `db_match_set_lint`.
+    pub(super) fn add_error(&mut self, text: &[u8]) {
+        self.add(-1, text.to_vec());
+    }
+
+    /// `add_dmc_err(..., "<prefix>%T<suffix>", term)`.
+    pub(super) fn add_term_error(&mut self, prefix: &str, term: Term, suffix: &str) {
+        let text = term_message(prefix, term, suffix);
+        self.add(-1, text);
+    }
+
+    // Port of erts/emulator/beam/erl_db_util.c (db_format_dmc_err_info), OTP-29.1.1.
+    pub(super) fn format<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
+        let mut builder = TermBuilder::new(dst);
+        let mut list = Term::NIL;
+        let mut entries = Vec::with_capacity(self.errors.len());
+        for error in &self.errors {
+            let variable = usize::try_from(error.variable).ok();
+            let vnum = match (variable, &self.var_trans) {
+                (Some(index), Some(trans)) if index < trans.len() => Some(trans[index]),
+                (variable, _) => variable,
+            };
+            let text = match vnum {
+                Some(vnum) => {
+                    replace_first(&error.error_string, b"%d", vnum.to_string().as_bytes())
+                }
+                None => error.error_string.clone(),
+            };
+            let chars = text
+                .iter()
+                .map(|&byte| Term::small(i64::from(byte)).ok_or(EtsError::BadArg))
+                .collect::<Result<Vec<_>, _>>()?;
+            let text = builder.list_from_iter(chars)?;
+            entries.push(
+                builder.tuple(&[
+                    Term::atom(
+                        global_atoms()
+                            .intern("error")
+                            .map_err(|_| EtsError::BadArg)?,
+                    ),
+                    text,
+                ])?,
+            );
+        }
+        for entry in entries.into_iter().rev() {
+            list = builder.cons(entry, list)?;
+        }
+        Ok(list)
+    }
+}
+
+fn replace_first(text: &[u8], pattern: &[u8], with: &[u8]) -> Vec<u8> {
+    match text
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+    {
+        Some(at) => [&text[..at], with, &text[at + pattern.len()..]].concat(),
+        None => text.to_vec(),
+    }
+}
+
+/// `erts_vsnprintf` of `"<prefix>%T<suffix>"`: the term printed, the result cut to fit the
+/// error buffer.
+fn term_message(prefix: &str, term: Term, suffix: &str) -> Vec<u8> {
+    let mut text = prefix.as_bytes().to_vec();
+    text.extend(format_term(term, DMC_ERR_STR_LEN));
+    text.extend_from_slice(suffix.as_bytes());
+    text.truncate(DMC_ERR_STR_LEN - 1);
+    text
+}
 
 /// `DMC_DEFAULT_SIZE`: variables numbered at or above this force a compaction.
 const DMC_DEFAULT_SIZE: usize = 100;
@@ -328,12 +464,16 @@ struct Dmc<'a> {
     stack_need: isize,
     num_match: usize,
     current_match: usize,
-    matchexpr: &'a [Term],
-    guardexpr: &'a [Term],
-    bodyexpr: &'a [Term],
+    matchexpr: Vec<Term>,
+    guardexpr: Vec<Term>,
+    bodyexpr: Vec<Term>,
     is_prefix: &'a [bool],
     /// `erts_get_stacklimit()` of the compiling thread.
     stack_limit: usize,
+    /// `context->err_info`: when set, errors are recorded and the compilation goes on.
+    err_info: Option<&'a mut DmcErrInfo>,
+    /// `context->freason`: `system_limit` when the nesting guard fired, else `badarg`.
+    system_limit: bool,
 }
 
 fn atom_is(term: Term, text: &str) -> bool {
@@ -341,8 +481,8 @@ fn atom_is(term: Term, text: &str) -> bool {
         .is_some_and(|atom| global_atoms().text(atom) == Some(text))
 }
 
-fn fail<T>() -> Result<T, EtsError> {
-    Err(EtsError::BadArg)
+fn fail<T>() -> DmcResult<T> {
+    Err(DmcFail::Fail)
 }
 
 /// Elements of a tuple term, empty for anything else.
@@ -352,16 +492,16 @@ fn tuple_items(term: Term) -> Vec<Term> {
         .unwrap_or_default()
 }
 
-fn map_pairs(term: Term) -> Result<Vec<(Term, Term)>, EtsError> {
-    arinsal_maps::to_list(term).map_err(|_| EtsError::BadArg)
+fn map_pairs(term: Term) -> DmcResult<Vec<(Term, Term)>> {
+    arinsal_maps::to_list(term).map_err(|_| DmcFail::Fail)
 }
 
 /// Port of erts/emulator/beam/erl_db_util.c:5916 (my_copy_struct), OTP-29.1.1: the term a
 /// constant expression stands for, with `{const, X}` and `{{...}}` unwrapped.
-fn const_value(term: Term, heap: &mut VecHeap) -> Result<Term, EtsError> {
+fn const_value(term: Term, heap: &mut VecHeap) -> DmcResult<Term> {
     match term.classify() {
         TermKind::List => {
-            let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
+            let (head, tail) = cons(term).ok_or(DmcFail::Fail)?;
             let head = const_value(head, heap)?;
             let tail = const_value(tail, heap)?;
             Ok(TermBuilder::new(heap).cons(head, tail)?)
@@ -393,18 +533,68 @@ fn const_value(term: Term, heap: &mut VecHeap) -> Result<Term, EtsError> {
 }
 
 impl Dmc<'_> {
+    // Port of erts/emulator/beam/erl_db_util.c (RETURN_ERROR_X), OTP-29.1.1: with error
+    // information the error is added and the expression counts as non-constant, without it
+    // the compilation fails.
+    fn error_x(&mut self, variable: i32, text: Vec<u8>) -> DmcResult<bool> {
+        match self.err_info.as_deref_mut() {
+            Some(info) => {
+                info.add(variable, text);
+                Ok(false)
+            }
+            None => fail(),
+        }
+    }
+
+    /// `RETURN_ERROR`.
+    fn return_error(&mut self, text: &str) -> DmcResult<bool> {
+        if self.err_info.is_none() {
+            return fail();
+        }
+        self.error_x(-1, text.as_bytes().to_vec())
+    }
+
+    /// `RETURN_TERM_ERROR` with the message `<prefix>%T<suffix>`.
+    fn return_term_error(&mut self, prefix: &str, term: Term, suffix: &str) -> DmcResult<bool> {
+        if self.err_info.is_none() {
+            return fail();
+        }
+        self.error_x(-1, term_message(prefix, term, suffix))
+    }
+
     fn bump_need(&mut self) {
         if self.stack_used > self.stack_need {
             self.stack_need = self.stack_used;
         }
     }
 
+    // Port of erts/emulator/beam/erl_db_util.c:4047 (dmc_one_term), OTP-29.1.1: the part for
+    // a variable number beyond the variable table ("Ouch, big integer in match variable").
+    fn restart_compacted(&mut self, stack: &mut Vec<Term>) -> DmcResult<()> {
+        let num_match = self.num_match;
+        let all: Vec<Term> = self
+            .matchexpr
+            .iter()
+            .chain(&self.guardexpr)
+            .chain(&self.bodyexpr)
+            .copied()
+            .collect();
+        let (compacted, size) = match_compact(&all, self.heap, self.err_info.as_deref_mut())?;
+        self.matchexpr = compacted[..num_match].to_vec();
+        self.guardexpr = compacted[num_match..2 * num_match].to_vec();
+        self.bodyexpr = compacted[2 * num_match..].to_vec();
+        self.vars = vec![DmcVariable::default(); size];
+        stack.clear();
+        self.text.clear();
+        Err(DmcFail::Restart)
+    }
+
     // Port of erts/emulator/beam/erl_db_util.c:4047 (dmc_one_term), OTP-29.1.1.
-    fn one_term(&mut self, stack: &mut Vec<Term>, c: Term) -> Result<(), EtsError> {
+    fn one_term(&mut self, stack: &mut Vec<Term>, c: Term) -> DmcResult<()> {
         if !c.is_pointer() {
             if let Some(n) = variable(c) {
                 if n >= self.vars.len() {
-                    return fail();
+                    return self.restart_compacted(stack);
                 }
                 if self.vars[n].is_bound {
                     self.text.push(Op::Cmp(n));
@@ -434,7 +624,7 @@ impl Dmc<'_> {
                 stack.push(c);
             }
             TermKind::Map => {
-                let n = arinsal_maps::size(c).map_err(|_| EtsError::BadArg)?;
+                let n = arinsal_maps::size(c).map_err(|_| DmcFail::Fail)?;
                 self.text.push(Op::PushM(n));
                 self.stack_used += 1;
                 stack.push(c);
@@ -450,7 +640,7 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4200 (do_emit_constant), OTP-29.1.1.
-    fn emit_constant(&mut self, t: Term) -> Result<(), EtsError> {
+    fn emit_constant(&mut self, t: Term) -> DmcResult<()> {
         let value = const_value(t, self.heap)?;
         self.text.push(Op::PushC(value));
         self.stack_used += 1;
@@ -459,7 +649,7 @@ impl Dmc<'_> {
     }
 
     /// Emit `elements` as the constant tuple `{{...}}` would produce.
-    fn emit_constant_tuple(&mut self, elements: &[Term]) -> Result<(), EtsError> {
+    fn emit_constant_tuple(&mut self, elements: &[Term]) -> DmcResult<()> {
         let mut values = Vec::with_capacity(elements.len());
         for &element in elements {
             values.push(const_value(element, self.heap)?);
@@ -472,8 +662,8 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4269 (dmc_list), OTP-29.1.1.
-    fn list(&mut self, t: Term) -> Result<bool, EtsError> {
-        let (head, tail) = cons(t).ok_or(EtsError::BadArg)?;
+    fn list(&mut self, t: Term) -> DmcResult<bool> {
+        let (head, tail) = cons(t).ok_or(DmcFail::Fail)?;
         let c1 = self.expr(head)?;
         let c2 = self.expr(tail)?;
         if c1 && c2 {
@@ -495,7 +685,7 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4308 (dmc_rearrange_constants), OTP-29.1.1.
-    fn rearrange_constants(&mut self, textpos: usize, p: &[Term]) -> Result<(), EtsError> {
+    fn rearrange_constants(&mut self, textpos: usize, p: &[Term]) -> DmcResult<()> {
         let saved = self.text.split_off(textpos);
         for &element in p.iter().rev() {
             self.emit_constant(element)?;
@@ -505,7 +695,7 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4324 (dmc_array), OTP-29.1.1.
-    fn array(&mut self, p: &[Term]) -> Result<bool, EtsError> {
+    fn array(&mut self, p: &[Term]) -> DmcResult<bool> {
         let nelems = p.len();
         let mut all_constant = true;
         let textpos = self.text.len();
@@ -538,7 +728,7 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4384 (dmc_tuple), OTP-29.1.1.
-    fn tuple_elements(&mut self, p: &[Term]) -> Result<bool, EtsError> {
+    fn tuple_elements(&mut self, p: &[Term]) -> DmcResult<bool> {
         let all_constant = self.array(p)?;
         if all_constant {
             return Ok(true);
@@ -549,7 +739,7 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4411 (dmc_map), OTP-29.1.1.
-    fn map(&mut self, t: Term) -> Result<bool, EtsError> {
+    fn map(&mut self, t: Term) -> DmcResult<bool> {
         let pairs = map_pairs(t)?;
         let nelems = pairs.len();
         if !t.is_hashmap() {
@@ -628,7 +818,7 @@ impl Dmc<'_> {
         }
         // If the first variable was a key, only its value is emitted this iteration.
         if preventive_bumps == -1 {
-            let &(_, value) = iter.next().ok_or(EtsError::BadArg)?;
+            let &(_, value) = iter.next().ok_or(DmcFail::Fail)?;
             let c = self.expr(value)?;
             if c {
                 self.emit_constant(value)?;
@@ -675,9 +865,9 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4643 (dmc_variable), OTP-29.1.1.
-    fn variable(&mut self, n: usize) -> Result<bool, EtsError> {
+    fn variable(&mut self, n: usize) -> DmcResult<bool> {
         if n >= self.vars_used || !self.vars[n].is_bound {
-            return fail();
+            return self.error_x(n as i32, b"Variable $%d is unbound.".to_vec());
         }
         self.add_pushv_variant(n);
         self.stack_used += 1;
@@ -702,7 +892,7 @@ impl Dmc<'_> {
     }
 
     /// Emit the arguments of a special form (last argument first), constants included.
-    fn push_args(&mut self, p: &[Term], from: usize) -> Result<(), EtsError> {
+    fn push_args(&mut self, p: &[Term], from: usize) -> DmcResult<()> {
         for i in (from..p.len()).rev() {
             if self.expr(p[i])? {
                 self.emit_constant(p[i])?;
@@ -712,10 +902,18 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4701 (dmc_and) and :4730 (dmc_or).
-    fn and_or(&mut self, p: &[Term], and: bool) -> Result<bool, EtsError> {
+    fn and_or(&mut self, t: Term, p: &[Term], and: bool) -> DmcResult<bool> {
         let a = p.len();
         if a < 2 {
-            return fail();
+            return self.return_term_error(
+                if and {
+                    "Special form 'and' called without arguments in "
+                } else {
+                    "Special form 'or' called without arguments in "
+                },
+                t,
+                ".",
+            );
         }
         self.push_args(p, 1)?;
         self.text
@@ -725,10 +923,18 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:4760 (dmc_andalso) and :4809 (dmc_orelse).
-    fn andalso_orelse(&mut self, p: &[Term], andalso: bool) -> Result<bool, EtsError> {
+    fn andalso_orelse(&mut self, t: Term, p: &[Term], andalso: bool) -> DmcResult<bool> {
         let a = p.len();
         if a < 2 {
-            return fail();
+            return self.return_term_error(
+                if andalso {
+                    "Special form 'andalso' called without arguments in "
+                } else {
+                    "Special form 'orelse' called without arguments in "
+                },
+                t,
+                ".",
+            );
         }
         let mut lbl: Option<usize> = None;
         for (i, &element) in p.iter().enumerate().skip(1) {
@@ -767,15 +973,20 @@ impl Dmc<'_> {
         Ok(false)
     }
 
-    /// Port of erts/emulator/beam/erl_db_util.c:4977 (check_trace), OTP-29.1.1.
-    fn check_trace(&self, need_cflags: u32, allow_in_guard: bool) -> Result<(), EtsError> {
-        if self.cflags & DCOMP_TRACE == 0
-            || self.cflags & need_cflags != need_cflags
-            || (self.is_guard && !allow_in_guard)
-        {
-            return fail();
-        }
-        Ok(())
+    /// Port of erts/emulator/beam/erl_db_util.c:4977 (check_trace), OTP-29.1.1. `false` means
+    /// an error was added and the form is done.
+    fn check_trace(&mut self, op: &str, need_cflags: u32, allow_in_guard: bool) -> DmcResult<bool> {
+        let message = if self.cflags & DCOMP_TRACE == 0 {
+            "used in wrong dialect."
+        } else if self.cflags & need_cflags != need_cflags {
+            "not allow for this trace event."
+        } else if self.is_guard && !allow_in_guard {
+            "called in guard context."
+        } else {
+            return Ok(true);
+        };
+        self.error_x(-1, format!("Special form '{op}' {message}").into_bytes())?;
+        Ok(false)
     }
 
     /// A form that pushes one fresh value, like `self` or `return_trace`.
@@ -786,38 +997,96 @@ impl Dmc<'_> {
         false
     }
 
+    /// The checks every trace-only special form opens with: `check_trace`, then the arity.
+    /// `Ok(false)` means an error was added and the form is done.
+    fn trace_form(
+        &mut self,
+        t: Term,
+        name: &str,
+        check_name: &str,
+        need_cflags: u32,
+        allow_in_guard: bool,
+        arity_ok: bool,
+    ) -> DmcResult<bool> {
+        if !self.check_trace(check_name, need_cflags, allow_in_guard)? {
+            return Ok(false);
+        }
+        if !arity_ok {
+            let wrong = if matches!(name, "set_seq_token" | "silent") {
+                "wrong number of arguments"
+            } else {
+                "arguments"
+            };
+            self.return_term_error(
+                &format!("Special form '{name}' called with {wrong} in "),
+                t,
+                ".",
+            )?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The dialect, guard and arity checks of `message` and `display`.
+    fn message_form(&mut self, t: Term, name: &str, arity_ok: bool) -> DmcResult<bool> {
+        if self.cflags & DCOMP_TRACE == 0 {
+            self.return_error(&format!("Special form '{name}' used in wrong dialect."))?;
+            return Ok(false);
+        }
+        if self.is_guard {
+            self.return_error(&format!("Special form '{name}' called in guard context."))?;
+            return Ok(false);
+        }
+        if !arity_ok {
+            self.return_term_error(
+                &format!("Special form '{name}' called with wrong number of arguments in "),
+                t,
+                ".",
+            )?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     // Port of erts/emulator/beam/erl_db_util.c:5460 (dmc_fun), OTP-29.1.1.
-    fn fun(&mut self, t: Term) -> Result<bool, EtsError> {
+    fn fun(&mut self, t: Term) -> DmcResult<bool> {
         let p: Vec<Term> = tuple_items(t);
         let a = p.len();
         let name = p[0]
             .as_atom()
             .and_then(|atom| global_atoms().text(atom))
-            .ok_or(EtsError::BadArg)?;
-        let trace = self.cflags & DCOMP_TRACE != 0;
+            .ok_or(DmcFail::Fail)?;
+        const WRONG: &str = "wrong number of arguments";
         // Special forms.
         match name {
             "const" => {
                 // dmc_const
                 if a != 2 {
-                    return fail();
+                    return self.return_term_error(
+                        "Special form 'const' called with more than one argument in ",
+                        t,
+                        ".",
+                    );
                 }
                 return Ok(true);
             }
-            "and" => return self.and_or(&p, true),
-            "or" => return self.and_or(&p, false),
-            "andalso" | "andthen" => return self.andalso_orelse(&p, true),
-            "orelse" => return self.andalso_orelse(&p, false),
+            "and" => return self.and_or(t, &p, true),
+            "or" => return self.and_or(t, &p, false),
+            "andalso" | "andthen" => return self.andalso_orelse(t, &p, true),
+            "orelse" => return self.andalso_orelse(t, &p, false),
             "self" => {
                 if a != 1 {
-                    return fail();
+                    return self.return_term_error(
+                        "Special form 'self' called with arguments in ",
+                        t,
+                        ".",
+                    );
                 }
                 return Ok(self.push_one(Op::SelfPid));
             }
             "message" => {
-                // dmc_message
-                if !trace || self.is_guard || a != 2 {
-                    return fail();
+                if !self.message_form(t, "message", a == 2)? {
+                    return Ok(false);
                 }
                 self.push_args(&p, 1)?;
                 self.text.push(Op::Return);
@@ -825,16 +1094,22 @@ impl Dmc<'_> {
                 return Ok(false);
             }
             "is_seq_trace" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, true)?;
-                if a != 1 {
-                    return fail();
+                if !self.trace_form(t, name, name, DCOMP_ALLOW_TRACE_OPS, true, a == 1)? {
+                    return Ok(false);
                 }
                 return Ok(self.push_one(Op::IsSeqTrace));
             }
             "set_seq_token" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, false)?;
-                if a != 3 {
-                    return fail();
+                // The check names the form "set_seq_trace" in erts.
+                if !self.trace_form(
+                    t,
+                    name,
+                    "set_seq_trace",
+                    DCOMP_ALLOW_TRACE_OPS,
+                    false,
+                    a == 3,
+                )? {
+                    return Ok(false);
                 }
                 self.push_args(&p, 1)?;
                 self.text
@@ -847,15 +1122,26 @@ impl Dmc<'_> {
                 return Ok(false);
             }
             "get_seq_token" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, false)?;
-                if a != 1 {
-                    return fail();
+                if !self.trace_form(t, name, name, DCOMP_ALLOW_TRACE_OPS, false, a == 1)? {
+                    return Ok(false);
                 }
                 return Ok(self.push_one(Op::GetSeqToken));
             }
             "return_trace" | "exception_trace" => {
-                if !trace || self.is_guard || a != 1 {
-                    return fail();
+                if self.cflags & DCOMP_TRACE == 0 {
+                    return self
+                        .return_error(&format!("Special form '{name}' used in wrong dialect."));
+                }
+                if self.is_guard {
+                    return self
+                        .return_error(&format!("Special form '{name}' called in guard context."));
+                }
+                if a != 1 {
+                    return self.return_term_error(
+                        &format!("Special form '{name}' called with arguments in "),
+                        t,
+                        ".",
+                    );
                 }
                 return Ok(self.push_one(if name == "return_trace" {
                     Op::SetReturnTrace
@@ -864,22 +1150,23 @@ impl Dmc<'_> {
                 }));
             }
             "display" => {
-                if !trace || self.is_guard || a != 2 {
-                    return fail();
+                if !self.message_form(t, "display", a == 2)? {
+                    return Ok(false);
                 }
                 self.push_args(&p, 1)?;
                 self.text.push(Op::Display);
                 return Ok(false);
             }
             "process_dump" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, false)?;
-                if a != 1 {
-                    return fail();
+                if !self.trace_form(t, name, name, DCOMP_ALLOW_TRACE_OPS, false, a == 1)? {
+                    return Ok(false);
                 }
                 return Ok(self.push_one(Op::ProcessDump));
             }
             "enable_trace" | "disable_trace" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, false)?;
+                if !self.check_trace(name, DCOMP_ALLOW_TRACE_OPS, false)? {
+                    return Ok(false);
+                }
                 let enable = name == "enable_trace";
                 match a {
                     2 => {
@@ -899,12 +1186,20 @@ impl Dmc<'_> {
                         });
                         self.stack_used -= 1;
                     }
-                    _ => return fail(),
+                    _ => {
+                        return self.return_term_error(
+                            &format!("Special form '{name}' called with {WRONG} in "),
+                            t,
+                            ".",
+                        );
+                    }
                 }
                 return Ok(false);
             }
             "trace" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, false)?;
+                if !self.check_trace(name, DCOMP_ALLOW_TRACE_OPS, false)? {
+                    return Ok(false);
+                }
                 match a {
                     3 => {
                         self.push_args(&p, 1)?;
@@ -916,14 +1211,26 @@ impl Dmc<'_> {
                         self.text.push(Op::Trace3);
                         self.stack_used -= 2;
                     }
-                    _ => return fail(),
+                    _ => {
+                        return self.return_term_error(
+                            &format!("Special form 'trace' called with {WRONG} in "),
+                            t,
+                            ".",
+                        );
+                    }
                 }
                 return Ok(false);
             }
             "caller" | "caller_line" => {
-                self.check_trace(DCOMP_CALL_TRACE | DCOMP_ALLOW_TRACE_OPS, false)?;
-                if a != 1 {
-                    return fail();
+                if !self.trace_form(
+                    t,
+                    name,
+                    name,
+                    DCOMP_CALL_TRACE | DCOMP_ALLOW_TRACE_OPS,
+                    false,
+                    a == 1,
+                )? {
+                    return Ok(false);
                 }
                 return Ok(self.push_one(if name == "caller" {
                     Op::Caller
@@ -932,26 +1239,39 @@ impl Dmc<'_> {
                 }));
             }
             "current_stacktrace" => {
-                self.check_trace(DCOMP_CALL_TRACE | DCOMP_ALLOW_TRACE_OPS, false)?;
+                if !self.check_trace(name, DCOMP_CALL_TRACE | DCOMP_ALLOW_TRACE_OPS, false)? {
+                    return Ok(false);
+                }
                 let depth = match a {
                     1 => MAX_BACKTRACE_SIZE,
                     2 => {
-                        let depth = p[1].as_small().ok_or(EtsError::BadArg)?;
+                        let Some(depth) = p[1].as_small() else {
+                            return self.return_error(
+                                "Special form 'current_stacktrace' called with non small argument.",
+                            );
+                        };
                         if depth < 0 {
-                            return fail();
+                            return self.return_error(
+                                "Special form 'current_stacktrace' called with negative integer argument.",
+                            );
                         }
                         (depth as usize).min(MAX_BACKTRACE_SIZE)
                     }
-                    _ => return fail(),
+                    _ => {
+                        return self.return_term_error(
+                            &format!("Special form 'current_stacktrace' called with {WRONG} in "),
+                            t,
+                            ".",
+                        );
+                    }
                 };
-                self.emit_constant(Term::small(depth as i64).ok_or(EtsError::BadArg)?)?;
+                self.emit_constant(Term::small(depth as i64).ok_or(DmcFail::Fail)?)?;
                 self.text.push(Op::CurrentStacktrace);
                 return Ok(false);
             }
             "silent" => {
-                self.check_trace(DCOMP_ALLOW_TRACE_OPS, false)?;
-                if a != 2 {
-                    return fail();
+                if !self.trace_form(t, name, name, DCOMP_ALLOW_TRACE_OPS, false, a == 2)? {
+                    return Ok(false);
                 }
                 self.push_args(&p, 1)?;
                 self.text.push(Op::Silent);
@@ -961,14 +1281,22 @@ impl Dmc<'_> {
             _ => {}
         }
         let Some(b) = dmc_lookup_bif(name, a - 1) else {
-            return fail();
+            return self.return_term_error(
+                "Function ",
+                p[0],
+                &format!("/{} does_not_exist.", a - 1),
+            );
         };
         let context_bit = 1
             << ((self.cflags & DCOMP_DIALECT_MASK)
                 + if self.is_guard { DBIF_GUARD } else { DBIF_BODY });
         if b.flags & context_bit == 0 {
             // Body clause used in wrong context.
-            return fail();
+            return self.return_term_error(
+                "Function ",
+                p[0],
+                &format!("/{} cannot be called in this context.", a - 1),
+            );
         }
         self.push_args(&p, 1)?;
         self.text.push(match b.arity {
@@ -984,9 +1312,10 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:5592 (dmc_expr), OTP-29.1.1.
-    fn expr(&mut self, t: Term) -> Result<bool, EtsError> {
+    fn expr(&mut self, t: Term) -> DmcResult<bool> {
         if super::stack_guard(self.stack_limit) {
-            return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
+            self.system_limit = true;
+            return self.return_term_error("Excessive nesting; system limit reached near: ", t, "");
         }
         match t.classify() {
             TermKind::List => self.list(t),
@@ -999,7 +1328,11 @@ impl Dmc<'_> {
                     self.fun(t)
                 } else {
                     // Neither a function call nor a tuple ({{...}} is how tuples are written).
-                    fail()
+                    self.return_term_error(
+                        "",
+                        t,
+                        " is neither a function call, nor a tuple (tuples are written {{ ... }}).",
+                    )
                 }
             }
             TermKind::Atom => {
@@ -1018,18 +1351,20 @@ impl Dmc<'_> {
     }
 
     // Port of erts/emulator/beam/erl_db_util.c:5663 (compile_guard_expr), OTP-29.1.1.
-    fn compile_guard_expr(&mut self, mut l: Term) -> Result<(), EtsError> {
+    fn compile_guard_expr(&mut self, mut l: Term) -> DmcResult<()> {
         if l == Term::NIL {
             return Ok(());
         }
         if l.classify() != TermKind::List {
-            return fail();
+            return self
+                .return_error("Match expression is not a list.")
+                .map(|_| ());
         }
         if !self.is_guard {
             self.text.push(Op::Catch);
         }
         while l.classify() == TermKind::List {
-            let (t, rest) = cons(l).ok_or(EtsError::BadArg)?;
+            let (t, rest) = cons(l).ok_or(DmcFail::Fail)?;
             if self.expr(t)? {
                 self.emit_constant(t)?;
             }
@@ -1039,7 +1374,9 @@ impl Dmc<'_> {
             self.stack_used -= 1;
         }
         if l != Term::NIL {
-            return fail();
+            return self
+                .return_error("Match expression is not a proper list.")
+                .map(|_| ());
         }
         if !self.is_guard && self.cflags & DCOMP_TABLE != 0 {
             // Same impact on the stack as matchWaste.
@@ -1049,9 +1386,16 @@ impl Dmc<'_> {
         Ok(())
     }
 
+    /// `if (context.err_info) add_dmc_err(context.err_info, text, -1, 0UL, dmcError)`.
+    fn add_head_error(&mut self, text: &str) {
+        if let Some(info) = self.err_info.as_deref_mut() {
+            info.add(-1, text.as_bytes().to_vec());
+        }
+    }
+
     /// The head compiler of db_match_compile's per-clause loop, `matchexpr` already
     /// converted to its array form for tracing.
-    fn compile_head(&mut self, mut t: Term) -> Result<(), EtsError> {
+    fn compile_head(&mut self, mut t: Term) -> DmcResult<()> {
         let mut stack: Vec<Term> = vec![Term::NIL];
         let mut structure_checked = false;
         loop {
@@ -1062,8 +1406,11 @@ impl Dmc<'_> {
                         self.text.push(Op::Map(pairs.len()));
                     }
                     for (key, value) in pairs {
-                        if variable(key).is_some() || atom_is(key, "_") {
-                            // Variable or underscore found in map key.
+                        if variable(key).is_some() {
+                            self.add_head_error("Variable found in map key.");
+                            return fail();
+                        } else if atom_is(key, "_") {
+                            self.add_head_error("Underscore found in map key.");
                             return fail();
                         }
                         self.text.push(Op::Key(key));
@@ -1092,7 +1439,7 @@ impl Dmc<'_> {
                         self.text.push(Op::List);
                     }
                     structure_checked = false;
-                    let (head, tail) = cons(t).ok_or(EtsError::BadArg)?;
+                    let (head, tail) = cons(t).ok_or(DmcFail::Fail)?;
                     self.one_term(&mut stack, head)?;
                     t = tail;
                     continue;
@@ -1105,7 +1452,7 @@ impl Dmc<'_> {
             // The program's stack just grows while one composite structure is traversed.
             self.bump_need();
             // At the end of one composite structure, pop substructures and emit matchPop.
-            t = stack.pop().ok_or(EtsError::BadArg)?;
+            t = stack.pop().ok_or(DmcFail::Fail)?;
             if t == Term::NIL {
                 break;
             }
@@ -1124,7 +1471,11 @@ const MAX_BACKTRACE_SIZE: usize = 64;
 /// `{$0, $1, $2}`.
 ///
 /// Port of erts/emulator/beam/erl_db_util.c:5769 (match_compact), OTP-29.1.1.
-fn match_compact(terms: &[Term], heap: &mut VecHeap) -> Result<Vec<Term>, EtsError> {
+fn match_compact(
+    terms: &[Term],
+    heap: &mut VecHeap,
+    err_info: Option<&mut DmcErrInfo>,
+) -> DmcResult<(Vec<Term>, usize)> {
     fn collect(term: Term, seen: &mut Vec<usize>) {
         match term.classify() {
             TermKind::Atom => {
@@ -1158,24 +1509,21 @@ fn match_compact(terms: &[Term], heap: &mut VecHeap) -> Result<Vec<Term>, EtsErr
             _ => {}
         }
     }
-    fn rewrite(term: Term, map: &[usize], heap: &mut VecHeap) -> Result<Term, EtsError> {
+    fn rewrite(term: Term, map: &[usize], heap: &mut VecHeap) -> DmcResult<Term> {
         Ok(match term.classify() {
             TermKind::Atom => match variable(term) {
                 Some(n) => {
-                    let index = map
-                        .iter()
-                        .position(|&old| old == n)
-                        .ok_or(EtsError::BadArg)?;
+                    let index = map.iter().position(|&old| old == n).ok_or(DmcFail::Fail)?;
                     Term::atom(
                         global_atoms()
                             .intern(&format!("${index}"))
-                            .map_err(|_| EtsError::BadArg)?,
+                            .map_err(|_| DmcFail::Fail)?,
                     )
                 }
                 None => term,
             },
             TermKind::List => {
-                let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
+                let (head, tail) = cons(term).ok_or(DmcFail::Fail)?;
                 let head = rewrite(head, map, heap)?;
                 let tail = rewrite(tail, map, heap)?;
                 TermBuilder::new(heap).cons(head, tail)?
@@ -1202,16 +1550,22 @@ fn match_compact(terms: &[Term], heap: &mut VecHeap) -> Result<Vec<Term>, EtsErr
         collect(term, &mut seen);
     }
     seen.sort_unstable();
-    terms
+    // Lint needs a translation table.
+    if let Some(info) = err_info {
+        info.var_trans = Some(seen.clone());
+    }
+    let rewritten = terms
         .iter()
         .map(|&term| rewrite(term, &seen, heap))
-        .collect()
+        .collect::<DmcResult<Vec<_>>>()?;
+    Ok((rewritten, seen.len()))
 }
 
 /// Port of erts/emulator/beam/erl_db_util.c:1717 (db_match_compile), OTP-29.1.1.
 ///
 /// `matchexpr`, `guards` and `body` hold one entry per clause and live in `heap`, which also
-/// receives the constants of the program.
+/// receives the constants of the program. With `err_info` the compilation records the errors
+/// of the clause it stops at, as `db_match_set_lint` wants them.
 pub(super) fn db_match_compile(
     heap: &mut VecHeap,
     matchexpr: &[Term],
@@ -1219,73 +1573,13 @@ pub(super) fn db_match_compile(
     body: &[Term],
     cflags: u32,
     is_prefix: &[bool],
+    err_info: Option<&mut DmcErrInfo>,
 ) -> Result<Compiled, EtsError> {
     let num_progs = matchexpr.len();
-    // Variables numbered DMC_DEFAULT_SIZE or more in a head make erts restart with a compacted
-    // numbering; compacting up front yields the same program.
-    let mut big_variable = false;
-    {
-        fn scan(term: Term, big: &mut bool) {
-            match term.classify() {
-                TermKind::Atom => {
-                    if variable(term).is_some_and(|n| n >= DMC_DEFAULT_SIZE) {
-                        *big = true;
-                    }
-                }
-                TermKind::List => {
-                    let mut rest = term;
-                    while let Some((head, tail)) = cons(rest) {
-                        scan(head, big);
-                        rest = tail;
-                    }
-                    scan(rest, big);
-                }
-                TermKind::Tuple => {
-                    for element in tuple_items(term) {
-                        scan(element, big);
-                    }
-                }
-                TermKind::Map => {
-                    if let Ok(pairs) = map_pairs(term) {
-                        for (key, value) in pairs {
-                            scan(key, big);
-                            scan(value, big);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for &term in matchexpr {
-            scan(term, &mut big_variable);
-        }
-    }
-    let (matchexpr, guards, body): (Vec<Term>, Vec<Term>, Vec<Term>) = if big_variable {
-        let all: Vec<Term> = matchexpr
-            .iter()
-            .chain(guards)
-            .chain(body)
-            .copied()
-            .collect();
-        let compacted = match_compact(&all, heap)?;
-        (
-            compacted[..num_progs].to_vec(),
-            compacted[num_progs..2 * num_progs].to_vec(),
-            compacted[2 * num_progs..].to_vec(),
-        )
-    } else {
-        (matchexpr.to_vec(), guards.to_vec(), body.to_vec())
-    };
-    let vars_size = if big_variable {
-        // All variables were renumbered into 0..count.
-        count_variables(&matchexpr, &guards, &body)
-    } else {
-        DMC_DEFAULT_SIZE
-    };
     let mut dmc = Dmc {
         heap,
         text: Vec::new(),
-        vars: vec![DmcVariable::default(); vars_size.max(1)],
+        vars: vec![DmcVariable::default(); DMC_DEFAULT_SIZE],
         vars_used: 0,
         cflags,
         is_guard: false,
@@ -1294,108 +1588,98 @@ pub(super) fn db_match_compile(
         stack_need: 0,
         num_match: num_progs,
         current_match: 0,
-        matchexpr: &matchexpr,
-        guardexpr: &guards,
-        bodyexpr: &body,
+        matchexpr: matchexpr.to_vec(),
+        guardexpr: guards.to_vec(),
+        bodyexpr: body.to_vec(),
         is_prefix,
         stack_limit: arinsal_alloc::ethr::erts_get_stacklimit(),
+        err_info,
+        system_limit: false,
     };
-    for current_match in 0..dmc.num_match {
-        dmc.current_match = current_match;
-        dmc.vars.fill(DmcVariable::default());
-        let t = dmc.matchexpr[current_match];
-        dmc.stack_used = 0;
-        let mut current_try_label = None;
-        if current_match < dmc.num_match - 1 {
-            dmc.text.push(Op::TryMeElse(0));
-            current_try_label = Some(dmc.text.len() - 1);
+    // `restart:` of erts, taken when a variable number does not fit the variable table.
+    let compiled = loop {
+        dmc.vars_used = 0;
+        match dmc.compile_clauses() {
+            Err(DmcFail::Restart) => continue,
+            result => break result,
         }
-        // The "special" test needs it.
-        let clause_start = dmc.text.len();
-        dmc.compile_head(t)?;
-        // There is one single top variable in the match expression iff the text is the single
-        // instruction 'matchBind', or it is only a skip.
-        dmc.special = dmc.text.len() == clause_start + 1
-            && matches!(dmc.text[clause_start], Op::Bind(_) | Op::Skip);
-        let special_bind = dmc.special && matches!(dmc.text[clause_start], Op::Bind(_));
-        if cflags & DCOMP_TRACE != 0 {
-            if dmc.special {
-                if special_bind && let Op::Bind(n) = dmc.text[clause_start] {
-                    dmc.text[clause_start] = Op::ArrayBind(n);
-                }
-            } else {
-                let Some(&Op::Tuple(n)) = dmc.text.get(clause_start) else {
-                    // The head is not a tuple: invalid when matching an array.
-                    return fail();
-                };
-                dmc.text[clause_start] =
-                    if dmc.is_prefix.get(current_match).copied().unwrap_or(false) {
-                        Op::ArrayPrefix(n)
-                    } else {
-                        Op::Array(n)
-                    };
-            }
-        }
-        // ... and the guards
-        dmc.is_guard = true;
-        dmc.compile_guard_expr(dmc.guardexpr[current_match])?;
-        dmc.is_guard = false;
-        if cflags & DCOMP_TABLE != 0 && dmc.bodyexpr[current_match].classify() != TermKind::List {
-            // Body clause does not return anything.
-            return fail();
-        }
-        dmc.compile_guard_expr(dmc.bodyexpr[current_match])?;
-        // If the match program comes here, the match is successful.
-        dmc.text.push(Op::Halt);
-        // Fill in the try-me-else label if there is one.
-        if let Some(label) = current_try_label {
-            let end = dmc.text.len();
-            dmc.text[label] = Op::TryMeElse(end);
-        }
+    };
+    match compiled {
+        Ok(()) => Ok(Compiled {
+            num_bindings: dmc.vars_used,
+            stack_need: dmc.stack_need.max(0) as usize,
+            text: dmc.text,
+        }),
+        Err(_) if dmc.system_limit => Err(EtsError::Term(TermError::SystemLimit)),
+        Err(_) => Err(EtsError::BadArg),
     }
-    Ok(Compiled {
-        num_bindings: dmc.vars_used,
-        stack_need: dmc.stack_need.max(0) as usize,
-        text: dmc.text,
-    })
 }
 
-/// Distinct variable count, used to size the variable table after a compaction.
-fn count_variables(matchexpr: &[Term], guards: &[Term], body: &[Term]) -> usize {
-    fn walk(term: Term, highest: &mut usize) {
-        match term.classify() {
-            TermKind::Atom => {
-                if let Some(n) = variable(term) {
-                    *highest = (*highest).max(n + 1);
-                }
+impl Dmc<'_> {
+    /// The clause loop of db_match_compile ("This loop is long, too long").
+    fn compile_clauses(&mut self) -> DmcResult<()> {
+        let cflags = self.cflags;
+        for current_match in 0..self.num_match {
+            self.current_match = current_match;
+            self.vars.fill(DmcVariable::default());
+            let t = self.matchexpr[current_match];
+            self.stack_used = 0;
+            let mut current_try_label = None;
+            if current_match < self.num_match - 1 {
+                self.text.push(Op::TryMeElse(0));
+                current_try_label = Some(self.text.len() - 1);
             }
-            TermKind::List => {
-                let mut rest = term;
-                while let Some((head, tail)) = cons(rest) {
-                    walk(head, highest);
-                    rest = tail;
-                }
-                walk(rest, highest);
-            }
-            TermKind::Tuple => {
-                for element in tuple_items(term) {
-                    walk(element, highest);
-                }
-            }
-            TermKind::Map => {
-                if let Ok(pairs) = map_pairs(term) {
-                    for (key, value) in pairs {
-                        walk(key, highest);
-                        walk(value, highest);
+            // The "special" test needs it.
+            let clause_start = self.text.len();
+            self.compile_head(t)?;
+            // There is one single top variable in the match expression iff the text is the
+            // single instruction 'matchBind', or it is only a skip.
+            self.special = self.text.len() == clause_start + 1
+                && matches!(self.text[clause_start], Op::Bind(_) | Op::Skip);
+            let special_bind = self.special && matches!(self.text[clause_start], Op::Bind(_));
+            if cflags & DCOMP_TRACE != 0 {
+                if self.special {
+                    if special_bind && let Op::Bind(n) = self.text[clause_start] {
+                        self.text[clause_start] = Op::ArrayBind(n);
                     }
+                } else {
+                    let Some(&Op::Tuple(n)) = self.text.get(clause_start) else {
+                        // The head is not a tuple: invalid when matching an array.
+                        self.add_head_error("Match head is invalid in this context.");
+                        return fail();
+                    };
+                    self.text[clause_start] =
+                        if self.is_prefix.get(current_match).copied().unwrap_or(false) {
+                            Op::ArrayPrefix(n)
+                        } else {
+                            Op::Array(n)
+                        };
                 }
             }
-            _ => {}
+            // ... and the guards
+            self.is_guard = true;
+            self.compile_guard_expr(self.guardexpr[current_match])?;
+            self.is_guard = false;
+            if cflags & DCOMP_TABLE != 0
+                && self.bodyexpr[current_match].classify() != TermKind::List
+            {
+                self.add_head_error("Body clause does not return anything.");
+                return fail();
+            }
+            self.compile_guard_expr(self.bodyexpr[current_match])?;
+            // The compilation does not bail out when error information is requested, so
+            // we need to detect that here...
+            if self.err_info.as_ref().is_some_and(|info| info.error_added) {
+                return fail();
+            }
+            // If the match program comes here, the match is successful.
+            self.text.push(Op::Halt);
+            // Fill in the try-me-else label if there is one.
+            if let Some(label) = current_try_label {
+                let end = self.text.len();
+                self.text[label] = Op::TryMeElse(end);
+            }
         }
+        Ok(())
     }
-    let mut highest = 0;
-    for &term in matchexpr.iter().chain(guards).chain(body) {
-        walk(term, &mut highest);
-    }
-    highest
 }
