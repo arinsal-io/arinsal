@@ -243,8 +243,11 @@ pub(crate) fn get_used_allctr(user: usize) -> UsedBlock {
         debug_assert_eq!(bhdr & FREE, 0, "live MBC block must not have FREE set");
         (ablk_to_mbc(blk, bhdr), bhdr & MBC_ABLK_SZ_MASK)
     };
+    // `erts_atomic_read_ddrb`: the owner word needs no barrier of its own. A thread that acts on
+    // an IN_POOL carrier takes the pool or homecoming lock before it touches the carrier, and
+    // that lock orders it after the thread that put the carrier there.
     let iallctr = WordView::new(crr as *mut u64, CARRIER_ALLCTR_WORD + 1)
-        .atomic_load(CARRIER_ALLCTR_WORD, Ordering::Acquire)
+        .atomic_load(CARRIER_ALLCTR_WORD, Ordering::Relaxed)
         .expect("carrier header allctr word") as usize;
     UsedBlock {
         instance: iallctr >> CRR_ALCTR_SHIFT,
