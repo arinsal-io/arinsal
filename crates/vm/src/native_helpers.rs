@@ -242,7 +242,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:116-118, 179, 191 (F_DELAY_GC set on
     // entry, cleared on the wait and schedule-out exits), OTP-29.1.1.
     process.delay_gc = true;
-    if let Some(message) = process.inbox.get(process.inbox.save()) {
+    if let Some(message) = process.inbox.peek() {
         return crate::native_hooks::raw(*message);
     }
     // The message queue is exhausted. Signals left unhandled in the middle queue, or sent
@@ -265,7 +265,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // call under eHeapAlloc), OTP-29.1.1: fetch messages in place and peek again.
     let fetched = process.fetch_messages_in_place();
     if fetched.is_ok()
-        && let Some(message) = process.inbox.get(process.inbox.save())
+        && let Some(message) = process.inbox.peek()
     {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_receive_helper,
         // `consumed_reds += 4` per fetch), OTP-29.1.1: the call site published FCALLS

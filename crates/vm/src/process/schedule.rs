@@ -33,6 +33,11 @@ impl Task for Process {
     type Message = Message;
     type SchedulerData = SchedulerData;
 
+    // Port of erts/emulator/beam/erl_process.c:12723-12727 (erl_create_process), OTP-29.1.1.
+    fn init_in_place(&mut self) {
+        self.inbox.init_in_place();
+    }
+
     fn gc_nanoseconds(&self) -> u64 {
         self.stats.gc.nanoseconds
     }
@@ -176,12 +181,14 @@ impl Task for Process {
         self.unblock_literal_release();
         crate::trace::clear_save_calls(self);
         self.heap.clear_for_exit();
+        // The queues go before the cold state: receive markers linked in them are nodes of
+        // the marker block it holds (erts_proc_sig_cleanup_queues skips them).
+        self.inbox = MessageQueue::default();
+        *self.sig_cont_mut() = Default::default();
         self.cold = None;
         // The probe keeps a reference to this process; holding it past exit leaks the struct.
         self.set_signal_probe(None);
         self.dictionary = None;
-        self.inbox = MessageQueue::default();
-        *self.sig_cont_mut() = Default::default();
         self.set_exit_cont(None);
         self.seq_trace_token = None;
         self.final_exit_reason = None;

@@ -110,10 +110,15 @@ impl Process {
         // OTP-29.1.1: the signals left in the inner queue come before the outer queue's.
         let mut unhandled = std::mem::take(&mut *self.sig_cont_mut());
         loop {
-            let Event { from, payload } = match unhandled.pop_front() {
-                Some(event) => {
+            let Event { from, payload } = match unhandled.pop_front_signal() {
+                // A receive marker goes with the marker block (erts_proc_sig_cleanup_queues).
+                Some(signal) if arinsal_sched::RecvMarker::is_marker(&signal) => {
+                    arinsal_sched::RecvMarker::from_signal(signal);
+                    continue;
+                }
+                Some(signal) => {
                     ctx.consume_fetched();
-                    event
+                    signal.into_value()
                 }
                 None => match ctx.receive() {
                     Some(event) => event,

@@ -9,11 +9,10 @@ pub(crate) enum MessageQueueData {
 }
 
 impl Process {
+    /// A priority message the process built itself enters the prio queue.
     pub(crate) fn push_priority_message(&mut self, term: Term) -> Result<(), VmError> {
-        let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-        let new_prio_len = self.inbox.push_priority(term, old_prio_len);
-        self.cold_mut().prio_len = new_prio_len;
-        self.priority_item_inserted(old_prio_len, term)
+        self.insert_prio_message(MessageQueue::node_for(term))
+            .map(|_| ())
     }
 
     // Port of erts/emulator/beam/erl_proc_sig_queue.h (FS_OFF_HEAP_MSGQ in sig_qs.flags),
@@ -54,13 +53,27 @@ impl Process {
     /// Stretch the limit by up to 100 reductions, to at most `abs_lim`, when `receive` has no
     /// message to inspect and handling more signals may make one available.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7181-7250 (stretch_limit), OTP-29.1.1.
-    pub(super) fn stretch_limit(&self, abs_lim: i32, limit: &mut i32, msgq_len: usize) -> bool {
+    pub(super) fn stretch_limit(
+        &self,
+        abs_lim: i32,
+        limit: &mut i32,
+        msgq_end: crate::process::SaveField,
+    ) -> bool {
         if abs_lim == *limit {
             return false;
         }
-        // The save pointer is in the message queue at a message (receive markers are not
-        // queue entries here).
-        if self.inbox.save() < msgq_len {
+        // From the save pointer, pass receive markers without punishing them; a message
+        // before the part handled during this call is there to inspect.
+        let entries = &self.inbox.entries;
+        let mut field = entries.save_field();
+        while field != msgq_end {
+            match entries.at(field) {
+                None => break,
+                Some(Some(_)) => return false,
+                Some(None) => field = entries.next_of(field).expect("a marker node"),
+            }
+        }
+        if entries.at(field).is_none() && self.sig_cont().is_empty() {
             return false;
         }
         *limit = (*limit + SIG_REDS_CNT_FACTOR * 100).min(abs_lim);
@@ -87,7 +100,7 @@ impl Process {
                 left_reds -= 4;
                 self.fetch_signals(ctx)?;
                 // Messages may have been moved directly to the message queue.
-                if self.inbox.get(self.inbox.save()).is_some() {
+                if self.inbox.peek().is_some() {
                     return Ok((consumed_reds, ReceiveHelper::Message));
                 }
                 if self.sig_cont_empty() {
@@ -103,7 +116,7 @@ impl Process {
             self.handle_incoming(ctx, &mut reds, max_reds, true)?;
             consumed_reds += reds;
             left_reds -= reds;
-            if self.inbox.get(self.inbox.save()).is_some() {
+            if self.inbox.peek().is_some() {
                 return Ok((consumed_reds, ReceiveHelper::Message));
             }
             if left_reds <= 0 {
@@ -189,28 +202,23 @@ impl Process {
                     message.priority = false;
                     priority = false;
                 }
-                let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                 let sender = from;
                 let before = self.message_words_before();
-                let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
-                self.uncount_message_words(before);
-                let trace_index = if priority {
-                    old_prio_len
+                // ERTS_SIG_Q_OP_ALTACT_MSG with a priority: insert_prepared_prio_msg.
+                let term = if priority {
+                    let term = self.insert_prio_message(node)?;
+                    self.uncount_message_words(before);
+                    term
                 } else {
-                    self.inbox.len().saturating_sub(1)
+                    let term = queued_term(&node);
+                    self.inbox.push_message_node(node);
+                    self.uncount_message_words(before);
+                    term
                 };
                 if !receive_traced
-                    && let Some(term) = self.inbox.get(trace_index).copied()
                     && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
                 {
                     crate::trace::receive_event(None, self, ctx, term, Some(sender));
-                }
-                self.cold_mut().prio_len = new_prio_len;
-                if priority {
-                    let priority_term = self.inbox.get(old_prio_len).copied().ok_or_else(|| {
-                        VmError::Unsupported("priority message missing after insertion".into())
-                    })?;
-                    self.priority_item_inserted(old_prio_len, priority_term)?;
                 }
             }
             return Ok(());

@@ -87,7 +87,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).native_resume_after_call).write(None);
         std::ptr::addr_of_mut!((*process).inbox).write(inbox);
         std::ptr::addr_of_mut!((*process).sig_cont).write(sig_cont);
-        std::ptr::addr_of_mut!((*process).sig_cont_taken).write(0);
         std::ptr::addr_of_mut!((*process).receive_timeout_pos).write(None);
         std::ptr::addr_of_mut!((*process).receive_timeout_next).write(0);
         std::ptr::addr_of_mut!((*process).receive_infinity).write(false);
@@ -172,7 +171,6 @@ fn process_fields_are_initialized(process: Process) {
         native_resume_after_call,
         inbox,
         sig_cont,
-        sig_cont_taken,
         receive_timeout_pos,
         receive_timeout_next,
         receive_infinity,
@@ -242,7 +240,6 @@ fn process_fields_are_initialized(process: Process) {
         native_resume_after_call,
         inbox,
         sig_cont,
-        sig_cont_taken,
         receive_timeout_pos,
         receive_timeout_next,
         receive_infinity,

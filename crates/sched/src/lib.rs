@@ -72,7 +72,11 @@ mod timer;
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
 pub use ptab_slot::{Progress, ProgressSlot};
-pub use sig_queue::{MessageQueueList, OwnedSignal, SignalQueue};
+pub use sig_queue::{
+    MessageQueueList, NextField, OwnedSignal, RECV_MARKER_TYPE_PRIO_Q_CONT,
+    RECV_MARKER_TYPE_PRIO_Q_END, RECV_MARKER_TYPE_RECV, RECV_MARKER_TYPE_YIELD, RecvMarker,
+    SignalQueue,
+};
 pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
@@ -1184,6 +1188,12 @@ pub trait Task: Send + 'static {
     ) -> Option<(Pid, Self::Message)> {
         None
     }
+    /// Initialise the fields that point into the task itself, once it is written into the
+    /// process block it stays in.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:12723-12727 (erl_create_process:
+    /// `p->sig_qs.last = p->sig_qs.save = &p->sig_qs.first` in the allocated block), OTP-29.1.1.
+    fn init_in_place(&mut self) {}
     /// Signals that landed after the task decided to exit, before it left the table.
     fn reap_signals(&mut self, _pid: Pid, _events: Vec<Event<Self::Message>>) {}
     /// Release what the exited task owns on the scheduler it exited on; only the process
@@ -1623,13 +1633,14 @@ impl<M: SignalMessage> SignalProbe<M> {
         self.input().take_all(into);
     }
 
-    /// Move the whole outer queue to `into` when it holds only messages that `accept` takes;
-    /// otherwise leave it for the scheduler. Returns the number of signals moved.
+    /// Move the whole outer queue, through `splice`, to the end of a queue when it holds only
+    /// messages that `accept` takes; otherwise leave it for the scheduler. Returns the number
+    /// of signals moved.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
     pub fn fetch_messages_if(
         &self,
         accept: impl Fn(&M) -> bool,
-        into: &mut SignalQueue<Event<M>>,
+        into: impl FnOnce(&mut SignalQueue<Event<M>>),
     ) -> usize {
         self.input().take_all_if(
             |event| matches!(&event.payload, Payload::Message(message) if accept(message)),
@@ -6266,7 +6277,17 @@ pub const LAZY_MONITOR: u64 = 1 << 62;
 pub const LAZY_LINK: u64 = 1 << 61;
 /// Metadata bit for an intrusive unlink operation, which is not a monitor half.
 pub const LAZY_UNLINK: u64 = 1 << 60;
-const _: () = assert!(PTAB_ID_DATA_MASK < LAZY_MONITOR);
+/// Lazy-node meta of a receive, yield or priority-queue marker (`ERTS_RECV_MARKER_TAG`), a
+/// node of the process's marker block: a combination no other lazy signal uses (an unlink
+/// carries `LAZY_MONITOR` only as an acknowledgement, never `LAZY_LINK`). A marker has no
+/// sender, so the data bits are 0.
+pub const LAZY_RECV_MARKER: u64 = LAZY_MONITOR | LAZY_LINK | LAZY_UNLINK;
+
+/// Whether lazy-node `meta` is that of a receive marker.
+pub const fn is_recv_marker_meta(meta: u64) -> bool {
+    meta & LAZY_RECV_MARKER == LAZY_RECV_MARKER
+}
+const _: () = assert!(PTAB_ID_DATA_MASK < LAZY_UNLINK);
 
 /// The metadata of a lazy node (a monitor half queued as its own signal) sent by `from`: what
 /// the delivery path needs without making the signal value.
@@ -8503,7 +8524,10 @@ mod in_signal_tests {
             psflg::SIG_IN_Q
         );
         let mut inner = SignalQueue::default();
-        assert_eq!(input.take_all_if(InSignal::is_message, &mut inner), 0);
+        assert_eq!(
+            input.take_all_if(InSignal::is_message, |queue| inner.append(queue)),
+            0
+        );
     }
 }
 

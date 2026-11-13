@@ -3325,7 +3325,7 @@ fn hibernate(
     process.x[2] = args;
     process.gc_live = 3;
     process.heap.abi.arity = 3;
-    process.inbox.set_save(0);
+    process.msgq_set_save_first();
     // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
     // continuation is process state.
     process.cold_mut().hibernate = Some(crate::process::HibernateCont {

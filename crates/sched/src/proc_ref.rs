@@ -401,7 +401,7 @@ impl<T: Task> TaskCell<T> {
     #[inline(always)]
     pub(crate) fn init_with<E>(&mut self, init: impl FnOnce() -> Result<T, E>) -> Result<(), E> {
         assert!(!self.initialized, "a task is written once");
-        self.task.write(init()?);
+        self.task.write(init()?).init_in_place();
         self.initialized = true;
         Ok(())
     }

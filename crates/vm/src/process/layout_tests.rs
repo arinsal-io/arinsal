@@ -12,19 +12,18 @@ fn envelope() -> Message {
 #[test]
 fn off_heap_message_fragment_stays_outside_gc_roots_until_removed() {
     let mut process = Process::new();
+    arinsal_sched::Task::init_in_place(&mut process);
     process.cold_mut().off_heap_msgq = true;
     let heap_words = process.heap.total_heap_size_words();
-    let prio_len = 0;
-    process.inbox.push_message(envelope(), prio_len).unwrap();
+    process.inbox.push_message(envelope()).unwrap();
 
     assert!(process.inbox.gc_root_snapshot().1.is_empty());
     assert_eq!(process.heap.total_heap_size_words(), heap_words);
     process.collect_heap_roots(0, &mut [], 0).unwrap();
     let term = process
         .inbox
-        .remove_to_heap(0, &mut process.heap, prio_len)
+        .remove_to_heap(&mut process.heap)
         .unwrap()
-        .0
         .unwrap();
     assert_eq!(
         arinsal_term::to_owned(term).unwrap(),
@@ -36,26 +35,25 @@ fn off_heap_message_fragment_stays_outside_gc_roots_until_removed() {
 #[test]
 fn on_heap_message_is_a_gc_root_in_the_process_heap() {
     let mut process = Process::new();
-    let prio_len = 0;
-    process.inbox.push_message(envelope(), prio_len).unwrap();
+    arinsal_sched::Task::init_in_place(&mut process);
+    process.inbox.push_message(envelope()).unwrap();
 
     // The fetched message keeps its fragment until a collection moves it onto the heap.
     assert!(process.inbox.gc_root_snapshot().1.is_empty());
-    assert!(!process.inbox.is_on_heap(0));
+    assert!(!process.inbox.is_on_heap_at_save());
     process.collect_heap_roots(0, &mut [], 0).unwrap();
     assert_eq!(process.inbox.gc_root_snapshot().1.len(), 1);
     assert_eq!(process.inbox.entries.len(), 1);
     assert!(
-        super::queued(process.inbox.entries.get(0).unwrap())
+        super::queued(process.inbox.entries.peek().unwrap())
             .fragment
             .is_none()
     );
     process.collect_heap_roots(0, &mut [], 0).unwrap();
     let term = process
         .inbox
-        .remove_to_heap(0, &mut process.heap, prio_len)
+        .remove_to_heap(&mut process.heap)
         .unwrap()
-        .0
         .unwrap();
     assert_eq!(
         arinsal_term::to_owned(term).unwrap(),
@@ -70,6 +68,7 @@ fn on_heap_message_is_a_gc_root_in_the_process_heap() {
 #[test]
 fn collection_publishes_the_new_heap_to_the_native_header() {
     let mut process = Process::new();
+    arinsal_sched::Task::init_in_place(&mut process);
     let before = (process.heap.abi.heap, process.heap.abi.hend);
     // Force a collection that grows the young heap.
     process.ensure(1 << 14, 0).unwrap();
@@ -89,6 +88,7 @@ fn collection_publishes_the_new_heap_to_the_native_header() {
 #[test]
 fn partial_cursor_sync_also_publishes_heap_bounds() {
     let mut process = Process::new();
+    arinsal_sched::Task::init_in_place(&mut process);
     let _ = process.heap.heap_bounds();
     process.heap.delay_collection(0);
     process.heap.abi.heap = std::ptr::null_mut();
@@ -100,6 +100,7 @@ fn partial_cursor_sync_also_publishes_heap_bounds() {
 #[test]
 fn post_bif_result_root_survives_collection_in_the_fast_arm() {
     let mut process = Process::new();
+    arinsal_sched::Task::init_in_place(&mut process);
     let elements = [
         Term::small(1).unwrap(),
         Term::small(2).unwrap(),
@@ -135,6 +136,7 @@ fn check_process_code_sees_the_function_of_a_return_trace_frame() {
     // A return trace frame names its traced function by a pc in it (erts `&mfa`); a purge of
     // that code has to find it.
     let mut process = Process::new();
+    arinsal_sched::Task::init_in_place(&mut process);
     let range = (0x4000_usize, 0x5000_usize);
     let stub = crate::trace::TraceFrameKind::ReturnTrace.address();
     assert!(process.heap.reserve_stack(4));
@@ -182,6 +184,7 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
     }
 
     let mut process = Process::new();
+    arinsal_sched::Task::init_in_place(&mut process);
     install(&mut process, packed(7, 4), 0, &[]);
     assert!(!process.references_code(7, |_| false));
     assert_eq!(process.heap.abi.exc.freason, 0);
@@ -252,9 +255,9 @@ fn worker_panic_aborts_instead_of_hanging() {
 
 #[test]
 fn idle_process_layout_stays_compact() {
-    // `first`, `last`, the length, the non-message count and the save cursor (position and
-    // node), like the inner queue of erts `ErtsSignalPrivQueues`.
-    assert_eq!(std::mem::size_of::<super::MessageQueue>(), 8 * 8);
+    // `first`, `last`, `save` and `mq_len` of erts `ErtsSignalPrivQueues` and the prio queue
+    // / save-info bits of `sig_qs.flags`.
+    assert_eq!(std::mem::size_of::<super::MessageQueue>(), 5 * 8);
     // Before `MessageHeapBlock`, the enum was the same size as its 240-byte ProcessHeap
     // payload; the NodeFragment variant needed no extra discriminant space.
     // The native ABI words (erts c_p htop/stop/heap/hend/fcalls/freason) moved into the heap.
