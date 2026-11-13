@@ -2456,10 +2456,6 @@ impl<'a> Reader<'a> {
 }
 
 impl<'a> Reader<'a, true> {
-    fn from_validated(body: ValidatedEtfBody<'a>) -> Self {
-        Self::from_validated_at(body, 0)
-    }
-
     fn from_validated_at(body: ValidatedEtfBody<'a>, at: usize) -> Self {
         Self {
             bytes: body.as_bytes(),
@@ -3195,15 +3191,6 @@ fn parse_step<H: HeapAlloc>(
         }
     }
     Ok(None)
-}
-
-fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, usize), BifError> {
-    let mut reader = Reader::new(bytes, 0);
-    let mut stack = SmallVec::new();
-    match parse_step(&mut reader, &mut stack, safe, None, ctx, usize::MAX, true)? {
-        Some(value) => Ok(value),
-        None => Err(BifError::BADARG),
-    }
 }
 
 fn write_decode_target(target: DecodeTarget, root: &mut Term, term: Term) -> Result<(), BifError> {
@@ -4452,9 +4439,7 @@ fn decode_direct_step(
 pub struct DecodeWalk<'a> {
     input: DecodeInput<'a>,
     plain: Option<SmallVec<[u8; 128]>>,
-    validator_at: usize,
     decode_at: usize,
-    stack: SmallVec<[Frame; 4]>,
     decode_next: Option<super::raw::HeapSlotPtr>,
     decode_root: Term,
     decode_root_started: bool,
@@ -4472,15 +4457,12 @@ pub struct DecodeWalk<'a> {
     expected_plain: usize,
     decompressor: Option<Decompress>,
     inflate_done: bool,
-    checked_root: Option<usize>,
     sizing: DecodedSizeWalk,
     heap_words: Option<usize>,
+    prepare_charge: usize,
     reservation: Option<HeapReservationState>,
     /// Allocation state before the first decode slice, to undo a failed decode.
     factory_mark: Option<arinsal_term::HeapFactoryMark>,
-    size_done: bool,
-    decode_started: bool,
-    initial_work: usize,
 }
 
 impl<'a> DecodeWalk<'a> {
@@ -4516,9 +4498,7 @@ impl<'a> DecodeWalk<'a> {
             // erts/emulator/beam/external.c, OTP-29.1.1: uncompressed input does not carry
             // or initialize an inflation buffer.
             plain: compressed.then(SmallVec::new),
-            validator_at: 0,
             decode_at: 0,
-            stack: SmallVec::new(),
             decode_next: None,
             decode_root: Term::NIL,
             decode_root_started: false,
@@ -4535,186 +4515,16 @@ impl<'a> DecodeWalk<'a> {
             expected_plain,
             decompressor,
             inflate_done: !compressed,
-            checked_root: None,
             sizing: DecodedSizeWalk::new(),
             heap_words: None,
+            prepare_charge: if compressed && expected_plain > B2T_MAX_DIRECT_UNCOMPRESSED_SIZE {
+                expected_plain
+            } else {
+                0
+            },
             reservation: None,
             factory_mark: None,
-            size_done: false,
-            decode_started: false,
-            initial_work: 0,
         })
-    }
-
-    /// Decode an uncompressed input synchronously when its body fits the current BIF budget.
-    ///
-    /// Port of erts/emulator/beam/external.c:2027-2058 (`B2TSize`/`B2TDecodeInit`), OTP-29.1.1.
-    pub fn decode_small(
-        args: &'a [Term],
-        heap: &mut ProcessHeap,
-        local_node: Option<(Atom, u32)>,
-        byte_budget: usize,
-        trap_context: &mut Option<DecodeWalk<'a>>,
-    ) -> Result<Option<(Term, usize)>, (BifError, usize)> {
-        // The synchronous path borrows the input as `binary_to_term_int` keeps its B2TContext
-        // on the C stack; the trap context (and its owned copy of the input) is built only
-        // when the decode yields.
-        let opts = decode_options(args.get(1).copied()).map_err(|error| (error, 0))?;
-        let (_, view) = decode_binary_view(args).map_err(|error| (error, 0))?;
-        if !view.bit_len().is_multiple_of(8) {
-            return Err((BifError::BADARG, 0));
-        }
-        if !view.start_bit().is_multiple_of(8) {
-            return Ok(None);
-        }
-        let start = view.start_bit() / 8;
-        let len = view.bit_len() / 8;
-        let bytes = view
-            .bytes()
-            .get(start..start + len)
-            .ok_or((BifError::BADARG, 0))?;
-        if bytes.first() != Some(&131) {
-            return Err((BifError::BADARG, 0));
-        }
-        if bytes.get(1) == Some(&80) {
-            return Ok(None);
-        }
-        let body = &bytes[1..];
-
-        let mut sizing = DecodedSizeWalk::new();
-        let (size, size_work) = sizing
-            .step(body, byte_budget, true, local_term_hash)
-            .map_err(|_| (BifError::BADARG, 0))?;
-        let Some((heap_words, checked)) = size else {
-            *trap_context = Some(Self::after_sizing(
-                args, local_node, sizing, body, None, size_work,
-            )?);
-            return Ok(None);
-        };
-        let validated_body = sizing
-            .validated_body(body)
-            .ok_or((BifError::BADARG, size_work))?;
-        let remaining_reds = byte_budget.saturating_sub(size_work);
-        if body.len() > remaining_reds {
-            *trap_context = Some(Self::after_sizing(
-                args,
-                local_node,
-                sizing,
-                body,
-                Some(heap_words),
-                size_work,
-            )?);
-            return Ok(None);
-        }
-        // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1:
-        // a failed decode undoes the factory, so no partial term stays on the heap or in a
-        // heap fragment that the BIF epilogue would treat as live.
-        let mark = heap.factory_mark();
-        let result = Self::decode_reserved(
-            args,
-            heap,
-            local_node,
-            &opts,
-            validated_body,
-            heap_words,
-            checked,
-            size_work,
-        );
-        if result.is_err() {
-            heap.factory_undo(mark);
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn decode_reserved(
-        _args: &'a [Term],
-        heap: &mut ProcessHeap,
-        local_node: Option<(Atom, u32)>,
-        opts: &DecodeOpts,
-        validated_body: ValidatedEtfBody<'_>,
-        heap_words: usize,
-        checked: usize,
-        size_work: usize,
-    ) -> Result<Option<(Term, usize)>, (BifError, usize)> {
-        let mut reservation = HeapReservation::new(heap, heap_words)
-            .map_err(|error| (map_term_build_error(error), size_work))?;
-        let mut next = None;
-        let mut root = Term::NIL;
-        let mut root_started = false;
-        let mut maps = SmallVec::<[DecodeMap; 10]>::new();
-        let mut pending = None;
-        let mut internal_nc = false;
-        let ((parsed, decode_work), _bytes_read) = reservation
-            .with_words(|reserved_words| {
-                let mut state = crate::BifState::default();
-                let mut decode_ctx = Ctx::with_allocator(reserved_words, &mut state);
-                let mut reader = Reader::from_validated(validated_body);
-                let parsed = decode_direct_step(
-                    &mut reader,
-                    &mut next,
-                    &mut root,
-                    &mut root_started,
-                    &mut maps,
-                    &mut pending,
-                    &mut internal_nc,
-                    opts.safe,
-                    local_node,
-                    &mut decode_ctx,
-                    usize::MAX,
-                )?;
-                Ok::<_, BifError>((parsed, reader.at))
-            })
-            .map_err(|error| (map_term_build_error(error), size_work))?
-            .map_err(|error| (error, size_work))?;
-        let Some((_term, decoded_bytes)) = parsed else {
-            return Err((BifError::BADARG, size_work + decode_work));
-        };
-        if decoded_bytes != checked {
-            return Err((BifError::BADARG, size_work + decode_work));
-        }
-        finish_decode_maps(&mut reservation, &mut maps, &mut root)
-            .map_err(|error| (error, size_work + decode_work))?;
-        drop(reservation);
-
-        let value = if opts.used {
-            let mut state = crate::BifState::default();
-            let handle = crate::ProcessHeapHandle(heap);
-            let mut result_ctx = Ctx::with_allocator(handle, &mut state);
-            let used = integer(&mut result_ctx, 1 + checked)
-                .map_err(|error| (error, size_work + decode_work))?;
-            tuple_build(&mut result_ctx, &[root, used])
-        } else {
-            root
-        };
-        Ok(Some((value, size_work + decode_work)))
-    }
-
-    /// Build the trap context after a synchronous sizing slice.
-    ///
-    /// Port of external.c B2TSize -> B2TDecodeInit state transfer, OTP-29.1.1.
-    fn after_sizing(
-        args: &'a [Term],
-        local_node: Option<(Atom, u32)>,
-        mut sizing: DecodedSizeWalk,
-        sized_body: &[u8],
-        heap_words: Option<usize>,
-        size_work: usize,
-    ) -> Result<Self, (BifError, usize)> {
-        let mut decoder = Self::new(args).map_err(|error| (error, size_work))?;
-        if heap_words.is_some() {
-            // The context may own a copy of the input; the sizing proof follows the bytes.
-            let body = &decoder.input.bytes()[1..];
-            if !sizing.rebind_input(sized_body, body) {
-                return Err((BifError::BADARG, size_work));
-            }
-        }
-        decoder.local_node = local_node;
-        decoder.sizing = sizing;
-        decoder.size_done = heap_words.is_some();
-        decoder.heap_words = heap_words;
-        decoder.initial_work = size_work;
-        Ok(decoder)
     }
 
     /// Configure this node's identity for external pid, port, and reference terms.
@@ -4727,9 +4537,7 @@ impl<'a> DecodeWalk<'a> {
         let Self {
             input,
             plain,
-            validator_at,
             decode_at,
-            stack,
             decode_next,
             decode_root,
             decode_root_started,
@@ -4746,14 +4554,11 @@ impl<'a> DecodeWalk<'a> {
             expected_plain,
             decompressor,
             inflate_done,
-            checked_root,
             sizing,
             heap_words,
+            prepare_charge,
             reservation,
             factory_mark,
-            size_done,
-            decode_started,
-            initial_work,
         } = self;
         let input = match input {
             DecodeInput::Inline(bytes) => DecodeInput::Inline(bytes),
@@ -4771,9 +4576,7 @@ impl<'a> DecodeWalk<'a> {
         Ok(DecodeWalk {
             input,
             plain,
-            validator_at,
             decode_at,
-            stack,
             decode_next,
             decode_root,
             decode_root_started,
@@ -4790,14 +4593,11 @@ impl<'a> DecodeWalk<'a> {
             expected_plain,
             decompressor,
             inflate_done,
-            checked_root,
             sizing,
             heap_words,
+            prepare_charge,
             reservation,
             factory_mark,
-            size_done,
-            decode_started,
-            initial_work,
         })
     }
 
@@ -4856,133 +4656,107 @@ impl<'a> DecodeWalk<'a> {
         }
     }
 
-    /// Validate at most `byte_budget` ETF input bytes and report consumed bytes.
-    pub fn step(
+    /// `b2ts.extsize`: the decoded external term data's size in bytes.
+    // Port of erts/emulator/beam/external.c (ErtsBinary2TermState.extsize), OTP-29.1.1.
+    pub fn extsize(&self) -> usize {
+        if self.compressed {
+            self.expected_plain
+        } else {
+            self.input_size - 1
+        }
+    }
+
+    /// Whether the input is compressed: `binary2term_prepare` starts in `B2TUncompressChunk`,
+    /// else in `B2TSizeInit`.
+    pub fn is_compressed(&self) -> bool {
+        self.compressed
+    }
+
+    /// The `ctx->reds -= dest_len` of `binary2term_prepare` after it validated an oversized
+    /// length claim by inflating the data once.
+    pub fn prepare_reds_charge(&self) -> usize {
+        self.prepare_charge
+    }
+
+    /// `B2TUncompressChunk`: inflate at most `budget` bytes; `true` when the stream ended.
+    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TUncompressChunk),
+    // OTP-29.1.1.
+    pub fn uncompress_chunk(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
+        let mut consumed = 0;
+        while !self.inflate_done && consumed < budget {
+            let produced = self
+                .inflate_more(budget - consumed)
+                .map_err(|error| (error, consumed))?;
+            consumed += produced.max(1);
+            if produced == 0 && !self.inflate_done {
+                return Err((BifError::BADARG, consumed));
+            }
+        }
+        Ok((self.inflate_done, consumed))
+    }
+
+    /// `B2TSize`: `decoded_size` with `budget` bytes of reductions; the heap size in words once
+    /// the whole term was walked.
+    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TSize; decoded_size),
+    // OTP-29.1.1.
+    pub fn size_chunk(
         &mut self,
-        byte_budget: usize,
+        budget: usize,
     ) -> Result<(Option<usize>, usize), (BifError, usize)> {
         let mut consumed = 0;
-        if let Some(checked) = self.checked_root {
-            while !self.inflate_done && consumed < byte_budget.max(1) {
-                let produced = self
-                    .inflate_more(byte_budget.saturating_sub(consumed))
-                    .map_err(|error| (error, consumed))?;
-                consumed += produced.max(1);
-            }
-            if self.inflate_done {
-                if checked != self.expected_plain || self.plain_bytes().len() != checked {
+        while consumed < budget {
+            let before = (self.input_offset, self.plain_bytes().len());
+            let bytes = if self.compressed {
+                self.plain
+                    .as_deref()
+                    .expect("compressed input has an inflate buffer")
+            } else {
+                &self.input.bytes()[1..]
+            };
+            let scanned = self
+                .sizing
+                .step(bytes, budget - consumed, true, local_term_hash)
+                .map_err(|error| (decode_size_error(error), consumed))?;
+            consumed += scanned.1;
+            if let Some((words, checked)) = scanned.0 {
+                if self.compressed
+                    && (checked != self.expected_plain || checked != self.plain_bytes().len())
+                {
                     return Err((BifError::BADARG, consumed));
                 }
-                return Ok((Some(checked), consumed));
+                self.heap_words = Some(words);
+                return Ok((Some(words), consumed));
             }
-            return Ok((None, consumed));
-        }
-        while consumed < byte_budget.max(1) {
-            let before = self.validator_at;
-            // One dec_term loop when the plain text is complete. Compressed
-            // chunks stay at one tag so inflate can refill the buffer.
-            let tags = if self.compressed && !self.inflate_done {
-                1
-            } else {
-                byte_budget.saturating_sub(consumed).max(1)
-            };
-            let (parsed, after) = {
-                let bytes = if self.compressed {
-                    self.plain
-                        .as_deref()
-                        .expect("compressed input has an inflate buffer")
-                } else {
-                    &self.input.bytes()[1..]
-                };
-                let mut reader = Reader::new(bytes, before);
-                let parsed = parse_step(
-                    &mut reader,
-                    &mut self.stack,
-                    self.safe,
-                    None,
-                    None::<&mut Ctx<'_, crate::ProcessHeapHandle<'_>>>,
-                    tags,
-                    !self.compressed || self.inflate_done,
-                );
-                (parsed, reader.at)
-            };
-            self.validator_at = after;
-            match parsed {
-                Ok(Some((_, checked))) => {
-                    consumed += self.validator_at - before;
-                    if self.compressed && !self.inflate_done {
-                        self.checked_root = Some(checked);
-                        let produced = self
-                            .inflate_more(byte_budget.saturating_sub(consumed))
-                            .map_err(|error| (error, consumed))?;
-                        consumed += produced.max(1);
-                        continue;
-                    }
-                    if self.compressed && checked != self.plain_bytes().len() {
-                        return Err((BifError::BADARG, consumed));
-                    }
-                    return Ok((Some(checked), consumed));
-                }
-                Ok(None) => consumed += self.validator_at - before,
-                Err(BifError::Unsupported("incomplete ETF input")) => {
-                    self.validator_at = before;
-                    if !self.compressed || self.inflate_done {
-                        return Err((BifError::BADARG, consumed));
-                    }
-                    let produced = self
-                        .inflate_more(byte_budget.saturating_sub(consumed))
-                        .map_err(|error| (error, consumed))?;
-                    consumed += produced.max(1);
-                }
-                Err(error) => return Err((error, consumed + self.validator_at - before)),
+            if consumed >= budget {
+                break;
+            }
+            if self.compressed && (self.input_offset, self.plain_bytes().len()) == before {
+                return Err((BifError::BADARG, consumed));
             }
         }
         Ok((None, consumed))
     }
 
-    /// Parse and build a bounded prefix into the supplied live process heap.
-    ///
-    /// A failure undoes everything built since the first slice, as `erts_factory_undo` does
-    /// when `binary_to_term_int` fails.
-    pub fn step_into(
-        &mut self,
-        byte_budget: usize,
-        ctx: &mut Ctx<'_>,
-    ) -> Result<(Option<Term>, usize), (BifError, usize)> {
-        let result = self.step_into_slice(byte_budget, ctx);
-        if !matches!(result, Ok((None, _)))
-            && let Some(mark) = self.factory_mark.take()
-            && result.is_err()
-        {
-            ctx.heap.0.factory_undo(mark);
+    /// Undo what the decode built, as `erts_factory_undo` does when `binary_to_term_int`
+    /// fails; a no-op before the first decode slice.
+    // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1.
+    pub fn undo_factory(&mut self, heap: &mut ProcessHeap) {
+        self.reservation = None;
+        if let Some(mark) = self.factory_mark.take() {
+            heap.factory_undo(mark);
         }
-        result
     }
 
-    fn step_into_slice(
+    /// `B2TDecode`: `dec_term` with `budget` bytes of reductions into the process heap; the
+    /// result once the whole term was decoded.
+    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TDecodeInit..B2TDecode,
+    // dec_term), OTP-29.1.1.
+    pub fn decode_chunk(
         &mut self,
         byte_budget: usize,
         ctx: &mut Ctx<'_>,
     ) -> Result<(Option<Term>, usize), (BifError, usize)> {
-        let mut consumed = std::mem::take(&mut self.initial_work);
-        if consumed >= byte_budget.max(1) {
-            return Ok((None, consumed));
-        }
-        if !self.size_done {
-            let size_budget = byte_budget.max(1).saturating_sub(consumed).max(1);
-            let (checked, size_work) = self.size_step(size_budget)?;
-            consumed += size_work;
-            let Some(_) = checked else {
-                return Ok((None, consumed));
-            };
-            self.begin_direct_decode();
-            if consumed >= byte_budget.max(1) {
-                return Ok((None, consumed));
-            }
-        }
-        if !self.decode_started {
-            self.begin_direct_decode();
-        }
+        let consumed = 0;
         let Some(heap_words) = self.heap_words else {
             return Err((BifError::BADARG, consumed));
         };
@@ -4995,7 +4769,7 @@ impl<'a> DecodeWalk<'a> {
                     .map_err(|error| (map_term_build_error(error), consumed))?
             }
         };
-        let budget = byte_budget.max(1).saturating_sub(consumed);
+        let budget = byte_budget.max(1);
         let before = self.decode_at;
         let (parsed, after) = reservation
             .with_words(|reserved_words| {
@@ -5054,8 +4828,7 @@ impl<'a> DecodeWalk<'a> {
             }
             Ok((None, decode_work)) => {
                 self.reservation = Some(reservation.suspend());
-                let consumed = consumed + decode_work;
-                Ok((None, consumed))
+                Ok((None, consumed + decode_work))
             }
             Err(error) => {
                 drop(reservation);
@@ -5066,77 +4839,6 @@ impl<'a> DecodeWalk<'a> {
                 Err((error, consumed + decoded))
             }
         }
-    }
-
-    fn begin_direct_decode(&mut self) {
-        self.decode_at = 0;
-        self.stack.clear();
-        self.decode_next = None;
-        self.decode_root = Term::NIL;
-        self.decode_root_started = false;
-        self.decode_maps.clear();
-        self.pending = None;
-        self.internal_nc = false;
-        self.decode_started = true;
-    }
-
-    fn size_step(
-        &mut self,
-        byte_budget: usize,
-    ) -> Result<(Option<usize>, usize), (BifError, usize)> {
-        let mut consumed = 0;
-        // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TUncompressChunk to
-        // B2TSizeInit), OTP-29.1.1: finish inflation before entering `decoded_size`.
-        while self.compressed && !self.inflate_done && consumed < byte_budget {
-            let produced = self
-                .inflate_more(byte_budget.saturating_sub(consumed))
-                .map_err(|error| (error, consumed))?;
-            consumed += produced.max(1);
-            if produced == 0 && !self.inflate_done {
-                return Err((BifError::BADARG, consumed));
-            }
-        }
-        if self.compressed && !self.inflate_done {
-            return Ok((None, consumed));
-        }
-        while consumed < byte_budget {
-            let before = (self.input_offset, self.plain_bytes().len());
-            let input_complete = !self.compressed || self.inflate_done;
-            let bytes = if self.compressed {
-                self.plain
-                    .as_deref()
-                    .expect("compressed input has an inflate buffer")
-            } else {
-                &self.input.bytes()[1..]
-            };
-            let scanned = self
-                .sizing
-                .step(
-                    bytes,
-                    byte_budget.saturating_sub(consumed),
-                    input_complete,
-                    local_term_hash,
-                )
-                .map_err(|error| (decode_size_error(error), consumed))?;
-            consumed += scanned.1;
-            if let Some((words, checked)) = scanned.0 {
-                if self.compressed
-                    && (checked != self.expected_plain || checked != self.plain_bytes().len())
-                {
-                    return Err((BifError::BADARG, consumed));
-                }
-                self.heap_words = Some(words);
-                self.size_done = true;
-                return Ok((Some(checked), consumed));
-            }
-            if consumed >= byte_budget {
-                break;
-            }
-            if self.compressed && (self.input_offset, self.plain_bytes().len()) == before {
-                return Err((BifError::BADARG, consumed));
-            }
-        }
-        Ok((None, consumed))
     }
 
     fn wrap_used(&self, ctx: &mut Ctx<'_>, term: Term, checked: usize) -> Result<Term, BifError> {
@@ -5151,18 +4853,6 @@ impl<'a> DecodeWalk<'a> {
         } else {
             Ok(term)
         }
-    }
-
-    /// Decode the validated prefix into the current process heap.
-    pub fn finish(&self, ctx: &mut Ctx<'_>, checked: usize) -> Result<Term, BifError> {
-        let (term, _) =
-            parse(&self.plain_bytes()[..checked], self.safe, Some(ctx)).map_err(decode_error)?;
-        self.wrap_used(ctx, term, checked)
-    }
-
-    /// Return the original ETF byte length for reduction accounting.
-    pub fn input_size(&self) -> usize {
-        self.input_size
     }
 }
 
@@ -5186,13 +4876,6 @@ fn compressed_uncompressed_size(input: &[u8]) -> Result<usize, BifError> {
         if decompressor.total_in() == consumed as u64 && decompressor.total_out() == before_out {
             return Err(BifError::BADARG);
         }
-    }
-}
-
-fn decode_error(error: BifError) -> BifError {
-    match error {
-        BifError::Unsupported(_) => BifError::BADARG,
-        other => other,
     }
 }
 

@@ -546,7 +546,10 @@ fn external_size(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
 }
 
 /// `B2T_BYTES_PER_REDUCTION`.
-const B2T_BYTES_PER_REDUCTION: usize = 128;
+const B2T_BYTES_PER_REDUCTION: i64 = 128;
+
+/// `B2T_MEMCPY_FACTOR`.
+const B2T_MEMCPY_FACTOR: i64 = 8;
 
 /// `sizeof(B2TContext)` on a 64-bit build (its decode union is the largest member): the magic
 /// binary's `orig_size`.
@@ -555,16 +558,49 @@ const ERTS_B2T_CONTEXT_SIZE: usize = 296;
 
 const BINARY_TO_TERM_TRAP: &str = "erts_internal:binary_to_term_trap/1";
 
-/// `B2TContext` of a trapped call: the decode (its `B2TUncompressChunk`..`B2TDecode*` state, the
-/// reserved heap block and the `PSTACK` of maps) plus `bif` and `arg[]`, the original call's
-/// number of arguments and arguments, which a failure reports.
-struct B2tContext {
-    walk: DecodeWalk<'static>,
+/// `B2TState` of external.c without `B2TDecodeFail` and `B2TBadArg`, which are `B2tExit::Fail`;
+/// the order matters: `state >= B2TDone` keeps the loop running.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum B2tState {
+    Prepare,
+    UncompressChunk,
+    SizeInit,
+    Size,
+    DecodeInit,
+    Decode,
+    Done,
+}
+
+/// `B2TContext`: the state, the decode (`b2ts` and the `u.uc`/`u.sc`/`u.dc` union live in the
+/// walk), the reductions left, `trap_bin` once exported, and `bif` and `arg[]`, the original
+/// call's number of arguments and arguments, which a failure reports.
+// Port of erts/emulator/beam/external.c (B2TContext), OTP-29.1.1.
+struct B2tContext<'a> {
+    state: B2tState,
+    walk: DecodeWalk<'a>,
+    reds: i64,
+    initial_reds: i64,
+    heap_size: usize,
+    result: Term,
+    trap_bin: Option<Term>,
     arity: usize,
     arg: [Term; 2],
 }
 
-type B2tHolder = Mutex<Option<B2tContext>>;
+type B2tHolder = Mutex<Option<B2tContext<'static>>>;
+
+/// Why `b2t_run` left the loop.
+enum B2tExit {
+    /// `B2TDone`.
+    Done,
+    /// `B2TBadArg` / `B2TDecodeFail`, with the error the phase reported.
+    Fail(BifError),
+    /// `ctx->reds <= 0` before `B2TDone`.
+    Yield,
+    /// `b2t_export_context` is wanted (`B2TPrepare` of compressed input, `B2TDecodeInit` that
+    /// will probably trap).
+    Export,
+}
 
 /// `erlang:binary_to_term/1`.
 // Port of erts/emulator/beam/external.c (binary_to_term_1), OTP-29.1.1.
@@ -586,9 +622,12 @@ fn b2t_error(
     process: &mut Process,
     args: &[Term],
     error: BifError,
-    consumed: usize,
+    consumed: i64,
 ) -> u64 {
-    charge(process, consumed / B2T_BYTES_PER_REDUCTION);
+    charge(
+        process,
+        (consumed / B2T_BYTES_PER_REDUCTION).max(0) as usize,
+    );
     // A decoder that cannot read the input is the input's fault.
     let error = match error {
         BifError::Unsupported(_) => BifError::BADARG,
@@ -602,10 +641,8 @@ fn b2t_error(
     bif_ret(c_p, i, Err(error))
 }
 
-/// The first call of `binary_to_term/1,2`: `binary_to_term_int` with a context on the stack,
-/// exported to a magic binary only when the decode traps.
-// Port of erts/emulator/beam/external.c (binary_to_term_1, binary_to_term_2,
-// binary_to_term_int), OTP-29.1.1.
+/// `binary_to_term_1/2`: the context on the stack, then `binary_to_term_int`.
+// Port of erts/emulator/beam/external.c (binary_to_term_1, binary_to_term_2), OTP-29.1.1.
 fn binary_to_term_start(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -613,69 +650,33 @@ fn binary_to_term_start(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
     process.heap.note_bif_entry();
     let call_args = [process.x[0], process.x[1]];
     let args = &call_args[..arity];
-    // `ERTS_BIF_REDS_LEFT(p) * B2T_BYTES_PER_REDUCTION`.
-    let reds = process.heap.abi.fcalls.max(0) as usize;
-    let initial_reds = reds.saturating_mul(B2T_BYTES_PER_REDUCTION);
-    let local_node = arinsal_term::this_node();
-    let mut prepared = None;
-    match DecodeWalk::decode_small(
-        args,
-        &mut process.heap,
-        Some(local_node),
-        initial_reds,
-        &mut prepared,
-    ) {
-        Ok(Some((value, consumed))) => {
-            charge(process, consumed / B2T_BYTES_PER_REDUCTION);
-            return crate::native_hooks::raw(value);
+    let walk = match DecodeWalk::new(args) {
+        Ok(mut walk) => {
+            // `dec_is_this_node`.
+            let local_node = arinsal_term::this_node();
+            walk.set_local_node(local_node.0, local_node.1);
+            walk
         }
-        Ok(None) => {}
-        Err((error, consumed)) => return b2t_error(c_p, i, process, args, error, consumed),
-    }
-    let mut walk = match prepared {
-        Some(walk) => walk,
-        None => match DecodeWalk::new(args) {
-            Ok(mut walk) => {
-                // `dec_is_this_node`.
-                walk.set_local_node(local_node.0, local_node.1);
-                walk
-            }
-            Err(error) => return b2t_error(c_p, i, process, args, error, 0),
-        },
+        Err(error) => return b2t_error(c_p, i, process, args, error, 0),
     };
-    match b2t_step(process, &mut walk, initial_reds) {
-        Ok((None, _)) => {
-            // `b2t_export_context`, then `erts_set_gc_state(p, 0)`.
-            let walk = match walk.into_owned() {
-                Ok(walk) => walk,
-                Err(error) => return b2t_error(c_p, i, process, args, error, 0),
-            };
-            let mut arg = [Term::NIL; 2];
-            arg[..arity].copy_from_slice(args);
-            let context = B2tContext { walk, arity, arg };
-            let Some(mref) = create_holder(
-                process,
-                B2tHolder::new(Some(context)),
-                ERTS_B2T_CONTEXT_SIZE,
-            ) else {
-                return b2t_error(c_p, i, process, args, BifError::SystemLimit, 0);
-            };
-            // BUMP_ALL_REDS(p), then BIF_TRAP1(&binary_to_term_trap_export, p, trap_bin).
-            process.heap.abi.fcalls = 0;
-            let trap = bif_trap(process, BINARY_TO_TERM_TRAP, vec![mref]);
-            bif_ret(c_p, i, Err(trap))
-        }
-        Ok((Some(value), consumed)) => {
-            charge(process, consumed / B2T_BYTES_PER_REDUCTION);
-            crate::native_hooks::raw(value)
-        }
-        Err((error, consumed)) => b2t_error(c_p, i, process, args, error, consumed),
-    }
+    let mut arg = [Term::NIL; 2];
+    arg[..arity].copy_from_slice(args);
+    let ctx = B2tContext {
+        state: B2tState::Prepare,
+        walk,
+        reds: 0,
+        initial_reds: 0,
+        heap_size: 0,
+        result: Term::NIL,
+        trap_bin: None,
+        arity,
+        arg,
+    };
+    binary_to_term_int(c_p, i, process, ctx)
 }
 
 /// `erts_internal:binary_to_term_trap/1`.
-// Port of erts/emulator/beam/external.c (binary_to_term_trap_1, binary_to_term_int with a
-// B2TContext taken from the magic binary), OTP-29.1.1.
+// Port of erts/emulator/beam/external.c (binary_to_term_trap_1), OTP-29.1.1.
 pub(crate) extern "C" fn binary_to_term_trap_1(
     c_p: *mut ProcessHeader,
     _reg: *mut u64,
@@ -689,43 +690,213 @@ pub(crate) extern "C" fn binary_to_term_trap_1(
     let context = mref
         .with_magic_payload::<B2tHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
-    let Some(mut context) = context else {
+    let Some(ctx) = context else {
         return bif_ret(c_p, i, Err(badarg()));
     };
-    let initial_reds =
-        (process.heap.abi.fcalls.max(0) as usize).saturating_mul(B2T_BYTES_PER_REDUCTION);
-    match b2t_step(process, &mut context.walk, initial_reds) {
-        Ok((None, _)) => {
-            // The context stays in its magic binary: BUMP_ALL_REDS, BIF_TRAP1 with the same ref.
+    binary_to_term_int(c_p, i, process, ctx)
+}
+
+/// `binary_to_term_int`: the B2T state machine with `ERTS_BIF_REDS_LEFT * 128` bytes of
+/// budget; it traps through `erts_internal:binary_to_term_trap/1` when that runs out.
+// Port of erts/emulator/beam/external.c (binary_to_term_int), OTP-29.1.1.
+fn binary_to_term_int(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut Process,
+    mut ctx: B2tContext<'_>,
+) -> u64 {
+    // ERTS_BIF_REDS_LEFT(p) * B2T_BYTES_PER_REDUCTION.
+    ctx.initial_reds = process.heap.abi.fcalls.max(0) as i64 * B2T_BYTES_PER_REDUCTION;
+    ctx.reds = ctx.initial_reds;
+    match b2t_run(process, &mut ctx) {
+        B2tExit::Export => {
+            // `b2t_export_context`: the rest of the call runs on the exported context.
+            let mut owned = match b2t_export_context(process, ctx) {
+                Ok(owned) => owned,
+                Err((args, error)) => return b2t_error(c_p, i, process, &args, error, 0),
+            };
+            let exit = b2t_run(process, &mut owned);
+            b2t_exit(c_p, i, process, owned, exit)
+        }
+        exit => b2t_exit(c_p, i, process, ctx, exit),
+    }
+}
+
+/// What `binary_to_term_int` does after its loop: the result, the BADARG or the trap.
+fn b2t_exit(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut Process,
+    mut ctx: B2tContext<'_>,
+    exit: B2tExit,
+) -> u64 {
+    match exit {
+        B2tExit::Done => {
+            // erts_set_gc_state(p, 1) when a magic binary disabled it; BUMP_REDS.
+            if ctx.trap_bin.is_some() {
+                gc_enable(process);
+            }
+            charge(
+                process,
+                ((ctx.initial_reds - ctx.reds) / B2T_BYTES_PER_REDUCTION).max(0) as usize,
+            );
+            crate::native_hooks::raw(ctx.result)
+        }
+        B2tExit::Fail(error) => {
+            ctx.walk.undo_factory(&mut process.heap);
+            if ctx.trap_bin.is_some() {
+                gc_enable(process);
+            }
+            let consumed = ctx.initial_reds - ctx.reds;
+            let (arity, arg) = (ctx.arity, ctx.arg);
+            b2t_error(c_p, i, process, &arg[..arity], error, consumed)
+        }
+        B2tExit::Yield | B2tExit::Export => {
+            // The context is in a magic binary by now (`B2TDecode*`) or is exported here
+            // (`ASSERT(ctx->state < B2TDecode)`), then BUMP_ALL_REDS and BIF_TRAP1.
+            let ctx = match b2t_export_context(process, ctx) {
+                Ok(owned) => owned,
+                Err((args, error)) => return b2t_error(c_p, i, process, &args, error, 0),
+            };
+            let mref = ctx.trap_bin.expect("exported context has a trap_bin");
             let _ = mref.with_magic_payload::<B2tHolder, _>(|holder| {
-                *holder.lock().expect("binary_to_term context") = Some(context);
+                *holder.lock().expect("binary_to_term context") = Some(ctx);
             });
             process.heap.abi.fcalls = 0;
             let trap = bif_trap(process, BINARY_TO_TERM_TRAP, vec![mref]);
             bif_ret(c_p, i, Err(trap))
         }
-        Ok((Some(value), consumed)) => {
-            // erts_set_gc_state(p, 1), BUMP_REDS.
-            gc_enable(process);
-            charge(process, consumed / B2T_BYTES_PER_REDUCTION);
-            crate::native_hooks::raw(value)
-        }
-        Err((error, consumed)) => {
-            gc_enable(process);
-            let args = context.arg;
-            b2t_error(c_p, i, process, &args[..context.arity], error, consumed)
-        }
     }
 }
 
-/// One `dec_term` slice of `binary_to_term_int` with `reds` bytes of budget.
-fn b2t_step(
+/// `b2t_export_context`: the context moves into a new magic binary (owned input, so nothing
+/// borrows the caller's argument) and `trap_bin` names it; a context that has one keeps it.
+// Port of erts/emulator/beam/external.c (b2t_export_context), OTP-29.1.1.
+#[allow(clippy::result_large_err)]
+fn b2t_export_context(
     process: &mut Process,
-    walk: &mut DecodeWalk<'_>,
-    reds: usize,
-) -> Result<(Option<Term>, usize), (BifError, usize)> {
-    let mut heap = ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    walk.step_into(reds, &mut ctx)
+    ctx: B2tContext<'_>,
+) -> Result<B2tContext<'static>, ([Term; 2], BifError)> {
+    let B2tContext {
+        state,
+        walk,
+        reds,
+        initial_reds,
+        heap_size,
+        result,
+        trap_bin,
+        arity,
+        arg,
+    } = ctx;
+    let walk = walk.into_owned().map_err(|error| (arg, error))?;
+    let trap_bin = match trap_bin {
+        Some(trap_bin) => trap_bin,
+        None => create_holder(process, B2tHolder::new(None), ERTS_B2T_CONTEXT_SIZE)
+            .ok_or((arg, BifError::SystemLimit))?,
+    };
+    Ok(B2tContext {
+        state,
+        walk,
+        reds,
+        initial_reds,
+        heap_size,
+        result,
+        trap_bin: Some(trap_bin),
+        arity,
+        arg,
+    })
+}
+
+/// The `do { switch (ctx->state) ... } while (ctx->reds > 0 || ctx->state >= B2TDone)` loop.
+// Port of erts/emulator/beam/external.c (binary_to_term_int), OTP-29.1.1.
+fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
+    loop {
+        match ctx.state {
+            B2tState::Prepare => {
+                // binary2term_prepare: compressed input exports the context first.
+                ctx.reds -= ctx.walk.prepare_reds_charge() as i64;
+                if ctx.walk.is_compressed() {
+                    ctx.state = B2tState::UncompressChunk;
+                    if ctx.trap_bin.is_none() {
+                        return B2tExit::Export;
+                    }
+                } else {
+                    ctx.state = B2tState::SizeInit;
+                }
+            }
+            B2tState::UncompressChunk => {
+                match ctx.walk.uncompress_chunk(ctx.reds.max(1) as usize) {
+                    Ok((done, consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        if done {
+                            ctx.state = B2tState::SizeInit;
+                        } else {
+                            ctx.reds = 0;
+                        }
+                    }
+                    Err((error, consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        return B2tExit::Fail(error);
+                    }
+                }
+            }
+            B2tState::SizeInit | B2tState::Size => {
+                ctx.state = B2tState::Size;
+                match ctx.walk.size_chunk(ctx.reds.max(1) as usize) {
+                    Ok((Some(words), consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        ctx.heap_size = words;
+                        ctx.state = B2tState::DecodeInit;
+                    }
+                    Ok((None, consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        ctx.reds = 0;
+                    }
+                    Err((error, consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        return B2tExit::Fail(error);
+                    }
+                }
+            }
+            B2tState::DecodeInit => {
+                if ctx.trap_bin.is_none() {
+                    if ctx.walk.extsize() as i64 > ctx.reds {
+                        // dec_term will maybe trap: the magic binary is allocated before the
+                        // factory so the result term can be trimmed with HRelease.
+                        return B2tExit::Export;
+                    }
+                    // We will probably not trap: artificially increase the available
+                    // reductions (GH-11404).
+                    let consumed = ctx.initial_reds - ctx.reds;
+                    ctx.reds = i32::MAX as i64 / B2T_MEMCPY_FACTOR;
+                    ctx.initial_reds = ctx.reds + consumed;
+                }
+                ctx.state = B2tState::Decode;
+            }
+            B2tState::Decode => {
+                let mut heap = ProcessHeapHandle(&mut process.heap);
+                let mut bif_state = arinsal_bifs::BifState::default();
+                let mut dctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
+                match ctx.walk.decode_chunk(ctx.reds.max(1) as usize, &mut dctx) {
+                    Ok((Some(value), consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        ctx.result = value;
+                        ctx.state = B2tState::Done;
+                    }
+                    Ok((None, consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        ctx.reds = 0;
+                    }
+                    Err((error, consumed)) => {
+                        ctx.reds -= consumed as i64;
+                        return B2tExit::Fail(error);
+                    }
+                }
+            }
+            B2tState::Done => return B2tExit::Done,
+        }
+        if !(ctx.reds > 0 || ctx.state >= B2tState::Done) {
+            return B2tExit::Yield;
+        }
+    }
 }
