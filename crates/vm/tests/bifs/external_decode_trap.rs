@@ -106,14 +106,11 @@ fn binary_to_term_matches_otp_on_big_inputs() {
             (e_reds - a_reds).abs() <= e_reds / 50 + 10,
             "case {index}: reductions erl {e_reds} arinsal {a_reds}"
         );
-        // Schedule-ins: erl takes one more `in` than Arinsal in the multi-slice cases (not
-        // explained yet); never fewer.
+        // Schedule-ins are exact: the `!` of the result yields as in erts and the
+        // `trace_delivered` reply goes through the system message dispatcher.
         let (OwnedTerm::Int(e_in), OwnedTerm::Int(a_in)) = (&e[2], &a[2]) else {
             panic!("case {index}: schedule-ins");
         };
-        assert!(
-            (0..=1).contains(&(e_in - a_in)),
-            "case {index}: schedule-ins erl {e_in} arinsal {a_in}"
-        );
+        assert_eq!(e_in, a_in, "case {index}: schedule-ins");
     }
 }

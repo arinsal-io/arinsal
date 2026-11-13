@@ -3,7 +3,7 @@
 //! Port of erts/emulator/beam/erl_trace.c (`enqueue_sys_msg`, `sys_msg_dispatcher_func`,
 //! `sys_msg_disp_failure`, `erts_queue_error_logger_message`), OTP-29.1.1. Producers queue
 //! system messages (`system_monitor`, `system_profile` and logger events); one dispatcher
-//! thread delivers them in order. `SYS_MSG_TYPE_PROC_MSG` has no sender in Arinsal.
+//! thread delivers them in order. `SYS_MSG_TYPE_PROC_MSG` is sent by `erts_send_sys_msg_proc`.
 
 use crate::Process;
 use crate::natives::sys::{print_otp_term, reset_system_logger};
@@ -17,6 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 /// `SYS_MSG_TYPE_*`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SysMsgType {
+    ProcMsg,
     Sysmon,
     Sysprof,
     Errlgr,
@@ -84,6 +85,25 @@ pub(crate) fn enqueue_sys_msg(ty: SysMsgType, from: Option<Pid>, to: Term, msg: 
         .unwrap_or_else(|poison| poison.into_inner())
         .push_back(SysMsgQ { ty, from, to, msg });
     smq.cnd.notify_one();
+}
+
+/// Port of erl_trace.c `erts_send_sys_msg_proc`: `SYS_MSG_TYPE_PROC_MSG` to a pid, delivered by
+/// the dispatcher thread.
+pub(crate) fn send_sys_msg_proc(runtime: &'static Runtime, from: Pid, to: Pid, msg: Message) {
+    let Ok(scheduler) = runtime.scheduler() else {
+        return;
+    };
+    let Some(to) = to.to_term() else {
+        return;
+    };
+    enqueue_sys_msg(
+        SysMsgType::ProcMsg,
+        scheduler,
+        Some(runtime),
+        Some(from),
+        to,
+        msg,
+    );
 }
 
 /// Port of erl_trace.c `erts_queue_error_logger_message`: queued to the system logger
@@ -164,6 +184,8 @@ fn dispatch(smqp: SysMsgQ, node: &NodeHandle) {
 // Port of erl_trace.c `sys_msg_disp_failure`.
 fn disp_failure(smqp: &SysMsgQ, receiver: Term, node: &NodeHandle) {
     match smqp.ty {
+        // sys_msg_disp_failure has no PROC_MSG case: a dead receiver drops the message.
+        SysMsgType::ProcMsg => {}
         SysMsgType::Sysmon => {
             if let Some(pid) = Pid::from_term(receiver) {
                 crate::natives::erts_debug::system_monitor_clear_receiver(node.runtime, pid);
