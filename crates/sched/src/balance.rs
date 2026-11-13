@@ -210,9 +210,8 @@ impl FullRedsHistory {
 }
 
 /// Port of erts/emulator/beam/erl_process.c:304-322 (`balance_info` fields guarded by
-/// `update_mtx` or `checking_balance`), OTP-29.1.1.
+/// `update_mtx`), OTP-29.1.1.
 struct BalanceState {
-    halftime: bool,
     forced_check_balance: bool,
     last_active_runqs: usize,
     prev_rise: PrevRise,
@@ -220,11 +219,16 @@ struct BalanceState {
     /// `rq->full_reds_history` and `rq->full_reds_history_sum`; only check_balance
     /// touches them.
     history: Vec<FullRedsHistory>,
+    /// Startup-sized `run_queue_info` workspace from `erl_process.c`.
+    run_queue_info: Vec<QueueBalance>,
+    /// Startup-sized `run_queue_compare` workspace from `erl_process.c`.
+    run_queue_compare: Vec<(usize, i64)>,
 }
 
 /// One run queue's balance statistics as read by check_balance.
 ///
 /// Port of erts/emulator/beam/erl_process.c:4685 (`ErtsRunQueueBalance`), OTP-29.1.1.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Sample {
     pub(crate) flags: u32,
@@ -273,6 +277,7 @@ pub(crate) struct Balance<T: Task> {
     /// The run queues, each with its balance statistics (`ErtsRunQueue`).
     pub(crate) rqs: Arc<[ProcQueues<T>]>,
     checking_balance: AtomicBool,
+    halftime: AtomicBool,
     state: Mutex<BalanceState>,
     /// Completed balance checks (`balance_info.n`).
     n: AtomicU64,
@@ -288,8 +293,9 @@ pub(crate) struct Balance<T: Task> {
 }
 
 impl<T: Task> Balance<T> {
-    /// Port of erts/emulator/beam/erl_process.c:6330-6343 (balance_info initialization)
-    /// and erl_process.c:4797 (init_migration_paths), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_process.c:6201-6207 (run_queue_info/run_queue_compare
+    /// preallocation), 6330-6343 (balance_info initialization), and 4797 (init_migration_paths),
+    /// OTP-29.1.1.
     pub(crate) fn new(
         schedulers: usize,
         online: usize,
@@ -299,13 +305,15 @@ impl<T: Task> Balance<T> {
         Self {
             rqs: (0..schedulers).map(|_| ProcQueues::new()).collect(),
             checking_balance: AtomicBool::new(false),
+            halftime: AtomicBool::new(true),
             state: Mutex::new(BalanceState {
-                halftime: true,
                 forced_check_balance: false,
                 last_active_runqs: schedulers,
                 prev_rise: PrevRise::default(),
                 full_reds_history_index: 0,
                 history: vec![FullRedsHistory::new(); schedulers],
+                run_queue_info: vec![QueueBalance::default(); schedulers],
+                run_queue_compare: vec![(0, 0); schedulers],
             }),
             n: AtomicU64::new(0),
             no_active_runqs: AtomicUsize::new(online),
@@ -479,9 +487,7 @@ impl<T: Task> Balance<T> {
             self.checking_balance.store(false, Ordering::Release);
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        if state.halftime {
-            state.halftime = false;
+        if self.halftime.swap(false, Ordering::AcqRel) {
             self.checking_balance.store(false, Ordering::Release);
             for rq in self.rqs.iter() {
                 if rq.waiting.load(Ordering::Acquire) {
@@ -496,6 +502,7 @@ impl<T: Task> Balance<T> {
             }
             return;
         }
+        let mut state = self.state.lock().unwrap();
         let forced = std::mem::take(&mut state.forced_check_balance);
         let (current_active, blnc_no_rqs) = self.no_runqs();
         if blnc_no_rqs == 1 {
@@ -508,25 +515,27 @@ impl<T: Task> Balance<T> {
         }
         let blnc_no_rqs = blnc_no_rqs.min(self.rqs.len());
         // Read balance information for all run queues.
-        let samples: Vec<Sample> = self.rqs[..blnc_no_rqs]
-            .iter()
-            .map(|rq| {
-                rq.check_balance_reds.store(i64::MAX, Ordering::Relaxed);
-                Sample {
-                    flags: rq.flags.load(Ordering::Acquire),
-                    max_len: std::array::from_fn(|p| {
-                        i64::from(rq.max_len[p].load(Ordering::Relaxed))
-                    }),
-                    reds: std::array::from_fn(|p| rq.reds[p].load(Ordering::Relaxed)),
-                    total_max_len: i64::from(rq.total_max_len.load(Ordering::Relaxed)),
-                }
-            })
-            .collect();
+        let freds_hist_ix = state.full_reds_history_index;
+        for qix in 0..blnc_no_rqs {
+            let rq = &self.rqs[qix];
+            let _queue = rq.lock();
+            let full_reds_history_sum = state.history[qix].sum;
+            let full_reds_history_change = state.history[qix].entries[freds_hist_ix];
+            let info = &mut state.run_queue_info[qix];
+            info.flags = rq.flags.load(Ordering::Acquire);
+            for pix in 0..PRIO_LEVELS {
+                info.prio[pix].max_len = i64::from(rq.max_len[pix].load(Ordering::Relaxed));
+                info.prio[pix].reds = rq.reds[pix].load(Ordering::Relaxed);
+            }
+            info.full_reds_history_sum = full_reds_history_sum;
+            info.full_reds_history_change = full_reds_history_change;
+            info.max_len = i64::from(rq.total_max_len.load(Ordering::Relaxed));
+            rq.check_balance_reds.store(i64::MAX, Ordering::Relaxed);
+        }
         let mut active = current_active;
         self.paths.publish_with(|paths, old| {
             let plan = plan(
                 &mut state,
-                &samples,
                 current_active,
                 forced,
                 self.compact_load,
@@ -537,10 +546,15 @@ impl<T: Task> Balance<T> {
         });
         state.last_active_runqs = active;
         self.set_no_active_runqs(active);
-        state.halftime = true;
+        self.halftime.store(true, Ordering::Release);
         // Keep offline run queues as is.
         // Reset balance statistics in all online queues.
-        for (qix, rq) in self.rqs[..blnc_no_rqs].iter().enumerate() {
+        for qix in 0..blnc_no_rqs {
+            let rq = &self.rqs[qix];
+            let _queue = rq.lock();
+            state.history[qix].sum = state.run_queue_info[qix].full_reds_history_sum;
+            state.history[qix].entries[freds_hist_ix] =
+                state.run_queue_info[qix].full_reds_history_change;
             let mut flags = self.paths.with_path(qix, |path| path.flags).unwrap_or(0);
             if rq.waiting.load(Ordering::Acquire) {
                 flags |= FLG_OUT_OF_WORK;
@@ -582,36 +596,18 @@ impl<T: Task> Drop for Balance<T> {
 /// Port of erts/emulator/beam/erl_process.c:4962-5395 (check_balance), OTP-29.1.1.
 fn plan(
     state: &mut BalanceState,
-    samples: &[Sample],
     current_active: usize,
     forced: bool,
     compact_load: bool,
     paths: &mut [MigrationPath],
 ) -> Plan {
-    let blnc_no_rqs = samples.len();
-    let freds_hist_ix = state.full_reds_history_index;
+    let info = &mut state.run_queue_info[..paths.len()];
+    let compare = &mut state.run_queue_compare[..paths.len()];
+    let blnc_no_rqs = info.len();
     state.full_reds_history_index += 1;
     if state.full_reds_history_index >= FULL_REDS_HISTORY_SIZE {
         state.full_reds_history_index = 0;
     }
-    let mut info: Vec<QueueBalance> = samples
-        .iter()
-        .enumerate()
-        .map(|(qix, sample)| {
-            let mut queue = QueueBalance {
-                flags: sample.flags,
-                full_reds_history_sum: state.history[qix].sum,
-                full_reds_history_change: state.history[qix].entries[freds_hist_ix],
-                max_len: sample.total_max_len,
-                ..QueueBalance::default()
-            };
-            for pix in 0..PRIO_LEVELS {
-                queue.prio[pix].max_len = sample.max_len[pix];
-                queue.prio[pix].reds = sample.reds[pix];
-            }
-            queue
-        })
-        .collect();
     // Port of erts/emulator/beam/erl_process.c:4756 (ERTS_UPDATE_FULL_REDS), OTP-29.1.1.
     let update_full_reds = |queue: &mut QueueBalance, last_reds: i64| {
         queue.full_reds = (queue.full_reds_history_sum + last_reds) >> FULL_REDS_HISTORY_AVG_SHFT;
@@ -627,7 +623,7 @@ fn plan(
     let mut mmax_len = 0_i64;
 
     // Calculate availability for each priority in each run queue.
-    for queue in &mut info {
+    for queue in info.iter_mut() {
         let mut treds = 0_i64;
         if queue.flags & FLG_OUT_OF_WORK != 0 {
             for prio in &mut queue.prio {
@@ -736,7 +732,7 @@ fn plan(
     if all_active {
         active = blnc_no_rqs;
         let mut avg = [(0_i64, 0_i64); PRIO_LEVELS];
-        for queue in &mut info {
+        for queue in info.iter_mut() {
             if full_scheds_reds > 0 && queue.flags & FLG_OUT_OF_WORK == 0 {
                 // Calculate availability compared to other schedulers.
                 let tmp = queue.full_reds * full_scheds;
@@ -758,7 +754,7 @@ fn plan(
             }
         }
         // Calculate migration limits for all priority queues in all run queues.
-        for queue in &mut info {
+        for queue in info.iter_mut() {
             queue.flags = 0;
             for (pix, prio) in queue.prio.iter_mut().enumerate() {
                 prio.migration_limit = if avg[pix].0 == 0 || prio.avail == 0 {
@@ -770,11 +766,11 @@ fn plan(
         }
         // Setup migration paths for all priorities.
         for pix in 0..PRIO_LEVELS {
-            setup_migration_paths(&mut info, pix);
+            setup_migration_paths(info, pix, compare);
         }
     }
 
-    for (path, queue) in paths.iter_mut().zip(&info) {
+    for (path, queue) in paths.iter_mut().zip(info.iter()) {
         let flags = queue.flags;
         *path = MigrationPath {
             flags,
@@ -799,10 +795,6 @@ fn plan(
             }
         }
     }
-    for (history, queue) in state.history.iter_mut().zip(&info) {
-        history.sum = queue.full_reds_history_sum;
-        history.entries[freds_hist_ix] = queue.full_reds_history_change;
-    }
     Plan { active }
 }
 
@@ -812,28 +804,24 @@ fn limit(value: i64) -> i32 {
 
 /// Port of erts/emulator/beam/erl_process.c:5222-5357 (check_balance migration path
 /// setup for one priority), OTP-29.1.1.
-fn setup_migration_paths(info: &mut [QueueBalance], pix: usize) {
+fn setup_migration_paths(info: &mut [QueueBalance], pix: usize, compare: &mut [(usize, i64)]) {
     let blnc_no_rqs = info.len();
     let mut low = 0;
     let mut high = 0;
-    let mut compare: Vec<(usize, i64)> = info
-        .iter()
-        .enumerate()
-        .map(|(qix, queue)| {
-            let len_diff = queue.prio[pix].max_len - queue.prio[pix].migration_limit;
-            if len_diff < 0 {
-                low += 1;
-            } else if len_diff > 0 {
-                high += 1;
-            }
-            (qix, len_diff)
-        })
-        .collect();
+    for (qix, queue) in info.iter().enumerate() {
+        let len_diff = queue.prio[pix].max_len - queue.prio[pix].migration_limit;
+        if len_diff < 0 {
+            low += 1;
+        } else if len_diff > 0 {
+            high += 1;
+        }
+        compare[qix] = (qix, len_diff);
+    }
     if low == 0 || high == 0 {
         return;
     }
     // qsort is not stable; any order of equal lengths is a valid erts outcome.
-    compare.sort_by_key(|&(_, len)| len);
+    compare.sort_unstable_by_key(|&(_, len)| len);
     let mut tix = 0_usize;
     let mut fix = blnc_no_rqs as isize - 1;
     let mut eof = false;
@@ -913,6 +901,7 @@ fn setup_migration_paths(info: &mut [QueueBalance], pix: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use similar_asserts::assert_eq;
 
     fn test_progress() -> Arc<crate::thr_progress::ThrProgress> {
         Arc::new(crate::thr_progress::ThrProgress::new(
@@ -936,12 +925,13 @@ mod tests {
 
     fn state(schedulers: usize) -> BalanceState {
         BalanceState {
-            halftime: false,
             forced_check_balance: false,
             last_active_runqs: schedulers,
             prev_rise: PrevRise::default(),
             full_reds_history_index: 0,
             history: vec![FullRedsHistory::new(); schedulers],
+            run_queue_info: vec![QueueBalance::default(); schedulers],
+            run_queue_compare: vec![(0, 0); schedulers],
         }
     }
 
@@ -962,14 +952,21 @@ mod tests {
         compact_load: bool,
     ) -> (Plan, Vec<MigrationPath>) {
         let mut paths = vec![MigrationPath::NONE; samples.len()];
-        let plan = plan(
-            state,
-            samples,
-            current_active,
-            forced,
-            compact_load,
-            &mut paths,
-        );
+        for (qix, sample) in samples.iter().enumerate() {
+            let mut queue = QueueBalance {
+                flags: sample.flags,
+                full_reds_history_sum: state.history[qix].sum,
+                full_reds_history_change: state.history[qix].entries[state.full_reds_history_index],
+                max_len: sample.total_max_len,
+                ..QueueBalance::default()
+            };
+            for pix in 0..PRIO_LEVELS {
+                queue.prio[pix].max_len = sample.max_len[pix];
+                queue.prio[pix].reds = sample.reds[pix];
+            }
+            state.run_queue_info[qix] = queue;
+        }
+        let plan = plan(state, current_active, forced, compact_load, &mut paths);
         (plan, paths)
     }
 
@@ -1062,6 +1059,27 @@ mod tests {
             balance.rqs[1].check_balance_reds.load(Ordering::Relaxed),
             CALL_CHECK_BALANCE_REDS
         );
+    }
+
+    #[test]
+    fn migration_paths_publish_only_after_the_full_pass() {
+        let balance = Balance::<IdleTask>::new(2, 2, true, test_progress());
+        for (rq, len) in balance.rqs.iter().zip([100, 10]) {
+            rq.add_len(PRIORITY_NORMAL, len);
+            rq.reductions_executed(PRIORITY_NORMAL, CHECK_BALANCE_REDS_PER_SCHED);
+        }
+        let before = balance.paths.snapshot();
+
+        balance.check_balance(0);
+        assert_eq!(balance.paths.snapshot(), before);
+        assert_eq!(balance.checks(), 0);
+
+        balance.check_balance(0);
+        let published = balance.paths.snapshot();
+        assert_ne!(published, before);
+        assert_ne!(published[0].flags & flg_emigrate(PRIORITY_NORMAL), 0);
+        assert_ne!(published[1].flags & flg_immigrate(PRIORITY_NORMAL), 0);
+        assert_eq!(balance.checks(), 1);
     }
 
     #[test]
