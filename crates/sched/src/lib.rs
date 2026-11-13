@@ -2616,9 +2616,16 @@ struct TimerService<M> {
     canceled: Arc<thr_queue::ThrQueue<CanceledTimer>>,
 }
 
+/// The cross-thread request queues of a scheduler's timer service; the service itself is
+/// created on the scheduler thread (erts_sched_init_time_sup).
+struct TimerServiceInit<M> {
+    commands: Arc<thr_queue::ThrQueue<TimerCommand<M>>>,
+    canceled: Arc<thr_queue::ThrQueue<CanceledTimer>>,
+}
+
 struct LocalInit<T: Task> {
     worker_id: usize,
-    timer_service: TimerService<T::Message>,
+    timer_service: TimerServiceInit<T::Message>,
     message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
@@ -2643,10 +2650,18 @@ struct LocalInit<T: Task> {
 }
 
 impl<T: Task> LocalInit<T> {
-    fn into_local(self) -> Local<T> {
+    /// Runs on the scheduler thread; `now` is its first clock read.
+    fn into_local(self, now: u64) -> Local<T> {
+        // Port of erts/emulator/beam/erl_process.c (sched_thread_func: erts_sched_init_time_sup
+        // creates the timer wheel and the timer service on the scheduler thread), OTP-29.1.1.
+        let timer_service = TimerService {
+            wheel: Wheel::new(now).for_worker(self.worker_id),
+            commands: self.timer_service.commands,
+            canceled: self.timer_service.canceled,
+        };
         Local {
             worker_id: self.worker_id,
-            timer_service: Rc::new(RefCell::new(self.timer_service)),
+            timer_service: Rc::new(RefCell::new(timer_service)),
             message_slabs: self.message_slabs,
             pending_waits: self.pending_waits,
             check_time_reds: self.check_time_reds,
@@ -4622,7 +4637,8 @@ impl<T: Task> Inner<T> {
                 // through AUX_WORK_TIMER_CMDS, which handle_local_aux_work serves; the queues
                 // are looked at directly only by the parking paths.
                 if (!force || (service.commands.is_empty() && service.canceled.is_empty()))
-                    && (!service.wheel.has_timers() || service.wheel.quiet_at(now))
+                    && !service.wheel.has_link_events()
+                    && now < service.wheel.next_timeout_time()
                 {
                     return;
                 }
@@ -4630,8 +4646,8 @@ impl<T: Task> Inner<T> {
             before_bump();
             let due = {
                 let mut service = local.timer_service.borrow_mut();
-                let due = if service.wheel.next_timeout().is_some_and(|next| now >= next) {
-                    service.wheel.advance(now)
+                let due = if now >= service.wheel.next_timeout_time() {
+                    service.wheel.bump_timers(now)
                 } else {
                     Vec::new()
                 };
@@ -4676,9 +4692,6 @@ impl<T: Task> Inner<T> {
                     deadline,
                     payload,
                 } => {
-                    if !service.wheel.has_timers() {
-                        let _ = service.wheel.advance(self.clock.now_ms());
-                    }
                     service.wheel.insert(id, deadline, payload);
                 }
                 TimerCommand::Read { id, callback } => {
@@ -4918,19 +4931,13 @@ impl<T: Task> Inner<T> {
         local: Option<&mut Local<T>>,
         ms: u64,
     ) -> Result<TimerRef, Error> {
-        let (now, deadline) = self.clock.timer_position(ms);
+        let (_, deadline) = self.clock.timer_position(ms);
         if let Some(local) = local.filter(|local| local.worker_id == worker) {
             let mut service = local.timer_service.borrow_mut();
-            if !service.wheel.has_timers() {
-                let _ = service.wheel.advance(now);
-            }
             service.wheel.insert(id, deadline, payload);
             self.apply_link_events(&mut service.wheel);
         } else if let Some(service) = self.owner_timer_service(worker) {
             let mut service = service.borrow_mut();
-            if !service.wheel.has_timers() {
-                let _ = service.wheel.advance(now);
-            }
             service.wheel.insert(id, deadline, payload);
             self.apply_link_events(&mut service.wheel);
         } else if let Some(queue) = self.timer_commands.get(worker) {
@@ -6834,8 +6841,7 @@ impl<T: Task> Scheduler<T> {
         for worker_id in 0..workers {
             locals.push(LocalInit {
                 worker_id,
-                timer_service: TimerService {
-                    wheel: Wheel::new(now).for_worker(worker_id),
+                timer_service: TimerServiceInit {
                     commands: timer_commands[worker_id].clone(),
                     canceled: canceled_timers[worker_id].clone(),
                 },
@@ -6933,7 +6939,10 @@ impl<T: Task> Scheduler<T> {
                     arinsal_alloc::ethr::ethr_thr_create(
                         Some(format!("erts_sched_{}", id + 1)),
                         Some(stack_size),
-                        move || worker_loop(inner, id, local.into_local()),
+                        move || {
+                            let now = inner.clock.now_ms();
+                            worker_loop(inner, id, local.into_local(now))
+                        },
                     )
                     .expect("spawn scheduler thread"),
                 );
@@ -9918,12 +9927,15 @@ fn schedule_next<T: Task>(
             inner.parked[id].store(false, Ordering::SeqCst);
             return None;
         }
-        let timer_ms = local
-            .timer_service
-            .borrow_mut()
-            .wheel
-            .next_timeout()
-            .map(|next| next.saturating_sub(inner.clock.now_ms()));
+        let timer_ms = {
+            let mut service = local.timer_service.borrow_mut();
+            service.wheel.has_timers().then(|| {
+                let next = service
+                    .wheel
+                    .check_next_timeout_time(|| inner.clock.now_ms());
+                next.saturating_sub(inner.clock.now_ms())
+            })
+        };
         local.set_wall_enabled(false);
         thr_progress::scheduler_prepare_wait();
         // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
@@ -10199,10 +10211,12 @@ fn schedule_next<T: Task>(
         if !service.commands.is_empty() || !service.canceled.is_empty() {
             Some(1_000_000)
         } else {
-            service
-                .wheel
-                .next_timeout()
-                .map(|next| inner.clock.ns_until_pos(next))
+            service.wheel.has_timers().then(|| {
+                let next = service
+                    .wheel
+                    .check_next_timeout_time(|| inner.clock.now_ms());
+                inner.clock.ns_until_pos(next)
+            })
         }
     };
     let wait_ns = match (
