@@ -957,19 +957,17 @@ impl Process {
         self.pass_markers_at_save();
     }
 
-    /// Removes the first message of a plain receive: no priority range, no receive marker, no
-    /// memory breakpoint and no seq_trace token to apply. `Ok(false)` means the general path
-    /// must run; nothing was changed then.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.h (erts_msgq_unlink_msg_set_save_first
-    // with the save pointer at the first message), OTP-29.1.1.
+    /// Removes the first message of a plain receive: no queued priority range, receive marker,
+    /// memory breakpoint or seq_trace token. Priority items alone do not exclude this path.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:2347 (erts_msgq_set_save_first), OTP-29.1.1.
     #[inline]
     pub(crate) fn remove_first_message(&mut self) -> Result<bool, VmError> {
         if !self.inbox.entries.save_is_first()
-            || self.cold.as_ref().is_some_and(|cold| {
-                cold.prio_q.is_some()
-                    || cold.receive_markers.is_some()
-                    || !cold.call_memory.is_empty()
-            })
+            || self.inbox.flags & FS_PRIO_MQ_END_MARK != 0
+            || self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| cold.receive_markers.is_some() || !cold.call_memory.is_empty())
             || !self
                 .inbox
                 .pop_front_untokened(&mut self.heap, self.seq_trace_token.is_some())?

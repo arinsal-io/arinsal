@@ -1424,6 +1424,8 @@ pub(crate) struct DistSpawnNoconnection {
     tag: OwnedTerm,
     /// ERTS_ML_FLG_SPAWN_ABANDONED or ERTS_ML_FLG_SPAWN_NO_EMSG: no message.
     quiet: bool,
+    /// The pending origin monitor held a priority item until this monitor-down signal.
+    monitor_priority: bool,
 }
 
 /// Tell the parents of the spawn requests of a lost connection: a live parent gets
@@ -1448,6 +1450,7 @@ fn notify_connection_spawn_requests(
                 id,
                 tag: request.tag.clone(),
                 quiet: request.abandoned || request.no_error_msg,
+                monitor_priority: request.monitor_priority,
             });
         // A parent that is gone needs nothing more.
         let _ = scheduler.signal(
@@ -1468,6 +1471,9 @@ pub(crate) fn spawn_noconnection_message(
     process: &mut Process,
     down: &DistSpawnNoconnection,
 ) -> Result<Option<Term>, VmError> {
+    if down.monitor_priority {
+        process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+    }
     if down.quiet {
         return Ok(None);
     }
@@ -1872,20 +1878,23 @@ fn dist_spawn_request(
         return Err(badarg());
     }
     let options = owned(args[2])?;
+    let option_terms = crate::signals::list(args[2]).ok_or_else(badarg)?;
     let kind = atom_name(args[3]).ok_or_else(badarg)?;
     let id = arinsal_bifs::next_ref_id();
     let reference = crate::signals::reference(process, id)?;
     let reference_owned = owned(reference)?;
     let mut tag = OwnedTerm::Atom("spawn_reply".into());
     let mut monitor = false;
+    let mut monitor_priority = false;
     let mut link = false;
+    let mut link_priority = false;
     let mut no_success_msg = false;
     let mut no_error_msg = false;
     let mut wire_opts = Vec::new();
     match &options {
         OwnedTerm::Nil => {}
         OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => {
-            for option in elems {
+            for (option, original) in elems.iter().zip(option_terms.iter().copied()) {
                 match option {
                     OwnedTerm::Atom(name) if name == "monitor" => {
                         monitor = true;
@@ -1925,12 +1934,23 @@ fn dist_spawn_request(
                         },
                         OwnedTerm::Atom(name) if name == "monitor" => {
                             monitor = true;
-                            wire_opts.push(option.clone());
+                            let (_, _, priority) = crate::signals::spawn_monitor_options(
+                                crate::natives::proc::tuple2(original).ok_or_else(badarg)?.1,
+                            )
+                            .ok_or_else(badarg)?;
+                            monitor_priority = priority;
+                            wire_opts.push(OwnedTerm::Atom("monitor".into()));
                         }
-                        // dist.c:5954 (`{link, Prio}`: ERTS_ML_FLG_SPAWN_LINK).
+                        // dist.c:5954-5956: `{link, Prio}` sets SPAWN_LINK and optionally
+                        // SPAWN_LINK_PRIO; the peer receives the normalized `link` option.
                         OwnedTerm::Atom(name) if name == "link" => {
+                            let priority = crate::natives::bif::erts_link_opts(
+                                crate::natives::proc::tuple2(original).ok_or_else(badarg)?.1,
+                            )
+                            .ok_or_else(badarg)?;
                             link = true;
-                            wire_opts.push(option.clone());
+                            link_priority |= priority;
+                            wire_opts.push(OwnedTerm::Atom("link".into()));
                         }
                         _ => wire_opts.push(option.clone()),
                     },
@@ -1972,10 +1992,12 @@ fn dist_spawn_request(
         caller: ctx.pid(),
         tag,
         monitor,
+        monitor_priority,
         no_success_msg,
         no_error_msg,
         abandoned: false,
         link,
+        link_priority,
         parent_exiting: false,
         child: None,
         waiter: None,
@@ -1984,6 +2006,9 @@ fn dist_spawn_request(
     // (erts_auto_connect, dist.c:3260); no reply can precede the connection, so the request is
     // registered right after that send in this case.
     let mut request = Some(request);
+    if monitor_priority {
+        process.prio_item_added(crate::receive::PrioItemType::Monitor);
+    }
     {
         let tables = node_tables::lock();
         if let Some(mut entry) = tables.entries.get(&node).map(|dep| dep.lock()) {
@@ -2003,12 +2028,28 @@ fn dist_spawn_request(
         control,
         Some(values[2].clone()),
     ) {
-        let tables = node_tables::lock();
-        if let Some(mut entry) = tables.entries.get(&node).map(|dep| dep.lock()) {
-            entry.pending_spawn_requests.remove(&id);
-            if let Some(state) = entry.dist.as_mut() {
-                state.spawn_requests.remove(&id);
-            }
+        let removed_priority_monitor = {
+            let tables = node_tables::lock();
+            tables.entries.get(&node).map(|dep| {
+                let mut entry = dep.lock();
+                entry
+                    .pending_spawn_requests
+                    .remove(&id)
+                    .or_else(|| {
+                        entry
+                            .dist
+                            .as_mut()
+                            .and_then(|state| state.spawn_requests.remove(&id))
+                    })
+                    .is_some_and(|request| request.monitor_priority)
+            })
+        };
+        if request
+            .as_ref()
+            .is_some_and(|request| request.monitor_priority)
+            || removed_priority_monitor == Some(true)
+        {
+            process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
         }
         return Err(error);
     }
@@ -2309,8 +2350,14 @@ pub(crate) fn spawn_reply_drop_monitor(data: &DistSpawnReplyData) {
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:5740-5878
 /// (handle_dist_spawn_reply), OTP-29.1.1.
-pub(crate) fn spawn_reply_install_origin_monitor(process: &mut Process, data: &DistSpawnReplyData) {
+pub(crate) fn spawn_reply_install_origin_monitor(
+    process: &mut Process,
+    data: &DistSpawnReplyData,
+    priority: bool,
+) {
     if let Some(origin) = data.take_monitor_half() {
+        let mut origin = origin;
+        origin.set_priority(priority);
         process.cold_mut().dist_monitors.insert(data.id);
         process.monitors.insert(origin);
     }
@@ -2322,29 +2369,42 @@ pub(crate) fn spawn_reply_install_origin_monitor(process: &mut Process, data: &D
 /// Port of erts/emulator/beam/bif.c:1166 (spawn_request_abandon_1), OTP-29.1.1, for a
 /// distributed request: one with link is left for the reply, which sends the child an
 /// `abandoned` exit (erl_proc_sig_queue.c:5786-5830).
-pub(crate) fn spawn_request_abandon(parent: Pid, id: u64) -> bool {
-    let tables = node_tables::lock();
-    for dep in tables.entries.values() {
-        let mut guard = dep.lock();
-        let entry = &mut *guard;
-        let connected = entry.dist.as_mut().map(|state| &mut state.spawn_requests);
-        for requests in std::iter::once(&mut entry.pending_spawn_requests).chain(connected) {
-            let Some(request) = requests.get_mut(&id) else {
-                continue;
-            };
-            if request.caller != parent || request.parent_exiting || request.abandoned {
-                return false;
+pub(crate) fn spawn_request_abandon(process: &mut Process, parent: Pid, id: u64) -> bool {
+    let monitor_priority = {
+        let tables = node_tables::lock();
+        let mut result = None;
+        'entries: for dep in tables.entries.values() {
+            let mut guard = dep.lock();
+            let entry = &mut *guard;
+            let connected = entry.dist.as_mut().map(|state| &mut state.spawn_requests);
+            for requests in std::iter::once(&mut entry.pending_spawn_requests).chain(connected) {
+                let Some(request) = requests.get_mut(&id) else {
+                    continue;
+                };
+                if request.caller != parent || request.parent_exiting || request.abandoned {
+                    break 'entries;
+                }
+                let monitor_priority = request.monitor_priority;
+                if request.link {
+                    // bif.c clears PRIO_ML but retains the pending linked request for its reply.
+                    request.abandoned = true;
+                    request.monitor_priority = false;
+                } else {
+                    requests.remove(&id);
+                }
+                result = Some(monitor_priority);
+                break 'entries;
             }
-            if request.link {
-                // Leave it for reply...
-                request.abandoned = true;
-            } else {
-                requests.remove(&id);
-            }
-            return true;
         }
+        result
+    };
+    let Some(monitor_priority) = monitor_priority else {
+        return false;
+    };
+    if monitor_priority {
+        process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
     }
-    false
+    true
 }
 
 /// The `{Tag, Ref, ok|error, Pid|ErrorAtom}` reply message on the parent's heap
@@ -2921,8 +2981,9 @@ pub(crate) fn link_remote(
     ctx: &mut RunCtx<'_, Message>,
     node: &str,
     target: Term,
+    priority: bool,
 ) -> Result<Term, VmError> {
-    elink::link_external(process, ctx, node, owned(target)?)
+    elink::link_external(process, ctx, node, owned(target)?, priority)
 }
 
 /// The `is_external_pid` arm of `unlink_1` for a pid of another node.

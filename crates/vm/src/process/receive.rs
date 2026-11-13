@@ -191,6 +191,19 @@ impl Process {
         Ok(Some((priority, prio_alias_deactivated)))
     }
 
+    /// Check alias state for an exit signal without applying `handle_alias_message`'s
+    /// reply-once deactivation.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4632-4660 (handle_exit_signal),
+    // OTP-29.1.1.
+    pub(super) fn alias_exit_accepted(&self, alias: u64) -> Option<bool> {
+        let monitor = self.monitors.get(alias)?;
+        if self.monitors.get_state(alias).is_none() || monitor.spawn_pending() {
+            return None;
+        }
+        monitor.alias_mode()?;
+        Some(monitor.alias_priority())
+    }
+
     /// Move a message signal into the message queue.
     pub(super) fn move_message(
         &mut self,

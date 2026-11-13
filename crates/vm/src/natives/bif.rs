@@ -1084,7 +1084,7 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
     }
     match external(other, false, false) {
         External::Remote(node) => with_sched(process, |_vm, process, ctx| {
-            crate::dist::link_remote(process, ctx, &node, other)
+            crate::dist::link_remote(process, ctx, &node, other, priority)
         })?,
         // An old incarnation of this node: `noproc`, or its link exit when trapping exits.
         External::ThisNode if !process.trap_exit => link_no_proc(process),
@@ -1587,7 +1587,7 @@ pub(crate) extern "C" fn spawn_request_abandon_1(
         let me = process.self_pid.ok_or_else(badarg);
         me.map(|me| {
             let abandoned = crate::signals::ref_id(id)
-                .is_some_and(|key| crate::dist::spawn_request_abandon(me, key));
+                .is_some_and(|key| crate::dist::spawn_request_abandon(process, me, key));
             Term::atom(if abandoned { atoms::TRUE } else { atoms::FALSE })
         })
     };

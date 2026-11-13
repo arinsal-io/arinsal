@@ -426,28 +426,35 @@ impl Process {
                     _ => unreachable!(),
                 };
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:4632-4815
-                // (handle_exit_signal), OTP-29.1.1: an exit through an alias is a priority
-                // message only through a priority alias; a linked exit removes the link, and a
-                // priority link makes the `'EXIT'` a priority message. The priority item of a
-                // deactivated alias or removed link is deleted once the message is inserted.
-                let mut prio_alias_deactivated = false;
+                // (handle_exit_signal), OTP-29.1.1: an exit through an alias checks active state
+                // without consuming a reply-once alias; a linked exit removes the link, and a
+                // priority link makes the `'EXIT'` a priority message. The removed link item is
+                // deleted after insertion.
                 let mut prio_link_removed = false;
                 let mut priority = false;
                 let mut was_linked = false;
                 if message.alias != 0 {
-                    let Some((alias_priority, deactivated)) =
-                        self.alias_message_accepted(ctx, message.alias)?
-                    else {
-                        return Ok(1);
+                    let Some(alias_priority) = self.alias_exit_accepted(message.alias) else {
+                        return Ok(2);
                     };
-                    prio_alias_deactivated = deactivated;
                     priority = alias_priority && message.is_priority();
-                } else if linked_exit && let Some(link) = self.links.remove(from.data()) {
-                    was_linked = true;
+                } else if linked_exit {
+                    let Some(link) = self.links.remove(from.data()) else {
+                        // A local EXIT_LINKED for a link that has already gone is ignored.
+                        return Ok(2);
+                    };
+                    let unlinking = link.view().unlinking() != 0;
                     if link.view().is_priority() {
                         prio_link_removed = true;
-                        priority = true;
+                        priority = !unlinking;
                     }
+                    if unlinking {
+                        if prio_link_removed {
+                            self.prio_item_deleted(crate::receive::PrioItemType::Link);
+                        }
+                        return Ok(2);
+                    }
+                    was_linked = true;
                 }
                 let result: Result<i32, VmError> = 'exit: {
                     let seq_token = message.take_seq_token();
@@ -494,9 +501,6 @@ impl Process {
                     // Ignored: `cnt = 1` plus one for destroying the signal.
                     Ok(2)
                 };
-                if prio_alias_deactivated {
-                    self.prio_item_deleted(crate::receive::PrioItemType::Alias);
-                }
                 if prio_link_removed {
                     self.prio_item_deleted(crate::receive::PrioItemType::Link);
                 }
@@ -780,7 +784,7 @@ impl Process {
             .downcast_ref::<crate::dist::DistSpawnReplyData>()
             .expect("dist spawn reply signal carries its reply data");
         let mut cnt = 1;
-        let Some(request) = crate::dist::take_spawn_request(ctx.pid(), data.id()) else {
+        let Some(mut request) = crate::dist::take_spawn_request(ctx.pid(), data.id()) else {
             // Stale reply: the link was never inserted here, only the distribution half of
             // the monitor is released.
             crate::dist::spawn_reply_drop_monitor(data);
@@ -790,10 +794,15 @@ impl Process {
         let mut adjust_monitor = false;
         if !data.is_success() {
             // Spawn error; the distribution code created no link.
+            if request.monitor_priority {
+                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+                request.monitor_priority = false;
+            }
             if request.abandoned || request.no_error_msg {
                 convert_to_message = false;
             }
         } else if request.abandoned {
+            debug_assert!(!request.monitor_priority);
             // Spawn operation has been abandoned and link option was passed: send exit
             // signal with exit reason `abandoned` and drop the message.
             if let Some(link) = data.link() {
@@ -811,31 +820,45 @@ impl Process {
             }
             if let Some(link) = data.link() {
                 cnt += 1;
+                let mut link = link;
+                link.view_mut().set_priority(request.link_priority);
                 if let Err(duplicate) = self.links.lookup_insert(link) {
                     let deleted = duplicate.dist_delete_other();
                     duplicate.release_external(deleted);
-                } else if crate::trace::active() {
-                    // linking(c_p, result)
-                    let result = crate::dist::spawn_reply_child_term(self, data)?;
-                    crate::trace::emit(
-                        None,
-                        self,
-                        ctx,
-                        ctx.pid(),
-                        crate::trace::PROCS,
-                        "link",
-                        &[result],
-                    );
+                } else {
+                    if request.link_priority {
+                        self.prio_item_added(crate::receive::PrioItemType::Link);
+                    }
+                    if crate::trace::active() {
+                        // linking(c_p, result)
+                        let result = crate::dist::spawn_reply_child_term(self, data)?;
+                        crate::trace::emit(
+                            None,
+                            self,
+                            ctx,
+                            ctx.pid(),
+                            crate::trace::PROCS,
+                            "link",
+                            &[result],
+                        );
+                    }
                 }
             }
             adjust_monitor = request.monitor;
             if adjust_monitor {
-                crate::dist::spawn_reply_install_origin_monitor(self, data);
+                crate::dist::spawn_reply_install_origin_monitor(
+                    self,
+                    data,
+                    request.monitor_priority,
+                );
                 cnt += 2;
             }
         }
         if !adjust_monitor {
             // Delete monitor; either spawn error or no monitor requested.
+            if request.monitor_priority {
+                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+            }
             crate::dist::spawn_reply_drop_monitor(data);
             cnt += 2;
         }

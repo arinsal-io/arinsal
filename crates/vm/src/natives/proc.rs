@@ -1681,8 +1681,14 @@ fn process_info_item_label(process: &mut Process) -> Result<Term, VmError> {
 
 #[inline(never)]
 fn process_info_item_priority_messages(process: &Process) -> Result<Term, VmError> {
-    Ok(flag_value(process, "priority_messages")
-        .unwrap_or_else(|| Term::atom(arinsal_term::atoms::FALSE)))
+    // Port of erts/emulator/beam/erl_bif_info.c:2320 (ERTS_PI_IX_PRIORITY_MESSAGES), OTP-29.1.1.
+    Ok(Term::atom(
+        if process.inbox.flags & crate::receive::FS_PRIO_MQ != 0 {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        },
+    ))
 }
 
 fn charlist(process: &mut Process, value: &str) -> Result<Term, VmError> {

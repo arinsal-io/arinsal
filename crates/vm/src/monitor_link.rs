@@ -1529,6 +1529,13 @@ impl<I, O, S> Monitor<I, O, S> {
         }
     }
 
+    /// Set `ERTS_ML_FLG_PRIO_ML` when a pending spawn monitor becomes an ordinary monitor.
+    pub(crate) fn set_priority(&mut self, priority: bool) {
+        let flags = node_flags(self.node) & !node_flag::PRIO_ML;
+        let priority = if priority { node_flag::PRIO_ML } else { 0 };
+        set_node_flags(self.node, flags | priority);
+    }
+
     #[cfg(test)]
     fn view_mut(&mut self) -> MonitorMut<'_, I, O, S> {
         MonitorMut {
@@ -1628,6 +1635,10 @@ impl<'a, I, O, S> MonitorRef<'a, I, O, S> {
 
     pub(crate) fn alias_priority(self) -> bool {
         node_flags(self.node) & node_flag::PRIO_ALIAS != 0
+    }
+
+    pub(crate) fn spawn_pending(self) -> bool {
+        node_flags(self.node) & node_flag::SPAWN_PENDING != 0
     }
 
     /// `ERTS_ML_FLG_PRIO_ML`: a priority monitor, its DOWN is a priority message.

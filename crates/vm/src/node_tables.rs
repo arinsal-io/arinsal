@@ -129,6 +129,10 @@ pub(crate) struct SpawnRequest {
     pub(crate) abandoned: bool,
     /// `ERTS_ML_FLG_SPAWN_LINK` of the pending-spawn origin monitor.
     pub(crate) link: bool,
+    /// `ERTS_ML_FLG_SPAWN_LINK_PRIO`: the successful link gets `PRIO_ML` on reply.
+    pub(crate) link_priority: bool,
+    /// `ERTS_ML_FLG_PRIO_ML` of the pending-spawn origin monitor.
+    pub(crate) monitor_priority: bool,
     /// The parent is exiting: erts moved the target half of the monitor to
     /// `dist->dist_pend_spawn_exit` (dist.c:665 erts_dist_pend_spawn_exit_parent_setup).
     pub(crate) parent_exiting: bool,

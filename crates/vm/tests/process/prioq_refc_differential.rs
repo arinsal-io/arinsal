@@ -8,6 +8,7 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_term::Term;
+use similar_asserts::assert_eq;
 
 const MODULE: &str = "prioq_refc_diff";
 const SOURCE: &str = r#"
@@ -22,7 +23,8 @@ run(S) ->
 all() -> [{S, run(S)} || S <- [two_aliases, monitor_alias_not_prio, prio_monitors,
                                noproc_down, link_sides, link_option_change,
                                items_gone_queue_kept, reply_alias_once, exit_alias,
-                               spawn_link_prio, selective_marker]].
+                               exit_reply_once_alias, priority_item_state, spawn_link_prio,
+                               selective_marker]].
 
 flush() -> receive M -> [M | flush()] after 0 -> [] end.
 %% Handle all pending signals without taking a message.
@@ -132,6 +134,24 @@ scenario(exit_alias) ->
     Self ! n2, exit(B, r2, [priority]),
     R2 = [case X of {'EXIT', Self, R} -> {exit, R}; _ -> X end || X <- flush()],
     {R1, R2};
+scenario(exit_reply_once_alias) ->
+    process_flag(trap_exit, true),
+    Self = self(),
+    A = alias([reply, priority]),
+    Self ! before,
+    exit(A, reply_exit, [priority]),
+    sync(),
+    R = [case X of {'EXIT', Self, reply_exit} -> exit; _ -> X end || X <- flush()],
+    {R, unalias(A)};
+scenario(priority_item_state) ->
+    Self = self(),
+    A = alias([priority]),
+    Enabled = element(2, process_info(self(), priority_messages)),
+    Self ! ordinary,
+    Received = receive ordinary -> ordinary after 0 -> missing end,
+    true = unalias(A),
+    Cleared = element(2, process_info(self(), priority_messages)),
+    {Enabled, Received, Cleared};
 scenario(spawn_link_prio) ->
     process_flag(trap_exit, true),
     P = spawn_opt(fun() -> receive go -> exit(boom) end end, [{link, [priority]}]),

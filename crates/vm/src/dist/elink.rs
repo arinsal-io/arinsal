@@ -416,36 +416,56 @@ pub(crate) fn proc_exit_handle_link(
     send_exit(runtime, nodename, connection_id, local, remote, reason);
 }
 
-/// `link(Pid)` for an external pid.
-// Port of erts/emulator/beam/bif.c (link_opt, is_external_pid), OTP-29.1.1.
+/// `link(Pid, Options)` for an external pid.
+// Port of erts/emulator/beam/bif.c:136-365 (link_opt: is_external_pid), OTP-29.1.1.
 pub(super) fn link_external(
     process: &mut crate::Process,
     ctx: &mut arinsal_sched::RunCtx<'_, Message>,
     node: &str,
     target: OwnedTerm,
+    priority: bool,
 ) -> Result<Term, crate::VmError> {
     let remote = external_pid(&target).ok_or_else(badarg)?;
     let me = ctx.pid();
     // `created` comes with the new link's dist half; an existing link being unlinked comes
     // with the connection it was made on and a prepared replacement (`pelnk`).
-    let (dist_half, old_connection, prepared) = {
+    let (dist_half, old_connection, prepared, was_priority, unlinking) = {
         let (mut link, dist_half) =
             process
                 .links
                 .lookup_create_external(node_type::LINK_DIST_PROC, me.data(), remote);
-        link.set_priority(false);
+        let was_priority = link.view().is_priority();
+        let unlinking = link.view().unlinking() != 0;
+        link.set_priority(priority);
         match dist_half {
-            Some(dist_half) => (Some(dist_half), None, None),
+            Some(dist_half) => (Some(dist_half), None, None, was_priority, false),
             None => {
-                if link.view().unlinking() == 0 {
-                    return Ok(Term::atom(arinsal_term::atoms::TRUE));
+                if !unlinking {
+                    (None, None, None, was_priority, false)
+                } else {
+                    let old_connection = link.view().external_dist().map(|dist| dist.connection_id);
+                    let (mut proc_half, dist_half) =
+                        Link::create_external(node_type::LINK_DIST_PROC, me.data(), remote);
+                    proc_half.view_mut().set_priority(priority);
+                    (
+                        None,
+                        old_connection,
+                        Some((proc_half, dist_half)),
+                        was_priority,
+                        true,
+                    )
                 }
-                let old_connection = link.view().external_dist().map(|dist| dist.connection_id);
-                let prepared = Link::create_external(node_type::LINK_DIST_PROC, me.data(), remote);
-                (None, old_connection, Some(prepared))
             }
         }
     };
+    match (was_priority, priority) {
+        (false, true) => process.prio_item_added(crate::receive::PrioItemType::Link),
+        (true, false) => process.prio_item_deleted(crate::receive::PrioItemType::Link),
+        _ => {}
+    }
+    if dist_half.is_none() && prepared.is_none() && !unlinking {
+        return Ok(Term::atom(arinsal_term::atoms::TRUE));
+    }
     let runtime = process.runtime.ok_or_else(badarg)?;
     match super::dsig_prepare(process, ctx, node)? {
         super::DsigPrepare::NotAlive | super::DsigPrepare::NotConnected => {
@@ -530,17 +550,26 @@ pub(super) fn unlink_external(
         return Ok(Term::atom(arinsal_term::atoms::TRUE));
     };
     let id = process.next_ref();
-    let connection_id = {
+    let (connection_id, was_priority) = {
         let Some(mut link) = process.links.get_external_mut(&remote) else {
             return Ok(Term::atom(arinsal_term::atoms::TRUE));
         };
         if link.view().unlinking() != 0 {
             return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
+        let was_priority = link.view().is_priority();
         link.set_priority(false);
         link.set_unlinking(id);
-        link.view().external_dist().map(|dist| dist.connection_id)
+        (
+            link.view().external_dist().map(|dist| dist.connection_id),
+            was_priority,
+        )
     };
+    // Port of bif.c:1318 (unlink_clear_prio): the process stops accepting priority link
+    // messages as soon as unlink starts, before the unlink acknowledgement.
+    if was_priority {
+        process.prio_item_deleted(crate::receive::PrioItemType::Link);
+    }
     let current = node_tables::find_dist_entry(node).and_then(|dep| {
         let entry = dep.lock();
         matches!(

@@ -1,3 +1,4 @@
+use similar_asserts::assert_eq;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
@@ -616,6 +617,49 @@ fn dist_mixed_spawn_request_abandon_link() {
             n = n
         ),
     );
+}
+
+#[test]
+fn dist_mixed_priority_link_and_spawn_request_match_erts() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    let expression = format!(
+        concat!(
+            "N={n}, pong=net_adm:ping(N), ",
+            "P=erpc:call(N,erlang,spawn,[timer,sleep,[60000]]), ",
+            "true=link(P,[priority]), LinkPriority=element(2,process_info(self(),priority_messages)), ",
+            "true=unlink(P), LinkCleared=element(2,process_info(self(),priority_messages)), ",
+            "true=erpc:call(N,erlang,exit,[P,kill]), ",
+            "process_flag(trap_exit,true), ",
+            "R=erlang:spawn_request(N,timer,sleep,[50],[{{link,[priority]}},{{monitor,[priority]}}]), ",
+            "SpawnPending=element(2,process_info(self(),priority_messages)), ",
+            "P2=receive {{spawn_reply,R,ok,Child}}->Child after 10000->exit(no_spawn_reply) end, ",
+            "self()!ordinary, timer:sleep(250), ",
+            "Flush=fun F() -> receive M -> [M|F()] after 0 -> [] end end, ",
+            "Classes=[case M of {{'EXIT',P2,normal}}->exit; {{'DOWN',R,process,P2,normal}}->down; ordinary->ordinary; _->other end || M <- Flush()], ",
+            "PriorityFirst=case Classes of [exit,down,ordinary]->true; [down,exit,ordinary]->true; _->false end, ",
+            "SpawnCleared=element(2,process_info(self(),priority_messages)), ",
+            "R2=erlang:spawn_request(N,timer,sleep,[5000],[{{link,[priority]}},{{monitor,[priority]}}]), ",
+            "AbandonPending=element(2,process_info(self(),priority_messages)), ",
+            "true=erlang:spawn_request_abandon(R2), Abandoned=not element(2,process_info(self(),priority_messages)), ",
+            "false=erlang:spawn_request_abandon(R2), timer:sleep(100), ",
+            "io:format(\"PRIO_FOLLOWUPS ~p~n\",[[LinkPriority,LinkCleared,SpawnPending,PriorityFirst,SpawnCleared,AbandonPending,Abandoned]]), ",
+            "io:format(\"DIST_MIXED_OK prio_followups~n\")"
+        ),
+        n = n
+    );
+    let expected = otp_eval(&cookie, &expression);
+    let actual = arinsal_eval(&cookie, &host, &expression);
+    let expected = expected
+        .lines()
+        .find(|line| line.starts_with("PRIO_FOLLOWUPS "))
+        .expect("OTP priority result marker");
+    let actual = actual
+        .lines()
+        .find(|line| line.starts_with("PRIO_FOLLOWUPS "))
+        .expect("Arinsal priority result marker");
+    assert_eq!(expected, actual);
 }
 
 #[test]
