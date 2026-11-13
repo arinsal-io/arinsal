@@ -160,9 +160,11 @@ impl<T: Task> ProcRef<T> {
     /// A later operation that releases the reference held at `raw`
     /// (erts `release_process` scheduled by erts_ptab_delete_element).
     pub(crate) fn release_later(raw: *mut ()) -> crate::thr_progress::LaterOp {
+        // erts_ptab_delete_element passes `ptab->r.o.element_size`, sizeof(Process).
         crate::thr_progress::LaterOp::Cleanup {
             release: release_raw_address::<T>,
             data: raw as usize,
+            size: std::mem::size_of::<ProcessBlock<T>>(),
         }
     }
 }
