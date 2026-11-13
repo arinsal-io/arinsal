@@ -188,6 +188,7 @@ fn schedule_release<T: Send + Sync + 'static>(raw: *mut T, progress: &Progress) 
         LaterOp::Cleanup {
             release: release::<T>,
             data: raw as usize,
+            size: std::mem::size_of::<T>(),
         },
     );
 }

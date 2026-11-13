@@ -21,16 +21,20 @@ use std::thread::Thread;
 pub(crate) enum LaterOp {
     /// `erts_schedule_thr_prgr_later_op` with an allocated closure.
     Boxed(Box<dyn FnOnce() + Send>),
-    /// `erts_schedule_thr_prgr_later_cleanup_op`: a release function and the address of the
-    /// element it releases, so scheduling it allocates nothing.
-    Cleanup { release: fn(usize), data: usize },
+    /// `erts_schedule_thr_prgr_later_cleanup_op`: a release function, the address of the
+    /// element it releases, so scheduling it allocates nothing, and the bytes it frees.
+    Cleanup {
+        release: fn(usize),
+        data: usize,
+        size: usize,
+    },
 }
 
 impl LaterOp {
     fn run(self) {
         match self {
             Self::Boxed(op) => op(),
-            Self::Cleanup { release, data } => release(data),
+            Self::Cleanup { release, data, .. } => release(data),
         }
     }
 }
@@ -58,6 +62,12 @@ const LFLG_ACTIVE_MASK: u32 = !(LFLG_NO_LEADER | LFLG_BLOCK | LFLG_WAITING_UM);
 const BC_FLG_NOT_BLOCKING: u32 = 1 << 31;
 /// `ERTS_THR_PRGR_WAKEUP_DATA_SIZE`.
 const WAKEUP_DATA_SIZE: usize = 4;
+/// `ERTS_MIN_THR_PRGR_LATER_OPS`: later operations run per pass at least.
+const MIN_THR_PRGR_LATER_OPS: usize = 50;
+/// `thr_prgr_later_cleanup_op_threshold` at its default
+/// (`ERTS_THR_PRGR_LATER_CLEANUP_OP_THRESHOLD_MEDIUM`, `+swct medium`): bytes of later cleanup
+/// operations queued before a thread progress wakeup is requested for them.
+const LATER_CLEANUP_OP_THRESHOLD: usize = 64 * 1024;
 
 fn next_val(val: u64) -> u64 {
     let next = val.wrapping_add(1);
@@ -220,7 +230,14 @@ struct ThrPrgrData {
     leader_next: u64,
     chk_next_ix: usize,
     wakeup_request: [u64; WAKEUP_DATA_SIZE],
+    /// `aux_work_data.later_op` first..last and `list_len`.
     later_ops: VecDeque<(u64, LaterOp)>,
+    /// `aux_work_data.later_op.size`: bytes of cleanup operations still allowed before one
+    /// requests a wakeup.
+    later_op_size: usize,
+    /// `aux_work_data.later_op.thr_prgr`: the value the last cleanup operation waits for.
+    later_op_thr_prgr: u64,
+    /// `aux_work_data.latest_wakeup`.
     latest_wakeup: u64,
     /// `leader_state.umrefc_ix.waiting`: the slot this leader waits to drain, `-1` for none.
     leader_umrefc_waiting: i32,
@@ -737,7 +754,11 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
         // erl_thr_progress.c:499 (init_wakeup_request_array): no slot matches its index.
         wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
         later_ops: VecDeque::new(),
-        latest_wakeup: VAL_WAITING,
+        // erl_process.c (init_aux_work_data): the aux work data starts zeroed and
+        // `latest_wakeup` is ERTS_THR_PRGR_VAL_FIRST.
+        later_op_size: 0,
+        later_op_thr_prgr: 0,
+        latest_wakeup: 0,
         leader_umrefc_waiting: -1,
         leader_umrefc_current: 0,
     })));
@@ -867,9 +888,11 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue: &mut dyn Ru
             leader_update(tpd);
         }
     }
-    // Each operation runs with the thread data released: releasing a process can schedule
-    // another later operation.
-    loop {
+    // Port of erts/emulator/beam/erl_process.c (handle_thr_prgr_later_op): the loop limit
+    // grows with the queue so the thread keeps up. Each operation runs with the thread data
+    // released: releasing a process can schedule another later operation.
+    let limit = managed.0.borrow().later_ops.len() / 8 + MIN_THR_PRGR_LATER_OPS;
+    for _ in 0..limit {
         let op = next_ready_later_op(&mut managed.0.borrow_mut());
         let Some(op) = op else {
             break;
@@ -919,7 +942,11 @@ fn next_ready_later_op(tpd: &mut ThrPrgrData) -> Option<LaterOp> {
         .front()
         .is_some_and(|(later, _)| has_reached_this(current, *later))
     {
-        return tpd.later_ops.pop_front().map(|(_, op)| op);
+        let op = tpd.later_ops.pop_front().map(|(_, op)| op);
+        if tpd.later_ops.is_empty() {
+            tpd.later_op_size = LATER_CLEANUP_OP_THRESHOLD;
+        }
+        return op;
     }
     if shared_len == 0 {
         return None;
@@ -989,6 +1016,41 @@ pub(crate) fn unblock(progress: &ThrProgress) {
     });
 }
 
+// Port of erts/emulator/beam/erl_process.c (haw_chk_later_cleanup_op_wakeup), OTP-29.1.1.
+fn haw_chk_later_cleanup_op_wakeup(tpd: &mut ThrPrgrData, val: u64) {
+    if !tpd.later_ops.is_empty() && cmp(val, tpd.later_op_thr_prgr) != std::cmp::Ordering::Less {
+        tpd.later_op_size = LATER_CLEANUP_OP_THRESHOLD;
+    }
+}
+
+// Port of erts/emulator/beam/erl_process.c (haw_thr_prgr_wakeup), OTP-29.1.1.
+fn haw_thr_prgr_wakeup(tpd: &mut ThrPrgrData, val: u64) {
+    let order = cmp(val, tpd.latest_wakeup);
+    if order != std::cmp::Ordering::Equal {
+        if order == std::cmp::Ordering::Greater {
+            tpd.latest_wakeup = val;
+            haw_chk_later_cleanup_op_wakeup(tpd, val);
+        }
+        request_wakeup_managed(tpd, val);
+    }
+}
+
+// Port of erts/emulator/beam/erl_process.c (haw_thr_prgr_later_cleanup_op_wakeup), OTP-29.1.1:
+// cleanup operations ask for a wakeup only once their bytes passed the threshold; until then
+// they run when the thread passes its progress points anyway.
+fn haw_thr_prgr_later_cleanup_op_wakeup(tpd: &mut ThrPrgrData, val: u64, size: usize) {
+    if cmp(val, tpd.latest_wakeup) == std::cmp::Ordering::Greater {
+        tpd.later_op_thr_prgr = val;
+        if tpd.later_op_size > size {
+            tpd.later_op_size -= size;
+        } else {
+            tpd.latest_wakeup = val;
+            tpd.later_op_size = LATER_CLEANUP_OP_THRESHOLD;
+            request_wakeup_managed(tpd, val);
+        }
+    }
+}
+
 /// Run `op` once every managed thread passed a thread progress point.
 // Port of erl_process.c:2351 (erts_schedule_thr_prgr_later_op, enqueue_later_op and
 // haw_thr_prgr_wakeup) and erl_thr_progress.h (erts_thr_progress_later), OTP-29.1.1.
@@ -1005,16 +1067,17 @@ pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
         let Some(tpd) = tpd.filter(|tpd| std::ptr::eq(Arc::as_ptr(&tpd.progress), progress)) else {
             return Some(op);
         };
+        // enqueue_later_op: erts_thr_progress_later issues a full barrier, then the value.
         fence(Ordering::SeqCst);
         let later = current_to_later(tpd.confirmed);
+        let cleanup_size = match op {
+            LaterOp::Cleanup { size, .. } => Some(size),
+            LaterOp::Boxed(_) => None,
+        };
         tpd.later_ops.push_back((later, op));
-        if cmp(later, tpd.latest_wakeup) != std::cmp::Ordering::Equal {
-            if tpd.latest_wakeup == VAL_WAITING
-                || cmp(later, tpd.latest_wakeup) == std::cmp::Ordering::Greater
-            {
-                tpd.latest_wakeup = later;
-            }
-            request_wakeup_managed(tpd, later);
+        match cleanup_size {
+            Some(size) => haw_thr_prgr_later_cleanup_op_wakeup(tpd, later, size),
+            None => haw_thr_prgr_wakeup(tpd, later),
         }
         None
     });
@@ -1139,6 +1202,74 @@ mod tests {
         });
     }
 
+    static CLEANED: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_cleanup(_: usize) {
+        CLEANED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// erl_process.c (haw_thr_prgr_later_cleanup_op_wakeup): the first cleanup operation asks
+    /// for a wakeup, later ones only once their bytes pass the threshold; a pass runs at most
+    /// `ERTS_MIN_THR_PRGR_LATER_OPS + list_len / 8` operations (handle_thr_prgr_later_op).
+    #[test]
+    fn cleanup_ops_wake_by_size_and_run_in_limited_batches() {
+        let progress = progress(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                progress.sleepers[0].set(std::thread::current()).unwrap();
+                let managed = register_managed_thread(&progress, 0);
+                let cleanup = |size| LaterOp::Cleanup {
+                    release: count_cleanup,
+                    data: 0,
+                    size,
+                };
+                schedule_later_op(&progress, cleanup(1024));
+                let first = managed.0.borrow().latest_wakeup;
+                assert_eq!(managed.0.borrow().later_op_size, LATER_CLEANUP_OP_THRESHOLD);
+                // Move progress on so later operations get a later value.
+                for _ in 0..4 {
+                    let tpd = &mut *managed.0.borrow_mut();
+                    if update(tpd) {
+                        leader_update(tpd);
+                    }
+                }
+                schedule_later_op(&progress, cleanup(1024));
+                {
+                    let tpd = managed.0.borrow();
+                    assert_eq!(tpd.latest_wakeup, first, "small cleanup requests no wakeup");
+                    assert_eq!(tpd.later_op_size, LATER_CLEANUP_OP_THRESHOLD - 1024);
+                }
+                schedule_later_op(&progress, cleanup(LATER_CLEANUP_OP_THRESHOLD));
+                {
+                    let tpd = managed.0.borrow();
+                    assert_ne!(tpd.latest_wakeup, first, "the threshold requests a wakeup");
+                    assert_eq!(tpd.later_op_size, LATER_CLEANUP_OP_THRESHOLD);
+                }
+                for _ in 0..400 {
+                    schedule_later_op(&progress, cleanup(8));
+                }
+                let queued = managed.0.borrow().later_ops.len();
+                CLEANED.store(0, Ordering::SeqCst);
+                for _ in 0..4 {
+                    let tpd = &mut *managed.0.borrow_mut();
+                    if update(tpd) {
+                        leader_update(tpd);
+                    }
+                }
+                scheduler_progress(&managed, &mut ());
+                assert_eq!(
+                    CLEANED.load(Ordering::SeqCst),
+                    queued / 8 + MIN_THR_PRGR_LATER_OPS
+                );
+                while !managed.0.borrow().later_ops.is_empty() {
+                    scheduler_progress(&managed, &mut ());
+                }
+                assert_eq!(CLEANED.load(Ordering::SeqCst), queued);
+                unregister_managed_thread();
+            });
+        });
+    }
+
     #[test]
     fn unmanaged_delay_holds_back_later_ops() {
         let progress = progress(1);
@@ -1186,6 +1317,7 @@ mod tests {
                     LaterOp::Cleanup {
                         release: |_| {},
                         data: 0,
+                        size: 0,
                     },
                 );
                 schedule_later_op(
