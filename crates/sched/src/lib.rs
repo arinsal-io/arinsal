@@ -1684,6 +1684,8 @@ struct ProcShared<M: SignalMessage> {
     rq_link: run_queue::RqLink,
     bound_worker: AtomicUsize,
     scheduler_id: AtomicUsize,
+    /// `ERTS_PSD_SCHED_ID`: last normal scheduler that selected this process for sched stats.
+    sched_stat_scheduler_id: AtomicUsize,
     /// Arm sequence of deferred receive timers (the low bits of a [`PTMR_DEFERRED`] tag).
     wait_epoch: AtomicU64,
     /// Wheels that may hold BIF timers aimed at this process: bit `w` for scheduler `w`, the
@@ -2205,6 +2207,7 @@ impl<T: Task> ProcessTable<T> {
                     rq_link: run_queue::RqLink::default(),
                     bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
                     scheduler_id: AtomicUsize::new(0),
+                    sched_stat_scheduler_id: AtomicUsize::new(0),
                     wait_epoch: AtomicU64::new(0),
                     bif_timer_wheels: AtomicU64::new(0),
                     btm: parking_lot::Mutex::new(ProcBtm {
@@ -5209,6 +5212,7 @@ impl<T: Task> Local<T> {
             self.adjust_metric(previous, -1);
             self.adjust_metric(worker, 1);
         }
+        process.set_scheduler_worker(worker);
     }
 
     fn record_waiting(&mut self, process: &Process<T>) {
@@ -9234,9 +9238,11 @@ fn run_process<T: Task>(
 /// Update the process's last scheduler and record its selection when statistics are enabled.
 // Port of erts/emulator/beam/erl_process.c:10208-10224 (schedule), OTP-29.1.1.
 fn record_sched_stat<T: Task>(process: &Process<T>, scheduler_id: usize) {
-    let scheduler_id = scheduler_id + 1;
-    let previous_scheduler = process.scheduler_id.swap(scheduler_id, Ordering::Relaxed);
     if sched_stat::enabled() {
+        let scheduler_id = scheduler_id + 1;
+        let previous_scheduler = process
+            .sched_stat_scheduler_id
+            .swap(scheduler_id, Ordering::Relaxed);
         sched_stat::record_execution(
             usize::from(process.user_priority.load(Ordering::Relaxed)),
             previous_scheduler != 0 && previous_scheduler != scheduler_id,

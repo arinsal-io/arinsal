@@ -339,7 +339,8 @@ impl<M: SignalMessage> SignalProbe<M> {
         } else {
             previous + 1
         };
-        let current = shared.scheduler_id.load(Ordering::Relaxed);
+        // `scheduler_id` stores worker + 1; `erts_set_runq_proc` compares run-queue indices.
+        let current = shared.scheduler_worker();
         (
             previous_id,
             target != crate::UNBOUND_WORKER && current != target,
