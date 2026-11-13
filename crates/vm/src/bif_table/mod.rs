@@ -64,9 +64,13 @@ pub fn has_function(module: &str, function: &str, arity: u8) -> bool {
     special(module, function, arity).is_some()
 }
 
-/// `Export.info` of the BIF being called: `c_p->current`, set by the call fragment.
+/// `Export.info` of the BIF being called: the export that owns `c_p->current`
+/// (`&Export.info.mfa`, set by the call fragment).
 pub(crate) fn current_info(header: *mut ProcessHeader) -> u64 {
-    raw::header_current(header)
+    match raw::header_current(header) {
+        0 => 0,
+        mfa => raw::export_info_of_mfa(mfa),
+    }
 }
 
 /// `(Export.info, Export*)` of the BIF being called: the call fragment points `c_p->current`
@@ -102,10 +106,10 @@ pub(crate) fn call_from_executor(
         Some(spec) => function_at(usize::from(spec.index))?,
         None => raw::bif_at(trap_function(module, function, arity8)?),
     };
-    // The executor calls the BIF as its export entry does: the trampoline stores the
-    // export's info word in `c_p->current` first, which BIF_ERROR and BIF_TRAP* name.
+    // The executor calls the BIF as its export entry does: the trampoline stores
+    // `&exp->info.mfa` in `c_p->current` first, which BIF_ERROR and BIF_TRAP* name.
     let export = crate::beamasm_integration::bif_mfa_export(module, function, arity8)?;
-    process.heap.abi.current = std::ptr::from_ref(export).cast();
+    process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     process.x.ensure_x(arity.max(1));
     let reg = std::ptr::from_mut(&mut process.x[0]).cast::<u64>();
     let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();
@@ -113,6 +117,19 @@ pub(crate) fn call_from_executor(
     if raw != arinsal_term::THE_NON_VALUE {
         return Some(Ok(crate::native_hooks::from_raw(raw)));
     }
+    // Port of erts/emulator/beam/beam_common.c (handle_error, save_stacktrace): the failure
+    // names `c_p->current` (the called export, or the BIF that first trapped after
+    // `ERTS_BIF_PREP_ERROR_TRAPPED*`) with the arguments in the X registers.
+    let named = arinsal_beamasm::bif::static_bif_mfa(process.heap.abi.current as usize as u64)
+        .and_then(|(module, function, arity)| {
+            let atoms = arinsal_term::global_atoms();
+            Some((
+                atoms.text(module)?,
+                atoms.text(function)?,
+                usize::from(arity),
+            ))
+        });
+    let (module, function, arity) = named.unwrap_or((module, function, arity));
     let args = process.x[..arity].to_vec();
     Some(Err(
         match crate::native_helpers::decode_failure(&mut process.heap.abi.exc) {

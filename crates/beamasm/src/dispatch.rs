@@ -1010,9 +1010,14 @@ fn emit_export_fragment(
         // the BIF finds its export through `c_p->current`.
         encoder.ldrb_uoff(Gpr::w(9), Gpr::x(0), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
         encoder.strb_uoff(Gpr::w(9), Gpr::x(21), 80)?;
-        encoder.ldr_uoff(Gpr::x(3), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210
         // (`emit_export_trampoline`), OTP-29.1.1: current points at Export.info.mfa.
+        encoder.add_imm(
+            Gpr::x(3),
+            Gpr::x(0),
+            crate::bif::EXPORT_MFA_OFFSET as u16,
+            false,
+        )?;
         encoder.str_uoff(
             Gpr::x(3),
             Gpr::x(21),
@@ -1031,8 +1036,14 @@ fn emit_export_fragment(
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
         // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.add_imm(
+            Gpr::x(9),
+            Gpr::x(0),
+            crate::bif::EXPORT_MFA_OFFSET as u16,
+            false,
+        )?;
         encoder.str_uoff(
-            Gpr::x(2),
+            Gpr::x(9),
             Gpr::x(21),
             std::mem::offset_of!(crate::ProcessHeader, current) as u32,
         )?;
@@ -1358,8 +1369,14 @@ fn emit_call_light_bif_shared(
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.str_uoff(Gpr::x(3), Gpr::sp(), 16)?;
         encoder.ldr_uoff(Gpr::x(9), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.add_imm(
+            Gpr::x(10),
+            Gpr::x(3),
+            crate::bif::EXPORT_MFA_OFFSET as u16,
+            false,
+        )?;
         encoder.str_uoff(
-            Gpr::x(9),
+            Gpr::x(10),
             Gpr::x(21),
             std::mem::offset_of!(crate::ProcessHeader, current) as u32,
         )?;
