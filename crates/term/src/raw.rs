@@ -23,6 +23,18 @@ pub fn term_from_bits(bits: u64) -> Term {
     unsafe { Term::from_raw_bits(bits) }
 }
 
+/// `ERTS_GET_BITSTRING_REF` of a BIF argument: the bytes of a bitstring term.
+///
+/// Contract: `term` is a BIF argument (or a term reachable from one) of the running process;
+/// its heap and off-heap owner stay live for the call, and the caller runs no writable append
+/// on that owner while the view is held.
+// Port of erts/emulator/beam/erl_bits.h (ERTS_GET_BITSTRING_REF), OTP-29.1.1.
+#[inline(always)]
+pub fn bif_arg_binary_ref<'a>(term: Term) -> Option<crate::BinaryRef<'a>> {
+    // SAFETY: the contract above.
+    unsafe { term.binary_ref() }
+}
+
 /// Fixed-capacity stack storage for terms whose populated prefix is known at runtime.
 ///
 /// The backing array has no capacity field and does not initialize unused slots.
@@ -944,6 +956,94 @@ impl HeapSlotPtr {
         // decode finishes or is rolled back after the cursor is discarded.
         unsafe { (self.0.get() as *mut u64).write(word) };
     }
+
+    /// `objp`/`hp` of `dec_term` for a word of the factory block (or `&ctx->u.dc.res`).
+    ///
+    /// Contract: `ptr` names a word of a live block the decoder owns (the parked factory block
+    /// or the boxed `B2TContext`), which stays at its address until the decode ends.
+    #[inline(always)]
+    pub fn from_ptr(ptr: *mut u64) -> Option<Self> {
+        NonZeroUsize::new(ptr as usize).map(Self)
+    }
+
+    /// The word address.
+    #[inline(always)]
+    pub fn as_ptr(self) -> *mut u64 {
+        self.0.get() as *mut u64
+    }
+
+    /// `objp + words` (pointer arithmetic inside the same block).
+    #[inline(always)]
+    pub fn offset(self, words: usize) -> Self {
+        Self(
+            NonZeroUsize::new(self.0.get().wrapping_add(words * 8))
+                .expect("heap word address is non-null"),
+        )
+    }
+
+    /// `objp - words` (pointer arithmetic inside the same block).
+    #[inline(always)]
+    pub fn back(self, words: usize) -> Self {
+        Self(
+            NonZeroUsize::new(self.0.get().wrapping_sub(words * 8))
+                .expect("heap word address is non-null"),
+        )
+    }
+
+    /// `*objp`: read the word.
+    #[inline(always)]
+    pub fn load(self) -> u64 {
+        // SAFETY: as for `store`: the word lies in the live block the decoder owns.
+        unsafe { (self.0.get() as *const u64).read() }
+    }
+}
+
+/// `sys_memcpy(ctx->u.dc.remaining_bytes, ep, n)` of `dec_term` (`B2TDecodeBinary`): copy into
+/// the payload of a refc `Binary` already wrapped in the decoded term.
+///
+/// Contract: `dst..dst + src.len()` lies in the payload of a `Binary` that only the decoding
+/// process references (its `BinRef` is on the factory heap, the process has GC disabled
+/// across the trap), and nothing reads those bytes before the decode ends.
+// Port of erts/emulator/beam/external.c (dec_term, B2TDecodeBinary), OTP-29.1.1.
+#[inline(always)]
+pub fn copy_to_binary_payload(dst: usize, src: &[u8]) {
+    // SAFETY: the contract above; `src` is the external format data, never the destination.
+    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) }
+}
+
+/// `erts_validate_and_sort_flatmap`: insertion sort of the keys (and values) of a flatmap that
+/// `dec_term` just filled; `false` on a duplicate key.
+///
+/// Contract: `map` is a flatmap of the decoder's factory heap whose keys and values are all
+/// written and whose key tuple is owned by the same decode.
+// Port of erts/emulator/beam/erl_map.c (erts_validate_and_sort_flatmap), OTP-29.1.1.
+pub fn validate_and_sort_flatmap(map: Term) -> bool {
+    // SAFETY: the contract above: the map and its key tuple are exclusive to this decode.
+    unsafe {
+        let map_ptr = map.raw_ptr().cast_mut();
+        let size = *map_ptr.add(1) as usize;
+        let keys = Term(*map_ptr.add(2))
+            .raw_ptr()
+            .cast_mut()
+            .add(1)
+            .cast::<Term>();
+        let values = map_ptr.add(3).cast::<Term>();
+        for ix in 1..size {
+            let mut jx = ix;
+            while jx > 0 {
+                match crate::heap::flat_key_cmp(*keys.add(jx), *keys.add(jx - 1)) {
+                    std::cmp::Ordering::Greater => break,
+                    std::cmp::Ordering::Equal => return false,
+                    std::cmp::Ordering::Less => {
+                        std::ptr::swap(keys.add(jx), keys.add(jx - 1));
+                        std::ptr::swap(values.add(jx), values.add(jx - 1));
+                        jx -= 1;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Get a reserved word's index when a safe heap builder API requires an indexed handle.

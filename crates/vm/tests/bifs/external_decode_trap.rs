@@ -8,14 +8,30 @@ use similar_asserts::assert_eq;
 
 const MODULE: &str = "external_decode_trap_test";
 
-const SOURCE: &str = r#"-module(external_decode_trap_test).
+const SOURCE: &str = r##"-module(external_decode_trap_test).
 -export([run/1]).
 term(list) -> lists:seq(1, 1000000);
 term(floats) -> [float(N) || N <- lists:seq(1, 200000)];
 term(tuple) -> deep(100000, a);
 term(binary) -> binary:copy(<<1, 2, 3>>, 500000);
 term(small) -> {a, [1, 2, 3], <<"x">>};
-term(mixed) -> [{N, <<N:32>>, #{N => N}} || N <- lists:seq(1, 20000)].
+term(mixed) -> [{N, <<N:32>>, #{N => N}} || N <- lists:seq(1, 20000)];
+term(hamt) -> maps:from_list([{N, [N]} || N <- lists:seq(1, 100000)]);
+term(flat) -> [#{a => N, b => [N], N => x} || N <- lists:seq(1, 30000)];
+term(string) -> [lists:duplicate(60000, $a) | lists:duplicate(2000, "abc")];
+term(nested) -> [[N, [N, {N, [], {}}], #{}] || N <- lists:seq(1, 100000)];
+term(bigbin) -> {binary:copy(<<5>>, 3000000), << <<1:7>> || _ <- lists:seq(1, 100000) >>};
+term(kinds) ->
+    Ext = binary_to_term(<<131, 88, 119, 4, "a@hh", 1:32, 2:32, 3:32>>),
+    ExtPort = binary_to_term(<<131, 120, 119, 4, "a@hh", 7:64, 3:32>>),
+    ExtRef = binary_to_term(<<131, 90, 0, 3, 119, 4, "a@hh", 3:32, 1:32, 2:32, 3:32>>),
+    [{fun lists:seq/2, fun deep/2, [fun lists:seq/2], Ext, ExtPort, ExtRef} | term(lkinds)];
+%% Under LOCAL_EXT only local identities and no funs: erts 29.1.1 overflows its decode heap on
+%% funs there (external.c:2309).
+term(lkinds) ->
+    lists:duplicate(3000, {list_to_pid("<0.1.0>"), list_to_ref("#Ref<0.1.2.3>"),
+        1 bsl 200, -(1 bsl 70), 1 bsl 59, 3.25, -0.0, "str", <<"bin">>, <<3:3>>,
+        'atom', 'ünï', [a | b], {}, #{}, [], 12345678901}).
 deep(0, T) -> T;
 deep(N, T) -> deep(N - 1, {T}).
 encode(list, plain) -> term_to_binary(term(list));
@@ -26,12 +42,17 @@ encode(binary, compressed) -> term_to_binary(term(binary), [{compressed, 9}]);
 encode(small, plain) -> term_to_binary(term(small));
 encode(mixed, plain) -> term_to_binary(term(mixed));
 encode(mixed, compressed) -> term_to_binary(term(mixed), [{compressed, 1}]);
-encode(list, bad) -> B = term_to_binary(term(list)), binary:part(B, 0, byte_size(B) - 5).
+encode(list, bad) -> B = term_to_binary(term(list)), binary:part(B, 0, byte_size(B) - 5);
+encode(T, plain) -> term_to_binary(term(T));
+encode(T, local) -> term_to_binary(term(T), [local]).
 cases() ->
     [{list, plain, []}, {list, plain, [safe]}, {list, plain, [used]},
      {list, compressed, []}, {list, compressed, [used]}, {floats, plain, []},
      {tuple, plain, [safe]}, {binary, compressed, []}, {small, plain, []},
-     {mixed, plain, [safe, used]}, {mixed, compressed, []}, {list, bad, [used]}].
+     {mixed, plain, [safe, used]}, {mixed, compressed, []}, {list, bad, [used]},
+     {hamt, plain, []}, {flat, plain, []}, {string, plain, []}, {nested, plain, []},
+     {kinds, plain, []}, {lkinds, local, []}, {bigbin, plain, []}, {hamt, local, [used]},
+     {kinds, plain, [safe]}].
 reds() -> element(2, process_info(self(), reductions)).
 run(Index) ->
     {T, Enc, Opts} = lists:nth(Index, cases()),
@@ -74,7 +95,7 @@ count_in(Pid, Ref, N) ->
         _ -> count_in(Pid, Ref, N)
     after 30000 -> -1
     end.
-"#;
+"##;
 
 #[test]
 fn binary_to_term_matches_otp_on_big_inputs() {
@@ -83,7 +104,7 @@ fn binary_to_term_matches_otp_on_big_inputs() {
     reference.load(MODULE, &beam).unwrap();
     let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    for index in 1..=12i64 {
+    for index in 1..=21i64 {
         let CallResult::Ok(expected) = reference.call(MODULE, "run", &[OwnedTerm::Int(index)])
         else {
             panic!("OTP failed case {index}");

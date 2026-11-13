@@ -1195,390 +1195,6 @@ impl HeapFactory {
     }
 }
 
-impl<'a> HeapReservation<'a, ProcessHeap> {
-    /// Borrow the reserved words once as a safe slice-backed allocator.
-    ///
-    /// Port of `erts_factory_proc_prealloc_init` followed by `hp++` in
-    /// erts/emulator/beam/erl_message.c and erts/emulator/beam/external.c (`dec_term`), OTP-29.1.1.
-    pub fn with_words<R>(
-        &mut self,
-        f: impl FnOnce(&mut HeapReservationWords<'_>) -> R,
-    ) -> Result<R, TermError> {
-        let Self {
-            heap,
-            start,
-            cur,
-            end,
-        } = self;
-        let first = *start;
-        let count = (*end as usize)
-            .checked_sub(first as usize)
-            .filter(|bytes| bytes.is_multiple_of(std::mem::size_of::<u64>()))
-            .ok_or(TermError::BadArg)?
-            / std::mem::size_of::<u64>();
-        let cursor = (*cur as usize)
-            .checked_sub(first as usize)
-            .filter(|bytes| bytes.is_multiple_of(std::mem::size_of::<u64>()))
-            .ok_or(TermError::BadArg)?
-            / std::mem::size_of::<u64>();
-        let allocator = heap.allocator_identity();
-        let (words, owners, bin_vheap) = heap.reservation_words_mut(first, count)?;
-        let mut slice = HeapReservationWords {
-            words,
-            cursor,
-            reservation_cursor: cur,
-            allocator,
-            owners,
-            bin_vheap,
-        };
-        Ok(f(&mut slice))
-    }
-}
-
-/// One reserved heap block viewed as a safe word slice and an `hp++` allocator.
-pub struct HeapReservationWords<'a> {
-    words: &'a mut [u64],
-    cursor: usize,
-    reservation_cursor: &'a mut *mut u64,
-    allocator: usize,
-    owners: &'a mut LazyOwners,
-    bin_vheap: &'a mut u64,
-}
-
-impl HeapReservationWords<'_> {
-    /// Return the reserved words and the `hp` cursor for inline heap block construction.
-    #[inline(always)]
-    pub fn words_and_cursor(&mut self) -> (&mut [u64], &mut usize) {
-        (&mut *self.words, &mut self.cursor)
-    }
-
-    /// Return the words already reserved by `HAlloc`.
-    #[inline]
-    pub fn as_mut_words(&mut self) -> &mut [u64] {
-        self.words
-    }
-
-    /// Build an index handle for an address returned by this slice allocator.
-    #[inline]
-    pub fn slot_for(&self, ptr: *mut u64) -> Result<HeapTermSlot, TermError> {
-        Ok(self.term_slot(ptr))
-    }
-
-    /// Store a decoded term into a previously reserved slot.
-    #[inline(always)]
-    pub fn write_term_slot(&mut self, slot: HeapTermSlot, term: Term) -> Result<(), TermError> {
-        let Some(word) = slot
-            .indexed
-            .then(|| self.words.get_mut(slot.value))
-            .flatten()
-        else {
-            return Err(TermError::BadArg);
-        };
-        *word = term.bits();
-        Ok(())
-    }
-
-    /// Read a decoded term from a previously reserved slot.
-    #[inline(always)]
-    pub fn read_term_slot(&self, slot: HeapTermSlot) -> Result<Term, TermError> {
-        let Some(bits) = slot
-            .indexed
-            .then(|| self.words.get(slot.value))
-            .flatten()
-            .copied()
-        else {
-            return Err(TermError::BadArg);
-        };
-        if bits & 7 == 0 {
-            return Err(TermError::BadArg);
-        }
-        Ok(Term(bits))
-    }
-
-    /// Return a list term over two adjacent words in the slice.
-    #[inline]
-    pub fn list_term_at(&self, slot: HeapTermSlot) -> Result<Term, TermError> {
-        if !slot.indexed || slot.value >= self.words.len().saturating_sub(1) {
-            return Err(TermError::BadArg);
-        }
-        Ok(Term::from_ptr(
-            self.words.as_ptr().wrapping_add(slot.value).cast_mut(),
-            1,
-        ))
-    }
-
-    /// Return a tuple term over an initialized header at a reserved word index.
-    #[inline(always)]
-    pub fn boxed_term_at(&self, slot: HeapTermSlot) -> Result<Term, TermError> {
-        if !slot.indexed || slot.value >= self.words.len() {
-            return Err(TermError::BadArg);
-        }
-        Ok(Term::from_ptr(
-            self.words.as_ptr().wrapping_add(slot.value).cast_mut(),
-            2,
-        ))
-    }
-
-    /// Reserve a decoded local fun and return the first captured-term slot.
-    // Port of erts/emulator/beam/external.c:5162-5168 (`dec_term`, NEW_FUN_EXT), OTP-29.1.1.
-    pub fn reserve_local_fun_stub(
-        &mut self,
-        entry: Arc<FunEntry>,
-        free: usize,
-    ) -> Result<(Term, Option<HeapTermSlot>), TermError> {
-        let entry = crate::fun::fun_entry_get_or_make_stub(entry);
-        crate::fun::make_fun_entry_permanent(&entry);
-        let header = crate::fun::local_header(entry.arity, free).ok_or(TermError::SystemLimit)?;
-        let words = 2usize.checked_add(free).ok_or(TermError::SystemLimit)?;
-        let ptr = self.alloc(words).ok_or(TermError::HeapFull)?;
-        store(ptr, header);
-        store(ptr.wrapping_add(1), Arc::as_ptr(&entry) as u64);
-        for offset in 0..free {
-            store(ptr.wrapping_add(2 + offset), Term::NIL.bits());
-        }
-        let first = (free != 0).then(|| self.term_slot(ptr.wrapping_add(2)));
-        Ok((Term::from_ptr(ptr, 2), first))
-    }
-
-    /// Reserve a decoded native record whose definition is known and return the slot of
-    /// every field value in definition order, for the `next` chain of the decoder.
-    // Port of erts/emulator/beam/external.c:5257-5385 (`dec_term`, RECORD_EXT) and
-    // erl_record.c (erts_canonical_record_def), OTP-29.1.1.
-    pub fn reserve_native_record(
-        &mut self,
-        module: Atom,
-        name: Atom,
-        exported: bool,
-        keys: &[Atom],
-    ) -> Result<(Term, Vec<HeapTermSlot>), TermError> {
-        let layout = RecordLayout::new(module, name, exported, keys.iter().copied())?;
-        let definition = match crate::record_table::canonical_definition(&layout) {
-            Some(canonical) => canonical,
-            None => TermBuilder::new(&mut *self).record_definition_tuple(&layout)?,
-        };
-        let count = keys.len();
-        let ptr = self.alloc(2 + count).ok_or(TermError::HeapFull)?;
-        store(ptr, ((1 + count) as u64) << 6 | RECORD);
-        store(ptr.wrapping_add(1), definition.bits());
-        for offset in 0..count {
-            store(ptr.wrapping_add(2 + offset), Term::NIL.bits());
-        }
-        let slots = layout
-            .order
-            .iter()
-            .map(|sorted_index| self.term_slot(ptr.wrapping_add(2 + sorted_index)))
-            .collect();
-        Ok((Term::from_ptr(ptr, 2), slots))
-    }
-
-    /// Return a slot at an offset in this reservation.
-    #[inline]
-    pub fn offset_slot(
-        &self,
-        slot: HeapTermSlot,
-        word_offset: usize,
-    ) -> Result<HeapTermSlot, TermError> {
-        let value = slot
-            .indexed
-            .then(|| slot.value.checked_add(word_offset))
-            .flatten()
-            .filter(|value| *value < self.words.len())
-            .ok_or(TermError::BadArg)?;
-        Ok(HeapTermSlot::index(value))
-    }
-
-    /// Store the next slot address, matching `dec_term`'s `*objp` chain.
-    // Port of erts/emulator/beam/external.c:4368-4376, OTP-29.1.1.
-    #[inline(always)]
-    pub fn write_next_slot(
-        &mut self,
-        slot: HeapTermSlot,
-        next: Option<HeapTermSlot>,
-    ) -> Result<(), TermError> {
-        let value = match next {
-            Some(next) if next.indexed && next.value < self.words.len() => {
-                self.words.as_mut_ptr().wrapping_add(next.value) as usize
-            }
-            Some(_) => return Err(TermError::BadArg),
-            None => 0,
-        };
-        *self
-            .words
-            .get_mut(
-                slot.indexed
-                    .then_some(slot.value)
-                    .ok_or(TermError::BadArg)?,
-            )
-            .ok_or(TermError::BadArg)? = value as u64;
-        Ok(())
-    }
-
-    /// Read and clear the next unfilled slot address.
-    // Port of erts/emulator/beam/external.c:4368-4376, OTP-29.1.1.
-    #[inline(always)]
-    pub fn take_next_slot(
-        &mut self,
-        slot: HeapTermSlot,
-    ) -> Result<Option<HeapTermSlot>, TermError> {
-        let word = self
-            .words
-            .get_mut(
-                slot.indexed
-                    .then_some(slot.value)
-                    .ok_or(TermError::BadArg)?,
-            )
-            .ok_or(TermError::BadArg)?;
-        let next = *word as usize;
-        *word = 0;
-        if next == 0 {
-            Ok(None)
-        } else {
-            let base = self.words.as_mut_ptr() as usize;
-            let offset = next
-                .checked_sub(base)
-                .filter(|offset| offset.is_multiple_of(std::mem::size_of::<u64>()))
-                .ok_or(TermError::BadArg)?;
-            let index = offset / std::mem::size_of::<u64>();
-            (index < self.words.len())
-                .then_some(HeapTermSlot::index(index))
-                .ok_or(TermError::BadArg)
-                .map(Some)
-        }
-    }
-
-    /// Swap two decoded terms inside the reserved slice.
-    #[inline(always)]
-    pub fn swap_term_slots(
-        &mut self,
-        left: HeapTermSlot,
-        right: HeapTermSlot,
-    ) -> Result<(), TermError> {
-        if !left.indexed || !right.indexed {
-            return Err(TermError::BadArg);
-        }
-        self.words.swap(left.value, right.value);
-        Ok(())
-    }
-}
-
-impl Drop for HeapReservationWords<'_> {
-    fn drop(&mut self) {
-        *self.reservation_cursor = self.words.as_mut_ptr().wrapping_add(self.cursor);
-    }
-}
-
-impl HeapAlloc for HeapReservationWords<'_> {
-    fn allocator_identity(&self) -> usize {
-        self.allocator
-    }
-
-    #[inline(always)]
-    fn term_slot(&self, ptr: *mut u64) -> HeapTermSlot {
-        let base = self.words.as_ptr() as usize;
-        let address = ptr as usize;
-        let offset = address.wrapping_sub(base);
-        if address < base
-            || !offset.is_multiple_of(std::mem::size_of::<u64>())
-            || offset / std::mem::size_of::<u64>() >= self.words.len()
-        {
-            return HeapTermSlot::index(usize::MAX);
-        }
-        HeapTermSlot::index(offset / std::mem::size_of::<u64>())
-    }
-
-    #[inline(always)]
-    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        let end = self.cursor.checked_add(words)?;
-        if end > self.words.len() {
-            return None;
-        }
-        let ptr = self.words[self.cursor..].as_mut_ptr();
-        self.cursor = end;
-        Some(ptr)
-    }
-
-    #[inline(always)]
-    fn alloc_with_extra(&mut self, words: usize, _extra: usize) -> Option<*mut u64> {
-        self.alloc(words)
-    }
-
-    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
-        *self.bin_vheap = self.bin_vheap.saturating_add((binary.len() / 8) as u64);
-        drop(binary);
-    }
-
-    fn link_bin_ref(
-        &mut self,
-        bin_ref: *mut u64,
-        writable: bool,
-        overhead_words: u64,
-        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
-        let head = if writable {
-            &mut self.owners.wrt_bins
-        } else {
-            &mut self.owners.off_heap_first
-        };
-        store(bin_ref.wrapping_add(2), *head as u64);
-        *head = bin_ref as usize;
-        if let Some(owner) = owner {
-            owner.transfer_to_bin_ref(bin_ref);
-        }
-        self.owners.overhead = self.owners.overhead.saturating_add(overhead_words);
-        Ok(())
-    }
-
-    fn add_bin_vheap(&mut self, words: u64) {
-        *self.bin_vheap = self.bin_vheap.saturating_add(words);
-    }
-
-    fn retain_writable_binary_with_apparent_size(
-        &mut self,
-        binary: Arc<WritableBinary>,
-        apparent_size_bits: usize,
-    ) -> Result<(), TermError> {
-        *self.bin_vheap = self
-            .bin_vheap
-            .saturating_add((apparent_size_bits.div_ceil(8) / 8) as u64);
-        drop(binary);
-        Ok(())
-    }
-
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
-        link_external_bin_ref(&mut self.owners.off_heap_first, bin_ref, binary);
-        Ok(())
-    }
-
-    fn supports_external_binary(&self) -> bool {
-        true
-    }
-
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
-        link_node_thing(&mut self.owners.off_heap_first, thing, node);
-    }
-
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
-        let HeapOwners {
-            off_heap_first: head,
-            overhead,
-            ..
-        } = &mut **self.owners;
-        link_magic_thing(head, overhead, thing, owner);
-        Ok(())
-    }
-
-    fn supports_magic(&self) -> bool {
-        true
-    }
-}
 impl<H: HeapAlloc + ?Sized> Drop for HeapReservation<'_, H> {
     fn drop(&mut self) {
         self.release_tail();
@@ -3150,54 +2766,6 @@ impl ProcessHeap {
         }
         (armed && mark != INVALID_HFRAG && mark as usize <= self.fragments.len())
             .then_some(mark as usize)
-    }
-
-    fn reservation_words_mut(
-        &mut self,
-        start: *mut u64,
-        count: usize,
-    ) -> Result<(&mut [u64], &mut LazyOwners, &mut u64), TermError> {
-        self.sync_mbuf_fast();
-        if self.detached {
-            return Err(TermError::Unsupported("detached heap decode slice"));
-        }
-        let bytes = count
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or(TermError::BadArg)?;
-        let address = start as usize;
-        let end = address.checked_add(bytes).ok_or(TermError::BadArg)?;
-        let Self {
-            words,
-            abi,
-            fragments,
-            owners,
-            bin_vheap,
-            ..
-        } = self;
-        let young_base = words.as_ptr() as usize;
-        let used_end = (abi.htop as usize).max(young_base);
-        let used_words = (used_end - young_base) / std::mem::size_of::<u64>();
-        let young_used_end = young_base.saturating_add(used_words.saturating_mul(8));
-        if address >= young_base && end <= young_used_end {
-            let offset = (address - young_base) / 8;
-            let all = words.words_mut();
-            return Ok((&mut all[offset..offset + count], owners, bin_vheap));
-        }
-        for fragment in fragments.iter_mut().rev() {
-            if let Fragment::Block { memory, used } = fragment {
-                let base = memory.as_ptr() as usize;
-                let used_end = base.saturating_add(used.saturating_mul(8));
-                if address >= base && end <= used_end {
-                    let offset = (address - base) / 8;
-                    return Ok((
-                        &mut memory.as_mut_slice()[offset..offset + count],
-                        owners,
-                        bin_vheap,
-                    ));
-                }
-            }
-        }
-        Err(TermError::BadArg)
     }
 }
 impl Default for ProcessHeap {
@@ -6234,6 +5802,54 @@ impl Term {
 }
 
 impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
+    /// `NEW_FUN_EXT` of `dec_term` after the module, index, uniq and pid were decoded: the
+    /// `ErlFunThing` at `funp` (`ERL_FUN_SIZE + num_free` words the decoder took before) gets
+    /// its header and entry; the environment words stay for the `next` chain.
+    // Port of erts/emulator/beam/external.c (dec_term, NEW_FUN_EXT), OTP-29.1.1.
+    pub fn init_decoded_fun(
+        funp: crate::raw::HeapSlotPtr,
+        entry: Arc<FunEntry>,
+        free: usize,
+    ) -> Result<Term, TermError> {
+        let entry = crate::fun::fun_entry_get_or_make_stub(entry);
+        crate::fun::make_fun_entry_permanent(&entry);
+        let header = crate::fun::local_header(entry.arity, free).ok_or(TermError::SystemLimit)?;
+        funp.store(header);
+        funp.offset(1).store(Arc::as_ptr(&entry) as u64);
+        Ok(Term::from_ptr(funp.as_ptr(), 2))
+    }
+
+    /// `RECORD_EXT` of `dec_term`: the canonical definition and the instance; the field value
+    /// words, in the order of the encoded keys, are returned for the `next` chain.
+    // Port of erts/emulator/beam/external.c (dec_term, RECORD_EXT) and erl_record.c
+    // (erts_canonical_record_def), OTP-29.1.1.
+    pub fn decoded_native_record(
+        &mut self,
+        module: Atom,
+        name: Atom,
+        exported: bool,
+        keys: &[Atom],
+    ) -> Result<(Term, Vec<crate::raw::HeapSlotPtr>), TermError> {
+        let layout = RecordLayout::new(module, name, exported, keys.iter().copied())?;
+        let definition = match crate::record_table::canonical_definition(&layout) {
+            Some(canonical) => canonical,
+            None => TermBuilder::new(&mut *self.heap).record_definition_tuple(&layout)?,
+        };
+        let count = keys.len();
+        let ptr = self.words(2 + count)?;
+        store(ptr, ((1 + count) as u64) << 6 | RECORD);
+        store(ptr.wrapping_add(1), definition.bits());
+        let base = crate::raw::HeapSlotPtr::from_ptr(ptr).ok_or(TermError::BadArg)?;
+        let slots = layout
+            .order
+            .iter()
+            .map(|sorted_index| base.offset(2 + sorted_index))
+            .collect();
+        Ok((Term::from_ptr(ptr, 2), slots))
+    }
+}
+
+impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Box a reference to an opaque owner for NIF resources and future native handles.
     pub fn magic_ref(&mut self, owner: Arc<crate::MagicRef>) -> Result<Term, TermError> {
         if !self.heap.supports_magic() {
@@ -6366,10 +5982,7 @@ impl Term {
 }
 #[cfg(test)]
 mod heap_block_tests {
-    use super::{
-        HeapAlloc, HeapReservation, MbufFast, ProcessHeap, Term, TermBuilder, TermError, TermKind,
-        VecHeap,
-    };
+    use super::{HeapAlloc, MbufFast, ProcessHeap, TermBuilder, VecHeap};
 
     #[test]
     fn positive_bignum_block_leaves_digits_for_incremental_fill() {
@@ -6477,35 +6090,5 @@ mod heap_block_tests {
         heap.release(end, released_to as *mut u64);
         similar_asserts::assert_eq!(heap.mbuf_size(), 3);
         similar_asserts::assert_eq!(heap.heap_fragment_with_extra(1, 200) as usize, released_to);
-    }
-
-    #[test]
-    fn reserved_words_use_indices_for_term_slots_and_next_fixups() {
-        let mut heap = ProcessHeap::with_words(64);
-        let mut reservation = HeapReservation::new(&mut heap, 8).unwrap();
-        let start = reservation.cursor();
-
-        let tuple = reservation
-            .with_words(|words| {
-                let (tuple, first, second) = {
-                    let mut builder = TermBuilder::new(words);
-                    let block = builder.reserve_tuple_block(2)?;
-                    (block.term_at(0)?, block.term_slot(1)?, block.term_slot(2)?)
-                };
-                words.write_next_slot(first, None)?;
-                similar_asserts::assert_eq!(words.take_next_slot(first)?, None);
-                words.write_next_slot(first, Some(second))?;
-                similar_asserts::assert_eq!(words.take_next_slot(first)?, Some(second));
-                let value = Term::small(7).unwrap();
-                words.write_term_slot(first, value)?;
-                words.write_term_slot(second, Term::NIL)?;
-                similar_asserts::assert_eq!(words.read_term_slot(first)?, value);
-                Ok::<_, TermError>(tuple)
-            })
-            .unwrap()
-            .unwrap();
-
-        similar_asserts::assert_eq!(reservation.cursor(), start.wrapping_add(3));
-        similar_asserts::assert_eq!(tuple.classify(), TermKind::Tuple);
     }
 }
