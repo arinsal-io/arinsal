@@ -145,6 +145,12 @@ pub(crate) fn call_from_executor(
     ))
 }
 
+/// Whether `f` (a `bif_table[].f`) is a BIF body: set, and not the shim that parks the call in
+/// the executor.
+pub(crate) fn is_body(f: usize) -> bool {
+    f != 0 && f != bif!(crate::native_helpers::yield_executor_bif)
+}
+
 /// The [`Bif`] at `bif_table[index]`, unless it is empty or the executor shim.
 fn function_at(index: usize) -> Option<Bif> {
     let address = BIF_TABLE.get(index)?.load(Ordering::Acquire);
@@ -170,32 +176,6 @@ pub(crate) enum BinaryGuard {
     ByteSize,
     BitSize,
     BinaryPart2,
-    BinaryPart3,
-}
-
-pub(crate) fn binary_guard(module: &str, function: &str, arity: u8) -> Option<BinaryGuard> {
-    match (module, function, arity) {
-        ("erlang", "byte_size", 1) => Some(BinaryGuard::ByteSize),
-        ("erlang", "bit_size", 1) => Some(BinaryGuard::BitSize),
-        ("erlang", "binary_part", 2) | ("binary", "part", 2) => Some(BinaryGuard::BinaryPart2),
-        ("erlang", "binary_part", 3) | ("binary", "part", 3) => Some(BinaryGuard::BinaryPart3),
-        _ => None,
-    }
-}
-
-/// The `i_bif*` function of a binary guard BIF, chosen when the call site is emitted.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (`mov ARG, bif->f` at load time),
-// OTP-29.1.1: the guard is known from the import, never recognised by name per call.
-pub(crate) fn guard_helper(module: &str, function: &str, arity: u8) -> Option<usize> {
-    use crate::native_helpers::{
-        binary_part_2_guard, binary_part_3_guard, bit_size_guard, byte_size_guard,
-    };
-    Some(match binary_guard(module, function, arity)? {
-        BinaryGuard::ByteSize => byte_size_guard as *const () as usize,
-        BinaryGuard::BitSize => bit_size_guard as *const () as usize,
-        BinaryGuard::BinaryPart2 => binary_part_2_guard as *const () as usize,
-        BinaryGuard::BinaryPart3 => binary_part_3_guard as *const () as usize,
-    })
 }
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
@@ -253,6 +233,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "update", 3) => bif!(erl_map::maps_update_3),
         ("maps", "remove", 2) => bif!(erl_map::maps_remove_2),
         ("maps", "take", 2) => bif!(erl_map::maps_take_2),
+        ("erlang", "map_size", 1) => bif!(erl_map::map_size_1),
+        ("erlang", "map_get", 2) => bif!(erl_map::map_get_2),
+        ("erlang", "is_map_key", 2) => bif!(erl_map::is_map_key_2),
         ("maps", "from_list", 1) => bif!(erl_map::maps_from_list_1),
         ("maps", "from_keys", 2) => bif!(erl_map::maps_from_keys_2),
         ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
@@ -303,6 +286,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "unique_integer", 1) => bif!(unique_integer_1_light),
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
         ("erlang", "node", 0) => bif!(crate::dist::node_0),
+        ("erlang", "node", 1) => bif!(crate::dist::node_1),
         ("persistent_term", "get", 1) => bif!(persistent_term_get_1_light),
         ("persistent_term", "get", 2) => bif!(persistent_term_get_2_light),
         // bif.c

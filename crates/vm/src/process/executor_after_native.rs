@@ -564,7 +564,7 @@ impl Executor {
                         | arinsal_loader::ImportClass::Fun
                 ) || export.trap_entry
                     || (crate::trace_bp::any_pattern()
-                        && crate::beamasm_integration::dispatch_bif(target_pc).is_some()
+                        && export.bif.is_some()
                         && crate::trace_bp::selects(
                             process,
                             &export.module,
@@ -828,8 +828,8 @@ impl Executor {
                         }
                     };
                     let result = result.or_else(|| {
-                        let (bif, arity) = crate::beamasm_integration::dispatch_bif(target_pc)?;
-                        let arity = usize::from(arity);
+                        let arity = usize::from(export.arity);
+                        let bif = export.bif?;
                         let result = self.vm.call_bif_traced_named(
                             process,
                             ctx,

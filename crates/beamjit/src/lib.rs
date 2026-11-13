@@ -224,10 +224,10 @@ pub trait ModuleEnv {
             update: unused_record_create,
         }
     }
-    /// Runtime hook calling the plain BIF with export `identity`: the BIF's own function,
-    /// chosen at load time (`bif_table[].f`).
-    fn bif_identity_helper(&self, _identity: usize) -> arinsal_beamasm::bif::BifIdentityHelper {
-        unused_bif_identity as *const () as usize
+    /// `bif_table[ep->bif_number].f` of the BIF export `identity`, which `i_bif*` calls as
+    /// `(c_p, reg, I)`.
+    fn bif_function(&self, _identity: usize) -> usize {
+        unused_bif_function as *const () as usize
     }
     /// Export identity of an import that is a plain (pure or heap-allocating) BIF, if it is one.
     fn plain_bif_identity(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {
@@ -342,13 +342,7 @@ extern "C" fn unused_wait_timeout(
     0
 }
 
-extern "C" fn unused_bif_identity(
-    _p: *mut ProcessHeader,
-    _i: u64,
-    _a: u64,
-    _b: u64,
-    _c: u64,
-) -> u64 {
+extern "C" fn unused_bif_function(_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
     0
 }
 
@@ -3322,10 +3316,10 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             assembler.emit_bif_by_identity(
                 identity,
                 bif_mfa,
+                env.bif_function(identity),
                 &sources,
                 fail,
                 value(bif_at + 1)?,
-                env.bif_identity_helper(identity),
             )
         }
         EmitterKind::Records => {
@@ -4098,10 +4092,10 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         assembler.emit_bif_by_identity(
                             identity,
                             bif_mfa,
+                            env.bif_function(identity),
                             &[value(key_at)?, value(map_at)?],
                             n(1)?,
                             value(dest_at)?,
-                            env.bif_identity_helper(identity),
                         )
                     } else {
                         assembler.emit_bif_is_map_key_typed(

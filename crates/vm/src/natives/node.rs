@@ -13,7 +13,6 @@ use crate::node_tables;
 /// Halt and node-identity BIFs. `handler` is this table.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "halt", 2),
-    ("erlang", "node", 1),
     ("erlang", "nodes", 0),
     ("erlang", "nodes", 1),
     ("erlang", "nodes", 2),
@@ -33,7 +32,6 @@ type Handler =
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
         ("erlang", "halt", 2) => Some(call_halt2),
-        ("erlang", "node", 1) => Some(call_node1),
         ("erlang", "nodes", 0) => Some(call_nodes0),
         ("erlang", "nodes", 1) => Some(call_nodes1),
         ("erlang", "nodes", 2) => Some(call_nodes2),
@@ -51,15 +49,6 @@ fn call_halt2(
     args: &[Term],
 ) -> Result<Term, VmError> {
     halt(process, ctx, args[0], args[1])
-}
-
-fn call_node1(
-    _vm: &mut Vm,
-    _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    node(args[0])
 }
 
 fn call_nodes0(

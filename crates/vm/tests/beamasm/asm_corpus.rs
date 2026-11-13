@@ -98,7 +98,14 @@ impl CorpusEnv {
                 .imports
                 .iter()
                 .enumerate()
-                .filter(|(_, import)| import.bif_fn().is_some())
+                .filter(|(_, import)| {
+                    import.bif_fn().is_some()
+                        || arinsal_vm::bif_table_has_function(
+                            import.module,
+                            import.function,
+                            import.arity,
+                        )
+                })
                 .map(|(index, _)| index as u32)
                 .collect(),
             literal_heap: RefCell::new(VecHeap::new()),

@@ -198,8 +198,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             }),
             O::Int(1),
         ],
-        ("erlang", "is_map_key" | "map_get", 2) => vec![atom("a"), O::Map(vec![(atom("a"), x)])],
-        ("erlang", "map_size", 1) => vec![O::Map(vec![(atom("a"), x)])],
         ("erlang", "error" | "exit" | "throw", 1) => vec![term(n)],
         ("erlang", "error", 2) => vec![term(n), list(vec![term(n + 1)])],
         ("erlang", "error", 3) => vec![term(n), list(vec![]), list(vec![])],
@@ -856,36 +854,6 @@ fn identity_bifs_are_unique_across_threads() {
     }
     assert_eq!(all_integers.len(), 8000);
     assert_eq!(all_references.len(), 8000);
-}
-
-#[test]
-fn map_error_reasons_match_otp() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let empty = O::Map(vec![]);
-    for (module, name, input) in [
-        ("erlang", "map_get", vec![atom("missing"), empty.clone()]),
-        ("erlang", "map_size", vec![atom("not_map")]),
-    ] {
-        let actual = call(module, name, &input);
-        let expected = reference.call(module, name, &input);
-        match (actual, expected) {
-            (
-                arinsal_difftest::CallResult::Exception {
-                    class: a_class,
-                    reason: a_reason,
-                    ..
-                },
-                arinsal_difftest::CallResult::Exception {
-                    class: e_class,
-                    reason: e_reason,
-                    ..
-                },
-            ) => {
-                assert_eq!((a_class, a_reason), (e_class, e_reason), "{module}:{name}");
-            }
-            (actual, expected) => panic!("{module}:{name}: {actual:?} != {expected:?}"),
-        }
-    }
 }
 
 #[test]

@@ -591,9 +591,6 @@ pub fn visit_bif<V: BifTableVisitor>(
     if let Some(found) = atomics::lookup(module, name, arity, visitor) {
         return Some(found);
     }
-    if let Some(found) = maps_bifs::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
     if let Some(found) = time::lookup(module, name, arity, visitor) {
         return Some(found);
     }

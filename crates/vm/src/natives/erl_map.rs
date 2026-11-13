@@ -54,6 +54,89 @@ pub(crate) extern "C" fn maps_values_1(c_p: *mut ProcessHeader, _reg: *mut u64, 
     maps_projection(c_p, i, "maps:values/1", false)
 }
 
+/// `map_size/1`.
+// Port of erts/emulator/beam/erl_map.c (map_size_1), OTP-29.1.1.
+pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let map = process.x[0];
+    match arinsal_maps::size(map) {
+        // A map's size is far below the small integer limit.
+        Ok(size) => Term::small(size as i64).map_or(0, crate::native_hooks::raw),
+        Err(_) => bif_error_tagged(
+            c_p,
+            i,
+            process,
+            "erlang:map_size/1",
+            1,
+            Term::atom(atoms::BADMAP),
+            map,
+        ),
+    }
+}
+
+/// `map_get/2`.
+// Port of erts/emulator/beam/erl_map.c (map_get_2), OTP-29.1.1.
+pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (key, map) = (process.x[0], process.x[1]);
+    if map.is_flatmap() || map.is_hashmap() {
+        if let Ok(Some(value)) = arinsal_maps::get(map, key) {
+            return crate::native_hooks::raw(value);
+        }
+        return bif_error_tagged(
+            c_p,
+            i,
+            process,
+            "erlang:map_get/2",
+            2,
+            Term::atom(atoms::BADKEY),
+            key,
+        );
+    }
+    bif_error_tagged(
+        c_p,
+        i,
+        process,
+        "erlang:map_get/2",
+        2,
+        Term::atom(atoms::BADMAP),
+        map,
+    )
+}
+
+/// `is_map_key/2`.
+// Port of erts/emulator/beam/erl_map.c (is_map_key_2), OTP-29.1.1.
+pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (key, map) = (process.x[0], process.x[1]);
+    if map.is_flatmap() || map.is_hashmap() {
+        let found = matches!(arinsal_maps::get(map, key), Ok(Some(_)));
+        return crate::native_hooks::raw(Term::atom(if found {
+            atoms::TRUE
+        } else {
+            atoms::FALSE
+        }));
+    }
+    bif_error_tagged(
+        c_p,
+        i,
+        process,
+        "erlang:is_map_key/2",
+        2,
+        Term::atom(atoms::BADMAP),
+        map,
+    )
+}
+
 /// `const long reds = iterations_per_red * ERTS_BIF_REDS_LEFT(p)`.
 #[inline(always)]
 fn ycf_reds(process: &crate::Process, iterations_per_red: i64) -> i64 {

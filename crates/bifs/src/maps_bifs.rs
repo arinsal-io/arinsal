@@ -1,6 +1,5 @@
 //! Map BIF adapters over flatmaps and HAMTs.
 
-use crate::pure::{bool_term, integer};
 use arinsal_maps::{self, MapError, MapResult};
 use arinsal_term::{
     Term, atoms,
@@ -8,21 +7,6 @@ use arinsal_term::{
 };
 
 use crate::{BifError, Ctx};
-
-pub(super) fn lookup<V: crate::BifTableVisitor>(
-    module: &str,
-    name: &str,
-    arity: u8,
-    v: &mut V,
-) -> Option<V::Output> {
-    let f = match (module, name, arity) {
-        ("erlang", "map_size", 1) => v.entry::<word_bodies::map_size>(),
-        ("erlang", "map_get", 2) => v.entry::<word_bodies::map_get>(),
-        ("erlang", "is_map_key", 2) => v.entry::<word_bodies::is_map_key>(),
-        _ => return None,
-    };
-    arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
-}
 
 // `UnsupportedKey` is deprecated and never produced any more, but the match
 // must stay exhaustive.
@@ -48,30 +32,6 @@ fn mapped<T>(ctx: &mut Ctx<'_>, result: MapResult<T>) -> Result<T, BifError> {
     result.map_err(|error| map_error(ctx, error))
 }
 
-// The JIT calls these three plain BIFs through the arinsal_bifs body (`emit_i_bif2` fallback of
-// the inlined guard BIFs); erts reaches `bif_table[].f` there.
-fn map_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match mapped(ctx, arinsal_maps::size(args[0])).and_then(|size| integer(ctx, size)) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-fn map_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match mapped(ctx, arinsal_maps::get(args[1], args[0])) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            let error = map_error(ctx, MapError::Badkey(args[0]));
-            ctx.fail(error)
-        }
-        Err(error) => ctx.fail(error),
-    }
-}
-fn is_map_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match mapped(ctx, arinsal_maps::is_key(args[1], args[0])) {
-        Ok(value) => bool_term(value),
-        Err(error) => ctx.fail(error),
-    }
-}
 /// Resumable `maps:keys/1` / `maps:values/1` over a hashmap.
 ///
 /// Port of erts/emulator/beam/erl_map.c:2801-2880 (hashmap_keys, hashmap_values), OTP-29.1.1:
@@ -476,7 +436,3 @@ impl MapsBuildWalk {
         }
     }
 }
-
-crate::word_bif_bodies_in!(word_bodies;
-    map_size, map_get, is_map_key,
-);
