@@ -1552,6 +1552,14 @@ fn internal_state_tuple_get(
             )))
         });
     }
+    if let Some(fields) = term_sequence(selector)
+        && let [name, term, opts] = fields.as_slice()
+        && name.as_atom().and_then(|name| global_atoms().text(name)) == Some("term_to_binary")
+    {
+        // Port of erts/emulator/beam/erl_bif_info.c:4920-4921, OTP-29.1.1.
+        return crate::natives::external::erts_debug_term_to_binary(process, *term, *opts)
+            .map(Some);
+    }
     let Ok(owned) = to_owned(selector) else {
         return Ok(None);
     };
@@ -1571,22 +1579,6 @@ fn internal_state_tuple_get(
             "no_time_warp" | "single_time_warp" | "multi_time_warp"
         );
         return Ok((valid_correction && valid_mode).then(|| Term::atom(arinsal_term::atoms::TRUE)));
-    }
-    if let [OwnedTerm::Atom(name), term, options] = fields.as_slice()
-        && name == "term_to_binary"
-    {
-        let Some(options) = term_binary_options(options) else {
-            return Ok(None);
-        };
-        let bytes = arinsal_etf::encode(term, options);
-        return TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-            .binary(&bytes)
-            .map(Some)
-            .map_err(|_| {
-                VmError::Trap(exceptions::Trap::error(Term::atom(
-                    arinsal_term::atoms::SYSTEM_LIMIT,
-                )))
-            });
     }
     if let [OwnedTerm::Atom(name), first, second] = fields.as_slice()
         && name == "make_unique_integer"
@@ -1923,49 +1915,6 @@ fn colliding_names(process: &mut Process, name: &str, count: u64) -> Result<Term
     }
     terms.reverse();
     list(process, &terms)
-}
-
-fn term_binary_options(options: &OwnedTerm) -> Option<arinsal_etf::EncodeOptions> {
-    let mut encoded = arinsal_etf::EncodeOptions::default();
-    let entries = match options {
-        OwnedTerm::Nil => return Some(encoded),
-        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems,
-        _ => return None,
-    };
-    for option in entries {
-        match option {
-            OwnedTerm::Atom(name) if name == "deterministic" => encoded.deterministic = true,
-            OwnedTerm::Tuple(fields) if fields.len() == 2 => {
-                let OwnedTerm::Atom(name) = &fields[0] else {
-                    return None;
-                };
-                let value = &fields[1];
-                match name.as_str() {
-                    "compressed" => {
-                        let level = match value {
-                            OwnedTerm::Atom(value) if value == "true" => 6,
-                            OwnedTerm::Int(value) => u8::try_from(*value).ok()?,
-                            _ => return None,
-                        };
-                        if level > 9 {
-                            return None;
-                        }
-                        encoded.compressed = Some(level);
-                    }
-                    "minor_version" => {
-                        let version = owned_uint(value)?;
-                        if version > 2 {
-                            return None;
-                        }
-                        encoded.minor_version = Some(version as u8);
-                    }
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        }
-    }
-    Some(encoded)
 }
 
 /// Port of erts_get_node_and_dist_references called by erl_bif_info.c:4354, OTP-29.1.1.

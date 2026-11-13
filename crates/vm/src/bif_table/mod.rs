@@ -205,9 +205,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "term_to_iovec", 2) => bif!(external::term_to_iovec_2),
         ("erlang", "external_size", 1) => bif!(external::external_size_1),
         ("erlang", "external_size", 2) => bif!(external::external_size_2),
-        ("erlang", "binary_to_term", 1) => {
-            bif!(crate::bif_traps::binary_to_term_1_light)
-        }
+        ("erlang", "binary_to_term", 1) => bif!(external::binary_to_term_1),
+        ("erlang", "binary_to_term", 2) => bif!(external::binary_to_term_2),
         // erl_bif_lists.c
         ("erlang", "++", 2) => bif!(erl_bif_lists::ebif_plusplus_2),
         ("erlang", "append", 2) => bif!(erl_bif_lists::append_2),
@@ -350,6 +349,7 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
         ("erts_internal", "term_to_binary_trap", 1) => bif!(external::term_to_binary_trap_1),
+        ("erts_internal", "binary_to_term_trap", 1) => bif!(external::binary_to_term_trap_1),
         ("erts_internal", "binary_to_list_continue", 1) => {
             bif!(binary::binary_to_list_continue_1)
         }
@@ -362,19 +362,6 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         }
         _ => return None,
     })
-}
-
-/// The light entry of a trapping BIF with its own body, compiled when the export is created.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:421-447, OTP-29.1.1: the fragment calls the
-// selected BIF body directly; that body leaves the light path only when it traps.
-pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    use crate::bif_traps::BinaryToTerm;
-    use crate::native_helpers::trap_bif_entry;
-    let func = match (module, function, arity) {
-        ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
-        _ => return None,
-    };
-    Some(func)
 }
 
 /// The entries compiled for one BIF of `arinsal_bifs`: its body is inlined into
@@ -520,10 +507,7 @@ mod tests {
         let direct = [
             ("term_to_binary", bif!(external::term_to_binary_1)),
             ("external_size", bif!(external::external_size_1)),
-            (
-                "binary_to_term",
-                bif!(crate::bif_traps::binary_to_term_1_light),
-            ),
+            ("binary_to_term", bif!(external::binary_to_term_1)),
         ];
         for (function, expected) in direct {
             similar_asserts::assert_eq!(special("erlang", function, 1), Some(expected));
@@ -532,7 +516,10 @@ mod tests {
             special("erlang", "term_to_binary", 2),
             Some(bif!(external::term_to_binary_2))
         );
-        assert!(special("erlang", "binary_to_term", 2).is_none());
+        similar_asserts::assert_eq!(
+            special("erlang", "binary_to_term", 2),
+            Some(bif!(external::binary_to_term_2))
+        );
     }
 
     #[test]

@@ -5597,12 +5597,14 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
         .and_then(|runtime| runtime.ports.get(id))
         .map(|handle| handle.owner_pid())
         .ok_or_else(badarg)?;
+    // enif_term_to_binary: erts_encode_ext_size + erts_encode_ext of the event, then the bytes
+    // become the binary of the `{command, Bin}` message.
     let encoded = {
+        let bytes = arinsal_bifs::encode_term_to_binary(event).map_err(|_| badarg())?;
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state);
-        let encode = arinsal_bifs::lookup("erlang", "term_to_binary", 1).ok_or_else(badarg)?;
-        encode(&mut ctx, &[event]).map_err(|_| badarg())?
+        TermBuilder::new(&mut heap)
+            .binary(&bytes)
+            .map_err(|_| badarg())?
     };
     let command = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);

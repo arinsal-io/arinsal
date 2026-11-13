@@ -606,9 +606,6 @@ pub fn visit_bif<V: BifTableVisitor>(
     if let Some(found) = dirty::lookup(module, name, arity, visitor) {
         return Some(found);
     }
-    if let Some(found) = etf::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
     if let Some(found) = pure::lookup(module, name, arity, visitor) {
         return Some(found);
     }

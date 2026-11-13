@@ -11,10 +11,6 @@ pub(crate) enum HandlerResult {
         value: Term,
         reductions: u32,
     },
-    Failed {
-        error: BifError,
-        reductions: u32,
-    },
     Yield {
         continuation: &'static str,
         state: Arc<MagicRef>,
@@ -28,9 +24,7 @@ impl HandlerResult {
     /// The charge the handler reported for its run.
     pub(crate) fn reductions(&self) -> u32 {
         match self {
-            Self::Done { reductions, .. }
-            | Self::Failed { reductions, .. }
-            | Self::Yield { reductions, .. } => *reductions,
+            Self::Done { reductions, .. } | Self::Yield { reductions, .. } => *reductions,
             Self::Export(_) => 0,
         }
     }
@@ -114,7 +108,6 @@ pub(crate) struct Entry {
 }
 
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
-const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
@@ -137,8 +130,6 @@ const ERTS_REGEX_RESTART_CONTEXT_SIZE: usize = 64;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
-// Port of erts/emulator/beam/external.c (B2TContext), including its decode union.
-const ERTS_BINARY_TO_TERM_CONTEXT_SIZE: usize = 296;
 // Port of erts/emulator/beam/erl_ptab.c (ErtsPTabListBifData).
 const ERTS_PTAB_LIST_STATE_SIZE: usize = 64;
 
@@ -504,20 +495,6 @@ const ENTRIES: &[Entry] = &[
         arity: 3,
         continuation: "re:run/3",
         handler: re_run_trap,
-    },
-    Entry {
-        module: "erlang",
-        function: "binary_to_term",
-        arity: 1,
-        continuation: BINARY_TO_TERM_CONTINUATION,
-        handler: binary_to_term,
-    },
-    Entry {
-        module: "erlang",
-        function: "binary_to_term",
-        arity: 2,
-        continuation: BINARY_TO_TERM_CONTINUATION,
-        handler: binary_to_term,
     },
     Entry {
         module: "binary",
@@ -1159,27 +1136,9 @@ pub(crate) fn execute_named(
     } else {
         (entry?.handler, None)
     };
-    if module_name == "erlang"
-        && function_name == "binary_to_term"
-        && state.is_none()
-        && let Some(bits) = arinsal_bifs::bitstring_bit_len(args[0]).ok()
-        && bits.is_multiple_of(8)
-        && let Some(reserve) = (bits / 8).checked_mul(2).and_then(|n| n.checked_add(64))
-    {
-        if let Err(error) = process.ensure(reserve, process.gc_live) {
-            return Some(Err(error));
-        }
-        for slot in 0..arity.min(args.len()) {
-            args[slot] = process.x.get(slot).copied().unwrap_or(Term::NIL);
-        }
-    }
-
     let pid = ctx.as_deref().map(|run| run.pid());
-    if module_name == "erlang" && function_name == "binary_to_term" {
-        process.set_gc_enabled(false);
-    }
     let resumed = state.is_some();
-    // The continuation export has its own arity (binary_copy_trap/3, binary_to_term_trap/1).
+    // The continuation export has its own arity (binary_copy_trap/3).
     // The handler still sees the original BIF's arguments, which the trap state kept.
     let call_arity = if resumed {
         process
@@ -1227,16 +1186,6 @@ pub(crate) fn execute_named(
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
             Ok(HandlerResult::Done { value, reductions })
-        }
-        Ok(HandlerResult::Failed { error, reductions }) => {
-            process.slice_mut().bif_trap = None;
-            clear_export_trap(process);
-            process.set_gc_enabled(gc_was_enabled);
-            charge(process, ctx, reductions);
-            let args = call_args(process, &args, report.2, resumed);
-            Err(exceptions::bif_error(
-                process, report.0, report.1, &args, error,
-            ))
         }
         Ok(HandlerResult::Yield {
             continuation,
@@ -1368,116 +1317,6 @@ pub(crate) fn light_entry(module: &str, function: &str, arity: u8) -> Option<&'s
         .find(|entry| entry.module == module && entry.function == function && entry.arity == arity)
 }
 
-/// The body of one trapping BIF, compiled into its own light entry (`native_helpers::
-/// trap_bif_entry`). The common run is a direct call; the trap state is built only when
-/// the run yields.
-pub(crate) trait TrapBody {
-    /// Fixed arity of a direct entry, if shared by the body type.
-    const ARITY: Option<usize> = None;
-
-    /// The value of a call that needs no trap state, no reduction charge and no collection
-    /// change, or `None` to take [`TrapBody::run`]. Nothing may be allocated before `None`.
-    #[inline(always)]
-    fn direct(_process: &mut Process, _args: &[Term]) -> Option<Term> {
-        None
-    }
-
-    /// The first run of the BIF. `restore_gc` is the process's collection state on entry.
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError>;
-}
-
-/// `binary_to_term/1,2` entered directly from the light-BIF fragment.
-pub(crate) struct BinaryToTerm;
-
-impl TrapBody for BinaryToTerm {
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        // Port of erts/emulator/beam/external.c:1948-2156 (`binary_to_term_int`), OTP-29.1.1.
-        binary_to_term(process, args, None, pid, restore_gc)
-    }
-}
-
-type NativeBifEntry = crate::bif_table::Bif;
-
-/// Calls an arity-one external-term BIF without constructing the generic trap-body adapter.
-// Port of erts/emulator/beam/external.c (term_to_binary_1, external_size_1,
-// binary_to_term_1), OTP-29.1.1: a completed BIF returns directly; only an error or trap
-// takes the cold continuation path.
-#[inline(always)]
-fn direct_external_term_entry<F>(
-    header: *mut arinsal_beamasm::ProcessHeader,
-    regs: *mut u64,
-    instruction: u64,
-    descriptor: u64,
-    identity: u64,
-    fallback: NativeBifEntry,
-    run: F,
-) -> u64
-where
-    F: FnOnce(&mut Process, &[Term], bool) -> Result<HandlerResult, BifError>,
-{
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
-        return fallback(header, regs, instruction);
-    }
-    let gc_was_enabled = process.heap.gc_enabled;
-    let result = run(process, &registers.x_reg_array[..1], gc_was_enabled);
-    match result {
-        Ok(HandlerResult::Done { value, reductions }) => {
-            process.set_gc_enabled(gc_was_enabled);
-            charge_light(process, reductions);
-            crate::native_hooks::raw(value)
-        }
-        other => crate::native_helpers::trap_body_finish(
-            process,
-            registers,
-            identity as usize,
-            descriptor,
-            1,
-            gc_was_enabled,
-            other,
-        )
-        .unwrap_or(0),
-    }
-}
-
-/// Direct `erlang:binary_to_term/1` entry for its first decode slice.
-// Port of erts/emulator/beam/external.c:2146 (`binary_to_term_1`), OTP-29.1.1.
-pub(crate) extern "C" fn binary_to_term_1_light(
-    header: *mut arinsal_beamasm::ProcessHeader,
-    regs: *mut u64,
-    instruction: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    direct_external_term_entry(
-        header,
-        regs,
-        instruction,
-        descriptor,
-        identity,
-        crate::native_helpers::trap_bif_entry::<BinaryToTerm>,
-        |process, args, restore_gc| {
-            let pid = process.self_pid;
-            binary_to_term(process, args, None, pid, restore_gc)
-        },
-    )
-}
-
 /// Outcome of a trapping BIF run from a light BIF call.
 pub(crate) enum LightTrap {
     /// The BIF finished: its value or its error, like any light BIF's result.
@@ -1485,13 +1324,6 @@ pub(crate) enum LightTrap {
     /// The BIF trapped to its continuation export (`THE_NON_VALUE` with `freason == TRAP`);
     /// the call site context-switches and the scheduler resumes it through the trap state.
     Trapped,
-}
-
-impl Entry {
-    /// Whether the BIF decodes onto the heap it reserved before the call.
-    pub(crate) fn reserves_heap(&self) -> bool {
-        self.continuation == BINARY_TO_TERM_CONTINUATION
-    }
 }
 
 /// Runs a trapping BIF from a light BIF call, with no trap pending for the process.
@@ -1507,9 +1339,6 @@ pub(crate) fn call_light(
     args: &[Term],
 ) -> LightTrap {
     let gc_was_enabled = process.heap.gc_enabled;
-    if entry.reserves_heap() {
-        process.set_gc_enabled(false);
-    }
     let pid = process.self_pid;
     let result = (entry.handler)(process, args, None, pid, gc_was_enabled);
     finish_light(process, import, callee, args, gc_was_enabled, result)
@@ -1529,7 +1358,6 @@ pub(crate) fn finish_light(
     let (result, reductions) = match result {
         Err(error) => (Err(error), 0),
         Ok(HandlerResult::Done { value, reductions }) => (Ok(value), reductions),
-        Ok(HandlerResult::Failed { error, reductions }) => (Err(error), reductions),
         Ok(HandlerResult::Yield {
             continuation,
             state,
@@ -1803,131 +1631,6 @@ fn code_permission(
         state: argument_trap_state(acquire),
         reductions: 1,
     })
-}
-
-fn binary_to_term(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    const BYTES_PER_REDUCTION: usize = 128;
-    // Port of erts/emulator/beam/external.c:116 (B2T_BYTES_PER_REDUCTION), OTP-29.1.1.
-    let reds = (process.heap.abi.fcalls.max(0) as usize).max(1);
-    let chunk_bytes = reds.saturating_mul(BYTES_PER_REDUCTION);
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let decoder = state
-            .downcast_ref::<Mutex<arinsal_bifs::DecodeWalk<'static>>>()
-            .ok_or(BifError::BADARG)?;
-        let mut decoder = decoder.lock().map_err(|_| BifError::SystemLimit)?;
-        let step = decode_step(process, &mut decoder, chunk_bytes);
-        return match step {
-            Ok((None, consumed)) => {
-                drop(decoder);
-                Ok(HandlerResult::Yield {
-                    continuation: BINARY_TO_TERM_CONTINUATION,
-                    state,
-                    reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-                })
-            }
-            Ok((Some(value), consumed)) => {
-                process.set_gc_enabled(restore_gc);
-                Ok(HandlerResult::Done {
-                    value,
-                    reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-                })
-            }
-            Err((error, consumed)) => {
-                process.set_gc_enabled(restore_gc);
-                Ok(HandlerResult::Failed {
-                    error: decode_trap_error(error),
-                    reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-                })
-            }
-        };
-    }
-
-    // Port of erts/emulator/beam/external.c:2027-2058 (`B2TSize`/`B2TDecodeInit`), OTP-29.1.1:
-    // keep the context on the BIF stack when the input fits, then carry B2TSize state if it traps.
-    let local_node = arinsal_term::this_node();
-    let mut prepared = None;
-    match arinsal_bifs::DecodeWalk::decode_small(
-        args,
-        &mut process.heap,
-        Some(local_node),
-        chunk_bytes,
-        &mut prepared,
-    ) {
-        Ok(Some((value, consumed))) => {
-            process.set_gc_enabled(restore_gc);
-            return Ok(HandlerResult::Done {
-                value,
-                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-            });
-        }
-        Ok(None) => {}
-        Err((error, consumed)) => {
-            process.set_gc_enabled(restore_gc);
-            return Ok(HandlerResult::Failed {
-                error: decode_trap_error(error),
-                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-            });
-        }
-    }
-
-    let mut decoder = match prepared {
-        Some(decoder) => decoder,
-        None => {
-            let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
-            // Port of erts/emulator/beam/external.c:3123 (`dec_is_this_node`), OTP-29.1.1.
-            decoder.set_local_node(local_node.0, local_node.1);
-            decoder
-        }
-    };
-    match decode_step(process, &mut decoder, chunk_bytes) {
-        Ok((None, consumed)) => {
-            let decoder = decoder.into_owned()?;
-            Ok(HandlerResult::Yield {
-                continuation: BINARY_TO_TERM_CONTINUATION,
-                state: magic_binary_state(Mutex::new(decoder), ERTS_BINARY_TO_TERM_CONTEXT_SIZE),
-                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-            })
-        }
-        Ok((Some(value), consumed)) => {
-            process.set_gc_enabled(restore_gc);
-            Ok(HandlerResult::Done {
-                value,
-                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-            })
-        }
-        Err((error, consumed)) => {
-            process.set_gc_enabled(restore_gc);
-            Ok(HandlerResult::Failed {
-                error: decode_trap_error(error),
-                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-            })
-        }
-    }
-}
-
-fn decode_step(
-    process: &mut Process,
-    decoder: &mut arinsal_bifs::DecodeWalk<'_>,
-    chunk_bytes: usize,
-) -> Result<(Option<Term>, usize), (BifError, usize)> {
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    decoder.step_into(chunk_bytes, &mut ctx)
-}
-
-fn decode_trap_error(error: BifError) -> BifError {
-    match error {
-        BifError::Unsupported(_) => BifError::BADARG,
-        other => other,
-    }
 }
 
 /// Bits copied per reduction: a cache line (`ERTS_CACHE_LINE_SIZE * 8`, 64-byte lines).

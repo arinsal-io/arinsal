@@ -494,13 +494,6 @@ impl Executor {
                             return Ok(Flow::Continue);
                         }
                         Some(Ok(crate::bif_traps::ResumeResult::Handler(
-                            crate::bif_traps::HandlerResult::Failed { .. },
-                        ))) => {
-                            return Ok(Flow::Break(Err(VmError::Unsupported(
-                                "failed trapping BIF without exception".into(),
-                            ))));
-                        }
-                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
                             crate::bif_traps::HandlerResult::Export(_),
                         ))) => {
                             unreachable!("resumed BIF handlers cannot install first-call exports")
@@ -694,11 +687,6 @@ impl Executor {
                                 Ok(crate::bif_traps::HandlerResult::Done { value, .. }) => {
                                     process.x[0] = process.gc_after_bif(value)?;
                                     Some(Ok(process.x[0]))
-                                }
-                                Ok(crate::bif_traps::HandlerResult::Failed { .. }) => {
-                                    Some(Err(VmError::Unsupported(
-                                        "failed trapping BIF without exception".into(),
-                                    )))
                                 }
                                 Ok(crate::bif_traps::HandlerResult::Export(_)) => {
                                     unreachable!("resumed BIF handler export")
