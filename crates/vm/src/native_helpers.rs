@@ -2853,6 +2853,32 @@ fn process_bif_error(
     export: ExportDispatch,
     trap: crate::exceptions::Trap,
 ) -> u64 {
+    let mut export = export;
+    // ERTS_BIF_PREP_ERROR_TRAPPED1/2/3(p, reason, bif, args...): a continuation's error names
+    // the original BIF: `c_p->current = &bif->info.mfa` and the arguments go back to X0...
+    if let Some(crate::stacktrace::TopFrame::Bif {
+        module,
+        function,
+        args,
+        ..
+    }) = &trap.top
+        && let Some(terms) = args.inline_terms()
+        && (*module, *function, terms.len())
+            != (
+                export.module_atom,
+                export.function_atom,
+                usize::from(export.arity),
+            )
+    {
+        let atoms = arinsal_term::global_atoms();
+        if let (Some(m), Some(f)) = (atoms.text(*module), atoms.text(*function))
+            && let Some(bif) = crate::beamasm_integration::bif_mfa_export(m, f, terms.len() as u8)
+        {
+            process.x.ensure_x(terms.len());
+            process.x[..terms.len()].copy_from_slice(terms);
+            export = bif;
+        }
+    }
     process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     bif_error(process, trap)
 }

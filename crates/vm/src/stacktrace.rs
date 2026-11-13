@@ -308,6 +308,14 @@ impl BifArgs {
         })))
     }
 
+    /// The argument terms when they are held inline (up to four).
+    pub(super) fn inline_terms(&self) -> Option<&[Term]> {
+        match self {
+            Self::Inline { values, len } => Some(&values[..usize::from(*len)]),
+            _ => None,
+        }
+    }
+
     /// Copy for storage in a saved trace: the payload is invisible to GC, so inline
     /// heap pointers are turned into an owned copy; immediates cannot dangle.
     fn detached(&self) -> Result<Self, VmError> {
