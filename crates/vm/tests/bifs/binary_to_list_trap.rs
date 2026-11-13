@@ -13,16 +13,25 @@ fn binary_to_list_one_megabyte_matches_otp_and_charges_reductions() {
             List = erlang:binary_to_list(subject()),
             {length(List), lists:sum(List), hd(List), lists:last(List)}.
         reductions() ->
-            List = erlang:binary_to_list(subject()),
-            {_, Reds} = process_info(self(), reductions),
-            {length(List), Reds}.
+            measure(fun erlang:binary_to_list/1).
         values3() ->
             List = erlang:binary_to_list(subject(), 17, 528),
             {length(List), lists:sum(List), hd(List), lists:last(List)}.
         reductions3() ->
-            List = erlang:binary_to_list(subject(), 17, 528),
-            {_, Reds} = process_info(self(), reductions),
-            {length(List), Reds}.
+            measure(fun(Bin) -> erlang:binary_to_list(Bin, 17, 528) end).
+        measure(Convert) ->
+            Parent = self(),
+            spawn_opt(fun() ->
+                Bin = subject(),
+                {reductions, R0} = process_info(self(), reductions),
+                {garbage_collection, GC0} = process_info(self(), garbage_collection),
+                List = Convert(Bin),
+                {reductions, R1} = process_info(self(), reductions),
+                {garbage_collection, GC1} = process_info(self(), garbage_collection),
+                Gcs = proplists:get_value(minor_gcs, GC1) - proplists:get_value(minor_gcs, GC0),
+                Parent ! {length(List), R1 - R0, Gcs}
+            end, [{min_heap_size, 3000000}]),
+            receive Result -> Result end.
     "#;
     let beam = reference.compile_named(MODULE, source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
@@ -56,7 +65,17 @@ fn binary_to_list_one_megabyte_matches_otp_and_charges_reductions() {
     else {
         panic!("reductions were not integers");
     };
-    let slack = (expected_reds / 10).max(32);
+    assert_eq!(
+        expected[2],
+        OwnedTerm::Int(0),
+        "OTP collected in measured window"
+    );
+    assert_eq!(
+        actual[2],
+        OwnedTerm::Int(0),
+        "Arinsal collected in measured window"
+    );
+    let slack = 32;
     assert!(
         (expected_reds - slack..=expected_reds + slack).contains(actual_reds),
         "OTP reductions {expected_reds}, Arinsal reductions {actual_reds}, slack {slack}"
@@ -83,10 +102,104 @@ fn binary_to_list_one_megabyte_matches_otp_and_charges_reductions() {
     else {
         panic!("range reductions were not integers");
     };
-    let slack3 = (expected_reds3 / 10).max(32);
+    assert_eq!(
+        expected3[2],
+        OwnedTerm::Int(0),
+        "OTP collected in range window"
+    );
+    assert_eq!(
+        actual3[2],
+        OwnedTerm::Int(0),
+        "Arinsal collected in range window"
+    );
+    let slack3 = 32;
     assert!(
         (expected_reds3 - slack3..=expected_reds3 + slack3).contains(actual_reds3),
         "OTP range reductions {expected_reds3}, Arinsal range reductions {actual_reds3}, slack {slack3}"
+    );
+}
+
+#[test]
+fn binary_to_list_delayed_gc_reductions_cover_gc_time() {
+    const MODULE: &str = "binary_to_list_dirty_gc_test";
+    let source = r#"-module(binary_to_list_dirty_gc_test).
+        -export([dirty/0, baseline/0]).
+        subject() -> binary:copy(<<0, 1, 255, 17>>, 262144).
+        dirty() -> measure([], true).
+        baseline() -> measure([{min_heap_size, 3000000}], false).
+        measure(HeapOptions, Collect) ->
+            Parent = self(),
+            Pid = spawn_opt(fun() ->
+                Bin = subject(),
+                erlang:trace(self(), true, [{tracer, Parent}, garbage_collection, timestamp]),
+                {reductions, R0} = process_info(self(), reductions),
+                List = erlang:binary_to_list(Bin),
+                case Collect of true -> erlang:garbage_collect(); false -> ok end,
+                {reductions, R1} = process_info(self(), reductions),
+                Parent ! {finished, length(List), R1 - R0}
+            end, HeapOptions),
+            Ref = monitor(process, Pid),
+            collect(Pid, Ref, undefined, undefined, 0).
+        collect(Pid, Ref, Result, Start, GcUs) ->
+            receive
+                {finished, _, _} = Value -> collect(Pid, Ref, Value, Start, GcUs);
+                {trace_ts, Pid, gc_major_start, _, Ts} ->
+                    collect(Pid, Ref, Result, Ts, GcUs);
+                {trace_ts, Pid, gc_major_end, _, Ts} when Start =/= undefined ->
+                    collect(Pid, Ref, Result, undefined, GcUs + timer:now_diff(Ts, Start));
+                {'DOWN', Ref, process, Pid, _} ->
+                    {Result, GcUs}
+            after 30000 -> timeout
+            end.
+    "#;
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+
+    let baseline = vm.eval_scheduled(MODULE, "baseline", &[], 1).unwrap();
+    let dirty = vm.eval_scheduled(MODULE, "dirty", &[], 1).unwrap();
+    let OwnedTerm::Tuple(baseline) = &baseline.term else {
+        panic!("baseline did not return a tuple");
+    };
+    let OwnedTerm::Tuple(dirty) = &dirty.term else {
+        panic!("dirty GC probe did not return a tuple");
+    };
+    let (OwnedTerm::Tuple(baseline_result), OwnedTerm::Int(baseline_gc_us)) =
+        (&baseline[0], &baseline[1])
+    else {
+        panic!("baseline returned {baseline:?}");
+    };
+    let (OwnedTerm::Tuple(dirty_result), OwnedTerm::Int(dirty_gc_us)) = (&dirty[0], &dirty[1])
+    else {
+        panic!("dirty GC probe returned {dirty:?}");
+    };
+    let (OwnedTerm::Int(baseline_len), OwnedTerm::Int(baseline_reds)) =
+        (&baseline_result[1], &baseline_result[2])
+    else {
+        panic!("baseline result returned {baseline_result:?}");
+    };
+    let (OwnedTerm::Int(dirty_len), OwnedTerm::Int(dirty_reds)) =
+        (&dirty_result[1], &dirty_result[2])
+    else {
+        panic!("dirty result returned {dirty_result:?}");
+    };
+    assert_eq!(baseline_len, dirty_len);
+    assert_eq!(*dirty_len, 1_048_576);
+    assert_eq!(
+        *baseline_gc_us, 0,
+        "preallocated baseline unexpectedly ran a major GC"
+    );
+    assert!(
+        *dirty_gc_us > 0,
+        "no major GC duration observed: baseline {baseline_gc_us} us, dirty {dirty_gc_us} us"
+    );
+    let charged = dirty_reds - baseline_reds;
+    let minimum = dirty_gc_us * 4;
+    assert!(
+        charged >= minimum,
+        "delayed major GC charged {charged} reductions over baseline, below 4 reds/us * {dirty_gc_us} us = {minimum}"
     );
 }
 
