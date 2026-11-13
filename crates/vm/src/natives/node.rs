@@ -112,7 +112,7 @@ pub(crate) fn call_nodes2(
 fn call_setnode2(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:4978 (setnode_2), OTP-29.1.1.
@@ -129,7 +129,13 @@ fn call_setnode2(
         }
         _ => return Err(badarg()),
     };
-    if !node_tables::set_this_node(name.clone(), creation) {
+    // erts_thr_progress_block() .. erts_thr_progress_unblock() around erts_set_this_node
+    // (dist.c:5018,5058): no managed thread reads the node identity while it changes.
+    let mut renamed = false;
+    ctx.with_thread_progress_blocked(|| {
+        renamed = node_tables::set_this_node(name.clone(), creation);
+    });
+    if !renamed {
         return Err(badarg());
     }
     Ok(Term::atom(arinsal_term::atoms::TRUE))
