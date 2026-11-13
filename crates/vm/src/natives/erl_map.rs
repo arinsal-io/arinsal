@@ -678,3 +678,119 @@ pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, 
         map,
     )
 }
+
+/// The failure of a map operation as `BIF_ERROR` with the BIF's frame: `{badmap, Map}` or
+/// `{badkey, Key}`.
+// Port of erts/emulator/beam/erl_map.c (BIF_ERROR(BADMAP) / BIF_ERROR(BADKEY) of
+// maps_put_3, maps_remove_2, maps_update_3, maps_take_2), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn map_failure(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut crate::Process,
+    export: &'static str,
+    arity: usize,
+    error: arinsal_maps::MapError,
+) -> u64 {
+    use arinsal_maps::MapError;
+    match error {
+        MapError::Badmap(map) => bif_error_tagged(
+            c_p,
+            i,
+            process,
+            export,
+            arity,
+            Term::atom(atoms::BADMAP),
+            map,
+        ),
+        MapError::Badkey(key) => bif_error_tagged(
+            c_p,
+            i,
+            process,
+            export,
+            arity,
+            Term::atom(atoms::BADKEY),
+            key,
+        ),
+        MapError::HeapFull { .. } => system_limit(c_p, i),
+        _ => ycf_error(c_p, i, process, export, arity, BifError::BADARG),
+    }
+}
+
+/// `maps:put/3`.
+// Port of erts/emulator/beam/erl_map.c (maps_put_3, erts_maps_put), OTP-29.1.1.
+pub(crate) extern "C" fn maps_put_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (key, value, map) = (process.x[0], process.x[1], process.x[2]);
+    let result = {
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        arinsal_maps::put(map, key, value, &mut heap)
+    };
+    match result {
+        Ok(res) => crate::native_hooks::raw(res),
+        Err(error) => map_failure(c_p, i, process, "maps:put/3", 3, error),
+    }
+}
+
+/// `maps:update/3`.
+// Port of erts/emulator/beam/erl_map.c (maps_update_3, erts_maps_update), OTP-29.1.1.
+pub(crate) extern "C" fn maps_update_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (key, value, map) = (process.x[0], process.x[1], process.x[2]);
+    let result = {
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        arinsal_maps::update(map, key, value, &mut heap)
+    };
+    match result {
+        Ok(res) => crate::native_hooks::raw(res),
+        Err(error) => map_failure(c_p, i, process, "maps:update/3", 3, error),
+    }
+}
+
+/// `maps:remove/2`.
+// Port of erts/emulator/beam/erl_map.c (maps_remove_2, erts_maps_remove), OTP-29.1.1.
+pub(crate) extern "C" fn maps_remove_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (key, map) = (process.x[0], process.x[1]);
+    let result = {
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        arinsal_maps::remove(map, key, &mut heap)
+    };
+    match result {
+        Ok(res) => crate::native_hooks::raw(res),
+        Err(error) => map_failure(c_p, i, process, "maps:remove/2", 2, error),
+    }
+}
+
+/// `maps:take/2`.
+// Port of erts/emulator/beam/erl_map.c (maps_take_2), OTP-29.1.1.
+pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (key, map) = (process.x[0], process.x[1]);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    let result = arinsal_maps::take(map, key, &mut heap).and_then(|taken| match taken {
+        Some((value, rest)) => TermBuilder::new(&mut heap)
+            .tuple2(value, rest)
+            .map(Some)
+            .map_err(|_| arinsal_maps::MapError::HeapFull { need_words: 3 }),
+        None => Ok(None),
+    });
+    match result {
+        Ok(Some(res)) => crate::native_hooks::raw(res),
+        Ok(None) => crate::native_hooks::raw(Term::atom(atoms::ERROR)),
+        Err(error) => map_failure(c_p, i, process, "maps:take/2", 2, error),
+    }
+}

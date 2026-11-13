@@ -19,10 +19,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "map_size", 1) => v.entry::<word_bodies::map_size>(),
         ("erlang", "map_get", 2) => v.entry::<word_bodies::map_get>(),
         ("erlang", "is_map_key", 2) => v.entry::<word_bodies::is_map_key>(),
-        ("maps", "put", 3) => v.entry::<word_bodies::put>(),
-        ("maps", "remove", 2) => v.entry::<word_bodies::remove>(),
-        ("maps", "update", 3) => v.entry::<word_bodies::update>(),
-        ("maps", "take", 2) => v.entry::<word_bodies::take>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -481,37 +477,6 @@ impl MapsBuildWalk {
     }
 }
 
-fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    let result = arinsal_maps::put(args[2], args[0], args[1], &mut ctx.heap);
-    match mapped(ctx, result) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-fn remove(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    let result = arinsal_maps::remove(args[1], args[0], &mut ctx.heap);
-    match mapped(ctx, result) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-fn update(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    let result = arinsal_maps::update(args[2], args[0], args[1], &mut ctx.heap);
-    match mapped(ctx, result) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/erl_map.c:1910-1925 (maps_take_2), OTP-29.1.1.
-    let result = arinsal_maps::take(args[1], args[0], &mut ctx.heap);
-    match mapped(ctx, result) {
-        Ok(Some((value, map))) => tuple2(ctx, value, map),
-        Ok(None) => Term::atom(atoms::ERROR),
-        Err(error) => ctx.fail(error),
-    }
-}
-
 crate::word_bif_bodies_in!(word_bodies;
-    map_size, map_get, is_map_key, put, remove, update, take,
+    map_size, map_get, is_map_key,
 );
