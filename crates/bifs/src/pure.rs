@@ -269,7 +269,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "=<", 2) => v.entry::<bodies::le>(),
         ("erlang", ">", 2) => v.entry::<bodies::gt>(),
         ("erlang", ">=", 2) => v.entry::<bodies::ge>(),
-        ("erlang", "phash2", 1 | 2) => v.entry::<bodies::phash2_bif>(),
         ("erlang", "phash", 2) => v.entry::<bodies::phash_bif>(),
         ("erlang", "make_ref", 0) => v.entry::<bodies::make_ref>(),
         ("erlang", "unique_integer", 0 | 1) => v.entry::<bodies::unique_integer>(),
@@ -629,25 +628,6 @@ pub struct Phash2Cont {
     range: Option<u64>,
 }
 
-impl Phash2Cont {
-    /// The continuation export this state belongs to.
-    pub fn continuation(&self) -> &'static str {
-        if self.range.is_some() {
-            "erlang:phash2_trap/2"
-        } else {
-            "erlang:phash2_trap/1"
-        }
-    }
-}
-
-/// A started `phash2`: finished, or the state to trap with.
-pub enum Phash2Step {
-    /// The finished value.
-    Done(Term),
-    /// The saved hash state.
-    More(Box<Phash2Cont>),
-}
-
 /// Run `run` for the reductions left, then charge them.
 // Port of erts/emulator/beam/bif.c (phash2_1, phash2_2), OTP-29.1.1, over `trapping_make_hash2`.
 pub fn phash2_slice(ctx: &mut Ctx<'_>, cont: &mut Phash2Cont) -> Result<Option<Term>, BifError> {
@@ -678,7 +658,7 @@ pub fn phash2_slice(ctx: &mut Ctx<'_>, cont: &mut Phash2Cont) -> Result<Option<T
     }
 }
 
-/// Outcome of [`phash2_run`].
+/// Outcome of [`phash2_run_2`] and [`phash2_run_1_after_immediate_check`].
 pub enum Phash2Run {
     /// The hash, and the reductions the walk used.
     Done {
@@ -691,28 +671,12 @@ pub enum Phash2Run {
     More(Box<Phash2Cont>),
 }
 
-/// `phash2/1,2` against the reductions left, building the trap state only when the walk
-/// yields; the common call hashes on the stack and returns a small.
-// Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`, OTP-29.1.1.
-pub fn phash2_run(args: &[Term], fcalls: i32) -> Result<Phash2Run, BifError> {
-    match args.get(1) {
-        Some(range) => phash2_run_2(args[0], *range, fcalls),
-        None => phash2_run_1(args[0], fcalls),
-    }
-}
-
 /// Run the `phash2/1` BIF after its direct entry checked the immediate cases.
 // Port of erts/emulator/beam/bif.c:5350-5360 (`phash2_1`), OTP-29.1.1.
 #[inline(always)]
 pub fn phash2_run_1_after_immediate_check(term: Term, fcalls: i32) -> Result<Phash2Run, BifError> {
     let run = arinsal_term::Hash2Run::new_after_immediate_check(term);
     phash2_run_initialized(run, None, fcalls, true)
-}
-
-/// Run the `phash2/1` BIF, including its immediate cases.
-// Port of erts/emulator/beam/bif.c:5350-5360 (`phash2_1`), OTP-29.1.1.
-pub fn phash2_run_1(term: Term, fcalls: i32) -> Result<Phash2Run, BifError> {
-    phash2_run_initialized(arinsal_term::Hash2Run::new(term), None, fcalls, false)
 }
 
 /// Run the `phash2/2` BIF after validating its range argument.
@@ -779,62 +743,6 @@ pub fn phash2_immediate_1(term: Term) -> Option<Term> {
     Some(Term::small(i64::from(hash & ((1 << 27) - 1))).expect("27-bit phash2 is a small"))
 }
 
-/// Return `phash2` immediately for the atom and small-integer cases.
-// Port of erts/emulator/beam/erl_term_hashing.c:974-980 (`make_hash2_helper`) and
-// erts/emulator/beam/bif.c:5350-5389 (`phash2_1`, `phash2_2`), OTP-29.1.1.
-#[inline(always)]
-pub fn phash2_immediate_result(args: &[Term]) -> Result<Option<Term>, BifError> {
-    let range = match args.get(1) {
-        Some(range) => Some(phash2_range_arg(*range)?),
-        None => None,
-    };
-    let Some(hash) = args
-        .first()
-        .and_then(|term| arinsal_term::hash2_immediate(*term))
-    else {
-        return Ok(None);
-    };
-    let value = match range {
-        None => u64::from(hash & ((1 << 27) - 1)),
-        Some(range) if range == 1_u64 << 32 => u64::from(hash),
-        Some(range) => u64::from(hash % range as u32),
-    };
-    Ok(Some(
-        Term::small(value as i64).ok_or(BifError::SystemLimit)?,
-    ))
-}
-
-/// Start `phash2/1` or `phash2/2`.
-pub fn phash2_start(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Phash2Step, BifError> {
-    let range = if args.len() == 2 {
-        Some(phash2_range_arg(args[1])?)
-    } else {
-        None
-    };
-    let mut cont = Phash2Cont {
-        run: arinsal_term::Hash2Run::new(args[0]),
-        range,
-    };
-    Ok(match phash2_slice(ctx, &mut cont)? {
-        Some(value) => Phash2Step::Done(value),
-        None => Phash2Step::More(Box::new(cont)),
-    })
-}
-
-fn phash2_bif_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`: a term
-    // that hashes without a work stack never builds the resumable state.
-    if let Some(value) = phash2_immediate_result(args)? {
-        return Ok(value);
-    }
-    match phash2_start(ctx, args)? {
-        Phash2Step::Done(value) => Ok(value),
-        Phash2Step::More(cont) => {
-            ctx.defer_trap(crate::lists::DeferredTrap::Phash2(cont));
-            Ok(Term::NIL)
-        }
-    }
-}
 fn phash_bif_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let range = args[1].as_small().ok_or(BADARG)?;
     let value = phash(args[0], range.try_into().map_err(|_| BADARG)?).ok_or(BADARG)?;
@@ -2450,20 +2358,10 @@ word_adapter!(math_atan2, math_atan2_result);
 word_adapter!(math_pow, math_pow_result);
 word_adapter!(math_fmod, math_fmod_result);
 
-fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match phash2_bif_result(ctx, args) {
-        Ok(value) if ctx.has_deferred() => {
-            ctx.take_deferred().map_or(value, |trap| ctx.trap(*trap))
-        }
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-
 crate::word_bif_bodies_in!(word_bodies;
     abs, to_float, trunc, round, ceil, floor, size, tuple_size, node,
     min, max, not, and, or, xor, eq, ne, exact_eq_bif, exact_ne, lt, le, gt, ge,
-    phash2_bif, phash_bif, make_ref, unique_integer, system_time, time_unit,
+    phash_bif, make_ref, unique_integer, system_time, time_unit,
     atom_to_binary, binary_to_atom, binary_to_existing_atom, float_to_list,
     float_to_binary, list_to_float, binary_to_float, integer_to_binary,
     is_atom, is_list, is_tuple, is_float, is_integer, is_integer_range, is_number,

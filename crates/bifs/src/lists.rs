@@ -280,14 +280,10 @@ fn keysearch_result(ctx: &mut Ctx<'_>, tuple: Term) -> Term {
 pub enum DeferredTrap {
     /// `erlang:binary_to_list/1` and `/3`.
     BinaryToList(crate::pure::BinaryToListWalk),
-    /// `erlang:crc32/1,2`, `adler32/1,2` or `md5/1`.
-    Chksum(crate::checksum::ChksumCont),
     /// `unicode:characters_to_binary/2` and `characters_to_list/2`.
     Unicode(crate::unicode::UnicodeCont),
     /// `erlang:length/1`.
     Length(LengthCont),
-    /// `erlang:phash2/1,2`.
-    Phash2(Box<crate::pure::Phash2Cont>),
 }
 
 /// A finished key BIF, or a trap back to the same export.

@@ -37,7 +37,11 @@ mod time;
 mod unicode;
 mod unique;
 
-pub use checksum::{ChksumCont, ChksumKind, ChksumStep, chksum_resume, chksum_start};
+pub use checksum::{
+    BYTES_PER_REDUCTION, CHUNK_PER_SCHEDULE, Chksum, Md5State, combine as chksum_combine,
+    do_chksum_md5, do_chksum_zlib, md5_state_arg, new_binary as chksum_new_binary, term_to_u32,
+    zlib_initial,
+};
 pub use etf::{DecodeWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary};
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
@@ -50,15 +54,14 @@ pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
-    IolistVecWalk, Phash2Cont, Phash2Run, Phash2Step, allocate_iolist_binary, atom_to_list_term,
-    binary_bytes, binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range,
-    copy_bitstring_range, copy_bitstring_range_to, erlang_binary_to_list, eval_unique_integer,
+    IolistVecWalk, Phash2Cont, Phash2Run, allocate_iolist_binary, atom_to_list_term, binary_bytes,
+    binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range, copy_bitstring_range,
+    copy_bitstring_range_to, erlang_binary_to_list, eval_unique_integer,
     finish_iolist_binary_output, for_each_list_term, iolist_size_direct, iolist_to_binary_direct,
     iolist_to_iovec_shortcut, iolist_yield_reductions, next_ref_id, next_unique_monotonic,
-    phash2_immediate_1, phash2_immediate_result, phash2_run, phash2_run_1,
-    phash2_run_1_after_immediate_check, phash2_run_2, phash2_slice, phash2_start,
-    proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair, tuple_terms,
-    with_binary_bytes, with_iolist_binary_output,
+    phash2_immediate_1, phash2_range_arg, phash2_run_1_after_immediate_check, phash2_run_2,
+    phash2_slice, proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair,
+    tuple_terms, with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
@@ -598,9 +601,6 @@ pub fn visit_bif<V: BifTableVisitor>(
         return Some(found);
     }
     if let Some(found) = sys::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
-    if let Some(found) = checksum::lookup(module, name, arity, visitor) {
         return Some(found);
     }
     if let Some(found) = dirty::lookup(module, name, arity, visitor) {

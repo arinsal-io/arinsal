@@ -101,7 +101,6 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> boo
             arinsal_bifs::IolistVecWalk,
             arinsal_bifs::IolistSizeWalk,
             arinsal_bifs::DecodeWalk<'static>,
-            arinsal_bifs::ChksumCont,
             arinsal_bifs::BinarySearchWalk,
             TermEncodeState,
             BinaryCopyState,
@@ -161,8 +160,6 @@ const RE_URUN_CONTINUATION: &str = "re:urun/3";
 
 // C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
 // data offset is added by MagicRef::with_erts_payload_size.
-// Port of erts/emulator/beam/erl_term_hashing.c (ErtsMakeHash2Context).
-const ERTS_HASH2_CONTEXT_SIZE: usize = 136;
 // Port of erts/emulator/beam/erl_unicode.c (RestartContext).
 const ERTS_UNICODE_RESTART_CONTEXT_SIZE: usize = 40;
 // Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
@@ -283,161 +280,6 @@ fn clear_export_trap(process: &mut Process) {
     if process.heap.abi.i as usize == bif_export_trap_pc() {
         process.heap.abi.i = std::ptr::null();
     }
-}
-
-fn chksum_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    kind: arinsal_bifs::ChksumKind,
-    md5_update: bool,
-) -> Result<HandlerResult, BifError> {
-    let resumed = match state {
-        Some(state) => Some(
-            state
-                .downcast_ref::<Mutex<arinsal_bifs::ChksumCont>>()
-                .ok_or(BifError::BADARG)?
-                .lock()
-                .map_err(|_| BifError::SystemLimit)?
-                .clone(),
-        ),
-        None => None,
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step = match &resumed {
-        Some(cont) => arinsal_bifs::chksum_resume(&mut ctx, cont),
-        None if md5_update => {
-            arinsal_bifs::chksum_start(&mut ctx, arinsal_bifs::ChksumKind::Md5Update, args)
-        }
-        None => arinsal_bifs::chksum_start(&mut ctx, kind, args),
-    };
-    drop(bif_state);
-    Ok(match step {
-        Ok(arinsal_bifs::ChksumStep::Done(value)) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        Ok(arinsal_bifs::ChksumStep::More(cont)) => HandlerResult::Yield {
-            continuation: cont.continuation(),
-            state: argument_trap_state(Mutex::new(cont)),
-            reductions: 0,
-        },
-        Err(error) => HandlerResult::Failed {
-            error,
-            reductions: 0,
-        },
-    })
-}
-
-fn erlang_crc32(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Crc32, false)
-}
-
-fn erlang_adler32(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    chksum_trap(
-        process,
-        args,
-        state,
-        arinsal_bifs::ChksumKind::Adler32,
-        false,
-    )
-}
-
-fn erlang_md5_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5, false)
-}
-
-// Port of erts/emulator/beam/erl_bif_chksum.c:551-585 (md5_update_2), OTP-29.1.1.
-fn erlang_md5_update_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5, true)
-}
-
-fn phash2_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-) -> Result<HandlerResult, BifError> {
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let Some(state) = state else {
-        let step = arinsal_bifs::phash2_start(&mut ctx, args);
-        drop(bif_state);
-        return Ok(match step {
-            Ok(arinsal_bifs::Phash2Step::Done(value)) => HandlerResult::Done {
-                value,
-                reductions: 0,
-            },
-            Ok(arinsal_bifs::Phash2Step::More(cont)) => HandlerResult::Yield {
-                continuation: cont.continuation(),
-                state: magic_binary_state(Mutex::new(*cont), ERTS_HASH2_CONTEXT_SIZE),
-                reductions: 0,
-            },
-            Err(error) => HandlerResult::Failed {
-                error,
-                reductions: 0,
-            },
-        });
-    };
-    let saved = state
-        .downcast_ref::<Mutex<arinsal_bifs::Phash2Cont>>()
-        .ok_or(BifError::BADARG)?;
-    let mut cont = saved.lock().map_err(|_| BifError::SystemLimit)?;
-    let step = arinsal_bifs::phash2_slice(&mut ctx, &mut cont);
-    let continuation = cont.continuation();
-    drop(cont);
-    drop(bif_state);
-    Ok(match step {
-        Ok(Some(value)) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        Ok(None) => HandlerResult::Yield {
-            continuation,
-            state: Arc::clone(state),
-            reductions: 0,
-        },
-        Err(error) => HandlerResult::Failed {
-            error,
-            reductions: 0,
-        },
-    })
-}
-
-fn erlang_phash2_trap_1(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    phash2_trap(process, args, state)
 }
 
 fn erlang_length_trap(
@@ -721,88 +563,6 @@ const ENTRIES: &[Entry] = &[
         arity: 3,
         continuation: "erlang:length/3",
         handler: erlang_length_trap,
-    },
-    Entry {
-        module: "erlang",
-        function: "phash2_trap",
-        arity: 1,
-        continuation: "erlang:phash2_trap/1",
-        handler: erlang_phash2_trap_1,
-    },
-    Entry {
-        module: "erlang",
-        function: "phash2_trap",
-        arity: 2,
-        continuation: "erlang:phash2_trap/2",
-        handler: erlang_phash2_trap_1,
-    },
-    // Port of erts/emulator/beam/bif.c:5350 (phash2_1), OTP-29.1.1.
-    Entry {
-        module: "erlang",
-        function: "phash2",
-        arity: 1,
-        continuation: "erlang:phash2_trap/1",
-        handler: erlang_phash2_trap_1,
-    },
-    // Port of erts/emulator/beam/bif.c:5362 (phash2_2), OTP-29.1.1.
-    Entry {
-        module: "erlang",
-        function: "phash2",
-        arity: 2,
-        continuation: "erlang:phash2_trap/2",
-        handler: erlang_phash2_trap_1,
-    },
-    // Port of erts/emulator/beam/erl_bif_chksum.c:290 (crc32_1), OTP-29.1.1.
-    Entry {
-        module: "erlang",
-        function: "crc32",
-        arity: 1,
-        continuation: "erlang:crc32/2",
-        handler: erlang_crc32,
-    },
-    Entry {
-        module: "erlang",
-        function: "crc32",
-        arity: 2,
-        continuation: "erlang:crc32/2",
-        handler: erlang_crc32,
-    },
-    Entry {
-        module: "erlang",
-        function: "adler32",
-        arity: 2,
-        continuation: "erlang:adler32/2",
-        handler: erlang_adler32,
-    },
-    // Port of erts/emulator/beam/erl_bif_chksum.c:370 (adler32_1), OTP-29.1.1.
-    Entry {
-        module: "erlang",
-        function: "adler32",
-        arity: 1,
-        continuation: "erlang:adler32/2",
-        handler: erlang_adler32,
-    },
-    // Port of erts/emulator/beam/erl_bif_chksum.c:455 (md5_1), OTP-29.1.1.
-    Entry {
-        module: "erlang",
-        function: "md5",
-        arity: 1,
-        continuation: "erlang:md5_trap/2",
-        handler: erlang_md5_trap,
-    },
-    Entry {
-        module: "erlang",
-        function: "md5_trap",
-        arity: 2,
-        continuation: "erlang:md5_trap/2",
-        handler: erlang_md5_trap,
-    },
-    Entry {
-        module: "erlang",
-        function: "md5_update",
-        arity: 2,
-        continuation: "erlang:md5_update/2",
-        handler: erlang_md5_update_trap,
     },
     Entry {
         module: "maps",
@@ -2180,56 +1940,6 @@ impl TrapBody for IolistSize {
     }
 }
 
-/// `erlang:phash2/N` as its own light entry.
-// Port of erts/emulator/beam/bif.c (phash2_1, phash2_2), OTP-29.1.1: the BIF hashes on the C
-// stack and traps only when `trapping_make_hash2` runs out of reductions.
-pub(crate) struct Phash2<const N: usize>;
-
-impl<const N: usize> TrapBody for Phash2<N> {
-    const ARITY: Option<usize> = Some(N);
-
-    // Port of erts/emulator/beam/erl_term_hashing.c:974-980 (`make_hash2_helper`): immediates
-    // return before the trapping work loop, without a trap state or reduction charge.
-    #[inline(always)]
-    fn direct(_process: &mut Process, args: &[Term]) -> Option<Term> {
-        if N == 1 {
-            arinsal_bifs::phash2_immediate_1(args[0])
-        } else {
-            None
-        }
-    }
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        _pid: Option<arinsal_sched::Pid>,
-        _restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        let result = match N {
-            1 => {
-                arinsal_bifs::phash2_run_1_after_immediate_check(args[0], process.heap.abi.fcalls)?
-            }
-            2 => arinsal_bifs::phash2_run_2(args[0], args[1], process.heap.abi.fcalls)?,
-            _ => unreachable!("phash2 BIF entry has arity one or two"),
-        };
-        Ok(match result {
-            arinsal_bifs::Phash2Run::Done { value, reductions } => {
-                HandlerResult::Done { value, reductions }
-            }
-            arinsal_bifs::Phash2Run::More(cont) => {
-                // BUMP_ALL_REDS before BIF_TRAP.
-                process.heap.abi.fcalls = 0;
-                HandlerResult::Yield {
-                    continuation: cont.continuation(),
-                    state: magic_binary_state(Mutex::new(*cont), ERTS_HASH2_CONTEXT_SIZE),
-                    reductions: 0,
-                }
-            }
-        })
-    }
-}
-
 /// `term_to_binary/1,2` entered directly from the light-BIF fragment.
 pub(crate) struct TermToBinary;
 
@@ -2541,13 +2251,6 @@ pub(crate) fn install_deferred_trap(
         ),
         arinsal_bifs::DeferredTrap::Length(cont) => {
             ("erlang:length/3", argument_trap_state(Mutex::new(cont)))
-        }
-        arinsal_bifs::DeferredTrap::Phash2(cont) => (
-            cont.continuation(),
-            magic_binary_state(Mutex::new(*cont), ERTS_HASH2_CONTEXT_SIZE),
-        ),
-        arinsal_bifs::DeferredTrap::Chksum(cont) => {
-            (cont.continuation(), argument_trap_state(Mutex::new(cont)))
         }
         arinsal_bifs::DeferredTrap::Unicode(cont) => (
             cont.continuation(),

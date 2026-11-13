@@ -5,6 +5,7 @@ use similar_asserts::assert_eq;
 const SEMANTICS: &str = r#"semantics() ->
     Long = lists:seq(1, 300000),
     Bad = Long ++ improper,
+    Bl = [I rem 256 || I <- Long],
     T = fun(F) -> try F() catch error:R -> {err, R} end end,
     G = fun(L) when length(L) > 250000 -> big; (_) -> small end,
     Err = fun(L) -> try length(L) catch error:E:St -> {E, [{M, F, is_list(A)} || {M, F, A, _} <- [hd(St)]]} end end,
@@ -22,6 +23,14 @@ const SEMANTICS: &str = r#"semantics() ->
      unicode:characters_to_list(lists:duplicate(100000, 255), latin1),
      unicode:characters_to_list(<<(binary:copy(<<"abc">>, 70000))/binary>>),
      G(Long), G(lists:seq(1, 10)), G(Bad), Err(Bad), Err(improper),
+     erlang:md5_final(erlang:md5_update(erlang:md5_init(), [Bl, <<1:16>>, [[2], Bl]])),
+     erlang:adler32(7, [Bl, <<1, 2>>, [3 | <<4>>]]), erlang:crc32_combine(1, 2, 3),
+     erlang:adler32_combine(1, 2, 0), erlang:adler32_combine(5, 6, 7),
+     T(fun() -> erlang:md5_update(<<1>>, <<>>) end), T(fun() -> erlang:md5_final(a) end),
+     T(fun() -> erlang:crc32(-1, <<>>) end), T(fun() -> erlang:adler32(1 bsl 32, <<>>) end),
+     T(fun() -> erlang:md5([Bl, 256]) end), T(fun() -> erlang:md5(<<1:3>>) end),
+     T(fun() -> erlang:md5_update(erlang:md5_init(), [Bl, a]) end),
+     T(fun() -> erlang:crc32_combine(a, 2, 3) end),
      Keep(Long, Long, 3, 4), erlang:crc32([lists:duplicate(100000, 5), <<1, 2, 3>>, [255 | <<4>>]]),
           erlang:md5([<<1>>, lists:duplicate(70000, 7), <<2>>])]
     ++ [T(fun() -> erlang:crc32([Long, a]) end), T(fun() -> erlang:phash2(Long, 0) end),
@@ -60,6 +69,21 @@ const CASES: &[(&str, &str, &str, Option<&str>)] = &[
     ("adler32", "bin(N)", "erlang:adler32(In)", None),
     ("adler32_2", "bin(N)", "erlang:adler32(7, In)", None),
     ("md5", "bin(N)", "erlang:md5(In)", None),
+    ("crc32_nested", "iol(N)", "erlang:crc32(In)", None),
+    ("adler32_nested", "iol(N)", "erlang:adler32(In)", None),
+    ("md5_nested", "iol(N)", "erlang:md5(In)", None),
+    (
+        "md5_update",
+        "bin(N)",
+        "erlang:md5_update(erlang:md5_init(), In)",
+        None,
+    ),
+    (
+        "md5_final_update",
+        "iol(N)",
+        "erlang:md5_final(erlang:md5_update(erlang:md5_init(), In))",
+        None,
+    ),
     ("crc32_list", "binl(N)", "erlang:crc32(In)", None),
     ("md5_list", "binl(N)", "erlang:md5(In)", None),
     ("phash2_list", "lists:seq(1, N)", "erlang:phash2(In)", None),
@@ -211,6 +235,8 @@ fn source() -> String {
 bin(N) -> binary:copy(<<0, 1, 2, 3, 255, 17, 9, 200>>, (N + 7) div 8).
 
 binl(N) -> [I rem 256 || I <- lists:seq(1, N)].
+
+iol(N) -> [[<<1, 2, 3>>, [4, 5 | <<6>>], 7, [], [[<<8, 9>>]]] || _ <- lists:seq(1, N div 16 + 1)].
 
 ets_set(N) -> ets_fill(ets:new(t, [set, public]), N).
 
