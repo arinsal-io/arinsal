@@ -167,7 +167,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        value: Arc<arinsal_term::MagicRef>,
+        value: arinsal_term::MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         self.0.link_magic_ref(thing, value)
     }

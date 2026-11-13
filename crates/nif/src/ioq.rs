@@ -9,7 +9,7 @@ use crate::binref::{NifBinary, adopt_block, copy_to_block, handle_clone, handle_
 use crate::iovec::{ErlNifIOVec, SysIOVec};
 use crate::raw::{deref, deref_mut, slice};
 use crate::{ErlNifBinary, ErlNifEnv};
-use arinsal_term::{MagicRef, Term, TermBuilder};
+use arinsal_term::{MagicBin, Term, TermBuilder};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
@@ -232,7 +232,7 @@ pub extern "C" fn enif_ioq_peek_head(
                 entry.iov_len,
                 // Port of erts/emulator/beam/erl_nif.c (enif_ioq_peek_head), OTP-29.1.1:
                 // this wraps the retained refc Binary, whose orig_size is its allocation size.
-                MagicRef::with_orig_size_and_refn(held, orig_size, arinsal_bifs::next_ref_words()),
+                MagicBin::with_orig_size_and_refn(held, orig_size, arinsal_bifs::next_ref_words()),
             )
         };
         builder.external_binary(external)

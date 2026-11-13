@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{BinaryRef, MagicRef, Term, TermBuilder, global_atoms, to_owned};
+use arinsal_term::{BinaryRef, MagicBin, Term, TermBuilder, global_atoms, to_owned};
 use num_traits::ToPrimitive;
 use zstd_sys as z;
 
@@ -199,7 +199,7 @@ pub(crate) fn make_resource<T: Any + Send + Sync>(
     orig_size: usize,
 ) -> Result<Term, BifError> {
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::with_orig_size_and_refn(
+        .magic_ref(MagicBin::with_orig_size_and_refn(
             payload,
             orig_size,
             arinsal_bifs::next_ref_words(),

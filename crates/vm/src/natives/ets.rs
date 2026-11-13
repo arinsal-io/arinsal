@@ -10,7 +10,7 @@ use arinsal_ets::{
     TableType, Tid, WriteConcurrency,
 };
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, TermKind, global_atoms};
+use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, TermKind, global_atoms};
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2063,7 +2063,7 @@ enum Next {
 struct Start {
     tid: Tid,
     program: Arc<MatchProgram>,
-    program_owner: Arc<MagicRef>,
+    program_owner: MagicBin,
     count: bool,
     chunk: usize,
     backwards: bool,
@@ -2772,7 +2772,7 @@ fn info_counters(
         let state_term = match state {
             Some(state) => Some(
                 TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                    .magic_ref(MagicRef::with_erts_payload_size(
+                    .magic_ref(MagicBin::with_erts_payload_size(
                         state,
                         std::mem::size_of::<InfoSnapshot>(),
                     ))
@@ -3501,7 +3501,7 @@ fn call_inner(
             let program = Arc::new(MatchProgram::compile(*spec).map_err(err)?);
             let payload_size = program.erts_magic_payload_size();
             TermBuilder::new(&mut heap)
-                .magic_ref(MagicRef::with_erts_payload_size_and_refn(
+                .magic_ref(MagicBin::with_erts_payload_size_and_refn(
                     program,
                     payload_size,
                     match_program_refn.expect("match-spec compile reference numbers"),

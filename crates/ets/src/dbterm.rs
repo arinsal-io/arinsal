@@ -9,7 +9,7 @@
 use super::{Compressed, EtsError, OffHeap};
 use arinsal_alloc::typed::{ets_alloc_words, ets_free_words, ets_realloc_words};
 use arinsal_term::{
-    ExternalBinary, HeapAlloc, MagicRef, Node as TermNode, Term, TermError, WritableBinary, cmp,
+    ExternalBinary, HeapAlloc, MagicBin, Node as TermNode, Term, TermError, WritableBinary, cmp,
 };
 use std::cmp::Ordering;
 use std::ptr::NonNull;
@@ -577,7 +577,7 @@ impl HeapAlloc for BlockHeap {
         let _ = self.chain_first_oh(thing as usize);
         self.off_heap().nodes.push(node);
     }
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) -> Result<(), TermError> {
         self.chain_first_oh(thing as usize)?;
         self.off_heap().magic.push(owner);
         Ok(())

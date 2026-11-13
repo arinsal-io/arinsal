@@ -595,7 +595,7 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                             copy_map(objp, hdr, argp, &mut htop);
                         }
                         REF if crate::is_magic_ref_thing_with_hdr(hdr, *objp.add(1)) => {
-                            let owner = crate::MagicRef::thing_owner(*objp.add(1), true);
+                            let owner = crate::MagicBin::thing_owner(*objp.add(1), true);
                             let thing = htop;
                             copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, true)?;
                             dst.link_magic_ref(thing, owner)?;
@@ -967,7 +967,7 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                         crate::heap::load(from.wrapping_add(1)),
                     ) =>
                     {
-                        let owner = crate::MagicRef::thing_owner(
+                        let owner = crate::MagicBin::thing_owner(
                             crate::heap::load(from.wrapping_add(1)),
                             true,
                         );

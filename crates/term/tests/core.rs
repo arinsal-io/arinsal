@@ -566,9 +566,9 @@ fn external_reference_id_counts_survive_copy_and_compare() {
 #[test]
 fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     arinsal_term::init_global_literals();
-    use arinsal_term::{Identity, MagicRef, TermBuilder};
+    use arinsal_term::{Identity, MagicBin, TermBuilder};
     let mut heap = VecHeap::new();
-    let owner = MagicRef::new(7_u32);
+    let owner = MagicBin::new(7_u32);
     let id = owner.id();
     let original = TermBuilder::new(&mut heap)
         .magic_ref(owner.clone())
@@ -583,7 +583,10 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     assert!(matches!(owned, OwnedTerm::MagicRef(_)));
     let copy = from_owned(&owned, &mut heap).unwrap();
     assert!(copy.is_magic_ref());
-    assert!(std::sync::Arc::ptr_eq(&copy.magic_owner().unwrap(), &owner));
+    assert!(arinsal_term::MagicBin::ptr_eq(
+        &copy.magic_owner().unwrap(),
+        &owner
+    ));
     // Reference numbers of a magic reference that was never saved give a plain reference.
     let plain = OwnedTerm::Ref {
         node: "nonode@nohost".into(),
@@ -599,13 +602,13 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     // erts_magic_ref_save_bin (term_to_binary, ref_to_list) makes the numbers resolvable.
     original.save_magic_ref();
     let resolved = from_owned(&plain, &mut heap).unwrap();
-    assert!(std::sync::Arc::ptr_eq(
+    assert!(arinsal_term::MagicBin::ptr_eq(
         &resolved.magic_owner().unwrap(),
         &owner
     ));
     drop((resolved, copy, original, owned, owner));
     drop(heap);
-    assert!(MagicRef::lookup_saved(id).is_none());
+    assert!(MagicBin::lookup_saved(id).is_none());
 }
 
 #[test]
@@ -1166,10 +1169,10 @@ fn magic_reference_uses_erts_ref_thing_header_and_marker() {
     arinsal_term::init_global_literals();
     // erl_term.h: ErtsMRefThing shares ERTS_REF_THING_HEADER with ErtsORefThing on 64-bit
     // little endian; the ordinary marker in word one tells them apart.
-    use arinsal_term::{MagicRef, TermBuilder};
+    use arinsal_term::{MagicBin, TermBuilder};
     let mut heap = VecHeap::new();
     let magic = TermBuilder::new(&mut heap)
-        .magic_ref(MagicRef::new(()))
+        .magic_ref(MagicBin::new(()))
         .unwrap();
     let ordinary = TermBuilder::new(&mut heap).local_ref([1, 2, 3]).unwrap();
     assert_eq!(magic.header(), Some((2 << 6) | 0x10));
@@ -1245,4 +1248,49 @@ fn to_owned_copies_aligned_unaligned_and_partial_byte_bitstrings() {
             bits: 5
         }
     );
+}
+
+#[test]
+fn magic_binary_block_refc_destructor_and_weak() {
+    // erl_binary.h: the destructor runs once when the last count is released; a weak
+    // reference (erts_refc_inc_unless(.., 0, ..)) cannot revive the binary afterwards.
+    use arinsal_term::MagicBin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted(Arc<AtomicUsize>);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[repr(align(64))]
+    struct Wide(u8);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let bin = MagicBin::new(Counted(drops.clone()));
+    let copy = bin.clone();
+    assert_eq!(bin.refc(), 2);
+    assert!(bin.downcast_ref::<Counted>().is_some());
+    assert!(bin.downcast_ref::<u64>().is_none());
+    let weak = MagicBin::downgrade(&bin);
+    drop(bin);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(weak.upgrade().is_some());
+    drop(copy);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(weak.upgrade().is_none());
+    drop(weak);
+    let wide = MagicBin::new(Wide(7));
+    let payload = wide.downcast_ref::<Wide>().unwrap();
+    assert_eq!(std::ptr::from_ref(payload) as usize % 64, 0);
+    assert_eq!(payload.0, 7);
+    // magic_ref_table: a saved binary is found by its numbers until it is freed.
+    let saved = MagicBin::new(1_u32);
+    let id = saved.id();
+    saved.save_in_table();
+    assert!(MagicBin::ptr_eq(
+        &MagicBin::lookup_saved(id).unwrap(),
+        &saved
+    ));
+    drop(saved);
+    assert!(MagicBin::lookup_saved(id).is_none());
 }

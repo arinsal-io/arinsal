@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arinsal_bifs::BifError;
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::MagicRef;
+use arinsal_term::MagicBin;
 use socket2::{Domain, MsgHdr, Protocol, SockAddr, Socket, Type};
 
 use crate::{Reactor, atom, errno, error, field, last_error, list, map, name, number, ok, pair};
@@ -123,7 +123,7 @@ pub(crate) struct State {
 /// as the descriptor is the data of a NIF resource. The resource destructor runs when the
 /// last reference to the magic reference is released.
 #[derive(Clone)]
-pub(crate) struct Sock(Arc<MagicRef>);
+pub(crate) struct Sock(MagicBin);
 
 impl Drop for Handle {
     /// The resource destructor, `esock_dtor`.
@@ -194,7 +194,7 @@ pub(crate) struct Handle {
     reference: OnceLock<O>,
     /// The reference the select machinery holds from the first selection until the stop
     /// callback (`enif_select` keeps the resource).
-    selector: Mutex<Option<Arc<MagicRef>>>,
+    selector: Mutex<Option<MagicBin>>,
     /// The controlling process, `ctrlPid` of `ESockDescriptor`.
     owner: Mutex<Option<O>>,
     /// Per-socket state shared with the requestors, see [`State`]. Lock order:
@@ -253,11 +253,11 @@ impl Counters {
     }
 }
 /// The owner a socket handle term carries, like the `mb` pointer of an `ErtsMRefThing`.
-fn owner_of(value: &O) -> Option<Arc<MagicRef>> {
+fn owner_of(value: &O) -> Option<MagicBin> {
     let O::MagicRef(handle) = value else {
         return None;
     };
-    handle.owner()?.downcast::<MagicRef>().ok()
+    arinsal_term::magic_handle_owner(handle)
 }
 /// `enif_get_resource`: the descriptor behind a socket reference.
 fn handle(value: &O) -> Result<Sock, BifError> {
@@ -268,7 +268,7 @@ fn handle(value: &O) -> Result<Sock, BifError> {
     Ok(Sock(magic))
 }
 /// The magic reference of the socket `handle`, if the socket is still alive.
-pub(super) fn resource(handle: &O) -> Option<Arc<MagicRef>> {
+pub(super) fn resource(handle: &O) -> Option<MagicBin> {
     let magic = owner_of(handle)?;
     magic.downcast_ref::<Handle>().is_some().then_some(magic)
 }
@@ -364,7 +364,7 @@ fn reference(
     options: HashMap<i32, O>,
     ctype: O,
 ) -> O {
-    let magic = MagicRef::with_orig_size_and_refn(
+    let magic = MagicBin::with_orig_size_and_refn(
         Handle {
             socket: Mutex::new(Some(socket)),
             reference: OnceLock::new(),
@@ -383,12 +383,12 @@ fn reference(
         arinsal_bifs::next_ref_words(),
     );
     let id = magic.id();
-    let reference = O::MagicRef(arinsal_etf::MagicHandle::strong(id, magic.clone()));
+    let reference = O::MagicRef(arinsal_term::magic_handle(magic.clone()));
     let h = Sock(magic);
     // The descriptor names itself by a weak handle: a counted one would keep it alive forever.
-    let _ = h.reference.set(O::MagicRef(arinsal_etf::MagicHandle::weak(
+    let _ = h.reference.set(O::MagicRef(arinsal_term::magic_handle_weak(
         id,
-        Arc::downgrade(&h.0) as std::sync::Weak<dyn std::any::Any + Send + Sync>,
+        MagicBin::downgrade(&h.0),
     )));
     CREATED.with(|created| created.borrow_mut().push(h.clone()));
     if let Some(pid) = owner.as_ref() {

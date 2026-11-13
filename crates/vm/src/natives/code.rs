@@ -7,7 +7,7 @@ use arinsal_etf::OwnedTerm;
 use arinsal_loader::CoverageMode;
 use arinsal_sched::Pid;
 use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
-use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
+use arinsal_term::{MagicBin, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -774,7 +774,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     let refn = arinsal_bifs::ordinary_ref_words(process.next_ref());
     let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
-    let result = builder.magic_ref(MagicRef::with_orig_size_and_refn(
+    let result = builder.magic_ref(MagicBin::with_orig_size_and_refn(
         prepared,
         LOADER_STATE_MAGIC_ORIG_SIZE,
         refn,

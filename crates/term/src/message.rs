@@ -173,11 +173,7 @@ impl HeapAlloc for MessageHeapBlock {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.off_heap.off_heap_first, thing, node);
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         link_magic_thing(
             &mut self.off_heap.off_heap_first,
             &mut self.off_heap.overhead,
@@ -296,11 +292,7 @@ impl HeapAlloc for InlineHeapAlloc<'_> {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.owners.0.off_heap_first, thing, node);
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         link_magic_thing(
             &mut self.owners.0.off_heap_first,
             &mut self.owners.0.overhead,
@@ -870,11 +862,7 @@ impl HeapAlloc for FragmentMut<'_> {
         link_node_thing(&mut self.fragment().off_heap.off_heap_first, thing, node);
     }
 
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         let owners = &mut self.fragment().off_heap;
         link_magic_thing(
             &mut owners.off_heap_first,

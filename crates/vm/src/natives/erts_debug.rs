@@ -1857,8 +1857,8 @@ fn internal_state_tuple_get(
             let Some(owner) = reference.magic_owner() else {
                 return Ok(Some(Term::atom(arinsal_term::atoms::FALSE)));
             };
-            let address = std::sync::Arc::as_ptr(&owner) as usize;
-            let references = std::sync::Arc::strong_count(&owner).saturating_sub(1);
+            let address = arinsal_term::MagicBin::as_ptr(&owner) as usize;
+            let references = owner.refc().saturating_sub(1);
             let address = int(process, address)?;
             let references = int(process, references)?;
             tuple(
@@ -3114,12 +3114,12 @@ fn internal_state_set(
         Some("make") if value == Term::atom(arinsal_term::atoms::MAGIC_REF) => {
             // Port of erts/emulator/beam/erl_bif_info.c (erts_debug_get_internal_state):
             // this probe creates a zero-payload magic binary.
-            let owner = arinsal_term::MagicRef::with_erts_payload_size_and_refn(
+            let owner = arinsal_term::MagicBin::with_erts_payload_size_and_refn(
                 (),
                 0,
                 arinsal_bifs::ordinary_ref_words(process.next_ref()),
             );
-            let address = std::sync::Arc::as_ptr(&owner) as usize;
+            let address = arinsal_term::MagicBin::as_ptr(&owner) as usize;
             let reference = TermBuilder::new(&mut process.heap)
                 .magic_ref(owner)
                 .map_err(|_| {

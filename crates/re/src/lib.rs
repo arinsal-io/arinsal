@@ -12,7 +12,7 @@ use arinsal_bifs::with_binary_bytes;
 use arinsal_bifs::{BifError, BifFn, Ctx, IolistCopyWalk, IolistSizeWalk, for_each_list_term};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{
-    BinaryOwner, HeapAlloc, MagicRef, Node, Term, TermBuilder, TermKind, from_owned, global_atoms,
+    BinaryOwner, HeapAlloc, MagicBin, Node, Term, TermBuilder, TermKind, from_owned, global_atoms,
     to_owned,
 };
 use num_traits::ToPrimitive;
@@ -217,7 +217,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        value: Arc<MagicRef>,
+        value: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         self.0.link_magic_ref(thing, value)
     }
@@ -872,7 +872,7 @@ struct CompiledCode {
     code: usize,
     capture_count: u32,
     unicode: bool,
-    owner: Arc<MagicRef>,
+    owner: MagicBin,
 }
 
 // Port of erts/emulator/beam/erl_bif_re.c:1568-1592 (precompiled pattern validation), OTP-29.1.1.
@@ -974,7 +974,7 @@ fn compiled_magic_term(
     let newline = code.info(INFO_NEWLINE);
     let mut heap = Heap(&mut ctx.heap);
     let captures = i64::from(captures);
-    let owner = MagicRef::with_erts_payload_size_and_refn(
+    let owner = MagicBin::with_erts_payload_size_and_refn(
         RegexHandle(code.into_raw()),
         8,
         arinsal_bifs::next_ref_words(),
@@ -1050,7 +1050,7 @@ fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifErro
         .collect::<Result<Vec<_>, _>>()?;
     // Port of erts/emulator/beam/erl_bif_re.c (struct regex_magic_indirect): one code pointer.
     let reference = TermBuilder::new(&mut heap)
-        .magic_ref(MagicRef::with_erts_payload_size_and_refn(
+        .magic_ref(MagicBin::with_erts_payload_size_and_refn(
             RegexHandle(code.into_raw()),
             8,
             arinsal_bifs::next_ref_words(),
@@ -1348,7 +1348,7 @@ fn subject_byte_at(state: &RunState, subject: Option<Term>, index: usize) -> Opt
 /// integers so the state can sit in a magic reference.
 pub struct RunState {
     code: usize,
-    code_owner: Option<Arc<MagicRef>>,
+    code_owner: Option<MagicBin>,
     capture_count: usize,
     subject: Subject,
     session: MatchSession,

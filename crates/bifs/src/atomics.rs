@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use arinsal_maps::from_list;
-use arinsal_term::{MagicRef, Term, TermBuilder, atoms, global_atoms};
+use arinsal_term::{MagicBin, Term, TermBuilder, atoms, global_atoms};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
@@ -96,7 +96,7 @@ fn new_ref(ctx: &mut Ctx<'_>, array: Array) -> Result<Term, BifError> {
         }
     };
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::with_erts_payload_size_and_refn(
+        .magic_ref(MagicBin::with_erts_payload_size_and_refn(
             array,
             payload_size,
             crate::next_ref_words(),

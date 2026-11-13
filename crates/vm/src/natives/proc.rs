@@ -1894,7 +1894,7 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     // erts_magic_ref_lookup_bin: numbers of a saved magic reference give that reference.
     let saved = ((refn[1] & (1 << 17)) != 0)
-        .then(|| arinsal_term::MagicRef::lookup_saved_numbers(refn))
+        .then(|| arinsal_term::MagicBin::lookup_saved_numbers(refn))
         .flatten();
     if let Some(owner) = saved {
         return arinsal_term::TermBuilder::new(&mut heap)

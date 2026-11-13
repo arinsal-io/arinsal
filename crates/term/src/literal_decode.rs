@@ -8,7 +8,7 @@
 //! (`erts_decode_ext_size`) or the hash check rejects it.
 
 use crate::{
-    Atom, AtomEncoding, ExportEntry, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder,
+    Atom, AtomEncoding, ExportEntry, FunEntry, HeapAlloc, MagicBin, Node, Term, TermBuilder,
     TermKind, atoms, global_atoms,
 };
 use num_bigint::{BigInt, Sign};
@@ -435,7 +435,7 @@ impl<H: HeapAlloc> LiteralDecoder<'_, '_, H> {
             let mut local = [0u32; 3];
             local[..count].copy_from_slice(&ids[..count]);
             let saved = (local[1] & (1 << 17) != 0)
-                .then(|| MagicRef::lookup_saved_numbers(local))
+                .then(|| MagicBin::lookup_saved_numbers(local))
                 .flatten();
             match saved {
                 Some(owner) => self.builder.magic_ref(owner).ok(),

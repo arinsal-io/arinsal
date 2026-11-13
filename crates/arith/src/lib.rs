@@ -239,7 +239,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        owner: Arc<arinsal_term::MagicRef>,
+        owner: arinsal_term::MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         self.0.link_magic_ref(thing, owner)
     }

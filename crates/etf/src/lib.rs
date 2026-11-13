@@ -13,45 +13,26 @@ use flate2::Compression;
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
-/// The owner of a magic reference inside an [`OwnedTerm`]: an opaque counted (or, for a
-/// resource naming itself, weak) pointer plus the reference identity.
+/// The owner of a magic reference inside an [`OwnedTerm`]: an opaque owner (a counted or,
+/// for a resource naming itself, a weak magic binary reference) plus the reference identity.
 #[derive(Clone)]
 pub struct MagicHandle {
     id: u64,
-    owner: MagicOwner,
-}
-
-#[derive(Clone)]
-enum MagicOwner {
-    Strong(std::sync::Arc<dyn std::any::Any + Send + Sync>),
-    Weak(std::sync::Weak<dyn std::any::Any + Send + Sync>),
+    owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 }
 
 impl MagicHandle {
-    /// A handle that keeps `owner` alive.
-    pub fn strong(id: u64, owner: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
-        Self {
-            id,
-            owner: MagicOwner::Strong(owner),
-        }
-    }
-    /// A handle that does not keep `owner` alive, for a resource's reference to itself.
-    pub fn weak(id: u64, owner: std::sync::Weak<dyn std::any::Any + Send + Sync>) -> Self {
-        Self {
-            id,
-            owner: MagicOwner::Weak(owner),
-        }
+    /// A handle carrying `owner`, which the term crate interprets.
+    pub fn new(id: u64, owner: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self { id, owner }
     }
     /// The reference identity (low and high 32 bits are the first two reference numbers).
     pub fn id(&self) -> u64 {
         self.id
     }
-    /// The owner, unless a weak handle outlived it.
-    pub fn owner(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        match &self.owner {
-            MagicOwner::Strong(owner) => Some(owner.clone()),
-            MagicOwner::Weak(owner) => owner.upgrade(),
-        }
+    /// The opaque owner.
+    pub fn owner(&self) -> &(dyn std::any::Any + Send + Sync) {
+        &*self.owner
     }
     /// The plain reference with the same numbers, which is what a magic reference encodes as.
     pub fn as_plain_ref(&self) -> OwnedTerm {

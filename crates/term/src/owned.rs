@@ -1,6 +1,6 @@
 //! Heap-independent ETF values, built without calling ETF encoding or decoding.
 use crate::{
-    ExportEntry, FLOAT, FunEntry, FunRef, HeapAlloc, Identity, MagicRef, NEG_BIG, Node, POS_BIG,
+    ExportEntry, FLOAT, FunEntry, FunRef, HeapAlloc, Identity, MagicBin, NEG_BIG, Node, POS_BIG,
     Term, TermBuilder, TermError, TermKind, global_atoms,
 };
 use arinsal_etf::OwnedTerm;
@@ -61,10 +61,7 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     }
                 }
                 OwnedTerm::MagicRef(handle) => {
-                    let owner = handle
-                        .owner()
-                        .and_then(|owner| owner.downcast::<MagicRef>().ok())
-                        .ok_or(TermError::BadArg)?;
+                    let owner = crate::magic_handle_owner(handle).ok_or(TermError::BadArg)?;
                     values.push(builder.magic_ref(owner)?);
                 }
                 OwnedTerm::Pid {
@@ -97,7 +94,7 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     let id_count = ids.len().min(3);
                     local_ids[..id_count].copy_from_slice(&ids[..id_count]);
                     let saved = (local_ids[1] & (1 << 17) != 0)
-                        .then(|| MagicRef::lookup_saved_numbers(local_ids))
+                        .then(|| MagicBin::lookup_saved_numbers(local_ids))
                         .flatten();
                     values.push(match saved {
                         Some(owner) => builder.magic_ref(owner)?,
@@ -337,10 +334,7 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                         }),
                         Identity::Ref { .. } if term.is_magic_ref() => {
                             let owner = term.magic_owner().ok_or(TermError::BadArg)?;
-                            values.push(OwnedTerm::MagicRef(arinsal_etf::MagicHandle::strong(
-                                owner.id(),
-                                owner,
-                            )));
+                            values.push(OwnedTerm::MagicRef(crate::magic_handle(owner)));
                         }
                         Identity::Ref {
                             node: ref_node,

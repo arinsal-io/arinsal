@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{HeapAlloc, MagicRef, Node, Term, from_owned, to_owned};
+use arinsal_term::{HeapAlloc, MagicBin, Node, Term, from_owned, to_owned};
 
 mod net;
 pub use net::{servbyname, servbyport};
@@ -281,7 +281,7 @@ pub fn load_info(info: &O) {
 /// The magic reference behind a socket handle term, when the socket is still alive. The
 /// runtime holds it while a selection of the socket is pending (`enif_select` keeps the
 /// resource) and keeps a weak reference for each monitor of the socket.
-pub fn resource(handle: &O) -> Option<Arc<MagicRef>> {
+pub fn resource(handle: &O) -> Option<MagicBin> {
     socket::resource(handle)
 }
 
@@ -349,7 +349,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        owner: Arc<MagicRef>,
+        owner: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         self.0.link_magic_ref(thing, owner)
     }

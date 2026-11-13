@@ -35,7 +35,7 @@ use tree::{InsertResult, Node, TreeRoot};
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
-    Atom, BinaryOwner, ExternalBinary, HeapAlloc, Identity, MagicRef, Node as TermNode, Term,
+    Atom, BinaryOwner, ExternalBinary, HeapAlloc, Identity, MagicBin, Node as TermNode, Term,
     TermBuilder, TermError, TermKind, VecHeap, binary_owner, cmp, copy_term, exact_eq,
     global_atoms, internal_hash, term_sequence,
 };
@@ -918,7 +918,7 @@ fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError>
 
 pub(crate) struct Compressed {
     pub(crate) elements: Vec<Option<Vec<u8>>>,
-    pub(crate) magic_refs: Vec<Option<Arc<MagicRef>>>,
+    pub(crate) magic_refs: Vec<Option<MagicBin>>,
     pub(crate) bytes: usize,
 }
 
@@ -929,7 +929,7 @@ pub(crate) struct OffHeap {
     pub(crate) binary_refs: Vec<arinsal_term::OwnedBinaryRef>,
     pub(crate) external: Vec<Arc<ExternalBinary>>,
     pub(crate) nodes: Vec<TermNode>,
-    pub(crate) magic: Vec<Arc<MagicRef>>,
+    pub(crate) magic: Vec<MagicBin>,
 }
 
 impl StoredTerm {
@@ -1269,7 +1269,7 @@ impl StoredTerm {
         self.compressed().map_or(&[], |c| &c.elements)
     }
 
-    fn compressed_magic_refs(&self) -> &[Option<Arc<MagicRef>>] {
+    fn compressed_magic_refs(&self) -> &[Option<MagicBin>] {
         self.compressed().map_or(&[], |c| &c.magic_refs)
     }
 
@@ -2453,7 +2453,7 @@ pub struct Table {
     /// Stable table identifier.
     pub tid: Tid,
     /// The magic reference of this table (`tb->common.btid`), set once the table is registered.
-    btid: std::sync::OnceLock<std::sync::Weak<arinsal_term::MagicRef>>,
+    btid: std::sync::OnceLock<arinsal_term::MagicWeak>,
     /// Creation options and owner metadata.
     pub options: TableOptions,
     /// Links in the owner's circular `DbTable.common.owned` list.
@@ -2506,7 +2506,7 @@ impl Table {
         let owner = self
             .btid
             .get()
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(arinsal_term::MagicWeak::upgrade)
             .ok_or(EtsError::NoTable)?;
         Ok(TermBuilder::new(dst).magic_ref(owner)?)
     }
@@ -5958,7 +5958,7 @@ impl Default for NamedTableIndex {
 /// carries its own `rwlock`; reads take it shared and writes exclusive. The registry lock
 /// only guards the identity and name maps (erts `meta_main_tab` and `meta_name_tab`).
 #[derive(Clone)]
-pub struct SharedTable(Arc<arinsal_term::MagicRef>);
+pub struct SharedTable(arinsal_term::MagicBin);
 
 impl SharedTable {
     /// Wrap a table lock in its magic binary and register the table's own reference.
@@ -5967,22 +5967,22 @@ impl SharedTable {
     fn new(lock: TableLock, refn: Option<[u32; 3]>) -> Self {
         let size = std::mem::size_of::<Table>();
         let magic = match refn {
-            Some(refn) => arinsal_term::MagicRef::with_erts_payload_size_and_refn(lock, size, refn),
-            None => arinsal_term::MagicRef::with_erts_payload_size(lock, size),
+            Some(refn) => arinsal_term::MagicBin::with_erts_payload_size_and_refn(lock, size, refn),
+            None => arinsal_term::MagicBin::with_erts_payload_size(lock, size),
         };
         let shared = Self(magic);
-        let _ = shared.read().btid.set(Arc::downgrade(&shared.0));
+        let _ = shared.read().btid.set(MagicBin::downgrade(&shared.0));
         shared
     }
 
     /// The table's reference term.
     pub fn to_term<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, TermError> {
-        TermBuilder::new(dst).magic_ref(Arc::clone(&self.0))
+        TermBuilder::new(dst).magic_ref(self.0.clone())
     }
 
     /// Whether both handles are the same table.
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        Arc::ptr_eq(&a.0, &b.0)
+        MagicBin::ptr_eq(&a.0, &b.0)
     }
 }
 

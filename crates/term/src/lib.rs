@@ -95,7 +95,7 @@ pub use identity::Identity;
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use literal_decode::decode_literal;
-pub use magic::{MAGIC_BIN_DATA_OFFSET, MagicRef};
+pub use magic::{magic_handle, magic_handle_owner, magic_handle_weak};
 pub use native_code::{
     is_cp, is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
     unregister_native_code_range,
@@ -110,6 +110,7 @@ pub use ops::{
     size_object_preserving_sharing_after, size_shared, small_add, small_mul, small_sub,
 };
 pub use owned::{from_owned, to_owned};
+pub use raw::magic_bin::{MAGIC_BIN_DATA_OFFSET, MagicBin, MagicRef, MagicWeak};
 pub use record::{
     RecordRef, RecordSnapshot, record_map_pairs, term_sequence, term_sequence_frames,
     term_sequence_small,

@@ -6,7 +6,7 @@ use arinsal_etf::OwnedTerm;
 use arinsal_term::{
     Atom, HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned,
 };
-use arinsal_term::{ExternalBinary, MagicRef, Node, WritableBinary};
+use arinsal_term::{ExternalBinary, MagicBin, Node, WritableBinary};
 use std::sync::{Arc, OnceLock};
 
 /// A `current` word with bit 63 set: erts `s->current` that is not a BIF MFA; the current
@@ -145,7 +145,7 @@ impl HeapAlloc for TraceHeap<'_> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        owner: Arc<MagicRef>,
+        owner: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         HeapAlloc::link_magic_ref(self.heap, thing, owner)
     }

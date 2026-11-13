@@ -11,7 +11,7 @@ use std::time::Instant;
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{
-    ExternalBinary, MagicRef, ProcessHeap, Term, TermBuilder, from_owned, to_owned,
+    ExternalBinary, MagicBin, ProcessHeap, Term, TermBuilder, from_owned, to_owned,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -110,7 +110,7 @@ fn write_of_resource_binary_references_its_bytes() {
     let mut heap = ProcessHeap::with_words(4096);
     let handle = open(&mut heap, &file);
     let bytes: Arc<Vec<u8>> = Arc::new(pattern(64 * MIB + 3));
-    let owner = MagicRef::new(Arc::clone(&bytes));
+    let owner = MagicBin::new(Arc::clone(&bytes));
     // SAFETY: `owner` keeps the `bytes` allocation alive and unmodified.
     let external = unsafe { ExternalBinary::new(bytes.as_ptr(), bytes.len(), owner) };
     let (handle_term, list) = {

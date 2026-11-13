@@ -1278,7 +1278,7 @@ fn context_is_freed_with_the_heap_that_holds_its_reference() {
         let mut ctx = Ctx::new(&mut alloc, &mut state);
         let entry = super::zstd::lookup("init_compress_nif", 0).unwrap();
         let resource = entry(&mut ctx, &[]).unwrap();
-        std::sync::Arc::downgrade(&resource.magic_owner().unwrap())
+        arinsal_term::MagicBin::downgrade(&resource.magic_owner().unwrap())
     };
     assert!(owner.upgrade().is_some());
     drop(heap);

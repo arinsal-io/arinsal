@@ -2,7 +2,7 @@
 use crate::Library;
 use crate::raw::{cstr, deref, deref_mut};
 use crate::{ErlNifEnv, ErlNifResourceTypeInit, put, terms};
-use arinsal_term::{ExternalBinary, MagicRef, Term, TermBuilder};
+use arinsal_term::{ExternalBinary, MagicBin, Term, TermBuilder};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
@@ -163,22 +163,22 @@ pub(crate) struct Resource {
     size: usize,
     /// Identity shared by every term of this resource while one is alive (erts: all
     /// magic refs point at the same magic binary). Weak: the payload owns the resource.
-    magic: Mutex<Weak<MagicRef>>,
+    magic: Mutex<arinsal_term::MagicWeak>,
     /// Process monitors this resource holds (`ErtsResourceMonitors`): target pid and monitor.
     pub(crate) monitors: Mutex<Vec<(Term, u64)>>,
 }
 impl Resource {
-    pub(crate) fn magic_ref(self: &Arc<Self>) -> Arc<MagicRef> {
+    pub(crate) fn magic_ref(self: &Arc<Self>) -> MagicBin {
         let mut slot = self.magic.lock().unwrap();
         if let Some(magic) = slot.upgrade() {
             return magic;
         }
-        let magic = MagicRef::with_orig_size_and_refn(
+        let magic = MagicBin::with_orig_size_and_refn(
             Arc::clone(self),
             self.magic_orig_size(),
             arinsal_bifs::next_ref_words(),
         );
-        *slot = Arc::downgrade(&magic);
+        *slot = MagicBin::downgrade(&magic);
         magic
     }
 
@@ -530,7 +530,7 @@ pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_
         kind,
         data,
         size,
-        magic: Mutex::new(Weak::new()),
+        magic: Mutex::new(arinsal_term::MagicWeak::new()),
         monitors: Mutex::new(Vec::new()),
     });
     owners()

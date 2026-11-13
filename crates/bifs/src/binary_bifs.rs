@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arinsal_term::{
-    ConsListBuilder, HeapAlloc, HeapBinaryWriter, MagicRef, ProcessHeap, TermBuilder,
+    ConsListBuilder, HeapAlloc, HeapBinaryWriter, MagicBin, ProcessHeap, TermBuilder,
     writable_bytes_mut, writable_extend_private, writable_finalize,
 };
 
@@ -1230,7 +1230,7 @@ fn compile_pattern_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifE
     let orig_size = arinsal_term::MAGIC_BIN_DATA_OFFSET + compiled.erts_payload_size();
     let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
     let reference = TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::with_orig_size_and_refn(
+        .magic_ref(MagicBin::with_orig_size_and_refn(
             compiled,
             orig_size,
             crate::next_ref_words(),

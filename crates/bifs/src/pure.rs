@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
-    AtomEncoding, AtomError, BinaryRef, ExternalBinary, HeapAlloc, MagicRef, Node, Term,
+    AtomEncoding, AtomError, BinaryRef, ExternalBinary, HeapAlloc, MagicBin, Node, Term,
     TermBuilder, TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms,
     loose_eq, phash,
 };
@@ -107,7 +107,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        owner: Arc<MagicRef>,
+        owner: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         self.0.link_magic_ref(thing, owner)
     }
@@ -223,7 +223,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        value: Arc<MagicRef>,
+        value: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         self.backing.link_magic_ref(thing, value)
     }

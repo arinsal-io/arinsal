@@ -231,7 +231,7 @@ impl RefcBinary {
 pub struct ExternalBinary {
     data: *const u8,
     len: usize,
-    _owner: Arc<crate::MagicRef>,
+    _owner: crate::MagicBin,
 }
 // SAFETY: native resource users synchronize any mutation of published bytes.
 unsafe impl Send for ExternalBinary {}
@@ -242,7 +242,7 @@ impl ExternalBinary {
     ///
     /// # Safety
     /// `data` must remain readable for `len` bytes until `owner` is dropped.
-    pub unsafe fn new(data: *const u8, len: usize, owner: Arc<crate::MagicRef>) -> Arc<Self> {
+    pub unsafe fn new(data: *const u8, len: usize, owner: crate::MagicBin) -> Arc<Self> {
         Arc::new(Self {
             data: if len == 0 && data.is_null() {
                 std::ptr::NonNull::dangling().as_ptr()
@@ -613,7 +613,9 @@ pub fn external_binary_magic<'a>(term: Term) -> Option<&'a crate::MagicRef> {
         if !bin_ref_val_is_external(*p.add(1)) {
             return None;
         }
-        Some(&*Arc::as_ptr(&(*external_val_ptr(*p.add(1)))._owner))
+        Some(&*crate::MagicBin::as_ptr(
+            &(*external_val_ptr(*p.add(1)))._owner,
+        ))
     }
 }
 

@@ -27,7 +27,7 @@ enum Target {
     Resource(Weak<Resource>),
     /// A resource of a built-in NIF: the resource, which the monitor does not own, and its
     /// `down` callback, called with the exiting pid and the monitor.
-    Native(Weak<arinsal_term::MagicRef>, NativeDown),
+    Native(arinsal_term::MagicWeak, NativeDown),
 }
 
 /// The `down` callback of a built-in NIF resource.
@@ -41,7 +41,7 @@ fn handle(id: u64) -> [u8; 32] {
 
 impl ResourceMonitor {
     /// The target half of a monitor held by a built-in NIF resource.
-    pub fn native(id: u64, resource: Weak<arinsal_term::MagicRef>, down: NativeDown) -> Self {
+    pub fn native(id: u64, resource: arinsal_term::MagicWeak, down: NativeDown) -> Self {
         Self {
             target: Target::Native(resource, down),
             id,
@@ -54,7 +54,7 @@ impl ResourceMonitor {
     }
 
     /// The monitoring resource as a magic reference, for `process_info(_, monitored_by)`.
-    pub fn resource_ref(&self) -> Option<Arc<arinsal_term::MagicRef>> {
+    pub fn resource_ref(&self) -> Option<arinsal_term::MagicBin> {
         match &self.target {
             Target::Resource(resource) => Some(resource.upgrade()?.magic_ref()),
             Target::Native(resource, _) => resource.upgrade(),

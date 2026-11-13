@@ -395,7 +395,7 @@ pub trait HeapAlloc {
     fn link_magic_ref(
         &mut self,
         _thing: *mut u64,
-        _owner: Arc<crate::MagicRef>,
+        _owner: crate::MagicBin,
     ) -> Result<(), TermError> {
         Err(TermError::Unsupported("magic reference heap owner"))
     }
@@ -522,11 +522,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         (**self).link_node(thing, node)
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         (**self).link_magic_ref(thing, owner)
     }
     fn supports_magic(&self) -> bool {
@@ -620,10 +616,13 @@ pub(crate) fn link_magic_thing(
     head: &mut usize,
     overhead: &mut u64,
     thing: *mut u64,
-    owner: Arc<crate::MagicRef>,
+    owner: crate::MagicBin,
 ) {
     let words = (owner.orig_size() / 8) as u64;
-    store(thing.wrapping_add(1), Arc::into_raw(owner) as u64);
+    store(
+        thing.wrapping_add(1),
+        crate::MagicBin::into_raw(owner) as u64,
+    );
     store(thing.wrapping_add(2), *head as u64);
     *head = thing as usize;
     *overhead = overhead.saturating_add(words);
@@ -1265,11 +1264,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
         self.heap.link_node(thing, node)
     }
     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT), OTP-29.1.1.
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         self.heap.link_magic_ref(thing, owner)
     }
     fn supports_magic(&self) -> bool {
@@ -3036,11 +3031,7 @@ impl HeapAlloc for ProcessHeap {
         }
         link_node_thing(&mut self.owners.off_heap_first, thing, node);
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         if self.detached
             && let Some(heap) = self.owners.detached.as_deref_mut()
         {
@@ -3284,11 +3275,7 @@ impl HeapAlloc for VecHeap {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.off_heap_first, thing, node);
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         link_magic_thing(&mut self.off_heap_first, &mut self.overhead, thing, owner);
         Ok(())
     }
@@ -3441,11 +3428,7 @@ impl HeapAlloc for TemporaryHeap {
         link_node_thing(&mut self.off_heap_first, thing, node);
     }
 
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: Arc<crate::MagicRef>,
-    ) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
         link_magic_thing(&mut self.off_heap_first, &mut self.overhead, thing, owner);
         Ok(())
     }
@@ -5846,7 +5829,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
 
 impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Box a reference to an opaque owner for NIF resources and future native handles.
-    pub fn magic_ref(&mut self, owner: Arc<crate::MagicRef>) -> Result<Term, TermError> {
+    pub fn magic_ref(&mut self, owner: crate::MagicBin) -> Result<Term, TermError> {
         if !self.heap.supports_magic() {
             return Err(TermError::Unsupported("magic reference heap owner"));
         }
@@ -5856,7 +5839,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         // erts_mk_magic_ref links the thing at the head of the off-heap list and charges
         // `mb->orig_size` to the virtual binary heap.
         store(p, crate::REF_THING_HEADER);
-        store(p.wrapping_add(1), Arc::as_ptr(&owner) as u64);
+        store(p.wrapping_add(1), crate::MagicBin::as_ptr(&owner) as u64);
         store(p.wrapping_add(2), 0);
         let words = (owner.orig_size() / 8) as u64;
         self.heap.link_magic_ref(p, owner)?;

@@ -11,6 +11,8 @@ use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 
+pub mod magic_bin;
+
 /// Rebuilds a term from its tagged word after it has been held by the ETF work stack.
 ///
 /// # Safety contract

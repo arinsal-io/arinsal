@@ -1,4 +1,4 @@
-use arinsal_term::{BinaryOwner, ExternalBinary, MagicRef};
+use arinsal_term::{BinaryOwner, ExternalBinary, MagicBin};
 use arinsal_term::{
     ExportEntry, FunEntry, HeapAlloc, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term, TermBuilder,
     VecHeap, binary_owner, copy_term, exact_eq, global_atoms, make_hash2, match_position,
@@ -174,7 +174,7 @@ fn gc_rebases_message_binary_chains_before_releasing_fragments() {
 fn magic_reference_survives_copy_and_gc_then_releases() {
     arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
-    let owner = MagicRef::new(DropCounter(count.clone()));
+    let owner = MagicBin::new(DropCounter(count.clone()));
     let mut source = VecHeap::new();
     let term = TermBuilder::new(&mut source)
         .magic_ref(owner.clone())
@@ -202,7 +202,7 @@ fn magic_reference_is_freed_with_its_last_reference() {
     let mut heap = ProcessHeap::with_words(1 << 16);
     let mut ids = Vec::new();
     for _ in 0..10_000 {
-        let owner = MagicRef::new(DropCounter(count.clone()));
+        let owner = MagicBin::new(DropCounter(count.clone()));
         ids.push(owner.id());
         let term = TermBuilder::new(&mut heap).magic_ref(owner).unwrap();
         assert!(term.is_magic_ref());
@@ -217,7 +217,7 @@ fn magic_reference_is_freed_with_its_last_reference() {
 fn magic_reference_stays_alive_while_any_heap_holds_it() {
     arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
-    let owner = MagicRef::new(DropCounter(count.clone()));
+    let owner = MagicBin::new(DropCounter(count.clone()));
     let id = owner.id();
     let mut source = VecHeap::new();
     let term = TermBuilder::new(&mut source)
@@ -245,7 +245,7 @@ fn collections_with_many_live_magic_references_stay_linear() {
     let mut list = Term::NIL;
     let mut ids = Vec::new();
     for _ in 0..40_000 {
-        let owner = MagicRef::new(DropCounter(count.clone()));
+        let owner = MagicBin::new(DropCounter(count.clone()));
         ids.push(owner.id());
         let magic = TermBuilder::new(&mut heap).magic_ref(owner).unwrap();
         list = TermBuilder::new(&mut heap).cons(magic, list).unwrap();
@@ -275,7 +275,7 @@ struct ExternalPayload {
 fn external_binary_keeps_resource_through_copy_and_gc() {
     arinsal_term::init_global_literals();
     let count = Arc::new(AtomicUsize::new(0));
-    let owner = MagicRef::new(ExternalPayload {
+    let owner = MagicBin::new(ExternalPayload {
         bytes: vec![1, 2, 3].into_boxed_slice(),
         _counter: DropCounter(count.clone()),
     });

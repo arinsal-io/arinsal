@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use arinsal_term::{ExternalBinary, HeapAlloc, MagicRef, NativeAbi, Node, ProcessHeap, Term};
+use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, NativeAbi, Node, ProcessHeap, Term};
 
 mod arith;
 mod atomics;
@@ -888,7 +888,7 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
-        owner: Arc<MagicRef>,
+        owner: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
         HeapAlloc::link_magic_ref(self.0, thing, owner)
     }

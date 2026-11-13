@@ -14,8 +14,8 @@ use arinsal_bifs::{
     AppendCont, AppendStep, BifCall, Ctx, KeyOp, KeyOutcome, MemberStep, ProcessHeapHandle,
     ReverseStep, SubtractWalk,
 };
-use arinsal_term::{MagicRef, Term, TermBuilder, atoms};
-use std::sync::{Arc, Mutex};
+use arinsal_term::{MagicBin, Term, TermBuilder, atoms};
+use std::sync::Mutex;
 
 /// `sizeof(ErtsAppendContext)` on a 64-bit build: the magic binary's `orig_size`.
 // Port of erts/emulator/beam/erl_bif_lists.c (ErtsAppendContext), OTP-29.1.1.
@@ -191,7 +191,7 @@ pub(crate) fn create_trap_state<T: std::any::Any + Send>(
     context: T,
     c_size: usize,
 ) -> Result<Term, VmError> {
-    let state: Arc<MagicRef> = MagicRef::with_erts_payload_size_and_refn(
+    let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         Mutex::new(context),
         c_size,
         arinsal_bifs::next_ref_words(),

@@ -10,7 +10,7 @@ use crate::VecHeap;
 use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
-    ARITY, BIN_REF, ExternalBinary, FUN, HEAP_BITS, HeapAlloc, MAP, MagicRef, Node, ProcessHeap,
+    ARITY, BIN_REF, ExternalBinary, FUN, HEAP_BITS, HeapAlloc, MAP, MagicBin, Node, ProcessHeap,
     RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
 use std::sync::Arc;
@@ -244,7 +244,7 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         HeapAlloc::link_node(self.0, thing, node);
     }
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) -> Result<(), TermError> {
         HeapAlloc::link_magic_ref(self.0, thing, owner)
     }
     fn supports_magic(&self) -> bool {
@@ -326,7 +326,7 @@ pub(crate) fn release_off_heap_chain(mut head: usize) {
 fn release_off_heap_node(node: usize) {
     let word = crate::heap::load((node as *const u64).wrapping_add(1));
     match crate::heap::off_heap_node_kind(node) {
-        crate::heap::OffHeapKind::Magic => drop(MagicRef::thing_owner(word, false)),
+        crate::heap::OffHeapKind::Magic => drop(MagicBin::thing_owner(word, false)),
         crate::heap::OffHeapKind::Node => {
             // An unforwarded external thing's list entry owns its node reference
             // (erts_cleanup_offheap: erts_deref_node_entry).
@@ -817,7 +817,7 @@ fn off_heap_node_overhead_words(node: usize) -> u64 {
         crate::heap::OffHeapKind::Node => 0,
         crate::heap::OffHeapKind::Magic => {
             // SAFETY: the list entry owns the counted reference the thing's pointer word names.
-            let owner = std::mem::ManuallyDrop::new(MagicRef::thing_owner(word, false));
+            let owner = std::mem::ManuallyDrop::new(MagicBin::thing_owner(word, false));
             owner.orig_size() as u64 / 8
         }
         crate::heap::OffHeapKind::BinRef if crate::bits::bin_ref_val_is_external(word) => {

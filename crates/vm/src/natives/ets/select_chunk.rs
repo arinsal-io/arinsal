@@ -11,7 +11,7 @@ use super::{badarg, list, tuple_items};
 use crate::VmError;
 use arinsal_ets::match_spec::MatchProgram;
 use arinsal_ets::{SavedKey, SavedMatches, ScanPosition};
-use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, copy_term};
+use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, copy_term};
 use std::sync::Arc;
 
 /// Reductions of `ets:reverse/3` per `CONTEXT_REDS` worth of list cells (it charges one per ten).
@@ -20,7 +20,7 @@ const REVERSE_CELLS: usize = 40_000;
 /// What a call starts from: a continuation the caller handed in.
 pub(super) struct Run {
     pub(super) program: Arc<MatchProgram>,
-    pub(super) program_owner: Arc<MagicRef>,
+    pub(super) program_owner: MagicBin,
     pub(super) chunk: usize,
     pub(super) backwards: bool,
     pub(super) position: ScanPosition,
@@ -125,7 +125,7 @@ pub(super) fn continuation_items(term: Term) -> Result<Vec<Term>, VmError> {
 pub(super) fn hash_loop_ended<H: HeapAlloc>(
     heap: &mut H,
     tid: Term,
-    program_owner: &Arc<MagicRef>,
+    program_owner: &MagicBin,
     chunk: usize,
     mut held: Vec<Term>,
     slot: Option<usize>,
@@ -182,7 +182,7 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
 pub(super) fn tree_continuation<H: HeapAlloc>(
     heap: &mut H,
     tid: Term,
-    program_owner: &Arc<MagicRef>,
+    program_owner: &MagicBin,
     chunk: usize,
     reverse: bool,
     key: &SavedKey,
@@ -233,7 +233,7 @@ pub(super) fn reverse_pass(left: usize) -> ReversePass {
 
 /// Keep the match program alive through every continuation term that names it.
 // Port of erts/emulator/beam/erl_db_util.h (erts_db_make_match_prog_ref), OTP-29.1.1.
-fn match_program_owner(reference: Term, program: &Arc<MatchProgram>) -> Arc<MagicRef> {
+fn match_program_owner(reference: Term, program: &Arc<MatchProgram>) -> MagicBin {
     reference
         .magic_owner()
         .filter(|owner| owner.downcast_ref::<Arc<MatchProgram>>().is_some())
@@ -241,8 +241,8 @@ fn match_program_owner(reference: Term, program: &Arc<MatchProgram>) -> Arc<Magi
 }
 
 /// Create the binary owner used by the first continuation for a match program.
-pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> Arc<MagicRef> {
-    MagicRef::with_erts_payload_size_and_refn(
+pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> MagicBin {
+    MagicBin::with_erts_payload_size_and_refn(
         Arc::clone(program),
         program.erts_magic_payload_size(),
         arinsal_bifs::next_ref_words(),
@@ -251,11 +251,8 @@ pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> Arc<MagicR
 
 /// Build a continuation reference with the same identity as its predecessor.
 // Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_loop_ended), OTP-29.1.1.
-fn match_program_reference<H: HeapAlloc>(
-    heap: &mut H,
-    owner: &Arc<MagicRef>,
-) -> Result<Term, VmError> {
+fn match_program_reference<H: HeapAlloc>(heap: &mut H, owner: &MagicBin) -> Result<Term, VmError> {
     TermBuilder::new(heap)
-        .magic_ref(Arc::clone(owner))
+        .magic_ref(MagicBin::clone(owner))
         .map_err(|_| badarg())
 }
