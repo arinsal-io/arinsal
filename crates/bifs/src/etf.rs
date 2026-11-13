@@ -161,6 +161,12 @@ struct EncodeOpts {
     local_node: Option<(arinsal_term::Atom, u32)>,
 }
 
+#[derive(Default)]
+struct SizePass {
+    estimated: usize,
+    output: usize,
+}
+
 // Port of erts/emulator/beam/external.c:1480-1535 (parse_t2b_opts), OTP-29.1.1.
 fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
     let mut opts = EncodeOpts {
@@ -533,6 +539,19 @@ fn write_small(out: &mut impl ByteOutput, n: i64) {
         out.extend_from_slice(&word.to_be_bytes());
     } else {
         int_bytes(out, &BigInt::from(n));
+    }
+}
+
+// Port of erts/emulator/beam/external.c:3986-3999 (nested enc_term in FUN_DEF/EXPORT_EXT), OTP-29.1.1.
+fn write_nested_small(out: &mut impl ByteOutput, n: i64, opts: EncodeOpts) {
+    if opts.local {
+        let mut body = SmallVec::<[u8; 5]>::new();
+        write_small(&mut body, n);
+        out.push(121);
+        out.extend_from_slice(&local_term_hash(&body).to_be_bytes());
+        out.extend_from_slice(&body);
+    } else {
+        write_small(out, n);
     }
 }
 
@@ -1059,13 +1078,14 @@ fn size_walk(
     node_source: Option<fn() -> (Atom, u32)>,
     stack: &mut WStack,
     pending: Option<Term>,
-    result: &mut usize,
+    sizes: &mut SizePass,
     consumed: &mut usize,
     budget: usize,
 ) -> Result<Option<Term>, BifError> {
     let table = global_atoms();
     let minor = opts.minor;
-    let mut total = *result;
+    let mut total = sizes.estimated;
+    let mut output_total = sizes.output;
     let mut work = *consumed;
     let mut obj = match pending {
         Some(obj) => obj,
@@ -1075,14 +1095,28 @@ fn size_walk(
         },
     };
     macro_rules! add {
-        ($size:expr) => {
-            total = total.checked_add($size).ok_or(BifError::SystemLimit)?
+        ($size:expr) => {{
+            let size = $size;
+            total = total.checked_add(size).ok_or(BifError::SystemLimit)?;
+            output_total = output_total
+                .checked_add(size)
+                .ok_or(BifError::SystemLimit)?;
+        }};
+    }
+    macro_rules! add_recursive_local_headers {
+        ($count:expr) => {
+            if opts.local {
+                output_total = output_total
+                    .checked_add(5 * $count)
+                    .ok_or(BifError::SystemLimit)?;
+            }
         };
     }
     loop {
         // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
         if work + 1 >= budget {
-            *result = total;
+            sizes.estimated = total;
+            sizes.output = output_total;
             *consumed = work;
             return Ok(Some(obj));
         }
@@ -1153,10 +1187,13 @@ fn size_walk(
             }
             FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
                 // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
-                resolve_local_node(opts, node_source);
+                let internal = is_internal_identity(obj);
+                if internal && !opts.local {
+                    resolve_local_node(opts, node_source);
+                }
                 let identity = obj.identity().ok_or(BifError::BADARG)?;
-                let identity = local_identity(identity, opts.local_node);
-                let node_size = if opts.local {
+                let identity = local_identity(identity, internal, opts.local, opts.local_node);
+                let node_size = if opts.local && internal {
                     1
                 } else {
                     atom_size_in(
@@ -1185,6 +1222,8 @@ fn size_walk(
                                 + atom_size_in(table, entry.function, minor)?
                                 + small_size(i64::from(entry.arity))
                         );
+                        // Port of external.c EXPORT_EXT: the arity is emitted by a nested enc_term.
+                        add_recursive_local_headers!(1);
                     }
                     FunRef::Local { entry, .. } => {
                         add!(
@@ -1197,6 +1236,8 @@ fn size_walk(
                                 + small_size(i64::from(entry.old_index))
                                 + small_size(i64::from(entry.old_uniq))
                         );
+                        // Port of external.c FUN_DEF: old_index and old_uniq use nested enc_term.
+                        add_recursive_local_headers!(2);
                         stack.push(entry.pid.word());
                         let free = fun.num_free();
                         if free > 1 {
@@ -1241,7 +1282,8 @@ fn size_walk(
         match size_pop(stack)? {
             Some(next) => obj = next,
             None => {
-                *result = total;
+                sizes.estimated = total;
+                sizes.output = output_total;
                 *consumed = work;
                 return Ok(None);
             }
@@ -1276,7 +1318,10 @@ pub struct EncodeWalk {
     work: Vec<u64>,
     current_term: Option<Term>,
     size_current: Option<Term>,
+    /// Size returned by `encode_size_struct_int` before the encoder's final binary resize.
     encoded_size: usize,
+    /// Bytes emitted by `enc_term_int`, including recursively encoded local fun fields.
+    output_size: usize,
     written: usize,
     direct_started: bool,
     sized: bool,
@@ -1317,6 +1362,7 @@ impl EncodeWalk {
             current_term: None,
             size_current: None,
             encoded_size: 0,
+            output_size: 0,
             written: 0,
             direct_started: false,
             sized: true,
@@ -1360,12 +1406,14 @@ impl EncodeWalk {
             // Port of erts/emulator/beam/external.c:3305 (encode LOCAL_EXT), OTP-29.1.1.
             encoded_size += 5;
         }
+        let output_size = encoded_size;
         Self {
             opts,
             work: Vec::new(),
             current_term: Some(term),
             size_current: Some(term),
             encoded_size,
+            output_size,
             written: 0,
             direct_started: false,
             sized: false,
@@ -1383,9 +1431,14 @@ impl EncodeWalk {
         self.record_splits = iovec;
     }
 
-    /// Exact serialized size after the `encode_size_struct_int` pass.
+    /// Size reported by `encode_size_struct_int` after its pass.
     pub fn encoded_size(&self) -> Option<usize> {
         self.sized.then_some(self.encoded_size)
+    }
+
+    /// Number of bytes emitted by `enc_term_int` after the result binary is resized.
+    pub fn output_size(&self) -> Option<usize> {
+        self.sized.then_some(self.output_size)
     }
 
     /// Whether zlib compression is active for this encoder.
@@ -1408,7 +1461,10 @@ impl EncodeWalk {
         let node_source = self.node_source;
         let mut stack = WStack::new();
         stack.restore(&mut self.work);
-        let mut result = self.encoded_size;
+        let mut sizes = SizePass {
+            estimated: self.encoded_size,
+            output: self.output_size,
+        };
         let mut work = *consumed;
         let pending = self.size_current.take();
         let outcome = size_walk(
@@ -1416,13 +1472,14 @@ impl EncodeWalk {
             node_source,
             &mut stack,
             pending,
-            &mut result,
+            &mut sizes,
             &mut work,
             budget,
         );
         self.opts = opts;
         stack.save(&mut self.work);
-        self.encoded_size = result;
+        self.encoded_size = sizes.estimated;
+        self.output_size = sizes.output;
         *consumed = work;
         match outcome? {
             None => Ok(true),
@@ -1433,7 +1490,7 @@ impl EncodeWalk {
         }
     }
 
-    /// Advance the exact size pass used before result allocation.
+    /// Advance the size pass used before result allocation.
     pub fn step_size(&mut self, budget: usize) -> Result<(bool, usize), BifError> {
         if self.sized {
             return Ok((true, 0));
@@ -1470,7 +1527,7 @@ impl EncodeWalk {
         if !sized {
             return Ok((false, budget));
         }
-        if output.len() != self.encoded_size {
+        if output.len() != self.output_size {
             return Err(BifError::SystemLimit);
         }
         if !self.direct_started {
@@ -1531,7 +1588,7 @@ impl EncodeWalk {
         heap: &mut H,
         budget: usize,
     ) -> Result<(RefcEncoded, usize), BifError> {
-        let size = self.encoded_size().ok_or(BifError::SystemLimit)?;
+        let size = self.output_size().ok_or(BifError::SystemLimit)?;
         let mut binary = RefcBinary::new_zeroed(size).map_err(|_| BifError::SystemLimit)?;
         let (done, work) = self.step_into(
             binary.bytes_mut_unique().ok_or(BifError::SystemLimit)?,
@@ -1548,7 +1605,7 @@ impl EncodeWalk {
     /// for the compression source on the compressed simple path.
     // Port of erts/emulator/beam/external.c:2250-2319 (`erts_term_to_binary_simple`), OTP-29.1.1.
     pub fn encode_simple_binary<H: HeapAlloc>(&mut self, heap: &mut H) -> Result<Term, BifError> {
-        let size = self.encoded_size().ok_or(BifError::SystemLimit)?;
+        let size = self.output_size().ok_or(BifError::SystemLimit)?;
         if size > 64 || !self.finishes_simple() {
             return Err(BifError::BADARG);
         }
@@ -1644,7 +1701,7 @@ impl EncodeWalk {
         self.cold.as_ref().is_some_and(|cold| {
             cold.compression_finished
                 && cold.compressor.as_ref().is_some_and(|compressor| {
-                    compressor.total_out().saturating_add(6) <= self.encoded_size as u64
+                    compressor.total_out().saturating_add(6) <= self.output_size as u64
                 })
         })
     }
@@ -1670,7 +1727,7 @@ impl EncodeWalk {
             .as_ref()
             .and_then(|cold| cold.compressor.as_ref())
             .is_some_and(|compressor| {
-                compressor.total_out() >= self.encoded_size.saturating_sub(6) as u64
+                compressor.total_out() >= self.output_size.saturating_sub(6) as u64
             })
     }
 
@@ -1995,9 +2052,16 @@ impl EncodeWalk {
                     }
                 }
                 FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
-                    resolve_local_node(&mut opts, node_source);
-                    let identity =
-                        local_identity(term.identity().ok_or(BifError::BADARG)?, opts.local_node);
+                    let internal = is_internal_identity(term);
+                    if internal && !opts.local {
+                        resolve_local_node(&mut opts, node_source);
+                    }
+                    let identity = local_identity(
+                        term.identity().ok_or(BifError::BADARG)?,
+                        internal,
+                        opts.local,
+                        opts.local_node,
+                    );
                     match identity {
                         Identity::Pid {
                             node,
@@ -2007,16 +2071,20 @@ impl EncodeWalk {
                         } => {
                             out.push(88);
                             // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
-                            write_node(out, node, opts)?;
+                            write_node(out, node, internal, opts)?;
                             out.extend_from_slice(&index.to_be_bytes());
                             out.extend_from_slice(&serial.to_be_bytes());
-                            out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
+                            out.extend_from_slice(
+                                &local_creation(creation, internal, opts).to_be_bytes(),
+                            );
                         }
                         Identity::Port { node, creation, id } => {
                             out.push(120);
-                            write_node(out, node, opts)?;
+                            write_node(out, node, internal, opts)?;
                             out.extend_from_slice(&id.to_be_bytes());
-                            out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
+                            out.extend_from_slice(
+                                &local_creation(creation, internal, opts).to_be_bytes(),
+                            );
                         }
                         Identity::Ref {
                             node,
@@ -2028,8 +2096,10 @@ impl EncodeWalk {
                             term.save_magic_ref();
                             out.push(90);
                             out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
-                            write_node(out, node, opts)?;
-                            out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
+                            write_node(out, node, internal, opts)?;
+                            out.extend_from_slice(
+                                &local_creation(creation, internal, opts).to_be_bytes(),
+                            );
                             for id in ids {
                                 out.extend_from_slice(&id.to_be_bytes());
                             }
@@ -2041,7 +2111,7 @@ impl EncodeWalk {
                         out.push(113);
                         atom_bytes_in(table, out, entry.module, opts.minor)?;
                         atom_bytes_in(table, out, entry.function, opts.minor)?;
-                        write_small(out, i64::from(entry.arity));
+                        write_nested_small(out, i64::from(entry.arity), opts);
                     }
                     FunRef::Local { entry, free_vars } => {
                         out.push(112);
@@ -2052,8 +2122,8 @@ impl EncodeWalk {
                         out.extend_from_slice(&entry.index.to_be_bytes());
                         out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
                         atom_bytes_in(table, out, entry.module, opts.minor)?;
-                        write_small(out, i64::from(entry.old_index));
-                        write_small(out, i64::from(entry.old_uniq));
+                        write_nested_small(out, i64::from(entry.old_index), opts);
+                        write_nested_small(out, i64::from(entry.old_uniq), opts);
                         stack.push(ENC_PATCH_FUN_SIZE);
                         stack.push(stack_small(at)?);
                         let view = fun_of(term)?;
@@ -2108,7 +2178,7 @@ impl EncodeWalk {
         stack.save(&mut self.work);
         self.current_term = cur;
         self.free_first = !done;
-        if out.failed() || (done && !iovec && out.len() != self.encoded_size) {
+        if out.failed() || (done && !iovec && out.len() != self.output_size) {
             return Err(BifError::SystemLimit);
         }
         Ok((done, if done { consumed } else { budget.max(consumed) }))
@@ -2173,7 +2243,15 @@ pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, BifError> {
 }
 
 // Port of erts/emulator/beam/external.c:3244 (enc_term, local pid/port/ref identity), OTP-29.1.1.
-fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u32)>) -> Identity {
+fn local_identity(
+    identity: Identity,
+    internal: bool,
+    local: bool,
+    local_node: Option<(arinsal_term::Atom, u32)>,
+) -> Identity {
+    if !internal || local {
+        return identity;
+    }
     let Some((local_node, local_creation)) = local_node else {
         return identity;
     };
@@ -2211,13 +2289,25 @@ fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u3
     }
 }
 
-// Port of erts/emulator/beam/external.c:3651 (NIL_EXT node when encoding local), OTP-29.1.1.
+// Port of is_internal_pid/is_internal_port/is_internal_ref in
+// erts/emulator/beam/external.c (enc_term_int), OTP-29.1.1.
+fn is_internal_identity(term: Term) -> bool {
+    match term.classify() {
+        TermKind::Pid => term.as_pid().is_some(),
+        TermKind::Port => term.as_port().is_some(),
+        TermKind::Ref => term.local_ref_numbers().is_some() || term.is_magic_ref(),
+        _ => false,
+    }
+}
+
+// Port of erts/emulator/beam/external.c:2974-3019, 3651, 3686, OTP-29.1.1.
 fn write_node(
     out: &mut impl ByteOutput,
     node: arinsal_term::Atom,
+    internal: bool,
     opts: EncodeOpts,
 ) -> Result<(), BifError> {
-    if opts.local {
+    if opts.local && internal {
         out.push(106);
         Ok(())
     } else {
@@ -2225,8 +2315,9 @@ fn write_node(
     }
 }
 
-fn local_creation(creation: u32, opts: EncodeOpts) -> u32 {
-    if opts.local { 0 } else { creation }
+// Port of erts/emulator/beam/external.c:2978-3019, 3651, 3686, OTP-29.1.1.
+fn local_creation(creation: u32, internal: bool, opts: EncodeOpts) -> u32 {
+    if opts.local && internal { 0 } else { creation }
 }
 
 fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
