@@ -144,7 +144,7 @@ use crate::native_helpers::{
 };
 use crate::natives::{
     bif_phash2, binary, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer,
-    erl_iolist, erl_map, erl_process_dict, register,
+    erl_iolist, erl_map, erl_process_dict, external, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -198,13 +198,13 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "process_info", 2) => {
             bif!(crate::native_helpers::process_info_2_light)
         }
-        // The C BIFs have direct entries in external.c rather than the generic trap adapter.
-        ("erlang", "term_to_binary", 1) => {
-            bif!(crate::bif_traps::term_to_binary_1_light)
-        }
-        ("erlang", "external_size", 1) => {
-            bif!(crate::bif_traps::external_size_1_light)
-        }
+        // external.c
+        ("erlang", "term_to_binary", 1) => bif!(external::term_to_binary_1),
+        ("erlang", "term_to_binary", 2) => bif!(external::term_to_binary_2),
+        ("erlang", "term_to_iovec", 1) => bif!(external::term_to_iovec_1),
+        ("erlang", "term_to_iovec", 2) => bif!(external::term_to_iovec_2),
+        ("erlang", "external_size", 1) => bif!(external::external_size_1),
+        ("erlang", "external_size", 2) => bif!(external::external_size_2),
         ("erlang", "binary_to_term", 1) => {
             bif!(crate::bif_traps::binary_to_term_1_light)
         }
@@ -349,6 +349,7 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
+        ("erts_internal", "term_to_binary_trap", 1) => bif!(external::term_to_binary_trap_1),
         ("erts_internal", "binary_to_list_continue", 1) => {
             bif!(binary::binary_to_list_continue_1)
         }
@@ -367,10 +368,9 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:421-447, OTP-29.1.1: the fragment calls the
 // selected BIF body directly; that body leaves the light path only when it traps.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    use crate::bif_traps::{BinaryToTerm, TermToBinary};
+    use crate::bif_traps::BinaryToTerm;
     use crate::native_helpers::trap_bif_entry;
     let func = match (module, function, arity) {
-        ("erlang", "term_to_binary", 1 | 2) => bif!(trap_bif_entry::<TermToBinary>),
         ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
         _ => return None,
     };
@@ -480,6 +480,7 @@ sched_bif!(
 #[cfg(test)]
 mod tests {
     use super::{entry, special};
+    use crate::natives::external;
 
     // install_bifs fills `bif_table[ep->bif_number]`; the export itself carries no function.
     #[test]
@@ -517,14 +518,8 @@ mod tests {
     #[test]
     fn external_term_bifs_have_direct_arity_one_entries() {
         let direct = [
-            (
-                "term_to_binary",
-                bif!(crate::bif_traps::term_to_binary_1_light),
-            ),
-            (
-                "external_size",
-                bif!(crate::bif_traps::external_size_1_light),
-            ),
+            ("term_to_binary", bif!(external::term_to_binary_1)),
+            ("external_size", bif!(external::external_size_1)),
             (
                 "binary_to_term",
                 bif!(crate::bif_traps::binary_to_term_1_light),
@@ -533,7 +528,10 @@ mod tests {
         for (function, expected) in direct {
             similar_asserts::assert_eq!(special("erlang", function, 1), Some(expected));
         }
-        assert!(special("erlang", "term_to_binary", 2).is_none());
+        similar_asserts::assert_eq!(
+            special("erlang", "term_to_binary", 2),
+            Some(bif!(external::term_to_binary_2))
+        );
         assert!(special("erlang", "binary_to_term", 2).is_none());
     }
 
