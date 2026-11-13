@@ -114,3 +114,54 @@ fn binary_to_term_matches_otp_on_big_inputs() {
         assert_eq!(e_in, a_in, "case {index}: schedule-ins");
     }
 }
+
+const GC_MODULE: &str = "external_decode_gc_test";
+
+const GC_SOURCE: &str = r#"-module(external_decode_gc_test).
+-export([run/1]).
+%% Another process requests collections of the decoder while it is parked between the slices
+%% of binary_to_term: erts_set_gc_state(p, 0) delays them until the decode is over.
+run(Kind) ->
+    List = lists:seq(1, 1000000),
+    Bin = case Kind of
+        plain -> term_to_binary(List);
+        compressed -> term_to_binary(List, [{compressed, 6}])
+    end,
+    Parent = self(),
+    Pid = spawn(fun() ->
+        V = binary_to_term(Bin),
+        Parent ! {done, V =:= List}
+    end),
+    Requested = gc_loop(Pid, 0),
+    receive {done, R} -> {R, Requested > 0} after 60000 -> timeout end.
+gc_loop(_Pid, 100) -> 100;
+gc_loop(Pid, N) ->
+    receive {done, _} = Done -> self() ! Done, N
+    after 0 ->
+        erlang:garbage_collect(Pid, [{async, make_ref()}]),
+        erlang:yield(),
+        gc_loop(Pid, N + 1)
+    end.
+"#;
+
+#[test]
+fn collections_requested_between_binary_to_term_slices_are_delayed() {
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let beam = reference.compile_named(GC_MODULE, GC_SOURCE, &[]).unwrap();
+    reference.load(GC_MODULE, &beam).unwrap();
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    for kind in ["plain", "compressed"] {
+        let arg = OwnedTerm::Atom(kind.into());
+        let expected = match reference.call(GC_MODULE, "run", &[arg]) {
+            CallResult::Ok(expected) => expected,
+            other => panic!("OTP failed {kind}: {other:?}"),
+        };
+        let atom = Term::atom(arinsal_term::global_atoms().intern(kind).unwrap());
+        let actual = vm
+            .eval_scheduled(GC_MODULE, "run", &[atom], 1)
+            .unwrap_or_else(|error| panic!("Arinsal failed {kind}: {error:?}"))
+            .term;
+        assert_eq!(expected, actual, "{kind}");
+    }
+}

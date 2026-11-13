@@ -575,7 +575,7 @@ enum B2tState {
 /// walk), the reductions left, `trap_bin` once exported, and `bif` and `arg[]`, the original
 /// call's number of arguments and arguments, which a failure reports.
 // Port of erts/emulator/beam/external.c (B2TContext), OTP-29.1.1.
-struct B2tContext<'a> {
+pub(crate) struct B2tContext<'a> {
     state: B2tState,
     walk: DecodeWalk<'a>,
     reds: i64,

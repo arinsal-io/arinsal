@@ -38,6 +38,7 @@ mod maps_ycf_bifs_differential;
 mod maps_yield;
 mod misc_bifs;
 mod missing_bifs;
+mod moved_bif_differential;
 mod phash2_unaligned_differential;
 mod re;
 mod re_error_info;

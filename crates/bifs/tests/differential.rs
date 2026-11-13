@@ -500,26 +500,10 @@ fn referenced_byte_size_keeps_subbinary_owner() {
 fn new_bifs_valid_inputs_match_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     for n in 0..1000 {
-        let map = O::Map(vec![(O::Int(1), O::Int(n)), (O::Int(2), O::Int(n + 1))]);
         let positive_cases = [
             ("erlang", "+", vec![O::Int(n), O::Int(n + 1)]),
             ("erlang", "div", vec![O::Int(n), O::Int(7)]),
             ("erlang", "bsl", vec![O::Int(n), O::Int(n % 20)]),
-            ("maps", "find", vec![O::Int(1), map.clone()]),
-            ("maps", "get", vec![O::Int(1), map.clone()]),
-            ("maps", "is_key", vec![O::Int(1), map.clone()]),
-            ("maps", "put", vec![O::Int(1), O::Int(n + 5), map.clone()]),
-            ("maps", "remove", vec![O::Int(1), map.clone()]),
-            (
-                "maps",
-                "update",
-                vec![O::Int(1), O::Int(n + 5), map.clone()],
-            ),
-            ("maps", "take", vec![O::Int(1), map.clone()]),
-            ("maps", "merge", vec![map.clone(), map.clone()]),
-            ("erlang", "map_size", vec![map.clone()]),
-            ("erlang", "map_get", vec![O::Int(1), map.clone()]),
-            ("erlang", "is_map_key", vec![O::Int(1), map]),
         ];
         for (module, name, input) in positive_cases {
             let actual = call(module, name, &input);
@@ -1184,14 +1168,12 @@ fn binary_match_accepts_unaligned_subbinary() {
 
 #[test]
 fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
     let mut heap = ProcessHeap::with_words(512);
     let mut builder = TermBuilder::new(&mut heap);
     let backing = builder
         .binary(&[0b0100_0000, 0b1100_0000, 0b0100_0000])
         .expect("backing");
     let subject = builder.sub_binary(backing, 1, 16).expect("subbinary");
-    let needle = builder.binary(&[0b1000_0000]).expect("needle");
 
     let mut unaligned_copy = [0];
     copy_bitstring_range(subject, 4, &mut unaligned_copy, 8).expect("unaligned copy");
@@ -1199,36 +1181,8 @@ fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
     let mut aligned_copy = [0];
     copy_bitstring_range(subject, 8, &mut aligned_copy, 8).expect("aligned copy");
     assert_eq!(aligned_copy, [0b1000_0000]);
-
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let reference_subject = O::Binary(vec![0b1000_0001, 0b1000_0000]);
-    for (module, name, args) in [
-        ("erlang", "binary_to_list", vec![subject]),
-        (
-            "binary",
-            "at",
-            vec![subject, arinsal_term::Term::small(1).unwrap()],
-        ),
-        ("binary", "match", vec![subject, needle]),
-        ("binary", "split", vec![subject, needle]),
-    ] {
-        let bif = lookup(module, name, args.len() as u8).expect("BIF");
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::new(&mut allocator, &mut state);
-        let actual = CallResult::Ok(to_owned(bif(&mut ctx, &args).expect("BIF succeeds")).unwrap());
-        let remote_args = if name == "at" {
-            vec![reference_subject.clone(), O::Int(1)]
-        } else if name == "binary_to_list" {
-            vec![reference_subject.clone()]
-        } else {
-            vec![reference_subject.clone(), O::Binary(vec![0b1000_0000])]
-        };
-        let expected = reference.call(module, name, &remote_args);
-        assert!(
-            equivalent(&actual, &expected),
-            "{module}:{name}: {actual:?} != {expected:?}"
-        );
-    }
+    // The binary:at/match/split and binary_to_list bodies are VM bodies
+    // (crates/vm/tests/bifs/moved_bif_differential.rs).
 }
 
 #[test]
@@ -1272,29 +1226,5 @@ fn cmp_term_uses_exact_numeric_order_inside_containers() {
         let actual = call("erts_internal", "cmp_term", &args);
         let expected = reference.call("erts_internal", "cmp_term", &args);
         assert_eq!(actual, expected);
-    }
-}
-
-#[test]
-fn list_bif_loops_match_otp_29() {
-    // The erl_bif_lists.c BIFs are VM bodies (crates/vm/tests/bifs/lists_bifs_differential.rs).
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let seq = O::list((1..8).map(O::Int).collect());
-    let improper = O::List {
-        elems: vec![O::Int(1)],
-        tail: Box::new(atom("tail")),
-    };
-    let cases: &[(&str, &str, Vec<O>)] = &[
-        ("erlang", "length", vec![O::Nil]),
-        ("erlang", "length", vec![seq.clone()]),
-        ("erlang", "length", vec![improper.clone()]),
-    ];
-    for (module, name, args) in cases {
-        let actual = call(module, name, args);
-        let expected = reference.call(module, name, args);
-        assert!(
-            equivalent(&actual, &expected),
-            "{module}:{name} {args:?}: {actual:?} != {expected:?}"
-        );
     }
 }
