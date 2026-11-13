@@ -1948,7 +1948,6 @@ fn trace_delivered(
         to_owned(target).map_err(|_| badarg("trace_delivered/1"))?,
         to_owned(reference).map_err(|_| badarg("trace_delivered/1"))?,
     ]);
-    let runtime = process.runtime.ok_or_else(|| badarg("trace_delivered/1"))?;
     let caller = ctx.pid();
     let refc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
         ctx.scheduler_count().max(1),
@@ -1961,7 +1960,7 @@ fn trace_delivered(
             return;
         };
         // erts_send_sys_msg_proc(rp->common.id, rp->common.id, msg, bp).
-        crate::erl_trace::send_sys_msg_proc(runtime, caller, caller, message);
+        crate::erl_trace::send_sys_msg_proc(caller, caller, message);
     });
     Ok(reference)
 }
