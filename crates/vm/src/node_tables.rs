@@ -386,8 +386,6 @@ pub(crate) enum NodeKind {
 
 #[derive(Debug)]
 pub(crate) struct NodeTables {
-    pub(crate) local_name: String,
-    pub(crate) local_creation: u32,
     pub(crate) distribution_buffer_busy_limit: u64,
     /// `erts_dist_table`: name to entry; this table lock covers membership only.
     pub(crate) entries: BTreeMap<String, Arc<DistEntry>>,
@@ -435,8 +433,6 @@ impl Default for NodeTables {
             }),
         );
         Self {
-            local_name: "nonode@nohost".into(),
-            local_creation: 0,
             distribution_buffer_busy_limit: 1024 * 1024,
             entries,
             monitors: Vec::new(),
@@ -458,7 +454,7 @@ impl NodeTables {
             self.pending_delete.remove(&node);
             // Port of erl_node_tables.c (try_delete_dist_entry), OTP-29.1.1: an entry is
             // only erased once the table holds the last reference (`refc` reached zero).
-            if node != self.local_name
+            if node != this_node().0
                 && self
                     .entries
                     .get(&node)
@@ -492,23 +488,11 @@ static NO_NODES: AtomicI64 = AtomicI64::new(0);
 /// `set_node_not_alive`, which reports it with the nodedown message of this node.
 static NODEDOWN_REASON: Mutex<Option<String>> = Mutex::new(None);
 
-/// The word holding the local node name atom; generated code reads it by address.
-pub(crate) fn this_node_sysname() -> &'static AtomicU64 {
-    arinsal_term::this_node_sysname()
-}
-
 /// Makes `name` the local node of the node table and publishes it as `erts_this_node`. The
 /// caller holds the thread-progress block, so no thread reads the identity while it changes.
 // Port of erts/emulator/beam/erl_node_tables.c:1042-1075 (erts_set_this_node), OTP-29.1.1.
 pub(crate) fn set_this_node(name: String, creation: u32) -> bool {
-    let mut tables = lock();
-    if !tables.set_local_node(name, creation) {
-        return false;
-    }
-    if let Ok(atom) = arinsal_term::global_atoms().intern(&tables.local_name) {
-        arinsal_term::set_this_node(atom, tables.local_creation);
-    }
-    true
+    lock().set_local_node(name, creation)
 }
 
 /// `erts_is_alive = value`.
@@ -663,15 +647,6 @@ impl NodeTables {
         }
     }
 
-    pub(crate) fn local_identity(&self) -> (&str, u32) {
-        let dep = self
-            .entries
-            .get(&self.local_name)
-            .expect("the local distribution entry is always present");
-        debug_assert_eq!(dep.lock().creation, self.local_creation);
-        (&dep.sysname, self.local_creation)
-    }
-
     /// The entry whose current connection has distribution handle `handle` (the
     /// `DistEntry` pointer of an erts dhandle).
     pub(crate) fn dep_by_handle(&self, handle: u64) -> Option<Arc<DistEntry>> {
@@ -713,7 +688,7 @@ impl NodeTables {
     ///
     /// Port of erts/emulator/beam/dist.c:6670 (net_kernel_dflag_unicode_io_1), OTP-29.1.1.
     pub(crate) fn pid_unicode_io(&self, node: &str) -> bool {
-        if node == self.local_name {
+        if node == this_node().0 {
             return true;
         }
         self.entries.get(node).is_some_and(|dep| {
@@ -729,10 +704,16 @@ impl NodeTables {
         if !is_node_name(&name) {
             return false;
         }
-        self.pending_delete.remove(&self.local_name);
-        self.entries.remove(&self.local_name);
-        self.local_name = name.clone();
-        self.local_creation = creation;
+        let Ok(sysname) = arinsal_term::global_atoms().intern(&name) else {
+            return false;
+        };
+        // Port of erl_node_tables.c (erts_set_this_node): the old `erts_this_dist_entry`
+        // reference is released, `erts_this_node` becomes the node entry of the new name and
+        // `erts_this_dist_entry` its dist entry.
+        let old = this_node().0;
+        self.pending_delete.remove(old);
+        self.entries.remove(old);
+        arinsal_term::set_this_node(sysname, creation);
         self.entries.insert(
             name.clone(),
             DistEntry::new(NodeEntry {
@@ -756,7 +737,7 @@ impl NodeTables {
     ///
     /// Returns `(connection_id, entry_ref)` for the distribution handle.
     pub(crate) fn new_connection(&mut self, node: &str) -> Option<(u32, u64)> {
-        if node == self.local_name {
+        if node == this_node().0 {
             return None;
         }
         self.pending_delete.remove(node);
@@ -786,7 +767,7 @@ impl NodeTables {
         conn_id: u32,
         entry_ref: u64,
     ) -> Option<bool> {
-        if node == self.local_name {
+        if node == this_node().0 {
             return None;
         }
         let mut entry = self.entries.get(node)?.lock();
@@ -839,7 +820,7 @@ impl NodeTables {
 
     /// Record a monitor and return true when an immediate down event is due.
     pub(crate) fn monitor(&mut self, pid: Pid, node: String, enabled: bool) -> bool {
-        if node == self.local_name {
+        if node == this_node().0 {
             return false;
         }
         if !enabled {
@@ -1111,9 +1092,11 @@ mod tests {
     fn set_local_node_replaces_the_local_entry() {
         let mut tables = NodeTables::default();
         assert!(tables.set_local_node("test@localhost".into(), 4));
-        assert_eq!(tables.local_identity(), ("test@localhost", 4));
+        assert_eq!(super::this_node(), ("test@localhost", 4));
+        assert!(tables.entries["test@localhost"].lock().creation == 4);
         assert!(tables.set_local_node("nonode@nohost".into(), 0));
-        assert_eq!(tables.local_identity(), ("nonode@nohost", 0));
+        assert_eq!(super::this_node(), ("nonode@nohost", 0));
+        assert!(!tables.entries.contains_key("test@localhost"));
     }
 
     #[test]

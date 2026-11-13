@@ -38,7 +38,7 @@ impl ModuleEnv for TestEnv {
         raw_raise_for_compile as *const () as usize
     }
 
-    fn this_node_sysname(&self) -> usize {
+    fn erts_this_node(&self) -> usize {
         1
     }
 

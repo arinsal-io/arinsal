@@ -138,7 +138,7 @@ impl HeapAlloc for TraceHeap<'_> {
         true
     }
 
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         HeapAlloc::link_node(self.heap, thing, node);
     }
 

@@ -334,17 +334,22 @@ impl Default for BeamModuleAssembler {
 }
 
 impl BeamModuleAssembler {
-    /// Loads the local node name from the word at `sysname` (`erts_this_node->sysname`).
+    /// Loads `erts_this_node->sysname`; `this_node` is the address of `erts_this_node`.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:701-705, OTP-29.1.1.
-    pub fn emit_node(&mut self, dst: ArgVal, sysname: usize) -> Result<(), ModuleError> {
-        if sysname == 0 {
+    pub fn emit_node(&mut self, dst: ArgVal, this_node: usize) -> Result<(), ModuleError> {
+        if this_node == 0 {
             return Err(ModuleError::InvalidOperand(
-                "local node name word is missing",
+                "erts_this_node address is missing",
             ));
         }
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(8), sysname as u64)?;
-            e.ldr_uoff(Gpr::x(8), Gpr::x(8), 0)
+            e.mov_const(Gpr::x(8), this_node as u64)?;
+            e.ldr_uoff(Gpr::x(8), Gpr::x(8), 0)?;
+            e.ldr_uoff(
+                Gpr::x(8),
+                Gpr::x(8),
+                arinsal_term::ERL_NODE_SYSNAME_OFFSET as u32,
+            )
         })?;
         self.store_register(dst, Gpr::x(8))
     }

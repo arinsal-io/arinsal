@@ -21,7 +21,7 @@ impl std::fmt::Debug for ErtsAlcType {
 
 /// Name and serving allocator (index in `ALLOCATOR_NAMES`, mapped like erl_alloc.types) of each
 /// type, indexed by the type number.
-const ALC_TYPES: [(&str, u8); 27] = [
+const ALC_TYPES: [(&str, u8); 29] = [
     ("HEAP", 4),
     ("OLD_HEAP", 4),
     ("HEAP_FRAG", 4),
@@ -49,6 +49,8 @@ const ALC_TYPES: [(&str, u8); 27] = [
     ("SIG_DATA", 1),
     ("PORT_DATA_HEAP", 9),
     ("ATOM_TABLE", 3),
+    ("NODE_TABLE", 2),
+    ("NODE_ENTRY", 2),
 ];
 
 impl ErtsAlcType {
@@ -106,6 +108,10 @@ impl ErtsAlcType {
     pub const PORT_DATA_HEAP: Self = Self(25);
     /// Atom hash buckets and index segments (`ERTS_ALC_T_ATOM_TABLE`).
     pub const ATOM_TABLE: Self = Self(26);
+    /// Node table bucket array (`ERTS_ALC_T_NODE_TABLE`).
+    pub const NODE_TABLE: Self = Self(27);
+    /// Node table entry, an `ErlNode` (`ERTS_ALC_T_NODE_ENTRY`).
+    pub const NODE_ENTRY: Self = Self(28);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {

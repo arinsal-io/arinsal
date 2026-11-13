@@ -86,9 +86,9 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     ids,
                 } if ids.len() <= 5
                     && ((*node == "nonode@nohost" && *creation == 0)
-                        || (crate::identity::this_node().1 == *creation
+                        || (crate::node_table::this_node().1 == *creation
                             && global_atoms()
-                                .text(crate::identity::this_node().0)
+                                .text(crate::node_table::this_node().0)
                                 .is_some_and(|local| local == node))) =>
                 {
                     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
@@ -351,7 +351,7 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                                 .local_pid_ref_pid_word()
                                 .is_some_and(|pid_word| pid_word.is_some())
                             {
-                                crate::identity::this_node()
+                                crate::node_table::this_node()
                             } else {
                                 (ref_node, ref_creation)
                             };

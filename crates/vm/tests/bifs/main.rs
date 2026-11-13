@@ -19,6 +19,7 @@ mod etf_differential;
 mod etf_external;
 mod external_decode_trap;
 mod external_encode_trap;
+mod external_identity_differential;
 mod guard_arith;
 mod guard_compare_differential;
 mod iolist_reductions;

@@ -261,10 +261,14 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
     // before the single pass instead of growing the temporary array as matches are found.
     let mut entries = Vec::with_capacity(tables.entries.len() + usize::from(want_this));
     if want_this {
-        entries.push((tables.local_name.clone(), node_tables::NodeKind::This, None));
+        entries.push((
+            crate::node_tables::this_node().0.to_owned(),
+            node_tables::NodeKind::This,
+            None,
+        ));
     }
     for entry in tables.entries.values().map(|dep| dep.lock()) {
-        if entry.name == tables.local_name {
+        if entry.name == crate::node_tables::this_node().0 {
             continue;
         }
         if !entry.connected {
@@ -286,8 +290,8 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
     }
     drop(tables);
     if want_known {
-        for node in arinsal_term::Node::live_nodes() {
-            let Some(name) = global_atoms().text(node.name) else {
+        for (sysname, _creation) in arinsal_term::node_table_entries() {
+            let Some(name) = global_atoms().text(sysname) else {
                 continue;
             };
             if name != "nonode@nohost" && !entries.iter().any(|(known, _, _)| known == name) {
@@ -410,10 +414,8 @@ fn monitor_options(options: Option<Term>) -> Result<(), VmError> {
 
 fn local_node_term() -> Term {
     // Port of erts/emulator/beam/dist.c:6217 and bif.c (node_0, `erts_this_node->sysname`),
-    // OTP-29.1.1: the word `setnode/2` publishes, read without the node table lock.
-    crate::native_hooks::from_raw(
-        node_tables::this_node_sysname().load(std::sync::atomic::Ordering::Acquire),
-    )
+    // OTP-29.1.1: read through `erts_this_node` without the node table lock.
+    Term::atom(arinsal_term::this_node().0)
 }
 
 /// `erlang:node/0`. The light-BIF pointer calls this; it does not enter the executor.
@@ -641,7 +643,7 @@ badarg(F) -> try F() of _ -> unexpected catch error:badarg -> badarg end.
     #[test]
     fn node_of_a_local_pid_does_not_wait_for_the_node_table_lock() {
         let pid = arinsal_term::Term::pid(1, 0).expect("pid in range");
-        let _ = crate::node_tables::this_node_sysname();
+        let _ = arinsal_term::this_node();
         let held = crate::node_tables::lock();
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

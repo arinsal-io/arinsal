@@ -549,10 +549,8 @@ pub(super) fn report_process_error(
     let Some(pid) = ctx.pid().to_term() else {
         return;
     };
-    let node_name = {
-        let nodes = crate::node_tables::lock();
-        crate::node_tables::is_alive().then(|| nodes.local_identity().0.to_owned())
-    };
+    let node_name =
+        { crate::node_tables::is_alive().then(|| crate::node_tables::this_node().0.to_owned()) };
     let format = if node_name.is_some() {
         "Error in process ~p on node ~p with exit value:~n~p~n"
     } else {

@@ -882,7 +882,7 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         HeapAlloc::link_node(self.0, thing, node)
     }
     fn link_magic_ref(

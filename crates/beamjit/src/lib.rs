@@ -98,9 +98,8 @@ pub trait ModuleEnv {
     fn sys_perf_counter(&self) -> usize {
         0
     }
-    /// Return the address of the word holding the local node name atom
-    /// (`erts_this_node->sysname`).
-    fn this_node_sysname(&self) -> usize {
+    /// Return the address of `erts_this_node` (the local node entry pointer).
+    fn erts_this_node(&self) -> usize {
         0
     }
     /// Return the runtime hook that materializes an Erlang stacktrace.
@@ -3598,7 +3597,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 erts_tables::GENOP_NODE_1 => {
                     count(1)?;
-                    assembler.emit_node(value(0)?, env.this_node_sysname())
+                    assembler.emit_node(value(0)?, env.erts_this_node())
                 }
                 erts_tables::GENOP_BUILD_STACKTRACE_0 => {
                     count(0)?;

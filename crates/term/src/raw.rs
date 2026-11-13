@@ -1093,3 +1093,17 @@ pub fn record_view<'h>(term: Term) -> Option<crate::RecordRef<'h>> {
     // SAFETY: the view contract of this section; the definition outlives its instances.
     unsafe { term.record_ref() }
 }
+
+/// The node table entry at `addr`: an `ExternalThing`'s node word or an address
+/// `erts_node_table` stores.
+///
+/// Contract: `addr` is a live `ErlNode`: either the caller holds a counted reference on it (a
+/// `Node`, or a live external thing that names it), or it holds the node table lock under which
+/// the entry is linked.
+// Port of erts/emulator/beam/erl_term.h (external_thing_ptr(..)->node), OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn node_entry<'a>(addr: usize) -> &'a crate::node_table::ErlNode {
+    // SAFETY: the contract above; entries are freed only by `try_delete_node` under the write
+    // lock once no reference remains.
+    unsafe { &*(addr as *const crate::node_table::ErlNode) }
+}

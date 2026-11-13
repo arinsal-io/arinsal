@@ -336,7 +336,7 @@ impl HeapAlloc for EnvHeap {
             Self::Bound(h) => Self::bound_ref(*h).supports_external_binary(),
         }
     }
-    fn link_node(&mut self, thing: *mut u64, x: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, x: Node) {
         match self {
             Self::Owned(h) => h.link_node(thing, x),
             Self::Bound(h) => Self::bound_mut(*h).link_node(thing, x),

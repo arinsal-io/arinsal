@@ -6,7 +6,6 @@ use crate::{
     MAP, Node, RECORD, REF, SUB_BITS, Term, TermError, size_object,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
 const COPY_QUEUE_INLINE: usize = 16;
 
@@ -664,11 +663,10 @@ fn copy_off_heap_thing<H: HeapAlloc + ?Sized>(
         *argp = Term::from_ptr(tp, 2).0;
         *htop = tp.add(words);
         if !magic_already_retained {
-            let ptr = *tp.add(1) as *const Node;
-            Arc::increment_strong_count(ptr);
+            let node = Node::ref_raw(*tp.add(1));
             // The copied `next` belongs to the source list; the link below rewrites it.
             *tp.add(2) = 0;
-            dst.link_node(tp, Arc::from_raw(ptr));
+            dst.link_node(tp, node);
         }
     }
     Ok(())

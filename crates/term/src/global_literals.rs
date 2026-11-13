@@ -141,7 +141,7 @@ impl HeapAlloc for GlobalLiteralBuild {
         Ok(())
     }
 
-    fn link_node(&mut self, thing: *mut u64, node: Arc<crate::Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: crate::Node) {
         let slot = self
             .chunks
             .last()

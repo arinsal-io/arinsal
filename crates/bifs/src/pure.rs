@@ -91,7 +91,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
-    fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, value: Node) {
         self.0.link_node(thing, value)
     }
     fn link_external_binary(
@@ -217,7 +217,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     fn supports_external_binary(&self) -> bool {
         self.backing.supports_external_binary()
     }
-    fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, value: Node) {
         self.backing.link_node(thing, value)
     }
     fn link_magic_ref(

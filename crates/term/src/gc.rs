@@ -241,7 +241,7 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         HeapAlloc::link_node(self.0, thing, node);
     }
     fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
@@ -328,8 +328,9 @@ fn release_off_heap_node(node: usize) {
     match crate::heap::off_heap_node_kind(node) {
         crate::heap::OffHeapKind::Magic => drop(MagicRef::thing_owner(word, false)),
         crate::heap::OffHeapKind::Node => {
-            // SAFETY: an unforwarded external thing's list entry owns its `Arc<Node>` count.
-            drop(unsafe { Arc::from_raw(word as *const Node) })
+            // An unforwarded external thing's list entry owns its node reference
+            // (erts_cleanup_offheap: erts_deref_node_entry).
+            drop(Node::from_raw(word))
         }
         crate::heap::OffHeapKind::BinRef if crate::bits::bin_ref_val_is_external(word) => {
             // An unforwarded resource-backed BinRef's list entry owns its count.

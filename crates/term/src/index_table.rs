@@ -86,9 +86,12 @@ impl IndexSlot {
     }
 }
 
-/// An object stored in a [`Hash`]: `#[repr(C)]` with an [`IndexSlot`] as its first field, so the
-/// address of the entry is the address of its bucket.
-pub(crate) trait IndexEntry {
+/// An object stored in a [`Hash`]: `#[repr(C)]` with a [`HashBucket`] as its first field (directly
+/// or through an [`IndexSlot`]), so the address of the entry is the address of its bucket.
+pub(crate) trait HashEntry {}
+
+/// An object stored in an [`IndexTable`]: `#[repr(C)]` with an [`IndexSlot`] as its first field.
+pub(crate) trait IndexEntry: HashEntry {
     /// The leading slot.
     fn slot(&self) -> &IndexSlot;
 }
@@ -97,7 +100,7 @@ pub(crate) trait IndexEntry {
 /// bucket arrays and segments from [`IndexTable::new`]'s type.
 pub(crate) trait HashFunctions {
     /// The stored object.
-    type Entry: IndexEntry;
+    type Entry: HashEntry;
     /// What a lookup is keyed by (`tmpl`).
     type Template<'a>;
     /// `HashFunctions.hash`.
@@ -106,8 +109,8 @@ pub(crate) trait HashFunctions {
     fn cmp(&self, tmpl: &Self::Template<'_>, obj: &Self::Entry) -> bool;
     /// `HashFunctions.alloc`: a new entry with `index == -1`, never freed while the table lives.
     fn alloc(&self, tmpl: &Self::Template<'_>) -> *mut Self::Entry;
-    /// `HashFunctions.free`. The atom table's is empty: entries seen by lock-free readers are
-    /// never released.
+    /// `HashFunctions.free`, called by `hash_erase` under the table's write lock. The atom
+    /// table's is empty: entries seen by lock-free readers are never released.
     fn free(&self, obj: &Self::Entry);
 }
 
@@ -153,7 +156,7 @@ impl Hash {
     }
 
     /// Port of hash.c:121 (hash_init), without the `is_allocated` / meta allocator parts.
-    fn init(ty: ErtsAlcType, size: i32) -> Self {
+    pub(crate) fn init(ty: ErtsAlcType, size: i32) -> Self {
         let mut shift = 1;
         while (1_i64 << shift) < i64::from(size) {
             shift += 1;
@@ -221,6 +224,18 @@ impl Hash {
         }
     }
 
+    /// Port of hash.c:300 (hash_foreach): `f` on every object.
+    pub(crate) fn foreach<E: HashEntry>(&self, mut f: impl FnMut(&E)) {
+        for ix in 0..self.slots() {
+            let mut b = self.head(ix);
+            while b != 0 {
+                let next = bucket_ref(b).next.load(Ordering::Relaxed);
+                f(entry_ref::<E>(b));
+                b = next;
+            }
+        }
+    }
+
     /// Bytes of the bucket array of `hash_table_sz`, without the `Hash` header and name.
     pub(crate) fn bucket_bytes(&self) -> usize {
         self.slots() * std::mem::size_of::<usize>()
@@ -257,7 +272,11 @@ impl Hash {
 
     /// Port of hash.h:133 (hash_fetch) / hash.c:226 (hash_get).
     #[inline]
-    fn get<F: HashFunctions>(&self, fun: &F, tmpl: &F::Template<'_>) -> Option<&F::Entry> {
+    pub(crate) fn get<F: HashFunctions>(
+        &self,
+        fun: &F,
+        tmpl: &F::Template<'_>,
+    ) -> Option<&F::Entry> {
         let hval = fun.hash(tmpl);
         let mut b = self.head(self.slot_of(hval));
         while b != 0 {
@@ -274,7 +293,7 @@ impl Hash {
     }
 
     /// Port of hash.c:235 (hash_put).
-    fn put<F: HashFunctions>(&mut self, fun: &F, tmpl: &F::Template<'_>) -> usize {
+    pub(crate) fn put<F: HashFunctions>(&mut self, fun: &F, tmpl: &F::Template<'_>) -> usize {
         let hval = fun.hash(tmpl);
         let ix = self.slot_of(hval);
         let mut b = self.head(ix);
@@ -299,7 +318,7 @@ impl Hash {
 
     /// Port of hash.c:262 (hash_erase). The entry is its own template: the object is found by
     /// address, which is what `cmp(obj, obj)` establishes for unique keys.
-    fn erase<F: HashFunctions>(&mut self, fun: &F, addr: usize) {
+    pub(crate) fn erase<F: HashFunctions>(&mut self, fun: &F, addr: usize) {
         let bucket = bucket_ref(addr);
         let ix = self.slot_of(bucket.hvalue());
         let mut b = self.head(ix);
@@ -339,7 +358,7 @@ pub(crate) struct IndexTable<F: HashFunctions> {
     seg_len: usize,
 }
 
-impl<F: HashFunctions> IndexTable<F> {
+impl<F: HashFunctions<Entry: IndexEntry>> IndexTable<F> {
     /// Port of index.c:52 (erts_index_init). `size` is the expected number of entries.
     pub(crate) fn new(ty: ErtsAlcType, name: &'static str, size: i32, limit: i32, fun: F) -> Self {
         let seg_len = (limit as usize).div_ceil(INDEX_PAGE_SIZE);
@@ -440,7 +459,7 @@ pub(crate) struct IndexReadGuard<'a, F: HashFunctions> {
     hash: FrequentReadGuard<'a, Hash>,
 }
 
-impl<F: HashFunctions> IndexReadGuard<'_, F> {
+impl<F: HashFunctions<Entry: IndexEntry>> IndexReadGuard<'_, F> {
     /// Port of index.c:116 (index_get): the index of the matching entry, or -1.
     #[inline]
     pub(crate) fn get(&self, tmpl: &F::Template<'_>) -> i32 {
@@ -462,7 +481,7 @@ pub(crate) struct IndexWriteGuard<'a, F: HashFunctions> {
     hash: FrequentWriteGuard<'a, Hash>,
 }
 
-impl<F: HashFunctions> IndexWriteGuard<'_, F> {
+impl<F: HashFunctions<Entry: IndexEntry>> IndexWriteGuard<'_, F> {
     /// Port of index.c:78 (index_put_entry).
     pub(crate) fn put_entry(&mut self, tmpl: &F::Template<'_>) -> &F::Entry {
         let t = self.table;
@@ -556,6 +575,13 @@ pub(crate) fn init_entry<T>(ptr: *mut T, value: T) {
     unsafe { ptr.write(value) }
 }
 
+/// `erts_free` of an entry [`alloc_entry`] returned, from `HashFunctions::free` inside
+/// `hash_erase`. The entry has no drop glue to run.
+pub(crate) fn free_entry<T>(ptr: *mut T, ty: ErtsAlcType) {
+    const { assert!(!std::mem::needs_drop::<T>()) };
+    free_words(ty, ptr as usize, std::mem::size_of::<T>().div_ceil(WORD));
+}
+
 #[inline(always)]
 fn bucket_ref<'a>(addr: usize) -> &'a HashBucket {
     entry_ref::<HashBucket>(addr)
@@ -564,9 +590,10 @@ fn bucket_ref<'a>(addr: usize) -> &'a HashBucket {
 #[inline(always)]
 fn entry_ref<'a, E>(addr: usize) -> &'a E {
     // SAFETY: every nonzero address that the table stores is an entry made by
-    // `HashFunctions::alloc` and initialised before `hash_put` links it. Entries are
-    // never released while the table lives (`HashFunctions::free` keeps the memory for the
-    // lock-free readers), and the `repr(C)` entry begins with its `HashBucket`.
+    // `HashFunctions::alloc` and initialised before `hash_put` links it, and the `repr(C)` entry
+    // begins with its `HashBucket`. Entries are released only by `hash_erase` under the write
+    // lock (never for the atom table, whose readers are lock-free), so a guard of the table lock
+    // keeps every linked entry live.
     unsafe { &*(addr as *const E) }
 }
 

@@ -763,7 +763,7 @@ pub(crate) fn size_object_with_prior(
 /// node unset, so comparisons against external identities substitute the local node first.
 // Port of erts/emulator/beam/utils.c:1749-1830 (erts_cmp_compound: anode = erts_this_node), OTP-29.1.1.
 fn localize_identity(identity: Identity) -> Identity {
-    let (name, creation) = crate::identity::this_node();
+    let (name, creation) = crate::node_table::this_node();
     match identity {
         Identity::Pid {
             node,
@@ -2196,8 +2196,8 @@ fn exact_ref_eq(a: Term, b: Term) -> bool {
                 (crate::atoms::NONAME, 0, 3)
             }
             crate::EXTERNAL_REF => {
-                // SAFETY: the external-ref payload retains the Node and stores its id count.
-                let node = unsafe { &*(*ptr.add(1) as *const crate::Node) };
+                // SAFETY: a live external thing's node word names a referenced `ErlNode`.
+                let node = crate::raw::node_entry(unsafe { *ptr.add(1) } as usize);
                 // SAFETY: the live reference header bounds its count and packed ids.
                 let count = unsafe {
                     let count = (*ptr.add(3) as u32) as usize;
@@ -2212,7 +2212,7 @@ fn exact_ref_eq(a: Term, b: Term) -> bool {
                     }
                     count
                 };
-                (node.name, node.creation, count)
+                (node.sysname(), node.creation(), count)
             }
             _ => unreachable!(),
         };

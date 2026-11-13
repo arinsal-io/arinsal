@@ -177,10 +177,8 @@ fn report_max_heap(
     let Some(pid) = ctx.pid().to_term() else {
         return;
     };
-    let node_name = {
-        let nodes = crate::node_tables::lock();
-        crate::node_tables::is_alive().then(|| nodes.local_identity().0.to_owned())
-    };
+    let node_name =
+        { crate::node_tables::is_alive().then(|| crate::node_tables::this_node().0.to_owned()) };
     let mut format = String::from("     Process:            ~p ");
     if node_name.is_some() {
         format.push_str("on node ~p");

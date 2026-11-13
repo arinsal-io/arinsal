@@ -170,7 +170,7 @@ impl HeapAlloc for MessageHeapBlock {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.off_heap.off_heap_first, thing, node);
     }
     fn link_magic_ref(
@@ -293,7 +293,7 @@ impl HeapAlloc for InlineHeapAlloc<'_> {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.owners.0.off_heap_first, thing, node);
     }
     fn link_magic_ref(
@@ -866,7 +866,7 @@ impl HeapAlloc for FragmentMut<'_> {
         true
     }
 
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.fragment().off_heap.off_heap_first, thing, node);
     }
 

@@ -224,7 +224,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn supports_magic(&self) -> bool {
         self.0.supports_magic()
     }
-    fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, value: Node) {
         self.0.link_node(thing, value)
     }
 }

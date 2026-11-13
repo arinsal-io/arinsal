@@ -388,7 +388,7 @@ pub trait HeapAlloc {
     /// Link an external pid, port or reference thing into this heap's off-heap list. The
     /// thing's node word names `node`, and the list entry takes over the counted reference.
     // Port of erts/emulator/beam/external.c (erts_ref_node_entry with `ohp->first`), OTP-29.1.1.
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>);
+    fn link_node(&mut self, thing: *mut u64, node: Node);
     /// Link a magic reference thing into this heap's off-heap list. The thing's pointer
     /// word names `owner`, and the list entry takes over the counted reference.
     // Port of erts/emulator/beam/erl_bif_unique.h (erts_mk_magic_ref), OTP-29.1.1.
@@ -519,7 +519,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     fn supports_external_binary(&self) -> bool {
         (**self).supports_external_binary()
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         (**self).link_node(thing, node)
     }
     fn link_magic_ref(
@@ -606,8 +606,8 @@ pub(crate) fn link_external_bin_ref(
 /// Link an external thing at the head of an off-heap list, which takes over `node`'s counted
 /// reference. External things add nothing to the list's overhead.
 // Port of erts/emulator/beam/external.c (erts_ref_node_entry; `ohp->first = ...`), OTP-29.1.1.
-pub(crate) fn link_node_thing(head: &mut usize, thing: *mut u64, node: Arc<Node>) {
-    store(thing.wrapping_add(1), Arc::into_raw(node) as u64);
+pub(crate) fn link_node_thing(head: &mut usize, thing: *mut u64, node: Node) {
+    store(thing.wrapping_add(1), node.into_raw());
     store(thing.wrapping_add(2), *head as u64);
     *head = thing as usize;
 }
@@ -1261,7 +1261,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
         self.heap
             .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         self.heap.link_node(thing, node)
     }
     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT), OTP-29.1.1.
@@ -3028,7 +3028,7 @@ impl HeapAlloc for ProcessHeap {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         if self.detached
             && let Some(heap) = self.owners.detached.as_deref_mut()
         {
@@ -3281,7 +3281,7 @@ impl HeapAlloc for VecHeap {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.off_heap_first, thing, node);
     }
     fn link_magic_ref(
@@ -3437,7 +3437,7 @@ impl HeapAlloc for TemporaryHeap {
         true
     }
 
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.off_heap_first, thing, node);
     }
 
@@ -5034,17 +5034,12 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an external pid with the OTP four-word ExternalThing head.
-    pub fn external_pid(
-        &mut self,
-        node: Arc<Node>,
-        index: u32,
-        serial: u32,
-    ) -> Result<Term, TermError> {
+    pub fn external_pid(&mut self, node: Node, index: u32, serial: u32) -> Result<Term, TermError> {
         let p = self.words(4)?;
-        // SAFETY: four words are reserved and the retained Arc keeps the node pointer live.
+        // SAFETY: four words are reserved; `link_node` stores the counted node word.
         unsafe {
             *p = (3 << 6) | EXTERNAL_PID;
-            *p.add(1) = Arc::as_ptr(&node) as u64;
+            *p.add(1) = std::ptr::from_ref(node.entry()) as u64;
             *p.add(2) = 0;
             *p.add(3) = (index as u64) | ((serial as u64) << 32);
         }
@@ -5052,12 +5047,12 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an external port.
-    pub fn external_port(&mut self, node: Arc<Node>, id: u64) -> Result<Term, TermError> {
+    pub fn external_port(&mut self, node: Node, id: u64) -> Result<Term, TermError> {
         let p = self.words(4)?;
-        // SAFETY: four words are reserved and the retained Arc keeps the node pointer live.
+        // SAFETY: four words are reserved; `link_node` stores the counted node word.
         unsafe {
             *p = (3 << 6) | EXTERNAL_PORT;
-            *p.add(1) = Arc::as_ptr(&node) as u64;
+            *p.add(1) = std::ptr::from_ref(node.entry()) as u64;
             *p.add(2) = 0;
             *p.add(3) = id;
         }
@@ -5066,14 +5061,14 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     }
     /// Construct an external ordinary or pid reference.
     // Port of erts/emulator/beam/erl_term.h:1142-1161 (ExternalThing layout), OTP-29.1.1.
-    pub fn external_ref(&mut self, node: Arc<Node>, ids: &[u32]) -> Result<Term, TermError> {
+    pub fn external_ref(&mut self, node: Node, ids: &[u32]) -> Result<Term, TermError> {
         check_external_ref(ids)?;
         let words = 3 + (ids.len() + 1).div_ceil(2);
         let p = self.words(words)?;
         // SAFETY: words includes the external head and packed 32-bit count and ids.
         unsafe {
             *p = (((words - 1) as u64) << 6) | EXTERNAL_REF;
-            *p.add(1) = Arc::as_ptr(&node) as u64;
+            *p.add(1) = std::ptr::from_ref(node.entry()) as u64;
             *p.add(2) = 0;
             *p.add(3) = ids.len() as u64;
             // Heap words are not cleared on allocation; the id words are OR-ed together.

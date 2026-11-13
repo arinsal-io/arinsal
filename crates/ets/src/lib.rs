@@ -928,7 +928,7 @@ pub(crate) struct OffHeap {
     pub(crate) first_oh: usize,
     pub(crate) binary_refs: Vec<arinsal_term::OwnedBinaryRef>,
     pub(crate) external: Vec<Arc<ExternalBinary>>,
-    pub(crate) nodes: Vec<Arc<TermNode>>,
+    pub(crate) nodes: Vec<TermNode>,
     pub(crate) magic: Vec<Arc<MagicRef>>,
 }
 
@@ -1680,7 +1680,7 @@ impl<H: HeapAlloc> HeapAlloc for ObjectAndListHeap<'_, H> {
         self.dst.retain_binary(binary);
     }
 
-    fn link_node(&mut self, thing: *mut u64, node: Arc<TermNode>) {
+    fn link_node(&mut self, thing: *mut u64, node: TermNode) {
         self.dst.link_node(thing, node);
     }
 }

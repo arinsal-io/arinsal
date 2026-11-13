@@ -573,7 +573,7 @@ impl HeapAlloc for BlockHeap {
     }
     // The DbTerm's first_oh chain links the thing; the token stands in for the counted
     // reference the thing holds until db_free_term.
-    fn link_node(&mut self, thing: *mut u64, node: Arc<TermNode>) {
+    fn link_node(&mut self, thing: *mut u64, node: TermNode) {
         let _ = self.chain_first_oh(thing as usize);
         self.off_heap().nodes.push(node);
     }

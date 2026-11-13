@@ -233,7 +233,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn supports_external_binary(&self) -> bool {
         self.0.supports_external_binary()
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<arinsal_term::Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: arinsal_term::Node) {
         self.0.link_node(thing, node)
     }
     fn link_magic_ref(

@@ -1748,7 +1748,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     ) -> Result<(), arinsal_term::TermError> {
         HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
     }
-    fn link_node(&mut self, thing: *mut u64, node: std::sync::Arc<arinsal_term::Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: arinsal_term::Node) {
         self.0.link_node(thing, node);
     }
 }

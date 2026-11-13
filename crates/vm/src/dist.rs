@@ -250,11 +250,11 @@ fn create_channel(
     let owner = ctx.pid();
     let visible = flags & 0x01 != 0; // DFLAG_PUBLISHED
     let mut tables = node_tables::lock();
-    if !node_tables::is_alive() || node == &tables.local_name {
+    if !node_tables::is_alive() || node == crate::node_tables::this_node().0 {
         return Err(badarg());
     }
-    let local_name = tables.local_name.clone();
-    let local_creation = tables.local_creation;
+    let local_name = crate::node_tables::this_node().0.to_owned();
+    let local_creation = crate::node_tables::this_node().1;
     let busy_limit = tables.distribution_buffer_busy_limit;
     if !tables.entries.contains_key(node) {
         let _ = tables.new_connection(node);
@@ -1076,8 +1076,8 @@ fn notify_auto_connect(
         return Ok(false);
     };
     let (local_name, local_creation) = {
-        let tables = node_tables::lock();
-        (tables.local_name.clone(), tables.local_creation)
+        let (name, creation) = crate::node_tables::this_node();
+        (name.to_owned(), creation)
     };
     let msg = OwnedTerm::tuple(vec![
         OwnedTerm::Atom("auto_connect".into()),
@@ -1778,8 +1778,8 @@ fn owned_to_message_with_heap_size(
     heap_words: usize,
 ) -> Result<Message, VmError> {
     let (local, creation) = {
-        let tables = node_tables::lock();
-        (tables.local_name.clone(), tables.local_creation)
+        let (name, creation) = crate::node_tables::this_node();
+        (name.to_owned(), creation)
     };
     let term = internalize_local_node(term.clone(), &local, creation);
     let mut heap = arinsal_term::ProcessHeap::with_words(heap_words);
@@ -1852,8 +1852,10 @@ fn dist_spawn_request(
         return fallback_dist_spawn(vm, process, ctx, args);
     };
     let (local, alive) = {
-        let tables = node_tables::lock();
-        (tables.local_name.clone(), node_tables::is_alive())
+        (
+            crate::node_tables::this_node().0.to_owned(),
+            node_tables::is_alive(),
+        )
     };
     if node == local || node == "nonode@nohost" || !alive {
         return fallback_dist_spawn(vm, process, ctx, args);
@@ -2180,7 +2182,7 @@ fn dist_spawn_reply(
                     .is_some_and(|state| state.handle == handle)
             })
             .map(|entry| entry.name.clone());
-        (tables.local_name.clone(), node)
+        (crate::node_tables::this_node().0.to_owned(), node)
     };
     let Some(_node) = node else {
         // The connection went down while the reply was routed.
@@ -2581,7 +2583,10 @@ pub(crate) fn pend_spawn_exit(
     let mut wait = false;
     let (local_name, local_creation) = {
         let tables = node_tables::lock();
-        let local = (tables.local_name.clone(), tables.local_creation);
+        let local = (
+            crate::node_tables::this_node().0.to_owned(),
+            crate::node_tables::this_node().1,
+        );
         for mut entry in tables.entries.values().map(|dep| dep.lock()) {
             let mut visit = |connection: Option<(u64, bool)>,
                              requests: &mut std::collections::BTreeMap<
@@ -2836,10 +2841,10 @@ fn handle_spawn_request_port(
     if let Ok(child) = spawn_result {
         let tables = node_tables::lock();
         result = OwnedTerm::Pid {
-            node: tables.local_name.clone(),
+            node: crate::node_tables::this_node().0.to_owned(),
             id: child.number(),
             serial: child.serial(),
-            creation: tables.local_creation,
+            creation: crate::node_tables::this_node().1,
         };
         drop(tables);
         child_to_schedule = Some(child);
@@ -2931,8 +2936,8 @@ pub(crate) fn forward_link_exit_if_proxy(
     }
     let (remote_watcher, handle, local_name, local_creation, exit_payload) = {
         let tables = node_tables::lock();
-        let local_name = tables.local_name.clone();
-        let local_creation = tables.local_creation;
+        let local_name = crate::node_tables::this_node().0.to_owned();
+        let local_creation = crate::node_tables::this_node().1;
         let Some(mut entry) = tables.entries.values().map(|dep| dep.lock()).find(|entry| {
             entry
                 .dist
@@ -3134,12 +3139,12 @@ pub(crate) fn remote_node(term: Term) -> Result<Option<String>, VmError> {
 }
 
 fn local_pid_owned(pid: Pid) -> OwnedTerm {
-    let tables = node_tables::lock();
+    let (node, creation) = node_tables::this_node();
     OwnedTerm::Pid {
-        node: tables.local_name.clone(),
+        node: node.to_owned(),
         id: pid.number(),
         serial: pid.serial(),
-        creation: tables.local_creation,
+        creation,
     }
 }
 

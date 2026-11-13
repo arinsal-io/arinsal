@@ -593,15 +593,15 @@ fn external_things_move_their_node_reference_through_collections() {
     let _dead = TermBuilder::new(&mut heap)
         .external_pid(node.clone(), 2, 0)
         .unwrap();
-    assert_eq!(Arc::strong_count(&node), 5);
+    assert_eq!(node.refc(), 5);
     heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert_eq!(Arc::strong_count(&node), 4);
+    assert_eq!(node.refc(), 4);
     heap.collect(&mut roots, &mut [], 0).unwrap();
     heap.set_fullsweep_after(0);
     heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert_eq!(Arc::strong_count(&node), 4);
+    assert_eq!(node.refc(), 4);
     drop(heap);
-    assert_eq!(Arc::strong_count(&node), 1);
+    assert_eq!(node.refc(), 1);
 }
 
 #[test]
@@ -664,7 +664,7 @@ fn heaps_do_not_count_fun_or_export_entries() {
     heap.collect(&mut [], &mut [], 0).unwrap();
     assert_eq!(binary_owner.ref_count(), Some(1));
     assert_eq!(heap.off_heap_count(), 0);
-    assert_eq!(Arc::strong_count(&node), 1);
+    assert_eq!(node.refc(), 1);
     assert_eq!(Arc::strong_count(&fun), fun_owners);
     assert_eq!(Arc::strong_count(&export), export_owners);
 }

@@ -18,6 +18,7 @@ mod literal;
 mod literal_decode;
 mod magic;
 pub mod message;
+mod node_table;
 mod ops;
 mod owned;
 pub mod printf_term;
@@ -90,7 +91,7 @@ pub use heap::{
     MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TemporaryHeap,
     TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
 };
-pub use identity::{Identity, Node, set_this_node, this_node, this_node_sysname};
+pub use identity::Identity;
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use literal_decode::decode_literal;
@@ -98,6 +99,10 @@ pub use magic::{MAGIC_BIN_DATA_OFFSET, MagicRef};
 pub use native_code::{
     is_cp, is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
     unregister_native_code_range,
+};
+pub use node_table::{
+    ERL_NODE_SYSNAME_OFFSET, ErlNode, Node, erts_this_node_addr, node_table_entries,
+    node_table_len, set_this_node, this_node,
 };
 pub use ops::{
     cmp, cmp_exact, exact_eq, exact_eq_after_word_mismatch, flat_size, integer_magnitude_cmp,

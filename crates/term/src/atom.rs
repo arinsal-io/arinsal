@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::Term;
 use crate::heap::TermBuilder;
 use crate::index_table::{
-    HashFunctions, IndexEntry, IndexSlot, IndexTable, alloc_entry, init_entry,
+    HashEntry, HashFunctions, IndexEntry, IndexSlot, IndexTable, alloc_entry, init_entry,
 };
 use arinsal_alloc::typed::ErtsAlcType;
 
@@ -106,6 +106,7 @@ struct AtomRec {
     bin: Term,
 }
 
+impl HashEntry for AtomRec {}
 impl IndexEntry for AtomRec {
     #[inline(always)]
     fn slot(&self) -> &IndexSlot {

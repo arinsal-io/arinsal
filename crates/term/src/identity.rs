@@ -2,51 +2,6 @@
 use crate::{
     Atom, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, REF, Term, TermError, atoms, global_atoms,
 };
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-/// Immutable node-table entry retained by every referencing heap.
-#[derive(Debug)]
-pub struct Node {
-    /// Node name atom.
-    pub name: Atom,
-    /// Distribution creation number.
-    pub creation: u32,
-}
-impl Node {
-    /// Create a node-table entry.
-    pub fn new(name: Atom, creation: u32) -> Arc<Self> {
-        let node = Arc::new(Self { name, creation });
-        live_node_registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Arc::downgrade(&node));
-        node
-    }
-
-    /// Return node identities retained by live external terms.
-    pub fn live_nodes() -> Vec<Arc<Self>> {
-        let mut registry = live_node_registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut nodes = Vec::new();
-        registry.retain(|entry| {
-            if let Some(node) = entry.upgrade() {
-                nodes.push(node);
-                true
-            } else {
-                false
-            }
-        });
-        nodes
-    }
-}
-
-fn live_node_registry() -> &'static std::sync::Mutex<Vec<std::sync::Weak<Node>>> {
-    static NODES: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Weak<Node>>>> =
-        std::sync::OnceLock::new();
-    NODES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
 
 /// Process identifier, port, or ordinary reference decoded from a tagged term.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,15 +119,15 @@ impl Term {
                 })
             }
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
-                // SAFETY: external thing stores a retained Node pointer at word one.
-                let node = unsafe { &*(*p.add(1) as *const Node) };
+                // SAFETY: a live external thing's node word names a referenced `ErlNode`.
+                let node = crate::raw::node_entry(unsafe { *p.add(1) } as usize);
                 match header & 63 {
                     EXTERNAL_PID => {
                         // SAFETY: packed number and serial occupy one data word.
                         let data = unsafe { *p.add(3) };
                         Some(Identity::Pid {
-                            node: node.name,
-                            creation: node.creation,
+                            node: node.sysname(),
+                            creation: node.creation(),
                             index: data as u32,
                             serial: (data >> 32) as u32,
                         })
@@ -181,8 +136,8 @@ impl Term {
                         // SAFETY: port id occupies one data word.
                         let id = unsafe { *p.add(3) };
                         Some(Identity::Port {
-                            node: node.name,
-                            creation: node.creation,
+                            node: node.sysname(),
+                            creation: node.creation(),
                             id,
                         })
                     }
@@ -204,8 +159,8 @@ impl Term {
                                 .collect::<Vec<_>>()
                         };
                         Some(Identity::Ref {
-                            node: node.name,
-                            creation: node.creation,
+                            node: node.sysname(),
+                            creation: node.creation(),
                             ids: ids.into(),
                         })
                     }
@@ -227,30 +182,4 @@ pub(crate) fn check_external_ref(ids: &[u32]) -> Result<(), TermError> {
     } else {
         Err(TermError::BadArg)
     }
-}
-
-/// `erts_this_node->sysname` as the tagged atom word that native `node/0` and generated code
-/// load by address; starts as `nonode@nohost`.
-static THIS_NODE_SYSNAME: AtomicU64 = AtomicU64::new(Term::atom(atoms::NONAME).tagged_word());
-/// `erts_this_node->creation`.
-static THIS_NODE_CREATION: AtomicU32 = AtomicU32::new(0);
-
-/// Publish the local node identity, as `erts_set_this_node` does for `erts_this_node`. The only
-/// writer; callers hold the thread-progress block, so readers never see a torn name/creation.
-// Port of erts/emulator/beam/erl_node_tables.c (erts_set_this_node), OTP-29.1.1.
-pub fn set_this_node(name: Atom, creation: u32) {
-    THIS_NODE_CREATION.store(creation, Ordering::Release);
-    THIS_NODE_SYSNAME.store(Term::atom(name).tagged_word(), Ordering::Release);
-}
-
-/// The word holding the local node name atom (`erts_this_node_sysname`).
-pub fn this_node_sysname() -> &'static AtomicU64 {
-    &THIS_NODE_SYSNAME
-}
-
-/// The local node name and creation; `nonode@nohost` and 0 until the node is named.
-pub fn this_node() -> (Atom, u32) {
-    // The word is `Term::atom(name)`: the atom index sits above the 6 tag bits.
-    let name = Atom((THIS_NODE_SYSNAME.load(Ordering::Acquire) >> 6) as u32);
-    (name, THIS_NODE_CREATION.load(Ordering::Acquire))
 }

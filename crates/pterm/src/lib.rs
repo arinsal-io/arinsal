@@ -819,7 +819,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
-    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
         self.0.link_node(thing, node);
     }
 }

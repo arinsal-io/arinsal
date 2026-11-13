@@ -1605,8 +1605,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
         arinsal_bifs::sys_perf_counter as *const () as usize
     }
 
-    fn this_node_sysname(&self) -> usize {
-        std::ptr::from_ref(crate::node_tables::this_node_sysname()) as usize
+    fn erts_this_node(&self) -> usize {
+        arinsal_term::erts_this_node_addr()
     }
 
     fn build_stacktrace_helper(&self) -> Option<arinsal_beamasm::catch::BuildStacktraceHook> {
