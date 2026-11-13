@@ -240,6 +240,11 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "merge", 2) => bif!(erl_map::maps_merge_2),
         // erl_iolist.c
         ("erlang", "iolist_size", 1) => bif!(erl_iolist::iolist_size_1),
+        ("erlang", "list_to_binary", 1) => bif!(erl_iolist::list_to_binary_1),
+        ("binary", "list_to_bin", 1) => bif!(erl_iolist::binary_list_to_bin_1),
+        ("erlang", "iolist_to_binary", 1) => bif!(erl_iolist::iolist_to_binary_1),
+        ("erlang", "list_to_bitstring", 1) => bif!(erl_iolist::list_to_bitstring_1),
+        ("erlang", "iolist_to_iovec", 1) => bif!(erl_iolist::iolist_to_iovec_1),
         // erl_bif_guard.c
         ("erlang", "length", 1) => bif!(erl_bif_guard::length_1),
         // erl_process_dict.c
@@ -342,6 +347,12 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
         ("erts_internal", "iolist_size_continue", 1) => bif!(erl_iolist::iolist_size_continue_1),
+        ("erts_internal", "list_to_bitstring_continue", 1) => {
+            bif!(erl_iolist::list_to_bitstring_continue_1)
+        }
+        ("erts_internal", "iolist_to_iovec_continue", 1) => {
+            bif!(erl_iolist::iolist_to_iovec_continue_1)
+        }
         _ => return None,
     })
 }
@@ -350,19 +361,12 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:421-447, OTP-29.1.1: the fragment calls the
 // selected BIF body directly; that body leaves the light path only when it traps.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    use crate::bif_traps::{
-        BinaryToTerm, IolistToBinary, IolistToIovec, ListToBinary, TermToBinary,
-    };
+    use crate::bif_traps::{BinaryToTerm, TermToBinary};
     use crate::native_helpers::trap_bif_entry;
     if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
         return arinsal_bifs::visit_bif(module, function, arity, &mut BinaryToListEntry);
     }
     let func = match (module, function, arity) {
-        ("erlang", "list_to_binary", 1) | ("binary", "list_to_bin", 1) => {
-            bif!(trap_bif_entry::<ListToBinary>)
-        }
-        ("erlang", "iolist_to_binary", 1) => bif!(trap_bif_entry::<IolistToBinary>),
-        ("erlang", "iolist_to_iovec", 1) => bif!(trap_bif_entry::<IolistToIovec>),
         ("erlang", "term_to_binary", 1 | 2) => bif!(trap_bif_entry::<TermToBinary>),
         ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
         _ => return None,

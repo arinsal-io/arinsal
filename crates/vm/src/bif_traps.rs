@@ -20,12 +20,6 @@ pub(crate) enum HandlerResult {
         state: Arc<MagicRef>,
         reductions: u32,
     },
-    /// A continuation state owned by the suspended process, like an ERTS trap argument.
-    YieldDirect {
-        continuation: &'static str,
-        state: Box<DirectContinuation>,
-        reductions: u32,
-    },
     /// Transfer directly to the BIF's export continuation without scheduling out.
     Export(crate::ExportTrap),
 }
@@ -36,8 +30,7 @@ impl HandlerResult {
         match self {
             Self::Done { reductions, .. }
             | Self::Failed { reductions, .. }
-            | Self::Yield { reductions, .. }
-            | Self::YieldDirect { reductions, .. } => *reductions,
+            | Self::Yield { reductions, .. } => *reductions,
             Self::Export(_) => 0,
         }
     }
@@ -89,26 +82,20 @@ pub(crate) fn trap_gc_policy(continuation: &str, state: &Arc<MagicRef>) -> TrapG
 }
 
 /// Whether the trap state of a parked BIF holds process-heap terms of its own.
-pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> bool {
+pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>) -> bool {
     macro_rules! any {
         ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<Mutex<$t>>().is_some())* };
     }
-    direct
-        || any!(
-            arinsal_bifs::BinaryToListWalk,
-            arinsal_bifs::UnicodeCont,
-            arinsal_bifs::IolistVecWalk,
-            arinsal_bifs::IolistSizeWalk,
-            arinsal_bifs::DecodeWalk<'static>,
-            arinsal_bifs::BinarySearchWalk,
-            TermEncodeState,
-            BinaryCopyState,
-        )
-}
-
-/// State copied into an ERTS-shaped trap continuation without a shared MagicRef mutex.
-pub(crate) enum DirectContinuation {
-    Iolist { root: Term, state: ErtsL2BState },
+    any!(
+        arinsal_bifs::BinaryToListWalk,
+        arinsal_bifs::UnicodeCont,
+        arinsal_bifs::IolistVecWalk,
+        arinsal_bifs::IolistSizeWalk,
+        arinsal_bifs::DecodeWalk<'static>,
+        arinsal_bifs::BinarySearchWalk,
+        TermEncodeState,
+        BinaryCopyState,
+    )
 }
 
 /// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
@@ -136,8 +123,6 @@ pub(crate) struct Entry {
 }
 
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
-const IOLIST_CONTINUATION: &str = "erts_internal:list_to_bitstring_continue/1";
-const IOLIST_TO_IOVEC_CONTINUATION: &str = "erts_internal:iolist_to_iovec_continue/1";
 const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 pub(crate) const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
@@ -166,7 +151,6 @@ const ERTS_BINARY_TO_LIST_STATE_SIZE: usize = 40;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
-const ERTS_IOLIST_TO_IOVEC_STATE_SIZE: usize = 152;
 // Port of erts/emulator/beam/external.c (B2TContext), including its decode union.
 const ERTS_BINARY_TO_TERM_CONTEXT_SIZE: usize = 296;
 // Port of erts/emulator/beam/dist.h (TTBContext), whose encode union is larger than B2TContext.
@@ -203,38 +187,6 @@ fn trap_state_term(
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let term = arinsal_term::TermBuilder::new(&mut heap).magic_ref(Arc::clone(state))?;
     Ok(Some(term))
-}
-
-// Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState): the suspended state belongs to the
-// trapped process and is passed to the continuation without a shared MagicRef mutex.
-fn install_direct_iolist_trap(
-    process: &mut Process,
-    import: usize,
-    callee: (arinsal_term::Atom, arinsal_term::Atom),
-    gc_was_enabled: bool,
-    schedule_out: bool,
-    root: Term,
-    state: Box<DirectContinuation>,
-) -> Arc<MagicRef> {
-    let state_ref = argument_trap_state(());
-    process.set_gc_enabled(false);
-    process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-        caller_module: process.trap_site().0,
-        caller_ip: process.trap_site().1,
-        schedule_out,
-        import,
-        continuation: IOLIST_CONTINUATION,
-        target: continuation_target(IOLIST_CONTINUATION),
-        state: Arc::clone(&state_ref),
-        direct_state: Some(state),
-        state_term: None,
-        gc_was_enabled,
-        arity: 1,
-        callee,
-        root_args: 0,
-        args: [root, Term::NIL, Term::NIL, Term::NIL],
-    });
-    state_ref
 }
 
 /// `beam_bif_export_trap`. `BIF_TRAP` points `c_p->i` here; it is not a BEAM function, so a
@@ -533,20 +485,6 @@ const ENTRIES: &[Entry] = &[
         continuation: CODE_PERMISSION_CONTINUATION,
         handler: code_permission,
     },
-    Entry {
-        module: "erlang",
-        function: "list_to_binary",
-        arity: 1,
-        continuation: IOLIST_CONTINUATION,
-        handler: list_to_binary,
-    },
-    Entry {
-        module: "erlang",
-        function: "iolist_to_binary",
-        arity: 1,
-        continuation: IOLIST_CONTINUATION,
-        handler: iolist_to_binary,
-    },
     // erl_bif_re.c: re_run_2/3 and re_internal_run_4 all trap to `re_match_trap_export`
     // (erlang:re_run_trap/3) with the restart state in a magic reference.
     Entry {
@@ -597,27 +535,6 @@ const ENTRIES: &[Entry] = &[
         arity: 3,
         continuation: BINARY_TO_LIST_CONTINUATION,
         handler: binary_to_list_trap,
-    },
-    Entry {
-        module: "binary",
-        function: "list_to_bin",
-        arity: 1,
-        continuation: IOLIST_CONTINUATION,
-        handler: list_to_binary,
-    },
-    Entry {
-        module: "erlang",
-        function: "list_to_bitstring",
-        arity: 1,
-        continuation: IOLIST_CONTINUATION,
-        handler: list_to_bitstring,
-    },
-    Entry {
-        module: "erlang",
-        function: "iolist_to_iovec",
-        arity: 1,
-        continuation: IOLIST_TO_IOVEC_CONTINUATION,
-        handler: iolist_to_iovec,
     },
     Entry {
         module: "erlang",
@@ -737,34 +654,6 @@ const ENTRIES: &[Entry] = &[
 struct BinaryCopyState {
     result: Term,
     copied_bits: usize,
-}
-
-pub(crate) enum ErtsL2BState {
-    Size(arinsal_bifs::IolistSizeWalk),
-    Copy {
-        output: IolistOutput,
-        bit_len: usize,
-        bitstring: bool,
-        walk: arinsal_bifs::IolistCopyWalk,
-        restore_gc: bool,
-    },
-    Done,
-}
-
-/// Output staging for `erts_new_bitstring`: up to 64 bytes stay on heap after the walk completes.
-// Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
-pub(crate) enum IolistOutput {
-    Small(arinsal_term::HeapBinaryWriter),
-    Bitstring(Vec<u8>),
-    Writable(Term),
-}
-
-impl IolistOutput {
-    fn finish_writer(&self) {
-        if let Self::Writable(term) = self {
-            arinsal_bifs::finish_iolist_binary_output(*term);
-        }
-    }
 }
 
 fn binary_match(
@@ -1260,7 +1149,6 @@ pub(crate) fn install_export_trap(
         continuation: trap.target.continuation,
         target: trap.target,
         state: argument_trap_state(()),
-        direct_state: None,
         state_term: None,
         gc_was_enabled,
         arity,
@@ -1571,7 +1459,6 @@ pub(crate) fn execute_named(
                 continuation,
                 target: continuation_target(continuation),
                 state,
-                direct_state: None,
                 state_term,
                 gc_was_enabled,
                 arity: trap_arity,
@@ -1599,45 +1486,6 @@ pub(crate) fn execute_named(
                     .and_then(|cold| cold.bif_trap.as_ref())
                     .map(|pending| Arc::clone(&pending.state))
                     .expect("stored continuation"),
-                reductions,
-            })
-        }
-        Ok(HandlerResult::YieldDirect {
-            continuation,
-            state,
-            reductions,
-        }) => {
-            let root = match state.as_ref() {
-                DirectContinuation::Iolist { root, .. } => *root,
-            };
-            let callee = if resumed {
-                process
-                    .cold
-                    .as_ref()
-                    .and_then(|cold| cold.bif_trap.as_ref())
-                    .map(|pending| pending.callee)
-                    .expect("resumed direct trap")
-            } else {
-                (
-                    global_atoms().intern(module_name).expect("BIF module atom"),
-                    global_atoms()
-                        .intern(function_name)
-                        .expect("BIF function atom"),
-                )
-            };
-            let state = install_direct_iolist_trap(
-                process,
-                import,
-                callee,
-                gc_was_enabled,
-                false,
-                root,
-                state,
-            );
-            charge(process, ctx, reductions);
-            Ok(HandlerResult::Yield {
-                continuation,
-                state,
                 reductions,
             })
         }
@@ -1690,12 +1538,6 @@ pub(crate) trait TrapBody {
 
 /// `binary_to_list/1,3`.
 pub(crate) struct BinaryToList<B>(std::marker::PhantomData<fn() -> B>);
-/// `list_to_binary/1` and `binary:list_to_bin/1`.
-pub(crate) struct ListToBinary;
-/// `iolist_to_binary/1`.
-pub(crate) struct IolistToBinary;
-/// `iolist_to_iovec/1`.
-pub(crate) struct IolistToIovec;
 
 impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
     fn run(
@@ -1707,57 +1549,6 @@ impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
     ) -> Result<HandlerResult, BifError> {
         // Port of erts/emulator/beam/binary.c:202-239 (`binary_to_list_1/3`), OTP-29.1.1.
         binary_to_list_start(process, args, restore_gc)
-    }
-}
-
-impl TrapBody for ListToBinary {
-    const ARITY: Option<usize> = Some(1);
-
-    // Port of erts/emulator/beam/erl_iolist.c (`list_to_bitstring_dispatch`):
-    // keep one size walk so its state can continue into copying or a trap.
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        // Port of erts/emulator/beam/erl_iolist.c:857-935 (`list_to_bitstring_bif`), OTP-29.1.1.
-        list_to_binary(process, args, None, pid, restore_gc)
-    }
-}
-
-impl TrapBody for IolistToBinary {
-    const ARITY: Option<usize> = Some(1);
-
-    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
-        iolist_binary_direct(process, args[0], true)
-    }
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        // Port of erts/emulator/beam/erl_iolist.c:916-927 (iolist_to_binary_1), OTP-29.1.1.
-        iolist_to_binary(process, args, None, pid, restore_gc)
-    }
-}
-
-impl TrapBody for IolistToIovec {
-    const ARITY: Option<usize> = Some(1);
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        iolist_to_iovec(process, args, None, pid, restore_gc)
     }
 }
 
@@ -1994,7 +1785,6 @@ pub(crate) fn finish_light(
                 continuation,
                 target: continuation_target(continuation),
                 state,
-                direct_state: None,
                 state_term,
                 gc_was_enabled,
                 arity: kept,
@@ -2002,18 +1792,6 @@ pub(crate) fn finish_light(
                 root_args,
                 args: saved,
             });
-            charge_light(process, reductions);
-            return LightTrap::Trapped;
-        }
-        Ok(HandlerResult::YieldDirect {
-            continuation: _,
-            state,
-            reductions,
-        }) => {
-            let root = match state.as_ref() {
-                DirectContinuation::Iolist { root, .. } => *root,
-            };
-            install_direct_iolist_trap(process, import, callee, gc_was_enabled, true, root, state);
             charge_light(process, reductions);
             return LightTrap::Trapped;
         }
@@ -2036,7 +1814,6 @@ pub(crate) fn finish_light(
                 continuation: trap.target.continuation,
                 target: trap.target,
                 state,
-                direct_state: None,
                 state_term,
                 gc_was_enabled,
                 arity: kept,
@@ -2095,7 +1872,6 @@ pub(crate) fn install_deferred_trap(
         continuation,
         target: continuation_target(continuation),
         state,
-        direct_state: None,
         state_term,
         gc_was_enabled,
         arity,
@@ -2253,449 +2029,6 @@ fn code_permission(
         state: argument_trap_state(acquire),
         reductions: 1,
     })
-}
-
-fn list_to_binary(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    let root = args[0];
-    if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
-        return Err(BifError::BADARG);
-    }
-    if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8)? {
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: 0,
-        });
-    }
-    iolist_binary_conversion(process, root, state, false, gc_changed)
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:718-762,857-927
-// (list_to_bitstring_engine, list_to_bitstring_bif, iolist_to_binary_1), OTP-29.1.1.
-// The size and copy passes run on the stack; only a yielding call needs saved state.
-fn iolist_binary_direct(process: &mut Process, root: Term, allow_binary: bool) -> Option<Term> {
-    if allow_binary && root.classify() == TermKind::Bitstring {
-        arinsal_bifs::bitstring_bit_len(root)
-            .ok()?
-            .is_multiple_of(8)
-            .then_some(())?;
-        return Some(root);
-    }
-    if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
-        return None;
-    }
-    if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8).ok()? {
-        return Some(value);
-    }
-    if root == Term::NIL {
-        return Some(
-            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                .binary(&[])
-                .expect("process HAlloc supplies the empty binary"),
-        );
-    }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    arinsal_bifs::iolist_to_binary_direct(&mut ctx, root)
-}
-
-fn iolist_to_binary(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    let root = args[0];
-    if root.classify() == TermKind::Bitstring {
-        if !arinsal_bifs::bitstring_bit_len(root)?.is_multiple_of(8) {
-            return Err(BifError::BADARG);
-        }
-        return Ok(HandlerResult::Done {
-            value: root,
-            reductions: 0,
-        });
-    }
-    if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8)? {
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: 0,
-        });
-    }
-    iolist_binary_conversion(process, root, state, false, gc_changed)
-}
-
-fn list_to_bitstring(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
-        return Err(BifError::BADARG);
-    }
-    if let Some(value) = arinsal_bifs::singleton_bitstring(args[0], 1)? {
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: 1,
-        });
-    }
-    iolist_binary_conversion(process, args[0], state, true, gc_changed)
-}
-
-const SIZE_YIELDS_PER_RED: usize = 8;
-
-fn iolist_to_iovec(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    let state = match state {
-        Some(state) => Arc::clone(state),
-        None => {
-            if let Some(value) = arinsal_bifs::iolist_to_iovec_shortcut(
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                args[0],
-            )? {
-                return Ok(HandlerResult::Done {
-                    value,
-                    reductions: 0,
-                });
-            }
-            magic_binary_state(
-                Mutex::new(arinsal_bifs::IolistVecWalk::new(args[0])),
-                ERTS_IOLIST_TO_IOVEC_STATE_SIZE,
-            )
-        }
-    };
-    let walk = state
-        .downcast_ref::<Mutex<arinsal_bifs::IolistVecWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
-    let entry_reds = process.heap.abi.fcalls.max(0) as usize;
-    let mut spent = 0_usize;
-    let mut reds_left = entry_reds;
-    let yielded = |state: Arc<MagicRef>, reductions: usize| {
-        Ok(HandlerResult::Yield {
-            continuation: IOLIST_TO_IOVEC_CONTINUATION,
-            state,
-            reductions: reductions as u32,
-        })
-    };
-    if !walk.sized() {
-        if reds_left == 0 {
-            drop(walk);
-            return yielded(state, 0);
-        }
-        match walk.size_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED)) {
-            Err((error, used)) => {
-                return Ok(HandlerResult::Failed {
-                    error,
-                    reductions: arinsal_bifs::iolist_yield_reductions(used) as u32,
-                });
-            }
-            Ok((false, _)) => {
-                drop(walk);
-                return yielded(state, entry_reds);
-            }
-            Ok((true, used)) => {
-                let reds = arinsal_bifs::iolist_yield_reductions(used);
-                spent += reds;
-                reds_left = reds_left.saturating_sub(reds);
-            }
-        }
-        if reds_left == 0 {
-            drop(walk);
-            return yielded(state, entry_reds);
-        }
-    }
-    if reds_left == 0 {
-        drop(walk);
-        return yielded(state, 0);
-    }
-    match walk.copy_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED)) {
-        Err((error, used)) => Ok(HandlerResult::Failed {
-            error,
-            reductions: (spent + arinsal_bifs::iolist_yield_reductions(used)) as u32,
-        }),
-        Ok((false, _)) => {
-            drop(walk);
-            yielded(state, entry_reds)
-        }
-        Ok((true, used)) => {
-            let reductions = (spent + arinsal_bifs::iolist_yield_reductions(used)) as u32;
-            let value = walk.finish(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))?;
-            Ok(HandlerResult::Done { value, reductions })
-        }
-    }
-}
-
-struct IolistCopySetup {
-    empty: Option<Term>,
-    ready: Option<(IolistOutput, usize, arinsal_bifs::IolistCopyWalk, bool)>,
-}
-
-/// Allocate the result after the size pass of `list_to_binary/1` and friends (`bitstring` false)
-/// or `list_to_bitstring/1`.
-// Port of erts/emulator/beam/erl_iolist.c (`list_to_bitstring_dispatch`), OTP-29.1.1.
-fn iolist_copy_setup(
-    process: &mut Process,
-    size: &mut arinsal_bifs::IolistSizeWalk,
-    root: Term,
-) -> Result<IolistCopySetup, BifError> {
-    if size.is_bits() {
-        let bit_len = size.take_bits();
-        if bit_len == 0 {
-            let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                .bitstring(&[], 0)
-                .map_err(|_| BifError::SystemLimit)?;
-            return Ok(IolistCopySetup {
-                empty: Some(value),
-                ready: None,
-            });
-        }
-        return Ok(IolistCopySetup {
-            empty: None,
-            ready: Some((
-                IolistOutput::Bitstring(vec![0; bit_len.div_ceil(8)]),
-                bit_len,
-                arinsal_bifs::IolistCopyWalk::new_bits(root),
-                process.heap.gc_enabled,
-            )),
-        });
-    }
-    let byte_len = size.take_size();
-    if byte_len == 0 {
-        let value = arinsal_bifs::allocate_iolist_binary(
-            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-            0,
-        )?;
-        return Ok(IolistCopySetup {
-            empty: Some(value),
-            ready: None,
-        });
-    }
-    if byte_len <= 64 {
-        let restore_gc = process.heap.gc_enabled;
-        let output = match arinsal_term::HeapBinaryWriter::new(&mut process.heap, byte_len) {
-            Ok(output) => output,
-            Err(_) => return Err(BifError::SystemLimit),
-        };
-        return Ok(IolistCopySetup {
-            empty: None,
-            ready: Some((
-                IolistOutput::Small(output),
-                byte_len * 8,
-                arinsal_bifs::IolistCopyWalk::new(root),
-                restore_gc,
-            )),
-        });
-    }
-    let output = IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
-        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-        byte_len,
-    )?);
-    Ok(IolistCopySetup {
-        empty: None,
-        ready: Some((
-            output,
-            byte_len * 8,
-            arinsal_bifs::IolistCopyWalk::new(root),
-            process.heap.gc_enabled,
-        )),
-    })
-}
-
-fn iolist_binary_conversion(
-    process: &mut Process,
-    root: Term,
-    state: Option<&Arc<MagicRef>>,
-    bitstring: bool,
-    _restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    if root == Term::NIL && state.is_none() {
-        let value = arinsal_bifs::allocate_iolist_binary(
-            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-            0,
-        )?;
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: 0,
-        });
-    }
-    if state.is_none() {
-        let mut phase = ErtsL2BState::Size(if bitstring {
-            arinsal_bifs::IolistSizeWalk::new_bits(root)
-        } else {
-            arinsal_bifs::IolistSizeWalk::new(root)
-        });
-        return Ok(match iolist_binary_step(process, root, &mut phase)? {
-            IolistStep::Finished(result) => result,
-            IolistStep::Yield(reductions) => HandlerResult::YieldDirect {
-                continuation: IOLIST_CONTINUATION,
-                state: Box::new(DirectContinuation::Iolist { root, state: phase }),
-                reductions,
-            },
-        });
-    };
-    let mut phase = match process
-        .bif_trap_mut()
-        .and_then(|pending| pending.direct_state.take())
-    {
-        Some(state) => match *state {
-            DirectContinuation::Iolist { state: phase, .. } => phase,
-        },
-        _ => return Err(BifError::BADARG),
-    };
-    let step = iolist_binary_step(process, root, &mut phase)?;
-    Ok(match step {
-        IolistStep::Finished(result) => result,
-        IolistStep::Yield(reductions) => HandlerResult::YieldDirect {
-            continuation: IOLIST_CONTINUATION,
-            state: Box::new(DirectContinuation::Iolist { root, state: phase }),
-            reductions,
-        },
-    })
-}
-
-enum IolistStep {
-    Finished(HandlerResult),
-    Yield(u32),
-}
-
-fn iolist_binary_step(
-    process: &mut Process,
-    root: Term,
-    phase: &mut ErtsL2BState,
-) -> Result<IolistStep, BifError> {
-    const SIZE_YIELDS_PER_RED: usize = 8;
-    let finished = |result| Ok(IolistStep::Finished(result));
-    let mut available_reductions = process.heap.abi.fcalls.max(0) as usize;
-    let mut size_reductions = 0_usize;
-
-    match phase {
-        ErtsL2BState::Size(walk) => {
-            let initial_yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
-            let (done, work) = match walk.step(initial_yield_count) {
-                Ok(progress) => progress,
-                Err((error, work)) => {
-                    let reductions = work.div_ceil(SIZE_YIELDS_PER_RED) as u32;
-                    return finished(HandlerResult::Failed { error, reductions });
-                }
-            };
-            size_reductions = work.div_ceil(SIZE_YIELDS_PER_RED);
-            if !done {
-                return Ok(IolistStep::Yield(size_reductions as u32));
-            }
-            let bitstring = walk.is_bits();
-            let setup = iolist_copy_setup(process, walk, root)?;
-            if let Some(value) = setup.empty {
-                *phase = ErtsL2BState::Done;
-                return finished(HandlerResult::Done {
-                    value,
-                    reductions: size_reductions as u32,
-                });
-            }
-            let (output, bit_len, walk, restore_gc) = setup
-                .ready
-                .expect("nonempty iolist output has a copy state");
-            *phase = ErtsL2BState::Copy {
-                output,
-                bit_len,
-                bitstring,
-                walk,
-                restore_gc,
-            };
-            available_reductions = available_reductions.saturating_sub(size_reductions);
-            if available_reductions == 0 {
-                return Ok(IolistStep::Yield(size_reductions as u32));
-            }
-        }
-        ErtsL2BState::Copy { .. } => {}
-        ErtsL2BState::Done => return Err(BifError::BADARG),
-    }
-
-    let ErtsL2BState::Copy {
-        output,
-        bit_len,
-        bitstring,
-        walk,
-        restore_gc,
-    } = &mut *phase
-    else {
-        unreachable!("the size phase transitions to copy or returns above")
-    };
-    let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
-    let stepped = match output {
-        IolistOutput::Small(writer) => {
-            walk.step_to_heap_binary(&mut process.heap, writer, yield_count)
-        }
-        IolistOutput::Bitstring(bytes) => walk.step(bytes, yield_count),
-        IolistOutput::Writable(term) => arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
-            Ok(walk.step(bytes, yield_count))
-        })?,
-    };
-    let (done, work) = match stepped {
-        Ok(progress) => progress,
-        Err((error, work)) => {
-            let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
-            if let IolistOutput::Small(writer) = output {
-                writer.cancel(&mut process.heap);
-            } else {
-                output.finish_writer();
-            }
-            process.set_gc_enabled(*restore_gc);
-            return finished(HandlerResult::Failed { error, reductions });
-        }
-    };
-    let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
-    if !done {
-        return Ok(IolistStep::Yield(reductions));
-    }
-    if walk.written_bits() != *bit_len {
-        if let IolistOutput::Small(writer) = output {
-            writer.cancel(&mut process.heap);
-        } else {
-            output.finish_writer();
-        }
-        process.set_gc_enabled(*restore_gc);
-        return finished(HandlerResult::Failed {
-            error: BifError::SystemLimit,
-            reductions,
-        });
-    }
-    let (bit_len, bitstring) = (*bit_len, *bitstring);
-    let value = match output {
-        IolistOutput::Small(writer) => writer
-            .finish(&mut process.heap)
-            .map_err(|_| BifError::SystemLimit)?,
-        IolistOutput::Bitstring(bytes) => {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let mut builder = TermBuilder::new(&mut heap);
-            if bitstring {
-                builder.bitstring(bytes, bit_len)
-            } else {
-                builder.binary(bytes)
-            }
-            .map_err(|_| BifError::SystemLimit)?
-        }
-        IolistOutput::Writable(term) => {
-            arinsal_bifs::finish_iolist_binary_output(*term);
-            *term
-        }
-    };
-    process.set_gc_enabled(*restore_gc);
-    *phase = ErtsL2BState::Done;
-    finished(HandlerResult::Done { value, reductions })
 }
 
 fn binary_to_term(

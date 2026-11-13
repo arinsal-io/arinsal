@@ -12,7 +12,7 @@ use arinsal_term::{
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::{BifError, Class, Ctx};
 
@@ -1645,6 +1645,7 @@ pub struct IolistSizeWalk {
     tails: arinsal_term::EStack<8>,
     size: usize,
     unit: usize,
+    overflowed: bool,
 }
 
 impl IolistSizeWalk {
@@ -1655,6 +1656,7 @@ impl IolistSizeWalk {
             tails: arinsal_term::EStack::new(),
             size: 0,
             unit: 8,
+            overflowed: false,
         }
     }
 
@@ -1703,9 +1705,10 @@ impl IolistSizeWalk {
                     if !(0..=255).contains(&byte) {
                         return Err((BADARG, consumed));
                     }
-                    size = size
-                        .checked_add(8)
-                        .ok_or((BifError::SystemLimit, consumed))?;
+                    let Some(sum) = size.checked_add(8) else {
+                        return Err(self.overflow(current, size, consumed));
+                    };
+                    size = sum;
                     current = tail;
                     continue;
                 }
@@ -1714,9 +1717,13 @@ impl IolistSizeWalk {
                     current = head;
                     continue;
                 }
-                size = self
-                    .leaf_size(size, head, true)
-                    .map_err(|error| (error, consumed))?;
+                size = match self.leaf_size(size, head, true) {
+                    Ok(size) => size,
+                    Err(BifError::SystemLimit) => {
+                        return Err(self.overflow(current, size, consumed));
+                    }
+                    Err(error) => return Err((error, consumed)),
+                };
                 current = tail;
             }
 
@@ -1726,9 +1733,13 @@ impl IolistSizeWalk {
                 return Ok((false, budget));
             }
             consumed += 1;
-            size = self
-                .leaf_size(size, current, false)
-                .map_err(|error| (error, consumed))?;
+            size = match self.leaf_size(size, current, false) {
+                Ok(size) => size,
+                Err(BifError::SystemLimit) => {
+                    return Err(self.overflow(current, size, consumed));
+                }
+                Err(error) => return Err((error, consumed)),
+            };
             match self.tails.pop() {
                 Some(tail) => current = tail,
                 None => {
@@ -1738,6 +1749,24 @@ impl IolistSizeWalk {
                 }
             }
         }
+    }
+
+    /// `L_overflow` of `generic_iolist_size`: the walk stops at the element whose size does not
+    /// fit the word, keeping the cursor on it, so the caller can accumulate `size` and resume.
+    fn overflow(&mut self, current: Term, size: usize, consumed: usize) -> (BifError, usize) {
+        self.current = current;
+        self.size = size;
+        self.overflowed = true;
+        (BifError::SystemLimit, consumed)
+    }
+
+    /// After a `SystemLimit` from [`Self::step`]: whether it was `ERTS_IOLIST_OVERFLOW`; if so
+    /// returns the bytes counted so far and restarts the count at zero.
+    pub fn take_overflow(&mut self) -> Option<usize> {
+        if !std::mem::take(&mut self.overflowed) {
+            return None;
+        }
+        Some(std::mem::take(&mut self.size) / 8)
     }
 
     /// Return the accumulated byte count after a complete traversal.
@@ -1774,55 +1803,6 @@ impl IolistSizeWalk {
 pub(crate) fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
     // SAFETY: The source heap remains live throughout the BIF call.
     unsafe { term.cons_ref() }.ok_or(BADARG)
-}
-trait BitBuffer {
-    fn push_byte(&mut self, byte: u8);
-    fn last_byte_mut(&mut self) -> Option<&mut u8>;
-}
-
-impl BitBuffer for Vec<u8> {
-    fn push_byte(&mut self, byte: u8) {
-        self.push(byte);
-    }
-
-    fn last_byte_mut(&mut self) -> Option<&mut u8> {
-        self.last_mut()
-    }
-}
-
-impl<A> BitBuffer for SmallVec<A>
-where
-    A: smallvec::Array<Item = u8>,
-{
-    fn push_byte(&mut self, byte: u8) {
-        self.push(byte);
-    }
-
-    fn last_byte_mut(&mut self) -> Option<&mut u8> {
-        self.last_mut()
-    }
-}
-
-fn append_term_bitstring<B: BitBuffer>(
-    bytes: &mut B,
-    length: &mut usize,
-    term: Term,
-) -> Result<(), BifError> {
-    let bit_len = bitstring_bit_len(term)?;
-    let mut data = SmallVec::<[u8; 64]>::new();
-    data.resize(bit_len.div_ceil(8), 0);
-    copy_bitstring_range(term, 0, &mut data, bit_len)?;
-    for i in 0..bit_len {
-        append_bit(bytes, length, (data[i / 8] >> (7 - i % 8)) & 1);
-    }
-    Ok(())
-}
-fn append_bit(bytes: &mut impl BitBuffer, length: &mut usize, bit: u8) {
-    if (*length).is_multiple_of(8) {
-        bytes.push_byte(0);
-    }
-    *bytes.last_byte_mut().expect("byte") |= bit << (7 - *length % 8);
-    *length += 1;
 }
 pub(super) fn bigint(term: Term) -> Result<BigInt, BifError> {
     if let Some(n) = term.as_small() {
