@@ -416,6 +416,24 @@ fn dist_mixed_fragmented_send_context_trap() {
     assert!(arinsal_output.contains(expected), "{arinsal_output}");
 }
 
+/// A sender killed while parked in `dsend_continue_trap/1` finishes its fragmented send at exit
+/// (erl_process.c erts_continue_exit_process, F_FRAGMENTED_SEND): the receiver sees the complete
+/// message or none, never a wedged connection, on `erl` and on Arinsal.
+#[test]
+fn dist_mixed_fragmented_send_sender_killed_while_parked() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    let expression = format!(
+        "N={n}, pong=net_adm:ping(N), {{echo,N}} ! {{get_alias,self()}}, Alias=receive {{remote_alias,A}} -> A after 10000 -> exit(no_alias) end, Big=binary:copy(<<9>>,30000000), Me=self(), Sender=spawn(fun() -> Alias ! {{alias_roundtrip,Me,Big}}, receive never -> ok end end), receive after 3 -> ok end, exit(Sender,kill), Outcome=receive {{alias_ack,Big}} -> complete after 8000 -> none end, {{echo,N}} ! {{get_alias,self()}}, Alive=receive {{remote_alias,_}} -> true after 10000 -> false end, io:format(\"DIST_MIXED_OK frag_kill outcome_ok=~p alive=~p~n\", [lists:member(Outcome,[complete,none]), Alive])"
+    );
+    let expected = "DIST_MIXED_OK frag_kill outcome_ok=true alive=true";
+    let otp_output = otp_eval_with_dist_buffer(&cookie, &expression, Some("1"));
+    assert!(otp_output.contains(expected), "{otp_output}");
+    let arinsal_output = arinsal_eval_with_dist_buffer(&cookie, &host, &expression, Some("1"));
+    assert!(arinsal_output.contains(expected), "{arinsal_output}");
+}
+
 #[test]
 fn dist_mixed_otp_node_monitor_disconnect_reconnect() {
     let _serial = serial_test();

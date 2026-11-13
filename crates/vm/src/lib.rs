@@ -184,6 +184,9 @@ pub struct ExportTrap {
     pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
     /// Arguments, X0 onwards.
     pub args: Vec<Term>,
+    /// `erts_set_gc_state(c_p, 0)` before the trap: the continuation state holds process-heap
+    /// terms, so the process is not collected while it is parked.
+    pub(crate) gc_disabled: bool,
 }
 
 impl ExportTrap {
@@ -195,6 +198,7 @@ impl ExportTrap {
             entry: process.trap_export_entry(target),
             target,
             args,
+            gc_disabled: false,
         }
     }
 }
