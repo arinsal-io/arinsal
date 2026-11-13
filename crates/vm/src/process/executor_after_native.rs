@@ -324,15 +324,10 @@ impl Executor {
                     process.set_native_resume_arity(function.arity);
                     process.gc_live = usize::from(function.arity);
                     process.set_native_pc(Some(resume_pc));
-                    // A loop of traced calls leaves native code on every call and
-                    // would never reach the end-of-slice check: preempt here once
-                    // the budget is used up (erts counts reductions per call).
-                    // The breakpoint left native code before its call's reduction was
-                    // charged.
-                    super::executor::bump_fcalls(process, 1);
-                    if process.heap.abi.fcalls <= 0 {
-                        return Ok(Flow::Break(Ok(RunState::Yield)));
-                    }
+                    // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95
+                    // (emit_generic_bp_local), OTP-29.1.1: the breakpoint takes no reduction;
+                    // the function's own `i_test_yield`, which runs when the call resumes
+                    // behind the trampoline, takes the call's and yields at the budget.
                     return Ok(Flow::Continue);
                 }
                 if target_pc == crate::bif_traps::bif_export_trap_pc() {
@@ -1131,7 +1126,9 @@ impl Executor {
                         )?;
                         process.gc_live = usize::from(export.arity);
                         process.set_native_pc(Some(function.start));
-                        process.tick();
+                        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp
+                        // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
+                        // function's own `i_test_yield` at `function.start`.
                         return Ok(Flow::Continue);
                     }
                 }
@@ -1141,7 +1138,9 @@ impl Executor {
                 if let Some(target_ip) = target_ip {
                     process.gc_live = usize::from(export.arity);
                     self.vm.set_position(process, module_id, target_ip)?;
-                    process.tick();
+                    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp
+                    // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
+                    // callee's own `i_test_yield` at its native entry.
                 } else {
                     let saved = process.x[..usize::from(export.arity)].to_vec();
                     let outcome = match self.vm.call_undefined_function(

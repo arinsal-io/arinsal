@@ -22,8 +22,12 @@ struct Case {
     heap_factor: usize,
     build: &'static str,
     call: &'static str,
-    /// `{M, F, A}` call-traced (local) in the measured process while the call runs.
+    /// `{M, F, A}` call-traced in the measured process while the call runs.
     trace: Option<&'static str>,
+    /// The trace pattern is global (export breakpoint) instead of local.
+    global: bool,
+    /// No slack: the reduction count is compared exactly.
+    exact: bool,
 }
 
 const fn case(
@@ -40,6 +44,21 @@ const fn case(
         build,
         call,
         trace: None,
+        global: false,
+        exact: false,
+    }
+}
+
+const fn exact_case(
+    name: &'static str,
+    sizes: &'static [usize],
+    heap_factor: usize,
+    build: &'static str,
+    call: &'static str,
+) -> Case {
+    Case {
+        exact: true,
+        ..case(name, sizes, heap_factor, build, call)
     }
 }
 
@@ -58,6 +77,22 @@ const fn traced_case(
         build,
         call,
         trace: Some(mfa),
+        global: false,
+        exact: true,
+    }
+}
+
+const fn traced_global_case(
+    name: &'static str,
+    sizes: &'static [usize],
+    heap_factor: usize,
+    build: &'static str,
+    call: &'static str,
+    mfa: &'static str,
+) -> Case {
+    Case {
+        global: true,
+        ..traced_case(name, sizes, heap_factor, build, call, mfa)
     }
 }
 
@@ -420,17 +455,6 @@ const MAP_CASES: &[Case] = &[
     case("keys_badmap", &[1], 4, "seq(N)", "catch maps:keys(In)"),
 ];
 
-/// A call-traced NIF function: erts enters the NIF through `call_nif_early`, which skips the
-/// `FCALLS--` of `call_nif_yield_helper` that an untraced call takes.
-const TRACED_NIF_CASES: &[Case] = &[traced_case(
-    "re_run_global_traced",
-    STD,
-    8,
-    "begin {match, _} = re:run(<<7>>, <<7>>, [global]), bytes(N) end",
-    "re:run(In, <<7>>, [global])",
-    "{re, run, 3}",
-)];
-
 const ONE: &[usize] = &[1];
 const SELECT: &[usize] = &[1, 10_000, 100_000];
 /// Long trap chains: a trap export that ran its own trap at once would recurse per slice.
@@ -492,6 +516,14 @@ const TRAP_CASES: &[Case] = &[
         "apply(element(1, In), run, [element(2, In), <<7>>, [global]])",
     ),
     traced_case(
+        "re_run_global_traced",
+        STD,
+        8,
+        "begin {match, _} = re:run(<<7>>, <<7>>, [global]), bytes(N) end",
+        "re:run(In, <<7>>, [global])",
+        "{re, run, 3}",
+    ),
+    traced_case(
         "demonitor_flush_apply_traced",
         ONE,
         4,
@@ -530,6 +562,131 @@ const TRAP_CASES: &[Case] = &[
     ),
 ];
 
+/// Calls that enter an Erlang function from the scheduler's own call paths (`call_fun`,
+/// export breakpoints, dynamic imports): the callee's `i_test_yield` is the call's only debit.
+const CALL_CASES: &[Case] = &[
+    exact_case("fun_apply", ONE, 4, "1", "apply(fun(X) -> X end, [In])"),
+    exact_case(
+        "fun_value_apply",
+        ONE,
+        4,
+        "fun(X) -> X end",
+        "apply(In, [1])",
+    ),
+    traced_case(
+        "fun_value_apply_traced",
+        ONE,
+        4,
+        "fun(X) -> X end",
+        "apply(In, [1])",
+        "{erlang, apply, 2}",
+    ),
+    traced_global_case(
+        "fun_value_apply_global_trace",
+        ONE,
+        4,
+        "fun(X) -> X end",
+        "apply(In, [1])",
+        "{erlang, apply, 2}",
+    ),
+    exact_case(
+        "spawned_fun_apply",
+        ONE,
+        4,
+        "fun(X) -> X end",
+        "erlang:apply(In, [1])",
+    ),
+    traced_case(
+        "fun_apply_traced",
+        ONE,
+        4,
+        "1",
+        "apply(fun(X) -> X end, [In])",
+        "{erlang, apply, 2}",
+    ),
+    traced_global_case(
+        "fun_apply_global_trace",
+        ONE,
+        4,
+        "1",
+        "apply(fun(X) -> X end, [In])",
+        "{erlang, apply, 2}",
+    ),
+    traced_case(
+        "apply3_traced",
+        ONE,
+        4,
+        "1",
+        "apply(reds_overcharge_test, traced_target, [In])",
+        "{erlang, apply, 3}",
+    ),
+    exact_case("lazy_import_call", ONE, 4, "1", "ordsets:new()"),
+    exact_case("lazy_import_call2", ONE, 4, "1", "queue:new()"),
+    exact_case("lazy_import_apply", ONE, 4, "1", "apply(gb_sets, new, [])"),
+    exact_case("lazy_import_fun", ONE, 4, "1", "(fun sets:new/0)()"),
+    exact_case(
+        "export_fun_apply",
+        ONE,
+        4,
+        "1",
+        "apply(fun reds_overcharge_test:traced_target/1, [In])",
+    ),
+    exact_case(
+        "export_fun_call",
+        ONE,
+        4,
+        "1",
+        "(fun reds_overcharge_test:traced_target/1)(In)",
+    ),
+    exact_case(
+        "remote_call",
+        ONE,
+        4,
+        "1",
+        "reds_overcharge_test:traced_target(In)",
+    ),
+    traced_case(
+        "remote_call_local_trace",
+        ONE,
+        4,
+        "1",
+        "reds_overcharge_test:traced_target(In)",
+        "{reds_overcharge_test, traced_target, 1}",
+    ),
+    traced_global_case(
+        "remote_call_global_trace",
+        ONE,
+        4,
+        "1",
+        "reds_overcharge_test:traced_target(In)",
+        "{reds_overcharge_test, traced_target, 1}",
+    ),
+    traced_global_case(
+        "apply3_global_trace",
+        ONE,
+        4,
+        "1",
+        "apply(reds_overcharge_test, traced_target, [In])",
+        "{reds_overcharge_test, traced_target, 1}",
+    ),
+    traced_global_case(
+        "export_fun_global_trace",
+        ONE,
+        4,
+        "1",
+        "(fun reds_overcharge_test:traced_target/1)(In)",
+        "{reds_overcharge_test, traced_target, 1}",
+    ),
+    traced_global_case(
+        "export_fun_apply_global_trace",
+        ONE,
+        4,
+        "1",
+        "apply(fun reds_overcharge_test:traced_target/1, [In])",
+        "{reds_overcharge_test, traced_target, 1}",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -543,7 +700,13 @@ fn source(cases: &[Case]) -> String {
             exports.push(format!("{function}/0"));
             let words = case.heap_factor * size + 100_000;
             let (measure, trace) = match case.trace {
-                Some(mfa) => ("measure_traced", format!(", {mfa}")),
+                Some(mfa) => (
+                    "measure_traced",
+                    format!(
+                        ", {mfa}, [{}]",
+                        if case.global { "global" } else { "local" }
+                    ),
+                ),
                 None => ("measure", String::new()),
             };
             bodies.push_str(&format!(
@@ -554,7 +717,9 @@ fn source(cases: &[Case]) -> String {
     }
     format!(
         r#"-module({MODULE}).
--export([{exports}]).
+-export([{exports}, traced_target/1]).
+
+traced_target(X) -> X.
 
 seq(N) -> lists:seq(1, N).
 
@@ -585,11 +750,12 @@ big(N) -> (1 bsl (N * 64)) - 1.
 measure(N, Words, Build, Run) ->
     measure(N, Words, Build, Run, [running]).
 
-measure_traced(N, Words, Build, Run, MFA) ->
-    erlang:trace_pattern(MFA, true, [local]),
-    Result = measure(N, Words, Build, Run, [running, call]),
-    erlang:trace_pattern(MFA, false, [local]),
-    Result.
+measure_traced(N, Words, Build, Run, MFA, Kind) ->
+    erlang:trace_pattern(MFA, true, Kind),
+    % A failed case must not leave its pattern on for the cases after it.
+    try measure(N, Words, Build, Run, [running, call])
+    after erlang:trace_pattern(MFA, false, Kind)
+    end.
 
 measure(N, Words, Build, Run, Flags) ->
     Parent = self(),
@@ -706,7 +872,8 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let mut vm = crate::common::node();
-    vm.load_bytes(&beam).unwrap();
+    // The node is shared by every test of this binary, each loading its own `MODULE`.
+    crate::common::load_fresh(&mut vm, &beam);
 
     let filter = std::env::var("REDS_CASES").ok();
     let mut failures = Vec::new();
@@ -765,7 +932,7 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                     && actual.ins.contains(expected.ins.median)
             } else {
                 // A call-traced case has no slack: its reduction count is exact.
-                let tolerance = if case.trace.is_some() {
+                let tolerance = if case.exact {
                     0
                 } else {
                     SLACK_PER_SLICE * expected.ins.max
@@ -824,13 +991,10 @@ fn bif_traps_schedule_out_like_otp() {
     check_with(TRAP_CASES, &["+S", "1"]);
 }
 
-// Root cause (open): the arinsal breakpoint trampoline fragment does not port the
-// `ERTS_ASM_BP_FLAG_CALL_NIF_EARLY` branch of emit_i_breakpoint_trampoline_shared, so a traced
-// NIF still takes the `subs FCALLS` of its call_nif body (one reduction more than erts).
+// Each call enters the callee once; the callee's own prologue takes the reduction.
 #[test]
-#[ignore = "traced NIF call charges one reduction more than erts: no call_nif_early in the breakpoint trampoline"]
-fn traced_nif_charges_like_otp() {
-    check_with(TRACED_NIF_CASES, &["+S", "1"]);
+fn erlang_calls_charge_like_otp() {
+    check_with(CALL_CASES, &["+S", "1"]);
 }
 
 #[test]

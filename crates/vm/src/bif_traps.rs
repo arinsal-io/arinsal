@@ -2670,13 +2670,15 @@ impl TrapMeter {
     }
 }
 
-// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1: the call's own reduction is
+// taken by the instruction that called the BIF (`subs FCALLS`), never added here: a traced BIF
+// call takes none, so a floor of one reduction overcharged it.
 fn charge(
     process: &mut Process,
     _ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
     reductions: u32,
 ) {
-    let charge = reductions.max(1);
+    let charge = reductions;
     process.heap.abi.fcalls = process
         .heap
         .abi
