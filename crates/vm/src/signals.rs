@@ -1927,7 +1927,12 @@ fn is_process_executing_dirty(process: &Process, pid: Term) -> Result<Term, VmEr
     }))
 }
 
-// Port of erts/emulator/beam/erl_bif_trace.c:3900 (trace_delivered_1), OTP-29.1.1.
+/// `erlang:trace_delivered/1`: the reply is a system message that the last scheduler sends
+/// when it has run the request at its next scheduling point, so every trace message the
+/// schedulers produced before it is in the caller's queue first.
+// Port of erts/emulator/beam/erl_bif_trace.c (trace_delivered_1, reply_trace_delivered_all),
+// OTP-29.1.1: `erts_schedule_multi_misc_aux_work` over all schedulers with `refc` set to their
+// number; the one that drops it to zero does `erts_send_sys_msg_proc`.
 fn trace_delivered(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -1938,19 +1943,28 @@ fn trace_delivered(
     }
     let id = process.next_ref();
     let reference = reference(process, id)?;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let message = TermBuilder::new(&mut heap)
-        .tuple(&[
-            Term::atom(arinsal_term::atoms::TRACE_DELIVERED),
-            target,
-            reference,
-        ])
-        .map_err(|_| system_limit())?;
-    let envelope = Message::copy_from(message)?;
-    match ctx.send(ctx.pid(), envelope) {
-        Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(reference),
-        Err(arinsal_sched::Error::Capacity) => Err(system_limit()),
-    }
+    let reply = arinsal_etf::OwnedTerm::Tuple(vec![
+        arinsal_etf::OwnedTerm::Atom("trace_delivered".into()),
+        to_owned(target).map_err(|_| badarg("trace_delivered/1"))?,
+        to_owned(reference).map_err(|_| badarg("trace_delivered/1"))?,
+    ]);
+    let runtime = process.runtime.ok_or_else(|| badarg("trace_delivered/1"))?;
+    let caller = ctx.pid();
+    let refc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+        ctx.scheduler_count().max(1),
+    ));
+    ctx.request_aux_work_all(move |_| {
+        if refc.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
+            return;
+        }
+        let Ok(message) = Message::from_owned(&reply) else {
+            return;
+        };
+        if let Ok(scheduler) = runtime.scheduler() {
+            let _ = scheduler.send(caller, caller, message);
+        }
+    });
+    Ok(reference)
 }
 
 // Port of erts/emulator/beam/erl_bif_trace.c:650
