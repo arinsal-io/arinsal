@@ -89,21 +89,11 @@ pub(crate) fn enqueue_sys_msg(ty: SysMsgType, from: Option<Pid>, to: Term, msg: 
 
 /// Port of erl_trace.c `erts_send_sys_msg_proc`: `SYS_MSG_TYPE_PROC_MSG` to a pid, delivered by
 /// the dispatcher thread.
-pub(crate) fn send_sys_msg_proc(runtime: &'static Runtime, from: Pid, to: Pid, msg: Message) {
-    let Ok(scheduler) = runtime.scheduler() else {
-        return;
-    };
+pub(crate) fn send_sys_msg_proc(from: Pid, to: Pid, msg: Message) {
     let Some(to) = to.to_term() else {
         return;
     };
-    enqueue_sys_msg(
-        SysMsgType::ProcMsg,
-        scheduler,
-        Some(runtime),
-        Some(from),
-        to,
-        msg,
-    );
+    enqueue_sys_msg(SysMsgType::ProcMsg, Some(from), to, msg);
 }
 
 /// Port of erl_trace.c `erts_queue_error_logger_message`: queued to the system logger
