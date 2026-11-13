@@ -8,7 +8,7 @@ use similar_asserts::assert_eq;
 const MODULE: &str = "etf_vm_differential";
 const SOURCE: &str = r#"
 -module(etf_vm_differential).
--export([run/3, run_raw/3, run_encoded/3, fun_encode/1, export_fun_encode/1, local_fun/0,
+-export([run/3, run_raw/3, run_encoded/3, fun_encode/1, local_fun/0,
          stress/1, fun_identity/1]).
 
 run(encode, Term, Options) ->
@@ -32,8 +32,6 @@ run_raw(size, Term, Options) -> erlang:external_size(Term, Options);
 run_raw(decode, Binary, Options) -> erlang:binary_to_term(Binary, Options).
 
 fun_encode(Options) -> erlang:term_to_binary(fun fun_identity/1, Options).
-export_fun_encode(Options) ->
-    erlang:term_to_binary(fun etf_vm_differential:fun_identity/1, Options).
 local_fun() -> fun fun_identity/1.
 stress(Kind) ->
     Term = deep(1000000, 1, Kind),
@@ -85,6 +83,22 @@ fn terms() -> Vec<O> {
             creation: 0,
             ids: vec![1, 2, 3],
         },
+        O::Pid {
+            node: "remote@host".into(),
+            id: 17,
+            serial: 4,
+            creation: 9,
+        },
+        O::Port {
+            node: "remote@host".into(),
+            id: 0x1020_3040_5060,
+            creation: 9,
+        },
+        O::Ref {
+            node: "remote@host".into(),
+            creation: 9,
+            ids: vec![0x1020_3040, 0x5060_7080, 0x90a0_b0c0],
+        },
     ];
     for bits in 1..8 {
         terms.push(O::BitString {
@@ -100,20 +114,6 @@ fn terms() -> Vec<O> {
     terms
 }
 
-fn contains_external_identity(term: &O) -> bool {
-    match term {
-        O::Pid { .. } | O::Port { .. } | O::Ref { .. } => true,
-        O::Tuple(values) => values.iter().any(contains_external_identity),
-        O::List { elems, tail } => {
-            elems.iter().any(contains_external_identity) || contains_external_identity(tail)
-        }
-        O::Map(entries) => entries.iter().any(|(key, value)| {
-            contains_external_identity(key) || contains_external_identity(value)
-        }),
-        _ => false,
-    }
-}
-
 fn options() -> Vec<O> {
     vec![
         O::Nil,
@@ -124,6 +124,36 @@ fn options() -> Vec<O> {
         O::list(vec![O::Tuple(vec![O::atom("minor_version"), O::Int(1)])]),
         O::list(vec![O::atom("deterministic")]),
     ]
+}
+
+fn local_fun_without_hashes(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut normalized = bytes.to_vec();
+    if bytes.get(0..2)? != [131, 121] || bytes.get(6) != Some(&112) {
+        return None;
+    }
+    normalized[2..6].fill(0);
+    let mut at = 6 + 1 + 4 + 1 + 16 + 4 + 4;
+    at = match bytes.get(at)? {
+        100 | 118 => {
+            let len = u16::from_be_bytes(bytes.get(at + 1..at + 3)?.try_into().ok()?) as usize;
+            at + 3 + len
+        }
+        115 | 119 => at + 2 + usize::from(*bytes.get(at + 1)?),
+        _ => return None,
+    };
+    for _ in 0..2 {
+        if bytes.get(at) != Some(&121) {
+            return None;
+        }
+        normalized[at + 1..at + 5].fill(0);
+        at += 5;
+        at = match bytes.get(at)? {
+            97 => at + 2,
+            98 => at + 5,
+            _ => return None,
+        };
+    }
+    Some(normalized)
 }
 
 fn args_to_terms(values: &[O], heap: &mut ProcessHeap) -> Vec<Term> {
@@ -333,24 +363,19 @@ fn vm_etf_encode_decode_iovec_and_size_match_otp() {
     let local_options = O::list(vec![O::atom("local")]);
     let expected_fun = reference.call(MODULE, "fun_encode", std::slice::from_ref(&local_options));
     let actual_fun = run_vm(&mut vm, "fun_encode", &[local_options]);
-    if actual_fun != expected_fun {
+    let fun_matches = match (&actual_fun, &expected_fun) {
+        (CallResult::Ok(O::Binary(actual)), CallResult::Ok(O::Binary(expected))) => {
+            local_fun_without_hashes(actual) == local_fun_without_hashes(expected)
+        }
+        _ => actual_fun == expected_fun,
+    };
+    if !fun_matches {
         differences.push(format!(
             "local fun encoding: Arinsal={actual_fun:?}; OTP={expected_fun:?}"
         ));
     }
-    let local_options = O::list(vec![O::atom("local")]);
-    let expected_export = reference.call(
-        MODULE,
-        "export_fun_encode",
-        std::slice::from_ref(&local_options),
-    );
-    let actual_export = run_vm(&mut vm, "export_fun_encode", &[local_options]);
-    if actual_export != expected_export {
-        differences.push(format!(
-            "local export-fun encoding: Arinsal={actual_export:?}; OTP={expected_export:?}"
-        ));
-    }
-
+    // No [local] export-fun comparison: erts 29.1.1 itself aborts the node on
+    // term_to_binary(fun M:F/A, [local]) ("external.c, line 2309: buffer overflow: 5 word(s)").
     for term in terms() {
         for option in options() {
             compare_case(&reference, &mut vm, "encode", term.clone(), option.clone());
@@ -359,73 +384,70 @@ fn vm_etf_encode_decode_iovec_and_size_match_otp() {
             compare_case(&reference, &mut vm, "iovec", term.clone(), option.clone());
         }
         let local_options = O::list(vec![O::atom("local")]);
-        // The separate etf_local_ext_nodes task covers external identities under [local].
-        if !contains_external_identity(&term) {
-            let expected_local = wrap_success(reference.call(
-                "erlang",
-                "term_to_binary",
-                &[term.clone(), local_options.clone()],
-            ));
-            let actual_local = run_vm(
-                &mut vm,
-                "run",
-                &[O::atom("encode"), term.clone(), local_options],
-            );
-            match (
-                wrapped_binary(&actual_local),
-                wrapped_binary(&expected_local),
-            ) {
-                (Some(actual), Some(expected)) => {
-                    assert_eq!(actual.len(), expected.len(), "local ETF size {term:?}");
-                    assert_eq!(&actual[..2], &expected[..2], "local ETF tag {term:?}");
-                    // LOCAL_EXT carries a node-specific hash in bytes 2..6.
-                    assert_eq!(&actual[6..], &expected[6..], "local ETF body {term:?}");
-                    if !matches!(term, O::Export { .. }) {
-                        compare_case(
-                            &reference,
-                            &mut vm,
-                            "size",
-                            term.clone(),
-                            O::list(vec![O::atom("local")]),
+        let expected_local = wrap_success(reference.call(
+            "erlang",
+            "term_to_binary",
+            &[term.clone(), local_options.clone()],
+        ));
+        let actual_local = run_vm(
+            &mut vm,
+            "run",
+            &[O::atom("encode"), term.clone(), local_options],
+        );
+        match (
+            wrapped_binary(&actual_local),
+            wrapped_binary(&expected_local),
+        ) {
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.len(), expected.len(), "local ETF size {term:?}");
+                assert_eq!(&actual[..2], &expected[..2], "local ETF tag {term:?}");
+                // LOCAL_EXT carries a node-specific hash in bytes 2..6.
+                assert_eq!(&actual[6..], &expected[6..], "local ETF body {term:?}");
+                if !matches!(term, O::Export { .. }) {
+                    compare_case(
+                        &reference,
+                        &mut vm,
+                        "size",
+                        term.clone(),
+                        O::list(vec![O::atom("local")]),
+                    );
+                    let iovec_args = [
+                        O::atom("iovec"),
+                        term.clone(),
+                        O::list(vec![O::atom("local")]),
+                    ];
+                    let expected_iovec = wrap_success(reference.call(
+                        "erlang",
+                        "term_to_iovec",
+                        &[term.clone(), iovec_args[2].clone()],
+                    ));
+                    let actual_iovec = run_vm(&mut vm, "run", &iovec_args);
+                    if let (Some(actual_bytes), Some(expected_bytes)) =
+                        (wrapped_iovec(&actual_iovec), wrapped_iovec(&expected_iovec))
+                    {
+                        assert_eq!(
+                            actual_bytes.len(),
+                            expected_bytes.len(),
+                            "local iovec size {term:?}"
                         );
-                        let iovec_args = [
-                            O::atom("iovec"),
-                            term.clone(),
-                            O::list(vec![O::atom("local")]),
-                        ];
-                        let expected_iovec = wrap_success(reference.call(
-                            "erlang",
-                            "term_to_iovec",
-                            &[term.clone(), iovec_args[2].clone()],
-                        ));
-                        let actual_iovec = run_vm(&mut vm, "run", &iovec_args);
-                        if let (Some(actual_bytes), Some(expected_bytes)) =
-                            (wrapped_iovec(&actual_iovec), wrapped_iovec(&expected_iovec))
-                        {
-                            assert_eq!(
-                                actual_bytes.len(),
-                                expected_bytes.len(),
-                                "local iovec size {term:?}"
-                            );
-                            assert_eq!(
-                                &actual_bytes[..2],
-                                &expected_bytes[..2],
-                                "local iovec tag {term:?}"
-                            );
-                            assert_eq!(
-                                &actual_bytes[6..],
-                                &expected_bytes[6..],
-                                "local iovec body {term:?}"
-                            );
-                        } else {
-                            assert_eq!(actual_iovec, expected_iovec, "local iovec {term:?}");
-                        }
+                        assert_eq!(
+                            &actual_bytes[..2],
+                            &expected_bytes[..2],
+                            "local iovec tag {term:?}"
+                        );
+                        assert_eq!(
+                            &actual_bytes[6..],
+                            &expected_bytes[6..],
+                            "local iovec body {term:?}"
+                        );
+                    } else {
+                        assert_eq!(actual_iovec, expected_iovec, "local iovec {term:?}");
                     }
                 }
-                _ => differences.push(format!(
-                    "local ETF {term:?}: Arinsal={actual_local:?}; OTP={expected_local:?}"
-                )),
             }
+            _ => differences.push(format!(
+                "local ETF {term:?}: Arinsal={actual_local:?}; OTP={expected_local:?}"
+            )),
         }
         let encoded =
             wrap_success(reference.call("erlang", "term_to_binary", &[term.clone(), O::Nil]));

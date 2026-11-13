@@ -359,7 +359,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                     let value = tri!(context.walk.encode_simple_binary(&mut heap));
                     return TtbStep::Done(value, 1);
                 }
-                let size = tri!(context.walk.encoded_size().ok_or(BifError::SystemLimit));
+                let size = tri!(context.walk.output_size().ok_or(BifError::SystemLimit));
                 if context.walk.uses_compression() {
                     let mut heap = ProcessHeapHandle(&mut process.heap);
                     let output = tri!(arinsal_bifs::allocate_iolist_binary(&mut heap, size));
@@ -372,7 +372,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                 }
             }
             TtbState::Encode(binary) => {
-                let size = tri!(context.walk.encoded_size().ok_or(BifError::SystemLimit));
+                let size = tri!(context.walk.output_size().ok_or(BifError::SystemLimit));
                 let budget = chunk.saturating_sub(work);
                 let bytes = tri!(
                     binary
@@ -403,7 +403,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                 }
                 arinsal_bifs::finish_iolist_binary_output(output);
                 // The deflate stream starts: the destination holds the 6-byte header.
-                let size = tri!(context.walk.encoded_size().ok_or(BifError::SystemLimit));
+                let size = tri!(context.walk.output_size().ok_or(BifError::SystemLimit));
                 let mut heap = ProcessHeapHandle(&mut process.heap);
                 let destination = tri!(arinsal_bifs::allocate_iolist_binary(&mut heap, size));
                 tri!(arinsal_bifs::with_iolist_binary_output(
@@ -435,7 +435,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                 destination,
             } => {
                 let (source, destination) = (*source, *destination);
-                let size = tri!(context.walk.encoded_size().ok_or(BifError::SystemLimit));
+                let size = tri!(context.walk.output_size().ok_or(BifError::SystemLimit));
                 let walk = &mut context.walk;
                 if !walk.compression_output_full() {
                     let budget = chunk.saturating_sub(work).max(1);
