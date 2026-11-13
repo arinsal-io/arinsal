@@ -3652,11 +3652,11 @@ fn enqueue_sysmon(
     receiver: arinsal_sched::Pid,
     message: Message,
 ) {
-    if let (Ok(scheduler), Some(to)) = (runtime.scheduler(), receiver.to_term()) {
+    if runtime.scheduler().is_ok()
+        && let Some(to) = receiver.to_term()
+    {
         crate::erl_trace::enqueue_sys_msg(
             crate::erl_trace::SysMsgType::Sysmon,
-            scheduler,
-            Some(runtime),
             Some(from),
             to,
             message,

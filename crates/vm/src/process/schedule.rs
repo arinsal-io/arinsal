@@ -140,11 +140,7 @@ impl Task for Process {
         }
     }
 
-    fn scheduler_profile_event(
-        scheduler_id: u32,
-        active: bool,
-        active_schedulers: u32,
-    ) -> Option<(Pid, Message)> {
+    fn scheduler_profile_event(scheduler_id: u32, active: bool, active_schedulers: u32) {
         crate::natives::misc::profile_scheduler_event(scheduler_id, active, active_schedulers)
     }
 

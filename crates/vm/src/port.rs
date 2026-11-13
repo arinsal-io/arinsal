@@ -2271,10 +2271,10 @@ impl arinsal_drv::PortHost for DrvHost {
         if !crate::natives::misc::profile_ports_enabled() {
             return;
         }
-        let Some(handle) = self.handle(port.id()) else {
+        let Some(_handle) = self.handle(port.id()) else {
             return;
         };
-        crate::natives::misc::profile_port_event(&handle.scheduler, port.id(), active);
+        crate::natives::misc::profile_port_event(port.id(), active);
     }
 
     // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
@@ -3314,7 +3314,7 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
         }
     }
     if became_inactive {
-        crate::natives::misc::profile_port_event(&handle.scheduler, handle.id, false);
+        crate::natives::misc::profile_port_event(handle.id, false);
     }
     woken
 }
@@ -3375,7 +3375,7 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
         became_active
     };
     if became_active {
-        crate::natives::misc::profile_port_event(&handle.scheduler, handle.id, true);
+        crate::natives::misc::profile_port_event(handle.id, true);
     }
     poke(handle);
     Ok(())
