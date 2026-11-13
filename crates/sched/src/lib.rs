@@ -1613,6 +1613,9 @@ pub mod proc_flags {
     /// `ERTS_PSFLG_SUSPENDED`: the process has an active suspend (erl_process.c:7235 suspend_process).
     /// Set by the suspend path, cleared when the last suspend is released. Outside `ALL`.
     pub const SUSPENDED: u32 = 1 << 13;
+    /// `F_DISTRIBUTION`: the process is `net_kernel` (set by `setnode/2` under the thread
+    /// progress block), so its exit runs `erts_do_net_exits` for this node. Outside `ALL`.
+    pub const DISTRIBUTION: u32 = 1 << 12;
     /// Sets a state bit of the owning process (no cleanup bookkeeping).
     pub fn set_state(flags: &AtomicU32, bit: u32) {
         flags.fetch_or(bit, Ordering::AcqRel);
@@ -7035,6 +7038,14 @@ impl<T: Task> Scheduler<T> {
                 && process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q)
                     == 0
         })
+    }
+    /// Run `op` between `erts_thr_progress_block` and `erts_thr_progress_unblock`, from a
+    /// scheduler thread outside a process (misc aux work).
+    // Port of erts/emulator/beam/erl_thr_progress.c:1386,1441, OTP-29.1.1.
+    pub fn with_thread_progress_blocked(&self, op: impl FnOnce()) {
+        thr_progress::block(&self.inner.progress);
+        op();
+        thr_progress::unblock(&self.inner.progress);
     }
     /// Run `op` after every managed thread of this scheduler passed a thread-progress point.
     /// Calls from non-managed threads join the same later-operation queue.

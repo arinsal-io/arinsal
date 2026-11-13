@@ -179,7 +179,7 @@ fn report_max_heap(
     };
     let node_name = {
         let nodes = crate::node_tables::lock();
-        nodes.alive.then(|| nodes.local_identity().0.to_owned())
+        crate::node_tables::is_alive().then(|| nodes.local_identity().0.to_owned())
     };
     let mut format = String::from("     Process:            ~p ");
     if node_name.is_some() {

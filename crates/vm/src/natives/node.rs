@@ -111,7 +111,7 @@ pub(crate) fn call_nodes2(
 
 fn call_setnode2(
     _vm: &mut Vm,
-    _process: &mut Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
@@ -129,13 +129,43 @@ fn call_setnode2(
         }
         _ => return Err(badarg()),
     };
-    // erts_thr_progress_block() .. erts_thr_progress_unblock() around erts_set_this_node
-    // (dist.c:5018,5058): no managed thread reads the node identity while it changes.
-    let mut renamed = false;
+    if name == "nonode@nohost" || node_tables::is_alive() || !node_tables::is_node_name(name) {
+        return Err(badarg());
+    }
+    let runtime = process.runtime.ok_or_else(badarg)?;
+    let net_kernel = runtime
+        .reg
+        .whereis_proc_str("net_kernel")
+        .ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler()?;
+    // erts_thr_progress_block() .. erts_thr_progress_unblock() (dist.c:5018,5058): no managed
+    // thread reads the node identity while it changes.
+    let mut success = false;
+    let mut events = Vec::new();
     ctx.with_thread_progress_blocked(|| {
-        renamed = node_tables::set_this_node(name.clone(), creation);
+        use arinsal_sched::proc_flags;
+        success = scheduler
+            .with_proc_flags(net_kernel, |flags| {
+                let state = flags.load(std::sync::atomic::Ordering::Acquire);
+                if state & (proc_flags::EXITING | proc_flags::DISTRIBUTION) != 0 {
+                    return false;
+                }
+                // Port of dist.c:5030-5037: a creation below 4 is raised to 4.
+                node_tables::inc_no_nodes();
+                node_tables::set_this_node(name.clone(), creation.max(4));
+                node_tables::set_alive(true);
+                events =
+                    node_tables::lock().nodes_monitor_events("nodeup", name, u32::MAX, true, None);
+                // F_DISTRIBUTION: the exit of net_kernel runs erts_do_net_exits (dist.c:5045).
+                proc_flags::set_state(flags, proc_flags::DISTRIBUTION);
+                true
+            })
+            .unwrap_or(false);
+        if success {
+            let _ = crate::dist::send_nodes_monitor_events(scheduler, std::mem::take(&mut events));
+        }
     });
-    if !renamed {
+    if !success {
         return Err(badarg());
     }
     Ok(Term::atom(arinsal_term::atoms::TRUE))
@@ -339,7 +369,7 @@ fn monitor_node(
     };
     monitor_options(options)?;
     let mut tables = node_tables::lock();
-    if name != "nonode@nohost" && !tables.alive {
+    if name != "nonode@nohost" && !node_tables::is_alive() {
         return Err(error("notalive"));
     }
     let immediate = tables.monitor(ctx.pid(), name.clone(), enabled);

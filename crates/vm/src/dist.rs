@@ -250,7 +250,7 @@ fn create_channel(
     let owner = ctx.pid();
     let visible = flags & 0x01 != 0; // DFLAG_PUBLISHED
     let mut tables = node_tables::lock();
-    if !tables.alive || node == &tables.local_name {
+    if !node_tables::is_alive() || node == &tables.local_name {
         return Err(badarg());
     }
     let local_name = tables.local_name.clone();
@@ -333,6 +333,8 @@ fn create_channel(
         }
     }
     drop(entry);
+    // Port of erts/emulator/beam/dist.c:5450 (erts_internal_create_dist_channel_3).
+    node_tables::inc_no_nodes();
     let nodeup_events = tables.nodes_monitor_events("nodeup", node, conn_id, visible, None);
     drop(tables);
     // OTP queues the net_kernel controller notification before node monitor
@@ -341,7 +343,10 @@ fn create_channel(
     if let Some(port_id) = port_controller {
         flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
     }
-    send_nodes_monitor_events(process.runtime.as_ref().ok_or_else(badarg)?, nodeup_events)?;
+    send_nodes_monitor_events(
+        process.runtime.as_ref().ok_or_else(badarg)?.scheduler()?,
+        nodeup_events,
+    )?;
     if let Some(handler) = flush_notify {
         ctx.send(
             handler,
@@ -1067,32 +1072,7 @@ fn notify_auto_connect(
 ) -> Result<bool, VmError> {
     let runtime = process.runtime.ok_or_else(badarg)?;
     let Some(net_kernel) = runtime.reg.whereis_proc_str("net_kernel") else {
-        let mld = {
-            let mut tables = node_tables::lock();
-            let aborts = tables
-                .entries
-                .get(node)
-                .map(|dep| dep.lock())
-                .is_some_and(|entry| {
-                    entry.entry_ref == entry_ref
-                        && entry.connection_id == conn_id
-                        && entry.state == node_tables::ConnState::Pending
-                });
-            let (mld, spawn_downs) = if aborts {
-                (
-                    tables.take_mld(node),
-                    take_connection_spawn_requests(&mut tables, node),
-                )
-            } else {
-                (None, Vec::new())
-            };
-            let _ = tables.abort_pending(node, conn_id, entry_ref);
-            (mld, spawn_downs)
-        };
-        let (mld, spawn_downs) = mld;
-        elink::links_connection_down(runtime, mld.clone());
-        emon::monitors_connection_down(runtime, mld.as_ref());
-        notify_connection_spawn_requests(runtime, spawn_downs)?;
+        abort_pending_connection_locally(runtime, node, conn_id, entry_ref)?;
         return Ok(false);
     };
     let (local_name, local_creation) = {
@@ -1114,6 +1094,87 @@ fn notify_auto_connect(
     ctx.send(net_kernel, owned_to_message(&msg)?)
         .map_err(|error| VmError::Unsupported(format!("auto_connect notify: {error}")))?;
     Ok(true)
+}
+
+/// Abort a pending connection and release its links, monitors and spawn requests.
+// Port of erts/emulator/beam/dist.c:5681 (abort_pending_connection), OTP-29.1.1.
+fn abort_pending_connection_locally(
+    runtime: &'static crate::process::Runtime,
+    node: &str,
+    conn_id: u32,
+    entry_ref: u64,
+) -> Result<(), VmError> {
+    let (mld, spawn_downs) = {
+        let mut tables = node_tables::lock();
+        let aborts = tables
+            .entries
+            .get(node)
+            .map(|dep| dep.lock())
+            .is_some_and(|entry| {
+                entry.entry_ref == entry_ref
+                    && entry.connection_id == conn_id
+                    && entry.state == node_tables::ConnState::Pending
+            });
+        let (mld, spawn_downs) = if aborts {
+            (
+                tables.take_mld(node),
+                take_connection_spawn_requests(&mut tables, node),
+            )
+        } else {
+            (None, Vec::new())
+        };
+        let _ = tables.abort_pending(node, conn_id, entry_ref);
+        (mld, spawn_downs)
+    };
+    elink::links_connection_down(runtime, mld.clone());
+    emon::monitors_connection_down(runtime, mld.as_ref());
+    notify_connection_spawn_requests(runtime, spawn_downs)
+}
+
+/// `net_kernel` exited: kill every distribution controller port, abort the pending
+/// connections and drop net_kernel's own `no_nodes` count; the node goes not-alive once the
+/// last controller is gone.
+// Port of erts/emulator/beam/dist.c:922 (erts_do_net_exits, `dep == erts_this_dist_entry`
+// branch and the final dec_no_nodes), OTP-29.1.1.
+pub(crate) fn net_kernel_exited(
+    process: &mut Process,
+    runtime: &'static crate::process::Runtime,
+    reason: Term,
+) -> Result<(), VmError> {
+    let no_network = global_atoms().intern("no_network").ok();
+    let nd_reason = if reason.as_atom().is_some() && reason.as_atom() == no_network {
+        "no_network"
+    } else {
+        "net_kernel_terminated"
+    };
+    let (ports, pending) = {
+        let tables = node_tables::lock();
+        let mut ports = Vec::new();
+        let mut pending = Vec::new();
+        for (name, dep) in &tables.entries {
+            let entry = dep.lock();
+            if let Some(port_id) = entry.dist.as_ref().and_then(|state| state.port_id)
+                && entry.state == node_tables::ConnState::Connected
+            {
+                ports.push(port_id);
+            } else if entry.state == node_tables::ConnState::Pending {
+                pending.push((name.clone(), entry.connection_id, entry.entry_ref));
+            }
+        }
+        (ports, pending)
+    };
+    let reason_term = Term::atom(global_atoms().intern(nd_reason).map_err(|_| badarg())?);
+    for port_id in ports {
+        if let Some(port) = Term::port(port_id) {
+            crate::port::exit_port(process, port, reason_term)?;
+        }
+    }
+    for (name, conn_id, entry_ref) in pending {
+        abort_pending_connection_locally(runtime, &name, conn_id, entry_ref)?;
+    }
+    node_tables::set_nodedown_reason(nd_reason);
+    node_tables::dec_no_nodes(runtime);
+    Ok(())
 }
 
 /// Ingest one length-delimited distribution packet from a DistCtrlr inet port.
@@ -1278,7 +1339,10 @@ pub(crate) fn port_connection_closed(
     emon::monitors_connection_down(runtime, mld.as_ref());
     notify_node_watchers(runtime, &node, watchers)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
-    send_nodes_monitor_events(runtime, node_events)
+    send_nodes_monitor_events(runtime.scheduler()?, node_events)?;
+    // Port of erts/emulator/beam/dist.c:1114 (erts_do_net_exits: dec_no_nodes).
+    node_tables::dec_no_nodes(runtime);
+    Ok(())
 }
 
 /// Kill a connected distribution entry that has no port controller.
@@ -1309,7 +1373,9 @@ pub(crate) fn kill_connection(
     emon::monitors_connection_down(runtime, mld.as_ref());
     notify_node_watchers(runtime, node, watchers)?;
     notify_connection_spawn_requests(runtime, spawn_downs)?;
-    send_nodes_monitor_events(runtime, node_events)?;
+    send_nodes_monitor_events(runtime.scheduler()?, node_events)?;
+    // Port of erts/emulator/beam/dist.c:1114 (erts_do_net_exits: dec_no_nodes).
+    node_tables::dec_no_nodes(runtime);
     Ok(true)
 }
 
@@ -1419,11 +1485,10 @@ pub(crate) fn spawn_noconnection_message(
     .map(Some)
 }
 
-fn send_nodes_monitor_events(
-    runtime: &crate::process::Runtime,
+pub(crate) fn send_nodes_monitor_events(
+    scheduler: &arinsal_sched::Scheduler<Process>,
     events: Vec<node_tables::NodesMonitorEvent>,
 ) -> Result<(), VmError> {
-    let scheduler = runtime.scheduler()?;
     for event in events {
         let mut heap = arinsal_term::VecHeap::new();
         let term = arinsal_term::from_owned(&event.message, &mut heap)
@@ -1782,7 +1847,7 @@ fn dist_spawn_request(
     };
     let (local, alive) = {
         let tables = node_tables::lock();
-        (tables.local_name.clone(), tables.alive)
+        (tables.local_name.clone(), node_tables::is_alive())
     };
     if node == local || node == "nonode@nohost" || !alive {
         return fallback_dist_spawn(vm, process, ctx, args);

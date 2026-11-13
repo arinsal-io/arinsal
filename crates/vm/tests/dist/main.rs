@@ -3,3 +3,4 @@
 mod common;
 
 mod dist_mixed;
+mod dist_restart;

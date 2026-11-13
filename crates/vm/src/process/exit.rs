@@ -340,6 +340,19 @@ impl Process {
                 scheduler.clear_registered_atom_index(ctx.pid(), index);
             }
         }
+        // Port of erts/emulator/beam/erl_process.c:14470-14504
+        // (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS_AFTER), OTP-29.1.1: after the name is gone,
+        // the exit of the F_DISTRIBUTION process (net_kernel) runs erts_do_net_exits.
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DISTRIBUTION != 0
+            && let Some(runtime) = self.runtime
+        {
+            let reason = if reason == Term::atom(arinsal_term::atoms::KILL) {
+                Term::atom(arinsal_term::atoms::KILLED)
+            } else {
+                reason
+            };
+            let _ = crate::dist::net_kernel_exited(self, runtime, reason);
+        }
         // Port of erts/emulator/beam/erl_process.c:14438-14456
         // (ERTS_CONTINUE_EXIT_FREE), OTP-29.1.1: unregister the name, then mark the pid
         // dead in the process table. Later exit phases process links, monitors and signals.
@@ -538,7 +551,7 @@ pub(super) fn report_process_error(
     };
     let node_name = {
         let nodes = crate::node_tables::lock();
-        nodes.alive.then(|| nodes.local_identity().0.to_owned())
+        crate::node_tables::is_alive().then(|| nodes.local_identity().0.to_owned())
     };
     let format = if node_name.is_some() {
         "Error in process ~p on node ~p with exit value:~n~p~n"

@@ -88,7 +88,7 @@ pub use heap::{
     LiteralArea, MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord,
     TemporaryHeap, TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
 };
-pub use identity::{Identity, Node, set_this_node, this_node};
+pub use identity::{Identity, Node, set_this_node, this_node, this_node_sysname};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use literal_decode::decode_literal;
