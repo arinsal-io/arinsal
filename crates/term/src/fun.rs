@@ -327,6 +327,8 @@ pub const EXPORT_TRAMPOLINE_OP_OFFSET: u32 = (core::mem::offset_of!(ExportEntry,
 
 /// Byte offset of [`ExportEntry::info`] for generated loads.
 pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;
+/// Byte offset of [`ExportEntry::mfa`] (`Export.info.mfa`): the address `c_p->current` holds.
+pub const EXPORT_MFA_OFFSET: u32 = core::mem::offset_of!(ExportEntry, mfa) as u32;
 const _: () = assert!(core::mem::offset_of!(ExportEntry, dispatch) == 0);
 const _: () = assert!(core::mem::offset_of!(FunEntry, dispatch_target) == 0);
 

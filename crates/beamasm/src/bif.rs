@@ -178,7 +178,8 @@ pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32)
 /// export funs point at the same entries.
 // Port of erts/emulator/beam/code_ix.h:72-95 and erts/emulator/beam/export.h:39-75, OTP-29.1.1.
 pub use arinsal_term::{
-    ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET, ExportEntry,
+    ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET,
+    EXPORT_MFA_OFFSET, ExportEntry,
 };
 /// Byte offset of [`ExportEntry::arity`] for the light-BIF yield path.
 // Port of erts/emulator/beam/export.h:69-86 (Export.info.mfa.arity), OTP-29.1.1.
