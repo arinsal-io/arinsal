@@ -1,20 +1,6 @@
-//! Raw access to ETF bytes already checked by `decoded_size`.
+//! Raw access to the decoder's heap slots.
 
-use arinsal_etf::ValidatedEtfBody;
 use std::num::NonZeroUsize;
-
-// Port of erts/emulator/beam/external.c:4308-5445 (`dec_term`), OTP-29.1.1.
-
-/// Read a range whose tag and length were validated by `DecodedSizeWalk`.
-#[inline(always)]
-pub(super) fn take_validated(body: ValidatedEtfBody<'_>, at: usize, length: usize) -> &[u8] {
-    let bytes = body.as_bytes();
-    debug_assert!(at <= bytes.len());
-    debug_assert!(length <= bytes.len() - at);
-    // SAFETY: the sizing pass validated every ETF field boundary in this same byte slice;
-    // `ValidatedEtfBody` binds the decoder to that slice and its checked term end.
-    unsafe { std::slice::from_raw_parts(bytes.as_ptr().add(at), length) }
-}
 
 /// A slot address inside the heap reservation held by an active ETF decode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

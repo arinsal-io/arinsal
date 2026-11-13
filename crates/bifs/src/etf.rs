@@ -5,14 +5,13 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
-use arinsal_etf::{DecodedSizeWalk, ValidatedEtfBody};
 use arinsal_term::raw::{Cons, Tuple, term_at_pointer, term_from_bits};
 use arinsal_term::{
     Atom, AtomEncoding, BinaryOwner, BinaryRef, ConsListBuilder, ExportEntry, FunEntry, FunRef,
     HeapAlloc, HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords,
     HeapTermSlot, HxNode, Identity, Node, OwnedBinaryRef, ProcessHeap, RefcBinary, Term,
     TermBuilder, TermKind, atoms, binary_owner, cmp_exact, flat_key_cmp, global_atoms,
-    hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array, hashmap_key_hash,
+    hashmap_from_unsorted_array, hashmap_key_hash,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
@@ -143,7 +142,7 @@ fn block_hash_mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
 }
 
 // Port of erts/emulator/beam/external.c:4046-4105, OTP-29.1.1.
-fn local_term_hash(bytes: &[u8]) -> u32 {
+pub fn local_term_hash(bytes: &[u8]) -> u32 {
     block_hash(bytes, local_node_hash())
 }
 
@@ -2359,22 +2358,12 @@ fn decode_input(args: &[Term]) -> Result<DecodeInput<'_>, BifError> {
     }
 }
 
-struct Reader<'a, const VALIDATED: bool = false> {
+struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
-    validated: Option<ValidatedEtfBody<'a>>,
 }
-impl<const VALIDATED: bool> Reader<'_, VALIDATED> {
+impl Reader<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], BifError> {
-        if VALIDATED {
-            let part = super::raw::take_validated(
-                self.validated.expect("validated reader token"),
-                self.at,
-                n,
-            );
-            self.at += n;
-            return Ok(part);
-        }
         let end = self.at.checked_add(n).ok_or(BifError::BADARG)?;
         let part = self
             .bytes
@@ -2447,64 +2436,8 @@ impl<const VALIDATED: bool> Reader<'_, VALIDATED> {
 
 impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8], at: usize) -> Self {
-        Self {
-            bytes,
-            at,
-            validated: None,
-        }
+        Self { bytes, at }
     }
-}
-
-impl<'a> Reader<'a, true> {
-    fn from_validated_at(body: ValidatedEtfBody<'a>, at: usize) -> Self {
-        Self {
-            bytes: body.as_bytes(),
-            at,
-            validated: Some(body),
-        }
-    }
-}
-
-enum Shape {
-    /// `None` is an interned atom. `Some` keeps the text only when the index is `NONAME`.
-    Atom(Option<String>),
-    Int(i64),
-    Pid,
-    Other,
-}
-
-enum FrameKind {
-    Local {
-        hash: u32,
-        term_start: usize,
-    },
-    Tuple {
-        slots: Option<arinsal_term::HeapBlockBuilder>,
-    },
-    List {
-        slots: Option<ConsListBuilder>,
-    },
-    Map {
-        keys: SmallVec<[Term; 4]>,
-        map_values: SmallVec<[Term; 4]>,
-    },
-    Export,
-    Fun {
-        arity: u8,
-        uniq: [u8; 16],
-        index: u32,
-        free: usize,
-    },
-    Record {
-        exported: bool,
-        fields: usize,
-    },
-}
-struct Frame {
-    kind: FrameKind,
-    left: usize,
-    values: SmallVec<[Term; 4]>,
-    shapes: SmallVec<[Shape; 4]>,
 }
 
 #[derive(Clone, Copy)]
@@ -2557,640 +2490,11 @@ enum DecodePending {
     },
 }
 
-fn built<H: HeapAlloc>(
-    ctx: &mut Option<&mut Ctx<'_, H>>,
-    f: impl FnOnce(&mut TermBuilder<'_, Heap<'_, H>>) -> Result<Term, arinsal_term::TermError>,
-) -> Result<Term, BifError> {
-    if let Some(ctx) = ctx.as_deref_mut() {
-        let mut heap = Heap(&mut ctx.heap);
-        f(&mut TermBuilder::new(&mut heap)).map_err(map_term_build_error)
-    } else {
-        Ok(Term::NIL)
-    }
-}
-
 fn map_term_build_error(error: arinsal_term::TermError) -> BifError {
     match error {
         arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
         _ => BifError::BADARG,
     }
-}
-
-// Port of erts/emulator/beam/external.c (dec_term, tuple_loop), OTP-29.1.1.
-fn reserve_tuple_slots<H: HeapAlloc>(
-    ctx: &mut Option<&mut Ctx<'_, H>>,
-    arity: usize,
-) -> Result<Option<arinsal_term::HeapBlockBuilder>, BifError> {
-    let Some(ctx) = ctx.as_deref_mut() else {
-        return Ok(None);
-    };
-    let mut heap = Heap(&mut ctx.heap);
-    TermBuilder::new(&mut heap)
-        .reserve_tuple_block(arity)
-        .map(Some)
-        .map_err(map_term_build_error)
-}
-
-// Port of erts/emulator/beam/external.c (dec_term, next child slot), OTP-29.1.1.
-fn accept_child(frame: &mut Frame, term: Term, shape: Shape) -> Result<(), BifError> {
-    match &mut frame.kind {
-        FrameKind::Tuple { slots } => {
-            if let Some(slots) = slots {
-                slots.write_term(term).map_err(map_term_build_error)?;
-            }
-        }
-        FrameKind::Map { keys, map_values } => {
-            if frame.left.is_multiple_of(2) {
-                keys.push(term);
-            } else {
-                map_values.push(term);
-            }
-        }
-        FrameKind::List { slots: Some(slots) } if frame.left > 1 => {
-            slots.append(term).map_err(map_term_build_error)?;
-        }
-        _ => {
-            frame.values.push(term);
-            frame.shapes.push(shape);
-        }
-    }
-    Ok(())
-}
-
-fn finish<H: HeapAlloc>(
-    frame: Frame,
-    ctx: &mut Option<&mut Ctx<'_, H>>,
-) -> Result<(Term, Shape), BifError> {
-    let values = frame.values;
-    match frame.kind {
-        FrameKind::Local { .. } => Err(BifError::BADARG),
-        FrameKind::Tuple { slots } => {
-            let term = if let Some(slots) = slots {
-                slots.finish().map_err(map_term_build_error)?
-            } else {
-                Term::NIL
-            };
-            Ok((term, Shape::Other))
-        }
-        FrameKind::List { slots: Some(slots) } => {
-            let tail = values.into_iter().next().ok_or(BifError::BADARG)?;
-            let term = slots.finish(tail).map_err(map_term_build_error)?;
-            Ok((term, Shape::Other))
-        }
-        FrameKind::List { slots: None } => {
-            let mut it = values.into_iter().rev();
-            let mut tail = it.next().ok_or(BifError::BADARG)?;
-            if ctx.is_some() {
-                for head in it {
-                    tail = built(ctx, |b| b.cons(head, tail))?;
-                }
-            }
-            Ok((tail, Shape::Other))
-        }
-        FrameKind::Map {
-            mut keys,
-            mut map_values,
-        } => {
-            // Port of erts/emulator/beam/external.c:5047-5060, 5428-5445
-            // (decoded key/value arrays and bottom-up map construction), OTP-29.1.1.
-            if ctx.is_some() {
-                let ctx = ctx.as_deref_mut().unwrap();
-                if keys.len() <= 32 {
-                    for index in 1..keys.len() {
-                        let mut current = index;
-                        while current > 0 {
-                            match flat_key_cmp(keys[current], keys[current - 1]) {
-                                Ordering::Greater => break,
-                                Ordering::Equal => return Err(BifError::BADARG),
-                                Ordering::Less => {
-                                    keys.swap(current, current - 1);
-                                    map_values.swap(current, current - 1);
-                                    current -= 1;
-                                }
-                            }
-                        }
-                    }
-                    let map = TermBuilder::new(&mut ctx.heap)
-                        .flatmap_from_sorted_arrays(&keys, &map_values)
-                        .map_err(map_term_build_error)?;
-                    Ok((map, Shape::Other))
-                } else {
-                    let map =
-                        hashmap_from_ks_and_vs_extra(&keys, &map_values, None, true, &mut ctx.heap)
-                            .map_err(map_term_build_error)?
-                            .ok_or(BifError::BADARG)?;
-                    Ok((map, Shape::Other))
-                }
-            } else {
-                Ok((Term::NIL, Shape::Other))
-            }
-        }
-        FrameKind::Export => {
-            if !matches!(
-                frame.shapes.as_slice(),
-                [Shape::Atom(_), Shape::Atom(_), Shape::Int(0..=255)]
-            ) {
-                return Err(BifError::BADARG);
-            }
-            let term = if ctx.is_some() {
-                let entry = Arc::new(ExportEntry::new(
-                    values[0].as_atom().unwrap(),
-                    values[1].as_atom().unwrap(),
-                    values[2].as_small().ok_or(BifError::BADARG)? as u8,
-                ));
-                built(ctx, |b| b.export_fun(entry))?
-            } else {
-                Term::NIL
-            };
-            Ok((term, Shape::Other))
-        }
-        FrameKind::Fun {
-            arity,
-            uniq,
-            index,
-            free,
-        } => {
-            if !matches!(frame.shapes.first(), Some(Shape::Atom(_)))
-                || !matches!(frame.shapes.get(1), Some(Shape::Int(0..=4_294_967_295)))
-                || !matches!(frame.shapes.get(2), Some(Shape::Int(0..=4_294_967_295)))
-                || !matches!(frame.shapes.get(3), Some(Shape::Pid))
-            {
-                return Err(BifError::BADARG);
-            }
-            let term = if ctx.is_some() {
-                let entry = Arc::new(FunEntry {
-                    dispatch_target: Default::default(),
-                    pend_purge_address: Default::default(),
-                    module: values[0].as_atom().unwrap(),
-                    arity,
-                    index,
-                    uniq,
-                    old_index: values[1].as_small().ok_or(BifError::BADARG)? as u32,
-                    old_uniq: values[2].as_small().ok_or(BifError::BADARG)? as u32,
-                    pid: values[3],
-                    dispatch: Default::default(),
-                    dispatch_epoch: Default::default(),
-                });
-                // Port of erts/emulator/beam/external.c:5162-5168, OTP-29.1.1.
-                built(ctx, |b| b.local_fun_stub(entry, &values[4..4 + free]))?
-            } else {
-                Term::NIL
-            };
-            Ok((term, Shape::Other))
-        }
-        FrameKind::Record { exported, fields } => {
-            let mut seen = std::collections::HashSet::new();
-            let mut unknown = std::collections::HashSet::new();
-            for (index, shape) in frame.shapes[..fields + 2].iter().enumerate() {
-                match shape {
-                    Shape::Atom(None) => {
-                        if index >= 2 {
-                            let atom = values[index].as_atom().ok_or(BifError::BADARG)?;
-                            if !seen.insert(atom) {
-                                return Err(BifError::BADARG);
-                            }
-                        }
-                    }
-                    Shape::Atom(Some(name)) => {
-                        if index >= 2 && !unknown.insert(name.as_str()) {
-                            return Err(BifError::BADARG);
-                        }
-                    }
-                    _ => return Err(BifError::BADARG),
-                }
-            }
-            let term = if ctx.is_some() {
-                let pairs: SmallVec<[(arinsal_term::Atom, Term); 4]> = (0..fields)
-                    .map(|i| (values[i + 2].as_atom().unwrap(), values[i + fields + 2]))
-                    .collect();
-                built(ctx, |b| {
-                    b.native_record(
-                        values[0].as_atom().unwrap(),
-                        values[1].as_atom().unwrap(),
-                        exported,
-                        &pairs,
-                    )
-                })?
-            } else {
-                Term::NIL
-            };
-            Ok((term, Shape::Other))
-        }
-    }
-}
-
-fn count_ok(count: usize, remaining: usize, input_complete: bool) -> Result<(), BifError> {
-    if count > remaining {
-        if input_complete {
-            Err(BifError::BADARG)
-        } else {
-            Err(BifError::Unsupported("incomplete ETF input"))
-        }
-    } else {
-        Ok(())
-    }
-}
-
-fn parse_step<H: HeapAlloc>(
-    r: &mut Reader,
-    stack: &mut SmallVec<[Frame; 4]>,
-    safe: bool,
-    local_node: Option<(arinsal_term::Atom, u32)>,
-    mut ctx: Option<&mut Ctx<'_, H>>,
-    budget: usize,
-    input_complete: bool,
-) -> Result<Option<(Term, usize)>, BifError> {
-    // Port of erts/emulator/beam/external.c:116 (`B2T_BYTES_PER_REDUCTION` 128) and
-    // the dec_term reds loop, OTP-29.1.1. `budget` is a byte limit. A tag that
-    // starts inside the limit may finish past it; the next call then traps.
-    let byte_limit = r.at.saturating_add(budget);
-    while r.at < byte_limit {
-        let tag = r.u8()?;
-        let result: Option<(Term, Shape)> = match tag {
-            121 => {
-                // Port of erts/emulator/beam/external.c:6437-6445 (LOCAL_EXT), OTP-29.1.1.
-                let hash = r.u32()?;
-                stack.push(Frame {
-                    kind: FrameKind::Local {
-                        hash,
-                        term_start: r.at,
-                    },
-                    left: 1,
-                    values: SmallVec::new(),
-                    shapes: SmallVec::new(),
-                });
-                None
-            }
-            97 | 98 => {
-                // Port of erts/emulator/beam/external.c:4452 (SMALL_INTEGER_EXT / INTEGER_EXT
-                // make_small), OTP-29.1.1. Both tags fit in an immediate small.
-                let n = if tag == 97 {
-                    r.u8()? as i64
-                } else {
-                    r.u32()? as i32 as i64
-                };
-                Some((Term::small(n).ok_or(BifError::BADARG)?, Shape::Int(n)))
-            }
-            110 | 111 => {
-                let len = if tag == 110 {
-                    r.u8()? as usize
-                } else {
-                    r.u32()? as usize
-                };
-                let sign = r.u8()?;
-                let number = BigInt::from_bytes_le(
-                    if sign == 0 { Sign::Plus } else { Sign::Minus },
-                    r.take(len)?,
-                );
-                let shape = number.to_i64().map_or(Shape::Other, Shape::Int);
-                Some((built(&mut ctx, |b| b.int_from_bigint(&number))?, shape))
-            }
-            70 | 99 => {
-                let f = if tag == 70 {
-                    f64::from_bits(r.u64()?)
-                } else {
-                    let raw = r.take(31)?;
-                    let end = raw.iter().position(|b| *b == 0).unwrap_or(31);
-                    std::str::from_utf8(&raw[..end])
-                        .map_err(|_| BifError::BADARG)?
-                        .parse::<f64>()
-                        .map_err(|_| BifError::BADARG)?
-                };
-                if !f.is_finite() {
-                    return Err(BifError::BADARG);
-                }
-                Some((built(&mut ctx, |b| b.float(f))?, Shape::Other))
-            }
-            100 | 115 | 118 | 119 => {
-                r.at -= 1;
-                let (term, unknown) = r.atom(safe, ctx.is_some())?;
-                Some((term, Shape::Atom(unknown)))
-            }
-            73 | 75 => {
-                // Port of external.c:5177-5190 (internal atom references), OTP-29.1.1.
-                let index = if tag == 73 {
-                    r.u16()? as u32
-                } else {
-                    let b = r.take(3)?;
-                    u32::from_be_bytes([0, b[0], b[1], b[2]])
-                };
-                let atom = arinsal_term::Atom(index);
-                if global_atoms().text(atom).is_none() {
-                    return Err(BifError::BADARG);
-                }
-                Some((Term::atom(atom), Shape::Atom(None)))
-            }
-            106 => Some((Term::NIL, Shape::Other)),
-            104 | 105 => {
-                let n = if tag == 104 {
-                    r.u8()? as usize
-                } else {
-                    r.u32()? as usize
-                };
-                count_ok(n, r.bytes.len() - r.at, input_complete)?;
-                if n == 0 {
-                    Some((built(&mut ctx, |b| b.tuple(&[]))?, Shape::Other))
-                } else {
-                    let slots = reserve_tuple_slots(&mut ctx, n)?;
-                    stack.push(Frame {
-                        kind: FrameKind::Tuple { slots },
-                        left: n,
-                        values: SmallVec::new(),
-                        shapes: SmallVec::new(),
-                    });
-                    None
-                }
-            }
-            107 => {
-                // Port of erts/emulator/beam/external.c:4615 (STRING_EXT), OTP-29.1.1.
-                let n = r.u16()? as usize;
-                let raw = r.take(n)?;
-                let tail = if let Some(ctx) = ctx.as_deref_mut() {
-                    TermBuilder::new(&mut ctx.heap)
-                        .byte_string_list(raw)
-                        .map_err(|error| match error {
-                            arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
-                            _ => BifError::BADARG,
-                        })?
-                } else {
-                    Term::NIL
-                };
-                Some((tail, Shape::Other))
-            }
-            108 | 116 => {
-                let n = r.u32()? as usize;
-                let count = if tag == 108 {
-                    n.checked_add(1)
-                } else {
-                    n.checked_mul(2)
-                }
-                .ok_or(BifError::BADARG)?;
-                count_ok(count, r.bytes.len() - r.at, input_complete)?;
-                if count == 0 {
-                    let t = if let Some(ctx) = ctx.as_deref_mut() {
-                        arinsal_maps::from_pairs(&[], &mut ctx.heap)
-                            .map_err(|_| BifError::BADARG)?
-                    } else {
-                        Term::NIL
-                    };
-                    Some((t, Shape::Other))
-                } else {
-                    stack.push(Frame {
-                        kind: if tag == 108 {
-                            let slots = if let Some(context) = ctx.as_deref_mut() {
-                                Some(
-                                    TermBuilder::new(&mut context.heap)
-                                        .reserve_cons_list(n)
-                                        .map_err(map_term_build_error)?,
-                                )
-                            } else {
-                                None
-                            };
-                            FrameKind::List { slots }
-                        } else {
-                            FrameKind::Map {
-                                keys: SmallVec::with_capacity(n.min(1024)),
-                                map_values: SmallVec::with_capacity(n.min(1024)),
-                            }
-                        },
-                        left: count,
-                        values: if tag == 108 {
-                            SmallVec::with_capacity(count.min(1024))
-                        } else {
-                            SmallVec::new()
-                        },
-                        shapes: SmallVec::new(),
-                    });
-                    None
-                }
-            }
-            109 | 77 => {
-                let n = r.u32()? as usize;
-                let bits = if tag == 77 { r.u8()? as usize } else { 8 };
-                if tag == 77 && (n == 0 || !(1..=8).contains(&bits)) {
-                    return Err(BifError::BADARG);
-                }
-                let raw = r.take(n)?;
-                let bit_len = if tag == 109 {
-                    n.checked_mul(8)
-                } else {
-                    n.checked_sub(1)
-                        .and_then(|v| v.checked_mul(8))
-                        .and_then(|v| v.checked_add(bits))
-                }
-                .ok_or(BifError::BADARG)?;
-                // Port of erts/emulator/beam/external.c:4940-4997 (`dec_term` binary cases),
-                // OTP-29.1.1: short payloads are heap bits and long payloads copy to a new Binary.
-                let t = built(&mut ctx, |b| b.bitstring(raw, bit_len))?;
-                Some((t, Shape::Other))
-            }
-            103 | 88 | 102 | 89 | 120 | 101 | 114 | 90 => {
-                let count = if tag == 101 {
-                    1
-                } else if tag == 114 || tag == 90 {
-                    r.u16()? as usize
-                } else {
-                    0
-                };
-                if matches!(tag, 101 | 114 | 90) && !(1..=5).contains(&count) {
-                    return Err(BifError::BADARG);
-                }
-                let local_ext = stack
-                    .iter()
-                    .any(|frame| matches!(&frame.kind, FrameKind::Local { .. }));
-                let (node_term, _) = if local_ext && r.bytes.get(r.at) == Some(&106) {
-                    r.at += 1;
-                    (Term::atom(arinsal_term::atoms::NONAME), None)
-                } else {
-                    r.atom(safe, ctx.is_some())?
-                };
-                let node = node_term.as_atom().unwrap();
-                let mut ids = [0; 5];
-                let identity = if tag == 103 || tag == 88 {
-                    let id = r.u32()?;
-                    let serial = r.u32()?;
-                    let creation = if tag == 103 { r.u8()? as u32 } else { r.u32()? };
-                    if tag == 103 && creation > 3 {
-                        return Err(BifError::BADARG);
-                    }
-                    (id as u64, serial, creation, 0)
-                } else if matches!(tag, 102 | 89 | 120) {
-                    let id = if tag == 120 {
-                        r.u64()?
-                    } else {
-                        r.u32()? as u64
-                    };
-                    let creation = if tag == 102 { r.u8()? as u32 } else { r.u32()? };
-                    if tag == 102 && creation > 3 {
-                        return Err(BifError::BADARG);
-                    }
-                    (id, 0, creation, 0)
-                } else if tag == 101 {
-                    let id = r.u32()?;
-                    let creation = r.u8()? as u32;
-                    if id >= (1 << 18) || creation > 3 {
-                        return Err(BifError::BADARG);
-                    }
-                    ids[0] = id;
-                    (0, 0, creation, 1)
-                } else {
-                    let creation = if tag == 90 { r.u32()? } else { r.u8()? as u32 };
-                    if tag != 90 && creation > 3 {
-                        return Err(BifError::BADARG);
-                    }
-                    for (i, slot) in ids.iter_mut().take(count).enumerate() {
-                        let id = r.u32()?;
-                        if i == 0 && tag != 90 && id >= (1 << 18) {
-                            return Err(BifError::BADARG);
-                        }
-                        *slot = id;
-                    }
-                    (0, 0, creation, count)
-                };
-                let (id, serial, creation, ids_len) = identity;
-                // Port of erts/emulator/beam/external.c (dec_is_this_node, dec_pid, dec_term),
-                // OTP-29.1.1: local identities use the current node entry and become internal terms.
-                let is_this_node = local_node.is_some_and(|(local_name, local_creation)| {
-                    node == local_name && creation == local_creation
-                });
-                let t = if ctx.is_none() {
-                    Term::NIL
-                } else if tag == 103 || tag == 88 {
-                    if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
-                        Term::pid(id as u32, serial).ok_or(BifError::BADARG)?
-                    } else {
-                        built(&mut ctx, |b| {
-                            b.external_pid(Node::new(node, creation), id as u32, serial)
-                        })?
-                    }
-                } else if matches!(tag, 102 | 89 | 120) {
-                    if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
-                        Term::port(id).ok_or(BifError::BADARG)?
-                    } else {
-                        built(&mut ctx, |b| b.external_port(Node::new(node, creation), id))?
-                    }
-                } else if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
-                    // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
-                    // OTP-29.1.1: local PID refs keep the creator PID in ETF words 3 and 4;
-                    // ordinary and saved magic refs use only their reference numbers.
-                    let mut local = [0; 3];
-                    for (slot, value) in local.iter_mut().zip(&ids[..ids_len]) {
-                        *slot = *value;
-                    }
-                    if ids_len == 5 && ids[1] & (1 << 16) != 0 {
-                        built(&mut ctx, |b| {
-                            b.local_pid_ref_from_words(local, ids[3], ids[4])
-                        })?
-                    } else {
-                        let saved = (local[1] & (1 << 17) != 0)
-                            .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local))
-                            .flatten();
-                        match saved {
-                            Some(owner) => built(&mut ctx, |b| b.magic_ref(owner))?,
-                            None => built(&mut ctx, |b| b.local_ref(local))?,
-                        }
-                    }
-                } else {
-                    built(&mut ctx, |b| {
-                        b.external_ref(Node::new(node, creation), &ids[..ids_len])
-                    })?
-                };
-                Some((
-                    t,
-                    if tag == 103 || tag == 88 {
-                        Shape::Pid
-                    } else {
-                        Shape::Other
-                    },
-                ))
-            }
-            113 => {
-                stack.push(Frame {
-                    kind: FrameKind::Export,
-                    left: 3,
-                    values: SmallVec::new(),
-                    shapes: SmallVec::new(),
-                });
-                None
-            }
-            112 => {
-                let _size = r.u32()?;
-                let arity = r.u8()?;
-                let uniq = r.take(16)?.try_into().unwrap();
-                let index = r.u32()?;
-                let free = r.u32()? as usize;
-                count_ok(free.saturating_add(4), r.bytes.len() - r.at, input_complete)?;
-                if free > 255 {
-                    return Err(BifError::Unsupported(
-                        "fun with more than 255 free variables",
-                    ));
-                }
-                stack.push(Frame {
-                    kind: FrameKind::Fun {
-                        arity,
-                        uniq,
-                        index,
-                        free,
-                    },
-                    left: free + 4,
-                    values: SmallVec::new(),
-                    shapes: SmallVec::new(),
-                });
-                None
-            }
-            67 => {
-                let fields = r.u32()? as usize;
-                if fields > (1 << 24) - 2 {
-                    return Err(BifError::SystemLimit);
-                }
-                let exported = match r.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(BifError::BADARG),
-                };
-                let count = fields
-                    .checked_mul(2)
-                    .and_then(|n| n.checked_add(2))
-                    .ok_or(BifError::BADARG)?;
-                count_ok(count, r.bytes.len() - r.at, input_complete)?;
-                stack.push(Frame {
-                    kind: FrameKind::Record { exported, fields },
-                    left: count,
-                    values: SmallVec::new(),
-                    shapes: SmallVec::new(),
-                });
-                None
-            }
-            _ => return Err(BifError::BADARG),
-        };
-        if let Some((mut term, mut shape)) = result {
-            loop {
-                if let Some(Frame {
-                    kind: FrameKind::Local { hash, term_start },
-                    ..
-                }) = stack.last()
-                {
-                    let hash = *hash;
-                    let term_start = *term_start;
-                    stack.pop();
-                    if local_term_hash(&r.bytes[term_start..r.at]) != hash {
-                        return Err(BifError::BADARG);
-                    }
-                    continue;
-                }
-                let Some(frame) = stack.last_mut() else {
-                    return Ok(Some((term, r.at)));
-                };
-                accept_child(frame, term, shape)?;
-                frame.left -= 1;
-                if frame.left != 0 {
-                    break;
-                }
-                (term, shape) = finish(stack.pop().unwrap(), &mut ctx)?;
-            }
-        }
-    }
-    Ok(None)
 }
 
 fn write_decode_target(target: DecodeTarget, root: &mut Term, term: Term) -> Result<(), BifError> {
@@ -3327,9 +2631,7 @@ fn finish_decode_maps(
 }
 
 // Port of erts/emulator/beam/external.c:4325-5445 (`dec_term`), OTP-29.1.1.
-fn read_small_integer<const VALIDATED: bool>(
-    r: &mut Reader<'_, VALIDATED>,
-) -> Result<i64, BifError> {
+fn read_small_integer(r: &mut Reader<'_>) -> Result<i64, BifError> {
     let tag = r.u8()?;
     let number = match tag {
         97 => r.u8()? as i64,
@@ -3357,8 +2659,8 @@ fn read_small_integer<const VALIDATED: bool>(
 }
 
 // Port of erts/emulator/beam/external.c:4640-4694 (PID_EXT/NEW_PID_EXT), OTP-29.1.1.
-fn read_pid_term<H: HeapAlloc, const VALIDATED: bool>(
-    r: &mut Reader<'_, VALIDATED>,
+fn read_pid_term<H: HeapAlloc>(
+    r: &mut Reader<'_>,
     safe: bool,
     local_node: Option<(Atom, u32)>,
     ctx: &mut Ctx<'_, H>,
@@ -3389,7 +2691,7 @@ fn read_pid_term<H: HeapAlloc, const VALIDATED: bool>(
 // Port of erts/emulator/beam/external.c:4325-5445 (`dec_term`, in-place `next` walk), OTP-29.1.1.
 #[allow(clippy::too_many_arguments)]
 fn decode_direct_step(
-    r: &mut Reader<'_, true>,
+    r: &mut Reader<'_>,
     next: &mut Option<super::raw::HeapSlotPtr>,
     root: &mut Term,
     root_started: &mut bool,
@@ -3607,7 +2909,6 @@ fn decode_direct_step(
         let mut defer_output = false;
         let mut reprocess_target = false;
         let mut yield_after_write = false;
-        let tag_start = r.at;
         let (tag, continuation, direct, cursor_hp) = {
             let (words, cursor) = ctx.heap.words_and_cursor();
             *cursor = hp;
@@ -4386,24 +3687,41 @@ fn decode_direct_step(
                     )
                 }
             }
-            _ => {
-                let mut legacy = Reader::new(r.bytes, tag_start);
-                let mut legacy_stack = SmallVec::new();
-                let parsed = parse_step(
-                    &mut legacy,
-                    &mut legacy_stack,
-                    safe,
-                    local_node,
-                    Some(ctx),
-                    usize::MAX,
-                    true,
-                )?;
-                let Some((term, _)) = parsed else {
-                    return Err(BifError::BADARG);
+            67 => {
+                // Port of erts/emulator/beam/external.c:5257-5385 (`dec_term`, RECORD_EXT),
+                // OTP-29.1.1: the definition is read inline, the values are the next terms.
+                let fields = r.u32()? as usize;
+                let exported = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(BifError::BADARG),
                 };
-                r.at = legacy.at;
+                let module = r.atom(safe, true)?.0.as_atom().ok_or(BifError::BADARG)?;
+                let name = r.atom(safe, true)?.0.as_atom().ok_or(BifError::BADARG)?;
+                let mut keys = SmallVec::<[Atom; 8]>::new();
+                for _ in 0..fields {
+                    keys.push(r.atom(safe, true)?.0.as_atom().ok_or(BifError::BADARG)?);
+                }
+                let (term, slots) = ctx
+                    .heap
+                    .reserve_native_record(module, name, exported, &keys)
+                    .map_err(map_term_build_error)?;
+                if !slots.is_empty() {
+                    let mut child = continuation
+                        .map(|slot| decode_heap_slot(ctx, slot))
+                        .transpose()?;
+                    for slot in slots.iter().rev() {
+                        ctx.heap
+                            .write_next_slot(*slot, child)
+                            .map_err(map_term_build_error)?;
+                        child = Some(*slot);
+                    }
+                    *next = decode_slot_ptrs(ctx, child)?;
+                    next_was_set = true;
+                }
                 Some(term)
             }
+            _ => return Err(BifError::BADARG),
         };
         if let Some(term) = term {
             if !defer_output {
@@ -4457,7 +3775,6 @@ pub struct DecodeWalk<'a> {
     expected_plain: usize,
     decompressor: Option<Decompress>,
     inflate_done: bool,
-    sizing: DecodedSizeWalk,
     heap_words: Option<usize>,
     prepare_charge: usize,
     reservation: Option<HeapReservationState>,
@@ -4515,7 +3832,6 @@ impl<'a> DecodeWalk<'a> {
             expected_plain,
             decompressor,
             inflate_done: !compressed,
-            sizing: DecodedSizeWalk::new(),
             heap_words: None,
             prepare_charge: if compressed && expected_plain > B2T_MAX_DIRECT_UNCOMPRESSED_SIZE {
                 expected_plain
@@ -4554,7 +3870,6 @@ impl<'a> DecodeWalk<'a> {
             expected_plain,
             decompressor,
             inflate_done,
-            sizing,
             heap_words,
             prepare_charge,
             reservation,
@@ -4593,7 +3908,6 @@ impl<'a> DecodeWalk<'a> {
             expected_plain,
             decompressor,
             inflate_done,
-            sizing,
             heap_words,
             prepare_charge,
             reservation,
@@ -4646,7 +3960,8 @@ impl<'a> DecodeWalk<'a> {
         Ok(produced)
     }
 
-    fn plain_bytes(&self) -> &[u8] {
+    /// The external term data after the version byte (`b2ts.extp`).
+    pub fn plain_bytes(&self) -> &[u8] {
         if self.compressed {
             self.plain
                 .as_deref()
@@ -4695,46 +4010,10 @@ impl<'a> DecodeWalk<'a> {
         Ok((self.inflate_done, consumed))
     }
 
-    /// `B2TSize`: `decoded_size` with `budget` bytes of reductions; the heap size in words once
-    /// the whole term was walked.
-    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TSize; decoded_size),
-    // OTP-29.1.1.
-    pub fn size_chunk(
-        &mut self,
-        budget: usize,
-    ) -> Result<(Option<usize>, usize), (BifError, usize)> {
-        let mut consumed = 0;
-        while consumed < budget {
-            let before = (self.input_offset, self.plain_bytes().len());
-            let bytes = if self.compressed {
-                self.plain
-                    .as_deref()
-                    .expect("compressed input has an inflate buffer")
-            } else {
-                &self.input.bytes()[1..]
-            };
-            let scanned = self
-                .sizing
-                .step(bytes, budget - consumed, true, local_term_hash)
-                .map_err(|error| (decode_size_error(error), consumed))?;
-            consumed += scanned.1;
-            if let Some((words, checked)) = scanned.0 {
-                if self.compressed
-                    && (checked != self.expected_plain || checked != self.plain_bytes().len())
-                {
-                    return Err((BifError::BADARG, consumed));
-                }
-                self.heap_words = Some(words);
-                return Ok((Some(words), consumed));
-            }
-            if consumed >= budget {
-                break;
-            }
-            if self.compressed && (self.input_offset, self.plain_bytes().len()) == before {
-                return Err((BifError::BADARG, consumed));
-            }
-        }
-        Ok((None, consumed))
+    /// The end of `decoded_size`: the heap size in words that `B2TDecodeInit` reserves. For
+    /// inflated input the walk must have covered exactly the data the header announced.
+    pub fn set_heap_words(&mut self, words: usize) {
+        self.heap_words = Some(words);
     }
 
     /// Undo what the decode built, as `erts_factory_undo` does when `binary_to_term_int`
@@ -4782,11 +4061,7 @@ impl<'a> DecodeWalk<'a> {
                 } else {
                     &self.input.bytes()[1..]
                 };
-                let validated_body = self
-                    .sizing
-                    .validated_body(bytes)
-                    .expect("direct decode follows a completed sizing pass");
-                let mut reader = Reader::from_validated_at(validated_body, before);
+                let mut reader = Reader::new(bytes, before);
                 let parsed = decode_direct_step(
                     &mut reader,
                     &mut self.decode_next,
@@ -4877,10 +4152,6 @@ fn compressed_uncompressed_size(input: &[u8]) -> Result<usize, BifError> {
             return Err(BifError::BADARG);
         }
     }
-}
-
-fn decode_size_error(_: arinsal_etf::DecodeError) -> BifError {
-    BifError::BADARG
 }
 
 #[cfg(test)]
