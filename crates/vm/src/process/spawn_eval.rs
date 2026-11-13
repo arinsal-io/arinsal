@@ -404,6 +404,7 @@ impl Vm {
                     .scheduler
                     .set(scheduler)
                     .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
+                crate::erl_trace::set_node(runtime);
                 // Port of code_ix.c:142-171 and beam_common.c (erts_schedule_code_barrier),
                 // OTP-29.1.1: code-table owners retire through this scheduler's progress queue.
                 let scheduler = Arc::downgrade(runtime.scheduler()?);

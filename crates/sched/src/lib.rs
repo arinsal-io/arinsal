@@ -1176,17 +1176,10 @@ pub trait Task: Send + 'static {
     fn gc_nanoseconds(&self) -> u64 {
         0
     }
-    /// Optional VM hook for a worker's transition between running and idle: the profile
-    /// message for `system_profile(.., [scheduler])`, or `None` when that profiling is off. It
-    /// takes no process: erts builds the message in a temporary message and reads one global
-    /// flag, without any process lock (erl_trace.c:1957, `profile_scheduler`).
-    fn scheduler_profile_event(
-        _scheduler_id: u32,
-        _active: bool,
-        _active_schedulers: u32,
-    ) -> Option<(Pid, Self::Message)> {
-        None
-    }
+    /// Optional VM hook for a worker's transition between running and idle. It takes no process:
+    /// erts builds the message in a temporary message and queues it globally without a process
+    /// lock (erl_trace.c:1957, `profile_scheduler`).
+    fn scheduler_profile_event(_scheduler_id: u32, _active: bool, _active_schedulers: u32) {}
     /// Initialise the fields that point into the task itself, once it is written into the
     /// process block it stays in.
     ///
@@ -9952,9 +9945,7 @@ fn schedule_next<T: Task>(
         if local.profile_active {
             let count = inner.active_schedulers.fetch_sub(1, Ordering::Relaxed) - 1;
             local.profile_active = false;
-            if let Some(pid) = local.last_process {
-                profile_scheduler_transition(inner, pid, id, false, count, &mut *local);
-            }
+            profile_scheduler_transition::<T>(id, false, count);
         }
         rq.unlock();
         // An offline or blocked scheduler hands its queued work and due timers to the
@@ -10085,9 +10076,7 @@ fn schedule_next<T: Task>(
         if !local.profile_active {
             let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
             local.profile_active = true;
-            if let Some(pid) = local.last_process {
-                profile_scheduler_transition(inner, pid, id, true, count, &mut *local);
-            }
+            profile_scheduler_transition::<T>(id, true, count);
         }
         inner.execute_port(&mut *local)
     };
@@ -10153,7 +10142,7 @@ fn schedule_next<T: Task>(
         if !local.profile_active {
             let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
             local.profile_active = true;
-            profile_scheduler_transition(inner, item.process.pid, id, true, count, &mut *local);
+            profile_scheduler_transition::<T>(id, true, count);
         }
         local.last_process = Some(item.process.pid);
         *steal_armed = true;
@@ -10198,9 +10187,7 @@ fn schedule_next<T: Task>(
     if local.profile_active {
         let count = inner.active_schedulers.fetch_sub(1, Ordering::Relaxed) - 1;
         local.profile_active = false;
-        if let Some(pid) = local.last_process {
-            profile_scheduler_transition(inner, pid, id, false, count, &mut *local);
-        }
+        profile_scheduler_transition::<T>(id, false, count);
     }
     // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait: sleep until the
     // next timeout, erts_check_next_timeout_time), OTP-29.1.1.
@@ -10666,19 +10653,11 @@ fn scheduler_spin_count(thresholds: &[Option<String>; 3], index: usize, default:
 /// scheduler becomes active or inactive) and erl_trace.c:1957 (profile_scheduler), OTP-29.1.1: no
 /// process lock is taken.
 fn profile_scheduler_transition<T: Task>(
-    inner: &Inner<T>,
-    sender: Pid,
     scheduler_id: usize,
     active: bool,
     active_schedulers: usize,
-    local: &mut Local<T>,
 ) {
-    let Some((target, message)) =
-        T::scheduler_profile_event(scheduler_id as u32 + 1, active, active_schedulers as u32)
-    else {
-        return;
-    };
-    let _ = inner.deliver(sender, target, Payload::Message(message), Some(local));
+    T::scheduler_profile_event(scheduler_id as u32 + 1, active, active_schedulers as u32);
 }
 
 #[cfg(test)]

@@ -160,20 +160,36 @@ fn misc_bifs_system_profile_emits_runnable_process_events_match_erts() {
 #[test]
 fn misc_bifs_system_profile_emits_scheduler_events_match_erts() {
     let _guard = PROFILE_TEST_LOCK.lock().unwrap();
-    compare_peer(
-        r#"-module(misc_bifs_profile_scheduler). -export([run/0]).
+    let source = r#"-module(misc_bifs_profile_scheduler). -export([run/0]).
         run() ->
             Previous = erlang:system_profile(self(), [scheduler, timestamp]),
-            Event = receive
-                {profile, scheduler, Id, State, Active, Timestamp} ->
-                    {Id > 0, State, Active >= 0, tuple_size(Timestamp)}
-            after 1000 -> timeout
-            end,
+            Workers = [spawn(fun work/0) || _ <- lists:seq(1, 3)],
+            Events = collect(8, []),
+            lists:foreach(fun(Pid) -> Pid ! stop end, Workers),
             _ = erlang:system_profile(undefined, []),
-            {Previous, Event}."#,
-        "misc_bifs_profile_scheduler",
-        "run",
+            {Previous, Events}.
+        work() -> receive stop -> ok after 0 -> work() end.
+        collect(0, Events) -> lists:reverse(Events);
+        collect(N, Events) ->
+            receive
+                {profile, scheduler, Id, State, Active, Timestamp} ->
+                    true = Id > 0,
+                    true = Active >= 0,
+                    true = tuple_size(Timestamp) =:= 3,
+                    collect(N - 1, [{Id, State, Active} | Events])
+            after 1000 -> lists:reverse(Events)
+            end."#;
+    let module = "misc_bifs_profile_scheduler";
+    let reference = RefErl::start_with_erl_args(&["+S", "1:1"]).unwrap();
+    let beam = reference.compile_named(module, source, &[]).unwrap();
+    reference.load(module, &beam).unwrap();
+    let expected = reference.call(module, "run", &[]);
+    let actual = crate::common::peer_eval(
+        &["+S", "1:1"],
+        &[&beam],
+        "misc_bifs_profile_scheduler:run()",
     );
+    assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]

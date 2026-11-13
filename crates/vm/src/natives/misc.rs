@@ -227,31 +227,30 @@ fn profile_set(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     Ok(previous)
 }
 
-/// Build the scheduler transition message for the scheduler's worker hook.
+/// Build and queue a scheduler transition message without a process lock.
 // Port of erts/emulator/beam/erl_trace.c:1957 (profile_scheduler), OTP-29.1.1.
-pub(crate) fn profile_scheduler_event(
-    scheduler_id: u32,
-    active: bool,
-    active_schedulers: u32,
-) -> Option<(arinsal_sched::Pid, Message)> {
+pub(crate) fn profile_scheduler_event(scheduler_id: u32, active: bool, active_schedulers: u32) {
     // erts reads the global flag and builds the message in a temporary message: no process, no
     // process lock.
     let flags = PROFILE_FLAGS.load(Ordering::Relaxed);
     if flags & PROFILE_SCHEDULER == 0 {
-        return None;
+        return;
     }
     let profile = profile().lock().unwrap().clone();
-    let target = profile_target(&profile)?;
-    let message = Message::from_owned(&O::Tuple(vec![
+    let Some(target) = profile_target(&profile).and_then(arinsal_sched::Pid::to_term) else {
+        return;
+    };
+    let Ok(message) = Message::from_owned(&O::Tuple(vec![
         O::Atom("profile".into()),
         O::Atom("scheduler".into()),
         O::Int(scheduler_id as i64),
         O::Atom(if active { "active" } else { "inactive" }.into()),
         O::Int(active_schedulers as i64),
         profile_timestamp(profile.timestamp),
-    ]))
-    .ok()?;
-    Some((target, message))
+    ])) else {
+        return;
+    };
+    crate::erl_trace::enqueue_sys_msg(crate::erl_trace::SysMsgType::Sysprof, None, target, message);
 }
 
 /// Emit a port queue transition from the port task's runnable boundary.
@@ -261,11 +260,7 @@ pub(crate) fn profile_ports_enabled() -> bool {
     PROFILE_FLAGS.load(Ordering::Relaxed) & PROFILE_RUNNABLE_PORTS != 0
 }
 
-pub(crate) fn profile_port_event(
-    scheduler: &std::sync::Arc<arinsal_sched::Scheduler<Process>>,
-    port_id: u64,
-    active: bool,
-) {
+pub(crate) fn profile_port_event(port_id: u64, active: bool) {
     if PROFILE_FLAGS.load(Ordering::Relaxed) & PROFILE_RUNNABLE_PORTS == 0 {
         return;
     }
@@ -293,8 +288,6 @@ pub(crate) fn profile_port_event(
     {
         crate::erl_trace::enqueue_sys_msg(
             crate::erl_trace::SysMsgType::Sysprof,
-            scheduler,
-            None,
             // erts passes the port identifier as `from`; never the profiler process.
             None,
             to,
@@ -385,14 +378,11 @@ pub(crate) fn profile_process_event(
         return;
     };
     if let Ok(message) = Message::copy_from(message)
-        && let Some(runtime) = process.runtime
-        && let Ok(scheduler) = runtime.scheduler()
+        && process.runtime.is_some()
         && let Some(to) = target.to_term()
     {
         crate::erl_trace::enqueue_sys_msg(
             crate::erl_trace::SysMsgType::Sysprof,
-            scheduler,
-            Some(runtime),
             Some(ctx.pid()),
             to,
             message,
