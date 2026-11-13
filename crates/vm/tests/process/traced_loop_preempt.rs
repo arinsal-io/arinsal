@@ -2,7 +2,6 @@
 //! its reductions run out, so `exit(Pid, kill)` reaches it.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SPIN: &str = r#"
 -module(tlp_spin).
@@ -31,20 +30,6 @@ fn traced_loop_is_preempted() {
         .expect("compile spin");
     reference.load("tlp_spin", &spin).expect("load spin");
     let expected = reference.call("tlp_spin", "run", &[]);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut vm = Vm::new([]);
-        // The breakpoint instruction itself is the loop's only switch-out point.
-        vm.load_bytes(&spin).expect("load VM spin");
-        let actual = vm
-            .eval_scheduled("tlp_spin", "run", &[], 1, None)
-            .map(|value| value.term)
-            .map_err(|error| error.to_string());
-        let _ = sender.send(actual);
-    });
-    let actual = receiver
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("tlp_spin:run did not finish (traced spinner never preempted)")
-        .unwrap_or_else(|error| panic!("tlp_spin:run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual));
+    let actual = crate::common::peer_eval(&[], &[&spin], "tlp_spin:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

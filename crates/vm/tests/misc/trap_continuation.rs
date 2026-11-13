@@ -3,7 +3,6 @@
 //! and backtrace match erts (OTP-29.1.1 `BIF_TRAP` / `emit_bif_export_trap`).
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trap_cont).
@@ -164,12 +163,12 @@ fn trap_continuation_stack_matches_erts() {
     let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
     reference.load("trap_cont", &beam).unwrap();
     let expected = reference.call("trap_cont", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     // A short quantum makes each trap a real schedule-out the tracer can sample.
     // The frame at that out does not depend on how far the BIF got.
     let actual = vm
-        .eval_scheduled_reductions("trap_cont", "run", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("trap_cont", "run", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -183,10 +182,10 @@ fn trap_frames_of_each_call_shape_match_erts() {
     let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
     reference.load("trap_cont", &beam).unwrap();
     let expected = reference.call("trap_cont", "run_shapes", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -201,10 +200,10 @@ fn apply_of_a_trapping_bif_traps_like_a_direct_call_match_erts() {
     reference.load("trap_cont", &beam).unwrap();
     let expected = reference.call("trap_cont", "run_apply_traps", &[]);
     for round in 0..4 {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled_reductions("trap_cont", "run_apply_traps", &[], 1, None, 4_000)
+            .eval_scheduled_reductions("trap_cont", "run_apply_traps", &[], 1, 4_000)
             .unwrap_or_else(|error| panic!("{error}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "round {round}");
     }
@@ -219,10 +218,10 @@ fn trap_frames_of_a_tail_called_export_fun_match_erts() {
     let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
     reference.load("trap_cont", &beam).unwrap();
     let expected = reference.call("trap_cont", "run_fun_shapes", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("trap_cont", "run_fun_shapes", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("trap_cont", "run_fun_shapes", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -244,10 +243,10 @@ run() ->
     let beam = reference.compile_named("rev_val", source, &[]).unwrap();
     reference.load("rev_val", &beam).unwrap();
     let expected = reference.call("rev_val", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("rev_val", "run", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("rev_val", "run", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -270,8 +269,8 @@ run() ->
     let beam = reference.compile_named("etf_entry", source, &[]).unwrap();
     reference.load("etf_entry", &beam).unwrap();
     let expected = reference.call("etf_entry", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled("etf_entry", "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled("etf_entry", "run", &[], 1).unwrap();
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

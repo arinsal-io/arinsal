@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
 use arinsal_term::global_atoms;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 use std::sync::Mutex;
 
@@ -17,14 +16,14 @@ fn compare(source: &str, module: &str, function: &str) {
     let beam = reference.compile_named(module, source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
     let expected = reference.call(module, function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, function, &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(module, function, &[], 1).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }
 
-fn compare_threaded(source: &str, module: &str, function: &str) {
+fn compare_peer(source: &str, module: &str, function: &str) {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping {module}:{function} differential test");
         return;
@@ -32,16 +31,13 @@ fn compare_threaded(source: &str, module: &str, function: &str) {
     let beam = reference.compile_named(module, source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
     let expected = reference.call(module, function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, function, &[], 1, None).unwrap();
-    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
-    assert_eq!(expected, CallResult::Ok(canonical));
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("{module}:{function}()"));
+    assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
 fn misc_bifs_ddll_static_driver_results_match_erts() {
-    compare(
+    compare_peer(
         r#"-module(misc_bifs_ddll). -export([run/0]).
         run() -> {erl_ddll:loaded_drivers(),
                   erl_ddll:info("tcp_inet", linked_in_driver),
@@ -66,7 +62,7 @@ fn misc_bifs_ddll_static_driver_results_match_erts() {
 
 #[test]
 fn misc_bifs_ddll_demonitor_cancels_pending_driver_monitor_match_erts() {
-    compare(
+    compare_peer(
         r#"-module(misc_bifs_ddll_demonitor). -export([run/0]).
         run() -> R = erl_ddll:monitor(driver, {"missing_driver", loaded}),
                  First = receive {'DOWN', R, driver, _, unloaded} -> down
@@ -104,18 +100,13 @@ fn misc_bifs_ddll_missing_driver_fails_with_formattable_open_error() {
         .unwrap();
     reference.load("misc_bifs_missing_driver", &beam).unwrap();
     let expected = reference.call("misc_bifs_missing_driver", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("misc_bifs_missing_driver", "run", &[], 1, None)
-        .unwrap();
-    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
-    assert_eq!(expected, CallResult::Ok(canonical));
+    let actual = crate::common::peer_eval(&[], &[&beam], "misc_bifs_missing_driver:run()");
+    assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
 fn misc_bifs_ddll_open_error_formats_as_a_string() {
-    compare(
+    compare_peer(
         r#"-module(misc_bifs_ddll_open_error). -export([run/0]).
         run() -> S = erl_ddll:format_error_int({open_error, -10}),
                  true = is_list(S),
@@ -130,7 +121,7 @@ fn misc_bifs_ddll_open_error_formats_as_a_string() {
 #[test]
 fn misc_bifs_system_profile_and_tags_match_erts() {
     let _guard = PROFILE_TEST_LOCK.lock().unwrap();
-    compare(
+    compare_peer(
         r#"-module(misc_bifs_profile). -export([run/0]).
         run() ->
             A = {erlang:dt_put_tag(not_a_bitstring), erlang:dt_get_tag(),
@@ -169,7 +160,7 @@ fn misc_bifs_system_profile_emits_runnable_process_events_match_erts() {
 #[test]
 fn misc_bifs_system_profile_emits_scheduler_events_match_erts() {
     let _guard = PROFILE_TEST_LOCK.lock().unwrap();
-    compare_threaded(
+    compare_peer(
         r#"-module(misc_bifs_profile_scheduler). -export([run/0]).
         run() ->
             Previous = erlang:system_profile(self(), [scheduler, timestamp]),
@@ -188,7 +179,7 @@ fn misc_bifs_system_profile_emits_scheduler_events_match_erts() {
 #[test]
 fn misc_bifs_system_profile_emits_runnable_port_events_match_erts() {
     let _guard = PROFILE_TEST_LOCK.lock().unwrap();
-    compare(
+    compare_peer(
         r#"-module(misc_bifs_profile_ports). -export([run/0]).
         run() ->
             Previous = erlang:system_profile(self(), [runnable_ports]),

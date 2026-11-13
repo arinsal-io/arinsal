@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "binary_search_differential";
@@ -52,13 +51,13 @@ fn binary_search_results_and_error_info_match_otp() {
     };
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     for function in ["results", "badargs"] {
         let expected = reference.call(MODULE, function, &[]);
         let actual = vm
-            .eval_scheduled(MODULE, function, &[], 1, None)
+            .eval_scheduled(MODULE, function, &[], 1)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
@@ -70,10 +69,10 @@ fn binary_search_large_subject_matches_otp_across_traps() {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "large", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "large", &[], 1, None, 4_000)
+        .eval_scheduled_reductions(MODULE, "large", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("large binary search: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }

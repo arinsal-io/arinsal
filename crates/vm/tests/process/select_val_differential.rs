@@ -3,7 +3,6 @@
 //! whatever order the compiler wrote the clauses in.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const MODULE: &str = r#"
 -module(select_val_probe).
@@ -111,11 +110,11 @@ fn select_val_dispatches_every_value_like_erts() {
     reference.load("select_val_probe", &beam).unwrap();
     let expected = reference.call("select_val_probe", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("select_val_probe", "run", &[], 1, None)
+        .eval_scheduled("select_val_probe", "run", &[], 1)
         .unwrap();
 
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

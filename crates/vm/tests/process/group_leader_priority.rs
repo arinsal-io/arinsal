@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(group_leader_priority_diff).
@@ -45,14 +44,14 @@ fn group_leader_remote_update_and_badarg_match_otp() {
         .compile_named("group_leader_priority_diff", SOURCE, &[])
         .unwrap();
     reference.load("group_leader_priority_diff", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     for function in ["run", "saturated", "badarg"] {
         let expected = reference.call("group_leader_priority_diff", function, &[]);
         let actual = vm
-            .eval_scheduled("group_leader_priority_diff", function, &[], 4, None)
+            .eval_scheduled("group_leader_priority_diff", function, &[], 4)
             .unwrap_or_else(|error| panic!("{function}: {error:?}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
 }

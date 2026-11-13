@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(msgq_port).
@@ -47,10 +46,10 @@ fn compare(function: &str) {
     let beam = reference.compile_named("msgq_port", SOURCE, &[]).unwrap();
     reference.load("msgq_port", &beam).unwrap();
     let expected = reference.call("msgq_port", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled("msgq_port", function, &[], 1, None);
-    assert_eq!(
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled("msgq_port", function, &[], 1);
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(
             actual

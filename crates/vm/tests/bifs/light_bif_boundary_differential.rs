@@ -15,7 +15,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "light_bif_boundary_differential";
 const TARGET: &str = "light_bif_boundary_target";
@@ -84,7 +83,7 @@ fn compare(step: &str) {
     let owned_args = vec![OwnedTerm::Binary(target), OwnedTerm::Atom(step.into())];
     let expected = reference.call(MODULE, "run", &owned_args);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load into arinsal");
     let mut heap = VecHeap::new();
     let args: Vec<_> = owned_args
@@ -92,7 +91,7 @@ fn compare(step: &str) {
         .map(|term| from_owned(term, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled(MODULE, "run", &args, 2, None)
+        .eval_scheduled(MODULE, "run", &args, 2)
         .unwrap_or_else(|error| panic!("{step}: {error}"));
     let actual = CallResult::Ok(actual.term);
     if expected != actual {

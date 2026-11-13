@@ -5,7 +5,11 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
+
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
 
 const SOURCE: &str = r#"
 -module(vm_apply_trap_diff).
@@ -65,11 +69,11 @@ fn trapping_bifs_through_apply_match_otp() {
         let args = [OwnedTerm::Int(size)];
         let expected = reference.call("vm_apply_trap_diff", "run", &args);
 
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
+        let mut vm = common::node();
+        common::load_fresh(&mut vm, &beam);
         let mut heap = VecHeap::new();
         let term = from_owned(&args[0], &mut heap).unwrap();
-        let actual = match vm.eval_scheduled("vm_apply_trap_diff", "run", &[term], 1, None) {
+        let actual = match vm.eval_scheduled("vm_apply_trap_diff", "run", &[term], 1) {
             Ok(outcome) => CallResult::Ok(outcome.term),
             Err(VmError::Raised(raised)) => CallResult::Exception {
                 class: format!("{:?}", raised.class).to_lowercase(),

@@ -4,7 +4,6 @@
 //! a lost exit signal left Common Test (and the whole node) waiting forever after a suite.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(link_exit_race).
@@ -62,11 +61,11 @@ fn link_to_exiting_process_matches_otp_29() {
         .expect("load link_exit_race");
     for function in ["reply_then_exit", "dead_link"] {
         let expected = reference.call("link_exit_race", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).expect("load");
         let actual = vm
-            .eval_scheduled("link_exit_race", function, &[], 4, None)
+            .eval_scheduled("link_exit_race", function, &[], 4)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
 }

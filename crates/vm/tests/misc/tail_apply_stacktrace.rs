@@ -6,7 +6,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "tail_apply_trace";
 
@@ -54,9 +53,9 @@ thrower(_) -> erlang:error(oops).
 "#;
 
 fn run_here(beam: &[u8], function: &str) -> String {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, function, &[], 2, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, function, &[], 2).unwrap();
     format!("{:?}", actual.term)
 }
 

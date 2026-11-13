@@ -3,7 +3,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const OPS: [&str; 10] = [
     "+", "-", "*", "band", "bor", "bxor", "bsl", "bsr", "rem", "div",
@@ -147,11 +146,9 @@ fn constant_and_typed_integer_arithmetic_matches_erts() {
     reference.load("jit_const_arith", &beam).unwrap();
     let expected = reference.call("jit_const_arith", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("jit_const_arith", "run", &[], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("jit_const_arith", "run", &[], 1).unwrap();
     let CallResult::Ok(expected) = expected else {
         panic!("reference run failed: {expected:?}");
     };
@@ -231,11 +228,9 @@ fn mul_add_fused_div_rem_and_typed_shift_match_erts() {
         .unwrap();
     reference.load("jit_mul_fuse", &beam).unwrap();
     let expected = reference.call("jit_mul_fuse", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("jit_mul_fuse", "run", &[], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("jit_mul_fuse", "run", &[], 1).unwrap();
     let CallResult::Ok(expected) = expected else {
         panic!("reference run failed: {expected:?}");
     };

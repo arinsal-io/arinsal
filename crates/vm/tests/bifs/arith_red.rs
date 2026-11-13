@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use std::fmt::Write as _;
 
 #[test]
@@ -36,11 +35,11 @@ fn arith_red_late_export_calls_reuse_the_resolved_target() {
         .unwrap();
     let expected = reference.call("arith_red_export_caller", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&target_beam).unwrap();
     vm.load_bytes(&caller_beam).unwrap();
     let actual = vm
-        .eval_scheduled("arith_red_export_caller", "run", &[], 1, None)
+        .eval_scheduled("arith_red_export_caller", "run", &[], 1)
         .unwrap();
     compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact).unwrap();
 }
@@ -82,13 +81,13 @@ fn arith_red_cached_export_targets_follow_code_epoch() {
         &[OwnedTerm::Binary(target_v2.clone())],
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&target_v1).unwrap();
     vm.load_bytes(&caller).unwrap();
     let mut heap = arinsal_term::VecHeap::new();
     let argument = arinsal_term::from_owned(&OwnedTerm::Binary(target_v2), &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("arith_red_reload_caller", "run", &[argument], 1, None)
+        .eval_scheduled("arith_red_reload_caller", "run", &[argument], 1)
         .unwrap();
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -115,10 +114,10 @@ fn arith_red_flatmap_merge_matches_otp_across_size_boundary() {
     reference.load("arith_red_flatmap_merge", &beam).unwrap();
     let expected = reference.call("arith_red_flatmap_merge", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("arith_red_flatmap_merge", "run", &[], 1, None)
+        .eval_scheduled("arith_red_flatmap_merge", "run", &[], 1)
         .unwrap();
     compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact).unwrap();
 }
@@ -227,10 +226,10 @@ fn arith_red_bignum_instruction_and_bif_reductions_meet_otp_minimums() {
         .expect("compile arithmetic reduction fixture");
     reference.load("arith_red_reductions", &beam).unwrap();
     let expected = reference.call("arith_red_reductions", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("arith_red_reductions", "run", &[], 1, None)
+        .eval_scheduled("arith_red_reductions", "run", &[], 1)
         .unwrap();
     let CallResult::Ok(expected) = expected else {
         panic!("OTP arithmetic reduction fixture failed: {expected:?}");
@@ -292,10 +291,10 @@ fn arith_red_bignum_select_literals_match_otp() {
         .unwrap();
     let expected = reference.call("arith_red_bignum_select_literals", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("arith_red_bignum_select_literals", "run", &[], 1, None)
+        .eval_scheduled("arith_red_bignum_select_literals", "run", &[], 1)
         .unwrap();
     compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact).unwrap();
 }

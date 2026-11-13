@@ -2,7 +2,6 @@
 //! loaded from the code path) must not strand an interpreted caller in `int_code_end`.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trace_native_only).
@@ -33,11 +32,6 @@ fn traced_native_only_function_called_from_interpreter() {
         .load("trace_native_only", &beam)
         .expect("load reference");
     let expected = reference.call("trace_native_only", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let actual = vm
-        .eval_scheduled("trace_native_only", "run", &[], 1, None)
-        .map(|value| value.term)
-        .unwrap_or_else(|error| panic!("run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual));
+    let actual = crate::common::peer_eval(&[], &[&beam], "trace_native_only:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

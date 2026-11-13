@@ -1,6 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 #[test]
 fn port_lifecycle_matches_otp() {
@@ -150,18 +148,18 @@ bad_port_info() ->
         "detached_child_survives",
     ] {
         let expected = reference.call("port_life", function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled("port_life", function, &[], 1, None);
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
+        let actual = vm.eval_scheduled("port_life", function, &[], 1);
         let actual = actual.unwrap_or_else(|error| panic!("{function}: {error:?}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
 
     let expected = reference.call("port_life", "owner_exit", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("port_life", "owner_exit", &[], 1, None)
+        .eval_scheduled("port_life", "owner_exit", &[], 1)
         .unwrap()
         .term;
     let arinsal_etf::OwnedTerm::Int(actual) = actual else {

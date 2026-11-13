@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "heap_gc_root_probe";
 const SOURCE: &str = r#"
@@ -88,8 +87,8 @@ fn gc_trace_roots_for_map_and_reverse_workloads_match_otp() {
     reference
         .load(MODULE, &beam)
         .expect("load heap trace probe");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load probe into Arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
 
     for (kind, name) in [
         (0, "maps:to_list/1 x 500,000"),
@@ -103,13 +102,7 @@ fn gc_trace_roots_for_map_and_reverse_workloads_match_otp() {
             other => panic!("OTP {name} failed: {other:?}"),
         };
         let outcome = vm
-            .eval_scheduled(
-                MODULE,
-                "run",
-                &[Term::small(kind).expect("workload id")],
-                1,
-                None,
-            )
+            .eval_scheduled(MODULE, "run", &[Term::small(kind).expect("workload id")], 1)
             .unwrap_or_else(|error| panic!("Arinsal {name} failed: {error:?}"));
         let expected = phases(&expected, "OTP", name);
         let actual = phases(&outcome.term, "Arinsal", name);

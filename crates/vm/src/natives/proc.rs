@@ -5877,7 +5877,7 @@ process_info_looper(Parent) ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("process_info_location_diff", "run", &[], 4, None)
+            .eval_scheduled("process_info_location_diff", "run", &[], 4)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }

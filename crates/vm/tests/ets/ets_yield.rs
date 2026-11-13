@@ -3,7 +3,6 @@
 //! into slices of reductions, visible as scheduling trace events like in erts.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_yield_diff).
@@ -109,10 +108,10 @@ fn ets_yield_matches_otp_29() {
         "results_survive",
     ] {
         let expected = reference.call("ets_yield_diff", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("ets_yield_diff", function, &[], 2, None)
+            .eval_scheduled("ets_yield_diff", function, &[], 2)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

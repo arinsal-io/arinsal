@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(link_state_diff).
@@ -72,10 +71,10 @@ fn link_state_matches_erts() {
         .expect("load link state differential");
     let expected = reference.call("link_state_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load link state differential");
     let actual = vm
-        .eval_scheduled("link_state_diff", "run", &[], 2, None)
+        .eval_scheduled("link_state_diff", "run", &[], 2)
         .expect("run link state differential")
         .term;
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "link state");

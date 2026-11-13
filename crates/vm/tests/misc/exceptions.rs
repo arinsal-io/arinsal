@@ -5,7 +5,7 @@ use arinsal_vm::{Vm, VmError};
 
 #[test]
 fn direct_bif_raise_preserves_class_and_reason() {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     let value = Term::atom(global_atoms().intern("direct_reason").unwrap());
     for (function, class, expected) in [
         ("error", "Error", OwnedTerm::Atom("direct_reason".into())),
@@ -88,7 +88,7 @@ fn four_hundred_exception_snippets_match_otp() {
         )
         .unwrap();
     reference.load("vm_exc_400", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for function in ["run", "captured", "nested", "after_run", "rethrow"] {
         for n in 1..=400 {
@@ -161,7 +161,7 @@ bs_invalid_size(Size) ->
         .compile_named("vm_exc_smoke", source, &[])
         .unwrap();
     reference.load("vm_exc_smoke", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for function in ["run", "captured"] {
         for n in 1..=9 {
@@ -246,7 +246,7 @@ fixed_badargs() ->
         .compile_named("vm_exc_apply", source, &[])
         .unwrap();
     reference.load("vm_exc_apply", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     for type_name in ["apply_last", "double_apply_last", "multi_apply_last"] {
@@ -292,9 +292,9 @@ fn ets4_return_to_trace_preserves_heap_terms_like_otp() {
         .unwrap();
     reference.load("ets4", &beam).unwrap();
     let expected = reference.call("ets4", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let outcome = vm.eval_scheduled("ets4", "run", &[], 1, None).unwrap();
+    let outcome = vm.eval_scheduled("ets4", "run", &[], 1).unwrap();
     let actual = CallResult::Ok(outcome.term);
     assert_eq!(expected, actual);
 }
@@ -314,10 +314,10 @@ fn traced_error_stack_growth_matches_otp() {
         .unwrap();
     reference.load("trace_error_stack_reserve", &beam).unwrap();
     let expected = reference.call("trace_error_stack_reserve", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("trace_error_stack_reserve", "run", &[], 1, None)
+        .eval_scheduled("trace_error_stack_reserve", "run", &[], 1)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(error.to_string()));
     assert_eq!(expected, actual);
@@ -404,7 +404,7 @@ trigger(exit) -> erlang:exit(mark).
 "#;
     let beam = reference.compile_named("vm_exc_lazy", source, &[]).unwrap();
     reference.load("vm_exc_lazy", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for class in ["throw", "error", "exit"] {
         for depth in [0, 1, 2, 4, 10] {

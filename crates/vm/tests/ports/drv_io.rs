@@ -7,7 +7,6 @@ use std::process::Command;
 
 use arinsal_difftest::{CallOptions, CallResult, RefErl, pretty};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../drv/tests/fixtures")
@@ -87,8 +86,8 @@ fn io_driver_matches_erl() {
         eprintln!("{}", pretty(&expected));
     }
 
-    let mut vm = Vm::new([dir.clone()]);
-    let actual = match vm.eval_scheduled("drv_io_main", "run", &[], 2, None) {
+    let mut vm = crate::common::node_with_dir(&dir);
+    let actual = match vm.eval_scheduled("drv_io_main", "run", &[], 2) {
         Ok(result) => result.term,
         Err(error) => panic!("drv_io:run/1 on Arinsal: {error}"),
     };

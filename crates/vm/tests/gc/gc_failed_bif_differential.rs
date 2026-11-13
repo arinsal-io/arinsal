@@ -4,7 +4,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "gc_failed_bif_differential";
 const SOURCE: &str = r#"
@@ -51,10 +50,10 @@ fn caught_failing_bif_loop_collects_as_often_as_otp() {
             other => panic!("reference loop failed: {other:?}"),
         })
         .collect::<Vec<_>>();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load probe into Arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = count(
-        &vm.eval_scheduled(MODULE, "run", &[], 1, None)
+        &vm.eval_scheduled(MODULE, "run", &[], 1)
             .expect("Arinsal loop")
             .term,
     );

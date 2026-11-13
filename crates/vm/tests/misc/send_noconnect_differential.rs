@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "send_noconnect_diff";
 const SOURCE: &str = r#"
@@ -22,9 +21,9 @@ fn remote_name_send_with_noconnect_reports_noconnect_without_connecting() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
 
     let expected_value = OwnedTerm::tuple(vec![
         OwnedTerm::atom("noconnect"),

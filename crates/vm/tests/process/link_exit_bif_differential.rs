@@ -3,7 +3,7 @@
 //! `exit/2` suicide cases, and the badarg/badopt/noproc errors with their `error_info`.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(link_exit_bif).
@@ -129,9 +129,9 @@ fn link_exit_bifs_match_otp() {
         .load("link_exit_bif", &beam)
         .expect("load reference module");
     let expected = reference.call("link_exit_bif", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("link_exit_bif", "run", &[], 2, None) {
+    let actual = match vm.eval_scheduled("link_exit_bif", "run", &[], 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

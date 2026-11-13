@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 /// The child setup helper is the `arinsal` binary next to the test executable's target directory, as
 /// `erl_child_setup` sits in erts's bindir. Ports with a working directory or a large environment
@@ -338,7 +337,7 @@ fn process_scenarios_match_otp_29() {
         .map_or_else(|| (0..40).collect::<Vec<_>>(), |category| vec![category]);
     // One node runs every scenario, as the reference node does: the scenarios run in normal
     // scheduler processes, where BIF timers live on the caller's scheduler wheel.
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let mut count = 0;
     for category in categories {
@@ -350,12 +349,20 @@ fn process_scenarios_match_otp_29() {
                 &[OwnedTerm::Int(category), OwnedTerm::Int(n)],
             );
             let args = [Term::small(category).unwrap(), Term::small(n).unwrap()];
-            let actual = vm
-                .eval_scheduled("proc_diff", "scenario", &args, 6, None)
-                .unwrap_or_else(|error| panic!("category {category} n {n}: {error}"));
-            assert_eq!(
+            let actual = if matches!(category, 25 | 26 | 31 | 32) {
+                crate::common::peer_eval(
+                    &[],
+                    &[&beam],
+                    &format!("proc_diff:scenario({category},{n})"),
+                )
+            } else {
+                vm.eval_scheduled("proc_diff", "scenario", &args, 6)
+                    .unwrap_or_else(|error| panic!("category {category} n {n}: {error}"))
+                    .term
+            };
+            similar_asserts::assert_eq!(
                 expected,
-                CallResult::Ok(actual.term),
+                CallResult::Ok(actual),
                 "category {category} n {n}"
             );
             count += 1;
@@ -423,13 +430,13 @@ await_waiting(Pid) ->
         .unwrap();
     reference.load("pinfo_qlen_diff", &beam).unwrap();
     let expected = reference.call("pinfo_qlen_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("pinfo_qlen_diff", "run", &[], 1, None)
+        .eval_scheduled("pinfo_qlen_diff", "run", &[], 1)
         .unwrap_or_else(|error| panic!("process_info direct-path scenario: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("true".into())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("true".into())));
 }
 
 #[test]
@@ -446,10 +453,10 @@ fn otp_6237_owner_exit_100_cycles_match_otp_29() {
         "OTP otp_6237: 100 owner cycles in {:.2}s",
         started.elapsed().as_secs_f64()
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let _ = vm
-        .eval_scheduled("proc_diff", "scenario33_start", &[], 6, None)
+        .eval_scheduled("proc_diff", "scenario33_start", &[], 6)
         .unwrap_or_else(|error| panic!("otp_6237 selector startup: {error}"));
     let started = std::time::Instant::now();
     let mut actual = None;
@@ -458,18 +465,18 @@ fn otp_6237_owner_exit_100_cycles_match_otp_29() {
             eprintln!("Arinsal otp_6237: starting owner cycle {cycle}");
         }
         actual = Some(
-            vm.eval_scheduled("proc_diff", "scenario33_cycle", &[], 6, None)
+            vm.eval_scheduled("proc_diff", "scenario33_cycle", &[], 6)
                 .unwrap_or_else(|error| panic!("otp_6237 owner cycle {cycle}: {error}")),
         );
     }
     let _ = vm
-        .eval_scheduled("proc_diff", "scenario33_stop", &[], 6, None)
+        .eval_scheduled("proc_diff", "scenario33_stop", &[], 6)
         .unwrap_or_else(|error| panic!("otp_6237 selector cleanup: {error}"));
     eprintln!(
         "Arinsal otp_6237: 100 owner cycles in {:.2}s",
         started.elapsed().as_secs_f64()
     );
-    assert_eq!(
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(actual.expect("100 cycles ran").term)
     );
@@ -599,12 +606,17 @@ block_normal() ->
         "block_normal",
     ] {
         let expected = reference.call("port_diff", function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let workers = 1;
-        let actual = vm.eval_scheduled("port_diff", function, &[], workers, None);
-        assert_eq!(expected, CallResult::Ok(actual.unwrap().term), "{function}");
-        assert_eq!(
+        let actual = if function == "block_normal" {
+            crate::common::peer_eval(&[], &[&beam], "port_diff:block_normal()")
+        } else {
+            let mut vm = crate::common::node();
+            vm.load_bytes(&beam).unwrap();
+            vm.eval_scheduled("port_diff", function, &[], 1)
+                .unwrap_or_else(|error| panic!("{function}: {error}"))
+                .term
+        };
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
+        similar_asserts::assert_eq!(
             expected,
             CallResult::Ok(arinsal_etf::OwnedTerm::Atom("ok".into())),
             "reference result for {function}"
@@ -671,13 +683,13 @@ count() ->
     let expected = reference.call("port_fd_diff", "count", &[]);
     let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let _pipe = std::os::unix::net::UnixStream::pair().unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("port_fd_diff", "count", &[], 1, None)
+        .eval_scheduled("port_fd_diff", "count", &[], 1)
         .unwrap_or_else(|error| panic!("port fd scenario: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Int(3)));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Int(3)));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -728,14 +740,10 @@ collect_done(Workers) ->
         .unwrap();
     reference.load("port_scheduler_diff", &beam).unwrap();
     let expected = reference.call("port_scheduler_diff", "run", &[]);
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("port_scheduler_diff", "run", &[], 5, None)
-        .unwrap_or_else(|error| panic!("blocked-scheduler port scenario: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    let actual = crate::common::peer_eval(&[], &[&beam], "port_scheduler_diff:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
@@ -775,13 +783,13 @@ run() ->
         .unwrap();
     reference.load("port_monitor_lifecycle", &beam).unwrap();
     let expected = reference.call("port_monitor_lifecycle", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("port_monitor_lifecycle", "run", &[], 2, None)
+        .eval_scheduled("port_monitor_lifecycle", "run", &[], 2)
         .unwrap_or_else(|error| panic!("port monitor lifecycle: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
 }
 
 #[test]
@@ -806,13 +814,13 @@ run() ->
         .unwrap();
     reference.load("port_invalid_cwd", &beam).unwrap();
     let expected = reference.call("port_invalid_cwd", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("port_invalid_cwd", "run", &[], 1, None)
+        .eval_scheduled("port_invalid_cwd", "run", &[], 1)
         .unwrap_or_else(|error| panic!("invalid port cwd: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("true".into())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("true".into())));
 }
 
 #[test]
@@ -838,13 +846,13 @@ collect(Port, Acc) ->
         .unwrap();
     reference.load("port_line_default", &beam).unwrap();
     let expected = reference.call("port_line_default", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("port_line_default", "run", &[], 1, None)
+        .eval_scheduled("port_line_default", "run", &[], 1)
         .unwrap_or_else(|error| panic!("bare line port option: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(OwnedTerm::List {
             elems: vec![
@@ -878,13 +886,13 @@ run() ->
         .unwrap();
     reference.load("port_link_exit", &beam).unwrap();
     let expected = reference.call("port_link_exit", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("port_link_exit", "run", &[], 2, None)
+        .eval_scheduled("port_link_exit", "run", &[], 2)
         .unwrap_or_else(|error| panic!("linked port exit: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
 }
 
 #[test]
@@ -920,13 +928,13 @@ run() ->
         .unwrap();
     reference.load("port_exec_errors", &beam).unwrap();
     let expected = reference.call("port_exec_errors", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("port_exec_errors", "run", &[], 1, None)
+        .eval_scheduled("port_exec_errors", "run", &[], 1)
         .unwrap_or_else(|error| panic!("spawn executable errors: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(OwnedTerm::Tuple(vec![
             OwnedTerm::atom("enoent"),
@@ -954,7 +962,7 @@ scenario(2) -> try exit({stopped,42}) catch exit:{stopped,42} -> caught_exit end
     reference.load("proc_errors", &beam).unwrap();
     for category in 0..3 {
         let expected = reference.call("proc_errors", "scenario", &[OwnedTerm::Int(category)]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled(
@@ -962,10 +970,9 @@ scenario(2) -> try exit({stopped,42}) catch exit:{stopped,42} -> caught_exit end
                 "scenario",
                 &[Term::small(category).unwrap()],
                 2,
-                None,
             )
             .unwrap_or_else(|error| panic!("category {category}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "category {category}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "category {category}");
     }
 }
 
@@ -997,19 +1004,13 @@ try_loop(N, Acc) ->
     reference.load("caught_loop", &beam).unwrap();
     let count = 200_000;
     let expected = reference.call("caught_loop", "run", &[OwnedTerm::Int(count)]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let started = std::time::Instant::now();
     let actual = vm
-        .eval_scheduled(
-            "caught_loop",
-            "run",
-            &[Term::small(count).unwrap()],
-            1,
-            None,
-        )
+        .eval_scheduled("caught_loop", "run", &[Term::small(count).unwrap()], 1)
         .unwrap_or_else(|error| panic!("caught_loop: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
     assert!(
         started.elapsed() < std::time::Duration::from_secs(60),
         "caught error loop took {:?}",
@@ -1034,12 +1035,12 @@ gather(0) -> ok;
 gather(N) -> receive ok -> gather(N-1) after 5000 -> timeout end.
 "#;
     let beam = reference.compile_named("load_race", source, &[]).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let result = vm
-        .eval_scheduled("load_race", "run", &[Term::small(200).unwrap()], 4, None)
+        .eval_scheduled("load_race", "run", &[Term::small(200).unwrap()], 4)
         .unwrap();
-    assert_eq!(result.term, OwnedTerm::Atom("ok".into()));
+    similar_asserts::assert_eq!(result.term, OwnedTerm::Atom("ok".into()));
 }
 
 /// A multi-scheduling block belongs to the runtime that set it. A runtime started
@@ -1068,28 +1069,11 @@ fresh() ->
     reference.load("msb_isolation", &beam).unwrap();
     let expected = reference.call("msb_isolation", "fresh", &[]);
 
-    let mut blocker = Vm::new([]);
-    blocker.load_bytes(&beam).unwrap();
-    let blocked = blocker
-        .eval_scheduled("msb_isolation", "block", &[], 2, None)
-        .unwrap();
-    assert_eq!(blocked.term, OwnedTerm::Atom("blocked_normal".into()));
+    let blocked = crate::common::peer_eval(&[], &[&beam], "msb_isolation:block()");
+    similar_asserts::assert_eq!(blocked, OwnedTerm::Atom("blocked_normal".into()));
 
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let fresh_beam = beam.clone();
-    std::thread::spawn(move || {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&fresh_beam).unwrap();
-        let result = vm
-            .eval_scheduled("msb_isolation", "fresh", &[], 2, None)
-            .map(|result| result.term);
-        let _ = sender.send(result);
-    });
-    let actual = receiver
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("runtime started after another runtime blocked multi-scheduling hung");
-    assert_eq!(expected, CallResult::Ok(actual.unwrap()));
-    drop(blocker);
+    let actual = crate::common::peer_eval(&[], &[&beam], "msb_isolation:fresh()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 /// `monitor(process, self())` creates only a ref (`bif.c` local_process). A live
@@ -1139,11 +1123,11 @@ run() ->
     let beam = reference.compile_named("mon_trees", source, &[]).unwrap();
     reference.load("mon_trees", &beam).unwrap();
     let expected = reference.call("mon_trees", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mon_trees", "run", &[], 2, None)
+        .eval_scheduled("mon_trees", "run", &[], 2)
         .unwrap_or_else(|error| panic!("monitor trees: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
 }

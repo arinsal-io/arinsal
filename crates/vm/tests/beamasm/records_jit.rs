@@ -3,7 +3,6 @@
 //! function called from an exported entry, which is where native code takes over.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -114,11 +113,11 @@ fn compare(function: &str) {
         .load("rj_probe", &probe)
         .expect("load reference probe");
     let expected = reference.call("rj_probe", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&definition).expect("load VM definition");
     vm.load_bytes(&probe).expect("load VM probe");
     let actual = vm
-        .eval_scheduled("rj_probe", function, &[], 2, None)
+        .eval_scheduled("rj_probe", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

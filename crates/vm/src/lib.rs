@@ -129,15 +129,13 @@ mod boot_loop1_shared_tests {
                 &[],
             )
             .unwrap();
-        let scope = beamasm_integration::new_code_scope();
-        let mut first = Vm::shared_replica(scope, &[]);
-        let mut second = Vm::shared_replica(scope, &[]);
+        let mut first = Vm::shared_replica(&[]);
+        let mut second = Vm::shared_replica(&[]);
         let id = first.load_bytes(&beam).unwrap();
         second.refresh_code();
         assert_eq!(second.code.modules[id].name, "boot_loop1_shared");
-        assert_eq!(first.code_ix.active_tables().modules.len(), id + 1);
+        assert!(first.code_ix.active_tables().modules.len() > id);
         drop((first, second));
-        beamasm_integration::release_code_scope(scope);
     }
 }
 
@@ -267,11 +265,9 @@ pub struct Vm {
     native_fns: Arc<Vec<Option<crate::natives::nif::NativeFn>>>,
     purge_state: Arc<crate::natives::code::PurgeState>,
     beamasm_targets: beamasm_integration::NativeTargetCache,
-    /// Identity of this node's code (erts' code index state); native registries are per scope.
-    pub(crate) code_scope: u64,
     /// Code indexes and per-index code tables of this node (`code_ix.c`).
     pub(crate) code_ix: Arc<crate::code_ix::CodeIndexes>,
-    /// A scheduler's VM; the node's own VM owns the code scope.
+    /// A scheduler's VM; the node's own VM owns the child setup.
     replica: bool,
     // ---- vm_exc ----
     backtrace_depth: usize,
@@ -347,9 +343,15 @@ fn cli_help_non_pollable_registration_fires_once() {
     assert!(rx.try_recv().is_err());
 }
 
+/// Port of erts/emulator/beam/erl_init.c (erts_exit): the one place a node's OS process ends,
+/// where the BeamAsm statistics are printed before `exit`.
+pub fn erts_exit(status: i32) -> ! {
+    beamasm_integration::print_stats();
+    std::process::exit(status)
+}
+
 impl Drop for Vm {
     fn drop(&mut self) {
-        beamasm_integration::print_stats();
         // Port of erts/emulator/beam/erl_init.c (erts_exit), OTP-29.1.1.
         if !self.replica
             && let Some(runtime) = self.runtime
@@ -357,19 +359,21 @@ impl Drop for Vm {
         {
             scheduler.release();
         }
-        // Scheduler replicas share their node's scope; the node's own VM owns it.
-        if !self.replica {
-            beamasm_integration::release_code_scope(self.code_scope);
+        // erts_exit closes the forker port: erl_child_setup reads EOF and exits, and the
+        // port's reader ends with it. The runtime's own handle must not keep them alive.
+        if !self.replica
+            && let Some(child_setup) = self.child_setup.take()
+        {
+            child_setup.shutdown();
         }
     }
 }
 impl Vm {
-    /// Registers a native function for this VM and removes it when its code scope is released.
+    /// Registers a native function for this VM and removes it when its code is purged.
     pub fn register_native_function(
         &mut self,
-        mut function: NativeFunction,
+        function: NativeFunction,
     ) -> Result<(), &'static str> {
-        function.scope = self.code_scope;
         native_bridge::register_native_function(function)
     }
 

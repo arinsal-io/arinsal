@@ -3,7 +3,6 @@
 //! export), so a reloaded module's old native code is never entered by new processes.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const TARGET_V1: &str = r#"
 -module(sev_target).
@@ -57,11 +56,11 @@ fn spawned_process_enters_current_module_version() {
         .expect("compile driver");
     reference.load("sev_driver", &driver).expect("load driver");
     let expected = reference.call("sev_driver", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&driver).expect("load VM driver");
     let actual = vm
-        .eval_scheduled("sev_driver", "run", &[], 2, None)
+        .eval_scheduled("sev_driver", "run", &[], 2)
         .map(|value| value.term)
         .unwrap_or_else(|error| panic!("sev_driver:run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

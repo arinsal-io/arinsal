@@ -185,7 +185,6 @@ impl Vm {
         &mut self,
         module: &str,
         workers: usize,
-        simulation_seed: Option<u64>,
         reductions: u32,
     ) -> Result<(), VmError> {
         let name = Term::atom(
@@ -198,7 +197,6 @@ impl Vm {
             "call_on_load_function",
             &[name],
             workers,
-            simulation_seed,
             reductions,
         );
         let keep = matches!(&result, Ok(done) if done.text == "ok");
@@ -212,9 +210,8 @@ impl Vm {
         function: &str,
         args: &[Term],
         workers: usize,
-        simulation_seed: Option<u64>,
     ) -> Result<ScheduledResult, VmError> {
-        self.eval_scheduled_reductions(module, function, args, workers, simulation_seed, 4_000)
+        self.eval_scheduled_reductions(module, function, args, workers, 4_000)
     }
 
     /// Executes one exported function in a fresh process: BIFs and the `erlang` fun builtins
@@ -247,7 +244,7 @@ impl Vm {
         function: &str,
         args: &[Term],
     ) -> Result<crate::EvalResult, VmError> {
-        let scheduled = self.eval_scheduled(module, function, args, 1, None)?;
+        let scheduled = self.eval_scheduled(module, function, args, 1)?;
         let mut process = Process::new();
         let term = {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -271,14 +268,13 @@ impl Vm {
         function: &str,
         args: &[Term],
         workers: usize,
-        simulation_seed: Option<u64>,
         reductions: u32,
     ) -> Result<ScheduledResult, VmError> {
         // A booted node gets these from erl_features:init_features/0 during the
         // boot, exactly like erts; seeding them earlier would also give the
         // feature atoms indices erts does not give them.
         if module != "erl_init" {
-            initialize_feature_defaults(arinsal_pterm::store_for(self.code_scope))?;
+            initialize_feature_defaults(arinsal_pterm::global_store())?;
         }
         if self.child_setup.is_none() {
             self.child_setup = Some(crate::child_setup::start().map_err(|error| {
@@ -294,7 +290,7 @@ impl Vm {
             return Err(error);
         }
         if self.code.pending_on_load.contains_key(module) {
-            self.run_pending_on_load(module, workers, simulation_seed, reductions)?;
+            self.run_pending_on_load(module, workers, reductions)?;
         }
         let module_id = self.load_named(module)?;
         // Port of erts/emulator/beam/erl_init.c:508 (load_preloaded), OTP-29.1.1:
@@ -313,25 +309,9 @@ impl Vm {
             ))));
         }
         let (sender, receiver) = mpsc::channel();
-        if let Some(runtime) = self.runtime
-            && runtime.simulated != simulation_seed.is_some()
-        {
-            return Err(VmError::Unsupported(
-                "a VM cannot change between real and simulated scheduling".into(),
-            ));
-        }
-        let runtime: &'static Runtime = if let Some(runtime) = self.runtime
-            && simulation_seed.is_none()
-        {
+        let runtime: &'static Runtime = if let Some(runtime) = self.runtime {
             runtime
         } else {
-            // A seeded scheduler run is an isolated simulation invocation: its seed and virtual
-            // process table belong to that run, as in the prior per-invocation scheduler scope.
-            if let Some(runtime) = self.runtime
-                && let Ok(scheduler) = runtime.scheduler()
-            {
-                scheduler.release();
-            }
             let code = Arc::clone(&self.code_ix);
             let port_layout = arinsal_term::ptab::port_table_layout();
             let port_ids = PtabIdRing::new(port_layout.max());
@@ -342,7 +322,6 @@ impl Vm {
                 statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
                 backtrace_depth: AtomicUsize::new(8),
                 code: Arc::clone(&code),
-                code_scope: self.code_scope,
                 trap_exports: std::array::from_fn(|_| OnceLock::new()),
                 system_processes: Mutex::new(std::collections::HashSet::new()),
                 otp_root: self.otp_root.clone(),
@@ -359,28 +338,21 @@ impl Vm {
                 system_monitor_flags: AtomicU8::new(0),
                 long_message_queues: Mutex::new(Vec::new()),
                 port_ids,
-                simulated: simulation_seed.is_some(),
-                virtual_ms: AtomicU64::new(0),
                 named_ets: Arc::clone(&named_ets),
                 ets: std::sync::RwLock::new(arinsal_ets::Registry::new_with_named_index(named_ets)),
                 result: Mutex::new(sender.clone()),
                 code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
-                breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
+                breakpoints: Arc::new(crate::trace_bp::BpNode::new()),
                 debug_wait_active: AtomicBool::new(false),
                 system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
                 gc_defaults: crate::natives::sys::GcDefaults::boot(),
-                persistent_terms: arinsal_pterm::store_for(self.code_scope),
+                persistent_terms: arinsal_pterm::global_store(),
                 multi_scheduling: Mutex::new(MultiScheduling::default()),
             }));
             self.runtime = Some(runtime);
             runtime
         };
         *runtime.result.lock().unwrap() = sender;
-        if runtime.simulated != simulation_seed.is_some() {
-            return Err(VmError::Unsupported(
-                "a VM cannot change between real and simulated scheduling".into(),
-            ));
-        }
         let first_runtime = runtime.scheduler.get().is_none();
         (|| -> Result<ScheduledResult, VmError> {
             if first_runtime {
@@ -420,10 +392,7 @@ impl Vm {
                         .workers
                         .min(arinsal_alloc::cpuinfo::cpu_info().configured.max(1)),
                 );
-                let scheduler = Arc::new(match simulation_seed {
-                    Some(seed) => Scheduler::simulation(config, seed),
-                    None => Scheduler::new(config),
-                });
+                let scheduler = Arc::new(Scheduler::new(config));
                 let online = crate::natives::sys::scheduler_online_default(runtime);
                 let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
                 let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
@@ -443,7 +412,7 @@ impl Vm {
                         retired.release();
                     }
                 });
-                if module == "erl_init" && function == "start" && simulation_seed.is_none() {
+                if module == "erl_init" && function == "start" {
                     crate::natives::env::install_boot_signals(runtime)?;
                 }
             }
@@ -483,16 +452,14 @@ impl Vm {
             // Port of erts/emulator/beam/erl_init.c system-process startup: every
             // VM needs the preloaded owner of the literal-area release protocol.
             if first_runtime {
-                if module == "erl_init" && function == "start" {
-                    // Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process), OTP-29.1.1.
-                    self.spawn_system_process_priority(
-                        scheduler,
-                        runtime,
-                        "erts_code_purger",
-                        "start",
-                        arinsal_sched::Priority::High,
-                    )?;
-                }
+                // Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process), OTP-29.1.1.
+                self.spawn_system_process_priority(
+                    scheduler,
+                    runtime,
+                    "erts_code_purger",
+                    "start",
+                    arinsal_sched::Priority::High,
+                )?;
                 let literal_collector = self.spawn_system_process_priority(
                     scheduler,
                     runtime,
@@ -525,42 +492,10 @@ impl Vm {
             scheduler
                 .schedule_unscheduled(entry_pid)
                 .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-            if simulation_seed.is_some() {
-                loop {
-                    if let Ok(result) = receiver.try_recv() {
-                        while arinsal_pterm::store_for(self.code_scope).has_retired() {
-                            if !scheduler.step() {
-                                let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
-                                scheduler.advance_ms(1).map_err(|error| {
-                                    VmError::Unsupported(format!("simulation clock: {error}"))
-                                })?;
-                                if now > 60_000 {
-                                    return Err(VmError::Unsupported(
-                                    "literal collector did not finish before simulation timeout"
-                                        .into(),
-                                ));
-                                }
-                            }
-                        }
-                        return result;
-                    }
-                    if !scheduler.step() {
-                        let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
-                        scheduler.advance_ms(1).map_err(|error| {
-                            VmError::Unsupported(format!("simulation clock: {error}"))
-                        })?;
-                        if now > 60_000 {
-                            return Err(VmError::Unsupported(
-                                "simulation has no runnable process or timer".into(),
-                            ));
-                        }
-                    }
-                }
-            }
             let result = receiver
                 .recv()
                 .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
-            while arinsal_pterm::store_for(self.code_scope).has_retired() {
+            while arinsal_pterm::global_store().has_retired() {
                 std::thread::park_timeout(std::time::Duration::from_millis(1));
             }
             self.refresh_code();

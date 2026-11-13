@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "ets_process_exit_lifetime";
@@ -57,16 +56,10 @@ fn named_table_name_is_released_and_new_tid_allocated_after_owner_exit() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "named_table_recreated_after_owner_exit", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(
-            MODULE,
-            "named_table_recreated_after_owner_exit",
-            &[],
-            2,
-            None,
-        )
+        .eval_scheduled(MODULE, "named_table_recreated_after_owner_exit", &[], 2)
         .unwrap_or_else(|error| panic!("ETS owner exit: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term));
@@ -79,10 +72,10 @@ fn exiting_owner_transfers_tables_in_erts_owned_list_order() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "heir_transfer_order_is_newest_first", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "heir_transfer_order_is_newest_first", &[], 2, None)
+        .eval_scheduled(MODULE, "heir_transfer_order_is_newest_first", &[], 2)
         .unwrap_or_else(|error| panic!("ETS heir transfer order: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term));

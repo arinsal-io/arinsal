@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 /// The interpreter counts a few more instructions around the call than BEAMASM and erts do.
@@ -87,7 +86,7 @@ fn binary_copy_reductions_and_slices_match_otp() {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let cases = [
@@ -105,11 +104,16 @@ fn binary_copy_reductions_and_slices_match_otp() {
         let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
             panic!("OTP {function} failed");
         };
-        let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
-            .unwrap();
+        let actual =
+            if function.starts_with("copy_loop_limit") || function == "copy_unaligned_source" {
+                crate::common::peer_eval(&[], &[&beam], &format!("{MODULE}:{function}()"))
+            } else {
+                vm.eval_scheduled_reductions(MODULE, function, &[], 1, 4_000)
+                    .unwrap()
+                    .term
+            };
         let (expected_reds, expected_slices) = measured(&expected);
-        let (actual_reds, actual_slices) = measured(&actual.term);
+        let (actual_reds, actual_slices) = measured(&actual);
         assert_eq!(
             expected_slices, actual_slices,
             "{function}: scheduler slices"

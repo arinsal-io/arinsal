@@ -4,7 +4,6 @@
 //! (code_SUITE:many_purges).
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const TARGET: &str = r#"
 -module(sol_target).
@@ -135,21 +134,8 @@ fn many_purges_keep_purger_alive() {
     let expected = reference.call("sol_driver", "run", &[]);
     // A dead purger leaves its literal area retired, which would block
     // `eval_scheduled` forever; bound the run so the regression fails instead.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&driver).expect("load VM driver");
-        let actual = vm
-            .eval_scheduled("sol_driver", "run", &[], 4, None)
-            .map(|value| value.term)
-            .map_err(|error| error.to_string());
-        let _ = sender.send(actual);
-    });
-    let actual = receiver
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("sol_driver:run did not finish (literal area never released)")
-        .unwrap_or_else(|error| panic!("sol_driver:run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual));
+    let actual = crate::common::peer_eval(&[], &[&driver], "sol_driver:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
@@ -171,19 +157,6 @@ fn killed_workers_answer_literal_copy_requests() {
     let driver = reference
         .compile_named("sol_driver", &source, &[])
         .expect("compile driver");
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&driver).expect("load VM driver");
-        let actual = vm
-            .eval_scheduled("sol_driver", "run_churn", &[], 4, None)
-            .map(|value| value.term)
-            .map_err(|error| error.to_string());
-        let _ = sender.send(actual);
-    });
-    let actual = receiver
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("collector never became idle (an exiting process dropped a literal-copy request)")
-        .unwrap_or_else(|error| panic!("sol_driver:run_churn: {error}"));
-    assert_eq!(actual, arinsal_etf::OwnedTerm::Atom("ok".into()));
+    let actual = crate::common::peer_eval(&[], &[&driver], "sol_driver:run_churn()");
+    similar_asserts::assert_eq!(actual, arinsal_etf::OwnedTerm::Atom("ok".into()));
 }

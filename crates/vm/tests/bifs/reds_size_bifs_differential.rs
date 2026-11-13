@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SEMANTICS: &str = r#"semantics() ->
@@ -351,13 +350,13 @@ fn trapped_calls_return_what_otp_returns() {
     let source = source();
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let CallResult::Ok(expected) = reference.call(MODULE, "semantics", &[]) else {
         panic!("OTP semantics failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "semantics", &[], 1, None, 4_000)
+        .eval_scheduled_reductions(MODULE, "semantics", &[], 1, 4_000)
         .unwrap();
     assert_eq!(expected, actual.term);
 }
@@ -368,7 +367,7 @@ fn size_proportional_bifs_charge_and_yield_like_otp() {
     let source = source();
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let mut failures = Vec::new();
@@ -381,7 +380,7 @@ fn size_proportional_bifs_charge_and_yield_like_otp() {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, 4_000)
             .unwrap();
         let (expected_reds, expected_ins, expected_gcs, expected_value) = measured(&expected);
         let (actual_reds, actual_ins, actual_gcs, actual_value) = measured(&actual.term);

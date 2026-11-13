@@ -100,7 +100,7 @@ bench() ->
 fn run(reference: &RefErl, vm: &mut Vm, function: &str) -> (CallResult, OwnedTerm) {
     let expected = reference.call(MODULE, function, &[]);
     let actual = vm
-        .eval_scheduled(MODULE, function, &[], 1, None)
+        .eval_scheduled(MODULE, function, &[], 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     (expected, actual.term)
 }
@@ -119,11 +119,11 @@ fn process_dictionary_non_atom_sequences_match_otp() {
     reference
         .load(MODULE, &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
     for function in ["run_ints", "run_nonatoms"] {
         let (expected, actual) = run(&reference, &mut vm, function);
-        assert_eq!(expected, CallResult::Ok(actual), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
     }
 }
 
@@ -249,9 +249,9 @@ fn process_dictionary_release_operation_timings() {
         .expect("load reference benchmark");
     let started = Instant::now();
     let actual = {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).expect("load VM benchmark");
-        vm.eval_scheduled(MODULE, "bench", &[], 1, None)
+        vm.eval_scheduled(MODULE, "bench", &[], 1)
             .expect("run VM benchmark")
             .term
     };

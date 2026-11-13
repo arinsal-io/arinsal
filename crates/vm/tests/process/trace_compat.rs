@@ -3,7 +3,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trace_compat_diff).
@@ -387,12 +386,14 @@ fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
         .load("trace_compat_diff", &beam)
         .expect("load reference");
     let expected = reference.call("trace_compat_diff", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let actual = vm
-        .eval_scheduled("trace_compat_diff", function, &[], 1, None)
-        .unwrap_or_else(|error| panic!("{function}: {error}"));
-    (expected, actual.term)
+    let actual = {
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
+        vm.eval_scheduled("trace_compat_diff", function, &[], 1)
+            .unwrap_or_else(|error| panic!("{function}: {error}"))
+            .term
+    };
+    (expected, actual)
 }
 
 fn check(function: &str) {

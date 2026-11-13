@@ -6,7 +6,6 @@
 //! erl. The cases run in a child because the validation flag is read once per process.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::process::Command;
 
 const CHILD: &str = "ARINSAL_BS_CREATE_BIN_ALLOC_CHILD";
@@ -74,11 +73,11 @@ sub(B, _, _) -> B.
 #[test]
 fn bs_create_bin_helpers_reserve_the_alloc_words() {
     if let Some(path) = std::env::var_os(CHILD) {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&std::fs::read(path).unwrap()).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 2, None).unwrap();
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &std::fs::read(path).unwrap());
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 2).unwrap();
         println!("RESULT:{}", actual.term);
-        return;
+        arinsal_vm::erts_exit(0);
     }
     let reference = RefErl::start().expect("OTP 29.1.1");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();

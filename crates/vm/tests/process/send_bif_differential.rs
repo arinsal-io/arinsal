@@ -3,7 +3,7 @@
 //! badarg cases with their `error_info`.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(send_bif).
@@ -66,9 +66,9 @@ fn send_bifs_match_otp() {
         .load("send_bif", &beam)
         .expect("load reference module");
     let expected = reference.call("send_bif", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("send_bif", "run", &[], 2, None) {
+    let actual = match vm.eval_scheduled("send_bif", "run", &[], 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

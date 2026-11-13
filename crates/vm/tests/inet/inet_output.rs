@@ -94,9 +94,9 @@ fn run_case(reference: &RefErl, vm: &mut Vm, case_name: &str) {
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("inet_output_diff", "run", &[arg], 2, None)
+        .eval_scheduled("inet_output_diff", "run", &[arg], 2)
         .unwrap_or_else(|error| panic!("{case_name}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
 }
 
 #[test]
@@ -111,8 +111,8 @@ fn tcp_inet_output_matches_erts() {
     reference
         .load("inet_output_diff", &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for case in ["passive_queued_send", "passive_queued_send_closed"] {
         run_case(&reference, &mut vm, case);
     }

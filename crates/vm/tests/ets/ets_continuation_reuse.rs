@@ -1,7 +1,6 @@
 //! ETS chunk continuations keep their match program alive while the caller retains the token.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "ets_continuation_reuse";
@@ -42,10 +41,10 @@ fn ets_match_continuations_remain_reusable() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "whitebox", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "whitebox", &[], 2, None)
+        .eval_scheduled(MODULE, "whitebox", &[], 2)
         .unwrap_or_else(|error| panic!("whitebox: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, from_owned};
-use arinsal_vm::Vm;
 
 fn on_load_case(callback: &str, module: &str) {
     let Ok(reference) = RefErl::start() else {
@@ -22,12 +21,12 @@ fn on_load_case(callback: &str, module: &str) {
     reference.load(&control_name, &control).unwrap();
     let expected = reference.call(&control_name, "run", &[OwnedTerm::Binary(beam.clone())]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&control).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &control);
     let mut heap = arinsal_term::VecHeap::new();
     let argument = from_owned(&OwnedTerm::Binary(beam), &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled(&control_name, "run", &[argument], 2, None)
+        .eval_scheduled(&control_name, "run", &[argument], 2)
         .map(|result| CallResult::Ok(result.term))
         .unwrap_or_else(|error| CallResult::Exception {
             class: "error".into(),
@@ -64,8 +63,8 @@ fn loader_ops_bif3_guard_matches_erl() {
     );
     let beam = reference.compile_named(module, &source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for inputs in [
         [OwnedTerm::Int(5), OwnedTerm::Int(1), OwnedTerm::Int(9)],
         [OwnedTerm::Int(0), OwnedTerm::Int(1), OwnedTerm::Int(9)],
@@ -77,7 +76,7 @@ fn loader_ops_bif3_guard_matches_erl() {
             .map(|term| from_owned(term, &mut heap).unwrap())
             .collect::<Vec<Term>>();
         let actual = vm
-            .eval_scheduled(module, "run", &args, 2, None)
+            .eval_scheduled(module, "run", &args, 2)
             .map(|result| CallResult::Ok(result.term))
             .unwrap_or_else(|error| CallResult::Exception {
                 class: "error".into(),

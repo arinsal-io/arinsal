@@ -5,7 +5,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(prim_file_dirty).
@@ -91,18 +90,17 @@ fn assert_scenario(reference: &RefErl, scenario: i64) -> OwnedTerm {
         .load("prim_file_dirty", &beam)
         .expect("load into erl");
     let expected = reference.call("prim_file_dirty", "run", &[OwnedTerm::Int(scenario)]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
         .eval_scheduled(
             "prim_file_dirty",
             "run",
             &[Term::small(scenario).unwrap()],
             2,
-            None,
         )
         .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
-    assert_eq!(
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(actual.term.clone()),
         "scenario {scenario}"
@@ -126,7 +124,7 @@ fn prim_file_write_file_large_binary_matches_otp() {
         return;
     };
     let term = assert_scenario(&reference, 0);
-    assert_eq!(
+    similar_asserts::assert_eq!(
         term,
         OwnedTerm::Tuple(vec![
             OwnedTerm::atom("ok"),
@@ -153,5 +151,5 @@ fn prim_file_writes_run_on_dirty_io_as_otp() {
     let OwnedTerm::Tuple(ref fields) = term else {
         panic!("scenario 2 result")
     };
-    assert_eq!(fields[1], OwnedTerm::atom("true"), "writer seen dirty");
+    similar_asserts::assert_eq!(fields[1], OwnedTerm::atom("true"), "writer seen dirty");
 }

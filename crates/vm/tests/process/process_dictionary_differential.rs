@@ -42,7 +42,7 @@ fn process_dictionary_inserts_and_erases_match_otp_29() {
                 return;
             };
             let actual = common::arinsal_once("dict_port", &beam, &expr);
-            assert_eq!(expected, actual, "kind {kind} k {k}");
+            similar_asserts::assert_eq!(expected, actual, "kind {kind} k {k}");
         }
     }
 }

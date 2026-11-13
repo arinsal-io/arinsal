@@ -2,7 +2,6 @@
 //! concurrent inserts and deletes: the snapshot protocol of erl_flxctr.c, against `erl`.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
@@ -98,10 +97,10 @@ fn ets_flxctr_matches_otp_29() {
         "info_deleted",
     ] {
         let expected = reference.call("ets_flxctr_diff", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("ets_flxctr_diff", function, &[], 4, None)
+            .eval_scheduled("ets_flxctr_diff", function, &[], 4)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(list_traps).
@@ -113,18 +112,18 @@ fn long_list_bifs_match_erts() {
     };
     let beam = reference.compile_named("list_traps", SOURCE, &[]).unwrap();
     reference.load("list_traps", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let expected = reference.call("list_traps", "values", &[]);
     let actual = vm
-        .eval_scheduled_reductions("list_traps", "values", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("list_traps", "values", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 
     let expected = reference.call("list_traps", "reds", &[]);
     let actual = vm
-        .eval_scheduled_reductions("list_traps", "reds", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("list_traps", "reds", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     let vm_term = actual.term;
     let CallResult::Ok(erl_term) = expected else {
@@ -146,7 +145,7 @@ fn long_list_bifs_match_erts() {
 
     let expected = reference.call("list_traps", "responsive", &[]);
     let actual = vm
-        .eval_scheduled_reductions("list_traps", "responsive", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("list_traps", "responsive", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     let tick = OwnedTerm::Atom("tick".to_string());
     assert_eq!(
@@ -165,10 +164,10 @@ fn keyfind_short_hits_bench() {
     let beam = reference.compile_named("list_traps", SOURCE, &[]).unwrap();
     reference.load("list_traps", &beam).unwrap();
     let expected = reference.call("list_traps", "bench", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions("list_traps", "bench", &[], 1, None, 4_000)
+        .eval_scheduled_reductions("list_traps", "bench", &[], 1, 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     let CallResult::Ok(erl_term) = expected else {
         panic!("erl bench: {expected:?}");

@@ -1,6 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -151,8 +149,8 @@ fn demonitor_flush_drops_a_racing_dynamic_port_down() {
     let CallResult::Ok(expected) = reference.call(MODULE, "run", &[]) else {
         panic!("OTP port monitor race failed");
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 10, None).unwrap();
-    assert_eq!(expected, actual.term);
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 10).unwrap();
+    similar_asserts::assert_eq!(expected, actual.term);
 }

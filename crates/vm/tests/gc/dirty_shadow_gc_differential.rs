@@ -6,7 +6,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(dirty_shadow_gc_differential).
@@ -69,15 +68,14 @@ fn assert_matches_otp(min_heap: i64, expected_events: Option<usize>) {
         "run",
         &[OwnedTerm::Int(min_heap)],
     );
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
         .eval_scheduled(
             "dirty_shadow_gc_differential",
             "run",
             &[Term::small(min_heap).unwrap()],
             2,
-            None,
         )
         .unwrap_or_else(|error| panic!("min_heap_size {min_heap}: {error}"));
     if let Some(count) = expected_events {
@@ -188,8 +186,8 @@ fn assert_placement_matches_otp(min_heap: i64, op: &str, calls: i64) {
             OwnedTerm::Int(calls),
         ],
     );
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
         .eval_scheduled(
             "dirty_result_placement_differential",
@@ -200,7 +198,6 @@ fn assert_placement_matches_otp(min_heap: i64, op: &str, calls: i64) {
                 Term::small(calls).unwrap(),
             ],
             2,
-            None,
         )
         .unwrap_or_else(|error| panic!("{op} x{calls} min_heap_size {min_heap}: {error}"));
     if let (CallResult::Ok(OwnedTerm::Tuple(want)), OwnedTerm::Tuple(got)) =

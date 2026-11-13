@@ -1005,30 +1005,6 @@ pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
     }
 }
 
-/// Run the later operations of a runtime without managed threads.
-pub(crate) fn run_unmanaged_later_ops(progress: &ThrProgress) {
-    loop {
-        let mut ready = Vec::new();
-        if progress
-            .umrefc
-            .iter()
-            .any(|refc| refc.load(Ordering::Acquire) != 0)
-        {
-            return;
-        }
-        let mut shared = progress.unmanaged_later.lock().unwrap();
-        progress.unmanaged_later_len.store(0, Ordering::Release);
-        ready.extend(shared.drain(..).map(|(_, op)| op));
-        drop(shared);
-        if ready.is_empty() {
-            return;
-        }
-        for op in ready {
-            op.run();
-        }
-    }
-}
-
 /// Whether `val` was reached (used by tests).
 #[cfg(test)]
 fn reached(progress: &ThrProgress, val: u64) -> bool {

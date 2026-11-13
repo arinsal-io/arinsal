@@ -1,5 +1,4 @@
 use arinsal_difftest::RefErl;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 #[test]
@@ -17,9 +16,9 @@ fn heap_size_schedule_matches_otp() {
         )
         .unwrap();
     let expected = reference.eval("erlang:system_info(heap_sizes)").unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap().term;
 
     assert_eq!(actual, expected);
 }

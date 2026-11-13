@@ -6,7 +6,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = r#"
 -module(map_get_err_probe).
@@ -174,10 +173,10 @@ fn map_get_is_map_key_and_map_size_failures_match_erts() {
     reference.load("map_get_err_probe", &beam).unwrap();
     let expected = reference.call("map_get_err_probe", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("map_get_err_probe", "run", &[], 1, None)
+        .eval_scheduled("map_get_err_probe", "run", &[], 1)
         .unwrap();
 
     let CallResult::Ok(OwnedTerm::List {

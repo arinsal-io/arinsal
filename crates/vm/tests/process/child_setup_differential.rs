@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(child_setup_diff).
@@ -63,10 +62,10 @@ fn port_child_sigchld_notifications_match_otp() {
         .call_opts("child_setup_diff", "sigchld", &[], &options)
         .result;
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load child-setup differential");
     let actual = vm
-        .eval_scheduled("child_setup_diff", "sigchld", &[], 2, None)
+        .eval_scheduled("child_setup_diff", "sigchld", &[], 2)
         .expect("run child-setup differential");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -116,7 +115,7 @@ fn concurrent_port_spawns_all_complete_like_otp() {
         .call_opts("child_setup_concurrent_diff", "run", &args, &options)
         .result;
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam)
         .expect("load concurrent child-setup differential");
     let mut heap = arinsal_term::VecHeap::new();
@@ -125,7 +124,7 @@ fn concurrent_port_spawns_all_complete_like_otp() {
         .map(|arg| arinsal_term::from_owned(arg, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled("child_setup_concurrent_diff", "run", &terms, 4, None)
+        .eval_scheduled("child_setup_concurrent_diff", "run", &terms, 4)
         .expect("run concurrent child-setup differential");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -169,10 +168,10 @@ fn port_start_results_match_otp() {
     let expected = reference
         .call_opts("child_setup_start_diff", "run", &[], &options)
         .result;
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load port start differential");
     let actual = vm
-        .eval_scheduled("child_setup_start_diff", "run", &[], 2, None)
+        .eval_scheduled("child_setup_start_diff", "run", &[], 2)
         .expect("run port start differential");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

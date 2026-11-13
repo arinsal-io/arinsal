@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 #[test]
@@ -13,9 +12,9 @@ fn select_matches_bignums_created_at_runtime() {
     let beam = reference.compile_named(module, source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
     let expected = reference.call(module, "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap().term;
 
     assert_eq!(CallResult::Ok(actual), expected);
 }
@@ -48,9 +47,9 @@ fn select_splits_small_integers_from_bignums_at_the_immediate_boundary() {
     let beam = reference.compile_named(module, &source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
     let expected = reference.call(module, "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap().term;
 
     assert_eq!(CallResult::Ok(actual), expected);
 }

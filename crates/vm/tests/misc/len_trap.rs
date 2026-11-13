@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_term::global_atoms;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "interp_len_trap";
@@ -25,9 +24,9 @@ fn trapping_gc_bifs_preserve_destinations() {
         CallResult::Ok(term) => term,
         other => panic!("reference call failed: {other:?}"),
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 2, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 2).unwrap();
     let _ = global_atoms();
     assert_eq!(format!("{:?}", actual.term), format!("{want:?}"));
 }

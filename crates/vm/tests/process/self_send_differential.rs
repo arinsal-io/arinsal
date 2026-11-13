@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "self_send_probe";
 const SOURCE: &str = r#"
@@ -126,7 +125,7 @@ fn self_send_matches_otp() {
         .compile_named(MODULE, SOURCE, &[])
         .expect("compile self send probe");
     reference.load(MODULE, &beam).expect("load self send probe");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load probe into Arinsal");
 
     // The first use of seq_trace in the reference node loads code and allocates on the
@@ -134,7 +133,7 @@ fn self_send_matches_otp() {
     // run the warm-up so they stay symmetric.
     let warm_up = Term::small(7).expect("workload id");
     let _ = reference.call(MODULE, "run", &[OwnedTerm::Int(7)]);
-    vm.eval_scheduled(MODULE, "run", &[warm_up], 1, None)
+    vm.eval_scheduled(MODULE, "run", &[warm_up], 1)
         .expect("Arinsal seq trace warm-up");
 
     for (kind, name) in KINDS {
@@ -143,13 +142,7 @@ fn self_send_matches_otp() {
             other => panic!("OTP {name} failed: {other:?}"),
         };
         let outcome = vm
-            .eval_scheduled(
-                MODULE,
-                "run",
-                &[Term::small(kind).expect("workload id")],
-                1,
-                None,
-            )
+            .eval_scheduled(MODULE, "run", &[Term::small(kind).expect("workload id")], 1)
             .unwrap_or_else(|error| panic!("Arinsal {name} failed: {error:?}"));
         similar_asserts::assert_eq!(expected, outcome.term, "self send {name}");
     }

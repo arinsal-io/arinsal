@@ -1,7 +1,5 @@
 use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 use std::path::Path;
 use std::process::Command;
 
@@ -22,11 +20,11 @@ fn standard_io_port_is_registered_and_orders_below_binary() {
     let expected = reference
         .eval("P = hd(erlang:ports()), {is_port(P), <<1>> > P}")
         .unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
-    assert_eq!(expected, OwnedTerm::Tuple(vec![OwnedTerm::atom("true"); 2]));
-    assert_eq!(actual, expected);
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap().term;
+    similar_asserts::assert_eq!(expected, OwnedTerm::Tuple(vec![OwnedTerm::atom("true"); 2]));
+    similar_asserts::assert_eq!(actual, expected);
 }
 
 fn compare_boot_ports(eval: &str, label: &str) {
@@ -55,7 +53,7 @@ fn compare_boot_ports(eval: &str, label: &str) {
     };
     let expected = run(Path::new("erl"));
     let actual = run(&arinsal);
-    assert_eq!(actual, expected, "{label}");
+    similar_asserts::assert_eq!(actual, expected, "{label}");
 }
 
 #[test]

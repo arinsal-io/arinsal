@@ -6,7 +6,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::global_atoms;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "interp_frame_trap";
 
@@ -42,10 +41,10 @@ fn bif_trap_keeps_frame_y_registers() {
         CallResult::Ok(term) => term,
         other => panic!("{MODULE}:run on erl: {other:?}"),
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let arg = arinsal_term::Term::small(20_000).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[arg], 2, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[arg], 2).unwrap();
     let _ = global_atoms();
     assert_eq!(format!("{:?}", actual.term), format!("{want:?}"));
 }

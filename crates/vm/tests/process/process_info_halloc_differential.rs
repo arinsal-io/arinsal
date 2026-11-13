@@ -10,7 +10,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "process_info_halloc_differential";
 const SOURCE: &str = r#"
@@ -85,12 +84,7 @@ fn process_info_result_placement_matches_otp() {
         CallResult::Ok(term) => term,
         other => panic!("reference probe failed: {other:?}"),
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load probe into Arinsal");
-    let actual = vm
-        .eval_scheduled(MODULE, "probe", &[], 1, None)
-        .unwrap_or_else(|error| panic!("Arinsal probe failed: {error:?}"))
-        .term;
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("{MODULE}:probe()"));
     let (
         OwnedTerm::List { elems: actual, .. },
         OwnedTerm::List {
@@ -100,7 +94,7 @@ fn process_info_result_placement_matches_otp() {
     else {
         panic!("probe did not return lists");
     };
-    assert_eq!(actual.len(), expected.len());
+    similar_asserts::assert_eq!(actual.len(), expected.len());
     let differing: Vec<String> = actual
         .iter()
         .zip(expected)

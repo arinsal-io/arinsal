@@ -6,8 +6,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "trace_sched_outs";
 const CASES: &[&str] = &[
@@ -173,18 +171,13 @@ fn running_trace_reports_the_erts_in_and_out_events() {
         .collect();
 
     let mut failures = Vec::new();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
     for (case, want) in &expected {
-        let arg = Term::atom(global_atoms().intern(case).unwrap());
-        let actual = vm
-            .eval_scheduled(MODULE, "run", &[arg], 2, None)
-            .expect("scheduled run");
-        if actual.term != *want {
+        let actual = crate::common::peer_eval(&[], &[&beam], &format!("{MODULE}:run('{case}')"));
+        if actual != *want {
             failures.push(format!(
                 "JIT {case}: erl {} / arinsal {}",
                 summary(&format!("{want:?}")),
-                summary(&format!("{:?}", actual.term))
+                summary(&format!("{actual:?}"))
             ));
         }
     }

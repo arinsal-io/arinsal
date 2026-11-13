@@ -9,7 +9,6 @@
 //! registers, in Y registers (after a call) and the result is parked in a Y register.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::fmt::Write as _;
 
 const SIZES: &[usize] = &[
@@ -161,10 +160,10 @@ fn update_record_matches_erts() {
         .load("jit_update_record_fx", &beam)
         .expect("load reference fixture");
     let expected = reference.call("jit_update_record_fx", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("jit_update_record_fx", "run", &[], 2, None)
+        .eval_scheduled("jit_update_record_fx", "run", &[], 2)
         .unwrap_or_else(|error| panic!("run: {error}"));
     let CallResult::Ok(expected_term) = expected else {
         panic!("reference failed: {expected:?}");

@@ -110,32 +110,6 @@ fn active_port_runs_until_out_of_tasks_and_counts_reductions() {
 }
 
 #[test]
-fn queued_ports_count_in_run_queue_lengths() {
-    let scheduler = Scheduler::<Idle>::simulation(Config::default(), 7);
-    let ports: Vec<_> = (0..3).map(|_| TestPort::new(0, 2)).collect();
-    for port in &ports {
-        scheduler.enqueue_port(port.clone());
-    }
-    assert_eq!(scheduler.stats().run_queue_lengths[0], 3);
-    // FIFO: each port runs once, then goes back to the end while still active.
-    for _ in 0..3 {
-        assert!(scheduler.step());
-    }
-    assert!(
-        ports
-            .iter()
-            .all(|port| port.executions.load(Ordering::SeqCst) == 1)
-    );
-    assert_eq!(scheduler.stats().run_queue_lengths[0], 3);
-    for _ in 0..3 {
-        assert!(scheduler.step());
-    }
-    assert_eq!(scheduler.stats().run_queue_lengths[0], 0);
-    assert!(!scheduler.step());
-    assert!(scheduler.stats().reductions >= 6000);
-}
-
-#[test]
 fn idle_scheduler_steals_a_port() {
     let scheduler = Scheduler::<Idle>::new(Config {
         workers: 2,

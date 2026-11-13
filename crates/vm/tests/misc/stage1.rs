@@ -1,7 +1,6 @@
 #![cfg(feature = "difftest")]
 
 use arinsal_difftest::{RefErl, Vm as _, compare, suites};
-use arinsal_vm::Vm;
 use std::collections::HashSet;
 
 #[test]
@@ -10,7 +9,7 @@ fn report_stage1_pass_rate() {
         eprintln!("erl unavailable; skipping stage1");
         return;
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     let cases = suites::stage1();
     let mut functions = HashSet::new();
     let mut failed = HashSet::new();

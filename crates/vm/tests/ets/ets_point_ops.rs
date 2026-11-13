@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
@@ -91,10 +90,10 @@ resize_list() ->
 
 fn run(function: &str, reference: &RefErl, beam: &[u8]) {
     let expected = reference.call("ets_point_ops_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_point_ops_diff", function, &[], 2, None)
+        .eval_scheduled("ets_point_ops_diff", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

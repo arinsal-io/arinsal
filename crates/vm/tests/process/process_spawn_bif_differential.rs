@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_spawn_bif_diff).
@@ -31,10 +30,10 @@ fn spawned_process_bif_receives_its_mfa_arguments() {
         .expect("load spawned BIF differential");
     let expected = reference.call("proc_spawn_bif_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load spawned BIF differential");
     let actual = vm
-        .eval_scheduled("proc_spawn_bif_diff", "run", &[], 2, None)
+        .eval_scheduled("proc_spawn_bif_diff", "run", &[], 2)
         .expect("run spawned BIF differential")
         .term;
 

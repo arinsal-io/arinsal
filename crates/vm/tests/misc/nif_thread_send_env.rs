@@ -12,7 +12,6 @@ use std::path::Path;
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 fn otp_include() -> std::path::PathBuf {
     let root = std::env::var_os("ARINSAL_OTP_ROOT")
@@ -77,12 +76,9 @@ fn compile_beam(erl: &RefErl, dir: &Path, module: &str, source: &str) {
     erl.load(module, &bytes).unwrap();
 }
 
+/// The tracer and NIF callbacks are node-global: each case runs in a node of its own.
 fn scheduled(dir: &Path, module: &str) -> OwnedTerm {
-    let mut vm = Vm::new([dir.to_path_buf()]);
-    match vm.eval_scheduled(module, "run", &[], 1, None) {
-        Ok(result) => result.term,
-        Err(error) => panic!("{module}:run/0 failed on Arinsal: {error}"),
-    }
+    crate::common::peer_eval_dir(&[], dir, &format!("{module}:run()"))
 }
 
 fn reference(erl: &RefErl, module: &str) -> OwnedTerm {

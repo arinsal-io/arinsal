@@ -4,7 +4,6 @@
 //! (an improper list) overwritten under the JIT.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(seq_trace_receive_heap_diff).
@@ -47,11 +46,11 @@ fn tracer_receiving_a_tokened_message_keeps_its_accumulator() {
     let CallResult::Ok(expected) = reference.call("seq_trace_receive_heap_diff", "run", &[]) else {
         panic!("reference run failed");
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("seq_trace_receive_heap_diff", "run", &[], 1, None)
+        .eval_scheduled("seq_trace_receive_heap_diff", "run", &[], 1)
         .unwrap()
         .term;
-    assert_eq!(actual, expected);
+    similar_asserts::assert_eq!(actual, expected);
 }

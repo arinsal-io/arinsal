@@ -2,7 +2,6 @@
 //! reductions run out: `call_fun` is a switch-out point with an exact live count.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SPIN: &str = r#"
 -module(sol_spin).
@@ -31,10 +30,10 @@ fn fun_tail_loop_is_preempted() {
     let expected = reference.call("sol_spin", "run", &[]);
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&spin).expect("load VM spin");
         let actual = vm
-            .eval_scheduled("sol_spin", "run", &[], 1, None)
+            .eval_scheduled("sol_spin", "run", &[], 1)
             .map(|value| value.term)
             .map_err(|error| error.to_string());
         let _ = sender.send(actual);
@@ -43,5 +42,5 @@ fn fun_tail_loop_is_preempted() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("sol_spin:run did not finish (spinner never preempted)")
         .unwrap_or_else(|error| panic!("sol_spin:run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

@@ -104,7 +104,7 @@ fn list_bifs_match_otp() {
 
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = match vm.eval_scheduled(MODULE, "cases", &[], 1, None) {
+    let actual = match vm.eval_scheduled(MODULE, "cases", &[], 1) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

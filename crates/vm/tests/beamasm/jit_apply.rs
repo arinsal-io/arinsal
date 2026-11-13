@@ -3,7 +3,6 @@
 //! applies of every target kind and for every error case.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"-module(jit_apply).
 -export([run/0, f/0, f/1, f/2, f/7, f/8, many/10]).
@@ -84,8 +83,8 @@ fn apply_node_and_perf_counter_instructions_match_erts() {
     let CallResult::Ok(expected) = reference.call("jit_apply", "run", &[]) else {
         panic!("reference run failed");
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled("jit_apply", "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled("jit_apply", "run", &[], 1).unwrap();
     assert_eq!(actual.term, expected);
 }

@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::sync::Mutex;
 
 static FLAG_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -234,18 +233,9 @@ fn compare(function: &str) {
         .expect("compile system flag fixture");
     reference.load("sysflag_rt", &beam).expect("load reference");
     let expected = reference.call("sysflag_rt", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let actual = vm
-        .eval_scheduled(
-            "sysflag_rt",
-            function,
-            &[],
-            arinsal_alloc::cpuinfo::default_schedulers().0,
-            None,
-        )
-        .unwrap_or_else(|error| panic!("{function}: {error:?}"));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    // The fixtures change scheduler flags and the CPU topology of the node.
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("sysflag_rt:{function}()"));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
 }
 
 #[test]
@@ -341,16 +331,9 @@ fn sysflag_rt_flags_are_per_runtime() {
         .expect("compile system flag fixture");
     reference.load("sysflag_rt", &beam).expect("load reference");
     let expected = reference.call("sysflag_rt", "runtime_defaults", &[]);
-    let mut first = Vm::new([]);
-    first.load_bytes(&beam).expect("load first VM");
-    let changed = first
-        .eval_scheduled("sysflag_rt", "change_flags", &[], 1, None)
-        .unwrap_or_else(|error| panic!("change_flags: {error}"));
-    similar_asserts::assert_eq!(changed.term, arinsal_etf::OwnedTerm::Atom("ok".into()));
-    let mut second = Vm::new([]);
-    second.load_bytes(&beam).expect("load second VM");
-    let actual = second
-        .eval_scheduled("sysflag_rt", "runtime_defaults", &[], 1, None)
-        .unwrap_or_else(|error| panic!("runtime_defaults: {error}"));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    // Two nodes: the flags one node changes are not seen by the other.
+    let changed = crate::common::peer_eval(&[], &[&beam], "sysflag_rt:change_flags()");
+    similar_asserts::assert_eq!(changed, arinsal_etf::OwnedTerm::Atom("ok".into()));
+    let actual = crate::common::peer_eval(&[], &[&beam], "sysflag_rt:runtime_defaults()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

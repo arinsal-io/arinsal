@@ -6,7 +6,6 @@
 
 use arinsal_difftest::RefErl;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -40,10 +39,10 @@ fn child() -> bool {
     };
     let beam = std::fs::read(&beam_path).unwrap();
     for run in 0..RUNS {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let arg = Term::small(OPS).unwrap();
-        vm.eval_scheduled(MODULE, "run", &[arg], 2, None)
+        vm.eval_scheduled(MODULE, "run", &[arg], 2)
             .expect("scheduled run");
         println!("RUN:{run}:done");
     }

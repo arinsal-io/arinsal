@@ -26,7 +26,7 @@ impl arinsal_difftest::Vm for Vm {
                     .map_err(|error| VmError::Unsupported(format!("result: {error:?}")))
             })
         } else {
-            self.eval_scheduled(module, function, &terms, 1, None)
+            self.eval_scheduled(module, function, &terms, 1)
                 .map(|outcome| outcome.term)
         };
         match result {

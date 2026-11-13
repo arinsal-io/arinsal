@@ -1,7 +1,6 @@
 //! Differential tests for the native fast paths of `ets:lookup/2`, `ets:member/2` and
 //! `ets:insert/2` and for the compressed-object decoder, against OTP 29.1.1.
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_direct_diff).
@@ -258,9 +257,9 @@ fn trapped_insert_lists_match_otp_29() {
 
 #[test]
 fn same_size_and_resized_overwrites_match_otp_29() {
-    assert_same_with_four_schedulers("overwrite_memory");
-    assert_same_with_four_schedulers("overwrite_binary_refc");
-    assert_same_with_four_schedulers("overwrite_readers");
+    assert_same_with_default_schedulers("overwrite_memory");
+    assert_same_with_default_schedulers("overwrite_binary_refc");
+    assert_same_with_default_schedulers("overwrite_readers");
 }
 
 fn assert_same(function: &str) {
@@ -271,8 +270,10 @@ fn assert_same(function: &str) {
     assert_same_with_reference(function, &reference);
 }
 
-fn assert_same_with_four_schedulers(function: &str) {
-    let Ok(reference) = RefErl::start_with_erl_args(&["+S", "4"]) else {
+fn assert_same_with_default_schedulers(function: &str) {
+    let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
+    let schedulers_arg = schedulers.to_string();
+    let Ok(reference) = RefErl::start_with_erl_args(&["+S", &schedulers_arg]) else {
         eprintln!("erl unavailable; skipping ETS direct-path differential {function}");
         return;
     };
@@ -285,10 +286,11 @@ fn assert_same_with_reference(function: &str, reference: &RefErl) {
         .unwrap();
     reference.load("ets_direct_diff", &beam).unwrap();
     let expected = reference.call("ets_direct_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
+    let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
     let actual = vm
-        .eval_scheduled("ets_direct_diff", function, &[], 4, None)
+        .eval_scheduled("ets_direct_diff", function, &[], schedulers)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

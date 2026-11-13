@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
-use arinsal_vm::Vm;
 
 #[test]
 fn aux_work_debug_wait_returns_after_scheduler_auxiliary_work() {
@@ -24,10 +23,10 @@ fn aux_work_debug_wait_returns_after_scheduler_auxiliary_work() {
         .unwrap();
     reference.load("aux_work_debug_wait", &beam).unwrap();
     let expected = reference.call("aux_work_debug_wait", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("aux_work_debug_wait", "run", &[], 2, None)
+        .eval_scheduled("aux_work_debug_wait", "run", &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
@@ -50,10 +49,10 @@ fn aux_work_allocator_replies_match_erts_shapes() {
         .unwrap();
     reference.load("aux_work_allocator", &beam).unwrap();
     let expected = reference.call("aux_work_allocator", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("aux_work_allocator", "run", &[], 2, None)
+        .eval_scheduled("aux_work_allocator", "run", &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
@@ -93,10 +92,10 @@ fn aux_work_async_timer_cancel_reply_matches_erts() {
         .load("aux_work_async_timer_cancel", &beam)
         .unwrap();
     let expected = reference.call("aux_work_async_timer_cancel", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("aux_work_async_timer_cancel", "run", &[], 2, None)
+        .eval_scheduled("aux_work_async_timer_cancel", "run", &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
@@ -131,10 +130,10 @@ fn aux_work_bulk_cross_scheduler_timer_cancellation_matches_erts() {
         .unwrap();
     reference.load("aux_work_bulk_timer_cancel", &beam).unwrap();
     let expected = reference.call("aux_work_bulk_timer_cancel", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("aux_work_bulk_timer_cancel", "run", &[], 2, None)
+        .eval_scheduled("aux_work_bulk_timer_cancel", "run", &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
@@ -192,13 +191,10 @@ fn aux_work_abs_timer_cancellation_at_deadline_matches_erts() {
         .unwrap();
     let expected = reference.call("aux_work_deadline_timer_cancel", "run", &[]);
     eprintln!("reference deadline-cancel result: {expected:?}");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
     eprintln!("starting Arinsal deadline-cancel run");
-    let actual = vm
-        .eval_scheduled("aux_work_deadline_timer_cancel", "run", &[], 8, None)
-        .unwrap();
-    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
+    // Timer wheel latency depends on an idle node: a node of its own.
+    let actual = crate::common::peer_eval(&[], &[&beam], "aux_work_deadline_timer_cancel:run()");
+    let canonical = decode(&encode(&actual, EncodeOptions::default())).unwrap();
     // How many timers beat their cancellation depends on thread wake-up latency; erts and
     // Arinsal must agree that every timer ended exactly once, as a timeout or as a cancel.
     let total = |value: &OwnedTerm| match value {
@@ -310,10 +306,10 @@ fn aux_work_process_exit_cancels_owned_timer_memory() {
             },
         )
         .result;
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("aux_work_timer_memory", "run", &[], 2, None)
+        .eval_scheduled("aux_work_timer_memory", "run", &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));

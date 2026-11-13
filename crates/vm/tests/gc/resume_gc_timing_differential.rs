@@ -9,7 +9,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "resume_gc_timing_differential";
 
@@ -93,12 +92,12 @@ fn assert_matches_otp(function: &str, ks: impl Iterator<Item = i64> + Clone) {
         .compile_named(MODULE, SOURCE, &[])
         .expect("compile resume_gc_timing_differential");
     reference.load(MODULE, &beam).expect("load into erl");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for k in ks {
         let expected = reference.call(MODULE, function, &[OwnedTerm::Int(k)]);
         let actual = vm
-            .eval_scheduled(MODULE, function, &[Term::small(k).unwrap()], 2, None)
+            .eval_scheduled(MODULE, function, &[Term::small(k).unwrap()], 2)
             .unwrap_or_else(|error| panic!("{function} K {k}: {error}"));
         assert_eq!(
             expected,

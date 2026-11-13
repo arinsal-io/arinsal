@@ -2,6 +2,10 @@ use similar_asserts::assert_eq;
 use std::path::Path;
 use std::process::Command;
 
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
+
 fn run(runtime: &Path, node: &str, peer: &str) -> String {
     let eval = format!(
         "{{ok,Peer,Remote}}=peer:start_link(#{{name=>{peer},connection=>standard_io}}), Parent=self(), Ref=make_ref(), ParentPid=self(), _=spawn(Remote,fun()->Parent!{{echo,Ref,ParentPid}} end), Result=receive {{echo,Received,ReceivedPid}}->{{Ref=:=Received,Ref==Received,ParentPid=:=ReceivedPid,Ref=:=binary_to_term(term_to_binary(Ref))}} after 5000->timeout end, io:format(\"result=~p~n\",[Result]), peer:stop(Peer), halt()."

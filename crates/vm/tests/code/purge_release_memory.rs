@@ -2,8 +2,6 @@
 
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{Term, VecHeap, from_owned};
-use arinsal_vm::Vm;
 
 const PROBE: &str = r#"
 -module(purge_release_probe).
@@ -179,15 +177,8 @@ fn one_thousand_large_literal_purges_match_erts_memory_growth() {
         .expect("compile purge probe");
     reference.load("purge_release_probe", &probe).unwrap();
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&probe).unwrap();
-    let mut input_heap = VecHeap::new();
-    let binary = from_owned(&OwnedTerm::Binary(target.clone()), &mut input_heap).unwrap();
-    let count = Term::small(100).unwrap();
     let mut first_expected = None;
     let mut last_expected = None;
-    let mut first_actual = None;
-    let mut last_actual = None;
 
     for _ in 0..10 {
         let expected = reference.call(
@@ -201,19 +192,28 @@ fn one_thousand_large_literal_purges_match_erts_memory_growth() {
         let (before, after) = observed_pair(&expected);
         first_expected.get_or_insert(before);
         last_expected = Some(after);
-
-        let actual = vm
-            .eval_scheduled("purge_release_probe", "measure", &[binary, count], 1, None)
-            .unwrap_or_else(|error| panic!("Arinsal purge memory probe failed: {error}"));
-        let (before, after) = observed_pair(&actual.term);
-        first_actual.get_or_insert(before);
-        last_actual = Some(after);
     }
+
+    let peer_dir =
+        std::env::temp_dir().join(format!("arinsal-purge-memory-peer-{}", std::process::id()));
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    std::fs::write(peer_dir.join("purge_release_target.beam"), &target).unwrap();
+    std::fs::write(peer_dir.join("purge_release_probe.beam"), &probe).unwrap();
+    let target_path = peer_dir.join("purge_release_target.beam");
+    let expr = format!(
+        "begin {{ok,Bin}}=file:read_file(\"{}\"),A=purge_release_probe:measure(Bin,100),B=purge_release_probe:measure(Bin,100),{{A,B}} end",
+        target_path.display()
+    );
+    let actual = crate::common::peer_eval_dir(&["+S", "1:1"], &peer_dir, &expr);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+    let OwnedTerm::Tuple(actual_runs) = &actual else {
+        panic!("Arinsal purge memory probe returned {actual:?}");
+    };
+    let (first_actual, _) = observed_pair(&actual_runs[0]);
+    let (_, last_actual) = observed_pair(&actual_runs[1]);
 
     let first_expected = first_expected.unwrap();
     let last_expected = last_expected.unwrap();
-    let first_actual = first_actual.unwrap();
-    let last_actual = last_actual.unwrap();
     let expected_growth = std::array::from_fn::<_, 4, _>(|index| {
         last_expected[index].saturating_sub(first_expected[index])
     });
@@ -259,17 +259,11 @@ fn literal_binaries_held_by_processes_are_released_after_purge() {
         .expect("compile purge probe");
     reference.load("purge_release_probe", &probe).unwrap();
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&probe).expect("load probe");
-    let mut input_heap = VecHeap::new();
-    let binary = from_owned(&OwnedTerm::Binary(target.clone()), &mut input_heap).unwrap();
-    let workers = std::thread::available_parallelism().map_or(1, usize::from);
-    let count = Term::small(10).unwrap();
     let expected = reference
         .call_opts(
             "purge_release_probe",
             "measure_workers",
-            &[OwnedTerm::Binary(target), OwnedTerm::Int(10)],
+            &[OwnedTerm::Binary(target.clone()), OwnedTerm::Int(10)],
             &CallOptions {
                 timeout_ms: Some(30_000),
                 ..CallOptions::default()
@@ -279,15 +273,18 @@ fn literal_binaries_held_by_processes_are_released_after_purge() {
     let CallResult::Ok(expected) = expected else {
         panic!("OTP worker literal purge probe failed: {expected:?}");
     };
-    let actual = vm
-        .eval_scheduled(
-            "purge_release_probe",
-            "measure_workers",
-            &[binary, count],
-            workers,
-            None,
-        )
-        .unwrap_or_else(|error| panic!("Arinsal worker literal purge probe failed: {error}"));
+    let peer_dir =
+        std::env::temp_dir().join(format!("arinsal-purge-workers-peer-{}", std::process::id()));
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    std::fs::write(peer_dir.join("literals.beam"), &target).unwrap();
+    std::fs::write(peer_dir.join("purge_release_probe.beam"), &probe).unwrap();
+    let target_path = peer_dir.join("literals.beam");
+    let expr = format!(
+        "begin {{ok,Bin}}=file:read_file(\"{}\"),purge_release_probe:measure_workers(Bin,10) end",
+        target_path.display()
+    );
+    let actual = crate::common::peer_eval_dir(&[], &peer_dir, &expr);
+    let _ = std::fs::remove_dir_all(&peer_dir);
 
     let binary_pair = |term: &OwnedTerm| {
         let OwnedTerm::Tuple(fields) = term else {
@@ -300,7 +297,7 @@ fn literal_binaries_held_by_processes_are_released_after_purge() {
         (*before, *after)
     };
     let (expected_before, expected_after) = binary_pair(&expected);
-    let (actual_before, actual_after) = binary_pair(&actual.term);
+    let (actual_before, actual_after) = binary_pair(&actual);
     let expected_growth = expected_after.saturating_sub(expected_before).max(0);
     let actual_growth = actual_after.saturating_sub(actual_before).max(0);
     eprintln!(

@@ -1,5 +1,4 @@
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use std::process::Command;
 use std::time::Instant;
 
@@ -21,8 +20,9 @@ fn beam_asm_kernels_match_erts() {
         String::from_utf8_lossy(&compiled.stderr)
     );
     let beam = std::fs::read(dir.join("kernels.beam")).unwrap();
-    let mut vm = Vm::new([dir.clone()]);
+    let mut vm = crate::common::node();
     assert_eq!(arinsal_beam::parse(&beam).unwrap().module, "kernels");
+    vm.load_bytes(&beam).unwrap();
 
     let cases = [
         ("tail", 20_000),
@@ -40,7 +40,7 @@ fn beam_asm_kernels_match_erts() {
         let interpreted_term = arinsal_term::to_owned(interpreted.term).unwrap();
         let started = Instant::now();
         let actual = vm
-            .eval_scheduled("kernels", function, &[Term::small(n).unwrap()], 1, None)
+            .eval_scheduled("kernels", function, &[Term::small(n).unwrap()], 1)
             .unwrap();
         let native_ns = started.elapsed().as_nanos();
         assert_eq!(

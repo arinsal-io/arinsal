@@ -3,7 +3,6 @@
 //! the fast path or the shared compare fragment decides.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const MODULE: &str = r#"
 -module(guard_compare_probe).
@@ -108,10 +107,10 @@ fn guard_comparisons_and_element_match_erts() {
     reference.load("guard_compare_probe", &beam).unwrap();
     let expected = reference.call("guard_compare_probe", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("guard_compare_probe", "run", &[], 1, None)
+        .eval_scheduled("guard_compare_probe", "run", &[], 1)
         .unwrap();
 
     assert_eq!(expected, CallResult::Ok(actual.term));

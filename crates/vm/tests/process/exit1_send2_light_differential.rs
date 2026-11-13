@@ -1,7 +1,6 @@
 //! `exit/1` and `erlang:send/2,3` called from native code (the light BIF entries) match erts.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(exit1_send2_diff).
@@ -36,10 +35,10 @@ fn exit1_and_send2_match_erts() {
         .load("exit1_send2_diff", &beam)
         .expect("load reference");
     let expected = reference.call("exit1_send2_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("exit1_send2_diff", "run", &[], 1, None)
+        .eval_scheduled("exit1_send2_diff", "run", &[], 1)
         .unwrap_or_else(|error| panic!("run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(sensitive_scen).
@@ -85,16 +84,15 @@ fn sensitive_save_calls_and_stack_scenarios_match_otp_29() {
     reference.load("sensitive_scen", &beam).unwrap();
     for scenario in 0..7 {
         let expected = reference.call("sensitive_scen", "scenario", &[OwnedTerm::Int(scenario)]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
         let actual = vm.eval_scheduled(
             "sensitive_scen",
             "scenario",
             &[Term::small(scenario).unwrap()],
             1,
-            None,
         );
-        assert_eq!(
+        similar_asserts::assert_eq!(
             expected,
             CallResult::Ok(
                 actual

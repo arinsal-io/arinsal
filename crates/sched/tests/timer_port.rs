@@ -21,87 +21,60 @@ impl Task for Sink {
     }
 }
 
-fn simulation() -> (Scheduler<Sink>, arinsal_sched::Pid, Arc<Mutex<Vec<u64>>>) {
-    let scheduler = Scheduler::simulation(
-        Config {
-            max_processes: 1,
-            ..Config::default()
-        },
-        1,
-    );
+fn sink() -> (Scheduler<Sink>, arinsal_sched::Pid, Arc<Mutex<Vec<u64>>>) {
+    let scheduler = Scheduler::new(Config {
+        workers: 1,
+        max_processes: 1,
+        ..Config::default()
+    });
     let output = Arc::new(Mutex::new(Vec::new()));
     let pid = scheduler.spawn(Sink(output.clone())).unwrap();
-    scheduler.step();
     (scheduler, pid, output)
+}
+
+fn wait_for_len(output: &Mutex<Vec<u64>>, len: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while output.lock().unwrap().len() < len && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
 fn soon_wheel_expiry_order() {
-    let (scheduler, pid, output) = simulation();
-    scheduler.start_timer(pid, 3, 3).unwrap();
-    scheduler.start_timer(pid, 1, 1).unwrap();
-    scheduler.start_timer(pid, 2, 2).unwrap();
-    scheduler.advance_ms(3).unwrap();
-    while scheduler.step() {}
+    let (scheduler, pid, output) = sink();
+    scheduler.start_timer(pid, 90, 3).unwrap();
+    scheduler.start_timer(pid, 30, 1).unwrap();
+    scheduler.start_timer(pid, 60, 2).unwrap();
+    wait_for_len(&output, 3);
     assert_eq!(*output.lock().unwrap(), [1, 2, 3]);
 }
 
 #[test]
-fn later_wheel_cascade() {
-    let (scheduler, pid, output) = simulation();
-    let timer = scheduler.start_timer(pid, 20_000, 7).unwrap();
-    scheduler.advance_ms(8_192).unwrap();
-    scheduler.advance_ms(8_192).unwrap();
-    assert_eq!(scheduler.read_timer(timer), Some(3_616));
-    scheduler.advance_ms(3_615).unwrap();
-    assert_eq!(scheduler.read_timer(timer), Some(1));
-    scheduler.advance_ms(1).unwrap();
-    while scheduler.step() {}
-    assert_eq!(*output.lock().unwrap(), [7]);
-}
-
-#[test]
-fn long_timer_rb_tree_beyond_wheel() {
-    let (scheduler, pid, output) = simulation();
-    let timeout = (1_u64 << 27) + 500;
-    let timer = scheduler.start_timer(pid, timeout, 9).unwrap();
-    scheduler.advance_ms(timeout - 1).unwrap();
-    assert_eq!(scheduler.read_timer(timer), Some(1));
-    scheduler.advance_ms(1).unwrap();
-    while scheduler.step() {}
-    assert_eq!(*output.lock().unwrap(), [9]);
-}
-
-#[test]
 fn cancel_returns_remaining_ms_like_erts() {
-    let (scheduler, pid, _) = simulation();
-    let timer = scheduler.start_timer(pid, 50, 1).unwrap();
-    scheduler.advance_ms(17).unwrap();
-    assert_eq!(scheduler.cancel_timer(timer), Some(33));
+    let (scheduler, pid, _) = sink();
+    let timer = scheduler.start_timer(pid, 60_000, 1).unwrap();
+    assert!(matches!(scheduler.read_timer(timer), Some(ms) if (59_000..=60_000).contains(&ms)));
+    assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if (59_000..=60_000).contains(&ms)));
     assert_eq!(scheduler.read_timer(timer), None);
 }
 
 #[test]
 fn bump_yields_after_limit() {
-    let (scheduler, pid, output) = simulation();
+    let (scheduler, pid, output) = sink();
     for value in 0..20_050 {
         scheduler.start_timer(pid, 1, value).unwrap();
     }
-    scheduler.advance_ms(1).unwrap();
-    while output.lock().unwrap().len() < 20_050 {
-        scheduler.advance_ms(0).unwrap();
-        while scheduler.step() {}
-    }
+    wait_for_len(&output, 20_050);
     assert_eq!(output.lock().unwrap().len(), 20_050);
 }
 
 #[test]
 fn one_million_timers_insert_cancel() {
-    let (scheduler, pid, _) = simulation();
+    let (scheduler, pid, _) = sink();
     let start = Instant::now();
     for _ in 0..1_000_000 {
         let timer = scheduler.start_timer(pid, 60_000, 1).unwrap();
-        assert_eq!(scheduler.cancel_timer(timer), Some(60_000));
+        assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if ms <= 60_000));
     }
     let ns_per_op = start.elapsed().as_nanos() / 1_000_000;
     println!("timer set+cancel: {ns_per_op} ns/op");

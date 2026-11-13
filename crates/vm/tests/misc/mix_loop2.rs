@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 /// `code_server` spawns the on_load runner with
 /// `spawn_opt(Fun, [{monitor, [{tag, {'ON_LOAD_DOWN', Mod}}]}])`.
@@ -23,11 +22,11 @@ fn spawn_opt_monitor_tag_matches_otp() {
         .compile_named("mix_loop2_monitor_tag", source, &[])
         .unwrap();
     reference.load("mix_loop2_monitor_tag", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop2_monitor_tag", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop2_monitor_tag", "run", &[], 2, None)
+        .eval_scheduled("mix_loop2_monitor_tag", "run", &[], 2)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -57,11 +56,11 @@ fn spawn_opt_monitor_tag_survives_immediate_exit() {
         .compile_named("mix_loop2_monitor_race", source, &[])
         .unwrap();
     reference.load("mix_loop2_monitor_race", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop2_monitor_race", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop2_monitor_race", "run", &[], 4, None)
+        .eval_scheduled("mix_loop2_monitor_race", "run", &[], 4)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -110,11 +109,11 @@ fn receive_sees_message_that_arrives_on_the_wait_instruction() {
         .compile_named("mix_loop2_wait_yield", source, &[])
         .unwrap();
     reference.load("mix_loop2_wait_yield", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop2_wait_yield", "run", &[]);
     let actual = vm
-        .eval_scheduled_reductions("mix_loop2_wait_yield", "run", &[], 2, None, 2)
+        .eval_scheduled_reductions("mix_loop2_wait_yield", "run", &[], 2, 2)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

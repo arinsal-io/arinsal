@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn caught_exit_does_not_replace_later_link_reason() {
@@ -22,11 +21,9 @@ fn caught_exit_does_not_replace_later_link_reason() {
         .unwrap();
     reference.load("boot_loop2_exit", &beam).unwrap();
     let expected = reference.call("boot_loop2_exit", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("boot_loop2_exit", "run", &[], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("boot_loop2_exit", "run", &[], 1).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -50,10 +47,10 @@ fn boot_term_printing_matches_otp() {
         .unwrap();
     reference.load("boot_loop2_print", &beam).unwrap();
     let expected = reference.call("boot_loop2_print", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_print", "run", &[], 1, None)
+        .eval_scheduled("boot_loop2_print", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -73,10 +70,10 @@ fn process_info_dictionary_lookup_matches_otp() {
         .unwrap();
     reference.load("boot_loop2_dictionary", &beam).unwrap();
     let expected = reference.call("boot_loop2_dictionary", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_dictionary", "run", &[], 1, None)
+        .eval_scheduled("boot_loop2_dictionary", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -109,10 +106,10 @@ fn flatmap_updates_share_the_key_tuple_like_otp() {
         .unwrap();
     reference.load("boot_loop2_map_keys", &beam).unwrap();
     let expected = reference.call("boot_loop2_map_keys", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_map_keys", "run", &[], 1, None)
+        .eval_scheduled("boot_loop2_map_keys", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -130,10 +127,10 @@ fn local_erts_debug_copy_shared_export_uses_its_native_body() {
         .unwrap();
     reference.load("boot_loop2_copy_shared", &beam).unwrap();
     let expected = reference.call("boot_loop2_copy_shared", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_copy_shared", "run", &[], 1, None)
+        .eval_scheduled("boot_loop2_copy_shared", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -159,10 +156,10 @@ fn display_returns_true_like_otp() {
     let beam = reference
         .compile_named("boot_loop2_display", source, &[])
         .unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop2_display", "run", &[], 1, None)
+        .eval_scheduled("boot_loop2_display", "run", &[], 1)
         .unwrap();
     assert_eq!(actual.term, arinsal_etf::OwnedTerm::Atom("true".into()));
 }

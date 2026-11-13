@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 
 #[test]
 fn full_width_integer_operands_match_erts() {
@@ -45,10 +44,10 @@ fn full_width_integer_operands_match_erts() {
         .unwrap();
     reference.load("boot_loop3_integer", &beam).unwrap();
     let expected = reference.call("boot_loop3_integer", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_integer", "run", &[], 1, None)
+        .eval_scheduled("boot_loop3_integer", "run", &[], 1)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
@@ -74,7 +73,7 @@ fn rand_seed_and_uniform_match_erts_for_each_algorithm() {
         .compile_named("boot_loop3_rand", source, &[])
         .unwrap();
     reference.load("boot_loop3_rand", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for algorithm in [
         "exs64",
@@ -91,7 +90,7 @@ fn rand_seed_and_uniform_match_erts_for_each_algorithm() {
         eprintln!("checking rand algorithm {algorithm}");
         let term = Term::atom(global_atoms().intern(algorithm).unwrap());
         let actual = vm
-            .eval_scheduled("boot_loop3_rand", "sample", &[term], 1, None)
+            .eval_scheduled("boot_loop3_rand", "sample", &[term], 1)
             .unwrap();
         let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
         assert_eq!(expected, CallResult::Ok(canonical), "{algorithm}");
@@ -120,10 +119,10 @@ fn system_logger_flag_matches_erts() {
         .unwrap();
     reference.load("boot_loop3_logger", &beam).unwrap();
     let expected = reference.call("boot_loop3_logger", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_logger", "run", &[], 1, None)
+        .eval_scheduled("boot_loop3_logger", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -147,11 +146,9 @@ fn scheduler_wall_time_toggle_matches_erts() {
         .unwrap();
     reference.load("boot_loop3_wall", &beam).unwrap();
     let expected = reference.call("boot_loop3_wall", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("boot_loop3_wall", "run", &[], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("boot_loop3_wall", "run", &[], 1).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -186,10 +183,10 @@ fn asynchronous_timer_queries_match_erts() {
         .unwrap();
     reference.load("boot_loop3_timer", &beam).unwrap();
     let expected = reference.call("boot_loop3_timer", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_timer", "run", &[], 1, None)
+        .eval_scheduled("boot_loop3_timer", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -215,11 +212,9 @@ fn dtrace_tag_bifs_match_erts_without_probes() {
         .unwrap();
     reference.load("boot_loop3_dt", &beam).unwrap();
     let expected = reference.call("boot_loop3_dt", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("boot_loop3_dt", "run", &[], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("boot_loop3_dt", "run", &[], 1).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -240,10 +235,10 @@ fn local_unicode_io_flag_matches_erts() {
         .unwrap();
     reference.load("boot_loop3_unicode", &beam).unwrap();
     let expected = reference.call("boot_loop3_unicode", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop3_unicode", "run", &[], 1, None)
+        .eval_scheduled("boot_loop3_unicode", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

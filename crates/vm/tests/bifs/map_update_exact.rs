@@ -1,7 +1,7 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const MODULE: &str = "vm_map_update_exact";
 const SOURCE: &str = r#"
@@ -30,7 +30,7 @@ fn atom_key_single_exact_updates_match_otp() {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let input = OwnedTerm::Int(100_000);
     let expected = reference.call(MODULE, "run", std::slice::from_ref(&input));

@@ -2,8 +2,6 @@
 //! invariants only, never raw timings.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(msacc_threads).
@@ -75,17 +73,11 @@ fn assert_load(load: &str) {
     let CallResult::Ok(expected_term) = &expected else {
         panic!("reference failed: {expected:?}");
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
-    let arg = Term::atom(arinsal_term::global_atoms().intern(load).unwrap());
-    // One worker per configured scheduler, as a booted node has.
-    let workers = std::thread::available_parallelism().map_or(2, usize::from);
-    let actual = vm
-        .eval_scheduled("msacc_threads", "run", &[arg], workers, None)
-        .unwrap_or_else(|error| panic!("{load}: {error}"));
+    // Microstate accounting is node-global: a node of its own.
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("msacc_threads:run({load})"));
     assert_eq!(
         &expected,
-        &CallResult::Ok(actual.term),
+        &CallResult::Ok(actual),
         "{load}: reference {expected_term:?}"
     );
 }

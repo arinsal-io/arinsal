@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_max_heap_diff).
@@ -183,10 +182,10 @@ fn max_heap_kill_is_immediate_across_exit_paths() {
         .expect("load max heap differential");
     let expected = reference.call("proc_max_heap_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load max heap differential");
     let actual = vm
-        .eval_scheduled("proc_max_heap_diff", "run", &[], 2, None)
+        .eval_scheduled("proc_max_heap_diff", "run", &[], 2)
         .expect("run max heap differential")
         .term;
 

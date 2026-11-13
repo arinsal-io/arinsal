@@ -75,8 +75,8 @@ fn update_perf_map(info: &NativeFunction) {
 /// Symbolic information attached to one executable native code range.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeFunction {
-    /// Code scope (node) the code belongs to; 0 registers it for every node.
-    pub scope: u64,
+    /// Process-wide fragment code, published into every code index; module code is staged.
+    pub fragment: bool,
     /// Inclusive first byte of generated code.
     pub start: usize,
     /// Exclusive end of generated code.
@@ -259,7 +259,8 @@ pub(crate) type FunctionTable = Arc<[NativeFunction]>;
 /// OTP-29.1.1. `find_range` binary-searches the module, then the function inside it.
 #[derive(Clone)]
 pub(crate) struct ModuleRange {
-    scope: u64,
+    /// Fragment ranges are published into every code index; module ranges are staged.
+    fragment: bool,
     start: usize,
     /// Shared across code-index snapshots so purge invalidates copies made during staging.
     end: Arc<AtomicUsize>,
@@ -272,10 +273,6 @@ pub(crate) struct ModuleRange {
 }
 
 impl ModuleRange {
-    pub(crate) fn scope(&self) -> u64 {
-        self.scope
-    }
-
     pub(crate) fn start(&self) -> usize {
         self.start
     }
@@ -291,14 +288,14 @@ impl ModuleRange {
     }
 }
 
-fn scope0_ranges() -> &'static arc_swap::ArcSwap<Vec<ModuleRange>> {
+fn fragment_ranges() -> &'static arc_swap::ArcSwap<Vec<ModuleRange>> {
     static RANGES: OnceLock<arc_swap::ArcSwap<Vec<ModuleRange>>> = OnceLock::new();
     RANGES.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(Vec::new())))
 }
 
-/// Scope-0 ranges a new node's code indexes start from.
-pub(crate) fn scope0_code_ranges() -> Arc<Vec<ModuleRange>> {
-    scope0_ranges().load_full()
+/// The fragment ranges the code indexes start from.
+pub(crate) fn code_ranges() -> Arc<Vec<ModuleRange>> {
+    fragment_ranges().load_full()
 }
 
 /// The range entry of a module version whose functions are `functions`.
@@ -308,9 +305,9 @@ fn module_range(
     module_atom: arinsal_term::Atom,
     functions: FunctionTable,
 ) -> ModuleRange {
-    let scope = functions.first().map_or(0, |function| function.scope);
+    let fragment = functions.first().is_some_and(|function| function.fragment);
     ModuleRange {
-        scope,
+        fragment,
         start,
         end: Arc::new(AtomicUsize::new(end)),
         module_atom,
@@ -324,7 +321,7 @@ fn module_range(
     }
 }
 
-/// Every module range of every scope, ordered by address. `erts_lookup_function_info` searches
+/// Every module range, ordered by address. `erts_lookup_function_info` searches
 /// the ranges of one code index; the code of different nodes lives at different addresses, so
 /// one table answers a lookup by address for all of them. Readers take a snapshot without a
 /// lock; writers serialize on [`ranges_writers`].
@@ -358,8 +355,8 @@ fn insert_global_range(range: &ModuleRange) -> Result<(), &'static str> {
 }
 
 /// Removes the ranges `matching` selects from [`all_ranges`], retires them and returns their
-/// scope, start and end.
-fn remove_global_ranges(matching: impl Fn(&ModuleRange) -> bool) -> Vec<(u64, usize, usize)> {
+/// start and end.
+fn remove_global_ranges(matching: impl Fn(&ModuleRange) -> bool) -> Vec<(usize, usize)> {
     let _writer = ranges_writers()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -367,7 +364,7 @@ fn remove_global_ranges(matching: impl Fn(&ModuleRange) -> bool) -> Vec<(u64, us
     let mut removed = Vec::new();
     ranges.retain(|entry| {
         if entry.end() > entry.start && matching(entry) {
-            removed.push((entry.scope, entry.start, entry.end()));
+            removed.push((entry.start, entry.end()));
             entry.retire();
             false
         } else {
@@ -394,31 +391,30 @@ fn insert_module_range(ranges: &mut Vec<ModuleRange>, range: ModuleRange) {
 }
 
 // Port of erts/emulator/beam/beam_ranges.c:194-219 (erts_update_ranges), OTP-29.1.1.
-fn publish_native_module_range(scope: u64, range: ModuleRange) {
-    if scope != 0 {
-        crate::code_ix::for_scope(scope).add_staging_code_range(range);
+fn publish_native_module_range(range: ModuleRange) {
+    if !range.fragment {
+        crate::code_ix::global().add_staging_code_range(range);
         return;
     }
-    let mut seed = scope0_ranges().load_full().as_ref().clone();
+    let mut seed = fragment_ranges().load_full().as_ref().clone();
     insert_module_range(&mut seed, range.clone());
-    scope0_ranges().store(Arc::new(seed));
-    crate::code_ix::with_all_scopes(|indexes| {
+    fragment_ranges().store(Arc::new(seed));
+    // Fragments exist before the code indexes (beamasm_init runs first, as in erl_init.c).
+    if let Some(indexes) = crate::code_ix::existing() {
         let mut ranges = indexes.with_code_ranges(<[_]>::to_vec);
-        insert_module_range(&mut ranges, range.clone());
+        insert_module_range(&mut ranges, range);
         indexes.store_code_ranges(Arc::new(ranges));
-    });
+    }
 }
 
 // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
-fn unpublish_native_module_range(scope: u64, start: usize, end: usize) {
-    if scope == 0 {
-        for range in scope0_ranges().load().iter() {
-            if range.start == start && range.end() == end {
-                range.retire();
-            }
+fn unpublish_native_module_range(start: usize, end: usize) {
+    for range in fragment_ranges().load().iter() {
+        if range.start == start && range.end() == end {
+            range.retire();
         }
-        crate::code_ix::with_all_scopes(|indexes| indexes.remove_code_range(start, end));
-    } else if let Some(indexes) = crate::code_ix::existing_scope(scope) {
+    }
+    if let Some(indexes) = crate::code_ix::existing() {
         indexes.remove_code_range(start, end);
     }
 }
@@ -562,29 +558,16 @@ fn native_generation() -> &'static AtomicU64 {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CatchTarget(usize);
 
-/// Code scope of `process`, or 0 when it has no node.
-pub(crate) fn process_code_scope(process: &Process) -> u64 {
-    process
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.code_scope)
-        .unwrap_or(0)
-}
-
-fn catch_indexes(scope: u64) -> std::sync::Arc<crate::code_ix::CodeIndexes> {
-    crate::code_ix::for_scope(scope)
-}
-
 /// Port of erts/emulator/beam/beam_catches.c:146 (`beam_catches_car`), OTP-29.1.1.
 /// Indexes `bccix[erts_active_code_ix()]`. The active index is the node's atomic.
-fn catch_slot(scope: u64, index: u32) -> Option<CatchTarget> {
-    crate::code_ix::for_scope(scope)
+fn catch_slot(index: u32) -> Option<CatchTarget> {
+    crate::code_ix::global()
         .with_active_catches(|table| table.get(usize::try_from(index).ok()?).copied().flatten())
 }
 
 /// Publishes `change` into the listed code indexes. Readers keep the previous `Arc`.
-fn publish_catches(scope: u64, indexes: &[usize], change: impl Fn(&mut Vec<Option<CatchTarget>>)) {
-    let code = catch_indexes(scope);
+fn publish_catches(indexes: &[usize], change: impl Fn(&mut Vec<Option<CatchTarget>>)) {
+    let code = crate::code_ix::global();
     let _publish = code.lock_catch_publish();
     let mut seen = [false; arinsal_term::ERTS_NUM_CODE_IX];
     for &index in indexes {
@@ -610,21 +593,21 @@ fn place_catch(table: &mut Vec<Option<CatchTarget>>, index: u32, target: CatchTa
 
 /// Whether a stack word is a catch tag registered by native code (`catch`/`try` in a BeamAsm
 /// frame), whose handler only `next_catch` can resolve.
-pub(crate) fn is_native_catch_tag(scope: u64, word: Term) -> bool {
+pub(crate) fn is_native_catch_tag(word: Term) -> bool {
     let raw = word.tagged_word();
     raw & 63 == 0x1b
         && u32::try_from(raw >> 6)
-            .is_ok_and(|index| matches!(catch_slot(scope, index), Some(CatchTarget(_))))
+            .is_ok_and(|index| matches!(catch_slot(index), Some(CatchTarget(_))))
 }
 
-pub(crate) fn register_native_catches(scope: u64, base: u32, handlers: &[*const u8]) -> Vec<u32> {
+pub(crate) fn register_native_catches(base: u32, handlers: &[*const u8]) -> Vec<u32> {
     let ids = (0..handlers.len())
         .filter_map(|offset| u32::try_from(offset).ok()?.checked_add(base))
         .collect::<Vec<_>>();
     // Port of erts/emulator/beam/beam_catches.c:108-143 (`beam_catches_cons` writes the
     // staging pool), OTP-29.1.1. The commit that ends this staging area makes that pool active.
-    let staging = catch_indexes(scope).staging();
-    publish_catches(scope, &[staging], |table| {
+    let staging = crate::code_ix::global().staging();
+    publish_catches(&[staging], |table| {
         for (&id, handler) in ids.iter().zip(handlers) {
             place_catch(table, id, CatchTarget(*handler as usize));
         }
@@ -632,10 +615,10 @@ pub(crate) fn register_native_catches(scope: u64, base: u32, handlers: &[*const 
     ids
 }
 
-pub(crate) fn unregister_native_catches(scope: u64, ids: &[u32]) {
+pub(crate) fn unregister_native_catches(ids: &[u32]) {
     // A purged module's handlers must not stay reachable from any code index still published.
     let all = [0, 1, 2];
-    publish_catches(scope, &all, |table| {
+    publish_catches(&all, |table| {
         for id in ids {
             if let Ok(index) = usize::try_from(*id)
                 && let Some(slot) = table.get_mut(index)
@@ -647,8 +630,8 @@ pub(crate) fn unregister_native_catches(scope: u64, ids: &[u32]) {
 }
 
 /// Native handler address of a catch-table index, if it names native code.
-pub(crate) fn native_catch(scope: u64, index: u32) -> Option<usize> {
-    catch_slot(scope, index).map(|CatchTarget(address)| address)
+pub(crate) fn native_catch(index: u32) -> Option<usize> {
+    catch_slot(index).map(|CatchTarget(address)| address)
 }
 
 /// A catch the scan found. The stack is unchanged until [`commit_catch`].
@@ -682,8 +665,7 @@ fn locate_catch(process: &mut Process) -> Option<LocatedCatch> {
             .code_indexes()
             .with_active_catches(|table| scan_catch(heap, table));
     }
-    crate::code_ix::for_scope(process_code_scope(process))
-        .with_active_catches(|table| scan_catch(heap, table))
+    crate::code_ix::global().with_active_catches(|table| scan_catch(heap, table))
 }
 
 fn scan_catch(
@@ -864,7 +846,7 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
             function.module, function.function, function.arity, function.start, function.end
         );
     }
-    publish_native_module_range(range.scope, range);
+    publish_native_module_range(range);
     native_generation().fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -883,7 +865,7 @@ pub(crate) fn register_native_module(
     }
     let first = &functions[0];
     if functions.iter().any(|function| {
-        function.scope != first.scope
+        function.fragment != first.fragment
             || function.module_atom != first.module_atom
             || function.start < code_start
             || function.end > code_end
@@ -906,19 +888,17 @@ pub(crate) fn register_native_module(
     if perf_map_enabled() {
         functions.iter().for_each(update_perf_map);
     }
-    publish_native_module_range(range.scope, range);
+    publish_native_module_range(range);
     native_generation().fetch_add(1, Ordering::Release);
     Ok(())
 }
 
 /// Removes a purged module's range from the code indexes and the address table.
 // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
-pub(crate) fn unregister_native_module(code_start: usize, code_end: usize, scope: u64) {
-    remove_global_ranges(|range| {
-        range.scope == scope && range.start == code_start && range.end() == code_end
-    });
+pub(crate) fn unregister_native_module(code_start: usize, code_end: usize) {
+    remove_global_ranges(|range| range.start == code_start && range.end() == code_end);
     arinsal_term::unregister_native_code_range(code_start, code_end);
-    unpublish_native_module_range(scope, code_start, code_end);
+    unpublish_native_module_range(code_start, code_end);
     native_generation().fetch_add(1, Ordering::Release);
 }
 
@@ -928,43 +908,14 @@ pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
     let mut removed = 0;
     for entry in entries {
         let ranges = remove_global_ranges(|range| range.start == entry.start);
-        for &(scope, start, end) in &ranges {
+        for &(start, end) in &ranges {
             arinsal_term::unregister_native_code_range(start, end);
-            unpublish_native_module_range(scope, start, end);
+            unpublish_native_module_range(start, end);
         }
         removed += ranges.len();
     }
     if removed == 0 {
         return;
-    }
-    native_generation().fetch_add(1, Ordering::Release);
-}
-
-/// Unregisters scoped native entries when their owning VM code scope is released.
-pub(crate) fn unregister_native_scope(scope: u64) {
-    if scope == 0 {
-        return;
-    }
-    let module_ranges = crate::code_ix::existing_scope(scope)
-        .map(|indexes| {
-            indexes.with_code_ranges(|ranges| {
-                ranges
-                    .iter()
-                    .filter(|range| range.scope == scope && range.end() > range.start)
-                    .map(|range| (range.start, range.end()))
-                    .collect::<Vec<_>>()
-            })
-        })
-        .unwrap_or_default();
-    let removed = remove_global_ranges(|range| range.scope == scope);
-    for &(_, start, end) in &removed {
-        arinsal_term::unregister_native_code_range(start, end);
-    }
-    if let Some(indexes) = crate::code_ix::existing_scope(scope) {
-        indexes.remove_code_ranges_scope(scope);
-    }
-    for (start, end) in module_ranges {
-        arinsal_term::unregister_native_code_range(start, end);
     }
     native_generation().fetch_add(1, Ordering::Release);
 }
@@ -1045,7 +996,6 @@ fn native_frame_at(address: usize) -> Option<NativeStackFrame> {
 // must be selected before the entries collapse into one per name and arity: a newer version
 // placed below the old one in memory would otherwise lose its entries to the old ones.
 pub(crate) fn native_functions_of(
-    scope: u64,
     module: &str,
     range: Option<(usize, usize)>,
 ) -> std::collections::HashMap<(String, u8), NativeFunction> {
@@ -1053,31 +1003,20 @@ pub(crate) fn native_functions_of(
         return std::collections::HashMap::new();
     };
     let ranges = all_ranges().load();
-    let functions_of = |wanted: u64| {
-        ranges
-            .iter()
-            .filter(move |entry| entry.scope == wanted && entry.module_atom == module_atom)
-            .flat_map(|entry| entry.functions.iter())
-            .filter(|function| {
-                range.is_none_or(|(start, end)| start <= function.start && function.start < end)
-            })
-    };
-    let mut scoped = functions_of(scope)
+    ranges
+        .iter()
+        .filter(|entry| entry.module_atom == module_atom)
+        .flat_map(|entry| entry.functions.iter())
+        .filter(|function| {
+            range.is_none_or(|(start, end)| start <= function.start && function.start < end)
+        })
         .map(|function| {
             (
                 (function.function.to_owned(), function.arity),
                 function.clone(),
             )
         })
-        .collect::<std::collections::HashMap<_, _>>();
-    if scope != 0 {
-        for function in functions_of(0) {
-            scoped
-                .entry((function.function.to_owned(), function.arity))
-                .or_insert_with(|| function.clone());
-        }
-    }
-    scoped
+        .collect()
 }
 
 /// Enter one native function and commit its ABI state before returning to the scheduler.
@@ -1720,10 +1659,10 @@ pub(crate) fn lifetime_trace_enabled() -> bool {
 mod version_selection_tests {
     use super::*;
 
-    fn function(scope: u64, start: usize, module: &str) -> NativeFunction {
+    fn function(start: usize, module: &str) -> NativeFunction {
         let atoms = arinsal_term::global_atoms();
         NativeFunction {
-            scope,
+            fragment: false,
             start,
             end: start + 16,
             module: atoms
@@ -1746,8 +1685,8 @@ mod version_selection_tests {
         let module_atom = atoms
             .intern("native_bridge_compact_functions")
             .expect("module atom");
-        let first = function(0, 0x1000, "native_bridge_compact_functions");
-        let second = function(0, 0x1020, "native_bridge_compact_functions");
+        let first = function(0x1000, "native_bridge_compact_functions");
+        let second = function(0x1020, "native_bridge_compact_functions");
         let range = module_range(
             0x1000,
             0x1040,
@@ -1779,14 +1718,14 @@ mod version_selection_tests {
         let memory: &'static [u8] = Box::leak(vec![0_u8; 256].into_boxed_slice());
         let base = memory.as_ptr() as usize;
         let module = "native_bridge_version_selection";
-        let old = function(7, base + 128, module);
-        let current = function(7, base, module);
+        let old = function(base + 128, module);
+        let current = function(base, module);
         register_native_function(old.clone()).expect("register old version");
         register_native_function(current.clone()).expect("register current version");
         let key = ("spin".to_owned(), 0);
-        let selected = native_functions_of(7, module, Some((base, base + 64)));
+        let selected = native_functions_of(module, Some((base, base + 64)));
         similar_asserts::assert_eq!(selected.get(&key), Some(&current));
-        let selected = native_functions_of(7, module, Some((base + 128, base + 192)));
+        let selected = native_functions_of(module, Some((base + 128, base + 192)));
         similar_asserts::assert_eq!(selected.get(&key), Some(&old));
         unregister_native_functions(&[old, current]);
     }
@@ -1795,8 +1734,8 @@ mod version_selection_tests {
     // may then reuse the same executable span; it must replace the retired staging entry.
     #[test]
     fn purge_reload_replaces_ranges_after_a_staging_snapshot() {
-        let scope = crate::beamasm_integration::new_code_scope();
-        let indexes = crate::code_ix::for_scope(scope);
+        // A private instance: the test replaces the whole range table.
+        let indexes = Arc::new(crate::code_ix::CodeIndexes::new());
         let atoms = arinsal_term::global_atoms();
         let module_atom = atoms
             .intern("native_bridge_purge_reload")
@@ -1805,7 +1744,7 @@ mod version_selection_tests {
         let start = 0x1000;
         let end = 0x1100;
         let function = NativeFunction {
-            scope,
+            fragment: false,
             start,
             end,
             module: "native_bridge_purge_reload",
@@ -1835,7 +1774,5 @@ mod version_selection_tests {
                 similar_asserts::assert_eq!((ranges[0].start(), ranges[0].end()), (start, end));
             });
         }
-
-        crate::beamasm_integration::release_code_scope(scope);
     }
 }

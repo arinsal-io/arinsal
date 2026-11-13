@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn spawn_options_iodata_fd_and_errors_match_otp() {
@@ -49,9 +48,9 @@ accepted() ->
         "fd_write",
     ] {
         let expected = reference.call("port_opts_diff", function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled("port_opts_diff", function, &[], 1, None);
-        assert_eq!(expected, CallResult::Ok(actual.unwrap().term), "{function}");
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
+        let actual = vm.eval_scheduled("port_opts_diff", function, &[], 1);
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.unwrap().term), "{function}");
     }
 }

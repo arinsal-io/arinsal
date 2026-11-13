@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "hello_undef_error_handler_diff";
@@ -39,8 +38,8 @@ fn missing_error_handler_keeps_original_undefined_call_arguments() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

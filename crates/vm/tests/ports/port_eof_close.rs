@@ -3,7 +3,6 @@
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{ProcessHeap, from_owned};
-use arinsal_vm::Vm;
 use std::sync::Mutex;
 
 /// The descriptor counts are process wide, so the scenarios run one at a time.
@@ -118,12 +117,12 @@ fn compare(function: &str) {
     let expected = reference
         .call_opts("port_eof_close_diff", function, &[], &options)
         .result;
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("port_eof_close_diff", function, &[], 2, None)
+        .eval_scheduled("port_eof_close_diff", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error:?}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }
 
 #[test]
@@ -149,7 +148,7 @@ fn pipe() -> (i32, i32) {
     let mut fds = [0; 2];
     // SAFETY: pipe initializes both slots with fresh descriptors on success.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0);
+    similar_asserts::assert_eq!(rc, 0);
     (fds[0], fds[1])
 }
 
@@ -170,8 +169,8 @@ fn fd_port_releases_the_input_descriptor_at_eof() {
     let beam = reference
         .compile_named("port_eof_close_diff", SOURCE, &[])
         .unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let before = open_fds();
     let mut cycle_args = Vec::with_capacity(1000);
     let mut descriptors = Vec::with_capacity(3000);
@@ -191,7 +190,7 @@ fn fd_port_releases_the_input_descriptor_at_eof() {
     };
     let mut heap = ProcessHeap::with_words(10_000);
     let argument = from_owned(&input, &mut heap).expect("build fd cycles");
-    let result = vm.eval_scheduled("port_eof_close_diff", "fd_cycles", &[argument], 1, None);
+    let result = vm.eval_scheduled("port_eof_close_diff", "fd_cycles", &[argument], 1);
     for fd in descriptors {
         close(fd);
     }

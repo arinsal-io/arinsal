@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(iolist_to_iovec_compat).
@@ -137,10 +136,10 @@ fn iolist_to_iovec_segmentation_matches_otp() {
     reference.load("iolist_to_iovec_compat", &beam).unwrap();
     let expected = reference.call("iolist_to_iovec_compat", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("iolist_to_iovec_compat", "run", &[], 1, None)
+        .eval_scheduled("iolist_to_iovec_compat", "run", &[], 1)
         .unwrap_or_else(|error| panic!("iolist_to_iovec cases: {error}"));
 
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -217,10 +216,10 @@ fn iolist_to_iovec_reductions_and_yields_match_otp() {
     reference.load("iolist_to_iovec_reds", &beam).unwrap();
     let expected = reference.call("iolist_to_iovec_reds", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("iolist_to_iovec_reds", "run", &[], 1, None)
+        .eval_scheduled("iolist_to_iovec_reds", "run", &[], 1)
         .unwrap_or_else(|error| panic!("iolist_to_iovec reductions: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

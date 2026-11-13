@@ -5,7 +5,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "tail_bif_wait";
 const CASES: &[&str] = &[
@@ -102,12 +101,12 @@ fn tail_bif_waits_to_erts_internal_and_matches_erl() {
         )
         .collect();
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load into arinsal");
     for (case, want) in &expected {
         let arg = Term::atom(global_atoms().intern(case).unwrap());
         let actual = vm
-            .eval_scheduled(MODULE, "run", &[arg], 2, None)
+            .eval_scheduled(MODULE, "run", &[arg], 2)
             .expect("scheduled run");
         assert_eq!(actual.term, *want, "{MODULE}:run({case})");
     }

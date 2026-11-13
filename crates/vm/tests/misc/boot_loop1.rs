@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned, to_owned};
-use arinsal_vm::Vm;
 
 #[test]
 fn re_native_binding_matches_otp() {
@@ -16,7 +15,7 @@ fn re_native_binding_matches_otp() {
         .unwrap();
     reference.load("boot_loop1_re", &beam).unwrap();
     let expected = reference.call("boot_loop1_re", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm.eval_exported("boot_loop1_re", "run", &[]).unwrap();
     assert_eq!(expected, CallResult::Ok(to_owned(actual.term).unwrap()));
@@ -38,10 +37,10 @@ fn kernel_process_flags_match_otp() {
         .unwrap();
     reference.load("boot_loop1_flags", &beam).unwrap();
     let expected = reference.call("boot_loop1_flags", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_flags", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_flags", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -59,10 +58,10 @@ fn local_node_queries_match_otp() {
         .unwrap();
     reference.load("boot_loop1_nodes", &beam).unwrap();
     let expected = reference.call("boot_loop1_nodes", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_nodes", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_nodes", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -87,11 +86,9 @@ fn foreign_registered_name_and_stacktrace_match_otp() {
         .unwrap();
     reference.load("boot_loop1_info", &beam).unwrap();
     let expected = reference.call("boot_loop1_info", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("boot_loop1_info", "run", &[], 2, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("boot_loop1_info", "run", &[], 2).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -111,7 +108,7 @@ fn tuple_arity_selection_matches_otp() {
         .compile_named("boot_loop1_select", source, &[])
         .unwrap();
     reference.load("boot_loop1_select", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for input in [
         OwnedTerm::Tuple(vec![]),
@@ -150,7 +147,7 @@ fn is_pid_instruction_matches_otp() {
         .compile_named("boot_loop1_pid", source, &[])
         .unwrap();
     reference.load("boot_loop1_pid", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for input in [reference.eval("self()").unwrap(), OwnedTerm::Int(1)] {
         let expected = reference.call("boot_loop1_pid", "choose", std::slice::from_ref(&input));
@@ -187,7 +184,7 @@ fn update_record_instruction_matches_otp() {
             .iter()
             .any(|instruction| { instruction.op == arinsal_spec::Opcode::UpdateRecord })
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let input = OwnedTerm::Tuple(vec![
         OwnedTerm::Atom("state".into()),
@@ -230,10 +227,10 @@ fn process_priority_flag_previous_value_matches_otp() {
         .unwrap();
     reference.load("boot_loop1_priority", &beam).unwrap();
     let expected = reference.call("boot_loop1_priority", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_priority", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_priority", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -255,10 +252,10 @@ fn registered_name_process_info_matches_otp() {
         .unwrap();
     reference.load("boot_loop1_process_info", &beam).unwrap();
     let expected = reference.call("boot_loop1_process_info", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_process_info", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_process_info", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -282,10 +279,10 @@ fn process_dictionary_get_put_erase_matches_otp() {
         .unwrap();
     reference.load("boot_loop1_dictionary", &beam).unwrap();
     let expected = reference.call("boot_loop1_dictionary", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_dictionary", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_dictionary", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -305,10 +302,10 @@ fn group_leader_self_change_matches_otp() {
         .unwrap();
     reference.load("boot_loop1_group_leader", &beam).unwrap();
     let expected = reference.call("boot_loop1_group_leader", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_group_leader", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_group_leader", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -333,10 +330,10 @@ fn undef_stacktrace_names_missing_dynamic_target() {
         .unwrap();
     reference.load("boot_loop1_undef", &beam).unwrap();
     let expected = reference.call("boot_loop1_undef", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_undef", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_undef", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -362,7 +359,7 @@ fn is_boolean_instruction_matches_otp() {
             .iter()
             .any(|instruction| { instruction.op == arinsal_spec::Opcode::IsBoolean })
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for input in [
         OwnedTerm::Atom("true".into()),
@@ -403,10 +400,10 @@ fn monitor_registered_name_matches_otp() {
         .unwrap();
     reference.load("boot_loop1_monitor_name", &beam).unwrap();
     let expected = reference.call("boot_loop1_monitor_name", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("boot_loop1_monitor_name", "run", &[], 1, None)
+        .eval_scheduled("boot_loop1_monitor_name", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

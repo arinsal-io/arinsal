@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
-use arinsal_vm::Vm;
 
 #[test]
 fn scheduler_binding_and_errors_match_otp() {
@@ -56,10 +55,10 @@ run() ->
     reference.load("sched_bind_probe", &beam).unwrap();
     let expected = reference.call("sched_bind_probe", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("sched_bind_probe", "run", &[], 2, None)
+        .eval_scheduled("sched_bind_probe", "run", &[], 2)
         .unwrap_or_else(|error| panic!("scheduler binding VM error: {error:?}"));
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));

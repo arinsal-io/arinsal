@@ -18,11 +18,11 @@ type Mfa = (Atom, Atom, u8);
 /// `erts_export_put` for a batch of exports already allocated for this node: each becomes the
 /// entry of its MFA in the staging export table (every table when no staging area is open).
 // Port of erts/emulator/beam/export.c:204-226 (erts_export_put), OTP-29.1.1.
-pub(crate) fn export_put_all(scope: u64, exports: &[(Mfa, &'static Arc<ExportEntry>)]) {
+pub(crate) fn export_put_all(exports: &[(Mfa, &'static Arc<ExportEntry>)]) {
     if exports.is_empty() {
         return;
     }
-    crate::code_ix::for_scope(scope).update_active(|tables| {
+    crate::code_ix::global().update_active(|tables| {
         for (mfa, export) in exports {
             tables.exports.put_export(*mfa, export);
         }
@@ -47,8 +47,8 @@ pub(crate) fn find_export_entry(
 
 /// `erts_active_export_entry`: the export of `mfa` in the active export table.
 // Port of erts/emulator/beam/export.h (erts_active_export_entry), OTP-29.1.1.
-pub(crate) fn active_export_entry(scope: u64, mfa: Mfa) -> Option<&'static Arc<ExportEntry>> {
-    crate::code_ix::for_scope(scope)
+pub(crate) fn active_export_entry(mfa: Mfa) -> Option<&'static Arc<ExportEntry>> {
+    crate::code_ix::global()
         .active_tables()
         .exports
         .find_arc(mfa)
@@ -57,17 +57,17 @@ pub(crate) fn active_export_entry(scope: u64, mfa: Mfa) -> Option<&'static Arc<E
 /// `erts_export_get_or_make_stub`: the export of `mfa`, or a new stub entering the export
 /// trampoline (whose call runs the error handler) entered in the export table.
 // Port of erts/emulator/beam/export.c:228-242 (erts_export_get_or_make_stub), OTP-29.1.1.
-pub(crate) fn export_get_or_make_stub(scope: u64, mfa: Mfa) -> Option<Arc<ExportEntry>> {
-    export_entry_or_stub(scope, mfa).map(Arc::clone)
+pub(crate) fn export_get_or_make_stub(mfa: Mfa) -> Option<Arc<ExportEntry>> {
+    export_entry_or_stub(mfa).map(Arc::clone)
 }
 
 /// [`export_get_or_make_stub`] returning the table's shared owner.
-pub(crate) fn export_entry_or_stub(scope: u64, mfa: Mfa) -> Option<&'static Arc<ExportEntry>> {
-    if let Some(export) = active_export_entry(scope, mfa) {
+pub(crate) fn export_entry_or_stub(mfa: Mfa) -> Option<&'static Arc<ExportEntry>> {
+    if let Some(export) = active_export_entry(mfa) {
         return Some(export);
     }
-    let export = crate::beamasm_integration::make_export(scope, mfa)?;
-    export_put_all(scope, &[(mfa, export)]);
+    let export = crate::beamasm_integration::make_export(mfa)?;
+    export_put_all(&[(mfa, export)]);
     Some(export)
 }
 
@@ -142,14 +142,13 @@ pub(crate) fn delete_code(tables: &crate::load::CodeTables, module: Atom, ix: us
 // Port of erts/emulator/beam/beam_load.c:242-330 (erts_finish_loading) and
 // jit/asm_load.c:1177-1206 (beam_load_finalize_code), OTP-29.1.1.
 pub(crate) fn finish_loading(
-    scope: u64,
     module: &arinsal_loader::Module,
     exports: &[(Mfa, &'static Arc<ExportEntry>)],
     imports: &[(Mfa, &'static Arc<ExportEntry>)],
     addresses: &[(Mfa, usize)],
     on_load: bool,
 ) {
-    let code = crate::code_ix::for_scope(scope);
+    let code = crate::code_ix::global();
     let staging = code.start_staging();
     let ix = staging.ix();
     staging.with(|tables| {
@@ -210,9 +209,9 @@ pub(crate) fn finish_after_on_load(
 // Port of erts/emulator/beam/erl_bif_trace.c:2690-2720 (erts_set_trace_pattern),
 // 2942-3005 (install_exp_breakpoints, uninstall_exp_breakpoints, clean_export_entries),
 // OTP-29.1.1.
-pub(crate) fn set_export_breakpoint(scope: u64, mfa: Mfa, enabled: bool, bif_traced: bool) {
-    let code = crate::code_ix::for_scope(scope);
-    let Some(ep) = active_export_entry(scope, mfa) else {
+pub(crate) fn set_export_breakpoint(mfa: Mfa, enabled: bool, bif_traced: bool) {
+    let code = crate::code_ix::global();
+    let Some(ep) = active_export_entry(mfa) else {
         return;
     };
     if has_export_breakpoint(ep) == enabled {

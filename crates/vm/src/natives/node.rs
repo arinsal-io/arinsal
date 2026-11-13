@@ -454,10 +454,10 @@ fn halt(
             dump_path.display()
         );
         let _ = std::io::stderr().flush();
-        std::process::exit(1);
+        crate::erts_exit(1);
     }
     if !flush {
-        std::process::exit(status);
+        crate::erts_exit(status);
     }
 
     let runtime = process.runtime.as_ref().cloned().ok_or_else(badarg)?;
@@ -478,7 +478,7 @@ fn halt(
             arinsal_drv::flush_async_exit();
             super::nif::wait_for_halt_calls();
             flush_stdio();
-            std::process::exit(status);
+            crate::erts_exit(status);
         },
     );
     Err(VmError::Yield)
@@ -551,7 +551,7 @@ fn combined_flush_timeout(option: Option<u32>) -> Option<u64> {
 
 fn halt_flush_timeout_callback(_ctx: &mut dyn arinsal_sched::TimerCallbackCtx<Message>) {
     // Port of erts/emulator/beam/erl_init.c:2771 (flush-timeout exit), OTP-29.1.1.
-    std::process::exit(255);
+    crate::erts_exit(255);
 }
 
 fn write_halt_crash_dump(message: &str) -> std::io::Result<std::path::PathBuf> {
@@ -645,7 +645,7 @@ badarg(F) -> try F() of _ -> unexpected catch error:badarg -> badarg end.
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("node_native_diff", "run", &[], 2, None)
+            .eval_scheduled("node_native_diff", "run", &[], 2)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }

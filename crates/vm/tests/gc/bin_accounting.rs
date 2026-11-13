@@ -38,7 +38,7 @@ badarg() -> try erlang:memory(not_a_category) catch error:badarg -> badarg end.
 
 fn call(vm: &mut Vm, function: &str) -> CallResult {
     let actual = vm
-        .eval_scheduled("bin_accounting_diff", function, &[], 2, None)
+        .eval_scheduled("bin_accounting_diff", function, &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     CallResult::Ok(canonical)
@@ -56,8 +56,8 @@ fn binary_memory_lifetime_matches_erts() {
     reference.load("bin_accounting_diff", &beam).unwrap();
     let expected = reference.call("bin_accounting_diff", "run", &[]);
     let expected_error = reference.call("bin_accounting_diff", "badarg", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
 
     assert_eq!(expected, call(&mut vm, "run"));
     assert_eq!(expected_error, call(&mut vm, "badarg"));
@@ -82,11 +82,11 @@ value() -> {literal, <<16#5a:1600000>>}.
     let reference_after = reference.eval("erlang:memory(binary)").unwrap();
 
     let local_before = arinsal_term::binary_memory_bytes();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let expected_value = reference.call("bin_accounting_literal", "value", &[]);
     let actual_value = vm
-        .eval_scheduled("bin_accounting_literal", "value", &[], 1, None)
+        .eval_scheduled("bin_accounting_literal", "value", &[], 1)
         .unwrap();
     let canonical_value = decode(&encode(&actual_value.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected_value, CallResult::Ok(canonical_value));
@@ -145,11 +145,7 @@ fn binary_freed_on_another_scheduler_is_gone_after_wait_deallocations() {
         .unwrap();
     reference.load("bin_accounting_cross", &beam).unwrap();
     let expected = reference.call("bin_accounting_cross", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("bin_accounting_cross", "run", &[], 2, None)
-        .unwrap();
-    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
+    let actual = crate::common::peer_eval(&[], &[&beam], "bin_accounting_cross:run()");
+    let canonical = decode(&encode(&actual, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }

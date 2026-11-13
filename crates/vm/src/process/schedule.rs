@@ -42,7 +42,7 @@ impl Task for Process {
         self.stats.gc.nanoseconds
     }
 
-    // Inlined into the worker loop: see `Executor::run`. The dirty and simulated scheduler
+    // Inlined into the worker loop: see `Executor::run`. The dirty scheduler
     // path (`run_slice`) gets its own copy, which the normal schedulers never execute.
     #[inline(always)]
     fn run(
@@ -83,18 +83,6 @@ impl Task for Process {
         {
             self.set_signal_probe(Some(probe));
         }
-        // Records built or decoded on this thread use its node's canonical definitions, and
-        // export funs built here its export entries. A scheduler thread serves one runtime, so
-        // the scopes are selected once; a simulated scheduler shares its thread with others.
-        if !data.scopes_selected || ctx.simulated() {
-            let scope = self
-                .runtime
-                .as_ref()
-                .map_or(0, |runtime| runtime.code_scope);
-            arinsal_term::set_record_scope(scope);
-            crate::fun_dispatch::set_thread_code_scope(scope);
-            data.scopes_selected = scope != 0;
-        }
         // Port of erts/emulator/beam/erl_alloc.c (erts_alloc passes `esdp->no` to the
         // thread-specific allocators), OTP-29.1.1: the process heap allocates on this scheduler's
         // instance without looking the thread up, for the span of this run.
@@ -102,7 +90,7 @@ impl Task for Process {
             .alloc_ix
             .get_or_insert_with(arinsal_alloc::thread_alloc_ix);
         self.heap.set_alloc_ix(Some(alloc_ix));
-        self.on_managed = !ctx.scheduler_type().is_dirty() && !ctx.simulated();
+        self.on_managed = !ctx.scheduler_type().is_dirty();
         if self.receive_timeout_pos.is_some() {
             self.receive_timeout_schedule_in();
         }

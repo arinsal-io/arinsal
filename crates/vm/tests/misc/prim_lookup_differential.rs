@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn function_exported_matches_otp_for_exports_bifs_and_stubs() {
@@ -30,10 +29,10 @@ fn function_exported_matches_otp_for_exports_bifs_and_stubs() {
         .load("prim_lookup_function_exported", &beam)
         .unwrap();
     let expected = reference.call("prim_lookup_function_exported", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("prim_lookup_function_exported", "run", &[], 1, None)
+        .eval_scheduled("prim_lookup_function_exported", "run", &[], 1)
         .unwrap();
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -54,17 +53,12 @@ fn get_all_matches_otp_for_empty_and_multiple_entries() {
     let beam = reference
         .compile_named("prim_lookup_get_all", source, &[])
         .unwrap();
-    reference.load("prim_lookup_get_all", &beam).unwrap();
-    let expected_empty = reference.call("prim_lookup_get_all", "empty", &[]);
-    let expected = reference.call("prim_lookup_get_all", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual_empty = vm
-        .eval_scheduled("prim_lookup_get_all", "empty", &[], 1, None)
-        .unwrap();
-    let actual = vm
-        .eval_scheduled("prim_lookup_get_all", "run", &[], 1, None)
-        .unwrap();
-    similar_asserts::assert_eq!(expected_empty, CallResult::Ok(actual_empty.term));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    // erts hashes a dictionary atom key by its atom index (erl_process_dict.c MAKE_HASH), so
+    // the order of get/0 follows the atom table of the node: a booted node of its own on
+    // each side, like erl, not the test binary's shared node.
+    let expression = "{prim_lookup_get_all:empty(), prim_lookup_get_all:run()}";
+    let expected =
+        crate::common::erl_once("prim_lookup_get_all", source, expression).expect("erl one-shot");
+    let actual = crate::common::arinsal_once("prim_lookup_get_all", &beam, expression);
+    similar_asserts::assert_eq!(expected, actual);
 }

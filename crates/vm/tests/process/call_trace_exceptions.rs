@@ -3,7 +3,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(call_trace_exc_diff).
@@ -118,13 +117,8 @@ fn run(reference: &RefErl, case: i64) -> (CallResult, OwnedTerm) {
         .expect("load reference");
     let arguments = [OwnedTerm::Int(case)];
     let expected = reference.call("call_trace_exc_diff", "c", &arguments);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let term = arinsal_term::Term::small(case).expect("small argument");
-    let actual = vm
-        .eval_scheduled("call_trace_exc_diff", "c", &[term], 1, None)
-        .unwrap_or_else(|error| panic!("case {case}: {error}"));
-    (expected, actual.term)
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("call_trace_exc_diff:c({case})"));
+    (expected, actual)
 }
 
 #[test]
@@ -136,6 +130,6 @@ fn exception_and_return_to_events_match_erts() {
     // Case 12 calls an undefined function, which goes through the code server of a booted node.
     for case in (1..=17).filter(|case| *case != 12) {
         let (expected, actual) = run(&reference, case);
-        assert_eq!(expected, CallResult::Ok(actual), "case {case}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "case {case}");
     }
 }

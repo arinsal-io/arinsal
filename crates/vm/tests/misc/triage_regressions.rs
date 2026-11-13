@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 use std::sync::{Mutex, MutexGuard};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -41,10 +40,10 @@ run() ->
         .load("vm_triage_improper_error", &beam)
         .expect("load improper error fixture in OTP");
     let expected = reference.call("vm_triage_improper_error", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load improper error fixture");
     let actual = vm
-        .eval_scheduled("vm_triage_improper_error", "run", &[], 1, None)
+        .eval_scheduled("vm_triage_improper_error", "run", &[], 1)
         .unwrap_or_else(|error| panic!("format improper error args: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "improper error args");
 }
@@ -72,7 +71,7 @@ run(Options) ->
     reference
         .load("vm_triage_dist_spawn", &beam)
         .expect("load dist spawn fixture in OTP");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load dist spawn fixture");
     for (options, label) in [
         (OwnedTerm::Nil, "without monitor"),
@@ -92,7 +91,7 @@ run(Options) ->
         let mut heap = VecHeap::new();
         let argument = from_owned(&options, &mut heap).expect("build spawn options");
         let actual = vm
-            .eval_scheduled("vm_triage_dist_spawn", "run", &[argument], 1, None)
+            .eval_scheduled("vm_triage_dist_spawn", "run", &[argument], 1)
             .unwrap_or_else(|error| panic!("dist spawn {label}: {error}"));
         assert_same(expected, CallResult::Ok(actual.term), label);
     }

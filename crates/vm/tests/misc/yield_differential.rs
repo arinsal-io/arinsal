@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 #[test]
 fn yield_emits_one_schedule_out_and_in_pair_per_call() {
@@ -40,10 +39,10 @@ collect(Pid, Acc) ->
     reference.load("yield_trace", &beam).unwrap();
     let expected = reference.call("yield_trace", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("yield_trace", "run", &[], 1, None)
+        .eval_scheduled("yield_trace", "run", &[], 1)
         .unwrap_or_else(|error| panic!("yield trace run: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term));
@@ -123,10 +122,10 @@ count_out(Pid, Ref, Count) ->
         .unwrap();
     reference.load("trap_lazy_yield", &beam).unwrap();
     let expected = reference.call("trap_lazy_yield", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("trap_lazy_yield", "run", &[], 2, None)
+        .eval_scheduled("trap_lazy_yield", "run", &[], 2)
         .unwrap_or_else(|error| panic!("large trapping BIF yields: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term.clone()));

@@ -23,15 +23,17 @@ impl Task for Collector {
     }
 }
 
+// erts guarantees the order of messages and signals only per sender/receiver pair, so the test
+// asserts exactly that on real schedulers.
 #[test]
-fn seeded_ordering_across_messages_and_signals() {
-    for seed in 0..64 {
+fn per_pair_ordering_across_messages_and_signals() {
+    for seed in 0..8u64 {
         let config = Config {
-            workers: 1,
+            workers: 2,
             max_processes: 64,
             ..Config::default()
         };
-        let sched = Scheduler::simulation(config, seed);
+        let sched = Scheduler::new(config);
         let output = Arc::new(Mutex::new(Vec::new()));
         let receivers: Vec<_> = (0..4)
             .map(|_| {
@@ -68,14 +70,13 @@ fn seeded_ordering_across_messages_and_signals() {
                     .unwrap();
             }
             expected[r][s].push((sequence as u32, signal));
-            if x & 15 == 0 {
-                for _ in 0..3 {
-                    sched.step();
-                }
-            }
         }
-        while sched.step() {}
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while output.lock().unwrap().len() < 200 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let actual = output.lock().unwrap();
+        assert_eq!(actual.len(), 200, "seed={seed}");
         for (r, receiver) in receivers.iter().enumerate() {
             for (s, sender) in senders.iter().enumerate() {
                 let found: Vec<_> = actual
@@ -437,15 +438,16 @@ fn pid_generation_and_timer_firing() {
             RunOutcome::Exit(0)
         }
     }
-    let sched = Scheduler::simulation(
-        Config {
-            max_processes: 1,
-            ..Config::default()
-        },
-        1,
-    );
+    let sched = Scheduler::new(Config {
+        workers: 1,
+        max_processes: 1,
+        ..Config::default()
+    });
     let first = sched.spawn(Exit).unwrap();
-    assert!(sched.step());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sched.lookup(first) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(!sched.lookup(first));
     let second = sched.spawn(Exit).unwrap();
     // erts hands out the next free-ring data, not the slot just released.
@@ -453,136 +455,19 @@ fn pid_generation_and_timer_firing() {
     assert_eq!(Pid::from_term(second.to_term().unwrap()), Some(second));
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::simulation(
-        Config {
-            max_processes: 2,
-            ..Config::default()
-        },
-        2,
-    );
+    let sched = Scheduler::new(Config {
+        workers: 1,
+        max_processes: 2,
+        ..Config::default()
+    });
     let pid = sched.spawn(CountTask(counter.clone())).unwrap();
-    sched.step();
-    let first = sched.start_timer(pid, 10, ()).unwrap();
-    let cancelled = sched.start_timer(pid, 20, ()).unwrap();
-    assert_eq!(sched.cancel_timer(cancelled), Some(20));
-    sched.advance_ms(10).unwrap();
-    assert_eq!(sched.cancel_timer(first), None);
-    while sched.step() {}
-    assert_eq!(counter.load(Ordering::Relaxed), 1);
-}
-
-#[test]
-fn bif_timer_tree_follows_create_fire_cancel_and_exit() {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::simulation(
-        Config {
-            max_processes: 4,
-            ..Config::default()
-        },
-        3,
-    );
-    let pid = sched.spawn(CountTask(counter)).unwrap();
-    sched.step();
-    assert_eq!(sched.bif_timers_of(pid), 0);
-    let fires = sched.start_timer(pid, 10, ()).unwrap();
-    let cancelled = sched.start_timer(pid, 20, ()).unwrap();
-    let kept = sched.send_after(pid, 30, ()).unwrap();
-    assert_eq!(sched.bif_timers_of(pid), 3);
-    assert_eq!(sched.cancel_timer(cancelled), Some(20));
-    assert_eq!(sched.bif_timers_of(pid), 2);
-    sched.advance_ms(10).unwrap();
-    assert_eq!(sched.cancel_timer(fires), None);
-    assert_eq!(sched.bif_timers_of(pid), 1);
-    sched.pause_target_timers(pid);
-    assert_eq!(sched.bif_timers_of(pid), 0);
-    sched.resume_target_timers(pid);
-    assert_eq!(sched.bif_timers_of(pid), 1);
-    assert_eq!(
-        sched.cancel_timer(kept),
-        None,
-        "resume re-arms with a fresh identity"
-    );
-}
-
-#[test]
-fn timer_envelope_and_wait_timeout_cancellation() {
-    struct Timed {
-        runs: Arc<AtomicUsize>,
-        received: Arc<Mutex<Vec<&'static str>>>,
-    }
-    impl Task for Timed {
-        type Message = ();
-        type SchedulerData = ();
-        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
-            let n = self.runs.fetch_add(1, Ordering::Relaxed);
-            while let Some(event) = ctx.receive() {
-                let kind = match event.payload {
-                    Payload::Message(()) => "plain",
-                    Payload::Timer { reference, .. } if reference.id() > 0 => "timer",
-                    _ => panic!("unexpected event"),
-                };
-                self.received.lock().unwrap().push(kind);
-            }
-            RunOutcome::Wait {
-                timeout_ms: (n == 0).then_some(100),
-            }
-        }
-    }
-    let sched = Scheduler::simulation(
-        Config {
-            max_processes: 1,
-            ..Config::default()
-        },
-        13,
-    );
-    let runs = Arc::new(AtomicUsize::new(0));
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let pid = sched
-        .spawn(Timed {
-            runs: runs.clone(),
-            received: received.clone(),
-        })
-        .unwrap();
-    sched.step();
-    sched.send(pid, pid, ()).unwrap();
-    sched.step();
-    assert_eq!(runs.load(Ordering::Relaxed), 2);
-    sched.advance_ms(100).unwrap();
-    assert!(!sched.step());
-    assert_eq!(runs.load(Ordering::Relaxed), 2);
-    sched.start_timer(pid, 1, ()).unwrap();
-    sched.send_after(pid, 1, ()).unwrap();
-    sched.advance_ms(1).unwrap();
-    while sched.step() {}
-    assert_eq!(*received.lock().unwrap(), ["plain", "timer", "plain"]);
-    let immediate = sched.start_timer(pid, 0, ()).unwrap();
-    assert_eq!(sched.read_timer(immediate), None);
-    assert_eq!(sched.cancel_timer(immediate), None);
-    let plain = sched.send_after(pid, 0, ()).unwrap();
-    assert_eq!(sched.read_timer(plain), None);
-    while sched.step() {}
-    assert_eq!(
-        *received.lock().unwrap(),
-        ["plain", "timer", "plain", "timer", "plain"]
-    );
-}
-
-#[test]
-fn timer_after_long_idle_uses_current_clock() {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::simulation(
-        Config {
-            max_processes: 1,
-            ..Config::default()
-        },
-        31,
-    );
-    let pid = sched.spawn(CountTask(counter.clone())).unwrap();
-    assert!(sched.step());
-    sched.advance_ms(100_000).unwrap();
+    let cancelled = sched.start_timer(pid, 60_000, ()).unwrap();
+    assert!(matches!(sched.cancel_timer(cancelled), Some(ms) if ms <= 60_000));
     sched.start_timer(pid, 10, ()).unwrap();
-    sched.advance_ms(10).unwrap();
-    while sched.step() {}
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 }
 
@@ -603,90 +488,6 @@ fn threaded_timer_wakes_its_assigned_worker() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(count.load(Ordering::Relaxed), 1);
-}
-
-#[test]
-fn simulation_seed_replays_dispatch_order() {
-    struct Record(Arc<Mutex<Vec<u32>>>);
-    impl Task for Record {
-        type Message = ();
-        type SchedulerData = ();
-        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
-            self.0.lock().unwrap().push(ctx.pid().number());
-            RunOutcome::Exit(0)
-        }
-    }
-    let trace = |seed| {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let sched = Scheduler::simulation(
-            Config {
-                max_processes: 20,
-                ..Config::default()
-            },
-            seed,
-        );
-        for _ in 0..20 {
-            sched.spawn(Record(output.clone())).unwrap();
-        }
-        while sched.step() {}
-        let result = output.lock().unwrap().clone();
-        drop(sched);
-        result
-    };
-    assert_eq!(trace(9), trace(9));
-    assert_ne!(trace(9), trace(10));
-}
-
-#[test]
-fn simulation_replays_batched_multi_recipient_delivery() {
-    enum Work {
-        Sink(Arc<Mutex<Vec<(u32, u32)>>>),
-        Sender(Vec<Pid>),
-    }
-    impl Task for Work {
-        type Message = u32;
-        type SchedulerData = ();
-        fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32) -> RunOutcome {
-            match self {
-                Work::Sink(output) => {
-                    while let Some(event) = ctx.receive() {
-                        if let Payload::Message(value) = event.payload {
-                            output.lock().unwrap().push((ctx.pid().number(), value));
-                        }
-                    }
-                    RunOutcome::Wait { timeout_ms: None }
-                }
-                Work::Sender(targets) => {
-                    for value in 0..90 {
-                        ctx.send(targets[value as usize % targets.len()], value)
-                            .unwrap();
-                    }
-                    RunOutcome::Exit(0)
-                }
-            }
-        }
-    }
-    let run = || {
-        let scheduler = Scheduler::simulation(
-            Config {
-                max_processes: 4,
-                ..Config::default()
-            },
-            51,
-        );
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let targets: Vec<_> = (0..3)
-            .map(|_| scheduler.spawn(Work::Sink(output.clone())).unwrap())
-            .collect();
-        scheduler.spawn(Work::Sender(targets)).unwrap();
-        while scheduler.step() {}
-        output.lock().unwrap().clone()
-    };
-    let first = run();
-    assert_eq!(first.len(), 90);
-    for _ in 0..20 {
-        assert_eq!(run(), first);
-    }
 }
 
 /// One scheduler blocks thread progress while another collects scheduler statistics,

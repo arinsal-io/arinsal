@@ -86,8 +86,6 @@ static PF_MONITOR_DOWN: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 pub struct SchedulerData {
     pub(super) executor: Option<Box<Executor>>,
-    /// The record and code scopes of this scheduler's runtime are selected on its thread.
-    pub(super) scopes_selected: bool,
     /// `esdp->no` as the allocator numbers it: the allocator index of this scheduler's thread,
     /// read once on its first process turn and handed to the heap of each process it runs.
     pub(super) alloc_ix: Option<usize>,
@@ -490,7 +488,7 @@ pub(crate) fn with_replica_vm<R>(runtime: &'static Runtime, f: impl FnOnce(&mut 
             .position(|(cached_key, _)| *cached_key == key)
             .map(|index| slot.swap_remove(index).1)
     });
-    let mut vm = cached.unwrap_or_else(|| Vm::shared_replica(runtime.code_scope, &runtime.paths));
+    let mut vm = cached.unwrap_or_else(|| Vm::shared_replica(&runtime.paths));
     vm.refresh_code();
     let result = f(&mut vm);
     TRACER_REPLICAS.with(|slot| {
@@ -526,7 +524,7 @@ pub(super) fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
         current_process: Default::default(),
         hub_bound: false,
         ref_state: None,
-        vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
+        vm: Vm::shared_replica(&runtime.paths),
         native_registers: {
             let mut registers = SchedulerRegisters::default();
             // The trace-return stub address is a per-scheduler constant (process_main sets it once).

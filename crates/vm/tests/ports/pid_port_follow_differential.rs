@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(pid_port_follow_diff).
@@ -82,12 +81,18 @@ fn assert_same(function: &str) {
         .unwrap();
     reference.load("pid_port_follow_diff", &beam).unwrap();
     let expected = reference.call("pid_port_follow_diff", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("pid_port_follow_diff", function, &[], 2, None)
-        .unwrap_or_else(|error| panic!("{function}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    if matches!(function, "next_port" | "port_wrap" | "port_reuse") {
+        let actual =
+            crate::common::peer_eval(&[], &[&beam], &format!("pid_port_follow_diff:{function}()"));
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
+    } else {
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
+        let actual = vm
+            .eval_scheduled("pid_port_follow_diff", function, &[], 2)
+            .unwrap_or_else(|error| panic!("{function}: {error}"));
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    }
 }
 
 #[test]

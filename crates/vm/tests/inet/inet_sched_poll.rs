@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 // Descriptors re-enabled more than ten times are polled by the schedulers; streams stay
 // complete and ordered across the migration.
@@ -40,10 +39,10 @@ fn scheduler_polled_sockets_match_erts() {
         .load("inet_sched_poll", &beam)
         .expect("load inet_sched_poll");
     let expected = reference.call("inet_sched_poll", "t", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("inet_sched_poll", "t", &[], 2, None)
+        .eval_scheduled("inet_sched_poll", "t", &[], 2)
         .expect("Arinsal inet_sched_poll");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

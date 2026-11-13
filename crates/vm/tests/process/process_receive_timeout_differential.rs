@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_receive_timeout_diff).
@@ -32,11 +31,11 @@ fn invalid_receive_timeouts_match_erts() {
         .expect("load receive timeout differential");
     let expected = reference.call("proc_receive_timeout_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam)
         .expect("load receive timeout differential");
     let actual = vm
-        .eval_scheduled("proc_receive_timeout_diff", "run", &[], 2, None)
+        .eval_scheduled("proc_receive_timeout_diff", "run", &[], 2)
         .expect("run receive timeout differential")
         .term;
 
@@ -92,11 +91,11 @@ fn receive_flooded_by_non_matching_messages_times_out_on_time() {
         .expect("load receive flood differential");
     let expected = reference.call("proc_receive_flood_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam)
         .expect("load receive flood differential");
     let actual = vm
-        .eval_scheduled("proc_receive_flood_diff", "run", &[], 4, None)
+        .eval_scheduled("proc_receive_flood_diff", "run", &[], 4)
         .expect("run receive flood differential")
         .term;
 

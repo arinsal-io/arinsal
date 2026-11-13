@@ -1,7 +1,6 @@
 //! `bs_create_bin` append followed by native byte integer stores.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "bs_append_integer_differential";
 const SOURCE: &str = r#"
@@ -20,10 +19,10 @@ fn append_integer_matches_erts_for_growth_and_unaligned_sources() {
         let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
         reference.load(MODULE, &beam).unwrap();
         let expected = reference.call(MODULE, function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
         let actual = vm
-            .eval_scheduled(MODULE, function, &[], 1, None)
+            .eval_scheduled(MODULE, function, &[], 1)
             .map(|outcome| CallResult::Ok(outcome.term))
             .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
         similar_asserts::assert_eq!(expected, actual, "{function}");

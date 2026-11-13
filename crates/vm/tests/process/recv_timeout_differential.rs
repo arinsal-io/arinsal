@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(recv_timeout_diff).
@@ -80,12 +79,12 @@ fn compare_with(function: &str) {
         .unwrap();
     reference.load("recv_timeout_diff", &beam).unwrap();
     let expected = reference.call("recv_timeout_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("recv_timeout_diff", function, &[], 2, None)
+        .eval_scheduled("recv_timeout_diff", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }
 
 #[test]

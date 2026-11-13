@@ -1,15 +1,17 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 
-fn render(vm: &mut Vm, reference: &RefErl, function: &str, input: &OwnedTerm) -> OwnedTerm {
+fn render(
+    vm: &mut arinsal_vm::Vm,
+    reference: &RefErl,
+    function: &str,
+    input: &OwnedTerm,
+) -> OwnedTerm {
     let expected = reference.call("mix_loop6", function, std::slice::from_ref(input));
     let mut heap = VecHeap::new();
     let arg = from_owned(input, &mut heap).unwrap();
-    let actual = vm
-        .eval_scheduled("mix_loop6", function, &[arg], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("mix_loop6", function, &[arg], 1).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term.clone()), "{input:?}");
     actual.term
 }
@@ -40,7 +42,7 @@ fn ref_port_fun_to_list_match_otp_29() {
             F().";
     let beam = reference.compile_named("mix_loop6", source, &[]).unwrap();
     reference.load("mix_loop6", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let reference_term = OwnedTerm::Ref {
@@ -66,9 +68,7 @@ fn ref_port_fun_to_list_match_otp_29() {
 
     for function in ["local", "export", "wide"] {
         let expected = reference.call("mix_loop6", function, &[]);
-        let actual = vm
-            .eval_scheduled("mix_loop6", function, &[], 1, None)
-            .unwrap();
+        let actual = vm.eval_scheduled("mix_loop6", function, &[], 1).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
 }

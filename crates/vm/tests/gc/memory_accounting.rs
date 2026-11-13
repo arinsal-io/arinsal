@@ -47,7 +47,7 @@ messages() ->
 "#;
 
 fn eval(vm: &mut Vm, function: &str) -> CallResult {
-    match vm.eval_scheduled("vm_memory_accounting", function, &[], 2, None) {
+    match vm.eval_scheduled("vm_memory_accounting", function, &[], 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),
@@ -68,8 +68,8 @@ fn run(function: &str) {
         .unwrap();
     reference.load("vm_memory_accounting", &beam).unwrap();
     let expected = reference.call("vm_memory_accounting", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = eval(&mut vm, function);
     compare(&expected, &actual, CompareMode::Exact)
         .unwrap_or_else(|error| panic!("{function}: {error}"));

@@ -7,7 +7,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "selfpush_diff";
 const SOURCE: &str = r#"
@@ -103,10 +102,10 @@ fn self_replies_go_through_the_signal_in_queue() {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "all", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "all", &[] as &[Term], 4, None)
+        .eval_scheduled(MODULE, "all", &[] as &[Term], 4)
         .unwrap_or_else(|error| panic!("{MODULE}:all: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

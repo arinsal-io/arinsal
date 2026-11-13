@@ -2,7 +2,6 @@
 //! the export's native address); the interpreter is entered only where no native code exists.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::process::Command;
 
 const CHILD: &str = "ARINSAL_JIT_SPAWN_CHILD";
@@ -46,11 +45,11 @@ fn child() -> bool {
     let Some(beam_path) = std::env::var_os(CHILD) else {
         return false;
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&std::fs::read(beam_path).unwrap()).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 2, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 2).unwrap();
     println!("RESULT:{}", actual.text);
-    true
+    arinsal_vm::erts_exit(0)
 }
 
 #[test]

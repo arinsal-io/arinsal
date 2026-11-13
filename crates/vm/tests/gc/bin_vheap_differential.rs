@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "bin_vheap_differential";
@@ -218,10 +217,10 @@ fn calls(function: &str) -> (CallResult, CallResult) {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled(MODULE, function, &[], 1, None)
+        .eval_scheduled(MODULE, function, &[], 1)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
     (expected, actual)
@@ -279,10 +278,10 @@ fn append_trap_magic_binary_size_matches_otp() {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "append_trap_magic_orig_size", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "append_trap_magic_orig_size", &[], 1, None, 20)
+        .eval_scheduled_reductions(MODULE, "append_trap_magic_orig_size", &[], 1, 20)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
     assert_eq!(expected, actual, "append trap binary virtual heap size");

@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_send_request_diff).
@@ -37,11 +36,11 @@ fn request_monitor_after_queued_exit_reports_noproc() {
         .expect("load send request differential");
     let expected = reference.call("proc_send_request_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam)
         .expect("load send request differential");
     let actual = vm
-        .eval_scheduled("proc_send_request_diff", "run", &[], 2, None)
+        .eval_scheduled("proc_send_request_diff", "run", &[], 2)
         .expect("run send request differential")
         .term;
 

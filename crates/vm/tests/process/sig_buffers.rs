@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(sig_buffers_order).
@@ -30,10 +29,6 @@ fn buffered_messages_precede_sender_down_signal_vs_erl() {
         .expect("compile parallel signal buffer probe");
     reference.load("sig_buffers_order", &beam).unwrap();
     let expected = reference.call("sig_buffers_order", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("sig_buffers_order", "run", &[], 4, None)
-        .unwrap_or_else(|error| panic!("parallel signal buffer probe: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    let actual = crate::common::peer_eval(&[], &[&beam], "sig_buffers_order:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(debug_bifs_diff).
@@ -218,11 +217,22 @@ internal_state_get_ported_tuples() ->
      BlockedReferences}.
 
 internal_state_set_ported() ->
-    erts_debug:set_internal_state(available_internal_state, true),
-    {garbage_collection, Before} = process_info(self(), garbage_collection),
-    Gc = erts_debug:set_internal_state(force_gc, self()),
-    {garbage_collection, After} = process_info(self(), garbage_collection),
-    {Gc, proplists:get_value(minor_gcs, After) - proplists:get_value(minor_gcs, Before)}.
+    %% The minor_gcs delta of a forced GC depends on the heap history of the calling process
+    %% (erl gives 1 in an -eval process and 0 in a process that already received a message), so
+    %% the body runs in a process of its own shape on both nodes.
+    Parent = self(),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        receive go -> ok end,
+        erts_debug:set_internal_state(available_internal_state, true),
+        {garbage_collection, Before} = process_info(self(), garbage_collection),
+        Gc = erts_debug:set_internal_state(force_gc, self()),
+        {garbage_collection, After} = process_info(self(), garbage_collection),
+        Parent ! {self(), {Gc, proplists:get_value(minor_gcs, After)
+                                - proplists:get_value(minor_gcs, Before)}}
+    end),
+    Pid ! go,
+    receive {Pid, Result} -> erlang:demonitor(Ref, [flush]), Result
+    after 5000 -> timeout end.
 
 internal_state_multizero_timer() ->
     erts_debug:set_internal_state(available_internal_state, true),
@@ -369,12 +379,9 @@ fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
         .load("debug_bifs_diff", &beam)
         .expect("load reference");
     let expected = reference.call("debug_bifs_diff", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let actual = vm
-        .eval_scheduled("debug_bifs_diff", function, &[], 1, None)
-        .unwrap_or_else(|error| panic!("{function}: {error}"));
-    (expected, actual.term)
+    // The fixtures flip erts_debug internal state: a node of its own.
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("debug_bifs_diff:{function}()"));
+    (expected, actual)
 }
 
 fn assert_reference(expected: CallResult, actual: OwnedTerm) {
@@ -382,9 +389,10 @@ fn assert_reference(expected: CallResult, actual: OwnedTerm) {
 }
 
 fn run_vm(beam: &[u8], function: &str) -> OwnedTerm {
-    let mut vm = Vm::new([]);
+    // Used by the cases that re-exec this test binary as the node to abort or halt.
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).expect("load VM fixture");
-    vm.eval_scheduled("debug_bifs_diff", function, &[], 1, None)
+    vm.eval_scheduled("debug_bifs_diff", function, &[], 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"))
         .term
 }

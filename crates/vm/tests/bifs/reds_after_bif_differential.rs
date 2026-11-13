@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(reds_after_bif).
@@ -152,10 +151,10 @@ fn reductions_and_preemption_survive_bif_and_instruction_helpers() {
         panic!("reference run failed");
     };
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("reds_after_bif", "run", &[], 1, None)
+        .eval_scheduled("reds_after_bif", "run", &[], 1)
         .unwrap_or_else(|error| panic!("reductions run: {error}"));
 
     let (expected, actual) = (rows(&expected), rows(&actual.term));

@@ -8,7 +8,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
-use arinsal_vm::Vm;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -18,9 +17,9 @@ const ASM_SOURCE: &str = include_str!("../fixtures/jit_bs_match_heap_asm.S");
 fn run_both(reference: &RefErl, module: &str, beam: &[u8]) {
     reference.load(module, beam).unwrap();
     let expected = reference.call(module, "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 2, None).unwrap();
+    let actual = vm.eval_scheduled(module, "run", &[], 2).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(
         expected,

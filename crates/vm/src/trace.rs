@@ -4443,7 +4443,7 @@ mod tests {
         let expected = reference.call(name, "run", &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(name, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(name, "run", &[], 1).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
@@ -4466,7 +4466,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let start = std::time::Instant::now();
-        vm.eval_scheduled("trace_refresh_bench", "run", &[], 1, None)
+        vm.eval_scheduled("trace_refresh_bench", "run", &[], 1)
             .unwrap();
         eprintln!(
             "trace refresh benchmark: 1000 rounds in {:?}",
@@ -4703,7 +4703,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let expected = reference.call(module, "run", &[]);
-        let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
@@ -4768,9 +4768,7 @@ mod tests {
         let expected = reference.call("trace_t1_shape", "run", &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
-        let actual = vm
-            .eval_scheduled("trace_t1_shape", "run", &[], 2, None)
-            .unwrap();
+        let actual = vm.eval_scheduled("trace_t1_shape", "run", &[], 2).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
@@ -4788,9 +4786,7 @@ mod tests {
         let expected = reference.call("trace_t1_send", "run", &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
-        let actual = vm
-            .eval_scheduled("trace_t1_send", "run", &[], 2, None)
-            .unwrap();
+        let actual = vm.eval_scheduled("trace_t1_send", "run", &[], 2).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
@@ -4809,7 +4805,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t1_timestamp", "run", &[], 2, None)
+            .eval_scheduled("trace_t1_timestamp", "run", &[], 2)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -4828,9 +4824,7 @@ mod tests {
         let expected = reference.call("trace_t1_info", "run", &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
-        let actual = vm
-            .eval_scheduled("trace_t1_info", "run", &[], 2, None)
-            .unwrap();
+        let actual = vm.eval_scheduled("trace_t1_info", "run", &[], 2).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
@@ -4849,7 +4843,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t4_sessions", "run", &[], 2, None)
+            .eval_scheduled("trace_t4_sessions", "run", &[], 2)
             .unwrap_or_else(|error| panic!("session VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -4926,7 +4920,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t4_session_info", "run", &[], 2, None)
+            .eval_scheduled("trace_t4_session_info", "run", &[], 2)
             .unwrap_or_else(|error| panic!("session info VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -4946,7 +4940,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t4_tracee_info", "run", &[], 2, None)
+            .eval_scheduled("trace_t4_tracee_info", "run", &[], 2)
             .unwrap_or_else(|error| panic!("per-tracee session info VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -4966,7 +4960,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t4_destroy_info", "run", &[], 2, None)
+            .eval_scheduled("trace_t4_destroy_info", "run", &[], 2)
             .unwrap_or_else(|error| panic!("trace session destroy VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -4986,7 +4980,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t4_session_gc", "run", &[], 2, None)
+            .eval_scheduled("trace_t4_session_gc", "run", &[], 2)
             .unwrap_or_else(|error| panic!("trace session GC VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -5008,7 +5002,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t8_dict_gc", "run", &[], 2, None)
+            .eval_scheduled("trace_t8_dict_gc", "run", &[], 2)
             .unwrap_or_else(|error| panic!("dictionary session GC VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -5028,7 +5022,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("trace_t4_weak_handle", "run", &[], 2, None)
+            .eval_scheduled("trace_t4_weak_handle", "run", &[], 2)
             .unwrap_or_else(|error| panic!("weak session handle VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }

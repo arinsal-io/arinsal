@@ -3,7 +3,6 @@
 //! calls that allocate across garbage collections.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
@@ -71,10 +70,10 @@ fn differential(function: &str, args: &[arinsal_etf::OwnedTerm], vm_args: &[arin
         .unwrap();
     reference.load("system_info_light", &beam).unwrap();
     let expected = reference.call("system_info_light", function, args);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("system_info_light", function, vm_args, 2, None)
+        .eval_scheduled("system_info_light", function, vm_args, 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected, "{function}");
 }

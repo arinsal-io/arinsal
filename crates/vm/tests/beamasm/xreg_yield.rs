@@ -9,7 +9,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SMALL: &str = r#"
 -module(xreg_small).
@@ -44,11 +43,11 @@ fn high_arity_arguments_survive_reduction_yield() {
     reference.load("xreg_big", &big).unwrap();
     let expected = reference.call("xreg_small", "go", &[OwnedTerm::Int(20_000)]);
     let args = [Term::small(20_000).unwrap()];
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&small).unwrap();
     vm.load_bytes(&big).unwrap();
     let actual = vm
-        .eval_scheduled("xreg_small", "go", &args, 1, None)
+        .eval_scheduled("xreg_small", "go", &args, 1)
         .map(|result| result.term)
         .unwrap_or_else(|error| panic!("VM error {error:?}"));
     assert_eq!(expected, CallResult::Ok(actual));

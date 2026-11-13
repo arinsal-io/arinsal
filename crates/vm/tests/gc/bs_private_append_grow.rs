@@ -1,7 +1,6 @@
 //! `bs_create_bin` private append when the source lives on the stack and the buffer must grow.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "bs_private_append_grow";
 const SOURCE: &str = r#"
@@ -38,10 +37,10 @@ fn private_append_grow_reads_the_stack_source_again() {
         let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
         reference.load(MODULE, &beam).unwrap();
         let expected = reference.call(MODULE, function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
         let actual = vm
-            .eval_scheduled(MODULE, function, &[], 1, None)
+            .eval_scheduled(MODULE, function, &[], 1)
             .map(|outcome| CallResult::Ok(outcome.term))
             .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
         assert_eq!(expected, actual, "{function}");

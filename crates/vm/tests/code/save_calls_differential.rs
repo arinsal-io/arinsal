@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(save_calls_differential).
@@ -90,9 +89,9 @@ fn save_calls_matches_otp_for_export_fun_bif_and_message_entries() {
 
     for function in ["suite_exact", "suite_calls", "repro", "remote"] {
         let expected = reference.call("save_calls_differential", function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled("save_calls_differential", function, &[], 1, None);
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &beam);
+        let actual = vm.eval_scheduled("save_calls_differential", function, &[], 1);
         similar_asserts::assert_eq!(
             expected,
             CallResult::Ok(

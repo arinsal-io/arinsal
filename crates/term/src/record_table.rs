@@ -1,6 +1,5 @@
 //! Canonical native record definitions (`erts_record_put`, `erts_canonical_record_def`).
 use crate::{Atom, Term, TermError};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -70,64 +69,45 @@ fn bool_term(value: bool) -> Term {
     })
 }
 
-type Key = (u64, u32, u32);
+type Key = (u32, u32);
 
+// Port of erts/emulator/beam/erl_record.c: one record table for the OS process.
 static TABLE: RwLock<Option<HashMap<Key, (u64, u64)>>> = RwLock::new(None);
-
-thread_local! {
-    static SCOPE: Cell<u64> = const { Cell::new(0) };
-}
-
-/// Select the code scope whose record definitions canonicalise records built on this thread.
-pub fn set_record_scope(scope: u64) {
-    SCOPE.with(|cell| cell.set(scope));
-}
 
 /// Register the `[Definition | Defaults]` literal `cons` of `module:name` and its
 /// `definition` tuple (`erts_record_put`).
-pub fn put_record_definition(scope: u64, module: Atom, name: Atom, cons: Term, definition: Term) {
+pub fn put_record_definition(module: Atom, name: Atom, cons: Term, definition: Term) {
     let mut table = TABLE.write().expect("record table poisoned");
     table
         .get_or_insert_with(HashMap::new)
-        .insert((scope, module.0, name.0), (cons.bits(), definition.bits()));
+        .insert((module.0, name.0), (cons.bits(), definition.bits()));
 }
 
 /// Forget every definition of `module` (`erts_record_module_delete`).
-pub fn delete_module_record_definitions(scope: u64, module: Atom) {
+pub fn delete_module_record_definitions(module: Atom) {
     let mut table = TABLE.write().expect("record table poisoned");
     if let Some(table) = table.as_mut() {
-        table.retain(|(entry_scope, entry_module, _), _| {
-            !(*entry_scope == scope && *entry_module == module.0)
-        });
+        table.retain(|(entry_module, _), _| *entry_module != module.0);
     }
 }
 
-/// Forget all definitions of a code scope that is being released.
-pub fn drop_record_scope(scope: u64) {
-    let mut table = TABLE.write().expect("record table poisoned");
-    if let Some(table) = table.as_mut() {
-        table.retain(|(entry_scope, _, _), _| *entry_scope != scope);
-    }
+/// The registered `[Definition | Defaults]` literal of `module:name`.
+pub fn find_record_definition(module: Atom, name: Atom) -> Option<Term> {
+    find_entry(module, name).map(|(cons, _)| cons)
 }
 
-/// The registered `[Definition | Defaults]` literal of `module:name` in an explicit scope.
-pub fn find_record_definition_in(scope: u64, module: Atom, name: Atom) -> Option<Term> {
-    find_entry(scope, module, name).map(|(cons, _)| cons)
-}
-
-fn find_entry(scope: u64, module: Atom, name: Atom) -> Option<(Term, Term)> {
+fn find_entry(module: Atom, name: Atom) -> Option<(Term, Term)> {
     let table = TABLE.read().expect("record table poisoned");
     table
         .as_ref()?
-        .get(&(scope, module.0, name.0))
+        .get(&(module.0, name.0))
         .map(|(cons, definition)| (Term(*cons), Term(*definition)))
 }
 
 /// Port of erts/emulator/beam/erl_record.c:106-153 (erts_canonical_record_def), OTP-29.1.1:
 /// the module's registered definition when it has the same visibility, keys and order.
 pub(crate) fn canonical_definition(layout: &RecordLayout) -> Option<Term> {
-    let scope = SCOPE.with(Cell::get);
-    let (_, definition) = find_entry(scope, layout.module, layout.name)?;
+    let (_, definition) = find_entry(layout.module, layout.name)?;
     let words = crate::term_sequence(definition)?;
     if words.len() != 5 + layout.sorted.len() || words[4] != layout.exported_term() {
         return None;

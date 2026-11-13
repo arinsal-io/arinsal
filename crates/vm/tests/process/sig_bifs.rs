@@ -3,7 +3,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(sig_bifs).
@@ -195,18 +194,12 @@ fn assert_scenario(reference: &RefErl, scenario: i64) {
         .expect("compile sig_bifs");
     reference.load("sig_bifs", &beam).expect("load into erl");
     let expected = reference.call("sig_bifs", "run", &[OwnedTerm::Int(scenario)]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load into arinsal");
     let actual = vm
-        .eval_scheduled(
-            "sig_bifs",
-            "run",
-            &[Term::small(scenario).unwrap()],
-            1,
-            None,
-        )
+        .eval_scheduled("sig_bifs", "run", &[Term::small(scenario).unwrap()], 1)
         .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
 }
 
 #[test]

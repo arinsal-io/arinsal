@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(tprof_bif_diff).
@@ -104,10 +103,10 @@ fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
         .load("tprof_bif_diff", &beam)
         .expect("load reference");
     let expected = reference.call("tprof_bif_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("tprof_bif_diff", function, &[], 1, None)
+        .eval_scheduled("tprof_bif_diff", function, &[], 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     (expected, actual.term)
 }

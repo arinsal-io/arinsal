@@ -1,5 +1,5 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = "-module(vm_records_bifs).\n\
     -export([create_query_update/0, errors/0, definition/0, native_syntax/0, native_record_order/0, native_record_roundtrip/0, internal_hash_record/0]).\n\
@@ -44,16 +44,24 @@ fn run(function: &str) {
         .unwrap();
     reference.load("vm_records_bifs", &beam).unwrap();
     let expected = reference.call("vm_records_bifs", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = match vm.eval_scheduled("vm_records_bifs", function, &[], 1, None) {
-        Ok(outcome) => CallResult::Ok(outcome.term),
-        Err(VmError::Raised(raised)) => CallResult::Exception {
-            class: format!("{:?}", raised.class).to_lowercase(),
-            reason: raised.reason,
-            stack_top: Some(raised.stack),
-        },
-        Err(error) => CallResult::TransportError(error.to_string()),
+    let actual = if function == "internal_hash_record" {
+        CallResult::Ok(crate::common::peer_eval(
+            &[],
+            &[&beam],
+            "vm_records_bifs:internal_hash_record()",
+        ))
+    } else {
+        let mut vm = crate::common::node();
+        vm.load_bytes(&beam).unwrap();
+        match vm.eval_scheduled("vm_records_bifs", function, &[], 1) {
+            Ok(outcome) => CallResult::Ok(outcome.term),
+            Err(VmError::Raised(raised)) => CallResult::Exception {
+                class: format!("{:?}", raised.class).to_lowercase(),
+                reason: raised.reason,
+                stack_top: Some(raised.stack),
+            },
+            Err(error) => CallResult::TransportError(error.to_string()),
+        }
     };
     compare(&expected, &actual, CompareMode::Exact)
         .unwrap_or_else(|diff| panic!("{function}: {diff}"));

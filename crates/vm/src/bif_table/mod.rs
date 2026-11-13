@@ -453,14 +453,13 @@ mod tests {
     // install_bifs fills `bif_table[ep->bif_number]`; the export itself carries no function.
     #[test]
     fn a_bif_export_reaches_its_function_through_bif_number() {
-        let scope = crate::beamasm_integration::new_code_scope();
         let atoms = arinsal_term::global_atoms();
         let mfa = (
             atoms.intern("erlang").expect("atom"),
             atoms.intern("self").expect("atom"),
             0,
         );
-        let export = crate::beamasm_integration::make_export(scope, mfa).expect("export");
+        let export = crate::beamasm_integration::make_export(mfa).expect("export");
         let number = export.bif_number();
         let spec = arinsal_spec::bif_lookup("erlang", "self", 0).expect("bif.tab entry");
         similar_asserts::assert_eq!(number, i32::from(spec.index));
@@ -469,7 +468,6 @@ mod tests {
             super::bif!(crate::natives::bif::self_0)
         );
         similar_asserts::assert_eq!(super::function(-1), 0);
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]

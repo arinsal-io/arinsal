@@ -10,7 +10,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "lists_reverse_differential";
 const SOURCE: &str = r#"
@@ -109,12 +108,12 @@ fn otp_runs(reference: &RefErl, function: &str) -> Vec<Probe> {
 }
 
 fn arinsal_runs(beam: &[u8], function: &str) -> Vec<Probe> {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).expect("load probe into Arinsal");
     (0..RUNS)
         .map(|_| {
             let outcome = vm
-                .eval_scheduled(MODULE, function, &[], 2, None)
+                .eval_scheduled(MODULE, function, &[], 2)
                 .unwrap_or_else(|error| panic!("Arinsal {function} failed: {error:?}"));
             probe(&outcome.term)
         })

@@ -1,7 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 const WORKER: &str = "check_process_code_order_worker";
 const SIGNAL_CONTROL: &str = "check_process_code_signal_control";
@@ -30,14 +28,14 @@ fn async_check_process_code_observes_prior_exit_signal() {
     reference.load(SIGNAL_CONTROL, &control).unwrap();
     let expected = reference.call(SIGNAL_CONTROL, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&worker).unwrap();
     vm.load_bytes(&control).unwrap();
     let actual = vm
-        .eval_scheduled(SIGNAL_CONTROL, "run", &[], 1, None)
+        .eval_scheduled(SIGNAL_CONTROL, "run", &[], 1)
         .unwrap()
         .term;
 
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("false".into())));
-    assert_eq!(CallResult::Ok(actual), expected);
+    similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("false".into())));
+    similar_asserts::assert_eq!(CallResult::Ok(actual), expected);
 }

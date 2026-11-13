@@ -1643,10 +1643,9 @@ impl Process {
         runtime: Option<&'static crate::process::Runtime>,
         min_bin_vheap_size: Option<u64>,
     ) {
-        let store = runtime.map_or_else(
-            || arinsal_pterm::store_for(0),
-            |runtime| runtime.persistent_terms,
-        );
+        let store = runtime.map_or_else(arinsal_pterm::global_store, |runtime| {
+            runtime.persistent_terms
+        });
         if let Some(min_bin_vheap_size) = min_bin_vheap_size {
             self.heap.set_min_bin_vheap_size(min_bin_vheap_size);
         }

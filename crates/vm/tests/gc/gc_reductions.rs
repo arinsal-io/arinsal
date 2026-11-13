@@ -12,7 +12,6 @@ use std::sync::{Mutex, MutexGuard};
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(gc_reds_diff).
@@ -67,10 +66,10 @@ fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
         .expect("compile");
     reference.load("gc_reds_diff", &beam).expect("load");
     let expected = reference.call("gc_reds_diff", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load bytes");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("gc_reds_diff", function, &[], 1, None)
+        .eval_scheduled("gc_reds_diff", function, &[], 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     (expected, actual.term)
 }

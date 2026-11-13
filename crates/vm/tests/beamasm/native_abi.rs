@@ -1,7 +1,7 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
 use arinsal_term::{Term, TermBuilder};
-use arinsal_vm::{Process, Vm};
+use arinsal_vm::Process;
 use similar_asserts::assert_eq;
 use std::process::Command;
 use std::sync::Mutex;
@@ -14,11 +14,11 @@ fn no_line_info_module_compiles_fully_native_and_matches_otp() {
     const CHILD: &str = "ARINSAL_NO_LINE_INFO_CHILD";
     const MODULE: &str = "native_no_line_info_test";
     if let Some(path) = std::env::var_os(CHILD) {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&std::fs::read(path).unwrap()).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -88,15 +88,15 @@ fn native_try_end_keeps_success_value_for_fun_call() {
     const CHILD: &str = "ARINSAL_NATIVE_TRY_END_CHILD";
     const MODULE: &str = "native_try_end_test";
     if let Some(path) = std::env::var_os(CHILD) {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&std::fs::read(path).unwrap()).unwrap();
         let mut input_heap = Process::new();
         let input = TermBuilder::new(&mut input_heap.heap)
             .binary(&[1, 2, 3])
             .unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[input], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[input], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -200,7 +200,7 @@ fn native_external_return_preserves_tuple_for_native_guards() {
         CallResult::Ok(OwnedTerm::Int(7))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&target_beam).unwrap();
     vm.load_bytes(&beam).unwrap();
     let mut input_heap = Process::new();
@@ -221,14 +221,13 @@ fn native_external_return_preserves_tuple_for_native_guards() {
                 Term::atom(arinsal_term::global_atoms().intern("inet").unwrap()),
             ],
             1,
-            None,
         )
         .unwrap();
     assert_eq!(
         decode(&encode(&direct.term, EncodeOptions::default())).unwrap(),
         expected_input
     );
-    let actual = vm.eval_scheduled(module, "run", &[input], 1, None).unwrap();
+    let actual = vm.eval_scheduled(module, "run", &[input], 1).unwrap();
     assert_eq!(
         decode(&encode(&actual.term, EncodeOptions::default())).unwrap(),
         OwnedTerm::Int(7)
@@ -242,7 +241,7 @@ fn native_tail_export_transitions_preserve_cp_only_frames() {
     const MODULE: &str = "native_cp_transition_wrapper";
     if let Some(dir) = std::env::var_os(CHILD) {
         let path = std::path::Path::new(&dir);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         for name in [
             "native_cp_transition_target",
             "native_cp_transition_native",
@@ -251,9 +250,9 @@ fn native_tail_export_transitions_preserve_cp_only_frames() {
             vm.load_bytes(&std::fs::read(path.join(format!("{name}.beam"))).unwrap())
                 .unwrap();
         }
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -348,7 +347,7 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
             Value.
     "#;
     if let Some(dir) = std::env::var_os(CHILD) {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(
             &std::fs::read(std::path::Path::new(&dir).join(format!("{MODULE}.beam"))).unwrap(),
         )
@@ -361,11 +360,10 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
                     arinsal_term::global_atoms().intern("false").unwrap(),
                 )],
                 1,
-                None,
             )
             .unwrap();
         println!("RESULT:false:{}", result.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -445,7 +443,7 @@ fn forced_jit_gc_large_append_keeps_native_stack() {
     let arguments = [OwnedTerm::Int(500), OwnedTerm::Int(256)];
     let expected = reference.call("beamasm_gc_append_vm_test", "run", &arguments);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
         .eval_scheduled(
@@ -453,7 +451,6 @@ fn forced_jit_gc_large_append_keeps_native_stack() {
             "run",
             &[Term::small(500).unwrap(), Term::small(256).unwrap()],
             1,
-            None,
         )
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
@@ -505,9 +502,9 @@ fn native_vm_bif_trap_returns_into_continuation() {
     reference.load(module, &beam).unwrap();
     let expected = reference.call(module, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }
@@ -519,11 +516,11 @@ fn native_boolean_bifs_keep_tagged_comparison_results() {
     const MODULE: &str = "native_boolean_bif_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -587,13 +584,13 @@ fn inet_udp_open_trace_matches_otp_with_native_open() {
         let inet_udp = read_beam("inet_udp.beam");
         let inet = read_beam("inet.beam");
         let wrapper = read_beam("wrapper.beam");
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&inet_udp).unwrap();
         vm.load_bytes(&inet).unwrap();
         vm.load_bytes(&wrapper).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -670,12 +667,12 @@ fn unaligned_binary_order_matches_otp() {
     const MODULE: &str = "unaligned_literal_order_vm_test";
     if let Some(path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let result = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let result = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         assert_eq!(result.term, OwnedTerm::Atom("ok".into()));
         println!("RESULT:ok");
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
@@ -780,9 +777,9 @@ fn malformed_etf_trap_does_not_leak_into_following_bifs() {
             OwnedTerm::atom("true"),
         ]))
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(
         canonical,
@@ -812,9 +809,9 @@ fn compressed_etf_decode_resumes_across_output_chunks() {
         CallResult::Ok(OwnedTerm::Int(300000))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::Int(300000));
 }
 
@@ -836,9 +833,9 @@ fn large_nested_list_etf_decode_resumes_with_one_reduction() {
         CallResult::Ok(OwnedTerm::atom("true"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     similar_asserts::assert_eq!(actual.term, OwnedTerm::atom("true"));
 }
 
@@ -916,9 +913,9 @@ fn nested_map_etf_decode_resumes_after_low_reductions() {
         ]))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(
         actual.term,
         OwnedTerm::Tuple(vec![
@@ -972,9 +969,9 @@ fn code_mod_permission_waiter_yields_to_the_lock_owner() {
         CallResult::Ok(OwnedTerm::atom("released_after_yield"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::atom("released_after_yield"));
 }
 
@@ -1001,9 +998,9 @@ fn apply_yield_keeps_completed_bif_result_in_x0() {
         CallResult::Ok(OwnedTerm::atom("true"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::atom("true"));
 }
 
@@ -1040,9 +1037,9 @@ fn deferred_gc_after_applied_binary_to_term_keeps_caller_roots() {
         CallResult::Ok(OwnedTerm::atom("ok"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::atom("ok"));
 }
 
@@ -1089,9 +1086,9 @@ fn traced_apply_resumes_trap_without_caller_import() {
         CallResult::Ok(OwnedTerm::atom("true"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::atom("true"));
 }
 
@@ -1133,9 +1130,9 @@ fn deterministic_etf_map_order_survives_bif_yields() {
         CallResult::Ok(OwnedTerm::atom("true"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(
         actual.term,
         OwnedTerm::atom("true"),
@@ -1178,9 +1175,9 @@ fn list_to_binary_error_after_yield_keeps_original_bif_frame() {
         CallResult::Ok(_)
     ));
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::atom("ok"));
 }
 
@@ -1212,9 +1209,9 @@ fn malformed_large_etf_trap_keeps_original_binary_to_term_frame() {
         CallResult::Ok(OwnedTerm::atom("badarg"))
     );
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     assert_eq!(actual.term, OwnedTerm::atom("badarg"));
 }
 
@@ -1235,9 +1232,9 @@ fn binary_search_bifs_resume_after_budget_exhaustion() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }
@@ -1249,11 +1246,11 @@ fn native_send_matches_otp_for_names_ports_and_tracing() {
     const MODULE: &str = "native_send_vm_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -1336,11 +1333,11 @@ fn native_node_instruction_matches_otp() {
     const MODULE: &str = "native_node_instruction_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -1398,11 +1395,11 @@ fn native_build_stacktrace_matches_otp() {
     const MODULE: &str = "native_build_stacktrace_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -1463,11 +1460,11 @@ fn native_spawn_entry_catch_preserves_arguments_after_throw() {
     const MODULE: &str = "native_spawn_entry_catch_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -1534,13 +1531,13 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
     const MODULE: &str = "native_gc_recursion_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled(MODULE, "run", &[Term::small(10_000).unwrap()], 1, None)
+            .eval_scheduled(MODULE, "run", &[Term::small(10_000).unwrap()], 1)
             .unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK
@@ -1613,11 +1610,11 @@ fn native_large_bif_result_keeps_the_heap_redzone_before_a_fun_call() {
     const MODULE: &str = "native_heap_redzone_test";
     if let Some(beam_path) = std::env::var_os(CHILD) {
         let beam = std::fs::read(beam_path).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(MODULE, "run", &[], 0, None).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 0).unwrap();
         println!("RESULT:{}", actual.text);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let _serial = NATIVE_TEST_LOCK

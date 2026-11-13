@@ -1067,9 +1067,7 @@ msg_tag(Tag) -> Tag."#;
         let expected = reference.call("seq_trace_chain", "run", &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
-        let actual = vm
-            .eval_scheduled("seq_trace_chain", "run", &[], 2, None)
-            .unwrap();
+        let actual = vm.eval_scheduled("seq_trace_chain", "run", &[], 2).unwrap();
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
@@ -1106,7 +1104,7 @@ msg_tag(Tag) -> Tag."#;
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("seq_trace_sensitive_exit", "run", &[], 2, None)
+            .eval_scheduled("seq_trace_sensitive_exit", "run", &[], 2)
             .unwrap();
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
     }

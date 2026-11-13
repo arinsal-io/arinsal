@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 #[test]
@@ -32,10 +31,10 @@ loop(F, X, N) -> F(X), loop(F, X, N - 1).
         .unwrap();
     reference.load("iolist_reductions", &beam).unwrap();
     let expected = reference.call("iolist_reductions", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("iolist_reductions", "run", &[], 1, None)
+        .eval_scheduled("iolist_reductions", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

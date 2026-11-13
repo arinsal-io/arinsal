@@ -75,7 +75,7 @@ fn five_hundred_generated_map_and_bit_syntax_snippets() {
         .compile_named("vm_maps_bits_diff", &source, &[])
         .unwrap();
     reference.load("vm_maps_bits_diff", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for (n, name) in names.iter().enumerate() {
         compare_call(&mut vm, &reference, name, n as i64 + 1);
@@ -97,7 +97,7 @@ fn one_hundred_thousand_binary_appends_match_otp() {
         .unwrap();
     reference.load("vm_maps_bits_loop", &beam).unwrap();
     let expected = reference.call("vm_maps_bits_loop", "run", &[OwnedTerm::Int(100_000)]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
         .eval_exported("vm_maps_bits_loop", "run", &[Term::small(100_000).unwrap()])
@@ -122,7 +122,7 @@ fn map_and_bit_error_reasons_match_otp_for_immediate_terms() {
         .compile_named("vm_maps_bits_errors", source, &[])
         .unwrap();
     reference.load("vm_maps_bits_errors", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for (name, input, expected_reason) in [
         (

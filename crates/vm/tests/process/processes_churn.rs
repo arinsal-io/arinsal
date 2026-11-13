@@ -4,7 +4,7 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(vm_processes_churn).
@@ -42,14 +42,14 @@ fn processes_snapshot_under_spawn_churn_matches_otp() {
     let args = [OwnedTerm::Int(50), OwnedTerm::Int(3)];
     let expected = reference.call("vm_processes_churn", "result", &args);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let mut heap = VecHeap::new();
     let terms: Vec<_> = args
         .iter()
         .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect();
-    let actual = match vm.eval_scheduled("vm_processes_churn", "result", &terms, 2, None) {
+    let actual = match vm.eval_scheduled("vm_processes_churn", "result", &terms, 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

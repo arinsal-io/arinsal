@@ -2,7 +2,6 @@
 //! BIF that exhausted the slice, and a stack trace whose arguments are a deeply nested term.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(crash_reg).
@@ -86,10 +85,10 @@ fn crashes_match_otp() {
         "bad_node_terms",
     ] {
         let expected = reference.call("crash_reg", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("crash_reg", function, &[], 1, None)
+            .eval_scheduled("crash_reg", function, &[], 1)
             .map(|result| result.term)
             .unwrap_or_else(|error| panic!("{function}: VM error {error:?}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");

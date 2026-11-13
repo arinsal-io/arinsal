@@ -996,7 +996,6 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
                     atoms::SYSTEM_LIMIT,
                 ))));
             }
-            Err(_) => return Err(badarg()),
         }
         if crate::trace::active() {
             wake_for_procs_trace(process, pid);

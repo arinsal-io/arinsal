@@ -283,8 +283,6 @@ pub struct EmulatorFlags {
     pub time_correction: Option<bool>,
     /// Scheduler emulator options controlled by the `+s*` flags.
     pub scheduler: SchedulerOptions,
-    /// Arinsal's `+Zsim` seed.
-    pub simulation_seed: Option<u64>,
     /// Arinsal's `+Spool` assignments.
     pub core_pools: Vec<CorePool>,
     /// Recognised options whose implementation belongs to later stages.
@@ -1510,10 +1508,6 @@ fn parse_emulator_flag(
                 value: v,
             });
         }
-        "+Zsim" => {
-            let v = value(true, &mut consumed)?.unwrap();
-            out.simulation_seed = Some(v.parse().map_err(|_| invalid(token, &v))?);
-        }
         "+Spool" => {
             let v = value(true, &mut consumed)?.unwrap();
             let (name, cpus) = v.split_once(':').ok_or_else(|| invalid(token, &v))?;
@@ -1677,8 +1671,8 @@ fn split_emulator_flag(token: &str) -> (&str, Option<&str>) {
         }
     }
     const PREFIXES: &[&str] = &[
-        "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+Zsim", "+zdbbl", "+hmbs", "+hms", "+Dibpl", "+D",
-        "+s", "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t", "+C", "+c",
+        "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+zdbbl", "+hmbs", "+hms", "+Dibpl", "+D", "+s",
+        "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t", "+C", "+c",
     ];
     for prefix in PREFIXES {
         if let Some(rest) = token.strip_prefix(prefix) {

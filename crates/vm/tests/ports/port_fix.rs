@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -128,12 +127,17 @@ kill_port(P) ->
 
 fn run(reference: &RefErl, beam: &[u8], function: &str) -> (CallResult, OwnedTerm) {
     let expected = reference.call("port_fix", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(beam).unwrap();
-    let actual = vm
-        .eval_scheduled("port_fix", function, &[], 2, None)
-        .unwrap_or_else(|error| panic!("{function}: {error:?}"));
-    (expected, actual.term)
+    if function == "signal_toggle" {
+        let actual = crate::common::peer_eval(&[], &[beam], &format!("port_fix:{function}()"));
+        (expected, actual)
+    } else {
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, beam);
+        let actual = vm
+            .eval_scheduled("port_fix", function, &[], 2)
+            .unwrap_or_else(|error| panic!("{function}: {error:?}"));
+        (expected, actual.term)
+    }
 }
 
 #[test]
@@ -145,7 +149,7 @@ fn owner_exit_closes_ports_synchronously() {
     let beam = reference.compile_named("port_fix", SOURCE, &[]).unwrap();
     reference.load("port_fix", &beam).unwrap();
     let (expected, actual) = run(&reference, &beam, "owner_exit");
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
@@ -158,7 +162,7 @@ fn busy_port_nosuspend_is_false_and_otherwise_suspends() {
     reference.load("port_fix", &beam).unwrap();
     for function in ["busy_nosuspend", "busy_suspend", "force"] {
         let (expected, actual) = run(&reference, &beam, function);
-        assert_eq!(expected, CallResult::Ok(actual), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
     }
 }
 
@@ -171,7 +175,7 @@ fn signal_toggle_three_times_matches_otp() {
     let beam = reference.compile_named("port_fix", SOURCE, &[]).unwrap();
     reference.load("port_fix", &beam).unwrap();
     let (expected, actual) = run(&reference, &beam, "signal_toggle");
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
@@ -183,12 +187,12 @@ fn closing_fd_port_unblocks_a_blocked_read() {
     let beam = reference.compile_named("port_fix", SOURCE, &[]).unwrap();
     reference.load("port_fix", &beam).unwrap();
     let (expected, actual) = run(&reference, &beam, "fd_close");
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 
     let mut fds = [0; 2];
     // SAFETY: pipe initializes both slots with fresh descriptors on success.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0);
+    similar_asserts::assert_eq!(rc, 0);
     // SAFETY: both descriptors were just created by pipe and are not aliased.
     let (read, mut write) = unsafe {
         (
@@ -196,13 +200,13 @@ fn closing_fd_port_unblocks_a_blocked_read() {
             FileWriter(OwnedFd::from_raw_fd(fds[1])),
         )
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let args = [
         arinsal_term::Term::small(i64::from(read.as_raw_fd())).unwrap(),
         arinsal_term::Term::small(i64::from(write.0.as_raw_fd())).unwrap(),
     ];
-    vm.eval_scheduled("port_fix", "fd_hold", &args, 1, None)
+    vm.eval_scheduled("port_fix", "fd_hold", &args, 1)
         .expect("fd port close");
     // The worker must have stopped selecting the duplicated input fd.
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -211,11 +215,12 @@ fn closing_fd_port_unblocks_a_blocked_read() {
     let mut buf = [0u8; 1];
     // SAFETY: `read` is still the open pipe end; the port closed only its duplicate.
     let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
-    assert_eq!(
-        n, 1,
+    similar_asserts::assert_eq!(
+        n,
+        1,
         "close must unblock the port worker so it does not consume this byte"
     );
-    assert_eq!(buf[0], 0x5a);
+    similar_asserts::assert_eq!(buf[0], 0x5a);
 }
 
 struct FileWriter(OwnedFd);

@@ -8,7 +8,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "gc_bif_epilogue_once";
 const ROUNDS: i64 = 20;
@@ -51,10 +50,10 @@ fn run(reference: &RefErl, beam: &[u8], function: &str) -> (i64, i64) {
         CallResult::Ok(term) => collections(&term),
         other => panic!("reference {function} failed: {other:?}"),
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(beam).expect("load probe into Arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, beam);
     let outcome = vm
-        .eval_scheduled(MODULE, function, &[], 1, None)
+        .eval_scheduled(MODULE, function, &[], 1)
         .unwrap_or_else(|error| panic!("Arinsal {function} failed: {error:?}"));
     (expected, collections(&outcome.term))
 }

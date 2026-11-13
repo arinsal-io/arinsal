@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "big_reds_arithmetic_test";
 const SOURCE: &str = r#"
@@ -190,10 +189,10 @@ fn bignum_instruction_guard_and_bif_reductions_match_otp() {
         panic!("OTP bignum reduction fixture failed");
     };
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "run", &[], 1, None)
+        .eval_scheduled(MODULE, "run", &[], 1)
         .expect("run bignum reduction fixture");
     let expected_counts = measurements(&expected);
     let actual_counts = measurements(&actual.term);
