@@ -2264,7 +2264,12 @@ fn invoke_dispatch_bif_slow(
         || (crate::trace_bp::any_pattern()
             && crate::trace_bp::selects(process, &export.module, &export.function, export.arity))
     {
-        if export_call {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397
+        // (call_light_bif_shared), OTP-29.1.1: a traced BIF branches to the
+        // export breakpoint before the ordinary FCALLS decrement.
+        let traced_export = crate::trace_bp::any_pattern()
+            && crate::trace_bp::selects(process, &export.module, &export.function, export.arity);
+        if export_call && !traced_export {
             charge_bif_reductions(process, 1);
         }
         process.heap.abi.arity = export.arity;
