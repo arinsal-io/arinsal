@@ -77,7 +77,7 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>) -> bool {
         arinsal_bifs::UnicodeCont,
         arinsal_bifs::IolistVecWalk,
         arinsal_bifs::IolistSizeWalk,
-        Option<crate::natives::external::B2tContext<'static>>,
+        Option<crate::natives::external_dec::B2tContext<'static>>,
         arinsal_bifs::BinarySearchWalk,
         BinaryCopyState,
     )

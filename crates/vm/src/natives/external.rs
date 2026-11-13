@@ -13,8 +13,9 @@ use crate::Process;
 use crate::natives::bif::{badarg, bif_ret};
 use crate::natives::erl_bif_lists::bif_trap;
 use crate::natives::erl_iolist::{charge, create_holder, gc_enable};
+use crate::natives::external_dec::{B2tContext, B2tState};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifError, DecodeWalk, EncodeWalk, ProcessHeapHandle};
+use arinsal_bifs::{BifError, EncodeWalk, ProcessHeapHandle};
 use arinsal_term::{RefcBinary, Term, TermBuilder, atoms};
 use std::sync::Mutex;
 
@@ -558,37 +559,7 @@ const ERTS_B2T_CONTEXT_SIZE: usize = 296;
 
 const BINARY_TO_TERM_TRAP: &str = "erts_internal:binary_to_term_trap/1";
 
-/// `B2TState` of external.c without `B2TDecodeFail` and `B2TBadArg`, which are `B2tExit::Fail`;
-/// the order matters: `state >= B2TDone` keeps the loop running.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum B2tState {
-    Prepare,
-    UncompressChunk,
-    SizeInit,
-    Size,
-    DecodeInit,
-    Decode,
-    Done,
-}
-
-/// `B2TContext`: the state, the decode (`b2ts` and the `u.uc`/`u.sc`/`u.dc` union live in the
-/// walk), the reductions left, `trap_bin` once exported, and `bif` and `arg[]`, the original
-/// call's number of arguments and arguments, which a failure reports.
-// Port of erts/emulator/beam/external.c (B2TContext), OTP-29.1.1.
-pub(crate) struct B2tContext<'a> {
-    state: B2tState,
-    walk: DecodeWalk<'a>,
-    reds: i64,
-    initial_reds: i64,
-    size: B2tSizeState,
-    heap_size: usize,
-    result: Term,
-    trap_bin: Option<Term>,
-    arity: usize,
-    arg: [Term; 2],
-}
-
-type B2tHolder = Mutex<Option<B2tContext<'static>>>;
+pub(crate) type B2tHolder = Mutex<Option<B2tContext<'static>>>;
 
 /// Why `b2t_run` left the loop.
 enum B2tExit {
@@ -651,29 +622,13 @@ fn binary_to_term_start(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
     process.heap.note_bif_entry();
     let call_args = [process.x[0], process.x[1]];
     let args = &call_args[..arity];
-    let walk = match DecodeWalk::new(args) {
-        Ok(mut walk) => {
-            // `dec_is_this_node`.
-            let local_node = arinsal_term::this_node();
-            walk.set_local_node(local_node.0, local_node.1);
-            walk
-        }
+    let mut ctx = match B2tContext::new(args, arity) {
+        Ok(ctx) => ctx,
         Err(error) => return b2t_error(c_p, i, process, args, error, 0),
     };
-    let mut arg = [Term::NIL; 2];
-    arg[..arity].copy_from_slice(args);
-    let ctx = B2tContext {
-        state: B2tState::Prepare,
-        walk,
-        reds: 0,
-        initial_reds: 0,
-        size: B2tSizeState::default(),
-        heap_size: 0,
-        result: Term::NIL,
-        trap_bin: None,
-        arity,
-        arg,
-    };
+    // `dec_is_this_node`.
+    let local_node = arinsal_term::this_node();
+    ctx.set_local_node(local_node.0, local_node.1);
     binary_to_term_int(c_p, i, process, ctx)
 }
 
@@ -745,7 +700,7 @@ fn b2t_exit(
             crate::native_hooks::raw(ctx.result)
         }
         B2tExit::Fail(error) => {
-            ctx.walk.undo_factory(&mut process.heap);
+            ctx.undo_factory(&mut process.heap);
             if ctx.trap_bin.is_some() {
                 gc_enable(process);
             }
@@ -779,36 +734,15 @@ fn b2t_export_context(
     process: &mut Process,
     ctx: B2tContext<'_>,
 ) -> Result<B2tContext<'static>, ([Term; 2], BifError)> {
-    let B2tContext {
-        state,
-        walk,
-        reds,
-        initial_reds,
-        size,
-        heap_size,
-        result,
-        trap_bin,
-        arity,
-        arg,
-    } = ctx;
-    let walk = walk.into_owned().map_err(|error| (arg, error))?;
-    let trap_bin = match trap_bin {
+    let arg = ctx.arg;
+    let had_trap_bin = ctx.trap_bin;
+    let mut owned = ctx.into_owned().map_err(|error| (arg, error))?;
+    owned.trap_bin = Some(match had_trap_bin {
         Some(trap_bin) => trap_bin,
         None => create_holder(process, B2tHolder::new(None), ERTS_B2T_CONTEXT_SIZE)
             .ok_or((arg, BifError::SystemLimit))?,
-    };
-    Ok(B2tContext {
-        state,
-        walk,
-        reds,
-        initial_reds,
-        size,
-        heap_size,
-        result,
-        trap_bin: Some(trap_bin),
-        arity,
-        arg,
-    })
+    });
+    Ok(owned)
 }
 
 /// The `do { switch (ctx->state) ... } while (ctx->reds > 0 || ctx->state >= B2TDone)` loop.
@@ -818,8 +752,8 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
         match ctx.state {
             B2tState::Prepare => {
                 // binary2term_prepare: compressed input exports the context first.
-                ctx.reds -= ctx.walk.prepare_reds_charge() as i64;
-                if ctx.walk.is_compressed() {
+                ctx.reds -= ctx.prepare_reds_charge() as i64;
+                if ctx.is_compressed() {
                     ctx.state = B2tState::UncompressChunk;
                     if ctx.trap_bin.is_none() {
                         return B2tExit::Export;
@@ -828,30 +762,27 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
                     ctx.state = B2tState::SizeInit;
                 }
             }
-            B2tState::UncompressChunk => {
-                match ctx.walk.uncompress_chunk(ctx.reds.max(1) as usize) {
-                    Ok((done, consumed)) => {
-                        ctx.reds -= consumed as i64;
-                        if done {
-                            ctx.state = B2tState::SizeInit;
-                        } else {
-                            ctx.reds = 0;
-                        }
-                    }
-                    Err((error, consumed)) => {
-                        ctx.reds -= consumed as i64;
-                        return B2tExit::Fail(error);
+            B2tState::UncompressChunk => match ctx.uncompress_chunk(ctx.reds.max(1) as usize) {
+                Ok((done, consumed)) => {
+                    ctx.reds -= consumed as i64;
+                    if done {
+                        ctx.state = B2tState::SizeInit;
+                    } else {
+                        ctx.reds = 0;
                     }
                 }
-            }
+                Err((error, consumed)) => {
+                    ctx.reds -= consumed as i64;
+                    return B2tExit::Fail(error);
+                }
+            },
             B2tState::SizeInit | B2tState::Size => {
                 ctx.state = B2tState::Size;
                 let before = ctx.reds;
-                let sized = decoded_size(ctx.walk.plain_bytes(), &mut ctx.size, &mut ctx.reds);
+                let sized = ctx.decoded_size();
                 match sized {
                     Ok(Some(words)) => {
-                        ctx.heap_size = words;
-                        ctx.walk.set_heap_words(words);
+                        ctx.set_heap_words(words);
                         ctx.state = B2tState::DecodeInit;
                     }
                     Ok(None) => {}
@@ -864,7 +795,7 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
             }
             B2tState::DecodeInit => {
                 if ctx.trap_bin.is_none() {
-                    if ctx.walk.extsize() as i64 > ctx.reds {
+                    if ctx.extsize() as i64 > ctx.reds {
                         // dec_term will maybe trap: the magic binary is allocated before the
                         // factory so the result term can be trimmed with HRelease.
                         return B2tExit::Export;
@@ -878,10 +809,7 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
                 ctx.state = B2tState::Decode;
             }
             B2tState::Decode => {
-                let mut heap = ProcessHeapHandle(&mut process.heap);
-                let mut bif_state = arinsal_bifs::BifState::default();
-                let mut dctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-                match ctx.walk.decode_chunk(ctx.reds.max(1) as usize, &mut dctx) {
+                match ctx.decode_chunk(ctx.reds.max(1) as usize, &mut process.heap) {
                     Ok((Some(value), consumed)) => {
                         ctx.reds -= consumed as i64;
                         ctx.result = value;
@@ -901,338 +829,6 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
         }
         if !(ctx.reds > 0 || ctx.state >= B2tState::Done) {
             return B2tExit::Yield;
-        }
-    }
-}
-
-/// `ctx->u.sc`: the state of `decoded_size` between slices.
-// Port of erts/emulator/beam/external.c (B2TContext.u.sc), OTP-29.1.1.
-#[derive(Default)]
-pub(crate) struct B2tSizeState {
-    started: bool,
-    ep: usize,
-    atom_extra_skip: usize,
-    heap_size: usize,
-    /// `lext_hash` as the hash value and the offset after it, and `lext_term_end`.
-    lext_hash: Option<(u32, usize)>,
-    lext_term_end: u32,
-    terms: u32,
-}
-
-/// `decoded_size(ep, endp, 0, ctx)` of a body that follows the version byte: the heap size in
-/// words once every term was walked, `None` when `reds` ran out first. Every length is
-/// checked against `endp` here; `dec_term` relies on it.
-// Port of erts/emulator/beam/external.c (decoded_size), OTP-29.1.1.
-fn decoded_size(
-    bytes: &[u8],
-    sc: &mut B2tSizeState,
-    reds: &mut i64,
-) -> Result<Option<usize>, BifError> {
-    const SMALL_MAP_LIMIT: usize = 32;
-    const ERL_ONHEAP_BIN_LIMIT: usize = 64;
-    const EXTERNAL_THING_HEAD_SIZE: usize = 3;
-    let endp = bytes.len();
-    if !sc.started {
-        *sc = B2tSizeState {
-            started: true,
-            terms: 1,
-            lext_term_end: u32::MAX,
-            ..B2tSizeState::default()
-        };
-    }
-    let mut ep = sc.ep;
-    let mut atom_extra_skip = sc.atom_extra_skip;
-    let mut heap_size = sc.heap_size;
-    let mut lext_hash = sc.lext_hash;
-    let mut lext_term_end = sc.lext_term_end;
-    let mut terms = sc.terms;
-    let error = || BifError::BADARG;
-    macro_rules! chksize {
-        ($sz:expr) => {
-            if $sz > endp - ep {
-                return Err(error());
-            }
-        };
-    }
-    macro_rules! skip {
-        ($sz:expr) => {{
-            let sz: usize = $sz;
-            if sz > endp - ep {
-                return Err(error());
-            }
-            ep += sz;
-        }};
-    }
-    macro_rules! skip2 {
-        ($sz1:expr, $sz2:expr) => {{
-            let sz = usize::checked_add($sz1, $sz2).ok_or_else(error)?;
-            skip!(sz);
-        }};
-    }
-    macro_rules! addterms {
-        ($n:expr) => {{
-            let n = u32::try_from($n).map_err(|_| error())?;
-            terms = terms.checked_add(n).ok_or_else(error)?;
-        }};
-    }
-    macro_rules! words {
-        ($n:expr) => {{
-            heap_size = heap_size.checked_add($n).ok_or_else(error)?;
-        }};
-    }
-    let u8_at = |ep: usize| bytes[ep];
-    let u16_at = |ep: usize| u16::from_be_bytes([bytes[ep], bytes[ep + 1]]);
-    let u32_at = |ep: usize| u32::from_be_bytes(bytes[ep..ep + 4].try_into().unwrap());
-    loop {
-        chksize!(1);
-        let tag = u8_at(ep);
-        ep += 1;
-        match tag {
-            97 => skip!(1),
-            98 => skip!(4),
-            110 => {
-                chksize!(1);
-                let n = u8_at(ep) as usize;
-                ep += 1;
-                skip2!(n, 1);
-                words!(1 + n.div_ceil(8));
-            }
-            111 => {
-                chksize!(4);
-                let n = u32_at(ep) as usize;
-                ep += 4;
-                if n > 65_535 * 4 {
-                    return Err(error());
-                }
-                skip2!(n, 1);
-                words!(2 + n.div_ceil(8));
-            }
-            100 | 118 => {
-                chksize!(2);
-                let n = u16_at(ep) as usize;
-                ep += 2;
-                if (tag == 118 && n > 1020) || (tag == 100 && n > 255) {
-                    return Err(error());
-                }
-                skip2!(n, atom_extra_skip);
-                atom_extra_skip = 0;
-            }
-            115 | 119 => {
-                chksize!(1);
-                let n = u8_at(ep) as usize;
-                ep += 1;
-                skip2!(n, atom_extra_skip);
-                atom_extra_skip = 0;
-            }
-            82 => {
-                skip2!(1, atom_extra_skip);
-                atom_extra_skip = 0;
-            }
-            73 => {
-                skip2!(2, atom_extra_skip);
-                atom_extra_skip = 0;
-            }
-            75 => {
-                skip2!(3, atom_extra_skip);
-                atom_extra_skip = 0;
-            }
-            103 | 88 | 102 | 89 | 120 => {
-                atom_extra_skip = match tag {
-                    103 => 9,
-                    88 => 12,
-                    102 => 5,
-                    89 => 8,
-                    _ => 12,
-                };
-                addterms!(1usize);
-                words!(4);
-            }
-            101 | 114 | 90 => {
-                let (id_words, extra) = if tag == 101 {
-                    (1usize, 5usize)
-                } else {
-                    chksize!(2);
-                    let n = u16_at(ep) as usize;
-                    ep += 2;
-                    if n > 5 {
-                        return Err(error());
-                    }
-                    (n, if tag == 114 { 1 + n * 4 } else { 4 + n * 4 })
-                };
-                atom_extra_skip = extra;
-                words!(EXTERNAL_THING_HEAD_SIZE + id_words / 2 + 1);
-                addterms!(1usize);
-            }
-            106 => {
-                if atom_extra_skip != 0 {
-                    if lext_hash.is_none() {
-                        return Err(error());
-                    }
-                    skip!(atom_extra_skip);
-                    atom_extra_skip = 0;
-                }
-            }
-            108 => {
-                chksize!(4);
-                let n = u32_at(ep) as usize;
-                ep += 4;
-                if n.checked_add(1).is_none_or(|count| count > endp - ep) {
-                    return Err(error());
-                }
-                addterms!(n);
-                addterms!(1usize);
-                words!(n.checked_mul(2).ok_or_else(error)?);
-            }
-            104 | 105 => {
-                let n = if tag == 104 {
-                    chksize!(1);
-                    ep += 1;
-                    u8_at(ep - 1) as usize
-                } else {
-                    chksize!(4);
-                    ep += 4;
-                    u32_at(ep - 4) as usize
-                };
-                if n > (1 << 24) - 1 || n > endp - ep {
-                    return Err(error());
-                }
-                addterms!(n);
-                if n > 0 {
-                    words!(n + 1);
-                }
-            }
-            116 => {
-                chksize!(4);
-                let n = u32_at(ep) as usize;
-                ep += 4;
-                if n > (1 << 31) - 1 {
-                    return Err(error());
-                }
-                let children = n.checked_mul(2).ok_or_else(error)?;
-                if children > endp - ep {
-                    return Err(error());
-                }
-                if n <= SMALL_MAP_LIMIT {
-                    words!(3 + n + usize::from(n > 0) * (1 + n));
-                } else {
-                    words!(
-                        n.checked_mul(3)
-                            .and_then(|base| base.checked_add(n.saturating_mul(8) / 10))
-                            .ok_or_else(error)?
-                    );
-                }
-                addterms!(children);
-            }
-            107 => {
-                chksize!(2);
-                let n = u16_at(ep) as usize;
-                ep += 2;
-                skip!(n);
-                words!(n.checked_mul(2).ok_or_else(error)?);
-            }
-            99 => {
-                skip!(31);
-                words!(3);
-            }
-            70 => {
-                skip!(8);
-                words!(3);
-            }
-            109 => {
-                chksize!(4);
-                let n = u32_at(ep) as usize;
-                ep += 4;
-                skip!(n);
-                words!(if n <= ERL_ONHEAP_BIN_LIMIT {
-                    2 + n.div_ceil(8)
-                } else {
-                    8
-                });
-            }
-            77 => {
-                chksize!(5);
-                let n = u32_at(ep) as usize;
-                let bits = u8_at(ep + 4);
-                ep += 5;
-                if !(1..=8).contains(&bits) || n == 0 {
-                    return Err(error());
-                }
-                skip!(n);
-                words!(if n <= ERL_ONHEAP_BIN_LIMIT {
-                    2 + n.div_ceil(8)
-                } else {
-                    8
-                });
-            }
-            113 => addterms!(3usize),
-            112 => {
-                // The Size field is ignored by dec_term; it has historical OTP bugs.
-                chksize!(4 + 1 + 16 + 4 + 4);
-                let free = u32_at(ep + 25) as usize;
-                ep += 29;
-                if free > 255 {
-                    return Err(error());
-                }
-                addterms!(4 + free);
-                words!(2 + free);
-            }
-            121 => {
-                chksize!(4);
-                let hash = u32_at(ep);
-                ep += 4;
-                if lext_hash.is_some() {
-                    return Err(error());
-                }
-                lext_hash = Some((hash, ep));
-                lext_term_end = terms.checked_sub(1).ok_or_else(error)?;
-                addterms!(1usize);
-            }
-            67 => {
-                chksize!(4);
-                let n = u32_at(ep) as usize;
-                ep += 4;
-                let record_words = n
-                    .checked_mul(2)
-                    .and_then(|fields| fields.checked_add(8))
-                    .ok_or_else(error)?;
-                skip!(1);
-                words!(record_words);
-                if n > 0 {
-                    words!(n + 1);
-                }
-                addterms!(2usize);
-                addterms!(n);
-                addterms!(n);
-            }
-            _ => return Err(error()),
-        }
-        terms = terms.checked_sub(1).ok_or_else(error)?;
-        if terms == lext_term_end {
-            let (expected, start) = lext_hash.take().ok_or_else(error)?;
-            if ep <= start {
-                return Err(error());
-            }
-            if arinsal_bifs::local_term_hash(&bytes[start..ep]) != expected {
-                return Err(error());
-            }
-            *reds -= (ep - start) as i64;
-            lext_term_end = u32::MAX;
-        }
-        *reds -= 1;
-        if *reds <= 0 && terms != 0 {
-            *sc = B2tSizeState {
-                started: true,
-                ep,
-                atom_extra_skip,
-                heap_size,
-                lext_hash,
-                lext_term_end,
-                terms,
-            };
-            return Ok(None);
-        }
-        if terms == 0 {
-            return Ok(Some(heap_size));
         }
     }
 }
