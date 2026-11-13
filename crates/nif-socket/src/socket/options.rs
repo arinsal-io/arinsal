@@ -244,7 +244,7 @@ pub(super) fn option(args: &[O], set: bool) -> Result<O, BifError> {
     }
 }
 
-fn setopt_otp(h: &Handle, opt: i32, value: &O) -> Result<O, BifError> {
+fn setopt_otp(h: &Sock, opt: i32, value: &O) -> Result<O, BifError> {
     let mut st = h.state.lock().unwrap();
     let flag_option = |st: &State, open_state: u32, opt: i32| -> Option<O> {
         let _ = st;
@@ -322,7 +322,7 @@ fn setopt_otp(h: &Handle, opt: i32, value: &O) -> Result<O, BifError> {
 
 /// `esock_setopt_otp_ctrl_proc`: the owner hands the socket to a new controlling
 /// process and the controlling process monitor moves with it.
-fn setopt_otp_ctrl_proc(h: &Handle, st: &mut State, value: &O) -> O {
+fn setopt_otp_ctrl_proc(h: &Sock, st: &mut State, value: &O) -> O {
     if !state_bits::is_open(st.write_state) {
         return error("closed");
     }
@@ -460,7 +460,7 @@ fn getsockopt_bytes(fd: i32, level: i32, opt: i32, size: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
-fn setopt(h: &Handle, level: i32, opt: i32, value: &O, native: bool) -> Result<O, BifError> {
+fn setopt(h: &Sock, level: i32, opt: i32, value: &O, native: bool) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let st = h.state.lock().unwrap();
     let Some(s) = guard.as_ref() else {

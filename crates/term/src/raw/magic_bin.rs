@@ -19,18 +19,18 @@ pub const MAGIC_BIN_DATA_OFFSET: usize = 24;
 
 /// `int (*destructor)(Binary *)`: finalizes the payload when the last count is released.
 /// Each payload type has its own named destructor, and the destructor identifies the type.
-/// `true` (erts 1) lets [`MagicBin`] free the block now; `false` (erts 0) means the destructor
-/// took control of the deallocation and calls [`MagicBin::magic_binary_free`] itself later.
-pub type MagicDestructor = unsafe fn(NonNull<MagicRef>) -> bool;
+/// `true` (erts 1) lets [`MagicBin`] free the block now; `false` (erts 0) means another owner
+/// will call `erts_bin_free` after the payload's deferred lifetime ends.
+pub type MagicDestructor = fn(&mut MagicRef) -> bool;
 
 /// A type that can be the data of a magic binary.
 ///
 /// # Safety
 /// `DESTRUCTOR` must be a function that no other type uses (it identifies the payload type in
-/// [`MagicRef::downcast_ref`]), that drops the payload exactly once with [`drop_payload`]
-/// before the block is freed, and that returns `false` only when it frees the block itself.
-/// [`crate::magic_payload!`] defines a distinct non-inlined destructor per type; a type whose
-/// destructor takes control of the deallocation implements the trait by hand.
+/// [`MagicRef::downcast_ref`]), that finalizes and drops the payload exactly once before the
+/// block is freed, and that returns `false` only when another owner will finish deallocation.
+/// The unique named destructor is the invariant that permits safe typed payload access.
+/// [`crate::magic_payload!`] defines a distinct non-inlined destructor per type.
 pub unsafe trait MagicPayload: Send + Sync + Sized + 'static {
     /// `ERTS_MAGIC_BIN_DESTRUCTOR` of binaries holding a `Self`.
     const DESTRUCTOR: MagicDestructor;
@@ -49,18 +49,31 @@ macro_rules! magic_payload {
         unsafe impl $crate::MagicPayload for $ty {
             const DESTRUCTOR: $crate::MagicDestructor = {
                 #[inline(never)]
-                unsafe fn $name(mb: ::std::ptr::NonNull<$crate::MagicRef>) -> bool {
+                fn $name(mb: &mut $crate::MagicRef) -> bool {
                     static MARKER: ::std::sync::atomic::AtomicU8 =
                         ::std::sync::atomic::AtomicU8::new(0);
                     ::std::hint::black_box(&MARKER);
-                    // SAFETY: called by `erts_bin_free` once for a block holding this type.
-                    unsafe { $crate::raw::magic_bin::drop_payload::<$ty>(mb) };
-                    true
+                    mb.finalize_payload::<$ty>(|_, _| true)
                 }
                 $name
             };
         }
     )+};
+    ($ty:ty => $name:ident, $finalize:path) => {
+        // SAFETY: the destructor below is defined once for this type and only finalizes it;
+        unsafe impl $crate::MagicPayload for $ty {
+            const DESTRUCTOR: $crate::MagicDestructor = {
+                #[inline(never)]
+                fn $name(mb: &mut $crate::MagicRef) -> bool {
+                    static MARKER: ::std::sync::atomic::AtomicU8 =
+                        ::std::sync::atomic::AtomicU8::new(0);
+                    ::std::hint::black_box(&MARKER);
+                    mb.finalize_payload::<$ty>($finalize)
+                }
+                $name
+            };
+        }
+    };
 }
 
 /// `ErtsMagicBinary`: the header of a magic binary block; the payload follows it inline.
@@ -97,16 +110,6 @@ const fn data_offset<T>() -> usize {
     (header + align - 1) & !(align - 1)
 }
 
-/// Drops a `T` payload in place: the body of every [`MagicPayload::DESTRUCTOR`].
-///
-/// # Safety
-/// `mb` is a block created with a `T` payload that has not been dropped yet.
-#[inline(always)]
-pub unsafe fn drop_payload<T>(mb: NonNull<MagicRef>) {
-    // SAFETY: by contract the block holds a live `T` at its data offset.
-    unsafe { std::ptr::drop_in_place(mb.cast::<u8>().as_ptr().add(data_offset::<T>()).cast::<T>()) }
-}
-
 impl MagicRef {
     /// `mb->orig_size` of the magic binary.
     pub fn orig_size(&self) -> usize {
@@ -140,33 +143,62 @@ impl MagicRef {
         })
     }
 
-    /// The trailing bytes after a `T` payload (`ErtsResource.data`), if the payload is a `T`.
-    pub fn trailing_ptr<T: MagicPayload>(&self, trailing_align: usize) -> Option<*mut u8> {
-        self.downcast_ref::<T>()?;
-        // SAFETY: the block was created with trailing bytes at this offset; writes through
-        // the pointer are the C owner's business, as with `ERTS_MAGIC_BIN_UNALIGNED_DATA`.
+    /// Mutably accesses this block's `T` payload while its destructor is running.
+    #[inline]
+    pub fn downcast_mut<T: MagicPayload>(&mut self) -> Option<&mut T> {
+        if !std::ptr::fn_addr_eq(self.destructor, T::DESTRUCTOR) {
+            return None;
+        }
+        // SAFETY: only the final destructor receives exclusive access to a live block.
         Some(unsafe {
-            std::ptr::from_ref(self)
+            &mut *std::ptr::from_mut(self)
                 .cast::<u8>()
-                .cast_mut()
-                .add(trailing_offset::<T>(trailing_align))
+                .add(data_offset::<T>())
+                .cast::<T>()
         })
     }
 
-    /// The `T` payload of a block whose count may be zero (inside its destructor, or under a
-    /// protocol that keeps the memory, like a resource's monitor count).
-    ///
-    /// # Safety
-    /// The block holds a live `T` payload (not yet dropped) for the lifetime `'a`.
-    pub unsafe fn payload_of<'a, T: MagicPayload>(block: NonNull<MagicRef>) -> &'a T {
-        // SAFETY: by contract the payload is live at this offset.
-        unsafe {
-            &*block
-                .cast::<u8>()
-                .as_ptr()
-                .add(data_offset::<T>())
-                .cast::<T>()
+    /// Runs a payload-specific finalizer and drops the payload when it is ready.
+    #[doc(hidden)]
+    pub fn finalize_payload<T: MagicPayload>(
+        &mut self,
+        finalize: impl FnOnce(&MagicRef, &mut T) -> bool,
+    ) -> bool {
+        if !std::ptr::fn_addr_eq(self.destructor, T::DESTRUCTOR) {
+            return false;
         }
+        let header = std::ptr::from_mut(self);
+        // SAFETY: the named destructor matched above, the header and payload occupy disjoint
+        // parts of the allocation, and `&mut self` excludes all other accesses.
+        unsafe {
+            let (header, payload) = (
+                &*header,
+                &mut *header.cast::<u8>().add(data_offset::<T>()).cast::<T>(),
+            );
+            if !finalize(header, payload) {
+                return false;
+            }
+            // `finalize` returned true to authorize the single payload drop.
+            std::ptr::drop_in_place(payload);
+        }
+        true
+    }
+
+    /// The trailing bytes after a `T` payload (`ErtsResource.data`), if the payload is a `T`.
+    pub fn trailing_ptr<T: MagicPayload>(&self, trailing_align: usize) -> Option<*mut u8> {
+        if !std::ptr::fn_addr_eq(self.destructor, T::DESTRUCTOR)
+            || !trailing_align.is_power_of_two()
+            || trailing_align > self.alloc_align
+        {
+            return None;
+        }
+        let offset = trailing_offset::<T>(trailing_align);
+        if offset > self.alloc_size {
+            return None;
+        }
+        // SAFETY: the block was created with trailing bytes at this offset; writes through
+        // the pointer are the C owner's business, as with `ERTS_MAGIC_BIN_UNALIGNED_DATA`.
+        Some(unsafe { std::ptr::from_ref(self).cast::<u8>().cast_mut().add(offset) })
     }
 
     /// Current `intern.refc`, for `erts_debug` introspection.
@@ -249,19 +281,24 @@ impl MagicBin {
         orig_size: usize,
         refn: [u32; 3],
     ) -> Self {
+        assert!(
+            trailing_align.is_power_of_two() && trailing_align <= isize::MAX as usize,
+            "magic binary trailing alignment"
+        );
         let align = align_of::<MagicRef>()
             .max(align_of::<T>())
             .max(trailing_align);
-        let size = trailing_offset::<T>(trailing_align) + trailing;
+        let size = trailing_offset::<T>(trailing_align)
+            .checked_add(trailing)
+            .expect("magic binary layout");
         let layout = Layout::from_size_align(size, align).expect("magic binary layout");
-        // SAFETY: the layout has a non-zero size (the header is never empty).
-        let raw = unsafe { alloc(layout) };
-        let Some(block) = NonNull::new(raw.cast::<MagicRef>()) else {
-            handle_alloc_error(layout)
-        };
-        // SAFETY: `block` is a fresh allocation large and aligned enough for the header and a
-        // `T` at `data_offset::<T>()`.
-        unsafe {
+        // SAFETY: `layout` has non-zero size, and the returned allocation is large and aligned
+        // enough for the header, the `T` payload, and trailing bytes.
+        let block = unsafe {
+            let raw = alloc(layout);
+            let Some(block) = NonNull::new(raw.cast::<MagicRef>()) else {
+                handle_alloc_error(layout)
+            };
             block.write(MagicRef {
                 refc: AtomicUsize::new(1),
                 weak: AtomicUsize::new(1),
@@ -275,99 +312,73 @@ impl MagicBin {
             raw.add(data_offset::<T>()).cast::<T>().write(payload);
             let tail = trailing_offset::<T>(trailing_align);
             raw.add(tail).write_bytes(0, size - tail);
-        }
-        Self(block)
-    }
-
-    /// The block, keeping this count (`Binary *` handed to a C owner).
-    pub fn into_raw_block(this: Self) -> NonNull<MagicRef> {
-        let block = this.0;
-        std::mem::forget(this);
-        block
-    }
-
-    /// Adopt a count previously given up with [`MagicBin::into_raw_block`].
-    ///
-    /// # Safety
-    /// `block` must be a live block and the caller must own one of its counts.
-    pub unsafe fn from_raw_block(block: NonNull<MagicRef>) -> Self {
-        Self(block)
-    }
-
-    /// `erts_refc_inc(&bin->intern.refc, 2)` on a block that has a count elsewhere.
-    ///
-    /// # Safety
-    /// `block` must be live with a non-zero count held by someone for the call.
-    pub unsafe fn retain_raw_block(block: NonNull<MagicRef>) -> Self {
-        // SAFETY: by contract the block is live.
-        unsafe { block.as_ref() }
-            .refc
-            .fetch_add(1, Ordering::Relaxed);
-        Self(block)
-    }
-
-    /// The block whose payload is `payload` (`ERTS_MAGIC_BIN_FROM_DATA`).
-    ///
-    /// # Safety
-    /// `payload` must be the payload of a magic binary block, not a value outside one.
-    pub unsafe fn block_of_payload<T: MagicPayload>(payload: &T) -> NonNull<MagicRef> {
-        // SAFETY: by contract the payload lies `data_offset::<T>()` bytes into a block.
-        let raw = unsafe {
-            std::ptr::from_ref(payload)
-                .cast::<u8>()
-                .sub(data_offset::<T>())
+            block
         };
-        NonNull::new(raw.cast_mut().cast::<MagicRef>()).expect("magic payload")
+        Self(block)
     }
 
-    /// `enif_make_resource` from the resource data itself: a new count on the binary whose
-    /// payload is `payload`.
+    /// Adopts the count owned by the NIF C pointer at `data`.
     ///
     /// # Safety
-    /// `payload` must be the payload of a live magic binary with a count held for the call
-    /// (borrowed from a [`MagicBin`] or a reference term), never inside its destructor.
-    pub unsafe fn from_payload<T: MagicPayload>(payload: &T) -> Self {
-        // SAFETY: forwarded caller contract.
-        unsafe { Self::retain_raw_block(Self::block_of_payload(payload)) }
-    }
-
-    /// `erts_refc_inc_unless(&bin->intern.refc, 0, 0)`: a new count unless the binary is dead.
-    ///
-    /// # Safety
-    /// The block memory must stay valid for the call (its owner frees it only after the
-    /// caller's protocol allows, e.g. a resource's monitor count).
-    pub unsafe fn retain_unless_dead(block: NonNull<MagicRef>) -> Option<Self> {
-        // SAFETY: forwarded caller contract.
-        unsafe { retain_unless_dead(block) }
-    }
-
-    /// `ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA`: the block whose trailing bytes start at `data`.
-    ///
-    /// # Safety
-    /// `data` must be the trailing data of a live block created by
-    /// [`MagicBin::with_trailing_and_refn`] with payload `T` and this alignment.
-    pub unsafe fn block_from_trailing<T: MagicPayload>(
+    /// `data` must be the trailing data of a live `T` magic block, and its C owner must hold
+    /// one reference count for the duration of this call.
+    // Port of erts/emulator/beam/erl_binary.h (ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA), OTP-29.1.1.
+    pub unsafe fn from_trailing_data<T: MagicPayload>(
         data: *mut u8,
         trailing_align: usize,
-    ) -> NonNull<MagicRef> {
-        // SAFETY: by contract `data` lies `trailing_offset` bytes into the block.
-        let raw = unsafe { data.sub(trailing_offset::<T>(trailing_align)) };
-        NonNull::new(raw.cast::<MagicRef>()).expect("magic binary data")
+    ) -> Option<Self> {
+        // SAFETY: the caller's live trailing-data pointer identifies this allocation, and its
+        // count keeps the recovered header allocated for the destructor identity check.
+        unsafe {
+            let raw = data.sub(trailing_offset::<T>(trailing_align));
+            let block = NonNull::new(raw.cast::<MagicRef>()).expect("magic binary data");
+            std::ptr::fn_addr_eq(block.as_ref().destructor, T::DESTRUCTOR).then_some(Self(block))
+        }
+    }
+
+    /// Gives a monitor token access to a payload whose owner has already acquired the
+    /// corresponding external monitor count.
+    ///
+    /// # Safety
+    /// The caller must hold one resource-monitor count for this exact block until the returned
+    /// token is dropped.
+    // Port of erts/emulator/beam/erl_nif.c (enif_monitor_process), OTP-29.1.1.
+    pub unsafe fn monitor_ref<T: MagicPayload>(&self) -> Option<MagicMonitor> {
+        self.downcast_ref::<T>()?;
+        self.weak.fetch_add(1, Ordering::Relaxed);
+        Some(MagicMonitor(self.0))
+    }
+
+    /// Transfers this count to the NIF C owner and returns its trailing data pointer.
+    ///
+    /// # Safety
+    /// The returned pointer must only be used according to the `enif_*_resource` contract.
+    // Port of erts/emulator/beam/erl_nif.c (enif_alloc_resource, enif_keep_resource), OTP-29.1.1.
+    pub unsafe fn into_trailing_data<T: MagicPayload>(
+        this: Self,
+        trailing_align: usize,
+    ) -> Option<*mut u8> {
+        this.downcast_ref::<T>()?;
+        let data = this.trailing_ptr::<T>(trailing_align)?;
+        std::mem::forget(this);
+        Some(data)
     }
 
     /// `erts_bin_free`: run the destructor of a block whose count reached zero and free it
-    /// unless the destructor took control of the deallocation.
+    /// unless the destructor returned zero to defer deallocation.
     ///
     /// # Safety
     /// `block`'s count is zero, and the caller is the one entitled to free it (the destructor
     /// handed the deallocation to it).
-    pub unsafe fn bin_free(block: NonNull<MagicRef>) {
-        // SAFETY: by contract nobody else uses the payload.
-        let header = unsafe { block.as_ref() };
-        // SAFETY: the destructor matches the payload written at creation.
-        if unsafe { (header.destructor)(block) } {
-            // SAFETY: the destructor returned 1: the block is ours to free.
-            unsafe { Self::magic_binary_free(block) };
+    unsafe fn bin_free(block: NonNull<MagicRef>) {
+        // SAFETY: the matching destructor is stored in the live block; `refc` reached zero, so
+        // no counted reference can access the payload. A true result transfers the zero-count
+        // block to `magic_binary_free` after the payload has been dropped.
+        unsafe {
+            let destructor = block.as_ref().destructor;
+            if destructor(&mut *block.as_ptr()) {
+                Self::magic_binary_free(block);
+            }
         }
     }
 
@@ -376,7 +387,7 @@ impl MagicBin {
     ///
     /// # Safety
     /// The count is zero, the payload is dropped, and no other code frees this block.
-    pub unsafe fn magic_binary_free(block: NonNull<MagicRef>) {
+    unsafe fn magic_binary_free(block: NonNull<MagicRef>) {
         // SAFETY: by contract the header memory is still allocated.
         let header = unsafe { block.as_ref() };
         if header.saved.load(Ordering::Acquire) {
@@ -470,16 +481,65 @@ impl std::fmt::Debug for MagicBin {
 
 /// Release one weak count; the last one frees the block.
 fn release_weak(block: NonNull<MagicRef>) {
-    // SAFETY: the caller holds a weak count, so the header memory is valid.
-    let header = unsafe { block.as_ref() };
-    if header.weak.fetch_sub(1, Ordering::Release) != 1 {
-        return;
+    // SAFETY: the caller holds a weak count, so the header is live until the decrement; the
+    // final weak release owns the allocation and its recorded layout.
+    unsafe {
+        let header = block.as_ref();
+        if header.weak.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        let layout = Layout::from_size_align(header.alloc_size, header.alloc_align)
+            .expect("magic binary layout");
+        dealloc(block.cast::<u8>().as_ptr(), layout);
     }
-    fence(Ordering::Acquire);
-    let layout = Layout::from_size_align(header.alloc_size, header.alloc_align)
-        .expect("magic binary layout");
-    // SAFETY: no count of any kind remains; the block was allocated with this layout.
-    unsafe { dealloc(block.cast::<u8>().as_ptr(), layout) };
+}
+
+/// A non-owning resource monitor handle. Its external monitor count, rather than `refc`, keeps
+/// the payload live; this weak count keeps the block header allocated.
+pub struct MagicMonitor(NonNull<MagicRef>);
+
+// SAFETY: the external monitor count protects the payload and both header counts are atomic.
+unsafe impl Send for MagicMonitor {}
+// SAFETY: as above; typed payload access is shared and `MagicPayload` is `Sync`.
+unsafe impl Sync for MagicMonitor {}
+
+impl MagicMonitor {
+    /// The resource payload protected by this monitor count, if it has the requested type.
+    pub fn downcast_ref<T: MagicPayload>(&self) -> Option<&T> {
+        // SAFETY: the constructor contract keeps the payload live; this weak count keeps the
+        // header allocation live for the token's lifetime.
+        unsafe { self.0.as_ref() }.downcast_ref::<T>()
+    }
+
+    /// `erts_refc_inc_unless(&bin->intern.refc, 0, 0)` while a monitor count keeps the header.
+    pub fn retain_unless_dead(&self) -> Option<MagicBin> {
+        // SAFETY: this token keeps the header allocated until after the atomic count attempt.
+        unsafe { retain_unless_dead(self.0) }
+    }
+
+    /// The address of the magic binary block held by this monitor token.
+    #[doc(hidden)]
+    pub fn block_address(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
+
+    /// Runs `erts_bin_free` after the final external monitor count is released.
+    ///
+    /// # Safety
+    /// The magic binary count is zero, and the caller has released the last monitor count for
+    /// this block after its destructor entered the deferred state.
+    // Port of erts/emulator/beam/erl_binary.h (erts_bin_free), OTP-29.1.1.
+    pub unsafe fn finish_dead(&self) {
+        // SAFETY: forwarded caller contract.
+        unsafe { MagicBin::bin_free(self.0) };
+    }
+}
+
+impl Drop for MagicMonitor {
+    fn drop(&mut self) {
+        release_weak(self.0);
+    }
 }
 
 /// `erts_refc_inc_unless(&mb->intern.refc, 0, 0)`: a new count unless the binary is dead.

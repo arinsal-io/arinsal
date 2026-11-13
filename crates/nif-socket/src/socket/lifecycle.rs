@@ -49,13 +49,13 @@ fn is_selected(st: &State) -> bool {
 
 /// `esock_stop_handle_current`: the current requestor never gets a select message, so
 /// it is told that the socket is gone.
-fn stop_handle_current(h: &Handle, requestor: &Requestor) {
+fn stop_handle_current(h: &Sock, requestor: &Requestor) {
     demonitor_process(h, &requestor.pid, requestor.mon);
     send_abort_msg(h, requestor, &atom("closed"));
 }
 
 /// `esock_inform_waiting_procs`.
-fn inform_waiting_procs(h: &Handle, queue: &mut VecDeque<Requestor>, reason: &O) {
+fn inform_waiting_procs(h: &Sock, queue: &mut VecDeque<Requestor>, reason: &O) {
     for requestor in queue.drain(..) {
         send_abort_msg(h, &requestor, reason);
         demonitor_process(h, &requestor.pid, requestor.mon);
@@ -63,7 +63,7 @@ fn inform_waiting_procs(h: &Handle, queue: &mut VecDeque<Requestor>, reason: &O)
 }
 
 /// `do_stop`: prepare for close and return whether the stop callback is scheduled.
-fn do_stop(h: &Handle, fd: Option<i32>, st: &mut State) -> bool {
+fn do_stop(h: &Sock, fd: Option<i32>, st: &mut State) -> bool {
     let mut scheduled = false;
     let mut sres = 0;
     if is_selected(st)
@@ -123,7 +123,7 @@ fn close_descriptor(socket: Socket) -> i32 {
 }
 
 /// The descriptor close of `esock_close_socket`, and the registry `del` message.
-fn close_socket_fd(h: &Handle, socket: Option<Socket>) -> i32 {
+fn close_socket_fd(h: &Sock, socket: Option<Socket>) -> i32 {
     let err = socket.map_or(0, close_descriptor);
     h.sendfile_fd.lock().unwrap().take();
     if use_reg(h) {
@@ -173,7 +173,7 @@ pub(super) fn finalize_close(value: &O) -> Result<O, BifError> {
 }
 
 /// `esock_send_close_msg`: `{'$socket', Socket, close, CloseRef}` to the closer.
-fn send_close_msg(h: &Handle, closer: &O, close_ref: O) {
+fn send_close_msg(h: &Sock, closer: &O, close_ref: O) {
     if let Some(reactor) = active_reactor() {
         let message = O::tuple(vec![
             atom("$socket"),
@@ -196,7 +196,7 @@ pub(crate) fn stop(value: &O) {
     h.release_for_select();
 }
 
-fn stop_callback(h: &Handle) {
+fn stop_callback(h: &Sock) {
     let mut guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     if let Some(closer) = st.closer.clone() {
@@ -212,7 +212,7 @@ fn stop_callback(h: &Handle) {
 }
 
 /// `essio_down_ctrl`: the controlling process is gone.
-pub(super) fn down_ctrl(h: &Handle, guard: &mut Option<Socket>, st: &mut State) {
+pub(super) fn down_ctrl(h: &Sock, guard: &mut Option<Socket>, st: &mut State) {
     let fd = guard.as_ref().map(AsRawFd::as_raw_fd);
     if !do_stop(h, fd, st) {
         mark_closed(h, st);
@@ -228,7 +228,7 @@ pub(crate) fn down(value: &O, pid: &O, monitor: u64) {
     essio_down(&h, pid, monitor);
 }
 
-fn essio_down(h: &Handle, pid: &O, monitor: u64) {
+fn essio_down(h: &Sock, pid: &O, monitor: u64) {
     let mut guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     if st.closer.as_ref() == Some(pid) {
@@ -271,7 +271,7 @@ fn essio_down(h: &Handle, pid: &O, monitor: u64) {
 }
 
 /// `essio_down_reader`, `essio_down_acceptor` and `essio_down_writer`.
-fn down_requestor(h: &Handle, st: &mut State, fd: Option<i32>, kind: Kind, pid: &O, monitor: u64) {
+fn down_requestor(h: &Sock, st: &mut State, fd: Option<i32>, kind: Kind, pid: &O, monitor: u64) {
     let is_current = st.current(kind).as_ref().and_then(|req| req.mon) == Some(monitor);
     if is_current {
         if let Some(current) = st.current(kind).as_mut() {
@@ -367,7 +367,7 @@ pub(super) fn cancel(args: &[O]) -> Result<O, BifError> {
 }
 
 /// `essio_cancel_connect`.
-fn cancel_connect(h: &Handle, op_ref: &O) -> Result<O, BifError> {
+fn cancel_connect(h: &Sock, op_ref: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     let Some(me) = self_pid() else {
@@ -391,7 +391,7 @@ fn cancel_connect(h: &Handle, op_ref: &O) -> Result<O, BifError> {
 }
 
 /// `essio_cancel_accept`, `essio_cancel_recv` and `essio_cancel_send`.
-fn cancel_requestor(h: &Handle, kind: Kind, op_ref: &O) -> Result<O, BifError> {
+fn cancel_requestor(h: &Sock, kind: Kind, op_ref: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     let state = if kind == Kind::Writer {

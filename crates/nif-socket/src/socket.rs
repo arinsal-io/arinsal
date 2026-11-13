@@ -31,6 +31,7 @@ mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
 mod options;
+mod raw;
 use options::bool_atom;
 
 const MAGIC: u32 = 0x534f_434b;
@@ -134,13 +135,13 @@ impl Drop for Handle {
 
 impl Handle {
     /// `enif_keep_resource` for the select machinery, on the first selection.
-    fn keep_for_select(&self) {
+    fn keep_for_select(&self, owner: &MagicBin) {
         let mut selector = self
             .selector
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if selector.is_none() {
-            *selector = owner_of(&self.reference());
+            *selector = Some(owner.clone());
         }
     }
 
@@ -153,14 +154,19 @@ impl Handle {
             .take();
         drop(selector);
     }
+}
 
+impl Sock {
     /// The socket reference term, made on demand like `enif_make_resource(env, descP)`.
     pub(crate) fn reference(&self) -> O {
-        // SAFETY: a `&Handle` is only reached through a counted reference to its binary (a
-        // `Sock` or a reference term held by the caller), never while its destructor runs.
-        O::MagicRef(arinsal_term::magic_handle(unsafe {
-            MagicBin::from_payload(self)
-        }))
+        O::MagicRef(arinsal_term::magic_handle(self.0.clone()))
+    }
+
+    fn keep_for_select(&self) {
+        self.0
+            .downcast_ref::<Handle>()
+            .expect("a socket resource holds a Handle")
+            .keep_for_select(&self.0);
     }
 }
 
@@ -190,20 +196,14 @@ pub(crate) fn release_created(mark: usize) {
     drop(created);
 }
 
-// SAFETY: `esock_dtor_prologue` is defined once, for `Handle` only; it drops the payload
-// exactly once and frees the block itself (it returns 0, like the NIF resource destructor).
-unsafe impl arinsal_term::MagicPayload for Handle {
-    const DESTRUCTOR: arinsal_term::MagicDestructor = esock_dtor_prologue;
-}
+arinsal_term::magic_payload!(Handle => socket_resource_destructor, esock_dtor_prologue);
 
 /// `NIF_RESOURCE_DTOR` of a socket descriptor: demonitor, wait for the monitor references,
 /// then run `esock_dtor` (the `Drop` of [`Handle`]) and free the binary.
 // Port of erts/emulator/beam/erl_nif.c (nif_resource_dtor_prologue, run_resource_dtor),
 // OTP-29.1.1, for the resource type of prim_socket_nif.c.
 #[inline(never)]
-unsafe fn esock_dtor_prologue(bin: std::ptr::NonNull<arinsal_term::MagicRef>) -> bool {
-    // SAFETY: the count is zero and the payload is live until it is dropped below.
-    let h = unsafe { arinsal_term::MagicRef::payload_of::<Handle>(bin) };
+fn esock_dtor_prologue(_: &arinsal_term::MagicRef, h: &mut Handle) -> bool {
     if !h.monitors.dtor_prologue(|pid, id| {
         if let (Ok(pid), Some(reactor)) = (arinsal_term::to_owned(pid), active_reactor()) {
             reactor.demonitor(&pid, id);
@@ -211,20 +211,7 @@ unsafe fn esock_dtor_prologue(bin: std::ptr::NonNull<arinsal_term::MagicRef>) ->
     }) {
         return false;
     }
-    // SAFETY: the payload is dropped once and the block is ours to free.
-    unsafe {
-        arinsal_term::raw::magic_bin::drop_payload::<Handle>(bin);
-        MagicBin::magic_binary_free(bin);
-    }
-    false
-}
-
-/// `resource->monitors` of a socket descriptor binary.
-fn socket_monitors(
-    bin: std::ptr::NonNull<arinsal_term::MagicRef>,
-) -> &'static arinsal_nif::ResourceMonitors {
-    // SAFETY: a monitor's share of the monitor count keeps the payload until it is released.
-    &unsafe { arinsal_term::MagicRef::payload_of::<Handle>(bin) }.monitors
+    true
 }
 
 /// `esock_down`, the `down` callback of the socket resource type.
@@ -475,7 +462,7 @@ fn use_reg(h: &Handle) -> bool {
     h.otp_options.lock().unwrap().get(&OTP_OPT_USE_REGISTRY) == Some(&atom("true"))
 }
 /// `esock_send_reg_add_msg` and `esock_send_reg_del_msg`: `{'$socket', add | del, Socket}`.
-fn send_reg_msg(tag: &str, h: &Handle) {
+fn send_reg_msg(tag: &str, h: &Sock) {
     let Some(registry) = REGISTRY_PID.lock().unwrap().clone() else {
         return;
     };
@@ -532,7 +519,7 @@ fn select_failed() -> i32 {
 }
 /// `esock_select_read`: with `pid` `None` the select message goes to the calling
 /// process, not to the controlling process.
-pub(crate) fn select_read(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) -> i32 {
+pub(crate) fn select_read(h: &Sock, fd: i32, pid: Option<&O>, reference: &O) -> i32 {
     let Some(reactor) = active_reactor() else {
         return select_failed();
     };
@@ -546,7 +533,7 @@ pub(crate) fn select_read(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) -
     result
 }
 /// `esock_select_write`; see [`select_read`].
-pub(crate) fn select_write(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) -> i32 {
+pub(crate) fn select_write(h: &Sock, fd: i32, pid: Option<&O>, reference: &O) -> i32 {
     let Some(reactor) = active_reactor() else {
         return select_failed();
     };
@@ -609,7 +596,7 @@ pub(crate) fn raise_invalid(what: &str) -> BifError {
     crate::raise(invalid(what))
 }
 /// `esock_send_abort_msg`: `{'$socket', Socket, abort, {Ref, Reason}}` to the requestor.
-pub(crate) fn send_abort_msg(h: &Handle, req: &Requestor, reason: &O) {
+pub(crate) fn send_abort_msg(h: &Sock, req: &Requestor, reason: &O) {
     if let Some(reactor) = active_reactor() {
         let message = crate::abort_message(&h.reference(), &req.reference, reason);
         reactor.send(&req.pid, &message);
@@ -617,7 +604,7 @@ pub(crate) fn send_abort_msg(h: &Handle, req: &Requestor, reason: &O) {
 }
 /// `esock_send_simple_abort_msg`: `{'$socket', Socket, abort, Reason}`.
 #[allow(dead_code)]
-pub(crate) fn send_simple_abort_msg(h: &Handle, pid: &O, reason: &O) {
+pub(crate) fn send_simple_abort_msg(h: &Sock, pid: &O, reason: &O) {
     if let Some(reactor) = active_reactor() {
         let message = O::tuple(vec![
             atom("$socket"),
@@ -631,7 +618,7 @@ pub(crate) fn send_simple_abort_msg(h: &Handle, pid: &O, reason: &O) {
 /// `MONP`: monitor `pid` for the socket.
 // Port of erts/emulator/beam/erl_nif.c (enif_monitor_process), OTP-29.1.1: the origin half
 // goes into `resource->monitors` with its monitor count before the signal is sent.
-pub(crate) fn monitor_process(h: &Handle, pid: &O) -> Option<u64> {
+pub(crate) fn monitor_process(h: &Sock, pid: &O) -> Option<u64> {
     let reactor = active_reactor()?;
     let O::Pid { id, serial, .. } = pid else {
         return None;
@@ -640,17 +627,8 @@ pub(crate) fn monitor_process(h: &Handle, pid: &O) -> Option<u64> {
     let mut taken = None;
     let result = reactor.monitor(pid, &mut |monitor| {
         taken = Some(monitor);
-        h.monitors.add(target, monitor);
-        // SAFETY: `h` is the payload of a live descriptor binary, whose destructor follows
-        // the dtor_prologue protocol in `esock_dtor_prologue`.
-        unsafe {
-            arinsal_nif::ResourceMonitor::new(
-                monitor,
-                MagicBin::block_of_payload(h),
-                socket_monitors,
-                socket_down,
-            )
-        }
+        let count = h.monitors.add(target, monitor, &h.0);
+        arinsal_nif::ResourceMonitor::new::<Handle>(monitor, &h.0, count, socket_down)
     });
     if result.is_none()
         && let Some(monitor) = taken
@@ -689,7 +667,7 @@ impl State {
         self.queue(kind).iter().any(|req| &req.pid == pid)
     }
     /// `esock_{acceptor,writer,reader}_push`.
-    pub(crate) fn push(&mut self, h: &Handle, kind: Kind, pid: &O, reference: &O) {
+    pub(crate) fn push(&mut self, h: &Sock, kind: Kind, pid: &O, reference: &O) {
         let mon = monitor_process(h, pid);
         self.queue(kind).push_back(Requestor {
             pid: pid.clone(),
@@ -706,13 +684,7 @@ impl State {
     }
     /// `esock_{acceptor,writer,reader}_unqueue`: remove the element of `pid`, and when
     /// `reference` is given only if it matches.
-    pub(crate) fn unqueue(
-        &mut self,
-        h: &Handle,
-        kind: Kind,
-        reference: Option<&O>,
-        pid: &O,
-    ) -> bool {
+    pub(crate) fn unqueue(&mut self, h: &Sock, kind: Kind, reference: Option<&O>, pid: &O) -> bool {
         let queue = self.queue(kind);
         let Some(index) = queue.iter().position(|req| &req.pid == pid) else {
             return false;
@@ -728,7 +700,7 @@ impl State {
     }
 }
 /// `esock_requestor_release`.
-pub(crate) fn requestor_release(h: &Handle, requestor: &mut Option<Requestor>) {
+pub(crate) fn requestor_release(h: &Sock, requestor: &mut Option<Requestor>) {
     if let Some(req) = requestor.take() {
         demonitor_process(h, &req.pid, req.mon);
     }
@@ -736,7 +708,7 @@ pub(crate) fn requestor_release(h: &Handle, requestor: &mut Option<Requestor>) {
 /// `esock_activate_next_{acceptor,writer,reader}`: pop the queue and select for the
 /// next requestor with its own pid. A failed select aborts that requestor with
 /// `{select_failed, Sres}` and the next one is tried.
-pub(crate) fn activate_next(h: &Handle, st: &mut State, fd: i32, kind: Kind) -> bool {
+pub(crate) fn activate_next(h: &Sock, st: &mut State, fd: i32, kind: Kind) -> bool {
     loop {
         if !st.pop(kind) {
             return false;
@@ -766,7 +738,7 @@ pub(crate) fn activate_next(h: &Handle, st: &mut State, fd: i32, kind: Kind) -> 
 /// the descriptor lock and `st`, so the select is ordered against `close` and the stop
 /// callback. Superseded by [`select_read`] and [`select_write`] (and the request queues)
 /// in the send and receive paths.
-fn selected(h: &Handle, st: &mut State, fd: i32, reference: &O, read: bool) -> O {
+fn selected(h: &Sock, st: &mut State, fd: i32, reference: &O, read: bool) -> O {
     let sres = if read {
         select_read(h, fd, None, reference)
     } else {
@@ -1214,7 +1186,7 @@ fn accept(args: &[O]) -> Result<O, BifError> {
     }
 }
 fn accept_listening_error(
-    h: &Handle,
+    h: &Sock,
     st: &mut State,
     s: &Socket,
     reference: &O,
@@ -1234,7 +1206,7 @@ fn accept_listening_error(
     accept_busy_retry(h, st, s.as_raw_fd(), reference, None)
 }
 fn accept_busy_retry(
-    h: &Handle,
+    h: &Sock,
     st: &mut State,
     fd: i32,
     reference: &O,
@@ -1255,7 +1227,7 @@ fn accept_busy_retry(
     Ok(atom("select"))
 }
 fn accept_accepting_current(
-    h: &Handle,
+    h: &Sock,
     st: &mut State,
     s: &Socket,
     reference: &O,
@@ -1393,7 +1365,7 @@ fn nif_send(args: &[O], destination: Option<&O>) -> Result<O, BifError> {
 }
 /// `essio_send` and `essio_sendto`.
 fn essio_send(
-    h: &Handle,
+    h: &Sock,
     send_ref: &O,
     data: &[u8],
     flags: i32,
@@ -1513,7 +1485,7 @@ fn nif_sendv(args: &[O]) -> Result<O, BifError> {
     essio_sendv(&h, &args[2], &args[1])
 }
 /// `essio_sendv`.
-fn essio_sendv(h: &Handle, send_ref: &O, iov: &O) -> Result<O, BifError> {
+fn essio_sendv(h: &Sock, send_ref: &O, iov: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     let Some(s) = guard
@@ -1561,13 +1533,7 @@ fn nif_sendmsg(args: &[O]) -> Result<O, BifError> {
     essio_sendmsg(&h, reference, message, flags, iov)
 }
 /// `essio_sendmsg`.
-fn essio_sendmsg(
-    h: &Handle,
-    send_ref: &O,
-    message: &O,
-    flags: i32,
-    iov: &O,
-) -> Result<O, BifError> {
+fn essio_sendmsg(h: &Sock, send_ref: &O, message: &O, flags: i32, iov: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     let Some(s) = guard
@@ -1628,7 +1594,7 @@ fn essio_sendmsg(
 }
 /// `send_check_writer`: `Some` is the result to return, `None` means this
 /// process is the current writer or there is none.
-fn send_check_writer(h: &Handle, st: &mut State, reference: &O) -> Result<Option<O>, BifError> {
+fn send_check_writer(h: &Sock, st: &mut State, reference: &O) -> Result<Option<O>, BifError> {
     let Some(current) = st.current_writer.as_ref() else {
         return Ok(None);
     };
@@ -1646,7 +1612,7 @@ fn send_check_writer(h: &Handle, st: &mut State, reference: &O) -> Result<Option
 }
 /// `send_check_result`.
 fn send_check_result(
-    h: &Handle,
+    h: &Sock,
     st: &mut State,
     fd: i32,
     result: io::Result<usize>,
@@ -1676,7 +1642,7 @@ fn send_check_result(
     }
 }
 /// `send_check_ok`.
-fn send_check_ok(h: &Handle, st: &mut State, fd: i32, written: usize) -> O {
+fn send_check_ok(h: &Sock, st: &mut State, fd: i32, written: usize) -> O {
     {
         let mut counters = h.counters.lock().unwrap();
         counters.write_pkg += 1;
@@ -1696,7 +1662,7 @@ fn send_check_ok(h: &Handle, st: &mut State, fd: i32, written: usize) -> O {
     atom("ok")
 }
 /// `send_check_fail`.
-fn send_check_fail(h: &Handle, st: &mut State, e: &io::Error) -> O {
+fn send_check_fail(h: &Sock, st: &mut State, e: &io::Error) -> O {
     h.counters.lock().unwrap().write_fails += 1;
     let reason = errno_reason(e);
     if e.raw_os_error() != Some(libc::EINVAL) && st.current_writer.is_some() {
@@ -1707,7 +1673,7 @@ fn send_check_fail(h: &Handle, st: &mut State, e: &io::Error) -> O {
     pair(atom("error"), reason)
 }
 /// `send_error_waiting_writers`: abort every queued writer.
-fn send_error_waiting_writers(h: &Handle, st: &mut State, reason: &O) {
+fn send_error_waiting_writers(h: &Sock, st: &mut State, reason: &O) {
     while st.pop(Kind::Writer) {
         if let Some(request) = st.current_writer.take() {
             send_abort_msg(h, &request, reason);
@@ -1717,7 +1683,7 @@ fn send_error_waiting_writers(h: &Handle, st: &mut State, reason: &O) {
 }
 /// `send_check_retry`: `written` is `None` when the send would have blocked.
 fn send_check_retry(
-    h: &Handle,
+    h: &Sock,
     st: &mut State,
     fd: i32,
     written: Option<usize>,
@@ -1990,7 +1956,7 @@ fn recv_create_bin(state: &mut State, size: usize) -> Vec<u8> {
 
 /// What `essio_recv`, `essio_recvfrom` and `essio_recvmsg` share for one call.
 struct Receiver<'a> {
-    h: &'a Handle,
+    h: &'a Sock,
     fd: i32,
     reference: &'a O,
     caller: &'a O,
