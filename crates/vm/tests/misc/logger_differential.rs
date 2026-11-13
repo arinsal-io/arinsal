@@ -4,7 +4,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use std::sync::{Mutex, MutexGuard};
 
 const SOURCE: &str = r#"
@@ -131,12 +130,9 @@ fn run(function: &str) {
         matches!(expected, CallResult::Ok(ref term) if *term != OwnedTerm::atom("timeout")),
         "{function}: erl returned {expected:?}"
     );
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load bytes");
-    let actual = vm
-        .eval_scheduled("logger_diff", function, &[], 1, None)
-        .unwrap_or_else(|error| panic!("{function}: {error}"));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    // erlang:system_logger is a node global: run on a separate node, as erts tests use a peer.
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("logger_diff:{function}()"));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]

@@ -30,8 +30,6 @@ pub fn global_store() -> &'static Store {
     &GLOBAL
 }
 
-}
-
 /// A stable table view held across a yielding `persistent_term:get/0` call.
 pub struct Snapshot {
     allocated: usize,
