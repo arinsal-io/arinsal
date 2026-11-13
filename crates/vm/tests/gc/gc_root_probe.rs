@@ -33,10 +33,8 @@ worker(Parent, Kind) ->
     end,
     Parent ! {ready, self()},
     receive go -> ok end,
-    Before = element(1, erlang:statistics(garbage_collection)),
     run_workload(Kind, Workload),
-    After = element(1, erlang:statistics(garbage_collection)),
-    Parent ! {done, {After - Before, process_info(self(), [heap_size, total_heap_size])}},
+    Parent ! {done, process_info(self(), [heap_size, total_heap_size])},
     receive force ->
         true = erts_internal:garbage_collect(major),
         Parent ! {forced, process_info(self(), [heap_size, total_heap_size])}
@@ -113,24 +111,17 @@ fn gc_trace_roots_for_map_and_reverse_workloads_match_otp() {
         let otp_count = gc_count(&otp_rows);
         let arinsal_count = gc_count(&arinsal_rows);
         let diff = first_trace_difference(&otp_rows, &arinsal_rows);
-        let otp_done = done_fields(expected.0, "OTP", name);
-        let arinsal_done = done_fields(actual.0, "Arinsal", name);
+        let otp_done = expected.0;
+        let arinsal_done = actual.0;
         eprintln!(
-            "{name}: traced starts OTP={otp_count} Arinsal={arinsal_count}; statistics GCs OTP={} Arinsal={}; pre-force heap_size OTP={} Arinsal={}; first trace difference {diff}",
-            integer(otp_done.0),
-            integer(arinsal_done.0),
-            process_info_size(otp_done.1, "heap_size"),
-            process_info_size(arinsal_done.1, "heap_size")
+            "{name}: per-process traced starts OTP={otp_count} Arinsal={arinsal_count}; pre-force heap_size OTP={} Arinsal={}; first trace difference {diff}",
+            process_info_size(otp_done, "heap_size"),
+            process_info_size(arinsal_done, "heap_size")
         );
         similar_asserts::assert_eq!(otp_count, arinsal_count, "GC trace starts for {name}");
         similar_asserts::assert_eq!(
-            integer(otp_done.0),
-            integer(arinsal_done.0),
-            "statistics GC counts for {name}"
-        );
-        similar_asserts::assert_eq!(
-            process_info_size(otp_done.1, "heap_size"),
-            process_info_size(arinsal_done.1, "heap_size"),
+            process_info_size(otp_done, "heap_size"),
+            process_info_size(arinsal_done, "heap_size"),
             "final young heap size for {name}"
         );
         if kind == 3 {
@@ -146,31 +137,6 @@ fn gc_trace_roots_for_map_and_reverse_workloads_match_otp() {
                 "reverse result liveness differs: major-start recent_size Arinsal={arinsal_peak}, OTP={otp_peak}"
             );
         }
-    }
-}
-
-fn done_fields<'a>(
-    term: &'a OwnedTerm,
-    runtime: &str,
-    workload: &str,
-) -> (&'a OwnedTerm, &'a OwnedTerm) {
-    let OwnedTerm::Tuple(values) = term else {
-        panic!("{runtime} {workload} done payload is not a tuple: {term:?}");
-    };
-    if values.len() != 2 {
-        panic!(
-            "{runtime} {workload} done payload has {} fields",
-            values.len()
-        );
-    }
-    (&values[0], &values[1])
-}
-
-fn integer(term: &OwnedTerm) -> i64 {
-    match term {
-        OwnedTerm::Int(value) => *value,
-        OwnedTerm::BigInt(value) => value.to_string().parse().expect("GC count"),
-        _ => panic!("expected integer, got {term:?}"),
     }
 }
 

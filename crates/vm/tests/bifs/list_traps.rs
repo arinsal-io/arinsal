@@ -2,6 +2,7 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
+use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(list_traps).
@@ -62,11 +63,10 @@ reds() ->
     }.
 
 delta(Fun) ->
-    erlang:statistics(reductions),
+    {reductions, Before} = process_info(self(), reductions),
     Value = Fun(),
-    erlang:yield(),
-    {_, Delta} = erlang:statistics(reductions),
-    {Delta, Value}.
+    {reductions, After} = process_info(self(), reductions),
+    {After - Before, Value}.
 
 responsive() ->
     L = lists:seq(1, 100000),

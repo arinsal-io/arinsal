@@ -467,18 +467,13 @@ writers(Type, Access) ->
         R3 = ets:select_count(T, [{{'$1', '_'}, [], [true]}]),
         Me ! {reader, R1, R2, R3}
     end, [link]),
-    Watcher = spawn(fun() -> watch(T, Reader, false, Me) end),
+    %% Start mutations only after ETS reports that the reader's traversal has fixed the table.
+    Watcher = spawn(fun() -> watch_writers(T, Reader, N, Me) end),
     Reader ! go,
-    Mod = spawn(fun() ->
-        [ets:delete(T, K) || K <- lists:seq(2, N, 2)],
-        [ets:insert(T, {K, K}) || K <- lists:seq(N + 1, N + 20000)],
-        Me ! modded
-    end),
     receive modded -> ok after 60000 -> exit(no_modded) end,
     {R1, R2, R3} = receive {reader, A, B, C} -> {A, B, C} after 60000 -> exit(no_reader) end,
     Watcher ! stop,
     Fixed = receive {watched, F} -> F after 5000 -> no_watch end,
-    _ = Mod,
     Odd = lists:seq(1, N, 2),
     Keys2 = [K || {K, _} <- R2],
     {Fixed,
@@ -487,6 +482,23 @@ writers(Type, Access) ->
      R3 >= N div 2 andalso R3 =< N + 20000,
      ets:info(T, safe_fixed),
      ets:info(T, size)}.
+
+watch_writers(T, Reader, N, Parent) ->
+    receive stop -> Parent ! {watched, true}
+    after 0 ->
+        case ets:info(T, safe_fixed) of
+            {_, Fixers} when is_list(Fixers) ->
+                case lists:keymember(Reader, 1, Fixers) of
+                    true ->
+                        [ets:delete(T, K) || K <- lists:seq(2, N, 2)],
+                        [ets:insert(T, {K, K}) || K <- lists:seq(N + 1, N + 20000)],
+                        Parent ! modded,
+                        watch(T, Reader, true, Parent);
+                    false -> watch_writers(T, Reader, N, Parent)
+                end;
+            _ -> watch_writers(T, Reader, N, Parent)
+        end
+    end.
 
 watch(T, Reader, Seen, Parent) ->
     receive stop -> Parent ! {watched, Seen}

@@ -121,6 +121,26 @@ fn selective_receive_scenarios_match_otp_29() {
         .compile_named("selective_receive_diff", SOURCE, &[])
         .unwrap();
     reference.load("selective_receive_diff", &beam).unwrap();
+    // The first OTP use of seq_trace loads the module from the child process; warm that path on
+    // both runtimes before comparing selective receive behavior.
+    let warm_up = [OwnedTerm::Int(7), OwnedTerm::Int(3)];
+    let warm_result = reference.call("selective_receive_diff", "scenario", &warm_up);
+    let warm_actual = {
+        let mut vm = crate::common::node();
+        vm.load_bytes(&beam).unwrap();
+        vm.eval_scheduled(
+            "selective_receive_diff",
+            "scenario",
+            &[Term::small(7).unwrap(), Term::small(3).unwrap()],
+            4,
+        )
+        .expect("seq_trace warm-up")
+    };
+    similar_asserts::assert_eq!(
+        warm_result,
+        CallResult::Ok(warm_actual.term),
+        "seq_trace warm-up"
+    );
     for size in [3, 200] {
         for scenario in 0..=8 {
             let expected = reference.call(

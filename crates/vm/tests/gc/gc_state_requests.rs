@@ -1,6 +1,7 @@
 //! Asynchronous garbage_collect requests to a process with GC disabled and to unstarted processes.
 
 use arinsal_difftest::{CallResult, RefErl};
+use similar_asserts::assert_eq;
 
 const MODULE: &str = "gc_state_requests";
 const SOURCE: &str = r#"
@@ -26,22 +27,25 @@ deferred() ->
     end,
     Reply = receive {garbage_collect, Ref, true} -> true after 5000 -> timeout end,
     {First, Reply}.
-tok() -> tok(200000).
-tok(0) -> ok;
-tok(N) -> tok(N - 1).
 unstarted() ->
     process_flag(priority, high),
-    Ps = [spawn_opt(fun tok/0, [{priority, low}, monitor]) || _ <- lists:seq(1, 10)],
+    Ps = [spawn_opt(fun() -> receive stop -> ok end end, [{priority, low}, monitor])
+          || _ <- lists:seq(1, 10)],
     lists:foreach(fun ({P, _}) -> true = erlang:garbage_collect(P) end, Ps),
+    lists:foreach(fun ({P, _}) -> P ! stop end, Ps),
     [receive {'DOWN', M, process, P, Reason} -> Reason end || {P, M} <- Ps].
 "#;
 
 fn assert_equal(function: &str) {
-    let reference = RefErl::start().expect("OTP 29.1.1");
+    assert_equal_with_flags(function, &[]);
+}
+
+fn assert_equal_with_flags(function: &str, flags: &[&str]) {
+    let reference = RefErl::start_with_erl_args(flags).expect("OTP 29.1.1");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, function, &[]);
-    let actual = crate::common::peer_eval(&[], &[&beam], &format!("{MODULE}:{function}()"));
+    let actual = crate::common::peer_eval(flags, &[&beam], &format!("{MODULE}:{function}()"));
     assert_eq!(expected, CallResult::Ok(actual), "{function}");
 }
 
@@ -52,5 +56,5 @@ fn async_gc_request_waits_for_gc_to_be_enabled() {
 
 #[test]
 fn gc_before_first_run_keeps_initial_fun_alive() {
-    assert_equal("unstarted");
+    assert_equal_with_flags("unstarted", &["+S", "1"]);
 }
