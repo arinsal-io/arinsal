@@ -2853,6 +2853,11 @@ fn bif_trap_export(
     mut export_trap: crate::ExportTrap,
     identity: usize,
 ) -> u64 {
+    // erl_gc.c:430-436 (erts_gc_after_bif_call_lhf): the first trap with F_DISABLE_GC saves
+    // live_hf_end. The fragment tests GC only after a value, so the trap epilogue does it.
+    if !process.heap.gc_enabled {
+        process.heap.save_live_frags_mark();
+    }
     // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and are the live roots
     // while the process is parked in `beam_bif_export_trap`.
     if crate::calls::gc_after_native_parts(process, &mut export_trap.args, None, None).is_err() {

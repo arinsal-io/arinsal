@@ -96,9 +96,6 @@ impl Process {
     /// Port of erts/emulator/beam/erl_process.c:11823 (`erts_set_gc_state`), OTP-29.1.1.
     pub(crate) fn set_gc_enabled(&mut self, enabled: bool) -> bool {
         let previous = self.heap.gc_enabled;
-        if previous && !enabled {
-            self.heap.save_live_frags_mark();
-        }
         self.heap.gc_enabled = enabled;
         previous
     }
