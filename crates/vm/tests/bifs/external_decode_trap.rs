@@ -60,6 +60,7 @@ run(Index) ->
     Parent = self(),
     %% A heap that holds the result: the decode charges no collection in either runtime.
     Pid = spawn_opt(fun() ->
+        Parent ! {ready, self()},
         receive start ->
             erlang:garbage_collect(),
             R0 = reds(),
@@ -69,6 +70,9 @@ run(Index) ->
             Parent ! {done, self(), R1 - R0, Res}
         end
     end, [{min_heap_size, 16000000}]),
+    %% The decoder is parked in its receive before tracing starts, so the one schedule-in of
+    %% `start` is counted whichever way the parent's own slice ends.
+    receive {ready, Pid} -> ok end,
     1 = erlang:trace(Pid, true, [running, {tracer, Parent}]),
     Pid ! start,
     receive
