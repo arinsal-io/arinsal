@@ -14,6 +14,7 @@ pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_os;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
+pub(crate) mod erl_iolist;
 pub(crate) mod erl_map;
 pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;

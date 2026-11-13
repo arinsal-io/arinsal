@@ -143,8 +143,8 @@ use crate::native_helpers::{
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer, erl_map,
-    erl_process_dict, register,
+    bif_phash2, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer,
+    erl_iolist, erl_map, erl_process_dict, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -238,6 +238,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
         ("maps", "values", 1) => bif!(erl_map::maps_values_1),
         ("maps", "merge", 2) => bif!(erl_map::maps_merge_2),
+        // erl_iolist.c
+        ("erlang", "iolist_size", 1) => bif!(erl_iolist::iolist_size_1),
         // erl_bif_guard.c
         ("erlang", "length", 1) => bif!(erl_bif_guard::length_1),
         // erl_process_dict.c
@@ -339,6 +341,7 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
+        ("erts_internal", "iolist_size_continue", 1) => bif!(erl_iolist::iolist_size_continue_1),
         _ => return None,
     })
 }
@@ -348,7 +351,7 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
 // selected BIF body directly; that body leaves the light path only when it traps.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{
-        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, TermToBinary,
+        BinaryToTerm, IolistToBinary, IolistToIovec, ListToBinary, TermToBinary,
     };
     use crate::native_helpers::trap_bif_entry;
     if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
@@ -359,7 +362,6 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
             bif!(trap_bif_entry::<ListToBinary>)
         }
         ("erlang", "iolist_to_binary", 1) => bif!(trap_bif_entry::<IolistToBinary>),
-        ("erlang", "iolist_size", 1) => bif!(trap_bif_entry::<IolistSize>),
         ("erlang", "iolist_to_iovec", 1) => bif!(trap_bif_entry::<IolistToIovec>),
         ("erlang", "term_to_binary", 1 | 2) => bif!(trap_bif_entry::<TermToBinary>),
         ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
@@ -527,10 +529,6 @@ mod tests {
         similar_asserts::assert_eq!(
             list_to_binary,
             trap_entry("binary", "list_to_bin", 1).unwrap()
-        );
-        assert_ne!(
-            list_to_binary,
-            trap_entry("erlang", "iolist_size", 1).unwrap()
         );
         assert_ne!(
             list_to_binary,

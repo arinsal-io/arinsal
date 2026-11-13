@@ -137,7 +137,6 @@ pub(crate) struct Entry {
 
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
 const IOLIST_CONTINUATION: &str = "erts_internal:list_to_bitstring_continue/1";
-const IOLIST_SIZE_CONTINUATION: &str = "erts_internal:iolist_size_continue/1";
 const IOLIST_TO_IOVEC_CONTINUATION: &str = "erts_internal:iolist_to_iovec_continue/1";
 const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
@@ -167,7 +166,6 @@ const ERTS_BINARY_TO_LIST_STATE_SIZE: usize = 40;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
-const ERTS_IOLIST_SIZE_STATE_SIZE: usize = 88;
 const ERTS_IOLIST_TO_IOVEC_STATE_SIZE: usize = 152;
 // Port of erts/emulator/beam/external.c (B2TContext), including its decode union.
 const ERTS_BINARY_TO_TERM_CONTEXT_SIZE: usize = 296;
@@ -613,13 +611,6 @@ const ENTRIES: &[Entry] = &[
         arity: 1,
         continuation: IOLIST_CONTINUATION,
         handler: list_to_bitstring,
-    },
-    Entry {
-        module: "erlang",
-        function: "iolist_size",
-        arity: 1,
-        continuation: IOLIST_SIZE_CONTINUATION,
-        handler: iolist_size,
     },
     Entry {
         module: "erlang",
@@ -1703,8 +1694,6 @@ pub(crate) struct BinaryToList<B>(std::marker::PhantomData<fn() -> B>);
 pub(crate) struct ListToBinary;
 /// `iolist_to_binary/1`.
 pub(crate) struct IolistToBinary;
-/// `iolist_size/1`.
-pub(crate) struct IolistSize;
 /// `iolist_to_iovec/1`.
 pub(crate) struct IolistToIovec;
 
@@ -1769,28 +1758,6 @@ impl TrapBody for IolistToIovec {
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
         iolist_to_iovec(process, args, None, pid, restore_gc)
-    }
-}
-
-impl TrapBody for IolistSize {
-    const ARITY: Option<usize> = Some(1);
-
-    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut bif_state = arinsal_bifs::BifState::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-        arinsal_bifs::iolist_size_direct(&mut ctx, args[0])
-    }
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        // Port of erts/emulator/beam/erl_iolist.c:938-1093 (`iolist_size_1`), OTP-29.1.1.
-        iolist_size(process, args, None, pid, restore_gc)
     }
 }
 
@@ -2381,93 +2348,6 @@ fn list_to_bitstring(
         });
     }
     iolist_binary_conversion(process, args[0], state, true, gc_changed)
-}
-
-fn iolist_size(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    // Port of erts/emulator/beam/erl_iolist.c (`iolist_size_dispatch`, `iolist_size_1`,
-    // `iolist_size_continue`), OTP-29.1.1: the walk gets `reds_left * 8` yield counts and
-    // charges one reduction per eight of them.
-    let root = args[0];
-    let reds_left = process.heap.abi.fcalls.max(0) as usize;
-    // erts walks on the C stack and allocates trap state only when it yields, so the common
-    // call that finishes in one go allocates nothing.
-    let (progress, size, parked) = match state {
-        Some(state) => {
-            let mut walker = state
-                .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
-                .ok_or(BifError::BADARG)?
-                .lock()
-                .map_err(|_| BifError::SystemLimit)?;
-            if reds_left == 0 {
-                drop(walker);
-                return Ok(HandlerResult::Yield {
-                    continuation: IOLIST_SIZE_CONTINUATION,
-                    state: Arc::clone(state),
-                    reductions: 0,
-                });
-            }
-            let progress = walker.step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED));
-            let size = if matches!(progress, Ok((true, _))) {
-                walker.take_size()
-            } else {
-                0
-            };
-            (progress, size, Some(Arc::clone(state)))
-        }
-        None => {
-            let mut walker = arinsal_bifs::IolistSizeWalk::new(root);
-            if reds_left == 0 {
-                return Ok(HandlerResult::Yield {
-                    continuation: IOLIST_SIZE_CONTINUATION,
-                    state: magic_binary_state(Mutex::new(walker), ERTS_IOLIST_SIZE_STATE_SIZE),
-                    reductions: 0,
-                });
-            }
-            let progress = walker.step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED));
-            match progress {
-                Ok((true, _)) => (progress, walker.take_size(), None),
-                _ => (
-                    progress,
-                    0,
-                    Some(magic_binary_state(
-                        Mutex::new(walker),
-                        ERTS_IOLIST_SIZE_STATE_SIZE,
-                    )),
-                ),
-            }
-        }
-    };
-    let (done, work) = match progress {
-        Ok(progress) => progress,
-        Err((error, work)) => {
-            return Ok(HandlerResult::Failed {
-                error,
-                reductions: arinsal_bifs::iolist_yield_reductions(work) as u32,
-            });
-        }
-    };
-    let reductions = arinsal_bifs::iolist_yield_reductions(work) as u32;
-    if !done {
-        let Some(state) = parked else {
-            return Err(BifError::SystemLimit);
-        };
-        return Ok(HandlerResult::Yield {
-            continuation: IOLIST_SIZE_CONTINUATION,
-            state,
-            reductions,
-        });
-    }
-    process.set_gc_enabled(restore_gc);
-    let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-        .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
-        .map_err(|_| BifError::SystemLimit)?;
-    Ok(HandlerResult::Done { value, reductions })
 }
 
 const SIZE_YIELDS_PER_RED: usize = 8;
