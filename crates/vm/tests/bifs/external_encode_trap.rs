@@ -79,8 +79,7 @@ fn term_to_binary_family_matches_otp_on_big_terms() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     for index in 1..=15i64 {
-        let CallResult::Ok(expected) =
-            reference.call(MODULE, "run", &[OwnedTerm::Int(index)])
+        let CallResult::Ok(expected) = reference.call(MODULE, "run", &[OwnedTerm::Int(index)])
         else {
             panic!("OTP failed case {index}");
         };
