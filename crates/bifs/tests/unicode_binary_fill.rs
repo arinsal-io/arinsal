@@ -44,7 +44,6 @@ fn utf8_size_and_fill_match_otp_with_and_without_traps() {
                 let mut step = match ctx.take_deferred().map(|trap| *trap) {
                     Some(DeferredTrap::Unicode(cont)) => UnicodeStep::More(cont),
                     None => UnicodeStep::Done(value),
-                    _ => panic!("unexpected continuation"),
                 };
                 let mut slices = 0;
                 let actual = loop {

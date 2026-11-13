@@ -143,7 +143,7 @@ use crate::native_helpers::{
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer,
+    bif_phash2, binary, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer,
     erl_iolist, erl_map, erl_process_dict, register,
 };
 
@@ -238,6 +238,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
         ("maps", "values", 1) => bif!(erl_map::maps_values_1),
         ("maps", "merge", 2) => bif!(erl_map::maps_merge_2),
+        // binary.c
+        ("erlang", "binary_to_list", 1) => bif!(binary::binary_to_list_1),
+        ("erlang", "binary_to_list", 3) => bif!(binary::binary_to_list_3),
         // erl_iolist.c
         ("erlang", "iolist_size", 1) => bif!(erl_iolist::iolist_size_1),
         ("erlang", "list_to_binary", 1) => bif!(erl_iolist::list_to_binary_1),
@@ -346,6 +349,9 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
+        ("erts_internal", "binary_to_list_continue", 1) => {
+            bif!(binary::binary_to_list_continue_1)
+        }
         ("erts_internal", "iolist_size_continue", 1) => bif!(erl_iolist::iolist_size_continue_1),
         ("erts_internal", "list_to_bitstring_continue", 1) => {
             bif!(erl_iolist::list_to_bitstring_continue_1)
@@ -363,26 +369,12 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{BinaryToTerm, TermToBinary};
     use crate::native_helpers::trap_bif_entry;
-    if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
-        return arinsal_bifs::visit_bif(module, function, arity, &mut BinaryToListEntry);
-    }
     let func = match (module, function, arity) {
         ("erlang", "term_to_binary", 1 | 2) => bif!(trap_bif_entry::<TermToBinary>),
         ("erlang", "binary_to_term", 1 | 2) => bif!(trap_bif_entry::<BinaryToTerm>),
         _ => return None,
     };
     Some(func)
-}
-
-struct BinaryToListEntry;
-
-impl arinsal_bifs::BifTableVisitor for BinaryToListEntry {
-    type Output = usize;
-
-    fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Self::Output {
-        crate::native_helpers::trap_bif_entry::<crate::bif_traps::BinaryToList<B>> as *const ()
-            as usize
-    }
 }
 
 /// The entries compiled for one BIF of `arinsal_bifs`: its body is inlined into
@@ -487,7 +479,7 @@ sched_bif!(
 
 #[cfg(test)]
 mod tests {
-    use super::{entry, special, trap_entry};
+    use super::{entry, special};
 
     // install_bifs fills `bif_table[ep->bif_number]`; the export itself carries no function.
     #[test]
@@ -520,25 +512,6 @@ mod tests {
         similar_asserts::assert_eq!(node0.plain, node1.plain);
         assert!(entry("erlang", "no_such_bif", 1).is_none());
         assert!(entry("erlang", "element", 3).is_none());
-    }
-
-    #[test]
-    fn binary_conversions_have_dedicated_trap_entries() {
-        let binary_to_list = trap_entry("erlang", "binary_to_list", 1).unwrap();
-        similar_asserts::assert_eq!(
-            binary_to_list,
-            trap_entry("erlang", "binary_to_list", 3).unwrap()
-        );
-        let list_to_binary = trap_entry("erlang", "list_to_binary", 1).unwrap();
-        similar_asserts::assert_eq!(
-            list_to_binary,
-            trap_entry("binary", "list_to_bin", 1).unwrap()
-        );
-        assert_ne!(
-            list_to_binary,
-            trap_entry("erlang", "iolist_to_binary", 1).unwrap()
-        );
-        assert!(trap_entry("erlang", "not_a_binary_bif", 1).is_none());
     }
 
     #[test]

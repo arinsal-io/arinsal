@@ -57,17 +57,9 @@ pub(crate) enum TrapGc {
 /// The one table of continuations that stay collectable while parked. Every other
 /// continuation disables collection, like erts' `erts_set_gc_state(c_p, 0)` before a
 /// state-carrying BIF_TRAP.
-pub(crate) fn trap_gc_policy(continuation: &str, state: &Arc<MagicRef>) -> TrapGc {
+pub(crate) fn trap_gc_policy(continuation: &str) -> TrapGc {
     if continuation == PTAB_LIST_CONTINUATION {
         // BIF_TRAP1 carries the accumulator in X0.
-        TrapGc::RootedArgs(1)
-    } else if continuation == BINARY_TO_LIST_CONTINUATION
-        && state
-            .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
-            .and_then(|walk| walk.lock().ok())
-            .is_some_and(|walk| walk.needs_initial_allocation())
-    {
-        // ERTS_BIF_YIELD1/3: no state exists yet; the call is retried with its arguments.
         TrapGc::RootedArgs(1)
     } else if continuation == CODE_PERMISSION_CONTINUATION {
         TrapGc::NoTerms
@@ -125,7 +117,6 @@ pub(crate) struct Entry {
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
 const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
-pub(crate) const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
@@ -145,9 +136,6 @@ const RE_URUN_CONTINUATION: &str = "re:urun/3";
 const ERTS_UNICODE_RESTART_CONTEXT_SIZE: usize = 40;
 // Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
 const ERTS_REGEX_RESTART_CONTEXT_SIZE: usize = 64;
-// Port of erts/emulator/beam/binary.c (ErtsB2LState) and erl_bif_binary.c
-// (BinaryFindContext).
-const ERTS_BINARY_TO_LIST_STATE_SIZE: usize = 40;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
@@ -341,7 +329,6 @@ fn unicode_convert_start(
             state: magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
             reductions: 0,
         }),
-        Some(_) => Err(BifError::BADARG),
         None => Ok(HandlerResult::Done {
             value: result,
             reductions: 0,
@@ -521,20 +508,6 @@ const ENTRIES: &[Entry] = &[
         arity: 3,
         continuation: "re:run/3",
         handler: re_run_trap,
-    },
-    Entry {
-        module: "erlang",
-        function: "binary_to_list",
-        arity: 1,
-        continuation: BINARY_TO_LIST_CONTINUATION,
-        handler: binary_to_list_trap,
-    },
-    Entry {
-        module: "erlang",
-        function: "binary_to_list",
-        arity: 3,
-        continuation: BINARY_TO_LIST_CONTINUATION,
-        handler: binary_to_list_trap,
     },
     Entry {
         module: "erlang",
@@ -794,77 +767,6 @@ fn re_run_trap(
             ))
         }
     })
-}
-
-// Port of erts/emulator/beam/binary.c:213-239 (binary_to_list_chunk), OTP-29.1.1.
-fn binary_to_list_trap(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    if state.is_none() {
-        return binary_to_list_start(process, args, restore_gc);
-    }
-    let state = Arc::clone(state.ok_or(BifError::BADARG)?);
-    let walk = state
-        .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
-    if walk.needs_initial_allocation() {
-        // ERTS_BIF_YIELD: the source is BIF_ARG_1 of the retried call, a root of the trap
-        // (`args_are_roots`) that any collection while the process was switched out updated.
-        if let Some(source) = process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.bif_trap.as_ref())
-            .map(|trap| trap.args[0])
-        {
-            walk.refresh_source(source);
-        }
-    }
-    let reds_left = process.heap.abi.fcalls.max(0) as usize;
-    let chunk = reds_left.saturating_add(1).saturating_mul(256);
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let (value, used) = walk.step(&mut heap, chunk)?;
-    let reductions = used.div_ceil(256).min(u32::MAX as usize) as u32;
-    if let Some(value) = value {
-        process.set_gc_enabled(restore_gc);
-        Ok(HandlerResult::Done { value, reductions })
-    } else {
-        drop(walk);
-        Ok(HandlerResult::Yield {
-            continuation: BINARY_TO_LIST_CONTINUATION,
-            state,
-            reductions,
-        })
-    }
-}
-
-fn binary_to_list_start(
-    process: &mut Process,
-    args: &[Term],
-    _restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    let budget = process.heap.abi.fcalls.max(0) as usize;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::new(&mut heap, &mut state);
-    ctx.set_reduction_budget(budget);
-    // Port of erts/emulator/beam/binary.c (`binary_to_list_1`), OTP-29.1.1:
-    // enter the concrete BIF directly; the trap path carries the same arguments.
-    let value = arinsal_bifs::erlang_binary_to_list(&mut ctx, args)?;
-    let reductions = ctx.reductions();
-    match ctx.take_deferred().map(|trap| *trap) {
-        Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(HandlerResult::Yield {
-            continuation: BINARY_TO_LIST_CONTINUATION,
-            state: magic_binary_state(Mutex::new(walk), ERTS_BINARY_TO_LIST_STATE_SIZE),
-            reductions,
-        }),
-        Some(_) => Err(BifError::BADARG),
-        None => Ok(HandlerResult::Done { value, reductions }),
-    }
 }
 
 fn binary_search(
@@ -1421,7 +1323,7 @@ pub(crate) fn execute_named(
             // `trap_gc_policy`; every other one disables collection as erts does before a
             // state-carrying BIF_TRAP (a ptab list or code-permission waiter keeps no heap
             // term of its own, erts runs GC tasks of such a suspended process).
-            let gc_policy = trap_gc_policy(continuation, &state);
+            let gc_policy = trap_gc_policy(continuation);
             if gc_policy == TrapGc::Disabled {
                 process.set_gc_enabled(false);
             }
@@ -1534,22 +1436,6 @@ pub(crate) trait TrapBody {
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError>;
-}
-
-/// `binary_to_list/1,3`.
-pub(crate) struct BinaryToList<B>(std::marker::PhantomData<fn() -> B>);
-
-impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        _pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        // Port of erts/emulator/beam/binary.c:202-239 (`binary_to_list_1/3`), OTP-29.1.1.
-        binary_to_list_start(process, args, restore_gc)
-    }
 }
 
 /// `term_to_binary/1,2` entered directly from the light-BIF fragment.
@@ -1757,7 +1643,7 @@ pub(crate) fn finish_light(
             state,
             reductions,
         }) => {
-            let gc_policy = trap_gc_policy(continuation, &state);
+            let gc_policy = trap_gc_policy(continuation);
             if gc_policy == TrapGc::Disabled {
                 process.set_gc_enabled(false);
             }
@@ -1843,17 +1729,13 @@ pub(crate) fn install_deferred_trap(
 ) -> Result<(), arinsal_term::TermError> {
     let gc_was_enabled = process.heap.gc_enabled;
     let (continuation, state) = match trap {
-        arinsal_bifs::DeferredTrap::BinaryToList(walk) => (
-            BINARY_TO_LIST_CONTINUATION,
-            magic_binary_state(Mutex::new(walk), ERTS_BINARY_TO_LIST_STATE_SIZE),
-        ),
         arinsal_bifs::DeferredTrap::Unicode(cont) => (
             cont.continuation(),
             magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
         ),
     };
     let state_term = trap_state_term(process, &state)?;
-    let gc_policy = trap_gc_policy(continuation, &state);
+    let gc_policy = trap_gc_policy(continuation);
     if gc_policy == TrapGc::Disabled {
         process.set_gc_enabled(false);
     }
