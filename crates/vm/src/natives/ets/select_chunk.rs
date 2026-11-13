@@ -231,19 +231,24 @@ pub(super) fn reverse_pass(left: usize) -> ReversePass {
     }
 }
 
+/// The data of a compiled match specification's magic binary.
+pub(crate) struct MatchProgRef(pub(crate) Arc<MatchProgram>);
+// erl_db_util.c: erts_db_match_prog_destructor.
+arinsal_term::magic_payload!(MatchProgRef => erts_db_match_prog_destructor);
+
 /// Keep the match program alive through every continuation term that names it.
 // Port of erts/emulator/beam/erl_db_util.h (erts_db_make_match_prog_ref), OTP-29.1.1.
 fn match_program_owner(reference: Term, program: &Arc<MatchProgram>) -> MagicBin {
     reference
         .magic_owner()
-        .filter(|owner| owner.downcast_ref::<Arc<MatchProgram>>().is_some())
+        .filter(|owner| owner.downcast_ref::<MatchProgRef>().is_some())
         .unwrap_or_else(|| new_match_program_owner(program))
 }
 
 /// Create the binary owner used by the first continuation for a match program.
 pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> MagicBin {
     MagicBin::with_erts_payload_size_and_refn(
-        Arc::clone(program),
+        MatchProgRef(Arc::clone(program)),
         program.erts_magic_payload_size(),
         arinsal_bifs::next_ref_words(),
     )

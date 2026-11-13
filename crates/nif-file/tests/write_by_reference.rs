@@ -110,7 +110,7 @@ fn write_of_resource_binary_references_its_bytes() {
     let mut heap = ProcessHeap::with_words(4096);
     let handle = open(&mut heap, &file);
     let bytes: Arc<Vec<u8>> = Arc::new(pattern(64 * MIB + 3));
-    let owner = MagicBin::new(Arc::clone(&bytes));
+    let owner = MagicBin::new(ResourceBytes(Arc::clone(&bytes)));
     // SAFETY: `owner` keeps the `bytes` allocation alive and unmodified.
     let external = unsafe { ExternalBinary::new(bytes.as_ptr(), bytes.len(), owner) };
     let (handle_term, list) = {
@@ -193,3 +193,7 @@ fn partial_writes_continue_with_the_unwritten_remainder() {
     assert_eq!(got.len(), total);
     assert!(got == expected);
 }
+
+/// The resource whose bytes `enif_make_resource_binary` exposes.
+struct ResourceBytes(#[allow(dead_code)] Arc<Vec<u8>>);
+arinsal_term::magic_payload!(ResourceBytes => resource_bytes_dtor);

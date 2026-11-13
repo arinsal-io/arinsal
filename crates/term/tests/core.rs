@@ -568,7 +568,7 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     arinsal_term::init_global_literals();
     use arinsal_term::{Identity, MagicBin, TermBuilder};
     let mut heap = VecHeap::new();
-    let owner = MagicBin::new(7_u32);
+    let owner = MagicBin::new(TestU32(7));
     let id = owner.id();
     let original = TermBuilder::new(&mut heap)
         .magic_ref(owner.clone())
@@ -1172,7 +1172,7 @@ fn magic_reference_uses_erts_ref_thing_header_and_marker() {
     use arinsal_term::{MagicBin, TermBuilder};
     let mut heap = VecHeap::new();
     let magic = TermBuilder::new(&mut heap)
-        .magic_ref(MagicBin::new(()))
+        .magic_ref(MagicBin::new(TestUnit))
         .unwrap();
     let ordinary = TermBuilder::new(&mut heap).local_ref([1, 2, 3]).unwrap();
     assert_eq!(magic.header(), Some((2 << 6) | 0x10));
@@ -1265,12 +1265,14 @@ fn magic_binary_block_refc_destructor_and_weak() {
     }
     #[repr(align(64))]
     struct Wide(u8);
+    arinsal_term::magic_payload!(Counted => destroy_counted, Wide => destroy_wide);
     let drops = Arc::new(AtomicUsize::new(0));
     let bin = MagicBin::new(Counted(drops.clone()));
     let copy = bin.clone();
     assert_eq!(bin.refc(), 2);
     assert!(bin.downcast_ref::<Counted>().is_some());
-    assert!(bin.downcast_ref::<u64>().is_none());
+    assert!(bin.downcast_ref::<TestU32>().is_none());
+    assert!(bin.downcast_ref::<TestUnit>().is_none());
     let weak = MagicBin::downgrade(&bin);
     drop(bin);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -1284,7 +1286,7 @@ fn magic_binary_block_refc_destructor_and_weak() {
     assert_eq!(std::ptr::from_ref(payload) as usize % 64, 0);
     assert_eq!(payload.0, 7);
     // magic_ref_table: a saved binary is found by its numbers until it is freed.
-    let saved = MagicBin::new(1_u32);
+    let saved = MagicBin::new(TestU32(1));
     let id = saved.id();
     saved.save_in_table();
     assert!(MagicBin::ptr_eq(
@@ -1294,3 +1296,9 @@ fn magic_binary_block_refc_destructor_and_weak() {
     drop(saved);
     assert!(MagicBin::lookup_saved(id).is_none());
 }
+
+/// Magic binary payloads of the tests above; the two have identical (no-op) drops, so their
+/// destructors must still stay distinct.
+struct TestU32(#[allow(dead_code)] u32);
+struct TestUnit;
+arinsal_term::magic_payload!(TestU32 => destroy_test_u32, TestUnit => destroy_test_unit);

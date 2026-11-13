@@ -2,7 +2,6 @@
 
 use crate::raw::magic_bin::thing_block;
 use crate::{MagicBin, MagicRef};
-use std::any::Any;
 
 impl crate::Term {
     /// `erts_magic_ref_save_bin` for a reference term; other terms are left alone.
@@ -25,7 +24,10 @@ impl crate::Term {
     // Port of erts/emulator/beam/erl_bif_unique.c / erl_db.c (erts_magic_ref2bin and the
     // `ERTS_MAGIC_BIN_DATA` read in db_get_table_aux), OTP-29.1.1: the magic binary is read
     // through the reference thing, with no refcount write.
-    pub fn with_magic_payload<T: Any, R>(self, visit: impl FnOnce(&T) -> R) -> Option<R> {
+    pub fn with_magic_payload<T: crate::MagicPayload, R>(
+        self,
+        visit: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
         // SAFETY: like every `Term` accessor taking a pointer-tagged term, the caller holds the
         // term in a live heap (a BIF argument or register), which retains the magic binary on
         // its off-heap list for the duration of this call.

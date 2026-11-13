@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct DropCounter(Arc<AtomicUsize>);
+arinsal_term::magic_payload!(DropCounter => destroy_drop_counter);
 impl Drop for DropCounter {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -267,6 +268,7 @@ fn collections_with_many_live_magic_references_stay_linear() {
     assert_eq!(count.load(Ordering::SeqCst), 40_000);
 }
 
+arinsal_term::magic_payload!(ExternalPayload => destroy_external_payload);
 struct ExternalPayload {
     bytes: Box<[u8]>,
     _counter: DropCounter,

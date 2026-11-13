@@ -349,6 +349,8 @@ fn resume_pending_lambda_callers(
 /// 24-byte magic data offset plus the 568-byte `LoaderState` of beam/jit/load.h.
 const LOADER_STATE_MAGIC_ORIG_SIZE: usize = 24 + 568;
 
+// beam_bif_load.c: the prepared-code (LoaderState) magic binary destructor.
+arinsal_term::magic_payload!(Prepared => erts_beam_loader_destructor);
 struct Prepared {
     bytes: Mutex<Vec<u8>>,
     has_on_load: bool,

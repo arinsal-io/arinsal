@@ -20,7 +20,6 @@ mod dict;
 mod param;
 mod stream;
 
-use std::any::Any;
 use std::ffi::{CStr, c_void};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -43,6 +42,11 @@ pub(crate) enum Kind {
     Compress,
     Decompress,
 }
+
+// zstd_nif.c: the context and dictionary resource destructors.
+arinsal_term::magic_payload!(CtxBox => zstd_ctx_dtor, DictResource => zstd_dict_dtor);
+/// The data of a dictionary resource's magic binary.
+pub(crate) struct DictResource(pub(crate) Arc<DictBox>);
 
 /// Payload of a `ZstdCompressContext` or `ZstdDecompressContext` resource.
 ///
@@ -185,15 +189,15 @@ pub(crate) fn get_zstd_dict(term: Term, kind: Kind) -> Option<Arc<DictBox>> {
     // reference is neither collected nor freed until the call returns.
     let owner = unsafe { term.magic_ref() }?;
     owner
-        .downcast_ref::<Arc<DictBox>>()
-        .filter(|dict| dict.kind == kind)
-        .cloned()
+        .downcast_ref::<DictResource>()
+        .filter(|dict| dict.0.kind == kind)
+        .map(|dict| Arc::clone(&dict.0))
 }
 
 /// `enif_alloc_resource` + `enif_make_resource` + `enif_release_resource`: a magic reference
 /// that is the only owner of `payload`, which is dropped when the last term that references it is
 /// collected.
-pub(crate) fn make_resource<T: Any + Send + Sync>(
+pub(crate) fn make_resource<T: arinsal_term::MagicPayload>(
     ctx: &mut Ctx<'_>,
     payload: T,
     orig_size: usize,

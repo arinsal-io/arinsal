@@ -110,7 +110,9 @@ pub use ops::{
     size_object_preserving_sharing_after, size_shared, small_add, small_mul, small_sub,
 };
 pub use owned::{from_owned, to_owned};
-pub use raw::magic_bin::{MAGIC_BIN_DATA_OFFSET, MagicBin, MagicRef, MagicWeak};
+pub use raw::magic_bin::{
+    MAGIC_BIN_DATA_OFFSET, MagicBin, MagicDestructor, MagicPayload, MagicRef, MagicWeak,
+};
 pub use record::{
     RecordRef, RecordSnapshot, record_map_pairs, term_sequence, term_sequence_frames,
     term_sequence_small,

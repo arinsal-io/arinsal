@@ -3115,7 +3115,7 @@ fn internal_state_set(
             // Port of erts/emulator/beam/erl_bif_info.c (erts_debug_get_internal_state):
             // this probe creates a zero-payload magic binary.
             let owner = arinsal_term::MagicBin::with_erts_payload_size_and_refn(
-                (),
+                EmptyMagicRef,
                 0,
                 arinsal_bifs::ordinary_ref_words(process.next_ref()),
             );
@@ -3645,3 +3645,8 @@ mod check_io_tests {
         INTERNAL_STATE.store(previous, Ordering::Relaxed);
     }
 }
+
+/// The zero-size data of the probe magic binary.
+struct EmptyMagicRef;
+// erl_bif_info.c: empty_magic_ref_destructor.
+arinsal_term::magic_payload!(EmptyMagicRef => empty_magic_ref_destructor);

@@ -910,6 +910,8 @@ fn magic_code(term: Term) -> Result<Option<CompiledCode>, BifError> {
 }
 
 struct RegexHandle(usize);
+// erl_bif_re.c: the compiled regex magic binary's destructor.
+arinsal_term::magic_payload!(RegexHandle => regex_magic_destructor);
 
 impl Drop for RegexHandle {
     fn drop(&mut self) {

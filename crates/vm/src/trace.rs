@@ -720,6 +720,8 @@ struct TraceSession {
     weak_id: i64,
 }
 
+// erl_trace.c: erts_trace_session_destructor.
+arinsal_term::magic_payload!(TraceSessionHandle => erts_trace_session_destructor);
 struct TraceSessionHandle {
     owner: usize,
     session: u64,

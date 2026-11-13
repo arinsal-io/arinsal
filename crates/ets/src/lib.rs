@@ -5996,6 +5996,8 @@ impl std::ops::Deref for SharedTable {
     }
 }
 
+// erl_db.c: db_table_tid_destructor identifies a table's magic binary in tid2tab.
+arinsal_term::magic_payload!(TableLock => db_table_tid_destructor);
 /// A table rwmutex. erts selects its frequent-reader implementation when either
 /// `DB_FINE_LOCKED` or `DB_FREQ_READ` is set.
 ///

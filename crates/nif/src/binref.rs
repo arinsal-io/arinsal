@@ -29,6 +29,8 @@ impl Drop for MallocBlock {
     }
 }
 
+// A NIF binary held by an external binary term is released through its magic binary.
+arinsal_term::magic_payload!(NifBinary => nif_binary_destructor);
 /// What a `Binary*` refers to. The payloads are held only to keep the bytes alive.
 #[derive(Clone)]
 #[allow(dead_code)]

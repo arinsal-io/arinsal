@@ -188,6 +188,9 @@ pub(crate) fn release_created(mark: usize) {
     drop(created);
 }
 
+// prim_socket_nif.c: esock_dtor is the destructor of socket descriptor resources.
+arinsal_term::magic_payload!(Handle => esock_dtor);
+
 pub(crate) struct Handle {
     socket: Mutex<Option<Socket>>,
     /// The socket reference term, set once the magic reference has its identity.

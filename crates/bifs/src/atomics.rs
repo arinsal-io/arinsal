@@ -27,6 +27,8 @@ enum Cells {
     Sharded(Vec<Vec<AtomicI64>>),
 }
 
+// erl_bif_atomics.c: atomics_destructor.
+arinsal_term::magic_payload!(Array => atomics_destructor);
 struct Array {
     cells: Cells,
     signed: bool,

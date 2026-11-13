@@ -1,7 +1,6 @@
 //! Binary and iolist BIFs ported from ERTS binary and iolist code.
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use arinsal_term::{
     ConsListBuilder, HeapAlloc, HeapBinaryWriter, MagicBin, ProcessHeap, TermBuilder,
@@ -1214,11 +1213,13 @@ fn pattern(term: Term) -> Result<SearchPatternHandle, BifError> {
         if let Some(tag) = tag {
             let reference = tuple_element(term, 1)?;
             let owner = reference.magic_owner().ok_or(BADARG)?;
-            let compiled = owner
-                .downcast_ref::<Arc<SearchPattern>>()
-                .filter(|compiled| compiled.tag() == tag)
-                .ok_or(BADARG)?;
-            return Ok(SearchPatternHandle::Shared(Arc::clone(compiled)));
+            if owner
+                .downcast_ref::<SearchPattern>()
+                .is_none_or(|compiled| compiled.tag() != tag)
+            {
+                return Err(BADARG);
+            }
+            return Ok(SearchPatternHandle::Shared(owner));
         }
     }
     Ok(SearchPatternHandle::Owned(compile_search_pattern(term)?))
@@ -1226,7 +1227,7 @@ fn pattern(term: Term) -> Result<SearchPatternHandle, BifError> {
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (binary_compile_pattern_1), OTP-29.1.1.
 fn compile_pattern_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let compiled = Arc::new(compile_search_pattern(args[0])?);
+    let compiled = compile_search_pattern(args[0])?;
     let orig_size = arinsal_term::MAGIC_BIN_DATA_OFFSET + compiled.erts_payload_size();
     let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
     let reference = TermBuilder::new(&mut Heap(&mut ctx.heap))

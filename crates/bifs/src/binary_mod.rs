@@ -1,7 +1,6 @@
 //! Boyer–Moore and Aho–Corasick search used by the `binary` BIFs.
 
 use std::ops::Deref;
-use std::sync::Arc;
 
 use crate::BifError;
 
@@ -18,7 +17,8 @@ pub(super) enum SearchPattern {
 /// Temporary search data belongs to one BIF call; compiled patterns retain their magic owner.
 pub(super) enum SearchPatternHandle {
     Owned(SearchPattern),
-    Shared(Arc<SearchPattern>),
+    /// The compiled pattern's magic binary (`erts_magic_ref2bin` of the `{bm | ac, Ref}`).
+    Shared(arinsal_term::MagicBin),
 }
 
 impl Deref for SearchPatternHandle {
@@ -27,10 +27,16 @@ impl Deref for SearchPatternHandle {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Owned(pattern) => pattern,
-            Self::Shared(pattern) => pattern,
+            Self::Shared(magic) => magic
+                .downcast_ref::<SearchPattern>()
+                .expect("a shared pattern handle holds a compiled pattern"),
         }
     }
 }
+
+// erl_bif_binary.c: cleanup_my_data_bm / cleanup_my_data_ac are the destructors of the
+// compiled pattern binaries.
+arinsal_term::magic_payload!(SearchPattern => cleanup_my_data);
 
 impl SearchPattern {
     /// Build the search data selected by OTP from the number of patterns.

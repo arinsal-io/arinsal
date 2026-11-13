@@ -157,6 +157,11 @@ pub(crate) fn unload_types(owner: &Arc<ResourceOwner>) {
     drop(removed);
 }
 
+/// The data of a resource's magic binary.
+pub(crate) struct MagicResource(pub(crate) Arc<Resource>);
+// erl_nif.c: NIF_RESOURCE_DTOR is the destructor of every resource magic binary.
+arinsal_term::magic_payload!(MagicResource => nif_resource_dtor);
+
 pub(crate) struct Resource {
     kind: Arc<ResourceType>,
     data: *mut u8,
@@ -174,7 +179,7 @@ impl Resource {
             return magic;
         }
         let magic = MagicBin::with_orig_size_and_refn(
-            Arc::clone(self),
+            MagicResource(Arc::clone(self)),
             self.magic_orig_size(),
             arinsal_bifs::next_ref_words(),
         );
@@ -215,7 +220,9 @@ pub(crate) fn resource_magic_orig_size(size: usize, has_down: bool) -> usize {
 fn from_reference(reference: Term) -> Option<Arc<Resource>> {
     // SAFETY: the caller retains the reference term and its heap during the callback.
     let magic = unsafe { reference.magic_ref() }?;
-    magic.downcast_ref::<Arc<Resource>>().cloned()
+    magic
+        .downcast_ref::<MagicResource>()
+        .map(|r| Arc::clone(&r.0))
 }
 /// Deliver a monitored process exit to a live resource's down callback.
 pub fn resource_down(reference: Term, pid: Term, monitor: &[u8; 32]) -> bool {
@@ -613,7 +620,7 @@ pub extern "C" fn enif_get_resource(
     }) else {
         return 0;
     };
-    let Some(owner) = magic.downcast_ref::<Arc<Resource>>() else {
+    let Some(MagicResource(owner)) = magic.downcast_ref::<MagicResource>() else {
         return 0;
     };
     if type_address(&owner.kind) != kind {

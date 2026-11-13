@@ -8,7 +8,6 @@
 //! accesses to it. All `unsafe` for magic binaries lives here.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
@@ -19,7 +18,45 @@ use std::sync::{OnceLock, RwLock};
 pub const MAGIC_BIN_DATA_OFFSET: usize = 24;
 
 /// `int (*destructor)(Binary *)`: finalizes the payload in place before the block is freed.
-type Destructor = unsafe fn(NonNull<MagicRef>);
+/// Each payload type has its own named destructor, and the destructor identifies the type.
+pub type MagicDestructor = unsafe fn(NonNull<MagicRef>);
+
+/// A type that can be the data of a magic binary.
+///
+/// # Safety
+/// `DESTRUCTOR` must be a function that no other type uses (it identifies the payload type in
+/// [`MagicRef::downcast_ref`]) and that only calls [`drop_payload`] for `Self`. Implement it
+/// with [`crate::magic_payload!`], which defines a distinct non-inlined destructor per type.
+pub unsafe trait MagicPayload: Send + Sync + Sized + 'static {
+    /// `ERTS_MAGIC_BIN_DESTRUCTOR` of binaries holding a `Self`.
+    const DESTRUCTOR: MagicDestructor;
+}
+
+/// Declare the magic binary destructor of a payload type, like the named destructor erts
+/// passes to `erts_create_magic_binary` (`db_table_tid_destructor`, `cleanup_match_pseudo_process`, ...).
+///
+/// The generated destructor is `#[inline(never)]` so that every crate refers to one symbol,
+/// and it touches a static of its own so that identical-function merging cannot fold two
+/// payload types into one address.
+#[macro_export]
+macro_rules! magic_payload {
+    ($($ty:ty => $name:ident),+ $(,)?) => {$(
+        // SAFETY: the destructor below is defined once for this type and only drops it.
+        unsafe impl $crate::MagicPayload for $ty {
+            const DESTRUCTOR: $crate::MagicDestructor = {
+                #[inline(never)]
+                unsafe fn $name(mb: ::std::ptr::NonNull<$crate::MagicRef>) {
+                    static MARKER: ::std::sync::atomic::AtomicU8 =
+                        ::std::sync::atomic::AtomicU8::new(0);
+                    ::std::hint::black_box(&MARKER);
+                    // SAFETY: called by `erts_bin_free` once for a block holding this type.
+                    unsafe { $crate::raw::magic_bin::drop_payload::<$ty>(mb) }
+                }
+                $name
+            };
+        }
+    )+};
+}
 
 /// `ErtsMagicBinary`: the header of a magic binary block; the payload follows it inline.
 #[repr(C)]
@@ -32,9 +69,7 @@ pub struct MagicRef {
     /// `orig_size`: what an owning heap charges to its virtual binary heap.
     orig_size: usize,
     /// `destructor`, run when `refc` reaches zero.
-    destructor: Destructor,
-    /// The payload type, checked by [`MagicRef::downcast_ref`].
-    type_id: TypeId,
+    destructor: MagicDestructor,
     /// `refn`.
     refn: [u32; 3],
     /// Whether the reference numbers are in [`magic_ref_table`].
@@ -51,11 +86,12 @@ const fn data_offset<T>() -> usize {
     (header + align - 1) & !(align - 1)
 }
 
-/// The destructor of `T` payloads: drops the payload in place.
+/// Drops a `T` payload in place: the body of every [`MagicPayload::DESTRUCTOR`].
 ///
 /// # Safety
 /// `mb` is a block created with a `T` payload that has not been dropped yet.
-unsafe fn drop_payload<T>(mb: NonNull<MagicRef>) {
+#[inline(always)]
+pub unsafe fn drop_payload<T>(mb: NonNull<MagicRef>) {
     // SAFETY: by contract the block holds a live `T` at its data offset.
     unsafe { std::ptr::drop_in_place(mb.cast::<u8>().as_ptr().add(data_offset::<T>()).cast::<T>()) }
 }
@@ -78,8 +114,9 @@ impl MagicRef {
 
     /// `ERTS_MAGIC_BIN_DATA` read as a `T`, if the payload is a `T`.
     #[inline]
-    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        if self.type_id != TypeId::of::<T>() {
+    // Port of erl_db.c (tid2tab: `ERTS_MAGIC_BIN_DESTRUCTOR(btid) != db_table_tid_destructor`).
+    pub fn downcast_ref<T: MagicPayload>(&self) -> Option<&T> {
+        if !std::ptr::fn_addr_eq(self.destructor, T::DESTRUCTOR) {
             return None;
         }
         // SAFETY: the block was created with a `T` payload at this offset, and the payload
@@ -110,20 +147,20 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 impl MagicBin {
     /// A magic binary whose `orig_size` is the payload size, with fresh reference numbers.
-    pub fn new<T: Any + Send + Sync>(payload: T) -> Self {
+    pub fn new<T: MagicPayload>(payload: T) -> Self {
         Self::with_orig_size(payload, size_of::<T>())
     }
 
     /// A magic binary whose `mb->orig_size` is `orig_size` bytes, for payloads that stand in
     /// for a fixed erts structure.
-    pub fn with_orig_size<T: Any + Send + Sync>(payload: T, orig_size: usize) -> Self {
+    pub fn with_orig_size<T: MagicPayload>(payload: T, orig_size: usize) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         Self::create(payload, orig_size, refn_for_key(id))
     }
 
     /// `erts_create_magic_binary_x` with the reference words returned by its scheduler
     /// (`erts_make_magic_ref_in_array`).
-    pub fn with_orig_size_and_refn<T: Any + Send + Sync>(
+    pub fn with_orig_size_and_refn<T: MagicPayload>(
         payload: T,
         orig_size: usize,
         mut refn: [u32; 3],
@@ -133,12 +170,12 @@ impl MagicBin {
     }
 
     /// `erts_create_magic_binary(payload_size, ...)`: `orig_size` includes the data offset.
-    pub fn with_erts_payload_size<T: Any + Send + Sync>(payload: T, payload_size: usize) -> Self {
+    pub fn with_erts_payload_size<T: MagicPayload>(payload: T, payload_size: usize) -> Self {
         Self::with_orig_size(payload, MAGIC_BIN_DATA_OFFSET + payload_size)
     }
 
     /// `erts_create_magic_binary` with reference numbers already assigned by its scheduler.
-    pub fn with_erts_payload_size_and_refn<T: Any + Send + Sync>(
+    pub fn with_erts_payload_size_and_refn<T: MagicPayload>(
         payload: T,
         payload_size: usize,
         refn: [u32; 3],
@@ -148,7 +185,7 @@ impl MagicBin {
 
     // Port of erts/emulator/beam/erl_binary.h (erts_create_magic_binary_x), OTP-29.1.1: one
     // allocation, header then aligned payload; the creator holds the first count.
-    fn create<T: Any + Send + Sync>(payload: T, orig_size: usize, refn: [u32; 3]) -> Self {
+    fn create<T: MagicPayload>(payload: T, orig_size: usize, refn: [u32; 3]) -> Self {
         let align = align_of::<MagicRef>().max(align_of::<T>());
         let size = data_offset::<T>() + size_of::<T>();
         let layout = Layout::from_size_align(size, align).expect("magic binary layout");
@@ -164,8 +201,7 @@ impl MagicBin {
                 refc: AtomicUsize::new(1),
                 weak: AtomicUsize::new(1),
                 orig_size,
-                destructor: drop_payload::<T>,
-                type_id: TypeId::of::<T>(),
+                destructor: T::DESTRUCTOR,
                 refn,
                 saved: AtomicBool::new(false),
                 alloc_size: size,

@@ -1788,8 +1788,8 @@ fn gated_by_busy(function: EtsBif) -> bool {
 fn compiled_match_program(reference: Term) -> Option<Arc<MatchProgram>> {
     reference
         .magic_owner()?
-        .downcast_ref::<Arc<MatchProgram>>()
-        .cloned()
+        .downcast_ref::<select_chunk::MatchProgRef>()
+        .map(|prog| Arc::clone(&prog.0))
 }
 
 /// Help finish the operation a busy table waits for, then trap so that the BIF runs again.
@@ -2603,6 +2603,8 @@ fn unfix_table(rt: &crate::process::Runtime, tid: Tid, caller: Term) {
     }
 }
 
+// erl_db.c: the ets:info decentralized-counter snapshot (DecentralizedReadSnapshotInfo).
+arinsal_term::magic_payload!(InfoSnapshot => erts_db_read_snapshot_destructor);
 /// The state an `ets:info` call that took a counter snapshot traps with: the counters of the
 /// snapshot and the words of the table structure at that time (erts folds the structure into
 /// the memory counter, Arinsal computes it from the table layout).
@@ -3502,7 +3504,7 @@ fn call_inner(
             let payload_size = program.erts_magic_payload_size();
             TermBuilder::new(&mut heap)
                 .magic_ref(MagicBin::with_erts_payload_size_and_refn(
-                    program,
+                    select_chunk::MatchProgRef(program),
                     payload_size,
                     match_program_refn.expect("match-spec compile reference numbers"),
                 ))
