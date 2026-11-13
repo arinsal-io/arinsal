@@ -186,7 +186,15 @@ cases() ->
     [r(fun() -> binary_to_term(B, Opts) end) || B <- Bins, Opts <- [[], [safe], [used]]] ++
     %% LOCAL_EXT: the block hash of the wrapped term is checked in slices.
     [r(fun() -> binary_to_term(term_to_binary(lists:seq(1, N), [local])) =:= lists:seq(1, N) end)
-     || N <- [10, 1000, 300000, 1500000]].
+     || N <- [10, 1000, 300000, 1500000]] ++
+    %% LOCAL_EXT with a wrong hash: the hash is the last term (`terms == 0`). erts rejects it when
+    %% the check finishes inside the slice, and accepts it when the block hash yields there.
+    [r(fun() -> <<_:2/binary, H:32, Rest/binary>> = term_to_binary(T, [local]),
+                Bad = <<131, 121, (H bxor 1):32, Rest/binary>>,
+                V = binary_to_term(Bad),
+                is_list(V) orelse is_binary(V)
+            end)
+     || T <- [[1, 2, 3], lists:seq(1, 1500000), binary:copy(<<7>>, 8000000)]].
 "#;
 
 #[test]

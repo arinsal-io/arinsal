@@ -15,8 +15,8 @@ use super::external_dec_term::{
 };
 use arinsal_bifs::{BifError, ProcessHeapHandle};
 use arinsal_term::{
-    BinaryOwner, BinaryRef, HeapReservation, HeapReservationState, OwnedBinaryRef, ProcessHeap,
-    Term, TermBuilder, binary_owner, global_atoms,
+    BinaryOwner, BinaryRef, HeapFactory, OwnedBinaryRef, ProcessHeap, Term, TermBuilder,
+    binary_owner, global_atoms,
 };
 use flate2::{Decompress, FlushDecompress, Status};
 use smallvec::SmallVec;
@@ -195,9 +195,8 @@ pub(crate) struct B2tContext<'a> {
     inflate_done: bool,
     heap_words: Option<usize>,
     prepare_charge: usize,
-    reservation: Option<HeapReservationState>,
-    /// Allocation state before the first decode slice, to undo a failed decode.
-    factory_mark: Option<arinsal_term::HeapFactoryMark>,
+    /// `ctx->u.dc.factory`: set by the first decode slice, parked between slices.
+    factory: Option<HeapFactory>,
 }
 
 impl<'a> B2tContext<'a> {
@@ -266,8 +265,7 @@ impl<'a> B2tContext<'a> {
             } else {
                 0
             },
-            reservation: None,
-            factory_mark: None,
+            factory: None,
         })
     }
 
@@ -320,8 +318,7 @@ impl<'a> B2tContext<'a> {
             inflate_done,
             heap_words,
             prepare_charge,
-            reservation,
-            factory_mark,
+            factory,
         } = self;
         let input = match input {
             DecodeInput::Inline(bytes) => DecodeInput::Inline(bytes),
@@ -366,8 +363,7 @@ impl<'a> B2tContext<'a> {
             inflate_done,
             heap_words,
             prepare_charge,
-            reservation,
-            factory_mark,
+            factory,
         })
     }
 
@@ -476,9 +472,8 @@ impl<'a> B2tContext<'a> {
     /// fails; a no-op before the first decode slice.
     // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1.
     pub fn undo_factory(&mut self, heap: &mut ProcessHeap) {
-        self.reservation = None;
-        if let Some(mark) = self.factory_mark.take() {
-            heap.factory_undo(mark);
+        if let Some(mut factory) = self.factory.take() {
+            factory.undo(heap);
         }
     }
 
@@ -495,14 +490,14 @@ impl<'a> B2tContext<'a> {
         let Some(heap_words) = self.heap_words else {
             return Err((BifError::BADARG, consumed));
         };
-        let mut reservation = match self.reservation.take() {
-            Some(state) => HeapReservation::resume(process_heap, state),
-            None => {
-                self.factory_mark = Some(process_heap.factory_mark());
-                HeapReservation::new(process_heap, heap_words)
-                    .map_err(|error| (map_term_build_error(error), consumed))?
-            }
-        };
+        if self.factory.is_none() {
+            self.factory = Some(
+                HeapFactory::proc_prealloc_init(process_heap, heap_words)
+                    .map_err(|error| (map_term_build_error(error), consumed))?,
+            );
+        }
+        let factory = self.factory.as_mut().expect("factory initialized above");
+        let mut reservation = factory.open(process_heap);
         let budget = byte_budget.max(1);
         let before = self.decode_at;
         let (parsed, after) = reservation
@@ -555,7 +550,7 @@ impl<'a> B2tContext<'a> {
                 Ok((Some(value), consumed + decode_work))
             }
             Ok((None, decode_work)) => {
-                self.reservation = Some(reservation.suspend());
+                factory.park(reservation);
                 Ok((None, consumed + decode_work))
             }
             Err(error) => {
