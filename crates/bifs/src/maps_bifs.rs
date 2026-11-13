@@ -1,12 +1,12 @@
 //! Map BIF adapters over flatmaps and HAMTs.
 
+use crate::pure::{bool_term, integer};
 use arinsal_maps::{self, MapError, MapResult};
 use arinsal_term::{
     Term, atoms,
     raw::{Cons, MapListValidator, Tuple, ValidatedMapPairs},
 };
 
-use crate::pure::{bool_term, integer};
 use crate::{BifError, Ctx};
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
@@ -19,9 +19,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "map_size", 1) => v.entry::<word_bodies::map_size>(),
         ("erlang", "map_get", 2) => v.entry::<word_bodies::map_get>(),
         ("erlang", "is_map_key", 2) => v.entry::<word_bodies::is_map_key>(),
-        ("maps", "find", 2) => v.entry::<word_bodies::find>(),
-        ("maps", "get", 2) => v.entry::<word_bodies::get>(),
-        ("maps", "is_key", 2) => v.entry::<word_bodies::is_key>(),
         ("maps", "put", 3) => v.entry::<word_bodies::put>(),
         ("maps", "remove", 2) => v.entry::<word_bodies::remove>(),
         ("maps", "update", 3) => v.entry::<word_bodies::update>(),
@@ -55,6 +52,8 @@ fn mapped<T>(ctx: &mut Ctx<'_>, result: MapResult<T>) -> Result<T, BifError> {
     result.map_err(|error| map_error(ctx, error))
 }
 
+// The JIT calls these three plain BIFs through the arinsal_bifs body (`emit_i_bif2` fallback of
+// the inlined guard BIFs); erts reaches `bif_table[].f` there.
 fn map_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match mapped(ctx, arinsal_maps::size(args[0])).and_then(|size| integer(ctx, size)) {
         Ok(value) => value,
@@ -74,19 +73,6 @@ fn map_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 fn is_map_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match mapped(ctx, arinsal_maps::is_key(args[1], args[0])) {
         Ok(value) => bool_term(value),
-        Err(error) => ctx.fail(error),
-    }
-}
-fn get(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    map_get(ctx, args)
-}
-fn is_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    is_map_key(ctx, args)
-}
-fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match mapped(ctx, arinsal_maps::find(args[1], args[0])) {
-        Ok(Some(value)) => tuple2(ctx, Term::atom(atoms::OK), value),
-        Ok(None) => Term::atom(atoms::ERROR),
         Err(error) => ctx.fail(error),
     }
 }
@@ -495,39 +481,6 @@ impl MapsBuildWalk {
     }
 }
 
-/// First, non-yielding part of `maps:merge/2`; a HAMT result continues with
-/// [`arinsal_maps::hashmap_merge`] under a reduction budget.
-///
-/// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2), OTP-29.1.1.
-pub fn maps_merge_start(
-    ctx: &mut Ctx<'_>,
-    args: &[Term],
-) -> Result<arinsal_maps::MergeStart, BifError> {
-    let result = arinsal_maps::merge_start(args[0], args[1], &mut ctx.heap);
-    mapped(ctx, result)
-}
-
-/// Start `maps:merge/2` directly on the process heap; map errors need a BIF context only off the
-/// successful path.
-///
-/// Port of `maps_merge_2` calling `flatmap_merge` directly in
-/// erts/emulator/beam/erl_map.c:1257-1284, OTP-29.1.1.
-#[inline(always)]
-pub fn maps_merge_start_on_process_heap(
-    heap: &mut crate::ProcessHeapHandle<'_>,
-    left: Term,
-    right: Term,
-) -> Result<arinsal_maps::MergeStart, BifError> {
-    match arinsal_maps::merge_start(left, right, heap) {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            let mut state = crate::BifState::default();
-            let mut ctx = Ctx::new(heap, &mut state);
-            Err(map_error(&mut ctx, error))
-        }
-    }
-}
-
 fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let result = arinsal_maps::put(args[2], args[0], args[1], &mut ctx.heap);
     match mapped(ctx, result) {
@@ -560,5 +513,5 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 }
 
 crate::word_bif_bodies_in!(word_bodies;
-    map_size, map_get, is_map_key, find, get, is_key, put, remove, update, take,
+    map_size, map_get, is_map_key, put, remove, update, take,
 );

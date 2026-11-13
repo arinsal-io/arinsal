@@ -3,7 +3,7 @@
 //! (`erts_debug:size/1` of the inputs and the result together).
 
 use arinsal_maps::{
-    MapError, MergeStart, from_keys, from_list, hashmap_merge, merge, merge_start, put,
+    HashmapMergeContext, MapError, from_keys, from_list, hashmap_merge, merge, put,
 };
 use arinsal_term::{ProcessHeap, Term, VecHeap};
 use std::collections::HashSet;
@@ -170,9 +170,7 @@ fn yielding_merge_matches_unbounded_merge() {
     let left = int_map(&mut heap, 1..=5000, 0);
     let right = int_map(&mut heap, 2500..=7500, 7);
     let expected = keys_line(merge(left, right, &mut heap).unwrap());
-    let MergeStart::Hashmap(mut ctx) = merge_start(left, right, &mut heap).unwrap() else {
-        panic!("two HAMTs merge structurally");
-    };
+    let mut ctx = HashmapMergeContext::new(left, right, false);
     let mut yields = 0;
     let merged = loop {
         let mut reds = 50;

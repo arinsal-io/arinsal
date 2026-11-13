@@ -246,7 +246,7 @@ fn hashmap_from_pairs<H: HeapAlloc + ?Sized>(
 }
 
 // Port of erts/emulator/beam/erl_map.c:1286-1423 (flatmap_merge), OTP-29.1.1.
-fn flatmap_merge<H: HeapAlloc + ?Sized>(
+pub fn flatmap_merge<H: HeapAlloc + ?Sized>(
     map1: Term,
     map2: Term,
     heap: &mut H,
@@ -461,7 +461,7 @@ impl std::fmt::Debug for HashmapMergeContext {
 
 impl HashmapMergeContext {
     // Port of erts/emulator/beam/erl_map.c:1592-1606 (first call setup), OTP-29.1.1.
-    fn new(map_a: Term, map_b: Term, swap_args: bool) -> Self {
+    pub fn new(map_a: Term, map_b: Term, swap_args: bool) -> Self {
         let (src_a, src_b) = if swap_args {
             (map_b, map_a)
         } else {
@@ -803,115 +803,51 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
     }
 }
 
-/// Outcome of the non-yielding part of `maps:merge/2`.
-// The inline stack is OTP's `PSTACK_DECLARE(s, 4)`; boxing it would allocate per merge.
-#[allow(clippy::large_enum_variant)]
-pub enum MergeStart {
-    /// The merged map.
-    Done(Term),
-    /// Both maps are (or became) HAMTs; continue with [`hashmap_merge`].
-    Hashmap(HashmapMergeContext),
-}
-
-/// Dispatch `maps:merge/2`: flatmap pairs merge immediately, HAMT pairs return
-/// a context for the yielding structural merge.
-///
-/// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2) and
-/// 1428-1465 (map_merge_mixed), OTP-29.1.1.
-pub fn merge_start<H: HeapAlloc + ?Sized>(
-    left: Term,
-    right: Term,
-    heap: &mut H,
-) -> MapResult<MergeStart> {
-    if left == right {
-        checked_hashmap(left)?;
-        return Ok(MergeStart::Done(left));
-    }
-    let left_hashmap = checked_hashmap(left)?;
-    let right_hashmap = checked_hashmap(right)?;
-    allocation_result(merge_start_checked(
-        left,
-        right,
-        left_hashmap,
-        right_hashmap,
-        heap,
-    ))
-}
-
-// Port of the is_flatmap/is_hashmap tests in erts/emulator/beam/erl_map.c:1260-1280, OTP-29.1.1.
-// Keep the classification from that header read for the following dispatch.
-#[inline(always)]
-fn checked_hashmap(map: Term) -> MapResult<bool> {
-    match map.header() {
-        Some(header) if header & 63 == MAP => Ok(header & 0xc0 != 0),
-        _ => Err(MapError::Badmap(map)),
-    }
-}
-
-// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2), OTP-29.1.1.
-fn merge_start_checked<H: HeapAlloc + ?Sized>(
-    left: Term,
-    right: Term,
-    left_hashmap: bool,
-    right_hashmap: bool,
-    heap: &mut H,
-) -> Result<MergeStart, TermError> {
-    match (left_hashmap, right_hashmap) {
-        (false, false) => flatmap_merge(left, right, heap).map(MergeStart::Done),
-        (false, true) => map_merge_mixed(left, right, false, heap),
-        (true, false) => map_merge_mixed(right, left, true, heap),
-        (true, true) => Ok(MergeStart::Hashmap(HashmapMergeContext::new(
-            left, right, false,
-        ))),
-    }
-}
-
-fn map_merge_mixed<H: HeapAlloc + ?Sized>(
+/// The `hashmap_from_unsorted_array` half of `map_merge_mixed`: the flatmap `flat` as a HAMT, or
+/// `None` for an empty flatmap (erts returns the tree itself then). The caller continues with
+/// `hashmap_merge` on the result and the tree.
+// Port of erts/emulator/beam/erl_map.c:1428-1465 (map_merge_mixed), OTP-29.1.1.
+pub fn map_merge_mixed_hashmap<H: HeapAlloc + ?Sized>(
     flat: Term,
-    tree: Term,
-    swap_args: bool,
     heap: &mut H,
-) -> Result<MergeStart, TermError> {
+) -> Result<Option<Term>, TermError> {
     let (ks, vs, _) = flatmap_kv(flat);
     if ks.is_empty() {
-        return Ok(MergeStart::Done(tree));
+        return Ok(None);
     }
     let pairs = ks.iter().zip(vs).map(|(&k, &v)| (term(k), term(v)));
-    let res = hashmap_from_pairs(pairs, heap)?;
-    Ok(MergeStart::Hashmap(HashmapMergeContext::new(
-        res, tree, swap_args,
-    )))
+    hashmap_from_pairs(pairs, heap).map(Some)
 }
 
-/// `maps:merge/2` of two flatmaps, the one case that never yields and cannot fail on the
-/// arguments: `None` for anything else (a hashmap, a non-map), with nothing allocated.
-// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2: the is_flatmap pair is
-// `flatmap_merge`), OTP-29.1.1.
-#[inline]
-pub fn merge_flatmaps<H: HeapAlloc + ?Sized>(
-    left: Term,
-    right: Term,
-    heap: &mut H,
-) -> Option<Term> {
-    let flat = |map: Term| matches!(map.header(), Some(header) if header & 63 == MAP && header & 0xc0 == 0);
-    if !flat(left) || !flat(right) {
-        return None;
-    }
-    if left == right {
-        return Some(left);
-    }
-    flatmap_merge(left, right, heap).ok()
-}
-
-/// `maps:merge/2` without yielding; right values win.
+/// `maps:merge/2` without yielding; right values win. The library form of `maps_merge_2`
+/// for callers that have no process to trap.
+// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2), OTP-29.1.1.
 pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> MapResult<Term> {
-    match merge_start(left, right, heap)? {
-        MergeStart::Done(map) => Ok(map),
-        MergeStart::Hashmap(mut ctx) => {
-            let mut reds = isize::MAX;
-            Ok(hashmap_merge(&mut ctx, &mut reds, heap)?.expect("unbounded merge completes"))
+    fn kind(map: Term) -> MapResult<bool> {
+        match map.header() {
+            Some(header) if header & 63 == MAP => Ok(header & 0xc0 != 0),
+            _ => Err(MapError::Badmap(map)),
         }
     }
+    let (left_hashmap, right_hashmap) = (kind(left)?, kind(right)?);
+    if left == right {
+        return Ok(left);
+    }
+    let (a, b, swap) = match (left_hashmap, right_hashmap) {
+        (false, false) => return allocation_result(flatmap_merge(left, right, heap)),
+        (true, true) => (left, right, false),
+        (false, true) => match allocation_result(map_merge_mixed_hashmap(left, heap))? {
+            Some(map) => (map, right, false),
+            None => return Ok(right),
+        },
+        (true, false) => match allocation_result(map_merge_mixed_hashmap(right, heap))? {
+            Some(map) => (map, left, true),
+            None => return Ok(left),
+        },
+    };
+    let mut ctx = HashmapMergeContext::new(a, b, swap);
+    let mut reds = isize::MAX;
+    Ok(hashmap_merge(&mut ctx, &mut reds, heap)?.expect("unbounded merge completes"))
 }
 
 // Port of erts/emulator/beam/erl_map.c:367-472 (flatmap_from_validated_list), OTP-29.1.1.
