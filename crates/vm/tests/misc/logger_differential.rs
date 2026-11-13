@@ -11,7 +11,6 @@ const SOURCE: &str = r#"
 -export([sysmon_large_heap/0, sysmon_long_gc/0, cpu_topology/0, scheduler_bind/0, max_heap/0, port_error/0, process_error/0, internal_state/0]).
 
 capture(Fun) ->
-    group_leader(self(), self()),
     Old = erlang:system_flag(system_logger, self()),
     try
         Fun(),
@@ -106,8 +105,8 @@ internal_state() ->
         erts_debug:set_internal_state(available_internal_state, true)
     end),
     [Text] = A,
-    PidText = lists:flatten(io_lib:format("~p", [self()])),
-    {L, F, [string:replace(Text, PidText, "<PID>", all)], meta(M)}.
+    Normalized = re:replace(Text, "<[0-9]+\\.[0-9]+\\.[0-9]+>", "<PID>", [global, {return, list}]),
+    {L, F, [lists:flatten(Normalized)], meta(M)}.
 "#;
 
 fn guard() -> MutexGuard<'static, ()> {
