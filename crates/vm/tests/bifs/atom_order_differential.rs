@@ -31,6 +31,11 @@ run() ->
                email => e, inserted_at => nil},
     FreshSmall = maps:from_list([{A, 1} || A <- lists:sublist(Fresh, 12)]),
     FreshHamt = maps:from_list([{A, atom_to_list(A)} || A <- Fresh]),
+    ReverseFresh = [list_to_atom("zz_mapkey_atom_index"),
+                    list_to_atom("aa_mapkey_atom_index")],
+    ReverseMap = #{hd(ReverseFresh) => 1, lists:nth(2, ReverseFresh) => 2},
+    ReverseProbe = {maps:keys(ReverseMap), maps:to_list(ReverseMap),
+                    lists:flatten(io_lib:format("~p", [ReverseMap]))},
     StaticHamt = maps:from_list([{A, 1} || A <- Static]),
     Mixed = maps:from_list([{A, 1} || A <- lists:sublist(Static, 20) ++ lists:sublist(Fresh, 20)]),
     {First, _, _} = maps:next(maps:iterator(FreshHamt)),
@@ -38,7 +43,8 @@ run() ->
     io:format("~p~n", [[Count, Literal, Struct, FreshSmall, maps:keys(FreshHamt),
                         maps:values(FreshHamt), maps:keys(StaticHamt), maps:to_list(Mixed),
                         First, Order, [erlang:phash2(A) || A <- Static],
-                        [erlang:phash2(M) || M <- [Literal, Struct, StaticHamt]]]]).
+                        [erlang:phash2(M) || M <- [Literal, Struct, StaticHamt]],
+                        ReverseProbe]]).
 "#;
 
 const EVAL: &str = "atom_order_probe:run(), halt().";
@@ -95,5 +101,17 @@ fn map_key_order_of_boot_and_fresh_atoms_matches_erl() {
         expected.starts_with("[1"),
         "unexpected erl output: {expected}"
     );
-    assert_eq!(actual, expected);
+    assert!(
+        expected.contains("[zz_mapkey_atom_index,aa_mapkey_atom_index]"),
+        "OTP must preserve fresh atom index order: {expected}"
+    );
+    assert!(
+        expected.contains("{zz_mapkey_atom_index,1},{aa_mapkey_atom_index,2}"),
+        "OTP maps:to_list order must follow atom indices: {expected}"
+    );
+    assert!(
+        expected.contains("#{zz_mapkey_atom_index => 1,aa_mapkey_atom_index => 2}"),
+        "OTP map formatting must follow atom indices: {expected}"
+    );
+    similar_asserts::assert_eq!(actual, expected);
 }

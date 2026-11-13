@@ -191,6 +191,7 @@ impl Index<usize> for WordBlock {
 }
 
 /// Order of flatmap keys (`erts_cmp_flatmap_keys`), also the order of record fields.
+// Port of erts/emulator/beam/erl_utils.h:267-271 (erts_cmp_flatmap_keys), OTP-29.1.1.
 pub fn flat_key_cmp(a: Term, b: Term) -> Ordering {
     exact_flat_key_cmp(a, b, true)
 }
@@ -199,7 +200,9 @@ pub(crate) fn exact_flat_key_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering 
     if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom())
         && flat_atom
     {
-        return a.0.cmp(&b.0);
+        return Term::atom(a)
+            .tagged_word()
+            .cmp(&Term::atom(b).tagged_word());
     }
     if a.classify() == TermKind::Number && b.classify() == TermKind::Number {
         let af = a.header().is_some_and(|h| h & 63 == FLOAT);
