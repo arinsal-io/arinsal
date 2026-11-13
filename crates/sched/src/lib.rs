@@ -6822,11 +6822,7 @@ impl<T: Task> Scheduler<T> {
         let parked: Arc<[AtomicBool]> = (0..workers).map(|_| AtomicBool::new(false)).collect();
         let sleepers: Arc<[OnceLock<thread::Thread>]> =
             (0..workers).map(|_| OnceLock::new()).collect();
-        let progress = Arc::new(thr_progress::ThrProgress::new(
-            Arc::clone(&parked),
-            Arc::clone(&sleepers),
-        ));
-        thr_progress::install_sspa_progress(Arc::clone(&progress));
+        let progress = thr_progress::init(Arc::clone(&parked), Arc::clone(&sleepers));
         let balance = Arc::new(balance::Balance::new(
             workers,
             workers,

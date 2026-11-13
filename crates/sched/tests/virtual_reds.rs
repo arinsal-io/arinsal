@@ -48,8 +48,13 @@ fn reductions_of(consumed: u32, virtual_reds: u32) -> u64 {
     }
 }
 
+// One case per test: erts has one runtime per OS process.
 #[test]
 fn virtual_reductions_are_not_counted() {
     assert_eq!(reductions_of(3000, 2900), 100);
+}
+
+#[test]
+fn consumed_reductions_are_counted() {
     assert_eq!(reductions_of(3000, 0), 3000);
 }

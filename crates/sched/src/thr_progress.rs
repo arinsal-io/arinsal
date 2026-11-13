@@ -150,17 +150,42 @@ pub(crate) struct ThrProgress {
     umrefc_waiting: std::sync::atomic::AtomicI32,
 }
 
-/// The thread progress of the latest runtime, for threads that are not managed threads of it.
-static GLOBAL_PROGRESS: Mutex<Option<Arc<ThrProgress>>> = Mutex::new(None);
+/// The thread progress of the OS process (erts `intrnl`, erl_thr_progress.c): one set of managed
+/// threads for the whole process, created once by [`init`].
+static INTRNL: OnceLock<Arc<ThrProgress>> = OnceLock::new();
+
+/// Creates the thread progress of the OS process, managed by the threads that `parked` and
+/// `sleepers` describe, and gives the allocator's delayed-dealloc queues and pools access to it.
+///
+/// Port of erts/emulator/beam/erl_thr_progress.c (erts_thr_progress_init), OTP-29.1.1, which
+/// `erl_start` runs once: erts has one runtime per OS process, so a second runtime in the same
+/// process is refused here instead of getting a thread progress of its own.
+pub(crate) fn init(
+    parked: Arc<[AtomicBool]>,
+    sleepers: Arc<[OnceLock<Thread>]>,
+) -> Arc<ThrProgress> {
+    let progress = Arc::new(ThrProgress::new(parked, sleepers));
+    assert!(
+        INTRNL.set(Arc::clone(&progress)).is_ok(),
+        "thread progress is initialized once per OS process (erts_thr_progress_init): \
+         one runtime per process"
+    );
+    let installed = arinsal_alloc::sspa::install_progress_ops(arinsal_alloc::sspa::ProgressOps {
+        current: sspa_current,
+        has_reached: sspa_has_reached,
+        is_managed: sspa_is_managed,
+    });
+    assert!(
+        installed.is_ok(),
+        "allocator thread progress installed twice"
+    );
+    progress
+}
 
 /// Print the current thread-progress value and each managed thread's confirmation.
 // Port of erts/emulator/beam/erl_thr_progress.c (erts_thr_progress_dbg_print_state), OTP-29.1.1.
 pub fn debug_print_state() {
-    let progress = GLOBAL_PROGRESS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    let Some(progress) = progress else {
+    let Some(progress) = INTRNL.get() else {
         println!(
             "--- thread progress ---\ncurrent={}\n-----------------------",
             std::process::id()
@@ -179,34 +204,12 @@ pub fn debug_print_state() {
     println!("-----------------------");
 }
 
-/// Give the allocator pool and the delayed-dealloc queues access to this runtime's existing
-/// thread-progress operations.
-pub(crate) fn install_sspa_progress(progress: Arc<ThrProgress>) {
-    *GLOBAL_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(progress);
-    let _ = arinsal_alloc::sspa::install_progress_ops(arinsal_alloc::sspa::ProgressOps {
-        current: sspa_current,
-        has_reached: sspa_has_reached,
-        is_managed: sspa_is_managed,
-    });
-}
-
-// Port of erl_thr_progress.h (erts_thr_progress_current): the global value, which an unmanaged
-// thread (the owner of a locked allocator instance) reads like a managed one.
+// Port of erl_thr_progress.h (erts_thr_progress_current): the global value of the process,
+// read alike by managed and unmanaged threads.
 fn sspa_current(_: usize) -> u64 {
-    SSPA_PROGRESS
-        .with(|progress| {
-            progress
-                .borrow()
-                .as_ref()
-                .map(|progress| progress.current.load(Ordering::Acquire))
-        })
-        .unwrap_or_else(|| {
-            GLOBAL_PROGRESS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map_or(0, |progress| progress.current.load(Ordering::Acquire))
-        })
+    INTRNL
+        .get()
+        .map_or(0, |progress| progress.current.load(Ordering::Acquire))
 }
 
 fn sspa_has_reached(scheduler: usize, value: u64) -> bool {
@@ -248,8 +251,6 @@ struct ThrPrgrData {
 thread_local! {
     /// erts `erts_thr_prgr_data_key__`.
     static TPD: RefCell<Option<ManagedThread>> = const { RefCell::new(None) };
-    /// Shared progress counter for SSPA callbacks, independent of the mutable thread data borrow.
-    static SSPA_PROGRESS: RefCell<Option<Arc<ThrProgress>>> = const { RefCell::new(None) };
     /// Block nesting of an unmanaged thread (erts temporary `ErtsThrPrgrData`).
     static UNMANAGED_BLOCKING: Cell<u32> = const { Cell::new(0) };
     /// The thread progress this thread is a managed thread of, compared by address only
@@ -283,7 +284,9 @@ impl Drop for LookupScope {
 }
 
 impl ThrProgress {
-    /// Port of erl_thr_progress.c:396 (erts_thr_progress_init), OTP-29.1.1.
+    /// The state `erts_thr_progress_init` (erl_thr_progress.c:396, OTP-29.1.1) allocates. The
+    /// runtime gets the one of the process through [`init`]; unit tests of the algorithm build
+    /// their own.
     pub(crate) fn new(parked: Arc<[AtomicBool]>, sleepers: Arc<[OnceLock<Thread>]>) -> Self {
         let managed = parked.len();
         let wakeup = std::array::from_fn(|_| WakeupData {
@@ -763,7 +766,6 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
         leader_umrefc_current: 0,
     })));
     TPD.with(|tpd| *tpd.borrow_mut() = Some(managed.clone()));
-    SSPA_PROGRESS.with(|slot| *slot.borrow_mut() = Some(Arc::clone(progress)));
     MANAGED_OF.with(|of| of.set(Arc::as_ptr(progress) as usize));
     managed
 }
@@ -773,7 +775,6 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
 /// [`run_remaining_later_ops`] once every managed thread stopped, runs them.
 pub(crate) fn unregister_managed_thread() {
     MANAGED_OF.with(|of| of.set(0));
-    SSPA_PROGRESS.with(|slot| *slot.borrow_mut() = None);
     let Some(managed) = TPD.with(|tpd| tpd.borrow_mut().take()) else {
         return;
     };

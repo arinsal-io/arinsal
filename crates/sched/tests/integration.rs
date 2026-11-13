@@ -27,13 +27,13 @@ impl Task for Collector {
 // asserts exactly that on real schedulers.
 #[test]
 fn per_pair_ordering_across_messages_and_signals() {
+    // One runtime per OS process, as erts: every seed spawns its own twelve processes.
+    let sched = Scheduler::new(Config {
+        workers: 2,
+        max_processes: 128,
+        ..Config::default()
+    });
     for seed in 0..8u64 {
-        let config = Config {
-            workers: 2,
-            max_processes: 64,
-            ..Config::default()
-        };
-        let sched = Scheduler::new(config);
         let output = Arc::new(Mutex::new(Vec::new()));
         let receivers: Vec<_> = (0..4)
             .map(|_| {
@@ -429,7 +429,7 @@ fn ping_pong_gives_external_work_a_turn() {
 }
 
 #[test]
-fn pid_generation_and_timer_firing() {
+fn pid_generation() {
     struct Exit;
     impl Task for Exit {
         type Message = ();
@@ -453,7 +453,10 @@ fn pid_generation_and_timer_firing() {
     // erts hands out the next free-ring data, not the slot just released.
     assert_ne!(first, second);
     assert_eq!(Pid::from_term(second.to_term().unwrap()), Some(second));
+}
 
+#[test]
+fn timer_firing() {
     let counter = Arc::new(AtomicUsize::new(0));
     let sched = Scheduler::new(Config {
         workers: 1,

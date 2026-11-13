@@ -55,9 +55,9 @@ fn total(runs: &[Arc<AtomicU64>]) -> u64 {
 /// erts runs a low priority process once per `RESCHEDULE_LOW` (8) passes over the shared
 /// normal queue, so a low process gets about 1/8 of a normal process's turns whatever the
 /// mix (scheduler_SUITE low_normal_test accepts 0.05..0.25).
-#[test]
-fn low_priority_gets_an_eighth_of_normal_turns() {
-    for (normal, low) in [(4, 4), (2, 16), (16, 2)] {
+/// One mix per test: erts has one runtime per OS process.
+fn low_priority_gets_an_eighth_of_normal_turns(normal: usize, low: usize) {
+    {
         let scheduler = Scheduler::new(Config {
             workers: 1,
             ..Config::default()
@@ -78,6 +78,21 @@ fn low_priority_gets_an_eighth_of_normal_turns() {
             "{normal} normal, {low} low: low/normal ratio {ratio}"
         );
     }
+}
+
+#[test]
+fn low_priority_gets_an_eighth_of_normal_turns_even_mix() {
+    low_priority_gets_an_eighth_of_normal_turns(4, 4);
+}
+
+#[test]
+fn low_priority_gets_an_eighth_of_normal_turns_many_low() {
+    low_priority_gets_an_eighth_of_normal_turns(2, 16);
+}
+
+#[test]
+fn low_priority_gets_an_eighth_of_normal_turns_many_normal() {
+    low_priority_gets_an_eighth_of_normal_turns(16, 2);
 }
 
 /// Busy schedulers complete the reductions-triggered balance checks counted by `nbalance`.

@@ -3,7 +3,7 @@
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const MODULE: &str = "vm_map_ycf_bifs_diff";
 const SOURCE: &str = r#"
@@ -57,8 +57,9 @@ fn ycf_map_bifs_match_otp() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "cases", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    // The node of this test process: erts runs one runtime per OS process.
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = match vm.eval_scheduled(MODULE, "cases", &[], 1) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {

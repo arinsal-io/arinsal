@@ -85,5 +85,10 @@ fn work_behind_a_blocked_scheduler_waits_without_the_supervisor() {
 #[test]
 fn supervisor_makes_idle_schedulers_take_over_blocked_run_queue() {
     assert_eq!(run_case(4, 1, Some(20)), 1);
+}
+
+// A second case of its own: erts has one runtime per OS process.
+#[test]
+fn supervisor_makes_idle_schedulers_take_over_a_longer_blocked_run_queue() {
     assert_eq!(run_case(4, 8, Some(20)), 8);
 }
