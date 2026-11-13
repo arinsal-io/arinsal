@@ -956,7 +956,10 @@ impl Vm {
             )?;
         }
         self.set_position(p, module_id, target)?;
-        p.tick();
+        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3098-3116 (emit_i_test_yield),
+        // OTP-29.1.1: the call's reduction is taken by the entered function's own
+        // `i_test_yield`, which runs at `set_position`'s native entry; a tick here charged
+        // it twice (a traced BIF's trap continuation went through this path).
         Ok(ImportOutcome::Dispatch)
     }
 

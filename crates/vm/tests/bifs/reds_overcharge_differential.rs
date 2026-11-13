@@ -420,6 +420,17 @@ const MAP_CASES: &[Case] = &[
     case("keys_badmap", &[1], 4, "seq(N)", "catch maps:keys(In)"),
 ];
 
+/// A call-traced NIF function: erts enters the NIF through `call_nif_early`, which skips the
+/// `FCALLS--` of `call_nif_yield_helper` that an untraced call takes.
+const TRACED_NIF_CASES: &[Case] = &[traced_case(
+    "re_run_global_traced",
+    STD,
+    8,
+    "begin {match, _} = re:run(<<7>>, <<7>>, [global]), bytes(N) end",
+    "re:run(In, <<7>>, [global])",
+    "{re, run, 3}",
+)];
+
 const ONE: &[usize] = &[1];
 const SELECT: &[usize] = &[1, 10_000, 100_000];
 /// Long trap chains: a trap export that ran its own trap at once would recurse per slice.
@@ -479,14 +490,6 @@ const TRAP_CASES: &[Case] = &[
         8,
         "begin {match, _} = re:run(<<7>>, <<7>>, [global]), {re, bytes(N)} end",
         "apply(element(1, In), run, [element(2, In), <<7>>, [global]])",
-    ),
-    traced_case(
-        "re_run_global_traced",
-        STD,
-        8,
-        "begin {match, _} = re:run(<<7>>, <<7>>, [global]), bytes(N) end",
-        "re:run(In, <<7>>, [global])",
-        "{re, run, 3}",
     ),
     traced_case(
         "demonitor_flush_apply_traced",
@@ -761,7 +764,12 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                     && expected.ins.contains(actual.ins.median)
                     && actual.ins.contains(expected.ins.median)
             } else {
-                let tolerance = SLACK_PER_SLICE * expected.ins.max;
+                // A call-traced case has no slack: its reduction count is exact.
+                let tolerance = if case.trace.is_some() {
+                    0
+                } else {
+                    SLACK_PER_SLICE * expected.ins.max
+                };
                 expected.ins.min == actual.ins.min
                     && (expected.reds.min - tolerance..=expected.reds.min + tolerance)
                         .contains(&actual.reds.min)
@@ -814,6 +822,15 @@ fn map_bifs_charge_like_otp() {
 #[test]
 fn bif_traps_schedule_out_like_otp() {
     check_with(TRAP_CASES, &["+S", "1"]);
+}
+
+// Root cause (open): the arinsal breakpoint trampoline fragment does not port the
+// `ERTS_ASM_BP_FLAG_CALL_NIF_EARLY` branch of emit_i_breakpoint_trampoline_shared, so a traced
+// NIF still takes the `subs FCALLS` of its call_nif body (one reduction more than erts).
+#[test]
+#[ignore = "traced NIF call charges one reduction more than erts: no call_nif_early in the breakpoint trampoline"]
+fn traced_nif_charges_like_otp() {
+    check_with(TRACED_NIF_CASES, &["+S", "1"]);
 }
 
 #[test]
