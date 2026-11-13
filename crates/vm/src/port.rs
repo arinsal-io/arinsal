@@ -5044,9 +5044,23 @@ pub(crate) fn link(
             }
             return Ok(true);
         }
-        // Port of erts/emulator/beam/io.c (erts_port_unlink): the immediate port operation
-        // deletes the port half and sends an unlink acknowledgement to the caller.
-        handle.links.lock().remove(pid.data());
+        // Port of erts/emulator/beam/io.c:2514 (port_unlink), OTP-29.1.1: trace the port half
+        // before deleting it, then acknowledge the process-side unlink.
+        let mut links = handle.links.lock();
+        let has_link = links
+            .get(pid.data())
+            .is_some_and(|link| link.unlinking() == 0);
+        if has_link && let Some(pid_term) = pid.to_term() {
+            crate::trace::emit_port_event(
+                runtime,
+                id,
+                crate::trace::PORTS,
+                "getting_unlinked",
+                &[pid_term],
+            );
+        }
+        links.remove(pid.data());
+        drop(links);
         let _ = handle.scheduler.signal(
             pid,
             pid,
