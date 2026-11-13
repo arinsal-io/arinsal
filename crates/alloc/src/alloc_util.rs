@@ -3,7 +3,7 @@
 
 use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, SegmentFlags};
 use crate::raw::{CarrierHeaderRef, MapError, NODE_WORDS, NodeRef, RawRegion, WordView, page_size};
-use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
+use std::collections::HashSet as StdHashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +32,6 @@ impl Hasher for FastHasher {
     }
 }
 
-pub(crate) type HashMap<K, V> = StdHashMap<K, V, BuildHasherDefault<FastHasher>>;
 pub(crate) type HashSet<K> = StdHashSet<K, BuildHasherDefault<FastHasher>>;
 
 const WORD: usize = std::mem::size_of::<usize>();
@@ -191,12 +190,49 @@ pub(crate) const fn blk_to_sbc(blk: usize) -> usize {
     blk - SBC_HEADER
 }
 
-/// Recovers `(instance, block_addr, user_size)` from a live payload address `user`.
+/// `ERTS_CRR_ALCTR_FLG_IN_POOL`: the carrier is in the carrier pool (or on its way home) and
+/// its owner word names the instance that abandoned it.
 ///
-/// Port of `UMEM2BLK` and `get_used_allctr`,
-/// erts/emulator/beam/erl_alloc_util.c:220,1736-1758, OTP-29.1.1.
-#[inline]
-pub(crate) fn used_block_from_payload(user: usize) -> (usize, u64, usize) {
+/// Port of erts/emulator/beam/erl_alloc_util.c:423-428 (ERTS_CRR_ALCTR_FLG_*), OTP-29.1.1. erts
+/// keeps the flags in the low bits of the aligned `Allctr_t *` stored in `crr->allctr`; the owner
+/// word here holds the instance index shifted past the same three flag bits.
+pub(crate) const CRR_ALCTR_FLG_IN_POOL: usize = 1 << 0;
+/// `ERTS_CRR_ALCTR_FLG_HOMECOMING`: the carrier was abandoned by another instance and is being
+/// sent back to the instance named in the owner word.
+pub(crate) const CRR_ALCTR_FLG_HOMECOMING: usize = 1 << 2;
+/// `ERTS_CRR_ALCTR_FLG_MASK` (IN_POOL, BUSY and HOMECOMING).
+const CRR_ALCTR_FLG_MASK: usize = 0b111;
+const CRR_ALCTR_SHIFT: u32 = CRR_ALCTR_FLG_MASK.count_ones();
+
+/// The `crr->allctr` word of a carrier owned by `instance` with `flags` set.
+#[inline(always)]
+pub(crate) const fn crr_allctr_word(instance: usize, flags: usize) -> u64 {
+    ((instance << CRR_ALCTR_SHIFT) | flags) as u64
+}
+
+/// A live block as `get_used_allctr` sees it from its payload address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UsedBlock {
+    /// Instance named by the carrier's owner word.
+    pub(crate) instance: usize,
+    /// `ERTS_CRR_ALCTR_FLG_*` bits of the owner word.
+    pub(crate) flags: usize,
+    /// Carrier address (`ABLK_TO_MBC` / `BLK_TO_SBC`).
+    pub(crate) carrier: usize,
+    /// Block address (`UMEM2BLK`).
+    pub(crate) blk: u64,
+    /// Payload capacity of the block (`MBC_ABLK_SZ(blk) - ABLK_HDR_SZ`).
+    pub(crate) size: usize,
+}
+
+/// Reads the owner of a live block from its carrier header.
+///
+/// Port of `UMEM2BLK` and `get_used_allctr`, erts/emulator/beam/erl_alloc_util.c:220,1736-1816,
+/// OTP-29.1.1: the block header gives the carrier, the carrier's `allctr` word its owner and
+/// state flags. erts claims a pooled carrier with the BUSY flag before freeing into it in place;
+/// the caller here takes the carrier back from the pool instead (see `ThreadSpecificAllocators`).
+#[inline(always)]
+pub(crate) fn get_used_allctr(user: usize) -> UsedBlock {
     let blk = user - BLOCK_HEADER;
     let bhdr = WordView::new(blk as *mut u64, 1)
         .atomic_load(0, Ordering::Relaxed)
@@ -207,10 +243,26 @@ pub(crate) fn used_block_from_payload(user: usize) -> (usize, u64, usize) {
         debug_assert_eq!(bhdr & FREE, 0, "live MBC block must not have FREE set");
         (ablk_to_mbc(blk, bhdr), bhdr & MBC_ABLK_SZ_MASK)
     };
-    let instance = WordView::new(crr as *mut u64, CARRIER_ALLCTR_WORD + 1)
+    let iallctr = WordView::new(crr as *mut u64, CARRIER_ALLCTR_WORD + 1)
         .atomic_load(CARRIER_ALLCTR_WORD, Ordering::Acquire)
         .expect("carrier header allctr word") as usize;
-    (instance, blk as u64, blk_sz - BLOCK_HEADER)
+    UsedBlock {
+        instance: iallctr >> CRR_ALCTR_SHIFT,
+        flags: iallctr & CRR_ALCTR_FLG_MASK,
+        carrier: crr,
+        blk: blk as u64,
+        size: blk_sz - BLOCK_HEADER,
+    }
+}
+
+/// Recovers `(instance, block_addr, user_size)` from a live payload address `user`.
+///
+/// Port of `UMEM2BLK` and `get_used_allctr`,
+/// erts/emulator/beam/erl_alloc_util.c:220,1736-1758, OTP-29.1.1.
+#[inline]
+pub(crate) fn used_block_from_payload(user: usize) -> (usize, u64, usize) {
+    let used = get_used_allctr(user);
+    (used.instance, used.blk, used.size)
 }
 
 const fn align_const(value: usize) -> usize {
@@ -687,12 +739,37 @@ pub(crate) struct CarrierTransfer {
 }
 
 impl CarrierTransfer {
+    #[cfg(test)]
     pub(crate) fn allocations(&self) -> &[(Allocation, usize)] {
         &self.allocations
     }
 
     pub(crate) fn origin_instance(&self) -> usize {
         self.origin_instance
+    }
+
+    /// Marks the carrier as inserted in the pool: its owner word names the origin instance with
+    /// IN_POOL set, and HOMECOMING when `abandoner` is not the origin.
+    ///
+    /// Port of cpool_insert and abandon_carrier, erl_alloc_util.c, OTP-29.1.1. The caller holds
+    /// the pool (or homecoming) lock and has already inserted the carrier, so a thread that reads
+    /// IN_POOL and then takes that lock finds the carrier there.
+    pub(crate) fn set_in_pool(&self, abandoner: usize) {
+        let flags = if self.origin_instance == abandoner {
+            CRR_ALCTR_FLG_IN_POOL
+        } else {
+            CRR_ALCTR_FLG_IN_POOL | CRR_ALCTR_FLG_HOMECOMING
+        };
+        self.carrier.memory.words().atomic_store(
+            CARRIER_ALLCTR_WORD,
+            crr_allctr_word(self.origin_instance, flags),
+            Ordering::Release,
+        );
+    }
+
+    /// Address of the carrier, as `get_used_allctr` finds it from a block.
+    pub(crate) fn carrier_address(&self) -> usize {
+        self.carrier.key_base
     }
 
     pub(crate) fn pool_summary(&self) -> (usize, usize, usize) {
@@ -713,10 +790,18 @@ struct ValueSeries {
     max_ever: usize,
 }
 
+/// Peaks of a value whose current word lives elsewhere.
+#[derive(Clone, Copy, Debug, Default)]
+struct PeakSeries {
+    max: usize,
+    max_ever: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ClassStats {
     blocks: ValueSeries,
-    blocks_size: ValueSeries,
+    /// Peaks of `blocks[ix].curr.size`; the current value is in `AllocUtil::blocks_size_curr`.
+    blocks_size: PeakSeries,
     carriers: ValueSeries,
     carriers_size: ValueSeries,
     mseg_carriers: ValueSeries,
@@ -930,6 +1015,11 @@ pub struct AllocUtil {
     /// Dynamic `sbct`, shared with the instance registry so another thread can set it without
     /// reaching into the allocator (`sbc_threshold` word of erl_alloc_util.c, OTP-29.1.1).
     dyn_sbct: Arc<AtomicUsize>,
+    /// `mbcs.blocks[ix].curr.size` and `sbcs.blocks[ix].curr.size`: the one copy of the current
+    /// block sizes. Only the owner writes them (a load and a store, no read-modify-write); any
+    /// thread reads them without a lock, as `erts_alcu_foreign_size` (erl_alloc_util.c,
+    /// OTP-29.1.1) reads the owner's counters.
+    blocks_size_curr: Arc<[AtomicUsize; 2]>,
     /// Last `carrier_ranges` hit; consecutive header accesses nearly always stay in one carrier.
     last_carrier: std::cell::Cell<CarrierSpan>,
     /// Carrier of the block tree being walked. Every node of a block tree lives in the carrier
@@ -1021,6 +1111,7 @@ impl AllocUtil {
             goodfit_interval_d: goodfit_interval_d(options.sbct),
             afit_head: 0,
             dyn_sbct: Arc::new(AtomicUsize::new(options.sbct)),
+            blocks_size_curr: Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]),
             stats: AllocStats::default(),
             class_stats: [ClassStats::default(); 2],
             mseg: MsegAllocator::new(0, CacheConfig::default()),
@@ -1074,15 +1165,27 @@ impl AllocUtil {
         Arc::clone(&self.dyn_sbct)
     }
 
+    /// The current block size words, for a thread that reads them without owning the allocator.
+    pub(crate) fn blocks_size_cell(&self) -> Arc<[AtomicUsize; 2]> {
+        Arc::clone(&self.blocks_size_curr)
+    }
+
+    /// `blocks[ix].curr.size` of the SBC (`sbc`) or MBC class.
+    #[inline(always)]
+    fn blocks_size_current(&self, sbc: bool) -> usize {
+        self.blocks_size_curr[usize::from(sbc)].load(Ordering::Relaxed)
+    }
+
     #[inline(always)]
     fn sbct(&self) -> usize {
         self.dyn_sbct.load(Ordering::Relaxed)
     }
 
-    /// Bytes in allocated blocks, for the registry's lock-free mirror.
+    /// Bytes in allocated blocks.
     #[inline(always)]
+    #[cfg(test)]
     pub(crate) fn blocks_size(&self) -> usize {
-        self.class_stats[0].blocks_size.current + self.class_stats[1].blocks_size.current
+        self.blocks_size_current(false) + self.blocks_size_current(true)
     }
 
     /// Number of allocated blocks, multiblock and single-block carriers together.
@@ -1624,7 +1727,7 @@ impl AllocUtil {
     /// stands for the checks of the pool and the strategy.
     #[inline(always)]
     fn abandon_decision(&self, span: CarrierSpan) -> Result<bool, AllocError> {
-        if !self.abandon || self.class_stats[0].blocks_size.current > self.abandon_limit {
+        if !self.abandon || self.blocks_size_current(false) > self.abandon_limit {
             return Ok(false);
         }
         if self.pending_carriers.len() >= self.options.acnl {
@@ -1761,13 +1864,6 @@ impl AllocUtil {
         let carrier = self
             .vacate_carrier(carrier_index)
             .ok_or(AllocError::Corrupt)?;
-        // Port of cpool_insert, erl_alloc_util.c:2185, OTP-29.1.1: while a carrier is in the
-        // pool or homecoming, crr->allctr names its origin instance.
-        carrier.memory.words().atomic_store(
-            std::mem::offset_of!(CarrierLayout, allocator) / WORD,
-            carrier.origin_instance as u64,
-            Ordering::Release,
-        );
         if carrier.mseg {
             self.mseg.release_transferred(carrier.size);
         }
@@ -2145,12 +2241,12 @@ impl AllocUtil {
                 class.sys_alloc_carriers_size += carrier.size;
             }
         }
-        for (info, stats) in [
-            (&mut mbcs, self.class_stats[0]),
-            (&mut sbcs, self.class_stats[1]),
+        for (info, stats, sbc) in [
+            (&mut mbcs, self.class_stats[0], false),
+            (&mut sbcs, self.class_stats[1], true),
         ] {
             info.blocks = stats.blocks.current;
-            info.blocks_size = stats.blocks_size.current;
+            info.blocks_size = self.blocks_size_current(sbc);
             info.blocks_max = stats.blocks.max;
             info.blocks_size_max = stats.blocks_size.max;
             info.blocks_max_ever = stats.blocks.max_ever;
@@ -2265,7 +2361,8 @@ impl AllocUtil {
             if carrier_header & !CARRIER_FLAGS != c.size
                 || carrier_header & CARRIER_FLAGS != expected_carrier_flags
                 || (!c.sbc && (c.key_base & !SACRR_UNIT_MASK) != 0)
-                || c.memory.read_word(CARRIER_ALLCTR_WORD * WORD) != Some(self.instance_index)
+                || c.memory.read_word(CARRIER_ALLCTR_WORD * WORD)
+                    != Some(crr_allctr_word(self.instance_index, 0) as usize)
                 || c.start - c.key_base
                     != if c.sbc {
                         SBC_HEADER
@@ -2334,7 +2431,7 @@ impl AllocUtil {
         if free != self.tree_free_blocks()?
             || (0..2).any(|class| {
                 count[class] != self.class_stats[class].blocks.current
-                    || bytes[class] != self.class_stats[class].blocks_size.current
+                    || bytes[class] != self.blocks_size_current(class == 1)
             })
         {
             return Err(AllocError::Corrupt);
@@ -2666,7 +2763,7 @@ impl AllocUtil {
     }
     fn write_carrier(&mut self, ci: usize) -> Result<(), AllocError> {
         let mbc_header_size = self.mbc_header_size();
-        let instance_index = self.instance_index as u64;
+        let instance_index = crr_allctr_word(self.instance_index, 0);
         let c = self.carriers[ci].as_mut().unwrap();
         let flags = (if c.sbc { SBC } else { 0 }) | (if c.mseg { MSEG_CARRIER } else { 0 });
         let _ = c.memory.write_word(0, c.size | flags);
@@ -3931,24 +4028,32 @@ impl AllocUtil {
             series.max_ever = series.max_ever.max(series.max);
         }
     }
+    /// Sets `blocks[ix].curr.size` and its peaks.
+    ///
+    /// Port of STAT_BLK_ALLOC_1 / STAT_BLK_FREE_1 (erl_alloc_util.c, OTP-29.1.1).
+    #[inline(always)]
+    fn set_blocks_size(&mut self, sbc: bool, current: usize) {
+        self.blocks_size_curr[usize::from(sbc)].store(current, Ordering::Relaxed);
+        let peak = &mut self.class_stats[usize::from(sbc)].blocks_size;
+        if current > peak.max {
+            peak.max = current;
+            peak.max_ever = peak.max_ever.max(current);
+        }
+    }
     #[inline(always)]
     fn block_added(&mut self, sbc: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
         class.blocks.current += 1;
-        class.blocks_size.current += size;
         Self::update_series(&mut class.blocks);
-        Self::update_series(&mut class.blocks_size);
+        self.set_blocks_size(sbc, self.blocks_size_current(sbc) + size);
     }
     #[inline(always)]
     fn block_removed(&mut self, sbc: bool, size: usize) {
-        let class = &mut self.class_stats[usize::from(sbc)];
-        class.blocks.current -= 1;
-        class.blocks_size.current -= size;
+        self.class_stats[usize::from(sbc)].blocks.current -= 1;
+        self.set_blocks_size(sbc, self.blocks_size_current(sbc) - size);
     }
     fn block_resized(&mut self, sbc: bool, old_size: usize, new_size: usize) {
-        let class = &mut self.class_stats[usize::from(sbc)];
-        class.blocks_size.current = class.blocks_size.current - old_size + new_size;
-        Self::update_series(&mut class.blocks_size);
+        self.set_blocks_size(sbc, self.blocks_size_current(sbc) - old_size + new_size);
     }
     fn carrier_added(&mut self, sbc: bool, mseg: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
@@ -4974,9 +5079,20 @@ mod tests {
         }
         let mut transfers = a.take_pending_carriers();
         assert!(!transfers.is_empty(), "expected abandoned carrier");
-        // While pooled, crr->allctr names origin instance 3.
-        let (pooled_inst, pooled_id, _) = used_block_from_payload(survivor.payload_address());
-        similar_asserts::assert_eq!((pooled_inst, pooled_id), (3, survivor.id()));
+        // Once pooled, crr->allctr names origin instance 3 with IN_POOL set.
+        for transfer in &transfers {
+            transfer.set_in_pool(3);
+        }
+        let used = get_used_allctr(survivor.payload_address());
+        similar_asserts::assert_eq!(
+            (used.instance, used.flags, used.blk),
+            (3, CRR_ALCTR_FLG_IN_POOL, survivor.id())
+        );
+        assert!(
+            transfers
+                .iter()
+                .any(|transfer| transfer.carrier_address() == used.carrier)
+        );
 
         let mut b = AllocUtil::new_for_instance(Strategy::AoffCbf, opts, "ets_alloc", 7, true);
         let mut imported = Vec::new();
@@ -4997,10 +5113,14 @@ mod tests {
             }
         }
         for homecoming in b.take_pending_carriers() {
-            // While homecoming, crr->allctr names origin instance 3.
+            // While homecoming, crr->allctr names origin instance 3 with IN_POOL and HOMECOMING.
+            homecoming.set_in_pool(7);
             if let Some(&(al, _)) = homecoming.allocations().first() {
-                let (hc_inst, hc_id, _) = used_block_from_payload(al.payload_address());
-                similar_asserts::assert_eq!((hc_inst, hc_id), (3, al.id()));
+                let used = get_used_allctr(al.payload_address());
+                similar_asserts::assert_eq!(
+                    (used.instance, used.flags, used.blk),
+                    (3, CRR_ALCTR_FLG_IN_POOL | CRR_ALCTR_FLG_HOMECOMING, al.id())
+                );
             }
             for (_, returned) in a.import_carrier_transfer(homecoming).unwrap() {
                 let (ret_inst, ret_id, _) = used_block_from_payload(returned.payload_address());

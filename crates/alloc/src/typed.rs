@@ -168,7 +168,6 @@ pub struct ErasedFixAllocArc {
 /// A uniquely owned value allocated through a fixed-size ERTS allocation type.
 pub struct FixAllocBox<T, const TYPE: u8 = 19> {
     pointer: std::ptr::NonNull<T>,
-    owner_ix: usize,
 }
 
 // SAFETY: the box uniquely owns T; sending it transfers that ownership, and allocator freeing
@@ -295,7 +294,6 @@ impl<T: FixAllocRefCount> FixAllocArc<T> {
             // SAFETY: these are the last two owners, so no reference to T remains.
             unsafe { std::ptr::drop_in_place(first.pointer.as_ptr()) };
             let _ = fix_free_payload_at(
-                first.owner_ix(),
                 T::ALLOCATION_TYPE,
                 first.pointer.as_ptr().cast(),
                 std::mem::size_of::<T>(),
@@ -324,11 +322,6 @@ impl<T: FixAllocRefCount> FixAllocArc<T> {
     #[allow(unsafe_code)]
     pub unsafe fn from_raw(pointer: std::ptr::NonNull<T>) -> Self {
         Self { pointer }
-    }
-
-    /// The allocator instance that owns the block, read from its carrier as erts does on free.
-    fn owner_ix(&self) -> usize {
-        crate::alloc_util::used_block_from_payload(self.pointer.as_ptr() as usize).0
     }
 
     /// Transfers this owner into a type-erased owner without allocating.
@@ -361,7 +354,7 @@ impl<T, const TYPE: u8> FixAllocBox<T, TYPE> {
             std::ptr::NonNull::new(payload.cast::<T>()).ok_or(AllocError::InvalidAllocation)?;
         // SAFETY: fix_alloc returned a live word-aligned block large enough for T.
         unsafe { pointer.as_ptr().write(value) };
-        Ok(Self { pointer, owner_ix })
+        Ok(Self { pointer })
     }
 
     /// [`Self::new`] for a large value: the block is allocated first and `init` builds the value
@@ -388,7 +381,7 @@ impl<T, const TYPE: u8> FixAllocBox<T, TYPE> {
         // SAFETY: fix_alloc returned a live word-aligned block large enough for T. `init` cannot
         // observe the block, so a panic in it leaks the block and nothing else.
         unsafe { pointer.as_ptr().write(init()) };
-        Ok(Self { pointer, owner_ix })
+        Ok(Self { pointer })
     }
 
     /// Moves the value out and releases its fixed-size allocation.
@@ -398,7 +391,6 @@ impl<T, const TYPE: u8> FixAllocBox<T, TYPE> {
         // SAFETY: `this` suppresses Drop; read moves out the initialized value exactly once.
         let value = unsafe { this.pointer.as_ptr().read() };
         let _ = fix_free_payload_at(
-            this.owner_ix,
             ErtsAlcType(TYPE),
             this.pointer.as_ptr().cast(),
             std::mem::size_of::<T>(),
@@ -431,7 +423,6 @@ impl<T, const TYPE: u8> Drop for FixAllocBox<T, TYPE> {
         // SAFETY: the unique box owns the initialized value and no references survive its drop.
         unsafe { std::ptr::drop_in_place(self.pointer.as_ptr()) };
         let _ = fix_free_payload_at(
-            self.owner_ix,
             ErtsAlcType(TYPE),
             self.pointer.as_ptr().cast(),
             std::mem::size_of::<T>(),
@@ -529,13 +520,7 @@ impl<T, const TYPE: u8> Drop for FixOrBox<T, TYPE> {
         }
         // SAFETY: the unique owner holds an initialized value in a live fixed-size block.
         unsafe { std::ptr::drop_in_place(pointer) };
-        let (owner_ix, _, _) = crate::alloc_util::used_block_from_payload(pointer as usize);
-        let _ = fix_free_payload_at(
-            owner_ix,
-            ErtsAlcType(TYPE),
-            pointer.cast(),
-            std::mem::size_of::<T>(),
-        );
+        let _ = fix_free_payload_at(ErtsAlcType(TYPE), pointer.cast(), std::mem::size_of::<T>());
     }
 }
 
@@ -663,12 +648,7 @@ impl<T: FixAllocRefCount> Drop for FixAllocArc<T> {
         let pointer = self.pointer.as_ptr();
         // SAFETY: this was the final counted owner, so no references to `T` remain.
         unsafe { std::ptr::drop_in_place(pointer) };
-        let _ = fix_free_payload_at(
-            self.owner_ix(),
-            T::ALLOCATION_TYPE,
-            pointer.cast(),
-            std::mem::size_of::<T>(),
-        );
+        let _ = fix_free_payload_at(T::ALLOCATION_TYPE, pointer.cast(), std::mem::size_of::<T>());
     }
 }
 
@@ -1468,11 +1448,12 @@ pub fn fix_alloc_payload_at(
     allocator_for(allocation_type)?.fix_alloc_payload_at(ix, fix_ix, bytes)
 }
 
-/// Frees a payload allocated by [`fix_alloc_payload_at`], taking the intrusive owner fast path.
-// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_free), OTP-29.1.1.
+/// Frees a payload allocated by [`fix_alloc_payload_at`] from the calling thread: the instance
+/// named by the block's carrier puts it on its free list, any other thread queues it there.
+// Port of erts/emulator/beam/erl_alloc_util.c (erts_alcu_free_thr_pref, get_used_allctr and
+// fix_cpool_free), OTP-29.1.1.
 #[inline(always)]
 pub fn fix_free_payload_at(
-    owner_ix: usize,
     allocation_type: ErtsAlcType,
     payload: *mut u64,
     bytes: usize,
@@ -1480,7 +1461,7 @@ pub fn fix_free_payload_at(
     let fix_ix = allocation_type
         .fix_index()
         .ok_or(AllocError::InvalidAllocation)?;
-    allocator_for(allocation_type)?.fix_free_payload_at(owner_ix, fix_ix, payload, bytes)
+    allocator_for(allocation_type)?.fix_free_payload_at(fix_ix, payload, bytes)
 }
 
 /// Frees a block from [`fix_alloc_at`] from the thread with allocator index `ix`.

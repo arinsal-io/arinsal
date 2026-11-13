@@ -18,10 +18,10 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
 pub(crate) mod raw;
 
-/// The fix_alloc block of one process: `common.refc`, its owner instance, and the process.
+/// The fix_alloc block of one process: `common.refc` and the process. The owning allocator
+/// instance is read from the block's carrier on free, as erts does.
 struct ProcessBlock<T: Task> {
     refc: AtomicUsize,
-    owner_ix: usize,
     process: Process<T>,
 }
 
@@ -68,7 +68,6 @@ impl<T: Task> ProcRef<T> {
             Some(context) => context,
             None => {
                 let _ = fix_free_payload_at(
-                    ix,
                     ErtsAlcType::PROC,
                     payload,
                     std::mem::size_of::<ProcessBlock<T>>(),
@@ -84,7 +83,6 @@ impl<T: Task> ProcRef<T> {
         let result = unsafe {
             let raw = block.as_ptr();
             (&raw mut (*raw).refc).write(AtomicUsize::new(1));
-            (&raw mut (*raw).owner_ix).write(ix);
             (&raw mut (*raw).process).write(build(&context));
             init(&mut (*raw).process, &context)
         };
@@ -185,12 +183,10 @@ impl<T: Task> Drop for ProcRef<T> {
             return;
         }
         fence(Ordering::Acquire);
-        let owner_ix = self.block().owner_ix;
         // SAFETY: the count reached zero, so this was the last reference: no other thread can
         // reach the block, and the process is dropped exactly once before its block is freed.
         unsafe { std::ptr::drop_in_place(&raw mut (*self.block.as_ptr()).process) };
         let _ = fix_free_payload_at(
-            owner_ix,
             ErtsAlcType::PROC,
             self.block.as_ptr().cast::<u64>(),
             std::mem::size_of::<ProcessBlock<T>>(),
