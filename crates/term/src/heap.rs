@@ -1781,15 +1781,18 @@ pub struct ProcessHeap {
     /// Whether the next collection is the epilogue of a BIF call that decided to collect
     /// (`erts_gc_after_bif_call_lhf` with a valid `live_hf_end`).
     live_frags_armed: std::cell::Cell<bool>,
-    /// Length of `fragments` when the last BIF epilogue found no collection due: every fragment
-    /// from this index on was allocated by the BIF that follows (erts `live_hf_end`).
+    /// Length of `fragments` at the entry of the BIF whose epilogue collects: every fragment
+    /// from this index on was allocated by that BIF (the JIT's spilled `live_hf_end`), or
+    /// `INVALID_HFRAG` (`ERTS_INVALID_HFRAG_PTR`).
     live_frag_mark: std::cell::Cell<u32>,
-    /// Whether `live_frag_mark` was taken at the entry of the BIF whose epilogue collects.
-    live_frag_valid: std::cell::Cell<bool>,
-    /// `c_p->live_hf_end`: the mark saved when a BIF trapped with collection disabled; the
-    /// collection that follows the continuation uses it instead of that call's own mark.
-    live_frag_saved: std::cell::Cell<Option<u32>>,
+    /// `c_p->live_hf_end`: the mark saved when a BIF trapped with collection disabled, or
+    /// `INVALID_HFRAG`; the collection that follows the continuation uses it instead of that
+    /// call's own mark.
+    live_frag_saved: std::cell::Cell<u32>,
 }
+
+/// `ERTS_INVALID_HFRAG_PTR` (erl_gc.h) for the fragment-index form of `live_hf_end`.
+const INVALID_HFRAG: u32 = u32::MAX;
 
 /// HAlloc space validated for a fixed heap object plus words reserved for following stores.
 pub struct HAllocReservation<'a> {
@@ -1985,9 +1988,8 @@ impl ProcessHeap {
         self.fragment_words = 0;
         self.gc_enabled = true;
         self.live_frags_armed.set(false);
-        self.live_frag_mark.set(0);
-        self.live_frag_valid.set(false);
-        self.live_frag_saved.set(None);
+        self.live_frag_mark.set(INVALID_HFRAG);
+        self.live_frag_saved.set(INVALID_HFRAG);
     }
 
     /// Byte offset of `fragment_words` (`mbuf_sz`) in the heap, for the native GC-desired test.
@@ -2078,9 +2080,8 @@ impl ProcessHeap {
             fragment_words: 0,
             gc_enabled: true,
             live_frags_armed: std::cell::Cell::new(false),
-            live_frag_mark: std::cell::Cell::new(0),
-            live_frag_valid: std::cell::Cell::new(false),
-            live_frag_saved: std::cell::Cell::new(None),
+            live_frag_mark: std::cell::Cell::new(INVALID_HFRAG),
+            live_frag_saved: std::cell::Cell::new(INVALID_HFRAG),
             owners: LazyOwners::default(),
         }
     }
@@ -3112,7 +3113,7 @@ impl ProcessHeap {
         if desired {
             self.live_frags_armed.set(true);
         } else {
-            self.live_frag_valid.set(false);
+            self.live_frag_mark.set(INVALID_HFRAG);
         }
         desired
     }
@@ -3124,15 +3125,14 @@ impl ProcessHeap {
     #[inline(always)]
     pub fn note_bif_entry(&self) {
         self.live_frag_mark.set(self.fragments.len() as u32);
-        self.live_frag_valid.set(true);
     }
 
     /// A BIF disables collection to trap: keep the mark taken at its entry as `c_p->live_hf_end`.
     // Port of erts/emulator/beam/erl_gc.c:428-436 (erts_gc_after_bif_call_lhf: the first trap
     // with F_DISABLE_GC saves live_hf_end), OTP-29.1.1.
     pub fn save_live_frags_mark(&self) {
-        if self.live_frag_saved.get().is_none() && self.live_frag_valid.get() {
-            self.live_frag_saved.set(Some(self.live_frag_mark.get()));
+        if self.live_frag_saved.get() == INVALID_HFRAG {
+            self.live_frag_saved.set(self.live_frag_mark.get());
         }
     }
 
@@ -3141,15 +3141,15 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_gc.c (`erts_gc_after_bif_call_lhf`), OTP-29.1.1.
     pub(crate) fn take_live_frags_from(&self) -> Option<usize> {
         let armed = self.live_frags_armed.replace(false);
-        let mut valid = self.live_frag_valid.replace(false);
-        let mut mark = self.live_frag_mark.replace(0) as usize;
+        let mut mark = self.live_frag_mark.replace(INVALID_HFRAG);
         // erl_gc.c garbage_collect: `else if (p->live_hf_end != ERTS_INVALID_HFRAG_PTR)`, and
         // the reset at the end of the collection.
-        if let Some(saved) = self.live_frag_saved.take() {
-            mark = saved as usize;
-            valid = true;
+        let saved = self.live_frag_saved.replace(INVALID_HFRAG);
+        if saved != INVALID_HFRAG {
+            mark = saved;
         }
-        (armed && valid && mark <= self.fragments.len()).then_some(mark)
+        (armed && mark != INVALID_HFRAG && mark as usize <= self.fragments.len())
+            .then_some(mark as usize)
     }
 
     fn reservation_words_mut(
