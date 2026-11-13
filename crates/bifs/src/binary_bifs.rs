@@ -9,7 +9,7 @@ use arinsal_term::{
 };
 
 use crate::binary_mod::{SearchPattern, SearchPatternHandle, SearchWalk};
-use crate::lists::{DeferredTrap, cons_cell};
+use crate::lists::cons_cell;
 use crate::{BifError, Ctx};
 
 use super::*;
@@ -23,7 +23,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     let bif = match (module, name, arity) {
         ("erlang", "byte_size", 1) => v.entry::<word_bodies::byte_size>(),
         ("erlang", "bit_size", 1) => v.entry::<word_bodies::bit_size>(),
-        ("erlang", "binary_to_list", 1 | 3) => v.entry::<bodies::erlang_binary_to_list>(),
         ("erlang", "bitstring_to_list", 1) => v.entry::<bodies::bitstring_to_list>(),
         ("erlang", "split_binary", 2) => v.entry::<word_bodies::split_binary>(),
         ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => {
@@ -60,113 +59,17 @@ fn bit_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, bitstring_bit_len(args[0])?)
 }
 
-// Port of erts/emulator/beam/binary.c (binary_to_list_1/3), OTP-29.1.1.
-/// Implements the process BIF entry used by the binary-to-list trap.
-// Port of erts/emulator/beam/binary.c (binary_to_list_1/3), OTP-29.1.1.
-pub fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    with_binary_bytes(args[0], |view| {
-        if !view.bit_len().is_multiple_of(8) {
-            return Err(BADARG);
-        }
-        let size = view.bit_len() / 8;
-        let (start, len) = if args.len() == 3 {
-            let start = args[1].as_small().ok_or(BADARG)?;
-            let end = args[2].as_small().ok_or(BADARG)?;
-            if start < 1 || end < start || end as usize > size {
-                return Err(BADARG);
-            }
-            (start as usize - 1, (end - start + 1) as usize)
-        } else {
-            (0, size)
-        };
-        if len == 0 {
-            return Ok(Term::NIL);
-        }
-        let bit_offset = view.start_bit() % 8;
-        let source_start = (view.start_bit() / 8).checked_add(start).ok_or(BADARG)?;
-        validate_binary_to_list_range(view.bytes(), source_start, len, bit_offset)?;
-
-        let budget = ctx.reduction_budget();
-        let min_reds = 1_000;
-        let resched_reds = 100;
-        if budget != usize::MAX
-            && size >= budget.saturating_mul(B2L_BYTES_PER_REDUCTION)
-            && size < min_reds * B2L_BYTES_PER_REDUCTION
-            && budget <= resched_reds
-        {
-            ctx.defer_trap(DeferredTrap::BinaryToList(BinaryToListWalk {
-                source: args[0],
-                source_start,
-                bit_offset,
-                remaining: len,
-                total: len,
-                list: None,
-            }));
-            return Ok(Term::NIL);
-        }
-        let one_chunk = budget == usize::MAX
-            || size < budget.saturating_mul(B2L_BYTES_PER_REDUCTION)
-            || (size < min_reds * B2L_BYTES_PER_REDUCTION && budget > resched_reds);
-        let reservation = {
-            let mut builder = TermBuilder::new(&mut ctx.heap);
-            builder
-                .reserve_cons_list(len)
-                .map_err(|_| BifError::SystemLimit)?
-        };
-        if one_chunk {
-            // Port of erts/emulator/beam/binary.c (erts_bin_bytes_to_list), OTP-29.1.1.
-            // `binary_to_list_chunk` bumps reductions immediately before its CONS loop.
-            ctx.charge_reductions(len.div_ceil(B2L_BYTES_PER_REDUCTION));
-            let mut reservation = reservation;
-            reservation
-                .prepend_binary_bytes(view.bytes(), source_start, len, bit_offset)
-                .map_err(|_| BifError::SystemLimit)?;
-            return reservation
-                .finish(Term::NIL)
-                .map_err(|_| BifError::SystemLimit);
-        }
-        let mut walk = BinaryToListWalk {
-            source: args[0],
-            source_start,
-            bit_offset,
-            remaining: len,
-            total: len,
-            list: Some(reservation),
-        };
-        let chunk = len.min(
-            budget
-                .saturating_add(1)
-                .saturating_mul(B2L_BYTES_PER_REDUCTION),
-        );
-        // Port of BUMP_REDS in binary_to_list_chunk, before the backwards fill loop.
-        ctx.charge_reductions(chunk.div_ceil(B2L_BYTES_PER_REDUCTION));
-        let (result, _) = walk.step_bytes(view.bytes(), source_start, bit_offset, chunk)?;
-        if let Some(result) = result {
-            Ok(result)
-        } else {
-            ctx.defer_trap(DeferredTrap::BinaryToList(walk));
-            Ok(Term::NIL)
-        }
-    })?
+/// The bit length, first byte and bit offset of a bitstring, as `ERTS_GET_BITSTRING` yields
+/// them (`BYTE_OFFSET(offset)`, `BIT_OFFSET(offset)`).
+// Port of erts/emulator/beam/binary.c (binary_to_list_1/3: ERTS_GET_BITSTRING), OTP-29.1.1.
+pub fn bitstring_source(term: Term) -> Result<(usize, usize, usize), BifError> {
+    with_binary_bytes(term, |view| {
+        (view.bit_len(), view.start_bit() / 8, view.start_bit() % 8)
+    })
 }
 
-fn validate_binary_to_list_range(
-    bytes: &[u8],
-    source_start: usize,
-    len: usize,
-    bit_offset: usize,
-) -> Result<(), BifError> {
-    let end = source_start
-        .checked_add(len)
-        .and_then(|end| end.checked_add(usize::from(bit_offset != 0)))
-        .ok_or(BADARG)?;
-    if end > bytes.len() {
-        return Err(BADARG);
-    }
-    Ok(())
-}
-
-const B2L_BYTES_PER_REDUCTION: usize = 256;
+/// `ERTS_B2L_BYTES_PER_REDUCTION`.
+pub const B2L_BYTES_PER_REDUCTION: usize = 256;
 
 /// Resumable fill of one HAlloc reservation, as in `ErtsB2LState`.
 // Port of erts/emulator/beam/binary.c (binary_to_list_chunk), OTP-29.1.1.
@@ -180,20 +83,16 @@ pub struct BinaryToListWalk {
 }
 
 impl BinaryToListWalk {
-    /// Whether OTP would first reschedule before creating the list reservation.
-    pub fn needs_initial_allocation(&self) -> bool {
-        self.list.is_none()
-    }
-
-    /// Re-read the source binary from the retried call's argument register.
-    // Port of erts/emulator/beam/binary.c (binary_to_list_1 / binary_to_list_3,
-    // ERTS_BIF_YIELD1 / ERTS_BIF_YIELD3), OTP-29.1.1: before the list is reserved erts creates
-    // no state, the yield retries the call with BIF_ARG_1 from the argument registers, which a
-    // collection while the process is switched out keeps current. This walk is created early
-    // and carries the source term, which that collection does not update.
-    pub fn refresh_source(&mut self, source: Term) {
-        debug_assert!(self.list.is_none());
-        self.source = source;
+    /// `ErtsB2LState` for `size` bytes of `source` starting at byte `source_start`.
+    pub fn new(source: Term, source_start: usize, bit_offset: usize, size: usize) -> Self {
+        Self {
+            source,
+            source_start,
+            bit_offset,
+            remaining: size,
+            total: size,
+            list: None,
+        }
     }
 
     /// Fill at most one scheduler chunk, visiting the source from its end.
@@ -283,173 +182,6 @@ pub(super) fn with_binary_input<R>(
     with_binary_bytes(term, |view| {
         let bytes = binary_input(&view)?;
         f(&bytes)
-    })?
-}
-
-/// Finish a small, non-yielding iolist conversion on the direct BIF entry.
-///
-/// Port of erts/emulator/beam/erl_iolist.c:114-397,425-620 (generic_iolist_size,
-/// generic_iolist_copy), OTP-29.1.1. The local tail stack is the non-yielding
-/// ERTS estack; the resumable walkers are only needed after a call yields. The
-/// direct caller has already handled the binary, nil, singleton and type cases.
-pub fn iolist_to_binary_direct(ctx: &mut Ctx<'_>, root: Term) -> Option<Term> {
-    let available = ctx.reduction_budget();
-    let yield_budget = available.checked_mul(IOL2V_YIELDS_PER_RED)?;
-    let (byte_len, size_units) = direct_iolist_size_only(root, yield_budget)?;
-    if byte_len >= IOL2V_COPY_BITS_PER_YIELD / 8 {
-        return None;
-    }
-    let size_reds = crate::iolist_yield_reductions(size_units);
-    let copy_budget = available.checked_sub(size_reds)?;
-    let copy_yield_count = copy_budget.checked_mul(IOL2V_YIELDS_PER_RED)?;
-    if size_units >= copy_yield_count {
-        return None;
-    }
-    let copy_yield_count = i64::try_from(copy_yield_count).ok()?;
-    if byte_len == 0 {
-        direct_iolist_copy(root, &mut [], copy_yield_count)
-            .expect("the size pass validated this iolist");
-    }
-    let result = write_binary(ctx, byte_len, |output| {
-        if byte_len != 0 {
-            direct_iolist_copy(root, output, copy_yield_count)
-                .expect("the size pass validated this iolist");
-        }
-        Ok(())
-    })
-    .ok()?;
-    ctx.charge_reductions(size_reds + crate::iolist_yield_reductions(size_units));
-    Some(result)
-}
-
-/// Finish a small `iolist_size/1` call without constructing continuation state.
-// Port of erts/emulator/beam/erl_iolist.c:1005-1093 (iolist_size_dispatch, iolist_size_1), OTP-29.1.1.
-pub fn iolist_size_direct(ctx: &mut Ctx<'_>, root: Term) -> Option<Term> {
-    let yield_budget = ctx.reduction_budget().checked_mul(IOL2V_YIELDS_PER_RED)?;
-    let (size, work) = direct_iolist_size_only(root, yield_budget)?;
-    ctx.charge_reductions(iolist_yield_reductions(work));
-    integer(ctx, size).ok()
-}
-
-#[inline(always)]
-fn direct_iolist_size_only(root: Term, budget: usize) -> Option<(usize, usize)> {
-    let mut yield_count = i64::try_from(budget).ok()?;
-    let mut size_bits = 0_usize;
-    let mut work = 0_usize;
-    let mut pending = arinsal_term::EStack::<8>::new();
-    let mut current = root;
-    loop {
-        while let Ok((head, tail)) = iolist_cons(current) {
-            yield_count -= 1;
-            if yield_count <= 0 {
-                return None;
-            }
-            work += 1;
-            if let Some(byte) = head.as_small() {
-                if !(0..=255).contains(&byte) {
-                    return None;
-                }
-                size_bits = size_bits.checked_add(8)?;
-            } else if head.classify() == TermKind::List {
-                pending.push(tail);
-                current = head;
-                continue;
-            } else if head != Term::NIL {
-                let bits = bitstring_bit_len(head).ok()?;
-                if !bits.is_multiple_of(8) {
-                    return None;
-                }
-                size_bits = size_bits.checked_add(bits)?;
-            }
-            current = tail;
-        }
-
-        yield_count -= 1;
-        if yield_count <= 0 {
-            return None;
-        }
-        work += 1;
-        if current != Term::NIL {
-            let bits = bitstring_bit_len(current).ok()?;
-            if !bits.is_multiple_of(8) {
-                return None;
-            }
-            size_bits = size_bits.checked_add(bits)?;
-        }
-        match pending.pop() {
-            Some(tail) => current = tail,
-            None => return Some((size_bits / 8, work)),
-        }
-    }
-}
-
-#[inline(always)]
-fn direct_iolist_copy(root: Term, output: &mut [u8], mut yield_count: i64) -> Result<(), BifError> {
-    let mut offset = 0_usize;
-    let mut pending = arinsal_term::EStack::<8>::new();
-    let mut current = root;
-    loop {
-        while let Ok((head, tail)) = iolist_cons(current) {
-            // Port of the signed `--yield_count <= 0` check in
-            // erts/emulator/beam/erl_iolist.c (generic_iolist_copy), OTP-29.1.1.
-            yield_count -= 1;
-            if yield_count <= 0 {
-                return Err(BADARG);
-            }
-            if let Some(number) = head.as_small() {
-                output[offset] = u8::try_from(number).map_err(|_| BADARG)?;
-                offset += 1;
-            } else if head.classify() == TermKind::Bitstring {
-                offset += direct_copy_binary(head, output, offset)?;
-            } else if head.classify() == TermKind::List {
-                pending.push(tail);
-                current = head;
-                continue;
-            } else if head != Term::NIL {
-                return Err(BADARG);
-            }
-            current = tail;
-        }
-
-        yield_count -= 1;
-        if yield_count <= 0 {
-            return Err(BADARG);
-        }
-        if current.classify() == TermKind::Bitstring {
-            offset += direct_copy_binary(current, output, offset)?;
-        } else if current != Term::NIL {
-            return Err(BADARG);
-        }
-        match pending.pop() {
-            Some(tail) => current = tail,
-            None => return (offset == output.len()).then_some(()).ok_or(BADARG),
-        }
-    }
-}
-
-fn direct_copy_binary(term: Term, output: &mut [u8], offset: usize) -> Result<usize, BifError> {
-    with_binary_bytes(term, |view| {
-        let start = view.start_bit();
-        let bits = view.bit_len();
-        if !bits.is_multiple_of(8) {
-            return Err(BADARG);
-        }
-        let count = bits / 8;
-        let end = offset.checked_add(count).ok_or(BifError::SystemLimit)?;
-        let destination = output.get_mut(offset..end).ok_or(BifError::SystemLimit)?;
-        if start.is_multiple_of(8) {
-            let first = start / 8;
-            destination.copy_from_slice(view.bytes().get(first..first + count).ok_or(BADARG)?);
-        } else {
-            let first = start / 8;
-            let shift = start % 8;
-            for (index, slot) in destination.iter_mut().enumerate() {
-                let current = *view.bytes().get(first + index).ok_or(BADARG)?;
-                let next = view.bytes().get(first + index + 1).copied().unwrap_or(0);
-                *slot = (current << shift) | (next >> (8 - shift));
-            }
-        }
-        Ok(count)
     })?
 }
 
@@ -1206,42 +938,6 @@ pub fn finish_iolist_binary_output(term: Term) {
     writable_finalize(term);
 }
 
-/// Allocate a binary and fill its final byte slice while its writer is private.
-pub(crate) fn write_binary(
-    ctx: &mut Ctx<'_>,
-    byte_len: usize,
-    fill: impl FnOnce(&mut [u8]) -> Result<(), BifError>,
-) -> Result<Term, BifError> {
-    if byte_len == 0 {
-        return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .binary(&[])
-            .expect("infallible BIF heap"));
-    }
-    byte_len.checked_mul(8).ok_or(BifError::SystemLimit)?;
-    // Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
-    const ONHEAP_BYTES: usize = 64;
-    if byte_len <= ONHEAP_BYTES {
-        // Port of `erts_new_binary` in erts/emulator/beam/erl_iolist.c (iolist_to_binary_1),
-        // OTP-29.1.1: fill the final HAlloc block instead of staging a second copy.
-        let mut failure = None;
-        let term = TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .binary_from_fn(byte_len, |output| failure = fill(output).err())
-            .map_err(|_| BifError::SystemLimit)?;
-        return failure.map_or(Ok(term), Err);
-    }
-    if !ctx.heap.supports_writable_binary() {
-        let mut bytes = vec![0; byte_len];
-        fill(&mut bytes)?;
-        return TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .binary(&bytes)
-            .map_err(|_| BifError::SystemLimit);
-    }
-    let result = allocate_iolist_binary(&mut ctx.heap, byte_len)?;
-    with_iolist_binary_output(result, fill)?;
-    finish_iolist_binary_output(result);
-    Ok(result)
-}
-
 // Port of erts/emulator/beam/binary.c:413-474 (bitstring_to_list_1), OTP-29.1.1.
 fn bitstring_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // SAFETY: The source bitstring and owner remain live.
@@ -1924,4 +1620,4 @@ crate::word_bif_bodies_in!(word_bodies;
     decode_unsigned,
 );
 
-crate::bif_bodies!(erlang_binary_to_list, bitstring_to_list,);
+crate::bif_bodies!(bitstring_to_list,);

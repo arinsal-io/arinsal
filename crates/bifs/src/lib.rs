@@ -53,15 +53,15 @@ pub use lists::{
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
-    BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
-    IolistVecWalk, Phash2Cont, Phash2Run, allocate_iolist_binary, atom_to_list_term, binary_bytes,
-    binary_part_2, bitstring_bit_len, copy_binary_pattern, copy_binary_range, copy_bitstring_range,
-    copy_bitstring_range_to, erlang_binary_to_list, eval_unique_integer,
-    finish_iolist_binary_output, for_each_list_term, iolist_size_direct, iolist_to_binary_direct,
-    iolist_to_iovec_shortcut, iolist_yield_reductions, next_ref_id, next_unique_monotonic,
-    phash2_immediate_1, phash2_range_arg, phash2_run_1_after_immediate_check, phash2_run_2,
-    phash2_slice, proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair,
-    tuple_terms, with_binary_bytes, with_iolist_binary_output,
+    B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk,
+    IolistSizeWalk, IolistVecWalk, Phash2Cont, Phash2Run, allocate_iolist_binary,
+    atom_to_list_term, binary_bytes, binary_part_2, bitstring_bit_len, bitstring_source,
+    copy_binary_pattern, copy_binary_range, copy_bitstring_range, copy_bitstring_range_to,
+    eval_unique_integer, finish_iolist_binary_output, for_each_list_term, iolist_to_iovec_shortcut,
+    iolist_yield_reductions, next_ref_id, next_unique_monotonic, phash2_immediate_1,
+    phash2_range_arg, phash2_run_1_after_immediate_check, phash2_run_2, phash2_slice,
+    proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair, tuple_terms,
+    with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,

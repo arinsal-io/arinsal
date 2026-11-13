@@ -848,7 +848,6 @@ fn characters_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match characters_to_binary_result(ctx, args) {
         Ok(_) if ctx.has_deferred() => match *ctx.take_deferred().expect("deferred Unicode trap") {
             DeferredTrap::Unicode(cont) => ctx.trap(DeferredTrap::Unicode(cont)),
-            _ => unreachable!("Unicode conversion only defers Unicode traps"),
         },
         Ok(value) => value,
         Err(error) => ctx.fail(error),
@@ -1341,7 +1340,6 @@ fn characters_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         Ok(_value) if ctx.has_deferred() => {
             match *ctx.take_deferred().expect("deferred Unicode trap") {
                 DeferredTrap::Unicode(cont) => ctx.trap(DeferredTrap::Unicode(cont)),
-                _ => unreachable!("Unicode conversion only defers Unicode traps"),
             }
         }
         Ok(value) => value,

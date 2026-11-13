@@ -19,9 +19,9 @@ use crate::{BifError, Class, Ctx};
 #[path = "binary_bifs.rs"]
 mod binary_bifs;
 pub use binary_bifs::{
-    BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistVecWalk,
-    allocate_iolist_binary, binary_part_2, erlang_binary_to_list, finish_iolist_binary_output,
-    iolist_size_direct, iolist_to_binary_direct, iolist_to_iovec_shortcut, iolist_yield_reductions,
+    B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk,
+    IolistVecWalk, allocate_iolist_binary, binary_part_2, bitstring_source,
+    finish_iolist_binary_output, iolist_to_iovec_shortcut, iolist_yield_reductions,
     with_iolist_binary_output,
 };
 

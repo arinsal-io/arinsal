@@ -253,8 +253,6 @@ fn keysearch_result(ctx: &mut Ctx<'_>, tuple: Term) -> Term {
 
 /// Continuation built only after a slice's counter runs out.
 pub enum DeferredTrap {
-    /// `erlang:binary_to_list/1` and `/3`.
-    BinaryToList(crate::pure::BinaryToListWalk),
     /// `unicode:characters_to_binary/2` and `characters_to_list/2`.
     Unicode(crate::unicode::UnicodeCont),
 }

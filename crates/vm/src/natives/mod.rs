@@ -7,6 +7,7 @@
 
 pub(crate) mod bif;
 pub(crate) mod bif_phash2;
+pub(crate) mod binary;
 pub(crate) mod erl_bif_chksum;
 pub(crate) mod erl_bif_guard;
 pub(crate) mod erl_bif_info;
