@@ -404,6 +404,11 @@ impl Term {
         self.header()
             .is_some_and(|h| h & 63 == MAP && h & 0xc0 != 0)
     }
+    /// Whether this is a flatmap head (`is_flatmap`).
+    pub fn is_flatmap(self) -> bool {
+        self.header()
+            .is_some_and(|h| h & 63 == MAP && h & 0xc0 == 0)
+    }
     /// Classify a valid term without allocating.
     pub fn classify(self) -> TermKind {
         if self.as_small().is_some() {

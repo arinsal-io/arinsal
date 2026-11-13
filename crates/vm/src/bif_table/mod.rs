@@ -254,6 +254,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
         ("maps", "values", 1) => bif!(erl_map::maps_values_1),
         ("maps", "merge", 2) => bif!(erl_map::maps_merge_2),
+        ("maps", "find", 2) => bif!(erl_map::maps_find_2),
+        ("maps", "get", 2) => bif!(erl_map::maps_get_2),
+        ("maps", "is_key", 2) => bif!(erl_map::maps_is_key_2),
         // binary.c
         ("erlang", "binary_to_list", 1) => bif!(binary::binary_to_list_1),
         ("erlang", "binary_to_list", 3) => bif!(binary::binary_to_list_3),

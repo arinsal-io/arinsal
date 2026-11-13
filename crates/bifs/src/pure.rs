@@ -309,9 +309,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "is_record", 1..=3) => v.entry::<bodies::is_record>(),
         ("erlang", "is_boolean", 1) => v.entry::<bodies::is_boolean>(),
         ("erlang", "is_map", 1) => v.entry::<bodies::is_map>(),
-        ("erlang", "is_map_key", 2) => v.entry::<bodies::is_map_key>(),
-        ("erlang", "map_get", 2) => v.entry::<bodies::map_get>(),
-        ("erlang", "map_size", 1) => v.entry::<bodies::map_size>(),
         ("erlang", "is_builtin", 3) => v.entry::<bodies::is_builtin>(),
         ("erlang", "error", 1..=3) => v.entry::<bodies::error>(),
         ("erlang", "exit", 1) => v.entry::<bodies::exit>(),
@@ -1949,48 +1946,6 @@ fn bin_is_7bit_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> 
             .is_ok_and(|is_ascii| is_ascii),
     ))
 }
-fn map_entries(ctx: &mut Ctx<'_>, term: Term) -> Result<Vec<(Term, Term)>, BifError> {
-    if term.classify() != TermKind::Map {
-        let reason = tuple_build(
-            ctx,
-            &[
-                Term::atom(global_atoms().intern("badmap").expect("atom")),
-                term,
-            ],
-        );
-        return Err(BifError::Error(reason));
-    }
-    // SAFETY: The source map heap remains live and stable.
-    unsafe { term.flatmap_ref() }
-        .map(|map| map.iter().collect())
-        .ok_or(BADARG)
-}
-fn map_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let len = map_entries(ctx, args[0])?.len();
-    integer(ctx, len)
-}
-fn is_map_key_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(
-        map_entries(ctx, args[1])?
-            .iter()
-            .any(|(k, _)| exact_eq(*k, args[0])),
-    ))
-}
-fn map_get_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match map_entries(ctx, args[1])?
-        .into_iter()
-        .find(|(k, _)| exact_eq(*k, args[0]))
-    {
-        Some((_, value)) => Ok(value),
-        None => Err(BifError::Error(tuple_build(
-            ctx,
-            &[
-                Term::atom(global_atoms().intern("badkey").expect("atom")),
-                args[0],
-            ],
-        ))),
-    }
-}
 fn is_builtin_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let module = atom_name(args[0]).ok_or(BADARG)?;
     let name = atom_name(args[1]).ok_or(BADARG)?;
@@ -2300,9 +2255,6 @@ word_adapter!(is_function, is_function_result);
 word_adapter!(is_record, is_record_result);
 word_adapter!(is_boolean, is_boolean_result);
 word_adapter!(is_map, is_map_result);
-word_adapter!(is_map_key, is_map_key_result);
-word_adapter!(map_get, map_get_result);
-word_adapter!(map_size, map_size_result);
 word_adapter!(is_builtin, is_builtin_result);
 // Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1.
 primary_exception_adapter!(error, error_result, Error);
@@ -2346,7 +2298,7 @@ crate::word_bif_bodies_in!(word_bodies;
     float_to_binary, list_to_float, binary_to_float, integer_to_binary,
     is_atom, is_list, is_tuple, is_float, is_integer, is_integer_range, is_number,
     is_pid, is_port, is_reference, is_binary, is_bitstring, is_function, is_record,
-    is_boolean, is_map, is_map_key, map_get, map_size, is_builtin, error, exit,
+    is_boolean, is_map, is_builtin, error, exit,
     throw, raise, cmp_term, debug_copy_shared, debug_flat_size, debug_same,
     bin_is_7bit, math_cos, math_cosh, math_sin, math_sinh, math_tan, math_tanh,
     math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atanh, math_erf,

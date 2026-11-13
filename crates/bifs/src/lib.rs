@@ -53,7 +53,6 @@ pub use lists::{
     length_slice, lists_append, lists_key, lists_member, lists_reverse, reverse_onheap_direct,
 };
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk};
-pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
     B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk,
     IolistSizeWalk, IolistVecWalk, Phash2Cont, Phash2Run, allocate_iolist_binary,
