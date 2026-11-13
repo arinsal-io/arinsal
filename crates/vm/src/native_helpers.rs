@@ -1139,11 +1139,6 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
         return Some(crate::bif_table::bif!(direct_bif_light));
     }
     if export.light_trap_bif.is_some() {
-        if let Some(func) =
-            crate::bif_table::trap_entry(&export.module, &export.function, export.arity)
-        {
-            return Some(func);
-        }
         return Some(crate::bif_table::bif!(trap_bif_light));
     }
     let bif = export.bif.is_some()
@@ -1969,20 +1964,6 @@ fn call_trap_bif(
         charge_bif_reductions(process, 1);
     }
     let arity = usize::from(export.arity);
-    if entry.reserves_heap()
-        && let Ok(bits) = arinsal_bifs::bitstring_bit_len(process.x[0])
-        && bits.is_multiple_of(8)
-        && let Some(reserve) = (bits / 8).checked_mul(2).and_then(|n| n.checked_add(64))
-    {
-        // The decoder builds on the heap it reserved, with collection off until it is
-        // done; the arguments stay live across the reservation.
-        let ensured = process.ensure(reserve, arity);
-        // A collection moved the heap: publish every cursor, not just HTOP.
-        if ensured.is_err() {
-            crate::native_hooks::set_error(process, "system_limit");
-            return Some(0);
-        }
-    }
     let mut args = [Term::NIL; 4];
     args[..arity].copy_from_slice(&process.x[..arity]);
     let callee = (export.module_atom, export.function_atom);
@@ -2028,135 +2009,6 @@ fn arm_light_trap(process: &mut crate::Process) -> Option<u64> {
     crate::bif_traps::arm_export_trap(process);
     process.heap.abi.exc.freason = 1 << 10;
     None
-}
-
-/// The light entry of one trapping BIF, compiled for its body `T` when the export is
-/// created (`bif_table`). It has the signature of `trap_bif_light`.
-// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1: a BIF with its own
-// C function is called from the fragment directly; BIF_TRAP is taken only when the body yields.
-pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
-    header: *mut ProcessHeader,
-    _regs: *mut u64,
-    instruction: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let arity = if let Some(arity) = T::ARITY {
-        Some(arity)
-    } else {
-        let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-            return 0;
-        };
-        if export.light_trap_bif.is_none() {
-            return park_executor(process, export, identity, false);
-        }
-        Some(usize::from(export.arity))
-    };
-    let Some(arity) = arity else { return 0 };
-    trap_body_call::<T>(
-        process,
-        registers,
-        identity as usize,
-        instruction as usize,
-        descriptor,
-        arity,
-    )
-    .unwrap_or(0)
-}
-
-/// [`call_trap_bif`] for a body known at compile time: a finished run returns at once.
-#[inline(always)]
-fn trap_body_call<T: crate::bif_traps::TrapBody>(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
-    instruction: usize,
-    descriptor: u64,
-    arity: usize,
-) -> Option<u64> {
-    // A call that needs no trap state returns its value at once.
-    if registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
-        && let Some(value) = T::direct(process, &registers.x_reg_array[..arity])
-    {
-        return Some(crate::native_hooks::raw(value));
-    }
-    let gc_was_enabled = process.heap.gc_enabled;
-    let pid = process.self_pid;
-    // The body reads its arguments in place; a copy is taken only when a trap must keep them.
-    match T::run(
-        process,
-        &registers.x_reg_array[..arity],
-        instruction,
-        pid,
-        gc_was_enabled,
-    ) {
-        Ok(crate::bif_traps::HandlerResult::Done { value, reductions }) => {
-            process.set_gc_enabled(gc_was_enabled);
-            crate::bif_traps::charge_light(process, reductions);
-            if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
-                // The save-calls entry branches through the export and does not return to the
-                // shared light-BIF fragment, so run that fragment's single epilogue here.
-                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397 and :488-523,
-                // OTP-29.1.1.
-                Some(plain_bif_result(
-                    process,
-                    registers,
-                    crate::beamasm_integration::export_from_info(descriptor)?,
-                    arity,
-                    Ok(value),
-                ))
-            } else {
-                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1:
-                // the native shared fragment performs its inline GC check on this return.
-                Some(crate::native_hooks::raw(value))
-            }
-        }
-        other => trap_body_finish(
-            process,
-            registers,
-            identity,
-            descriptor,
-            arity,
-            gc_was_enabled,
-            other,
-        ),
-    }
-}
-
-/// The yield or error tail of [`trap_body_call`]: out of line, so the direct return stays small.
-#[cold]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn trap_body_finish(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
-    descriptor: u64,
-    arity: usize,
-    gc_was_enabled: bool,
-    other: Result<crate::bif_traps::HandlerResult, arinsal_bifs::BifError>,
-) -> Option<u64> {
-    let export = crate::beamasm_integration::export_from_info(descriptor)?;
-    let mut args = [Term::NIL; 3];
-    args[..arity].copy_from_slice(&process.x[..arity]);
-    let callee = (export.module_atom, export.function_atom);
-    match crate::bif_traps::finish_light(
-        process,
-        identity,
-        callee,
-        &args[..arity],
-        gc_was_enabled,
-        other,
-    ) {
-        crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
-            process, registers, export, arity, false, result,
-        )),
-        crate::bif_traps::LightTrap::Trapped => arm_light_trap(process),
-    }
 }
 
 /// Checks heap cursors and the pending trap arguments before a trap changes execution tiers.

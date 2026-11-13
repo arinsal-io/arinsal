@@ -12,15 +12,14 @@ use arinsal_term::{
     HeapAlloc, HeapBlockBuilder, HeapReservation, HeapReservationState, HeapReservationWords,
     HeapTermSlot, HxNode, Identity, Node, OwnedBinaryRef, ProcessHeap, RefcBinary, Term,
     TermBuilder, TermKind, atoms, binary_owner, cmp_exact, flat_key_cmp, global_atoms,
-    hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array, hashmap_key_hash, writable_finalize,
-    writable_resize_private,
+    hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array, hashmap_key_hash,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 
-use crate::pure::{Heap, integer, make_list, tuple_build};
+use crate::pure::{Heap, integer, tuple_build};
 use crate::{BifError, Ctx};
 
 static LOCAL_NODE_HASH: OnceLock<u32> = OnceLock::new();
@@ -146,22 +145,6 @@ fn block_hash_mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
 // Port of erts/emulator/beam/external.c:4046-4105, OTP-29.1.1.
 fn local_term_hash(bytes: &[u8]) -> u32 {
     block_hash(bytes, local_node_hash())
-}
-
-pub(super) fn lookup<V: crate::BifTableVisitor>(
-    module: &str,
-    name: &str,
-    arity: u8,
-    v: &mut V,
-) -> Option<V::Output> {
-    let f = match (module, name, arity) {
-        ("erlang", "term_to_binary", 1 | 2) => v.entry::<word_bodies::term_to_binary>(),
-        ("erlang", "term_to_iovec", 1 | 2) => v.entry::<word_bodies::term_to_iovec>(),
-        ("erlang", "external_size", 1 | 2) => v.entry::<word_bodies::external_size>(),
-        ("erlang", "binary_to_term", 1 | 2) => v.entry::<word_bodies::binary_to_term>(),
-        _ => return None,
-    };
-    arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1291,8 +1274,6 @@ fn size_walk(
     }
 }
 
-type EncodedWithSplits = (Vec<u8>, Vec<(usize, usize)>);
-
 /// Build the heap term of a refc binary that holds a finished encoding of `size` bytes.
 pub fn install_refc_binary<H: HeapAlloc>(
     heap: &mut H,
@@ -2216,15 +2197,6 @@ pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, BifError> {
     walk.finish_binary()
 }
 
-fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithSplits, BifError> {
-    let mut walk = EncodeWalk::start(term, opts);
-    walk.record_splits = true;
-    walk.step(usize::MAX)?;
-    walk.patch_local_hash();
-    let EncodeCold { out, splits, .. } = *walk.cold.take().unwrap_or_default();
-    Ok((out, splits))
-}
-
 // Port of erts/emulator/beam/external.c:3244 (enc_term, local pid/port/ref identity), OTP-29.1.1.
 fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u32)>) -> Identity {
     let Some((local_node, local_creation)) = local_node else {
@@ -2282,15 +2254,6 @@ fn local_creation(creation: u32, opts: EncodeOpts) -> u32 {
     if opts.local { 0 } else { creation }
 }
 
-fn encode_plain(term: Term, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
-    encode_plain_with_splits(term, opts).map(|(bytes, _)| bytes)
-}
-
-fn encode(term: Term, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
-    let plain = encode_plain(term, opts)?;
-    encode_bytes(plain, opts)
-}
-
 fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
     if let Some(level) = opts.compressed.filter(|n| *n > 0) {
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), Compression::new(level as u32));
@@ -2306,130 +2269,6 @@ fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
         }
     }
     Ok(plain)
-}
-
-fn result_binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .binary(bytes)
-        .map_err(|_| BifError::SystemLimit)
-}
-
-fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match term_to_binary_result(ctx, args) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-
-fn term_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let opts = options(args.get(1).copied())?;
-    let mut encoder = EncodeWalk::start(args[0], opts);
-    encoder.step_size(usize::MAX)?;
-    let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
-    if encoder.finishes_simple() {
-        let binary = encoder.encode_simple_binary(&mut ctx.heap)?;
-        // Port of erts/emulator/beam/external.c (TTBSize simple path), OTP-29.1.1:
-        // erts_term_to_binary_simple charges exactly one reduction, independent of size.
-        ctx.charge_reductions(1);
-        return Ok(binary);
-    }
-    if !encoder.uses_compression() {
-        match encoder.encode_into_refc(&mut ctx.heap, usize::MAX)? {
-            (RefcEncoded::Done(binary), _) => {
-                ctx.charge_reductions(size);
-                return Ok(binary);
-            }
-            (RefcEncoded::Partial(_), _) => return Err(BifError::SystemLimit),
-        }
-    }
-    let mut heap = Heap(&mut ctx.heap);
-    let binary = crate::allocate_iolist_binary(&mut heap, size)?;
-    crate::with_iolist_binary_output(binary, |destination| {
-        match encoder.step_into(destination, usize::MAX)? {
-            (true, _) => Ok(()),
-            (false, _) => Err(BifError::SystemLimit),
-        }
-    })?;
-    writable_finalize(binary);
-    if encoder.uses_compression() {
-        let compressed = crate::allocate_iolist_binary(&mut heap, size)?;
-        let progress = crate::with_binary_bytes(binary, |view| {
-            crate::with_iolist_binary_output(compressed, |destination| {
-                destination[..6].copy_from_slice(&[131, 80, 0, 0, 0, 0]);
-                destination[2..6].copy_from_slice(&((size - 1) as u32).to_be_bytes());
-                encoder.compress_into(&view.bytes()[1..], &mut destination[6..], usize::MAX)
-            })
-        })??;
-        if progress.0 && encoder.compression_is_useful() {
-            let final_size = 6usize
-                .checked_add(
-                    encoder
-                        .compressed_payload_len()
-                        .ok_or(BifError::SystemLimit)?,
-                )
-                .ok_or(BifError::SystemLimit)?;
-            writable_resize_private(
-                compressed,
-                final_size.checked_mul(8).ok_or(BifError::SystemLimit)?,
-            )
-            .map_err(|_| BifError::SystemLimit)?;
-            writable_finalize(compressed);
-            ctx.charge_reductions(final_size);
-            return Ok(compressed);
-        }
-        crate::finish_iolist_binary_output(compressed);
-        ctx.charge_reductions(size);
-        return Ok(binary);
-    }
-    ctx.charge_reductions(size);
-    Ok(binary)
-}
-
-fn external_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match external_size_result(ctx, args) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-
-fn external_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut encoder = EncodeWalk::new_external_size(args)?;
-    encoder.step_size(usize::MAX)?;
-    let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
-    // Port of erts/emulator/beam/external.c (external_size_1), OTP-29.1.1: the size
-    // is computed in one go without charging reductions.
-    integer(ctx, size)
-}
-
-fn term_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match term_to_iovec_result(ctx, args) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-
-fn term_to_iovec_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let opts = options(args.get(1).copied())?;
-    if opts.compressed.is_some_and(|level| level > 0) {
-        let bytes = encode(args[0], opts)?;
-        ctx.charge_reductions(bytes.len());
-        return result_binary(ctx, &bytes);
-    }
-    let (bytes, splits) = encode_plain_with_splits(args[0], opts)?;
-    ctx.charge_reductions(bytes.len());
-    let mut at = 0;
-    let mut parts = Vec::new();
-    for (start, end) in splits {
-        if start > at {
-            parts.push(result_binary(ctx, &bytes[at..start])?);
-        }
-        parts.push(result_binary(ctx, &bytes[start..end])?);
-        at = end;
-    }
-    if at < bytes.len() {
-        parts.push(result_binary(ctx, &bytes[at..])?);
-    }
-    Ok(make_list(ctx, parts, Term::NIL))
 }
 
 #[derive(Default)]
@@ -5350,22 +5189,6 @@ fn compressed_uncompressed_size(input: &[u8]) -> Result<usize, BifError> {
     }
 }
 
-fn binary_to_term(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    match binary_to_term_result(ctx, args) {
-        Ok(value) => value,
-        Err(error) => ctx.fail(error),
-    }
-}
-
-fn binary_to_term_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut decoder = DecodeWalk::new(args)?;
-    ctx.charge_reductions(decoder.input_size());
-    let (term, _) = decoder
-        .step_into(usize::MAX, ctx)
-        .map_err(|(error, _)| decode_error(error))?;
-    term.ok_or(BifError::BADARG)
-}
-
 fn decode_error(error: BifError) -> BifError {
     match error {
         BifError::Unsupported(_) => BifError::BADARG,
@@ -5417,5 +5240,3 @@ mod map_sort_tests {
         assert_eq!(keys, (0..33).collect::<Vec<_>>());
     }
 }
-
-crate::word_bif_bodies_in!(word_bodies; term_to_binary, term_to_iovec, external_size, binary_to_term);

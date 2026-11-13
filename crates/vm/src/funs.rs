@@ -808,9 +808,6 @@ impl Vm {
                     p.x[0] = p.gc_after_bif(value)?;
                     Ok(Self::return_value(p))
                 }
-                crate::bif_traps::HandlerResult::Failed { .. } => {
-                    unreachable!("failed trapping BIFs become VM exceptions")
-                }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
                 crate::bif_traps::HandlerResult::Export(_) => {
                     unreachable!("execute_named converts export traps to VM transfers")
