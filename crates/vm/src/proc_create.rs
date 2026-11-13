@@ -1165,6 +1165,8 @@ pub enum AliasMode {
     ReplyDemonitor,
 }
 
+/// The reference flags of a new monitor or alias: `alias_priority` is `ERTS_ML_FLG_PRIO_ALIAS`
+/// (`alias([priority])` only); a priority monitor adds `with_prio_ml` itself.
 pub(crate) fn monitor_reference(
     id: u64,
     alias_mode: Option<AliasMode>,
@@ -1455,9 +1457,6 @@ pub(crate) struct ProcessCold {
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
     pub(crate) dist_monitors: std::collections::BTreeSet<u64>,
-    /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
-    /// every monitor kind, since the origin decides priority when it receives the DOWN.
-    pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
     /// Target halves of NIF resource monitors (erts `ERTS_MON_TYPE_RESOURCE` in `ERTS_P_LT_MONITORS`).
     pub(crate) resource_monitors:
         std::collections::BTreeMap<u64, std::sync::Arc<arinsal_nif::ResourceMonitor>>,

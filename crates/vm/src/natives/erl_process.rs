@@ -594,7 +594,10 @@ fn create_child(
             // the child has a pid and remains locked while both monitor halves are installed.
             let (origin, target) = crate::proc_create::create_monitor_with_reference_at(
                 parent.heap.alloc_ix(),
-                crate::proc_create::monitor_reference(id, monitor.alias, monitor.priority),
+                crate::natives::bif::prio_ml(
+                    crate::proc_create::monitor_reference(id, monitor.alias, false),
+                    monitor.priority,
+                ),
                 parent_pid.data(),
                 child_pid.data(),
                 crate::proc_create::MonitorInfo::new(monitor.tag.clone(), None),
@@ -602,8 +605,9 @@ fn create_child(
             );
             parent.monitors.insert(origin);
             child.lt_monitors.insert(target);
+            // erl_process.c:12942 (erl_create_process): ERTS_ML_FLG_PRIO_ML.
             if monitor.priority {
-                parent.cold_mut().prio_monitors.insert(id);
+                parent.prio_item_added(crate::receive::PrioItemType::Monitor);
             }
         }
         Ok(())
@@ -665,6 +669,10 @@ fn create_child(
             spawned.pid(),
             so.link_priority,
         ));
+        // erl_process.c:12922 (erl_create_process): ERTS_ML_FLG_PRIO_ML.
+        if so.link_priority {
+            parent.prio_item_added(crate::receive::PrioItemType::Link);
+        }
     }
     Ok(UnscheduledChild { spawned, seq_spawn })
 }

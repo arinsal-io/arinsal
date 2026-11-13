@@ -5008,7 +5008,7 @@ pub(crate) fn link(
     linked: bool,
 ) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let runtime: &'static crate::process::Runtime = process.runtime.ok_or_else(badarg)?;
     let Some(handle) = runtime.ports.get(id) else {
         return Ok(!linked);
     };
@@ -5027,8 +5027,15 @@ pub(crate) fn link(
             _ => return Ok(true),
         }
         let unlink_id = next_port_unlink_id(&mut process.uniq_counter);
+        let mut prio = false;
         if let Some(mut link) = process.links.get_mut(key) {
+            // bif.c unlink_1 (is_internal_port): unlink_clear_prio, then `ilnk->unlinking`.
+            prio = link.view().is_priority();
+            link.set_priority(false);
             link.set_unlinking(unlink_id);
+        }
+        if prio {
+            process.prio_item_deleted(crate::receive::PrioItemType::Link);
         }
         if let Some(drv) = handle.drv_port() {
             if !drv_sig::link(runtime, &handle, &drv, pid, false, unlink_id) {

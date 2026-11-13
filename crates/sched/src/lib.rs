@@ -629,8 +629,10 @@ impl Eq for SharedPayload {}
 /// Control signals delivered in the same stream as messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Signal<M: SignalMessage> {
-    /// Link half queued as the signal itself, as `erts_proc_sig_send_link` does.
-    Link { priority: bool },
+    /// Link half queued as the signal itself, as `erts_proc_sig_send_link` does. The half
+    /// the receiver keeps carries no option flags: `link/2` options (`priority`) apply to the
+    /// linker's own half only (bif.c link_opt: `rlnk = erts_link_internal_create(.., c_p)`).
+    Link,
     /// Apply trace flags ahead of the link signal that carries the same ordered update.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (sig_enqueue_trace,
     // ERTS_SIG_Q_OP_TRACE_CHANGE_STATE), OTP-29.1.1.
@@ -6508,7 +6510,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
             // OTP-29.1.1.
             let link = matches!(signal.lazy_meta(), Some(meta) if meta & LAZY_LINK != 0)
-                || (!lazy && matches!(&signal.payload, Payload::Signal(Signal::Link { .. })));
+                || (!lazy && matches!(&signal.payload, Payload::Signal(Signal::Link)));
             if waiting || monitor || link || deferred.is_some() || force_enqueue {
                 if let Some(first) = deferred {
                     // The held monitor and this signal enter the queue together.
@@ -8144,7 +8146,7 @@ mod spawn_request_tests {
 
         fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: &mut (), _: u32) -> RunOutcome {
             while let Some(event) = ctx.receive() {
-                if matches!(event.payload, Payload::Signal(Signal::Link { .. })) {
+                if matches!(event.payload, Payload::Signal(Signal::Link)) {
                     self.0.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -8164,7 +8166,7 @@ mod spawn_request_tests {
             .spawn_unscheduled(LinkSignalProbe(Arc::clone(&observed)))
             .unwrap();
         scheduler
-            .signal(Pid::new(7, 0), child, Signal::Link { priority: false })
+            .signal(Pid::new(7, 0), child, Signal::Link)
             .unwrap();
 
         thread::sleep(Duration::from_millis(50));

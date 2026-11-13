@@ -226,9 +226,6 @@ fn monitor_process(
     } else {
         crate::signals::monitor_info_for(tag, name)?
     };
-    if priority {
-        process.cold_mut().prio_monitors.insert(id);
-    }
     let scheduler = runtime.scheduler()?;
     // erts_proc_sig_send_monitor: no lookup here. On a normal scheduler the monitor is held as
     // `esdp->pending_signal`; a target gone when it is published gets the `noproc` DOWN
@@ -236,7 +233,10 @@ fn monitor_process(
     if let Some(pid) = pid {
         let (origin, target_half) = crate::proc_create::create_monitor_with_reference_at(
             process.heap.alloc_ix(),
-            crate::proc_create::monitor_reference(id, alias_mode, priority),
+            prio_ml(
+                crate::proc_create::monitor_reference(id, alias_mode, false),
+                priority,
+            ),
             me.data(),
             pid.data(),
             info,
@@ -268,12 +268,31 @@ fn monitor_process(
                 target,
                 tag,
                 alias_mode,
+                priority,
             )?;
+        } else if priority {
+            // bif.c monitor `done:` (add_oflags & ERTS_ML_FLG_PRIO_ML).
+            process.prio_item_added(crate::receive::PrioItemType::Monitor);
         }
     } else {
-        crate::signals::send_noproc_down(process, me, id, name, pid, target, tag, alias_mode)?;
+        crate::signals::send_noproc_down(
+            process, me, id, name, pid, target, tag, alias_mode, priority,
+        )?;
     }
     Ok(ref_term)
+}
+
+/// The monitor reference with `ERTS_ML_FLG_PRIO_ML` when the `priority` option was given
+/// (bif.c erts_monitor_opts).
+pub(crate) fn prio_ml(
+    reference: crate::monitor_link::MonitorReference,
+    priority: bool,
+) -> crate::monitor_link::MonitorReference {
+    if priority {
+        reference.with_prio_ml()
+    } else {
+        reference
+    }
 }
 
 /// The `remote_process` arm called from native code: `erts_dsig_prepare` needs the
@@ -996,7 +1015,7 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         // erts_link_internal_tree_lookup_create; a link that exists and is not unlinking sends
         // nothing.
         if !link_node_create(
-            &mut process.links,
+            process,
             pid.data(),
             || crate::proc_create::process_link(pid, priority),
             priority,
@@ -1006,12 +1025,8 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         if crate::trace::active() {
             send_link_trace_changes(process, me, pid);
         }
-        let sent = scheduler.signal_ordered_from(
-            me,
-            pid,
-            arinsal_sched::Signal::Link { priority },
-            process.on_managed,
-        );
+        let sent =
+            scheduler.signal_ordered_from(me, pid, arinsal_sched::Signal::Link, process.on_managed);
         match sent {
             Ok(()) => {}
             // erts_proc_sig_send_link_exit(NULL, other, rlnk, am_noproc, NIL): the target is
@@ -1044,12 +1059,7 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         // and is not unlinking sends nothing; an unlink in progress is cancelled
         // (`ilnk->unlinking = 0`), so its late acknowledgement leaves the link.
         let key = crate::proc_create::port_link_key(id);
-        let send = link_node_create(
-            &mut process.links,
-            key,
-            || crate::proc_create::port_link(id),
-            priority,
-        );
+        let send = link_node_create(process, key, || crate::proc_create::port_link(id), priority);
         if !send {
             return ok;
         }
@@ -1100,25 +1110,35 @@ fn link_no_proc(process: &mut Process) -> Result<Term, VmError> {
 
 /// `erts_link_internal_tree_lookup_create` with `link_modify_flags` and the `unlinking` reset
 /// of `link_opt`: whether a link signal must be sent. `create` builds the half for a new link.
-// Port of erts/emulator/beam/bif.c (link_opt: is_internal_pid, is_internal_port), OTP-29.1.1.
+/// A link that gains or loses `ERTS_ML_FLG_PRIO_ML` adds or deletes a priority item (`done:`).
+// Port of erts/emulator/beam/bif.c (link_opt: is_internal_pid, is_internal_port, done;
+// link_modify_flags), OTP-29.1.1.
 fn link_node_create(
-    links: &mut crate::proc_create::LinkTree,
+    process: &mut Process,
     key: u64,
     create: impl FnOnce() -> crate::monitor_link::Link,
     priority: bool,
 ) -> bool {
-    if links.get(key).is_none() {
+    let links = &mut process.links;
+    let (before, send) = if links.get(key).is_none() {
         links.insert(create());
-        if let Some(mut node) = links.get_mut(key) {
-            node.set_priority(priority);
-        }
-        return true;
+        (false, true)
+    } else {
+        let mut node = links.get_mut(key).expect("link checked");
+        let before = node.view().is_priority();
+        let unlinking = node.view().unlinking();
+        node.set_unlinking(0);
+        (before, unlinking != 0)
+    };
+    if let Some(mut node) = links.get_mut(key) {
+        node.set_priority(priority);
     }
-    let mut node = links.get_mut(key).expect("link checked");
-    node.set_priority(priority);
-    let unlinking = node.view().unlinking();
-    node.set_unlinking(0);
-    unlinking != 0
+    match (before, priority) {
+        (false, true) => process.prio_item_added(crate::receive::PrioItemType::Link),
+        (true, false) => process.prio_item_deleted(crate::receive::PrioItemType::Link),
+        _ => {}
+    }
+    send
 }
 
 /// `trace_proc(c_p, ..., am_link | am_unlink, other)` when the caller traces `procs`.
@@ -1214,6 +1234,10 @@ fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
             .is_ok();
         // unlink_clear_prio, then `ilnk->unlinking = id`, or the link deleted when the target
         // is gone (erts_proc_sig_send_unlink returned 0).
+        let prio = process
+            .links
+            .get(pid.data())
+            .is_some_and(|node| node.is_priority());
         if sent {
             if let Some(mut node) = process.links.get_mut(pid.data()) {
                 node.set_unlinking(id);
@@ -1221,6 +1245,9 @@ fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
             }
         } else {
             process.links.remove(pid.data());
+        }
+        if prio {
+            process.prio_item_deleted(crate::receive::PrioItemType::Link);
         }
         if crate::trace::active() {
             wake_for_procs_trace(process, pid);
@@ -1231,8 +1258,11 @@ fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
         // The port traces `unlink` itself; a port that is gone has its link deleted.
         if crate::port::is_live(process, id) {
             crate::port::link(process, other, me, false)?;
-        } else {
-            process.links.remove(crate::proc_create::port_link_key(id));
+        } else if let Some(link) = process.links.remove(crate::proc_create::port_link_key(id))
+            && link.view().is_priority()
+        {
+            // bif.c unlink_1: unlink_clear_prio before the link is deleted.
+            process.prio_item_deleted(crate::receive::PrioItemType::Link);
         }
         return ok;
     }
@@ -1600,6 +1630,9 @@ fn alias(process: &mut Process, opts: Term) -> Result<Term, VmError> {
             0,
             OriginMonitor::Alias,
         ));
+    if priority {
+        process.prio_item_added(crate::receive::PrioItemType::Alias);
+    }
     Ok(reference)
 }
 

@@ -1411,6 +1411,12 @@ impl MonitorReference {
         self.flags |= node_flag::PRIO_ALIAS;
         self
     }
+
+    /// `ERTS_ML_FLG_PRIO_ML` (erts_monitor_opts `priority`): the DOWN is a priority message.
+    pub(crate) fn with_prio_ml(mut self) -> Self {
+        self.flags |= node_flag::PRIO_ML;
+        self
+    }
 }
 
 // SAFETY: a half is moved between processes only as a whole; the data it shares with the other
@@ -1622,6 +1628,11 @@ impl<'a, I, O, S> MonitorRef<'a, I, O, S> {
 
     pub(crate) fn alias_priority(self) -> bool {
         node_flags(self.node) & node_flag::PRIO_ALIAS != 0
+    }
+
+    /// `ERTS_ML_FLG_PRIO_ML`: a priority monitor, its DOWN is a priority message.
+    pub(crate) fn prio_ml(self) -> bool {
+        node_flags(self.node) & node_flag::PRIO_ML != 0
     }
 
     pub(crate) fn info(self) -> &'a I {

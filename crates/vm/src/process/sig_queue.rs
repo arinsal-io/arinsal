@@ -269,10 +269,10 @@ impl Process {
                 cnt += cost + 1;
                 continue;
             }
-            if let Payload::Signal(Signal::Link { priority }) = payload {
+            if let Payload::Signal(Signal::Link) = payload {
                 if let Err(duplicate) = self
                     .links
-                    .lookup_insert(crate::proc_create::process_link(*from, *priority))
+                    .lookup_insert(crate::proc_create::process_link(*from, false))
                 {
                     drop(duplicate);
                 } else {
@@ -321,12 +321,12 @@ impl Process {
                 crate::trace::apply_linked_trace_change(self, ctx.pid(), change);
                 0
             }
-            arinsal_sched::Signal::Link { priority } => {
+            arinsal_sched::Signal::Link => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
                 // the receiver reports getting_linked in signal order, for a new link only.
                 if let Err(duplicate) = self
                     .links
-                    .lookup_insert(crate::proc_create::process_link(from, priority))
+                    .lookup_insert(crate::proc_create::process_link(from, false))
                 {
                     drop(duplicate);
                 } else {
@@ -425,65 +425,82 @@ impl Process {
                     arinsal_sched::Signal::Exit(message) => (false, message),
                     _ => unreachable!(),
                 };
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:4632-4815
+                // (handle_exit_signal), OTP-29.1.1: an exit through an alias is a priority
+                // message only through a priority alias; a linked exit removes the link, and a
+                // priority link makes the `'EXIT'` a priority message. The priority item of a
+                // deactivated alias or removed link is deleted once the message is inserted.
+                let mut prio_alias_deactivated = false;
+                let mut prio_link_removed = false;
+                let mut priority = false;
+                let mut was_linked = false;
                 if message.alias != 0 {
-                    let Some(alias_priority) = self.alias_message_accepted(ctx, message.alias)?
+                    let Some((alias_priority, deactivated)) =
+                        self.alias_message_accepted(ctx, message.alias)?
                     else {
                         return Ok(1);
                     };
-                    if !alias_priority {
-                        message.priority = false;
+                    prio_alias_deactivated = deactivated;
+                    priority = alias_priority && message.is_priority();
+                } else if linked_exit && let Some(link) = self.links.remove(from.data()) {
+                    was_linked = true;
+                    if link.view().is_priority() {
+                        prio_link_removed = true;
+                        priority = true;
                     }
                 }
-                // Port of erts/emulator/beam/erl_proc_sig_queue.c:4685-4795
-                // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
-                // process that survives it traces getting_unlinked.
-                let priority = message.is_priority()
-                    || self
-                        .links
-                        .get(from.data())
-                        .is_some_and(|node| node.is_priority());
-                let was_linked = linked_exit && self.links.remove(from.data()).is_some();
-                let seq_token = message.take_seq_token();
-                let reason = message.into_receiver(self)?;
-                if reason == Term::atom(arinsal_term::atoms::KILL) && !linked_exit {
-                    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
-                    // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
-                    return Err(VmError::Trap(crate::exceptions::Trap::killed()));
-                }
-                if self.trap_exit {
-                    // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
-                    // A scheduler proxy stands in for a remote PID internally, but
-                    // EXIT messages expose the peer's original PID to Erlang code.
-                    let sender = from;
-                    let from = crate::dist::remote_pid_term(self, from)?
-                        .or_else(|| from.to_term())
-                        .ok_or_else(|| VmError::Unsupported("invalid signal sender pid".into()))?;
-                    let tuple =
-                        self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), from, reason])?;
-                    if priority {
-                        self.push_priority_message(tuple)?;
-                    } else if let Some(token) = seq_token {
-                        self.inbox.push_back_token(tuple, token);
-                    } else {
-                        // A process exit without a token converts to a message with NIL.
-                        self.inbox.push_back_nil(tuple);
+                let result: Result<i32, VmError> = 'exit: {
+                    let seq_token = message.take_seq_token();
+                    let reason = message.into_receiver(self)?;
+                    if reason == Term::atom(arinsal_term::atoms::KILL) && !linked_exit {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
+                        // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
+                        break 'exit Err(VmError::Trap(crate::exceptions::Trap::killed()));
                     }
-                    self.trace_converted_signal(ctx, tuple, sender);
+                    if self.trap_exit {
+                        // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
+                        // A scheduler proxy stands in for a remote PID internally, but
+                        // EXIT messages expose the peer's original PID to Erlang code.
+                        let sender = from;
+                        let from = crate::dist::remote_pid_term(self, from)?
+                            .or_else(|| from.to_term())
+                            .ok_or_else(|| {
+                                VmError::Unsupported("invalid signal sender pid".into())
+                            })?;
+                        let tuple =
+                            self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), from, reason])?;
+                        if priority {
+                            self.push_priority_message(tuple)?;
+                        } else if let Some(token) = seq_token {
+                            self.inbox.push_back_token(tuple, token);
+                        } else {
+                            // A process exit without a token converts to a message with NIL.
+                            self.inbox.push_back_nil(tuple);
+                        }
+                        self.trace_converted_signal(ctx, tuple, sender);
+                        if was_linked {
+                            self.trace_getting_unlinked(ctx, sender);
+                        }
+                        // handle_exit_signal (erl_proc_sig_queue.c:4633-4800): converted, `cnt = 1`.
+                        break 'exit Ok(1);
+                    }
+                    if reason != Term::atom(arinsal_term::atoms::NORMAL) {
+                        self.heap.abi.exc.fvalue = reason.tagged_word();
+                        break 'exit Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                    }
                     if was_linked {
-                        self.trace_getting_unlinked(ctx, sender);
+                        self.trace_getting_unlinked(ctx, from);
                     }
-                    // handle_exit_signal (erl_proc_sig_queue.c:4633-4800): converted, `cnt = 1`.
-                    return Ok(1);
+                    // Ignored: `cnt = 1` plus one for destroying the signal.
+                    Ok(2)
+                };
+                if prio_alias_deactivated {
+                    self.prio_item_deleted(crate::receive::PrioItemType::Alias);
                 }
-                if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                    self.heap.abi.exc.fvalue = reason.tagged_word();
-                    return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                if prio_link_removed {
+                    self.prio_item_deleted(crate::receive::PrioItemType::Link);
                 }
-                if was_linked {
-                    self.trace_getting_unlinked(ctx, from);
-                }
-                // Ignored: `cnt = 1` plus one for destroying the signal.
-                2
+                result?
             }
             // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
             arinsal_sched::Signal::PortExit(exit) => {
@@ -495,6 +512,7 @@ impl Process {
                 // that arrives after unlink was requested, is ignored; the link is removed and a
                 // priority link (ERTS_ML_FLG_PRIO_ML) makes the `'EXIT'` a priority message.
                 let mut prio = false;
+                let mut prio_link_removed = false;
                 if let Some(id) = port.as_port() {
                     let key = crate::proc_create::port_link_key(id);
                     let Some((unlinking, link_prio)) = self
@@ -505,28 +523,42 @@ impl Process {
                         return Ok(2);
                     };
                     self.links.remove(key);
+                    if link_prio {
+                        // A priority link is never unlinking: unlink clears the flag first.
+                        prio_link_removed = true;
+                    }
                     if unlinking {
+                        if prio_link_removed {
+                            self.prio_item_deleted(crate::receive::PrioItemType::Link);
+                        }
                         return Ok(2);
                     }
                     prio = link_prio;
                 }
                 // A link exit is never untrappable: `kill` only kills as an `exit/2` signal
                 // (handle_exit_signal: `!linked && reason == am_kill`).
-                if self.trap_exit {
-                    let tuple =
-                        self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), port, reason])?;
-                    if prio {
-                        self.push_priority_message(tuple)?;
-                    } else {
-                        self.inbox.push_back(tuple);
+                let result: Result<i32, VmError> = 'exit: {
+                    if self.trap_exit {
+                        let tuple =
+                            self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), port, reason])?;
+                        if prio {
+                            self.push_priority_message(tuple)?;
+                        } else {
+                            self.inbox.push_back(tuple);
+                        }
+                        break 'exit Ok(1);
                     }
-                    return Ok(1);
+                    if reason != Term::atom(arinsal_term::atoms::NORMAL) {
+                        self.heap.abi.exc.fvalue = reason.tagged_word();
+                        break 'exit Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                    }
+                    Ok(2)
+                };
+                // handle_exit_signal: deleted after the message is inserted.
+                if prio_link_removed {
+                    self.prio_item_deleted(crate::receive::PrioItemType::Link);
                 }
-                if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                    self.heap.abi.exc.fvalue = reason.tagged_word();
-                    return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
-                }
-                2
+                result?
             }
             arinsal_sched::Signal::MonitorNoproc(reference) => {
                 let queued = self.inbox.len();
@@ -645,6 +677,10 @@ impl Process {
                     .get_external(&op.remote)
                     .is_some_and(|link| link.unlinking() == 0);
                 if active && let Some(link) = self.links.remove_external(&op.remote) {
+                    // erl_proc_sig_queue.c:6680-6684: a priority link is a priority item.
+                    if link.view().is_priority() {
+                        self.prio_item_deleted(crate::receive::PrioItemType::Link);
+                    }
                     let deleted = link.dist_delete_other();
                     link.release_external(deleted);
                     cnt += 8;
@@ -821,7 +857,16 @@ impl Process {
         // when no unlink is pending, then send the operation's acknowledgement.
         let removed = match self.links.get(from.data()) {
             Some(node) if node.unlinking() != 0 => false,
-            Some(_) => self.links.remove(from.data()).is_some(),
+            Some(_) => match self.links.remove(from.data()) {
+                Some(link) => {
+                    // erl_proc_sig_queue.c:6700-6707: a priority link is a priority item.
+                    if link.view().is_priority() {
+                        self.prio_item_deleted(crate::receive::PrioItemType::Link);
+                    }
+                    true
+                }
+                None => false,
+            },
             None => false,
         };
         if removed {
@@ -873,6 +918,7 @@ impl Process {
         } = exit;
         let mut prio = false;
         let mut was_linked = false;
+        let mut prio_link_removed = false;
         if linked {
             let state = self.links.get_external(&from).map(|link| {
                 let lost_elsewhere = connection_lost.is_some_and(|id| {
@@ -890,15 +936,42 @@ impl Process {
                 return Ok(2);
             }
             if let Some(link) = self.links.remove_external(&from) {
+                prio_link_removed = link.view().is_priority();
                 let deleted = link.dist_delete_other();
                 link.release_external(deleted);
             }
             if unlinking {
+                if prio_link_removed {
+                    self.prio_item_deleted(crate::receive::PrioItemType::Link);
+                }
                 return Ok(2);
             }
             was_linked = true;
             prio = link_prio;
         }
+        let result =
+            self.convert_dist_exit_signal(ctx, sender, from, linked, was_linked, prio, reason);
+        // handle_exit_signal: deleted after the message is inserted, so the prio queue is
+        // still installed for it.
+        if prio_link_removed {
+            self.prio_item_deleted(crate::receive::PrioItemType::Link);
+        }
+        result
+    }
+
+    /// The `'EXIT'` message or the exit of a remote exit signal whose link (if any) is gone.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_exit_signal), OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_dist_exit_signal(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        sender: Pid,
+        from: crate::monitor_link::ExternalPid,
+        linked: bool,
+        was_linked: bool,
+        prio: bool,
+        reason: Message,
+    ) -> Result<i32, VmError> {
         let mut message = reason;
         let seq_token = message.take_seq_token();
         let reason = message.into_receiver(self)?;

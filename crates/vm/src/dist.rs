@@ -2920,9 +2920,6 @@ pub(crate) fn monitor_remote(
     } else {
         crate::signals::reference(process, id)?
     };
-    if priority {
-        process.cold_mut().prio_monitors.insert(id);
-    }
     // DOP_MONITOR_P ToProc is a pid or registered name atom (not {Name,Node}).
     let wire_target = match &target {
         OwnedTerm::Tuple(parts) if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) => {
@@ -2958,7 +2955,10 @@ pub(crate) fn monitor_remote(
     let origin = emon::create_origin_or_down(
         runtime,
         process.heap.alloc_ix(),
-        crate::proc_create::monitor_reference(id, alias_mode, priority),
+        crate::natives::bif::prio_ml(
+            crate::proc_create::monitor_reference(id, alias_mode, false),
+            priority,
+        ),
         ctx.pid(),
         info,
         crate::proc_create::DistTarget {
@@ -2969,6 +2969,10 @@ pub(crate) fn monitor_remote(
     )?;
     process.monitors.insert(origin);
     process.cold_mut().dist_monitors.insert(id);
+    // bif.c monitor `done:` (add_oflags & ERTS_ML_FLG_PRIO_ML).
+    if priority {
+        process.prio_item_added(crate::receive::PrioItemType::Monitor);
+    }
     if let DsigPrepare::Connected { connection_id, .. } = prepared {
         queue_outgoing_on(
             process,

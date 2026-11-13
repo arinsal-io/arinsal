@@ -127,28 +127,36 @@ impl Process {
     }
 
     /// A message sent through an alias is handled only while the alias is active, and a
-    /// `reply` alias is deactivated by the first one.
+    /// `reply` alias is deactivated by the first one. `None` drops the message; otherwise
+    /// whether the alias is a priority alias, and whether this message deactivated it (its
+    /// priority item is deleted once the message is in the queue).
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message, ERTS_ALIAS_ONCE),
     // OTP-29.1.1.
     pub(super) fn alias_message_accepted(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
         alias: u64,
-    ) -> Result<Option<bool>, VmError> {
+    ) -> Result<Option<(bool, bool)>, VmError> {
         if alias == 0 {
-            return Ok(Some(false));
+            return Ok(Some((false, false)));
         }
         if self.monitors.get_state(alias).is_none() {
             return Ok(None);
         }
         let monitor = self.monitors.get(alias).expect("monitor state has a node");
         let priority = monitor.alias_priority();
+        let mut prio_alias_deactivated = false;
         if monitor.alias_mode() == Some(crate::proc_create::AliasMode::ReplyDemonitor) {
+            let prio_ml = monitor.prio_ml();
             let entry = self.monitors.remove(alias);
+            prio_alias_deactivated = priority;
+            // erl_proc_sig_queue.c:6058-6062: a priority monitor is deleted at once.
+            if prio_ml {
+                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+            }
             let state = entry.as_ref().and_then(|entry| entry.state()).cloned();
             match state {
                 Some(crate::proc_create::OriginMonitor::Process(_)) => {
-                    self.cold_mut().prio_monitors.remove(&alias);
                     let origin = entry.expect("origin half of the entry");
                     let target = Pid::from_data(origin.view().other());
                     let shared = origin.into_shared();
@@ -168,7 +176,6 @@ impl Process {
                     // ERTS_MON_TYPE_DIST_PROC): demonitor of the remote process.
                     if let Some(cold) = self.cold.as_mut() {
                         cold.dist_monitors.remove(&alias);
-                        cold.prio_monitors.remove(&alias);
                     }
                     let origin = entry.expect("origin half of the entry");
                     crate::dist::demonitor_remote(self.runtime, ctx.pid(), origin);
@@ -181,7 +188,7 @@ impl Process {
                 | None => {}
             }
         }
-        Ok(Some(priority))
+        Ok(Some((priority, prio_alias_deactivated)))
     }
 
     /// Move a message signal into the message queue.
@@ -195,10 +202,14 @@ impl Process {
             let (alias, receive_traced, mut priority) =
                 (message.alias, message.receive_traced, message.is_priority());
             {
-                let Some(alias_priority) = self.alias_message_accepted(ctx, alias)? else {
+                let Some((alias_priority, prio_alias_deactivated)) =
+                    self.alias_message_accepted(ctx, alias)?
+                else {
                     return Ok(());
                 };
-                if alias != 0 && !alias_priority {
+                // erl_proc_sig_queue.c:6021-6045: only a priority alias delivers a priority
+                // message.
+                if alias == 0 || !alias_priority {
                     message.priority = false;
                     priority = false;
                 }
@@ -219,6 +230,11 @@ impl Process {
                     && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
                 {
                     crate::trace::receive_event(None, self, ctx, term, Some(sender));
+                }
+                // erl_proc_sig_queue.c:6209-6217: after the message is inserted, so the prio
+                // queue is still installed for it.
+                if prio_alias_deactivated {
+                    self.prio_item_deleted(crate::receive::PrioItemType::Alias);
                 }
             }
             return Ok(());
