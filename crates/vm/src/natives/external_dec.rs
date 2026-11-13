@@ -4,16 +4,14 @@
 //!
 //! Port of erts/emulator/beam/external.c (`B2TContext`, `binary2term_prepare`,
 //! `B2TUncompressChunk`, `decoded_size`, `dec_term`, `erts_factory_*` as used by
-//! `binary_to_term_int`), OTP-29.1.1. The heap words of the decoded term are written through
-//! a `HeapReservation` (the preallocated factory) and the `next` pointer chain of
-//! [`arinsal_term::raw::HeapSlotPtr`]; every length is checked against the end of the data by
-//! `decoded_size` and by the [`Reader`].
+//! `binary_to_term_int`), OTP-29.1.1. Every length is checked against the end of the data by
+//! `decoded_size`.
 
 use super::external_dec_size::{B2tSizeState, decoded_size};
 use super::external_dec_term::{
-    DecodeMap, DecodePending, Reader, decode_direct_step, finish_decode_maps, map_term_build_error,
+    B2tDecodeContext, DecCtx, DecFlags, dec_term, map_term_build_error,
 };
-use arinsal_bifs::{BifError, ProcessHeapHandle};
+use arinsal_bifs::BifError;
 use arinsal_term::{
     BinaryOwner, BinaryRef, HeapFactory, OwnedBinaryRef, ProcessHeap, Term, TermBuilder,
     binary_owner, global_atoms,
@@ -33,8 +31,7 @@ fn atom_text(term: Term) -> Option<&'static str> {
 }
 
 fn bit_bytes(term: Term) -> Result<(SmallVec<[u8; 64]>, usize), BifError> {
-    // SAFETY: the process owns the binary; no writable append occurs in this BIF.
-    let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
+    let view = arinsal_term::raw::bif_arg_binary_ref(term).ok_or(BifError::BADARG)?;
     let mut bytes = SmallVec::new();
     bytes.resize(view.bit_len().div_ceil(8), 0);
     if view.start_bit().is_multiple_of(8) {
@@ -66,6 +63,10 @@ pub(crate) enum B2tState {
     Size,
     DecodeInit,
     Decode,
+    DecodeList,
+    DecodeTuple,
+    DecodeString,
+    DecodeBinary,
     Done,
 }
 
@@ -81,8 +82,9 @@ fn decode_options(term: Option<Term>) -> Result<DecodeOpts, BifError> {
         return Ok(opts);
     };
     while tail != Term::NIL {
-        // SAFETY: the option list remains live and stable during the BIF.
-        let (head, next) = unsafe { tail.cons_ref() }.ok_or_else(badopt)?;
+        let (head, next) = arinsal_term::raw::Cons::try_from(tail)
+            .map_err(|_| badopt())?
+            .pair();
         tail = next;
         match atom_text(head) {
             Some("safe") => opts.safe = true,
@@ -116,8 +118,7 @@ enum DecodeInput<'a> {
 
 fn decode_binary_view(args: &[Term]) -> Result<(Term, BinaryRef<'_>), BifError> {
     let term = *args.first().ok_or(BifError::BADARG)?;
-    // SAFETY: the input binary owner is live and stable during the BIF call.
-    let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
+    let view = arinsal_term::raw::bif_arg_binary_ref(term).ok_or(BifError::BADARG)?;
     Ok((term, view))
 }
 
@@ -175,13 +176,8 @@ pub(crate) struct B2tContext<'a> {
     // b2ts, u.uc and u.dc of B2TContext.
     input: DecodeInput<'a>,
     plain: Option<SmallVec<[u8; 128]>>,
-    decode_at: usize,
-    decode_next: Option<arinsal_term::raw::HeapSlotPtr>,
-    decode_root: Term,
-    decode_root_started: bool,
-    // Port of `PSTACK_DECLARE(map_array, 10)` in external.c:4316, OTP-29.1.1.
-    decode_maps: SmallVec<[DecodeMap; 10]>,
-    pending: Option<DecodePending>,
+    /// `u.dc`.
+    dc: B2tDecodeContext,
     internal_nc: bool,
     safe: bool,
     local_node: Option<(arinsal_term::Atom, u32)>,
@@ -195,8 +191,6 @@ pub(crate) struct B2tContext<'a> {
     inflate_done: bool,
     heap_words: Option<usize>,
     prepare_charge: usize,
-    /// `ctx->u.dc.factory`: set by the first decode slice, parked between slices.
-    factory: Option<HeapFactory>,
 }
 
 impl<'a> B2tContext<'a> {
@@ -242,12 +236,7 @@ impl<'a> B2tContext<'a> {
             // erts/emulator/beam/external.c, OTP-29.1.1: uncompressed input does not carry
             // or initialize an inflation buffer.
             plain: compressed.then(SmallVec::new),
-            decode_at: 0,
-            decode_next: None,
-            decode_root: Term::NIL,
-            decode_root_started: false,
-            decode_maps: SmallVec::new(),
-            pending: None,
+            dc: B2tDecodeContext::default(),
             internal_nc: false,
             safe: opts.safe,
             local_node: None,
@@ -265,7 +254,6 @@ impl<'a> B2tContext<'a> {
             } else {
                 0
             },
-            factory: None,
         })
     }
 
@@ -299,12 +287,7 @@ impl<'a> B2tContext<'a> {
             arg,
             input,
             plain,
-            decode_at,
-            decode_next,
-            decode_root,
-            decode_root_started,
-            decode_maps,
-            pending,
+            dc,
             internal_nc,
             safe,
             local_node,
@@ -318,7 +301,6 @@ impl<'a> B2tContext<'a> {
             inflate_done,
             heap_words,
             prepare_charge,
-            factory,
         } = self;
         let input = match input {
             DecodeInput::Inline(bytes) => DecodeInput::Inline(bytes),
@@ -344,12 +326,7 @@ impl<'a> B2tContext<'a> {
             arg,
             input,
             plain,
-            decode_at,
-            decode_next,
-            decode_root,
-            decode_root_started,
-            decode_maps,
-            pending,
+            dc,
             internal_nc,
             safe,
             local_node,
@@ -363,7 +340,6 @@ impl<'a> B2tContext<'a> {
             inflate_done,
             heap_words,
             prepare_charge,
-            factory,
         })
     }
 
@@ -469,104 +445,103 @@ impl<'a> B2tContext<'a> {
     }
 
     /// Undo what the decode built, as `erts_factory_undo` does when `binary_to_term_int`
-    /// fails; a no-op before the first decode slice.
-    // Port of erts/emulator/beam/external.c (binary_to_term_int failure path), OTP-29.1.1.
+    /// fails; a no-op before `B2TDecodeInit`.
+    // Port of erts/emulator/beam/external.c (dec_term error path), OTP-29.1.1.
     pub fn undo_factory(&mut self, heap: &mut ProcessHeap) {
-        if let Some(mut factory) = self.factory.take() {
+        if let Some(mut factory) = self.dc.factory.take() {
             factory.undo(heap);
         }
     }
 
-    /// `B2TDecode`: `dec_term` with `budget` bytes of reductions into the process heap; the
-    /// result once the whole term was decoded.
-    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TDecodeInit..B2TDecode,
-    // dec_term), OTP-29.1.1.
-    pub fn decode_chunk(
-        &mut self,
-        byte_budget: usize,
-        process_heap: &mut ProcessHeap,
-    ) -> Result<(Option<Term>, usize), (BifError, usize)> {
-        let consumed = 0;
-        let Some(heap_words) = self.heap_words else {
-            return Err((BifError::BADARG, consumed));
+    /// `B2TDecodeInit` after the export decision: `u.dc.ep`, `res`, `next = &res` and
+    /// `erts_factory_proc_prealloc_init(&ctx->u.dc.factory, p, ctx->heap_size)`. The context
+    /// must stay at its address until the decode ends (on the stack of a call that will not
+    /// trap, or in the trap's magic binary).
+    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TDecodeInit), OTP-29.1.1.
+    pub fn decode_init(&mut self, heap: &mut ProcessHeap) -> Result<(), BifError> {
+        let heap_words = self.heap_words.ok_or(BifError::BADARG)?;
+        self.dc.ep = 0;
+        self.dc.res = 0;
+        self.dc.next = arinsal_term::raw::HeapSlotPtr::from_ptr(&mut self.dc.res);
+        self.dc.map_array.clear();
+        self.dc.factory =
+            Some(HeapFactory::proc_prealloc_init(heap, heap_words).map_err(map_term_build_error)?);
+        self.state = B2tState::Decode;
+        Ok(())
+    }
+
+    /// `B2TDecode*`: `dec_term(NULL, NULL, NULL, NULL, ctx, 0)`; `ctx->reds` and `ctx->state`
+    /// are updated as erts does. At `B2TDone` the `used` tuple is produced on the factory and
+    /// the factory is closed (`b2t_destroy_context`).
+    // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TDecode..B2TDone), OTP-29.1.1.
+    pub fn decode(&mut self, heap: &mut ProcessHeap) -> Result<Option<Term>, BifError> {
+        let mut factory = self.dc.factory.take().ok_or(BifError::BADARG)?;
+        let mut fac = factory.open(heap);
+        let bytes = if self.compressed {
+            self.plain
+                .as_deref()
+                .expect("compressed input has an inflate buffer")
+        } else {
+            &self.input.bytes()[1..]
         };
-        if self.factory.is_none() {
-            self.factory = Some(
-                HeapFactory::proc_prealloc_init(process_heap, heap_words)
-                    .map_err(|error| (map_term_build_error(error), consumed))?,
-            );
-        }
-        let factory = self.factory.as_mut().expect("factory initialized above");
-        let mut reservation = factory.open(process_heap);
-        let budget = byte_budget.max(1);
-        let before = self.decode_at;
-        let (parsed, after) = reservation
-            .with_words(|reserved_words| {
-                let bytes = if self.compressed {
-                    self.plain
-                        .as_deref()
-                        .expect("compressed input has an inflate buffer")
-                } else {
-                    &self.input.bytes()[1..]
-                };
-                let mut reader = Reader::new(bytes, before);
-                let parsed = decode_direct_step(
-                    &mut reader,
-                    &mut self.decode_next,
-                    &mut self.decode_root,
-                    &mut self.decode_root_started,
-                    &mut self.decode_maps,
-                    &mut self.pending,
-                    &mut self.internal_nc,
-                    self.safe,
-                    self.local_node,
-                    &mut *reserved_words,
-                    budget,
-                );
-                let after = reader.at;
-                debug_assert_eq!(reserved_words.as_mut_words().len(), heap_words);
-                (parsed, after)
-            })
-            .map_err(|error| (map_term_build_error(error), consumed))?;
-        self.decode_at = after;
-        let decoded = self.decode_at - before;
-        match parsed {
-            Ok((Some((_term, checked)), decode_work)) => {
-                if self.compressed && checked != self.plain_bytes().len() {
-                    drop(reservation);
-                    return Err((BifError::BADARG, consumed + decoded));
-                }
-                finish_decode_maps(
-                    &mut reservation,
-                    &mut self.decode_maps,
-                    &mut self.decode_root,
-                )
-                .map_err(|error| (error, consumed + decode_work))?;
-                let term = self.decode_root;
-                drop(reservation);
-                let value = self
-                    .wrap_used(process_heap, term, checked)
-                    .map_err(|error| (error, consumed + decode_work))?;
-                Ok((Some(value), consumed + decode_work))
+        let mut flags = DecFlags {
+            safe: self.safe,
+            internal_nc: self.internal_nc,
+            this_node: self.local_node.unwrap_or((arinsal_term::atoms::NONAME, 0)),
+        };
+        let ep = self.dc.ep;
+        let result = dec_term(
+            &mut fac,
+            bytes,
+            ep,
+            None,
+            Some(DecCtx {
+                state: &mut self.state,
+                reds: &mut self.reds,
+                dc: &mut self.dc,
+            }),
+            &mut flags,
+        );
+        self.internal_nc = flags.internal_nc;
+        let result = result.map_err(|error| match error {
+            BifError::Unsupported("incomplete ETF input") => BifError::BADARG,
+            error => error,
+        });
+        match result {
+            Ok(None) => {
+                factory.park(fac);
+                self.dc.factory = Some(factory);
+                Ok(None)
             }
-            Ok((None, decode_work)) => {
-                factory.park(reservation);
-                Ok((None, consumed + decode_work))
+            Ok(Some(checked)) => {
+                let plain_len = self.plain_bytes().len();
+                if self.compressed && checked != plain_len {
+                    drop(fac);
+                    self.dc.factory = Some(factory);
+                    return Err(BifError::BADARG);
+                }
+                let res = arinsal_term::raw::term_from_bits(self.dc.res);
+                let value = self.wrap_used(&mut fac, res, checked);
+                drop(fac);
+                match value {
+                    Ok(value) => Ok(Some(value)),
+                    Err(error) => {
+                        self.dc.factory = Some(factory);
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
-                drop(reservation);
-                let error = match error {
-                    BifError::Unsupported("incomplete ETF input") => BifError::BADARG,
-                    error => error,
-                };
-                Err((error, consumed + decoded))
+                drop(fac);
+                self.dc.factory = Some(factory);
+                Err(error)
             }
         }
     }
 
     fn wrap_used(
         &self,
-        heap: &mut ProcessHeap,
+        fac: &mut arinsal_term::HeapReservation<'_, ProcessHeap>,
         term: Term,
         checked: usize,
     ) -> Result<Term, BifError> {
@@ -576,8 +551,7 @@ impl<'a> B2tContext<'a> {
             } else {
                 self.used_prefix + checked
             };
-            let mut handle = ProcessHeapHandle(heap);
-            let mut builder = TermBuilder::new(&mut handle);
+            let mut builder = TermBuilder::new(fac);
             let size = builder
                 .int_from_u64(used as u64)
                 .map_err(map_term_build_error)?;
