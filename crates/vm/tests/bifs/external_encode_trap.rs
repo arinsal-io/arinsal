@@ -5,7 +5,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "external_encode_trap_test";
@@ -76,7 +75,7 @@ fn term_to_binary_family_matches_otp_on_big_terms() {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for index in 1..=15i64 {
         let CallResult::Ok(expected) = reference.call(MODULE, "run", &[OwnedTerm::Int(index)])
@@ -89,7 +88,6 @@ fn term_to_binary_family_matches_otp_on_big_terms() {
                 "run",
                 &[Term::small(index).unwrap()],
                 1,
-                None,
                 4_000,
             )
             .unwrap_or_else(|error| panic!("Arinsal failed case {index}: {error:?}"))
