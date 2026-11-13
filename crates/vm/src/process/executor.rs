@@ -162,7 +162,6 @@ impl Executor {
             && !process.dirty_bif_completed()
             && ctx.fast_slice_ok_before_signals()
             && !crate::suspend::ctx_suspended(ctx)
-            && !crate::dist::fragment_continuation_pending()
             && !trace_boot_enabled()
             && !process
                 .native_pc()

@@ -258,7 +258,6 @@ impl Executor {
                             }
                         }
                         process.native_transfer = false;
-                        crate::dist::continue_fragmented_send(process, ctx)?;
                         // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1:
                         // the dirty scheduler runs the NIF, then the process returns to a normal
                         // scheduler to continue after the call.

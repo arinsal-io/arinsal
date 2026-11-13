@@ -82,12 +82,8 @@ pub(crate) struct DistState {
     pub(crate) owner: Pid,
     pub(crate) input_handler: Pid,
     pub(crate) output: VecDeque<Vec<u8>>,
-    /// Number of FIFO head packets prepared for the port scheduler.
-    pub(crate) output_ready_packets: usize,
     /// Serializes port writes so concurrent schedulers cannot reorder atom-cache headers.
     pub(crate) flushing_output: bool,
-    /// Encoded fragment tails retained until the sending process continues.
-    pub(crate) fragment_continuations: VecDeque<DistFragmentContinuation>,
     pub(crate) incoming_cache: AtomCache,
     pub(crate) outgoing_sequence_id: u64,
     /// Incomplete incoming fragmented signals, keyed by OTP sequence id.
@@ -108,36 +104,6 @@ pub(crate) struct DistState {
     /// Reverse map for local proxy pids created by [`Self::remote_pids`].
     pub(crate) proxy_to_remote: HashMap<Pid, OwnedTerm>,
     pub(crate) spawn_requests: BTreeMap<u64, SpawnRequest>,
-}
-
-#[derive(Debug)]
-pub(crate) struct DistFragmentContinuation {
-    /// `None` is output from a no-suspend controller/exit path.
-    pub(crate) sender: Option<Pid>,
-    pub(crate) remaining_packets: usize,
-}
-
-impl DistFragmentContinuation {
-    /// A deferred fragment tail; counted in [`FRAGMENT_CONTINUATIONS`] while it exists.
-    pub(crate) fn new(sender: Option<Pid>, remaining_packets: usize) -> Self {
-        FRAGMENT_CONTINUATIONS.fetch_add(1, Ordering::AcqRel);
-        Self {
-            sender,
-            remaining_packets,
-        }
-    }
-}
-
-impl Clone for DistFragmentContinuation {
-    fn clone(&self) -> Self {
-        Self::new(self.sender, self.remaining_packets)
-    }
-}
-
-impl Drop for DistFragmentContinuation {
-    fn drop(&mut self) {
-        FRAGMENT_CONTINUATIONS.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 /// Reassembly state for an OTP `DIST_FRAG_HEADER` signal.
@@ -184,9 +150,7 @@ impl DistState {
             owner,
             input_handler: owner,
             output: VecDeque::new(),
-            output_ready_packets: 0,
             flushing_output: false,
-            fragment_continuations: VecDeque::new(),
             incoming_cache: AtomCache::new(),
             outgoing_sequence_id: 1,
             incoming_fragments: HashMap::new(),
@@ -259,11 +223,9 @@ impl DistState {
         control: OwnedTerm,
         message: Option<OwnedTerm>,
     ) -> Result<Vec<Vec<u8>>, arinsal_etf::DecodeError> {
-        let packets = self.encode_packets(&control, message.as_ref())?;
-        self.pending_bytes = self
-            .pending_bytes
-            .saturating_add(packets.iter().map(|packet| packet.len() as u64).sum());
-        Ok(packets)
+        // The queue size grows when the fragments enter `output` (dist.c PHASE_SEND,
+        // update_qsizes), not when they are encoded.
+        self.encode_packets(&control, message.as_ref())
     }
 }
 
@@ -516,12 +478,6 @@ static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(60 * 1000);
 /// `ERTS_NODE_TAB_DELAY_GC_INFINITY` (erl_node_tables.h): `ERTS_NODE_TAB_DELAY_GC_MAX + 1`.
 pub(crate) const NODE_TAB_DELAY_GC_INFINITY: u64 = 100 * 1000 * 1000 + 1;
 static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
-
-/// Number of live [`DistFragmentContinuation`]s over all entries. Exact (each continuation
-/// counts itself from creation to drop), so it needs no lock; schedulers skip the
-/// continuation scan while it is zero.
-pub(crate) static FRAGMENT_CONTINUATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 /// `erts_this_node->sysname`: the local node name atom, which native `node/0` loads
 /// without a runtime call; [`set_this_node`] updates it.

@@ -621,9 +621,26 @@ fn erl_send(c_p: *mut ProcessHeader, i: u64) -> u64 {
         // export once it is resumed.
         Ok(Sent::Yield) => Err(send_yield(process, "erlang:send/2", vec![to, msg])),
         Ok(Sent::YieldReturn) => send_yield_return(process, msg),
+        Ok(Sent::YieldContinue(ctx)) => send_yield_continue(process, ctx, msg),
         Err(error) => Err(error),
     };
     bif_ret(c_p, i, result)
+}
+
+/// `SEND_YIELD_CONTINUE`: `BUMP_ALL_REDS`, then `BIF_TRAP1` to `dsend_continue_trap_export`
+/// with the send context.
+// Port of erts/emulator/beam/bif.c (erl_send, send_3: SEND_YIELD_CONTINUE), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn send_yield_continue(
+    process: &mut Process,
+    ctx: crate::dist::DsigSendContext,
+    return_term: Term,
+) -> Result<Term, VmError> {
+    process.heap.abi.fcalls = 0;
+    let trap = crate::bif_traps::dsend_export_trap(process, ctx, return_term)
+        .map_err(|_| VmError::Unsupported("dsend context".into()))?;
+    Err(VmError::TrapExport(trap))
 }
 
 /// `result >= 0`: `ERTS_VBUMP_REDS(p, 4)`, then the value, or `ERTS_BIF_PREP_YIELD_RETURN`
@@ -743,6 +760,7 @@ fn remote_send(
             msg,
             !opts.noconnect,
             !opts.nosuspend,
+            true,
         )? {
             RemoteSendOutcome::Sent => {
                 crate::trace::emit_process(
@@ -755,6 +773,17 @@ fn remote_send(
                 );
                 Ok(Sent::Done)
             }
+            RemoteSendOutcome::Continue(send_ctx) => {
+                crate::trace::emit_process(
+                    Some(vm),
+                    process,
+                    ctx.pid(),
+                    crate::trace::SEND,
+                    "send",
+                    &[msg, to],
+                );
+                Ok(Sent::YieldContinue(send_ctx))
+            }
             RemoteSendOutcome::NotConnected => Ok(Sent::NoConnect),
             RemoteSendOutcome::WouldSuspend => Ok(Sent::Yield),
             RemoteSendOutcome::NotRemote => Err(badarg()),
@@ -763,7 +792,6 @@ fn remote_send(
 }
 
 /// The non-error results of `do_send` (its `Sint` result codes).
-#[derive(Clone, Copy)]
 enum Sent {
     /// `result >= 0`.
     Done,
@@ -774,6 +802,8 @@ enum Sent {
     Yield,
     /// `SEND_YIELD_RETURN`: sent, and the sender is suspended on the busy port.
     YieldReturn,
+    /// `SEND_YIELD_CONTINUE`: fragments of a distributed signal are left in the context.
+    YieldContinue(crate::dist::DsigSendContext),
 }
 
 impl Sent {
@@ -814,6 +844,7 @@ pub(crate) extern "C" fn send_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64)
         Ok(Sent::Yield) => Err(send_yield(process, "erlang:send/3", vec![to, msg, list])),
         Ok(Sent::YieldReturn) if opts.nosuspend => Ok(Term::atom(atoms::NOSUSPEND)),
         Ok(Sent::YieldReturn) => send_yield_return(process, ok),
+        Ok(Sent::YieldContinue(ctx)) => send_yield_continue(process, ctx, ok),
         Err(error) => Err(error),
     };
     bif_ret(c_p, i, result)

@@ -397,6 +397,25 @@ fn dist_mixed_arinsal_fragmented_alias_send() {
     arinsal_eval_with_dist_buffer(&cookie, &host, &expression, Some("1"));
 }
 
+/// A message larger than the distribution buffer is sent as fragments. The sender parks in
+/// `dsend_continue_trap/1` while the queue is busy (dist.c erts_dsig_send,
+/// ERTS_DSIG_SEND_CONTINUE): the peer receives the data intact, another process keeps
+/// running, and the sender is scheduled in again more than once, on `erl` and on Arinsal.
+#[test]
+fn dist_mixed_fragmented_send_context_trap() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    let expression = format!(
+        "N={n}, pong=net_adm:ping(N), {{echo,N}} ! {{get_alias,self()}}, Alias=receive {{remote_alias,A}} -> A after 10000 -> exit(no_alias) end, Big=binary:copy(<<7>>,30000000), Ticker=spawn(fun() -> (fun Tick(C) -> receive {{stop,F}} -> F ! {{ticks,C}} after 1 -> Tick(C+1) end end)(0) end), Tracer=spawn(fun() -> (fun Count(C) -> receive {{trace,_,in,_}} -> Count(C+1); {{trace,_,_,_}} -> Count(C); {{get,F}} -> F ! {{ins,C}} end end)(0) end), erlang:trace(self(),true,[running,{{tracer,Tracer}}]), Alias ! {{alias_roundtrip,self(),Big}}, Intact=receive {{alias_ack,Big}} -> true after 20000 -> false end, erlang:trace(self(),false,[running]), Tracer ! {{get,self()}}, Ins=receive {{ins,I}} -> I end, Ticker ! {{stop,self()}}, Ticks=receive {{ticks,T}} -> T end, io:format(\"DIST_MIXED_OK frag_ctx intact=~p resumed=~p responsive=~p~n\", [Intact, Ins >= 2, Ticks >= 1])"
+    );
+    let expected = "DIST_MIXED_OK frag_ctx intact=true resumed=true responsive=true";
+    let otp_output = otp_eval_with_dist_buffer(&cookie, &expression, Some("1"));
+    assert!(otp_output.contains(expected), "{otp_output}");
+    let arinsal_output = arinsal_eval_with_dist_buffer(&cookie, &host, &expression, Some("1"));
+    assert!(arinsal_output.contains(expected), "{arinsal_output}");
+}
+
 #[test]
 fn dist_mixed_otp_node_monitor_disconnect_reconnect() {
     let _serial = serial_test();

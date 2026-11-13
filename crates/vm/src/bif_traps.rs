@@ -149,6 +149,10 @@ const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
 const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
+/// `dsend_continue_trap_export`.
+pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
+// sizeof(ErtsDSigSendContext) on macOS arm64 (dist.h), the magic binary payload of a parked send.
+const ERTS_DSIG_SEND_CONTEXT_SIZE: usize = 256;
 const CONTEXT_REDS: usize = 4000;
 const RE_RUN_CONTINUATION: &str = "erlang:re_run_trap/3";
 const RE_GRUN_CONTINUATION: &str = "re:grun/3";
@@ -654,6 +658,13 @@ unicode_trap_entry!(erlang_characters_to_list_trap_3);
 unicode_trap_entry!(erlang_characters_to_list_trap_4);
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erts_internal",
+        function: "dsend_continue_trap",
+        arity: 1,
+        continuation: DSEND_CONTINUE_CONTINUATION,
+        handler: dsend_continue_trap_1,
+    },
     Entry {
         module: "unicode",
         function: "characters_to_binary",
@@ -4551,6 +4562,78 @@ fn scan_port_table(list: &mut PortPtabListState, table_max: u32, reds_left: u32)
         first_chunk = false;
     }
     (list.next_index >= table_max, spent)
+}
+
+/// `erts_dsend_export_trap_context`: the magic binary of a parked distributed send, as the
+/// `BIF_TRAP1` argument of `dsend_continue_trap/1`. The return term travels as the second
+/// trap argument, a live register the collector updates, where erts disables garbage
+/// collection (`erts_set_gc_state(c_p, 0)`) so that the term stays in the context.
+// Port of erts/emulator/beam/bif.c (erts_dsend_export_trap_context, ERTS_BIF_PREP_TRAP1 of
+// dsend_continue_trap_export), OTP-29.1.1.
+pub(crate) fn dsend_export_trap(
+    process: &mut Process,
+    ctx: crate::dist::DsigSendContext,
+    return_term: Term,
+) -> Result<crate::ExportTrap, BifError> {
+    let state = magic_binary_state(Mutex::new(ctx), ERTS_DSIG_SEND_CONTEXT_SIZE);
+    let state_term = trap_state_term(process, &state)
+        .map_err(|_| BifError::SystemLimit)?
+        .ok_or(BifError::SystemLimit)?;
+    Ok(crate::ExportTrap::new(
+        process,
+        DSEND_CONTINUE_CONTINUATION,
+        vec![state_term, return_term],
+    ))
+}
+
+/// `dsend_continue_trap_1`: restore the reductions and resume `erts_dsig_send` on the context,
+/// trapping again while fragments remain.
+// Port of erts/emulator/beam/bif.c:2806-2840 (dsend_continue_trap_1), OTP-29.1.1.
+fn dsend_continue_trap_1(
+    process: &mut Process,
+    args: &[Term],
+    _state: Option<&Arc<MagicRef>>,
+    pid: Option<arinsal_sched::Pid>,
+    _gc_was_enabled: bool,
+) -> Result<HandlerResult, BifError> {
+    let (Some(sender), [context, return_term]) = (pid, args) else {
+        return Err(BifError::BADARG);
+    };
+    let (context, return_term) = (*context, *return_term);
+    let result = context
+        .with_magic_payload::<Mutex<crate::dist::DsigSendContext>, _>(|ctx| {
+            let mut ctx = ctx.lock().map_err(|_| BifError::SystemLimit)?;
+            crate::dist::dsend_continue(process, &mut ctx, sender).map_err(|_| BifError::BADARG)
+        })
+        .ok_or(BifError::BADARG)??;
+    Ok(match result {
+        crate::dist::DsendContinue::Done => HandlerResult::Done {
+            value: return_term,
+            reductions: 0,
+        },
+        crate::dist::DsendContinue::Yield { no_suspend: true } => HandlerResult::Done {
+            value: Term::atom(arinsal_term::atoms::NOSUSPEND),
+            reductions: 0,
+        },
+        crate::dist::DsendContinue::Yield { no_suspend: false } => {
+            // ERTS_BIF_YIELD_RETURN(BIF_P, ctx->return_term).
+            vbump_all_reds(process);
+            HandlerResult::Export(crate::ExportTrap::new(
+                process,
+                crate::natives::sys::BIF_RETURN_TRAP,
+                vec![return_term, Term::atom(arinsal_term::atoms::UNDEFINED)],
+            ))
+        }
+        crate::dist::DsendContinue::Continue => {
+            // BUMP_ALL_REDS(BIF_P); BIF_TRAP1(&dsend_continue_trap_export, BIF_P, BIF_ARG_1).
+            process.heap.abi.fcalls = 0;
+            HandlerResult::Export(crate::ExportTrap::new(
+                process,
+                DSEND_CONTINUE_CONTINUATION,
+                vec![context, return_term],
+            ))
+        }
+    })
 }
 
 #[cfg(test)]
