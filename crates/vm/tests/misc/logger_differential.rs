@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 const SOURCE: &str = r#"
 -module(logger_diff).
--export([sysmon_large_heap/0, sysmon_long_gc/0, cpu_topology/0, scheduler_bind/0, max_heap/0, port_error/0, process_error/0]).
+-export([sysmon_large_heap/0, sysmon_long_gc/0, cpu_topology/0, scheduler_bind/0, max_heap/0, port_error/0, process_error/0, internal_state/0]).
 
 capture(Fun) ->
     group_leader(self(), self()),
@@ -101,6 +101,14 @@ process_error() ->
     end),
     [Pid, {Reason, _Stack}] = A,
     {L, F, {Pid =:= P, Reason}, meta(M)}.
+
+internal_state() ->
+    {log, L, F, A, _} = M = capture(fun() ->
+        erts_debug:set_internal_state(available_internal_state, true)
+    end),
+    [Text] = A,
+    PidText = lists:flatten(io_lib:format("~p", [self()])),
+    {L, F, [string:replace(Text, PidText, "<PID>", all)], meta(M)}.
 "#;
 
 fn guard() -> MutexGuard<'static, ()> {
@@ -154,6 +162,11 @@ fn port_bad_output_value_report_matches_erl() {
 #[test]
 fn process_exit_error_report_matches_erl() {
     run("process_error");
+}
+
+#[test]
+fn internal_state_warning_matches_erl() {
+    run("internal_state");
 }
 
 #[test]

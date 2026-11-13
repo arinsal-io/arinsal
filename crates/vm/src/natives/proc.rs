@@ -4029,7 +4029,18 @@ fn trace(
         }
         if !apply(process, pid) {
             // Port of erts/emulator/beam/erl_bif_trace.c:1172-1176 (already_traced), OTP-29.1.1.
-            // The "** can only have one tracer per process" logger report is not sent yet.
+            if let Some(runtime) = process.runtime {
+                let group_leader = process
+                    .group_leader_pid(ctx.pid())
+                    .to_term()
+                    .unwrap_or(Term::NIL);
+                crate::utils::send_error_to_logger_str(
+                    runtime,
+                    ctx.pid(),
+                    group_leader,
+                    "** can only have one tracer per process\n",
+                );
+            }
             return Err(badarg());
         }
         1

@@ -1195,6 +1195,18 @@ fn delete(
     match outcome {
         Outcome::NotPurged => {
             staging.abort();
+            if let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid) {
+                let group_leader = process.group_leader_pid(pid).to_term().unwrap_or(Term::NIL);
+                crate::utils::send_error_to_logger_str(
+                    runtime,
+                    pid,
+                    group_leader,
+                    &format!(
+                        "Module {} must be purged before deleting\n",
+                        arinsal_etf::OwnedTerm::Atom(name.to_owned())
+                    ),
+                );
+            }
             Err(badarg())
         }
         Outcome::Undefined => {

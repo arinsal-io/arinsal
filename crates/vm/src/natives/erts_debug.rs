@@ -2709,6 +2709,27 @@ fn internal_state_set(
             value == Term::atom(arinsal_term::atoms::TRUE),
             Ordering::Relaxed,
         );
+        if value == Term::atom(arinsal_term::atoms::TRUE)
+            && let (Some(runtime), Some(pid)) = (process.runtime, ctx.pid().to_term())
+        {
+            let arinsal_etf::OwnedTerm::Pid {
+                id,
+                serial,
+                creation,
+                ..
+            } = arinsal_term::to_owned(pid).expect("process identifier")
+            else {
+                unreachable!("process identifier is a pid")
+            };
+            let text = format!(
+                "Process <{id}.{serial}.{creation}> enabled access to the emulator internal state.\nNOTE: This is an erts internal test feature and should *only* be used by OTP test-suites.\n"
+            );
+            let group_leader = process
+                .group_leader_pid(ctx.pid())
+                .to_term()
+                .unwrap_or(Term::NIL);
+            crate::utils::send_warning_to_logger_str(runtime, ctx.pid(), group_leader, &text);
+        }
         return Ok(Term::atom(if previous {
             arinsal_term::atoms::TRUE
         } else {

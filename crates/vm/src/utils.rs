@@ -97,6 +97,16 @@ pub(crate) fn send_warning_to_logger_str(
     );
 }
 
+/// Port of utils.c `erts_send_error_to_logger_str` with the caller's group leader.
+pub(crate) fn send_error_to_logger_str(
+    runtime: &'static Runtime,
+    from: Pid,
+    gleader: Term,
+    text: &str,
+) {
+    do_send_to_logger(runtime, Some(from), gleader, Term::atom(atoms::ERROR), text);
+}
+
 /// Port of utils.c `erts_send_error_to_logger_nogl`: no group leader; `from` is
 /// `erts_get_current_pid()`, `None` when a port or the scheduler runs it.
 pub(crate) fn send_error_to_logger_nogl(runtime: &'static Runtime, from: Option<Pid>, text: &str) {
