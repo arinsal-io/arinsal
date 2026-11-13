@@ -9,12 +9,6 @@ use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 /// BIF target supplied by the runtime.
 pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32) -> u64;
 
-/// Address of the runtime hook calling the BIF of an export, an
-/// `extern "C" fn(process, descriptor, a1, a2, a3) -> u64` whose descriptor is the export's
-/// `info` word (see [`ExportEntry::info`]) typed by the runtime, then up to three argument
-/// terms. Zero means an exception is pending in `freason`.
-pub type BifIdentityHelper = usize;
-
 pub use arinsal_term::ErtsCodeMfa;
 
 /// Static BIF descriptor stored by `emit_int_div_rem_body_shared` before calling its helper.
@@ -451,75 +445,70 @@ impl BeamModuleAssembler {
         self.emit_apply(resolver, live, true, true)
     }
 
-    /// Calls a BIF through its export identity (`i_bif1/2/3`, `nofail_bif1/2`).
+    /// Calls `bif_table[].f` of a BIF export (`i_bif1/2/3`, `nofail_bif1/2`).
     ///
     /// With a nonzero `fail` label an exception raised by the BIF is discarded and control
     /// branches to the label instead, like `bif1 Fail Bif ...` in a guard.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-200, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:46-200 (emit_i_bif_guard_shared,
+    // emit_i_bif_body_shared, emit_i_bif1/2/3, emit_i_bif), OTP-29.1.1: the operands are stored
+    // in X0..X2 of the register array, which holds no live value (X0..X3 live in callee-saved
+    // machine registers), and the BIF is called as `f(c_p, reg, 0)` with only the reductions
+    // synchronized. `identity` is the export, whose `info.mfa` `c_p->current` points at for
+    // the BIF body; `bif` is `bif_table[ep->bif_number].f`, bound when the call site is emitted.
     pub fn emit_bif_by_identity(
         &mut self,
         identity: usize,
         bif_mfa: usize,
+        bif: usize,
         args: &[ArgVal],
         fail: u32,
         dst: ArgVal,
-        helper: BifIdentityHelper,
     ) -> Result<(), ModuleError> {
         if args.len() > 3 {
             return Err(ModuleError::InvalidOperand("BIF arity exceeds three"));
         }
-        let mut regs = [Gpr::xzr(); 3];
         for (i, arg) in args.iter().copied().enumerate() {
             let source = self.source_reg(arg)?;
-            regs[i] = Gpr::x(10 + i as u8);
-            self.code.emit(|e| e.mov_reg(regs[i], source))?;
+            self.code
+                .emit(|e| e.str_uoff(source, Gpr::x(19), i as u32 * 8))?;
         }
-        let update = Update::HEAP_ALLOC
-            .union(Update::REDUCTIONS)
-            .union(Update::X_REGS);
+        let update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
+            // `c_p->current = &exp->info.mfa`, which the BIF body's BIF_ERROR names.
+            e.mov_const(Gpr::x(1), identity as u64 + u64::from(EXPORT_MFA_OFFSET))?;
+            e.str_uoff(
+                Gpr::x(1),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )?;
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            if bif_mfa != 0 {
-                e.mov_const(Gpr::x(1), bif_mfa as u64)?;
-                e.str_uoff(
-                    Gpr::x(1),
-                    Gpr::x(21),
-                    std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-                )?;
-            }
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (i_bif*: the BIF is
-            // bound at load time), OTP-29.1.1: the helper gets the export's descriptor word.
-            e.mov_const(Gpr::x(1), identity as u64)?;
-            e.ldr_uoff(Gpr::x(1), Gpr::x(1), EXPORT_INFO_OFFSET)?;
-            for (index, reg) in regs.iter().copied().enumerate() {
-                if index < args.len() {
-                    e.mov_reg(Gpr::x(index as u8 + 2), reg)?;
-                }
-            }
-            Ok(())
+            e.mov_reg(Gpr::x(1), Gpr::x(19))?;
+            e.mov_reg(Gpr::x(2), Gpr::xzr())
         })?;
-        self.fragment_call(helper)?;
-        // A guard failure (`fail != 0`) must leave the live X registers alone: the helper
-        // stores the failing BIF's operands in the register array for `handle_error`, which
-        // only a raising call wants reloaded (erts passes guard BIF operands in ARG regs and
-        // never rewrites X on a guard failure).
-        let leave = if fail != 0 {
-            Update::HEAP_ALLOC.union(Update::REDUCTIONS)
-        } else {
-            update
-        };
-        emit_leave_runtime(&mut self.code, 6, leave)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
+        self.fragment_call(bif)?;
+        emit_leave_runtime(&mut self.code, 6, update)?;
         let ok = self.code.new_label();
-        self.code.cbz(Gpr::x(9), ok)?;
+        self.code.cbnz(Gpr::x(0), ok)?;
         if fail != 0 {
+            // A guard failure drops the exception; the registers are untouched.
             let label = self.label(fail);
             self.code.emit(|e| e.str_uoff(Gpr::xzr(), Gpr::x(21), 40))?;
             self.code.b(label)?;
         } else {
-            // The helper already left the operands in X0..X2 (`set_native_bif_context`);
-            // restaging them from the reloaded registers would read them back clobbered.
+            // handle_error names the BIF by its MFA and reads the operands from X0..X2:
+            // reload them from the register array, where the call left them.
+            if bif_mfa != 0 {
+                self.code.emit(|e| {
+                    e.mov_const(Gpr::x(1), bif_mfa as u64)?;
+                    e.str_uoff(
+                        Gpr::x(1),
+                        Gpr::x(21),
+                        std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+                    )
+                })?;
+            }
+            emit_leave_runtime(&mut self.code, 3, Update::X_REGS)?;
             self.branch_error_with_bif()?;
         }
         self.code.bind(ok)?;

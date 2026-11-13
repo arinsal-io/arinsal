@@ -1271,7 +1271,6 @@ fn binary_guard_apply(
                 .int_from_u64(value as u64)
                 .map_err(|_| arinsal_bifs::BifError::SystemLimit)
         }
-        BinaryGuard::BinaryPart3 => binary_part_3_apply(process, args),
         BinaryGuard::BinaryPart2 => {
             let (result, reductions) = {
                 let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -1364,66 +1363,6 @@ fn binary_guard_light(
     args[..arity].copy_from_slice(&process.x[..arity]);
     binary_guard_result(process, export, guard, &args[..arity], true)
 }
-
-/// `i_bif*` entry of a binary guard: the guard kind is the function, bound at load time.
-fn binary_guard_i_bif(
-    header: *mut ProcessHeader,
-    export: Option<ExportDispatch>,
-    guard: crate::bif_table::BinaryGuard,
-    arity: usize,
-    args: [u64; 3],
-) -> u64 {
-    let Some(export) = export else {
-        return 0;
-    };
-    let Some((process, _)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let args = args.map(crate::native_hooks::from_raw);
-    binary_guard_result(process, export, guard, &args[..arity], false)
-}
-
-macro_rules! binary_guard_i_bif {
-    ($(#[$doc:meta])* $name:ident, $guard:ident, $arity:literal) => {
-        $(#[$doc])*
-        pub(crate) extern "C" fn $name(
-            header: *mut ProcessHeader,
-            export: Option<ExportDispatch>,
-            first: u64,
-            second: u64,
-            third: u64,
-        ) -> u64 {
-            binary_guard_i_bif(
-                header,
-                export,
-                crate::bif_table::BinaryGuard::$guard,
-                $arity,
-                [first, second, third],
-            )
-        }
-    };
-}
-
-binary_guard_i_bif!(
-    /// `i_bif1` of `byte_size/1`.
-    // Port of erts/emulator/beam/erl_bif_guard.c:376 (`byte_size_1`), OTP-29.1.1.
-    byte_size_guard, ByteSize, 1
-);
-binary_guard_i_bif!(
-    /// `i_bif1` of `bit_size/1`.
-    // Port of erts/emulator/beam/erl_bif_guard.c:354 (`bit_size_1`), OTP-29.1.1.
-    bit_size_guard, BitSize, 1
-);
-binary_guard_i_bif!(
-    /// `i_bif2` of `binary_part/2`.
-    // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
-    binary_part_2_guard, BinaryPart2, 2
-);
-binary_guard_i_bif!(
-    /// `i_bif3` of `binary_part/3`.
-    // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
-    binary_part_3_guard, BinaryPart3, 3
-);
 
 /// Dedicated BeamAsm entry for `byte_size/1` and its guard form.
 // Port of erts/emulator/beam/erl_bif_guard.c:376 (`byte_size_1`), OTP-29.1.1.
@@ -3039,46 +2978,6 @@ fn charge_bif_reductions(process: &mut crate::Process, reductions: u32) {
         .abi
         .fcalls
         .saturating_sub(reductions.min(i32::MAX as u32) as i32);
-}
-
-/// Calls a plain BIF named by its export's descriptor word (`i_bif1/2/3`, `nofail_bif1/2`).
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-200, OTP-29.1.1.
-pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
-    header: *mut ProcessHeader,
-    export: Option<ExportDispatch>,
-    first: u64,
-    second: u64,
-    third: u64,
-) -> u64 {
-    // A guard BIF never collects (erts calls it with only Update::eReductions).
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let all_args = [first, second, third].map(crate::native_hooks::from_raw);
-    let Some((bif, arity)) = export.and_then(|export| Some((export.bif?, export.arity))) else {
-        crate::native_hooks::set_error(process, "undef");
-        return 0;
-    };
-    let args = &all_args[..usize::from(arity).min(all_args.len())];
-    // Matched where the BIF wrote it, like the light BIF path.
-    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut call = arinsal_bifs::BifCall::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
-    let result = bif(&mut ctx, args);
-    match result {
-        Ok(value) => crate::native_hooks::raw(value),
-        Err(error) => {
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (i_bif: the failing BIF and its
-            // arguments are the top frame), OTP-29.1.1.
-            match export {
-                // `i_bif*` passes each operand explicitly; a literal BIF operand need not
-                // be present in X0..X2 when the scheduler expands the saved error.
-                Some(export) => set_native_bif_export_error(process, export, args, error),
-                None => set_light_bif_error(process, &error),
-            }
-            0
-        }
-    }
 }
 
 /// Raises `error:{Tag, Value}` from a native helper.

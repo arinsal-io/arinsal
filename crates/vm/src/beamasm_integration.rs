@@ -176,6 +176,20 @@ impl DispatchTarget {
         self.slot
     }
 
+    /// Whether `bif_table[].f` of this export runs the BIF itself, as `i_bif*` calls it: a body
+    /// of its own, or the plain adapter of its `arinsal_bifs` body. Not an entry that parks the
+    /// call in the executor.
+    pub(crate) fn bif_table_runs_bif(&self) -> bool {
+        crate::bif_table::is_body(self.bif_table_function())
+            && (self.light_bif.is_some()
+                || crate::bif_table::special(&self.module, &self.function, self.arity).is_some())
+    }
+
+    /// `bif_table[ep->bif_number].f` of this export, or 0.
+    pub(crate) fn bif_table_function(&self) -> usize {
+        crate::bif_table::function(self.slot.bif_number())
+    }
+
     /// Trapping BIFs keep continuation state that only the executor's call site handles.
     pub(crate) fn runs_in_executor(&self) -> bool {
         matches!(
@@ -870,11 +884,6 @@ pub(crate) fn export_from_info(info: u64) -> Option<ExportDispatch> {
     // SAFETY: `intern_identity` leaks this `DispatchTarget` and stores its
     // address in `Export.info` before any generated call can run. The export table never frees it.
     Some(unsafe { &*(info as *const DispatchTarget) })
-}
-
-pub(crate) fn dispatch_bif(identity: usize) -> Option<(arinsal_bifs::BifFn, u8)> {
-    let target = target_for_identity(identity)?;
-    Some((target.bif?, target.arity))
 }
 
 static MODULES: AtomicU64 = AtomicU64::new(0);
@@ -1783,16 +1792,16 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (i_bif*: `mov ARG, bif->f`), OTP-29.1.1:
     // the BIF function is bound when the call site is emitted, never looked up by name per call.
-    fn bif_identity_helper(&self, identity: usize) -> arinsal_beamasm::bif::BifIdentityHelper {
-        export_dispatch(identity)
-            .and_then(|export| {
-                crate::bif_table::guard_helper(&export.module, &export.function, export.arity)
-            })
-            .unwrap_or(crate::native_helpers::arinsal_beamasm_bif_by_identity as *const () as usize)
+    fn bif_function(&self, identity: usize) -> usize {
+        export_dispatch(identity).map_or(0, |export| export.bif_table_function())
     }
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (`bif->f`) and beam_load.c (BIF
+    // import resolution), OTP-29.1.1: an import is a plain BIF when `bif_table` has its body.
     fn plain_bif_identity(&self, _beam: &BeamFile, index: u32) -> Option<usize> {
         let identity = *self.export_entries.get(index as usize)?;
-        dispatch_bif(identity).is_some().then_some(identity)
+        export_dispatch(identity)?
+            .bif_table_runs_bif()
+            .then_some(identity)
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1:
     // `bif_mfa` is the stable address of the export descriptor's MFA.
