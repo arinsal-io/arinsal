@@ -198,7 +198,15 @@ impl Runtime {
             .get(target.trap_export_id)
             .expect("trap export table capacity")
             .get_or_init(|| {
-                crate::export::export_get_or_make_stub(mfa).unwrap_or_else(|| {
+                // A hidden trap export (`erts_init_trap_export`) is a static `Export` that no
+                // export table holds, so reloading its module cannot invalidate it.
+                let hidden = target.trap_function.is_some();
+                let export = if hidden {
+                    crate::beamasm_integration::make_export(mfa).map(Arc::clone)
+                } else {
+                    crate::export::export_get_or_make_stub(mfa)
+                };
+                export.unwrap_or_else(|| {
                     Arc::new(arinsal_beamasm::bif::ExportEntry::new(mfa.0, mfa.1, mfa.2))
                 })
             });

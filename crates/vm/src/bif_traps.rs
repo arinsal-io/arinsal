@@ -97,7 +97,6 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> boo
         || any!(
             arinsal_bifs::BinaryToListWalk,
             arinsal_bifs::UnicodeCont,
-            arinsal_bifs::LengthCont,
             arinsal_bifs::IolistVecWalk,
             arinsal_bifs::IolistSizeWalk,
             arinsal_bifs::DecodeWalk<'static>,
@@ -105,7 +104,6 @@ pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>, direct: bool) -> boo
             TermEncodeState,
             BinaryCopyState,
         )
-        || state.downcast_ref::<MapsMergeState>().is_some()
 }
 
 /// State copied into an ERTS-shaped trap continuation without a shared MagicRef mutex.
@@ -147,7 +145,6 @@ pub(crate) const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
-const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
 /// `dsend_continue_trap_export`.
 pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
 // sizeof(ErtsDSigSendContext) (dist.h), measured with a C probe against the configured OTP-29.1.1
@@ -168,8 +165,6 @@ const ERTS_REGEX_RESTART_CONTEXT_SIZE: usize = 64;
 // (BinaryFindContext).
 const ERTS_BINARY_TO_LIST_STATE_SIZE: usize = 40;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
-// Port of erts/emulator/beam/erl_map.c (HashmapMergeContext).
-const ERTS_HASHMAP_MERGE_CONTEXT_SIZE: usize = 56;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
 const ERTS_IOLIST_SIZE_STATE_SIZE: usize = 88;
@@ -280,44 +275,6 @@ fn clear_export_trap(process: &mut Process) {
     if process.heap.abi.i as usize == bif_export_trap_pc() {
         process.heap.abi.i = std::ptr::null();
     }
-}
-
-fn erlang_length_trap(
-    process: &mut Process,
-    _args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    let state = state.ok_or(BifError::BADARG)?;
-    let (list, acc) = {
-        let saved = state
-            .downcast_ref::<Mutex<arinsal_bifs::LengthCont>>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        (saved.list(), saved.acc())
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step = arinsal_bifs::length_slice(&mut ctx, list, acc);
-    drop(bif_state);
-    Ok(match step {
-        Ok(arinsal_bifs::LengthStep::Done(value)) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        Ok(arinsal_bifs::LengthStep::More(cont)) => HandlerResult::Yield {
-            continuation: "erlang:length/3",
-            state: argument_trap_state(Mutex::new(cont)),
-            reductions: 0,
-        },
-        Err(error) => HandlerResult::Failed {
-            error,
-            reductions: 0,
-        },
-    })
 }
 
 fn unicode_trap(
@@ -556,20 +513,6 @@ const ENTRIES: &[Entry] = &[
         arity: 1,
         continuation: "erlang:characters_to_list_trap_4/1",
         handler: erlang_characters_to_list_trap_4,
-    },
-    Entry {
-        module: "erlang",
-        function: "length",
-        arity: 3,
-        continuation: "erlang:length/3",
-        handler: erlang_length_trap,
-    },
-    Entry {
-        module: "maps",
-        function: "merge",
-        arity: 2,
-        continuation: MAPS_MERGE_CONTINUATION,
-        handler: maps_merge,
     },
     Entry {
         module: "erlang",
@@ -1104,78 +1047,6 @@ fn finish_binary_search(
     Ok(HandlerResult::Done { value, reductions })
 }
 
-type MapsMergeState = Mutex<Option<arinsal_maps::HashmapMergeContext>>;
-
-// Port of erts/emulator/beam/erl_map.c:1257 (maps_merge_2), 1498 (maps_merge_trap_1) and
-// 1558-1861 (hashmap_merge: MAP_MERGE_LOOP_FACTOR budget, BUMP_REDS, trap), OTP-29.1.1.
-fn maps_merge(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&Arc<MagicRef>>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    use arinsal_maps::{MAP_MERGE_LOOP_FACTOR, MergeStart};
-    let initial_reds =
-        (process.heap.abi.fcalls.max(0) as isize).saturating_mul(MAP_MERGE_LOOP_FACTOR);
-    let mut reds = initial_reds;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let mut guard = state
-            .downcast_ref::<MapsMergeState>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        let merge = guard.as_mut().ok_or(BifError::BADARG)?;
-        let merged = arinsal_maps::hashmap_merge(merge, &mut reds, &mut heap)
-            .map_err(|_| BifError::SystemLimit)?;
-        let Some(value) = merged else {
-            drop(guard);
-            return Ok(HandlerResult::Yield {
-                continuation: MAPS_MERGE_CONTINUATION,
-                state,
-                reductions: process.heap.abi.fcalls.max(0) as u32,
-            });
-        };
-        *guard = None;
-        drop(guard);
-        process.set_gc_enabled(restore_gc);
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
-        });
-    }
-
-    let mut merge =
-        match arinsal_bifs::maps_merge_start_on_process_heap(&mut heap, args[0], args[1])? {
-            MergeStart::Done(value) => {
-                return Ok(HandlerResult::Done {
-                    value,
-                    reductions: 0,
-                });
-            }
-            MergeStart::Hashmap(merge) => merge,
-        };
-    let merged = arinsal_maps::hashmap_merge(&mut merge, &mut reds, &mut heap)
-        .map_err(|_| BifError::SystemLimit)?;
-    let Some(value) = merged else {
-        // BUMP_ALL_REDS before trapping.
-        return Ok(HandlerResult::Yield {
-            continuation: MAPS_MERGE_CONTINUATION,
-            state: magic_binary_state(
-                MapsMergeState::new(Some(merge)),
-                ERTS_HASHMAP_MERGE_CONTEXT_SIZE,
-            ),
-            reductions: process.heap.abi.fcalls.max(0) as u32,
-        });
-    };
-    Ok(HandlerResult::Done {
-        value,
-        reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
-    })
-}
-
 /// Key of a trapped call made through `apply` when the caller does not import the BIF.
 pub(crate) const APPLY_TRAP_KEY: usize = usize::MAX;
 
@@ -1237,6 +1108,8 @@ pub(crate) struct ContinuationTarget {
     pub(crate) function_atom: arinsal_term::Atom,
     /// The Rust handler of the continuation, absent when it is an Erlang export.
     pub(crate) entry: Option<&'static Entry>,
+    /// `trampoline.bif.address` of a hidden trap export (`erts_init_trap_export`).
+    pub(crate) trap_function: Option<usize>,
 }
 
 impl std::fmt::Debug for ContinuationTarget {
@@ -1300,6 +1173,9 @@ pub(crate) fn continuation_target(continuation: &'static str) -> &'static Contin
                 .intern(function)
                 .expect("continuation function atom"),
             entry: lookup_entry(module, function, arity),
+            trap_function: u8::try_from(arity)
+                .ok()
+                .and_then(|arity| crate::bif_table::trap_function(module, function, arity)),
         }));
         let _ = all.insert(continuation, target);
         target
@@ -1821,8 +1697,6 @@ pub(crate) trait TrapBody {
     ) -> Result<HandlerResult, BifError>;
 }
 
-/// `maps:merge/2`.
-pub(crate) struct MapsMerge;
 /// `binary_to_list/1,3`.
 pub(crate) struct BinaryToList<B>(std::marker::PhantomData<fn() -> B>);
 /// `list_to_binary/1` and `binary:list_to_bin/1`.
@@ -1833,26 +1707,6 @@ pub(crate) struct IolistToBinary;
 pub(crate) struct IolistSize;
 /// `iolist_to_iovec/1`.
 pub(crate) struct IolistToIovec;
-
-impl TrapBody for MapsMerge {
-    const ARITY: Option<usize> = Some(2);
-
-    #[inline(always)]
-    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        arinsal_maps::merge_flatmaps(args[0], args[1], &mut heap)
-    }
-
-    fn run(
-        process: &mut Process,
-        args: &[Term],
-        _instruction: usize,
-        pid: Option<arinsal_sched::Pid>,
-        restore_gc: bool,
-    ) -> Result<HandlerResult, BifError> {
-        maps_merge(process, args, None, pid, restore_gc)
-    }
-}
 
 impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
     fn run(
@@ -2249,9 +2103,6 @@ pub(crate) fn install_deferred_trap(
             BINARY_TO_LIST_CONTINUATION,
             magic_binary_state(Mutex::new(walk), ERTS_BINARY_TO_LIST_STATE_SIZE),
         ),
-        arinsal_bifs::DeferredTrap::Length(cont) => {
-            ("erlang:length/3", argument_trap_state(Mutex::new(cont)))
-        }
         arinsal_bifs::DeferredTrap::Unicode(cont) => (
             cont.continuation(),
             magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),

@@ -204,6 +204,13 @@ fn new_export_slot(
     {
         export.set_bif_number(i32::from(bif.index));
     }
+    // Port of erts/emulator/beam/bif.c (erts_init_trap_export: `bif_number = -1`,
+    // `trampoline.bif.address = bif`), OTP-29.1.1.
+    if let (Some(module), Some(function)) = (global_atoms().text(mfa.0), global_atoms().text(mfa.1))
+        && let Some(function) = crate::bif_table::trap_function(module, function, mfa.2)
+    {
+        export.set_trampoline_address(function);
+    }
     export
 }
 

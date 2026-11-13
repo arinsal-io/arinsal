@@ -22,7 +22,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("maps", "find", 2) => v.entry::<word_bodies::find>(),
         ("maps", "get", 2) => v.entry::<word_bodies::get>(),
         ("maps", "is_key", 2) => v.entry::<word_bodies::is_key>(),
-        ("maps", "merge", 2) => v.entry::<bodies::merge>(),
         ("maps", "put", 3) => v.entry::<word_bodies::put>(),
         ("maps", "remove", 2) => v.entry::<word_bodies::remove>(),
         ("maps", "update", 3) => v.entry::<word_bodies::update>(),
@@ -496,10 +495,6 @@ impl MapsBuildWalk {
     }
 }
 
-fn merge(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let result = arinsal_maps::merge(args[0], args[1], &mut ctx.heap);
-    mapped(ctx, result)
-}
 /// First, non-yielding part of `maps:merge/2`; a HAMT result continues with
 /// [`arinsal_maps::hashmap_merge`] under a reduction budget.
 ///
@@ -567,4 +562,3 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
 crate::word_bif_bodies_in!(word_bodies;
     map_size, map_get, is_map_key, find, get, is_key, put, remove, update, take,
 );
-crate::process_bif_bodies!(merge);

@@ -11,6 +11,7 @@ use crate::VmError;
 use crate::natives::bif::bif_ret;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, Ctx, MapsBuildWalk, MapsProjectionWalk, ProcessHeapHandle};
+use arinsal_maps::{HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MergeStart};
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms};
 use std::sync::{Arc, Mutex};
 
@@ -124,10 +125,11 @@ fn ycf_trap(
 fn create_state_mref<T: std::any::Any + Send + Sync>(
     process: &mut crate::Process,
     state: T,
+    c_payload_size: usize,
 ) -> Result<Term, VmError> {
     let state: Arc<MagicRef> = MagicRef::with_erts_payload_size_and_refn(
         state,
-        ERTS_YCF_TRAP_HOLDER_SIZE,
+        c_payload_size,
         arinsal_bifs::next_ref_words(),
     );
     let mut heap = ProcessHeapHandle(&mut process.heap);
@@ -218,7 +220,11 @@ fn build_first_trap(
     arity: usize,
     walk: MapsBuildWalk,
 ) -> u64 {
-    let state_mref = match create_state_mref::<BuildState>(process, Mutex::new(Some(walk))) {
+    let state_mref = match create_state_mref::<BuildState>(
+        process,
+        Mutex::new(Some(walk)),
+        ERTS_YCF_TRAP_HOLDER_SIZE,
+    ) {
         Ok(state_mref) => state_mref,
         Err(error) => return bif_ret(c_p, i, Err(error)),
     };
@@ -286,7 +292,11 @@ fn projection_hashmap(
     if done {
         return crate::native_hooks::raw(walk.finish());
     }
-    let state_mref = match create_state_mref::<ProjectionState>(process, Mutex::new(Some(walk))) {
+    let state_mref = match create_state_mref::<ProjectionState>(
+        process,
+        Mutex::new(Some(walk)),
+        ERTS_YCF_TRAP_HOLDER_SIZE,
+    ) {
         Ok(state_mref) => state_mref,
         Err(error) => return bif_ret(c_p, i, Err(error)),
     };
@@ -328,5 +338,129 @@ fn projection_resume(
             process.set_gc_enabled(false);
             ycf_trap(c_p, i, process, export, 1, state_mref)
         }
+    }
+}
+
+/// `sizeof(HashmapMergeContext)` on a 64-bit build: the magic binary's `orig_size`.
+// Port of erts/emulator/beam/erl_map.c (HashmapMergeContext), OTP-29.1.1.
+const ERTS_HASHMAP_MERGE_CONTEXT_SIZE: usize = 56;
+
+/// The trap state of `hashmap_merge`: the `HashmapMergeContext` of its magic binary.
+type MergeState = Mutex<Option<HashmapMergeContext>>;
+
+/// `maps:merge/2`.
+// Port of erts/emulator/beam/erl_map.c (maps_merge_2, flatmap_merge, map_merge_mixed),
+// OTP-29.1.1.
+pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [map1, map2] = bif_args::<2>(process);
+    let started = {
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        arinsal_bifs::maps_merge_start_on_process_heap(&mut heap, map1, map2)
+    };
+    match started {
+        Ok(MergeStart::Done(value)) => crate::native_hooks::raw(value),
+        // `hashmap_merge(p, map_A, map_B, swap_args, NULL)`: the first call.
+        Ok(MergeStart::Hashmap(merge)) => hashmap_merge(c_p, i, process, merge, None),
+        Err(error) => ycf_error(c_p, i, process, "maps:merge/2", 2, error),
+    }
+}
+
+/// `maps:merge_trap/1`, `hashmap_merge_trap_export`.
+// Port of erts/emulator/beam/erl_map.c (maps_merge_trap_1), OTP-29.1.1.
+pub(crate) extern "C" fn maps_merge_trap_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let state_mref = process.x[0];
+    // `erts_magic_ref2bin(BIF_ARG_1)`: only `hashmap_merge` traps here, with its own state.
+    let merge = state_mref
+        .with_magic_payload::<MergeState, _>(|state| state.lock().ok()?.take())
+        .flatten();
+    match merge {
+        Some(merge) => hashmap_merge(c_p, i, process, merge, Some(state_mref)),
+        None => ycf_error(
+            c_p,
+            i,
+            process,
+            "maps:merge_trap/1",
+            1,
+            arinsal_bifs::BifError::BADARG,
+        ),
+    }
+}
+
+/// `hashmap_merge`: runs the merge for `MAP_MERGE_LOOP_FACTOR * ERTS_BIF_REDS_LEFT(p)` loop
+/// steps, then returns the map (re-enabling collection after a trap) or `BIF_TRAP1`s to
+/// `hashmap_merge_trap_export` with the context's magic reference.
+// Port of erts/emulator/beam/erl_map.c (hashmap_merge: the ctx == NULL / resume_from_trap
+// entries, `BUMP_REDS`, and the `trap:` label), OTP-29.1.1.
+fn hashmap_merge(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut crate::Process,
+    mut merge: HashmapMergeContext,
+    trap_bin: Option<Term>,
+) -> u64 {
+    let factor = MAP_MERGE_LOOP_FACTOR;
+    let initial_reds = (process.heap.abi.fcalls.max(0) as isize).saturating_mul(factor);
+    let mut reds = initial_reds;
+    let merged = {
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        arinsal_maps::hashmap_merge(&mut merge, &mut reds, &mut heap)
+    };
+    match merged {
+        Ok(Some(value)) => {
+            if trap_bin.is_some() {
+                // erts_set_gc_state(p, 1)
+                process.set_gc_enabled(true);
+            }
+            ycf_bump_reds(process, initial_reds as i64, reds as i64, factor as i64);
+            crate::native_hooks::raw(value)
+        }
+        Ok(None) => {
+            let state_mref = match trap_bin {
+                Some(state_mref) => {
+                    let _ = state_mref.with_magic_payload::<MergeState, _>(|state| {
+                        *state.lock().expect("hashmap merge state") = Some(merge);
+                    });
+                    state_mref
+                }
+                None => {
+                    let created = create_state_mref::<MergeState>(
+                        process,
+                        Mutex::new(Some(merge)),
+                        ERTS_HASHMAP_MERGE_CONTEXT_SIZE,
+                    );
+                    match created {
+                        Ok(state_mref) => {
+                            process.set_gc_enabled(false);
+                            state_mref
+                        }
+                        Err(error) => return bif_ret(c_p, i, Err(error)),
+                    }
+                }
+            };
+            // BUMP_ALL_REDS(p); BIF_TRAP1(&hashmap_merge_trap_export, p, ctx->trap_bin)
+            crate::natives::erl_bif_chksum::bump_all_reds(process);
+            let trap = crate::natives::erl_bif_lists::bif_trap(
+                process,
+                "maps:merge_trap/1",
+                vec![state_mref],
+            );
+            bif_ret(c_p, i, Err(trap))
+        }
+        Err(_) => ycf_error(
+            c_p,
+            i,
+            process,
+            "maps:merge/2",
+            2,
+            arinsal_bifs::BifError::SystemLimit,
+        ),
     }
 }

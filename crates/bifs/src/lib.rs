@@ -609,9 +609,6 @@ pub fn visit_bif<V: BifTableVisitor>(
     if let Some(found) = etf::lookup(module, name, arity, visitor) {
         return Some(found);
     }
-    if let Some(found) = lists::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
     if let Some(found) = pure::lookup(module, name, arity, visitor) {
         return Some(found);
     }
@@ -639,14 +636,6 @@ macro_rules! bif_bodies {
     };
 }
 pub(crate) use bif_bodies;
-
-/// Process-shaped BIF bodies shared by process dispatch and allocator-only callers.
-macro_rules! process_bif_bodies {
-    ($($bif:ident),* $(,)?) => {
-        $crate::process_bif_bodies_in!(bodies; $($bif),*);
-    };
-}
-pub(crate) use process_bif_bodies;
 
 /// Process-shaped BIF bodies in a separate table module for mixed families.
 macro_rules! process_bif_bodies_in {

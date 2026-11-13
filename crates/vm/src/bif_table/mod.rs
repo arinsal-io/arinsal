@@ -96,11 +96,15 @@ pub(crate) fn call_from_executor(
     function: &str,
     arity: usize,
 ) -> Option<Result<arinsal_term::Term, crate::VmError>> {
-    let spec = arinsal_spec::bif_lookup(module, function, u8::try_from(arity).ok()?)?;
-    let func = function_at(usize::from(spec.index))?;
+    let arity8 = u8::try_from(arity).ok()?;
+    // A hidden trap export calls its `trampoline.bif.address`; every other BIF its table entry.
+    let func = match arinsal_spec::bif_lookup(module, function, arity8) {
+        Some(spec) => function_at(usize::from(spec.index))?,
+        None => raw::bif_at(trap_function(module, function, arity8)?),
+    };
     // The executor calls the BIF as its export entry does: the trampoline stores the
     // export's info word in `c_p->current` first, which BIF_ERROR and BIF_TRAP* name.
-    let export = crate::beamasm_integration::bif_mfa_export(module, function, spec.arity)?;
+    let export = crate::beamasm_integration::bif_mfa_export(module, function, arity8)?;
     process.heap.abi.current = std::ptr::from_ref(export).cast();
     process.x.ensure_x(arity.max(1));
     let reg = std::ptr::from_mut(&mut process.x[0]).cast::<u64>();
@@ -139,7 +143,7 @@ use crate::native_helpers::{
     persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, erl_bif_chksum, erl_bif_info, erl_bif_lists, erl_hl_timer, erl_map,
+    bif_phash2, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer, erl_map,
     erl_process_dict, register,
 };
 
@@ -233,6 +237,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "from_keys", 2) => bif!(erl_map::maps_from_keys_2),
         ("maps", "keys", 1) => bif!(erl_map::maps_keys_1),
         ("maps", "values", 1) => bif!(erl_map::maps_values_1),
+        ("maps", "merge", 2) => bif!(erl_map::maps_merge_2),
+        // erl_bif_guard.c
+        ("erlang", "length", 1) => bif!(erl_bif_guard::length_1),
         // erl_process_dict.c
         ("erlang", "get", 0) => bif!(erl_process_dict::get_0),
         ("erlang", "get", 1) => bif!(erl_process_dict::get_1),
@@ -321,20 +328,33 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
     Some(func)
 }
 
+/// `erts_init_trap_export` users: the hidden trap exports (`bif_number` -1) whose
+/// `trampoline.bif.address` is a BIF function. The export is entered in no export table.
+// Port of erts/emulator/beam/bif.c (erts_init_trap_export) and its callers
+// (erl_bif_chksum.c erts_init_bif_chksum, erl_map.c erts_init_map, erl_bif_guard.c
+// erts_init_bif_guard), OTP-29.1.1. erts calls it once per export at boot; the function is
+// fixed here when the export is created.
+pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<usize> {
+    Some(match (module, function, arity) {
+        ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
+        ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
+        ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
+        _ => return None,
+    })
+}
+
 /// The light entry of a trapping BIF with its own body, compiled when the export is created.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:421-447, OTP-29.1.1: the fragment calls the
 // selected BIF body directly; that body leaves the light path only when it traps.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{
-        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsMerge,
-        TermToBinary,
+        BinaryToTerm, IolistSize, IolistToBinary, IolistToIovec, ListToBinary, TermToBinary,
     };
     use crate::native_helpers::trap_bif_entry;
     if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
         return arinsal_bifs::visit_bif(module, function, arity, &mut BinaryToListEntry);
     }
     let func = match (module, function, arity) {
-        ("maps", "merge", 2) => bif!(trap_bif_entry::<MapsMerge>),
         ("erlang", "list_to_binary", 1) | ("binary", "list_to_bin", 1) => {
             bif!(trap_bif_entry::<ListToBinary>)
         }
