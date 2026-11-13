@@ -342,8 +342,9 @@ const LIST_CASES: &[Case] = &[
 ];
 
 const MAPS: &[usize] = &[1, 32, 33, 1_000, 100_000];
-/// Above 32 keys, `erts_qsort` uses a scheduler-local random pivot, so constructor charges vary
-/// between OTP runs. Compare against several reference samples below.
+/// Above 128 keys, `erts_qsort` seeds its pivot from scheduler-local random state (up to 128 the
+/// seed is fixed and only addresses vary), so constructor charges vary
+/// between runs on both sides: both are sampled and their distributions compared.
 const MAP_BUILD_SIZES: &[usize] = &[1, 32, 33, 1_000, 100_000];
 const MAP_BUILD_REFERENCE_SAMPLES: usize = 20;
 /// erl_map.c: the YCF-yielding constructors and projections, flat and hashmap.
@@ -647,6 +648,49 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64) {
     (*reds, *ins, *gcs)
 }
 
+/// min / median / max of one measured quantity over the samples of a case.
+#[derive(Clone, Copy)]
+struct Range {
+    min: i64,
+    median: i64,
+    max: i64,
+}
+
+impl Range {
+    fn of(mut values: Vec<i64>) -> Self {
+        values.sort_unstable();
+        Self {
+            min: values[0],
+            median: values[values.len() / 2],
+            max: values[values.len() - 1],
+        }
+    }
+
+    fn contains(&self, value: i64) -> bool {
+        (self.min..=self.max).contains(&value)
+    }
+}
+
+impl std::fmt::Display for Range {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..={} (median {})", self.min, self.max, self.median)
+    }
+}
+
+struct Spread {
+    reds: Range,
+    ins: Range,
+}
+
+impl Spread {
+    fn of(samples: &[(i64, i64, i64)]) -> Self {
+        Self {
+            reds: Range::of(samples.iter().map(|s| s.0).collect()),
+            ins: Range::of(samples.iter().map(|s| s.1).collect()),
+        }
+    }
+}
+
 fn check(cases: &[Case]) {
     check_with(cases, &[]);
 }
@@ -672,7 +716,7 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                 continue;
             }
             let function = function_name(case, size);
-            let sample_count = if size > 32
+            let random_pivot = size > 128
                 && matches!(
                     case.name,
                     "from_list"
@@ -681,55 +725,51 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                         | "from_keys_dups"
                         | "from_list_prefix"
                         | "from_keys_prefix"
-                ) {
+                );
+            let sample_count = if random_pivot {
                 MAP_BUILD_REFERENCE_SAMPLES
             } else {
                 1
             };
             let mut expected_samples = Vec::with_capacity(sample_count);
+            let mut actual_samples = Vec::with_capacity(sample_count);
             for _ in 0..sample_count {
                 let CallResult::Ok(expected) = reference.call(MODULE, &function, &[]) else {
                     panic!("OTP {function} failed");
                 };
                 expected_samples.push(measured(&expected));
+                let actual = vm
+                    .eval_scheduled_reductions(MODULE, &function, &[], 1, 4_000)
+                    .unwrap();
+                actual_samples.push(measured(&actual.term));
             }
-            let actual = vm
-                .eval_scheduled_reductions(MODULE, &function, &[], 1, 4_000)
-                .unwrap();
-            let (actual_reds, actual_ins, actual_gcs) = measured(&actual.term);
-            let min_reds = expected_samples
-                .iter()
-                .map(|sample| sample.0)
-                .min()
-                .unwrap();
-            let max_reds = expected_samples
-                .iter()
-                .map(|sample| sample.0)
-                .max()
-                .unwrap();
-            let min_ins = expected_samples
-                .iter()
-                .map(|sample| sample.1)
-                .min()
-                .unwrap();
-            let max_ins = expected_samples
-                .iter()
-                .map(|sample| sample.1)
-                .max()
-                .unwrap();
-            let expected_reds = format!("{min_reds}..={max_reds}");
-            let expected_ins = format!("{min_ins}..={max_ins}");
-            let expected_gcs = expected_samples[0].2;
+            let expected = Spread::of(&expected_samples);
+            let actual = Spread::of(&actual_samples);
             eprintln!(
-                "{function}: erl reds {expected_reds} ins {expected_ins} gcs {expected_gcs}; \
-                 arinsal reds {actual_reds} ins {actual_ins} gcs {actual_gcs}"
+                "{function}: erl reds {} ins {} gcs {}; arinsal reds {} ins {} gcs {}",
+                expected.reds,
+                expected.ins,
+                expected_samples[0].2,
+                actual.reds,
+                actual.ins,
+                actual_samples[0].2
             );
-            let tolerance = SLACK_PER_SLICE * max_ins;
-            if !(min_ins..=max_ins).contains(&actual_ins)
-                || !(min_reds - tolerance..=max_reds + tolerance).contains(&actual_reds)
-            {
+            let passed = if random_pivot {
+                // Both runtimes draw the qsort pivot at random: compare the distributions.
+                expected.reds.contains(actual.reds.median)
+                    && actual.reds.contains(expected.reds.median)
+                    && expected.ins.contains(actual.ins.median)
+                    && actual.ins.contains(expected.ins.median)
+            } else {
+                let tolerance = SLACK_PER_SLICE * expected.ins.max;
+                expected.ins.min == actual.ins.min
+                    && (expected.reds.min - tolerance..=expected.reds.min + tolerance)
+                        .contains(&actual.reds.min)
+            };
+            if !passed {
                 failures.push(format!(
-                    "{function}: erl reds {min_reds}..={max_reds} ins {min_ins}..={max_ins}, arinsal reds {actual_reds} ins {actual_ins}"
+                    "{function}: erl reds {} ins {}, arinsal reds {} ins {}",
+                    expected.reds, expected.ins, actual.reds, actual.ins
                 ));
             }
         }
