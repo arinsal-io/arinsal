@@ -6,8 +6,10 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
+
 use similar_asserts::assert_eq;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -66,12 +68,11 @@ fn alive_request_reply_fetched_before_park_wakes_the_caller() {
     };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut vm = common::node();
+        common::load_fresh(&mut vm, &beam);
         for _ in 0..6 {
-            let mut vm = Vm::new([]);
-            vm.load_bytes(&beam).expect("load into arinsal");
-            let arg = Term::small(20_000).unwrap();
-            let result = vm.eval_scheduled(MODULE, "run", &[arg], 2, None);
-            let _ = global_atoms();
+            let arg = arinsal_term::Term::small(20_000).unwrap();
+            let result = vm.eval_scheduled(MODULE, "run", &[arg], 2);
             if tx.send(result.map(|r| r.term)).is_err() {
                 return;
             }

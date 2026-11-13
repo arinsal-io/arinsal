@@ -10,7 +10,6 @@
 
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use std::process::Command;
 
 const ASM_SOURCE: &str = include_str!("../fixtures/xreg_poison_asm.S");
@@ -50,11 +49,11 @@ fn patch_to_dead_register(beam: &mut [u8]) {
 }
 
 fn probe(beam: &[u8]) -> OwnedTerm {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).unwrap();
     let args = [Term::NIL; 4];
     let result = vm
-        .eval_scheduled("xreg_poison_asm", "probe", &args, 1, None)
+        .eval_scheduled("xreg_poison_asm", "probe", &args, 1)
         .unwrap_or_else(|error| panic!("VM error {error:?}"));
     result.term
 }

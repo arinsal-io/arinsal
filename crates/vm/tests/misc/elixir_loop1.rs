@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 
 #[test]
 fn pid_to_list_matches_otp_29() {
@@ -15,7 +14,7 @@ fn pid_to_list_matches_otp_29() {
         .compile_named("elixir_loop1_pid", source, &[])
         .unwrap();
     reference.load("elixir_loop1_pid", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for input in [
         OwnedTerm::Pid {
@@ -36,7 +35,7 @@ fn pid_to_list_matches_otp_29() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval_scheduled("elixir_loop1_pid", "render", &[arg], 1, None)
+            .eval_scheduled("elixir_loop1_pid", "render", &[arg], 1)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "{input:?}");
     }
@@ -64,10 +63,10 @@ fn hibernate_zero_waits_and_resumes_at_the_call_site() {
         .unwrap();
     reference.load("elixir_loop1_hibernate", &beam).unwrap();
     let expected = reference.call("elixir_loop1_hibernate", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("elixir_loop1_hibernate", "run", &[], 2, None)
+        .eval_scheduled("elixir_loop1_hibernate", "run", &[], 2)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -89,10 +88,10 @@ fn fun_info_mfa_matches_otp_29() {
         .unwrap();
     reference.load("elixir_loop1_fun", &beam).unwrap();
     let expected = reference.call("elixir_loop1_fun", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("elixir_loop1_fun", "run", &[], 1, None)
+        .eval_scheduled("elixir_loop1_fun", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
     let args = [
@@ -106,7 +105,7 @@ fn fun_info_mfa_matches_otp_29() {
         .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled("elixir_loop1_fun", "dynamic", &terms, 1, None)
+        .eval_scheduled("elixir_loop1_fun", "dynamic", &terms, 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -131,7 +130,7 @@ fn dynamic_apply_of_re_import_matches_otp_29() {
         OwnedTerm::Atom("import".into()),
     ];
     let expected = reference.call("elixir_loop1_re", "run", &args);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let mut heap = VecHeap::new();
     let terms: Vec<_> = args
@@ -139,7 +138,7 @@ fn dynamic_apply_of_re_import_matches_otp_29() {
         .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled("elixir_loop1_re", "run", &terms, 1, None)
+        .eval_scheduled("elixir_loop1_re", "run", &terms, 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

@@ -10,7 +10,6 @@
 //! runs with `ERTS_SAVE_CALLS_CODE_IX`, whose address of every export is the save_calls
 //! dispatch fragment.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
@@ -47,7 +46,6 @@ struct Permission {
 
 /// One node's code index state (`the_active_code_index`, `the_staging_code_index`).
 pub(crate) struct CodeIndexes {
-    scope: u64,
     active: AtomicU32,
     staging: AtomicU32,
     /// `module_tables[ERTS_NUM_CODE_IX]`, the export tables and the ranges of each code index.
@@ -81,18 +79,15 @@ pub(crate) struct CodeIndexes {
 impl CodeIndexes {
     // Port of erts/emulator/beam/code_ix.c:100-118 (erts_code_ix_init), OTP-29.1.1: preloading
     // runs with active and staging both zero, and its commit sets things straight.
-    fn new(scope: u64) -> Self {
-        let initial = Arc::new(CodeTables::new(scope));
+    pub(crate) fn new() -> Self {
+        let initial = Arc::new(CodeTables::new());
         Self {
-            scope,
             active: AtomicU32::new(0),
             staging: AtomicU32::new(0),
             generations: std::array::from_fn(|_| AtomicU64::new(initial.generation)),
             tables: std::array::from_fn(|_| RawSlot::new(Arc::clone(&initial))),
             catches: std::array::from_fn(|_| RawSlot::new(Arc::new(Vec::new()))),
-            ranges: std::array::from_fn(|_| {
-                RawSlot::new(crate::native_bridge::scope0_code_ranges())
-            }),
+            ranges: std::array::from_fn(|_| RawSlot::new(crate::native_bridge::code_ranges())),
             retire_hook: OnceLock::new(),
             pending_retired: Mutex::new(Vec::new()),
             catch_publish: Mutex::default(),
@@ -289,19 +284,6 @@ impl CodeIndexes {
     }
 
     // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
-    pub(crate) fn remove_code_ranges_scope(&self, scope: u64) {
-        self.seize(true);
-        for slot in &self.ranges {
-            slot.read(|ranges| {
-                for range in ranges.iter() {
-                    if range.scope() == scope {
-                        range.retire();
-                    }
-                }
-            });
-        }
-        self.release();
-    }
 
     /// Copies the active catch table into the staging code index.
     // Port of erts/emulator/beam/beam_catches.c:89-99 (beam_catches_start_staging), OTP-29.1.1.
@@ -635,7 +617,7 @@ impl CodeIndexes {
         for ix in 0..ERTS_NUM_CODE_IX {
             self.store_slot(ix, Arc::clone(&tables));
         }
-        crate::natives::nif::invalidate_tracer_callbacks(self.scope);
+        crate::natives::nif::invalidate_tracer_callbacks();
     }
 
     /// The NIF bodies `NativeBody` instructions index.
@@ -904,61 +886,23 @@ thread_local! {
 static CODE_BARRIER_THREADS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-fn scopes() -> &'static RwLock<HashMap<u64, Arc<CodeIndexes>>> {
-    // Scope entries are not evicted: their fun and export tables own entries for the VM life.
-    static SCOPES: OnceLock<RwLock<HashMap<u64, Arc<CodeIndexes>>>> = OnceLock::new();
-    SCOPES.get_or_init(Default::default)
+static CODE_IX: OnceLock<Arc<CodeIndexes>> = OnceLock::new();
+
+/// The code indexes once they exist: the fragments published by `beamasm_init` come first.
+pub(crate) fn existing() -> Option<&'static Arc<CodeIndexes>> {
+    CODE_IX.get()
 }
 
-/// The code indexes of the node with code scope `scope`.
-pub(crate) fn for_scope(scope: u64) -> Arc<CodeIndexes> {
-    if let Some(indexes) = scopes()
-        .read()
-        .ok()
-        .and_then(|scopes| scopes.get(&scope).cloned())
-    {
+/// The process's code indexes. Port of erts/emulator/beam/code_ix.c (the_active_code_index,
+/// the_staging_code_index, and the per-index tables): one set per OS process.
+pub(crate) fn global() -> &'static Arc<CodeIndexes> {
+    if let Some(indexes) = CODE_IX.get() {
         return indexes;
     }
     // `CodeIndexes::new` installs the BIF exports (install_bifs), which erts does only after
-    // beamasm_init. Generating the fragments publishes the run-process stub's range into every
-    // node, under the read side of this lock, so it must finish before the write lock is taken.
+    // beamasm_init.
     crate::beamasm_integration::beamasm_init();
-    let mut scopes = scopes().write().unwrap_or_else(|error| error.into_inner());
-    Arc::clone(
-        scopes
-            .entry(scope)
-            .or_insert_with(|| Arc::new(CodeIndexes::new(scope))),
-    )
-}
-
-/// The code indexes of `scope` when that node already exists.
-pub(crate) fn existing_scope(scope: u64) -> Option<Arc<CodeIndexes>> {
-    scopes()
-        .read()
-        .ok()
-        .and_then(|scopes| scopes.get(&scope).cloned())
-}
-
-/// Every node's code indexes. Used while the native-function registry lock is held
-/// to publish a range; it does not take that lock itself.
-pub(crate) fn with_all_scopes(mut visit: impl FnMut(&CodeIndexes)) {
-    let Ok(nodes) = scopes().read() else {
-        return;
-    };
-    for indexes in nodes.values() {
-        visit(indexes);
-    }
-}
-
-/// Forgets the code indexes of a node whose code is gone.
-pub(crate) fn release_scope(scope: u64) {
-    // Dropped after the registry lock: the last reference frees native code, whose
-    // unregistration reads this registry again (`existing_scope`).
-    let released = scopes()
-        .write()
-        .ok()
-        .and_then(|mut scopes| scopes.remove(&scope));
-    drop(released);
+    CODE_IX.get_or_init(|| Arc::new(CodeIndexes::new()))
 }
 
 #[cfg(test)]
@@ -967,7 +911,7 @@ mod tests {
 
     #[test]
     fn commit_rotates_through_the_code_indexes() {
-        let indexes = CodeIndexes::new(0);
+        let indexes = CodeIndexes::new();
         assert_eq!((indexes.active(), indexes.staging()), (0, 0));
         indexes.commit_with_barrier(true);
         assert_eq!((indexes.active(), indexes.staging()), (0, 1));
@@ -979,14 +923,16 @@ mod tests {
         assert_eq!(indexes.process_code_ix(true), ERTS_SAVE_CALLS_CODE_IX);
     }
 
-    fn node() -> (u64, Arc<CodeIndexes>) {
-        let scope = crate::beamasm_integration::new_code_scope();
-        (scope, for_scope(scope))
+    /// A fresh index set: these tests assert exact index and table state, which the process's
+    /// own indexes (shared with every other test) do not keep.
+    fn node() -> Arc<CodeIndexes> {
+        crate::beamasm_integration::beamasm_init();
+        Arc::new(CodeIndexes::new())
     }
 
     #[test]
     fn staged_changes_become_active_only_on_commit() {
-        let (scope, code) = node();
+        let code = node();
         let before = code.active_tables();
         let (active, staging_ix) = (code.active(), code.staging());
         let staging = code.start_staging();
@@ -1011,12 +957,11 @@ mod tests {
             Some(7)
         );
         drop(next);
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn repeated_fun_stub_hits_keep_active_tables_published_in_place() {
-        let (_scope, code) = node();
+        let code = node();
         let candidate = Arc::new(FunEntry {
             dispatch_target: Default::default(),
             pend_purge_address: Default::default(),
@@ -1044,7 +989,7 @@ mod tests {
     #[test]
     fn ended_staging_committed_after_thread_progress_does_not_schedule_a_second_barrier() {
         TEST_COUNTS_BARRIER.with(|counted| counted.set(Some(true)));
-        let (scope, code) = node();
+        let code = node();
         let staging = code.start_staging();
         staging.with(|tables| {
             tables.loaded.insert("barrier_mod", 11);
@@ -1057,13 +1002,12 @@ mod tests {
 
         drop(code.start_staging());
         assert!(take_code_barrier());
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn code_barrier_count_returns_to_zero_once_the_scheduler_thread_takes_it() {
         TEST_COUNTS_BARRIER.with(|counted| counted.set(Some(true)));
-        let (scope, code) = node();
+        let code = node();
         let before = CODE_BARRIER_THREADS.load(Ordering::SeqCst);
         drop(code.start_staging());
         assert_eq!(CODE_BARRIER_THREADS.load(Ordering::SeqCst), before + 1);
@@ -1073,12 +1017,11 @@ mod tests {
         TEST_COUNTS_BARRIER.with(|counted| counted.set(Some(false)));
         drop(code.start_staging());
         assert_eq!(CODE_BARRIER_THREADS.load(Ordering::SeqCst), before);
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn aborted_staging_changes_nothing() {
-        let (scope, code) = node();
+        let code = node();
         let before = code.active_tables();
         let (active, staging_ix) = (code.active(), code.staging());
         let staging = code.start_staging();
@@ -1093,12 +1036,11 @@ mod tests {
         let staging = code.start_staging();
         assert!(!staging.with(|tables| tables.loaded.contains_key("aborted_mod")));
         drop(staging);
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn purged_native_body_slots_are_reused() {
-        let (scope, code) = node();
+        let code = node();
         let native = crate::natives::nif::NativeFn::Bif(
             arinsal_bifs::lookup("erlang", "length", 1).unwrap(),
         );
@@ -1110,12 +1052,11 @@ mod tests {
         assert!(code.native_fns()[first as usize].is_none());
         assert_eq!(code.push_native_fn(native), Some(first));
         assert_eq!(code.native_fns().len(), 2);
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn nested_staging_joins_and_commits_once() {
-        let (scope, code) = node();
+        let code = node();
         let generation = code.active_generation();
         let outer = code.start_staging();
         let inner = code.start_staging();
@@ -1128,12 +1069,11 @@ mod tests {
         drop(outer);
         assert_ne!(code.active_generation(), generation);
         assert!(code.active_tables().loaded.contains_key("inner_mod"));
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn staging_holds_the_code_modification_permission() {
-        let (scope, code) = node();
+        let code = node();
         let staging = code.start_staging();
         let other = Arc::clone(&code);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1159,12 +1099,11 @@ mod tests {
             Some(3)
         );
         waiter.join().unwrap();
-        crate::beamasm_integration::release_code_scope(scope);
     }
 
     #[test]
     fn active_updates_keep_the_code_index() {
-        let (scope, code) = node();
+        let code = node();
         let before = code.active_tables();
         let (active, staging_ix) = (code.active(), code.staging());
         code.update_active(|tables| {
@@ -1182,6 +1121,5 @@ mod tests {
         assert!(!code.active_tables().old.contains_key("staged_purge"));
         drop(staging);
         assert_eq!(code.active_tables().old.get("staged_purge"), Some(&5));
-        crate::beamasm_integration::release_code_scope(scope);
     }
 }

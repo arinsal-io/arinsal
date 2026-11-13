@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 /// A select that traps keeps the results it already has as terms of the caller's heap. Another
 /// process collects the caller between the traps, and the results must survive it.
@@ -38,10 +37,10 @@ fn trapped_select_results_survive_collections() {
         .unwrap();
     reference.load("ets_select_gc_diff", &beam).unwrap();
     let expected = reference.call("ets_select_gc_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_select_gc_diff", "run", &[], 2, None)
+        .eval_scheduled("ets_select_gc_diff", "run", &[], 2)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

@@ -4,7 +4,6 @@ use std::process::Command;
 use arinsal_difftest::{CallOptions, CallResult, RefErl, pretty};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{ProcessHeap, from_owned};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "port_trace7_repro";
 const CASES: [&str; 8] = [
@@ -99,8 +98,8 @@ fn port_trace_event_sequences_match_otp() {
         .unwrap_or_else(|error| panic!("compile {MODULE}: {error}"));
     reference.load(MODULE, &beam).unwrap();
     let driver_dir = dir.to_str().unwrap();
-    let mut vm = Vm::new([dir.clone()]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node_with_dir(&dir);
+    crate::common::load_fresh(&mut vm, &beam);
 
     for case in CASES {
         let expected = run(&reference, MODULE, case, driver_dir);
@@ -110,7 +109,7 @@ fn port_trace_event_sequences_match_otp() {
             from_owned(&string_term(driver_dir), &mut heap).unwrap(),
         ];
         let actual = vm
-            .eval_scheduled(MODULE, "run", &args, 1, None)
+            .eval_scheduled(MODULE, "run", &args, 1)
             .unwrap_or_else(|error| panic!("{MODULE}:run({case}) on Arinsal: {error}"))
             .term;
         similar_asserts::assert_eq!(

@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 
 /// `raise/2` after an `after` body must keep the caught class. The body may
 /// clobber the X registers that held the class (`gen_server:reply/2` does).
@@ -24,7 +23,7 @@ fn try_after_reraise_keeps_class() {
         .compile_named("mix_loop1_reraise", source, &[])
         .unwrap();
     reference.load("mix_loop1_reraise", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for kind in ["error", "exit", "throw"] {
         let input = OwnedTerm::Atom(kind.into());
@@ -32,7 +31,7 @@ fn try_after_reraise_keeps_class() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval_scheduled("mix_loop1_reraise", "run", &[arg], 1, None)
+            .eval_scheduled("mix_loop1_reraise", "run", &[arg], 1)
             .unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term), "{kind}");
     }
@@ -60,11 +59,11 @@ fn ets_insert_keeps_appended_binary() {
         .compile_named("mix_loop1_ets_bin", source, &[])
         .unwrap();
     reference.load("mix_loop1_ets_bin", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop1_ets_bin", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop1_ets_bin", "run", &[], 0, None)
+        .eval_scheduled("mix_loop1_ets_bin", "run", &[], 0)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -86,11 +85,11 @@ fn os_env_pairs_match_otp() {
         .compile_named("mix_loop1_os_env", source, &[])
         .unwrap();
     reference.load("mix_loop1_os_env", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop1_os_env", "run", &[]);
     let actual = vm
-        .eval_scheduled("mix_loop1_os_env", "run", &[], 1, None)
+        .eval_scheduled("mix_loop1_os_env", "run", &[], 1)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

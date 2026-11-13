@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{ProcessHeap, from_owned};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 use std::path::Path;
 
@@ -49,12 +48,12 @@ fn hello_entry_point_preserves_unaligned_binary_match_tail() {
     };
     let expected = reference.call(MODULE, "test", std::slice::from_ref(&boot_args));
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).unwrap();
     let mut argument_heap = ProcessHeap::with_words(128);
     let boot_args_term = from_owned(&boot_args, &mut argument_heap).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "test", &[boot_args_term], 10, None)
+        .eval_scheduled(MODULE, "test", &[boot_args_term], 10)
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

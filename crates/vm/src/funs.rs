@@ -1290,8 +1290,8 @@ impl Vm {
         };
         let (module, function) = (module.as_atom()?, function.as_atom()?);
         let arity = u8::try_from(arity.as_small()?).ok()?;
-        let scope = process.runtime?.code_scope;
-        let entry = crate::export::export_get_or_make_stub(scope, (module, function, arity))?;
+        process.runtime?;
+        let entry = crate::export::export_get_or_make_stub((module, function, arity))?;
         TermBuilder::new(&mut process.heap)
             .export_fun(entry)
             .ok()
@@ -1315,9 +1315,8 @@ impl Vm {
             .ok_or_else(|| self.exception(p, "badarg"))? as u8;
         // Port of erts/emulator/beam/bif.c (erlang:make_fun/3: erts_export_get_or_make_stub,
         // the fun is the export's lambda), OTP-29.1.1.
-        let entry =
-            crate::export::export_get_or_make_stub(self.code_scope, (module, function, arity))
-                .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)));
+        let entry = crate::export::export_get_or_make_stub((module, function, arity))
+            .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)));
         TermBuilder::new(&mut p.heap)
             .export_fun(entry)
             .map_err(|e| VmError::Unsupported(format!("export fun allocation {e:?}")))
@@ -1548,7 +1547,7 @@ mod tests {
         vm.load_bytes(&beam).unwrap();
         let args = [Term::small(17).unwrap(), Term::small(29).unwrap()];
         let result = vm
-            .eval_scheduled("vm_make_fun_gc_stress", "run", &args, 1, None)
+            .eval_scheduled("vm_make_fun_gc_stress", "run", &args, 1)
             .unwrap();
         let arinsal_etf::OwnedTerm::Tuple(items) = &result.term else {
             panic!("expected {{17, 29, Fun}}, got {:?}", result.term);

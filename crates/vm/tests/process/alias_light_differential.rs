@@ -4,8 +4,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 const MODULE: &str = "alias_light_differential";
 const CASES: &[&str] = &[
@@ -196,7 +194,7 @@ fn alias_and_iolist_size_light_bifs_match_erl() {
         .compile_named(MODULE, SOURCE, &[])
         .expect("compile alias_light_differential");
     reference.load(MODULE, &beam).expect("load into erl");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load into arinsal");
     for case in CASES {
         let want: OwnedTerm =
@@ -206,8 +204,8 @@ fn alias_and_iolist_size_light_bifs_match_erl() {
             };
         let arg = Term::atom(global_atoms().intern(case).unwrap());
         let actual = vm
-            .eval_scheduled(MODULE, "run", &[arg], 2, None)
+            .eval_scheduled(MODULE, "run", &[arg], 2)
             .unwrap_or_else(|error| panic!("{MODULE}:run({case}): {error}"));
-        assert_eq!(actual.term, want, "{MODULE}:run({case})");
+        similar_asserts::assert_eq!(actual.term, want, "{MODULE}:run({case})");
     }
 }

@@ -2,7 +2,7 @@
 
 use arinsal_term::{
     Atom, LiteralArea, ProcessHeap, Term, TermBuilder, delete_module_record_definitions,
-    global_atoms, put_record_definition, set_record_scope,
+    global_atoms, put_record_definition,
 };
 
 fn atom(name: &str) -> Atom {
@@ -13,10 +13,9 @@ fn definition_of(record: Term) -> u64 {
     record.record_snapshot().unwrap().definition.tagged_word()
 }
 
-/// Register the definition of `module:name` with the given fields in `scope`.
+/// Register the definition of `module:name` with the given fields.
 fn register(
     area: &mut LiteralArea,
-    scope: u64,
     module: Atom,
     name: Atom,
     exported: bool,
@@ -29,7 +28,6 @@ fn register(
         .unwrap();
     // The definition tuple is the head of the literal; read it back through a record built
     // from the same layout while no definition is registered.
-    set_record_scope(0);
     let values: Vec<(Atom, Term)> = fields
         .iter()
         .map(|(field, _)| (*field, Term::NIL))
@@ -41,7 +39,7 @@ fn register(
         .record_snapshot()
         .unwrap()
         .definition;
-    put_record_definition(scope, module, name, cons, definition);
+    put_record_definition(module, name, cons, definition);
     definition.tagged_word()
 }
 
@@ -51,11 +49,9 @@ fn records_reuse_the_registered_definition() {
     let (module, name) = (atom("canon_mod"), atom("point"));
     let (x, y) = (atom("canon_x"), atom("canon_y"));
     let mut area = LiteralArea::new();
-    let scope = 9001;
-    let registered = register(&mut area, scope, module, name, true, &[x, y]);
+    let registered = register(&mut area, module, name, true, &[x, y]);
     let mut heap = ProcessHeap::with_words(256);
 
-    set_record_scope(scope);
     let one = TermBuilder::new(&mut heap)
         .native_record(
             module,
@@ -89,17 +85,10 @@ fn records_reuse_the_registered_definition() {
         assert_ne!(definition_of(record), registered);
     }
 
-    // Another scope and a deleted module have no canonical definition.
-    set_record_scope(scope + 1);
-    let elsewhere = TermBuilder::new(&mut heap)
-        .native_record(module, name, true, &[(x, Term::NIL), (y, Term::NIL)])
-        .unwrap();
-    assert_ne!(definition_of(elsewhere), registered);
-    set_record_scope(scope);
-    delete_module_record_definitions(scope, module);
+    // A deleted module has no canonical definition.
+    delete_module_record_definitions(module);
     let deleted = TermBuilder::new(&mut heap)
         .native_record(module, name, true, &[(x, Term::NIL), (y, Term::NIL)])
         .unwrap();
     assert_ne!(definition_of(deleted), registered);
-    set_record_scope(0);
 }

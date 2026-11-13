@@ -2,7 +2,6 @@
 //! like erts_proc_sig_receive_helper.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(native_sig_fetch).
@@ -156,10 +155,10 @@ fn compare(function: &str) {
         .unwrap();
     reference.load("native_sig_fetch", &beam).unwrap();
     let expected = reference.call("native_sig_fetch", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("native_sig_fetch", function, &[], 2, None)
+        .eval_scheduled("native_sig_fetch", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

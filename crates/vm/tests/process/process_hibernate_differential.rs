@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_hib_diff).
@@ -51,10 +50,10 @@ fn hibernate_current_functions_match_erts() {
         .expect("load hibernate differential");
     let expected = reference.call("proc_hib_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load hibernate differential");
     let actual = vm
-        .eval_scheduled("proc_hib_diff", "run", &[], 2, None)
+        .eval_scheduled("proc_hib_diff", "run", &[], 2)
         .expect("run hibernate differential")
         .term;
 

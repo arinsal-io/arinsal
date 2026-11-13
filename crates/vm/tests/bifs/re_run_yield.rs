@@ -1,7 +1,6 @@
 //! `re:run` yields between PCRE2 loop budgets, so a process stuck in a long match can be killed.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "re_run_yield";
 const SOURCE: &str = r#"
@@ -64,10 +63,10 @@ fn both(function: &str) -> (CallResult, CallResult) {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, function, &[], 2, None)
+        .eval_scheduled(MODULE, function, &[], 2)
         .map(|outcome| CallResult::Ok(outcome.term))
         .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
     (expected, actual)

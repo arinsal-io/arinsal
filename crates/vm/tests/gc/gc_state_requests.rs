@@ -1,7 +1,6 @@
 //! Asynchronous garbage_collect requests to a process with GC disabled and to unstarted processes.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "gc_state_requests";
 const SOURCE: &str = r#"
@@ -42,13 +41,8 @@ fn assert_equal(function: &str) {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(MODULE, function, &[], 1, None)
-        .map(|outcome| CallResult::Ok(outcome.term))
-        .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
-    assert_eq!(expected, actual, "{function}");
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("{MODULE}:{function}()"));
+    assert_eq!(expected, CallResult::Ok(actual), "{function}");
 }
 
 #[test]

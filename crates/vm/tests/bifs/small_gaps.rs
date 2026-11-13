@@ -2,7 +2,6 @@
 //! `hibernate` called through `apply/3`, and heap accounting of parked processes.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -146,11 +145,11 @@ fn compare(function: &str) {
         .expect("load reference records");
     reference.load("sg_probe", &probe).expect("load reference");
     let expected = reference.call("sg_probe", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&records).expect("load VM records");
     vm.load_bytes(&probe).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("sg_probe", function, &[], 2, None)
+        .eval_scheduled("sg_probe", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

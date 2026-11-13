@@ -504,9 +504,7 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
             "nifs" => {
                 let mut nifs = Vec::new();
                 // `erts_nif_get_funcs(mod->curr.nif)`: the functions of the library entry.
-                if let Some(functions) =
-                    crate::natives::nif::instance_nif_functions(vm.code_scope, id)
-                {
+                if let Some(functions) = crate::natives::nif::instance_nif_functions(id) {
                     for (function, arity) in functions {
                         nifs.push(make_tuple(
                             process,
@@ -872,14 +870,15 @@ fn finish_stage(
             // enabled; staging_epilogue then commits at once and sets the on_load trace
             // patterns), OTP-29.1.1.
             let blocking = !crate::trace_bp::on_load_patterns_of(process).is_empty()
-                || staged.names.iter().any(|name| {
-                    crate::trace_bp::module_has_breakpoints(process, vm.code_scope, name)
-                });
+                || staged
+                    .names
+                    .iter()
+                    .any(|name| crate::trace_bp::module_has_breakpoints(process, name));
             let (Some(runtime), Some(pid), Some(ctx), false) =
                 (process.runtime, pid, ctx, blocking)
             else {
                 for name in &staged.names {
-                    crate::trace_bp::module_code_changed(process, vm.code_scope, name);
+                    crate::trace_bp::module_code_changed(process, name);
                 }
                 if let Some(ended) = staged.ended {
                     ended.commit();
@@ -1182,7 +1181,7 @@ fn delete(
         }
         if let Some(current) = tables.loaded.remove(name) {
             tables.old.insert(name.to_owned(), current);
-            crate::load::retract_module_records(tables.code_scope, name);
+            crate::load::retract_module_records(name);
             tables.deleted.insert(name.to_owned());
             tables.module_files.remove(name);
             Outcome::Deleted
@@ -1208,7 +1207,7 @@ fn delete(
             if let Some(module) = arinsal_term::global_atoms().get(name) {
                 staging.with(|tables| crate::export::delete_code(tables, module, staging.ix()));
             }
-            crate::trace_bp::module_code_changed(process, vm.code_scope, name);
+            crate::trace_bp::module_code_changed(process, name);
             // Port of erts/emulator/beam/beam_bif_load.c (staging_epilogue), OTP-29.1.1:
             // successful nonblocking deletes commit only after the caller's code barrier.
             Ok((Term::atom(arinsal_term::atoms::TRUE), staging.end()))
@@ -1303,7 +1302,7 @@ fn purge(
                 if let Some(id) = removed {
                     // Port of erts/emulator/beam/beam_bif_load.c:2254-2258, OTP-29.1.1: the
                     // purged instance's NIF library is unloaded even while its slot lingers.
-                    crate::natives::nif::unload_instance(tables.code_scope, id);
+                    crate::natives::nif::unload_instance(id);
                     if module_id_referenced(process, &tables.code_meta, id) {
                         keep.push(id);
                     } else {
@@ -1363,7 +1362,7 @@ pub(crate) fn finish_after_on_load(vm: &mut Vm, name: &str, keep: bool) -> Resul
         drop(staging);
         vm.refresh_code();
     } else if let Some(module) = module {
-        let code = crate::code_ix::for_scope(vm.code_scope);
+        let code = crate::code_ix::global();
         crate::export::finish_after_on_load(&code.active_tables(), module, false, code.active());
     }
     Ok(())
@@ -1897,9 +1896,7 @@ mod tests {
     fn value(vm: &mut Vm, module: &str) -> OwnedTerm {
         // Through a scheduler, which runs the module's native code: a module loaded by
         // `prepare_loading` has no interpreter form to run.
-        vm.eval_scheduled(module, "value", &[], 1, None)
-            .unwrap()
-            .term
+        vm.eval_scheduled(module, "value", &[], 1).unwrap().term
     }
 
     #[test]
@@ -2348,7 +2345,7 @@ mod tests {
         }
         let expected = reference.call("arinsal_hot_info", "module_info", &[]);
         let actual = vm
-            .eval_scheduled("arinsal_hot_info", "module_info", &[], 1, None)
+            .eval_scheduled("arinsal_hot_info", "module_info", &[], 1)
             .unwrap();
         compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2381,7 +2378,7 @@ mod tests {
         compare(&actual, &expected, CompareMode::Exact).unwrap();
         // The module has no interpreter form: a scheduler runs its native code.
         let init = vm
-            .eval_scheduled("arinsal_hot_onload", "init", &[], 1, None)
+            .eval_scheduled("arinsal_hot_onload", "init", &[], 1)
             .unwrap();
         compare(
             &CallResult::Ok(init.term),
@@ -2413,7 +2410,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let binary = from_owned(&OwnedTerm::Binary(v2), &mut heap).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_hot_control", "run", &[binary], 2, None)
+            .eval_scheduled("arinsal_hot_control", "run", &[binary], 2)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2468,7 +2465,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let binary = from_owned(&OwnedTerm::Binary(new), &mut heap).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_cpc_control", "run", &[binary], 2, None)
+            .eval_scheduled("arinsal_cpc_control", "run", &[binary], 2)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2509,7 +2506,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let binary = from_owned(&OwnedTerm::Binary(old), &mut heap).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_cpc_busy_control", "run", &[binary], 2, None)
+            .eval_scheduled("arinsal_cpc_busy_control", "run", &[binary], 2)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2537,7 +2534,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let args = [ok, bad].map(|bytes| from_owned(&OwnedTerm::Binary(bytes), &mut heap).unwrap());
         let result = vm
-            .eval_scheduled("arinsal_onload_control", "run", &args, 2, None)
+            .eval_scheduled("arinsal_onload_control", "run", &args, 2)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2584,7 +2581,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let binary = from_owned(&OwnedTerm::Binary(beam), &mut heap).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_bad_bs_match_control", "run", &[binary], 1, None)
+            .eval_scheduled("arinsal_bad_bs_match_control", "run", &[binary], 1)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2608,7 +2605,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let input = from_owned(&input, &mut heap).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_wide_bs_match", "run", &[input], 1, None)
+            .eval_scheduled("arinsal_wide_bs_match", "run", &[input], 1)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2649,7 +2646,7 @@ mod tests {
         let mut heap = arinsal_term::VecHeap::new();
         let binary = from_owned(&OwnedTerm::Binary(v2), &mut heap).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_fun_purge_control", "run", &[binary], 2, None)
+            .eval_scheduled("arinsal_fun_purge_control", "run", &[binary], 2)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2675,7 +2672,7 @@ mod tests {
         vm.load_bytes(&target).unwrap();
         vm.load_bytes(&control).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_delete_control", "run", &[], 1, None)
+            .eval_scheduled("arinsal_delete_control", "run", &[], 1)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
@@ -2692,7 +2689,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&control).unwrap();
         let result = vm
-            .eval_scheduled("arinsal_code_errors", "run", &[], 1, None)
+            .eval_scheduled("arinsal_code_errors", "run", &[], 1)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }

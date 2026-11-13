@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 // A send of refc binaries (whole, sub-binary, mixed iolist) is queued by reference and
 // written with writev, through partial writes on a small send buffer.
@@ -42,10 +41,10 @@ fn refc_binary_send_matches_erts() {
         .load("inet_refc_send", &beam)
         .expect("load inet_refc_send");
     let expected = reference.call("inet_refc_send", "t", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("inet_refc_send", "t", &[], 2, None)
+        .eval_scheduled("inet_refc_send", "t", &[], 2)
         .expect("Arinsal inet_refc_send");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

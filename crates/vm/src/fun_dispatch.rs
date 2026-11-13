@@ -2,44 +2,18 @@
 //! built outside a process, and the runtime half of the `dispatch_save_calls_fun` fragment.
 use arinsal_beamasm::ProcessHeader;
 use arinsal_term::{Atom, ExportEntry, FunEntry};
-use std::cell::Cell;
 use std::sync::Arc;
-
-thread_local! {
-    /// Code scope (node) of the runtime this thread works for; zero when it has none.
-    static CODE_SCOPE: Cell<u64> = const { Cell::new(0) };
-}
-
-/// Records the node this thread runs code for, so export funs built here (literals,
-/// `binary_to_term`) point at that node's export entries.
-pub(crate) fn set_thread_code_scope(scope: u64) {
-    CODE_SCOPE.with(|cell| cell.set(scope));
-}
-
-/// The node this thread runs code for, or 0 when none was recorded.
-pub(crate) fn code_scope() -> u64 {
-    CODE_SCOPE.with(Cell::get)
-}
 
 /// Export fun lookup for the term crate.
 // Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
 fn export_stub_hook(module: Atom, function: Atom, arity: u8) -> Option<Arc<ExportEntry>> {
-    let scope = CODE_SCOPE.with(Cell::get);
-    if scope == 0 {
-        return None;
-    }
-    crate::export::export_get_or_make_stub(scope, (module, function, arity))
+    crate::export::export_get_or_make_stub((module, function, arity))
 }
 
 /// Local fun lookup for ETF terms decoded by a process on this node.
 // Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
 fn fun_entry_stub_hook(candidate: Arc<FunEntry>) -> Option<Arc<FunEntry>> {
-    let scope = CODE_SCOPE.with(Cell::get);
-    if scope == 0 {
-        None
-    } else {
-        Some(crate::code_ix::for_scope(scope).intern_fun_entry(candidate))
-    }
+    Some(crate::code_ix::global().intern_fun_entry(candidate))
 }
 
 /// Publishes the fun dispatch fragments as `beam_unloaded_fun` / `beam_save_calls_fun` and
@@ -60,12 +34,10 @@ pub(crate) extern "C" fn arinsal_beamasm_save_calls_fun(
     header: *mut ProcessHeader,
     fun_raw: u64,
 ) -> usize {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some((_process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return arinsal_term::beam_unloaded_fun();
     };
-    let active = process.runtime.as_ref().map_or(0, |runtime| {
-        crate::code_ix::for_scope(runtime.code_scope).active()
-    });
+    let active = crate::code_ix::global().active();
     match crate::native_hooks::fun_view(crate::native_hooks::from_raw(fun_raw)) {
         Some(arinsal_term::FunRef::Local { entry, .. }) => entry.dispatch_target.address(active),
         Some(arinsal_term::FunRef::Export { entry }) => entry.address(active),

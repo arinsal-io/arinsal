@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, VecHeap, from_owned, to_owned};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(raise_stacktrace_differential).
@@ -45,7 +44,7 @@ error_none() ->
     end.
 "#;
 
-fn vm_call(vm: &mut Vm, function: &str, args: &[OwnedTerm]) -> CallResult {
+fn vm_call(vm: &mut arinsal_vm::Vm, function: &str, args: &[OwnedTerm]) -> CallResult {
     let mut heap = VecHeap::new();
     let args = args
         .iter()
@@ -69,7 +68,7 @@ fn legacy_raise_frames_and_depth_match_otp() {
     reference
         .load("raise_stacktrace_differential", &beam)
         .expect("load raise_stacktrace_differential");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load test module");
 
     for function in ["explicit", "invalid_frame", "error_none"] {
@@ -97,7 +96,7 @@ fn error_three_argument_frames_match_otp() {
     reference
         .load("raise_stacktrace_differential", &beam)
         .expect("load raise_stacktrace_differential");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load test module");
     let args = [OwnedTerm::Int(11), OwnedTerm::Int(22)];
 

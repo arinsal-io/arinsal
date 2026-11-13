@@ -3,7 +3,7 @@
 //! so the target keeps no stale `monitored_by` entry for a dead watcher.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(exit_demonitor).
@@ -39,9 +39,9 @@ fn exiting_watcher_demonitors_its_target_like_otp() {
         .expect("load reference module");
     let expected = reference.call("exit_demonitor", "run", &[]);
     for workers in [1, 4] {
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).expect("load VM module");
-        let actual = match vm.eval_scheduled("exit_demonitor", "run", &[], workers, None) {
+        let actual = match vm.eval_scheduled("exit_demonitor", "run", &[], workers) {
             Ok(outcome) => CallResult::Ok(outcome.term),
             Err(VmError::Raised(raised)) => CallResult::Exception {
                 class: format!("{:?}", raised.class).to_lowercase(),

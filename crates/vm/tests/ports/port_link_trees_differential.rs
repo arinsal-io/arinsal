@@ -1,7 +1,6 @@
 //! Port links and monitors live in the trees of the processes at both ends: `process_info`
 //! of the owner and of a driver-monitored process, and the exit of a process that unlinked.
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(port_link_trees_diff).
@@ -80,10 +79,10 @@ fn port_links_and_monitors_in_process_trees_match_erts() {
         .expect("compile");
     reference.load("port_link_trees_diff", &beam).unwrap();
     let expected = reference.call("port_link_trees_diff", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("port_link_trees_diff", "run", &[], 5, None)
+        .eval_scheduled("port_link_trees_diff", "run", &[], 5)
         .expect("run")
         .term;
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual));

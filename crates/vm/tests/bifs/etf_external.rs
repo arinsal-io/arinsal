@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 use std::path::Path;
 use std::process::Command;
@@ -32,10 +31,10 @@ fn binary_to_term_badopt_error_info_matches_erts() {
         .load("etf_external_error_info_diff", &beam)
         .unwrap();
     let expected = reference.call("etf_external_error_info_diff", "badopt", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("etf_external_error_info_diff", "badopt", &[], 1, None)
+        .eval_scheduled("etf_external_error_info_diff", "badopt", &[], 1)
         .unwrap()
         .term;
     let CallResult::Ok(expected) = expected else {
@@ -130,9 +129,9 @@ fn binary_to_term_borrowed_and_copied_inputs_match_erts() {
     let CallResult::Ok(expected) = reference.call(module, "run", &[]) else {
         panic!("reference call failed");
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap().term;
     assert_eq!(actual, expected);
 }
 
@@ -167,8 +166,6 @@ fn binary_to_term_trapped_list_tail_matches_erts() {
     let CallResult::Ok(expected) = reference.call(module, "run", &[]) else {
         panic!("reference call failed");
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap().term;
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("{module}:run()"));
     assert_eq!(actual, expected);
 }

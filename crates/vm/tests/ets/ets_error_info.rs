@@ -2,7 +2,6 @@
 //! update/select/rename edge cases they guard behave like OTP 29.1.1.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_error_info_diff).
@@ -154,10 +153,10 @@ fn assert_same(function: &str) {
         .unwrap();
     reference.load("ets_error_info_diff", &beam).unwrap();
     let expected = reference.call("ets_error_info_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_error_info_diff", function, &[], 2, None)
+        .eval_scheduled("ets_error_info_diff", function, &[], 2)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

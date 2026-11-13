@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(env_diff).
@@ -69,7 +68,7 @@ signal() ->
 
 fn compare_call(reference: &RefErl, beam: &[u8], function: &str, args: &[OwnedTerm]) {
     let expected = reference.call("env_diff", function, args);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).unwrap();
     let args = args
         .iter()
@@ -79,7 +78,7 @@ fn compare_call(reference: &RefErl, beam: &[u8], function: &str, args: &[OwnedTe
         })
         .collect::<Vec<_>>();
     let actual = vm
-        .eval_scheduled("env_diff", function, &args, 1, None)
+        .eval_scheduled("env_diff", function, &args, 1)
         .map(|result| result.term)
         .unwrap_or_else(|error| panic!("{function}: VM error {error:?}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
@@ -114,10 +113,8 @@ fn environment_and_signal_bifs_match_otp() {
         "set_signal",
         &[OwnedTerm::atom("sigusr1"), OwnedTerm::atom("handle")],
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("env_diff", "signal", &[], 1, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("env_diff", "signal", &[], 1).unwrap();
     similar_asserts::assert_eq!(signal_expected, CallResult::Ok(actual.term));
 }

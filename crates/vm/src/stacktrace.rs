@@ -1190,10 +1190,7 @@ pub(crate) fn native_catch_address(term: Term) -> Option<usize> {
     if payload >> 32 != 0 {
         return None;
     }
-    crate::native_bridge::native_catch(
-        crate::fun_dispatch::code_scope(),
-        u32::try_from(payload).ok()?,
-    )
+    crate::native_bridge::native_catch(u32::try_from(payload).ok()?)
 }
 
 fn atom(name: &str) -> Result<Term, VmError> {

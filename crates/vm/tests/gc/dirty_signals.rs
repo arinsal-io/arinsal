@@ -7,7 +7,6 @@ use std::process::Command;
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 
 const NIF_SOURCE: &str = r#"
 #include <unistd.h>
@@ -273,9 +272,9 @@ fn signals_to_long_dirty_nifs_are_handled_while_they_run() {
             CallResult::Ok(term) => term,
             other => panic!("{module}:run({case}) on erl: {other:?}"),
         };
-        let mut vm = Vm::new([dir.clone()]);
+        let mut vm = crate::common::node_with_dir(&dir);
         let arg = Term::atom(global_atoms().intern(case).unwrap());
-        let actual = match vm.eval_scheduled(module, "run", &[arg], 4, None) {
+        let actual = match vm.eval_scheduled(module, "run", &[arg], 4) {
             Ok(result) => result.term,
             Err(error) => panic!("{module}:run({case}) failed on Arinsal: {error}"),
         };

@@ -4,7 +4,6 @@
 //! expanded after a non-`defmodule` form can wait for the defining module.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn process_flag_error_handler_receives_unloaded_call() {
@@ -47,12 +46,13 @@ unloaded() ->
     reference.load("mix_loop5_call", &caller_beam).unwrap();
     for function in ["unloaded", "run"] {
         let expected = reference.call("mix_loop5_call", function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&handler_beam).unwrap();
-        vm.load_bytes(&caller_beam).unwrap();
-        let actual = vm
-            .eval_scheduled("mix_loop5_call", function, &[], 2, None)
-            .unwrap_or_else(|error| panic!("{function}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        // The test registers a stand-in `code_server`, a registered name of the node: each case
+        // runs in a node of its own, as a peer.
+        let actual = crate::common::peer_eval(
+            &[],
+            &[&handler_beam, &caller_beam],
+            &format!("mix_loop5_call:{function}()"),
+        );
+        assert_eq!(expected, CallResult::Ok(actual), "{function}");
     }
 }

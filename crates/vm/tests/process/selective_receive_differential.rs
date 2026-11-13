@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(selective_receive_diff).
@@ -129,7 +128,7 @@ fn selective_receive_scenarios_match_otp_29() {
                 "scenario",
                 &[OwnedTerm::Int(scenario), OwnedTerm::Int(size)],
             );
-            let mut vm = Vm::new([]);
+            let mut vm = crate::common::node();
             vm.load_bytes(&beam).unwrap();
             let actual = vm
                 .eval_scheduled(
@@ -137,10 +136,9 @@ fn selective_receive_scenarios_match_otp_29() {
                     "scenario",
                     &[Term::small(scenario).unwrap(), Term::small(size).unwrap()],
                     4,
-                    None,
                 )
                 .unwrap_or_else(|error| panic!("scenario {scenario} size {size}: {error}"));
-            assert_eq!(
+            similar_asserts::assert_eq!(
                 expected,
                 CallResult::Ok(actual.term),
                 "scenario {scenario} size {size}"

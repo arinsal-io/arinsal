@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 #[test]
 fn bad_arithmetic_in_guard_uses_the_failure_label() {
@@ -19,10 +18,10 @@ fn bad_arithmetic_in_guard_uses_the_failure_label() {
     reference.load("guard_arith_regression", &beam).unwrap();
     let expected = reference.call("guard_arith_regression", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("guard_arith_regression", "run", &[], 1, None)
+        .eval_scheduled("guard_arith_regression", "run", &[], 1)
         .unwrap();
 
     assert_eq!(expected, CallResult::Ok(actual.term.clone()));
@@ -61,10 +60,10 @@ fn float_register_conversion_rejects_bignum_overflow_like_otp() {
         .unwrap();
     let expected = reference.call("float_conversion_regression", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("float_conversion_regression", "run", &[], 1, None)
+        .eval_scheduled("float_conversion_regression", "run", &[], 1)
         .unwrap();
 
     assert_eq!(expected, CallResult::Ok(actual.term.clone()));

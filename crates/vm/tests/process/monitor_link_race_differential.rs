@@ -4,7 +4,7 @@
 //! bookkeeping on both ends is empty afterwards. Run on one scheduler and on four.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(monitor_link_race).
@@ -63,9 +63,9 @@ peer() ->
 "#;
 
 fn run_on(vm_workers: usize, beam: &[u8]) -> CallResult {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam).expect("load VM module");
-    match vm.eval_scheduled("monitor_link_race", "run", &[], vm_workers, None) {
+    match vm.eval_scheduled("monitor_link_race", "run", &[], vm_workers) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 // Packets read into a binary of their own and delivered as sub-binaries of it, or copied when
 // small, in active, once and passive modes with packet headers and `{header, N}`.
@@ -43,10 +42,10 @@ fn recv_packets_match_erts() {
         .load("inet_recv_binary", &beam)
         .expect("load inet_recv_binary");
     let expected = reference.call("inet_recv_binary", "t", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("inet_recv_binary", "t", &[], 2, None)
+        .eval_scheduled("inet_recv_binary", "t", &[], 2)
         .expect("Arinsal inet_recv_binary");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

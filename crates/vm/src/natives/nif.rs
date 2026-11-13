@@ -46,27 +46,26 @@ struct CachedTracerCallbacks {
     callbacks: HashMap<(String, u8), NativeFn>,
 }
 
-static TRACER_CALLBACKS: OnceLock<Mutex<HashMap<(u64, String), CachedTracerCallbacks>>> =
-    OnceLock::new();
+static TRACER_CALLBACKS: OnceLock<Mutex<HashMap<String, CachedTracerCallbacks>>> = OnceLock::new();
 
-fn tracer_callbacks() -> &'static Mutex<HashMap<(u64, String), CachedTracerCallbacks>> {
+fn tracer_callbacks() -> &'static Mutex<HashMap<String, CachedTracerCallbacks>> {
     TRACER_CALLBACKS.get_or_init(Default::default)
 }
 
-/// Drops cached callback pointers when a scope publishes new active code.
+/// Drops cached callback pointers when new active code is published.
 // Port of erts/emulator/beam/code_ix.c:169 and erl_trace.c:3553-3596
 // (erts_tracer_nif_clear), OTP-29.1.1.
-pub(crate) fn invalidate_tracer_callbacks(scope: u64) {
+pub(crate) fn invalidate_tracer_callbacks() {
     tracer_callbacks()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .retain(|(cached_scope, _), _| *cached_scope != scope);
+        .clear();
 }
 
 fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Option<NativeFn> {
     let code = vm.code_ix.active_tables();
     let generation = code.generation;
-    let key = (vm.code_scope, module_name.to_owned());
+    let key = module_name.to_owned();
     {
         let cache = tracer_callbacks()
             .lock()
@@ -122,8 +121,8 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
 // library is closed (`unload` runs), whatever still refers to the struct.
 pub(crate) struct ModuleNif {
     library: arinsal_nif::NifLibrary,
-    /// `mod` and `mi_copy`: the code scope and the module instance the library is loaded into.
-    owner: (u64, usize),
+    /// `mod` and `mi_copy`: the module instance the library is loaded into.
+    owner: usize,
     dynlib_refc: std::sync::atomic::AtomicUsize,
     /// `ERTS_MOD_NIF_FLG_LOADING` until every function is published: callers then wait for
     /// the publication, as `call_nif_early` does.
@@ -318,19 +317,19 @@ impl NifBinding {
     }
 }
 
-/// Unload the NIF library bound to module instance `id` of `scope`.
+/// Unload the NIF library bound to module instance `id`.
 // Port of erts/emulator/beam/beam_bif_load.c:2254-2258 (purge complete) and
 // erts/emulator/beam/erl_nif.c:5334-5373 (erts_unload_nif), OTP-29.1.1: purging a code
 // instance drops its `dynlib_refc` reference; the library closes once no dirty call or
 // scheduled continuation of it is left.
-pub(crate) fn unload_instance(scope: u64, id: usize) {
+pub(crate) fn unload_instance(id: usize) {
     let released = {
         let mut libs = MODULE_NIFS
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let (released, kept) = std::mem::take(&mut *libs)
             .into_iter()
-            .partition::<Vec<_>, _>(|lib| lib.owner == (scope, id));
+            .partition::<Vec<_>, _>(|lib| lib.owner == id);
         *libs = kept;
         released
     };
@@ -340,21 +339,21 @@ pub(crate) fn unload_instance(scope: u64, id: usize) {
     }
 }
 
-/// The library loaded into module instance `id` of `scope` (`erl_module_instance.nif`).
-fn instance_nif(scope: u64, id: usize) -> Option<Arc<ModuleNif>> {
+/// The library loaded into module instance `id` (`erl_module_instance.nif`).
+fn instance_nif(id: usize) -> Option<Arc<ModuleNif>> {
     MODULE_NIFS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .iter()
-        .find(|lib| lib.owner == (scope, id))
+        .find(|lib| lib.owner == id)
         .cloned()
 }
 
 /// Name and arity of the functions of the library loaded into module instance `id` of
 /// `scope`, in the order of its entry.
 // Port of erts/emulator/beam/erl_nif.c:5406-5411 (erts_nif_get_funcs), OTP-29.1.1.
-pub(crate) fn instance_nif_functions(scope: u64, id: usize) -> Option<Vec<(String, u32)>> {
-    let lib = instance_nif(scope, id)?;
+pub(crate) fn instance_nif_functions(id: usize) -> Option<Vec<(String, u32)>> {
+    let lib = instance_nif(id)?;
     Some(
         lib.library
             .functions()
@@ -1237,7 +1236,7 @@ fn install_stubs(
 ) -> Result<(), VmError> {
     let lib = Arc::new(ModuleNif {
         library,
-        owner: (vm.code_scope, module_id),
+        owner: module_id,
         dynlib_refc: std::sync::atomic::AtomicUsize::new(1),
         publishing: std::sync::atomic::AtomicBool::new(true),
         scheduler,
@@ -1411,7 +1410,7 @@ fn load_dynamic(
     // loaded. erts runs the upgrade with thread progress blocked; Arinsal does not block the
     // other schedulers.
     let pid = process.self_pid.and_then(|pid| pid.to_term());
-    let prev = prev_id.and_then(|id| instance_nif(vm.code_scope, id));
+    let prev = prev_id.and_then(instance_nif);
     let committed = match &prev {
         Some(prev) => image.upgrade(info, &prev.library, pid),
         None => image.commit_for(info, pid),

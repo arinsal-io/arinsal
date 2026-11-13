@@ -3,7 +3,6 @@
 //! waits for `{'DOWN', _, process, _, {ok, Result, Diagnostics}}`.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn monitored_exit_tuple_survives_gc() {
@@ -41,10 +40,10 @@ run() ->
         .unwrap();
     reference.load("mix_loop4_down", &beam).unwrap();
     let expected = reference.call("mix_loop4_down", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop4_down", "run", &[], 4, None)
+        .eval_scheduled("mix_loop4_down", "run", &[], 4)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -70,10 +69,10 @@ run() ->
         .unwrap();
     reference.load("mix_loop4_fun", &beam).unwrap();
     let expected = reference.call("mix_loop4_fun", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop4_fun", "run", &[], 2, None)
+        .eval_scheduled("mix_loop4_fun", "run", &[], 2)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -110,10 +109,10 @@ run() ->
         .unwrap();
     reference.load("mix_loop4_mon", &beam).unwrap();
     let expected = reference.call("mix_loop4_mon", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("mix_loop4_mon", "run", &[], 4, None)
+        .eval_scheduled("mix_loop4_mon", "run", &[], 4)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

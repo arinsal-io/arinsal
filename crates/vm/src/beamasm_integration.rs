@@ -30,7 +30,6 @@ fn existing_mfa(module: &str, function: &str, arity: u8) -> Option<Mfa> {
 
 /// Function-indexed BeamAsm target cache, invalidated when native code is published.
 pub(crate) struct NativeTargetCache {
-    scope: u64,
     /// The start address of the native code of each function, or 0.
     targets: Vec<Vec<usize>>,
     generations: Vec<u64>,
@@ -40,9 +39,8 @@ pub(crate) struct NativeTargetCache {
 }
 
 impl NativeTargetCache {
-    pub(crate) fn new(scope: u64) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            scope,
             targets: Vec::new(),
             generations: Vec::new(),
             module_identities: Vec::new(),
@@ -95,8 +93,7 @@ impl NativeTargetCache {
             // One registry pass per module: a lookup per function would be quadratic. An old
             // instance of the module may still be registered (a reused module id can even
             // reuse the `Module` address), so only this instance's own code counts.
-            let mut natives =
-                crate::native_bridge::native_functions_of(self.scope, &module.name, range);
+            let mut natives = crate::native_bridge::native_functions_of(&module.name, range);
             let cache = self.targets.get_mut(module_id)?;
             cache.clear();
             cache.extend(module.functions.iter().map(|(_, function, arity)| {
@@ -131,8 +128,6 @@ pub(crate) enum SchedulerCounterBif {
 pub(crate) struct DispatchTarget {
     /// The node's export entry; export funs of this MFA hold it too (`Export.lambda`).
     slot: &'static Arc<arinsal_beamasm::bif::ExportEntry>,
-    /// Code scope whose code indexes select the slot's address; zero for scope-free slots.
-    scope: u64,
     pub module: String,
     pub function: String,
     pub module_atom: arinsal_term::Atom,
@@ -215,8 +210,8 @@ fn new_export_slot(
 /// One node's export state, like an erts code index: import slots, interpreted and native
 /// export targets and global call breakpoints.
 #[derive(Default)]
-struct ScopeExports {
-    // One slot per MFA, shared by every import and export in this code scope.
+struct ExportTable {
+    // One slot per MFA, shared by every import and export.
     dispatch: HashMap<Mfa, Arc<DispatchTarget>, ExportHasher>,
 }
 
@@ -272,7 +267,7 @@ impl std::hash::Hasher for ExportHashState {
 
 #[derive(Default)]
 struct DispatchRegistry {
-    scopes: HashMap<u64, ScopeExports, IdentityHasher>,
+    exports: ExportTable,
     // Leaked on first registration: native BIF calls read these on every call, and a shared
     // reference count would bounce between schedulers. Each is a few hundred bytes per import.
     by_identity: HashMap<usize, &'static DispatchTarget>,
@@ -360,21 +355,18 @@ fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
     REGISTRY.get_or_init(|| RwLock::new(DispatchRegistry::default()))
 }
 
-/// What the export table of `scope` already holds for each import of `imports`: its class,
+/// What the export table already holds for each import of `imports`: its class,
 /// native entry bits and whether its BIF traps. An import to an MFA that some module of the
 /// node imported or defined needs no classification again.
 // Port of erts/emulator/beam/export.c:154-180 (the export entry of an MFA carries its BIF
 // number and trap information), OTP-29.1.1.
 pub(crate) fn known_imports(
-    scope: u64,
     imports: &[arinsal_loader::Import],
 ) -> Vec<Option<(arinsal_loader::ImportClass, usize)>> {
     let Ok(registry) = dispatch_registry().read() else {
         return vec![None; imports.len()];
     };
-    let Some(exports) = registry.scopes.get(&scope) else {
-        return vec![None; imports.len()];
-    };
+    let exports = &registry.exports;
     imports
         .iter()
         .map(|import| {
@@ -389,26 +381,16 @@ pub(crate) fn known_imports(
 
 // Port of erts/emulator/beam/export.c:59-98 (MFA-keyed export lookup and initialization), OTP-29.1.1.
 fn dispatch_entry(
-    scope: u64,
     key: Mfa,
     create: impl FnOnce() -> Option<DispatchTarget>,
 ) -> Option<&'static DispatchTarget> {
     let mut registry = dispatch_registry().write().ok()?;
-    let existing = registry
-        .scopes
-        .get(&scope)
-        .and_then(|exports| exports.dispatch.get(&key))
-        .cloned();
+    let existing = registry.exports.dispatch.get(&key).cloned();
     let entry = match existing {
         Some(entry) => entry,
         None => {
             let entry = Arc::new(create()?);
-            registry
-                .scopes
-                .entry(scope)
-                .or_default()
-                .dispatch
-                .insert(key, Arc::clone(&entry));
+            registry.exports.dispatch.insert(key, Arc::clone(&entry));
             entry
         }
     };
@@ -426,30 +408,6 @@ fn dispatch_entry(
 // init_emulator) and jit/beam_jit_main.cpp (beamasm_init), OTP-29.1.1.
 pub(crate) fn beamasm_init() {
     let _ = fragments();
-}
-
-/// Allocates the code scope of a new node.
-pub(crate) fn new_code_scope() -> u64 {
-    beamasm_init();
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Forgets the export state of a node whose code is gone.
-pub(crate) fn release_code_scope(scope: u64) {
-    arinsal_term::drop_record_scope(scope);
-    crate::native_bridge::unregister_native_scope(scope);
-    crate::code_ix::release_scope(scope);
-    let Ok(mut registry) = dispatch_registry().write() else {
-        return;
-    };
-    if let Some(exports) = registry.scopes.remove(&scope) {
-        for entry in exports.dispatch.values() {
-            registry
-                .by_identity
-                .remove(&(Arc::as_ptr(entry.slot) as usize));
-        }
-    }
 }
 
 fn fragments() -> Option<&'static DispatchFragments> {
@@ -505,7 +463,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
                 let module = "$beam_run_process";
                 let undefined = names.get("undefined").expect("predefined atom");
                 let info = crate::NativeFunction {
-                    scope: 0,
+                    fragment: true,
                     start,
                     end,
                     module,
@@ -601,20 +559,14 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
         .as_ref()
 }
 
-/// The `Export` object of `mfa` in `scope`, allocated (entering the export trampoline) when the
+/// The `Export` object of `mfa`, allocated (entering the export trampoline) when the
 /// node has none. It is not entered in any code index's export table: [`crate::export`] does
 /// that, as `export_staged_put` / `export_staged_upsert` insert the blob erts allocates here.
 // Port of erts/emulator/beam/export.c:73-98 (export_init) and erl_code_staged.h (the blob
 // allocation of put/upsert), OTP-29.1.1.
-pub(crate) fn make_export(
-    scope: u64,
-    mfa: Mfa,
-) -> Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>> {
+pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>> {
     if let Ok(registry) = dispatch_registry().read()
-        && let Some(entry) = registry
-            .scopes
-            .get(&scope)
-            .and_then(|exports| exports.dispatch.get(&mfa))
+        && let Some(entry) = registry.exports.dispatch.get(&mfa)
     {
         return Some(entry.slot);
     }
@@ -622,13 +574,12 @@ pub(crate) fn make_export(
     let save_calls = fragments()?.save_calls_export();
     let module = global_atoms().text(mfa.0)?.to_string();
     let function = global_atoms().text(mfa.1)?.to_string();
-    let entry = dispatch_entry(scope, mfa, || {
+    let entry = dispatch_entry(mfa, || {
         let bif = arinsal_bifs::lookup(&module, &function, mfa.2);
         let (class, bits) = crate::natives::classify(&module, &function, mfa.2, bif.is_some());
         Some(DispatchTarget {
             // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
             slot: new_export_slot(mfa, trampoline, save_calls),
-            scope,
             trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
             light_kind: light_kind(&module, &function, mfa.2),
             direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2),
@@ -653,7 +604,6 @@ pub(crate) fn make_export(
 // Port of erts/emulator/beam/beam_bp.c:1828-1830
 // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
 pub(crate) fn line_breakpoint_export(
-    scope: u64,
     code_ix: usize,
 ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
     let atoms = arinsal_term::global_atoms();
@@ -662,7 +612,7 @@ pub(crate) fn line_breakpoint_export(
         atoms.intern("breakpoint").ok()?,
         4,
     );
-    crate::export::find_export_entry(&crate::code_ix::for_scope(scope), mfa, code_ix)
+    crate::export::find_export_entry(crate::code_ix::global(), mfa, code_ix)
 }
 
 /// The dispatch entry of every import: its identity for the emitter, and its binding for the
@@ -672,14 +622,14 @@ type ImportEntries = (
     Vec<(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)>,
 );
 
-fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportEntries> {
+fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
     let trampoline = fragments()?.export_trampoline();
     let save_calls = fragments()?.save_calls_export();
     let mut identities = Vec::with_capacity(module.imports.len());
     let mut bindings = Vec::with_capacity(module.imports.len());
     for import in &module.imports {
         let mfa = (import.module_atom, import.function_atom, import.arity);
-        let entry = dispatch_entry(scope, mfa, || {
+        let entry = dispatch_entry(mfa, || {
             // A module can be compiled before the VM classified its imports.
             let (class, bits) = if import.class() == arinsal_loader::ImportClass::Fresh {
                 crate::natives::classify(
@@ -694,7 +644,6 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<ImportE
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
-                scope,
                 trap_entry: crate::bif_traps::traps(import.module, import.function, import.arity),
                 light_kind: light_kind(import.module, import.function, import.arity),
                 direct_ets: crate::natives::ets::direct_entry(
@@ -743,7 +692,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
             slot: new_export_slot(key, trampoline, save_calls),
-            scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
             light_kind: light_kind(module, function, arity),
             direct_ets: crate::natives::ets::direct_entry(module, function, arity),
@@ -768,7 +716,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
 
 // Port of erts/emulator/beam/export.c:154-180 (find an export) and erts_export_put, OTP-29.1.1.
 fn publish_module(
-    scope: u64,
     module: &arinsal_loader::Module,
     native: &[(Mfa, usize)],
     imports: &[(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)],
@@ -783,11 +730,10 @@ fn publish_module(
         let bif = arinsal_bifs::lookup(&module.name, export.function, export.arity);
         let (class, bits) =
             crate::natives::classify(&module.name, export.function, export.arity, bif.is_some());
-        let target = dispatch_entry(scope, mfa, || {
+        let target = dispatch_entry(mfa, || {
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
-                scope,
                 trap_entry: crate::bif_traps::traps(&module.name, export.function, export.arity),
                 light_kind: light_kind(&module.name, export.function, export.arity),
                 direct_ets: crate::natives::ets::direct_entry(
@@ -820,7 +766,7 @@ fn publish_module(
         .iter()
         .map(|(mfa, target)| (*mfa, target.export_object()))
         .collect();
-    crate::export::finish_loading(scope, module, &exports, imports, native, deferred);
+    crate::export::finish_loading(module, &exports, imports, native, deferred);
 }
 
 /// The address a process saving calls continues with after recording the call of the export
@@ -831,7 +777,7 @@ pub(crate) fn save_calls_continuation(export: Option<ExportDispatch>) -> usize {
     export.map_or_else(
         || fragments().map_or(0, DispatchFragments::export_trampoline),
         |target| {
-            let active = crate::code_ix::for_scope(target.scope).active();
+            let active = crate::code_ix::global().active();
             target.slot.address(active)
         },
     )
@@ -846,10 +792,8 @@ pub(crate) fn set_bif_traced(module: &str, function: &str, arity: u8, traced: bo
     let Ok(registry) = dispatch_registry().read() else {
         return;
     };
-    for exports in registry.scopes.values() {
-        if let Some(target) = exports.dispatch.get(&mfa) {
-            target.slot.set_bif_traced(traced);
-        }
+    if let Some(target) = registry.exports.dispatch.get(&mfa) {
+        target.slot.set_bif_traced(traced);
     }
     if let Some(target) = registry.bif_mfas.get(&mfa) {
         target.slot.set_bif_traced(traced);
@@ -967,7 +911,6 @@ pub(crate) struct CompiledVersion {
     /// installed (`erts_export_put` of `beam_load_finalize_code`).
     import_bindings: Vec<(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)>,
     /// Functions of the module BeamAsm could not compile: they run in the interpreter.
-    scope: u64,
     module_handle: u64,
     installed: AtomicBool,
     pub(crate) map_lookups: Box<[arinsal_beamasm::map::MapLookupTable]>,
@@ -1008,7 +951,7 @@ pub(crate) struct CompiledVersion {
 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
 // Batched per module: a per-function call rescanned every version's breakpoint table, which made
 // a `{'_','_','_'}` trace pattern quadratic in the loaded code.
-pub(crate) fn patch_native_breakpoints(scope: u64, module: &str, wanted: &[(&str, u8, bool)]) {
+pub(crate) fn patch_native_breakpoints(module: &str, wanted: &[(&str, u8, bool)]) {
     if wanted.is_empty() {
         return;
     }
@@ -1023,7 +966,7 @@ pub(crate) fn patch_native_breakpoints(scope: u64, module: &str, wanted: &[(&str
     for version in versions
         .iter()
         .filter_map(Weak::upgrade)
-        .filter(|version| version.scope == scope && version.module == module)
+        .filter(|version| version.module == module)
     {
         let Ok(mut memory) = version.memory.lock() else {
             continue;
@@ -1071,14 +1014,14 @@ pub(crate) fn is_line_breakpoint_cleanup(address: usize) -> bool {
 /// Whether the native line table of `module` has an entry for source line `line`.
 // Port of erts/emulator/beam/beam_ranges.c (erts_find_next_code_for_line: a search of the
 // code header's line table), OTP-29.1.1.
-pub(crate) fn native_code_has_line(scope: u64, module: &str, line: u32) -> bool {
+pub(crate) fn native_code_has_line(module: &str, line: u32) -> bool {
     let Ok(versions) = compiled_versions().read() else {
         return false;
     };
     versions
         .iter()
         .filter_map(Weak::upgrade)
-        .filter(|version| version.scope == scope && version.module == module)
+        .filter(|version| version.module == module)
         .any(|version| {
             version
                 .native_functions
@@ -1087,7 +1030,7 @@ pub(crate) fn native_code_has_line(scope: u64, module: &str, line: u32) -> bool 
         })
 }
 
-pub(crate) fn patch_native_line_breakpoint(scope: u64, module: &str, line: u32, enabled: bool) {
+pub(crate) fn patch_native_line_breakpoint(module: &str, line: u32, enabled: bool) {
     let Ok(mut versions) = compiled_versions().write() else {
         return;
     };
@@ -1095,7 +1038,7 @@ pub(crate) fn patch_native_line_breakpoint(scope: u64, module: &str, line: u32, 
     for version in versions
         .iter()
         .filter_map(Weak::upgrade)
-        .filter(|version| version.scope == scope && version.module == module)
+        .filter(|version| version.module == module)
     {
         for &(site_line, offset, branch) in &version.line_breakpoints {
             if site_line != line {
@@ -1188,7 +1131,6 @@ impl CompiledVersion {
             return false;
         }
         let catch_ids = crate::native_bridge::register_native_catches(
-            self.scope,
             self.catch_base,
             &self
                 .catch_table
@@ -1197,7 +1139,7 @@ impl CompiledVersion {
                 .collect::<Vec<_>>(),
         );
         *self.catch_ids.lock().unwrap() = catch_ids;
-        let code_index = crate::code_ix::for_scope(self.scope).staging();
+        let code_index = crate::code_ix::global().staging();
         for (entry, target) in &self.lambda_targets {
             entry.set_fun_code(code_index, *target);
         }
@@ -1211,7 +1153,6 @@ impl CompiledVersion {
         }
         self.installed.store(true, Ordering::Release);
         publish_module(
-            self.scope,
             module,
             &self.export_addresses,
             &self.import_bindings,
@@ -1247,7 +1188,7 @@ impl CompiledVersion {
                     heap.used_words()
                 );
             }
-            arinsal_pterm::store_for(self.scope).retire_module_area(heap);
+            arinsal_pterm::global_store().retire_module_area(heap);
         }
     }
     /// The half-open address range of this version's native code.
@@ -1287,14 +1228,9 @@ impl Drop for CompiledVersion {
             self.retire_literals();
         }
         if self.installed.load(Ordering::Acquire) && !self.native_functions.is_empty() {
-            crate::native_bridge::unregister_native_module(
-                self.code_start,
-                self.code_end,
-                self.scope,
-            );
+            crate::native_bridge::unregister_native_module(self.code_start, self.code_end);
         }
         crate::native_bridge::unregister_native_catches(
-            self.scope,
             &self
                 .catch_ids
                 .lock()
@@ -1340,7 +1276,7 @@ struct VmModuleEnv<'a> {
     light_bif_helper_fragment: usize,
     breakpoint_fragment: usize,
     line_breakpoint_fragment: usize,
-    /// `BIF_TRAP_EXPORT(BIF_send_2)`: the `erlang:send/2` export of the module's code scope.
+    /// `BIF_TRAP_EXPORT(BIF_send_2)`: the `erlang:send/2` export of the module's code.
     send_export: usize,
     module_name: String,
     /// The module's NIFs are in this runtime (`static_nif_module`).
@@ -1957,7 +1893,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
 pub(crate) fn compile(
     beam: &arinsal_beam::BeamFile,
     module: &mut arinsal_loader::Module,
-    scope: u64,
     line_breakpoints: bool,
     code_ix: &crate::code_ix::CodeIndexes,
 ) -> Option<Arc<CompiledVersion>> {
@@ -1969,13 +1904,14 @@ pub(crate) fn compile(
     }
     let fragments = fragments()?;
     arinsal_loader::file_atoms(beam).ok()?;
-    let (export_entries, import_bindings) = import_entries(scope, module)?;
+    let (export_entries, import_bindings) = import_entries(module)?;
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send: the `send/2`
     // export is the one `send` calls), OTP-29.1.1.
-    let send_export = Arc::as_ptr(make_export(
-        scope,
-        (arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2),
-    )?) as usize;
+    let send_export = Arc::as_ptr(make_export((
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::SEND,
+        2,
+    ))?) as usize;
     let module_handle = NEXT_MODULE_HANDLE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handle| {
             handle.checked_add(1)
@@ -2200,7 +2136,7 @@ pub(crate) fn compile(
             .copied()
             .unwrap_or(code_end);
         native_functions.push(crate::NativeFunction {
-            scope,
+            fragment: false,
             start,
             end,
             module: module_text,
@@ -2263,7 +2199,6 @@ pub(crate) fn compile(
             .on_load
             .and_then(|index| compiled.functions.get(index))
             .map(|function| (function.name.to_owned(), function.arity)),
-        scope,
         module_handle,
         installed: AtomicBool::new(false),
         map_lookups: compiled.native.map_lookups,

@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(gen_udp_compat).
@@ -47,12 +46,12 @@ fn udp_options_and_fd_match_erts() {
     reference
         .load("gen_udp_compat", &beam)
         .expect("load gen_udp_compat");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for function in ["buffer_cap", "ipv6_class_opts", "fd_lookup"] {
         let expected = reference.call("gen_udp_compat", function, &[]);
         let actual = vm
-            .eval_scheduled("gen_udp_compat", function, &[], 2, None)
+            .eval_scheduled("gen_udp_compat", function, &[], 2)
             .unwrap_or_else(|error| panic!("Arinsal {function}: {error}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

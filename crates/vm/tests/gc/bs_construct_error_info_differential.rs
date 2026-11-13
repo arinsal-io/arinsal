@@ -3,7 +3,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use std::process::Command;
 
 const CHILD: &str = "ARINSAL_BS_ERROR_INFO_CHILD";
@@ -32,20 +31,18 @@ fn bit_sized_binary_construct_errors_match_otp() {
             .expect("child bit size")
             .parse()
             .expect("integer bit size");
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&std::fs::read(beam_path).expect("test BEAM"))
-            .expect("load test module");
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &std::fs::read(beam_path).expect("test BEAM"));
         let actual = vm
             .eval_scheduled(
                 MODULE,
                 "run",
                 &[Term::small(bits).expect("small bit size")],
                 1,
-                None,
             )
             .unwrap_or_else(|error| panic!("run/1 with {bits} bits: {error}"));
         println!("RESULT:{:?}", actual.term);
-        return;
+        arinsal_vm::erts_exit(0);
     }
 
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");

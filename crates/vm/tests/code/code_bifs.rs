@@ -1,11 +1,5 @@
 use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
-
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).unwrap())
-}
 
 fn zero_coverage_counts(term: &OwnedTerm) -> OwnedTerm {
     match term {
@@ -38,13 +32,10 @@ fn code_bifs_coverage_support_matches_otp() {
         )
         .unwrap();
     let expected = reference.eval("code:coverage_support()").unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(wrapper, "run", &[], 1, None)
-        .unwrap()
-        .term;
-    assert_eq!(actual, expected);
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled(wrapper, "run", &[], 1).unwrap().term;
+    similar_asserts::assert_eq!(actual, expected);
 }
 
 #[test]
@@ -53,31 +44,30 @@ fn code_bifs_coverage_modes_match_otp() {
         eprintln!("erl unavailable; skipping code_bifs coverage mode differential test");
         return;
     };
-    let wrapper = "code_bifs_mode_wrapper";
     let beam = reference
         .compile_named(
-            wrapper,
+            "code_bifs_mode_wrapper",
             "-module(code_bifs_mode_wrapper). -export([set/1,get/0]). set(M) -> code:set_coverage_mode(M). get() -> code:get_coverage_mode().",
             &[],
         )
         .unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual_old = vm
-        .eval_scheduled(wrapper, "set", &[atom("function_counters")], 1, None)
-        .unwrap()
-        .term;
-    assert_eq!(
+    let actual = crate::common::peer_eval(
+        &[],
+        &[&beam],
+        "{code:set_coverage_mode(function_counters),code:get_coverage_mode()}",
+    );
+    let OwnedTerm::Tuple(actual_values) = &actual else {
+        panic!("unexpected coverage mode result: {actual:?}");
+    };
+    let actual_old = actual_values[0].clone();
+    similar_asserts::assert_eq!(
         actual_old,
         reference
             .eval("code:set_coverage_mode(function_counters)")
             .unwrap()
     );
-    let actual_mode = vm
-        .eval_scheduled(wrapper, "get", &[], 1, None)
-        .unwrap()
-        .term;
-    assert_eq!(
+    let actual_mode = actual_values[1].clone();
+    similar_asserts::assert_eq!(
         actual_mode,
         reference.eval("code:get_coverage_mode()").unwrap()
     );
@@ -106,26 +96,13 @@ fn code_bifs_function_counters_match_otp_through_vm_dispatch() {
         .eval("code:get_coverage(function, code_bifs_dispatch_cov)")
         .unwrap();
 
-    let wrapper = "code_bifs_query_wrapper";
-    let wrapper_beam = reference
-        .compile_named(
-            wrapper,
-            "-module(code_bifs_query_wrapper). -export([set/1,get/2]). set(M) -> code:set_coverage_mode(M). get(Mode, Mod) -> code:get_coverage(Mode, Mod).",
-            &[],
-        )
-        .unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&wrapper_beam).unwrap();
-    vm.eval_scheduled(wrapper, "set", &[atom("function_counters")], 1, None)
-        .unwrap();
-    vm.load_bytes(&beam).unwrap();
-    vm.eval_scheduled(module, "run", &[], 1, None).unwrap();
-    let actual = vm
-        .eval_scheduled(wrapper, "get", &[atom("function"), atom(module)], 1, None)
-        .unwrap()
-        .term;
+    let actual = crate::common::peer_eval(
+        &[],
+        &[&beam],
+        "begin code:set_coverage_mode(function_counters),code_bifs_dispatch_cov:run(),code:get_coverage(function,code_bifs_dispatch_cov) end",
+    );
     // BeamAsm native execution currently skips interpreter coverage probes.
-    assert_eq!(
+    similar_asserts::assert_eq!(
         zero_coverage_counts(&actual),
         zero_coverage_counts(&expected)
     );
@@ -157,38 +134,13 @@ fn code_bifs_line_counters_match_otp_through_vm_dispatch() {
         .eval("{code:get_coverage(line, code_bifs_dispatch_line_cov),code:get_coverage(cover_id_line, code_bifs_dispatch_line_cov)}")
         .unwrap();
 
-    let wrapper = "code_bifs_line_query_wrapper";
-    let wrapper_beam = reference
-        .compile_named(
-            wrapper,
-            "-module(code_bifs_line_query_wrapper). -export([set/1,get/2]). set(M) -> code:set_coverage_mode(M). get(Mode, Mod) -> code:get_coverage(Mode, Mod).",
-            &[],
-        )
-        .unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&wrapper_beam).unwrap();
-    vm.eval_scheduled(wrapper, "set", &[atom("line_counters")], 1, None)
-        .unwrap();
-    vm.load_bytes(&beam).unwrap();
-    vm.eval_scheduled(module, "run", &[atom("a")], 1, None)
-        .unwrap();
-    let lines = vm
-        .eval_scheduled(wrapper, "get", &[atom("line"), atom(module)], 1, None)
-        .unwrap()
-        .term;
-    let ids = vm
-        .eval_scheduled(
-            wrapper,
-            "get",
-            &[atom("cover_id_line"), atom(module)],
-            1,
-            None,
-        )
-        .unwrap()
-        .term;
-    let actual = OwnedTerm::Tuple(vec![lines, ids]);
+    let actual = crate::common::peer_eval(
+        &[],
+        &[&beam],
+        "begin code:set_coverage_mode(line_counters),code_bifs_dispatch_line_cov:run(a),{code:get_coverage(line,code_bifs_dispatch_line_cov),code:get_coverage(cover_id_line,code_bifs_dispatch_line_cov)} end",
+    );
     // BeamAsm native execution currently skips interpreter coverage probes.
-    assert_eq!(
+    similar_asserts::assert_eq!(
         zero_coverage_counts(&actual),
         zero_coverage_counts(&expected)
     );

@@ -1,7 +1,6 @@
 //! Differential coverage of the process/port name registry against OTP 29.1.1.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(reg_table_diff).
@@ -95,10 +94,10 @@ fn register_whereis_unregister_matches_otp_29() {
         .load("reg_table_diff", &beam)
         .expect("load reg_table_diff into erl");
     let expected = reference.call("reg_table_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load reg_table_diff");
     let actual = vm
-        .eval_scheduled("reg_table_diff", "run", &[], 1, None)
+        .eval_scheduled("reg_table_diff", "run", &[], 1)
         .expect("run reg_table_diff");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

@@ -1,7 +1,7 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(vm_subtract_trap_diff).
@@ -25,11 +25,11 @@ fn large_subtract_continuation_matches_otp() {
     let args = [OwnedTerm::Int(50_000)];
     let expected = reference.call("vm_subtract_trap_diff", "result", &args);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let mut heap = VecHeap::new();
     let term = from_owned(&args[0], &mut heap).unwrap();
-    let actual = match vm.eval_scheduled("vm_subtract_trap_diff", "result", &[term], 1, None) {
+    let actual = match vm.eval_scheduled("vm_subtract_trap_diff", "result", &[term], 1) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

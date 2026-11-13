@@ -199,7 +199,7 @@ fn call(reference: &RefErl, vm: &mut Vm, function: &str, argument: OwnedTerm) {
     let mut heap = arinsal_term::VecHeap::new();
     let term = arinsal_term::from_owned(&argument, &mut heap).expect("convert argument");
     let actual = vm
-        .eval_scheduled(MODULE, function, &[term], 1, None)
+        .eval_scheduled(MODULE, function, &[term], 1)
         .unwrap_or_else(|error| panic!("{function}: VM raised unexpectedly: {error:?}"));
     let actual = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     similar_asserts::assert_eq!(CallResult::Ok(actual), expected, "{function}");
@@ -216,8 +216,8 @@ fn bs_match_segments_match_otp() {
     reference
         .load(MODULE, &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
 
     let count = SHAPES.len() + WIDTHS.len() * 4 + FIRST.len() * SECOND.len() * 3;
     for index in 0..count {
@@ -240,8 +240,8 @@ fn bs_match_loops_match_otp() {
     reference
         .load(MODULE, &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for name in ["scan8", "scan16le", "sum32", "eq_loop"] {
         call(&reference, &mut vm, "run", OwnedTerm::Atom(name.to_owned()));
     }

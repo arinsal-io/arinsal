@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ram_file_compat).
@@ -131,10 +130,10 @@ fn compare(function: &str) {
         .load("ram_file_compat", &beam)
         .expect("load ram_file_compat");
     let expected = reference.call("ram_file_compat", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("ram_file_compat", function, &[], 2, None)
+        .eval_scheduled("ram_file_compat", function, &[], 2)
         .unwrap_or_else(|error| panic!("Arinsal {function}: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }
@@ -176,10 +175,7 @@ fn ports_of_concurrent_vms_are_independent() {
     let run = |function: &'static str| {
         let beam = beam.clone();
         std::thread::spawn(move || {
-            let mut vm = Vm::new([]);
-            vm.load_bytes(&beam).expect("load Arinsal module");
-            vm.eval_scheduled("ram_file_compat", function, &[], 2, None)
-                .map(|result| result.term)
+            crate::common::peer_eval(&[], &[&beam], &format!("ram_file_compat:{function}()"))
         })
     };
     let holder = run("hold");
@@ -187,10 +183,7 @@ fn ports_of_concurrent_vms_are_independent() {
     for (name, thread) in
         std::iter::once(("hold", holder)).chain(churners.into_iter().map(|t| ("churn", t)))
     {
-        let term = thread
-            .join()
-            .expect("Vm thread")
-            .unwrap_or_else(|error| panic!("Arinsal {name}: {error}"));
+        let term = thread.join().expect("peer process thread");
         similar_asserts::assert_eq!(OwnedTerm::Atom("ok".into()), term, "{name}");
     }
 }

@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
-use arinsal_vm::Vm;
 
 /// Whitebox scenario of code_SUITE:code_permission, trimmed: a waiter that is user-suspended
 /// while queued for the code modification permission must still run a GC system task.
@@ -54,11 +53,7 @@ fn code_permission_gc_of_suspended_waiter_matches_erts() {
         .unwrap();
     reference.load("code_perm_gc", &beam).unwrap();
     let expected = reference.call("code_perm_gc", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("code_perm_gc", "run", &[], 2, None)
-        .unwrap();
-    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
-    assert_eq!(expected, CallResult::Ok(canonical));
+    let actual = crate::common::peer_eval(&[], &[&beam], "code_perm_gc:run()");
+    let canonical = decode(&encode(&actual, EncodeOptions::default())).unwrap();
+    similar_asserts::assert_eq!(expected, CallResult::Ok(canonical));
 }

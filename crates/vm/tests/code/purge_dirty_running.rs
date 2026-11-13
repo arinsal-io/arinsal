@@ -3,7 +3,6 @@
 //! (dirty_nif_SUITE:code_purge). The loader stays suspended until the code barrier commits.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const TARGET: &str = r#"
 -module(dpr_target).
@@ -62,11 +61,6 @@ fn purge_kills_process_running_dirty_bif_in_old_code() {
         .expect("compile driver");
     reference.load("dpr_driver", &driver).expect("load driver");
     let expected = reference.call("dpr_driver", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&driver).expect("load VM driver");
-    let actual = vm
-        .eval_scheduled("dpr_driver", "run", &[], 4, None)
-        .map(|value| value.term)
-        .unwrap_or_else(|error| panic!("dpr_driver:run: {error}"));
+    let actual = crate::common::peer_eval(&[], &[&driver], "dpr_driver:run()");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

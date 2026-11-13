@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(dirty_bif_continuation).
@@ -124,10 +123,10 @@ fn dirty_bif_resume_trace_matches_erts() {
         "reference trace must contain events: {expected:?}"
     );
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("dirty_bif_continuation", "run", &[], 2, None)
+        .eval_scheduled("dirty_bif_continuation", "run", &[], 2)
         .expect("run dirty BIF trace test");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -150,15 +149,14 @@ fn dirty_bif_multischedule_matches_erts() {
         &[OwnedTerm::Int(12)],
     );
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
         .eval_scheduled(
             "dirty_bif_continuation",
             "reschedule",
             &[arinsal_term::Term::small(12).unwrap()],
             2,
-            None,
         )
         .expect("run dirty BIF multischedule test");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -178,10 +176,10 @@ fn dirty_bif_inflight_process_info_matches_erts() {
         .expect("load reference module");
     let expected = reference.call("dirty_bif_continuation", "current_info", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("dirty_bif_continuation", "current_info", &[], 2, None)
+        .eval_scheduled("dirty_bif_continuation", "current_info", &[], 2)
         .expect("run dirty BIF process info test");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -200,10 +198,10 @@ fn dirty_bif_exception_trace_matches_erts() {
         .expect("load reference module");
     let expected = reference.call("dirty_bif_continuation", "exception_run", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("dirty_bif_continuation", "exception_run", &[], 2, None)
+        .eval_scheduled("dirty_bif_continuation", "exception_run", &[], 2)
         .expect("run dirty BIF exception test");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -222,10 +220,10 @@ fn dirty_bif_heap_args_survive_collection() {
         .expect("load reference module");
     let expected = reference.call("dirty_bif_continuation", "heap_args_run", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("dirty_bif_continuation", "heap_args_run", &[], 2, None)
+        .eval_scheduled("dirty_bif_continuation", "heap_args_run", &[], 2)
         .expect("run dirty BIF heap argument test");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

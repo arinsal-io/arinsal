@@ -20,9 +20,8 @@ impl Executor {
             process.self_pid = Some(ctx.pid());
         }
         // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
-        // = p), OTP-29.1.1. A simulated scheduler shares its thread with other runtimes, so
-        // it binds the thread's hub on every turn.
-        if self.hub_bound && !ctx.simulated() {
+        // = p), OTP-29.1.1.
+        if self.hub_bound {
             self.current_process
                 .store(ctx.pid().data(), Ordering::Relaxed);
         } else {

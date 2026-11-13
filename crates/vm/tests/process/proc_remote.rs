@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_remote).
@@ -213,16 +212,10 @@ fn remote_process_requests_match_otp_29() {
     reference.load("proc_remote", &beam).unwrap();
     for scenario in 0..12 {
         let expected = reference.call("proc_remote", "run", &[OwnedTerm::Int(scenario)]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(
-            "proc_remote",
-            "run",
-            &[Term::small(scenario).unwrap()],
-            1,
-            None,
-        );
+        let actual = vm.eval_scheduled("proc_remote", "run", &[Term::small(scenario).unwrap()], 1);
         let actual = actual.unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
     }
 }

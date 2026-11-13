@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(gen_tcp_misc_compat).
@@ -70,10 +69,10 @@ fn compare(function: &str) {
         .load("gen_tcp_misc_compat", &beam)
         .expect("load gen_tcp_misc_compat");
     let expected = reference.call("gen_tcp_misc_compat", function, &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("gen_tcp_misc_compat", function, &[], 2, None)
+        .eval_scheduled("gen_tcp_misc_compat", function, &[], 2)
         .unwrap_or_else(|error| panic!("Arinsal {function}: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

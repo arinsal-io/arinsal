@@ -8,7 +8,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "reds_apply_bif_test";
@@ -214,7 +213,7 @@ fn apply_bif_reductions_slices_and_gc_match_otp() {
         RefErl::start_with_erl_args(&["+S", "1"]).expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, &source(), &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let mut expected_all = Vec::new();
     let mut actual_all = Vec::new();
@@ -223,7 +222,7 @@ fn apply_bif_reductions_slices_and_gc_match_otp() {
             panic!("OTP {name} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, name, &[], 1, None, 4_000)
+            .eval_scheduled_reductions(MODULE, name, &[], 1, 4_000)
             .unwrap();
         let expected = measured(&expected);
         let actual = measured(&actual.term);

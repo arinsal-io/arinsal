@@ -7,7 +7,6 @@ use std::process::Command;
 
 use arinsal_difftest::{CallOptions, CallResult, RefErl, pretty};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 use crate::common;
 
@@ -100,8 +99,8 @@ fn smoke_driver_matches_erl() {
         eprintln!("{}", pretty(&expected));
     }
 
-    let mut vm = Vm::new([dir.clone()]);
-    let actual = match vm.eval_scheduled("drv_smoke_main", "run", &[], 1, None) {
+    let mut vm = crate::common::node_with_dir(&dir);
+    let actual = match vm.eval_scheduled("drv_smoke_main", "run", &[], 1) {
         Ok(result) => result.term,
         Err(error) => panic!("drv_smoke:run/1 on Arinsal: {error}"),
     };

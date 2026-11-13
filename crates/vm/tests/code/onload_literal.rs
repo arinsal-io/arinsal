@@ -1,7 +1,7 @@
 //! `-on_load` on the `eval_scheduled` / `code:load_file` paths, and refc literal
 //! binaries released by purge.
 
-use arinsal_vm::Vm;
+use arinsal_etf::OwnedTerm;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -53,20 +53,22 @@ ping() -> persistent_term:get(ol_sched, not_loaded).
         "-eval",
         "io:format(\"~p~n\", [ol_sched:ping()]), halt().",
     ]);
-    assert_eq!(expected.trim(), "ran");
+    similar_asserts::assert_eq!(expected.trim(), "ran");
 
-    let mut autoload = Vm::new([dir.clone()]);
-    let autoloaded = autoload
-        .eval_scheduled("ol_sched", "ping", &[], 1, None)
-        .expect("autoload on_load");
-    assert_eq!(autoloaded.text, "ran", "path load via eval_scheduled");
+    let autoloaded =
+        crate::common::peer_eval(&[], &[&std::fs::read(&beam).unwrap()], "ol_sched:ping()");
+    similar_asserts::assert_eq!(
+        autoloaded,
+        arinsal_etf::OwnedTerm::Atom("ran".into()),
+        "path load via eval_scheduled"
+    );
 
-    let mut loaded = Vm::new([]);
+    let mut loaded = crate::common::node();
     loaded.load_file(&beam).unwrap();
     let from_file = loaded
-        .eval_scheduled("ol_sched", "ping", &[], 1, None)
+        .eval_scheduled("ol_sched", "ping", &[], 1)
         .expect("load_file on_load");
-    assert_eq!(from_file.text, "ran", "Vm::load_file then eval_scheduled");
+    similar_asserts::assert_eq!(from_file.text, "ran", "Vm::load_file then eval_scheduled");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -91,7 +93,7 @@ ping() -> persistent_term:get(ol_file, not_loaded).
         dir.display()
     );
     let expected = erl_eval(&["-noshell", "-eval", &eval]);
-    assert_eq!(expected.trim(), "ran");
+    similar_asserts::assert_eq!(expected.trim(), "ran");
 
     let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
     assert!(
@@ -108,7 +110,7 @@ ping() -> persistent_term:get(ol_file, not_loaded).
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
+    similar_asserts::assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         "ran",
         "stderr {}",
@@ -189,15 +191,10 @@ wait_purger() ->
         "erl itself leaked {expected_delta}"
     );
 
-    let mut vm = Vm::new([dir.clone()]);
-    let actual = vm
-        .eval_scheduled("lit_mem_probe", "run", &[], 1, None)
-        .expect("literal purge");
-    let delta: i64 = actual
-        .text
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("arinsal delta {}", actual.text));
+    let actual = crate::common::peer_eval_dir(&[], &dir, "lit_mem_probe:run()");
+    let OwnedTerm::Int(delta) = actual else {
+        panic!("arinsal returned unexpected literal purge result: {actual:?}");
+    };
     assert!(
         delta < 64 * 1024,
         "binary memory grew by {delta} after purging refc literals (erl {expected_delta})"

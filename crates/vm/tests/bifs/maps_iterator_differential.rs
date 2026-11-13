@@ -1,7 +1,7 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 fn map(size: usize) -> OwnedTerm {
     OwnedTerm::Map(
@@ -99,7 +99,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
         .compile_named("vm_map_iter_diff", source, &[])
         .unwrap();
     reference.load("vm_map_iter_diff", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     for size in [0, 1, 8, 32, 33, 1_000, 20_000] {
@@ -154,7 +154,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
                 reference.call("vm_map_iter_diff", function, std::slice::from_ref(&input));
             let mut heap = VecHeap::new();
             let term = from_owned(&input, &mut heap).unwrap();
-            let actual = match vm.eval_scheduled("vm_map_iter_diff", function, &[term], 1, None) {
+            let actual = match vm.eval_scheduled("vm_map_iter_diff", function, &[term], 1) {
                 Ok(outcome) => CallResult::Ok(outcome.term),
                 Err(VmError::Raised(raised)) => CallResult::Exception {
                     class: format!("{:?}", raised.class).to_lowercase(),
@@ -184,8 +184,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
                     .iter()
                     .map(|arg| from_owned(arg, &mut heap).unwrap())
                     .collect();
-                let actual = match vm.eval_scheduled("vm_map_iter_diff", function, &terms, 1, None)
-                {
+                let actual = match vm.eval_scheduled("vm_map_iter_diff", function, &terms, 1) {
                     Ok(outcome) => CallResult::Ok(outcome.term),
                     Err(VmError::Raised(raised)) => CallResult::Exception {
                         class: format!("{:?}", raised.class).to_lowercase(),
@@ -220,7 +219,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
             .iter()
             .map(|arg| from_owned(arg, &mut heap).unwrap())
             .collect();
-        let actual = match vm.eval_scheduled("vm_map_iter_diff", function, &terms, 1, None) {
+        let actual = match vm.eval_scheduled("vm_map_iter_diff", function, &terms, 1) {
             Ok(outcome) => CallResult::Ok(outcome.term),
             Err(VmError::Raised(raised)) => CallResult::Exception {
                 class: format!("{:?}", raised.class).to_lowercase(),

@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(dirty_major_gc).
@@ -87,19 +86,15 @@ fn self_initiated_long_gc_matches_otp_and_uses_dirty_cpu() {
         .load("dirty_major_gc", &beam)
         .expect("load into erl");
     let expected = reference.call("dirty_major_gc", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
-    let actual = vm
-        .eval_scheduled("dirty_major_gc", "run", &[], 2, None)
-        .expect("scheduled dirty major GC run");
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term.clone()));
+    let actual = crate::common::peer_eval(&[], &[&beam], "dirty_major_gc:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.clone()));
     let run = OwnedTerm::Tuple(vec![
         OwnedTerm::Int(1_000_000),
         OwnedTerm::Atom("true".into()),
         OwnedTerm::Atom("running".into()),
     ]);
     similar_asserts::assert_eq!(
-        actual.term,
+        actual,
         OwnedTerm::Tuple(vec![
             OwnedTerm::List {
                 elems: vec![run.clone(), run.clone(), run],
@@ -279,10 +274,10 @@ fn explicit_dirty_gc_reductions_match_otp_formula() {
     let CallResult::Ok(expected) = reference.call("dirty_gc_reds", "run", &[]) else {
         panic!("erl run failed");
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("dirty_gc_reds", "run", &[], 2, None)
+        .eval_scheduled("dirty_gc_reds", "run", &[], 2)
         .expect("scheduled dirty GC reductions run");
     let expected = groups(&expected);
     let actual = groups(&actual.term);
@@ -379,10 +374,10 @@ fn explicit_gc_heap_sizes_and_events_match_otp() {
     let CallResult::Ok(expected) = reference.call("dirty_gc_sizes", "run", &[]) else {
         panic!("erl run failed");
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("dirty_gc_sizes", "run", &[], 2, None)
+        .eval_scheduled("dirty_gc_sizes", "run", &[], 2)
         .expect("scheduled dirty GC sizes run");
     similar_asserts::assert_eq!(expected, actual.term);
 }

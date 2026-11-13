@@ -1073,13 +1073,9 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     if (function.module, function.function, function.arity) == ("erts_internal", "breakpoint", 4) {
         return 0;
     }
-    let Some(runtime) = process.runtime.as_ref() else {
-        return 0;
-    };
-    let Some(export) = crate::beamasm_integration::line_breakpoint_export(
-        runtime.code_scope,
-        registers.active_code_ix as usize,
-    ) else {
+    let Some(export) =
+        crate::beamasm_integration::line_breakpoint_export(registers.active_code_ix as usize)
+    else {
         return 0;
     };
 
@@ -3658,10 +3654,11 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
                 runtime
                     .export_entry((entry.module, entry.function, entry.arity), code_ix)
                     .or_else(|| {
-                        crate::export::export_entry_or_stub(
-                            runtime.code_scope,
-                            (entry.module, entry.function, entry.arity),
-                        )
+                        crate::export::export_entry_or_stub((
+                            entry.module,
+                            entry.function,
+                            entry.arity,
+                        ))
                         .map(|export| &**export)
                     })
             });
@@ -3934,9 +3931,9 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     // the export's `addresses[code_ix]` with the Export* in ARG1.
     let mfa = (module_atom, function_atom, arity as u8);
     let Some(export) = process.runtime.as_ref().and_then(|runtime| {
-        runtime.export_entry(mfa, code_ix).or_else(|| {
-            crate::export::export_entry_or_stub(runtime.code_scope, mfa).map(|export| &**export)
-        })
+        runtime
+            .export_entry(mfa, code_ix)
+            .or_else(|| crate::export::export_entry_or_stub(mfa).map(|export| &**export))
     }) else {
         return apply_error(
             process,
@@ -4076,7 +4073,7 @@ fn apply3(
         runtime
             .export_entry((module, function, arity), code_ix)
             .or_else(|| {
-                crate::export::export_entry_or_stub(runtime.code_scope, (module, function, arity))
+                crate::export::export_entry_or_stub((module, function, arity))
                     .map(|export| &**export)
             })
     }) else {

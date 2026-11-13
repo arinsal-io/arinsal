@@ -1,7 +1,6 @@
 //! Scheduler-path differentials for hibernate, suspend, spawn_request, and max_heap_size.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_sched).
@@ -395,11 +394,15 @@ fn proc_sched_matches_otp_29() {
     ];
     for function in functions {
         let expected = reference.call("proc_sched", function, &[]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).expect("load");
-        let actual = vm
-            .eval_scheduled("proc_sched", function, &[], 1, None)
-            .unwrap_or_else(|error| panic!("{function}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        let actual = if function == "gc_trace_tags" {
+            crate::common::peer_eval(&[], &[&beam], "proc_sched:gc_trace_tags()")
+        } else {
+            let mut vm = crate::common::node();
+            vm.load_bytes(&beam).expect("load");
+            vm.eval_scheduled("proc_sched", function, &[], 1)
+                .unwrap_or_else(|error| panic!("{function}: {error}"))
+                .term
+        };
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
     }
 }

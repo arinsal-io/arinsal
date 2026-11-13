@@ -1,6 +1,5 @@
 //! `+S` scheduler counts: system_info and the scheduler bind checks match erl for the same flags.
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(sched_online).
@@ -50,10 +49,6 @@ fn sched_online_spawned_child_runs_before_a_later_woken_process() {
         .load("sched_online", &beam)
         .expect("load reference");
     let expected = reference.call("sched_online", "spawn_order", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let actual = vm
-        .eval_scheduled("sched_online", "spawn_order", &[], 4, None)
-        .expect("eval");
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    let actual = crate::common::peer_eval(&[], &[&beam], "sched_online:spawn_order()");
+    assert_eq!(expected, CallResult::Ok(actual));
 }

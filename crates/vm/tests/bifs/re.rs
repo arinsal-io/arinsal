@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, Term, from_owned};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
@@ -34,11 +33,11 @@ fn eval(
     function: &str,
     values: &[O],
 ) -> Result<arinsal_vm::ScheduledResult, arinsal_vm::VmError> {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam)?;
     let mut heap = ProcessHeap::with_words(1024);
     let terms = args_to_terms(values, &mut heap);
-    vm.eval_scheduled("re_vm_diff", function, &terms, 1, None)
+    vm.eval_scheduled("re_vm_diff", function, &terms, 1)
 }
 
 #[test]

@@ -41,8 +41,6 @@ fn typed_emulator_flags_and_launch_metadata() {
         "multi_time_warp",
         "+c",
         "true",
-        "+Zsim",
-        "42",
         "+Spool",
         "batch:2,3",
         "-boot",
@@ -81,7 +79,6 @@ fn typed_emulator_flags_and_launch_metadata() {
     assert_eq!(launch.emulator.distribution_buffer_busy_limit, Some(1024));
     assert_eq!(launch.emulator.time_warp, Some(TimeWarp::Multi));
     assert_eq!(launch.emulator.time_correction, Some(true));
-    assert_eq!(launch.emulator.simulation_seed, Some(42));
     assert_eq!(launch.emulator.core_pools[0].name, "batch");
     assert_eq!(launch.emulator.core_pools[0].cpus, [2, 3]);
     assert_eq!(launch.boot_script.as_deref(), Some("start"));

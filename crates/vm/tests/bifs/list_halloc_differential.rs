@@ -9,7 +9,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "list_halloc_differential";
 const SOURCE: &str = r#"
@@ -73,10 +72,10 @@ fn integer_to_list_gc_events_match_otp() {
         CallResult::Ok(term) => term,
         other => panic!("reference probe failed: {other:?}"),
     };
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load probe into Arinsal");
     let actual = vm
-        .eval_scheduled(MODULE, "probe", &[], 1, None)
+        .eval_scheduled(MODULE, "probe", &[], 1)
         .unwrap_or_else(|error| panic!("Arinsal probe failed: {error:?}"))
         .term;
     assert_eq!(render(&actual), render(&expected));

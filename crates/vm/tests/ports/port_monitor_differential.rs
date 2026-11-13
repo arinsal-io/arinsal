@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(port_mon_diff).
@@ -48,11 +47,6 @@ fn port_monitors_match_erts() {
         .expect("compile");
     reference.load("port_mon_diff", &beam).unwrap();
     let expected = reference.call("port_mon_diff", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load");
-    let actual = vm
-        .eval_scheduled("port_mon_diff", "run", &[], 2, None)
-        .expect("run")
-        .term;
+    let actual = crate::common::peer_eval(&[], &[&beam], "port_mon_diff:run()");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

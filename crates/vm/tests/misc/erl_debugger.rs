@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
-use arinsal_vm::Vm;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Mutex;
@@ -30,10 +29,10 @@ fn erl_debugger_supported_matches_otp_without_debug_flag() {
         .load("erl_debugger_supported_fixture", &beam)
         .expect("load OTP fixture");
     let expected = reference.call("erl_debugger_supported_fixture", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     let actual = vm
         .load_bytes(&beam)
-        .and_then(|_| vm.eval_scheduled("erl_debugger_supported_fixture", "run", &[], 1, None))
+        .and_then(|_| vm.eval_scheduled("erl_debugger_supported_fixture", "run", &[], 1))
         .unwrap_or_else(|error| panic!("erl_debugger:supported/0: {error}"));
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -88,13 +87,10 @@ fn erl_debugger_internal_state_toggle_enables_support() {
         .load("erl_debugger_internal_state_fixture", &beam)
         .expect("load OTP fixture");
     let expected = reference.call("erl_debugger_internal_state_fixture", "run", &[]);
-    let mut vm = Vm::new([]);
-    let actual = vm
-        .load_bytes(&beam)
-        .and_then(|_| vm.eval_scheduled("erl_debugger_internal_state_fixture", "run", &[], 1, None))
-        .unwrap_or_else(|error| panic!("debugger internal-state toggle: {error}"));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
-    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+    // The fixture changes the node's debugger state: run it in a peer.
+    let actual =
+        crate::common::peer_eval(&[], &[&beam], "erl_debugger_internal_state_fixture:run()");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
@@ -130,7 +126,7 @@ fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
         "run",
         &[arinsal_etf::OwnedTerm::Atom("sample".into())],
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
         .eval_scheduled(
@@ -140,7 +136,6 @@ fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
                 arinsal_term::global_atoms().intern("sample").unwrap(),
             )],
             1,
-            None,
         )
         .expect("run VM fixture");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -295,21 +290,8 @@ capture(Fun) ->
         "OTP fixture: {expected:?}"
     );
 
-    let preloaded = reference
-        .eval("element(2, code:get_object_code(erts_internal))")
-        .expect("read OTP's preloaded breakpoint wrapper");
-    let arinsal_etf::OwnedTerm::Binary(preloaded) = &preloaded else {
-        panic!("OTP erts_internal object code was not a binary");
-    };
-    let mut vm = Vm::new_with_debugger_flags([], true, true);
-    vm.load_bytes(preloaded)
-        .expect("load OTP's preloaded breakpoint wrapper");
-    vm.load_bytes(&beam).expect("load debugger BIF fixture");
-    let actual = vm
-        .eval_scheduled(module, "run", &[], 8, None)
-        .unwrap_or_else(|error| panic!("run debugger BIF fixture: {error}"));
-    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
-    let mut actual = CallResult::Ok(actual.term);
+    let actual = crate::common::peer_eval(&["+D"], &[&beam], &format!("{module}:run()"));
+    let mut actual = CallResult::Ok(actual);
     arinsal_difftest::compare(&expected, &actual, arinsal_difftest::CompareMode::Exact)
         .unwrap_or_else(|mismatch| panic!("debugger BIF semantic mismatch: {mismatch}"));
     canonicalize_call_result(&mut expected);
@@ -418,22 +400,9 @@ compact_fun(Fun) -> Fun.
     };
     assert!(expected != arinsal_etf::OwnedTerm::Atom("no_debugger_event".into()));
 
-    let preloaded = reference
-        .eval("element(2, code:get_object_code(erts_internal))")
-        .expect("read OTP's preloaded breakpoint wrapper");
-    let arinsal_etf::OwnedTerm::Binary(preloaded) = &preloaded else {
-        panic!("OTP erts_internal object code was not a binary");
-    };
-    let mut vm = Vm::new_with_debugger_flags([], true, true);
-    vm.load_bytes(preloaded)
-        .expect("load OTP's preloaded breakpoint wrapper");
-    vm.load_bytes(&beam).expect("load debugger hit fixture");
-    let actual = vm
-        .eval_scheduled("erl_debugger_active_fixture", "run", &[], 8, None)
-        .unwrap_or_else(|error| panic!("run debugger hit fixture: {error}"));
-    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
-    assert!(actual.term != arinsal_etf::OwnedTerm::Atom("no_debugger_event".into()));
-    similar_asserts::assert_eq!(expected, actual.term);
+    let actual = crate::common::peer_eval(&["+D"], &[&beam], "erl_debugger_active_fixture:run()");
+    assert!(actual != arinsal_etf::OwnedTerm::Atom("no_debugger_event".into()));
+    similar_asserts::assert_eq!(expected, actual);
 }
 
 /// Runs `module:run/0` of `source` (compiled with `+beam_debug_info`) on OTP with `+D` and
@@ -468,20 +437,8 @@ fn assert_debugger_fixture_matches_otp(module: &str, source: &str) {
         panic!("OTP debugger fixture failed: {expected:?}");
     };
 
-    let preloaded = reference
-        .eval("element(2, code:get_object_code(erts_internal))")
-        .expect("read OTP's preloaded breakpoint wrapper");
-    let arinsal_etf::OwnedTerm::Binary(preloaded) = &preloaded else {
-        panic!("OTP erts_internal object code was not a binary");
-    };
-    let mut vm = Vm::new_with_debugger_flags([], true, true);
-    vm.load_bytes(preloaded).expect("load breakpoint wrapper");
-    vm.load_bytes(&beam).expect("load debugger fixture");
-    let actual = vm
-        .eval_scheduled(module, "run", &[], 8, None)
-        .unwrap_or_else(|error| panic!("run debugger fixture: {error}"));
-    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
-    similar_asserts::assert_eq!(expected, actual.term);
+    let actual = crate::common::peer_eval(&["+D"], &[&beam], &format!("{module}:run()"));
+    similar_asserts::assert_eq!(expected, actual);
 }
 
 /// Every line breakpoint of a function with more live X registers than the register cache
@@ -606,22 +563,11 @@ fn erl_debugger_get_debug_info_survives_release_and_matches_otp() {
             &[],
         )
         .unwrap();
-    let mut vm = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), true, true);
-    vm.load_bytes(&wrapper_beam).unwrap();
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(
-            wrapper,
-            "get",
-            &[arinsal_term::Term::atom(
-                arinsal_term::global_atoms().intern(module).unwrap(),
-            )],
-            1,
-            None,
-        )
-        .unwrap()
-        .term;
-    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+    let actual = crate::common::peer_eval(
+        &["+D"],
+        &[&wrapper_beam, &beam],
+        &format!("begin {{module, _}} = code:ensure_loaded({module}), {wrapper}:get({module}) end"),
+    );
     // Flatmap key order follows atom indices, which differ between runtimes; compare as maps.
     fn sorted(term: &arinsal_etf::OwnedTerm) -> arinsal_etf::OwnedTerm {
         use arinsal_etf::OwnedTerm as T;

@@ -1,7 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 const MODULE: &str = "open_port_filename_test";
 const SOURCE: &str = r#"
@@ -45,8 +43,8 @@ fn spawn_executable_filename_terms_match_otp() {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
 
     for function in [
         "atom_arg",
@@ -58,8 +56,8 @@ fn spawn_executable_filename_terms_match_otp() {
         let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
             panic!("OTP open_port failed in {function}");
         };
-        let actual = vm.eval_scheduled(MODULE, function, &[], 1, None).unwrap();
-        assert_eq!(expected, actual.term, "open_port {function}");
+        let actual = vm.eval_scheduled(MODULE, function, &[], 1).unwrap();
+        similar_asserts::assert_eq!(expected, actual.term, "open_port {function}");
     }
 }
 
@@ -81,14 +79,9 @@ fn spawn_port_descriptor_exhaustion_matches_otp() {
         panic!("OTP descriptor exhaustion probe failed");
     };
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(MODULE, "fd_exhaustion", &[], 1, None)
-        .unwrap()
-        .term;
-    assert_eq!(expected, OwnedTerm::atom("emfile"));
-    assert_eq!(actual, expected);
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("{MODULE}:fd_exhaustion()"));
+    similar_asserts::assert_eq!(expected, OwnedTerm::atom("emfile"));
+    similar_asserts::assert_eq!(actual, expected);
 }
 
 struct RestoreFileLimit(rustix::process::Rlimit);

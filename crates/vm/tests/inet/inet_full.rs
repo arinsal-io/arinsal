@@ -374,9 +374,9 @@ fn run_case(reference: &RefErl, vm: &mut Vm, case_name: &str) {
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("inet_full_diff", "run", &[arg], 2, None)
+        .eval_scheduled("inet_full_diff", "run", &[arg], 2)
         .unwrap_or_else(|error| panic!("{case_name}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
 }
 
 #[test]
@@ -392,8 +392,8 @@ fn tcp_inet_matches_erts() {
     reference
         .load("inet_full_diff", &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for case in [
         "opts",
         "opts6",
@@ -425,14 +425,14 @@ fn tcp_inet_matches_erts() {
         .expect("erl");
     assert!(status.success());
     let expected = std::fs::read_to_string("/tmp/debug_on.term").unwrap();
-    assert_eq!(expected.trim(), "{ok,{ok,[{debug,true}]}}");
+    similar_asserts::assert_eq!(expected.trim(), "{ok,{ok,[{debug,true}]}}");
     let input = OwnedTerm::Atom("debug_on".into());
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("inet_full_diff", "run", &[arg], 2, None)
+        .eval_scheduled("inet_full_diff", "run", &[arg], 2)
         .expect("debug_on");
-    assert_eq!(
+    similar_asserts::assert_eq!(
         actual.term,
         OwnedTerm::Tuple(vec![
             OwnedTerm::Atom("ok".into()),
@@ -473,7 +473,7 @@ fn thread_count() -> usize {
             size,
         )
     };
-    assert_eq!(written, size, "proc_pidinfo");
+    similar_asserts::assert_eq!(written, size, "proc_pidinfo");
     info.pti_threadnum as usize
 }
 
@@ -487,13 +487,13 @@ fn scheduler_exits_after_tcp_port() {
     let beam = reference
         .compile_named("inet_full_diff", source(), &[])
         .expect("compile");
-    let once = || {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).expect("load");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
+    let mut once = || {
         let input = OwnedTerm::Atom("sched".into());
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
-        vm.eval_scheduled("inet_full_diff", "run", &[arg], 2, None)
+        vm.eval_scheduled("inet_full_diff", "run", &[arg], 2)
             .expect("sched");
     };
     once();

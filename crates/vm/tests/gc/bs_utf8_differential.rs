@@ -353,7 +353,7 @@ fn call(reference: &RefErl, vm: &mut Vm, function: &str, argument: OwnedTerm) ->
     let mut heap = VecHeap::new();
     let term = from_owned(&argument, &mut heap).expect("convert differential argument");
     let actual = vm
-        .eval_scheduled(MODULE, function, &[term], 1, None)
+        .eval_scheduled(MODULE, function, &[term], 1)
         .unwrap_or_else(|error| panic!("{function}: VM raised unexpectedly: {error:?}"));
     let actual = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.clone()), "{function}");
@@ -493,8 +493,8 @@ fn build_utf8_multibyte_list_does_not_segfault() {
     reference
         .load(MODULE, &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let values = list(
         (0..200)
             .map(|index| OwnedTerm::Int(i64::from(if index % 5 == 0 { 0x20acu32 } else { 0x80 })))
@@ -513,8 +513,8 @@ fn utf_segments_match_otp_for_boundaries_invalid_data_offsets_subbinaries_and_bu
     reference
         .load(MODULE, &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
 
     for encoding in ENCODINGS {
         assert_encoding(&reference, &mut vm, encoding);

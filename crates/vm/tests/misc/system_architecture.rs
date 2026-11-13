@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(system_architecture_diff).
@@ -27,10 +26,10 @@ fn system_architecture_names_the_same_target_as_erts() {
         .load("system_architecture_diff", &beam)
         .expect("load reference module");
     let expected = reference.call("system_architecture_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load arinsal module");
     let actual = vm
-        .eval_scheduled("system_architecture_diff", "run", &[], 1, None)
+        .eval_scheduled("system_architecture_diff", "run", &[], 1)
         .unwrap_or_else(|error| panic!("system_architecture_diff:run/0: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term.clone()));
     let OwnedTerm::Tuple(ref fields) = actual.term else {

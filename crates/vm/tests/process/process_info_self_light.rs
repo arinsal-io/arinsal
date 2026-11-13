@@ -3,7 +3,6 @@ use crate::common;
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 // Self-item results from the light path (`process_info_light`) and the executor fallback must
 // match erl. Pids and heap sizes differ between runtimes, and erl's calling process carries a
@@ -203,14 +202,13 @@ fn run_scenarios(scenarios: &[i64]) -> Vec<String> {
             "scenario",
             &[OwnedTerm::Int(scenario)],
         );
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled(
             "process_info_self_light",
             "scenario",
             &[Term::small(scenario).unwrap()],
             1,
-            None,
         );
         let actual = CallResult::Ok(
             actual
@@ -258,6 +256,6 @@ fn process_info_dictionary_order_matches_otp_29() {
             return;
         };
         let actual = common::arinsal_once("process_info_self_light", &beam, &expr);
-        assert_eq!(expected, actual, "scenario {scenario}");
+        similar_asserts::assert_eq!(expected, actual, "scenario {scenario}");
     }
 }

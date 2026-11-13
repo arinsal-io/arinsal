@@ -2,8 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(dirty_sched).
@@ -119,18 +117,8 @@ fn assert_scenario(reference: &RefErl, scenario: i64) {
         .expect("compile dirty_sched");
     reference.load("dirty_sched", &beam).expect("load into erl");
     let expected = reference.call("dirty_sched", "run", &[OwnedTerm::Int(scenario)]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
-    let actual = vm
-        .eval_scheduled(
-            "dirty_sched",
-            "run",
-            &[Term::small(scenario).unwrap()],
-            2,
-            None,
-        )
-        .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
+    let actual = crate::common::peer_eval(&[], &[&beam], &format!("dirty_sched:run({scenario})"));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "scenario {scenario}");
 }
 
 macro_rules! scenario {

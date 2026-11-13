@@ -3,7 +3,7 @@
 //! called statically and through `apply`.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(monitor_bif).
@@ -107,9 +107,9 @@ fn monitor_and_demonitor_match_otp() {
         .load("monitor_bif", &beam)
         .expect("load reference module");
     let expected = reference.call("monitor_bif", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("monitor_bif", "run", &[], 2, None) {
+    let actual = match vm.eval_scheduled("monitor_bif", "run", &[], 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

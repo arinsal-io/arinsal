@@ -3866,7 +3866,7 @@ run() ->
         let mut vm = crate::Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("dist_missing_send_diff", "run", &[], 2, None)
+            .eval_scheduled("dist_missing_send_diff", "run", &[], 2)
             .unwrap();
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }

@@ -25,7 +25,7 @@ fn literal_trace() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("ARINSAL_LITERAL_TRACE").is_some())
 }
 
-/// The table used by BIF calls outside a node.
+/// The persistent-term table of the node: one per OS process, as in erts.
 pub fn global_store() -> &'static Store {
     &GLOBAL
 }
@@ -46,22 +46,6 @@ pub fn last_retirement_of_any_store() -> RetirementTrace {
         freed: LAST_TRACE[2].load(Ordering::Relaxed),
         copied_roots: LAST_TRACE[3].load(Ordering::Relaxed),
     }
-}
-
-/// The store of one node (code scope). Like erts, each node has its own persistent-term
-/// table and literal-area collector queue; scope 0 is the process-wide default store.
-// A node's store lives for the rest of the OS process: processes and native code hold
-// `'static` references into it.
-pub fn store_for(scope: u64) -> &'static Store {
-    static STORES: LazyLock<Mutex<HashMap<u64, &'static Store>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    if scope == 0 {
-        return &GLOBAL;
-    }
-    let mut stores = STORES.lock().unwrap_or_else(|poison| poison.into_inner());
-    stores
-        .entry(scope)
-        .or_insert_with(|| Box::leak(Box::new(Store::new())))
 }
 
 /// A stable table view held across a yielding `persistent_term:get/0` call.

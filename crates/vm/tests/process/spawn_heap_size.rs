@@ -3,7 +3,6 @@
 //! right after the spawn match erl for small and large arguments and for `min_heap_size`.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"-module(spawn_heap_size).
 -export([run/0, wait/2]).
@@ -39,10 +38,10 @@ fn spawned_process_heap_is_sized_like_erts() {
         .load("spawn_heap_size", &beam)
         .expect("load into erl");
     let expected = reference.call("spawn_heap_size", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load into arinsal");
     let actual = vm
-        .eval_scheduled("spawn_heap_size", "run", &[], 2, None)
+        .eval_scheduled("spawn_heap_size", "run", &[], 2)
         .expect("scheduled run");
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

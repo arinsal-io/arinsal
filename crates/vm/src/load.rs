@@ -147,7 +147,6 @@ pub(crate) fn nif_key(name: &str, id: usize) -> String {
 // beam_ranges.c:58 (r), OTP-29.1.1.
 #[derive(Clone)]
 pub(crate) struct CodeTables {
-    pub(crate) code_scope: u64,
     /// The published version of these tables; see [`crate::code_ix::next_generation`].
     pub(crate) generation: u64,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
@@ -159,8 +158,8 @@ pub(crate) struct CodeTables {
     pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     // g_code_fix
     pub(crate) exports: SharedTable<ExportIndex>,
-    /// OTP's global local-fun table. It never removes entries on purge; its node scope is
-    /// retained by the code-index registry for the VM lifetime.
+    /// OTP's global local-fun table. It never removes entries on purge; the node's code
+    /// indexes live for the OS process.
     funs: SharedTable<FunEntries>,
     pub(crate) free_ids: SharedTable<Vec<usize>>,
     pub(crate) module_live: SharedTable<Vec<bool>>,
@@ -328,7 +327,7 @@ struct ExportIndexEntry {
 impl ExportIndex {
     // Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs: an export with its
     // `bif_number` for every BIF table entry), OTP-29.1.1.
-    fn new(scope: u64) -> Self {
+    fn new() -> Self {
         let mut index = Self {
             order: Vec::new(),
             seen: HashSet::new(),
@@ -336,7 +335,7 @@ impl ExportIndex {
         };
         for line in include_str!("../../../spec/otp-29.1.1/bif.tab").lines() {
             if let Some((module, function, arity)) = parse_bif_mfa(line) {
-                index.put_builtin(scope, &module, &function, arity);
+                index.put_builtin(&module, &function, arity);
             }
         }
         // Port of erts/emulator/beam/bif.c (dirty_bif_result, dirty_bif_exception,
@@ -349,7 +348,7 @@ impl ExportIndex {
             ("dirty_bif_trap", 2),
             ("dirty_bif_trap", 3),
         ] {
-            index.put_builtin(scope, "erts_internal", function, arity);
+            index.put_builtin("erts_internal", function, arity);
         }
         // Port of erts/emulator/beam/erl_bif_re.c:222 (erts_init_bif_re) and
         // erts/emulator/beam/erl_unicode.c:103 (erts_init_unicode), OTP-29.1.1.
@@ -389,7 +388,7 @@ impl ExportIndex {
         }
     }
 
-    fn put_builtin(&mut self, scope: u64, module: &str, function: &str, arity: u8) {
+    fn put_builtin(&mut self, module: &str, function: &str, arity: u8) {
         let (Ok(module), Ok(function)) = (
             global_atoms().intern(module),
             global_atoms().intern(function),
@@ -398,7 +397,7 @@ impl ExportIndex {
         };
         let key = (module, function, arity);
         self.put_atoms(module, function, arity);
-        if let Some(export) = crate::beamasm_integration::make_export(scope, key) {
+        if let Some(export) = crate::beamasm_integration::make_export(key) {
             self.put_export(key, export);
         }
     }
@@ -611,9 +610,8 @@ impl CodeTables {
         }
     }
 
-    pub(crate) fn new(code_scope: u64) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            code_scope,
             generation: crate::code_ix::next_generation(),
             modules: SharedTable::new(Vec::new()),
             loaded: SharedTable::new(ModuleIndex::default()),
@@ -622,7 +620,7 @@ impl CodeTables {
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
-            exports: SharedTable::new(ExportIndex::new(code_scope)),
+            exports: SharedTable::new(ExportIndex::new()),
             funs: SharedTable::new(HashMap::with_hasher(BuildHasherDefault::default())),
             free_ids: SharedTable::new(Vec::new()),
             module_live: SharedTable::new(Vec::new()),
@@ -677,14 +675,14 @@ impl CodeTables {
             module,
             meta,
         );
-        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
+        crate::trace_bp::clear_module_line_breakpoints(id);
         id
     }
 
     /// Makes instance `id` the current code of `name` and returns the instance it replaces.
     pub(crate) fn make_current(&mut self, name: &str, id: usize) -> Option<usize> {
         let previous = self.loaded.insert(name, id);
-        activate_module_records(self.code_scope, &self.modules[id]);
+        activate_module_records(&self.modules[id]);
         self.deleted.remove(name);
         self.known_modules.insert(name.to_owned());
         previous
@@ -706,18 +704,18 @@ impl CodeTables {
             .get(id)
             .and_then(Option::as_ref)
             .and_then(|meta| meta.beamasm.clone());
-        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
+        crate::trace_bp::clear_module_line_breakpoints(id);
         // Port of erts/emulator/beam/erl_nif.c (erts_unload_nif on purge), OTP-29.1.1: a NIF
         // library belongs to its code instance, so purging it lets a later load bind again.
         if self.module_live.get(id).copied() == Some(true)
             && let Some(module) = self.modules.get(id)
         {
-            crate::code_ix::for_scope(self.code_scope).release_native_fns(module);
+            crate::code_ix::global().release_native_fns(module);
             let key = nif_key(&module.name, id);
             self.loaded_nifs.remove(&key);
-            crate::natives::nif::unload_instance(self.code_scope, id);
+            crate::natives::nif::unload_instance(id);
             if let Some(area) = self.modules[id].literal_area().take() {
-                arinsal_pterm::store_for(self.code_scope).retire_module_area(area);
+                arinsal_pterm::global_store().retire_module_area(area);
             }
         }
         release_slot(
@@ -734,8 +732,8 @@ impl CodeTables {
 /// Port of erts/emulator/beam/erl_record.c:171-193 (erts_record_put,
 /// erts_record_module_delete), OTP-29.1.1: make the record definitions of the code that
 /// becomes current for its module the canonical ones, replacing those of the previous code.
-pub(crate) fn activate_module_records(scope: u64, module: &Module) {
-    arinsal_term::delete_module_record_definitions(scope, module.name_atom);
+pub(crate) fn activate_module_records(module: &Module) {
+    arinsal_term::delete_module_record_definitions(module.name_atom);
     let atoms = global_atoms();
     for (record, cons) in module.records.iter().zip(&module.record_defs) {
         let (Ok(name), Some((definition, _))) =
@@ -743,15 +741,15 @@ pub(crate) fn activate_module_records(scope: u64, module: &Module) {
         else {
             continue;
         };
-        arinsal_term::put_record_definition(scope, module.name_atom, name, *cons, definition);
+        arinsal_term::put_record_definition(module.name_atom, name, *cons, definition);
     }
 }
 
 /// Port of erts/emulator/beam/beam_bif_load.c:2451 (erts_record_module_delete) at the point
 /// where the current code of `module` becomes old.
-pub(crate) fn retract_module_records(scope: u64, module: &str) {
+pub(crate) fn retract_module_records(module: &str) {
     if let Ok(atom) = global_atoms().intern(module) {
-        arinsal_term::delete_module_record_definitions(scope, atom);
+        arinsal_term::delete_module_record_definitions(atom);
     }
 }
 
@@ -833,18 +831,11 @@ impl Vm {
             paths.extend(dirs);
         }
         paths.push(otp.join("lib/erts-17.1/ebin"));
-        let code_scope = beamasm_integration::new_code_scope();
-        Self::for_code_scope(paths, Some(otp), code_scope, false)
+        Self::for_node(paths, Some(otp), false)
     }
 
-    fn for_code_scope(
-        paths: Vec<PathBuf>,
-        otp_root: Option<PathBuf>,
-        code_scope: u64,
-        replica: bool,
-    ) -> Self {
-        crate::fun_dispatch::set_thread_code_scope(code_scope);
-        let code_ix = crate::code_ix::for_scope(code_scope);
+    fn for_node(paths: Vec<PathBuf>, otp_root: Option<PathBuf>, replica: bool) -> Self {
+        let code_ix = Arc::clone(crate::code_ix::global());
         Self {
             paths,
             child_setup: None,
@@ -858,17 +849,16 @@ impl Vm {
             code: code_ix.active_tables(),
             native_fns: code_ix.native_fns(),
             purge_state: Arc::clone(&code_ix.purge_state),
-            beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
-            code_scope,
+            beamasm_targets: beamasm_integration::NativeTargetCache::new(),
             code_ix,
             replica,
             backtrace_depth: 8,
         }
     }
 
-    /// A scheduler's VM over the code of the node with code scope `code_scope`.
-    pub(crate) fn shared_replica(code_scope: u64, paths: &[PathBuf]) -> Self {
-        Self::for_code_scope(paths.to_vec(), None, code_scope, true)
+    /// A scheduler's VM over the node's code.
+    pub(crate) fn shared_replica(paths: &[PathBuf]) -> Self {
+        Self::for_node(paths.to_vec(), None, true)
     }
 
     /// Construct a VM with OTP's debugger startup flags applied before any module is loaded.
@@ -958,7 +948,7 @@ impl Vm {
         funs::set_module_uniq(&mut module, uniq);
         // The functions of a module that is not emitted yet are not known: its NIF bodies
         // are bound after the emitter has found them (`bind_native_static_nifs`).
-        let known = beamasm_integration::known_imports(self.code_scope, &module.imports);
+        let known = beamasm_integration::known_imports(&module.imports);
         bind_import_targets_of(&mut module, &known);
         Ok(module)
     }
@@ -977,7 +967,6 @@ impl Vm {
         if let Some(native) = beamasm_integration::compile(
             &meta.beam,
             module,
-            self.code_scope,
             crate::trace_bp::line_breakpoints_instrumented(),
             &self.code_ix,
         ) {
@@ -1277,11 +1266,7 @@ impl Vm {
                 global || crate::trace_bp::any_breakpoint(process, &module.name, function, *arity),
             ));
         }
-        crate::beamasm_integration::patch_native_breakpoints(
-            self.code_scope,
-            &module.name,
-            &native_patches,
-        );
+        crate::beamasm_integration::patch_native_breakpoints(&module.name, &native_patches);
         let mut exports_retargeted = false;
         let global_patches = global_patches
             .into_iter()
@@ -1293,7 +1278,6 @@ impl Vm {
             {
                 exports_retargeted = true;
                 crate::export::set_export_breakpoint(
-                    self.code_scope,
                     (module.name_atom, export.function_atom, export.arity),
                     global,
                     bif_traced,
@@ -1532,7 +1516,7 @@ mod purge_free_tests {
         };
         let mut vm = Vm::new([]);
         let id = vm.load_bytes(&beam).unwrap();
-        let store = arinsal_pterm::store_for(vm.code_scope);
+        let store = arinsal_pterm::global_store();
         let released = vm.code_ix.update_active(|tables| tables.release(id));
         let native = released.expect("native code of the old version");
         let before = store.retired_generation();

@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_class_c).
@@ -53,7 +52,7 @@ fn removed_process_wrappers_match_otp_29() {
     reference.load("proc_class_c", &beam).unwrap();
     for scenario in 0..31 {
         let expected = reference.call("proc_class_c", "scenario", &[OwnedTerm::Int(scenario)]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled(
@@ -61,9 +60,8 @@ fn removed_process_wrappers_match_otp_29() {
                 "scenario",
                 &[Term::small(scenario).unwrap()],
                 2,
-                None,
             )
             .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
     }
 }

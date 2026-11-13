@@ -3,11 +3,10 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, Vm as _, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, VecHeap, exact_eq, from_owned, phash2};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 fn call_vm(vm: &mut Vm, module: &str, function: &str, args: &[Term]) -> CallResult {
-    match vm.eval_scheduled(module, function, args, 1, None) {
+    match vm.eval_scheduled(module, function, args, 1) {
         Ok(result) => CallResult::Ok(result.term),
         Err(error) => CallResult::TransportError(error.to_string()),
     }
@@ -31,7 +30,7 @@ fn fun_info_and_export_literals_match_otp() {
         erlang:fun_info(F,env),erlang:fun_info(F,pid)}.";
     let beam = reference.compile_named(module, source, &[]).unwrap();
     reference.load(module, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     for (function, args) in [
@@ -70,7 +69,7 @@ fn local_funs_survive_same_code_reload_and_keep_equality_hash() {
         other => panic!("make before reload failed: {other:?}"),
     };
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let old_vm = vm
         .eval_exported(module, "make", &[Term::small(17).unwrap()])
@@ -154,7 +153,7 @@ fn local_fun_from_purged_old_code_raises_badfun() {
     compare(&purge_expected, &actual_expected, CompareMode::Exact)
         .unwrap_or_else(|error| panic!("reference purge setup: {error}"));
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&old_beam).unwrap();
     let old_vm = vm.eval_exported(module, "make", &[]).unwrap();
     let mut input_heap = VecHeap::new();

@@ -54,7 +54,7 @@ fn call_vm(vm: &mut Vm, function: &str, args: &[O]) -> CallResult {
     let mut heap = VecHeap::new();
     let function = from_owned(&O::atom(function), &mut heap).expect("function atom");
     let args = from_owned(&O::list(args.to_vec()), &mut heap).expect("argument list");
-    match vm.eval_scheduled("difftest_server", "test_call", &[function, args], 1, None) {
+    match vm.eval_scheduled("difftest_server", "test_call", &[function, args], 1) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(error) => CallResult::TransportError(error.to_string()),
     }
@@ -86,7 +86,7 @@ fn tuple_construction_bifs_match_otp() {
     reference
         .load("list_tuple_construction_differential", &beam)
         .expect("load reference wrapper");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load test wrapper");
     vm.load_bytes(&server_frame)
         .expect("load test caller frame");

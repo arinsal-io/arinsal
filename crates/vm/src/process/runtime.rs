@@ -7,8 +7,6 @@ pub(crate) struct Runtime {
     pub(crate) backtrace_depth: AtomicUsize,
     /// The node's code indexes and their code tables.
     pub(super) code: Arc<crate::code_ix::CodeIndexes>,
-    /// The node's code scope, which keys its native code registries.
-    pub(crate) code_scope: u64,
     /// Runtime-owned stable exports indexed by the target id interned with each continuation.
     /// The entry remains the indirection when a module replaces code, as in erts' export table.
     pub(super) trap_exports:
@@ -36,8 +34,6 @@ pub(crate) struct Runtime {
     pub(crate) long_message_queues: Mutex<Vec<(Pid, Option<u64>)>>,
     /// Port identifier table's free id ring, like `erts_port.ptab`.
     pub(crate) port_ids: PtabIdRing,
-    pub(crate) simulated: bool,
-    pub(crate) virtual_ms: AtomicU64,
     /// `meta_name_tab`, read without taking the global ETS registry lock.
     pub(crate) named_ets: Arc<arinsal_ets::NamedTableIndex>,
     pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
@@ -55,7 +51,7 @@ pub(crate) struct Runtime {
     pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
     /// Spawn GC defaults, read without a lock (erts' `H_MIN_SIZE` and friends).
     pub(crate) gc_defaults: crate::natives::sys::GcDefaults,
-    /// The persistent term store of this runtime's code scope, looked up once.
+    /// The persistent term store of the node, looked up once.
     pub(crate) persistent_terms: &'static arinsal_pterm::Store,
     /// Multi-scheduling block state of this runtime.
     pub(crate) multi_scheduling: Mutex<MultiScheduling>,
@@ -202,7 +198,7 @@ impl Runtime {
             .get(target.trap_export_id)
             .expect("trap export table capacity")
             .get_or_init(|| {
-                crate::export::export_get_or_make_stub(self.code_scope, mfa).unwrap_or_else(|| {
+                crate::export::export_get_or_make_stub(mfa).unwrap_or_else(|| {
                     Arc::new(arinsal_beamasm::bif::ExportEntry::new(mfa.0, mfa.1, mfa.2))
                 })
             });
@@ -377,11 +373,7 @@ impl Runtime {
 
     /// Current position of the clock receive timeout positions are taken on.
     fn receive_clock_now_ms(&self) -> u64 {
-        if self.simulated {
-            self.virtual_ms.load(Ordering::Relaxed)
-        } else {
-            arinsal_sched::receive_timeout_pos(0)
-        }
+        arinsal_sched::receive_timeout_pos(0)
     }
 
     /// Live pids in this runtime's process table.

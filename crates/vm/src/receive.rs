@@ -998,10 +998,6 @@ impl Process {
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:231 (F_DELAY_GC cleared), OTP-29.1.1.
         self.delay_gc = false;
-        let simulated = self
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.simulated);
         // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1240
         // (beam_jit_wait_timeout), OTP-29.1.1: with F_INSLPQUEUE or F_TIMO set the timer is
         // already set and the operand is not read again (no X register is live across the
@@ -1045,13 +1041,7 @@ impl Process {
         };
         // Port of erts/emulator/beam/erl_hl_timer.c:2786-2806 (erts_set_proc_timer_term),
         // OTP-29.1.1: one monotonic clock read gives the wheel position the timer keeps.
-        let pos = match self.runtime.as_ref() {
-            Some(runtime) if simulated => runtime
-                .virtual_ms
-                .load(Ordering::Relaxed)
-                .saturating_add(ms),
-            _ => arinsal_sched::receive_timeout_pos(ms),
-        };
+        let pos = arinsal_sched::receive_timeout_pos(ms);
         self.receive_timeout_pos = Some(pos);
         Ok(Some(pos))
     }

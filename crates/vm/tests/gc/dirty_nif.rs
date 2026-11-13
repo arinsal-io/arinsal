@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const NIF_SOURCE: &str = r#"
 #include <unistd.h>
@@ -282,8 +281,8 @@ fn check_entry(module: &str, c_source: &str, erl_source: &str, entry: &str) {
         CallResult::Ok(term) => term,
         other => panic!("{module}:run/0 on erl: {other:?}"),
     };
-    let mut vm = Vm::new([dir.clone()]);
-    let actual = match vm.eval_scheduled(module, "run", &[], 4, None) {
+    let mut vm = crate::common::node_with_dir(&dir);
+    let actual = match vm.eval_scheduled(module, "run", &[], 4) {
         Ok(result) => result.term,
         Err(error) => panic!("{module}:run/0 failed on Arinsal: {error}"),
     };

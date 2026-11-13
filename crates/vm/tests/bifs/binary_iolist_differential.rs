@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn small_iolists_match_otp_at_heap_binary_and_walk_boundaries() {
@@ -24,10 +23,10 @@ run() ->
         .unwrap();
     reference.load("small_iolist_fill", &beam).unwrap();
     let expected = reference.call("small_iolist_fill", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("small_iolist_fill", "run", &[], 1, None)
+        .eval_scheduled("small_iolist_fill", "run", &[], 1)
         .unwrap();
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -59,10 +58,10 @@ run() ->
     reference.load("binary_iolist_differential", &beam).unwrap();
     let expected = reference.call("binary_iolist_differential", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("binary_iolist_differential", "run", &[], 1, None)
+        .eval_scheduled("binary_iolist_differential", "run", &[], 1)
         .unwrap_or_else(|error| panic!("large iolist conversion: {error}"));
 
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -101,10 +100,10 @@ substrings() ->
     reference.load("binary_iolist_differential", &beam).unwrap();
     let expected = reference.call("binary_iolist_differential", "substrings", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("binary_iolist_differential", "substrings", &[], 1, None)
+        .eval_scheduled("binary_iolist_differential", "substrings", &[], 1)
         .unwrap_or_else(|error| panic!("binary substring/conversion differential: {error}"));
 
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -131,10 +130,10 @@ search() ->
     reference.load("binary_iolist_differential", &beam).unwrap();
     let expected = reference.call("binary_iolist_differential", "search", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("binary_iolist_differential", "search", &[], 1, None)
+        .eval_scheduled("binary_iolist_differential", "search", &[], 1)
         .unwrap_or_else(|error| panic!("overlapping binary search: {error}"));
 
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -174,7 +173,7 @@ after_both_binary_conversions() ->
         .compile_named("binary_iolist_differential", source, &[])
         .unwrap();
     reference.load("binary_iolist_differential", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for function in [
         "flat_bitstring",
@@ -184,7 +183,7 @@ after_both_binary_conversions() ->
     ] {
         let expected = reference.call("binary_iolist_differential", function, &[]);
         let actual = vm
-            .eval_scheduled("binary_iolist_differential", function, &[], 1, None)
+            .eval_scheduled("binary_iolist_differential", function, &[], 1)
             .unwrap_or_else(|error| panic!("large list_to_bitstring after {function}: {error}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
     }

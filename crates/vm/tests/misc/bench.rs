@@ -1,5 +1,4 @@
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use std::process::Command;
 
 #[test]
@@ -27,7 +26,7 @@ fn benchmark_kernels_match_otp_small_cases() {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let mut vm = Vm::new([dir.clone()]);
+    let mut vm = crate::common::node_with_dir(&dir);
     for (function, n) in [("fib", 20), ("trees", 12), ("nbody", 100), ("idle", 0)] {
         let expression = format!("io:format(\"~p\", [bench:{function}({n})]), halt().");
         let otp = Command::new("erl")
@@ -79,7 +78,7 @@ fn select_tables_match_otp() {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let mut vm = Vm::new([dir.clone()]);
+    let mut vm = crate::common::node_with_dir(&dir);
     for (function, values) in [
         ("dense", vec![-1, 0, 1, 2, 3, 4, 5]),
         ("sparse", vec![-100, -1, 0, 100, 1000, 10000]),
@@ -140,7 +139,7 @@ fn continuations_survive_stack_collection() {
         .output()
         .unwrap();
     assert!(otp.status.success());
-    let mut vm = Vm::new([dir.clone()]);
+    let mut vm = crate::common::node_with_dir(&dir);
     let result = vm
         .eval_exported("stack_gc", "f", &[Term::small(1000).unwrap()])
         .unwrap();

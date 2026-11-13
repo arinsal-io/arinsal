@@ -6,7 +6,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "ets_select_trap_test";
@@ -586,8 +585,8 @@ fn family(chunked: bool) {
     let source = source();
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
 
     let mut failures = Vec::new();
     let filter = std::env::var("REDS_FILTER").unwrap_or_default();
@@ -607,7 +606,7 @@ fn family(chunked: bool) {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, 4_000)
             .unwrap();
         let (expected_reds, expected_ins, expected_gcs, expected_value) = measured(&expected);
         let (actual_reds, actual_ins, actual_gcs, actual_value) = measured(&actual.term);
@@ -641,13 +640,13 @@ fn both(function: &str, workers: usize) -> (OwnedTerm, OwnedTerm) {
     let source = source();
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
         panic!("OTP {function} failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, function, &[], workers, None, 4_000)
+        .eval_scheduled_reductions(MODULE, function, &[], workers, 4_000)
         .unwrap();
     (expected, actual.term)
 }

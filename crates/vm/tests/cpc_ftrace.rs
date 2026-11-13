@@ -3,8 +3,11 @@
 //! suspended in the old module does pin it.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
+
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
 
 const V1: &str = r#"
 -module(cpc_ftrace_m).
@@ -110,10 +113,10 @@ fn caught_stacktrace_does_not_pin_old_code() {
         .load("cpc_ftrace_drv", &driver)
         .expect("load driver");
     let expected = reference.call("cpc_ftrace_drv", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&driver).expect("load VM driver");
+    let mut vm = common::node();
+    common::load_fresh(&mut vm, &driver);
     let actual = vm
-        .eval_scheduled("cpc_ftrace_drv", "run", &[], 2, None)
+        .eval_scheduled("cpc_ftrace_drv", "run", &[], 2)
         .unwrap_or_else(|error| panic!("cpc_ftrace_drv:run: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

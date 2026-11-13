@@ -50,13 +50,6 @@ impl Definition {
     }
 }
 
-fn scope(process: &Process) -> u64 {
-    process
-        .runtime
-        .as_ref()
-        .map_or(0, |runtime| runtime.code_scope)
-}
-
 fn report(process: &mut Process, failure: Failure) {
     let (tag, value) = match failure {
         Failure::BadRecord(value) => ("badrecord", Ok(value)),
@@ -113,16 +106,12 @@ fn staged_pairs(process: &Process, base: usize, count: usize) -> Vec<(Term, Term
 }
 
 /// The registered definition literal of `Module:Name` when it is exported.
-fn exported_definition(process: &Process, id: Term) -> Option<Term> {
+fn exported_definition(id: Term) -> Option<Term> {
     let parts = term_sequence(id)?;
     let [module, name] = parts.as_slice() else {
         return None;
     };
-    let cons = arinsal_term::find_record_definition_in(
-        scope(process),
-        module.as_atom()?,
-        name.as_atom()?,
-    )?;
+    let cons = arinsal_term::find_record_definition(module.as_atom()?, name.as_atom()?)?;
     let (definition, _) = crate::lists::split(cons)?;
     Definition::parse(definition)?.exported.then_some(cons)
 }
@@ -169,7 +158,7 @@ fn create_record(
     external: bool,
 ) -> Result<Term, Failure> {
     let cons = if external {
-        exported_definition(process, id).ok_or(Failure::BadRecord(id))?
+        exported_definition(id).ok_or(Failure::BadRecord(id))?
     } else {
         id
     };

@@ -626,11 +626,9 @@ pub(super) fn resume(
         // Port of erts/emulator/beam/beam_common.c:581-680 (next_catch), OTP-29.1.1: the
         // frames above were unwound here (with their exception trace events); a catch in a
         // native frame is resumed by the native catch search.
-        if crate::native_bridge::is_native_catch_tag(
-            crate::native_bridge::process_code_scope(p),
-            word,
-        ) && let Some(handler) =
-            crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
+        if crate::native_bridge::is_native_catch_tag(word)
+            && let Some(handler) =
+                crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
         {
             p.set_native_pc(Some(handler));
             let target = crate::native_function_at(handler).map(|function| {
@@ -810,7 +808,7 @@ mod tail_apply_exception_stacktrace_matches_otp {
             .iter()
             .map(|arg| from_owned(arg, &mut heap).expect("test argument"))
             .collect::<Vec<Term>>();
-        match vm.eval_scheduled("vm_exc_apply", function, &inputs, 2, None) {
+        match vm.eval_scheduled("vm_exc_apply", function, &inputs, 2) {
             Ok(result) => CallResult::Ok(result.term),
             Err(VmError::Raised(raised)) => CallResult::Exception {
                 class: format!("{:?}", raised.class).to_lowercase(),

@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(missing_bifs).
@@ -152,25 +151,22 @@ fn missing_bifs_match_otp_29() {
         .compile_named("missing_bifs", SOURCE, &[])
         .unwrap();
     reference.load("missing_bifs", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for scenario in 0..12 {
         let expected = reference.call("missing_bifs", "run", &[OwnedTerm::Int(scenario)]);
-        let actual = vm.eval_scheduled(
-            "missing_bifs",
-            "run",
-            &[Term::small(scenario).unwrap()],
-            1,
-            None,
-        );
-        similar_asserts::assert_eq!(
-            expected,
-            CallResult::Ok(
-                actual
-                    .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"))
-                    .term
-            ),
-            "scenario {scenario}"
-        );
+        let actual = if scenario == 6 || scenario == 7 {
+            CallResult::Ok(crate::common::peer_eval(
+                &[],
+                &[&beam],
+                &format!("missing_bifs:run({scenario})"),
+            ))
+        } else {
+            match vm.eval_scheduled("missing_bifs", "run", &[Term::small(scenario).unwrap()], 1) {
+                Ok(outcome) => CallResult::Ok(outcome.term),
+                Err(error) => CallResult::TransportError(error.to_string()),
+            }
+        };
+        similar_asserts::assert_eq!(expected, actual, "scenario {scenario}");
     }
 }

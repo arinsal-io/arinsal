@@ -63,7 +63,7 @@ fn closures_and_dynamic_calls_match_otp() {
         assert!(captures.contains(&count), "missing {count}-capture lambda");
     }
     reference.load("vm_funs_cases", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load("vm_funs_cases", &beam).unwrap();
     let mut cases = 0;
     for count in 0..=20 {

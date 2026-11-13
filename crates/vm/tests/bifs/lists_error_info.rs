@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "lists_error_info";
@@ -34,10 +33,10 @@ fn list_bif_badarg_error_info_matches_otp_29() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "badargs", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled(MODULE, "badargs", &[], 1, None)
+        .eval_scheduled(MODULE, "badargs", &[], 1)
         .unwrap_or_else(|error| panic!("badargs: {error}"));
 
     assert_eq!(expected, CallResult::Ok(actual.term));

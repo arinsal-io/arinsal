@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(re_error_info_diff).
@@ -27,10 +26,10 @@ fn invalid_run_options_preserve_badopt_error_info_like_otp() {
         .unwrap();
     reference.load("re_error_info_diff", &beam).unwrap();
     let expected = reference.call("re_error_info_diff", "bad_options", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("re_error_info_diff", "bad_options", &[], 1, None)
+        .eval_scheduled("re_error_info_diff", "bad_options", &[], 1)
         .unwrap_or_else(|error| panic!("Arinsal re:run/3 error_info: {error}"));
     let CallResult::Ok(expected) = expected else {
         panic!("reference error_info call failed: {expected:?}");

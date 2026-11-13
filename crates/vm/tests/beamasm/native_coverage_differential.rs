@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const TARGET: &str = "native_coverage_differential_target";
@@ -41,14 +40,14 @@ fn native_coverage_modes_match_otp() {
             .eval(&format!("code:get_coverage({kind}, {TARGET})"))
             .unwrap();
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&driver).unwrap();
         let mode_term = Term::atom(global_atoms().intern(mode).unwrap());
-        vm.eval_scheduled(DRIVER, "set_mode", &[mode_term], 1, None)
+        vm.eval_scheduled(DRIVER, "set_mode", &[mode_term], 1)
             .unwrap();
-        vm.load_bytes(&target).unwrap();
+        crate::common::load_fresh(&mut vm, &target);
         let actual_result = vm
-            .eval_scheduled(TARGET, "fib", &[Term::small(5).unwrap()], 1, None)
+            .eval_scheduled(TARGET, "fib", &[Term::small(5).unwrap()], 1)
             .unwrap()
             .term;
         let actual_coverage = vm
@@ -57,7 +56,6 @@ fn native_coverage_modes_match_otp() {
                 "coverage",
                 &[Term::atom(global_atoms().intern(kind).unwrap())],
                 1,
-                None,
             )
             .unwrap()
             .term;

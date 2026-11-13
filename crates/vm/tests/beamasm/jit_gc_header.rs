@@ -6,7 +6,6 @@
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(jit_gc_header).
@@ -49,7 +48,7 @@ nested(N, Seed, Acc) ->
     nested(N + 1, Seed, lists:sublist([Joined | Acc], 12)).
 "#;
 
-fn run_case(reference: &RefErl, vm: &mut Vm, case_name: &str) {
+fn run_case(reference: &RefErl, vm: &mut arinsal_vm::Vm, case_name: &str) {
     let input = OwnedTerm::Atom(case_name.into());
     let expected = reference
         .call_opts(
@@ -65,7 +64,7 @@ fn run_case(reference: &RefErl, vm: &mut Vm, case_name: &str) {
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("jit_gc_header", "run", &[arg], 4, None)
+        .eval_scheduled("jit_gc_header", "run", &[arg], 4)
         .unwrap_or_else(|error| panic!("{case_name}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
 }
@@ -82,7 +81,7 @@ fn binary_construction_with_collections_matches_erts() {
     reference
         .load("jit_gc_header", &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load arinsal module");
     for case in ["concat", "codec", "nested"] {
         run_case(&reference, &mut vm, case);

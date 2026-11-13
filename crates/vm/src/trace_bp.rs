@@ -372,11 +372,10 @@ struct GenericBpData {
 }
 
 /// Port of erts/emulator/beam/beam_bp.h:85-94 (GenericBp), OTP-29.1.1: one per trace session
-/// and function. Runtime and code scope tag the VM instance the function belongs to.
+/// and function. The runtime tags the VM instance the function belongs to.
 #[derive(Clone)]
 struct GenericBp {
     runtime: usize,
-    code: u64,
     session: u64,
     data: [GenericBpData; 2],
 }
@@ -432,7 +431,7 @@ impl FunctionBp {
 
     /// Modify the chain; keeps `node`'s breakpoint count and the cache version current.
     fn write<R>(&self, node: &BpNode, change: impl FnOnce(&mut Vec<GenericBp>) -> R) -> R {
-        let runtime = node.code_scope as usize;
+        let runtime = node_id(node);
         let mut bps = self.bps.write().unwrap();
         let before = bps.iter().filter(|g| g.runtime == runtime).count();
         let result = change(&mut bps);
@@ -444,13 +443,12 @@ impl FunctionBp {
     }
 }
 
-/// The breakpoint data of one node (a runtime and its code scope): erts keeps the active
+/// The breakpoint data of one node (one runtime): erts keeps the active
 /// breakpoint index per node, and only the holder of that node's code modification permission
 /// changes breakpoints.
 // Port of erts/emulator/beam/beam_bp.c:73-80 (erts_active_bp_index, erts_staging_bp_index)
 // and beam_bp.h:230-238 (erts_active_bp_ix, erts_staging_bp_ix), OTP-29.1.1.
 pub(crate) struct BpNode {
-    code_scope: u64,
     /// Serializes writers (erts: the code modification permission).
     writer: Mutex<()>,
     /// Only changed with `writer` held.
@@ -464,9 +462,8 @@ pub(crate) struct BpNode {
 static ACTIVE_NODES: AtomicUsize = AtomicUsize::new(0);
 
 impl BpNode {
-    pub(crate) fn new(code_scope: u64) -> Self {
+    pub(crate) fn new() -> Self {
         BpNode {
-            code_scope,
             writer: Mutex::new(()),
             active_ix: AtomicUsize::new(0),
             entries: AtomicUsize::new(0),
@@ -515,7 +512,7 @@ impl Drop for BpNode {
         if !self.has_entries() {
             return;
         }
-        let runtime = self.code_scope as usize;
+        let runtime = node_id(self);
         for cell in all_cells() {
             if cell.read().iter().any(|g| g.runtime == runtime) {
                 cell.write(self, |bps| bps.retain(|g| g.runtime != runtime));
@@ -529,51 +526,50 @@ fn bp_node(process: &Process) -> &BpNode {
     static DETACHED: OnceLock<BpNode> = OnceLock::new();
     match process.runtime {
         Some(runtime) => &runtime.breakpoints,
-        None => DETACHED.get_or_init(|| BpNode::new(0)),
+        None => DETACHED.get_or_init(BpNode::new),
     }
 }
 
 /// The breakpoints of one function in this VM, any session.
-fn function_bps(bps: &[GenericBp], runtime: usize, code: u64) -> impl Iterator<Item = &GenericBp> {
-    bps.iter()
-        .filter(move |g| g.runtime == runtime && g.code == code)
+fn function_bps(bps: &[GenericBp], runtime: usize) -> impl Iterator<Item = &GenericBp> {
+    bps.iter().filter(move |g| g.runtime == runtime)
 }
 
-fn code_scope(process: &Process) -> u64 {
-    process
-        .runtime
-        .as_ref()
-        .map_or(0, |runtime| runtime.code_scope)
+/// Identity of a breakpoint node, which tags the breakpoints of its runtime.
+fn node_id(node: &BpNode) -> usize {
+    std::ptr::from_ref(node) as usize
 }
 
 /// Breakpoints belong to a code instance: breakpoints set before a module was loaded,
 /// upgraded or deleted never apply to the module's later code.
 // Port of erts/emulator/beam/beam_bp.c:854-900 (erts_clear_module_break), called from
 // erts/emulator/beam/beam_bif_load.c:470-480 and 714-720, OTP-29.1.1.
-pub(crate) fn module_code_changed(process: &Process, code: u64, module: &str) {
+pub(crate) fn module_code_changed(process: &Process, module: &str) {
     let node = bp_node(process);
+    let runtime = node_id(node);
     if !node.has_entries() {
         return;
     }
     let _permission = node.lock();
     for cell in module_cells(module) {
-        if cell.read().iter().any(|g| g.code == code) {
-            cell.write(node, |bps| bps.retain(|g| g.code != code));
+        if cell.read().iter().any(|g| g.runtime == runtime) {
+            cell.write(node, |bps| bps.retain(|g| g.runtime != runtime));
         }
     }
 }
 
-/// Whether functions of `module` in code scope `code` have breakpoints
+/// Whether functions of `module` have breakpoints
 /// (`modp->curr.num_breakpoints > 0`).
-pub(crate) fn module_has_breakpoints(process: &Process, code: u64, module: &str) -> bool {
+pub(crate) fn module_has_breakpoints(process: &Process, module: &str) -> bool {
     let node = bp_node(process);
+    let runtime = node_id(node);
     if !node.has_entries() {
         return false;
     }
     let _permission = node.lock();
     module_cells(module)
         .iter()
-        .any(|cell| cell.read().iter().any(|g| g.code == code))
+        .any(|cell| cell.read().iter().any(|g| g.runtime == runtime))
 }
 
 /// Port of erts/emulator/beam/beam_bp.c:2145-2295 (set_function_break), OTP-29.1.1, for the
@@ -581,16 +577,16 @@ pub(crate) fn module_has_breakpoints(process: &Process, code: u64, module: &str)
 fn set_function_break(
     ix: usize,
     bps: &mut Vec<GenericBp>,
-    tag: (usize, u64, u64),
+    tag: (usize, u64),
     match_spec: Option<&Arc<MatchSpec>>,
     break_flags: u32,
     count_op: BreakOp,
     tracer: Option<&crate::trace::Tracer>,
 ) {
-    let (runtime, code, session) = tag;
+    let (runtime, session) = tag;
     let position = bps
         .iter()
-        .position(|g| g.runtime == runtime && g.code == code && g.session == session);
+        .position(|g| g.runtime == runtime && g.session == session);
     // Global trace lives in the export entry's own GenericBp in erts: a code breakpoint exists
     // only while some code breakpoint flag is staged.
     let exists = position.is_some_and(|index| {
@@ -605,7 +601,6 @@ fn set_function_break(
         None => {
             bps.push(GenericBp {
                 runtime,
-                code,
                 session,
                 data: Default::default(),
             });
@@ -667,16 +662,11 @@ fn set_function_break(
 }
 
 /// Port of erts/emulator/beam/beam_bp.c:2332-2362 (clear_function_break_session), OTP-29.1.1.
-fn clear_function_break(
-    ix: usize,
-    bps: &mut [GenericBp],
-    tag: (usize, u64, u64),
-    break_flags: u32,
-) {
-    let (runtime, code, session) = tag;
+fn clear_function_break(ix: usize, bps: &mut [GenericBp], tag: (usize, u64), break_flags: u32) {
+    let (runtime, session) = tag;
     let Some(g) = bps
         .iter_mut()
-        .find(|g| g.runtime == runtime && g.code == code && g.session == session)
+        .find(|g| g.runtime == runtime && g.session == session)
     else {
         return;
     };
@@ -712,7 +702,7 @@ fn clear_function_break(
 // Port of erts/emulator/beam/beam_bp.c:443-560 (consolidate_bp_data,
 // consolidate_bp_data_session), OTP-29.1.1.
 fn consolidate_bp_data(node: &BpNode, bps: &mut Vec<GenericBp>) {
-    let runtime = node.code_scope as usize;
+    let runtime = node_id(node);
     let (active, staging) = (node.active_bp_ix(), node.staging_bp_ix());
     for g in bps.iter_mut().filter(|g| g.runtime == runtime) {
         g.data[staging] = g.data[active].clone();
@@ -735,7 +725,7 @@ pub(crate) fn commit_staged(process: &Process) {
 pub(crate) fn consolidate_staged(process: &Process, functions: &[BpFunction]) {
     let node = bp_node(process);
     let _permission = node.lock();
-    let runtime = node.code_scope as usize;
+    let runtime = node_id(node);
     for function in functions {
         let Some(cell) = lookup_cell(&function.module, &function.function, function.arity) else {
             continue;
@@ -904,7 +894,7 @@ pub(crate) fn stage_trace_pattern(
     flags: TracePatternFlags,
     meta_tracer: &crate::trace::Tracer,
 ) {
-    let tag = (scope(process), code_scope(process), session);
+    let tag = (runtime_id(process), session);
     let match_spec = match_spec.map(|source| Arc::new(MatchSpec::new(source)));
     let meta_match_spec = meta_match_spec.map(|source| Arc::new(MatchSpec::new(source)));
     let node = bp_node(process);
@@ -1027,7 +1017,7 @@ pub(crate) fn clear_session(process: &Process, session: u64) {
 
 /// [`clear_session`] for the node that created the session.
 pub(crate) fn clear_session_node(node: &BpNode, session: u64) {
-    let runtime = node.code_scope as usize;
+    let runtime = node_id(node);
     if node.has_entries() {
         let _permission = node.lock();
         // Port of erts/emulator/beam/erl_bif_trace.c (erts_bp_match_functions over all code):
@@ -1063,7 +1053,7 @@ pub(crate) struct Hit {
 pub(crate) fn hits(process: &Process, module: &str, function: &str, arity: u8) -> Vec<Hit> {
     let ix = bp_node(process).active_bp_ix();
     with_function_bps(module, function, arity, |bps| {
-        function_bps(bps, scope(process), code_scope(process))
+        function_bps(bps, runtime_id(process))
             .filter(|g| g.data[ix].flags != 0)
             .map(|g| {
                 let data = &g.data[ix];
@@ -1101,7 +1091,6 @@ pub(crate) const HIT_COUNT_ACTIVE: u32 = BPF_COUNT_ACTIVE;
 struct SiteBreakpoints {
     site: usize,
     runtime: usize,
-    code: u64,
     /// The function's breakpoint chain (erts: the code info the trampoline belongs to).
     cell: Arc<FunctionBp>,
     version: u64,
@@ -1130,8 +1119,7 @@ thread_local! {
 }
 
 fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoints>> {
-    let runtime = scope(process);
-    let code = code_scope(process);
+    let runtime = runtime_id(process);
     let slot = (site >> 2) % SITE_CACHE_SIZE;
     let ix = bp_node(process).active_bp_ix();
     let generation = crate::native_bridge::native_registry_generation();
@@ -1141,7 +1129,6 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
             .filter(|entry| {
                 entry.site == site
                     && entry.runtime == runtime
-                    && entry.code == code
                     && entry.ix == ix
                     && entry.generation == generation
                     && entry.version == entry.cell.version.load(Ordering::Acquire)
@@ -1161,7 +1148,7 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
     let cell = function_cell(&module, &function_name, arity);
     let (version, bps) = {
         let chain = cell.read();
-        let bps = function_bps(&chain, runtime, code)
+        let bps = function_bps(&chain, runtime)
             .map(|g| SiteBp {
                 session: g.session,
                 flags: g.data[ix].flags & !BPF_GLOBAL_TRACE,
@@ -1175,7 +1162,6 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
     let entry = Arc::new(SiteBreakpoints {
         site,
         runtime,
-        code,
         ci: cell.id,
         cell,
         version,
@@ -1320,8 +1306,7 @@ pub(crate) fn native_breakpoint_accounting(
 /// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
 /// restarting a breakpoint only concerns them.
 pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) -> Vec<BpFunction> {
-    let runtime = scope(process);
-    let code = code_scope(process);
+    let runtime = runtime_id(process);
     functions
         .into_iter()
         .filter(|function| {
@@ -1329,7 +1314,7 @@ pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) ->
                 &function.module,
                 &function.function,
                 function.arity,
-                |bps| function_bps(bps, runtime, code).next().is_some(),
+                |bps| function_bps(bps, runtime).next().is_some(),
             )
         })
         .collect()
@@ -1344,7 +1329,7 @@ pub(crate) fn any_pattern() -> bool {
 // Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
 pub(crate) fn selects(process: &Process, module: &str, function: &str, arity: u8) -> bool {
     let ix = bp_node(process).active_bp_ix();
-    let runtime = scope(process);
+    let runtime = runtime_id(process);
     with_function_bps(module, function, arity, |bps| {
         bps.iter()
             .any(|g| g.runtime == runtime && g.data[ix].flags != 0)
@@ -1400,12 +1385,9 @@ pub(crate) fn prepare_timem_info(
     let Some(cell) = lookup_cell(module, function, arity) else {
         return;
     };
-    let tag = (scope(process), code_scope(process), session);
+    let tag = (runtime_id(process), session);
     cell.write(node, |bps| {
-        let Some(bp) = bps
-            .iter_mut()
-            .find(|bp| (bp.runtime, bp.code, bp.session) == tag)
-        else {
+        let Some(bp) = bps.iter_mut().find(|bp| (bp.runtime, bp.session) == tag) else {
             return;
         };
         let data = &mut bp.data[staging];
@@ -1428,12 +1410,9 @@ pub(crate) fn collect_timem_info(
     arity: u8,
 ) -> TimemInfoSnapshot {
     let staging = bp_node(process).staging_bp_ix();
-    let tag = (scope(process), code_scope(process), session);
+    let tag = (runtime_id(process), session);
     with_function_bps(module, function, arity, |bps| {
-        let Some(bp) = bps
-            .iter()
-            .find(|bp| (bp.runtime, bp.code, bp.session) == tag)
-        else {
+        let Some(bp) = bps.iter().find(|bp| (bp.runtime, bp.session) == tag) else {
             return (None, None);
         };
         let data = &bp.data[staging];
@@ -1478,12 +1457,9 @@ pub(crate) fn consolidate_timem_info(
     let Some(cell) = lookup_cell(module, function, arity) else {
         return (time_base, memory_base);
     };
-    let tag = (scope(process), code_scope(process), session);
+    let tag = (runtime_id(process), session);
     cell.write(node, |bps| {
-        let Some(bp) = bps
-            .iter_mut()
-            .find(|bp| (bp.runtime, bp.code, bp.session) == tag)
-        else {
+        let Some(bp) = bps.iter_mut().find(|bp| (bp.runtime, bp.session) == tag) else {
             return (time_base, memory_base);
         };
         let data = &mut bp.data;
@@ -1531,7 +1507,7 @@ pub(crate) fn function_info(
 ) -> FunctionInfo {
     let ix = bp_node(process).active_bp_ix();
     let bp = with_function_bps(module, function, arity, |bps| {
-        function_bps(bps, scope(process), code_scope(process))
+        function_bps(bps, runtime_id(process))
             .find(|g| g.session == session)
             .map(|g| g.data[ix].clone())
             .unwrap_or_default()
@@ -1581,7 +1557,7 @@ pub(crate) fn sessions_for_function(
 ) -> Vec<u64> {
     let ix = bp_node(process).active_bp_ix();
     let mut sessions = with_function_bps(module, function, arity, |bps| {
-        function_bps(bps, scope(process), code_scope(process))
+        function_bps(bps, runtime_id(process))
             .filter_map(|bp| (bp.data[ix].flags != 0).then_some(bp.session))
             .collect::<Vec<_>>()
     });
@@ -1609,7 +1585,7 @@ pub(crate) fn breakpoint_kinds(
     );
     let install = INSTALL_VIEW.with(std::cell::Cell::get);
     with_function_bps(module, function, arity, |bps| {
-        for g in function_bps(bps, scope(process), code_scope(process)) {
+        for g in function_bps(bps, runtime_id(process)) {
             let mut flags = g.data[ix].flags;
             if install {
                 flags |= g.data[staging].flags;
@@ -1630,7 +1606,7 @@ pub(crate) fn any_breakpoint(process: &Process, module: &str, function: &str, ar
     );
     let install = INSTALL_VIEW.with(std::cell::Cell::get);
     with_function_bps(module, function, arity, |bps| {
-        function_bps(bps, scope(process), code_scope(process)).any(|g| {
+        function_bps(bps, runtime_id(process)).any(|g| {
             let mut flags = g.data[ix].flags;
             if install {
                 flags |= g.data[staging].flags;
@@ -1640,11 +1616,8 @@ pub(crate) fn any_breakpoint(process: &Process, module: &str, function: &str, ar
     })
 }
 
-fn scope(process: &Process) -> usize {
-    process
-        .runtime
-        .as_ref()
-        .map_or(0, |runtime| runtime.code_scope as usize)
+fn runtime_id(process: &Process) -> usize {
+    node_id(bp_node(process))
 }
 
 // Runtime-scoped breakpoint entries must not keep the global gate enabled
@@ -1652,7 +1625,7 @@ fn scope(process: &Process) -> usize {
 impl Drop for crate::process::Runtime {
     fn drop(&mut self) {
         crate::trace::clear_runtime(self as *const Self as usize);
-        clear_scope(self as *const Self as usize);
+        clear_scope(node_id(&self.breakpoints));
     }
 }
 
@@ -1703,7 +1676,7 @@ pub(crate) fn change_on_load(
     meta_tracer: &crate::trace::Tracer,
 ) {
     let mut map = on_load_patterns().lock().unwrap();
-    let s = map.entry((scope(process), session)).or_default();
+    let s = map.entry((runtime_id(process), session)).or_default();
     if flags.local || !flags.breakpoint {
         s.match_spec = match_spec.clone();
     }
@@ -1764,7 +1737,7 @@ pub(crate) fn change_on_load(
 
 /// Whether any session of this runtime has an active on_load pattern.
 pub(crate) fn any_on_load_pattern(process: &Process) -> bool {
-    let runtime = scope(process);
+    let runtime = runtime_id(process);
     on_load_patterns()
         .lock()
         .unwrap()
@@ -1776,14 +1749,14 @@ pub(crate) fn on_load_pattern(process: &Process, session: u64) -> Option<OnLoadP
     on_load_patterns()
         .lock()
         .unwrap()
-        .get(&(scope(process), session))
+        .get(&(runtime_id(process), session))
         .filter(|pattern| pattern.is_on)
         .cloned()
 }
 
 /// The on_load patterns of all sessions of this runtime.
 pub(crate) fn on_load_patterns_of(process: &Process) -> Vec<(u64, OnLoadPattern)> {
-    let runtime = scope(process);
+    let runtime = runtime_id(process);
     on_load_patterns()
         .lock()
         .unwrap()
@@ -1828,11 +1801,11 @@ fn line_breakpoints() -> &'static Mutex<HashMap<LineKey, bool>> {
 }
 
 /// Forget line sites when a module slot is reused for another code generation.
-pub(crate) fn clear_module_line_breakpoints(runtime: u64, module_id: usize) {
+pub(crate) fn clear_module_line_breakpoints(module_id: usize) {
     line_breakpoints()
         .lock()
         .unwrap()
-        .retain(|(scope, id, _), _| *scope != runtime as usize || *id != module_id);
+        .retain(|(_, id, _), _| *id != module_id);
 }
 
 /// Set once a debug breakpoint was enabled; until then no table scan can find one.
@@ -1857,7 +1830,7 @@ pub(crate) fn set_debug_breakpoint(
     debug_breakpoints()
         .lock()
         .unwrap()
-        .insert((scope(process), module, function, arity), enabled);
+        .insert((runtime_id(process), module, function, arity), enabled);
 }
 
 pub(crate) fn debug_breakpoint_enabled(
@@ -1875,7 +1848,7 @@ pub(crate) fn debug_breakpoint_enabled(
         .iter()
         .any(|((owner, m, f, a), enabled)| {
             *enabled
-                && *owner == scope(process)
+                && *owner == runtime_id(process)
                 && (m == "_" || m == module)
                 && (f == "_" || f == function)
                 && a.is_none_or(|a| a == i64::from(arity))
@@ -1894,7 +1867,7 @@ fn registrations() -> &'static Mutex<HashMap<usize, DebuggerRegistration>> {
 }
 
 pub(crate) fn debugger_registration(process: &Process) -> Option<DebuggerRegistration> {
-    let runtime = scope(process);
+    let runtime = runtime_id(process);
     let registration = registrations().lock().unwrap().get(&runtime).copied()?;
     let runtime_ref = process.runtime.as_ref()?;
     runtime_ref
@@ -1905,7 +1878,7 @@ pub(crate) fn debugger_registration(process: &Process) -> Option<DebuggerRegistr
 }
 
 pub(crate) fn register_debugger(process: &Process, pid: Pid) -> Result<u64, ()> {
-    let runtime = scope(process);
+    let runtime = runtime_id(process);
     let mut registrations = registrations().lock().unwrap();
     if registrations.get(&runtime).is_some_and(|entry| {
         process
@@ -1922,7 +1895,7 @@ pub(crate) fn register_debugger(process: &Process, pid: Pid) -> Result<u64, ()> 
 }
 
 pub(crate) fn unregister_debugger(process: &Process, pid: Pid, session: u64) -> Result<(), bool> {
-    let runtime = scope(process);
+    let runtime = runtime_id(process);
     let mut registrations = registrations().lock().unwrap();
     if let Some(entry) = registrations.get(&runtime).copied()
         && entry.pid == pid
@@ -1939,14 +1912,14 @@ pub(crate) fn set_line_breakpoint(process: &Process, module_id: usize, line: u32
     line_breakpoints()
         .lock()
         .unwrap()
-        .insert((scope(process), module_id, line), enabled);
+        .insert((runtime_id(process), module_id, line), enabled);
 }
 
 pub(crate) fn line_breakpoint_enabled(process: &Process, module_id: usize, line: u32) -> bool {
     line_breakpoints()
         .lock()
         .unwrap()
-        .get(&(scope(process), module_id, line))
+        .get(&(runtime_id(process), module_id, line))
         .copied()
         .unwrap_or(false)
 }
@@ -2084,7 +2057,7 @@ fn timem_break_of(
 ) -> Option<Arc<TimemTrace>> {
     let ix = bp_node(process).active_bp_ix();
     let bps = cell.read();
-    let bp = function_bps(&bps, scope(process), code_scope(process))
+    let bp = function_bps(&bps, runtime_id(process))
         .find(|g| g.session == session)
         .map(|g| &g.data[ix])?;
     if memory {

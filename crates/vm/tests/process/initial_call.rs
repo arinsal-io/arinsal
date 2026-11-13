@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(initial_call_diff).
@@ -32,10 +31,10 @@ fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
         .load("initial_call_diff", &beam)
         .expect("load reference");
     let expected = reference.call("initial_call_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("initial_call_diff", function, &[], 1, None)
+        .eval_scheduled("initial_call_diff", function, &[], 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     (expected, actual.term)
 }
@@ -47,5 +46,5 @@ fn initial_call_is_the_spawn_mfa() {
         return;
     };
     let (expected, actual) = run(&reference, "initial");
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

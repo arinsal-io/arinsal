@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_link_info_diff).
@@ -119,12 +118,7 @@ fn link_and_monitor_introspection_matches_erts() {
         .expect("load link info differential");
     let expected = reference.call("proc_link_info_diff", "run", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load link info differential");
-    let actual = vm
-        .eval_scheduled("proc_link_info_diff", "run", &[], 2, None)
-        .expect("run link info differential")
-        .term;
+    let actual = crate::common::peer_eval(&[], &[&beam], "proc_link_info_diff:run()");
 
     let expected_shape = CallResult::Ok(OwnedTerm::Tuple(vec![
         OwnedTerm::atom("true"),

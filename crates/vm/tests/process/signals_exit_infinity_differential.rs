@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(sig_exit_inf_diff).
@@ -38,10 +37,10 @@ fn check(function: &str) {
         .expect("compile");
     reference.load("sig_exit_inf_diff", &beam).unwrap();
     let expected = reference.call("sig_exit_inf_diff", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load");
     let actual = vm
-        .eval_scheduled("sig_exit_inf_diff", function, &[], 2, None)
+        .eval_scheduled("sig_exit_inf_diff", function, &[], 2)
         .expect("run")
         .term;
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");

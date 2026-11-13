@@ -2,7 +2,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(literal_gc_diff).
@@ -83,10 +82,10 @@ fn applied_get_all_keeps_outer_arguments_across_yields() {
     let expected = reference.call("literal_gc_diff", "applied_get_all", &[]);
     assert_eq!(expected, CallResult::Ok(OwnedTerm::Int(5000)));
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load bytes");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("literal_gc_diff", "applied_get_all", &[], 1, None)
+        .eval_scheduled("literal_gc_diff", "applied_get_all", &[], 1)
         .expect("scheduled evaluation");
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -101,10 +100,10 @@ fn literals_stay_shared_across_spawn_send_and_copy_shared() {
     let expected = reference.call("literal_gc_diff", "shared_literals", &[]);
     assert!(matches!(expected, CallResult::Ok(_)), "{expected:?}");
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load bytes");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("literal_gc_diff", "shared_literals", &[], 1, None)
+        .eval_scheduled("literal_gc_diff", "shared_literals", &[], 1)
         .expect("scheduled evaluation");
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
@@ -125,10 +124,10 @@ fn dirty_bif_results_are_roots_of_literal_area_collections() {
         })
     );
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load bytes");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("literal_gc_diff", "dirty_results", &[], 2, None)
+        .eval_scheduled("literal_gc_diff", "dirty_results", &[], 2)
         .expect("scheduled evaluation");
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

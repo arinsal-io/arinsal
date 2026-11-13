@@ -1,7 +1,6 @@
 use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, VecHeap, from_owned, to_owned};
-use arinsal_vm::Vm;
 
 fn term(value: &OwnedTerm, heap: &mut VecHeap) -> Term {
     from_owned(value, heap).expect("test term")
@@ -14,7 +13,7 @@ fn prim_file_local_nif_entry_reads_existing_file() {
     std::fs::write(&path, bytes).unwrap();
     let path_term = OwnedTerm::charlist(path.to_string_lossy().as_ref());
     let mut heap = VecHeap::new();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     let result = vm
         .eval_exported("prim_file", "read_file", &[term(&path_term, &mut heap)])
         .expect("prim_file:read_file/1");
@@ -38,7 +37,7 @@ fn prim_file_missing_file_matches_erts() {
     let path_term = OwnedTerm::charlist(path.to_string_lossy().as_ref());
     let expected = reference.call("prim_file", "read_file", std::slice::from_ref(&path_term));
     let mut heap = VecHeap::new();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     let actual = vm
         .eval_exported("prim_file", "read_file", &[term(&path_term, &mut heap)])
         .expect("prim_file:read_file/1");
@@ -63,7 +62,7 @@ fn iolist_to_iovec_matches_erts() {
         ]),
         OwnedTerm::Nil,
     ];
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     for input in inputs {
         let expected = reference.call("erlang", "iolist_to_iovec", std::slice::from_ref(&input));
         let mut heap = VecHeap::new();

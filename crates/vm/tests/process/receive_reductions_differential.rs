@@ -5,8 +5,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 const MODULE: &str = "receive_reductions_test";
 
@@ -167,7 +165,7 @@ fn receive_and_signal_reductions_match_otp() {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let mut mismatches = Vec::new();
@@ -176,12 +174,12 @@ fn receive_and_signal_reductions_match_otp() {
             panic!("OTP {function} failed");
         };
         let actual = vm
-            .eval_scheduled_reductions(MODULE, function, &[], 1, None, 4_000)
+            .eval_scheduled_reductions(MODULE, function, &[], 1, 4_000)
             .unwrap();
         let (expected, actual) = (reductions(&expected), reductions(&actual.term));
         if expected != actual {
             mismatches.push(format!("{function}: OTP {expected}, Arinsal {actual}"));
         }
     }
-    assert_eq!(Vec::<String>::new(), mismatches);
+    similar_asserts::assert_eq!(Vec::<String>::new(), mismatches);
 }

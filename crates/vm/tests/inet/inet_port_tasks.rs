@@ -188,9 +188,9 @@ fn run_case(reference: &RefErl, vm: &mut Vm, case_name: &str) {
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();
     let actual = vm
-        .eval_scheduled("inet_port_tasks_diff", "run", &[arg], 4, None)
+        .eval_scheduled("inet_port_tasks_diff", "run", &[arg], 4)
         .unwrap_or_else(|error| panic!("{case_name}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
 }
 
 #[test]
@@ -205,8 +205,8 @@ fn inet_port_tasks_match_erts() {
     reference
         .load("inet_port_tasks_diff", &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     for case in [
         "parallel_controls",
         "sender_order",

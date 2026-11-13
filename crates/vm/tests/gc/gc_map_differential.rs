@@ -103,7 +103,7 @@ fn call_reference(reference: &RefErl) -> Snapshot {
 
 fn call_arinsal(vm: &mut Vm) -> Snapshot {
     let outcome = vm
-        .eval_scheduled(MODULE, "run", &[], 1, None)
+        .eval_scheduled(MODULE, "run", &[], 1)
         .expect("Arinsal map loop");
     Snapshot::read(&outcome.term)
 }
@@ -148,9 +148,8 @@ fn map_building_gc_counts_and_heap_sizes_match_otp_variance() {
     let references = (0..3)
         .map(|_| call_reference(&reference))
         .collect::<Vec<_>>();
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam)
-        .expect("load map GC probe into Arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = call_arinsal(&mut vm);
     for field in [
         "collections",

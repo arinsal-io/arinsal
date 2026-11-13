@@ -5,7 +5,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "gc_stats_differential";
 const SOURCE: &str = r#"
@@ -114,11 +113,10 @@ fn call_both(reference: &RefErl, beam: &[u8], function: &str) -> (Vec<i64>, Vec<
         CallResult::Ok(term) => fields(&term),
         other => panic!("reference {function} failed: {other:?}"),
     };
-    let mut vm = Vm::new([]);
-    vm.load_bytes(beam)
-        .expect("load GC stats probe into Arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, beam);
     let outcome = vm
-        .eval_scheduled(MODULE, function, &[], 1, None)
+        .eval_scheduled(MODULE, function, &[], 1)
         .unwrap_or_else(|error| panic!("Arinsal {function} failed: {error:?}"));
     (expected, fields(&outcome.term))
 }

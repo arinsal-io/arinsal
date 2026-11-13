@@ -3110,8 +3110,8 @@ fn system_flag(
     };
     match name {
         "multi_scheduling" => multi_scheduling(process, ctx, args[1]),
-        "schedulers_online" => schedulers_online(process, ctx, args[1], false),
-        "dirty_cpu_schedulers_online" => schedulers_online(process, ctx, args[1], true),
+        "schedulers_online" => schedulers_online(process, args[1], false),
+        "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
         "fullsweep_after" => fullsweep_after(process, args[1]),
         "min_heap_size" => heap_minimum(process, args[1], true),
         "min_bin_vheap_size" => heap_minimum(process, args[1], false),
@@ -4548,7 +4548,11 @@ fn multi_scheduling(
         process.cold_mut().have_blocked_multi_scheduling = true;
     }
     if let Ok(scheduler) = runtime.scheduler() {
-        scheduler.set_scheduling_blocked(state.any_blocked(), ctx.worker_id());
+        // Port of erts/emulator/beam/erl_process.c:8559-8561 (erts_block_multi_scheduling,
+        // OTP-29.1.1): every run queue but the first is suspended, so the blocking scheduler is
+        // scheduler 1 whichever scheduler the caller ran on. The caller's own scheduler may be
+        // offline (`schedulers_online` 1), where nothing would ever run the blocked node.
+        scheduler.set_scheduling_blocked(state.any_blocked(), Some(0));
     }
     Ok(crate::atom_cache::put(state.state()))
 }
@@ -4576,12 +4580,7 @@ pub(crate) fn release_multi_scheduling_blocks(process: &mut Process, pid: arinsa
     }
 }
 
-fn schedulers_online(
-    process: &Process,
-    ctx: &RunCtx<'_, Message>,
-    value: Term,
-    dirty: bool,
-) -> Result<Term, VmError> {
+fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8228 (erts_set_schedulers_online), OTP-29.1.1.
     let requested = value.as_small().ok_or_else(badarg)?;
     with_flags(process, |flags| {
@@ -4634,13 +4633,9 @@ fn schedulers_online(
             scheduler.set_dirty_cpu_online(flags.dirty_cpu_online);
             if !dirty && multi_scheduling_state(process, |state| state.any_blocked()) {
                 // Port of erts/emulator/beam/erl_process.c:8316-8321
-                // (`erts_set_schedulers_online`), OTP-29.1.1: keep the blocking
-                // scheduler online so the suspended caller can be resumed.
-                let caller = ctx
-                    .worker_id()
-                    .filter(|worker| *worker < flags.schedulers_online)
-                    .unwrap_or(0);
-                scheduler.set_scheduling_blocked(true, Some(caller));
+                // (`erts_set_schedulers_online`), OTP-29.1.1: scheduler 1 stays online and is
+                // the blocking scheduler.
+                scheduler.set_scheduling_blocked(true, Some(0));
             }
         }
         Term::small(previous as i64).ok_or_else(badarg)
@@ -5662,7 +5657,6 @@ fn badarg() -> VmError {
 mod tests {
     use super::*;
     use arinsal_difftest::{CallResult, RefErl};
-    use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
 
     /// Tests that change or read the process-global scheduler flags run one
     /// at a time; the flags are shared by every test in this binary.
@@ -5690,7 +5684,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("scheduler_startup_info_probe", "run", &[], 1, None)
+            .eval_scheduled("scheduler_startup_info_probe", "run", &[], 1)
             .unwrap_or_else(|error| panic!("scheduler startup system_info VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -5713,7 +5707,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("beam_jump_table_probe", "run", &[], 1, None)
+            .eval_scheduled("beam_jump_table_probe", "run", &[], 1)
             .unwrap_or_else(|error| panic!("BEAM jump-table VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -5737,7 +5731,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("all_scheduler_state_probe", "run", &[], 10, None)
+            .eval_scheduled("all_scheduler_state_probe", "run", &[], 10)
             .unwrap_or_else(|error| panic!("all scheduler state VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -5766,7 +5760,7 @@ mod tests {
         first.load_bytes(&first_beam).unwrap();
         assert_eq!(
             first
-                .eval_scheduled("runtime_logger_first", "run", &[], 1, None)
+                .eval_scheduled("runtime_logger_first", "run", &[], 1)
                 .unwrap()
                 .term,
             OwnedTerm::atom("logger")
@@ -5775,7 +5769,7 @@ mod tests {
         second.load_bytes(&second_beam).unwrap();
         assert_eq!(
             second
-                .eval_scheduled("runtime_logger_second", "run", &[], 1, None)
+                .eval_scheduled("runtime_logger_second", "run", &[], 1)
                 .unwrap()
                 .term,
             OwnedTerm::atom("logger")
@@ -5798,13 +5792,13 @@ mod tests {
         let mut first = Vm::new([]);
         first.load_bytes(&beam).unwrap();
         first
-            .eval_scheduled("runtime_reductions_probe", "run", &[], 1, None)
+            .eval_scheduled("runtime_reductions_probe", "run", &[], 1)
             .unwrap();
 
         let mut second = Vm::new([]);
         second.load_bytes(&beam).unwrap();
         let result = second
-            .eval_scheduled("runtime_reductions_probe", "run", &[], 1, None)
+            .eval_scheduled("runtime_reductions_probe", "run", &[], 1)
             .unwrap_or_else(|error| panic!("statistics VM error: {error:?}"));
         let OwnedTerm::Tuple(values) = &result.term else {
             panic!(
@@ -5843,7 +5837,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("scheduler_count_probe", "run", &[], 10, None)
+            .eval_scheduled("scheduler_count_probe", "run", &[], 10)
             .unwrap_or_else(|error| panic!("scheduler-count VM error: {error:?}"));
         assert_eq!(expected, CallResult::Ok(actual.term));
     }
@@ -6034,28 +6028,6 @@ mod tests {
     }
     use arinsal_etf::OwnedTerm;
     use arinsal_term::{VecHeap, from_owned, to_owned};
-
-    struct CountedYield;
-    impl Task for CountedYield {
-        type Message = ();
-        type SchedulerData = ();
-        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
-            assert!(ctx.consume(3));
-            RunOutcome::Yield
-        }
-    }
-
-    #[test]
-    fn sched_acct_scheduler_dispatch_and_reductions_are_exact() {
-        let scheduler = Scheduler::simulation(Config::default(), 9);
-        scheduler.spawn(CountedYield).unwrap();
-        assert!(scheduler.step());
-        let stats = scheduler.stats();
-        assert_eq!(stats.context_switches, 1);
-        assert_eq!(stats.reductions, 3);
-        assert_eq!(stats.run_queue_lengths.iter().sum::<u64>(), 1);
-        assert_eq!(stats.active_tasks.iter().sum::<u64>(), 1);
-    }
 
     #[test]
     fn sched_acct_scheduler_flag_parser_matches_otp_count_forms() {

@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 #[test]
 fn binary_replace_large_subjects_resume_after_search_traps() {
@@ -24,10 +23,10 @@ fn binary_replace_large_subjects_resume_after_search_traps() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "run", &[], 1, None, 4_000)
+        .eval_scheduled_reductions(MODULE, "run", &[], 1, 4_000)
         .unwrap();
     let canonical = arinsal_etf::decode(&arinsal_etf::encode(
         &actual.term,

@@ -4,8 +4,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(sys_task_prio).
@@ -75,27 +73,10 @@ fn system_tasks_run_at_requester_priority() {
         .compile_named("sys_task_prio", SOURCE, &[])
         .unwrap();
     reference.load("sys_task_prio", &beam).unwrap();
-    // `schedulers_online` reports the host's cores, as on the reference node.
-    let workers = std::thread::available_parallelism().map_or(2, usize::from);
     for scenario in 0..3 {
         let expected = reference.call("sys_task_prio", "run", &[OwnedTerm::Int(scenario)]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let actual = vm.eval_scheduled(
-            "sys_task_prio",
-            "run",
-            &[Term::small(scenario).unwrap()],
-            workers,
-            None,
-        );
-        assert_eq!(
-            expected,
-            CallResult::Ok(
-                actual
-                    .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"))
-                    .term
-            ),
-            "scenario {scenario}"
-        );
+        let actual =
+            crate::common::peer_eval(&[], &[&beam], &format!("sys_task_prio:run({scenario})"));
+        assert_eq!(expected, CallResult::Ok(actual), "scenario {scenario}");
     }
 }

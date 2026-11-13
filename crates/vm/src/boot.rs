@@ -147,7 +147,6 @@ pub fn run_with_debugger_flags(
         "start",
         &[Term::atom(init), boot_list],
         workers.max(1),
-        None,
     )
 }
 

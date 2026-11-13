@@ -72,7 +72,7 @@ mod task_latency_tests {
         vm.load_bytes(&beam)
             .expect("load alias monitor latency probe");
         let elapsed = vm
-            .eval_scheduled("task_latency_probe", "run", &[], 1, None)
+            .eval_scheduled("task_latency_probe", "run", &[], 1)
             .expect("run alias monitor latency probe")
             .term;
         let arinsal_etf::OwnedTerm::Int(micros) = elapsed else {
@@ -123,7 +123,7 @@ suspend_busy() ->
                 failure => panic!("erts {function} failed: {failure:?}"),
             };
             let actual = vm
-                .eval_scheduled("sig_prio_mon_probe", function, &[], 2, None)
+                .eval_scheduled("sig_prio_mon_probe", function, &[], 2)
                 .unwrap_or_else(|error| panic!("Arinsal {function} failed: {error:?}"));
             assert_eq!(actual.term, expected, "{function} differs from erts");
         }
@@ -158,7 +158,7 @@ run() ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("spawn_scheduler_probe", "run", &[], workers, None)
+            .eval_scheduled("spawn_scheduler_probe", "run", &[], workers)
             .unwrap()
             .term;
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual));
@@ -199,7 +199,7 @@ catch_error(F) -> try F() catch error:R -> R end.
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("light_spawn_probe", "run", &[], 2, None)
+            .eval_scheduled("light_spawn_probe", "run", &[], 2)
             .unwrap()
             .term;
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual));
@@ -220,7 +220,7 @@ catch_error(F) -> try F() catch error:R -> R end.
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("absolute_timer_probe", "run", &[], 2, None)
+            .eval_scheduled("absolute_timer_probe", "run", &[], 2)
             .unwrap_or_else(|error| panic!("absolute timer VM error: {error:?}"));
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
@@ -257,7 +257,7 @@ busy_wait(Until) ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("queued_timeout_cancel_probe", "run", &[], 2, None)
+            .eval_scheduled("queued_timeout_cancel_probe", "run", &[], 2)
             .unwrap_or_else(|error| panic!("queued-timeout cancellation VM error: {error:?}"));
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
@@ -286,7 +286,7 @@ busy_wait(Until) ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("dead_pid_timer_probe", "run", &[], 2, None)
+            .eval_scheduled("dead_pid_timer_probe", "run", &[], 2)
             .unwrap_or_else(|error| panic!("dead-pid timer VM error: {error:?}"));
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
@@ -311,7 +311,7 @@ busy_wait(Until) ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("wide_timer_probe", "run", &[], 2, None)
+            .eval_scheduled("wide_timer_probe", "run", &[], 2)
             .unwrap_or_else(|error| panic!("wide timer VM error: {error:?}"));
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
@@ -351,7 +351,7 @@ busy_wait(Until) ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("cross_timer_probe", "run", &[], 2, None)
+            .eval_scheduled("cross_timer_probe", "run", &[], 2)
             .unwrap_or_else(|error| panic!("cross-scheduler timer VM error: {error:?}"));
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
@@ -379,7 +379,7 @@ busy_wait(Until) ->
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("registered_timer_probe", "run", &[], 2, None)
+            .eval_scheduled("registered_timer_probe", "run", &[], 2)
             .unwrap_or_else(|error| panic!("registered-name timer VM error: {error:?}"));
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
@@ -1937,7 +1937,6 @@ fn trace_delivered(
     match ctx.send(ctx.pid(), envelope) {
         Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(reference),
         Err(arinsal_sched::Error::Capacity) => Err(system_limit()),
-        Err(_) => Err(badarg("trace_delivered/1")),
     }
 }
 

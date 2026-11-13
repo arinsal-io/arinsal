@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(gen_tcp_echo_compat).
@@ -45,16 +44,10 @@ fn read_ahead_packet_echo_matches_erts() {
         .load("gen_tcp_echo_compat", &beam)
         .expect("load gen_tcp_echo_compat");
     let expected = reference.call("gen_tcp_echo_compat", "read_ahead_packet_echo", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled(
-            "gen_tcp_echo_compat",
-            "read_ahead_packet_echo",
-            &[],
-            2,
-            None,
-        )
+        .eval_scheduled("gen_tcp_echo_compat", "read_ahead_packet_echo", &[], 2)
         .expect("Arinsal read_ahead_packet_echo");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

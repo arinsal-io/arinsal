@@ -126,7 +126,7 @@ fn badarith_caught_by_interpreted_try() {
             &[],
         )
         .unwrap();
-    let mut vm = arinsal_vm::Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let result = vm.eval_exported("native_hook_try", "caught", &[]).unwrap();
     let atom = result.term.as_atom().unwrap();

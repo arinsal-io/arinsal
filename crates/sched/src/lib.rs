@@ -11,8 +11,7 @@
 //!
 //! The real scheduler gives each worker a run queue (a Chase-Lev deque fed by a
 //! queue for submissions from other threads) and steals from other run queues when idle.
-//! The simulator uses the same task and mailbox protocol with seeded dispatch and
-//! an injected virtual clock. [`RunCtx::consume`] lets the VM account for
+//! [`RunCtx::consume`] lets the VM account for
 //! reductions; a task returning [`RunOutcome::Yield`] receives a fresh budget.
 //!
 //! Wake protocol: a process is QUEUED, RUNNING, WAITING, or EXITED. A sender
@@ -49,13 +48,9 @@
 //!         RunOutcome::Wait { timeout_ms: None }
 //!     }
 //! }
-//! let sched = Scheduler::<Echo>::simulation(Config::default(), 7);
+//! let sched = Scheduler::<Echo>::new(Config::default());
 //! let pid = sched.spawn(Echo).unwrap();
 //! sched.send(pid, pid, 42).unwrap();
-//! sched.step();
-//! let timer = sched.start_timer(pid, 10, 99).unwrap();
-//! assert_eq!(sched.read_timer(timer), Some(10));
-//! sched.advance_ms(10);
 //! ```
 
 mod balance;
@@ -991,8 +986,7 @@ pub enum RunOutcome {
     /// The task blocks in receive; an optional timeout wakes it.
     Wait { timeout_ms: Option<u64> },
     /// The task blocks in receive with its receive timer already set at wheel position
-    /// `timeout_pos` (from [`receive_timeout_pos`] on a real-time scheduler, virtual
-    /// milliseconds on a simulated one): no clock is read to arm it.
+    /// `timeout_pos` (from [`receive_timeout_pos`]): no clock is read to arm it.
     ///
     /// Port of erts/emulator/beam/erl_hl_timer.c (erts_set_proc_timer_term computes the
     /// position once, while the process runs `i_wait_timeout`), OTP-29.1.1.
@@ -1157,8 +1151,8 @@ impl PendingSlot {
 pub trait Task: Send + 'static {
     /// Opaque message envelope owned by the receiving process.
     type Message: SignalMessage;
-    /// Task-side part of one scheduler's data (`ErtsSchedulerData`): created once per normal,
-    /// dirty or simulated scheduler and lent to every [`Task::run`] on it.
+    /// Task-side part of one scheduler's data (`ErtsSchedulerData`): created once per normal
+    /// or dirty scheduler and lent to every [`Task::run`] on it.
     type SchedulerData: Default + Send + 'static;
     /// Execute cooperatively, consuming at most `budget` reductions, on the scheduler whose
     /// data is `data`.
@@ -1239,7 +1233,7 @@ pub enum DirtySignals {
     Handled,
 }
 
-/// Configuration for threaded and simulated execution.
+/// Configuration of the scheduler threads.
 pub struct Config {
     /// Number of worker threads; defaults to available parallelism minus two.
     pub workers: usize,
@@ -1303,7 +1297,6 @@ impl Default for Config {
 pub enum Error {
     Capacity,
     NoProcess,
-    WrongMode,
 }
 
 /// Why [`Scheduler::spawn_unscheduled_init`] created no process.
@@ -1345,62 +1338,6 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
-
-/// Source of monotonically increasing milliseconds.
-pub trait Clock: Send + Sync {
-    /// Current virtual or real time.
-    fn now_ms(&self) -> u64;
-
-    /// Nanoseconds until the clock reaches wheel position `pos`.
-    fn ns_until_pos(&self, pos: u64) -> u64 {
-        pos.saturating_sub(self.now_ms()).saturating_mul(1_000_000)
-    }
-
-    /// The erts wheel position for a relative millisecond timeout.
-    fn timeout_pos(&self, ms: u64) -> u64 {
-        if ms == 0 {
-            self.now_ms()
-        } else {
-            self.now_ms().saturating_add(ms)
-        }
-    }
-
-    /// The current wheel position and deadline for one relative timer.
-    // Port of erts/emulator/beam/erl_hl_timer.c:670-679 (get_timeout_pos): the BIF
-    // computes its wheel position once, then carries it through timer creation.
-    fn timer_position(&self, ms: u64) -> (u64, u64) {
-        (self.now_ms(), self.timeout_pos(ms))
-    }
-
-    /// The erts clock position used to report a timer's remaining milliseconds.
-    fn time_left_now_ms(&self) -> u64 {
-        self.now_ms()
-    }
-}
-
-/// Source of scheduling choices, local to one scheduler.
-pub trait Rng: Send {
-    /// Return the next pseudorandom word.
-    fn next_u64(&mut self) -> u64;
-}
-
-/// Seeded, reproducible SplitMix64 generator.
-pub struct SeededRng(u64);
-impl SeededRng {
-    /// Construct from a simulation seed.
-    pub fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-}
-impl Rng for SeededRng {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
-    }
-}
 
 /// Base of the real-time scheduler clock: one per OS process, as erts has one
 /// `time_sup` monotonic clock, so a running process computes wheel positions without
@@ -1447,7 +1384,7 @@ pub fn monotonic_now_ms() -> u64 {
 }
 
 struct RealClock(Instant);
-impl Clock for RealClock {
+impl RealClock {
     fn now_ms(&self) -> u64 {
         let elapsed = self.0.elapsed();
         elapsed
@@ -1484,21 +1421,6 @@ impl Clock for RealClock {
                 .saturating_add(1)
         };
         (now_ms, deadline)
-    }
-}
-
-/// Manually advanced clock for deterministic simulation.
-#[derive(Default)]
-pub struct VirtualClock(AtomicU64);
-impl VirtualClock {
-    /// Advance virtual time; timers fire when the simulation is stepped.
-    pub fn advance(&self, ms: u64) {
-        self.0.fetch_add(ms, Ordering::Relaxed);
-    }
-}
-impl Clock for VirtualClock {
-    fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -1812,19 +1734,6 @@ impl<T: Task> std::ops::Deref for Process<T> {
 }
 
 impl<M: SignalMessage> ProcShared<M> {
-    /// The dirty run queue the process has work for (`ERTS_PSFLG_DIRTY_CPU_PROC` /
-    /// `ERTS_PSFLG_DIRTY_IO_PROC`).
-    fn dirty_kind(&self) -> Option<DirtyKind> {
-        let state = self.input.state().load(Ordering::Acquire);
-        if state & psflg::DIRTY_CPU_PROC != 0 {
-            Some(DirtyKind::Cpu)
-        } else if state & psflg::DIRTY_IO_PROC != 0 {
-            Some(DirtyKind::Io)
-        } else {
-            None
-        }
-    }
-
     /// Claim priority queue `queue` of the dirty run queue of `kind` for a new entry; `false`
     /// when the process already has one there. A process struct reserved for the entry
     /// (`IN_RUNQ` set by the caller's state change) is released again then.
@@ -2753,11 +2662,6 @@ impl<T: Task> LocalInit<T> {
         }
     }
 }
-struct SimState<T: Task> {
-    queue: VecDeque<Scheduled<T>>,
-    rng: Box<dyn Rng>,
-}
-
 use thr_progress::LaterOp;
 pub use thr_progress::thread_progress_wait;
 
@@ -2793,14 +2697,10 @@ struct Inner<T: Task> {
     /// Process queues of each normal run queue (`rq->procs`); the owner dequeues from its own,
     /// other schedulers enqueue to it and steal from it.
     run_queues: Arc<[run_queue::ProcQueues<T>]>,
-    sim_timers: Option<Vec<Mutex<Wheel<T::Message>>>>,
     timer_commands: Vec<Arc<thr_queue::ThrQueue<TimerCommand<T::Message>>>>,
     canceled_timers: Vec<Arc<thr_queue::ThrQueue<CanceledTimer>>>,
     next_timer: AtomicU64,
-    clock: Arc<dyn Clock>,
-    sim: Option<Mutex<SimState<T>>>,
-    /// Scheduler data of the simulated scheduler, which runs on the stepping thread.
-    sim_data: Mutex<T::SchedulerData>,
+    clock: RealClock,
     /// Requested and applied CPU ids for normal scheduler threads.
     cpu_bind_targets: RwLock<Vec<Option<usize>>>,
     cpu_bind_actual: RwLock<Vec<Option<usize>>>,
@@ -3113,10 +3013,6 @@ impl<T: Task> Inner<T> {
             return;
         }
         let pool = &self.dirty[kind.index()];
-        if let Some(sim) = &self.sim {
-            sim.lock().unwrap().queue.push_back(item);
-            return;
-        }
         pool.procs.push(item);
         {
             let mut queue = pool.queue.lock().unwrap();
@@ -3464,11 +3360,7 @@ impl<T: Task> Inner<T> {
     /// Another scheduler takes the process by `try_steal_task` after it ran out of
     /// work, or by `wakeup_other_check` once the surplus passes the limit.
     fn enqueue(&self, item: Scheduled<T>, already_active: bool) {
-        if let Some(sim) = &self.sim {
-            let scheduler = self.select_run_queue(&item.process);
-            self.record_queued(&item.process, scheduler, already_active);
-            sim.lock().unwrap().queue.push_back(item);
-        } else if let Some(worker) = item.process.bound_worker() {
+        if let Some(worker) = item.process.bound_worker() {
             self.record_queued(&item.process, worker, already_active);
             self.run_queues[worker].push(item);
             self.note_queued(worker);
@@ -3771,7 +3663,7 @@ impl<T: Task> Inner<T> {
     ///
     /// Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process), OTP-29.1.1.
     fn enqueue_new(&self, item: Scheduled<T>) {
-        if self.sim.is_some() || item.process.bound_worker().is_some() {
+        if item.process.bound_worker().is_some() {
             self.enqueue(item, false);
             return;
         }
@@ -3791,7 +3683,6 @@ impl<T: Task> Inner<T> {
     /// `already_active`). The queue lengths are counted per entry by the run queue itself
     /// (`enqueue_process`); this keeps the active-process count of each run queue.
     fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
-        // Simulation runs one worker but keeps the configured scheduler ids.
         let worker = worker.min(self.worker_counts.len() - 1);
         let previous = process
             .scheduler_id
@@ -3909,56 +3800,11 @@ impl<T: Task> Inner<T> {
             .collect()
     }
 
-    fn simulation_stats(&self) -> SchedulerStats {
-        let counts: Vec<u64> = self
-            .worker_counts
-            .iter()
-            .map(|value| value.0.load(Ordering::Relaxed))
-            .collect();
-        let dirty = self.dirty_stats();
-        let ports = self.queued_ports();
-        // The simulator keeps runnable processes in its own queue, not in the run queues, so
-        // their entries are counted from the per-worker counts here.
-        let queued: Vec<u64> = counts
-            .iter()
-            .zip(&ports)
-            .map(|(value, ports)| value + ports)
-            .collect();
-        SchedulerStats {
-            run_queue_lengths: queued.clone(),
-            active_tasks: queued,
-            active_ns: self
-                .worker_stats
-                .iter()
-                .map(|value| value.active_ns.load(Ordering::Relaxed))
-                .collect(),
-            msacc_ns: vec![[0; MSACC_STATE_COUNT]; self.worker_stats.len()],
-            context_switches: self
-                .worker_stats
-                .iter()
-                .map(|value| value.context_switches.load(Ordering::Relaxed))
-                .sum(),
-            reductions: self
-                .worker_stats
-                .iter()
-                .map(|value| value.reductions.load(Ordering::Relaxed))
-                .sum(),
-            active_schedulers: self.active_schedulers.load(Ordering::Relaxed) as u64,
-            elapsed_ns: u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            dirty_active_ns: dirty.0,
-            dirty_msacc_ns: dirty.1,
-            dirty_run_queue_lengths: dirty.2,
-        }
-    }
-
     fn scheduler_stats(
         &self,
         current: Option<&Local<T>>,
         current_reductions: u64,
     ) -> SchedulerStats {
-        if self.sim.is_some() {
-            return self.simulation_stats();
-        }
         let accounting_flags = self.accounting_flags.load(Ordering::Relaxed);
         let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
         let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
@@ -4008,8 +3854,7 @@ impl<T: Task> Inner<T> {
         }
         let dirty = self.dirty_stats();
         let ports = self.queued_ports();
-        // The simulator keeps runnable processes in its own queue, not in the run queues, so
-        // their entries are counted from the per-worker counts here.
+        // Runnable processes are counted from the per-worker counts.
         let queued: Vec<u64> = counts
             .iter()
             .zip(&ports)
@@ -4044,14 +3889,6 @@ impl<T: Task> Inner<T> {
     // Port of erts/emulator/beam/erl_process.c:erts_get_total_context_switches,
     // erts_get_total_reductions, and run_queues_len_aux, OTP-29.1.1.
     fn statistics_counters(&self) -> (u64, u64, u64) {
-        if self.sim.is_some() {
-            let stats = self.simulation_stats();
-            return (
-                stats.run_queue_lengths.iter().sum(),
-                stats.reductions,
-                stats.context_switches,
-            );
-        }
         let reductions = self
             .worker_stats
             .iter()
@@ -4070,9 +3907,6 @@ impl<T: Task> Inner<T> {
     /// point.
     // Port of erts/emulator/beam/erl_process.c:erts_get_exact_total_reductions, OTP-29.1.1.
     fn exact_total_reductions(&self) -> u64 {
-        if self.sim.is_some() {
-            return self.simulation_stats().reductions;
-        }
         thr_progress::block(&self.progress);
         let total = self
             .worker_stats
@@ -4216,9 +4050,8 @@ impl<T: Task> Inner<T> {
     #[inline]
     fn apply_link_events(&self, wheel: &mut Wheel<T::Message>) {
         if wheel.has_link_events() {
-            // A real wheel belongs to its scheduler thread (a managed thread of thread
-            // progress); only the simulated scheduler's shared wheels are touched by any thread.
-            self.drain_link_events(wheel, self.sim_timers.is_none());
+            // A wheel belongs to its scheduler thread (a managed thread of thread progress).
+            self.drain_link_events(wheel, true);
         }
     }
 
@@ -4341,16 +4174,6 @@ impl<T: Task> Inner<T> {
         // Exit has to destroy the paused list (erts_destroy_paused_bif_timers).
         process.bif_timer_wheels.store(u64::MAX, Ordering::Release);
         proc_flags::publish(&process.exit_flags, proc_flags::BIF_TIMERS);
-        if let Some(timers) = self.sim_timers.as_ref() {
-            let now = self.clock.time_left_now_ms();
-            for wheel in timers {
-                let mut wheel = wheel.lock().unwrap();
-                let ids = self.bif_timer_ids(pid, wheel.worker());
-                wheel.pause_target(pid, &ids, now);
-                self.apply_link_events(&mut wheel);
-            }
-            return;
-        }
         for (worker, queue) in self.timer_commands.iter().enumerate() {
             let ids = self.bif_timer_ids(pid, worker);
             if ids.is_empty() {
@@ -4436,9 +4259,7 @@ impl<T: Task> Inner<T> {
                 let item = Scheduled::at_prio(process.clone(), kind, prio);
                 // The extra entry counts in the run queue lengths like any other entry
                 // (enqueue_process does not tell proxies apart).
-                if let Some(sim) = &self.sim {
-                    sim.lock().unwrap().queue.push_back(item);
-                } else if let Some(worker) = process.bound_worker() {
+                if let Some(worker) = process.bound_worker() {
                     self.run_queues[worker].push(item);
                     self.note_queued(worker);
                     self.wake_scheduler(worker);
@@ -4616,7 +4437,6 @@ impl<T: Task> Inner<T> {
         let online_schedulers;
         if let Some(local) = local
             && item.process.bound_worker().is_none()
-            && self.sim.is_none()
             && {
                 // Keep the queue choice on one scheduler-count snapshot, as
                 // `select_enqueue_run_queue` chooses one run queue for the enqueue.
@@ -4662,14 +4482,7 @@ impl<T: Task> Inner<T> {
             return;
         }
         let worker = process.rtimer.worker.load(Ordering::Relaxed);
-        if let Some(timers) = self.sim_timers.as_ref() {
-            if let Some(wheel) = timers.get(worker) {
-                wheel
-                    .lock()
-                    .unwrap()
-                    .cancel_at(id, self.clock.time_left_now_ms());
-            }
-        } else if let Some(queue) = self.canceled_timers.get(worker) {
+        if let Some(queue) = self.canceled_timers.get(worker) {
             queue.push(CanceledTimer { id });
             self.flag_timer_work(worker);
             self.wake_worker(worker);
@@ -4837,26 +4650,6 @@ impl<T: Task> Inner<T> {
             if queued {
                 self.apply_timer_commands(local);
             }
-            return;
-        }
-        let Some(timers) = self.sim_timers.as_ref() else {
-            return;
-        };
-        let Some(wheel) = timers.get(worker) else {
-            return;
-        };
-        if !wheel.lock().unwrap().has_timers() {
-            return;
-        }
-        let now = self.clock.now_ms();
-        let due = {
-            let mut wheel = wheel.lock().unwrap();
-            let due = wheel.advance(now);
-            self.apply_link_events(&mut wheel);
-            due
-        };
-        for (id, event) in due {
-            self.fire_timer(worker, id, event, None);
         }
     }
 
@@ -5140,16 +4933,6 @@ impl<T: Task> Inner<T> {
             }
             service.wheel.insert(id, deadline, payload);
             self.apply_link_events(&mut service.wheel);
-        } else if let Some(timers) = self.sim_timers.as_ref() {
-            let Some(wheel) = timers.get(worker) else {
-                return Err(Error::NoProcess);
-            };
-            let mut wheel = wheel.lock().unwrap();
-            if !wheel.has_timers() {
-                let _ = wheel.advance(now);
-            }
-            wheel.insert(id, deadline, payload);
-            self.apply_link_events(&mut wheel);
         } else if let Some(queue) = self.timer_commands.get(worker) {
             // Port of erts/emulator/beam/erl_hl_timer.c:2731 (erts_start_timer_callback),
             // OTP-29.1.1: a thread that does not own the wheel schedules the insertion as
@@ -5192,20 +4975,6 @@ impl<T: Task> Inner<T> {
         reference: TimerRef,
         callback: Box<dyn FnOnce(Option<u64>) + Send>,
     ) {
-        if let Some(timers) = self.sim_timers.as_ref() {
-            self.poll_timers(reference.worker, None, true);
-            let remaining = timers
-                .get(reference.worker)
-                .and_then(|wheel| {
-                    let mut wheel = wheel.lock().unwrap();
-                    let canceled = wheel.cancel_at(reference.id, self.clock.time_left_now_ms());
-                    self.apply_link_events(&mut wheel);
-                    canceled
-                })
-                .map(|entry| entry.0);
-            callback(remaining);
-            return;
-        }
         if let Some(service) = self.owner_timer_service_synced(reference.worker) {
             // The wheel's own `now` lags the clock between advances; remaining
             // time is measured against the current time.
@@ -5239,9 +5008,6 @@ impl<T: Task> Inner<T> {
     // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): the owning scheduler
     // accesses its btm tree directly, only a foreign scheduler goes through a request.
     fn try_access_timer_local(&self, reference: TimerRef, cancel: bool) -> Option<Option<u64>> {
-        if self.sim_timers.is_some() {
-            return None;
-        }
         let service = self.owner_timer_service_synced(reference.worker)?;
         self.access_service_timer(&service, reference, cancel)
     }
@@ -5277,16 +5043,6 @@ impl<T: Task> Inner<T> {
     }
 
     fn read_timer_async(&self, reference: TimerRef, callback: Box<dyn FnOnce(Option<u64>) + Send>) {
-        if let Some(timers) = self.sim_timers.as_ref() {
-            self.poll_timers(reference.worker, None, true);
-            callback(timers.get(reference.worker).and_then(|wheel| {
-                wheel
-                    .lock()
-                    .unwrap()
-                    .remaining_at(reference.id, self.clock.time_left_now_ms())
-            }));
-            return;
-        }
         if let Some(service) = self.owner_timer_service_synced(reference.worker) {
             let remaining = service
                 .borrow()
@@ -5700,8 +5456,6 @@ struct SliceConsts {
     worker: Option<usize>,
     worker_count: usize,
     sched_type: SchedulerType,
-    /// The turn runs on a simulated scheduler, whose thread steps other runtimes too.
-    simulated: bool,
 }
 
 trait ContextOps<M: SignalMessage> {
@@ -5843,14 +5597,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn scheduler_id(&self) -> Option<usize> {
         self.consts.worker.map(|worker| worker + 1)
     }
-    /// Identity of the normal scheduler thread running this slice, zero on a dirty or simulated
+    /// Identity of the normal scheduler thread running this slice, zero on a dirty
     /// scheduler. A task caches what it derived from the scheduler (its `esdp`) under this key
     /// and redoes it only when the process moves to another scheduler.
     // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData: the per-scheduler values
     // process_main reads once per scheduler, not once per process switch), OTP-29.1.1.
     #[inline(always)]
     pub fn scheduler_key(&self) -> u64 {
-        if self.consts.simulated || self.consts.sched_type != SchedulerType::Normal {
+        if self.consts.sched_type != SchedulerType::Normal {
             return 0;
         }
         self.consts.worker.map_or(0, |worker| worker as u64 + 1)
@@ -5868,11 +5622,6 @@ impl<M: SignalMessage> RunCtx<'_, M> {
             && !self.sys_task_run
             && !self.dirty_running
             && !self.dirty_queued
-    }
-    /// Whether this turn runs on a simulated scheduler: its thread is not dedicated to one
-    /// scheduler, so thread-specific data must be selected for every turn.
-    pub fn simulated(&self) -> bool {
-        self.consts.simulated
     }
     /// Type of the scheduler executing this process turn.
     pub fn scheduler_type(&self) -> SchedulerType {
@@ -6382,12 +6131,8 @@ impl<T: Task> Runner<'_, T> {
             // children join the caller's FIFO run queue behind earlier children.
             // The child joins the same local deque a woken process does (place_runnable), so
             // it runs before a process the parent wakes afterwards.
-            if self.inner.sim.is_none() {
-                local.record_queued(&item.process, local.worker_id, false);
-                self.inner.run_queues[local.worker_id].push(item);
-            } else {
-                self.inner.push_run_queue(local.worker_id, item, false);
-            }
+            local.record_queued(&item.process, local.worker_id, false);
+            self.inner.run_queues[local.worker_id].push(item);
         } else {
             self.inner.enqueue_new(item);
         }
@@ -6468,7 +6213,6 @@ impl<T: Task> Runner<'_, T> {
             worker: None,
             worker_count: self.inner.config.workers,
             sched_type: SchedulerType::Normal,
-            simulated: self.inner.sim.is_some(),
         };
         let task = cell.task_mut();
         let mut ctx = RunCtx {
@@ -6635,16 +6379,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
 
     fn cancel_target_timers(&mut self, pid: Pid) {
-        if let Some(timers) = self.inner.sim_timers.as_ref() {
-            for wheel in timers {
-                let mut wheel = wheel.lock().unwrap();
-                let ids = self.inner.bif_timer_ids(pid, wheel.worker());
-                wheel.cancel_target(&ids);
-                self.inner.apply_link_events(&mut wheel);
-            }
-            self.inner.destroy_paused_bif_timers(pid);
-            return;
-        }
         // Port of erts/emulator/beam/erl_hl_timer.c:2455 (erts_cancel_bif_timers), OTP-29.1.1:
         // only the wheels holding the receiver's timers are visited; a canceled timer on
         // another scheduler is handed to it as aux work.
@@ -6864,9 +6598,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         self.publish_deferred_monitor();
     }
     fn total_reductions(&self) -> u64 {
-        if self.inner.sim.is_some() {
-            return self.inner.simulation_stats().reductions;
-        }
         self.inner
             .scheduler_stats(self.local.map(RefCell::borrow).as_deref(), 0)
             .reductions
@@ -6964,7 +6695,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
 pub struct Scheduler<T: Task> {
     inner: Arc<Inner<T>>,
     threads: Vec<JoinHandle<()>>,
-    virtual_clock: Option<Arc<VirtualClock>>,
 }
 
 /// A table-list invocation that reconciles removals between 1000-slot scan chunks.
@@ -7064,47 +6794,23 @@ impl<T: Task> Scheduler<T> {
         // erts_no_schedulers), OTP-29.1.1. A launcher that already configured the allocators
         // (with `+Mdai`) or an earlier runtime in this process keeps its counts.
         let _ = arinsal_alloc::typed::configure(config.workers.max(1), 0);
-        Self::build(config, Arc::new(RealClock(monotonic_base())), None, None)
+        Self::build(config, RealClock(monotonic_base()))
     }
 
-    /// Build a single-threaded scheduler with a reproducible seed and virtual clock.
-    pub fn simulation(config: Config, seed: u64) -> Self {
-        let clock = Arc::new(VirtualClock::default());
-        Self::build(
-            config,
-            clock.clone(),
-            Some(Box::new(SeededRng::new(seed))),
-            Some(clock),
-        )
-    }
-
-    /// Build a simulator with injected clock and random generator.
-    pub fn simulation_with(config: Config, clock: Arc<dyn Clock>, rng: Box<dyn Rng>) -> Self {
-        Self::build(config, clock, Some(rng), None)
-    }
-
-    fn build(
-        mut config: Config,
-        clock: Arc<dyn Clock>,
-        rng: Option<Box<dyn Rng>>,
-        virtual_clock: Option<Arc<VirtualClock>>,
-    ) -> Self {
+    fn build(mut config: Config, clock: RealClock) -> Self {
         assert!(config.max_processes > 0 && config.max_processes <= PID_LIMIT);
         assert!(config.reductions > 0);
         config.workers = config.workers.max(1);
         let dirty_cpu = config.dirty_cpu_schedulers.max(1);
         let dirty_io = config.dirty_io_schedulers.max(1);
-        let simulated = rng.is_some();
-        let workers = if simulated { 1 } else { config.workers };
+        let workers = config.workers;
         let parked: Arc<[AtomicBool]> = (0..workers).map(|_| AtomicBool::new(false)).collect();
         let sleepers: Arc<[OnceLock<thread::Thread>]> =
             (0..workers).map(|_| OnceLock::new()).collect();
-        // The simulated scheduler runs no scheduler threads, so it has no managed threads.
-        let progress = Arc::new(if simulated {
-            thr_progress::ThrProgress::new(Arc::from([]), Arc::from([]))
-        } else {
-            thr_progress::ThrProgress::new(Arc::clone(&parked), Arc::clone(&sleepers))
-        });
+        let progress = Arc::new(thr_progress::ThrProgress::new(
+            Arc::clone(&parked),
+            Arc::clone(&sleepers),
+        ));
         thr_progress::install_sspa_progress(Arc::clone(&progress));
         let balance = Arc::new(balance::Balance::new(
             workers,
@@ -7153,24 +6859,12 @@ impl<T: Task> Scheduler<T> {
             table: ProcessTable::new(config.max_processes, Arc::clone(&progress)),
             config,
             run_queues: Arc::clone(&balance.rqs),
-            sim_timers: simulated.then(|| {
-                (0..workers)
-                    .map(|worker| Mutex::new(Wheel::new(now).for_worker(worker)))
-                    .collect()
-            }),
             timer_commands,
             canceled_timers,
             next_timer: AtomicU64::new(1),
             clock,
-            sim_data: Mutex::new(T::SchedulerData::default()),
             cpu_bind_targets: RwLock::new(vec![None; workers]),
             cpu_bind_actual: RwLock::new(vec![None; workers]),
-            sim: rng.map(|rng| {
-                Mutex::new(SimState {
-                    queue: VecDeque::new(),
-                    rng,
-                })
-            }),
             stopped: AtomicBool::new(false),
             halt_started: AtomicBool::new(false),
             halt_requested: AtomicBool::new(false),
@@ -7223,7 +6917,7 @@ impl<T: Task> Scheduler<T> {
             port_queues: (0..workers).map(|_| ports::PortQueue::default()).collect(),
         });
         let mut threads = Vec::new();
-        if !simulated {
+        {
             for (id, local) in locals.into_iter().enumerate() {
                 let inner = inner.clone();
                 // Port of erts/emulator/beam/erl_process.c (erts_start_schedulers,
@@ -7264,9 +6958,7 @@ impl<T: Task> Scheduler<T> {
         }
         // Port of erts/emulator/beam/erl_process.c:8921 (erts_start_schedulers, runq_supervisor
         // thread): only when `+sfwi` (`erts_runq_supervision_interval`) is non-zero.
-        if !simulated
-            && let Some(interval) = inner.config.forced_wakeup_interval.filter(|&ms| ms > 0)
-        {
+        if let Some(interval) = inner.config.forced_wakeup_interval.filter(|&ms| ms > 0) {
             let inner = inner.clone();
             threads.push(
                 // erl_process.c gives the supervisor a 16 kilo word stack.
@@ -7278,11 +6970,7 @@ impl<T: Task> Scheduler<T> {
                 .expect("spawn run queue supervisor thread"),
             );
         }
-        Self {
-            inner,
-            threads,
-            virtual_clock,
-        }
+        Self { inner, threads }
     }
 
     /// Run `f` on the process-local exit words of `pid`.
@@ -7528,12 +7216,6 @@ impl<T: Task> Scheduler<T> {
             .queue_new(process.priority().index(), Ordering::Release);
         process.scheduler_id.store(worker, Ordering::Relaxed);
         let item = Scheduled::new(process);
-        if self.inner.sim.is_some() {
-            // The simulator has no worker run-queue loop; erts' newly created process
-            // is runnable on its selected scheduler, represented by the simulation queue.
-            self.inner.enqueue(item, false);
-            return Ok(pid);
-        }
         let scheduler = self.inner.enqueue_run_queue(&item.process);
         self.inner.push_run_queue(scheduler, item, false);
         Ok(pid)
@@ -8070,7 +7752,6 @@ impl<T: Task> Scheduler<T> {
             return true;
         }
         // Port of erts/emulator/beam/erl_process.c:4226 (resume_run_queue), OTP-29.1.1.
-        // Simulation keeps one run queue for all configured schedulers.
         let rqs = &self.inner.balance.rqs;
         for rq in &rqs[previous.min(online).min(rqs.len())..online.min(rqs.len())] {
             rq.reset_statistics();
@@ -8302,18 +7983,7 @@ impl<T: Task> Scheduler<T> {
         let (reply, receiver) = mpsc::channel();
         let mut pending = 0;
         for worker in 0..workers {
-            if let Some(sim) = self.inner.sim_timers.as_ref() {
-                if let Some(wheel) = sim.get(worker) {
-                    results.extend(
-                        wheel
-                            .lock()
-                            .unwrap()
-                            .bif_timer_messages()
-                            .into_iter()
-                            .map(&*f),
-                    );
-                }
-            } else if let Some(service) = self.inner.owner_timer_service(worker) {
+            if let Some(service) = self.inner.owner_timer_service(worker) {
                 results.extend(
                     service
                         .borrow()
@@ -8356,11 +8026,6 @@ impl<T: Task> Scheduler<T> {
 
     /// The number of BIF timers on the wheel of `worker`, read from that scheduler's thread.
     pub fn bif_timer_count(&self, worker: usize) -> usize {
-        if let Some(sim) = self.inner.sim_timers.as_ref() {
-            return sim
-                .get(worker)
-                .map_or(0, |wheel| wheel.lock().unwrap().bif_timer_messages().len());
-        }
         self.inner.owner_timer_service(worker).map_or(0, |service| {
             service.borrow().wheel.bif_timer_messages().len()
         })
@@ -8421,73 +8086,6 @@ impl<T: Task> Scheduler<T> {
     ) {
         self.inner.read_timer_async(reference, Box::new(callback));
     }
-    /// Advance the built-in simulation clock.
-    pub fn advance_ms(&self, ms: u64) -> Result<(), Error> {
-        self.virtual_clock
-            .as_ref()
-            .ok_or(Error::WrongMode)?
-            .advance(ms);
-        self.inner.poll_timers(0, None, true);
-        Ok(())
-    }
-    /// Execute one deterministic scheduling turn. Returns false when no task is runnable.
-    pub fn step(&self) -> bool {
-        let Some(sim) = &self.inner.sim else {
-            return false;
-        };
-        self.inner.handle_aux_work(0);
-        self.inner.poll_timers(0, None, true);
-        // Port of erts/emulator/beam/erl_process.c:9977-9986 (find a new port to run),
-        // OTP-29.1.1.
-        if let Some(port) = self.inner.port_queues[0].pop(&self.inner.balance.rqs[0]) {
-            let PortExecution { active, reds } = port.execute();
-            if active {
-                port.run_queue().set(0);
-                self.inner.port_queues[0].enqueue(&self.inner.balance.rqs[0], port);
-            }
-            let reds = reds.max(0);
-            self.inner.balance.rqs[0]
-                .reductions_executed(balance::PORT_PRIO_LEVEL, i64::from(reds));
-            self.inner.worker_stats[0]
-                .reductions
-                .fetch_add(reds as u64, Ordering::Relaxed);
-            return true;
-        }
-        let item = {
-            let mut sim = sim.lock().unwrap();
-            let len = sim.queue.len();
-            if len == 0 {
-                drop(sim);
-                // Port of erts/emulator/beam/erl_process.c:scheduler_wait, OTP-29.1.1:
-                // yield while the idle simulated scheduler waits for asynchronous I/O workers
-                // to publish work into the scheduler queue.
-                std::thread::yield_now();
-                return false;
-            }
-            // Port of erts/emulator/beam/erl_process.c:9603 (priority queues), OTP-29.1.1:
-            // max and high run before normal; normal and low share one class here.
-            let class = |item: &Scheduled<T>| item.process.priority().index().min(2);
-            let best = sim.queue.iter().map(class).min().unwrap_or(2);
-            let ready: Vec<usize> = (0..len)
-                .filter(|&index| class(&sim.queue[index]) == best)
-                .collect();
-            let index = ready[sim.rng.next_u64() as usize % ready.len()];
-            sim.queue.remove(index).unwrap()
-        };
-        let dirty = item.process.dirty_kind();
-        // A task stepping a simulation from inside its own slice gets a scheduler of its own.
-        match self.inner.sim_data.try_lock() {
-            Ok(mut data) => run_one(&self.inner, item, &mut data, None, dirty),
-            Err(_) => run_one(
-                &self.inner,
-                item,
-                &mut T::SchedulerData::default(),
-                None,
-                dirty,
-            ),
-        }
-        true
-    }
 }
 
 #[cfg(test)]
@@ -8532,263 +8130,6 @@ mod in_signal_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod msgq_stage_microbench {
-    use super::*;
-
-    struct Idle;
-
-    impl Task for Idle {
-        type Message = usize;
-        type SchedulerData = ();
-
-        fn run(&mut self, _ctx: &mut RunCtx<'_, usize>, _: &mut (), _budget: u32) -> RunOutcome {
-            RunOutcome::Wait { timeout_ms: None }
-        }
-    }
-
-    fn report(stage: &str, count: usize, started: Instant) {
-        println!(
-            "{stage}: {:.1} ns/op",
-            started.elapsed().as_nanos() as f64 / count as f64
-        );
-    }
-
-    #[test]
-    #[ignore = "manual message queue stage benchmark"]
-    fn stages() {
-        const N: usize = 200_000;
-        let table = ProcessTable::<Idle>::new(
-            1,
-            Arc::new(thr_progress::ThrProgress::new(Arc::from([]), Arc::from([]))),
-        );
-        let process = table.insert(Idle, Priority::Normal, None).unwrap();
-        let pid = process.pid;
-        let started = Instant::now();
-        for _ in 0..N {
-            std::hint::black_box(table.lookup(pid));
-        }
-        report("lookup", N, started);
-
-        let ingress = Incoming::default();
-        let sender = Pid::new(1, 0);
-        let blocks: Vec<Vec<Event<usize>>> = (0..N / 32)
-            .map(|block| {
-                (0..32)
-                    .map(|offset| Event {
-                        from: sender,
-                        payload: Payload::Message(block * 32 + offset),
-                    })
-                    .collect()
-            })
-            .collect();
-        let mut blocks = blocks.into_iter();
-        let started = Instant::now();
-        for mut block in blocks.by_ref() {
-            ingress.push_block_reuse(&mut block);
-        }
-        report("enqueue block", N, started);
-
-        let mut fetched = SignalQueue::default();
-        let started = Instant::now();
-        ingress.take_all(&mut fetched);
-        assert_eq!(fetched.len(), N);
-        report("fetch batch", N, started);
-        let mut inner_queue: VecDeque<_> = std::iter::from_fn(|| fetched.pop_front()).collect();
-
-        let started = Instant::now();
-        for expected in 0..N {
-            let index = inner_queue
-                .iter()
-                .position(
-                    |event| matches!(event.payload, Payload::Message(value) if value == expected),
-                )
-                .unwrap();
-            std::hint::black_box(inner_queue.remove(index).unwrap());
-        }
-        report("receive match", N, started);
-
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 3);
-        let process = scheduler.spawn(Idle).unwrap();
-        let process_ref = scheduler.inner.table.lookup(process).unwrap();
-        let input = &process_ref.input;
-        let blocks = (0..N / 32)
-            .map(|block| {
-                (0..32)
-                    .map(|offset| Event {
-                        from: sender,
-                        payload: Payload::Message(block * 32 + offset),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter();
-        for mut block in blocks {
-            input.push_block_reuse(&mut block);
-        }
-        let mut receive_runner = Runner {
-            inner: &scheduler.inner,
-            local: None,
-            managed: false,
-        };
-        let consts = SliceConsts {
-            worker: None,
-            worker_count: scheduler.inner.config.workers,
-            sched_type: SchedulerType::Normal,
-            simulated: scheduler.inner.sim.is_some(),
-        };
-        let mut context = RunCtx {
-            inner: &mut receive_runner,
-            proc: &process_ref.shared,
-            consts: &consts,
-            reds_used: 0,
-            budget: 1_000,
-            virtual_reds: 0,
-            msacc_enabled: false,
-            wall_enabled: false,
-            gc_accounted_total: 0,
-            sys_task_run: false,
-            dirty_running: false,
-            dirty_queued: false,
-        };
-        let started = Instant::now();
-        let mut fetched = SignalQueue::default();
-        context.fetch_signals(&mut fetched);
-        assert_eq!(fetched.len(), N);
-        while let Some(event) = fetched.pop_front() {
-            context.consume_fetched();
-            std::hint::black_box(event);
-        }
-        report("RunCtx batch fetch + pop", N, started);
-
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
-        let process = scheduler
-            .inner
-            .table
-            .lookup(scheduler.spawn(Idle).unwrap())
-            .unwrap();
-        let started = Instant::now();
-        for _ in 0..N {
-            process.run_state().store(WAITING, Ordering::SeqCst);
-            scheduler
-                .inner
-                .wake_after_publish(&process, None, false, None);
-        }
-        report("wake transition + schedule", N, started);
-        scheduler
-            .inner
-            .sim
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .queue
-            .clear();
-
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 2);
-        let from = scheduler.spawn(Idle).unwrap();
-        let to = scheduler.spawn(Idle).unwrap();
-        let process = scheduler.inner.table.lookup(to).unwrap();
-        process.run_state().store(RUNNING, Ordering::Relaxed);
-        let mut runner = Runner {
-            inner: &scheduler.inner,
-            local: None,
-            managed: false,
-        };
-        let started = Instant::now();
-        for message in 0..N {
-            <Runner<'_, Idle> as ContextOps<usize>>::deliver(
-                &mut runner,
-                from,
-                to,
-                Payload::Message(message),
-            )
-            .unwrap();
-        }
-        runner.flush();
-        report("runner delivery high backlog", N, started);
-
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 4);
-        let from = scheduler.spawn(Idle).unwrap();
-        let to = scheduler.spawn(Idle).unwrap();
-        let target = scheduler.inner.table.lookup(to).unwrap();
-        target.run_state().store(RUNNING, Ordering::Relaxed);
-        let mut inner_queue = SignalQueue::default();
-        let started = Instant::now();
-        for message in 0..N {
-            let mut runner = Runner {
-                inner: &scheduler.inner,
-                local: None,
-                managed: false,
-            };
-            <Runner<'_, Idle> as ContextOps<usize>>::deliver(
-                &mut runner,
-                from,
-                to,
-                Payload::Message(message),
-            )
-            .unwrap();
-            runner.flush();
-            if message % 32 == 31 {
-                target.input.take_all(&mut inner_queue);
-                while inner_queue.pop_front().is_some() {}
-            }
-        }
-        target.input.take_all(&mut inner_queue);
-        while inner_queue.pop_front().is_some() {}
-        report("one send per runner slice", N, started);
-    }
-
-    #[test]
-    fn sends_preserve_order_and_wake_only_once() {
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 5);
-        let from = scheduler.spawn(Idle).unwrap();
-        let to = scheduler.spawn(Idle).unwrap();
-        scheduler
-            .inner
-            .sim
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .queue
-            .clear();
-        let process = scheduler.inner.table.lookup(to).unwrap();
-        process.run_state().store(WAITING, Ordering::Relaxed);
-        let mut runner = Runner {
-            inner: &scheduler.inner,
-            local: None,
-            managed: false,
-        };
-        for value in 1..=3 {
-            <Runner<'_, Idle> as ContextOps<usize>>::deliver(
-                &mut runner,
-                from,
-                to,
-                Payload::Message(value),
-            )
-            .unwrap();
-            if value == 1 {
-                process.run_state().store(RUNNING, Ordering::Relaxed);
-            }
-        }
-        runner.flush();
-        let ready = scheduler.inner.sim.as_ref().unwrap().lock().unwrap();
-        assert_eq!(ready.queue.len(), 1);
-        drop(ready);
-        let mut inner_queue = SignalQueue::default();
-        process.input.take_all(&mut inner_queue);
-        let messages = (0..3)
-            .map(|_| match inner_queue.pop_front().unwrap().payload {
-                Payload::Message(value) => value,
-                _ => panic!("unexpected control signal"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(messages, [1, 2, 3]);
-    }
-}
-
-#[cfg(test)]
 mod spawn_request_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8811,14 +8152,11 @@ mod spawn_request_tests {
 
     #[test]
     fn unscheduled_process_signals_do_not_publish_child() {
-        let scheduler = Scheduler::simulation(
-            Config {
-                workers: 1,
-                max_processes: 8,
-                ..Config::default()
-            },
-            1,
-        );
+        let scheduler = Scheduler::new(Config {
+            workers: 1,
+            max_processes: 8,
+            ..Config::default()
+        });
         let observed = Arc::new(AtomicUsize::new(0));
         let child = scheduler
             .spawn_unscheduled(LinkSignalProbe(Arc::clone(&observed)))
@@ -8827,11 +8165,18 @@ mod spawn_request_tests {
             .signal(Pid::new(7, 0), child, Signal::Link { priority: false })
             .unwrap();
 
-        assert!(!scheduler.step(), "setup signal scheduled the child");
-        assert_eq!(observed.load(Ordering::Relaxed), 0);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            0,
+            "setup signal scheduled the child"
+        );
 
         scheduler.schedule_unscheduled(child).unwrap();
-        assert!(scheduler.step());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while observed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(observed.load(Ordering::Relaxed), 1);
     }
 }
@@ -8849,28 +8194,6 @@ mod dirty_state_tests {
         fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _: u32) -> RunOutcome {
             RunOutcome::Wait { timeout_ms: None }
         }
-    }
-
-    #[test]
-    fn non_managed_later_operation_uses_the_simulated_scheduler_progress_queue() {
-        let scheduler = Scheduler::simulation(Config::default(), 1);
-        let ran = Arc::new(AtomicBool::new(false));
-        let scheduled = Arc::clone(&ran);
-        let progress_scheduler = Arc::new(scheduler);
-        let external = Arc::clone(&progress_scheduler);
-        let nested_scheduler = Arc::downgrade(&progress_scheduler);
-        let thread = thread::spawn(move || {
-            external.thread_progress_later(move || {
-                nested_scheduler
-                    .upgrade()
-                    .unwrap()
-                    .thread_progress_later(move || scheduled.store(true, Ordering::Release));
-            });
-        });
-        thread.join().unwrap();
-        progress_scheduler.spawn(Idle).unwrap();
-        assert!(progress_scheduler.step());
-        assert!(ran.load(Ordering::Acquire));
     }
 
     #[test]
@@ -8917,7 +8240,7 @@ mod dirty_state_tests {
 
     #[test]
     fn executing_dirty_excludes_queued_dirty_work() {
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let scheduler = Scheduler::<Idle>::new(Config::default());
         let pid = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(pid).unwrap();
         process
@@ -8935,7 +8258,7 @@ mod dirty_state_tests {
     /// enqueue_process to dequeue_process (erl_process.c:3951-4030); a `Not` entry is none.
     #[test]
     fn run_queue_lengths_count_every_entry() {
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let scheduler = Scheduler::<Idle>::new(Config::default());
         let pid = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(pid).unwrap();
         let rq = run_queue::ProcQueues::<Idle>::new();
@@ -8961,7 +8284,7 @@ mod dirty_state_tests {
     /// 4288 clear_proc_dirty_queue_bit).
     #[test]
     fn a_dirty_queue_takes_one_entry_per_priority() {
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let scheduler = Scheduler::<Idle>::new(Config::default());
         let pid = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(pid).unwrap();
         let normal = queue_index(Priority::Normal.index());
@@ -9036,9 +8359,11 @@ mod dirty_state_tests {
 
     #[test]
     fn on_heap_send_requires_a_stable_receiver() {
-        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
-        let from = scheduler.spawn(Idle).unwrap();
-        let to = scheduler.spawn(Idle).unwrap();
+        let scheduler = Scheduler::<Idle>::new(Config::default());
+        // Unscheduled processes: no worker ever runs them, so the test owns their state word.
+        // The test stores run states directly, which a running worker would race with.
+        let from = scheduler.spawn_unscheduled(Idle).unwrap();
+        let to = scheduler.spawn_unscheduled(Idle).unwrap();
         let target = scheduler.inner.table.lookup(to).unwrap();
         // A queued receiver is not executing. Collection fetches the outer queue
         // before scanning, so the on-heap term is a root by then.
@@ -9372,18 +8697,6 @@ impl<T: Task> Scheduler<T> {
     }
 }
 
-fn run_one<T: Task>(
-    inner: &Inner<T>,
-    item: Scheduled<T>,
-    data: &mut T::SchedulerData,
-    worker: Option<usize>,
-    dirty: Option<DirtyKind>,
-) {
-    run_slice(inner, item, data, worker, dirty);
-    // A runtime without managed threads runs later operations after the slice.
-    thr_progress::run_unmanaged_later_ops(&inner.progress);
-}
-
 /// What a finished slice leaves for the schedule-out half of `erts_schedule`.
 struct SliceEnd<T: Task> {
     process: ProcRef<T>,
@@ -9419,7 +8732,7 @@ fn exit_cleanup<T: Task>(inner: &Inner<T>, process: &Process<T>, cell: &mut Task
 
 /// Schedule a finished slice out: reductions executed, the outcome's state transition and the
 /// enqueue decision. Shared by the normal scheduler loop (inside `erts_schedule`'s one borrow
-/// of the scheduler state) and by `run_slice` (dirty and simulated schedulers, no `Local`).
+/// of the scheduler state) and by `run_slice` (dirty schedulers, no `Local`).
 // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule_out_process and
 // ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1.
 fn schedule_out<T: Task>(
@@ -9463,11 +8776,9 @@ fn schedule_out<T: Task>(
     } else if let Some(local) = local.as_deref_mut() {
         local.reductions += consumed;
         local.stat_reductions += actual;
-        if inner.sim.is_none() {
-            inner.worker_stats[local.worker_id]
-                .reductions
-                .fetch_add(actual, Ordering::Relaxed);
-        }
+        inner.worker_stats[local.worker_id]
+            .reductions
+            .fetch_add(actual, Ordering::Relaxed);
         if SCHED_POLL.get().is_some() {
             FUNCTION_CALLS.fetch_add(
                 u32::try_from(consumed).unwrap_or(u32::MAX),
@@ -9606,7 +8917,7 @@ fn schedule_out<T: Task>(
                         deadline_ms: wait_pos.unwrap_or_else(|| inner.clock.timeout_pos(ms)),
                     });
                 } else {
-                    // Off the scheduler-local path (dirty or simulated) the timer goes on a
+                    // Off the scheduler-local path (dirty) the timer goes on a
                     // wheel through the relative interface. The id is in the timer word before
                     // the timer can fire (set_proc_timer_common publishes `tmr` after
                     // create_timer, under the main lock no fire contends for).
@@ -9696,7 +9007,7 @@ fn schedule_out<T: Task>(
     own_enqueue
 }
 
-/// Run one slice of a process on a dirty scheduler or the simulator (no per-scheduler
+/// Run one slice of a process on a dirty scheduler (no per-scheduler
 /// `Local`), as erts' `erts_dirty_process_main` keeps its own loop.
 fn run_slice<T: Task>(
     inner: &Inner<T>,
@@ -9748,7 +9059,6 @@ fn run_slice<T: Task>(
         // Port of erts/emulator/beam/erl_nif.c:468-499 (erts_call_dirty_nif), OTP-29.1.1:
         // the job runs without the main lock, so a dirty signal handler can take it.
         drop(cell);
-        // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
         let thread_type = SCHEDULER_TYPE.with(|current| current.replace(kind.into()));
         let result = job();
         SCHEDULER_TYPE.with(|current| current.set(thread_type));
@@ -9759,7 +9069,6 @@ fn run_slice<T: Task>(
         worker,
         worker_count: inner.config.workers,
         sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
-        simulated: inner.sim.is_some(),
     };
     let (outcome, reds_used, virtual_reds, active_ns) = {
         let mut runner = Runner {
@@ -9790,7 +9099,6 @@ fn run_slice<T: Task>(
             if msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Emulator);
             }
-            // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
             // A normal scheduler thread already has its type, like `esdp->type`.
             let thread_type = worker
                 .is_none()
@@ -9855,11 +9163,9 @@ fn run_process<T: Task>(
         let mut local = local_cell.borrow_mut();
         local.record_running(&process, id);
         local.context_switches += 1;
-        if inner.sim.is_none() {
-            inner.worker_stats[local.worker_id]
-                .context_switches
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        inner.worker_stats[local.worker_id]
+            .context_switches
+            .fetch_add(1, Ordering::Relaxed);
     }
     let budget = inner.config.reductions;
     // `schedule_next` has synchronized the scheduler's accounting state with these flags.
@@ -10105,9 +9411,6 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
     // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): the reference carries
     // the scheduler id; when it is the calling scheduler, its own btm tree answers.
     fn access_bif_timer(&self, key: u64, cancel: bool) -> Option<Option<u64>> {
-        if self.inner.sim_timers.is_some() {
-            return None;
-        }
         let reference = TimerRef::from_ref_key(key, self.inner.timer_commands.len());
         let local = self.local.upgrade()?;
         let service = {
@@ -10763,7 +10066,7 @@ fn schedule_next<T: Task>(
         }
         inner.execute_port(&mut *local)
     };
-    if inner.scheduling_blocked.load(Ordering::Acquire) && inner.sim.is_none() {
+    if inner.scheduling_blocked.load(Ordering::Acquire) {
         rq.unlock();
         let normal_prio = inner.run_queues[id].best_priority();
         if inner.dirty_best_priority(DirtyKind::Cpu).is_some()
@@ -11007,7 +10310,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         worker: Some(id),
         worker_count: inner.config.workers,
         sched_type: SchedulerType::Normal,
-        simulated: false,
     };
     let mut previous: Option<SliceEnd<T>> = None;
     while !inner.stopped.load(Ordering::Acquire) {
@@ -11305,7 +10607,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         thread.stats.lock().unwrap().begin_active();
         let process = item.process.clone();
         process.dirty_runner.store(slot + 1, Ordering::SeqCst);
-        run_one(&inner, item, &mut scheduler_data, None, Some(kind));
+        run_slice(&inner, item, &mut scheduler_data, None, Some(kind));
         process.dirty_runner.store(0, Ordering::SeqCst);
         {
             let mut stats = thread.stats.lock().unwrap();

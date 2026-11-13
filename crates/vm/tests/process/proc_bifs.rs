@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_bifs).
@@ -118,16 +117,15 @@ fn process_bif_scenarios_match_otp_29() {
     reference.load("proc_bifs", &beam).unwrap();
     for scenario in 0..65 {
         let expected = reference.call("proc_bifs", "scenario", &[OwnedTerm::Int(scenario)]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled(
             "proc_bifs",
             "scenario",
             &[Term::small(scenario).unwrap()],
             1,
-            None,
         );
-        assert_eq!(
+        similar_asserts::assert_eq!(
             expected,
             CallResult::Ok(
                 actual
@@ -166,10 +164,10 @@ collect(Count, Values) -> receive Value -> collect(Count - 1, [Value | Values]) 
     reference.load("proc_bifs_backtrace_depth", &beam).unwrap();
     let expected = reference.call("proc_bifs_backtrace_depth", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("proc_bifs_backtrace_depth", "run", &[], 8, None)
+        .eval_scheduled("proc_bifs_backtrace_depth", "run", &[], 8)
         .unwrap();
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

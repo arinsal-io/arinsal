@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "phash2_unaligned_test";
@@ -20,14 +19,14 @@ fn unaligned_sub_binary_phash2_matches_otp_while_trapping() {
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let CallResult::Ok(expected) = reference.call(MODULE, "hash", &[]) else {
         panic!("OTP phash2 failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "hash", &[], 1, None, 4_000)
+        .eval_scheduled_reductions(MODULE, "hash", &[], 1, 4_000)
         .unwrap();
     assert_eq!(expected, actual.term);
 }

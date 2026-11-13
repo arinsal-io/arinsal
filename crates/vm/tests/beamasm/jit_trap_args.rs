@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
-use arinsal_vm::Vm;
 
 /// binary_SUITE:error_after_yield, trimmed: a trapping BIF that fails after several yields
 /// (running trace forces schedule-out/in around each) reports the original call arguments,
@@ -49,11 +48,9 @@ fn trapping_bif_error_after_yield_reports_original_arguments() {
         .unwrap();
     reference.load("jit_trap_args", &beam).unwrap();
     let expected = reference.call("jit_trap_args", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled("jit_trap_args", "run", &[], 2, None)
-        .unwrap();
+    let actual = vm.eval_scheduled("jit_trap_args", "run", &[], 2).unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }

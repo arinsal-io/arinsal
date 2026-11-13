@@ -7,7 +7,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "reds_overcharge_test";
@@ -605,7 +604,7 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
     let source = source(cases);
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
 
     let filter = std::env::var("REDS_CASES").ok();
@@ -623,7 +622,7 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                 panic!("OTP {function} failed");
             };
             let actual = vm
-                .eval_scheduled_reductions(MODULE, &function, &[], 1, None, 4_000)
+                .eval_scheduled_reductions(MODULE, &function, &[], 1, 4_000)
                 .unwrap();
             let (expected_reds, expected_ins, expected_gcs) = measured(&expected);
             let (actual_reds, actual_ins, actual_gcs) = measured(&actual.term);
@@ -718,12 +717,12 @@ size() ->
         .compile_named("reds_l2b_values", source, &[])
         .unwrap();
     reference.load("reds_l2b_values", &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for function in ["small", "odd", "large", "tail", "bad_unit", "size"] {
         let expected = reference.call("reds_l2b_values", function, &[]);
         let actual = vm
-            .eval_scheduled("reds_l2b_values", function, &[], 1, None)
+            .eval_scheduled("reds_l2b_values", function, &[], 1)
             .unwrap_or_else(|error| panic!("{function}: {}", &format!("{error:?}")[..200]));
         compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact)
             .unwrap_or_else(|error| panic!("{function}: {error:?}"));

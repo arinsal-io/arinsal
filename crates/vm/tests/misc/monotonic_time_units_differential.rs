@@ -1,7 +1,6 @@
 //! `erlang:monotonic_time/1` and `time_offset/1` unit conversion match erts.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(mono_units_diff).
@@ -44,10 +43,10 @@ fn monotonic_time_units_match_erts() {
         .load("mono_units_diff", &beam)
         .expect("load reference");
     let expected = reference.call("mono_units_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("mono_units_diff", "run", &[], 1, None)
+        .eval_scheduled("mono_units_diff", "run", &[], 1)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

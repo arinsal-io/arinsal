@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(gen_tcp_api_compat).
@@ -38,10 +37,10 @@ fn ipv6_loopback_accept_matches_erts() {
         .load("gen_tcp_api_compat", &beam)
         .expect("load gen_tcp_api_compat");
     let expected = reference.call("gen_tcp_api_compat", "ipv6_accept", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load Arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("gen_tcp_api_compat", "ipv6_accept", &[], 2, None)
+        .eval_scheduled("gen_tcp_api_compat", "ipv6_accept", &[], 2)
         .expect("Arinsal ipv6_accept");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

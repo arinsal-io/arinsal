@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
@@ -140,10 +139,10 @@ fn ets_process_semantics_match_otp_29() {
         "concurrent_ordered_binary_info",
     ] {
         let expected = reference.call("ets_vm_diff", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled(function_module(), function, &[], 2, None)
+            .eval_scheduled(function_module(), function, &[], 2)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
@@ -213,10 +212,10 @@ fn ets_lookup_traversal_matches_otp_29() {
         .unwrap();
     reference.load("ets_lookup_diff", &beam).unwrap();
     let expected = reference.call("ets_lookup_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("ets_lookup_diff", "run", &[], 4, None)
+        .eval_scheduled("ets_lookup_diff", "run", &[], 4)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

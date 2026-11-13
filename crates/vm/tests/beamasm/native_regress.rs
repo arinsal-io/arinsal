@@ -1,7 +1,6 @@
 //! Differential regressions for BeamAsm code paths: native results must match OTP 29.1.1.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 use std::process::Command;
 
@@ -330,11 +329,11 @@ fn run_child_case() -> bool {
         return false;
     };
     let module = std::env::var(CHILD_MODULE).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&std::fs::read(beam_path).unwrap()).unwrap();
-    let actual = vm.eval_scheduled(&module, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(&module, "run", &[], 1).unwrap();
     println!("RESULT:{}", actual.text);
-    true
+    arinsal_vm::erts_exit(0)
 }
 
 /// Compares `module:run/0` under BeamAsm and under OTP 29.1.1.

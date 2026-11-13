@@ -2,7 +2,6 @@
 //! what `erl` gives: the counters with and without queued signals, and the fallbacks.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
@@ -84,10 +83,10 @@ fn self_counters_and_group_leader_match_otp() {
         .unwrap();
     reference.load("light_bif_self", &beam).unwrap();
     let expected = reference.call("light_bif_self", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("light_bif_self", "run", &[], 2, None)
+        .eval_scheduled("light_bif_self", "run", &[], 2)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }
@@ -103,10 +102,10 @@ fn bif_timers_match_otp() {
         .unwrap();
     reference.load("light_bif_self", &beam).unwrap();
     let expected = reference.call("light_bif_self", "timers", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("light_bif_self", "timers", &[], 2, None)
+        .eval_scheduled("light_bif_self", "timers", &[], 2)
         .unwrap_or_else(|error| panic!("timers: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }
@@ -122,10 +121,10 @@ fn statistics_and_code_queries_match_otp() {
         .unwrap();
     reference.load("light_bif_self", &beam).unwrap();
     let expected = reference.call("light_bif_self", "info", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("light_bif_self", "info", &[], 2, None)
+        .eval_scheduled("light_bif_self", "info", &[], 2)
         .unwrap_or_else(|error| panic!("info: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);
 }
@@ -145,7 +144,7 @@ fn fun_info_arity_repeated_calls_match_otp() {
         "fun_info_loop",
         &[arinsal_etf::OwnedTerm::Int(2000)],
     );
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
         .eval_scheduled(
@@ -153,7 +152,6 @@ fn fun_info_arity_repeated_calls_match_otp() {
             "fun_info_loop",
             &[arinsal_term::Term::small(2000).unwrap()],
             2,
-            None,
         )
         .unwrap_or_else(|error| panic!("fun_info_loop: {error}"));
     assert_eq!(CallResult::Ok(actual.term), expected);

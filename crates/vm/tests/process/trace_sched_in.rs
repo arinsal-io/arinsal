@@ -4,7 +4,6 @@
 //! lost its MFA field, which the maps_SUITE trapping checks saw as `other_sched_mismatch`.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trace_sched_in_diff).
@@ -48,11 +47,7 @@ fn scheduled_in_events_keep_their_function() {
     reference.load("trace_sched_in_diff", &beam).unwrap();
     let expected = reference.call("trace_sched_in_diff", "pairs", &[]);
     for _ in 0..4 {
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
-        let actual = vm
-            .eval_scheduled("trace_sched_in_diff", "pairs", &[], 4, None)
-            .unwrap_or_else(|error| panic!("pairs: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term));
+        let actual = crate::common::peer_eval(&[], &[&beam], "trace_sched_in_diff:pairs()");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
     }
 }

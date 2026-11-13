@@ -1,9 +1,12 @@
 //! Differential coverage for long `bs_create_bin` instruction segment lists.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 use std::fmt::Write as _;
+
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
 
 const MODULE: &str = "bs_create_bin_many_segments";
 
@@ -41,9 +44,9 @@ fn long_segment_lists_and_bad_operands_match_erts() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 2, None).unwrap();
+    let mut vm = common::node();
+    common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 2).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -87,11 +90,9 @@ fn append_collects_with_live_plus_one_roots_like_erts() {
     reference.load(APPEND_MODULE, &beam).unwrap();
     let expected = reference.call(APPEND_MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(APPEND_MODULE, "run", &[], 2, None)
-        .unwrap();
+    let mut vm = common::node();
+    common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled(APPEND_MODULE, "run", &[], 2).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -123,10 +124,8 @@ fn append_successor_takes_its_owner_from_the_collected_register() {
     reference.load(RETAINED_MODULE, &beam).unwrap();
     let expected = reference.call(RETAINED_MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
-    let actual = vm
-        .eval_scheduled(RETAINED_MODULE, "run", &[], 2, None)
-        .unwrap();
+    let mut vm = common::node();
+    common::load_fresh(&mut vm, &beam);
+    let actual = vm.eval_scheduled(RETAINED_MODULE, "run", &[], 2).unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

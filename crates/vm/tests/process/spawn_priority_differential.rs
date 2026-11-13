@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const MODULE: &str = "spawn_priority_diff";
 const SOURCE: &str = r#"
@@ -44,9 +43,9 @@ fn spawn_opt_priority_is_visible_through_spawn_proc_lib_and_gen_server() {
     reference.load(MODULE, &beam).unwrap();
     let expected = reference.call(MODULE, "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1).unwrap();
 
     let high = OwnedTerm::Tuple(vec![OwnedTerm::atom("priority"), OwnedTerm::atom("high")]);
     similar_asserts::assert_eq!(

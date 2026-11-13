@@ -4,7 +4,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
-use arinsal_vm::Vm;
 
 #[test]
 fn spawn_entry_arguments_match_otp() {
@@ -36,11 +35,11 @@ fn spawn_entry_arguments_match_otp() {
         .unwrap();
     reference.load("spawn_args_entry", &beam).unwrap();
     let expected = reference.call("spawn_args_entry", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("spawn_args_entry", "run", &[], 2, None)
+        .eval_scheduled("spawn_args_entry", "run", &[], 2)
         .unwrap();
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
-    assert_eq!(expected, CallResult::Ok(canonical));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(canonical));
 }

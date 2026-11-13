@@ -3,7 +3,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 use socket2::SockRef;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::Duration;
@@ -384,8 +383,8 @@ fn gen_udp_matches_erts() {
     reference
         .load("inet_udp_diff", &beam)
         .expect("load reference module");
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load arinsal module");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let multicast_available = match multicast_probe() {
         Ok(()) => true,
         Err(reason) => {
@@ -425,7 +424,7 @@ fn gen_udp_matches_erts() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval_scheduled("inet_udp_diff", "run", &[arg], 2, None)
+            .eval_scheduled("inet_udp_diff", "run", &[arg], 2)
             .unwrap_or_else(|error| panic!("{case}: {error}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
     }

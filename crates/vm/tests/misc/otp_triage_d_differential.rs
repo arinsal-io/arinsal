@@ -1,7 +1,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "otp_triage_d_differential";
@@ -120,7 +119,7 @@ fn otp_case_roots_match_otp_29_1_1() {
         .compile_named(MODULE, SOURCE, &[])
         .expect("compile differential scenarios");
     reference.load(MODULE, &beam).expect("load into erl");
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load into Arinsal");
 
     for case in [
@@ -136,7 +135,7 @@ fn otp_case_roots_match_otp_29_1_1() {
         let expected = reference.call(MODULE, "run", &[OwnedTerm::Atom(case.into())]);
         let argument = Term::atom(global_atoms().intern(case).expect("case atom"));
         let actual = vm
-            .eval_scheduled(MODULE, "run", &[argument], 1, None)
+            .eval_scheduled(MODULE, "run", &[argument], 1)
             .unwrap_or_else(|error| panic!("{MODULE}:run({case}): {error}"));
         assert_eq!(
             expected,

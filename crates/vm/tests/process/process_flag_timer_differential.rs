@@ -5,7 +5,7 @@
 //! and through `apply`.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(pflag_timer).
@@ -192,9 +192,9 @@ fn run(function: &str) {
         .load("pflag_timer", &beam)
         .expect("load reference module");
     let expected = reference.call("pflag_timer", function, &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("pflag_timer", function, &[], 2, None) {
+    let actual = match vm.eval_scheduled("pflag_timer", function, &[], 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

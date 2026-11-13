@@ -3,7 +3,7 @@
 //! badarg causes in `error_info`.
 
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(register_bif).
@@ -96,9 +96,9 @@ fn register_bifs_match_otp() {
         .load("register_bif", &beam)
         .expect("load reference module");
     let expected = reference.call("register_bif", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("register_bif", "run", &[], 2, None) {
+    let actual = match vm.eval_scheduled("register_bif", "run", &[], 2) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

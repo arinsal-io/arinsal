@@ -1,8 +1,8 @@
-//! Inet driver state belongs to a port's runtime-local driver data.
+//! Inet driver state belongs to a port's runtime-local driver data: two nodes in two OS
+//! processes allocate colliding port ids without interfering.
 
 use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
@@ -74,12 +74,9 @@ fn port_ids(result: OwnedTerm) -> (u64, u64) {
     (*tcp_id, *udp_id)
 }
 
+/// One node of the test: its own `arinsal` OS process, as erts tests start peer nodes.
 fn run_vm(beam: Vec<u8>) -> OwnedTerm {
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load isolation module");
-    vm.eval_scheduled("inet_driver_vm_isolation", "run", &[], 2, None)
-        .expect("run isolated TCP and UDP sockets")
-        .term
+    crate::common::peer_eval(&[], &[&beam], "inet_driver_vm_isolation:run()")
 }
 
 #[test]

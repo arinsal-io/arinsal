@@ -1,5 +1,4 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_select_diff).
@@ -143,10 +142,10 @@ fn ets_select_family_matches_otp_29() {
         "info",
     ] {
         let expected = reference.call("ets_select_diff", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("ets_select_diff", function, &[], 2, None)
+            .eval_scheduled("ets_select_diff", function, &[], 2)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }

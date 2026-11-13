@@ -240,8 +240,7 @@ fn breakpoint(
         .iter()
         .any(|(_, candidate, _)| *candidate == line)
     {
-        let appears_in_source =
-            crate::beamasm_integration::native_code_has_line(vm.code_scope, &module, line);
+        let appears_in_source = crate::beamasm_integration::native_code_has_line(&module, line);
         return result_error(
             process,
             O::Tuple(vec![
@@ -264,7 +263,6 @@ fn breakpoint(
         enable == Term::atom(arinsal_term::atoms::TRUE),
     );
     crate::beamasm_integration::patch_native_line_breakpoint(
-        vm.code_scope,
         &module,
         line,
         enable == Term::atom(arinsal_term::atoms::TRUE),

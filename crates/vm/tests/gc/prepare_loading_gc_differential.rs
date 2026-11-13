@@ -9,7 +9,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
 
 const MODULE: &str = "prepare_loading_gc_differential";
 const TARGET: &str = "prepare_loading_gc_target";
@@ -104,15 +103,15 @@ fn compare(function: &str, step: Option<&str>) {
     }
     let expected = reference.call(MODULE, function, &owned_args);
 
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let mut heap = VecHeap::new();
     let args: Vec<_> = owned_args
         .iter()
         .map(|term| from_owned(term, &mut heap).unwrap())
         .collect();
     let actual = vm
-        .eval_scheduled(MODULE, function, &args, 2, None)
+        .eval_scheduled(MODULE, function, &args, 2)
         .unwrap_or_else(|error| panic!("{function} {step:?}: {error}"));
     let actual = CallResult::Ok(actual.term);
     if expected != actual {

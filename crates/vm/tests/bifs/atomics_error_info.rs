@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(atomics_error_info_diff).
@@ -26,10 +25,10 @@ fn atomics_error_three_preserves_error_info_in_stacktrace() {
         .unwrap();
     reference.load("atomics_error_info_diff", &beam).unwrap();
     let expected = reference.call("atomics_error_info_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("atomics_error_info_diff", "run", &[], 1, None)
+        .eval_scheduled("atomics_error_info_diff", "run", &[], 1)
         .unwrap()
         .term;
     let CallResult::Ok(expected) = expected else {

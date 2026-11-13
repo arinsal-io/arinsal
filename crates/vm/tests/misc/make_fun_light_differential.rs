@@ -1,7 +1,6 @@
 //! `erlang:make_fun/3` called from native code (the light BIF entry) matches erts.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(make_fun_diff).
@@ -37,10 +36,10 @@ fn make_fun_matches_erts() {
         .load("make_fun_diff", &beam)
         .expect("load reference");
     let expected = reference.call("make_fun_diff", "run", &[]);
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("make_fun_diff", "run", &[], 1, None)
+        .eval_scheduled("make_fun_diff", "run", &[], 1)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }

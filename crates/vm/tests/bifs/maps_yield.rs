@@ -3,7 +3,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(maps_yield_diff).
@@ -85,10 +84,10 @@ fn yielding_map_bifs_match_otp_29() {
     reference.load("maps_yield_diff", &beam).unwrap();
     for function in ["build", "merge"] {
         let expected = reference.call("maps_yield_diff", function, &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
-            .eval_scheduled("maps_yield_diff", function, &[], 2, None)
+            .eval_scheduled("maps_yield_diff", function, &[], 2)
             .unwrap_or_else(|error| panic!("{function}: {error}"));
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
@@ -119,10 +118,10 @@ fn yielding_map_bifs_match_otp_29() {
         );
     }
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("maps_yield_diff", "trap_count", &[], 2, None)
+        .eval_scheduled("maps_yield_diff", "trap_count", &[], 2)
         .unwrap_or_else(|error| panic!("trap_count: {error}"));
     let actual_counts = trap_counts(CallResult::Ok(actual.term));
     for index in [0, 1, 2, 4] {

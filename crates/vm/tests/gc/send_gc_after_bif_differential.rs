@@ -6,7 +6,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 
 const SOURCE: &str = r##"
 -module(send_gc_after_bif_differential).
@@ -75,15 +74,14 @@ fn assert_matches_otp(k: i64) {
         "run",
         &[OwnedTerm::Int(k)],
     );
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load into arinsal");
+    let mut vm = crate::common::node();
+    crate::common::load_fresh(&mut vm, &beam);
     let actual = vm
         .eval_scheduled(
             "send_gc_after_bif_differential",
             "run",
             &[Term::small(k).unwrap()],
             2,
-            None,
         )
         .unwrap_or_else(|error| panic!("K {k}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term.clone()), "K {k}");

@@ -1,5 +1,8 @@
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_vm::Vm;
+
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
 
 const SOURCE: &str = r#"
 -module(port_data_race_diff).
@@ -52,10 +55,10 @@ fn port_set_get_data_race_matches_erts() {
         .expect("compile");
     reference.load("port_data_race_diff", &beam).unwrap();
     let expected = reference.call("port_data_race_diff", "run", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load");
+    let mut vm = common::node();
+    common::load_fresh(&mut vm, &beam);
     let actual = vm
-        .eval_scheduled("port_data_race_diff", "run", &[], 8, None)
+        .eval_scheduled("port_data_race_diff", "run", &[], 8)
         .expect("run");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

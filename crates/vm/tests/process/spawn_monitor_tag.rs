@@ -1,5 +1,5 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(spawn_monitor_tag).
@@ -28,9 +28,9 @@ fn spawn_request_monitor_tag_matches_otp() {
         .expect("load reference module");
     let expected = reference.call("spawn_monitor_tag", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("spawn_monitor_tag", "run", &[], 1, None) {
+    let actual = match vm.eval_scheduled("spawn_monitor_tag", "run", &[], 1) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

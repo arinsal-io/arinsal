@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use arinsal_difftest::RefErl;
 use arinsal_etf::{OwnedTerm, decode};
-use arinsal_vm::Vm;
 
 static STDIO: Mutex<()> = Mutex::new(());
 
@@ -131,9 +130,9 @@ fn scheduled(function: &str) -> OwnedTerm {
 }
 
 fn scheduled_args(function: &str, args: &[arinsal_term::Term]) -> OwnedTerm {
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(beam()).unwrap();
-    vm.eval_scheduled("tty_diff", function, args, 1, None)
+    vm.eval_scheduled("tty_diff", function, args, 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"))
         .term
 }
@@ -461,12 +460,7 @@ fn width_locale_and_badarg_match_erl() {
         &[],
         "begin ok = prim_tty:load(), {prim_tty:sizeof_wchar(), [prim_tty:wcswidth(<<C:32/native-signed>>) || C <- [65, 10, 16#1F600, 0]]} end",
     );
-    let mut vm = Vm::new([]);
-    vm.load_bytes(beam()).unwrap();
-    let actual = vm
-        .eval_scheduled("tty_diff", "chars", &[], 1, None)
-        .unwrap()
-        .term;
+    let actual = scheduled("chars");
     let OwnedTerm::Tuple(parts) = &actual else {
         panic!("chars {actual}");
     };

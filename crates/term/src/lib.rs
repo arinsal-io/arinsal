@@ -108,8 +108,7 @@ pub use record::{
     term_sequence_small,
 };
 pub use record_table::{
-    delete_module_record_definitions, drop_record_scope, find_record_definition_in,
-    put_record_definition, set_record_scope,
+    delete_module_record_definitions, find_record_definition, put_record_definition,
 };
 pub use rwmutex::{
     FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, current_reader_group,

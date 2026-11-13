@@ -11,7 +11,6 @@ pub fn command(args: &[String]) -> Result<(), VmError> {
         .map_or(1, |count| count.get())
         .saturating_sub(2)
         .max(1);
-    let mut simulation_seed = None;
     while let Some(flag) = args.get(at).map(String::as_str) {
         match flag {
             "-pa" => {
@@ -27,14 +26,6 @@ pub fn command(args: &[String]) -> Result<(), VmError> {
                     .and_then(|value| value.parse::<usize>().ok())
                     .filter(|&value| value > 0)
                     .ok_or_else(|| VmError::Load(format!("{flag} needs a positive count")))?;
-                at += 2;
-            }
-            "--sim" | "+Zsim" => {
-                simulation_seed = Some(
-                    args.get(at + 1)
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .ok_or_else(|| VmError::Load(format!("{flag} needs a seed")))?,
-                );
                 at += 2;
             }
             _ => break,
@@ -70,7 +61,7 @@ pub fn command(args: &[String]) -> Result<(), VmError> {
         .ok_or_else(|| VmError::Load(format!("module {module} not found")))?;
     vm.load_file(&path)?;
     let start = Instant::now();
-    let outcome = vm.eval_scheduled(module, function, &values, workers, simulation_seed)?;
+    let outcome = vm.eval_scheduled(module, function, &values, workers)?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     println!("{}", outcome.text);
     println!("{function} {elapsed:.3}ms");

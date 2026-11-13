@@ -3,8 +3,6 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 const MODULE: &str = "exit_reductions_test";
 
@@ -29,14 +27,14 @@ fn exit_reductions_match_otp() {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     let CallResult::Ok(expected) = reference.call(MODULE, "per_exit", &[]) else {
         panic!("OTP per_exit failed");
     };
     let actual = vm
-        .eval_scheduled_reductions(MODULE, "per_exit", &[], 1, None, 4_000)
+        .eval_scheduled_reductions(MODULE, "per_exit", &[], 1, 4_000)
         .unwrap();
-    assert_eq!(expected, actual.term);
+    similar_asserts::assert_eq!(expected, actual.term);
     assert!(matches!(expected, OwnedTerm::Int(reds) if reds >= 10));
 }

@@ -144,7 +144,7 @@ fn load_order(reference: &RefErl) -> Vec<String> {
 }
 
 fn run(vm: &mut Vm, function: &str, owned_args: &[OwnedTerm], terms: &[Term]) -> OwnedTerm {
-    vm.eval_scheduled("code_fix_probe", function, terms, 1, None)
+    vm.eval_scheduled("code_fix_probe", function, terms, 1)
         .unwrap_or_else(|error| panic!("{function} {owned_args:?}: {error}"))
         .term
 }
@@ -167,7 +167,7 @@ fn lists_module_info_matches_erts_export_order() {
     }
     let order = load_order(&reference);
     let mut beams = std::collections::HashMap::new();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     for name in &order {
         let bytes = object_code(&reference, name);
         vm.note_beam_exports(&bytes)
@@ -199,7 +199,7 @@ fn lists_module_info_matches_erts_export_order() {
         .compile_named("code_fix_probe", PROBE, &[])
         .unwrap();
     reference.load("code_fix_probe", &probe).unwrap();
-    vm.load_bytes(&probe).unwrap();
+    crate::common::load_fresh(&mut vm, &probe);
 
     diff(
         &reference,
@@ -345,7 +345,9 @@ fn purged_module_versions_stay_bounded() {
         );
         similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::atom("ok")));
     }
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
+    let baseline_live = vm.module_storage_count();
+    let baseline_table = vm.module_table_len();
     vm.load_bytes(&reclaim).unwrap();
     for _ in 0..1000 {
         vm.load_next_version(&reclaim).unwrap();
@@ -353,7 +355,7 @@ fn purged_module_versions_stay_bounded() {
     let stored = vm.module_storage_count();
     let len = vm.module_table_len();
     assert!(
-        stored <= 3 && len <= 4,
-        "module storage grew: live {stored}, table {len}"
+        stored <= baseline_live + 3 && len <= baseline_table + 4,
+        "module storage grew from live {baseline_live}, table {baseline_table} to live {stored}, table {len}"
     );
 }

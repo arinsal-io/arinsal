@@ -1,5 +1,5 @@
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
-use arinsal_vm::{Vm, VmError};
+use arinsal_vm::VmError;
 
 const SOURCE: &str = r#"
 -module(records_doctest_stack).
@@ -26,9 +26,9 @@ fn records_doctest_error_stack_matches_otp() {
         .expect("load reference module");
     let expected = reference.call("records_doctest_stack", "run", &[]);
 
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load VM module");
-    let actual = match vm.eval_scheduled("records_doctest_stack", "run", &[], 1, None) {
+    let actual = match vm.eval_scheduled("records_doctest_stack", "run", &[], 1) {
         Ok(outcome) => CallResult::Ok(outcome.term),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),
