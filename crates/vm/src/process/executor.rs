@@ -273,16 +273,8 @@ impl Executor {
                     process.gc_live = 0;
                     process.set_native_resume_arity(0);
                     let self_wait = std::mem::take(&mut process.native_wait_self);
-                    if self_wait {
-                        if let Err(error) = process.fetch_signals(ctx) {
-                            return Some(Err(error));
-                        }
-                    } else {
-                        match Vm::mailbox_ready_to_wait(process, &mut Some(&mut *ctx)) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(error) => return Some(Err(error)),
-                        }
+                    if self_wait && let Err(error) = process.fetch_signals(ctx) {
+                        return Some(Err(error));
                     }
                     return Some(Ok(RunState::Wait { timeout_pos }));
                 }

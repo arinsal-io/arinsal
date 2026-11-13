@@ -106,29 +106,6 @@ impl Vm {
             frame: self.frame_name(p),
         }
     }
-    /// Report whether `wait` / `wait_timeout` may block: nothing waits in the middle queue, the
-    /// outer queue or the message queue past the save pointer.
-    ///
-    /// A scheduling quantum can expire on the wait instruction after `loop_rec`
-    /// has already observed an empty mailbox. Signals that arrived since send the
-    /// process back to `loop_rec`, which fetches them, instead of sleeping with them queued.
-    pub(crate) fn mailbox_ready_to_wait(
-        process: &mut Process,
-        ctx: &mut Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-    ) -> Result<bool, VmError> {
-        let ctx = ctx
-            .as_deref_mut()
-            .ok_or_else(|| VmError::Unsupported("receive requires a scheduler".into()))?;
-        // erts reaches `wait` from `loop_rec` with the message queue lock held: nothing can
-        // arrive in between, and `wait` does not fetch. Here signals that arrived since (or are
-        // left in the middle queue) send the process back to `loop_rec`, whose receive helper
-        // fetches and handles them.
-        if ctx.has_pending_input() || !process.sig_cont_empty() {
-            return Ok(false);
-        }
-        Ok(process.inbox.peek().is_none())
-    }
-
     /// Puts the process at the code address of function entry `target` of module `module_id`,
     /// as erts jumps to the export's code address. Every function has native code; a target
     /// that is not a function entry of it is an error.
