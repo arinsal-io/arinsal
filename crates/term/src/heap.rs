@@ -1142,6 +1142,59 @@ impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
     }
 }
 
+/// `ErtsHeapFactory` of a process in `FACTORY_HALLOC` mode: the saved allocation state plus the
+/// block `erts_factory_proc_prealloc_init` took, kept between the slices of a trapping BIF.
+///
+/// Port of erts/emulator/beam/erl_message.c (`erts_factory_proc_prealloc_init`,
+/// `erts_factory_close`, `erts_factory_undo`) and the `hp`/`hp_end` fields of `ErtsHeapFactory`
+/// in erl_message.h, OTP-29.1.1. The process heap stays live and GC disabled while it is
+/// parked, as for the BIF argument roots erts holds across a trap.
+pub struct HeapFactory {
+    mark: HeapFactoryMark,
+    block: Option<HeapReservationState>,
+}
+
+impl HeapFactory {
+    /// `erts_factory_proc_prealloc_init(&factory, p, size)`: save the allocation state and
+    /// `HAlloc` `size` words (a heap fragment when the young heap is full).
+    pub fn proc_prealloc_init(heap: &mut ProcessHeap, size: usize) -> Result<Self, TermError> {
+        let mark = heap.factory_mark();
+        let block = HeapReservation::new(heap, size)?.suspend();
+        Ok(Self {
+            mark,
+            block: Some(block),
+        })
+    }
+
+    /// Take the `hp`/`hp_end` block out of the factory to produce heap from it.
+    ///
+    /// # Panics
+    /// When the block is already taken or was closed.
+    pub fn open<'a>(&mut self, heap: &'a mut ProcessHeap) -> HeapReservation<'a, ProcessHeap> {
+        HeapReservation::resume(heap, self.block.take().expect("factory block is parked"))
+    }
+
+    /// Park the block after a slice that has not finished (`ctx->u.dc.factory` stays).
+    pub fn park(&mut self, block: HeapReservation<'_, ProcessHeap>) {
+        assert!(self.block.is_none(), "factory block is already parked");
+        self.block = Some(block.suspend());
+    }
+
+    /// `erts_factory_close`: `HRelease(p, hp_end, hp)` on a parked block.
+    pub fn close(&mut self, heap: &mut ProcessHeap) {
+        if let Some(block) = self.block.take() {
+            drop(HeapReservation::resume(heap, block));
+        }
+    }
+
+    /// `erts_factory_undo`: release the tail, then drop the off-heap entries and fragments
+    /// allocated since `proc_prealloc_init` and restore the heap top.
+    pub fn undo(&mut self, heap: &mut ProcessHeap) {
+        self.close(heap);
+        heap.factory_undo(self.mark);
+    }
+}
+
 impl<'a> HeapReservation<'a, ProcessHeap> {
     /// Borrow the reserved words once as a safe slice-backed allocator.
     ///
