@@ -614,7 +614,7 @@ fn binary_to_term_start(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
     let call_args = [process.x[0], process.x[1]];
     let args = &call_args[..arity];
     // `ERTS_BIF_REDS_LEFT(p) * B2T_BYTES_PER_REDUCTION`.
-    let reds = (process.heap.abi.fcalls.max(0) as usize).max(1);
+    let reds = process.heap.abi.fcalls.max(0) as usize;
     let initial_reds = reds.saturating_mul(B2T_BYTES_PER_REDUCTION);
     let local_node = arinsal_term::this_node();
     let mut prepared = None;
@@ -693,7 +693,7 @@ pub(crate) extern "C" fn binary_to_term_trap_1(
         return bif_ret(c_p, i, Err(badarg()));
     };
     let initial_reds =
-        ((process.heap.abi.fcalls.max(0) as usize).max(1)).saturating_mul(B2T_BYTES_PER_REDUCTION);
+        (process.heap.abi.fcalls.max(0) as usize).saturating_mul(B2T_BYTES_PER_REDUCTION);
     match b2t_step(process, &mut context.walk, initial_reds) {
         Ok((None, _)) => {
             // The context stays in its magic binary: BUMP_ALL_REDS, BIF_TRAP1 with the same ref.

@@ -1960,9 +1960,8 @@ fn trace_delivered(
         let Ok(message) = Message::from_owned(&reply) else {
             return;
         };
-        if let Ok(scheduler) = runtime.scheduler() {
-            let _ = scheduler.send(caller, caller, message);
-        }
+        // erts_send_sys_msg_proc(rp->common.id, rp->common.id, msg, bp).
+        crate::erl_trace::send_sys_msg_proc(runtime, caller, caller, message);
     });
     Ok(reference)
 }

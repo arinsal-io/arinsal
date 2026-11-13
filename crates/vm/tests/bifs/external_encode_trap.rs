@@ -83,13 +83,7 @@ fn term_to_binary_family_matches_otp_on_big_terms() {
             panic!("OTP failed case {index}");
         };
         let actual = vm
-            .eval_scheduled_reductions(
-                MODULE,
-                "run",
-                &[Term::small(index).unwrap()],
-                1,
-                4_000,
-            )
+            .eval_scheduled_reductions(MODULE, "run", &[Term::small(index).unwrap()], 1, 4_000)
             .unwrap_or_else(|error| panic!("Arinsal failed case {index}: {error:?}"))
             .term;
         let (expected_check, expected_size) = split(expected);
