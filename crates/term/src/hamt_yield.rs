@@ -30,6 +30,13 @@ macro_rules! tick {
     }};
 }
 
+/// Reductions YCF charges per iteration of a loop nested `depth` loops deep in its function: the
+/// transform wraps every enclosing loop body once more (ycf_yield_fun.c, loop consume
+/// insertion), so a nested loop pays twice as much per level. Read off the generated
+/// erl_map.ycf.h (hashmap_from_unsorted_array, _sorted_unique_array, _chunked_array).
+const LOOP_DEPTH_2: i64 = 2;
+const LOOP_DEPTH_3: i64 = 4;
+
 thread_local! {
     /// `esdp->rand_state`: per-scheduler counter hashed by `erts_sched_local_random`.
     static RAND_STATE: Cell<Option<u64>> = const { Cell::new(None) };
@@ -560,7 +567,7 @@ impl Unsorted {
                 UnsortedPhase::JxTest => {
                     if self.jx < n && hxns[self.ix].hx == hxns[self.jx].hx {
                         self.ph = UnsortedPhase::JxBody;
-                        *reds -= 1;
+                        *reds -= LOOP_DEPTH_2;
                         if *reds <= 0 {
                             return UnsortedOut::Yield;
                         }
@@ -587,7 +594,7 @@ impl Unsorted {
                 UnsortedPhase::RegionTest => {
                     if self.ix < self.jx {
                         self.ph = UnsortedPhase::RegionBody;
-                        *reds -= 1;
+                        *reds -= LOOP_DEPTH_2;
                         if *reds <= 0 {
                             return UnsortedOut::Yield;
                         }
@@ -606,7 +613,7 @@ impl Unsorted {
                         && crate::exact_eq(leaf_key(hxns[self.ix].val), leaf_key(hxns[self.lx].val))
                     {
                         self.ph = UnsortedPhase::DupBody;
-                        *reds -= 1;
+                        *reds -= LOOP_DEPTH_3;
                         if *reds <= 0 {
                             return UnsortedOut::Yield;
                         }
@@ -703,7 +710,7 @@ impl SortedUnique {
                 }
                 SortedPhase::JTest => {
                     if self.jx < n && hxns[self.ix].hx == hxns[self.jx].hx {
-                        tick!(self, reds, 1, SortedPhase::JBody);
+                        tick!(self, reds, LOOP_DEPTH_2, SortedPhase::JBody);
                     }
                     self.n_colliders = self.jx - self.ix;
                     let mut builder = TermBuilder::new(heap)
@@ -719,7 +726,7 @@ impl SortedUnique {
                 }
                 SortedPhase::ForTest => {
                     if self.i < self.n_colliders {
-                        tick!(self, reds, 1, SortedPhase::ForBody);
+                        tick!(self, reds, LOOP_DEPTH_2, SortedPhase::ForBody);
                     }
                     self.ph = SortedPhase::ForEnd;
                 }
@@ -1023,7 +1030,7 @@ impl Chunked {
                 let wat = d.max(dn);
                 let mut dc = HAMT_MAX_LEVEL - 1;
                 while dc > wat {
-                    remaining_reds -= 1;
+                    remaining_reds -= LOOP_DEPTH_2;
                     if remaining_reds <= 0 {
                         self.elems = elems;
                         self.ix = ix;
@@ -1047,7 +1054,7 @@ impl Chunked {
 
             if d < dn {
                 while d < dn {
-                    remaining_reds -= 1;
+                    remaining_reds -= LOOP_DEPTH_2;
                     if remaining_reds <= 0 {
                         self.elems = elems;
                         self.ix = ix;
@@ -1074,7 +1081,7 @@ impl Chunked {
                 self.push2(res.bits(), hdr | bp);
             } else {
                 while dn != d {
-                    remaining_reds -= 1;
+                    remaining_reds -= LOOP_DEPTH_2;
                     if remaining_reds <= 0 {
                         self.elems = elems;
                         self.ix = ix;
@@ -1096,17 +1103,17 @@ impl Chunked {
                         TermBuilder::new(heap).reserve_boxed_words(sz + 1, HALLOC_EXTRA)?;
                     builder.write_words(&[node_bitmap_header(hdr), res.bits()])?;
                     sz -= 1;
-                    if sz != 0 && remaining_reds > 1 {
-                        let count = sz.min((remaining_reds - 1) as usize);
+                    if sz != 0 && remaining_reds > LOOP_DEPTH_3 {
+                        let count = sz.min(((remaining_reds - 1) / LOOP_DEPTH_3) as usize);
                         let stack_start = self.stack.len() - count;
                         builder.write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
                         self.stack.truncate(stack_start);
                         sz -= count;
-                        remaining_reds -= count as i64;
+                        remaining_reds -= count as i64 * LOOP_DEPTH_3;
                     }
                     if sz != 0 {
                         sz -= 1;
-                        remaining_reds -= 1;
+                        remaining_reds -= LOOP_DEPTH_3;
                         self.elems = elems;
                         self.ix = ix;
                         self.d = d;
@@ -1244,7 +1251,7 @@ impl Chunked {
                 }
                 C::L4Test => {
                     if self.dc > self.wat {
-                        chunk_tick!(1, C::L4Body);
+                        chunk_tick!(LOOP_DEPTH_2, C::L4Body);
                     }
                     phase = C::Branch;
                 }
@@ -1269,7 +1276,7 @@ impl Chunked {
                 }
                 C::L5Test => {
                     if self.d < self.dn {
-                        chunk_tick!(1, C::L5Body);
+                        chunk_tick!(LOOP_DEPTH_2, C::L5Body);
                     }
                     self.slot = maskval(self.v, self.d);
                     self.push2(self.res.bits(), 1 << self.slot);
@@ -1284,7 +1291,7 @@ impl Chunked {
                 }
                 C::L6Test => {
                     if self.dn != self.d {
-                        chunk_tick!(1, C::L6Body);
+                        chunk_tick!(LOOP_DEPTH_2, C::L6Body);
                     }
                     self.push2(self.res.bits(), self.hdr);
                     phase = C::ElemEnd;
@@ -1303,8 +1310,8 @@ impl Chunked {
                     phase = C::L7Test;
                 }
                 C::L7Test => {
-                    if self.sz != 0 && remaining_reds > 1 {
-                        let count = self.sz.min((remaining_reds - 1) as usize);
+                    if self.sz != 0 && remaining_reds > LOOP_DEPTH_3 {
+                        let count = self.sz.min(((remaining_reds - 1) / LOOP_DEPTH_3) as usize);
                         let stack_start = self.stack.len() - count;
                         self.pending
                             .as_mut()
@@ -1312,12 +1319,12 @@ impl Chunked {
                             .write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
                         self.stack.truncate(stack_start);
                         self.sz -= count;
-                        remaining_reds -= count as i64;
+                        remaining_reds -= count as i64 * LOOP_DEPTH_3;
                     }
                     if self.sz != 0 {
                         // YCF consumes the reduction before popping the next stack word.
                         self.sz -= 1;
-                        remaining_reds -= 1;
+                        remaining_reds -= LOOP_DEPTH_3;
                         phase = C::L7Body;
                         self.ph = phase;
                         *reds = remaining_reds;
@@ -1394,8 +1401,8 @@ impl Chunked {
                     phase = C::L10Test;
                 }
                 C::L10Test => {
-                    if self.sz != 0 && remaining_reds > 1 {
-                        let count = self.sz.min((remaining_reds - 1) as usize);
+                    if self.sz != 0 && remaining_reds > LOOP_DEPTH_2 {
+                        let count = self.sz.min(((remaining_reds - 1) / LOOP_DEPTH_2) as usize);
                         let stack_start = self.stack.len() - count;
                         self.pending
                             .as_mut()
@@ -1403,11 +1410,11 @@ impl Chunked {
                             .write_term_bits_reversed(&self.stack.as_slice()[stack_start..])?;
                         self.stack.truncate(stack_start);
                         self.sz -= count;
-                        remaining_reds -= count as i64;
+                        remaining_reds -= count as i64 * LOOP_DEPTH_2;
                     }
                     if self.sz != 0 {
                         self.sz -= 1;
-                        remaining_reds -= 1;
+                        remaining_reds -= LOOP_DEPTH_2;
                         phase = C::L10Body;
                         self.ph = phase;
                         *reds = remaining_reds;

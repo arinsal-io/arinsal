@@ -342,14 +342,26 @@ const LIST_CASES: &[Case] = &[
 ];
 
 const MAPS: &[usize] = &[1, 32, 33, 1_000, 100_000];
-/// Flatmap sizes: erts sorts a hashmap's leaves with `erts_qsort`, whose pivot is seeded from
-/// scheduler-local random state (utils.c), so the constructors' charge above 32 keys varies
-/// between OTP runs (from_keys of 1000 keys: 637, 654, 685).
-const FLATMAPS: &[usize] = &[1, 32];
+/// Above 32 keys, `erts_qsort` uses a scheduler-local random pivot, so constructor charges vary
+/// between OTP runs. Compare against several reference samples below.
+const MAP_BUILD_SIZES: &[usize] = &[1, 32, 33, 1_000, 100_000];
+const MAP_BUILD_REFERENCE_SAMPLES: usize = 7;
 /// erl_map.c: the YCF-yielding constructors and projections, flat and hashmap.
 const MAP_CASES: &[Case] = &[
-    case("from_list", FLATMAPS, 10, "kv(N)", "maps:from_list(In)"),
-    case("from_keys", FLATMAPS, 8, "seq(N)", "maps:from_keys(In, v)"),
+    case(
+        "from_list",
+        MAP_BUILD_SIZES,
+        10,
+        "kv(N)",
+        "maps:from_list(In)",
+    ),
+    case(
+        "from_keys",
+        MAP_BUILD_SIZES,
+        8,
+        "seq(N)",
+        "maps:from_keys(In, v)",
+    ),
     case(
         "from_list_badarg",
         MAPS,
@@ -618,24 +630,55 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                 continue;
             }
             let function = function_name(case, size);
-            let CallResult::Ok(expected) = reference.call(MODULE, &function, &[]) else {
-                panic!("OTP {function} failed");
+            let sample_count = if size > 32 && matches!(case.name, "from_list" | "from_keys") {
+                MAP_BUILD_REFERENCE_SAMPLES
+            } else {
+                1
             };
+            let mut expected_samples = Vec::with_capacity(sample_count);
+            for _ in 0..sample_count {
+                let CallResult::Ok(expected) = reference.call(MODULE, &function, &[]) else {
+                    panic!("OTP {function} failed");
+                };
+                expected_samples.push(measured(&expected));
+            }
             let actual = vm
                 .eval_scheduled_reductions(MODULE, &function, &[], 1, 4_000)
                 .unwrap();
-            let (expected_reds, expected_ins, expected_gcs) = measured(&expected);
             let (actual_reds, actual_ins, actual_gcs) = measured(&actual.term);
+            let min_reds = expected_samples
+                .iter()
+                .map(|sample| sample.0)
+                .min()
+                .unwrap();
+            let max_reds = expected_samples
+                .iter()
+                .map(|sample| sample.0)
+                .max()
+                .unwrap();
+            let min_ins = expected_samples
+                .iter()
+                .map(|sample| sample.1)
+                .min()
+                .unwrap();
+            let max_ins = expected_samples
+                .iter()
+                .map(|sample| sample.1)
+                .max()
+                .unwrap();
+            let expected_reds = format!("{min_reds}..={max_reds}");
+            let expected_ins = format!("{min_ins}..={max_ins}");
+            let expected_gcs = expected_samples[0].2;
             eprintln!(
                 "{function}: erl reds {expected_reds} ins {expected_ins} gcs {expected_gcs}; \
                  arinsal reds {actual_reds} ins {actual_ins} gcs {actual_gcs}"
             );
-            let tolerance = SLACK_PER_SLICE * expected_ins;
-            if expected_ins != actual_ins
-                || !(expected_reds - tolerance..=expected_reds + tolerance).contains(&actual_reds)
+            let tolerance = SLACK_PER_SLICE * max_ins;
+            if !(min_ins..=max_ins).contains(&actual_ins)
+                || !(min_reds - tolerance..=max_reds + tolerance).contains(&actual_reds)
             {
                 failures.push(format!(
-                    "{function}: erl reds {expected_reds} ins {expected_ins}, arinsal reds {actual_reds} ins {actual_ins}"
+                    "{function}: erl reds {min_reds}..={max_reds} ins {min_ins}..={max_ins}, arinsal reds {actual_reds} ins {actual_ins}"
                 ));
             }
         }
