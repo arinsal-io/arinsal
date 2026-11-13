@@ -27,7 +27,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "list_to_binary", 1) => v.entry::<bodies::list_to_binary>(),
         ("erlang", "iolist_to_binary", 1) => v.entry::<bodies::iolist_to_binary>(),
         ("erlang", "iolist_to_iovec", 1) => v.entry::<bodies::iolist_to_iovec>(),
-        ("erlang", "iolist_size", 1) => v.entry::<bodies::iolist_size>(),
         ("erlang", "bitstring_to_list", 1) => v.entry::<bodies::bitstring_to_list>(),
         ("erlang", "list_to_bitstring", 1) => v.entry::<bodies::list_to_bitstring>(),
         ("erlang", "split_binary", 2) => v.entry::<word_bodies::split_binary>(),
@@ -829,13 +828,6 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let (_, copy_used) = walk.copy_step(usize::MAX).map_err(|(error, _)| error)?;
     ctx.charge_reductions(iolist_yield_reductions(size_used) + iolist_yield_reductions(copy_used));
     walk.finish(&mut ctx.heap)
-}
-
-// Port of erts/emulator/beam/erl_iolist.c:938-1093 (iolist_size_1), OTP-29.1.1.
-fn iolist_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let size = iolist_size_value(args[0])?;
-    ctx.charge_reductions(size);
-    integer(ctx, size)
 }
 
 // Port of erts/emulator/beam/erl_iolist.c:114-397 (generic_iolist_size), OTP-29.1.1.
@@ -2117,7 +2109,6 @@ crate::bif_bodies!(
     list_to_binary,
     iolist_to_binary,
     iolist_to_iovec,
-    iolist_size,
     bitstring_to_list,
     list_to_bitstring,
 );
