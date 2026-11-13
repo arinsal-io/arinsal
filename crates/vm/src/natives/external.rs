@@ -10,6 +10,7 @@
 //! `{Term, Opts, MagicRef, BifIx}` (`RETURN_STATE`).
 
 use crate::Process;
+use crate::bif_traps::TrapContext;
 use crate::natives::bif::{badarg, bif_ret};
 use crate::natives::erl_bif_lists::bif_trap;
 use crate::natives::erl_iolist::{charge, create_holder, gc_enable};
@@ -17,7 +18,6 @@ use crate::natives::external_dec::{B2tContext, B2tState};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, EncodeWalk, ProcessHeapHandle};
 use arinsal_term::{RefcBinary, Term, TermBuilder, atoms};
-use std::sync::Mutex;
 
 /// `TERM_TO_BINARY_LOOP_FACTOR`.
 const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
@@ -61,7 +61,7 @@ struct TtbContext {
     walk: EncodeWalk,
 }
 
-type TtbHolder = Mutex<Option<TtbContext>>;
+type TtbHolder = TrapContext<Option<TtbContext>>;
 
 /// What one pass of `erts_term_to_binary_int` produced.
 enum TtbStep {
@@ -559,7 +559,7 @@ const ERTS_B2T_CONTEXT_SIZE: usize = 296;
 
 const BINARY_TO_TERM_TRAP: &str = "erts_internal:binary_to_term_trap/1";
 
-pub(crate) type B2tHolder = Mutex<Option<Box<B2tContext<'static>>>>;
+pub(crate) type B2tHolder = TrapContext<Option<Box<B2tContext<'static>>>>;
 
 /// Why `b2t_run` left the loop.
 enum B2tExit {
@@ -842,3 +842,8 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
         }
     }
 }
+
+arinsal_term::magic_payload!(
+    TtbHolder => ttb_context_destructor,
+    B2tHolder => b2t_context_destructor,
+);

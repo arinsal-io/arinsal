@@ -8,12 +8,12 @@
 //! the other arguments unchanged; the export calls the same body, which recognises its state.
 
 use crate::VmError;
+use crate::bif_traps::TrapContext;
 use crate::natives::bif::bif_ret;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, BifError, Ctx, MapsBuildWalk, MapsProjectionWalk, ProcessHeapHandle};
 use arinsal_maps::{HashmapMergeContext, MAP_MERGE_LOOP_FACTOR};
-use arinsal_term::{MagicRef, Term, TermBuilder, atoms};
-use std::sync::{Arc, Mutex};
+use arinsal_term::{MagicBin, Term, TermBuilder, atoms};
 
 /// `sizeof(erts_ycf_trap_driver_state_holder)` on a 64-bit build: the magic binary's
 /// `orig_size`.
@@ -26,9 +26,9 @@ const FROM_LIST_ITERATIONS_PER_RED: i64 = 40;
 const PROJECTION_ITERATIONS_PER_RED: i64 = 15;
 
 /// The YCF trap state of `maps:from_list/1` and `maps:from_keys/2`.
-type BuildState = Mutex<Option<MapsBuildWalk>>;
+type BuildState = TrapContext<Option<MapsBuildWalk>>;
 /// The YCF trap state of `maps:keys/1` and `maps:values/1`.
-type ProjectionState = Mutex<Option<MapsProjectionWalk>>;
+type ProjectionState = TrapContext<Option<MapsProjectionWalk>>;
 
 /// `maps:from_list/1`.
 // Port of erts/emulator/beam/erl_map.c (maps_from_list_1), OTP-29.1.1.
@@ -205,12 +205,12 @@ fn ycf_trap(
 /// `erts_mk_magic_ref` of a new trap state.
 // Port of erts/emulator/beam/utils.c (erts_ycf_trap_driver: the "We need to trap" arm),
 // OTP-29.1.1.
-fn create_state_mref<T: std::any::Any + Send + Sync>(
+fn create_state_mref<T: arinsal_term::MagicPayload>(
     process: &mut crate::Process,
     state: T,
     c_payload_size: usize,
 ) -> Result<Term, VmError> {
-    let state: Arc<MagicRef> = MagicRef::with_erts_payload_size_and_refn(
+    let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         state,
         c_payload_size,
         arinsal_bifs::next_ref_words(),
@@ -305,7 +305,7 @@ fn build_first_trap(
 ) -> u64 {
     let state_mref = match create_state_mref::<BuildState>(
         process,
-        Mutex::new(Some(walk)),
+        TrapContext::new(Some(walk)),
         ERTS_YCF_TRAP_HOLDER_SIZE,
     ) {
         Ok(state_mref) => state_mref,
@@ -377,7 +377,7 @@ fn projection_hashmap(
     }
     let state_mref = match create_state_mref::<ProjectionState>(
         process,
-        Mutex::new(Some(walk)),
+        TrapContext::new(Some(walk)),
         ERTS_YCF_TRAP_HOLDER_SIZE,
     ) {
         Ok(state_mref) => state_mref,
@@ -429,7 +429,7 @@ fn projection_resume(
 const ERTS_HASHMAP_MERGE_CONTEXT_SIZE: usize = 56;
 
 /// The trap state of `hashmap_merge`: the `HashmapMergeContext` of its magic binary.
-type MergeState = Mutex<Option<HashmapMergeContext>>;
+type MergeState = TrapContext<Option<HashmapMergeContext>>;
 
 /// `BIF_P->fvalue = value; BIF_ERROR(BIF_P, BADMAP)` (`tag` is `badmap`) or `BADKEY`: the
 /// `{Tag, Value}` reason `expand_error_value` builds, raised with the BIF's frame.
@@ -629,7 +629,7 @@ fn hashmap_merge(
                 None => {
                     let created = create_state_mref::<MergeState>(
                         process,
-                        Mutex::new(Some(merge)),
+                        TrapContext::new(Some(merge)),
                         ERTS_HASHMAP_MERGE_CONTEXT_SIZE,
                     );
                     match created {
@@ -876,3 +876,9 @@ pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, _reg: *mut u64, i:
         Err(error) => map_failure(c_p, i, process, "maps:take/2", 2, error),
     }
 }
+
+arinsal_term::magic_payload!(
+    BuildState => maps_from_keys_destructor,
+    ProjectionState => maps_projection_destructor,
+    MergeState => hashmap_merge_ctx_destructor,
+);

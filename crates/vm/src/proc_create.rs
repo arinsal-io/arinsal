@@ -1505,7 +1505,7 @@ pub(crate) struct BifTrapPending {
     /// The continuation export, resolved when the trap is installed (erts BIF_TRAP names the
     /// trap `Export*` directly).
     pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
-    pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,
+    pub(crate) state: arinsal_term::MagicBin,
     /// The live magic-reference thing passed to the continuation export, when erts allocates one.
     pub(crate) state_term: Option<Term>,
     pub(crate) gc_was_enabled: bool,
@@ -2310,7 +2310,7 @@ pub(crate) struct EtsFree {
 pub(crate) struct EtsSelect {
     pub(crate) tid: arinsal_ets::Tid,
     pub(crate) program: std::sync::Arc<arinsal_ets::match_spec::MatchProgram>,
-    pub(crate) program_owner: std::sync::Arc<arinsal_term::MagicRef>,
+    pub(crate) program_owner: arinsal_term::MagicBin,
     /// `select_count/2` instead of a result list.
     pub(crate) count: bool,
     /// Where the traversal resumes.

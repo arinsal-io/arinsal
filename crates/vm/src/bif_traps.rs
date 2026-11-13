@@ -2,9 +2,47 @@
 
 use super::*;
 use arinsal_bifs::BifError;
-use arinsal_term::{MagicRef, global_atoms};
+use arinsal_term::{MagicBin, global_atoms};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// The data of a trap context's magic binary: the C context struct (`ErtsAppendContext`,
+/// `TTBContext`, ...) behind the lock the resuming BIF takes. A local type so that every
+/// context gets its own named destructor.
+pub(crate) struct TrapContext<T>(Mutex<T>);
+
+impl<T> TrapContext<T> {
+    pub(crate) fn new(context: T) -> Self {
+        Self(Mutex::new(context))
+    }
+}
+
+impl<T> std::ops::Deref for TrapContext<T> {
+    type Target = Mutex<T>;
+    fn deref(&self) -> &Mutex<T> {
+        &self.0
+    }
+}
+
+/// A continuation that carries everything in its arguments: OTP allocates no context.
+pub(crate) struct NoContext;
+/// The `erts_internal:try_seize_code_mod_permission` retry flag.
+pub(crate) struct CodePermission(#[allow(dead_code)] bool);
+
+// One named destructor per trap context, as each erts trap passes its own to
+// erts_create_magic_binary (bif.c, erl_bif_binary.c, external.c, erl_map.c, ...).
+arinsal_term::magic_payload!(
+    NoContext => no_context_destructor,
+    TrapContext<arinsal_bifs::Phash2Cont> => make_hash2_destructor,
+    CodePermission => code_permission_destructor,
+    TrapContext<arinsal_bifs::UnicodeCont> => unicode_restart_destructor,
+    TrapContext<arinsal_bifs::BinarySearchWalk> => binary_find_context_destructor,
+    TrapContext<BinaryCopyState> => binary_copy_destructor,
+    TrapContext<PtabListContinuation> => cleanup_ptab_list_bif_data,
+    TrapContext<Option<Box<arinsal_re::RunState>>> => cleanup_restart_context_bin,
+    TrapContext<crate::dist::DsigSendContext> => dsig_send_context_destructor,
+
+);
 
 pub(crate) enum HandlerResult {
     Done {
@@ -13,7 +51,7 @@ pub(crate) enum HandlerResult {
     },
     Yield {
         continuation: &'static str,
-        state: Arc<MagicRef>,
+        state: MagicBin,
         reductions: u32,
     },
     /// Transfer directly to the BIF's export continuation without scheduling out.
@@ -68,16 +106,13 @@ pub(crate) fn trap_gc_policy(continuation: &str) -> TrapGc {
 }
 
 /// Whether the trap state of a parked BIF holds process-heap terms of its own.
-pub(crate) fn state_holds_heap_terms(state: &Arc<MagicRef>) -> bool {
+pub(crate) fn state_holds_heap_terms(state: &MagicBin) -> bool {
     macro_rules! any {
-        ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<Mutex<$t>>().is_some())* };
+        ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<TrapContext<$t>>().is_some())* };
     }
     any!(
         arinsal_bifs::BinaryToListWalk,
         arinsal_bifs::UnicodeCont,
-        arinsal_bifs::IolistVecWalk,
-        arinsal_bifs::IolistSizeWalk,
-        Option<crate::natives::external_dec::B2tContext<'static>>,
         arinsal_bifs::BinarySearchWalk,
         BinaryCopyState,
     )
@@ -93,7 +128,7 @@ pub(crate) enum ResumeResult {
 pub(crate) type Handler = fn(
     &mut Process,
     &[Term],
-    Option<&Arc<MagicRef>>,
+    Option<&MagicBin>,
     Option<arinsal_sched::Pid>,
     bool,
 ) -> Result<HandlerResult, BifError>;
@@ -122,7 +157,7 @@ const RE_GRUN_CONTINUATION: &str = "re:grun/3";
 const RE_URUN_CONTINUATION: &str = "re:urun/3";
 
 // C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
-// data offset is added by MagicRef::with_erts_payload_size.
+// data offset is added by MagicBin::with_erts_payload_size.
 // Port of erts/emulator/beam/erl_unicode.c (RestartContext).
 const ERTS_UNICODE_RESTART_CONTEXT_SIZE: usize = 40;
 // Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
@@ -133,11 +168,11 @@ const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
 // Port of erts/emulator/beam/erl_ptab.c (ErtsPTabListBifData).
 const ERTS_PTAB_LIST_STATE_SIZE: usize = 64;
 
-fn magic_binary_state<T: std::any::Any + Send + Sync>(
+fn magic_binary_state<T: arinsal_term::MagicPayload>(
     payload: T,
     c_payload_size: usize,
-) -> Arc<MagicRef> {
-    MagicRef::with_erts_payload_size_and_refn(
+) -> MagicBin {
+    MagicBin::with_erts_payload_size_and_refn(
         payload,
         c_payload_size,
         arinsal_bifs::next_ref_words(),
@@ -145,14 +180,14 @@ fn magic_binary_state<T: std::any::Any + Send + Sync>(
 }
 
 /// OTP keeps these continuations in BIF arguments/registers and allocates no magic binary.
-fn argument_trap_state<T: std::any::Any + Send + Sync>(payload: T) -> Arc<MagicRef> {
-    MagicRef::with_orig_size(payload, 0)
+fn argument_trap_state<T: arinsal_term::MagicPayload>(payload: T) -> MagicBin {
+    MagicBin::with_orig_size(payload, 0)
 }
 
 /// Build the continuation argument that owns an erts magic binary.
 fn trap_state_term(
     process: &mut Process,
-    state: &Arc<MagicRef>,
+    state: &MagicBin,
 ) -> Result<Option<Term>, arinsal_term::TermError> {
     if state.orig_size() == 0 {
         return Ok(None);
@@ -160,7 +195,7 @@ fn trap_state_term(
     // Port of erts/emulator/beam/erl_bif_lists.c (append_create_trap_state): the magic reference
     // thing is a live continuation argument, so its off-heap owner charges orig_size to vheap.
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let term = arinsal_term::TermBuilder::new(&mut heap).magic_ref(Arc::clone(state))?;
+    let term = arinsal_term::TermBuilder::new(&mut heap).magic_ref(MagicBin::clone(state))?;
     Ok(Some(term))
 }
 
@@ -204,11 +239,11 @@ fn clear_export_trap(process: &mut Process) {
 
 fn unicode_trap(
     process: &mut Process,
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
 ) -> Result<HandlerResult, BifError> {
     let cont = state
         .ok_or(BifError::BADARG)?
-        .downcast_ref::<Mutex<arinsal_bifs::UnicodeCont>>()
+        .downcast_ref::<TrapContext<arinsal_bifs::UnicodeCont>>()
         .ok_or(BifError::BADARG)?
         .lock()
         .map_err(|_| BifError::SystemLimit)?
@@ -225,7 +260,7 @@ fn unicode_trap(
         },
         arinsal_bifs::UnicodeStep::More(cont) => HandlerResult::Yield {
             continuation: cont.continuation(),
-            state: magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
+            state: magic_binary_state(TrapContext::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
             reductions: 0,
         },
     })
@@ -234,7 +269,7 @@ fn unicode_trap(
 // Port of erts/emulator/beam/erl_unicode.c:851 (characters_to_utf8_trap), OTP-29.1.1.
 fn unicode_binary_trap(
     process: &mut Process,
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
 ) -> Result<HandlerResult, BifError> {
     // BIF_TRAP4 restores the continuation arguments in the live X registers.
     let cont = arinsal_bifs::UnicodeCont::from_binary_trap_arguments(&process.x[..4])
@@ -254,7 +289,9 @@ fn unicode_binary_trap(
             process.gc_live = trap_args.len();
             Ok(HandlerResult::Yield {
                 continuation: cont.continuation(),
-                state: state.cloned().unwrap_or_else(|| argument_trap_state(())),
+                state: state
+                    .cloned()
+                    .unwrap_or_else(|| argument_trap_state(NoContext)),
                 reductions: 0,
             })
         }
@@ -264,7 +301,7 @@ fn unicode_binary_trap(
 fn unicode_convert_start(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     function: &'static str,
 ) -> Result<HandlerResult, BifError> {
     if state.is_some() {
@@ -307,13 +344,13 @@ fn unicode_convert_start(
             process.gc_live = trap_args.len();
             Ok(HandlerResult::Yield {
                 continuation: cont.continuation(),
-                state: argument_trap_state(()),
+                state: argument_trap_state(NoContext),
                 reductions: 0,
             })
         }
         Some(arinsal_bifs::DeferredTrap::Unicode(cont)) => Ok(HandlerResult::Yield {
             continuation: cont.continuation(),
-            state: magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
+            state: magic_binary_state(TrapContext::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
             reductions: 0,
         }),
         None => Ok(HandlerResult::Done {
@@ -327,7 +364,7 @@ fn unicode_convert_start(
 fn unicode_characters_to_binary(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -346,7 +383,7 @@ fn unicode_characters_to_binary(
 fn unicode_characters_to_list(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -358,7 +395,7 @@ macro_rules! unicode_trap_entry {
         fn $name(
             process: &mut Process,
             _args: &[Term],
-            state: Option<&Arc<MagicRef>>,
+            state: Option<&MagicBin>,
             _pid: Option<arinsal_sched::Pid>,
             _gc_changed: bool,
         ) -> Result<HandlerResult, BifError> {
@@ -370,7 +407,7 @@ macro_rules! unicode_trap_entry {
 fn erlang_characters_to_utf8_trap(
     process: &mut Process,
     _args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -563,7 +600,7 @@ struct BinaryCopyState {
 fn binary_match(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -579,7 +616,7 @@ fn binary_match(
 fn binary_matches(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -595,7 +632,7 @@ fn binary_matches(
 fn binary_split(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -615,11 +652,11 @@ fn binary_split(
 fn re_run_trap(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
-    type Resume = Mutex<Option<Box<arinsal_re::RunState>>>;
+    type Resume = TrapContext<Option<Box<arinsal_re::RunState>>>;
     let prior = match state {
         Some(state) => state
             .downcast_ref::<Resume>()
@@ -657,7 +694,7 @@ fn re_run_trap(
                 arinsal_re::Progress::Yield(run) => HandlerResult::Yield {
                     continuation: RE_RUN_CONTINUATION,
                     state: magic_binary_state(
-                        Mutex::new(Some(run)),
+                        TrapContext::new(Some(run)),
                         ERTS_REGEX_RESTART_CONTEXT_SIZE,
                     ),
                     reductions,
@@ -703,7 +740,7 @@ fn re_run_trap(
 fn binary_search(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     restore_gc: bool,
     kind: arinsal_bifs::BinarySearchKind,
 ) -> Result<HandlerResult, BifError> {
@@ -714,9 +751,9 @@ fn binary_search(
         .saturating_mul(SEARCH_LOOP_FACTOR)
         .max(1);
     if let Some(state) = state {
-        let state = Arc::clone(state);
+        let state = MagicBin::clone(state);
         let search = state
-            .downcast_ref::<Mutex<arinsal_bifs::BinarySearchWalk>>()
+            .downcast_ref::<TrapContext<arinsal_bifs::BinarySearchWalk>>()
             .ok_or(BifError::BADARG)?;
         let mut search = search.lock().map_err(|_| BifError::SystemLimit)?;
         let (done, work) = search.step(budget);
@@ -741,7 +778,7 @@ fn binary_search(
     if !done {
         return Ok(HandlerResult::Yield {
             continuation: BINARY_SEARCH_CONTINUATION,
-            state: magic_binary_state(Mutex::new(search), ERTS_BINARY_FIND_CONTEXT_SIZE),
+            state: magic_binary_state(TrapContext::new(search), ERTS_BINARY_FIND_CONTEXT_SIZE),
             reductions,
         });
     }
@@ -981,7 +1018,7 @@ pub(crate) fn install_export_trap(
         import,
         continuation: trap.target.continuation,
         target: trap.target,
-        state: argument_trap_state(()),
+        state: argument_trap_state(NoContext),
         state_term: None,
         gc_was_enabled,
         arity,
@@ -1132,7 +1169,7 @@ pub(crate) fn execute_named(
         // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
         // arguments), OTP-29.1.1: a resumed call takes its arguments from the trap state.
         args = pending.args;
-        (entry.handler, Some(Arc::clone(&pending.state)))
+        (entry.handler, Some(MagicBin::clone(&pending.state)))
     } else {
         (entry?.handler, None)
     };
@@ -1198,7 +1235,7 @@ pub(crate) fn execute_named(
                         .cold
                         .as_ref()
                         .and_then(|cold| cold.bif_trap.as_ref())
-                        .filter(|pending| Arc::ptr_eq(&pending.state, &state))
+                        .filter(|pending| MagicBin::ptr_eq(&pending.state, &state))
                         .map(|pending| pending.state_term)
                 })
                 .flatten();
@@ -1289,7 +1326,7 @@ pub(crate) fn execute_named(
                     .cold
                     .as_ref()
                     .and_then(|cold| cold.bif_trap.as_ref())
-                    .map(|pending| Arc::clone(&pending.state))
+                    .map(|pending| MagicBin::clone(&pending.state))
                     .expect("stored continuation"),
                 reductions,
             })
@@ -1402,7 +1439,7 @@ pub(crate) fn finish_light(
             return LightTrap::Trapped;
         }
         Ok(HandlerResult::Export(trap)) => {
-            let state = argument_trap_state(Mutex::new(()));
+            let state = argument_trap_state(NoContext);
             let Ok(state_term) = trap_state_term(process, &state) else {
                 return LightTrap::Returned(Err(BifError::SystemLimit));
             };
@@ -1451,7 +1488,7 @@ pub(crate) fn install_deferred_trap(
     let (continuation, state) = match trap {
         arinsal_bifs::DeferredTrap::Unicode(cont) => (
             cont.continuation(),
-            magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
+            magic_binary_state(TrapContext::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
         ),
     };
     let state_term = trap_state_term(process, &state)?;
@@ -1589,7 +1626,7 @@ fn charge(
 fn code_permission(
     process: &mut Process,
     args: &[Term],
-    _state: Option<&Arc<MagicRef>>,
+    _state: Option<&MagicBin>,
     pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -1628,7 +1665,7 @@ fn code_permission(
     }
     Ok(HandlerResult::Yield {
         continuation: CODE_PERMISSION_CONTINUATION,
-        state: argument_trap_state(acquire),
+        state: argument_trap_state(CodePermission(acquire)),
         reductions: 1,
     })
 }
@@ -1666,7 +1703,7 @@ fn binary_loop_budget(process: &Process, loop_factor: u64) -> u64 {
 fn binary_copy(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -1701,9 +1738,9 @@ fn binary_copy(
     let max_copy_bits = usize::try_from(binary_loop_budget(process, BITSTRING_COPY_LOOP_FACTOR))
         .unwrap_or(usize::MAX);
     if let Some(state) = state {
-        let state = Arc::clone(state);
+        let state = MagicBin::clone(state);
         let copy = state
-            .downcast_ref::<Mutex<BinaryCopyState>>()
+            .downcast_ref::<TrapContext<BinaryCopyState>>()
             .ok_or(BifError::BADARG)?;
         let mut copy = copy.lock().map_err(|_| BifError::SystemLimit)?;
         let initial_target_offset = copy.copied_bits;
@@ -1766,7 +1803,7 @@ fn binary_copy(
     vbump_all_reds(process);
     Ok(HandlerResult::Yield {
         continuation: BINARY_COPY_CONTINUATION,
-        state: argument_trap_state(Mutex::new(BinaryCopyState {
+        state: argument_trap_state(TrapContext::new(BinaryCopyState {
             result,
             copied_bits,
         })),
@@ -1815,7 +1852,7 @@ struct PtabListState {
 fn processes(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -1825,9 +1862,9 @@ fn processes(
     let table_max = arinsal_term::ptab::process_table_layout().max();
     let reds_left = process.heap.abi.fcalls.max(0) as u32;
     if let Some(state) = state {
-        let state = Arc::clone(state);
+        let state = MagicBin::clone(state);
         let list = state
-            .downcast_ref::<Mutex<PtabListContinuation>>()
+            .downcast_ref::<TrapContext<PtabListContinuation>>()
             .ok_or(BifError::BADARG)?;
         let mut list = list.lock().map_err(|_| BifError::SystemLimit)?;
         let accumulator = args.first().copied().unwrap_or(Term::NIL);
@@ -1838,7 +1875,7 @@ fn processes(
                 list,
                 table_max,
                 reds_left,
-                Arc::clone(&state),
+                MagicBin::clone(&state),
                 accumulator,
             ),
             PtabListContinuation::Ports(list) => resume_ports(
@@ -1846,7 +1883,7 @@ fn processes(
                 list,
                 table_max,
                 reds_left,
-                Arc::clone(&state),
+                MagicBin::clone(&state),
                 accumulator,
             ),
         };
@@ -1864,17 +1901,17 @@ fn processes(
     };
     set_ptab_accumulator(process, Term::NIL)?;
     let state = magic_binary_state(
-        Mutex::new(PtabListContinuation::Processes(list)),
+        TrapContext::new(PtabListContinuation::Processes(list)),
         ERTS_PTAB_LIST_STATE_SIZE,
     );
     let list_cell = state
-        .downcast_ref::<Mutex<PtabListContinuation>>()
+        .downcast_ref::<TrapContext<PtabListContinuation>>()
         .ok_or(BifError::BADARG)?;
     let mut list = list_cell.lock().map_err(|_| BifError::SystemLimit)?;
     if reds_left < MIN_START_REDS {
         return Ok(HandlerResult::Yield {
             continuation: PTAB_LIST_CONTINUATION,
-            state: Arc::clone(&state),
+            state: MagicBin::clone(&state),
             reductions: 1,
         });
     }
@@ -1884,7 +1921,7 @@ fn processes(
             list,
             table_max,
             reds_left,
-            Arc::clone(&state),
+            MagicBin::clone(&state),
             Term::NIL,
         ),
         PtabListContinuation::Ports(_) => unreachable!(),
@@ -1933,7 +1970,7 @@ fn run_process_list(
     list: &mut PtabListState,
     table_max: u32,
     reds_left: u32,
-    state: Arc<MagicRef>,
+    state: MagicBin,
     accumulator: Term,
 ) -> Result<HandlerResult, BifError> {
     let (table_done, mut spent) = scan_process_table(list, table_max, reds_left);
@@ -1972,7 +2009,7 @@ fn resume_processes(
     list: &mut PtabListState,
     table_max: u32,
     reds_left: u32,
-    state: Arc<MagicRef>,
+    state: MagicBin,
     accumulator: Term,
 ) -> Result<HandlerResult, BifError> {
     run_process_list(process, list, table_max, reds_left, state, accumulator)
@@ -1985,7 +2022,7 @@ fn build_ptab_result(
     accumulator: Term,
     reds_left: u32,
     spent: u32,
-    state: Arc<MagicRef>,
+    state: MagicBin,
 ) -> Result<HandlerResult, BifError> {
     const CONSES_PER_RED: usize = 75;
     let conses = terms
@@ -2033,7 +2070,7 @@ fn set_ptab_accumulator(process: &mut Process, accumulator: Term) -> Result<(), 
 
 fn ptab_yield(
     process: &mut Process,
-    state: Arc<MagicRef>,
+    state: MagicBin,
     accumulator: Term,
     reductions: u32,
 ) -> Result<HandlerResult, BifError> {
@@ -2064,7 +2101,7 @@ enum PtabListContinuation {
 fn ports(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    state: Option<&MagicBin>,
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -2095,17 +2132,17 @@ fn ports(
         };
         set_ptab_accumulator(process, Term::NIL)?;
         let state = magic_binary_state(
-            Mutex::new(PtabListContinuation::Ports(list)),
+            TrapContext::new(PtabListContinuation::Ports(list)),
             ERTS_PTAB_LIST_STATE_SIZE,
         );
         let list_cell = state
-            .downcast_ref::<Mutex<PtabListContinuation>>()
+            .downcast_ref::<TrapContext<PtabListContinuation>>()
             .ok_or(BifError::BADARG)?;
         let mut list = list_cell.lock().map_err(|_| BifError::SystemLimit)?;
         if reds_left < MIN_START_REDS {
             return Ok(HandlerResult::Yield {
                 continuation: PTAB_LIST_CONTINUATION,
-                state: Arc::clone(&state),
+                state: MagicBin::clone(&state),
                 reductions: 1,
             });
         }
@@ -2115,15 +2152,15 @@ fn ports(
                 list,
                 table_max,
                 reds_left,
-                Arc::clone(&state),
+                MagicBin::clone(&state),
                 Term::NIL,
             ),
             PtabListContinuation::Processes(_) => unreachable!(),
         };
     };
-    let state = Arc::clone(state);
+    let state = MagicBin::clone(state);
     let list = state
-        .downcast_ref::<Mutex<PtabListContinuation>>()
+        .downcast_ref::<TrapContext<PtabListContinuation>>()
         .ok_or(BifError::BADARG)?;
     let mut list = list.lock().map_err(|_| BifError::SystemLimit)?;
     let accumulator = args.first().copied().unwrap_or(Term::NIL);
@@ -2134,7 +2171,7 @@ fn ports(
             list,
             table_max,
             reds_left,
-            Arc::clone(&state),
+            MagicBin::clone(&state),
             accumulator,
         ),
         PtabListContinuation::Processes(list) => resume_processes(
@@ -2142,7 +2179,7 @@ fn ports(
             list,
             table_max,
             reds_left,
-            Arc::clone(&state),
+            MagicBin::clone(&state),
             accumulator,
         ),
     }
@@ -2154,7 +2191,7 @@ fn resume_ports(
     list: &mut PortPtabListState,
     table_max: u32,
     reds_left: u32,
-    state: Arc<MagicRef>,
+    state: MagicBin,
     accumulator: Term,
 ) -> Result<HandlerResult, BifError> {
     run_port_list(process, list, table_max, reds_left, state, accumulator)
@@ -2166,7 +2203,7 @@ fn run_port_list(
     list: &mut PortPtabListState,
     table_max: u32,
     reds_left: u32,
-    state: Arc<MagicRef>,
+    state: MagicBin,
     accumulator: Term,
 ) -> Result<HandlerResult, BifError> {
     let (table_done, mut spent) = scan_port_table(list, table_max, reds_left);
@@ -2250,7 +2287,7 @@ pub(crate) fn dsend_export_trap(
     return_term: Term,
 ) -> Result<crate::ExportTrap, BifError> {
     ctx.set_return_term(return_term);
-    let state = magic_binary_state(Mutex::new(ctx), ERTS_DSIG_SEND_CONTEXT_SIZE);
+    let state = magic_binary_state(TrapContext::new(ctx), ERTS_DSIG_SEND_CONTEXT_SIZE);
     let state_term = trap_state_term(process, &state)
         .map_err(|_| BifError::SystemLimit)?
         .ok_or(BifError::SystemLimit)?;
@@ -2265,7 +2302,7 @@ pub(crate) fn dsend_export_trap(
 fn dsend_continue_trap_1(
     process: &mut Process,
     args: &[Term],
-    _state: Option<&Arc<MagicRef>>,
+    _state: Option<&MagicBin>,
     pid: Option<arinsal_sched::Pid>,
     _gc_was_enabled: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -2274,7 +2311,7 @@ fn dsend_continue_trap_1(
     };
     let context = *context;
     let (result, return_term) = context
-        .with_magic_payload::<Mutex<crate::dist::DsigSendContext>, _>(|ctx| {
+        .with_magic_payload::<TrapContext<crate::dist::DsigSendContext>, _>(|ctx| {
             let mut ctx = ctx.lock().map_err(|_| BifError::SystemLimit)?;
             let result = crate::dist::dsend_continue(process, &mut ctx, sender)
                 .map_err(|_| BifError::BADARG)?;
@@ -2324,7 +2361,7 @@ pub(crate) fn finish_parked_dsend(process: &mut Process, sender: arinsal_sched::
     else {
         return;
     };
-    let _ = context.with_magic_payload::<Mutex<crate::dist::DsigSendContext>, _>(|ctx| {
+    let _ = context.with_magic_payload::<TrapContext<crate::dist::DsigSendContext>, _>(|ctx| {
         if let Ok(mut ctx) = ctx.lock() {
             crate::dist::dsend_exit(process, &mut ctx, sender);
         }

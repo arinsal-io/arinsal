@@ -920,7 +920,7 @@ fn dec_port_or_ref(
             .map_err(map_term_build_error)
     } else {
         let saved = (local_ids[1] & (1 << 17) != 0)
-            .then(|| arinsal_term::MagicRef::lookup_saved_numbers(local_ids))
+            .then(|| arinsal_term::MagicBin::lookup_saved_numbers(local_ids))
             .flatten();
         match saved {
             Some(owner) => TermBuilder::new(fac)

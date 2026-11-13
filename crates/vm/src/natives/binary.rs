@@ -6,12 +6,12 @@
 //! end: the state (`ErtsB2LState`) lives in a magic binary, collection is disabled while
 //! parked, and the BIF `BIF_TRAP1`s to the hidden `erts_internal:binary_to_list_continue/1`.
 
+use crate::bif_traps::TrapContext;
 use crate::natives::bif::{badarg, bif_ret};
 use crate::natives::erl_bif_lists::bif_trap;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{B2L_BYTES_PER_REDUCTION, BifCall, BinaryToListWalk, Ctx, ProcessHeapHandle};
-use arinsal_term::{MagicRef, Term, TermBuilder};
-use std::sync::{Arc, Mutex};
+use arinsal_term::{MagicBin, Term, TermBuilder};
 
 /// `CONTEXT_REDS`, `B2L_MIN_EXEC_REDS` and `B2L_RESCHED_REDS`.
 const CONTEXT_REDS: usize = 4000;
@@ -22,7 +22,7 @@ const B2L_RESCHED_REDS: usize = CONTEXT_REDS / 40;
 // Port of erts/emulator/beam/binary.c (ErtsB2LState), OTP-29.1.1.
 const ERTS_B2L_STATE_SIZE: usize = 40;
 
-type B2lHolder = Mutex<BinaryToListWalk>;
+type B2lHolder = TrapContext<BinaryToListWalk>;
 
 /// `erlang:binary_to_list/1`.
 // Port of erts/emulator/beam/binary.c (binary_to_list_1), OTP-29.1.1.
@@ -229,7 +229,7 @@ fn chunk_locked(
 
 /// `erts_create_magic_binary(sizeof(ErtsB2LState))` + `erts_mk_magic_ref`.
 fn create_state(process: &mut crate::Process, walk: BinaryToListWalk) -> Option<Term> {
-    let state: Arc<MagicRef> = MagicRef::with_erts_payload_size_and_refn(
+    let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         B2lHolder::new(walk),
         ERTS_B2L_STATE_SIZE,
         arinsal_bifs::next_ref_words(),
@@ -243,3 +243,7 @@ fn system_limit() -> crate::VmError {
         arinsal_term::atoms::SYSTEM_LIMIT,
     )))
 }
+
+arinsal_term::magic_payload!(
+    B2lHolder => binary_to_list_destructor,
+);

@@ -8,11 +8,11 @@
 
 use super::bif::{badarg, bif_ret};
 use super::erl_bif_lists::{bif_trap, create_trap_state};
+use crate::bif_traps::TrapContext;
 use crate::{Process, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, Ctx, Phash2Cont, Phash2Run, ProcessHeapHandle};
 use arinsal_term::Term;
-use std::sync::Mutex;
 
 /// `sizeof(ErtsMakeHash2Context)` on a 64-bit build: the magic binary's `orig_size`.
 // Port of erts/emulator/beam/erl_term_hashing.c (ErtsMakeHash2Context), OTP-29.1.1.
@@ -61,7 +61,7 @@ fn trapping_make_hash2(
     bif: &'static str,
 ) -> Result<Term, VmError> {
     // `ASSERT(p->flags & F_DISABLE_GC); erts_set_gc_state(p, 1);` after restoring the context.
-    let resumed = term.with_magic_payload::<Mutex<Phash2Cont>, _>(|context| {
+    let resumed = term.with_magic_payload::<TrapContext<Phash2Cont>, _>(|context| {
         let mut context = context.lock().expect("phash2 context");
         process.set_gc_enabled(true);
         let mut heap = ProcessHeapHandle(&mut process.heap);

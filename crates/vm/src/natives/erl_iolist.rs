@@ -9,11 +9,11 @@
 //! magic reference in X0.
 
 use crate::Process;
+use crate::bif_traps::TrapContext;
 use crate::natives::bif::bif_ret;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, BifError, Ctx, IolistSizeWalk, IolistVecWalk, ProcessHeapHandle};
-use arinsal_term::{MagicRef, Term, TermBuilder, TermKind};
-use std::sync::{Arc, Mutex};
+use arinsal_term::{MagicBin, Term, TermBuilder, TermKind};
 
 /// `CONTEXT_REDS`.
 const CONTEXT_REDS: usize = 4000;
@@ -44,7 +44,7 @@ struct SizeState {
     arg: Term,
 }
 
-type SizeHolder = Mutex<Option<SizeState>>;
+type SizeHolder = TrapContext<Option<SizeState>>;
 
 /// `ErtsL2BState`: the phase, the list being converted and the BIF that is blamed on error.
 struct L2bState {
@@ -53,7 +53,7 @@ struct L2bState {
     bif: &'static str,
 }
 
-type L2bHolder = Mutex<Option<L2bState>>;
+type L2bHolder = TrapContext<Option<L2bState>>;
 
 /// `ErtsIOList2VecState`.
 struct VecState {
@@ -61,7 +61,7 @@ struct VecState {
     arg: Term,
 }
 
-type VecHolder = Mutex<Option<VecState>>;
+type VecHolder = TrapContext<Option<VecState>>;
 
 /// `BUMP_REDS(c_p, reds)`.
 pub(crate) fn charge(process: &mut crate::Process, reds: usize) {
@@ -79,13 +79,13 @@ pub(crate) fn gc_enable(process: &mut crate::Process) -> bool {
 
 /// The magic reference of a new trap state: `erts_create_magic_binary` + `erts_mk_magic_ref`,
 /// then `erts_set_gc_state(c_p, 0)`.
-pub(crate) fn create_holder<T: std::any::Any + Send + Sync>(
+pub(crate) fn create_holder<T: arinsal_term::MagicPayload>(
     process: &mut crate::Process,
     holder: T,
     c_size: usize,
 ) -> Option<Term> {
-    let state: Arc<MagicRef> =
-        MagicRef::with_erts_payload_size_and_refn(holder, c_size, arinsal_bifs::next_ref_words());
+    let state: MagicBin =
+        MagicBin::with_erts_payload_size_and_refn(holder, c_size, arinsal_bifs::next_ref_words());
     let mref = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap).magic_ref(state).ok()?
@@ -836,3 +836,9 @@ fn iolist_to_iovec_dispatch(
         }
     }
 }
+
+arinsal_term::magic_payload!(
+    SizeHolder => iolist_size_destructor,
+    L2bHolder => list_to_bitstring_destructor,
+    VecHolder => iolist_to_iovec_destructor,
+);

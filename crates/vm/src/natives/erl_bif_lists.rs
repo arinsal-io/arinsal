@@ -8,6 +8,7 @@
 //! reference to the `ErtsAppendContext` / `ErtsSubtractContext` for `++` and `--`).
 
 use crate::VmError;
+use crate::bif_traps::TrapContext;
 use crate::natives::bif::{badarg, bif_ret};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{
@@ -15,7 +16,6 @@ use arinsal_bifs::{
     ReverseStep, SubtractWalk,
 };
 use arinsal_term::{MagicBin, Term, TermBuilder, atoms};
-use std::sync::Mutex;
 
 /// `sizeof(ErtsAppendContext)` on a 64-bit build: the magic binary's `orig_size`.
 // Port of erts/emulator/beam/erl_bif_lists.c (ErtsAppendContext), OTP-29.1.1.
@@ -101,7 +101,7 @@ fn append_general(
     if is_list(lhs) {
         return append_start(c_p, i, process, lhs, rhs, bif_entry);
     }
-    let resumed = lhs.with_magic_payload::<Mutex<AppendCont>, _>(|context| {
+    let resumed = lhs.with_magic_payload::<TrapContext<AppendCont>, _>(|context| {
         std::mem::replace(
             &mut *context.lock().expect("append context"),
             AppendCont::start(Term::NIL, Term::NIL),
@@ -118,7 +118,7 @@ fn append_general(
             crate::native_hooks::raw(value)
         }
         Ok(AppendStep::More(next)) => {
-            let _ = lhs.with_magic_payload::<Mutex<AppendCont>, _>(|context| {
+            let _ = lhs.with_magic_payload::<TrapContext<AppendCont>, _>(|context| {
                 *context.lock().expect("append context") = next;
             });
             let trap = bif_trap(process, bif_entry, vec![lhs, Term::NIL]);
@@ -186,13 +186,16 @@ fn append_continue(
 /// `erts_create_magic_binary` + `erts_mk_magic_ref` of a trap context.
 // Port of erts/emulator/beam/erl_bif_lists.c (append_create_trap_state,
 // subtract_create_trap_state), OTP-29.1.1.
-pub(crate) fn create_trap_state<T: std::any::Any + Send>(
+pub(crate) fn create_trap_state<T>(
     process: &mut crate::Process,
     context: T,
     c_size: usize,
-) -> Result<Term, VmError> {
+) -> Result<Term, VmError>
+where
+    TrapContext<T>: arinsal_term::MagicPayload,
+{
     let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
-        Mutex::new(context),
+        TrapContext::new(context),
         c_size,
         arinsal_bifs::next_ref_words(),
     );
@@ -276,7 +279,7 @@ fn subtract_resume(
     lhs: Term,
     bif_entry: &'static str,
 ) -> u64 {
-    let resumed = lhs.with_magic_payload::<Mutex<SubtractWalk>, _>(|context| {
+    let resumed = lhs.with_magic_payload::<TrapContext<SubtractWalk>, _>(|context| {
         let mut context = context.lock().expect("subtract context");
         let originals = context.originals();
         (subtract_continue(process, &mut context), originals)
@@ -438,3 +441,8 @@ fn keyfind(c_p: *mut ProcessHeader, i: u64, op: KeyOp, bif: &'static str) -> u64
         Err(_) => bif_ret(c_p, i, Err(badarg())),
     }
 }
+
+arinsal_term::magic_payload!(
+    TrapContext<AppendCont> => append_ctx_bin_dtor,
+    TrapContext<SubtractWalk> => subtract_ctx_bin_dtor,
+);

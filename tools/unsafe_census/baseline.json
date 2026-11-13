@@ -20,8 +20,8 @@
     "maps": 39,
     "nif": 265,
     "nif-buffer": 0,
-    "nif-file": 9,
-    "nif-socket": 54,
+    "nif-file": 8,
+    "nif-socket": 50,
     "nif-tty": 54,
     "nif-zlib": 52,
     "packet": 0,
@@ -29,7 +29,7 @@
     "re": 19,
     "sched": 121,
     "spec": 0,
-    "term": 345,
+    "term": 372,
     "vm": 325,
     "drv": 92
   }
