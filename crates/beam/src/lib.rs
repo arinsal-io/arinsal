@@ -547,8 +547,17 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     while r.pos < bytes.len() {
         let id: ChunkId = r.take(4)?.try_into().unwrap();
         let size = r.u32()? as usize;
+        let chunk_context = String::from_utf8_lossy(&id).into_owned();
+        // Port of erts/emulator/beam/beam_file.c:1587 (beamfile_read), OTP-29.1.1:
+        // preserve the failing chunk identity for beam_load.c's error category.
+        if size > r.data.len().saturating_sub(r.pos) {
+            return Err(bad(&chunk_context, r.pos, "truncated chunk data"));
+        }
         let data = r.take(size)?;
         let padding = (4 - size % 4) % 4;
+        if padding > r.data.len().saturating_sub(r.pos) {
+            return Err(bad(&chunk_context, r.pos, "truncated chunk padding"));
+        }
         r.take(padding)?;
         chunks.push((id, size));
         if map.insert(id, data).is_some() {

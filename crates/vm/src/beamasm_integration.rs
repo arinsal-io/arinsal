@@ -1895,6 +1895,7 @@ pub(crate) fn compile(
     module: &mut arinsal_loader::Module,
     line_breakpoints: bool,
     code_ix: &crate::code_ix::CodeIndexes,
+    failure: &mut Option<arinsal_beamjit::CompileError>,
 ) -> Option<Arc<CompiledVersion>> {
     if lifetime_trace_enabled() {
         eprintln!(
@@ -1936,10 +1937,7 @@ pub(crate) fn compile(
     let compiled = match compile_parsed_module_with_options(beam, &env, line_breakpoints) {
         Ok(compiled) => compiled,
         Err(error) => {
-            eprintln!(
-                "arinsal boot: beamasm compile failed for {}: {error:?}",
-                beam.module
-            );
+            *failure = Some(error);
             return None;
         }
     };
