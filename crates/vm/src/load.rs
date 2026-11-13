@@ -913,10 +913,12 @@ impl Vm {
 
     /// Decodes the instructions of `beam` when the coverage table or the debugger lines are
     /// laid out from them. Nothing else needs them: the emitter reads the code chunk itself.
-    pub(crate) fn decode_for_native_tables(&self, beam: &mut BeamFile) -> Result<(), VmError> {
+    pub(crate) fn decode_for_native_tables(
+        &self,
+        beam: &mut BeamFile,
+    ) -> Result<(), arinsal_beam::BeamError> {
         if self.native_tables_need_instructions(beam) {
-            beam.decode_code()
-                .map_err(|e| VmError::Load(e.to_string()))?;
+            beam.decode_code()?;
         }
         Ok(())
     }
@@ -962,13 +964,19 @@ impl Vm {
     /// Compiles `module` with BeamAsm into `meta`.
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
-    pub(crate) fn compile_native(&self, module: &mut Module, meta: &mut CodeMeta) {
+    pub(crate) fn compile_native(
+        &self,
+        module: &mut Module,
+        meta: &mut CodeMeta,
+    ) -> Option<arinsal_beamjit::CompileError> {
         // The BEAM was parsed in prepare_loading. erts does not parse it again here.
+        let mut failure = None;
         if let Some(native) = beamasm_integration::compile(
             &meta.beam,
             module,
             crate::trace_bp::line_breakpoints_instrumented(),
             &self.code_ix,
+            &mut failure,
         ) {
             // Port of erts/emulator/beam/jit/asm_load.c:1020 (stp->on_load = beamasm_get_on_load):
             // the emitter found the function.
@@ -977,6 +985,7 @@ impl Vm {
             }
             meta.beamasm = Some(native);
         }
+        failure
     }
 
     /// Port of beam_load.c (beam_load_finalize): the decoded ops and tables are freed once the
@@ -1013,7 +1022,8 @@ impl Vm {
     /// every generation.
     pub fn load_next_version(&mut self, bytes: &[u8]) -> Result<(), VmError> {
         let mut beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        self.decode_for_native_tables(&mut beam)?;
+        self.decode_for_native_tables(&mut beam)
+            .map_err(|error| VmError::Load(error.to_string()))?;
         let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
         let name = module.name.clone();
@@ -1030,7 +1040,7 @@ impl Vm {
             native.unpublish();
         }
         let mut module = module;
-        self.compile_native(&mut module, &mut meta);
+        let _ = self.compile_native(&mut module, &mut meta);
         if meta.beamasm.is_none() {
             staging.abort();
             return Err(VmError::Load(format!(
@@ -1089,7 +1099,8 @@ impl Vm {
         let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         // erts has no interpreter form of a module: its code goes from the transform straight
         // to the emitter.
-        self.decode_for_native_tables(&mut meta.beam)?;
+        self.decode_for_native_tables(&mut meta.beam)
+            .map_err(|error| VmError::Load(error.to_string()))?;
         let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
         let staging = self.code_ix.start_staging();
         // Another scheduler may have loaded the module since this one looked.
@@ -1101,7 +1112,7 @@ impl Vm {
         staging.with(|tables| {
             tables.intern_fun_entries(&mut module);
         });
-        self.compile_native(&mut module, &mut meta);
+        let _ = self.compile_native(&mut module, &mut meta);
         if meta.beamasm.is_none() {
             // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT
             // flavor has no other way to run the module.

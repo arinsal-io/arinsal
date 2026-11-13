@@ -650,15 +650,19 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     };
     let bytes = std::mem::take(bytes_slot);
     // Port of erts/emulator/beam/beam_file.c:beamfile_read: the tables; the instructions stay bytes.
-    let Ok(beam) = arinsal_beam::read(&bytes) else {
-        let error = make_tuple(
-            process,
-            &[
-                Term::atom(arinsal_term::atoms::ERROR),
-                Term::atom(arinsal_term::atoms::BADFILE),
-            ],
-        )?;
-        return Ok(error);
+    let beam = match arinsal_beam::read(&bytes) {
+        Ok(beam) => beam,
+        Err(cause) => {
+            report_beam_load_error(process, &name, beam_load_reason(&cause));
+            let error = make_tuple(
+                process,
+                &[
+                    Term::atom(arinsal_term::atoms::ERROR),
+                    Term::atom(arinsal_term::atoms::BADFILE),
+                ],
+            )?;
+            return Ok(error);
+        }
     };
     if beam.module != name {
         let error = make_tuple(
@@ -694,7 +698,8 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     let mut meta = CodeMeta::from_beam_owned(beam, &bytes);
     // erts has no interpreter form of a module: decode the instructions only for the coverage
     // table and the debugger lines, which are laid out from them.
-    if vm.decode_for_native_tables(&mut meta.beam).is_err() {
+    if let Err(cause) = vm.decode_for_native_tables(&mut meta.beam) {
+        report_beam_load_error(process, &name, beam_load_reason(&cause));
         let error = make_tuple(
             process,
             &[
@@ -704,7 +709,36 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         )?;
         return Ok(error);
     }
-    let Ok(mut module) = vm.prepare_module(&meta.beam, &bytes, meta.md5) else {
+    let mut module = match vm.prepare_module(&meta.beam, &bytes, meta.md5) {
+        Ok(module) => module,
+        Err(_) => {
+            let error = make_tuple(
+                process,
+                &[
+                    Term::atom(arinsal_term::atoms::ERROR),
+                    Term::atom(arinsal_term::atoms::BADFILE),
+                ],
+            )?;
+            return Ok(error);
+        }
+    };
+    vm.intern_prepared_fun_entries(&mut module);
+    if let Some(cause) = vm.compile_native(&mut module, &mut meta) {
+        if matches!(
+            &cause,
+            arinsal_beamjit::CompileError::Parse(message)
+                | arinsal_beamjit::CompileError::Assemble(message)
+                if message.contains("opcode")
+        ) {
+            report_beam_load_error(
+                process,
+                &name,
+                BeamLoadReason {
+                    line: 436,
+                    text: "invalid opcode",
+                },
+            );
+        }
         let error = make_tuple(
             process,
             &[
@@ -713,9 +747,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
             ],
         )?;
         return Ok(error);
-    };
-    vm.intern_prepared_fun_entries(&mut module);
-    vm.compile_native(&mut module, &mut meta);
+    }
     if meta.beamasm.is_none() {
         // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT flavor has
         // no other way to run the module.
@@ -752,6 +784,70 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
             arinsal_term::atoms::SYSTEM_LIMIT,
         )))
     })
+}
+
+// Port of erts/emulator/beam/beam_load.c:372-414 (beam_load_report_error), OTP-29.1.1.
+fn report_beam_load_error(process: &Process, module: &str, reason: BeamLoadReason) {
+    let Some((runtime, pid)) = process.runtime.zip(process.self_pid) else {
+        return;
+    };
+    let group_leader = process.group_leader_pid(pid).to_term().unwrap_or(Term::NIL);
+    let text = format!(
+        "beam/beam_load.c({}): Error loading module {}:\n  {}\n",
+        reason.line, module, reason.text
+    );
+    crate::utils::send_error_to_logger_str(runtime, pid, group_leader, &text);
+}
+
+#[derive(Clone, Copy)]
+struct BeamLoadReason {
+    line: u16,
+    text: &'static str,
+}
+
+fn beam_load_reason(error: &arinsal_beam::BeamError) -> BeamLoadReason {
+    let (context, message) = match error {
+        arinsal_beam::BeamError::Invalid {
+            context, message, ..
+        } => {
+            if context == "Code" && message.contains("opcode") {
+                return BeamLoadReason {
+                    line: 436,
+                    text: "invalid opcode",
+                };
+            }
+            (context.as_str(), message.as_str())
+        }
+        arinsal_beam::BeamError::Literal(_) => ("LitT", ""),
+    };
+    let (line, text) = if context == "IFF" {
+        match message
+            .strip_prefix("missing ")
+            .and_then(|message| message.strip_suffix(" chunk"))
+        {
+            Some("AtU8" | "Atom") => (148, "missing atom table"),
+            Some("Code") => (154, "missing code chunk"),
+            Some("ExpT") => (158, "missing export table"),
+            Some("ImpT") => (162, "missing import table"),
+            _ => (146, "corrupt file header"),
+        }
+    } else {
+        match context {
+            "AtU8" | "Atom" => (152, "corrupt atom table"),
+            "Code" => (156, "corrupt code chunk"),
+            "ExpT" => (160, "corrupt export table"),
+            "ImpT" => (164, "corrupt import table"),
+            "FunT" => (166, "corrupt lambda table"),
+            "Line" => (168, "corrupt line table"),
+            value if value.starts_with("LitT") => (170, "corrupt literal table"),
+            "LocT" => (172, "corrupt locals table"),
+            "Type" => (174, "corrupt type table"),
+            "DbgB" => (176, "corrupt BEAM debug information table"),
+            "Recs" => (178, "corrupt record table"),
+            _ => (146, "corrupt file header"),
+        }
+    };
+    BeamLoadReason { line, text }
 }
 
 /// Seizes the code loading permission for the calling process; when another process holds

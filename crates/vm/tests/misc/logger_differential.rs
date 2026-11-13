@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 
 const SOURCE: &str = r#"
 -module(logger_diff).
--export([sysmon_large_heap/0, sysmon_long_gc/0, cpu_topology/0, scheduler_bind/0, max_heap/0, port_error/0, process_error/0, internal_state/0]).
+-export([sysmon_large_heap/0, sysmon_long_gc/0, cpu_topology/0, scheduler_bind/0, max_heap/0, port_error/0, process_error/0, internal_state/0, bad_load/1]).
 
 capture(Fun) ->
     Old = erlang:system_flag(system_logger, self()),
@@ -107,6 +107,17 @@ internal_state() ->
     [Text] = A,
     Normalized = re:replace(Text, "<[0-9]+\\.[0-9]+\\.[0-9]+>", "<PID>", [global, {return, list}]),
     {L, F, [lists:flatten(Normalized)], meta(M)}.
+
+bad_load(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    Old = erlang:system_flag(system_logger, self()),
+    Result = code:load_binary(logger_bad, "bad.beam", Bin),
+    Event = receive
+        {log, L, F, A, M} -> {L, F, A, maps:remove(gl, maps:remove(pid, maps:remove(time, M)))}
+    after 2000 -> timeout
+    end,
+    erlang:system_flag(system_logger, Old),
+    {Result, Event}.
 "#;
 
 fn guard() -> MutexGuard<'static, ()> {
@@ -248,4 +259,92 @@ fn no_logger_present_stderr_matches_erl() {
         );
         similar_asserts::assert_eq!(normalize(&expected), normalize(&actual));
     }
+}
+
+#[test]
+fn malformed_beam_load_diagnostics_match_erl() {
+    let _guard = guard();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping malformed loader diagnostic differential test");
+        return;
+    };
+    let control = reference
+        .compile_named("logger_diff", SOURCE, &[])
+        .expect("compile logger harness");
+    reference
+        .load("logger_diff", &control)
+        .expect("load harness");
+    let valid = reference
+        .compile_named(
+            "logger_bad",
+            "-module(logger_bad). -export([run/0]). run() -> {lists:reverse([]), #{alpha => 1, beta => 2}}.",
+            &[],
+        )
+        .expect("compile module to corrupt");
+    let cases = ["truncated_code", "bad_opcode", "bad_import", "bad_literal"];
+    let path = std::env::temp_dir().join(format!("arinsal-bad-beam-{}.beam", std::process::id()));
+    for case in cases {
+        let corrupt = corrupt_beam(&valid, case);
+        std::fs::write(&path, &corrupt).expect("write malformed beam");
+        let path_string = path.to_string_lossy().into_owned();
+        let expected = reference.call(
+            "logger_diff",
+            "bad_load",
+            &[OwnedTerm::List {
+                elems: path_string
+                    .chars()
+                    .map(|ch| OwnedTerm::Int(ch as i64))
+                    .collect(),
+                tail: Box::new(OwnedTerm::Nil),
+            }],
+        );
+        let expr = format!("logger_diff:bad_load({path_string:?})");
+        let actual = crate::common::peer_eval(&[], &[&control], &expr);
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "case: {case}");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+fn corrupt_beam(input: &[u8], case: &str) -> Vec<u8> {
+    let mut chunks = Vec::new();
+    let mut offset = 12;
+    while offset < input.len() {
+        let id: [u8; 4] = input[offset..offset + 4].try_into().expect("chunk id");
+        let size = u32::from_be_bytes(input[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let data_start = offset + 8;
+        let data_end = data_start + size;
+        chunks.push((id, input[data_start..data_end].to_vec()));
+        offset = data_end + (4 - size % 4) % 4;
+    }
+    match case {
+        "truncated_code" => chunks
+            .iter_mut()
+            .find(|(id, _)| id == b"Code")
+            .expect("Code chunk")
+            .1
+            .truncate(4),
+        "bad_opcode" => {
+            let code = &mut chunks.iter_mut().find(|(id, _)| id == b"Code").unwrap().1;
+            code[20] = 255;
+        }
+        "bad_import" => {
+            let imports = &mut chunks.iter_mut().find(|(id, _)| id == b"ImpT").unwrap().1;
+            imports[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        }
+        "bad_literal" => {
+            let literals = &mut chunks.iter_mut().find(|(id, _)| id == b"LitT").unwrap().1;
+            literals[4] ^= 0xff;
+        }
+        _ => unreachable!(),
+    }
+    let mut output = b"FOR1\0\0\0\0BEAM".to_vec();
+    for (id, data) in chunks {
+        output.extend_from_slice(&id);
+        output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        output.extend_from_slice(&data);
+        output.resize(output.len() + (4 - data.len() % 4) % 4, 0);
+    }
+    let form_size = (output.len() - 8) as u32;
+    output[4..8].copy_from_slice(&form_size.to_be_bytes());
+    output
 }
