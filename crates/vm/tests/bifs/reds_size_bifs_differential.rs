@@ -5,6 +5,9 @@ use similar_asserts::assert_eq;
 const SEMANTICS: &str = r#"semantics() ->
     Long = lists:seq(1, 300000),
     Bad = Long ++ improper,
+    H = fun(M) -> {maps:size(M), erlang:phash2(M)} end,
+    Hm1 = maps:from_list([{I, I} || I <- lists:seq(1, 200000)]),
+    Hm2 = maps:from_list([{I + 100000, x} || I <- lists:seq(1, 200000)]),
     Bl = [I rem 256 || I <- Long],
     T = fun(F) -> try F() catch error:R -> {err, R} end end,
     G = fun(L) when length(L) > 250000 -> big; (_) -> small end,
@@ -23,6 +26,12 @@ const SEMANTICS: &str = r#"semantics() ->
      unicode:characters_to_list(lists:duplicate(100000, 255), latin1),
      unicode:characters_to_list(<<(binary:copy(<<"abc">>, 70000))/binary>>),
      G(Long), G(lists:seq(1, 10)), G(Bad), Err(Bad), Err(improper),
+     H(maps:merge(Hm1, Hm2)), H(maps:merge(Hm2, Hm1)), H(maps:merge(Hm1, Hm1)),
+     H(maps:merge(#{a => 1}, Hm1)), H(maps:merge(Hm2, #{a => 1})),
+     maps:merge(#{a => 1}, #{b => 2}), H(maps:merge(Hm1, #{})),
+     maps:get(150000, maps:merge(Hm1, Hm2)), maps:get(150000, maps:merge(Hm2, Hm1)),
+     T(fun() -> maps:merge(a, Hm1) end), T(fun() -> maps:merge(Hm1, b) end),
+     T(fun() -> maps:merge(#{}, c) end),
      erlang:md5_final(erlang:md5_update(erlang:md5_init(), [Bl, <<1:16>>, [[2], Bl]])),
      erlang:adler32(7, [Bl, <<1, 2>>, [3 | <<4>>]]), erlang:crc32_combine(1, 2, 3),
      erlang:adler32_combine(1, 2, 0), erlang:adler32_combine(5, 6, 7),
@@ -62,6 +71,19 @@ const CASES: &[(&str, &str, &str, Option<&str>)] = &[
         "length_apply",
         "lists:seq(1, N)",
         "apply(erlang, length, [In])",
+        None,
+    ),
+    // erl_map.c hashmap_merge: the trap state is `maps:merge_trap/1`'s magic reference.
+    (
+        "maps_merge",
+        "mm_input(N)",
+        "maps:merge(element(1, In), element(2, In))",
+        None,
+    ),
+    (
+        "maps_merge_apply",
+        "mm_input(N)",
+        "apply(maps, merge, [element(1, In), element(2, In)])",
         None,
     ),
     ("crc32", "bin(N)", "erlang:crc32(In)", None),
@@ -232,6 +254,10 @@ fn source() -> String {
 -export([{exports}, semantics/0]).
 
 {semantics}
+mm_input(N) ->
+    {{maps:from_list([{{I, I}} || I <- lists:seq(1, N)]),
+      maps:from_list([{{I + N div 2, x}} || I <- lists:seq(1, N)])}}.
+
 bin(N) -> binary:copy(<<0, 1, 2, 3, 255, 17, 9, 200>>, (N + 7) div 8).
 
 binl(N) -> [I rem 256 || I <- lists:seq(1, N)].

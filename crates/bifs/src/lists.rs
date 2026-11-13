@@ -39,19 +39,6 @@ fn is_list_bits(bits: u64) -> bool {
     bits & 2 == 0
 }
 
-pub(super) fn lookup<V: crate::BifTableVisitor>(
-    module: &str,
-    name: &str,
-    arity: u8,
-    v: &mut V,
-) -> Option<V::Output> {
-    let f = match (module, name, arity) {
-        ("erlang", "length", 1) => v.entry::<word_bodies::length>(),
-        _ => return None,
-    };
-    arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
-}
-
 /// CAR/CDR of a cons cell.
 #[inline(always)]
 pub(crate) fn cons_cell(term: Term) -> Option<(Term, Term)> {
@@ -120,18 +107,6 @@ pub fn length_slice(ctx: &mut Ctx<'_>, mut list: Term, acc: usize) -> Result<Len
         ctx.charge_reductions((saved_max_iter - max_iter) / LENGTH_PER_RED);
     }
     Ok(LengthStep::Done(integer(ctx, count)?))
-}
-
-fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/erl_bif_guard.c:210-224 (length_1), OTP-29.1.1.
-    let &[list] = args else {
-        return ctx.badarg();
-    };
-    match length_slice(ctx, list, 0) {
-        Ok(LengthStep::Done(value)) => value,
-        Ok(LengthStep::More(cont)) => ctx.trap(DeferredTrap::Length(cont)),
-        Err(error) => ctx.fail(error),
-    }
 }
 
 /// Cells of `erlang:'++'/2` per reduction on the alloc path.
@@ -282,8 +257,6 @@ pub enum DeferredTrap {
     BinaryToList(crate::pure::BinaryToListWalk),
     /// `unicode:characters_to_binary/2` and `characters_to_list/2`.
     Unicode(crate::unicode::UnicodeCont),
-    /// `erlang:length/1`.
-    Length(LengthCont),
 }
 
 /// A finished key BIF, or a trap back to the same export.
@@ -2010,5 +1983,3 @@ mod trap_budget_tests {
         assert_eq!(same, lhs);
     }
 }
-
-crate::word_bif_bodies_in!(word_bodies; length);

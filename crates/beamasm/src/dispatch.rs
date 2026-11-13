@@ -956,11 +956,36 @@ fn emit_export_fragment(
         // export (bif_number -1) or a table entry without a function stays on the helper.
         encoder.ldr_uoff(Gpr::w(9), Gpr::x(0), crate::bif::EXPORT_BIF_NUMBER_OFFSET)
     })?;
-    code.tbnz(Gpr::w(9), 31, helper_call)?;
+    let hidden_trap = code.new_label();
+    let have_function = code.new_label();
+    code.tbnz(Gpr::w(9), 31, hidden_trap)?;
     code.emit(|encoder| {
         encoder.mov_const(Gpr::x(8), bif_table as u64)?;
         encoder.ldr_regoff(Gpr::x(8), Gpr::x(8), Gpr::x(9), 3)
     })?;
+    code.b(have_function)?;
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210 (emit_export_trampoline,
+    // `call_bif`: the function is `trampoline.bif.address`), OTP-29.1.1: an export with
+    // bif_number -1 whose trampoline is `op_call_bif_W` (erts_init_trap_export) calls the
+    // function stored in it.
+    code.bind(hidden_trap)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(
+            Gpr::x(9),
+            Gpr::x(0),
+            arinsal_term::EXPORT_TRAMPOLINE_OP_OFFSET,
+        )?;
+        encoder.cmp_imm(Gpr::x(9), arinsal_term::TRAMPOLINE_CALL_BIF as u16, false)
+    })?;
+    code.b_cond(Cond::Ne, helper_call)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(
+            Gpr::x(8),
+            Gpr::x(0),
+            arinsal_term::EXPORT_TRAMPOLINE_OP_OFFSET + 8,
+        )
+    })?;
+    code.bind(have_function)?;
     code.cbz(Gpr::x(8), helper_call)?;
     code.emit(|encoder| {
         // A traced BIF still goes through the helper. Save-calls does not: that

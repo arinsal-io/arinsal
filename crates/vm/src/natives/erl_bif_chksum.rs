@@ -8,7 +8,7 @@
 
 use super::bif::{badarg, bif_ret};
 use super::erl_bif_lists::{bif_reds_left, bif_trap};
-use crate::{Process, Vm, VmError};
+use crate::{Process, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, BifError, Chksum, Ctx, Md5State, ProcessHeapHandle};
 use arinsal_term::{Term, atoms};
@@ -37,7 +37,7 @@ fn bump_reds(process: &mut Process, reds: usize) {
 }
 
 /// `BUMP_ALL_REDS(c_p)`.
-fn bump_all_reds(process: &mut Process) {
+pub(crate) fn bump_all_reds(process: &mut Process) {
     with_ctx(process, |ctx| ctx.bump_all_reds());
 }
 
@@ -215,23 +215,20 @@ pub(crate) extern "C" fn md5_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) 
     bif_ret(c_p, i, result)
 }
 
-/// `erlang:md5_trap/2`, the hidden trap target of `md5_1`. The context is always a binary of
-/// `sizeof(erts_md5_state)` bytes because only `md5_1` and this function trap to it.
+/// `erlang:md5_trap/2`, the hidden trap target of `md5_1`, installed by `erts_init_trap_export`
+/// (`bif_table::trap_function`). The context is always a binary of `sizeof(erts_md5_state)`
+/// bytes because only `md5_1` and this function trap to it.
 // Port of erts/emulator/beam/erl_bif_chksum.c (md5_2), OTP-29.1.1.
-pub(crate) fn md5_2(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let context = arinsal_bifs::md5_state_arg(args[0]).map_err(|_| badarg())?;
-    md5_run(process, context, args[1])
-}
-
-/// `md5_2` as the native the hidden export's trampoline calls (`trampoline.bif.address`).
-// Port of erts/emulator/beam/bif.c (erts_init_trap_export), OTP-29.1.1.
-pub(crate) fn md5_trap_2_native(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut arinsal_sched::RunCtx<'_, crate::process::Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    md5_2(process, args)
+pub(crate) extern "C" fn md5_trap_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (context, data) = (process.x[0], process.x[1]);
+    let result = arinsal_bifs::md5_state_arg(context)
+        .map_err(|_| badarg())
+        .and_then(|state| md5_run(process, state, data));
+    bif_ret(c_p, i, result)
 }
 
 /// `erlang:md5_init/0`.

@@ -8,6 +8,7 @@
 pub(crate) mod bif;
 pub(crate) mod bif_phash2;
 pub(crate) mod erl_bif_chksum;
+pub(crate) mod erl_bif_guard;
 pub(crate) mod erl_bif_info;
 pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_os;
@@ -554,6 +555,10 @@ fn classify_by_name(
     if let Some(entry) = resolve(module, function, arity) {
         return (ImportClass::Native, pack_native(entry));
     }
+    // A hidden trap export is its `trampoline.bif.address`: the executor calls that function.
+    if crate::bif_table::trap_function(module, function, arity).is_some() {
+        return (ImportClass::Native, 0);
+    }
     if is_fun(module, function, arity) {
         return (ImportClass::Fun, 0);
     }
@@ -639,8 +644,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if module == "erlang" {
         match (function, arity) {
-            // The hidden trap export of `md5/1` (`chksum_md5_2_exp`).
-            ("md5_trap", 2) => return Some(NativeEntry::Direct(erl_bif_chksum::md5_trap_2_native)),
             ("monitor", 2 | 3) => return Some(NativeEntry::Direct(bif::monitor_executor)),
             ("demonitor", 1 | 2) => return Some(NativeEntry::Direct(bif::demonitor_executor)),
             _ => {}
