@@ -241,13 +241,11 @@ impl Process {
             .as_ref()
             .is_some_and(|cold| !cold.call_memory.is_empty());
         if !traced_words {
-            let old_len = self.inbox.len();
             let Some(fetched) = self.probe_fetch_messages_into_inbox() else {
                 return Ok(0);
             };
             if fetched != 0 {
-                self.sig_cont_taken += fetched as u64;
-                self.inbox.spliced_at(old_len);
+                self.inbox.spliced();
                 crate::natives::erts_debug::after_message_queue_change(self);
             }
             return Ok(fetched);
@@ -256,18 +254,13 @@ impl Process {
             return Ok(0);
         };
         while let Some(node) = self.pop_sig_cont_signal() {
-            self.sig_cont_taken += 1;
             debug_assert!(
                 matches!(node.payload, Payload::Message(_)),
                 "fetch_messages_if takes messages only"
             );
-            let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
             let before = self.message_words_before();
-            let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
+            self.inbox.push_message_node(node);
             self.uncount_message_words(before);
-            if new_prio_len != old_prio_len {
-                self.cold_mut().prio_len = new_prio_len;
-            }
         }
         if fetched != 0 {
             crate::natives::erts_debug::after_message_queue_change(self);

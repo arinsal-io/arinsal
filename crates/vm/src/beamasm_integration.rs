@@ -569,11 +569,13 @@ fn receive_fragments() -> Option<&'static arinsal_beamasm::receive_frag::Receive
                 crate::native_helpers::arinsal_beamasm_wait,
                 yield_fragments()?.context_switch(),
                 Some(arinsal_beamasm::receive_frag::InlinePeek {
-                    save_term_offset: u32::try_from(
+                    save_offset: u32::try_from(
                         std::mem::offset_of!(crate::Process, inbox)
-                            + crate::process::MessageQueue::SAVE_TERM_OFFSET,
+                            + crate::process::MessageQueue::SAVE_OFFSET,
                     )
                     .ok()?,
+                    term_offset: u32::try_from(crate::process::MessageQueue::node_term_offset())
+                        .ok()?,
                     delay_gc_offset: u16::try_from(std::mem::offset_of!(crate::Process, delay_gc))
                         .ok()?,
                 }),

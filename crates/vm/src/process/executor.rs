@@ -382,7 +382,7 @@ impl Executor {
         // BIF_TRAP_CODE_PTR(beam_run_process, 3)), OTP-29.1.1: the process wakes in the
         // beam_run_process stub, which applies X0..X2.
         process.set_run_process_entry()?;
-        process.inbox.set_save(0);
+        process.msgq_set_save_first();
         process.cancel_receive_timer();
         Ok(())
     }

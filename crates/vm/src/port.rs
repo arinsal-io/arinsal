@@ -3199,19 +3199,7 @@ pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, Message>)
     process
         .fetch_signals(ctx)
         .expect("fetching signals links queued messages and cannot fail");
-    let len = process.inbox.len();
-    if let Some(cold) = process.cold.as_mut() {
-        cold.priority_resume_cursor = None;
-    }
-    if process.sig_cont_empty() {
-        // `c_p->sig_qs.save = c_p->sig_qs.last`.
-        process.inbox.set_save(len);
-    } else {
-        // Unhandled signals in the middle queue: a receive marker passes through it and
-        // sets the save pointer when it enters the message queue.
-        // erts_msgq_recv_marker_create_insert_set_save(c_p, NIL): the marker goes to the end.
-        process.recv_marker_create_insert_set_save(None);
-    }
+    process.msgq_set_save_end();
 }
 
 /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend) with a busy port: `false`

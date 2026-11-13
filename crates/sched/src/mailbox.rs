@@ -759,7 +759,11 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// Returns the number of signals taken.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__: an outer
     // queue without non-message signals is spliced onto the message queue), OTP-29.1.1.
-    pub fn take_all_if(&self, _accept: impl Fn(&T) -> bool, into: &mut SignalQueue<T>) -> usize {
+    pub fn take_all_if(
+        &self,
+        _accept: impl Fn(&T) -> bool,
+        into: impl FnOnce(&mut SignalQueue<T>),
+    ) -> usize {
         if !self.has_pending() {
             return 0;
         }
@@ -771,7 +775,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             return 0;
         }
         let count = queue.len();
-        into.append(&mut queue);
+        into(&mut queue);
+        debug_assert!(queue.is_empty(), "the target took the whole queue");
         // `accept` took only messages.
         self.dequeued(&queue);
         drop(queue);
@@ -838,7 +843,10 @@ mod tests {
         assert_eq!(bits(&input), 0);
         input.push_block(vec![3, 4]);
         assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
-        assert_eq!(input.take_all_if(|value| *value >= 0, &mut inner), 2);
+        assert_eq!(
+            input.take_all_if(|value| *value >= 0, |queue| inner.append(queue)),
+            2
+        );
         assert_eq!(bits(&input), 0);
         assert_eq!(inner.iter().copied().collect::<Vec<_>>(), [-1, 2, 3, 4]);
     }

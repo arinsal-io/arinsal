@@ -55,7 +55,7 @@ impl Process {
     /// Receive-trace the message, if any, that a conversion appended after `queued` entries.
     fn trace_new_message(&mut self, ctx: &mut RunCtx<'_, Message>, queued: usize, from: Pid) {
         if self.inbox.len() > queued
-            && let Some(message) = self.inbox.get(self.inbox.len() - 1).copied()
+            && let Some(message) = self.inbox.back().copied()
         {
             self.trace_converted_signal(ctx, message, from);
         }
@@ -84,16 +84,13 @@ impl Process {
         // The whole batch is one splice onto the message queue in erts (LINK_MESSAGE of the
         // fetched list); a plain message needs no alias, priority or receive-trace handling.
         let count = self.sig_cont().len();
-        self.sig_cont_taken += count as u64;
         ctx.consume_fetched_many(count);
         while let Some(node) = self.pop_sig_cont_signal() {
             match &node.payload {
                 Payload::Message(message) if message.alias == 0 && !message.is_priority() => {
-                    let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                     let before = self.message_words_before();
-                    let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
+                    self.inbox.push_message_node(node);
                     self.uncount_message_words(before);
-                    debug_assert_eq!(new_prio_len, old_prio_len);
                 }
                 _ => self.move_message(ctx, node)?,
             }
@@ -167,43 +164,37 @@ impl Process {
         if limit > abs_lim {
             limit = abs_lim;
         }
-        // The message queue as it was before this call: erts moves the handled part of the
-        // middle queue there only when it stops, so `stretch_limit` looks at this prefix.
-        let msgq_len = self.inbox.len();
+        // The end of the message queue before this call: erts moves the handled part of the
+        // middle queue there only when it stops, so `stretch_limit` looks at what precedes.
+        let msgq_end = self.inbox.entries.last_field();
         let mut cnt = 0_i32;
         let mut handled = false;
         let result = loop {
-            // Messages up to the next non-message signal or receive marker.
-            let marker = loop {
-                if self.recv_marker_due() {
-                    break true;
-                }
-                match self.sig_cont().front() {
-                    Some(event) if Self::is_ordinary_message(&event.payload) => {
-                        let node = self.pop_sig_cont_signal().expect("front checked");
-                        self.sig_cont_taken += 1;
-                        ctx.consume_fetched();
-                        self.move_message(ctx, node)?;
-                    }
-                    _ => break false,
-                }
-            };
-            if !marker && self.sig_cont().is_empty() {
+            // Messages up to the next non-message signal or receive marker (a lazy node, which
+            // has no value to look at).
+            while let Some(event) = self.sig_cont().front()
+                && Self::is_ordinary_message(&event.payload)
+            {
+                let node = self.pop_sig_cont_signal().expect("front checked");
+                ctx.consume_fetched();
+                self.move_message(ctx, node)?;
+            }
+            if self.sig_cont().is_empty() {
                 break Ok(true);
             }
-            if handled && !(cnt <= limit || self.stretch_limit(abs_lim, &mut limit, msgq_len)) {
+            if handled && !(cnt <= limit || self.stretch_limit(abs_lim, &mut limit, msgq_end)) {
                 break Ok(false);
             }
             handled = true;
-            if marker {
-                self.recv_marker_enter_msgq();
-                cnt += 1;
-                continue;
-            }
             let Some(node) = self.pop_sig_cont_signal() else {
                 break Ok(true);
             };
-            self.sig_cont_taken += 1;
+            if arinsal_sched::RecvMarker::is_marker(&node) {
+                // ERTS_SIG_Q_OP_RECV_MARK: inserted by this process, not fetched.
+                self.recv_marker_enter_msgq(node);
+                cnt += 1;
+                continue;
+            }
             ctx.consume_fetched();
             if !node.is_lazy() && !matches!(node.payload, Payload::Signal(_)) {
                 // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
@@ -296,6 +287,8 @@ impl Process {
                 Err(error) => break Err(error),
             }
         };
+        // Port of erl_proc_sig_queue.c:7146-7150: the save pointer does not stay at a marker.
+        self.pass_markers_at_save();
         // Port of erl_proc_sig_queue.c:7160 (`*redsp = cnt/ERTS_SIG_REDS_CNT_FACTOR + 1`).
         *reds = cnt / SIG_REDS_CNT_FACTOR + 1;
         ctx.set_sig_q(!self.sig_cont_empty());

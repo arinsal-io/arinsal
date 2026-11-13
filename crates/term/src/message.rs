@@ -464,6 +464,14 @@ impl<T> OwnedSignal<T> {
         is_lazy_word(word).then_some(word as u64 & LAZY_META_MASK)
     }
 
+    /// [`OwnedSignal::lazy_meta`] of a node a queue holds.
+    ///
+    /// Contract: `node` is a live node of this type.
+    pub fn lazy_meta_of(node: NonNull<SignalNode<T>>) -> Option<u64> {
+        let word = Self::marker(node);
+        is_lazy_word(word).then_some(word as u64 & LAZY_META_MASK)
+    }
+
     /// Take the value of a lazy node out of its structure; the node is not used afterwards.
     fn materialise(node: NonNull<SignalNode<T>>) -> T {
         crate::raw::lazy_make(node.cast())

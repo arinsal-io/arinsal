@@ -456,9 +456,6 @@ pub struct Process {
     /// Reached through `sig_cont`/`sig_cont_mut`; the collector's root walk also borrows it
     /// field-wise (updating message words never changes whether the queue is empty).
     pub(crate) sig_cont: arinsal_sched::SignalQueue<arinsal_sched::Event<crate::process::Message>>,
-    /// Signals taken from the front of `sig_cont` so far; receive markers inserted into the
-    /// middle queue are positioned by it.
-    pub(crate) sig_cont_taken: u64,
     pub(crate) receive_timeout_pos: Option<u64>,
     /// `def_arg_reg[0]` of a receive with a timer: where the process continues when it is
     /// scheduled in timed out: a native code address, 0 when unset.
@@ -1389,10 +1386,8 @@ pub(crate) struct ProcessCold {
     /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
     /// for events raised outside a scheduler context (GC trace).
     pub(crate) scheduler_id: usize,
-    /// Number of priority messages at the front of the private mailbox.
-    pub(crate) prio_len: usize,
-    /// Saved ordinary-message cursor while a newly arrived priority section is scanned.
-    pub(crate) priority_resume_cursor: Option<usize>,
+    /// `ErtsPrioQInfo`: the prio queue's markers, while it has messages.
+    pub(crate) prio_q: Option<Box<crate::receive::PrioQInfo>>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
     pub(crate) native_return_events: Option<Box<NativeReturnEvents>>,
@@ -1942,8 +1937,10 @@ impl Process {
     #[inline(always)]
     pub(crate) fn probe_fetch_messages(&mut self) -> Option<usize> {
         let probe = self.signal_probe.as_ref()?;
-        let fetched =
-            probe.fetch_messages_if(|message| !message.is_altact_msg(), &mut self.sig_cont);
+        let fetched = probe.fetch_messages_if(
+            |message| !message.is_altact_msg(),
+            |queue| self.sig_cont.append(queue),
+        );
         let busy = !self.sig_cont.is_empty();
         self.set_slow(Self::SLOW_SIG_CONT, busy);
         Some(fetched)
@@ -1953,9 +1950,10 @@ impl Process {
     #[inline(always)]
     pub(crate) fn probe_fetch_messages_into_inbox(&mut self) -> Option<usize> {
         let probe = self.signal_probe.as_ref()?;
+        let inbox = &mut self.inbox;
         Some(probe.fetch_messages_if(
             |message| !message.is_altact_msg(),
-            self.inbox.fetch_target(),
+            |queue| inbox.fetch_target().append(queue),
         ))
     }
     /// Moves the whole outer queue to the middle queue through the signal probe.
@@ -2128,7 +2126,6 @@ impl Process {
             native_resume_after_call: None,
             inbox: process::MessageQueue::default(),
             sig_cont: arinsal_sched::SignalQueue::default(),
-            sig_cont_taken: 0,
             receive_timeout_pos: None,
             receive_timeout_next: 0,
             receive_infinity: false,
@@ -2928,10 +2925,6 @@ mod layout_report {
         );
         eprintln!("  Process.inbox {}", size_of_val(&process.inbox));
         eprintln!("  Process.sig_cont {}", size_of_val(&process.sig_cont));
-        eprintln!(
-            "  Process.sig_cont_taken {}",
-            size_of_val(&process.sig_cont_taken)
-        );
         eprintln!(
             "  Process.receive_timeout_pos {}",
             size_of_val(&process.receive_timeout_pos)

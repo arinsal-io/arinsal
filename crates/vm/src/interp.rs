@@ -126,7 +126,7 @@ impl Vm {
         if ctx.has_pending_input() || !process.sig_cont_empty() {
             return Ok(false);
         }
-        Ok(process.inbox.save() >= process.inbox.len())
+        Ok(process.inbox.peek().is_none())
     }
 
     /// Puts the process at the code address of function entry `target` of module `module_id`,

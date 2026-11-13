@@ -17,6 +17,7 @@ impl<T: Task> TaskCell<T> {
         let slot = self.task.as_mut_ptr();
         let task = init(&mut self.task);
         assert!(std::ptr::eq(slot, task));
+        task.init_in_place();
         self.initialized = true;
     }
 }
