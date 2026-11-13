@@ -225,15 +225,14 @@ pub extern "C" fn enif_ioq_peek_head(
         // SAFETY: the segment's handle is live while it is queued.
         let held: NifBinary = unsafe { &*handle.cast::<NifBinary>() }.clone();
         let orig_size = held.orig_size();
-        // SAFETY: the segment's bytes stay readable while `held` is retained by the term.
-        let external = unsafe {
-            arinsal_term::ExternalBinary::new(
-                entry.iov_base.cast(),
-                entry.iov_len,
-                // Port of erts/emulator/beam/erl_nif.c (enif_ioq_peek_head), OTP-29.1.1:
-                // this wraps the retained refc Binary, whose orig_size is its allocation size.
-                MagicBin::with_orig_size_and_refn(held, orig_size, arinsal_bifs::next_ref_words()),
-            )
+        // Port of erts/emulator/beam/erl_nif.c (enif_ioq_peek_head), OTP-29.1.1: this wraps
+        // the retained refc Binary, whose orig_size is its allocation size.
+        let Some(external) = arinsal_term::ExternalBinary::new::<NifBinary>(
+            entry.iov_base.cast(),
+            entry.iov_len,
+            MagicBin::with_orig_size_and_refn(held, orig_size, arinsal_bifs::next_ref_words()),
+        ) else {
+            return 0;
         };
         builder.external_binary(external)
     } else {

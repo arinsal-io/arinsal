@@ -240,11 +240,9 @@ pub extern "C" fn enif_monitor_process(
     pid: *const Term,
     monitor: *mut [u8; 32],
 ) -> c_int {
-    if pid.is_null() {
+    let Some(target) = crate::raw::resource_monitor_pid(pid) else {
         return -1;
-    }
-    // SAFETY: the NIF passes a pid it got from enif_get_local_pid.
-    let target = unsafe { *pid };
+    };
     if target.as_pid().is_none() {
         return -1;
     }
@@ -287,16 +285,14 @@ pub extern "C" fn enif_demonitor_process(
     obj: *mut c_void,
     monitor: *const [u8; 32],
 ) -> c_int {
-    if monitor.is_null() {
+    let Some(bytes) = crate::raw::resource_monitor_id(monitor) else {
         return -1;
-    }
+    };
     crate::raw::with_resource(obj, |bin| {
         let resource = bin.downcast_ref::<Resource>().expect("a resource binary");
         let Some(rm) = resource.monitors.as_ref() else {
             return 1;
         };
-        // SAFETY: the NIF passes the monitor it got from enif_monitor_process.
-        let bytes: [u8; 32] = unsafe { *monitor };
         let id = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
         let Some(target) = rm.remove(id) else {
             return 1;

@@ -2,8 +2,13 @@
 //!
 //! Each helper holds the one `unsafe` block for its pattern, with the contract of the NIF API
 //! as its safety argument, so call sites stay free of repeated blocks.
+use crate::ErlNifEnv;
+use crate::binref::NifBinary;
 use arinsal_term::raw::magic_bin::MagicMonitor;
-use arinsal_term::{BinaryRef, FloatRef, ListIter, MagicBin, MagicPayload, Term, TupleRef};
+use arinsal_term::{
+    BinaryOwner, BinaryRef, ExternalBinary, FloatRef, ListIter, MagicBin, MagicPayload, MagicRef,
+    Term, TermBuilder, TupleRef,
+};
 use std::ffi::{CStr, c_char, c_void};
 
 /// A magic payload whose destructor defers payload destruction until its monitor state reaches
@@ -38,6 +43,67 @@ unsafe impl MonitoredResourcePayload for crate::resources::Resource {
     fn monitor_state(&self) -> Option<&crate::res_monitor::ResourceMonitors> {
         self.monitors.as_ref()
     }
+}
+
+/// Port of erts/emulator/beam/erl_nif.c:3206 (`enif_make_resource_binary`), OTP-29.1.1.
+/// The NIF raw boundary retains the magic block and uses the C API's external-byte lifetime
+/// contract to construct a typed, owner-carrying span.
+#[unsafe(no_mangle)]
+pub extern "C" fn enif_make_resource_binary(
+    e: *mut ErlNifEnv,
+    data: *mut c_void,
+    bytes: *const c_void,
+    size: usize,
+) -> Term {
+    if bytes.is_null() && size > 0 {
+        return crate::terms::enif_make_badarg(e);
+    }
+    let Some(bin) = with_resource(data, MagicBin::clone) else {
+        return crate::terms::enif_make_badarg(e);
+    };
+    // SAFETY: erl_nif.md's enif_make_resource_binary contract requires the byte span to remain
+    // readable and unchanged until this resource's destructor; the resource pointer has a live
+    // count held by its C caller, retained by `with_resource` above.
+    let Some(bytes) =
+        (unsafe { bin.external_data::<crate::resources::Resource>(bytes.cast(), size) })
+    else {
+        return crate::terms::enif_make_badarg(e);
+    };
+    let external = ExternalBinary::from_magic_data::<crate::resources::Resource>(bytes);
+    // SAFETY: the NIF passes a live environment to this C ABI entry point.
+    let env = crate::raw::deref_mut(e);
+    TermBuilder::new(&mut env.heap)
+        .external_binary(external)
+        .unwrap_or_else(|_| crate::terms::enif_make_badarg(e))
+}
+
+/// The bytes owned by one NIF `Binary*` handle.
+// Port of erts/emulator/beam/erl_nif.c (enif_ioq_peek_head), OTP-29.1.1.
+pub(crate) fn nif_binary_data_bytes<'a>(
+    binary: &'a NifBinary,
+    _: &'a MagicRef,
+) -> Option<&'a [u8]> {
+    if let NifBinary::Owner(BinaryOwner::Binary(owner)) = binary {
+        return owner.payload(0, owner.capacity()?);
+    }
+    let (data, len) = match binary {
+        NifBinary::Owner(BinaryOwner::External(external)) => {
+            let range = external.data_range();
+            (
+                range.start as *const u8,
+                range.end.checked_sub(range.start)?,
+            )
+        }
+        NifBinary::Block(block) => (block.data.cast_const(), block.orig_size),
+        NifBinary::Owner(BinaryOwner::Binary(_)) => unreachable!(),
+    };
+    if len == 0 {
+        return Some(&[]);
+    }
+    if data.is_null() {
+        return None;
+    }
+    Some(slice(data, len))
 }
 
 /// Adopts the resource count owned by an `enif_*_resource` C pointer.
@@ -119,6 +185,38 @@ pub(crate) fn finish_dead_monitor(
     unsafe { bin.finish_dead() };
 }
 
+/// Invoke the destructor callback retained by a live resource type.
+// Port of erts/emulator/beam/erl_nif.c (run_resource_dtor), OTP-29.1.1.
+pub(crate) fn call_resource_destructor(
+    dtor: unsafe extern "C" fn(*mut ErlNifEnv, *mut c_void),
+    env: &mut ErlNifEnv,
+    data: *mut c_void,
+) {
+    // SAFETY: `erl_nif.c` invokes this callback while the resource allocation and its type are
+    // live; the resource destructor calls us before dropping the payload.
+    unsafe { dtor(env, data) };
+}
+
+/// Read the pid supplied to `enif_monitor_process` for the duration of the NIF call.
+// Port of erts/emulator/beam/erl_nif.c (enif_monitor_process), OTP-29.1.1.
+pub(crate) fn resource_monitor_pid(pid: *const Term) -> Option<Term> {
+    if pid.is_null() {
+        return None;
+    }
+    // SAFETY: `erl_nif.c` passes a readable `ErlNifPid` for the duration of this call.
+    Some(unsafe { *pid })
+}
+
+/// Copy the monitor supplied to `enif_demonitor_process` for the duration of the NIF call.
+// Port of erts/emulator/beam/erl_nif.c (enif_demonitor_process), OTP-29.1.1.
+pub(crate) fn resource_monitor_id(monitor: *const [u8; 32]) -> Option<[u8; 32]> {
+    if monitor.is_null() {
+        return None;
+    }
+    // SAFETY: `erl_nif.c` passes a readable `ErlNifMonitor` for the duration of this call.
+    Some(unsafe { *monitor })
+}
+
 /// A shared reference to the object behind a pointer the NIF API contract makes valid.
 pub(crate) fn deref<'a, T>(p: *const T) -> &'a T {
     // SAFETY: NIF API calls take live objects; the reference does not outlive the call.
@@ -137,9 +235,9 @@ pub(crate) fn cstr<'a>(p: *const c_char) -> &'a CStr {
     unsafe { CStr::from_ptr(p) }
 }
 
-/// The `n` elements a NIF passed at `p`.
+/// The `n` elements at `p` that the caller keeps readable for the returned borrow.
 pub(crate) fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
-    // SAFETY: the NIF passes `n` readable elements valid for the call.
+    // SAFETY: callers pass `n` readable elements that remain live for the returned borrow.
     unsafe { std::slice::from_raw_parts(p, n) }
 }
 

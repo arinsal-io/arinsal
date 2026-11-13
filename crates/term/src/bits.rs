@@ -229,26 +229,33 @@ impl RefcBinary {
 
 /// Bytes borrowed from a native resource whose owner remains live with the term.
 pub struct ExternalBinary {
-    data: *const u8,
+    data: usize,
     len: usize,
     _owner: crate::MagicBin,
 }
-// SAFETY: native resource users synchronize any mutation of published bytes.
-unsafe impl Send for ExternalBinary {}
-// SAFETY: the retained magic owner keeps the borrowed allocation live.
-unsafe impl Sync for ExternalBinary {}
 impl ExternalBinary {
-    /// Keep an external byte range alive through a magic reference.
-    ///
-    /// # Safety
-    /// `data` must remain readable for `len` bytes until `owner` is dropped.
-    pub unsafe fn new(data: *const u8, len: usize, owner: crate::MagicBin) -> Arc<Self> {
+    /// Keep a byte range owned by a typed magic payload alive through a magic reference.
+    // Port of erts/emulator/beam/erl_nif.c (enif_make_resource_binary), OTP-29.1.1.
+    pub fn new<T: crate::MagicPayload>(
+        data: *const u8,
+        len: usize,
+        owner: crate::MagicBin,
+    ) -> Option<Arc<Self>> {
+        let data = owner.validated_data_pointer::<T>(data, len)?;
+        Some(Arc::new(Self {
+            data: data as usize,
+            len,
+            _owner: owner,
+        }))
+    }
+
+    /// Keep a byte span whose destructor contract was established at a raw resource boundary.
+    pub fn from_magic_data<T: crate::MagicPayload>(
+        data: crate::raw::magic_bin::MagicBinaryData<T>,
+    ) -> Arc<Self> {
+        let (data, len, owner) = data.into_parts();
         Arc::new(Self {
-            data: if len == 0 && data.is_null() {
-                std::ptr::NonNull::dangling().as_ptr()
-            } else {
-                data
-            },
+            data,
             len,
             _owner: owner,
         })
@@ -265,6 +272,11 @@ impl ExternalBinary {
     /// `Binary.orig_size` of the retained owner.
     pub fn owner_orig_size(&self) -> usize {
         self._owner.orig_size()
+    }
+
+    /// Address span retained by this external binary.
+    pub fn data_range(&self) -> std::ops::Range<usize> {
+        self.data..self.data + self.len
     }
 }
 
@@ -628,7 +640,7 @@ pub(crate) unsafe fn binary_data(bin_ref: *const u64) -> *const u8 {
     // SAFETY: caller guarantees a live BinRef and retained owner.
     unsafe {
         if bin_ref_val_is_external(*bin_ref.add(1)) {
-            (&*external_val_ptr(*bin_ref.add(1))).data
+            (&*external_val_ptr(*bin_ref.add(1))).data as *const u8
         } else {
             (*bin_ref.add(1) as *const u64)
                 .wrapping_add(BINARY_HEADER_WORDS)
@@ -1063,7 +1075,7 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         if !self.heap.supports_external_binary() {
             return Err(TermError::Unsupported("external binary heap owner"));
         }
-        let adjustment = owner.data as usize & 3;
+        let adjustment = owner.data & 3;
         let len = owner.len();
         let end = len
             .checked_add(adjustment)

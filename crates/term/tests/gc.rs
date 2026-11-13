@@ -268,11 +268,20 @@ fn collections_with_many_live_magic_references_stay_linear() {
     assert_eq!(count.load(Ordering::SeqCst), 40_000);
 }
 
-arinsal_term::magic_payload!(ExternalPayload => destroy_external_payload);
 struct ExternalPayload {
     bytes: Box<[u8]>,
     _counter: DropCounter,
 }
+fn external_payload_data_bytes<'a>(
+    payload: &'a ExternalPayload,
+    _: &'a arinsal_term::MagicRef,
+) -> Option<&'a [u8]> {
+    Some(&payload.bytes)
+}
+arinsal_term::magic_payload!(
+    ExternalPayload => destroy_external_payload,
+    data = external_payload_data_bytes
+);
 #[test]
 fn external_binary_keeps_resource_through_copy_and_gc() {
     arinsal_term::init_global_literals();
@@ -282,8 +291,8 @@ fn external_binary_keeps_resource_through_copy_and_gc() {
         _counter: DropCounter(count.clone()),
     });
     let bytes = &owner.downcast_ref::<ExternalPayload>().unwrap().bytes;
-    // SAFETY: the ExternalBinary retains owner, which owns these three bytes.
-    let external = unsafe { ExternalBinary::new(bytes.as_ptr(), bytes.len(), owner.clone()) };
+    let external =
+        ExternalBinary::new::<ExternalPayload>(bytes.as_ptr(), bytes.len(), owner.clone()).unwrap();
     let mut source = VecHeap::new();
     let term = TermBuilder::new(&mut source)
         .external_binary(external)

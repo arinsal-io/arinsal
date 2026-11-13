@@ -41,8 +41,7 @@ impl crate::Term {
     /// The term's heap and its off-heap owners must stay live for the borrow.
     pub unsafe fn magic_ref<'a>(self) -> Option<&'a MagicRef> {
         let word = self.magic_word()?;
-        // SAFETY: forwarded caller contract.
-        Some(unsafe { thing_block(word) })
+        Some(thing_block(word))
     }
 }
 

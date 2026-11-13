@@ -30,10 +30,20 @@ pub type MagicDestructor = fn(&mut MagicRef) -> bool;
 /// [`MagicRef::downcast_ref`]), that finalizes and drops the payload exactly once before the
 /// block is freed, and that returns `false` only when another owner will finish deallocation.
 /// The unique named destructor is the invariant that permits safe typed payload access.
+/// If [`MagicPayload::external_data_bytes`] returns `Some`, those bytes must remain
+/// readable and immutable or synchronized until the payload is dropped.
 /// [`crate::magic_payload!`] defines a distinct non-inlined destructor per type.
 pub unsafe trait MagicPayload: Send + Sync + Sized + 'static {
     /// `ERTS_MAGIC_BIN_DESTRUCTOR` of binaries holding a `Self`.
     const DESTRUCTOR: MagicDestructor;
+
+    /// Bytes whose storage is kept alive by this payload, if it owns external bytes.
+    ///
+    /// Implementations returning `Some` must keep the complete slice readable and immutable or
+    /// synchronized while this payload remains live.
+    fn external_data_bytes<'a>(&'a self, _block: &'a MagicRef) -> Option<&'a [u8]> {
+        None
+    }
 }
 
 /// Declare the magic binary destructor of a payload type, like the named destructor erts
@@ -44,6 +54,52 @@ pub unsafe trait MagicPayload: Send + Sync + Sized + 'static {
 /// payload types into one address.
 #[macro_export]
 macro_rules! magic_payload {
+    ($ty:ty => $name:ident, finalize = $finalize:path, data = $bytes:path) => {
+        // SAFETY: the destructor below is defined once for this type and only finalizes it;
+        // the byte view is borrowed from storage kept valid by this payload.
+        unsafe impl $crate::MagicPayload for $ty {
+            const DESTRUCTOR: $crate::MagicDestructor = {
+                #[inline(never)]
+                fn $name(mb: &mut $crate::MagicRef) -> bool {
+                    static MARKER: ::std::sync::atomic::AtomicU8 =
+                        ::std::sync::atomic::AtomicU8::new(0);
+                    ::std::hint::black_box(&MARKER);
+                    mb.finalize_payload::<$ty>($finalize)
+                }
+                $name
+            };
+
+            fn external_data_bytes<'a>(
+                &'a self,
+                block: &'a $crate::MagicRef,
+            ) -> Option<&'a [u8]> {
+                $bytes(self, block)
+            }
+        }
+    };
+    ($ty:ty => $name:ident, data = $bytes:path) => {
+        // SAFETY: the destructor below is defined once for this type and only drops it; the
+        // byte view is borrowed from storage kept valid by this payload.
+        unsafe impl $crate::MagicPayload for $ty {
+            const DESTRUCTOR: $crate::MagicDestructor = {
+                #[inline(never)]
+                fn $name(mb: &mut $crate::MagicRef) -> bool {
+                    static MARKER: ::std::sync::atomic::AtomicU8 =
+                        ::std::sync::atomic::AtomicU8::new(0);
+                    ::std::hint::black_box(&MARKER);
+                    mb.finalize_payload::<$ty>(|_, _| true)
+                }
+                $name
+            };
+
+            fn external_data_bytes<'a>(
+                &'a self,
+                block: &'a $crate::MagicRef,
+            ) -> Option<&'a [u8]> {
+                $bytes(self, block)
+            }
+        }
+    };
     ($($ty:ty => $name:ident),+ $(,)?) => {$(
         // SAFETY: the destructor below is defined once for this type and only drops it.
         unsafe impl $crate::MagicPayload for $ty {
@@ -208,16 +264,15 @@ impl MagicRef {
 }
 
 /// A counted reference to a magic binary: `Binary *` with one `intern.refc` held.
-pub struct MagicBin(NonNull<MagicRef>);
-
-// SAFETY: payloads are `Send + Sync` and the count is atomic.
-unsafe impl Send for MagicBin {}
-// SAFETY: as above; shared access only reads the header and borrows the `Sync` payload.
-unsafe impl Sync for MagicBin {}
+pub struct MagicBin(usize);
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl MagicBin {
+    fn block(&self) -> NonNull<MagicRef> {
+        NonNull::new(self.0 as *mut MagicRef).expect("magic binary block")
+    }
+
     /// A magic binary whose `orig_size` is the payload size, with fresh reference numbers.
     pub fn new<T: MagicPayload>(payload: T) -> Self {
         Self::with_orig_size(payload, size_of::<T>())
@@ -274,6 +329,60 @@ impl MagicBin {
         Self::create_x(payload, trailing, trailing_align, orig_size, refn)
     }
 
+    /// The pointer for a byte span inside the payload's retained data, preserving its provenance.
+    pub(crate) fn validated_data_pointer<T: MagicPayload>(
+        &self,
+        data: *const u8,
+        len: usize,
+    ) -> Option<*const u8> {
+        if len == 0 {
+            return self
+                .downcast_ref::<T>()
+                .map(|_| std::ptr::NonNull::<u8>::dangling().as_ptr().cast_const());
+        }
+        if data.is_null() {
+            return None;
+        }
+        let payload = self.downcast_ref::<T>()?;
+        let bytes = payload.external_data_bytes(self)?;
+        let end = (data as usize).checked_add(len)?;
+        let start = bytes.as_ptr() as usize;
+        let bytes_end = start.checked_add(bytes.len())?;
+        let address = data as usize;
+        if address < start || end > bytes_end {
+            return None;
+        }
+        Some(bytes.as_ptr().wrapping_add(address - start))
+    }
+
+    /// Retain bytes managed by a resource binary's destructor.
+    ///
+    /// # Safety
+    /// For non-empty spans, `data..data + len` must stay readable and unchanged until this
+    /// resource payload is dropped. This is the `enif_make_resource_binary` contract.
+    // Port of erts/emulator/beam/erl_nif.c:3206 (`enif_make_resource_binary`), OTP-29.1.1.
+    pub unsafe fn external_data<T: MagicPayload>(
+        self,
+        data: *const u8,
+        len: usize,
+    ) -> Option<MagicBinaryData<T>> {
+        self.downcast_ref::<T>()?;
+        let data = if len == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            if data.is_null() || (data as usize).checked_add(len).is_none() {
+                return None;
+            }
+            data.cast_mut()
+        };
+        Some(MagicBinaryData {
+            data: data as usize,
+            len,
+            owner: self,
+            _payload: std::marker::PhantomData,
+        })
+    }
+
     fn create_x<T: MagicPayload>(
         payload: T,
         trailing: usize,
@@ -314,7 +423,7 @@ impl MagicBin {
             raw.add(tail).write_bytes(0, size - tail);
             block
         };
-        Self(block)
+        Self(block.as_ptr() as usize)
     }
 
     /// Adopts the count owned by the NIF C pointer at `data`.
@@ -332,7 +441,8 @@ impl MagicBin {
         unsafe {
             let raw = data.sub(trailing_offset::<T>(trailing_align));
             let block = NonNull::new(raw.cast::<MagicRef>()).expect("magic binary data");
-            std::ptr::fn_addr_eq(block.as_ref().destructor, T::DESTRUCTOR).then_some(Self(block))
+            std::ptr::fn_addr_eq(block.as_ref().destructor, T::DESTRUCTOR)
+                .then_some(Self(block.as_ptr() as usize))
         }
     }
 
@@ -403,12 +513,12 @@ impl MagicBin {
 
     /// The block address, the pointer word of an `ErtsMRefThing`.
     pub fn as_ptr(this: &Self) -> *const MagicRef {
-        this.0.as_ptr()
+        this.0 as *const MagicRef
     }
 
     /// Give up this count to a raw pointer word (an `ErtsMRefThing` taking over the count).
     pub(crate) fn into_raw(this: Self) -> *const MagicRef {
-        let ptr = this.0.as_ptr();
+        let ptr = this.0 as *const MagicRef;
         std::mem::forget(this);
         ptr
     }
@@ -425,7 +535,7 @@ impl MagicBin {
                 .refc
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Self(block)
+        Self(block.as_ptr() as usize)
     }
 
     /// A reference that does not keep the payload alive.
@@ -443,12 +553,29 @@ impl MagicBin {
     }
 }
 
+/// An owner-carrying byte span whose lifetime is guaranteed by a magic payload destructor.
+///
+/// Values can only be created by [`MagicBin::external_data`] after its caller upholds that
+/// method's resource binary contract.
+pub struct MagicBinaryData<T: MagicPayload> {
+    data: usize,
+    len: usize,
+    owner: MagicBin,
+    _payload: std::marker::PhantomData<T>,
+}
+
+impl<T: MagicPayload> MagicBinaryData<T> {
+    pub(crate) fn into_parts(self) -> (usize, usize, MagicBin) {
+        (self.data, self.len, self.owner)
+    }
+}
+
 impl std::ops::Deref for MagicBin {
     type Target = MagicRef;
     #[inline]
     fn deref(&self) -> &MagicRef {
         // SAFETY: a counted reference keeps the block and its payload live.
-        unsafe { self.0.as_ref() }
+        unsafe { self.block().as_ref() }
     }
 }
 
@@ -469,7 +596,7 @@ impl Drop for MagicBin {
             return;
         }
         fence(Ordering::Acquire);
-        Self::free(self.0);
+        Self::free(self.block());
     }
 }
 
@@ -497,31 +624,33 @@ fn release_weak(block: NonNull<MagicRef>) {
 
 /// A non-owning resource monitor handle. Its external monitor count, rather than `refc`, keeps
 /// the payload live; this weak count keeps the block header allocated.
-pub struct MagicMonitor(NonNull<MagicRef>);
+pub struct MagicMonitor(usize);
 
-// SAFETY: the external monitor count protects the payload and both header counts are atomic.
-unsafe impl Send for MagicMonitor {}
-// SAFETY: as above; typed payload access is shared and `MagicPayload` is `Sync`.
-unsafe impl Sync for MagicMonitor {}
+impl MagicMonitor {
+    fn block(&self) -> NonNull<MagicRef> {
+        NonNull::new(self.0 as *mut MagicRef).expect("magic monitor block")
+    }
+}
 
 impl MagicMonitor {
     /// The resource payload protected by this monitor count, if it has the requested type.
     pub fn downcast_ref<T: MagicPayload>(&self) -> Option<&T> {
         // SAFETY: the constructor contract keeps the payload live; this weak count keeps the
         // header allocation live for the token's lifetime.
-        unsafe { self.0.as_ref() }.downcast_ref::<T>()
+        // SAFETY: this token's external monitor count keeps the block allocated.
+        unsafe { self.block().as_ref() }.downcast_ref::<T>()
     }
 
     /// `erts_refc_inc_unless(&bin->intern.refc, 0, 0)` while a monitor count keeps the header.
     pub fn retain_unless_dead(&self) -> Option<MagicBin> {
         // SAFETY: this token keeps the header allocated until after the atomic count attempt.
-        unsafe { retain_unless_dead(self.0) }
+        unsafe { retain_unless_dead(self.block()) }
     }
 
     /// The address of the magic binary block held by this monitor token.
     #[doc(hidden)]
     pub fn block_address(&self) -> usize {
-        self.0.as_ptr() as usize
+        self.0
     }
 
     /// Runs `erts_bin_free` after the final external monitor count is released.
@@ -532,13 +661,13 @@ impl MagicMonitor {
     // Port of erts/emulator/beam/erl_binary.h (erts_bin_free), OTP-29.1.1.
     pub unsafe fn finish_dead(&self) {
         // SAFETY: forwarded caller contract.
-        unsafe { MagicBin::bin_free(self.0) };
+        unsafe { MagicBin::bin_free(self.block()) };
     }
 }
 
 impl Drop for MagicMonitor {
     fn drop(&mut self) {
-        release_weak(self.0);
+        release_weak(self.block());
     }
 }
 
@@ -556,19 +685,14 @@ unsafe fn retain_unless_dead(block: NonNull<MagicRef>) -> Option<MagicBin> {
         }
         match refc.compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
         {
-            Ok(_) => return Some(MagicBin(block)),
+            Ok(_) => return Some(MagicBin(block.as_ptr() as usize)),
             Err(seen) => current = seen,
         }
     }
 }
 
 /// A reference to a magic binary that does not keep its payload alive.
-pub struct MagicWeak(Option<NonNull<MagicRef>>);
-
-// SAFETY: only the atomic header counts are touched through a weak reference.
-unsafe impl Send for MagicWeak {}
-// SAFETY: as above.
-unsafe impl Sync for MagicWeak {}
+pub struct MagicWeak(Option<usize>);
 
 impl MagicWeak {
     /// A weak reference to no binary.
@@ -579,8 +703,11 @@ impl MagicWeak {
     /// A counted reference, unless the binary's payload is gone.
     pub fn upgrade(&self) -> Option<MagicBin> {
         // SAFETY: the weak count keeps the header memory valid.
-        self.0
-            .and_then(|block| unsafe { retain_unless_dead(block) })
+        self.0.and_then(|address| {
+            let block = NonNull::new(address as *mut MagicRef).expect("magic weak block");
+            // SAFETY: the weak count keeps the header memory valid.
+            unsafe { retain_unless_dead(block) }
+        })
     }
 }
 
@@ -592,7 +719,8 @@ impl Default for MagicWeak {
 
 impl Clone for MagicWeak {
     fn clone(&self) -> Self {
-        if let Some(block) = self.0 {
+        if let Some(address) = self.0 {
+            let block = NonNull::new(address as *mut MagicRef).expect("magic weak block");
             // SAFETY: the weak count keeps the header memory valid.
             unsafe { block.as_ref() }
                 .weak
@@ -605,17 +733,15 @@ impl Clone for MagicWeak {
 impl Drop for MagicWeak {
     fn drop(&mut self) {
         if let Some(block) = self.0 {
-            release_weak(block);
+            release_weak(NonNull::new(block as *mut MagicRef).expect("magic weak block"));
         }
     }
 }
 
-/// Borrow the magic binary of a magic reference thing's pointer word.
-///
-/// # Safety
-/// The thing's heap and its off-heap owners must stay live for the borrow.
-pub(crate) unsafe fn thing_block<'a>(word: u64) -> &'a MagicRef {
-    // SAFETY: the pointer word of a live magic reference thing holds a count.
+/// Borrow the magic binary of a live magic reference thing's pointer word.
+pub(crate) fn thing_block<'a>(word: u64) -> &'a MagicRef {
+    // SAFETY: callers pass the pointer word of a live magic reference thing, which holds a
+    // count for the duration of the borrow.
     unsafe { &*(word as *const MagicRef) }
 }
 
@@ -626,11 +752,7 @@ pub(crate) unsafe fn thing_block<'a>(word: u64) -> &'a MagicRef {
 // binary again, and the entry goes away when the binary is freed.
 const TABLE_SHARDS: usize = 64;
 
-struct Entry(NonNull<MagicRef>);
-// SAFETY: the table only hands the pointer to `retain_unless_dead` under its lock.
-unsafe impl Send for Entry {}
-// SAFETY: as above.
-unsafe impl Sync for Entry {}
+struct Entry(usize);
 
 type Shard = RwLock<HashMap<u64, Entry>>;
 
@@ -662,9 +784,11 @@ impl MagicBin {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: an entry is removed under the write lock before its block is freed, so the
         // block is valid while the read lock is held.
-        shard
-            .get(&id)
-            .and_then(|entry| unsafe { retain_unless_dead(entry.0) })
+        shard.get(&id).and_then(|entry| {
+            let block = NonNull::new(entry.0 as *mut MagicRef).expect("magic table block");
+            // SAFETY: an entry is removed under the write lock before its block is freed.
+            unsafe { retain_unless_dead(block) }
+        })
     }
 
     /// The live magic binary addressed by its local reference numbers.

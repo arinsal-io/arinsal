@@ -2,7 +2,7 @@
 use crate::Library;
 use crate::raw::{cstr, deref, deref_mut};
 use crate::{ErlNifEnv, ErlNifResourceTypeInit, put, terms};
-use arinsal_term::{ExternalBinary, MagicBin, Term, TermBuilder};
+use arinsal_term::{MagicBin, Term, TermBuilder};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::hint::black_box;
@@ -172,7 +172,10 @@ pub(crate) struct Resource {
     pub(crate) size: usize,
 }
 
-arinsal_term::magic_payload!(Resource => nif_resource_destructor, nif_resource_dtor_prologue);
+arinsal_term::magic_payload!(
+    Resource => nif_resource_destructor,
+    nif_resource_dtor_prologue
+);
 
 /// `NIF_RESOURCE_DTOR`: the last count of a resource's magic binary is gone.
 // Port of erts/emulator/beam/erl_nif.c (nif_resource_dtor_prologue), OTP-29.1.1. erts
@@ -187,8 +190,7 @@ fn nif_resource_dtor_prologue(bin: &arinsal_term::MagicRef, resource: &mut Resou
     let kind = &resource.kind;
     if let Some(dtor) = kind.callbacks().dtor {
         let mut env = kind.env();
-        // SAFETY: the destructor runs before `finalize_payload` drops the resource block.
-        unsafe { dtor(&mut env, resource_data(bin).cast()) };
+        crate::raw::call_resource_destructor(dtor, &mut env, resource_data(bin).cast());
     }
     true
 }
@@ -542,28 +544,6 @@ pub extern "C" fn enif_get_resource(
         put(out, resource_data(magic).cast())
     };
     1
-}
-/// Port of erts/emulator/beam/erl_nif.c (enif_make_resource_binary).
-#[unsafe(no_mangle)]
-pub extern "C" fn enif_make_resource_binary(
-    e: *mut ErlNifEnv,
-    data: *mut c_void,
-    bytes: *const c_void,
-    size: usize,
-) -> Term {
-    if bytes.is_null() && size > 0 {
-        return terms::enif_make_badarg(e);
-    };
-    let Some(bin) = crate::raw::with_resource(data, MagicBin::clone) else {
-        return terms::enif_make_badarg(e);
-    };
-    // SAFETY: the magic binary retains the native resource containing these bytes.
-    let external = unsafe { ExternalBinary::new(bytes.cast::<u8>(), size, bin) };
-    // SAFETY: The resource allocation and callback remain live during this access.
-    let env = deref_mut(e);
-    TermBuilder::new(&mut env.heap)
-        .external_binary(external)
-        .unwrap_or_else(|_| terms::enif_make_badarg(e))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_dynamic_resource_call(

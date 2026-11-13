@@ -4,6 +4,7 @@
 static ErlNifResourceType *counter_type;
 static ErlNifResourceType *dynamic_type;
 static unsigned destructors;
+static const char external_resource_bytes[] = "xyz";
 static void counter_dtor(ErlNifEnv *env, void *object) { (void)env; (void)object; destructors++; }
 static void dynamic_call(ErlNifEnv *env, void *object, void *call_data) {
     (void)env;
@@ -138,8 +139,7 @@ static ERL_NIF_TERM resource_binary_probe(ErlNifEnv *env, int argc, const ERL_NI
     (void)argc; (void)argv;
     char *object = enif_alloc_resource(counter_type, 4);
     if (!object) return enif_make_badarg(env);
-    memcpy(object, "xyz", 4);
-    ERL_NIF_TERM binary = enif_make_resource_binary(env, object, object, 3);
+    ERL_NIF_TERM binary = enif_make_resource_binary(env, object, external_resource_bytes, 3);
     enif_release_resource(object);
     return binary;
 }
