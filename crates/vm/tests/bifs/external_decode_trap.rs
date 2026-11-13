@@ -38,7 +38,8 @@ run(Index) ->
     {T, Enc, Opts} = lists:nth(Index, cases()),
     Bin = encode(T, Enc),
     Parent = self(),
-    Pid = spawn(fun() ->
+    %% A heap that holds the result: the decode charges no collection in either runtime.
+    Pid = spawn_opt(fun() ->
         receive start ->
             erlang:garbage_collect(),
             R0 = reds(),
@@ -47,7 +48,7 @@ run(Index) ->
             R1 = reds(),
             Parent ! {done, self(), R1 - R0, Res}
         end
-    end),
+    end, [{min_heap_size, 16000000}]),
     1 = erlang:trace(Pid, true, [running, {tracer, Parent}]),
     Pid ! start,
     receive
@@ -94,8 +95,26 @@ fn binary_to_term_matches_otp_on_big_inputs() {
             .term;
         eprintln!("case {index}: erl {expected:?} arinsal {actual:?}");
         let (OwnedTerm::Tuple(e), OwnedTerm::Tuple(a)) = (&expected, &actual) else {
-            panic!()
+            panic!("case {index}: not tuples");
         };
-        assert_eq!(e[0], a[0], "case {index}");
+        assert_eq!(e[0], a[0], "case {index}: result");
+        // The same units as erts (one per term in `decoded_size` and `dec_term`, 128 per
+        // reduction): within 2% plus the BIF call itself.
+        let (OwnedTerm::Int(e_reds), OwnedTerm::Int(a_reds)) = (&e[1], &a[1]) else {
+            panic!("case {index}: reductions");
+        };
+        assert!(
+            (e_reds - a_reds).abs() <= e_reds / 50 + 10,
+            "case {index}: reductions erl {e_reds} arinsal {a_reds}"
+        );
+        // Schedule-ins: erl takes one more `in` than Arinsal in the multi-slice cases (not
+        // explained yet); never fewer.
+        let (OwnedTerm::Int(e_in), OwnedTerm::Int(a_in)) = (&e[2], &a[2]) else {
+            panic!("case {index}: schedule-ins");
+        };
+        assert!(
+            (0..=1).contains(&(e_in - a_in)),
+            "case {index}: schedule-ins erl {e_in} arinsal {a_in}"
+        );
     }
 }
