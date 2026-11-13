@@ -717,7 +717,7 @@ fn source(cases: &[Case]) -> String {
     }
     format!(
         r#"-module({MODULE}).
--export([{exports}, traced_target/1]).
+-export([{exports}, traced_target/1, prepare_prefixkeys/0, cleanup_prefixkeys/0]).
 
 traced_target(X) -> X.
 
@@ -735,8 +735,15 @@ dupkeys(N) -> [I rem (N div 10) || I <- lists:seq(1, N)].
 
 dupkv(N) -> [{{K, I}} || {{K, I}} <- lists:zip(dupkeys(N), lists:seq(1, N))].
 
+prepare_prefixkeys() ->
+    persistent_term:put({{reds_overcharge_test, prefixkeys}},
+        lists:sublist(maps:keys(maps:from_keys(lists:seq(1, 300000), v)), 1000)).
+
+cleanup_prefixkeys() ->
+    persistent_term:erase({{reds_overcharge_test, prefixkeys}}).
+
 prefixkeys(N) ->
-    lists:sublist(maps:keys(maps:from_keys(lists:seq(1, 300000), v)), N).
+    lists:sublist(persistent_term:get({{reds_overcharge_test, prefixkeys}}), N).
 
 prefixkv(N) -> [{{K, K}} || K <- prefixkeys(N)].
 
@@ -788,17 +795,26 @@ baseline(Fun, In) ->
     {{reductions, B1}} = process_info(self(), reductions),
     B1 - B0.
 
+% erts erl_bif_trace.c:3900 uses this marker to fence prior trace delivery.
 drain(Pid) ->
+    Ref = erlang:trace_delivered(Pid),
+    drain(Pid, Ref).
+
+drain(Pid, Ref) ->
     receive
-        {{trace, Pid, _, _}} -> drain(Pid)
-    after 300 -> ok
+        {{trace, Pid, _, _}} -> drain(Pid, Ref);
+        {{trace_delivered, Pid, Ref}} -> ok
     end.
 
 schedule_ins(Pid, Count) ->
+    Ref = erlang:trace_delivered(Pid),
+    schedule_ins(Pid, Ref, Count).
+
+schedule_ins(Pid, Ref, Count) ->
     receive
-        {{trace, Pid, in, _}} -> schedule_ins(Pid, Count + 1);
-        {{trace, Pid, _, _}} -> schedule_ins(Pid, Count)
-    after 300 -> Count
+        {{trace, Pid, in, _}} -> schedule_ins(Pid, Ref, Count + 1);
+        {{trace, Pid, _, _}} -> schedule_ins(Pid, Ref, Count);
+        {{trace_delivered, Pid, Ref}} -> Count
     end.
 "#,
         exports = exports.join(", ")
@@ -874,8 +890,23 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
     let mut vm = crate::common::node();
     // The node is shared by every test of this binary, each loading its own `MODULE`.
     crate::common::load_fresh(&mut vm, &beam);
-
     let filter = std::env::var("REDS_CASES").ok();
+    let prefixkeys_ready = cases
+        .iter()
+        .any(|case| matches!(case.name, "from_list_prefix" | "from_keys_prefix"))
+        && filter.as_deref().is_none_or(|filter| {
+            filter
+                .split(',')
+                .any(|case| matches!(case, "from_list_prefix" | "from_keys_prefix"))
+        });
+    if prefixkeys_ready {
+        let CallResult::Ok(_) = reference.call(MODULE, "prepare_prefixkeys", &[]) else {
+            panic!("OTP prefix key setup failed");
+        };
+        vm.eval_scheduled(MODULE, "prepare_prefixkeys", &[], 1)
+            .expect("Arinsal prefix key setup failed");
+    }
+
     let mut failures = Vec::new();
     for case in cases {
         for &size in case.sizes {
@@ -948,6 +979,13 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                 ));
             }
         }
+    }
+    if prefixkeys_ready {
+        let CallResult::Ok(_) = reference.call(MODULE, "cleanup_prefixkeys", &[]) else {
+            panic!("OTP prefix key cleanup failed");
+        };
+        vm.eval_scheduled(MODULE, "cleanup_prefixkeys", &[], 1)
+            .expect("Arinsal prefix key cleanup failed");
     }
     assert_eq!(Vec::<String>::new(), failures);
 }
