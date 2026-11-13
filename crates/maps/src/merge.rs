@@ -923,73 +923,7 @@ fn flatmap_from_validated_list<H: HeapAlloc + ?Sized>(
     pairs: impl Iterator<Item = (Term, Term)>,
     heap: &mut H,
 ) -> Result<Term, TermError> {
-    if allocated == 0 {
-        return super::empty_flatmap(heap);
-    }
-    // erl_map.c:376-393. ks starts just after the key-tuple arity word; the
-    // flatmap header is `MAP_HEADER_FLATMAP_SZ` (3) words; vs follows it.
-    let words = 3 + 1 + 2 * allocated;
-    let (block, ptr) = arinsal_term::alloc_terms(heap, words)?;
-    block[0] = term((allocated as u64) << 6);
-    let map_at = 1 + allocated;
-    let vs = map_at + 3;
-    block[map_at] = term(MAP_HEADER_FLATMAP);
-    block[map_at + 1] = term(allocated as u64);
-    block[map_at + 2] = term(ptr as u64 | 2);
-
-    // erl_map.c:399-408, first entry, then size becomes 1.
-    let mut pairs = pairs;
-    let (key, value) = pairs
-        .next()
-        .expect("validated list length matches the iterator");
-    // ks[0] is block[1]; vs[0] is block[vs].
-    block[1] = key;
-    block[vs] = value;
-    let mut size = 1usize;
-    let mut unused_size = 0usize;
-
-    // erl_map.c:411-458, insertion sort in the HAlloc block.
-    for (key, value) in pairs {
-        // erl_map.c:432-436. `idx` is the hole. ks[idx - 1] is block[idx]
-        // because ks[0] is block[1]. Stop on equal or greater.
-        let mut idx = size;
-        let mut ordering = Ordering::Less;
-        while idx > 0 {
-            ordering = key_cmp(key, block[idx]);
-            if ordering != Ordering::Less {
-                break;
-            }
-            idx -= 1;
-        }
-        if ordering == Ordering::Equal {
-            // erl_map.c:438-445.
-            block[idx] = key;
-            block[vs + idx - 1] = value;
-            unused_size += 1;
-        } else {
-            // erl_map.c:446-455. `ordering` is Less when the scan reached 0.
-            let mut i = size;
-            while i > idx {
-                block[1 + i] = block[i];
-                block[vs + i] = block[vs + i - 1];
-                i -= 1;
-            }
-            block[1 + idx] = key;
-            block[vs + idx] = value;
-            size += 1;
-        }
-    }
-
-    // erl_map.c:460-471.
-    if unused_size > 0 {
-        block[1 + size] = term(heap_filler_header(unused_size));
-        let end = ptr.wrapping_add(vs + size + unused_size);
-        let start = ptr.wrapping_add(vs + size);
-        heap.release(end, start);
-    }
-    block[0] = term((size as u64) << 6);
-    block[map_at + 1] = term(size as u64);
-    Ok(boxed(ptr.wrapping_add(map_at)))
+    super::raw::flatmap_from_validated_list(allocated, pairs, heap)
 }
 
 // Port of erts/emulator/beam/erl_map.c:482-591 (hashmap_from_validated_list), OTP-29.1.1.

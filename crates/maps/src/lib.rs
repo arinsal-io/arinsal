@@ -15,6 +15,7 @@ use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 mod merge;
+mod raw;
 pub use merge::{
     HashmapFromPairs, HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MergeStart, from_keys, from_list,
     from_small_pairs, hashmap_merge, merge, merge_flatmaps, merge_start,
