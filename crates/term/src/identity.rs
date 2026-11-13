@@ -3,7 +3,7 @@ use crate::{
     Atom, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, REF, Term, TermError, atoms, global_atoms,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Immutable node-table entry retained by every referencing heap.
 #[derive(Debug)]
@@ -229,23 +229,28 @@ pub(crate) fn check_external_ref(ids: &[u32]) -> Result<(), TermError> {
     }
 }
 
-/// `erts_this_node`: the name and creation that internal pids, ports and references compare
-/// with, packed as `name << 32 | creation`. Set by the node table when the node gets its name.
-static THIS_NODE: AtomicU64 = AtomicU64::new(0);
+/// `erts_this_node->sysname` as the tagged atom word that native `node/0` and generated code
+/// load by address; starts as `nonode@nohost`.
+static THIS_NODE_SYSNAME: AtomicU64 = AtomicU64::new(Term::atom(atoms::NONAME).tagged_word());
+/// `erts_this_node->creation`.
+static THIS_NODE_CREATION: AtomicU32 = AtomicU32::new(0);
 
-/// Publish the local node identity, as `erts_set_this_node` does for `erts_this_node`.
+/// Publish the local node identity, as `erts_set_this_node` does for `erts_this_node`. The only
+/// writer; callers hold the thread-progress block, so readers never see a torn name/creation.
 // Port of erts/emulator/beam/erl_node_tables.c (erts_set_this_node), OTP-29.1.1.
 pub fn set_this_node(name: Atom, creation: u32) {
-    THIS_NODE.store(
-        (u64::from(name.0) << 32) | u64::from(creation),
-        Ordering::Release,
-    );
+    THIS_NODE_CREATION.store(creation, Ordering::Release);
+    THIS_NODE_SYSNAME.store(Term::atom(name).tagged_word(), Ordering::Release);
+}
+
+/// The word holding the local node name atom (`erts_this_node_sysname`).
+pub fn this_node_sysname() -> &'static AtomicU64 {
+    &THIS_NODE_SYSNAME
 }
 
 /// The local node name and creation; `nonode@nohost` and 0 until the node is named.
 pub fn this_node() -> (Atom, u32) {
-    match THIS_NODE.load(Ordering::Acquire) {
-        0 => (atoms::NONAME, 0),
-        packed => (Atom((packed >> 32) as u32), packed as u32),
-    }
+    // The word is `Term::atom(name)`: the atom index sits above the 6 tag bits.
+    let name = Atom((THIS_NODE_SYSNAME.load(Ordering::Acquire) >> 6) as u32);
+    (name, THIS_NODE_CREATION.load(Ordering::Acquire))
 }

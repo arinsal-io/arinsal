@@ -4,7 +4,7 @@ use arinsal_etf::{AtomCache, DistributionPacket, OwnedTerm};
 use arinsal_sched::Pid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -384,7 +384,6 @@ pub(crate) enum NodeKind {
 pub(crate) struct NodeTables {
     pub(crate) local_name: String,
     pub(crate) local_creation: u32,
-    pub(crate) alive: bool,
     pub(crate) distribution_buffer_busy_limit: u64,
     /// `erts_dist_table`: name to entry; this table lock covers membership only.
     pub(crate) entries: BTreeMap<String, Arc<DistEntry>>,
@@ -434,7 +433,6 @@ impl Default for NodeTables {
         Self {
             local_name: "nonode@nohost".into(),
             local_creation: 0,
-            alive: false,
             distribution_buffer_busy_limit: 1024 * 1024,
             entries,
             monitors: Vec::new(),
@@ -479,39 +477,86 @@ static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(60 * 1000);
 pub(crate) const NODE_TAB_DELAY_GC_INFINITY: u64 = 100 * 1000 * 1000 + 1;
 static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
 
-/// `erts_this_node->sysname`: the local node name atom, which native `node/0` loads
-/// without a runtime call; [`set_this_node`] updates it.
-static THIS_NODE_SYSNAME: AtomicU64 = AtomicU64::new(0);
+/// `erts_is_alive`: set by `setnode/2` and `set_node_not_alive` under the thread-progress block.
+static IS_ALIVE: AtomicBool = AtomicBool::new(false);
 
-fn node_atom_word(name: &str) -> u64 {
-    arinsal_term::global_atoms()
-        .intern(name)
-        .map_or(0, |atom| arinsal_term::Term::atom(atom).tagged_word())
-}
+/// `no_nodes` (dist.c): the net_kernel plus every connected distribution controller; the node
+/// goes not-alive when it drops to zero.
+static NO_NODES: AtomicI64 = AtomicI64::new(0);
+
+/// `nodedown.reason` (dist.c): the reason `erts_do_net_exits` of `net_kernel` leaves for
+/// `set_node_not_alive`, which reports it with the nodedown message of this node.
+static NODEDOWN_REASON: Mutex<Option<String>> = Mutex::new(None);
 
 /// The word holding the local node name atom; generated code reads it by address.
 pub(crate) fn this_node_sysname() -> &'static AtomicU64 {
-    if THIS_NODE_SYSNAME.load(Ordering::Acquire) == 0 {
-        let word = node_atom_word(&lock().local_name);
-        let _ = THIS_NODE_SYSNAME.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire);
-    }
-    &THIS_NODE_SYSNAME
+    arinsal_term::this_node_sysname()
 }
 
-/// Makes `name` the local node of the node table, as `setnode/2` does, and publishes it to
-/// native `node/0`.
+/// Makes `name` the local node of the node table and publishes it as `erts_this_node`. The
+/// caller holds the thread-progress block, so no thread reads the identity while it changes.
 // Port of erts/emulator/beam/erl_node_tables.c:1042-1075 (erts_set_this_node), OTP-29.1.1.
 pub(crate) fn set_this_node(name: String, creation: u32) -> bool {
     let mut tables = lock();
-    let word = node_atom_word(&name);
     if !tables.set_local_node(name, creation) {
         return false;
     }
-    THIS_NODE_SYSNAME.store(word, Ordering::Release);
     if let Ok(atom) = arinsal_term::global_atoms().intern(&tables.local_name) {
         arinsal_term::set_this_node(atom, tables.local_creation);
     }
     true
+}
+
+/// `erts_is_alive = value`.
+pub(crate) fn set_alive(value: bool) {
+    IS_ALIVE.store(value, Ordering::Release);
+}
+
+/// Port of erts/emulator/beam/dist.c:887 (inc_no_nodes), OTP-29.1.1.
+pub(crate) fn inc_no_nodes() {
+    NO_NODES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Port of erts/emulator/beam/dist.c:875 (dec_no_nodes), OTP-29.1.1: the last one schedules
+/// `set_node_not_alive` on the calling scheduler.
+pub(crate) fn dec_no_nodes(runtime: &crate::process::Runtime) {
+    if NO_NODES.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    let Ok(scheduler) = runtime.scheduler() else {
+        return;
+    };
+    let ix = scheduler.current_run_queue();
+    let scheduler = Arc::clone(scheduler);
+    scheduler.request_aux_work(ix, {
+        let scheduler = Arc::clone(&scheduler);
+        move || set_node_not_alive(&scheduler)
+    });
+}
+
+/// Remember the nodedown reason of this node (`nodedown.reason`).
+pub(crate) fn set_nodedown_reason(reason: &str) {
+    *NODEDOWN_REASON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_owned());
+}
+
+/// Port of erts/emulator/beam/dist.c:854 (set_node_not_alive), OTP-29.1.1: the node goes back
+/// to `nonode@nohost` under the thread-progress block and its nodes monitors get nodedown.
+fn set_node_not_alive(scheduler: &arinsal_sched::Scheduler<crate::Process>) {
+    let nodename = this_node().0.to_owned();
+    scheduler.with_thread_progress_blocked(|| {
+        debug_assert_eq!(NO_NODES.load(Ordering::Acquire), 0);
+        set_this_node("nonode@nohost".into(), 0);
+        set_alive(false);
+        let reason = NODEDOWN_REASON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let events =
+            lock().nodes_monitor_events("nodedown", &nodename, u32::MAX, true, reason.as_deref());
+        let _ = crate::dist::send_nodes_monitor_events(scheduler, events);
+    });
 }
 
 pub(crate) fn lock() -> NodeTablesGuard {
@@ -539,7 +584,7 @@ pub(crate) fn this_node() -> (&'static str, u32) {
 
 /// `erts_is_alive`.
 pub(crate) fn is_alive() -> bool {
-    arinsal_term::this_node().0 != arinsal_term::atoms::NONAME
+    IS_ALIVE.load(Ordering::Acquire)
 }
 
 /// `find_dist_entry`: a reference to the entry for `sysname`, holding the table lock only for
@@ -609,7 +654,7 @@ fn fresh_entry(name: String) -> NodeEntry {
 
 impl NodeTables {
     pub(crate) fn set_distribution_buffer_busy_limit(&mut self, limit: u64) {
-        if !self.alive {
+        if !is_alive() {
             self.distribution_buffer_busy_limit = limit.max(1);
         }
     }
@@ -677,15 +722,13 @@ impl NodeTables {
 
     /// Port of erts/emulator/beam/dist.c:4978 (setnode_2), OTP-29.1.1.
     pub(crate) fn set_local_node(&mut self, name: String, creation: u32) -> bool {
-        if self.alive || name == "nonode@nohost" || !is_node_name(&name) {
+        if !is_node_name(&name) {
             return false;
         }
-        let creation = creation.max(4);
         self.pending_delete.remove(&self.local_name);
         self.entries.remove(&self.local_name);
         self.local_name = name.clone();
         self.local_creation = creation;
-        self.alive = true;
         self.entries.insert(
             name.clone(),
             DistEntry::new(NodeEntry {
@@ -1061,20 +1104,18 @@ mod tests {
     use similar_asserts::assert_eq;
 
     #[test]
-    fn setnode_initializes_local_node_and_clamps_creation() {
+    fn set_local_node_replaces_the_local_entry() {
         let mut tables = NodeTables::default();
-        assert!(tables.set_local_node("test@localhost".into(), 1));
-        assert!(tables.alive);
+        assert!(tables.set_local_node("test@localhost".into(), 4));
         assert_eq!(tables.local_identity(), ("test@localhost", 4));
-        assert!(!tables.set_local_node("other@localhost".into(), 4));
+        assert!(tables.set_local_node("nonode@nohost".into(), 0));
+        assert_eq!(tables.local_identity(), ("nonode@nohost", 0));
     }
 
     #[test]
-    fn setnode_rejects_invalid_or_reserved_names() {
+    fn set_local_node_rejects_invalid_names() {
         let mut tables = NodeTables::default();
-        assert!(!tables.set_local_node("nonode@nohost".into(), 4));
         assert!(!tables.set_local_node("missing-host".into(), 4));
-        assert!(!tables.alive);
     }
 
     #[test]
