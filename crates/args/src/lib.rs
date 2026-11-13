@@ -1712,9 +1712,9 @@ fn split_emulator_flag(token: &str) -> (&str, Option<&str>) {
         }
     }
     const PREFIXES: &[&str] = &[
-        "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+zhft", "+zdbbl", "+hmbs", "+hms", "+Dibpl",
-        "+D", "+T", "+s", "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t",
-        "+C", "+c",
+        "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+zhft", "+zdbbl", "+hmbs", "+hms", "+Dibpl", "+D",
+        "+T", "+s", "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t", "+C",
+        "+c",
     ];
     for prefix in PREFIXES {
         if let Some(rest) = token.strip_prefix(prefix) {
