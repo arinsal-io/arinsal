@@ -1062,3 +1062,34 @@ pub fn slot_index(base: usize, length: usize, slot: HeapSlotPtr) -> Option<usize
 pub fn slot_address(base: usize, index: usize) -> u64 {
     base.wrapping_add(index * std::mem::size_of::<u64>()) as u64
 }
+
+/// Value of a boxed float term (`GET_DOUBLE`).
+///
+/// Port of erts/emulator/beam/erl_term.h (`GET_DOUBLE`), OTP-29.1.1. Same view contract as
+/// the other accessors of this section: the term's heap stays live.
+#[inline(always)]
+pub fn float_value(term: Term) -> Option<f64> {
+    // SAFETY: the view contract of this section.
+    unsafe { term.float_ref() }.map(|float| float.get())
+}
+
+/// Value of a boxed bignum term.
+#[inline(always)]
+pub fn big_value(term: Term) -> Option<num_bigint::BigInt> {
+    // SAFETY: the view contract of this section.
+    unsafe { term.big_ref() }.map(|big| big.to_bigint())
+}
+
+/// Borrowed fun entry of a fun term (`fun_val`, `is_local_fun`).
+#[inline(always)]
+pub fn fun_view<'h>(term: Term) -> Option<crate::FunRef<'h>> {
+    // SAFETY: the view contract of this section; fun and export entries are permanent.
+    unsafe { term.fun_ref() }
+}
+
+/// Borrowed native record instance with its definition (`RECORD_INST_P`, `RECORD_DEF_P`).
+#[inline(always)]
+pub fn record_view<'h>(term: Term) -> Option<crate::RecordRef<'h>> {
+    // SAFETY: the view contract of this section; the definition outlives its instances.
+    unsafe { term.record_ref() }
+}

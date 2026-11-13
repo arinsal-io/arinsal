@@ -163,3 +163,38 @@ fn display_returns_true_like_otp() {
         .unwrap();
     assert_eq!(actual.term, arinsal_etf::OwnedTerm::Atom("true".into()));
 }
+
+#[test]
+fn term_printer_funs_and_sub_bitstrings_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping term printer differential test");
+        return;
+    };
+    let source = "-module(boot_loop2_print_more). -export([run/0]).
+        run() ->
+            Bits = <<5:3, \"hello \\\"world\\\"\", 3:2>>,
+            <<_:3, Aligned:11/bitstring, Rest/bitstring>> = Bits,
+            <<_:1, Odd/bitstring>> = <<\"abcdefgh\">>,
+            <<_:5, Short:2/bitstring, _/bitstring>> = <<255, 1>>,
+            Fun = fun(X) -> X end,
+            Local = [erts_internal:term_to_string({F, Fun2}, L)
+                     || {F, Fun2, L} <- [{Fun, fun lists:map/2, undefined},
+                                         {Fun, fun 'My Mod':'a b'/0, 4},
+                                         {Fun, fun erlang:'+'/2, 7}]],
+            Local ++ [erts_internal:term_to_string(T, L)
+                      || T <- [Aligned, Rest, Odd, Short, {Odd, Rest}, [Short | Aligned]],
+                         L <- [undefined, 3, 10]]
+            ++ [erlang:fun_to_list(Fun), erlang:fun_to_list(fun lists:map/2),
+                erlang:pid_to_list(self()) =:= erts_internal:term_to_string(self(), undefined)].";
+    let beam = reference
+        .compile_named("boot_loop2_print_more", source, &[])
+        .unwrap();
+    reference.load("boot_loop2_print_more", &beam).unwrap();
+    let expected = reference.call("boot_loop2_print_more", "run", &[]);
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("boot_loop2_print_more", "run", &[], 1)
+        .unwrap();
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}

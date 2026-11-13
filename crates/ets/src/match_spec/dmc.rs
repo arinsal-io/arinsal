@@ -5,7 +5,6 @@
 //! variant per `matchXxx` opcode; label operands are indices into that vector instead of
 //! word offsets.
 
-use super::printf_term::format_term;
 use super::{cons, is_float_term, tuple_view, variable};
 use crate::EtsError;
 use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError, TermKind, VecHeap, global_atoms};
@@ -160,7 +159,8 @@ fn replace_first(text: &[u8], pattern: &[u8], with: &[u8]) -> Vec<u8> {
 /// error buffer.
 fn term_message(prefix: &str, term: Term, suffix: &str) -> Vec<u8> {
     let mut text = prefix.as_bytes().to_vec();
-    text.extend(format_term(term, DMC_ERR_STR_LEN));
+    // `%T` without precision: the default print budget; the buffer only truncates.
+    arinsal_term::printf_term::erts_printf_t(&mut text, term, -1);
     text.extend_from_slice(suffix.as_bytes());
     text.truncate(DMC_ERR_STR_LEN - 1);
     text
