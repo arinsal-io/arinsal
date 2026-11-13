@@ -65,12 +65,8 @@ fn spawn_opt_monitor_tag_survives_immediate_exit() {
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
-/// A two-reduction quantum yields on `wait` after `loop_rec` saw an empty
-/// mailbox. (Schedule-in sets FCALLS to the quantum, erl_process.c `p->fcalls = reds`; with one
-/// reduction every `i_test_yield` would yield before its function runs, as in erts.) The message that arrives before that `wait` executes must still
-/// be received. This is the Hex.State `gen:call` alias-reply timeout: the
-/// server slept with `{'$gen_call', ...}` already in its inbox, the caller
-/// demonitored, and `gen:reply` to the alias was dropped.
+/// Exercises the signal-fetch/inactivate race in `wait` with independent
+/// senders running on other schedulers and a short reduction quantum.
 #[test]
 fn receive_sees_message_that_arrives_on_the_wait_instruction() {
     let Ok(reference) = RefErl::start() else {
@@ -80,29 +76,51 @@ fn receive_sees_message_that_arrives_on_the_wait_instruction() {
     let source = "-module(mix_loop2_wait_yield). -export([run/0]).
         run() ->
             Parent = self(),
-            Server = spawn(fun() -> loop() end),
-            N = 80,
-            lists:foreach(fun(I) ->
-                spawn(fun() ->
-                    Server ! {self(), I},
-                    receive
-                        {ack, I} -> Parent ! done
-                    after 2000 ->
-                        Parent ! {timeout, I}
-                    end
-                end)
-            end, lists:seq(1, N)),
+            N = 256,
+            Rounds = 20,
+            Receivers = [spawn(fun() -> receiver(Parent, I, Rounds) end)
+                         || I <- lists:seq(1, N)],
+            wait_ready(N),
+            Senders = [spawn(fun() ->
+                sender(Receiver, I, Rounds)
+            end) || {Receiver, I} <- lists:zip(Receivers, lists:seq(1, N))],
+            _ = Senders,
             collect(N).
-        loop() ->
+        receiver(Parent, I, Rounds) ->
+            Parent ! {ready, I},
             receive
-                {From, I} -> From ! {ack, I}, loop()
+                {payload, I, 1, Sender} ->
+                    Sender ! {ack, I, 1},
+                    receiver_loop(Parent, I, Rounds, 2, Sender)
             end.
+        receiver_loop(Parent, I, Rounds, Rounds, _Sender) ->
+            receive {payload, I, Rounds, _} -> Parent ! done end;
+        receiver_loop(Parent, I, Rounds, Round, Sender) ->
+            receive
+                {payload, I, Round, Sender} ->
+                    Sender ! {ack, I, Round},
+                    receiver_loop(Parent, I, Rounds, Round + 1, Sender)
+            end.
+        sender(Receiver, I, Rounds) ->
+            Receiver ! {payload, I, 1, self()},
+            sender_loop(Receiver, I, Rounds, 1).
+        sender_loop(_Receiver, _I, Rounds, Rounds) -> ok;
+        sender_loop(Receiver, I, Rounds, Round) ->
+            receive
+                {ack, I, Round} ->
+                    Receiver ! {payload, I, Round + 1, self()},
+                    sender_loop(Receiver, I, Rounds, Round + 1)
+            end.
+        wait_ready(0) -> ok;
+        wait_ready(N) ->
+            receive {ready, _} -> wait_ready(N - 1)
+            after 10000 -> error(ready_timeout) end.
         collect(0) -> ok;
         collect(N) ->
             receive
                 done -> collect(N - 1);
                 Other -> Other
-            after 5000 ->
+            after 10000 ->
                 {timeout, N}
             end.";
     let beam = reference
@@ -113,7 +131,7 @@ fn receive_sees_message_that_arrives_on_the_wait_instruction() {
     vm.load_bytes(&beam).unwrap();
     let expected = reference.call("mix_loop2_wait_yield", "run", &[]);
     let actual = vm
-        .eval_scheduled_reductions("mix_loop2_wait_yield", "run", &[], 2, 2)
+        .eval_scheduled_reductions("mix_loop2_wait_yield", "run", &[], 4, 2)
         .unwrap();
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

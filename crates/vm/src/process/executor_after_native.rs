@@ -63,8 +63,6 @@ impl Executor {
                             // Queued messages never match; fetch them so the outer
                             // queue does not keep waking the process.
                             process.fetch_signals(ctx)?;
-                        } else if !Vm::mailbox_ready_to_wait(process, &mut Some(&mut *ctx))? {
-                            return Ok(Flow::Continue);
                         }
                         return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos })));
                     }
