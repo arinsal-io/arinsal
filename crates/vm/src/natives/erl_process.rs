@@ -608,36 +608,48 @@ fn create_child(
         }
         Ok(())
     };
-    let spawned = scheduler
-        .spawn_unscheduled_try_prepare_init(
-            || {
-                // erts allocates the Process before sizing the copied argument graph and
-                // allocating its initial heap.
-                let size = arinsal_term::size_object_litopt(args, &literals);
-                arg_size.set(size);
-                let heap_need = size.saturating_add(arinsal_term::S_RESERVED);
-                arinsal_term::spawned_heap_words(heap_need, min_heap)
-                    .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))
-            },
-            |heap_words, slot| {
-                crate::proc_create::raw::initialize_spawned(
-                    slot,
-                    3,
-                    heap_words,
-                    parent_alloc_ix,
-                    min_heap,
-                )
-            },
-            init_child,
-            priority,
-            bound,
-            parent_alloc_ix,
-        )
-        .map_err(|error| match error {
-            arinsal_sched::SpawnInitError::Init(error) => CreateError::Vm(error),
-            // alloc_process failed: "Too many processes".
-            arinsal_sched::SpawnInitError::Table(_) => CreateError::SystemLimit,
-        })?;
+    let spawned = scheduler.spawn_unscheduled_try_prepare_init(
+        || {
+            // erts allocates the Process before sizing the copied argument graph and
+            // allocating its initial heap.
+            let size = arinsal_term::size_object_litopt(args, &literals);
+            arg_size.set(size);
+            let heap_need = size.saturating_add(arinsal_term::S_RESERVED);
+            arinsal_term::spawned_heap_words(heap_need, min_heap)
+                .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))
+        },
+        |heap_words, slot| {
+            crate::proc_create::raw::initialize_spawned(
+                slot,
+                3,
+                heap_words,
+                parent_alloc_ix,
+                min_heap,
+            )
+        },
+        init_child,
+        priority,
+        bound,
+        parent_alloc_ix,
+    );
+    let spawned = match spawned {
+        Ok(spawned) => spawned,
+        Err(arinsal_sched::SpawnInitError::Init(error)) => return Err(CreateError::Vm(error)),
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1:
+        // alloc_process logs this before setting SYSTEM_LIMIT when the process table is full.
+        Err(arinsal_sched::SpawnInitError::Table(_)) => {
+            crate::utils::send_error_to_logger_str(
+                runtime,
+                parent_pid,
+                parent
+                    .group_leader_pid(parent_pid)
+                    .to_term()
+                    .unwrap_or(Term::NIL),
+                "Too many processes\n",
+            );
+            return Err(CreateError::SystemLimit);
+        }
+    };
     let seq_spawn = if crate::seq_trace::has_token(parent) {
         spawned
             .with_task(|child: &mut Process| {

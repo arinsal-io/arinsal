@@ -3922,7 +3922,6 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
 // the caller's group leader), OTP-29.1.1.
 fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>, text: &str) {
     let Some(runtime) = process.runtime else {
-        eprintln!("{text}");
         return;
     };
     let group_leader = process
