@@ -269,7 +269,6 @@ impl Vm {
                 }
                 p.gc_live = arity + free_vars.len();
                 self.set_position(p, module_id, target)?;
-                p.tick();
                 Ok(ImportOutcome::Dispatch)
             }
             FunRef::Export { entry } => {

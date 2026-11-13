@@ -573,6 +573,13 @@ const CALL_CASES: &[Case] = &[
         "fun(X) -> X end",
         "apply(In, [1])",
     ),
+    exact_case(
+        "closure_fun_apply",
+        ONE,
+        4,
+        "captured_fun(N)",
+        "apply(In, [1])",
+    ),
     traced_case(
         "fun_value_apply_traced",
         ONE,
@@ -722,6 +729,8 @@ fn source(cases: &[Case]) -> String {
 traced_target(X) -> X.
 
 seq(N) -> lists:seq(1, N).
+
+captured_fun(N) -> K = N, fun(X) -> X + K end.
 
 improper(N) -> lists:foldl(fun(I, Acc) -> [I | Acc] end, tail, lists:seq(1, N)).
 
