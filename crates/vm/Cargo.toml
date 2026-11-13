@@ -65,4 +65,5 @@ arinsal-etf.workspace = true
 arinsal-pterm.workspace = true
 libc = "0.2"
 similar-asserts = "2"
+proptest.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }

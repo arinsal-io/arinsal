@@ -15,6 +15,7 @@ mod binary_iolist_differential;
 mod binary_replace_differential;
 mod binary_search_differential;
 mod binary_to_list_trap;
+mod etf_differential;
 mod etf_external;
 mod external_decode_trap;
 mod external_encode_trap;
