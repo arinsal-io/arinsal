@@ -5,7 +5,7 @@ use arinsal_difftest::{CallResult, RefErl};
 
 const SOURCE: &str = r#"
 -module(ets_rest_diff).
--export([access_causes/0, partly_bound/0, delete_all_memory/0, nesting/0]).
+-export([access_causes/0, partly_bound/0, delete_all_memory/0, nesting/0, nesting_lint/0]).
 cause(F) ->
   try F(), none
   catch error:Reason:St ->
@@ -62,6 +62,16 @@ nesting() ->
   Replace = try ets:select_replace(ets:new(t, [ordered_set]), MS), compiled
             catch error:system_limit -> system_limit end,
   {Compile, Replace}.
+nesting_lint() ->
+  Mk = fun(_F, N) when N < 0 -> true;
+          (F, N) -> {'orelse', {'==', N, '$1'}, F(F, N - 1)}
+       end,
+  Prefix = "Excessive nesting; system limit reached near: ",
+  [begin
+     {error, Errors} = erlang:match_spec_test({1, 2}, [{{'$1', '$2'}, Guards, Body}], table),
+     lists:usort([lists:prefix(Prefix, Text) || {error, Text} <- Errors])
+   end || {Guards, Body} <- [{[Mk(Mk, 1000000)], [{{'$1', blipp}}]},
+                             {[], [Mk(Mk, 1000000)]}]].
 "#;
 
 #[test]
@@ -89,6 +99,7 @@ fn run_scenarios() {
         "partly_bound",
         "delete_all_memory",
         "nesting",
+        "nesting_lint",
     ] {
         let expected = reference.call("ets_rest_diff", function, &[]);
         let mut vm = crate::common::node();

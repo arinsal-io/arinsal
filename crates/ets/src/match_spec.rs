@@ -4,7 +4,7 @@ use crate::EtsError;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
     Atom, HeapAlloc, Identity, Term, TermBuilder, TermKind, VecHeap, cmp, copy_shallow,
-    copy_struct, copy_term, exact_eq, from_owned, global_atoms, to_owned,
+    copy_struct, copy_term, exact_eq, global_atoms, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 mod dmc;
 mod pam;
+mod printf_term;
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -209,11 +210,15 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
     {
         return Err(EtsError::BadArg);
     }
-    let compiled = MatchProgram::compile_test(specification, dialect == MatchDialect::Trace);
-    let program = match compiled {
+    let cflags = test_cflags(dialect == MatchDialect::Trace);
+    let lint_res = db_match_set_lint(specification, cflags, dst)?;
+    let program = match MatchProgram::compile_with_flags(specification, cflags) {
         Ok(program) => program,
         Err(_) => {
-            return compiler_error_result(specification, dialect == MatchDialect::Trace, dst);
+            return Ok(TermBuilder::new(dst).tuple(&[
+                Term::atom(global_atoms().intern("error").unwrap()),
+                lint_res,
+            ])?);
         }
     };
     let test_context = TestContext {
@@ -234,28 +239,134 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
         Term::atom(global_atoms().intern("ok").unwrap()),
         result,
         flags,
-        Term::NIL,
+        lint_res,
     ])?)
 }
 
-fn compiler_error_result<H: HeapAlloc>(
-    specification: Term,
-    trace: bool,
+/// The flags `match_spec_test` compiles with: no process state may change.
+// Port of erts/emulator/beam/erl_db_util.c (match_spec_test), OTP-29.1.1.
+fn test_cflags(trace: bool) -> u32 {
+    if trace {
+        dmc::DCOMP_TRACE
+            | dmc::DCOMP_FAKE_DESTRUCTIVE
+            | dmc::DCOMP_CALL_TRACE
+            | dmc::DCOMP_ALLOW_TRACE_OPS
+    } else {
+        dmc::DCOMP_TABLE | dmc::DCOMP_FAKE_DESTRUCTIVE
+    }
+}
+
+/// The clauses of a match specification split the way `db_match_compile` takes them.
+struct SetParts {
+    matches: Vec<Term>,
+    guards: Vec<Term>,
+    bodies: Vec<Term>,
+    is_prefix: Vec<bool>,
+}
+
+/// The shape checks and the trace-head conversion shared by `db_match_set_compile` and
+/// `db_match_set_lint`; with `err_info` the shape errors are recorded as lint does.
+// Port of erts/emulator/beam/erl_db_util.c (db_match_set_compile, db_match_set_lint),
+// OTP-29.1.1.
+fn match_set_parts(
+    heap: &mut VecHeap,
+    matchexpr: Term,
+    cflags: u32,
+    mut err_info: Option<&mut dmc::DmcErrInfo>,
+) -> Option<SetParts> {
+    if matchexpr.classify() != TermKind::List {
+        if let Some(info) = err_info.as_deref_mut() {
+            info.add_error(b"Match programs are not in a list.");
+        }
+        return None;
+    }
+    let mut clauses = Vec::new();
+    let mut l = matchexpr;
+    while let Some((head, tail)) = cons(l) {
+        clauses.push(head);
+        l = tail;
+    }
+    if l != Term::NIL {
+        if let Some(info) = err_info.as_deref_mut() {
+            info.add_error(b"Match programs are not in a proper list.");
+        }
+        return None;
+    }
+    let mut parts = SetParts {
+        matches: Vec::new(),
+        guards: Vec::new(),
+        bodies: Vec::new(),
+        is_prefix: Vec::new(),
+    };
+    for clause in clauses {
+        let triple = tuple_view(clause)
+            .map(|view| view.iter().collect::<Vec<_>>())
+            .filter(|items| items.len() == 3);
+        let Some(triple) = triple else {
+            if let Some(info) = err_info.as_deref_mut() {
+                info.add_error(b"Match program part is not a tuple of arity 3.");
+            }
+            return None;
+        };
+        let mut prefix = false;
+        let head = if cflags & dmc::DCOMP_TRACE == 0
+            || !matches!(triple[0].classify(), TermKind::List | TermKind::Nil)
+        {
+            triple[0]
+        } else {
+            // This is when tracing, the parameter is a list, that I convert to a tuple and
+            // that is matched against an array (strange, but gives the semantics of
+            // matching against a parameter list).
+            let mut elements = Vec::new();
+            let mut rest = triple[0];
+            while let Some((head, tail)) = cons(rest) {
+                elements.push(head);
+                rest = tail;
+            }
+            if atom_name(rest).as_deref() == Some("_") {
+                prefix = true;
+            } else if rest != Term::NIL {
+                if let Some(info) = err_info.as_deref_mut() {
+                    info.add_term_error(
+                        "Match expression part ",
+                        triple[0],
+                        " is not a proper list.",
+                    );
+                }
+                return None;
+            }
+            TermBuilder::new(heap).tuple(&elements).ok()?
+        };
+        parts.matches.push(head);
+        parts.guards.push(triple[1]);
+        parts.bodies.push(triple[2]);
+        parts.is_prefix.push(prefix);
+    }
+    Some(parts)
+}
+
+/// Compile with error information and return the error list `match_spec_test` reports.
+// Port of erts/emulator/beam/erl_db_util.c (db_match_set_lint), OTP-29.1.1.
+fn db_match_set_lint<H: HeapAlloc>(
+    matchexpr: Term,
+    cflags: u32,
     dst: &mut H,
 ) -> Result<Term, EtsError> {
-    let messages = compiler_diagnostics(specification, trace);
-    let mut builder = TermBuilder::new(dst);
-    let mut diagnostics = Vec::with_capacity(messages.len());
-    for message in messages {
-        let text = builder.string_to_list(&message)?;
-        diagnostics
-            .push(builder.tuple(&[Term::atom(global_atoms().intern("error").unwrap()), text])?);
+    let mut err_info = dmc::DmcErrInfo::new();
+    let mut heap = VecHeap::new();
+    if let Some(parts) = match_set_parts(&mut heap, matchexpr, cflags, Some(&mut err_info)) {
+        // The program is not wanted, only the errors it leaves in `err_info`.
+        let _ = dmc::db_match_compile(
+            &mut heap,
+            &parts.matches,
+            &parts.guards,
+            &parts.bodies,
+            cflags,
+            &parts.is_prefix,
+            Some(&mut err_info),
+        );
     }
-    let diagnostics = builder.list_from_iter(diagnostics)?;
-    Ok(builder.tuple(&[
-        Term::atom(global_atoms().intern("error").unwrap()),
-        diagnostics,
-    ])?)
+    err_info.format(dst)
 }
 
 /// Key interval inferred from a single ordered-table match clause.
@@ -522,158 +633,6 @@ fn variable(term: Term) -> Option<usize> {
     digits.parse::<usize>().ok()
 }
 
-// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_one_term).
-fn head_variables(term: Term, bound: &mut HashSet<usize>) -> Result<(), EtsError> {
-    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchPushV).
-    if let Some(index) = variable(term) {
-        bound.insert(index);
-        return Ok(());
-    }
-    match term.classify() {
-        TermKind::Tuple => {
-            // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchTuple).
-            for element in tuple(term)? {
-                head_variables(element, bound)?;
-            }
-        }
-        TermKind::List => {
-            // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchList).
-            let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
-            head_variables(head, bound)?;
-            head_variables(tail, bound)?;
-        }
-        TermKind::Map => {
-            // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchMap).
-            let OwnedTerm::Map(pairs) = &to_owned(term)? else {
-                return Err(EtsError::BadArg);
-            };
-            let mut heap = VecHeap::new();
-            for (key, value) in pairs {
-                let key = from_owned(key, &mut heap)?;
-                if variable(key).is_some() || atom_name(key).as_deref() == Some("_") {
-                    return Err(EtsError::BadArg);
-                }
-                let value = from_owned(value, &mut heap)?;
-                head_variables(value, bound)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn unbound_variable(term: Term, bound: &HashSet<usize>) -> Option<usize> {
-    if let Some(index) = variable(term) {
-        return (!bound.contains(&index)).then_some(index);
-    }
-    match term.classify() {
-        TermKind::List => owned_unbound_variable(&to_owned(term).ok()?, bound),
-        TermKind::Map => {
-            let owned = to_owned(term).ok()?;
-            owned_unbound_variable(&owned, bound)
-        }
-        TermKind::Tuple => {
-            let parts = tuple(term).ok()?;
-            if parts.first().and_then(|&head| atom_name(head)).as_deref() == Some("const") {
-                return None;
-            }
-            parts
-                .into_iter()
-                .skip(1)
-                .find_map(|part| unbound_variable(part, bound))
-        }
-        _ => None,
-    }
-}
-
-fn owned_unbound_variable(term: &OwnedTerm, bound: &HashSet<usize>) -> Option<usize> {
-    match term {
-        OwnedTerm::Atom(name) => {
-            let index = name.strip_prefix('$')?.parse::<usize>().ok()?;
-            (!bound.contains(&index)).then_some(index)
-        }
-        OwnedTerm::Tuple(parts) => {
-            if matches!(parts.first(), Some(OwnedTerm::Atom(name)) if name == "const") {
-                return None;
-            }
-            parts
-                .iter()
-                .skip(1)
-                .find_map(|part| owned_unbound_variable(part, bound))
-        }
-        OwnedTerm::List { elems, tail } => elems
-            .iter()
-            .find_map(|part| owned_unbound_variable(part, bound))
-            .or_else(|| owned_unbound_variable(tail, bound)),
-        OwnedTerm::Map(pairs) => pairs.iter().find_map(|(key, value)| {
-            owned_unbound_variable(key, bound).or_else(|| owned_unbound_variable(value, bound))
-        }),
-        _ => None,
-    }
-}
-
-// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (match_spec_test).
-fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
-    const INVALID: &str = "Invalid match specification.";
-    let Ok(clauses) = proper_list(specification) else {
-        return vec![INVALID.into()];
-    };
-    if clauses.is_empty() {
-        return vec![INVALID.into()];
-    }
-    let mut messages = Vec::new();
-    for clause in clauses {
-        let Ok(parts) = tuple(clause) else {
-            messages.push(INVALID.into());
-            continue;
-        };
-        if parts.len() != 3 {
-            messages.push(INVALID.into());
-            continue;
-        }
-        let Ok(guards) = proper_list(parts[1]) else {
-            messages.push(INVALID.into());
-            continue;
-        };
-        let Ok(body) = proper_list(parts[2]) else {
-            messages.push(INVALID.into());
-            continue;
-        };
-        if body.is_empty() && !trace {
-            messages.push("Body clause does not return anything.".into());
-            continue;
-        }
-        let mut bound = HashSet::new();
-        if head_variables(parts[0], &mut bound).is_err() {
-            messages.push(INVALID.into());
-            continue;
-        }
-        for (expressions, is_guard) in [(&guards, true), (&body, false)] {
-            for expression in expressions {
-                let valid = validate_expr(
-                    *expression,
-                    is_guard,
-                    &bound,
-                    trace,
-                    arinsal_alloc::ethr::erts_get_stacklimit(),
-                );
-                if valid == Err(EtsError::Term(arinsal_term::TermError::SystemLimit)) {
-                    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1.
-                    messages.push("Excessive nesting; system limit reached.".into());
-                } else if let Some(index) = unbound_variable(*expression, &bound) {
-                    messages.push(format!("Variable ${index} is unbound."));
-                } else if valid.is_err() {
-                    messages.push(INVALID.into());
-                }
-            }
-        }
-    }
-    if messages.is_empty() {
-        messages.push(INVALID.into());
-    }
-    messages
-}
-
 /// Stack kept free below the match-spec compiler's deepest frame.
 // Port of erts/emulator/beam/erl_db_util.c (ERTS_DB_STACK_MARGIN), OTP-29.1.1.
 const ERTS_DB_STACK_MARGIN: usize = std::mem::size_of::<usize>() * 1024;
@@ -695,135 +654,6 @@ pub(crate) fn stack_guard(limit: usize) -> bool {
     } else {
         ethr::erts_check_above_limit(c, limit.wrapping_sub(ERTS_DB_STACK_MARGIN))
     }
-}
-
-// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (guard_tab).
-fn validate_expr(
-    term: Term,
-    guard: bool,
-    bound: &HashSet<usize>,
-    trace: bool,
-    stack_limit: usize,
-) -> Result<(), EtsError> {
-    // Port of erts/emulator/beam/erl_db_util.c (dmc_expr stack_guard), OTP-29.1.1.
-    if stack_guard(stack_limit) {
-        return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
-    }
-    if let Some(index) = variable(term) {
-        return if bound.contains(&index) {
-            Ok(())
-        } else {
-            Err(EtsError::BadArg)
-        };
-    }
-    if term.classify() == TermKind::List {
-        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_list).
-        // Walk the spine iteratively: long lists are not nesting.
-        let mut rest = term;
-        while rest.classify() == TermKind::List {
-            let (head, tail) = cons(rest).ok_or(EtsError::BadArg)?;
-            validate_expr(head, guard, bound, trace, stack_limit)?;
-            rest = tail;
-        }
-        return validate_expr(rest, guard, bound, trace, stack_limit);
-    }
-    if term.classify() == TermKind::Map {
-        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_map).
-        let owned = to_owned(term)?;
-        let OwnedTerm::Map(pairs) = &owned else {
-            return Err(EtsError::BadArg);
-        };
-        let mut heap = VecHeap::new();
-        for (key, value) in pairs {
-            let key = from_owned(key, &mut heap)?;
-            validate_expr(key, guard, bound, trace, stack_limit)?;
-            let value = from_owned(value, &mut heap)?;
-            validate_expr(value, guard, bound, trace, stack_limit)?;
-        }
-        return Ok(());
-    }
-    if term.classify() != TermKind::Tuple {
-        return Ok(());
-    }
-    let elements = tuple(term)?;
-    if elements.is_empty() {
-        return Err(EtsError::BadArg);
-    }
-    if elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
-        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_tuple).
-        return validate_construct(elements[0], bound, trace, stack_limit);
-    }
-    let Some(name) = atom_name(elements[0]) else {
-        return Err(EtsError::BadArg);
-    };
-    if name == "const" && elements.len() == 2 {
-        return Ok(());
-    }
-    let arity = elements.len() - 1;
-    // Port of erts/emulator/beam/erl_db_util.c (guard_tab and dmc_fun), OTP-29.1.1.
-    let supported = match name.as_str() {
-        "==" | "/=" | "=:=" | "=/=" | ">" | ">=" | "<" | "=<" | "*" | "/" | "xor" | "element"
-        | "div" | "rem" | "band" | "bor" | "bxor" | "bsl" | "bsr" | "max" | "min" | "map_get"
-        | "is_map_key" => arity == 2,
-        "and" | "or" | "andalso" | "andthen" | "orelse" => arity >= 1,
-        "+" | "-" => arity == 1 || arity == 2,
-        "not" | "is_atom" | "is_float" | "is_number" | "is_tuple" | "is_list" | "is_map"
-        | "is_binary" | "is_boolean" | "is_reference" | "is_pid" | "is_port" | "tuple_size"
-        | "length" | "abs" | "hd" | "tl" | "is_bitstring" | "size" | "map_size" | "bit_size"
-        | "byte_size" | "round" | "trunc" | "float" | "ceil" | "floor" | "bnot" => arity == 1,
-        "is_function" => arity == 1 || arity == 2,
-        "node" => arity == 0 || arity == 1,
-        "is_integer" => arity == 1 || arity == 3,
-        "is_record" => arity == 3,
-        "binary_part" => arity == 2 || arity == 3,
-        "self" => arity == 0,
-        "get_tcw" if trace => arity == 0,
-        "set_tcw" if trace && !guard => arity == 1,
-        "message" | "display" | "silent" if trace && !guard => arity == 1,
-        "set_seq_token" if trace && !guard => arity == 2,
-        "is_seq_trace" if trace => arity == 0,
-        "return_trace" | "exception_trace" | "process_dump" | "caller" | "caller_line"
-        | "get_seq_token"
-            if trace && !guard =>
-        {
-            arity == 0
-        }
-        "current_stacktrace" if trace && !guard => {
-            arity == 0 || (arity == 1 && elements[1].as_small().is_some_and(|n| n >= 0))
-        }
-        "enable_trace" | "disable_trace" if trace && !guard => arity == 1 || arity == 2,
-        "trace" if trace && !guard => arity == 2 || arity == 3,
-        _ => false,
-    };
-    if !supported {
-        return Err(EtsError::BadArg);
-    }
-    for &argument in &elements[1..] {
-        validate_expr(argument, guard, bound, trace, stack_limit)?;
-    }
-    Ok(())
-}
-
-// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_tuple).
-fn validate_construct(
-    term: Term,
-    bound: &HashSet<usize>,
-    trace: bool,
-    stack_limit: usize,
-) -> Result<(), EtsError> {
-    if stack_guard(stack_limit) {
-        return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
-    }
-    if term.classify() == TermKind::Tuple {
-        // Port of erts/emulator/beam/erl_db_util.c (dmc_tuple), OTP-29.1.1: each
-        // element of a constructed tuple is an expression of its own.
-        for element in tuple(term)? {
-            validate_expr(element, false, bound, trace, stack_limit)?;
-        }
-    } else {
-        validate_expr(term, false, bound, trace, stack_limit)?;
-    }
-    Ok(())
 }
 
 impl MatchProgram {
@@ -930,19 +760,6 @@ impl MatchProgram {
         )
     }
 
-    /// Compile for `erlang:match_spec_test/3`: no process state may change.
-    fn compile_test(specification: Term, trace: bool) -> Result<Self, EtsError> {
-        Self::compile_with_flags(
-            specification,
-            dmc::DCOMP_FAKE_DESTRUCTIVE
-                | if trace {
-                    dmc::DCOMP_TRACE | dmc::DCOMP_CALL_TRACE | dmc::DCOMP_ALLOW_TRACE_OPS
-                } else {
-                    dmc::DCOMP_TABLE
-                },
-        )
-    }
-
     fn compile_with_flags(specification: Term, cflags: u32) -> Result<Self, EtsError> {
         let mut heap = VecHeap::new();
         let specification = copy_term(specification, &mut heap)?;
@@ -953,72 +770,29 @@ impl MatchProgram {
     // Port of erts/emulator/beam/erl_db_util.c (db_match_set_compile), OTP-29.1.1.
     fn compile_in(mut heap: VecHeap, specification: Term, cflags: u32) -> Result<Self, EtsError> {
         let trace = cflags & dmc::DCOMP_TRACE != 0;
-        // Port of erts/emulator/beam/erl_db_util.c (db_match_compile:
-        // context.stack_limit = erts_get_stacklimit()), OTP-29.1.1.
-        let stack_limit = arinsal_alloc::ethr::erts_get_stacklimit();
-        let mut clauses = Vec::new();
-        let mut matches = Vec::new();
-        let mut guard_exprs = Vec::new();
-        let mut body_exprs = Vec::new();
-        let mut is_prefix = Vec::new();
-        for clause in proper_list(specification)? {
-            let triple = tuple(clause)?;
-            if triple.len() != 3 {
-                return Err(EtsError::BadArg);
-            }
-            let guards = proper_list(triple[1])?;
-            let body = proper_list(triple[2])?;
-            if body.is_empty() && !trace {
-                return Err(EtsError::BadArg);
-            }
-            let mut bound = HashSet::new();
-            head_variables(triple[0], &mut bound)?;
-            for &guard in &guards {
-                validate_expr(guard, true, &bound, trace, stack_limit)?;
-            }
-            for &expr in &body {
-                validate_expr(expr, false, &bound, trace, stack_limit)?;
-            }
-            // When tracing, a list head is converted to a tuple and matched against the
-            // argument array; a '_' tail makes it a prefix match.
-            let mut prefix = false;
-            let head = if trace && matches!(triple[0].classify(), TermKind::List | TermKind::Nil) {
-                let mut elements = Vec::new();
-                let mut rest = triple[0];
-                while let Some((head, tail)) = cons(rest) {
-                    elements.push(head);
-                    rest = tail;
-                }
-                if atom_name(rest).as_deref() == Some("_") {
-                    prefix = true;
-                } else if rest != Term::NIL {
-                    return Err(EtsError::BadArg);
-                }
-                TermBuilder::new(&mut heap).tuple(&elements)?
-            } else {
-                triple[0]
-            };
-            matches.push(head);
-            guard_exprs.push(triple[1]);
-            body_exprs.push(triple[2]);
-            is_prefix.push(prefix);
-            clauses.push(Clause {
-                head: triple[0],
-                guards,
-                body,
-            });
-        }
-        if clauses.is_empty() {
-            return Err(EtsError::BadArg);
-        }
+        let parts =
+            match_set_parts(&mut heap, specification, cflags, None).ok_or(EtsError::BadArg)?;
         let compiled = dmc::db_match_compile(
             &mut heap,
-            &matches,
-            &guard_exprs,
-            &body_exprs,
+            &parts.matches,
+            &parts.guards,
+            &parts.bodies,
             cflags,
-            &is_prefix,
+            &parts.is_prefix,
+            None,
         )?;
+        // The compiler accepted the specification: every guard and body is a proper list.
+        let mut clauses = Vec::with_capacity(parts.matches.len());
+        let mut rest = specification;
+        for index in 0..parts.matches.len() {
+            let (clause, tail) = cons(rest).ok_or(EtsError::BadArg)?;
+            rest = tail;
+            clauses.push(Clause {
+                head: tuple(clause)?[0],
+                guards: proper_list(parts.guards[index])?,
+                body: proper_list(parts.bodies[index])?,
+            });
+        }
         Ok(Self {
             heap,
             clauses,
