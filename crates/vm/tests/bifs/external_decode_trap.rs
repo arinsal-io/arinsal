@@ -4,7 +4,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
 const MODULE: &str = "external_decode_trap_test";
@@ -82,7 +81,7 @@ fn binary_to_term_matches_otp_on_big_inputs() {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
-    let mut vm = Vm::new([]);
+    let mut vm = crate::common::node();
     vm.load_bytes(&beam).unwrap();
     for index in 1..=12i64 {
         let CallResult::Ok(expected) = reference.call(MODULE, "run", &[OwnedTerm::Int(index)])
@@ -90,7 +89,7 @@ fn binary_to_term_matches_otp_on_big_inputs() {
             panic!("OTP failed case {index}");
         };
         let actual = vm
-            .eval_scheduled(MODULE, "run", &[Term::small(index).unwrap()], 1, None)
+            .eval_scheduled(MODULE, "run", &[Term::small(index).unwrap()], 1)
             .unwrap_or_else(|error| panic!("Arinsal failed case {index}: {error:?}"))
             .term;
         eprintln!("case {index}: erl {expected:?} arinsal {actual:?}");
