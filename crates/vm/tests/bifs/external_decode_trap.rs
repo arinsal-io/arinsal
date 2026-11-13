@@ -165,3 +165,42 @@ fn collections_requested_between_binary_to_term_slices_are_delayed() {
         assert_eq!(expected, actual, "{kind}");
     }
 }
+
+const BAD_MODULE: &str = "external_decode_bounds_test";
+
+const BAD_SOURCE: &str = r#"-module(external_decode_bounds_test).
+-export([cases/0]).
+r(F) -> try F() catch C:R -> {C, R} end.
+cases() ->
+    Rec = term_to_binary(records:create(external_decode_bounds_test, point,
+                                        [{x, 1}, {y, [2, 3]}], #{is_exported => true})),
+    <<Head:6/binary, _Flag, Tail/binary>> = Rec,
+    BadFlag = <<Head/binary, 2, Tail/binary>>,
+    Bins = [<<131, 104, 2, 97, 1>>, <<131, 108, 0, 0, 0, 5, 97, 1>>, <<131, 255>>,
+            <<131, 97, 1, 97, 2>>, <<131, 109, 0, 0, 0, 9, 1, 2>>, <<131, 100, 0, 3, 97, 98>>,
+            <<131, 77, 0, 0, 0, 1, 9, 1>>, <<131, 116, 0, 0, 0, 2, 97, 1, 97, 2>>,
+            <<131, 110, 200, 0, 1>>, <<131, 111, 0, 4, 0, 0, 0, 1>>, <<131>>, <<>>,
+            <<130, 97, 1>>, <<131, 119, 3, 97, 98>>, <<131, 103, 119, 1, 97>>,
+            <<131, 121, 0, 0, 0, 0, 97, 1>>, Rec, BadFlag,
+            binary:part(Rec, 0, byte_size(Rec) - 1)],
+    [r(fun() -> binary_to_term(B, Opts) end) || B <- Bins, Opts <- [[], [safe], [used]]].
+"#;
+
+#[test]
+fn malformed_and_record_inputs_match_otp() {
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let beam = reference
+        .compile_named(BAD_MODULE, BAD_SOURCE, &[])
+        .unwrap();
+    reference.load(BAD_MODULE, &beam).unwrap();
+    let CallResult::Ok(expected) = reference.call(BAD_MODULE, "cases", &[]) else {
+        panic!("OTP failed");
+    };
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled(BAD_MODULE, "cases", &[], 1)
+        .expect("Arinsal cases")
+        .term;
+    assert_eq!(expected, actual);
+}

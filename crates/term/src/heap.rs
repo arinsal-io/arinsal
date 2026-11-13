@@ -1287,6 +1287,37 @@ impl HeapReservationWords<'_> {
         Ok((Term::from_ptr(ptr, 2), first))
     }
 
+    /// Reserve a decoded native record whose definition is known and return the slot of
+    /// every field value in definition order, for the `next` chain of the decoder.
+    // Port of erts/emulator/beam/external.c:5257-5385 (`dec_term`, RECORD_EXT) and
+    // erl_record.c (erts_canonical_record_def), OTP-29.1.1.
+    pub fn reserve_native_record(
+        &mut self,
+        module: Atom,
+        name: Atom,
+        exported: bool,
+        keys: &[Atom],
+    ) -> Result<(Term, Vec<HeapTermSlot>), TermError> {
+        let layout = RecordLayout::new(module, name, exported, keys.iter().copied())?;
+        let definition = match crate::record_table::canonical_definition(&layout) {
+            Some(canonical) => canonical,
+            None => TermBuilder::new(&mut *self).record_definition_tuple(&layout)?,
+        };
+        let count = keys.len();
+        let ptr = self.alloc(2 + count).ok_or(TermError::HeapFull)?;
+        store(ptr, ((1 + count) as u64) << 6 | RECORD);
+        store(ptr.wrapping_add(1), definition.bits());
+        for offset in 0..count {
+            store(ptr.wrapping_add(2 + offset), Term::NIL.bits());
+        }
+        let slots = layout
+            .order
+            .iter()
+            .map(|sorted_index| self.term_slot(ptr.wrapping_add(2 + sorted_index)))
+            .collect();
+        Ok((Term::from_ptr(ptr, 2), slots))
+    }
+
     /// Return a slot at an offset in this reservation.
     #[inline]
     pub fn offset_slot(

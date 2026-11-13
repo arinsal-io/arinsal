@@ -42,7 +42,10 @@ pub use checksum::{
     do_chksum_md5, do_chksum_zlib, md5_state_arg, new_binary as chksum_new_binary, term_to_u32,
     zlib_initial,
 };
-pub use etf::{DecodeWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary};
+pub use etf::{
+    DecodeWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary,
+    local_term_hash,
+};
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
     DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,
