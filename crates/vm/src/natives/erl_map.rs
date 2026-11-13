@@ -578,7 +578,6 @@ fn hashmap_merge(
     }
 }
 
-
 /// `maps:find/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_find_2), OTP-29.1.1.
 pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
