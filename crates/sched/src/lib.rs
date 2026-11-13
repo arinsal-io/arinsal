@@ -68,6 +68,7 @@ mod sig_queue;
 mod thr_progress;
 mod thr_queue;
 mod timer;
+pub mod twheel;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
