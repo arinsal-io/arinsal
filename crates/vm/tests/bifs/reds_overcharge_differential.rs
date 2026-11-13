@@ -345,7 +345,7 @@ const MAPS: &[usize] = &[1, 32, 33, 1_000, 100_000];
 /// Above 32 keys, `erts_qsort` uses a scheduler-local random pivot, so constructor charges vary
 /// between OTP runs. Compare against several reference samples below.
 const MAP_BUILD_SIZES: &[usize] = &[1, 32, 33, 1_000, 100_000];
-const MAP_BUILD_REFERENCE_SAMPLES: usize = 7;
+const MAP_BUILD_REFERENCE_SAMPLES: usize = 20;
 /// erl_map.c: the YCF-yielding constructors and projections, flat and hashmap.
 const MAP_CASES: &[Case] = &[
     case(
@@ -360,6 +360,39 @@ const MAP_CASES: &[Case] = &[
         MAP_BUILD_SIZES,
         8,
         "seq(N)",
+        "maps:from_keys(In, v)",
+    ),
+    // Ten copies of every key: equal hashes take the region, duplicate-key and last-wins loops
+    // of hashmap_from_unsorted_array (nested loops, 2 and 4 units per iteration).
+    case(
+        "from_list_dups",
+        &[1_000, 100_000],
+        10,
+        "dupkv(N)",
+        "maps:from_list(In)",
+    ),
+    case(
+        "from_keys_dups",
+        &[1_000, 100_000],
+        8,
+        "dupkeys(N)",
+        "maps:from_keys(In, v)",
+    ),
+    // The first N keys, in trie order, of a 300000-key map: consecutive in hash order, so they
+    // share their first two HAMT levels and the chunked builder runs the deep-prefix loops
+    // (d < dn, collision nodes) from the start.
+    case(
+        "from_list_prefix",
+        &[1_000],
+        10,
+        "prefixkv(N)",
+        "maps:from_list(In)",
+    ),
+    case(
+        "from_keys_prefix",
+        &[1_000],
+        8,
+        "prefixkeys(N)",
         "maps:from_keys(In, v)",
     ),
     case(
@@ -529,6 +562,15 @@ bytes(N) -> list_to_binary([I rem 200 || I <- lists:seq(1, N)]).
 
 kv(N) -> [{{I, I}} || I <- lists:seq(1, N)].
 
+dupkeys(N) -> [I rem (N div 10) || I <- lists:seq(1, N)].
+
+dupkv(N) -> [{{K, I}} || {{K, I}} <- lists:zip(dupkeys(N), lists:seq(1, N))].
+
+prefixkeys(N) ->
+    lists:sublist(maps:keys(maps:from_keys(lists:seq(1, 300000), v)), N).
+
+prefixkv(N) -> [{{K, K}} || K <- prefixkeys(N)].
+
 tuples(N) -> [{{I, foo, "ab", <<"x">>}} || I <- lists:seq(1, N)].
 
 deep(N) -> [[I rem 200, <<"ab">>, [I rem 100]] || I <- lists:seq(1, N)].
@@ -630,7 +672,16 @@ fn check_with(cases: &[Case], erl_args: &[&str]) {
                 continue;
             }
             let function = function_name(case, size);
-            let sample_count = if size > 32 && matches!(case.name, "from_list" | "from_keys") {
+            let sample_count = if size > 32
+                && matches!(
+                    case.name,
+                    "from_list"
+                        | "from_keys"
+                        | "from_list_dups"
+                        | "from_keys_dups"
+                        | "from_list_prefix"
+                        | "from_keys_prefix"
+                ) {
                 MAP_BUILD_REFERENCE_SAMPLES
             } else {
                 1

@@ -5,7 +5,7 @@
 //! erts/lib_src/yielding_c_fun): every loop body costs one unit of the `ycf_nr_of_reductions`
 //! counter and the function yields when the counter reaches zero or below. Rust has no stackful
 //! coroutines, so each YCF function is an explicit state machine whose phases are the loop
-//! tests and bodies; a `tick!` is the generated `YCF_CONSUME_REDS(1)` plus yield check.
+//! tests and bodies; each consume site is the generated `YCF_CONSUME_REDS(1)` plus yield check.
 
 use crate::hamt::{
     HAMT_MAX_LEVEL, HEAD_ARRAY_HEADER, HxNode, boxed_object_words, cdepth, child_range,
@@ -17,25 +17,32 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// Consume `$n` reductions and leave the machine in phase `$next`; yields when the budget is
-/// used up. Port of the code YCF generates for `YCF_CONSUME_REDS` (ycf_yield_fun.c:592-610).
-macro_rules! tick {
-    ($self:ident, $reds:ident, $n:expr, $next:expr) => {{
-        $self.ph = $next;
-        *$reds -= $n as i64;
-        if *$reds <= 0 {
-            return Ok(None);
-        }
-        continue;
-    }};
-}
-
 /// Reductions YCF charges per iteration of a loop nested `depth` loops deep in its function: the
 /// transform wraps every enclosing loop body once more (ycf_yield_fun.c, loop consume
 /// insertion), so a nested loop pays twice as much per level. Read off the generated
 /// erl_map.ycf.h (hashmap_from_unsorted_array, _sorted_unique_array, _chunked_array).
 const LOOP_DEPTH_2: i64 = 2;
 const LOOP_DEPTH_3: i64 = 4;
+
+/// Pay `weight` consume sites one unit at a time, as the generated code does: the counter stops
+/// at zero on the unit that exhausts it (`true`, yield) and the sites not yet reached are carried
+/// in `debt`, paid first when the call resumes.
+fn consume(reds: &mut i64, debt: &mut i64, weight: i64) -> bool {
+    if weight < *reds {
+        *reds -= weight;
+        false
+    } else {
+        *debt = weight - *reds;
+        *reds = 0;
+        true
+    }
+}
+
+/// Pay the sites left over from the previous yield; `true` when they exhaust the new budget.
+fn pay_debt(reds: &mut i64, debt: &mut i64) -> bool {
+    let owed = std::mem::take(debt);
+    owed > 0 && consume(reds, debt, owed)
+}
 
 thread_local! {
     /// `esdp->rand_state`: per-scheduler counter hashed by `erts_sched_local_random`.
@@ -488,6 +495,8 @@ struct Unsorted {
     jx: usize,
     lx: usize,
     cx: usize,
+    /// Consume sites left unpaid at the last yield.
+    debt: i64,
 }
 
 enum UnsortedOut {
@@ -499,6 +508,9 @@ enum UnsortedOut {
 impl Unsorted {
     fn step(&mut self, hxns: &mut [HxNode], reds: &mut i64) -> UnsortedOut {
         let n = hxns.len();
+        if pay_debt(reds, &mut self.debt) {
+            return UnsortedOut::Yield;
+        }
         loop {
             match self.ph {
                 UnsortedPhase::Sort1 => {
@@ -567,8 +579,7 @@ impl Unsorted {
                 UnsortedPhase::JxTest => {
                     if self.jx < n && hxns[self.ix].hx == hxns[self.jx].hx {
                         self.ph = UnsortedPhase::JxBody;
-                        *reds -= LOOP_DEPTH_2;
-                        if *reds <= 0 {
+                        if consume(reds, &mut self.debt, LOOP_DEPTH_2) {
                             return UnsortedOut::Yield;
                         }
                     } else {
@@ -594,8 +605,7 @@ impl Unsorted {
                 UnsortedPhase::RegionTest => {
                     if self.ix < self.jx {
                         self.ph = UnsortedPhase::RegionBody;
-                        *reds -= LOOP_DEPTH_2;
-                        if *reds <= 0 {
+                        if consume(reds, &mut self.debt, LOOP_DEPTH_2) {
                             return UnsortedOut::Yield;
                         }
                     } else {
@@ -613,8 +623,7 @@ impl Unsorted {
                         && crate::exact_eq(leaf_key(hxns[self.ix].val), leaf_key(hxns[self.lx].val))
                     {
                         self.ph = UnsortedPhase::DupBody;
-                        *reds -= LOOP_DEPTH_3;
-                        if *reds <= 0 {
+                        if consume(reds, &mut self.debt, LOOP_DEPTH_3) {
                             return UnsortedOut::Yield;
                         }
                     } else {
@@ -660,6 +669,7 @@ struct SortedUnique {
     i: usize,
     n_colliders: usize,
     pending: Option<HeapBlockBuilder>,
+    debt: i64,
 }
 
 impl SortedUnique {
@@ -672,6 +682,7 @@ impl SortedUnique {
             i: 0,
             n_colliders: 0,
             pending: None,
+            debt: 0,
         }
     }
 
@@ -683,6 +694,9 @@ impl SortedUnique {
         heap: &mut H,
     ) -> Result<Option<usize>, TermError> {
         let n = hxns.len();
+        if pay_debt(reds, &mut self.debt) {
+            return Ok(None);
+        }
         loop {
             match self.ph {
                 SortedPhase::OutTest => {
@@ -710,7 +724,11 @@ impl SortedUnique {
                 }
                 SortedPhase::JTest => {
                     if self.jx < n && hxns[self.ix].hx == hxns[self.jx].hx {
-                        tick!(self, reds, LOOP_DEPTH_2, SortedPhase::JBody);
+                        self.ph = SortedPhase::JBody;
+                        if consume(reds, &mut self.debt, LOOP_DEPTH_2) {
+                            return Ok(None);
+                        }
+                        continue;
                     }
                     self.n_colliders = self.jx - self.ix;
                     let mut builder = TermBuilder::new(heap)
@@ -726,7 +744,11 @@ impl SortedUnique {
                 }
                 SortedPhase::ForTest => {
                     if self.i < self.n_colliders {
-                        tick!(self, reds, LOOP_DEPTH_2, SortedPhase::ForBody);
+                        self.ph = SortedPhase::ForBody;
+                        if consume(reds, &mut self.debt, LOOP_DEPTH_2) {
+                            return Ok(None);
+                        }
+                        continue;
                     }
                     self.ph = SortedPhase::ForEnd;
                 }
@@ -828,6 +850,8 @@ struct Chunked {
     res: Term,
     stack: ErtsEStack,
     pending: Option<HeapBlockBuilder>,
+    /// Consume sites left unpaid at the last yield.
+    debt: i64,
 }
 
 /// The default-array and growth behavior of erts `ErtsEStack`.
@@ -953,6 +977,7 @@ impl Chunked {
             res: Term::NIL,
             stack: ErtsEStack::new(),
             pending: None,
+            debt: 0,
         }
     }
 
@@ -1030,8 +1055,7 @@ impl Chunked {
                 let wat = d.max(dn);
                 let mut dc = HAMT_MAX_LEVEL - 1;
                 while dc > wat {
-                    remaining_reds -= LOOP_DEPTH_2;
-                    if remaining_reds <= 0 {
+                    if consume(&mut remaining_reds, &mut self.debt, LOOP_DEPTH_2) {
                         self.elems = elems;
                         self.ix = ix;
                         self.d = d;
@@ -1054,8 +1078,7 @@ impl Chunked {
 
             if d < dn {
                 while d < dn {
-                    remaining_reds -= LOOP_DEPTH_2;
-                    if remaining_reds <= 0 {
+                    if consume(&mut remaining_reds, &mut self.debt, LOOP_DEPTH_2) {
                         self.elems = elems;
                         self.ix = ix;
                         self.d = d;
@@ -1081,8 +1104,7 @@ impl Chunked {
                 self.push2(res.bits(), hdr | bp);
             } else {
                 while dn != d {
-                    remaining_reds -= LOOP_DEPTH_2;
-                    if remaining_reds <= 0 {
+                    if consume(&mut remaining_reds, &mut self.debt, LOOP_DEPTH_2) {
                         self.elems = elems;
                         self.ix = ix;
                         self.d = d;
@@ -1113,7 +1135,7 @@ impl Chunked {
                     }
                     if sz != 0 {
                         sz -= 1;
-                        remaining_reds -= LOOP_DEPTH_3;
+                        consume(&mut remaining_reds, &mut self.debt, LOOP_DEPTH_3);
                         self.elems = elems;
                         self.ix = ix;
                         self.d = d;
@@ -1151,11 +1173,14 @@ impl Chunked {
         let max_level = HAMT_MAX_LEVEL;
         let mut phase = self.ph;
         let mut remaining_reds = *reds;
+        if pay_debt(&mut remaining_reds, &mut self.debt) {
+            *reds = remaining_reds;
+            return Ok(None);
+        }
         macro_rules! chunk_tick {
             ($n:expr, $next:expr) => {{
                 phase = $next;
-                remaining_reds -= $n as i64;
-                if remaining_reds <= 0 {
+                if consume(&mut remaining_reds, &mut self.debt, $n as i64) {
                     self.ph = phase;
                     *reds = remaining_reds;
                     return Ok(None);
@@ -1244,10 +1269,20 @@ impl Chunked {
                 C::ElemsTest => {
                     self.run_simple_elements(hxns, &mut remaining_reds, false, heap)?;
                     phase = self.ph;
+                    // run_simple_elements stops at a yield with the budget spent.
+                    if remaining_reds <= 0 {
+                        *reds = remaining_reds;
+                        return Ok(None);
+                    }
                 }
                 C::ElemsBody => {
                     self.run_simple_elements(hxns, &mut remaining_reds, true, heap)?;
                     phase = self.ph;
+                    // run_simple_elements stops at a yield with the budget spent.
+                    if remaining_reds <= 0 {
+                        *reds = remaining_reds;
+                        return Ok(None);
+                    }
                 }
                 C::L4Test => {
                     if self.dc > self.wat {
@@ -1324,7 +1359,7 @@ impl Chunked {
                     if self.sz != 0 {
                         // YCF consumes the reduction before popping the next stack word.
                         self.sz -= 1;
-                        remaining_reds -= LOOP_DEPTH_3;
+                        consume(&mut remaining_reds, &mut self.debt, LOOP_DEPTH_3);
                         phase = C::L7Body;
                         self.ph = phase;
                         *reds = remaining_reds;
@@ -1414,7 +1449,7 @@ impl Chunked {
                     }
                     if self.sz != 0 {
                         self.sz -= 1;
-                        remaining_reds -= LOOP_DEPTH_2;
+                        consume(&mut remaining_reds, &mut self.debt, LOOP_DEPTH_2);
                         phase = C::L10Body;
                         self.ph = phase;
                         *reds = remaining_reds;
@@ -1528,6 +1563,7 @@ impl HashmapBuild {
                 jx: 0,
                 lx: 0,
                 cx: 0,
+                debt: 0,
             }),
         }
     }
