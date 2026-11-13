@@ -430,6 +430,7 @@ dependencies = [
  "arinsal-sched",
  "arinsal-spec",
  "arinsal-term",
+ "flate2",
  "libc",
  "mio",
  "nix",

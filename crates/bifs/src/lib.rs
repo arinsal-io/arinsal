@@ -31,7 +31,6 @@ mod lists;
 mod maps_bifs;
 mod math;
 mod pure;
-mod raw;
 mod sys;
 mod time;
 mod unicode;
@@ -43,7 +42,7 @@ pub use checksum::{
     zlib_initial,
 };
 pub use etf::{
-    DecodeWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary,
+    BlockHashWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary,
     local_term_hash,
 };
 pub use lists::{
@@ -240,10 +239,6 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     pub fn with_allocator(heap: H, state: &'a mut BifCall) -> Self {
         state.begin_allocator_call();
         Self { heap, state }
-    }
-
-    pub(crate) fn into_allocator(self) -> H {
-        self.heap
     }
 
     /// Reductions left for this call. `usize::MAX` means do not trap.

@@ -183,7 +183,10 @@ cases() ->
             <<130, 97, 1>>, <<131, 119, 3, 97, 98>>, <<131, 103, 119, 1, 97>>,
             <<131, 121, 0, 0, 0, 0, 97, 1>>, Rec, BadFlag,
             binary:part(Rec, 0, byte_size(Rec) - 1)],
-    [r(fun() -> binary_to_term(B, Opts) end) || B <- Bins, Opts <- [[], [safe], [used]]].
+    [r(fun() -> binary_to_term(B, Opts) end) || B <- Bins, Opts <- [[], [safe], [used]]] ++
+    %% LOCAL_EXT: the block hash of the wrapped term is checked in slices.
+    [r(fun() -> binary_to_term(term_to_binary(lists:seq(1, N), [local])) =:= lists:seq(1, N) end)
+     || N <- [10, 1000, 300000, 1500000]].
 "#;
 
 #[test]

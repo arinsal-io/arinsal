@@ -9,6 +9,7 @@
 use crate::{ARITY, BIN_REF, HeapAlloc, SUB_BITS, Term, TermError};
 use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
+use std::num::NonZeroUsize;
 
 /// Rebuilds a term from its tagged word after it has been held by the ETF work stack.
 ///
@@ -897,4 +898,67 @@ pub fn boxed_header(term: Term) -> Option<u64> {
 pub fn term_at(words: &[u64], index: usize, tag: u64) -> Term {
     assert!(index < words.len() && tag < 4);
     Term((words.as_ptr() as u64).wrapping_add(8 * index as u64) | tag)
+}
+
+// Port of erts/emulator/beam/external.c (dec_term: the `next` pointer chain written into the
+// words of the preallocated heap), OTP-29.1.1.
+/// A slot address inside the heap reservation held by an active ETF decode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct HeapSlotPtr(NonZeroUsize);
+
+impl HeapSlotPtr {
+    /// Retain an in-range heap slot as an address for the decoder's `next` chain.
+    #[inline(always)]
+    pub fn at(words: &mut [u64], index: usize) -> Option<Self> {
+        words
+            .get_mut(index)
+            .and_then(|word| NonZeroUsize::new(word as *mut u64 as usize).map(Self))
+    }
+
+    /// Return the address stored in a term word, as used by erts' `next` chain.
+    #[inline(always)]
+    pub fn address(self) -> u64 {
+        self.0.get() as u64
+    }
+
+    /// Clear this destination and take its chained child slot.
+    #[inline(always)]
+    pub fn take_next(self) -> Option<Self> {
+        // SAFETY: `HeapSlotPtr` is created from an in-range reserved heap word or from a
+        // pointer previously stored in such a word. `B2tContext` retains the reservation
+        // across yields, and a failed decode drops the cursor before factory rollback.
+        let address = unsafe {
+            let slot = self.0.get() as *mut u64;
+            let address = *slot;
+            *slot = 0;
+            address
+        };
+        NonZeroUsize::new(address as usize).map(Self)
+    }
+
+    /// Store an encoded term or chain link in this destination word.
+    #[inline(always)]
+    pub fn store(self, word: u64) {
+        // SAFETY: this cursor points into the live reservation, which is retained until the
+        // decode finishes or is rolled back after the cursor is discarded.
+        unsafe { (self.0.get() as *mut u64).write(word) };
+    }
+}
+
+/// Get a reserved word's index when a safe heap builder API requires an indexed handle.
+#[inline(always)]
+pub fn slot_index(base: usize, length: usize, slot: HeapSlotPtr) -> Option<usize> {
+    let offset = slot.0.get().checked_sub(base)?;
+    if !offset.is_multiple_of(std::mem::size_of::<u64>()) {
+        return None;
+    }
+    let index = offset / std::mem::size_of::<u64>();
+    (index < length).then_some(index)
+}
+
+/// Encode a reserved heap word's address as erts stores it in `next` chains.
+#[inline(always)]
+pub fn slot_address(base: usize, index: usize) -> u64 {
+    base.wrapping_add(index * std::mem::size_of::<u64>()) as u64
 }
