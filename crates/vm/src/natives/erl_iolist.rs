@@ -64,7 +64,7 @@ struct VecState {
 type VecHolder = Mutex<Option<VecState>>;
 
 /// `BUMP_REDS(c_p, reds)`.
-fn charge(process: &mut crate::Process, reds: usize) {
+pub(crate) fn charge(process: &mut crate::Process, reds: usize) {
     let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut call = BifCall::default();
     let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
@@ -72,14 +72,14 @@ fn charge(process: &mut crate::Process, reds: usize) {
 }
 
 /// `erts_set_gc_state(c_p, 1)`: whether delayed GC tasks were moved back to the system queue.
-fn gc_enable(process: &mut crate::Process) -> bool {
+pub(crate) fn gc_enable(process: &mut crate::Process) -> bool {
     process.set_gc_enabled(true);
     process.delayed_gc_due()
 }
 
 /// The magic reference of a new trap state: `erts_create_magic_binary` + `erts_mk_magic_ref`,
 /// then `erts_set_gc_state(c_p, 0)`.
-fn create_holder<T: std::any::Any + Send + Sync>(
+pub(crate) fn create_holder<T: std::any::Any + Send + Sync>(
     process: &mut crate::Process,
     holder: T,
     c_size: usize,

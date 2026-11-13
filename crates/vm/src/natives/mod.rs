@@ -20,6 +20,7 @@ pub(crate) mod erl_map;
 pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erts_debug;
+pub(crate) mod external;
 pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
 pub(crate) mod register;
