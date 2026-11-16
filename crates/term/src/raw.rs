@@ -913,6 +913,22 @@ pub fn boxed_header(term: Term) -> Option<u64> {
     (term.0 & 3 == 2).then(|| read_tagged(term.0, -2))
 }
 
+/// `(start_bit, bit_len)` of a bitstring term without resolving its owner: the start is the
+/// absolute bit offset in the owner's address space, which equals the window offset modulo 8.
+// Port of erts/emulator/beam/erl_bits.h (ERTS_GET_BITSTRING offset and size), OTP-29.1.1.
+#[inline(always)]
+pub fn bitstring_extent(term: Term) -> Option<(usize, usize)> {
+    match boxed_header(term)? & 63 {
+        crate::HEAP_BITS => Some((0, read_tagged(term.0, 8 - 2) as usize)),
+        crate::SUB_BITS => {
+            let start = read_tagged(term.0, 16 - 2) as usize;
+            let end = read_tagged(term.0, 24 - 2) as usize;
+            Some((start, end - start))
+        }
+        _ => None,
+    }
+}
+
 /// The tagged term for word `index` of `words` (a pointer into a reserved block).
 ///
 /// `tag` is the primary tag: 1 list, 2 boxed. Panics when `index` is outside `words`, so the

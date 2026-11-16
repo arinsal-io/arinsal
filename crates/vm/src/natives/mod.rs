@@ -21,7 +21,7 @@ pub(crate) mod erl_bif_re;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_iolist;
-pub(crate) mod erl_iolist_vec;
+pub(crate) mod erl_iolist_generic;
 pub(crate) mod erl_map;
 // Port of erts/emulator/beam/erl_math.c, OTP-29.1.1.
 pub(crate) mod erl_math;

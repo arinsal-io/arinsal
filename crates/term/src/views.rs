@@ -1,5 +1,5 @@
 //! Borrowed typed views over stable heap words.
-use crate::{ARITY, FLOAT, MAP, NEG_BIG, POS_BIG, Term, exact_eq};
+use crate::{ARITY, FLOAT, HEAP_BITS, MAP, NEG_BIG, POS_BIG, Term, exact_eq};
 use num_bigint::{BigInt, Sign};
 
 /// Sequential view of a possibly improper list.
@@ -186,6 +186,25 @@ impl Term {
         let digits =
             unsafe { std::slice::from_raw_parts_mut(self.raw_ptr().add(1).cast_mut(), len) };
         Some(body(digits, header & 63 == NEG_BIG))
+    }
+    /// Run `body` on the payload bytes of a heap bitstring that its builder is still filling.
+    /// `body` must not allocate on the heap.
+    // Port of erts/emulator/beam/erl_bits.c (erts_new_bitstring: the caller writes through `to_base`
+    // until the BIF returns), OTP-29.1.1.
+    pub fn with_heap_bits_mut<R>(self, body: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let header = self.header()?;
+        if header & 63 != HEAP_BITS {
+            return None;
+        }
+        // SAFETY: a heap bitstring has its bit length in word one and `ceil(bits / 8)` payload
+        // bytes from word two; the view ends with `body`, which does not allocate, so the heap
+        // does not move under it.
+        let bytes = unsafe {
+            let p = self.raw_ptr();
+            let len = (*p.add(1) as usize).div_ceil(8);
+            std::slice::from_raw_parts_mut(p.add(2).cast_mut().cast::<u8>(), len)
+        };
+        Some(body(bytes))
     }
     /// Borrow a flatmap's keys and values.
     ///

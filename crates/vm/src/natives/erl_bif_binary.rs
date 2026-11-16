@@ -1933,13 +1933,11 @@ fn copy_loop(
     // `binary_copy_trap`: the contents of the unshared result are updated in place.
     let mut target =
         arinsal_term::raw::UninitBitstring::from_term(result).ok_or(BifError::BADARG)?;
-    let destination = target.bytes_mut().ok_or(BifError::BADARG)?;
-    Ok(binary_copy_loop(
-        source,
-        destination,
-        copied_bits,
-        trap_offset,
-    ))
+    target
+        .with_bytes_mut(|destination| {
+            binary_copy_loop(source, destination, copied_bits, trap_offset)
+        })
+        .ok_or(BifError::BADARG)
 }
 
 /// `get_reds` for the copy loops.

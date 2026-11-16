@@ -4401,13 +4401,30 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             written.checked_mul(8).ok_or(TermError::SystemLimit)?,
         )
     }
+    /// A heap bitstring of `bit_len` bits with an unspecified payload; fill it through
+    /// [`Term::with_heap_bits_mut`] before the BIF returns.
+    // Port of erts/emulator/beam/erl_bits.c (erts_new_bitstring_heap), OTP-29.1.1.
+    pub fn heap_bitstring_uninit(&mut self, bit_len: usize) -> Result<Term, TermError> {
+        self.heap_bitstring_with_data_len(bit_len, false, |payload| {
+            // The unused tail bits of a bitstring are zero.
+            if !bit_len.is_multiple_of(8)
+                && let Some(last) = payload.last_mut()
+            {
+                *last = 0;
+            }
+            Ok(bit_len)
+        })
+    }
+
     /// A whole-byte off-heap binary of `size` bytes (`size > 0`) that the caller fills while it
     /// still holds the only reference (`erts_bin_nrml_alloc` plus
     /// its `BinRef`, as `iolist_to_iovec` does for its copied components). The payload is not
     /// initialized.
     // Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_engine), OTP-29.1.1.
-    pub fn refc_binary_uninit(&mut self, size: usize) -> Result<Term, TermError> {
-        let bit_len = size.checked_mul(8).ok_or(TermError::SystemLimit)?;
+    pub fn refc_binary_uninit(&mut self, size: usize, bit_len: usize) -> Result<Term, TermError> {
+        if bit_len.div_ceil(8) != size {
+            return Err(TermError::BadArg);
+        }
         let binary = RefcBinary::new_uninit(size)?;
         self.install_refc_binary(binary, bit_len)
     }

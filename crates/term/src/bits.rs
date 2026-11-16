@@ -725,54 +725,90 @@ pub unsafe fn writable_bytes_mut<'a>(term: Term) -> Option<&'a mut [u8]> {
     )
 }
 
-/// A whole off-heap binary that one BIF is still filling: the result of `erts_new_bitstring`
-/// that nothing else references yet, kept in a trap argument between the slices of the copy.
+/// A bitstring that one BIF is still filling: the result of `erts_new_bitstring` that nothing
+/// else references yet, kept by the BIF (or in a trap argument) between the slices of the work.
 ///
-/// Only [`Self::allocate`] and [`Self::from_term`] make one, and both check what the term layer
-/// can check: a plain (not writable) off-heap Binary whose reference count is one, viewed whole
-/// from its first bit. Every [`Self::bytes_mut`] checks the count again. Still assumed: the term
-/// is not a sub-binary of the same Binary held elsewhere (sub-binaries do not count references)
-/// and does not live in a literal area; the only producer is the trapping BIF itself.
-// Port of erts/emulator/beam/erl_bif_binary.c (binary_copy_trap: "This function cannot be
-// traced, so it's safe to update the contents"), OTP-29.1.1.
-pub struct UninitBitstring(Term);
+/// Only the `allocate` functions and [`Self::from_term`] make one. The payload is reached through
+/// the term on every [`Self::with_bytes_mut`], so a heap that moved in between cannot leave it
+/// dangling, and the view lasts only for the closure, which must not allocate. A heap bitstring
+/// is the term itself. An off-heap Binary is checked again on every access: not writable, viewed
+/// from its first bit, and a reference count of one (`from_term` makes the same checks). Still
+/// assumed for the off-heap kind: the term is not a sub-binary of the same Binary held elsewhere
+/// (sub-binaries do not count references) and does not live in a literal area; the producers are
+/// the trapping BIFs themselves.
+// Port of erts/emulator/beam/erl_bits.c (erts_new_bitstring) and erl_bif_binary.c
+// (binary_copy_trap: "This function cannot be traced, so it's safe to update the contents"),
+// OTP-29.1.1.
+pub struct UninitBitstring {
+    term: Term,
+    heap: bool,
+}
 
 impl UninitBitstring {
-    /// Allocate an uninitialized off-heap binary of `len > 0` bytes (`erts_new_bitstring` with its
-    /// `BinRef`).
+    /// `erts_new_bitstring(p, bit_len, &to_base)`: a heap bitstring up to `ERL_ONHEAP_BITS_LIMIT`
+    /// bits, else an off-heap binary.
+    pub fn allocate_bits<H: HeapAlloc + ?Sized>(
+        heap: &mut H,
+        bit_len: usize,
+    ) -> Result<Self, TermError> {
+        let len = bit_len.div_ceil(8);
+        if len <= 64 {
+            let term = crate::TermBuilder::new(heap).heap_bitstring_uninit(bit_len)?;
+            return Ok(Self { term, heap: true });
+        }
+        let term = crate::TermBuilder::new(heap).refc_binary_uninit(len, bit_len)?;
+        let mut handle = Self::from_term(term).ok_or(TermError::BadArg)?;
+        if !bit_len.is_multiple_of(8) {
+            // Keep the unused tail bits of the last byte zero.
+            handle.with_bytes_mut(|bytes| {
+                if let Some(last) = bytes.last_mut() {
+                    *last = 0;
+                }
+            });
+        }
+        Ok(handle)
+    }
+
+    /// `erts_bin_nrml_alloc(len)` with its `BinRef`: an uninitialized off-heap binary of
+    /// `len > 0` bytes.
     pub fn allocate<H: HeapAlloc + ?Sized>(heap: &mut H, len: usize) -> Result<Self, TermError> {
-        let term = crate::TermBuilder::new(heap).refc_binary_uninit(len)?;
+        let term = crate::TermBuilder::new(heap).refc_binary_uninit(len, len * 8)?;
         Self::from_term(term).ok_or(TermError::BadArg)
     }
 
-    /// Rebuild the handle from the trap argument, `None` unless the conditions above hold.
+    /// Rebuild the handle of an off-heap result from a trap argument, `None` unless the
+    /// conditions above hold.
     pub fn from_term(term: Term) -> Option<Self> {
-        let handle = Self(term);
+        let handle = Self { term, heap: false };
         handle.payload_len()?;
         Some(handle)
     }
 
     /// The bitstring term.
     pub fn term(&self) -> Term {
-        self.0
+        self.term
     }
 
-    /// The payload length when the conditions of this type hold.
+    /// The payload length when the conditions of the off-heap kind hold.
     fn payload_len(&self) -> Option<usize> {
-        let (_, binary) = owner_any(self.0)?;
+        let (_, binary) = owner_any(self.term)?;
         if binary.has_flags(BINARY_FLAG_WRITABLE) {
             return None;
         }
-        let view = crate::raw::BinRef::try_from(self.0).ok()?;
+        let view = crate::raw::BinRef::try_from(self.term).ok()?;
         let len = binary.len()?;
-        (view.start_bit() == 0 && view.bit_len() == len.checked_mul(8)?).then_some(len)
+        (view.start_bit() == 0 && view.bit_len().div_ceil(8) == len).then_some(len)
     }
 
-    /// The whole payload, writable while the Binary has a single reference.
-    pub fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+    /// Run `body` on the whole payload; `None` when the conditions of the kind do not hold.
+    /// `body` must not allocate on the heap.
+    pub fn with_bytes_mut<R>(&mut self, body: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        if self.heap {
+            return self.term.with_heap_bits_mut(body);
+        }
         let len = self.payload_len()?;
-        let (_, binary) = owner_any(self.0)?;
-        binary.bytes_mut_unique(len)
+        let (_, binary) = owner_any(self.term)?;
+        Some(body(binary.bytes_mut_unique(len)?))
     }
 }
 

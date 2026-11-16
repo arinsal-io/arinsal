@@ -34,6 +34,12 @@ run() ->
         {copy1, fun binary:copy/1}]] ++
     [{part, erlang:phash2(P), both(fun() -> binary:part(B, P) end), both(fun() -> erlang:binary_part(B, element(1, P), element(2, P)) end)}
      || B <- Bins, P <- [{0, 0}, {0, 3}, {2, 5}, {3, -3}, {100, 1}, {1, -2}, {a, 1}, {-1, 1}, {1 bsl 62, 1}, {0, -1}]] ++
+    [{l2bs, N, both(fun() -> list_to_bitstring(X) end)} || {N, X} <- lists:zip(lists:seq(1, 9),
+        [[<<1:3>>, 5, <<7:7>>, [<<1:1>>, <<255, 255>>], <<2:5>>], [<<1:1>>], [<<1:3>>, <<1:5>>], [1, 2, <<3:3>>],
+         [<<1:3>>, binary:copy(<<"ab">>, 300), <<1:2>>, [Sub, 9]], [[], <<>>, [[<<1:1>>]]], [<<1:3>> | <<2:5>>],
+         [<<1:3>> | foo], [lists:duplicate(300, <<7:5>>)]])] ++
+    [{l2bin, N, both(fun() -> iolist_to_binary(X) end), both(fun() -> list_to_binary(X) end)} || {N, X} <- lists:zip(lists:seq(1, 6),
+        [[1, 2, <<3>>, [Sub, [<<"ab">>]]], [<<1:3>>], [256], [binary:copy(<<"x">>, 70), 1 | <<2>>], [[<<1:4, 2:4>>] | <<9>>], x])] ++
     [{at, I, both(fun() -> binary:at(B, I) end)} || B <- Bins, I <- [0, 1, 2, 6, 100, -1, a]] ++
     [{lcp, both(fun() -> binary:longest_common_prefix(L) end), both(fun() -> binary:longest_common_suffix(L) end)}
      || L <- Lists] ++
