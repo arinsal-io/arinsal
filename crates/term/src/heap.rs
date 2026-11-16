@@ -4115,11 +4115,23 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     }
     /// Select immediate or bignum storage for an `i64`.
     pub fn int_from_i64(&mut self, value: i64) -> Result<Term, TermError> {
-        self.int_from_bigint(&BigInt::from(value))
+        self.int_from_i128(i128::from(value))
     }
-    /// Select immediate or bignum storage for an `i128`.
+    /// Select immediate or bignum storage for an `i128`: a small when it fits, otherwise the
+    /// one or two magnitude digits written straight into a bignum.
+    // Port of erts/emulator/beam/erl_bif_unique.c (bld_unique_integer_term) and big.c
+    // (erts_sint64_to_big), OTP-29.1.1.
     pub fn int_from_i128(&mut self, value: i128) -> Result<Term, TermError> {
-        self.int_from_bigint(&BigInt::from(value))
+        if let Some(small) = i64::try_from(value).ok().and_then(Term::small) {
+            return Ok(small);
+        }
+        let sign = if value < 0 { Sign::Minus } else { Sign::Plus };
+        let magnitude = value.unsigned_abs();
+        let (low, high) = (magnitude as u64, (magnitude >> 64) as u64);
+        let digits = if high == 0 { 1 } else { 2 };
+        let p = self.words(1 + digits)?;
+        self.write_bignum(p, digits, sign, |index| if index == 0 { low } else { high });
+        Ok(Term::from_ptr(p, 2))
     }
     /// Select immediate or positive bignum storage for an unsigned integer.
     pub fn int_from_u64(&mut self, value: u64) -> Result<Term, TermError> {

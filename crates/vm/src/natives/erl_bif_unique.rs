@@ -8,8 +8,8 @@ use crate::bif_table::bif_args;
 use crate::natives::bif::{badarg, bif_ret};
 use crate::{Process, VmError};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifError, ProcessHeapHandle};
-use arinsal_term::{Term, TermBuilder, atoms, global_atoms};
+use arinsal_bifs::ProcessHeapHandle;
+use arinsal_term::{Term, TermBuilder, atoms};
 
 /// `erlang:make_ref/0`.
 // Port of erts/emulator/beam/erl_bif_unique.c (make_ref_0) and erl_bif_unique.h
@@ -31,18 +31,23 @@ fn system_limit() -> VmError {
 }
 
 fn option_flags(options: Term) -> Result<(bool, bool), VmError> {
-    // Port of erts/emulator/beam/erl_bif_unique.c (unique_integer_1), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_bif_unique.c (unique_integer_1), OTP-29.1.1: the option
+    // list is walked comparing each element with `am_monotonic` and `am_positive`.
     let mut positive = false;
     let mut monotonic = false;
-    arinsal_bifs::for_each_list_term(options, |flag| {
-        match flag.as_atom().and_then(|atom| global_atoms().text(atom)) {
-            Some("positive") => positive = true,
-            Some("monotonic") => monotonic = true,
-            _ => return Err(BifError::BADARG),
+    let mut modlist = options;
+    while let Ok(cons) = arinsal_term::raw::Cons::try_from(modlist) {
+        let (option, next) = cons.pair();
+        match option.as_atom() {
+            Some(atoms::MONOTONIC) => monotonic = true,
+            Some(atoms::POSITIVE) => positive = true,
+            _ => return Err(badarg()),
         }
-        Ok(())
-    })
-    .map_err(|_| badarg())?;
+        modlist = next;
+    }
+    if modlist != Term::NIL {
+        return Err(badarg());
+    }
     Ok((positive, monotonic))
 }
 

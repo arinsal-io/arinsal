@@ -105,46 +105,57 @@ arithmetic_bif!(bnot_1, "bnot", 1, "bnot", "bnot_1");
 arithmetic_bif!(neg_1, "-", 1, "-", "sminus_1");
 arithmetic_bif!(plus_1, "+", 1, "+1", "splus_1");
 
-fn integer_text_bif(
+/// The `BIF_RET` / `BIF_ERROR` of `integer_to_list`; the text itself is built by
+/// `arinsal_arith` (`Sint_to_buf` and `buf_to_intlist` for a small).
+// Port of erts/emulator/beam/bif.c (integer_to_list), OTP-29.1.1.
+#[inline(always)]
+fn integer_to_list(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
     i: u64,
-    function: &'static str,
+    process: &mut crate::Process,
     arity: usize,
+    result: Result<Term, arinsal_arith::ArithError>,
 ) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
-        return 0;
-    };
-    process.heap.note_bif_entry();
-    let args = crate::bif_table::bif_arg_vec(reg, arity);
-    let result = {
-        let mut heap = ProcessHeapHandle(&mut process.heap);
-        if function == "integer_to_list" {
-            if arity == 1 {
-                arinsal_arith::integer_to_list_decimal(args[0], &mut heap)
-            } else {
-                arinsal_arith::integer_to_list(args[0], args[1], &mut heap)
-            }
-        } else if arity == 1 {
-            arinsal_arith::integer_to_binary_decimal(args[0], &mut heap)
-        } else {
-            arinsal_arith::integer_to_binary(args[0], args[1], &mut heap)
-        }
-        .map_err(arith_error)
-    };
-    finish(c_p, reg, i, process, "erlang", function, arity, result)
+    match result {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(error) => finish(
+            c_p,
+            reg,
+            i,
+            process,
+            "erlang",
+            "integer_to_list",
+            arity,
+            Err(arith_error(error)),
+        ),
+    }
 }
 
 /// `erlang:integer_to_list/1`.
 // Port of erts/emulator/beam/bif.c (integer_to_list_1), OTP-29.1.1.
 pub(crate) extern "C" fn integer_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    integer_text_bif(c_p, reg, i, "integer_to_list", 1)
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [num] = crate::bif_table::bif_args::<1>(reg);
+    let result =
+        arinsal_arith::integer_to_list_decimal(num, &mut ProcessHeapHandle(&mut process.heap));
+    integer_to_list(c_p, reg, i, process, 1, result)
 }
 
 /// `erlang:integer_to_list/2`.
 // Port of erts/emulator/beam/bif.c (integer_to_list_2), OTP-29.1.1.
 pub(crate) extern "C" fn integer_to_list_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    integer_text_bif(c_p, reg, i, "integer_to_list", 2)
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [num, base] = crate::bif_table::bif_args::<2>(reg);
+    let result =
+        arinsal_arith::integer_to_list(num, base, &mut ProcessHeapHandle(&mut process.heap));
+    integer_to_list(c_p, reg, i, process, 2, result)
 }
 
 fn status(name: &'static str) -> Result<Term, BifError> {
