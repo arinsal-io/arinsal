@@ -1331,7 +1331,7 @@ pub fn install_refc_binary<H: HeapAlloc>(
         .map_err(|_| EncodeError::SystemLimit)
 }
 
-/// Result of [`EncodeWalk::encode_into_refc`].
+/// Result of [`TtbContext::encode_into_refc`].
 pub enum RefcEncoded {
     /// The finished binary term.
     Done(Term),
@@ -1339,24 +1339,64 @@ pub enum RefcEncoded {
     Partial(RefcBinary),
 }
 
-/// Incremental ETF encoder used by the VM's trapping `term_to_binary` path.
-pub struct EncodeWalk {
-    opts: EncodeOpts,
-    /// The saved work stack of whichever pass is running (`ctx->wstack`).
+/// `TTBSizeContext`: the state of `encode_size_struct_int` across a yield.
+// Port of erts/emulator/beam/external.c (TTBSizeContext), OTP-29.1.1.
+struct TtbSizeContext {
+    /// The saved work stack (`WSTACK_SAVE`).
     work: Vec<u64>,
-    current_term: Option<Term>,
-    size_current: Option<Term>,
+    /// The object that was about to be sized when the pass yielded.
+    current: Option<Term>,
     /// Size returned by `encode_size_struct_int` before the encoder's final binary resize.
-    encoded_size: usize,
+    encoded: usize,
     /// Bytes emitted by `enc_term_int`, including recursively encoded local fun fields.
-    output_size: usize,
+    output: usize,
+    /// Whether the size pass has finished.
+    done: bool,
+}
+
+/// `TTBEncodeContext`: the state of `enc_term_int` across a yield.
+// Port of erts/emulator/beam/external.c (TTBEncodeContext), OTP-29.1.1.
+struct TtbEncodeContext {
+    /// The saved work stack (`WSTACK_SAVE`).
+    work: Vec<u64>,
+    current: Option<Term>,
     written: usize,
     direct_started: bool,
-    sized: bool,
     free_first: bool,
+}
+
+/// `TTBContext.state` with the members of its union.
+pub enum TtbState {
+    /// `TTBSize`: the walk is sizing the term.
+    Size,
+    /// `TTBEncode` into `s.ec.result_bin`, a refc binary of the sized length.
+    Encode(Option<RefcBinary>),
+    /// `TTBEncode` of a result that is compressed next: the plain encoding is staged in a
+    /// writable binary.
+    EncodeStaged(Term),
+    /// `TTBEncode` of `term_to_iovec`, whose parts are cut from the encoded bytes.
+    Iovec,
+    /// `TTBCompress`: `s.cc.result_bin` (the plain encoding) and `s.cc.destination_bin`.
+    Compress {
+        /// The plain encoding.
+        source: Term,
+        /// The compressed output.
+        destination: Term,
+    },
+}
+
+/// `TTBContext`: the state of one `term_to_binary` call, which lives on the caller's stack and
+/// is copied into a magic binary only when the call yields.
+// Port of erts/emulator/beam/external.c (TTBContext), OTP-29.1.1.
+pub struct TtbContext {
+    /// `TTBContext.state`.
+    pub state: TtbState,
+    opts: EncodeOpts,
+    size: TtbSizeContext,
+    encode: TtbEncodeContext,
     iovec: bool,
-    /// State that the plain `term_to_binary` path never touches, out of line so that the
-    /// walk stays small enough to be moved without a call to `memcpy`.
+    /// State that the plain `term_to_binary` path never touches (`s.cc`, the iovec splits, the
+    /// deterministic map sort and the local hash), out of line so that the context stays small.
     cold: Option<Box<EncodeCold>>,
     /// Whether to record the boundaries of large binaries for `term_to_iovec`.
     record_splits: bool,
@@ -1365,7 +1405,7 @@ pub struct EncodeWalk {
     node_source: Option<fn() -> (Atom, u32)>,
 }
 
-/// The rarely used parts of an [`EncodeWalk`]: the owned output buffer of `step`, the iovec
+/// The rarely used parts of an [`TtbContext`]: the owned output buffer of `step`, the iovec
 /// split points, the deterministic map sort, the local-hash walk and the zlib stream.
 #[derive(Default)]
 struct EncodeCold {
@@ -1377,7 +1417,7 @@ struct EncodeCold {
     compression_finished: bool,
 }
 
-impl EncodeWalk {
+impl TtbContext {
     fn cold(&mut self) -> &mut EncodeCold {
         self.cold.get_or_insert_with(Default::default)
     }
@@ -1385,16 +1425,22 @@ impl EncodeWalk {
     /// Empty state used after the source term has been fully encoded.
     pub fn completed() -> Self {
         Self {
+            state: TtbState::Size,
             opts: EncodeOpts::default(),
-            work: Vec::new(),
-            current_term: None,
-            size_current: None,
-            encoded_size: 0,
-            output_size: 0,
-            written: 0,
-            direct_started: false,
-            sized: true,
-            free_first: false,
+            size: TtbSizeContext {
+                work: Vec::new(),
+                current: None,
+                encoded: 0,
+                output: 0,
+                done: true,
+            },
+            encode: TtbEncodeContext {
+                work: Vec::new(),
+                current: None,
+                written: 0,
+                direct_started: false,
+                free_first: false,
+            },
             iovec: false,
             cold: None,
             record_splits: false,
@@ -1436,16 +1482,22 @@ impl EncodeWalk {
         }
         let output_size = encoded_size;
         Self {
+            state: TtbState::Size,
             opts,
-            work: Vec::new(),
-            current_term: Some(term),
-            size_current: Some(term),
-            encoded_size,
-            output_size,
-            written: 0,
-            direct_started: false,
-            sized: false,
-            free_first: true,
+            size: TtbSizeContext {
+                work: Vec::new(),
+                current: Some(term),
+                encoded: encoded_size,
+                output: output_size,
+                done: false,
+            },
+            encode: TtbEncodeContext {
+                work: Vec::new(),
+                current: Some(term),
+                written: 0,
+                direct_started: false,
+                free_first: true,
+            },
             iovec: false,
             cold: None,
             record_splits: false,
@@ -1461,12 +1513,12 @@ impl EncodeWalk {
 
     /// Size reported by `encode_size_struct_int` after its pass.
     pub fn encoded_size(&self) -> Option<usize> {
-        self.sized.then_some(self.encoded_size)
+        self.size.done.then_some(self.size.encoded)
     }
 
     /// Number of bytes emitted by `enc_term_int` after the result binary is resized.
     pub fn output_size(&self) -> Option<usize> {
-        self.sized.then_some(self.output_size)
+        self.size.done.then_some(self.size.output)
     }
 
     /// Whether zlib compression is active for this encoder.
@@ -1479,7 +1531,7 @@ impl EncodeWalk {
     // Port of erts/emulator/beam/external.c (TTBSize, simple path), OTP-29.1.1.
     pub fn finishes_simple(&self) -> bool {
         let plain = self.opts.compressed.is_none_or(|level| level == 0);
-        !(self.iovec && plain) && self.encoded_size <= 64
+        !(self.iovec && plain) && self.size.encoded <= 64
     }
 
     /// `encode_size_struct_int`: size the term with `budget` yield counts, a loop over a
@@ -1495,13 +1547,13 @@ impl EncodeWalk {
         let mut opts = self.opts;
         let node_source = self.node_source;
         let mut stack = WStack::new();
-        stack.restore(&mut self.work);
+        stack.restore(&mut self.size.work);
         let table = global_atoms();
         let minor = opts.minor;
-        let mut total = self.encoded_size;
-        let mut output_total = self.output_size;
+        let mut total = self.size.encoded;
+        let mut output_total = self.size.output;
         let mut work = *consumed;
-        let mut obj = match self.size_current.take() {
+        let mut obj = match self.size.current.take() {
             Some(obj) => obj,
             None => match size_pop(&mut stack)? {
                 Some(obj) => obj,
@@ -1511,10 +1563,10 @@ impl EncodeWalk {
         macro_rules! save {
             ($pending:expr) => {{
                 self.opts = opts;
-                stack.save(&mut self.work);
-                self.size_current = $pending;
-                self.encoded_size = total;
-                self.output_size = output_total;
+                stack.save(&mut self.size.work);
+                self.size.current = $pending;
+                self.size.encoded = total;
+                self.size.output = output_total;
                 *consumed = work;
             }};
         }
@@ -1603,13 +1655,13 @@ impl EncodeWalk {
 
     /// Advance the size pass used before result allocation.
     pub fn step_size(&mut self, budget: usize) -> Result<(bool, usize), EncodeError> {
-        if self.sized {
+        if self.size.done {
             return Ok((true, 0));
         }
         let mut consumed = 0;
         let done = self.encode_size_struct_int(budget, &mut consumed)?;
         if done {
-            self.sized = true;
+            self.size.done = true;
         }
         Ok((done, consumed))
     }
@@ -1638,10 +1690,10 @@ impl EncodeWalk {
         if !sized {
             return Ok((false, budget));
         }
-        if output.len() != self.output_size {
+        if output.len() != self.size.output {
             return Err(EncodeError::SystemLimit);
         }
-        if !self.direct_started {
+        if !self.encode.direct_started {
             let mut writer = OutputSlice::new(output, 0);
             writer.push(131);
             if self.opts.local {
@@ -1650,20 +1702,20 @@ impl EncodeWalk {
             if writer.failed() {
                 return Err(EncodeError::SystemLimit);
             }
-            self.written = writer.len();
-            self.direct_started = true;
+            self.encode.written = writer.len();
+            self.encode.direct_started = true;
             if let Some(cold) = self.cold.as_mut() {
                 cold.out.clear();
             }
         }
-        let mut writer = OutputSlice::new(output, self.written);
+        let mut writer = OutputSlice::new(output, self.encode.written);
         let (mut done, used) = self.step_with_output(budget, &mut writer, size_work)?;
-        self.written = writer.len();
+        self.encode.written = writer.len();
         if writer.failed() {
             return Err(EncodeError::SystemLimit);
         }
         if done && self.opts.local {
-            let written = self.written;
+            let written = self.encode.written;
             let hash_walk = self
                 .cold()
                 .local_hash
@@ -1815,7 +1867,7 @@ impl EncodeWalk {
         self.cold.as_ref().is_some_and(|cold| {
             cold.compression_finished
                 && cold.compressor.as_ref().is_some_and(|compressor| {
-                    compressor.total_out().saturating_add(6) <= self.output_size as u64
+                    compressor.total_out().saturating_add(6) <= self.size.output as u64
                 })
         })
     }
@@ -1841,7 +1893,7 @@ impl EncodeWalk {
             .as_ref()
             .and_then(|cold| cold.compressor.as_ref())
             .is_some_and(|compressor| {
-                compressor.total_out() >= self.output_size.saturating_sub(6) as u64
+                compressor.total_out() >= self.size.output.saturating_sub(6) as u64
             })
     }
 
@@ -1852,7 +1904,7 @@ impl EncodeWalk {
         out: &mut impl ByteOutput,
         mut consumed: usize,
     ) -> Result<(bool, usize), EncodeError> {
-        if !self.sized {
+        if !self.size.done {
             let (done, size_work) = self.step_size(budget)?;
             consumed += size_work;
             if !done {
@@ -1867,9 +1919,9 @@ impl EncodeWalk {
         // The stack and the pending object live in locals so that the output writes cannot
         // alias them; erts keeps them in registers (`DECLARE_WSTACK`, `obj`).
         let mut stack = WStack::new();
-        stack.restore(&mut self.work);
-        let mut cur = self.current_term.take();
-        let mut free_first = self.free_first;
+        stack.restore(&mut self.encode.work);
+        let mut cur = self.encode.current.take();
+        let mut free_first = self.encode.free_first;
         loop {
             if consumed + 1 >= budget && !(free_first && (cur.is_some() || !stack.is_empty())) {
                 break;
@@ -2134,10 +2186,10 @@ impl EncodeWalk {
                 .as_ref()
                 .is_none_or(|cold| cold.map_sort.is_none());
         self.opts = opts;
-        stack.save(&mut self.work);
-        self.current_term = cur;
-        self.free_first = !done;
-        if out.failed() || (done && !iovec && out.len() != self.output_size) {
+        stack.save(&mut self.encode.work);
+        self.encode.current = cur;
+        self.encode.free_first = !done;
+        if out.failed() || (done && !iovec && out.len() != self.size.output) {
             return Err(EncodeError::SystemLimit);
         }
         Ok((done, if done { consumed } else { budget.max(consumed) }))
@@ -2196,7 +2248,7 @@ impl EncodeWalk {
 ///
 /// Port of erts/emulator/beam/external.c:3305 (`erts_term_to_binary`), OTP-29.1.1.
 pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, EncodeError> {
-    let mut walk = EncodeWalk::new(&[term])?;
+    let mut walk = TtbContext::new(&[term])?;
     walk.step(usize::MAX)?;
     walk.finish_binary()
 }
@@ -2302,8 +2354,8 @@ mod map_sort_tests {
     fn reports_encode_walk_layout() {
         use super::*;
         eprintln!(
-            "EncodeWalk={} WStack={} EncodeCold={} BlockHashWalk={} EncodeOpts={} Compress={} out={} splits={} work={}",
-            std::mem::size_of::<EncodeWalk>(),
+            "TtbContext={} WStack={} EncodeCold={} BlockHashWalk={} EncodeOpts={} Compress={} out={} splits={} work={}",
+            std::mem::size_of::<TtbContext>(),
             std::mem::size_of::<WStack>(),
             std::mem::size_of::<EncodeCold>(),
             std::mem::size_of::<BlockHashWalk>(),
