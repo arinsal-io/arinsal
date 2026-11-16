@@ -26,15 +26,12 @@ impl<T> std::ops::Deref for TrapContext<T> {
 
 /// A continuation that carries everything in its arguments: OTP allocates no context.
 pub(crate) struct NoContext;
-/// The `erts_internal:try_seize_code_mod_permission` retry flag.
-pub(crate) struct CodePermission(#[allow(dead_code)] bool);
 
 // One named destructor per trap context, as each erts trap passes its own to
 // erts_create_magic_binary (bif.c, erl_bif_binary.c, external.c, erl_map.c, ...).
 arinsal_term::magic_payload!(
     NoContext => no_context_destructor,
     TrapContext<arinsal_bifs::Phash2Cont> => make_hash2_destructor,
-    CodePermission => code_permission_destructor,
     TrapContext<BinaryCopyState> => binary_copy_destructor,
     TrapContext<crate::dist::DsigSendContext> => dsig_send_context_destructor,
 
@@ -75,17 +72,13 @@ pub(crate) enum TrapGc {
     Disabled,
     /// The arguments are the live X registers of the continuation export (`gc_live`).
     LiveRegisters,
-    /// The state holds no heap term and the arguments are immediates.
-    NoTerms,
 }
 
 /// The one table of continuations that stay collectable while parked. Every other
 /// continuation disables collection, like erts' `erts_set_gc_state(c_p, 0)` before a
 /// state-carrying BIF_TRAP.
 pub(crate) fn trap_gc_policy(continuation: &str) -> TrapGc {
-    if continuation == CODE_PERMISSION_CONTINUATION {
-        TrapGc::NoTerms
-    } else if continuation == "erlang:characters_to_utf8_trap/4" {
+    if continuation == "erlang:characters_to_utf8_trap/4" {
         TrapGc::LiveRegisters
     } else {
         TrapGc::Disabled
@@ -124,7 +117,6 @@ pub(crate) struct Entry {
     handler: Handler,
 }
 
-const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 /// `dsend_continue_trap_export`.
 pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
@@ -205,20 +197,6 @@ fn clear_export_trap(process: &mut Process) {
 }
 
 const ENTRIES: &[Entry] = &[
-    Entry {
-        module: "erts_internal",
-        function: "dsend_continue_trap",
-        arity: 1,
-        continuation: DSEND_CONTINUE_CONTINUATION,
-        handler: dsend_continue_trap_1,
-    },
-    Entry {
-        module: "erts_debug",
-        function: "set_internal_state",
-        arity: 2,
-        continuation: CODE_PERMISSION_CONTINUATION,
-        handler: code_permission,
-    },
     Entry {
         module: "binary",
         function: "copy",
@@ -558,13 +536,6 @@ pub(crate) fn execute_named(
         if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
             process.set_gc_enabled(pending.gc_was_enabled);
         }
-    }
-    if module_name == "erts_debug"
-        && function_name == "set_internal_state"
-        && args[0].as_atom().and_then(|atom| global_atoms().text(atom))
-            != Some("code_mod_permission")
-    {
-        return None;
     }
     // A resume names its handler through the trap, the way BIF_TRAP names the `Export*`.
     let entry = if continuation_resume {
@@ -1004,53 +975,6 @@ fn charge(
         .max(0);
 }
 
-fn code_permission(
-    process: &mut Process,
-    args: &[Term],
-    _state: Option<&MagicBin>,
-    pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    if !crate::natives::internal_state_enabled() {
-        return Err(BifError::Error(Term::atom(
-            global_atoms().intern("undef").unwrap(),
-        )));
-    }
-    if args[0] != Term::atom(global_atoms().intern("code_mod_permission").unwrap()) {
-        return Err(BifError::Unsupported(
-            "unhandled set_internal_state selector",
-        ));
-    }
-    let acquire = match global_atoms().text(args[1].as_atom().ok_or(BifError::BADARG)?) {
-        Some("true") => true,
-        Some("false") => false,
-        _ => return Err(BifError::BADARG),
-    };
-    let pid = pid.ok_or(BifError::Unsupported(
-        "code_mod_permission requires a scheduler",
-    ))?;
-    let Some(runtime) = process.runtime else {
-        return Err(BifError::Unsupported(
-            "code_mod_permission requires a runtime",
-        ));
-    };
-    // Port of erts/emulator/beam/erl_bif_info.c:5385-5400, OTP-29.1.1.
-    if !acquire {
-        crate::natives::code::release_code_mod_permission(runtime);
-    }
-    if !acquire || crate::natives::code::try_seize_code_mod_permission(runtime, process, pid) {
-        return Ok(HandlerResult::Done {
-            value: Term::atom(global_atoms().intern("true").unwrap()),
-            reductions: 1,
-        });
-    }
-    Ok(HandlerResult::Yield {
-        continuation: CODE_PERMISSION_CONTINUATION,
-        state: argument_trap_state(CodePermission(acquire)),
-        reductions: 1,
-    })
-}
-
 /// Bits copied per reduction: a cache line (`ERTS_CACHE_LINE_SIZE * 8`, 64-byte lines).
 const BITSTRING_COPY_LOOP_FACTOR: u64 = 64 * 8;
 
@@ -1231,58 +1155,6 @@ pub(crate) fn dsend_export_trap(
     let mut trap = crate::ExportTrap::new(process, DSEND_CONTINUE_CONTINUATION, vec![state_term]);
     trap.gc_disabled = true;
     Ok(trap)
-}
-
-/// `dsend_continue_trap_1`: restore the reductions and resume `erts_dsig_send` on the context,
-/// trapping again while fragments remain.
-// Port of erts/emulator/beam/bif.c:2806-2840 (dsend_continue_trap_1), OTP-29.1.1.
-fn dsend_continue_trap_1(
-    process: &mut Process,
-    args: &[Term],
-    _state: Option<&MagicBin>,
-    pid: Option<arinsal_sched::Pid>,
-    _gc_was_enabled: bool,
-) -> Result<HandlerResult, BifError> {
-    let (Some(sender), [context]) = (pid, args) else {
-        return Err(BifError::BADARG);
-    };
-    let context = *context;
-    let (result, return_term) = context
-        .with_magic_payload::<TrapContext<crate::dist::DsigSendContext>, _>(|ctx| {
-            let mut ctx = ctx.lock().map_err(|_| BifError::SystemLimit)?;
-            let result = crate::dist::dsend_continue(process, &mut ctx, sender)
-                .map_err(|_| BifError::BADARG)?;
-            Ok::<_, BifError>((result, ctx.return_term()))
-        })
-        .ok_or(BifError::BADARG)??;
-    Ok(match result {
-        // erts_set_gc_state(BIF_P, 1) is the restore of the trap's GC state on completion.
-        crate::dist::DsendContinue::Done => HandlerResult::Done {
-            value: return_term,
-            reductions: 0,
-        },
-        crate::dist::DsendContinue::Yield { no_suspend: true } => HandlerResult::Done {
-            value: Term::atom(arinsal_term::atoms::NOSUSPEND),
-            reductions: 0,
-        },
-        crate::dist::DsendContinue::Yield { no_suspend: false } => {
-            // ERTS_BIF_YIELD_RETURN(BIF_P, ctx->return_term).
-            vbump_all_reds(process);
-            HandlerResult::Export(crate::ExportTrap::new(
-                process,
-                crate::natives::sys::BIF_RETURN_TRAP,
-                vec![return_term, Term::atom(arinsal_term::atoms::UNDEFINED)],
-            ))
-        }
-        crate::dist::DsendContinue::Continue => {
-            // BUMP_ALL_REDS(BIF_P); BIF_TRAP1(&dsend_continue_trap_export, BIF_P, BIF_ARG_1).
-            process.heap.abi.fcalls = 0;
-            let mut trap =
-                crate::ExportTrap::new(process, DSEND_CONTINUE_CONTINUATION, vec![context]);
-            trap.gc_disabled = true;
-            HandlerResult::Export(trap)
-        }
-    })
 }
 
 /// A process that exits while parked in `dsend_continue_trap/1` finishes its fragmented send

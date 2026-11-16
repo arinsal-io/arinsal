@@ -17,9 +17,6 @@ use std::time::{Duration, Instant};
 
 static INTERNAL_STATE: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn internal_state_enabled() -> bool {
-    INTERNAL_STATE.load(Ordering::Relaxed)
-}
 static JIT_ASM_DUMP: AtomicBool = AtomicBool::new(false);
 static TEST_LONG_GC_SLEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNIQUE_MONOTONIC_INTEGER_STATE: std::sync::atomic::AtomicU64 =
@@ -2692,6 +2689,29 @@ fn internal_state_set(
     }
     if !INTERNAL_STATE.load(Ordering::Relaxed) {
         return Err(undef());
+    }
+    // Port of erts/emulator/beam/erl_bif_info.c:5385-5400 (erts_debug_set_internal_state_2,
+    // code_mod_permission), OTP-29.1.1: a busy permission suspends the caller in
+    // `erts_try_seize_code_mod_permission` and the BIF yields to its own export
+    // (ERTS_BIF_YIELD2), retried once the holder hands the permission over.
+    if arg_name(selector).as_deref() == Some("code_mod_permission") {
+        let runtime = process.runtime.ok_or_else(badarg)?;
+        if value == Term::atom(arinsal_term::atoms::FALSE) {
+            crate::natives::code::release_code_mod_permission(runtime);
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
+        }
+        if value != Term::atom(arinsal_term::atoms::TRUE) {
+            return Err(badarg());
+        }
+        if crate::natives::code::try_seize_code_mod_permission(runtime, process, ctx.pid()) {
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
+        }
+        crate::bif_traps::vbump_all_reds(process);
+        return Err(VmError::TrapExport(crate::ExportTrap::new(
+            process,
+            "erts_debug:set_internal_state/2",
+            vec![selector, value],
+        )));
     }
     if arg_name(selector).as_deref() == Some("wait") {
         let kind = arg_name(value).ok_or_else(badarg)?;

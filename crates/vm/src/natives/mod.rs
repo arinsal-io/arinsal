@@ -33,7 +33,6 @@ pub(crate) mod external;
 pub(crate) mod external_dec;
 pub(crate) mod external_dec_size;
 pub(crate) mod external_dec_term;
-pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
 pub(crate) mod register;
 pub(crate) mod sys;

@@ -701,6 +701,70 @@ fn send_yield_continue(
     Err(VmError::TrapExport(trap))
 }
 
+/// `erts_internal:dsend_continue_trap/1`, the hidden trap export a fragmented distributed send
+/// traps to: resume `erts_dsig_send` on the context in the magic binary, and trap again while
+/// fragments remain. Collection stays disabled while the send is parked.
+// Port of erts/emulator/beam/bif.c:2806-2843 (dsend_continue_trap_1), OTP-29.1.1.
+pub(crate) extern "C" fn dsend_continue_trap_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [context] = bif_args::<1>(reg);
+    let Some(sender) = process.self_pid else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let outcome = context
+        .with_magic_payload::<crate::bif_traps::TrapContext<crate::dist::DsigSendContext>, _>(
+            |ctx| {
+                let mut ctx = ctx.lock().ok()?;
+                let result = crate::dist::dsend_continue(process, &mut ctx, sender).ok()?;
+                Some((result, ctx.return_term()))
+            },
+        )
+        .flatten();
+    let Some((result, return_term)) = outcome else {
+        process.set_gc_enabled(true);
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let result = match result {
+        crate::dist::DsendContinue::Done => {
+            process.set_gc_enabled(true);
+            Ok(return_term)
+        }
+        crate::dist::DsendContinue::Yield { no_suspend: true } => {
+            process.set_gc_enabled(true);
+            Ok(Term::atom(atoms::NOSUSPEND))
+        }
+        crate::dist::DsendContinue::Yield { no_suspend: false } => {
+            // ERTS_BIF_YIELD_RETURN(BIF_P, ctx->return_term).
+            process.set_gc_enabled(true);
+            crate::bif_traps::vbump_all_reds(process);
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                crate::natives::sys::BIF_RETURN_TRAP,
+                vec![return_term, Term::atom(atoms::UNDEFINED)],
+            )))
+        }
+        crate::dist::DsendContinue::Continue => {
+            // BUMP_ALL_REDS(BIF_P); BIF_TRAP1(&dsend_continue_trap_export, BIF_P, BIF_ARG_1).
+            process.heap.abi.fcalls = 0;
+            let mut trap = crate::ExportTrap::new(
+                process,
+                crate::bif_traps::DSEND_CONTINUE_CONTINUATION,
+                vec![context],
+            );
+            trap.gc_disabled = true;
+            Err(VmError::TrapExport(trap))
+        }
+    };
+    bif_ret(c_p, i, result)
+}
+
 /// `result >= 0`: `ERTS_VBUMP_REDS(p, 4)`, then the value, or `ERTS_BIF_PREP_YIELD_RETURN`
 /// (`bif_return_trap/2`) when the send used up the slice (`ERTS_IS_PROC_OUT_OF_REDS`).
 // Port of erts/emulator/beam/bif.c (erl_send, send_3: yield_return) and bif.h
