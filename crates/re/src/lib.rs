@@ -9,8 +9,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use arinsal_bifs::with_binary_bytes;
-use arinsal_bifs::{BifError, BifFn, Ctx, IolistCopyWalk, IolistSizeWalk, for_each_list_term};
+use arinsal_bifs::{BifError, BifFn, Ctx, for_each_list_term};
 use arinsal_etf::OwnedTerm as O;
+use arinsal_term::erl_iolist::{IolistCopyWalk, IolistError, IolistSizeWalk};
 use arinsal_term::{
     BinaryOwner, HeapAlloc, MagicBin, Node, Term, TermBuilder, TermKind, from_owned, global_atoms,
     to_owned,
@@ -330,10 +331,19 @@ fn iodata(value: &O, unicode: bool) -> Result<Vec<u8>, BifError> {
     Ok(out)
 }
 
+fn iolist_error(error: IolistError) -> BifError {
+    match error {
+        IolistError::BadArg => BifError::BADARG,
+        IolistError::SystemLimit => BifError::SystemLimit,
+    }
+}
+
 // Port of erts_iolist_size and erts_iolist_to_buf used by erl_bif_re.c, OTP-29.1.1.
 fn term_iodata(value: Term) -> Result<Vec<u8>, BifError> {
     let mut size = IolistSizeWalk::new(value);
-    let (complete, _) = size.step(usize::MAX).map_err(|(error, _)| error)?;
+    let (complete, _) = size
+        .step(usize::MAX)
+        .map_err(|(error, _)| iolist_error(error))?;
     if !complete {
         return Err(BifError::SystemLimit);
     }
@@ -346,7 +356,7 @@ fn term_iodata(value: Term) -> Result<Vec<u8>, BifError> {
     let mut copy = IolistCopyWalk::new(value);
     let (complete, _) = copy
         .step(&mut bytes, usize::MAX)
-        .map_err(|(error, _)| error)?;
+        .map_err(|(error, _)| iolist_error(error))?;
     if !complete {
         return Err(BifError::SystemLimit);
     }

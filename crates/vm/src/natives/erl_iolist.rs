@@ -12,7 +12,8 @@ use crate::Process;
 use crate::bif_traps::TrapContext;
 use crate::natives::bif::bif_ret;
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifCall, BifError, Ctx, IolistSizeWalk, IolistVecWalk, ProcessHeapHandle};
+use arinsal_bifs::{BifCall, BifError, Ctx, IolistVecWalk, ProcessHeapHandle};
+use arinsal_term::erl_iolist::{IolistCopyWalk, IolistError, IolistProgress, IolistSizeWalk};
 use arinsal_term::{MagicBin, Term, TermBuilder, TermKind};
 
 /// `CONTEXT_REDS`.
@@ -62,6 +63,17 @@ struct VecState {
 }
 
 type VecHolder = TrapContext<Option<VecState>>;
+
+/// The walks' progress with the error of the BIF layer.
+fn bif_progress(progress: IolistProgress) -> Result<(bool, usize), (BifError, usize)> {
+    progress.map_err(|(error, work)| {
+        let error = match error {
+            IolistError::BadArg => BifError::BADARG,
+            IolistError::SystemLimit => BifError::SystemLimit,
+        };
+        (error, work)
+    })
+}
 
 /// `BUMP_REDS(c_p, reds)`.
 pub(crate) fn charge(process: &mut crate::Process, reds: usize) {
@@ -216,7 +228,7 @@ fn iolist_size_dispatch(
     let gc_disabled = mref.is_some();
     loop {
         let budget = (process.heap.abi.fcalls.max(0) as usize).saturating_mul(SIZE_YIELDS_PER_RED);
-        let step = state.walk.step(budget);
+        let step = bif_progress(state.walk.step(budget));
         let work = match step {
             Ok((_, work)) | Err((_, work)) => work,
         };
@@ -484,12 +496,12 @@ fn list_to_bitstring_dispatch(
 }
 
 enum ErtsL2BState {
-    Size(arinsal_bifs::IolistSizeWalk),
+    Size(IolistSizeWalk),
     Copy {
         output: IolistOutput,
         bit_len: usize,
         bitstring: bool,
-        walk: arinsal_bifs::IolistCopyWalk,
+        walk: IolistCopyWalk,
     },
     Done,
 }
@@ -512,7 +524,7 @@ impl IolistOutput {
 
 struct IolistCopySetup {
     empty: Option<Term>,
-    ready: Option<(IolistOutput, usize, arinsal_bifs::IolistCopyWalk)>,
+    ready: Option<(IolistOutput, usize, IolistCopyWalk)>,
 }
 
 /// Allocate the result after the size pass of `list_to_binary/1` and friends (`bitstring` false)
@@ -520,7 +532,7 @@ struct IolistCopySetup {
 // Port of erts/emulator/beam/erl_iolist.c (`list_to_bitstring_dispatch`), OTP-29.1.1.
 fn iolist_copy_setup(
     process: &mut Process,
-    size: &mut arinsal_bifs::IolistSizeWalk,
+    size: &mut IolistSizeWalk,
     root: Term,
 ) -> Result<IolistCopySetup, BifError> {
     if size.is_bits() {
@@ -539,7 +551,7 @@ fn iolist_copy_setup(
             ready: Some((
                 IolistOutput::Bitstring(vec![0; bit_len.div_ceil(8)]),
                 bit_len,
-                arinsal_bifs::IolistCopyWalk::new_bits(root),
+                IolistCopyWalk::new_bits(root),
             )),
         });
     }
@@ -564,7 +576,7 @@ fn iolist_copy_setup(
             ready: Some((
                 IolistOutput::Small(output),
                 byte_len * 8,
-                arinsal_bifs::IolistCopyWalk::new(root),
+                IolistCopyWalk::new(root),
             )),
         });
     }
@@ -574,11 +586,7 @@ fn iolist_copy_setup(
     )?);
     Ok(IolistCopySetup {
         empty: None,
-        ready: Some((
-            output,
-            byte_len * 8,
-            arinsal_bifs::IolistCopyWalk::new(root),
-        )),
+        ready: Some((output, byte_len * 8, IolistCopyWalk::new(root))),
     })
 }
 
@@ -600,7 +608,7 @@ fn iolist_binary_step(
     match phase {
         ErtsL2BState::Size(walk) => {
             let initial_yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
-            let (done, work) = match walk.step(initial_yield_count) {
+            let (done, work) = match bif_progress(walk.step(initial_yield_count)) {
                 Ok(progress) => progress,
                 Err((error, work)) => {
                     let reductions = work.div_ceil(SIZE_YIELDS_PER_RED) as u32;
@@ -646,10 +654,10 @@ fn iolist_binary_step(
     };
     let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
     let stepped = match output {
-        IolistOutput::Small(writer) => walk.step(writer.bytes_mut(), yield_count),
-        IolistOutput::Bitstring(bytes) => walk.step(bytes, yield_count),
+        IolistOutput::Small(writer) => bif_progress(walk.step(writer.bytes_mut(), yield_count)),
+        IolistOutput::Bitstring(bytes) => bif_progress(walk.step(bytes, yield_count)),
         IolistOutput::Writable(term) => arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
-            Ok(walk.step(bytes, yield_count))
+            Ok(bif_progress(walk.step(bytes, yield_count)))
         })?,
     };
     let (done, work) = match stepped {

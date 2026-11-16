@@ -9,7 +9,7 @@
     "beamasm": 19,
     "beamjit": 2,
     "beamops": 0,
-    "bifs": 53,
+    "bifs": 45,
     "bits": 5,
     "cli": 0,
     "difftest": 0,
@@ -26,11 +26,11 @@
     "nif-zlib": 52,
     "packet": 0,
     "pterm": 3,
-    "re": 19,
+    "re": 18,
     "sched": 121,
     "spec": 0,
     "term": 373,
-    "vm": 327,
+    "vm": 329,
     "drv": 92
   }
 }
