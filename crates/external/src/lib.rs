@@ -790,6 +790,180 @@ fn size_rare(
     Ok((added, local_headers, next))
 }
 
+/// The rare terms of `enc_term_int` (maps, pids, ports, refs, funs, records), out of line so
+/// that the common-term loop stays compact.
+// Port of erts/emulator/beam/external.c (enc_term_int), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn enc_rare<O: ByteOutput>(
+    kind: TermKind,
+    term: Term,
+    out: &mut O,
+    stack: &mut WStack,
+    opts: &mut EncodeOpts,
+    node_source: Option<fn() -> (Atom, u32)>,
+    table: &arinsal_term::AtomTable,
+    cold: &mut Option<Box<EncodeCold>>,
+) -> Result<(), EncodeError> {
+    match kind {
+        TermKind::Map => {
+            let checked = arinsal_maps::checked_map(term).map_err(|_| EncodeError::BadArg)?;
+            match checked.kind() {
+                arinsal_maps::CheckedMapKind::Flatmap(_) => {
+                    let len = checked.size();
+                    out.push(116);
+                    out.extend_from_slice(
+                        &u32::try_from(len)
+                            .map_err(|_| EncodeError::SystemLimit)?
+                            .to_be_bytes(),
+                    );
+                    if len > 0 && opts.deterministic {
+                        let pairs = arinsal_maps::term_to_binary_pairs(term)
+                            .map_err(|_| EncodeError::BadArg)?;
+                        cold.get_or_insert_with(Default::default).map_sort =
+                            Some(Box::new(MapSort::new(pairs)));
+                        stack.push(ENC_START_SORTING_MAP);
+                        stack.push(Term::NON_VALUE.word());
+                    } else if len > 0 {
+                        // WSTACK_PUSH4(s, kptr, vptr, ENC_MAP_PAIR, size)
+                        push_flatmap_task(stack, term, len)?;
+                    }
+                }
+                arinsal_maps::CheckedMapKind::Hashmap(_) => {
+                    let children =
+                        arinsal_term::MapNodeChildren::new(term).ok_or(EncodeError::BadArg)?;
+                    if children.is_head() {
+                        let len = checked.size();
+                        out.push(116);
+                        out.extend_from_slice(
+                            &u32::try_from(len)
+                                .map_err(|_| EncodeError::SystemLimit)?
+                                .to_be_bytes(),
+                        );
+                        if len > 0 && opts.deterministic {
+                            let pairs = arinsal_maps::term_to_binary_pairs(term)
+                                .map_err(|_| EncodeError::BadArg)?;
+                            cold.get_or_insert_with(Default::default).map_sort =
+                                Some(Box::new(MapSort::new(pairs)));
+                            stack.push(ENC_START_SORTING_MAP);
+                            stack.push(Term::NON_VALUE.word());
+                        } else {
+                            push_hashmap_root_tasks(stack, term, ENC_HASHMAP_NODE, Some(ENC_TERM))?;
+                        }
+                    } else {
+                        push_hashmap_root_tasks(stack, term, ENC_HASHMAP_NODE, Some(ENC_TERM))?;
+                    }
+                }
+            }
+        }
+        TermKind::Pid | TermKind::Port | TermKind::Ref => {
+            let internal = is_internal_identity(term);
+            if internal && !opts.local {
+                resolve_local_node(opts, node_source);
+            }
+            let identity = local_identity(
+                term.identity().ok_or(EncodeError::BadArg)?,
+                internal,
+                opts.local,
+                opts.local_node,
+            );
+            match identity {
+                Identity::Pid {
+                    node,
+                    creation,
+                    index,
+                    serial,
+                } => {
+                    out.push(88);
+                    // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
+                    write_node(out, node, internal, *opts)?;
+                    out.extend_from_slice(&index.to_be_bytes());
+                    out.extend_from_slice(&serial.to_be_bytes());
+                    out.extend_from_slice(&local_creation(creation, internal, *opts).to_be_bytes());
+                }
+                Identity::Port { node, creation, id } => {
+                    out.push(120);
+                    write_node(out, node, internal, *opts)?;
+                    out.extend_from_slice(&id.to_be_bytes());
+                    out.extend_from_slice(&local_creation(creation, internal, *opts).to_be_bytes());
+                }
+                Identity::Ref {
+                    node,
+                    creation,
+                    ids,
+                } => {
+                    // Port of erts/emulator/beam/external.c (enc_term, reference
+                    // case), OTP-29.1.1: the numbers leave the term.
+                    term.save_magic_ref();
+                    out.push(90);
+                    out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+                    write_node(out, node, internal, *opts)?;
+                    out.extend_from_slice(&local_creation(creation, internal, *opts).to_be_bytes());
+                    for id in ids {
+                        out.extend_from_slice(&id.to_be_bytes());
+                    }
+                }
+            }
+        }
+        TermKind::Fun => match fun_of(term)? {
+            FunRef::Export { entry } => {
+                out.push(113);
+                atom_bytes_in(table, out, entry.module, opts.minor)?;
+                atom_bytes_in(table, out, entry.function, opts.minor)?;
+                write_nested_small(out, i64::from(entry.arity), *opts);
+            }
+            FunRef::Local { entry, free_vars } => {
+                out.push(112);
+                let at = out.len();
+                out.extend_from_slice(&[0; 4]);
+                out.push(entry.arity);
+                out.extend_from_slice(&entry.uniq);
+                out.extend_from_slice(&entry.index.to_be_bytes());
+                out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
+                atom_bytes_in(table, out, entry.module, opts.minor)?;
+                write_nested_small(out, i64::from(entry.old_index), *opts);
+                write_nested_small(out, i64::from(entry.old_uniq), *opts);
+                stack.push(ENC_PATCH_FUN_SIZE);
+                stack.push(stack_small(at)?);
+                let view = fun_of(term)?;
+                for i in (0..view.num_free()).rev() {
+                    push_term_task(stack, ENC_TERM, view.free(i).ok_or(EncodeError::BadArg)?);
+                }
+                push_term_task(stack, ENC_TERM, entry.pid);
+            }
+        },
+        TermKind::Record => {
+            // Port of erts/emulator/beam/external.c:4010-4031, OTP-29.1.1.
+            let record = record_of(term)?;
+            out.push(67);
+            out.extend_from_slice(&(record.len() as u32).to_be_bytes());
+            out.push(u8::from(record.is_exported()));
+            atom_bytes_in(table, out, record.module(), opts.minor)?;
+            atom_bytes_in(table, out, record.name(), opts.minor)?;
+            for i in 0..record.len() {
+                let sorted = record.sorted_index(i).ok_or(EncodeError::BadArg)?;
+                atom_bytes_in(
+                    table,
+                    out,
+                    record.key(sorted).ok_or(EncodeError::BadArg)?,
+                    opts.minor,
+                )?;
+            }
+            for i in (0..record.len()).rev() {
+                let sorted = record.sorted_index(i).ok_or(EncodeError::BadArg)?;
+                push_term_task(
+                    stack,
+                    ENC_TERM,
+                    record.value(sorted).ok_or(EncodeError::BadArg)?,
+                );
+            }
+        }
+        _ => return Err(EncodeError::BadArg),
+    }
+    Ok(())
+}
+
 /// The work stack of the encoder passes (`DECLARE_WSTACK` with the default size).
 type WStack = arinsal_term::raw::WordStack<32>;
 
@@ -1893,65 +2067,6 @@ impl EncodeWalk {
                         );
                     }
                 }
-                FastEncodeKind::Rare(TermKind::Map) => {
-                    let checked =
-                        arinsal_maps::checked_map(term).map_err(|_| EncodeError::BadArg)?;
-                    match checked.kind() {
-                        arinsal_maps::CheckedMapKind::Flatmap(_) => {
-                            let len = checked.size();
-                            out.push(116);
-                            out.extend_from_slice(
-                                &u32::try_from(len)
-                                    .map_err(|_| EncodeError::SystemLimit)?
-                                    .to_be_bytes(),
-                            );
-                            if len > 0 && opts.deterministic {
-                                let pairs = arinsal_maps::term_to_binary_pairs(term)
-                                    .map_err(|_| EncodeError::BadArg)?;
-                                self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
-                                stack.push(ENC_START_SORTING_MAP);
-                                stack.push(Term::NON_VALUE.word());
-                            } else if len > 0 {
-                                // WSTACK_PUSH4(s, kptr, vptr, ENC_MAP_PAIR, size)
-                                push_flatmap_task(&mut stack, term, len)?;
-                            }
-                        }
-                        arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                            let children = arinsal_term::MapNodeChildren::new(term)
-                                .ok_or(EncodeError::BadArg)?;
-                            if children.is_head() {
-                                let len = checked.size();
-                                out.push(116);
-                                out.extend_from_slice(
-                                    &u32::try_from(len)
-                                        .map_err(|_| EncodeError::SystemLimit)?
-                                        .to_be_bytes(),
-                                );
-                                if len > 0 && opts.deterministic {
-                                    let pairs = arinsal_maps::term_to_binary_pairs(term)
-                                        .map_err(|_| EncodeError::BadArg)?;
-                                    self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
-                                    stack.push(ENC_START_SORTING_MAP);
-                                    stack.push(Term::NON_VALUE.word());
-                                } else {
-                                    push_hashmap_root_tasks(
-                                        &mut stack,
-                                        term,
-                                        ENC_HASHMAP_NODE,
-                                        Some(ENC_TERM),
-                                    )?;
-                                }
-                            } else {
-                                push_hashmap_root_tasks(
-                                    &mut stack,
-                                    term,
-                                    ENC_HASHMAP_NODE,
-                                    Some(ENC_TERM),
-                                )?;
-                            }
-                        }
-                    }
-                }
                 FastEncodeKind::Rare(TermKind::Bitstring) => {
                     // SAFETY: the binary owner remains live and no append runs during encoding.
                     let view = unsafe { term.binary_ref() }.ok_or(EncodeError::BadArg)?;
@@ -1998,120 +2113,17 @@ impl EncodeWalk {
                         }
                     }
                 }
-                FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
-                    let internal = is_internal_identity(term);
-                    if internal && !opts.local {
-                        resolve_local_node(&mut opts, node_source);
-                    }
-                    let identity = local_identity(
-                        term.identity().ok_or(EncodeError::BadArg)?,
-                        internal,
-                        opts.local,
-                        opts.local_node,
-                    );
-                    match identity {
-                        Identity::Pid {
-                            node,
-                            creation,
-                            index,
-                            serial,
-                        } => {
-                            out.push(88);
-                            // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
-                            write_node(out, node, internal, opts)?;
-                            out.extend_from_slice(&index.to_be_bytes());
-                            out.extend_from_slice(&serial.to_be_bytes());
-                            out.extend_from_slice(
-                                &local_creation(creation, internal, opts).to_be_bytes(),
-                            );
-                        }
-                        Identity::Port { node, creation, id } => {
-                            out.push(120);
-                            write_node(out, node, internal, opts)?;
-                            out.extend_from_slice(&id.to_be_bytes());
-                            out.extend_from_slice(
-                                &local_creation(creation, internal, opts).to_be_bytes(),
-                            );
-                        }
-                        Identity::Ref {
-                            node,
-                            creation,
-                            ids,
-                        } => {
-                            // Port of erts/emulator/beam/external.c (enc_term, reference
-                            // case), OTP-29.1.1: the numbers leave the term.
-                            term.save_magic_ref();
-                            out.push(90);
-                            out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
-                            write_node(out, node, internal, opts)?;
-                            out.extend_from_slice(
-                                &local_creation(creation, internal, opts).to_be_bytes(),
-                            );
-                            for id in ids {
-                                out.extend_from_slice(&id.to_be_bytes());
-                            }
-                        }
-                    }
-                }
-                FastEncodeKind::Rare(TermKind::Fun) => match fun_of(term)? {
-                    FunRef::Export { entry } => {
-                        out.push(113);
-                        atom_bytes_in(table, out, entry.module, opts.minor)?;
-                        atom_bytes_in(table, out, entry.function, opts.minor)?;
-                        write_nested_small(out, i64::from(entry.arity), opts);
-                    }
-                    FunRef::Local { entry, free_vars } => {
-                        out.push(112);
-                        let at = out.len();
-                        out.extend_from_slice(&[0; 4]);
-                        out.push(entry.arity);
-                        out.extend_from_slice(&entry.uniq);
-                        out.extend_from_slice(&entry.index.to_be_bytes());
-                        out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
-                        atom_bytes_in(table, out, entry.module, opts.minor)?;
-                        write_nested_small(out, i64::from(entry.old_index), opts);
-                        write_nested_small(out, i64::from(entry.old_uniq), opts);
-                        stack.push(ENC_PATCH_FUN_SIZE);
-                        stack.push(stack_small(at)?);
-                        let view = fun_of(term)?;
-                        for i in (0..view.num_free()).rev() {
-                            push_term_task(
-                                &mut stack,
-                                ENC_TERM,
-                                view.free(i).ok_or(EncodeError::BadArg)?,
-                            );
-                        }
-                        push_term_task(&mut stack, ENC_TERM, entry.pid);
-                    }
-                },
-                FastEncodeKind::Rare(TermKind::Record) => {
-                    // Port of erts/emulator/beam/external.c:4010-4031, OTP-29.1.1.
-                    let record = record_of(term)?;
-                    out.push(67);
-                    out.extend_from_slice(&(record.len() as u32).to_be_bytes());
-                    out.push(u8::from(record.is_exported()));
-                    atom_bytes_in(table, out, record.module(), opts.minor)?;
-                    atom_bytes_in(table, out, record.name(), opts.minor)?;
-                    for i in 0..record.len() {
-                        let sorted = record.sorted_index(i).ok_or(EncodeError::BadArg)?;
-                        atom_bytes_in(
-                            table,
-                            out,
-                            record.key(sorted).ok_or(EncodeError::BadArg)?,
-                            opts.minor,
-                        )?;
-                    }
-                    for i in (0..record.len()).rev() {
-                        let sorted = record.sorted_index(i).ok_or(EncodeError::BadArg)?;
-                        push_term_task(
-                            &mut stack,
-                            ENC_TERM,
-                            record.value(sorted).ok_or(EncodeError::BadArg)?,
-                        );
-                    }
-                }
-                FastEncodeKind::Rare(_) => {
-                    return Err(EncodeError::BadArg);
+                FastEncodeKind::Rare(kind) => {
+                    enc_rare(
+                        kind,
+                        term,
+                        out,
+                        &mut stack,
+                        &mut opts,
+                        node_source,
+                        table,
+                        &mut self.cold,
+                    )?;
                 }
             }
         }
