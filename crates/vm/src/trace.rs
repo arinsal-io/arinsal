@@ -2880,7 +2880,7 @@ pub(crate) fn executor_native_call_event(
     function: &crate::NativeFunction,
     local: bool,
 ) -> Result<Vec<NativeTraceAction>, VmError> {
-    let args = process.x[..usize::from(function.arity)].to_vec();
+    let args = vm.x_regs()?[..usize::from(function.arity)].to_vec();
     let actions = call_event(
         vm,
         process,
@@ -2932,6 +2932,7 @@ pub(crate) enum NativeReturnEvent {
 // OTP-29.1.1.
 pub(crate) fn return_through_trace_frame(
     process: &mut Process,
+    x0: Term,
     kind: TraceFrameKind,
     mut drop_words: impl FnMut(&mut Process, usize),
 ) -> Option<(Option<NativeReturnEvent>, Term)> {
@@ -2949,7 +2950,7 @@ pub(crate) fn return_through_trace_frame(
             Some(NativeReturnEvent::Return {
                 function_pc: data(process, 0) as usize,
                 session: data(process, 2) as u64,
-                value: process.x[0],
+                value: x0,
             })
         }
         TraceFrameKind::ReturnToTrace => Some(NativeReturnEvent::ReturnTo {

@@ -336,6 +336,7 @@ impl Executor {
                             process.set_native_pc(None);
                             let returned = crate::trace::return_through_trace_frame(
                                 process,
+                                self.native_registers.x_reg_array[0],
                                 kind,
                                 |p, words| {
                                     p.heap.release_stack(words);

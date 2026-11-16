@@ -3965,13 +3965,14 @@ pub(crate) extern "C" fn node_0(
 // Port of erts/emulator/beam/dist.c (node_1), OTP-29.1.1.
 pub(crate) extern "C" fn node_1(
     c_p: *mut arinsal_beamasm::ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+    if crate::native_hooks::process_from_header(c_p).is_none() {
         return 0;
-    };
-    let result = crate::natives::node::node(process.x[0]);
+    }
+    let [arg] = crate::bif_table::bif_args::<1>(reg);
+    let result = crate::natives::node::node(arg);
     crate::natives::bif::bif_ret(c_p, i, result)
 }
 

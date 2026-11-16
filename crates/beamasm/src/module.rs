@@ -2184,7 +2184,9 @@ impl BeamModuleAssembler {
         crate::emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), Gpr::x(13))
+            e.mov_reg(Gpr::x(1), Gpr::x(13))?;
+            // `reg`: beam_jit_call_nif reads the arguments from the X register array.
+            e.mov_reg(Gpr::x(2), Gpr::x(19))
         })?;
         self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, 6, update)?;

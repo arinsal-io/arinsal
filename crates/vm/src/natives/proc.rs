@@ -3077,7 +3077,7 @@ fn call_values(
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
             ("hibernate", [module, function, args]) => {
-                hibernate(process, ctx, *module, *function, *args)
+                hibernate(process, vm.x_regs()?, ctx, *module, *function, *args)
             }
             ("hibernate", []) if module == "erlang" => hibernate_zero(vm, process, ctx),
             ("suspend_process", [pid, options]) if module == "erts_internal" => {
@@ -3202,6 +3202,7 @@ pub(crate) fn save_calls_flag(
 // beam_common.c:1568 (`erts_hibernate`), OTP-29.1.1.
 fn hibernate(
     process: &mut Process,
+    reg: &mut [Term],
     ctx: &RunCtx<'_, Message>,
     module: Term,
     function: Term,
@@ -3235,9 +3236,9 @@ fn hibernate(
     // arguments stay in the argument registers (arity 3) as the only roots and the stack
     // is discarded; the executor shrinks the heap once the BIF has unwound.
     process.heap.release_stack(process.heap.stack_words());
-    process.x[0] = module;
-    process.x[1] = function;
-    process.x[2] = args;
+    reg[0] = module;
+    reg[1] = function;
+    reg[2] = args;
     process.gc_live = 3;
     process.heap.abi.arity = 3;
     process.msgq_set_save_first();

@@ -93,12 +93,8 @@ pub extern "C" fn arinsal_beamasm_build_stacktrace(
     };
     let trace = crate::native_hooks::from_raw(trace_raw);
     match crate::exceptions::materialize(process, trace) {
-        Ok(value) => {
-            if let Some(reg) = crate::process::sched_data::sched_registers(process) {
-                reg[0] = value;
-            }
-            crate::native_hooks::raw(value)
-        }
+        // The fragment places the value in X0 (instr_common.cpp:3054).
+        Ok(value) => crate::native_hooks::raw(value),
         Err(_) => {
             crate::native_hooks::set_error(process, "system_limit");
             0
@@ -647,15 +643,16 @@ fn leave_native_nif(
 
 /// Calls a static NIF body through the same BIF function used by NativeBody.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identity: u64) -> u64 {
-    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+pub extern "C" fn arinsal_beamasm_static_nif(
+    header: *mut ProcessHeader,
+    identity: u64,
+    reg: *mut u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
-    // `erts_proc_sched_data(c_p)->registers`: the NIF's arguments.
-    let Some(reg) = crate::process::sched_data::sched_registers(process) else {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    };
+    // `reg`: the NIF's arguments, as beam_jit_call_nif passes them.
+    let reg = &mut registers.x_reg_array;
     let Some(nif) = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&(identity as usize))?;
         Some(StaticNif {
@@ -689,15 +686,16 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900 (call_nif_shared loads Func and
 // NifMod from the function's code) and erts/emulator/beam/jit/beam_jit_common.cpp:623-677
 // (beam_jit_call_nif), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64) -> u64 {
-    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+pub extern "C" fn arinsal_beamasm_call_nif(
+    header: *mut ProcessHeader,
+    site: u64,
+    reg: *mut u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
-    // `erts_proc_sched_data(c_p)->registers`: the NIF's arguments.
-    let Some(reg) = crate::process::sched_data::sched_registers(process) else {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    };
+    // `reg`: the NIF's arguments, as beam_jit_call_nif passes them.
+    let reg = &mut registers.x_reg_array;
     // SAFETY: `site` is the address this call-NIF body was compiled with: a boxed
     // `NativeNifSite` owned by the `CompiledVersion` whose code is executing, which keeps the
     // box until it frees that code.
@@ -992,12 +990,15 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(
     let Some(kind) = crate::trace::TraceFrameKind::from_index(kind) else {
         return 0;
     };
-    let Some((event, caller)) =
-        crate::trace::return_through_trace_frame(process, kind, |p, words| {
+    let Some((event, caller)) = crate::trace::return_through_trace_frame(
+        process,
+        registers.x_reg_array[0],
+        kind,
+        |p, words| {
             p.heap
                 .set_stack_pointer(p.heap.abi.stop.wrapping_add(words));
-        })
-    else {
+        },
+    ) else {
         return 0;
     };
     if let Some(event) = event {
