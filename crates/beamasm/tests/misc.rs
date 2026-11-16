@@ -33,7 +33,7 @@ extern "C" fn apply3_hook(
     arinsal_beamasm::misc::ApplyResolution::default()
 }
 
-extern "C" fn fun_hook(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
+extern "C" fn fun_hook(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
     0
 }
 
@@ -183,7 +183,12 @@ fn native_bs_set_position() {
     assert_eq!(context[2], 7);
 }
 
-extern "C" fn apply_fun_hook(process: *mut ProcessHeader, _fun: u64, arity: u32) -> usize {
+extern "C" fn apply_fun_hook(
+    process: *mut ProcessHeader,
+    _fun: u64,
+    arity: u32,
+    _reg: *mut u64,
+) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue = u64::from(arity));
     arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
 }

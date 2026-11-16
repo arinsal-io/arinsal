@@ -126,7 +126,7 @@ fn create(
     base: u64,
     external: bool,
 ) -> u64 {
-    let Some((process, _registers)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     let (Ok(live), Ok(count), Ok(base)) = (
@@ -234,7 +234,7 @@ pub extern "C" fn arinsal_beamasm_update_record(
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, _registers)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     let (Ok(live), Ok(count), Ok(base)) = (
@@ -306,7 +306,7 @@ pub extern "C" fn arinsal_beamasm_get_record_elements(
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, registers)) = enter_runtime(header) else {
+    let Some((process, registers)) = native_hooks::enter_runtime_attached(header) else {
         return 0;
     };
     let (Ok(count), Ok(base)) = (usize::try_from(count), usize::try_from(base)) else {
@@ -342,7 +342,7 @@ fn get_field(
     raise: u64,
     local: bool,
 ) -> u64 {
-    let Some((process, _)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     let source = native_hooks::from_raw(source);

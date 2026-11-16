@@ -256,7 +256,7 @@ impl ModuleEnv for CorpusEnv {
         ) -> arinsal_beamasm::misc::ApplyResolution {
             arinsal_beamasm::misc::ApplyResolution::default()
         }
-        extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
+        extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
             0
         }
         arinsal_beamasm::misc::ApplyRuntime {
@@ -364,7 +364,7 @@ impl ModuleEnv for CorpusEnv {
     }
 }
 
-extern "C" fn arith(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
+extern "C" fn arith(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64, _: *mut u64) -> u64 {
     0
 }
 extern "C" fn guard(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
@@ -418,7 +418,7 @@ extern "C" fn exception(
 ) -> usize {
     0
 }
-extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
+extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
     0
 }
 

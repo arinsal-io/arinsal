@@ -405,7 +405,12 @@ extern "C" fn unused_apply3_resolver(
     arinsal_beamasm::misc::ApplyResolution::default()
 }
 
-extern "C" fn unused_fun_resolver(_process: *mut ProcessHeader, _fun: u64, _arity: u32) -> usize {
+extern "C" fn unused_fun_resolver(
+    _process: *mut ProcessHeader,
+    _fun: u64,
+    _arity: u32,
+    _reg: *mut u64,
+) -> usize {
     0
 }
 

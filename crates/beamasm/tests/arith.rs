@@ -25,16 +25,17 @@ extern "C" fn runtime_arith(
     lhs: u64,
     rhs: u64,
     extra: u64,
+    _reg: *mut u64,
 ) -> u64 {
     if op == 15 {
         return OVERFLOW;
     }
     if op == 13 {
-        let product = runtime_arith(_process, 2, lhs, rhs, 0);
+        let product = runtime_arith(_process, 2, lhs, rhs, 0, std::ptr::null_mut());
         if product == OVERFLOW || product == BADARITH {
             return product;
         }
-        return runtime_arith(_process, 0, product, extra, 0);
+        return runtime_arith(_process, 0, product, extra, 0, std::ptr::null_mut());
     }
     if matches!(op, 16 | 17) {
         return lhs;
@@ -275,7 +276,8 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     for (a, b) in cases {
         let ta = tagged(a).unwrap();
         let tb = tagged(b).unwrap();
-        let expected = |op: u32| runtime_arith(std::ptr::null_mut(), op, ta, tb, 0);
+        let expected =
+            |op: u32| runtime_arith(std::ptr::null_mut(), op, ta, tb, 0, std::ptr::null_mut());
         assert_eq!(add(ta, tb), expected(0));
         assert_eq!(sub(ta, tb), expected(1));
         assert_eq!(mul(ta, tb), expected(2));
@@ -481,6 +483,7 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
         _lhs: u64,
         _rhs: u64,
         _extra: u64,
+        _reg: *mut u64,
     ) -> u64 {
         1
     }

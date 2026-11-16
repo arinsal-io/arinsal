@@ -1189,6 +1189,7 @@ fn emit_unloaded_fun_fragment(
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(3))?;
         encoder.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
+        encoder.mov_reg(Gpr::x(3), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         encoder.mov_reg(Gpr::x(17), Gpr::x(0))

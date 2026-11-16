@@ -295,7 +295,12 @@ extern "C" fn exception_resolver(
     0
 }
 
-extern "C" fn fun_resolver(_process: *mut ProcessHeader, _fun: u64, _arity: u32) -> usize {
+extern "C" fn fun_resolver(
+    _process: *mut ProcessHeader,
+    _fun: u64,
+    _arity: u32,
+    _reg: *mut u64,
+) -> usize {
     0
 }
 
@@ -327,6 +332,7 @@ extern "C" fn arithmetic_helper(
     _lhs: u64,
     _rhs: u64,
     _extra: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }

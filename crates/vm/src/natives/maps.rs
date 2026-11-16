@@ -636,7 +636,7 @@ extern "C" fn map_next_light(
     regs: *mut u64,
     i: u64,
 ) -> u64 {
-    if let Some(raw) = map_next_native(header) {
+    if let Some(raw) = map_next_native(header, regs) {
         return raw;
     }
     crate::native_helpers::thin_bif_light::<MapNext>(header, regs, i)
@@ -645,8 +645,8 @@ extern "C" fn map_next_light(
 /// Run OTP's flatmap iterator branch directly against the native heap top.
 // Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3), OTP-29.1.1.
 #[inline(always)]
-fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader) -> Option<u64> {
-    let (process, registers) = crate::native_hooks::enter_runtime(header)?;
+fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader, regs: *mut u64) -> Option<u64> {
+    let (process, registers) = crate::native_hooks::enter_runtime_reg(header, regs)?;
     let (path, flat, list_mode, mode) = flatmap_step(&registers.x_reg_array[..3])?;
     let n = flat.size();
     if path.as_small().filter(|index| *index >= 0)? > n as i64 {

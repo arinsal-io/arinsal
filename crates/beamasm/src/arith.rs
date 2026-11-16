@@ -11,13 +11,16 @@ use crate::types::{
 
 /// Runtime fallback for arithmetic that cannot return a small integer.
 ///
-/// The VM supplies this hook. Arguments and the result use OTP tagged-term words.
+/// The VM supplies this hook. Arguments and the result use OTP tagged-term words; `reg` is the
+/// scheduler's register array (`x19`), whose TMP_MEM slots carry `erts_mul_add`'s `pp` and the
+/// remainder of `erts_int_div_rem`.
 pub type ArithHelper = unsafe extern "C" fn(
     process: *mut crate::ProcessHeader,
     op: u32,
     lhs: u64,
     rhs: u64,
     extra: u64,
+    reg: *mut u64,
 ) -> u64;
 
 const ARG1: Gpr = Gpr::x(0);

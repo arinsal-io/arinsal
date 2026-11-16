@@ -8,19 +8,34 @@ use arinsal_beamasm::{
 use arinsal_term::{ExportEntry, ProcessHeap, TermBuilder, global_atoms};
 use similar_asserts::assert_eq;
 
-extern "C" fn resolve_normal(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
+extern "C" fn resolve_normal(
+    process: *mut ProcessHeader,
+    fun: u64,
+    arity: u32,
+    _: *mut u64,
+) -> usize {
     let target =
         arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize);
     resolve(fun, arity, target)
 }
 
-extern "C" fn resolve_tail(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
+extern "C" fn resolve_tail(
+    process: *mut ProcessHeader,
+    fun: u64,
+    arity: u32,
+    _: *mut u64,
+) -> usize {
     let target =
         arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize);
     resolve(fun, arity, target)
 }
 
-extern "C" fn resolve_export(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
+extern "C" fn resolve_export(
+    process: *mut ProcessHeader,
+    fun: u64,
+    arity: u32,
+    _: *mut u64,
+) -> usize {
     let (expected, target) = arinsal_beamasm::rt::process_header_mut(process, |header| {
         (header.exc.fvalue, header.self_pid as usize)
     });
@@ -216,7 +231,7 @@ fn native_i_lambda_trampoline() {
     assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(191));
 }
 
-extern "C" fn unused_resolver(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
+extern "C" fn unused_resolver(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
     0
 }
 
@@ -453,7 +468,12 @@ fn native_call_fun_errors_badfun_and_badarity() {
     );
 }
 
-extern "C" fn resolve_badfun(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
+extern "C" fn resolve_badfun(
+    process: *mut ProcessHeader,
+    fun: u64,
+    arity: u32,
+    _: *mut u64,
+) -> usize {
     if fun & 7 != 2 {
         arinsal_beamasm::rt::process_header_mut(process, |header| {
             header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;

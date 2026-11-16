@@ -19,7 +19,7 @@ pub extern "C" fn append_binary(
     live: u64,
     alloc: u64,
 ) -> u64 {
-    let Some((process, _registers)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     let (Ok(src_index), Ok(extra_index), Ok(live), Ok(alloc)) = (

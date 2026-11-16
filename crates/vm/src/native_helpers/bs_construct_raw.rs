@@ -106,7 +106,7 @@ pub(crate) extern "C" fn bit_size(
     source: u64,
     _index: u64,
 ) -> u64 {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return u64::MAX;
     };
     match arinsal_bits::bit_size(crate::native_hooks::from_raw(source)) {
@@ -149,7 +149,7 @@ pub(crate) extern "C" fn utf32_size(
 }
 
 fn utf_size(header: *mut ProcessHeader, source: u64, unit_bits: u64) -> u64 {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return u64::MAX;
     };
     let value = crate::native_hooks::from_raw(source);
@@ -177,7 +177,7 @@ pub(crate) extern "C" fn fail(
     arg3: u64,
     arg1: u64,
 ) -> u64 {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let segment = (packed >> 10) as i64;

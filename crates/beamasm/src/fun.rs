@@ -22,7 +22,7 @@ const fn logical_xreg(index: u8) -> Gpr {
 }
 
 /// Resolves a fun term to a native entry, setting `freason` and `fvalue` on failure.
-pub type FunResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32) -> usize;
+pub type FunResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, *mut u64) -> usize;
 
 /// Identifies a statically known lambda trampoline or a dynamically resolved fun.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,7 +389,9 @@ pub(crate) fn emit_call_fun_error(
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
         e.mov_reg(Gpr::x(1), Gpr::x(3))?;
-        e.lsr_imm(Gpr::x(2), Gpr::x(2), 8)
+        e.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
+        // `reg`, as erts passes the X register array to beam_jit_handle_call_fun_error.
+        e.mov_reg(Gpr::x(3), Gpr::x(19))
     })?;
     asm.fragment_call(helper)?;
     emit_leave_runtime(&mut asm.code, 6, update)?;

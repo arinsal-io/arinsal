@@ -2446,7 +2446,9 @@ impl BeamModuleAssembler {
                 e.mov_reg(Gpr::x(0), C_P)?;
                 e.mov_const(Gpr::x(1), u64::from(op))?;
                 e.mov_reg(Gpr::x(2), Gpr::x(14))?;
-                e.mov_reg(Gpr::x(3), Gpr::x(17))
+                e.mov_reg(Gpr::x(3), Gpr::x(17))?;
+                // `reg`: erts passes TMP_MEM addresses inside the scheduler registers.
+                e.mov_reg(Gpr::x(5), SCHEDULER_REGS)
             })?;
             self.fragment_call(helper)?;
             crate::emit_leave_runtime(&mut self.code, 6, update)?;

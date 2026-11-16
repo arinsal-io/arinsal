@@ -21,7 +21,7 @@ pub extern "C" fn arinsal_beamasm_map_lookup(
     _hash: u64,
     _hashed: u64,
 ) -> u64 {
-    let Some((process, _registers)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     match arinsal_maps::get(from_raw(map), from_raw(key)) {
@@ -64,34 +64,61 @@ pub extern "C" fn arinsal_beamasm_bif_mfa(
     _function: u64,
     _arity: u64,
 ) -> u64 {
-    let Some((process, _registers)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     set_error(process, "undef");
     0
 }
 
-/// The process and scheduler registers of a helper called from native code; the X registers
-/// stay in the register array, where the helper reads them.
+/// The process of a helper called from native code that reads no X register.
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:460-540 (emit_enter_runtime stores HTOP/E/
-// FCALLS into `c_p`; the runtime gets `reg`, the scheduler's x_reg_array, not a copy), OTP-29.1.1.
-// HTOP, E and FCALLS already live in `c_p` here (`ProcessHeap::abi`), so nothing is converted.
+// FCALLS into `c_p`), OTP-29.1.1. HTOP, E and FCALLS already live in `c_p` here
+// (`ProcessHeap::abi`), so nothing is converted. A helper that needs the X registers takes
+// `reg` from its fragment and enters through [`enter_runtime_reg`].
 #[track_caller]
-pub(crate) fn enter_runtime<'a>(
-    header: *mut ProcessHeader,
-) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+pub(crate) fn enter_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
     let process = process_from_header(header)?;
     // erts spills `c_p->mbuf` as the BIF starts (`live_hf_end`); every native helper enters here.
     process.heap.note_bif_entry();
-    scheduler_registers(process)
+    Some(process)
 }
 
-/// [`enter_runtime`] for the collection that follows a BIF: it must not take a new
+/// The process and the register array `reg` (`x19`, the scheduler's `x_reg_array`) a native
+/// fragment passed, as erts passes `reg` to the runtime functions it calls with X registers
+/// live (`load_x_reg_array(ARGn)`).
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:460-540 (emit_enter_runtime) and
+// beam_asm.hpp (load_x_reg_array), OTP-29.1.1.
+#[track_caller]
+pub(crate) fn enter_runtime_reg<'a>(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+    let process = process_from_header(header)?;
+    process.heap.note_bif_entry();
+    // `x_reg_array` is the first field of the `repr(C)` register file, so `reg` is its address.
+    scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
+}
+
+/// [`enter_runtime_reg`] for the collection that follows a BIF: it must not take a new
 /// `live_hf_end`, the one spilled before the BIF is still the one that counts.
 pub(crate) fn enter_runtime_after_bif<'a>(
     header: *mut ProcessHeader,
+    reg: *mut u64,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let process = process_from_header(header)?;
+    scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
+}
+
+/// The process and the register file it is attached to, for a helper whose fragment does not
+/// pass `reg` yet (XREG-1: each caller moves to [`enter_runtime_reg`] as its fragment starts
+/// passing `x19`; this accessor goes with the attached `ArgRegs`).
+#[track_caller]
+pub(crate) fn enter_runtime_attached<'a>(
+    header: *mut ProcessHeader,
+) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+    let process = process_from_header(header)?;
+    process.heap.note_bif_entry();
     scheduler_registers(process)
 }
 
@@ -298,8 +325,9 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     lhs: u64,
     rhs: u64,
     extra: u64,
+    reg: *mut u64,
 ) -> u64 {
-    let Some((process, registers)) = enter_runtime(header) else {
+    let Some((process, registers)) = enter_runtime_reg(header, reg) else {
         return 0;
     };
     // An operation with a failure label branches there instead of raising (QUIET_GUARD).
@@ -540,7 +568,7 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
     first: u64,
     second: u64,
 ) -> u64 {
-    let Some((process, _registers)) = enter_runtime(header) else {
+    let Some(process) = enter_runtime(header) else {
         return 0;
     };
     // A guard with a failure label passes QUIET_GUARD: the failure branches there instead of

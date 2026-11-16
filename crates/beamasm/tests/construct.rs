@@ -23,6 +23,7 @@ extern "C" fn arithmetic_fallback(
     _lhs: u64,
     _rhs: u64,
     _extra: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }

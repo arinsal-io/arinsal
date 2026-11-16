@@ -116,7 +116,7 @@ extern "C" fn record_update(
     VALUE
 }
 
-extern "C" fn resolve_fun(process: *mut ProcessHeader, _: u64, _: u32) -> usize {
+extern "C" fn resolve_fun(process: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
     observe(process);
     rt::process_header_mut(process, |header| header.self_pid as usize)
 }
