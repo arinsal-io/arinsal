@@ -636,7 +636,7 @@ pub(super) fn resume(
         // native frame is resumed by the native catch search.
         if crate::native_bridge::is_native_catch_tag(word)
             && let Some(handler) =
-                crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
+                crate::native_bridge::next_catch(p, vm.x_regs()?, trap.class, trap.reason, trace)
         {
             p.set_native_pc(Some(handler));
             let target = crate::native_function_at(handler).map(|function| {

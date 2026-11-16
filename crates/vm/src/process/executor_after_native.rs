@@ -751,17 +751,22 @@ impl Executor {
                                 let reduced = match result {
                                     Ok(value) => Some(Ok(*value)),
                                     Err(VmError::Exception { reason, frame }) => {
-                                        legacy_exception_trap(process, reason, frame)
+                                        legacy_exception_trap(
+                                            process,
+                                            &self.native_registers.x_reg_array,
+                                            reason,
+                                            frame,
+                                        )
+                                        .ok()
+                                        .and_then(|trap| {
+                                            crate::exceptions::trace_class_reason(
+                                                process,
+                                                trap.class,
+                                                trap.reason,
+                                            )
                                             .ok()
-                                            .and_then(|trap| {
-                                                crate::exceptions::trace_class_reason(
-                                                    process,
-                                                    trap.class,
-                                                    trap.reason,
-                                                )
-                                                .ok()
-                                            })
-                                            .map(Err)
+                                        })
+                                        .map(Err)
                                     }
                                     Err(VmError::Trap(trap)) => {
                                         crate::exceptions::trace_class_reason(
@@ -892,9 +897,14 @@ impl Executor {
                     // Interpreter-style BIF errors raise like traps, as in
                     // the interpreter's own call_ext path.
                     let result = match result {
-                        Some(Err(VmError::Exception { reason, frame })) => Some(Err(
-                            VmError::Trap(legacy_exception_trap(process, &reason, &frame)?),
-                        )),
+                        Some(Err(VmError::Exception { reason, frame })) => {
+                            Some(Err(VmError::Trap(legacy_exception_trap(
+                                process,
+                                &self.native_registers.x_reg_array,
+                                &reason,
+                                &frame,
+                            )?)))
+                        }
                         other => other,
                     };
                     if let Some(result) = result {

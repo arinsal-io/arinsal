@@ -2545,7 +2545,9 @@ pub(crate) fn bif_return(
             return bif_trap_export(process, export, trap, identity as usize);
         }
         Err(crate::VmError::Exception { reason, frame }) => {
-            match crate::process::legacy_exception_trap(process, &reason, &frame) {
+            let reg: &[Term] =
+                crate::process::sched_data::sched_registers(process).map_or(&[], |reg| &*reg);
+            match crate::process::legacy_exception_trap(process, reg, &reason, &frame) {
                 Ok(trap) => Err(trap),
                 Err(error) => {
                     return bif_scheduler_outcome(process, export, identity, light_call, error);
@@ -3142,7 +3144,14 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     };
     let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
     // The fragment branches to the handler, so no scheduler resume record is written.
-    crate::native_bridge::native_found_catch(process, class, reason, trace).unwrap_or(0)
+    crate::native_bridge::native_found_catch(
+        process,
+        &mut registers.x_reg_array,
+        class,
+        reason,
+        trace,
+    )
+    .unwrap_or(0)
 }
 
 /// `GET_EXC_CLASS(freason)` for a failure `handle_error` completes in native code, or `None`

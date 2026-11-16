@@ -58,3 +58,11 @@ pub(crate) fn with_sched_data<R>(
         f(vm, process, ctx)
     })
 }
+
+/// `erts_proc_sched_data(c_p)->registers->x_reg_array` of the native slice `process` runs
+/// in, or `None` outside one.
+// Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data, ErtsSchedulerData.registers),
+// OTP-29.1.1.
+pub(crate) fn sched_registers<'a>(process: &mut Process) -> Option<&'a mut [arinsal_term::Term]> {
+    with_sched_data(process, |vm, _, _| vm.x_regs().ok()).flatten()
+}

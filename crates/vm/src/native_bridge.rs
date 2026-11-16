@@ -734,6 +734,7 @@ fn scan_catch(
 #[inline]
 pub(crate) fn native_found_catch(
     process: &mut Process,
+    reg: &mut [Term],
     class: arinsal_bifs::Class,
     reason: Term,
     trace: Term,
@@ -743,7 +744,7 @@ pub(crate) fn native_found_catch(
     if found.traced != 0 {
         return None;
     }
-    found_catch(process, found, class, reason, trace);
+    found_catch(process, reg, found, class, reason, trace);
     Some(handler)
 }
 
@@ -760,6 +761,7 @@ fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
 
 pub(crate) fn next_catch(
     process: &mut Process,
+    reg: &mut [Term],
     class: arinsal_bifs::Class,
     reason: Term,
     trace: Term,
@@ -767,9 +769,8 @@ pub(crate) fn next_catch(
     let found = locate_catch(process)?;
     // The scheduler resumes the handler through `run_native`; the native resolver branches to
     // it directly, so these Rust-side resume records are this caller's, not `found_catch`'s.
-    process.x.ensure_x(4);
     process.exc_class = Some(class);
-    found_catch(process, found, class, reason, trace);
+    found_catch(process, reg, found, class, reason, trace);
     let CatchTarget(handler) = found.target;
     process.native_continuation_resume = true;
     process.set_native_resume_arity(4);
@@ -782,6 +783,7 @@ pub(crate) fn next_catch(
 #[inline]
 fn found_catch(
     process: &mut Process,
+    reg: &mut [Term],
     found: LocatedCatch,
     class: arinsal_bifs::Class,
     reason: Term,
@@ -791,10 +793,10 @@ fn found_catch(
     process.heap.stack_set(found.index, Term::NIL);
     process.heap.release_stack(found.resume);
     // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
-    process.x[0] = Term::catch(0);
-    process.x[1] = reason;
-    process.x[2] = trace;
-    process.x[3] = exception_class_atom(class);
+    reg[0] = Term::catch(0);
+    reg[1] = reason;
+    reg[2] = trace;
+    reg[3] = exception_class_atom(class);
     // handle_error clears `fvalue` and `ftrace` once the catch registers own them. Arinsal
     // also clears `freason`: its native exits read a nonzero `freason` as a pending failure.
     process.heap.abi.exc.freason = 0;

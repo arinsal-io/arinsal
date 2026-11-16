@@ -295,9 +295,12 @@ impl Vm {
         bif: arinsal_bifs::BifFn,
         arity: usize,
     ) -> Result<Term, arinsal_bifs::BifError> {
+        let reg = self
+            .x_regs()
+            .map_err(|_| arinsal_bifs::BifError::SystemLimit)?;
         // The BIF's BUMP_REDS lowers FCALLS, which the context switch reads.
         let untraced = |p: &mut Process, _: &mut arinsal_sched::RunCtx<'_, process::Message>| {
-            calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity])
+            calls::call_bif_metered(&mut p.heap, bif, &reg[..arity])
         };
         if !crate::trace_bp::any_pattern()
             || !crate::trace_bp::selects(p, module, function, arity as u8)
@@ -305,7 +308,7 @@ impl Vm {
             return untraced(p, ctx);
         }
         let (module, function) = (module.to_owned(), function.to_owned());
-        let args = p.x[..arity].to_vec();
+        let args = reg[..arity].to_vec();
         // A native import that missed (dynamic natives) already emitted the call event.
         let mut site = None;
         let actions = match p
@@ -372,7 +375,7 @@ impl Vm {
             return None;
         }
         let (module, function) = (module.to_owned(), function.to_owned());
-        let args = p.x[..arity].to_vec();
+        let args = self.x_regs().ok()?[..arity].to_vec();
         let resumed = p.cold.as_ref().is_some_and(
             |cold| matches!(&cold.traced_native_call, Some((m, ip, _)) if (*m, *ip) == site),
         );
@@ -444,24 +447,24 @@ impl Vm {
         );
     }
 
-    /// Return the BIF result in `x0` to the caller's continuation.
-    pub(crate) fn return_value(p: &mut Process) -> ImportOutcome {
-        Self::ret(p);
-        ImportOutcome::Returned(p.x[0])
+    /// Return the BIF result `x0` (`reg[0]`) to the caller's continuation.
+    pub(crate) fn return_value(p: &mut Process, x0: Term) -> ImportOutcome {
+        Self::ret(p, x0);
+        ImportOutcome::Returned(x0)
     }
 
     /// `return_value`, but a dirty scheduler hands a resumed continuation back to a normal one.
-    pub(crate) fn return_value_after_dirty(p: &mut Process) -> ImportOutcome {
-        match Self::ret(p) {
+    pub(crate) fn return_value_after_dirty(p: &mut Process, x0: Term) -> ImportOutcome {
+        match Self::ret(p, x0) {
             Some(value) => ImportOutcome::Returned(value),
-            None => after_dirty(ImportOutcome::Returned(p.x[0])),
+            None => after_dirty(ImportOutcome::Returned(x0)),
         }
     }
 
     /// Return a BIF's result to its caller's continuation.
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif_nif_epilogue: `ret` to the CP with
     // no reduction test), OTP-29.1.1: the BIF's BUMP_REDS is its whole charge.
-    pub(crate) fn ret(p: &mut Process) -> Option<Term> {
+    pub(crate) fn ret(p: &mut Process, x0: Term) -> Option<Term> {
         while let Some(cp) = p.heap.stack_get(0) {
             if cp.classify() == TermKind::Catch {
                 break;
@@ -486,7 +489,7 @@ impl Vm {
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (the BIF return paths jump
         // to the CP), OTP-29.1.1: every CP is a native code address; a stack top that is not
         // one is a caller entered from the runtime, which takes the value from x0.
-        Some(p.x[0])
+        Some(x0)
     }
 }
 

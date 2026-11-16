@@ -10,11 +10,14 @@ pub(super) fn raise_undefined_call(
     arguments: &[Term],
     error: VmError,
 ) -> Result<Option<VmError>, VmError> {
-    for (register, value) in process.x.iter_mut().zip(arguments) {
+    let reg = vm.x_regs()?;
+    for (register, value) in reg.iter_mut().zip(arguments) {
         *register = *value;
     }
     let trap = match error {
-        VmError::Exception { reason, frame } => legacy_exception_trap(process, &reason, &frame)?,
+        VmError::Exception { reason, frame } => {
+            legacy_exception_trap(process, reg, &reason, &frame)?
+        }
         VmError::Trap(trap) => trap,
         other => return Err(other),
     };
@@ -29,7 +32,8 @@ pub(super) fn raise_undefined_call(
 
 /// Turns a legacy interpreter exception into a trap, attaching the `undef` call arguments.
 pub(crate) fn legacy_exception_trap(
-    process: &mut Process,
+    _process: &mut Process,
+    reg: &[Term],
     reason: &str,
     frame: &str,
 ) -> Result<crate::exceptions::Trap, VmError> {
@@ -38,7 +42,7 @@ pub(crate) fn legacy_exception_trap(
         && let Some((mfa, arity)) = frame.rsplit_once('/')
         && let Some((module, function)) = mfa.split_once(':')
         && let Ok(arity) = arity.parse::<usize>()
-        && arity <= process.x.len()
+        && arity <= reg.len()
     {
         trap.top = Some(crate::stacktrace::TopFrame::Bif {
             module: global_atoms()
@@ -47,7 +51,7 @@ pub(crate) fn legacy_exception_trap(
             function: global_atoms()
                 .intern(function)
                 .map_err(|_| VmError::Unsupported("undef function atom".into()))?,
-            args: crate::stacktrace::BifArgs::from_terms(&process.x[..arity])?,
+            args: crate::stacktrace::BifArgs::from_terms(&reg[..arity])?,
             info: crate::stacktrace::BifErrorInfo::None,
         });
     }
@@ -246,7 +250,7 @@ impl Executor {
             if matches!(outcome, arinsal_beamasm::ExitReason::Returned) {
                 // The entry function returned: the process continues in its caller or is done.
                 if !resume_after_native_return(process) {
-                    return Some(Ok(RunState::Done(process.x[0])));
+                    return Some(Ok(RunState::Done(self.native_registers.x_reg_array[0])));
                 }
                 continue;
             }
@@ -363,7 +367,7 @@ impl Executor {
         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
         process.slice_mut().hibernate_sched = false;
         // hibernate/3 left `apply(M, F, A)` in X0..X2.
-        if process.x.len() < 3 {
+        if self.native_registers.x_reg_array.len() < 3 {
             return Err(VmError::Unsupported("hibernate registers".into()));
         }
         // Port of erts/emulator/beam/bif.c:1426-1427 (hibernate_3: erts_hibernate, then

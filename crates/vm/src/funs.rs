@@ -697,7 +697,7 @@ impl Vm {
         // and instr_call.cpp (emit_variable_apply, emit_fixed_apply), OTP-29.1.1: neither the
         // apply nor the BIF stub decrements FCALLS; the BIF's own BUMP_REDS, already taken
         // from FCALLS and folded above, is the whole charge.
-        Ok(Self::return_value(p))
+        Ok(Self::return_value(p, self.x_regs()?[0]))
     }
 
     #[allow(clippy::too_many_arguments)] // Same signature as `call_named_resolved`, which it backs.
@@ -760,7 +760,7 @@ impl Vm {
                     // (call_bif_shared, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the export
                     // trampoline an apply reaches collects after the BIF as a static call does.
                     self.x_regs()?[0] = p.gc_after_bif(result?)?;
-                    return Ok(Self::return_value_after_dirty(p));
+                    return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
                 }
             }
         }
@@ -803,7 +803,7 @@ impl Vm {
             return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
                     self.x_regs()?[0] = p.gc_after_bif(value)?;
-                    Ok(Self::return_value(p))
+                    Ok(Self::return_value(p, self.x_regs()?[0]))
                 }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
                 crate::bif_traps::HandlerResult::Export(_) => {
@@ -865,22 +865,22 @@ impl Vm {
                 result => result,
             };
             self.x_regs()?[0] = result?;
-            return Ok(Self::return_value_after_dirty(p));
+            return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
         }
         // elixir_loop1: apply/3 reaches this path without an import slot.
         // sys_core_fold:fold_lit_args/4 applies erlang:make_fun/3 the same way.
         if module == "erlang" && function == "make_fun" && arity == 3 {
             let args = [self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]];
             self.x_regs()?[0] = self.make_export_fun(p, &args)?;
-            return Ok(Self::return_value(p));
+            return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         if module == "erlang" && function == "fun_info" && (arity == 1 || arity == 2) {
             self.x_regs()?[0] = self.fun_info(p, arity == 2)?;
-            return Ok(Self::return_value(p));
+            return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         if module == "erlang" && function == "fun_info_mfa" && arity == 1 {
             self.x_regs()?[0] = self.fun_info_mfa(p)?;
-            return Ok(Self::return_value(p));
+            return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
         if let Some(bif) = arinsal_bifs::lookup(module, function, arity as u8)
