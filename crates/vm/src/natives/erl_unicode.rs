@@ -1746,11 +1746,10 @@ pub(crate) extern "C" fn prim_file_internal_native2name_1(
             .expect("HAlloc");
         return crate::native_hooks::raw(result);
     };
-    let points: Vec<u32> = text.chars().map(|c| c as u32).collect();
-    let points = if encoding == FilenameEncoding::Utf8Mac {
-        super::erl_unicode_normalize::normalize_filename(points)
+    let points: Vec<u32> = if encoding == FilenameEncoding::Utf8Mac {
+        super::erl_unicode_normalize::do_utf8_to_list_normalize(text.as_bytes())
     } else {
-        points
+        text.chars().map(|c| c as u32).collect()
     };
     let list = codepoint_list(process, &points);
     crate::native_hooks::raw(list)
@@ -1774,8 +1773,7 @@ pub(crate) extern "C" fn prim_file_internal_normalize_utf8_1(
     let Ok(text) = std::str::from_utf8(&data) else {
         return bif_ret(c_p, i, Err(badarg()));
     };
-    let points: Vec<u32> = text.chars().map(|c| c as u32).collect();
-    let normalized = super::erl_unicode_normalize::normalize_filename(points);
+    let normalized = super::erl_unicode_normalize::do_utf8_to_list_normalize(text.as_bytes());
     let list = codepoint_list(process, &normalized);
     crate::native_hooks::raw(list)
 }

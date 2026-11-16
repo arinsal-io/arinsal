@@ -13,7 +13,7 @@ f(A, E) ->
         {T, B, Rest} -> {T, erlang:phash2(B), byte_size(B), erlang:phash2(Rest)}
     catch C:_ -> C end.
 run() ->
-    process_flag(min_heap_size, 100000),
+    process_flag(min_heap_size, 2000000),
     Big = lists:duplicate(60000, $a) ++ [16#1F600, 16#e9] ++ lists:duplicate(30000, 16#4e2d),
     Bin = unicode:characters_to_binary(Big),
     Cases = [
@@ -30,12 +30,16 @@ run() ->
       {[Bin, [<<226,130>>, <<172>>], Bin], utf8}, {Big ++ [16#D800|Big], utf8},
       {[Bin, <<255>>, Bin], utf8}, {[Bin|<<226,130>>], utf8}, {binary:copy(Bin, 3), latin1},
       {Big, latin1}],
-    %% The reductions of the calls that trap depend on where the scheduler slices fall; the
-    %% small calls (the first ones) must match exactly, the trapping ones only in their result.
-    {Small, Large} = lists:split(26, Cases),
-    [{f(A, E), reds(A, E)} || {A, E} <- Small] ++ [{f(A, E), 0} || {A, E} <- Large].
+    % Calls that finish within a few reductions, and the trapping calls whose result and
+    % input stay below the binary virtual heap limit, must match exactly. The calls with
+    % the 450000 byte binaries are compared by result only: erts collects garbage after
+    % them at a point that depends on its virtual binary heap, which varies from run to run
+    % (the reference itself differs by up to 1700 reductions between runs).
+    {Exact, ResultOnly} = lists:split(28, Cases),
+    [{f(A, E), reds(A, E)} || {A, E} <- Exact] ++ [{f(A, E), 0} || {A, E} <- ResultOnly].
 reds(A, E) ->
     erlang:garbage_collect(),
+    erlang:yield(),
     {reductions, Before} = process_info(self(), reductions),
     f(A, E),
     {reductions, After} = process_info(self(), reductions),
