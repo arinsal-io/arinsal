@@ -174,12 +174,6 @@ struct EncodeOpts {
     local_node: Option<(arinsal_term::Atom, u32)>,
 }
 
-#[derive(Default)]
-struct SizePass {
-    estimated: usize,
-    output: usize,
-}
-
 // Port of erts/emulator/beam/external.c:1480-1535 (parse_t2b_opts), OTP-29.1.1.
 fn options(term: Option<Term>) -> Result<EncodeOpts, EncodeError> {
     let mut opts = EncodeOpts {
@@ -1008,228 +1002,6 @@ impl MapSort {
     }
 }
 
-/// The body of `encode_size_struct_int`: `Ok(None)` when the pass finished, `Ok(Some(obj))`
-/// when the reduction budget ran out with `obj` still to be sized.
-#[inline(always)]
-fn size_walk(
-    opts: &mut EncodeOpts,
-    node_source: Option<fn() -> (Atom, u32)>,
-    stack: &mut WStack,
-    pending: Option<Term>,
-    sizes: &mut SizePass,
-    consumed: &mut usize,
-    budget: usize,
-) -> Result<Option<Term>, EncodeError> {
-    let table = global_atoms();
-    let minor = opts.minor;
-    let mut total = sizes.estimated;
-    let mut output_total = sizes.output;
-    let mut work = *consumed;
-    let mut obj = match pending {
-        Some(obj) => obj,
-        None => match size_pop(stack)? {
-            Some(obj) => obj,
-            None => return Ok(None),
-        },
-    };
-    macro_rules! add {
-        ($size:expr) => {{
-            let size = $size;
-            total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
-            output_total = output_total
-                .checked_add(size)
-                .ok_or(EncodeError::SystemLimit)?;
-        }};
-    }
-    macro_rules! add_recursive_local_headers {
-        ($count:expr) => {
-            if opts.local {
-                output_total = output_total
-                    .checked_add(5 * $count)
-                    .ok_or(EncodeError::SystemLimit)?;
-            }
-        };
-    }
-    loop {
-        // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
-        if work + 1 >= budget {
-            sizes.estimated = total;
-            sizes.output = output_total;
-            *consumed = work;
-            return Ok(Some(obj));
-        }
-        work += 1;
-        match fast_encode_kind(obj) {
-            FastEncodeKind::Small(value) => add!(small_size(value)),
-            FastEncodeKind::Atom(atom) => add!(atom_size_in(table, atom, minor)?),
-            FastEncodeKind::Nil => add!(1),
-            FastEncodeKind::List(cons) => {
-                // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
-                let (len, is_string) = external_string_prefix(obj, cons);
-                work += len / 2;
-                if is_string {
-                    add!(3 + len);
-                } else {
-                    add!(5);
-                    let (head, rest) = cons.pair();
-                    push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
-                    obj = head;
-                    continue;
-                }
-            }
-            FastEncodeKind::Tuple(tuple) => {
-                let arity = tuple.arity();
-                add!(if arity <= 255 { 2 } else { 5 });
-                if arity > 0 {
-                    if arity > 1 {
-                        let pointer = tuple.element_pointer(1).ok_or(EncodeError::BadArg)?;
-                        push_size_tuple_array(stack, pointer, arity - 1);
-                    }
-                    obj = tuple.get(0).ok_or(EncodeError::BadArg)?;
-                    continue;
-                }
-            }
-            FastEncodeKind::Rare(TermKind::Number) => {
-                if obj.header().is_some_and(|header| header & 63 == 0x18) {
-                    add!(if minor == 0 { 32 } else { 9 });
-                } else {
-                    add!(bignum_size(obj)?);
-                }
-            }
-            FastEncodeKind::Rare(TermKind::Map) => {
-                let checked = arinsal_maps::checked_map(obj).map_err(|_| EncodeError::BadArg)?;
-                match checked.kind() {
-                    arinsal_maps::CheckedMapKind::Flatmap(_) => {
-                        let size = checked.size();
-                        add!(5);
-                        if size > 0 {
-                            push_size_array(stack, obj, size, ARRAY_FLAT_VALUES);
-                            push_size_array(stack, obj, size, ARRAY_FLAT_KEYS);
-                        }
-                    }
-                    arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                        let children =
-                            arinsal_term::MapNodeChildren::new(obj).ok_or(EncodeError::BadArg)?;
-                        if children.is_head() {
-                            add!(5);
-                        }
-                        push_hashmap_root_tasks(stack, obj, size_op(SIZE_HASHMAP_NODE), None)?;
-                    }
-                }
-            }
-            FastEncodeKind::Rare(TermKind::Bitstring) => {
-                let bits =
-                    arinsal_term::erl_bits::bitstring_bit_len(obj).ok_or(EncodeError::BadArg)?;
-                let len = bits.div_ceil(8);
-                let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
-                add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
-            }
-            FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
-                // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
-                let internal = is_internal_identity(obj);
-                if internal && !opts.local {
-                    resolve_local_node(opts, node_source);
-                }
-                let identity = obj.identity().ok_or(EncodeError::BadArg)?;
-                let identity = local_identity(identity, internal, opts.local, opts.local_node);
-                let node_size = if opts.local && internal {
-                    1
-                } else {
-                    atom_size_in(
-                        table,
-                        match identity {
-                            Identity::Pid { node, .. }
-                            | Identity::Port { node, .. }
-                            | Identity::Ref { node, .. } => node,
-                        },
-                        minor,
-                    )?
-                };
-                let size = match identity {
-                    Identity::Pid { .. } => 1 + node_size + 12,
-                    Identity::Port { .. } => 1 + node_size + 12,
-                    Identity::Ref { ids, .. } => 1 + 2 + node_size + 4 + 4 * ids.len(),
-                };
-                add!(size);
-            }
-            FastEncodeKind::Rare(TermKind::Fun) => {
-                let fun = fun_of(obj)?;
-                match &fun {
-                    FunRef::Export { entry } => {
-                        add!(
-                            1 + atom_size_in(table, entry.module, minor)?
-                                + atom_size_in(table, entry.function, minor)?
-                                + small_size(i64::from(entry.arity))
-                        );
-                        // Port of external.c EXPORT_EXT: the arity is emitted by a nested enc_term.
-                        add_recursive_local_headers!(1);
-                    }
-                    FunRef::Local { entry, .. } => {
-                        add!(
-                            1 + 4
-                                + 1
-                                + 16
-                                + 4
-                                + 4
-                                + atom_size_in(table, entry.module, minor)?
-                                + small_size(i64::from(entry.old_index))
-                                + small_size(i64::from(entry.old_uniq))
-                        );
-                        // Port of external.c FUN_DEF: old_index and old_uniq use nested enc_term.
-                        add_recursive_local_headers!(2);
-                        stack.push(entry.pid.word());
-                        let free = fun.num_free();
-                        if free > 1 {
-                            push_size_array(stack, obj, free - 1, ARRAY_FUN_ENV);
-                        }
-                        if free != 0 {
-                            obj = fun.free(0).ok_or(EncodeError::BadArg)?;
-                            continue;
-                        }
-                    }
-                }
-            }
-            FastEncodeKind::Rare(TermKind::Record) => {
-                let record = record_of(obj)?;
-                let mut size = 1
-                    + 4
-                    + 1
-                    + atom_size_in(table, record.module(), minor)?
-                    + atom_size_in(table, record.name(), minor)?;
-                for index in 0..record.len() {
-                    let sorted = record.sorted_index(index).ok_or(EncodeError::BadArg)?;
-                    size = size
-                        .checked_add(atom_size_in(
-                            table,
-                            record.key(sorted).ok_or(EncodeError::BadArg)?,
-                            minor,
-                        )?)
-                        .ok_or(EncodeError::SystemLimit)?;
-                }
-                add!(size);
-                let values = record.len();
-                if values > 1 {
-                    push_size_array(stack, obj, values - 1, ARRAY_RECORD);
-                }
-                if values != 0 {
-                    obj = record.value(0).ok_or(EncodeError::BadArg)?;
-                    continue;
-                }
-            }
-            FastEncodeKind::Rare(_) => return Err(EncodeError::BadArg),
-        }
-        match size_pop(stack)? {
-            Some(next) => obj = next,
-            None => {
-                sizes.estimated = total;
-                sizes.output = output_total;
-                *consumed = work;
-                return Ok(None);
-            }
-        }
-    }
-}
-
 /// Build the heap term of a refc binary that holds a finished encoding of `size` bytes.
 pub fn install_refc_binary<H: HeapAlloc>(
     heap: &mut H,
@@ -1392,38 +1164,238 @@ impl EncodeWalk {
         !(self.iovec && plain) && self.encoded_size <= 64
     }
 
-    /// Count the yield counts of the size pass, at most `budget - 1` of them.
-    // Port of erts/emulator/beam/external.c:5579 (encode_size_struct_int), OTP-29.1.1.
-    fn size_step(&mut self, budget: usize, consumed: &mut usize) -> Result<bool, EncodeError> {
+    /// `encode_size_struct_int`: size the term with `budget` yield counts, a loop over a
+    /// frame-local work stack; on running out of budget only the stack, the pending object and
+    /// the sizes so far are saved into the context. Returns whether the pass finished.
+    // Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
+    #[inline(always)]
+    fn encode_size_struct_int(
+        &mut self,
+        budget: usize,
+        consumed: &mut usize,
+    ) -> Result<bool, EncodeError> {
         let mut opts = self.opts;
         let node_source = self.node_source;
         let mut stack = WStack::new();
         stack.restore(&mut self.work);
-        let mut sizes = SizePass {
-            estimated: self.encoded_size,
-            output: self.output_size,
-        };
+        let table = global_atoms();
+        let minor = opts.minor;
+        let mut total = self.encoded_size;
+        let mut output_total = self.output_size;
         let mut work = *consumed;
-        let pending = self.size_current.take();
-        let outcome = size_walk(
-            &mut opts,
-            node_source,
-            &mut stack,
-            pending,
-            &mut sizes,
-            &mut work,
-            budget,
-        );
-        self.opts = opts;
-        stack.save(&mut self.work);
-        self.encoded_size = sizes.estimated;
-        self.output_size = sizes.output;
-        *consumed = work;
-        match outcome? {
-            None => Ok(true),
-            Some(obj) => {
-                self.size_current = Some(obj);
-                Ok(false)
+        let mut obj = match self.size_current.take() {
+            Some(obj) => obj,
+            None => match size_pop(&mut stack)? {
+                Some(obj) => obj,
+                None => return Ok(true),
+            },
+        };
+        macro_rules! save {
+            ($pending:expr) => {{
+                self.opts = opts;
+                stack.save(&mut self.work);
+                self.size_current = $pending;
+                self.encoded_size = total;
+                self.output_size = output_total;
+                *consumed = work;
+            }};
+        }
+        macro_rules! add {
+            ($size:expr) => {{
+                let size = $size;
+                total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
+                output_total = output_total
+                    .checked_add(size)
+                    .ok_or(EncodeError::SystemLimit)?;
+            }};
+        }
+        macro_rules! add_recursive_local_headers {
+            ($count:expr) => {
+                if opts.local {
+                    output_total = output_total
+                        .checked_add(5 * $count)
+                        .ok_or(EncodeError::SystemLimit)?;
+                }
+            };
+        }
+        loop {
+            // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
+            if work + 1 >= budget {
+                save!(Some(obj));
+                return Ok(false);
+            }
+            work += 1;
+            match fast_encode_kind(obj) {
+                FastEncodeKind::Small(value) => add!(small_size(value)),
+                FastEncodeKind::Atom(atom) => add!(atom_size_in(table, atom, minor)?),
+                FastEncodeKind::Nil => add!(1),
+                FastEncodeKind::List(cons) => {
+                    // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
+                    let (len, is_string) = external_string_prefix(obj, cons);
+                    work += len / 2;
+                    if is_string {
+                        add!(3 + len);
+                    } else {
+                        add!(5);
+                        let (head, rest) = cons.pair();
+                        push_term_task(&mut stack, size_op(SIZE_LIST_TAIL), rest);
+                        obj = head;
+                        continue;
+                    }
+                }
+                FastEncodeKind::Tuple(tuple) => {
+                    let arity = tuple.arity();
+                    add!(if arity <= 255 { 2 } else { 5 });
+                    if arity > 0 {
+                        if arity > 1 {
+                            let pointer = tuple.element_pointer(1).ok_or(EncodeError::BadArg)?;
+                            push_size_tuple_array(&mut stack, pointer, arity - 1);
+                        }
+                        obj = tuple.get(0).ok_or(EncodeError::BadArg)?;
+                        continue;
+                    }
+                }
+                FastEncodeKind::Rare(TermKind::Number) => {
+                    if obj.header().is_some_and(|header| header & 63 == 0x18) {
+                        add!(if minor == 0 { 32 } else { 9 });
+                    } else {
+                        add!(bignum_size(obj)?);
+                    }
+                }
+                FastEncodeKind::Rare(TermKind::Map) => {
+                    let checked =
+                        arinsal_maps::checked_map(obj).map_err(|_| EncodeError::BadArg)?;
+                    match checked.kind() {
+                        arinsal_maps::CheckedMapKind::Flatmap(_) => {
+                            let size = checked.size();
+                            add!(5);
+                            if size > 0 {
+                                push_size_array(&mut stack, obj, size, ARRAY_FLAT_VALUES);
+                                push_size_array(&mut stack, obj, size, ARRAY_FLAT_KEYS);
+                            }
+                        }
+                        arinsal_maps::CheckedMapKind::Hashmap(_) => {
+                            let children = arinsal_term::MapNodeChildren::new(obj)
+                                .ok_or(EncodeError::BadArg)?;
+                            if children.is_head() {
+                                add!(5);
+                            }
+                            push_hashmap_root_tasks(
+                                &mut stack,
+                                obj,
+                                size_op(SIZE_HASHMAP_NODE),
+                                None,
+                            )?;
+                        }
+                    }
+                }
+                FastEncodeKind::Rare(TermKind::Bitstring) => {
+                    let bits = arinsal_term::erl_bits::bitstring_bit_len(obj)
+                        .ok_or(EncodeError::BadArg)?;
+                    let len = bits.div_ceil(8);
+                    let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
+                    add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
+                }
+                FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
+                    // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
+                    let internal = is_internal_identity(obj);
+                    if internal && !opts.local {
+                        resolve_local_node(&mut opts, node_source);
+                    }
+                    let identity = obj.identity().ok_or(EncodeError::BadArg)?;
+                    let identity = local_identity(identity, internal, opts.local, opts.local_node);
+                    let node_size = if opts.local && internal {
+                        1
+                    } else {
+                        atom_size_in(
+                            table,
+                            match identity {
+                                Identity::Pid { node, .. }
+                                | Identity::Port { node, .. }
+                                | Identity::Ref { node, .. } => node,
+                            },
+                            minor,
+                        )?
+                    };
+                    let size = match identity {
+                        Identity::Pid { .. } => 1 + node_size + 12,
+                        Identity::Port { .. } => 1 + node_size + 12,
+                        Identity::Ref { ids, .. } => 1 + 2 + node_size + 4 + 4 * ids.len(),
+                    };
+                    add!(size);
+                }
+                FastEncodeKind::Rare(TermKind::Fun) => {
+                    let fun = fun_of(obj)?;
+                    match &fun {
+                        FunRef::Export { entry } => {
+                            add!(
+                                1 + atom_size_in(table, entry.module, minor)?
+                                    + atom_size_in(table, entry.function, minor)?
+                                    + small_size(i64::from(entry.arity))
+                            );
+                            // Port of external.c EXPORT_EXT: the arity is emitted by a nested enc_term.
+                            add_recursive_local_headers!(1);
+                        }
+                        FunRef::Local { entry, .. } => {
+                            add!(
+                                1 + 4
+                                    + 1
+                                    + 16
+                                    + 4
+                                    + 4
+                                    + atom_size_in(table, entry.module, minor)?
+                                    + small_size(i64::from(entry.old_index))
+                                    + small_size(i64::from(entry.old_uniq))
+                            );
+                            // Port of external.c FUN_DEF: old_index and old_uniq use nested enc_term.
+                            add_recursive_local_headers!(2);
+                            stack.push(entry.pid.word());
+                            let free = fun.num_free();
+                            if free > 1 {
+                                push_size_array(&mut stack, obj, free - 1, ARRAY_FUN_ENV);
+                            }
+                            if free != 0 {
+                                obj = fun.free(0).ok_or(EncodeError::BadArg)?;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                FastEncodeKind::Rare(TermKind::Record) => {
+                    let record = record_of(obj)?;
+                    let mut size = 1
+                        + 4
+                        + 1
+                        + atom_size_in(table, record.module(), minor)?
+                        + atom_size_in(table, record.name(), minor)?;
+                    for index in 0..record.len() {
+                        let sorted = record.sorted_index(index).ok_or(EncodeError::BadArg)?;
+                        size = size
+                            .checked_add(atom_size_in(
+                                table,
+                                record.key(sorted).ok_or(EncodeError::BadArg)?,
+                                minor,
+                            )?)
+                            .ok_or(EncodeError::SystemLimit)?;
+                    }
+                    add!(size);
+                    let values = record.len();
+                    if values > 1 {
+                        push_size_array(&mut stack, obj, values - 1, ARRAY_RECORD);
+                    }
+                    if values != 0 {
+                        obj = record.value(0).ok_or(EncodeError::BadArg)?;
+                        continue;
+                    }
+                }
+                FastEncodeKind::Rare(_) => return Err(EncodeError::BadArg),
+            }
+            match size_pop(&mut stack)? {
+                Some(next) => obj = next,
+                None => {
+                    save!(None);
+                    return Ok(true);
+                }
             }
         }
     }
@@ -1434,7 +1406,7 @@ impl EncodeWalk {
             return Ok((true, 0));
         }
         let mut consumed = 0;
-        let done = self.size_step(budget, &mut consumed)?;
+        let done = self.encode_size_struct_int(budget, &mut consumed)?;
         if done {
             self.sized = true;
         }

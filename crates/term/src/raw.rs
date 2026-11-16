@@ -1213,19 +1213,25 @@ impl<const N: usize> Default for WordStack<N> {
     }
 }
 
-/// `erts_atom_get_name`: the `len` bytes of an atom's literal binary (`Atom.u.bin`).
+/// `erts_atom_get_name`: the bytes of an atom's literal binary (`Atom.u.bin`), at most `len`.
 ///
-/// Contract: `bin` is the global-literal binary of an atom, which is never freed or moved, and
-/// `len` is the atom's name length.
+/// `bin` is the global-literal binary of an atom, which is never freed or moved; `len` is the
+/// atom's name length and is checked against the binary's own size, so a wrong length cannot
+/// read outside it.
 // Port of erts/emulator/beam/atom.c (erts_atom_get_name, ERTS_GET_BINARY_BYTES), OTP-29.1.1:
 // a heap binary is read where it lies; a longer name sits in a refc binary.
 #[inline(always)]
 pub fn atom_literal_bytes(bin: Term, len: usize) -> &'static [u8] {
     if boxed_header(bin).is_some_and(|header| header & 63 == HEAP_BITS) {
-        // SAFETY: the contract above; a heap binary holds its `len` payload bytes from word two
-        // of the object (`bin` is the object address plus tag two).
+        // Word one of a heap binary is its size in bits.
+        let size = (read_tagged(bin.0, 6) / 8) as usize;
+        debug_assert!(len <= size, "atom name longer than its literal");
+        let len = len.min(size);
+        // SAFETY: a heap binary holds `size` payload bytes from word two of the object (`bin`
+        // is the object address plus tag two), and `len <= size`.
         return unsafe { std::slice::from_raw_parts(bin.0.wrapping_add(14) as *const u8, len) };
     }
-    let view = BinRef::try_from(bin).expect("atom literal is a binary");
-    view.bytes().expect("atom literal is a byte string")
+    let bytes = BinRef::try_from(bin).ok().and_then(BinRef::bytes);
+    debug_assert!(bytes.is_some_and(|bytes| bytes.len() == len));
+    bytes.unwrap_or(&[])
 }
