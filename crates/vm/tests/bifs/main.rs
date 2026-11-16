@@ -59,3 +59,4 @@ mod reg_table;
 mod small_gaps;
 mod system_info_light;
 mod unicode_to_binary_differential;
+mod unicode_to_list_differential;

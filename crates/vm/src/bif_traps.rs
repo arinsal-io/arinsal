@@ -112,7 +112,6 @@ pub(crate) fn state_holds_heap_terms(state: &MagicBin) -> bool {
     }
     any!(
         arinsal_bifs::BinaryToListWalk,
-        arinsal_bifs::UnicodeCont,
         arinsal_bifs::BinarySearchWalk,
         BinaryCopyState,
     )
@@ -158,6 +157,7 @@ const RE_URUN_CONTINUATION: &str = "re:urun/3";
 
 // C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
 // data offset is added by MagicBin::with_erts_payload_size.
+// Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
 // Port of erts/emulator/beam/erl_unicode.c (RestartContext).
 const ERTS_UNICODE_RESTART_CONTEXT_SIZE: usize = 40;
 // Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
@@ -237,127 +237,6 @@ fn clear_export_trap(process: &mut Process) {
     }
 }
 
-fn unicode_trap(
-    process: &mut Process,
-    state: Option<&MagicBin>,
-) -> Result<HandlerResult, BifError> {
-    let cont = state
-        .ok_or(BifError::BADARG)?
-        .downcast_ref::<TrapContext<arinsal_bifs::UnicodeCont>>()
-        .ok_or(BifError::BADARG)?
-        .lock()
-        .map_err(|_| BifError::SystemLimit)?
-        .clone();
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    let step = arinsal_bifs::unicode_resume(&mut ctx, &cont);
-    drop(bif_state);
-    Ok(match step {
-        arinsal_bifs::UnicodeStep::Done(value) => HandlerResult::Done {
-            value,
-            reductions: 0,
-        },
-        arinsal_bifs::UnicodeStep::More(cont) => HandlerResult::Yield {
-            continuation: cont.continuation(),
-            state: magic_binary_state(TrapContext::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
-            reductions: 0,
-        },
-    })
-}
-
-fn unicode_convert_start(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    function: &'static str,
-) -> Result<HandlerResult, BifError> {
-    if state.is_some() {
-        return unicode_trap(process, state);
-    }
-    // erts binds this continuation BIF when its export is loaded. Resolve the
-    // Rust function pointer once, then keep the call path to the body itself.
-    static CHARACTERS_TO_BINARY: std::sync::OnceLock<arinsal_bifs::BifFn> =
-        std::sync::OnceLock::new();
-    static CHARACTERS_TO_LIST: std::sync::OnceLock<arinsal_bifs::BifFn> =
-        std::sync::OnceLock::new();
-    let bif = match function {
-        "characters_to_binary" => CHARACTERS_TO_BINARY.get_or_init(|| {
-            arinsal_bifs::lookup("unicode", function, args.len() as u8)
-                .expect("registered Unicode BIF")
-        }),
-        "characters_to_list" => CHARACTERS_TO_LIST.get_or_init(|| {
-            arinsal_bifs::lookup("unicode", function, args.len() as u8)
-                .expect("registered Unicode BIF")
-        }),
-        _ => return Err(BifError::BADARG),
-    };
-    let (result, deferred) = {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        // Port of erts/emulator/beam/erl_unicode.c:166 (allowed_iterations), OTP-29.1.1:
-        // the loop budget rereads FCALLS after cost_to_proc charges it.
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state);
-        let result = bif(&mut ctx, args)?;
-        let deferred = ctx.take_deferred();
-        (result, deferred)
-    };
-    match deferred.map(|trap| *trap) {
-        Some(arinsal_bifs::DeferredTrap::Unicode(cont))
-            if cont.continuation() == "erlang:characters_to_utf8_trap/4" =>
-        {
-            let trap_args = cont.binary_trap_arguments().ok_or(BifError::BADARG)?;
-            process.x.ensure_x(trap_args.len());
-            process.x[..trap_args.len()].copy_from_slice(&trap_args);
-            process.gc_live = trap_args.len();
-            Ok(HandlerResult::Yield {
-                continuation: cont.continuation(),
-                state: argument_trap_state(NoContext),
-                reductions: 0,
-            })
-        }
-        Some(arinsal_bifs::DeferredTrap::Unicode(cont)) => Ok(HandlerResult::Yield {
-            continuation: cont.continuation(),
-            state: magic_binary_state(TrapContext::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
-            reductions: 0,
-        }),
-        None => Ok(HandlerResult::Done {
-            value: result,
-            reductions: 0,
-        }),
-    }
-}
-
-// Port of erts/emulator/beam/erl_unicode.c:1122 (unicode_characters_to_list_2), OTP-29.1.1.
-fn unicode_characters_to_list(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    unicode_convert_start(process, args, state, "characters_to_list")
-}
-
-macro_rules! unicode_trap_entry {
-    ($name:ident) => {
-        fn $name(
-            process: &mut Process,
-            _args: &[Term],
-            state: Option<&MagicBin>,
-            _pid: Option<arinsal_sched::Pid>,
-            _gc_changed: bool,
-        ) -> Result<HandlerResult, BifError> {
-            unicode_trap(process, state)
-        }
-    };
-}
-
-unicode_trap_entry!(erlang_characters_to_list_trap_1);
-unicode_trap_entry!(erlang_characters_to_list_trap_2);
-unicode_trap_entry!(erlang_characters_to_list_trap_3);
-unicode_trap_entry!(erlang_characters_to_list_trap_4);
-
 const ENTRIES: &[Entry] = &[
     Entry {
         module: "erts_internal",
@@ -365,41 +244,6 @@ const ENTRIES: &[Entry] = &[
         arity: 1,
         continuation: DSEND_CONTINUE_CONTINUATION,
         handler: dsend_continue_trap_1,
-    },
-    Entry {
-        module: "unicode",
-        function: "characters_to_list",
-        arity: 2,
-        continuation: "erlang:characters_to_list_trap_1/3",
-        handler: unicode_characters_to_list,
-    },
-    Entry {
-        module: "erlang",
-        function: "characters_to_list_trap_1",
-        arity: 3,
-        continuation: "erlang:characters_to_list_trap_1/3",
-        handler: erlang_characters_to_list_trap_1,
-    },
-    Entry {
-        module: "erlang",
-        function: "characters_to_list_trap_2",
-        arity: 3,
-        continuation: "erlang:characters_to_list_trap_2/3",
-        handler: erlang_characters_to_list_trap_2,
-    },
-    Entry {
-        module: "erlang",
-        function: "characters_to_list_trap_3",
-        arity: 3,
-        continuation: "erlang:characters_to_list_trap_3/3",
-        handler: erlang_characters_to_list_trap_3,
-    },
-    Entry {
-        module: "erlang",
-        function: "characters_to_list_trap_4",
-        arity: 1,
-        continuation: "erlang:characters_to_list_trap_4/1",
-        handler: erlang_characters_to_list_trap_4,
     },
     Entry {
         module: "erlang",

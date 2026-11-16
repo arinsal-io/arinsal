@@ -312,6 +312,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("unicode", "characters_to_binary", 2) => {
             bif!(erl_unicode::unicode_characters_to_binary_2)
         }
+        ("unicode", "characters_to_list", 2) => {
+            bif!(erl_unicode::unicode_characters_to_list_2)
+        }
         // erl_iolist.c
         ("erlang", "iolist_size", 1) => bif!(erl_iolist::iolist_size_1),
         ("erlang", "list_to_binary", 1) => bif!(erl_iolist::list_to_binary_1),
@@ -464,6 +467,10 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
             bif!(binary::binary_to_list_continue_1)
         }
         ("erlang", "characters_to_utf8_trap", 4) => bif!(erl_unicode::characters_to_utf8_trap),
+        ("erlang", "characters_to_list_trap_1", 3) => bif!(erl_unicode::characters_to_list_trap_1),
+        ("erlang", "characters_to_list_trap_2", 3) => bif!(erl_unicode::characters_to_list_trap_2),
+        ("erlang", "characters_to_list_trap_3", 3) => bif!(erl_unicode::characters_to_list_trap_3),
+        ("erlang", "characters_to_list_trap_4", 1) => bif!(erl_unicode::characters_to_list_trap_4),
         ("erts_internal", "iolist_size_continue", 1) => bif!(erl_iolist::iolist_size_continue_1),
         ("erts_internal", "list_to_bitstring_continue", 1) => {
             bif!(erl_iolist::list_to_bitstring_continue_1)

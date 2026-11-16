@@ -895,3 +895,685 @@ pub(crate) extern "C" fn characters_to_utf8_trap(
         encoding,
     )
 }
+
+// ---- unicode:characters_to_list/2 ---------------------------------------------------------
+
+const ERTS_UTF8_OK: i32 = 0;
+const ERTS_UTF8_INCOMPLETE: i32 = 1;
+const ERTS_UTF8_ERROR: i32 = 2;
+const ERTS_UTF8_ANALYZE_MORE: i32 = 3;
+
+const CHARACTERS_TO_LIST_INT: &str = "unicode:characters_to_list_int/2";
+const CHARACTERS_TO_LIST_TRAP_1: &str = "erlang:characters_to_list_trap_1/3";
+const CHARACTERS_TO_LIST_TRAP_2: &str = "erlang:characters_to_list_trap_2/3";
+const CHARACTERS_TO_LIST_TRAP_3: &str = "erlang:characters_to_list_trap_3/3";
+const CHARACTERS_TO_LIST_TRAP_4: &str = "erlang:characters_to_list_trap_4/1";
+
+/// `sizeof(RestartContext)` on a 64-bit build: the magic binary's `orig_size`.
+const ERTS_RESTART_CONTEXT_SIZE: usize = 40;
+
+/// `RestartContext`: the UTF-8 buffer built so far and what remains to turn into a list.
+// Port of erts/emulator/beam/erl_unicode.c (RestartContext), OTP-29.1.1.
+struct RestartContext {
+    bytes: Vec<u8>,
+    num_processed_bytes: usize,
+    num_bytes_to_process: usize,
+    num_resulting_chars: usize,
+    state: i32,
+}
+
+type RestartHolder = crate::bif_traps::TrapContext<RestartContext>;
+
+// `cleanup_restart_context_bin`: dropping the context frees its buffer.
+arinsal_term::magic_payload!(RestartHolder => cleanup_restart_context_bin);
+
+/// `make_magic_bin_for_restart`: a magic reference holding `rc`.
+fn make_magic_bin_for_restart(process: &mut Process, rc: RestartContext) -> Term {
+    let bin = arinsal_term::MagicBin::with_erts_payload_size_and_refn(
+        RestartHolder::new(rc),
+        ERTS_RESTART_CONTEXT_SIZE,
+        arinsal_bifs::next_ref_words(),
+    );
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .magic_ref(bin)
+        .expect("HAlloc")
+}
+
+/// `analyze_utf8` without the Latin-1 and maximum-character options: the state, the end of the
+/// accepted prefix and the characters in it. `left` counts down one per character.
+// Port of erts/emulator/beam/erl_unicode.c (analyze_utf8, erts_analyze_utf8), OTP-29.1.1.
+fn analyze_utf8(source: &[u8], mut left: Option<&mut i64>) -> (i32, usize, usize) {
+    let mut res = ERTS_UTF8_OK;
+    let mut at = 0usize;
+    let mut size = source.len();
+    let mut nchars = 0usize;
+    let mut err_pos = 0usize;
+    while size > 0 {
+        let byte = source[at];
+        if byte & 0x80 == 0 {
+            at += 1;
+            size -= 1;
+        } else if byte & 0xE0 == 0xC0 {
+            if size < 2 {
+                res = ERTS_UTF8_INCOMPLETE;
+                break;
+            }
+            if source[at + 1] & 0xC0 != 0x80 || byte < 0xC2 {
+                res = ERTS_UTF8_ERROR;
+                break;
+            }
+            at += 2;
+            size -= 2;
+        } else if byte & 0xF0 == 0xE0 {
+            if size < 3 {
+                res = ERTS_UTF8_INCOMPLETE;
+                break;
+            }
+            if source[at + 1] & 0xC0 != 0x80
+                || source[at + 2] & 0xC0 != 0x80
+                || (byte == 0xE0 && source[at + 1] < 0xA0)
+                || (byte & 0xF == 0xD && source[at + 1] & 0x20 != 0)
+            {
+                res = ERTS_UTF8_ERROR;
+                break;
+            }
+            at += 3;
+            size -= 3;
+        } else if byte & 0xF8 == 0xF0 {
+            if size < 4 {
+                res = ERTS_UTF8_INCOMPLETE;
+                break;
+            }
+            if source[at + 1] & 0xC0 != 0x80
+                || source[at + 2] & 0xC0 != 0x80
+                || source[at + 3] & 0xC0 != 0x80
+                || (byte == 0xF0 && source[at + 1] < 0x90)
+                || byte & 0x7 > 0x4
+                || (byte & 0x7 == 0x4 && source[at + 1] & 0x3F > 0xF)
+            {
+                res = ERTS_UTF8_ERROR;
+                break;
+            }
+            at += 4;
+            size -= 4;
+        } else {
+            res = ERTS_UTF8_ERROR;
+            break;
+        }
+        nchars += 1;
+        err_pos = at;
+        if let Some(left) = left.as_deref_mut() {
+            *left -= 1;
+            if *left <= 0 && size > 0 {
+                res = ERTS_UTF8_ANALYZE_MORE;
+                break;
+            }
+        }
+    }
+    (res, err_pos, nchars)
+}
+
+/// `do_utf8_to_list` / `erts_make_list_from_utf8_buf`: the last `num` (at most `left`)
+/// characters of the valid UTF-8 `bytes`, prepended to `tail`; returns the list, the
+/// characters built and the bytes eaten from the end.
+// Port of erts/emulator/beam/erl_unicode.c (do_utf8_to_list, erts_make_list_from_utf8_buf),
+// OTP-29.1.1.
+fn do_utf8_to_list(
+    process: &mut Process,
+    num: usize,
+    bytes: &[u8],
+    left: usize,
+    tail: Term,
+) -> (Term, usize, usize) {
+    let mut num = num;
+    if left < num {
+        num = if left > 0 { left } else { 1 };
+    }
+    let mut points: smallvec::SmallVec<[Term; 64]> = smallvec::SmallVec::new();
+    let mut remaining = num;
+    let mut source = bytes.len();
+    while source > 0 {
+        source -= 1;
+        let b = bytes[source];
+        let unipoint = if b & 0x80 == 0 {
+            u32::from(b)
+        } else if b & 0xE0 == 0xC0 {
+            (u32::from(b & 0x1F) << 6) | u32::from(bytes[source + 1] & 0x3F)
+        } else if b & 0xF0 == 0xE0 {
+            (u32::from(b & 0xF) << 12)
+                | (u32::from(bytes[source + 1] & 0x3F) << 6)
+                | u32::from(bytes[source + 2] & 0x3F)
+        } else if b & 0xF8 == 0xF0 {
+            (u32::from(b & 0x7) << 18)
+                | (u32::from(bytes[source + 1] & 0x3F) << 12)
+                | (u32::from(bytes[source + 2] & 0x3F) << 6)
+                | u32::from(bytes[source + 3] & 0x3F)
+        } else {
+            // Ignore 2#10XXXXXX.
+            continue;
+        };
+        points.push(Term::small(i64::from(unipoint)).expect("a code point is small"));
+        remaining -= 1;
+        if remaining == 0 {
+            break;
+        }
+    }
+    points.reverse();
+    let eaten = bytes.len() - source;
+    let list = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .list_from_slice_with_tail(&points, tail)
+        .expect("HAlloc");
+    (list, num, eaten)
+}
+
+/// `{Tag, Converted, Rest}` as `finalize_list_to_list` and `do_bif_utf8_to_list` return it.
+fn tuple3(process: &mut Process, tag: arinsal_term::Atom, converted: Term, rest: Term) -> Term {
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .tuple(&[Term::atom(tag), converted, rest])
+        .expect("HAlloc")
+}
+
+/// `erts_make_integer`.
+fn make_integer(process: &mut Process, value: usize) -> Term {
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(value as u64)
+        .expect("HAlloc")
+}
+
+/// `finalize_list_to_list`: the last step of `characters_to_list`, building the list from the
+/// UTF-8 buffer, trapping to `characters_to_list_trap_2` when the reductions run out.
+// Port of erts/emulator/beam/erl_unicode.c (finalize_list_to_list), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn finalize_list_to_list(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut Process,
+    bytes: Vec<u8>,
+    rest: Term,
+    num_processed_bytes: usize,
+    num_bytes_to_process: usize,
+    num_resulting_chars: usize,
+    state: i32,
+    left: i64,
+    tail: Term,
+) -> u64 {
+    let converted = if num_bytes_to_process == 0 {
+        tail
+    } else {
+        let (converted, num_built, num_eaten) = do_utf8_to_list(
+            process,
+            num_resulting_chars,
+            &bytes[..num_bytes_to_process],
+            left as u64 as usize,
+            tail,
+        );
+        cost_to_proc(process, num_built as i64);
+        if num_built != num_resulting_chars {
+            // Work left to do.
+            let rc = RestartContext {
+                bytes,
+                num_processed_bytes: num_processed_bytes + num_eaten,
+                num_bytes_to_process: num_bytes_to_process - num_eaten,
+                num_resulting_chars: num_resulting_chars - num_built,
+                state,
+            };
+            process.heap.abi.fcalls = 0;
+            let mref = make_magic_bin_for_restart(process, rc);
+            let trap = bif_trap(
+                process,
+                CHARACTERS_TO_LIST_TRAP_2,
+                vec![mref, rest, converted],
+            );
+            return bif_ret(c_p, i, Err(trap));
+        }
+        converted
+    };
+    // No more trapping: the temporary array is released (`free_restart`).
+    drop(bytes);
+    let ret = if state == ERTS_UTF8_INCOMPLETE {
+        tuple3(process, atoms::INCOMPLETE, converted, rest)
+    } else if state == ERTS_UTF8_ERROR {
+        tuple3(process, atoms::ERROR, converted, rest)
+    } else {
+        converted
+    };
+    crate::native_hooks::raw(ret)
+}
+
+/// `build_list_return`.
+// Port of erts/emulator/beam/erl_unicode.c (build_list_return), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn build_list_return(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut Process,
+    bytes: Vec<u8>,
+    state: &BuildState<'_>,
+    rest_term: Term,
+    latin1: Term,
+    left: i64,
+) -> u64 {
+    let left = if left <= 0 { 1 } else { left };
+    let (pos, characters, err, num_leftovers) =
+        (state.pos, state.characters, state.err, state.num_leftovers);
+    let leftover = &state.leftover[..num_leftovers];
+    let mut rest_term = rest_term;
+    if err {
+        if num_leftovers > 0 {
+            let leftover_bin = binary(process, leftover);
+            rest_term = cons(process, rest_term, Term::NIL);
+            rest_term = cons(process, leftover_bin, rest_term);
+        }
+        return finalize_list_to_list(
+            c_p,
+            i,
+            process,
+            bytes,
+            rest_term,
+            0,
+            pos,
+            characters,
+            ERTS_UTF8_ERROR,
+            left,
+            Term::NIL,
+        );
+    }
+    if rest_term == Term::NIL && num_leftovers != 0 {
+        let leftover_bin = binary(process, leftover);
+        let state = if check_leftovers(leftover) != 0 {
+            ERTS_UTF8_ERROR
+        } else {
+            ERTS_UTF8_INCOMPLETE
+        };
+        return finalize_list_to_list(
+            c_p,
+            i,
+            process,
+            bytes,
+            leftover_bin,
+            0,
+            pos,
+            characters,
+            state,
+            left,
+            Term::NIL,
+        );
+    }
+    if rest_term != Term::NIL {
+        // Trap.
+        if num_leftovers > 0 {
+            let rest_bin = binary(process, leftover);
+            rest_term = cons(process, rest_bin, rest_term);
+        }
+        process.heap.abi.fcalls = 0;
+        let rc = RestartContext {
+            bytes,
+            num_processed_bytes: 0,
+            num_bytes_to_process: pos,
+            num_resulting_chars: characters,
+            state: ERTS_UTF8_OK,
+        };
+        let mref = make_magic_bin_for_restart(process, rc);
+        let trap = bif_trap(
+            process,
+            CHARACTERS_TO_LIST_TRAP_1,
+            vec![mref, rest_term, latin1],
+        );
+        return bif_ret(c_p, i, Err(trap));
+    }
+    finalize_list_to_list(
+        c_p,
+        i,
+        process,
+        bytes,
+        Term::NIL,
+        0,
+        pos,
+        characters,
+        ERTS_UTF8_OK,
+        left,
+        Term::NIL,
+    )
+}
+
+/// `unicode:characters_to_list/2`.
+// Port of erts/emulator/beam/erl_unicode.c (unicode_characters_to_list_2), OTP-29.1.1.
+pub(crate) extern "C" fn unicode_characters_to_list_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [arg1, arg2] = crate::bif_table::bif_args::<2>(reg);
+    let latin1 = if arg2 == Term::atom(atoms::LATIN1) {
+        true
+    } else if arg2 == Term::atom(atoms::UNICODE) || arg2 == Term::atom(atoms::UTF8) {
+        false
+    } else {
+        let trap = bif_trap(process, CHARACTERS_TO_LIST_INT, vec![arg1, arg2]);
+        return bif_ret(c_p, i, Err(trap));
+    };
+    if is_bitstring(arg1) && !latin1 {
+        // Optimized behaviour for this case: `utf8_to_list`.
+        if aligned_binary_size(arg1) < 0 {
+            return bif_ret(c_p, i, Err(badarg()));
+        }
+        return do_bif_utf8_to_list(
+            c_p,
+            i,
+            process,
+            arg1,
+            0,
+            0,
+            0,
+            ERTS_UTF8_ANALYZE_MORE,
+            Term::NIL,
+        );
+    }
+    let (need, cost_of_utf8_need) = utf8_need(arg1, latin1);
+    if need < 0 {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    let mut bytes = vec![0u8; need as usize];
+    cost_to_proc(process, simple_loops_to_common(cost_of_utf8_need));
+    let mut left = allowed_iterations(process) - simple_loops_to_common(cost_of_utf8_need);
+    if left <= 0 {
+        // Simplified: let everything be set up by setting left to 1.
+        left = 1;
+    }
+    let sleft = left;
+    let mut state = BuildState {
+        target: &mut bytes,
+        pos: 0,
+        characters: 0,
+        left,
+        err: false,
+        leftover: [0; 4],
+        num_leftovers: 0,
+    };
+    let rest_term = do_build_utf8(process, arg1, &mut state, latin1);
+    cost_to_proc(process, sleft - state.left);
+    let (pos, characters, left_after, err, leftover, num_leftovers) = (
+        state.pos,
+        state.characters,
+        state.left,
+        state.err,
+        state.leftover,
+        state.num_leftovers,
+    );
+    let state = BuildState {
+        target: &mut [],
+        pos,
+        characters,
+        left: left_after,
+        err,
+        leftover,
+        num_leftovers,
+    };
+    build_list_return(c_p, i, process, bytes, &state, rest_term, arg2, left_after)
+}
+
+/// `do_bif_utf8_to_list`: a plain UTF-8 binary is analyzed from its start while the result is
+/// built from the end of the accepted part, trapping in either phase.
+// Port of erts/emulator/beam/erl_unicode.c (do_bif_utf8_to_list), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn do_bif_utf8_to_list(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut Process,
+    orig_bin: Term,
+    num_processed_bytes: usize,
+    mut num_bytes_to_process: usize,
+    mut num_resulting_chars: usize,
+    mut state: i32,
+    tail: Term,
+) -> u64 {
+    let Some(bytes) = aligned_bytes(orig_bin) else {
+        let ret = tuple3(process, atoms::ERROR, Term::NIL, orig_bin);
+        return crate::native_hooks::raw(ret);
+    };
+    let size = bytes.len();
+    let mut left = allowed_iterations(process);
+    if state == ERTS_UTF8_ANALYZE_MORE {
+        let (analyzed, end, numchar) =
+            analyze_utf8(&bytes[num_bytes_to_process..], Some(&mut left));
+        state = analyzed;
+        cost_to_proc(process, numchar as i64);
+        num_resulting_chars += numchar;
+        num_bytes_to_process += end;
+        if state == ERTS_UTF8_ANALYZE_MORE {
+            let epos = make_integer(process, num_bytes_to_process);
+            let enumchar = make_integer(process, num_resulting_chars);
+            process.heap.abi.fcalls = 0;
+            let trap = bif_trap(
+                process,
+                CHARACTERS_TO_LIST_TRAP_3,
+                vec![orig_bin, epos, enumchar],
+            );
+            return bif_ret(c_p, i, Err(trap));
+        }
+    }
+    // Everything is analyzed: build.
+    let converted = if num_bytes_to_process == 0 {
+        tail
+    } else {
+        let (list, num_built, num_eaten) = do_utf8_to_list(
+            process,
+            num_resulting_chars,
+            &bytes[..num_bytes_to_process],
+            left as u64 as usize,
+            tail,
+        );
+        cost_to_proc(process, num_built as i64);
+        if num_built != num_resulting_chars {
+            let new_chars = make_integer(process, num_resulting_chars - num_built);
+            let new_bytes = make_integer(process, num_bytes_to_process - num_eaten);
+            let new_processed = make_integer(process, num_processed_bytes + num_eaten);
+            let state_term = Term::small(i64::from(state)).expect("a small state");
+            let trap_tuple = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+                .tuple(&[
+                    orig_bin,
+                    new_processed,
+                    new_bytes,
+                    new_chars,
+                    state_term,
+                    list,
+                ])
+                .expect("HAlloc");
+            process.heap.abi.fcalls = 0;
+            let trap = bif_trap(process, CHARACTERS_TO_LIST_TRAP_4, vec![trap_tuple]);
+            return bif_ret(c_p, i, Err(trap));
+        }
+        list
+    };
+    // No more trapping: build the rest binary if there is one.
+    let b_sz = size - (num_bytes_to_process + num_processed_bytes);
+    let mut rest = Term::NIL;
+    if b_sz != 0 {
+        let offset = num_bytes_to_process + num_processed_bytes;
+        rest = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+            .sub_binary(orig_bin, offset * 8, b_sz * 8)
+            .expect("HAlloc");
+    }
+    let error = |process: &mut Process, converted: Term, rest: Term| {
+        let ret = tuple3(process, atoms::ERROR, converted, rest);
+        crate::native_hooks::raw(ret)
+    };
+    if state == ERTS_UTF8_INCOMPLETE {
+        let from = num_bytes_to_process + num_processed_bytes;
+        if check_leftovers(&bytes[from..from + b_sz]) != 0 {
+            return error(process, converted, rest);
+        }
+        let ret = tuple3(process, atoms::INCOMPLETE, converted, rest);
+        return crate::native_hooks::raw(ret);
+    }
+    if state == ERTS_UTF8_ERROR {
+        return error(process, converted, rest);
+    }
+    crate::native_hooks::raw(converted)
+}
+
+/// `characters_to_list_trap_1/3`.
+// Port of erts/emulator/beam/erl_unicode.c (characters_to_list_trap_1), OTP-29.1.1.
+pub(crate) extern "C" fn characters_to_list_trap_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [mref, rest, encoding] = crate::bif_table::bif_args::<3>(reg);
+    let latin1 = encoding == Term::atom(atoms::LATIN1);
+    let taken = mref.with_magic_payload::<RestartHolder, _>(|holder| {
+        let mut rc = holder.lock().ok()?;
+        Some((
+            std::mem::take(&mut rc.bytes),
+            rc.num_bytes_to_process,
+            rc.num_resulting_chars,
+        ))
+    });
+    let Some(Some((mut bytes, pos, characters))) = taken else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let sleft = allowed_iterations(process);
+    let mut state = BuildState {
+        target: &mut bytes,
+        pos,
+        characters,
+        left: sleft,
+        err: false,
+        leftover: [0; 4],
+        num_leftovers: 0,
+    };
+    let rest_term = do_build_utf8(process, rest, &mut state, latin1);
+    cost_to_proc(process, sleft - state.left);
+    let (pos, characters, left, err, leftover, num_leftovers) = (
+        state.pos,
+        state.characters,
+        state.left,
+        state.err,
+        state.leftover,
+        state.num_leftovers,
+    );
+    let state = BuildState {
+        target: &mut [],
+        pos,
+        characters,
+        left,
+        err,
+        leftover,
+        num_leftovers,
+    };
+    build_list_return(c_p, i, process, bytes, &state, rest_term, encoding, left)
+}
+
+/// `characters_to_list_trap_2/3`.
+// Port of erts/emulator/beam/erl_unicode.c (characters_to_list_trap_2), OTP-29.1.1.
+pub(crate) extern "C" fn characters_to_list_trap_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [mref, rest, tail] = crate::bif_table::bif_args::<3>(reg);
+    let taken = mref.with_magic_payload::<RestartHolder, _>(|holder| {
+        let mut rc = holder.lock().ok()?;
+        Some((
+            std::mem::take(&mut rc.bytes),
+            rc.num_processed_bytes,
+            rc.num_bytes_to_process,
+            rc.num_resulting_chars,
+            rc.state,
+        ))
+    });
+    let Some(Some((bytes, processed, to_process, chars, state))) = taken else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let left = allowed_iterations(process);
+    finalize_list_to_list(
+        c_p, i, process, bytes, rest, processed, to_process, chars, state, left, tail,
+    )
+}
+
+/// `characters_to_list_trap_3/3`: analyzing is still to be done.
+// Port of erts/emulator/beam/erl_unicode.c (characters_to_list_trap_3), OTP-29.1.1.
+pub(crate) extern "C" fn characters_to_list_trap_3(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [bin, analyzed, chars] = crate::bif_table::bif_args::<3>(reg);
+    let (Some(analyzed), Some(chars)) = (
+        analyzed.as_small().and_then(|n| usize::try_from(n).ok()),
+        chars.as_small().and_then(|n| usize::try_from(n).ok()),
+    ) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    do_bif_utf8_to_list(
+        c_p,
+        i,
+        process,
+        bin,
+        0,
+        analyzed,
+        chars,
+        ERTS_UTF8_ANALYZE_MORE,
+        Term::NIL,
+    )
+}
+
+/// `characters_to_list_trap_4/1`: analyzing is done and the building trapped.
+// Port of erts/emulator/beam/erl_unicode.c (characters_to_list_trap_4), OTP-29.1.1.
+pub(crate) extern "C" fn characters_to_list_trap_4(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [state_tuple] = crate::bif_table::bif_args::<1>(reg);
+    let element = |index: usize| arinsal_bifs::tuple_element(state_tuple, index).ok();
+    let (
+        Some(orig_bin),
+        Some(processed),
+        Some(to_process),
+        Some(chars),
+        Some(last_state),
+        Some(tail),
+    ) = (
+        element(0),
+        element(1).and_then(|t| t.as_small()),
+        element(2).and_then(|t| t.as_small()),
+        element(3).and_then(|t| t.as_small()),
+        element(4).and_then(|t| t.as_small()),
+        element(5),
+    )
+    else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    do_bif_utf8_to_list(
+        c_p,
+        i,
+        process,
+        orig_bin,
+        processed as usize,
+        to_process as usize,
+        chars as usize,
+        last_state as i32,
+        tail,
+    )
+}

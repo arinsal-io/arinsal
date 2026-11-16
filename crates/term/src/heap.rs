@@ -4044,7 +4044,12 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             .collect();
         self.list_from_slice_with_tail(&chars, tail)
     }
-    fn list_from_slice_with_tail(&mut self, values: &[Term], end: Term) -> Result<Term, TermError> {
+    /// Build a list of `values` ending in `end` from one reservation of `2 * n` words.
+    pub fn list_from_slice_with_tail(
+        &mut self,
+        values: &[Term],
+        end: Term,
+    ) -> Result<Term, TermError> {
         if values.is_empty() {
             return Ok(end);
         }
