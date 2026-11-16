@@ -385,15 +385,6 @@ impl Executor {
 /// sites and trap continuations directly, an interpreted switch-out through the
 /// executor epilogue, a spawn or hibernate when it fills the file.
 pub(crate) fn switched_out_live(process: &Process) -> usize {
-    // A trap whose arguments are GC roots of its own keeps no live X registers.
-    if process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.bif_trap.as_ref())
-        .is_some_and(|trap| trap.args_are_roots())
-    {
-        return 0;
-    }
     process.saved_arity()
 }
 

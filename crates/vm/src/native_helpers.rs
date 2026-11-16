@@ -1165,9 +1165,6 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     if export.direct_ets.is_some() {
         return Some(crate::bif_table::bif!(direct_bif_light));
     }
-    if export.light_trap_bif.is_some() {
-        return Some(crate::bif_table::bif!(trap_bif_light));
-    }
     let bif = export.bif.is_some()
         || matches!(
             export.class,
@@ -1551,32 +1548,11 @@ pub(crate) extern "C" fn direct_bif_light(
     0
 }
 
-/// A trapping BIF. A value returns here; a trap is `THE_NON_VALUE`.
-pub(crate) extern "C" fn trap_bif_light(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, regs) else {
-        return 0;
-    };
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    let Some(entry) = export.light_trap_bif else {
-        return park_executor(process, export, identity, false);
-    };
-    call_trap_bif(process, registers, identity as usize, export, entry, false).unwrap_or(0)
-}
-
 // `export_call`: reached through an export entry, whose BIF trampoline charges the call one
 // reduction (erts/emulator/beam/jit/arm/instr_bif.cpp:399, OTP-29.1.1); a light BIF call
 // site has already charged it.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1:
-// a plain BIF is called straight away; save_calls, tracing, trapping BIFs and the
+// a plain BIF is called straight away; save_calls, tracing and the
 // breakpoint and send identities branch off to the slow path.
 #[inline(always)]
 fn invoke_dispatch_bif(
@@ -1607,7 +1583,6 @@ fn invoke_dispatch_bif(
                 || crate::trace_bp::any_pattern());
         if let Some(bif) = export.light_bif
             && !export_checks
-            && !export.trap_entry
         {
             return Some(call_plain_bif(process, registers, export, bif, export_call));
         }
@@ -1624,7 +1599,6 @@ fn invoke_dispatch_bif(
         && !(export_call
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
                 || crate::trace_bp::any_pattern()))
-        && !export.trap_entry
         // Port of erl_gc.c:987-990: an on-heap queue with signals still in the
         // outer queue is fetched before the collection. That fetch needs the
         // scheduler context, so this call leaves native code. An empty outer
@@ -1636,86 +1610,7 @@ fn invoke_dispatch_bif(
     {
         return Some(raw);
     }
-    // The export trampoline has a separate interpreted-call sentinel. Only the light-BIF
-    // fragment turns THE_NON_VALUE with TRAP into `context_switch_simplified`.
-    if let Some(export) = export
-        && let Some(entry) = export.light_trap_bif
-        && !export_call
-        && registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
-        && !crate::trace_bp::any_pattern()
-        && process
-            .cold
-            .as_ref()
-            .is_none_or(|cold| cold.bif_trap.is_none())
-    {
-        return call_trap_bif(process, registers, identity, export, entry, export_call);
-    }
     invoke_dispatch_bif_slow(process, registers, identity, site, export, export_call)
-}
-
-/// Calls a trapping BIF straight from native code; `None` when it trapped.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared), OTP-29.1.1:
-// the BIF's value or error is handled like any light BIF's; THE_NON_VALUE with
-// `freason == TRAP` pushes the return address and context-switches to `c_p->i`, which the
-// scheduler resumes from the trap state.
-#[inline(never)]
-fn call_trap_bif(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
-    export: ExportDispatch,
-    entry: &'static crate::bif_traps::Entry,
-    export_call: bool,
-) -> Option<u64> {
-    if export_call {
-        charge_bif_reductions(process, 1);
-    }
-    let arity = usize::from(export.arity);
-    let mut args = [Term::NIL; 4];
-    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-    let callee = (export.module_atom, export.function_atom);
-    let outcome = crate::bif_traps::call_light(process, entry, identity, callee, &args[..arity]);
-    match outcome {
-        crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
-            process,
-            registers,
-            export,
-            arity,
-            export_call,
-            result,
-        )),
-        crate::bif_traps::LightTrap::Trapped => arm_light_trap(process),
-    }
-}
-
-/// A trapping BIF's result. A light call's value returns straight to the fragment, which
-/// tests the collection itself (instr_bif.cpp:488-523); an export call and an error take
-/// the collecting path.
-#[inline(always)]
-fn light_trap_result(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: ExportDispatch,
-    arity: usize,
-    export_call: bool,
-    result: Result<Term, arinsal_bifs::BifError>,
-) -> u64 {
-    match result {
-        Ok(value) if !export_call => crate::native_hooks::raw(value),
-        result => plain_bif_result(process, registers, export, arity, result),
-    }
-}
-
-/// The trap state of a light BIF that yielded (`BIF_TRAP`): the caller resumes through the
-/// continuation export when the scheduler runs the process again.
-// Port of erts/emulator/beam/bif.h:316-326 (ERTS_BIF_PREP_TRAP), OTP-29.1.1.
-fn arm_light_trap(process: &mut crate::Process) -> Option<u64> {
-    debug_assert_native_heap(process);
-    // BIF_TRAP sets c_p->i to beam_bif_export_trap. The fragment loads that
-    // address and context-switches; schedule-in calls the continuation export.
-    crate::bif_traps::arm_export_trap(process);
-    process.heap.abi.exc.freason = 1 << 10;
-    None
 }
 
 /// Checks heap cursors and the pending trap arguments before a trap changes execution tiers.

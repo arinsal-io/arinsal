@@ -24,86 +24,13 @@ impl<T> std::ops::Deref for TrapContext<T> {
     }
 }
 
-/// A continuation that carries everything in its arguments: OTP allocates no context.
-pub(crate) struct NoContext;
-
 // One named destructor per trap context, as each erts trap passes its own to
 // erts_create_magic_binary (bif.c, erl_bif_binary.c, external.c, erl_map.c, ...).
 arinsal_term::magic_payload!(
-    NoContext => no_context_destructor,
     TrapContext<arinsal_bifs::Phash2Cont> => make_hash2_destructor,
     TrapContext<crate::dist::DsigSendContext> => dsig_send_context_destructor,
 
 );
-
-pub(crate) enum HandlerResult {
-    Done {
-        value: Term,
-        reductions: u32,
-    },
-    Yield {
-        continuation: &'static str,
-        state: MagicBin,
-        reductions: u32,
-    },
-}
-
-impl HandlerResult {
-    /// The charge the handler reported for its run.
-    pub(crate) fn reductions(&self) -> u32 {
-        match self {
-            Self::Done { reductions, .. } | Self::Yield { reductions, .. } => *reductions,
-        }
-    }
-}
-
-/// How a trapped BIF keeps its heap terms across a collection that runs while it is parked.
-// Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn) and erl_gc.c (F_DISABLE_GC,
-// erts_set_gc_state), OTP-29.1.1: a BIF continuation either keeps every heap term in the
-// arguments of its trap (the X registers, `c_p->arity`), which the collector updates, or it
-// keeps process-heap pointers in its off-heap state and disables collection while it is parked.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TrapGc {
-    /// The state may hold heap terms; the process is not collected while the trap is parked.
-    Disabled,
-    /// The arguments are the live X registers of the continuation export (`gc_live`).
-    LiveRegisters,
-}
-
-/// The one table of continuations that stay collectable while parked. Every other
-/// continuation disables collection, like erts' `erts_set_gc_state(c_p, 0)` before a
-/// state-carrying BIF_TRAP.
-pub(crate) fn trap_gc_policy(continuation: &str) -> TrapGc {
-    if continuation == "erlang:characters_to_utf8_trap/4" {
-        TrapGc::LiveRegisters
-    } else {
-        TrapGc::Disabled
-    }
-}
-
-/// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
-/// calls (erts BIF_TRAP*: `c_p->i` is the export, the arguments are its X registers).
-pub(crate) enum ResumeResult {
-    Handler(HandlerResult),
-    Export(crate::ExportTrap),
-}
-
-pub(crate) type Handler = fn(
-    &mut Process,
-    &[Term],
-    Option<&MagicBin>,
-    Option<arinsal_sched::Pid>,
-    bool,
-) -> Result<HandlerResult, BifError>;
-
-/// A trapping BIF and the continuation export it traps to.
-pub(crate) struct Entry {
-    module: &'static str,
-    function: &'static str,
-    arity: u8,
-    continuation: &'static str,
-    handler: Handler,
-}
 
 /// `dsend_continue_trap_export`.
 pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
@@ -123,11 +50,6 @@ fn magic_binary_state<T: arinsal_term::MagicPayload>(
         c_payload_size,
         arinsal_bifs::next_ref_words(),
     )
-}
-
-/// OTP keeps these continuations in BIF arguments/registers and allocates no magic binary.
-fn argument_trap_state<T: arinsal_term::MagicPayload>(payload: T) -> MagicBin {
-    MagicBin::with_orig_size(payload, 0)
 }
 
 /// Build the continuation argument that owns an erts magic binary.
@@ -183,57 +105,6 @@ fn clear_export_trap(process: &mut Process) {
     }
 }
 
-const ENTRIES: &[Entry] = &[];
-
-/// Key of a trapped call made through `apply` when the caller does not import the BIF.
-pub(crate) const APPLY_TRAP_KEY: usize = usize::MAX;
-
-/// Execute or resume a trapping BIF named by module and function; `key` identifies the call
-/// at the current call site (an import index, or [`APPLY_TRAP_KEY`]).
-/// Whether `module:function/arity` is a BIF that may trap to a continuation.
-pub(crate) fn traps(module: &str, function: &str, arity: u8) -> bool {
-    lookup_entry(module, function, usize::from(arity)).is_some()
-}
-
-/// Index of [`ENTRIES`] by export name, the way erts finds an export by `{M, F, A}`: the
-/// first entry with that name, else the first whose continuation export has it.
-struct EntryIndex {
-    direct: HashMap<(&'static str, &'static str, usize), usize>,
-    continuation: HashMap<(&'static str, &'static str, usize), usize>,
-}
-
-fn entry_index() -> &'static EntryIndex {
-    static INDEX: OnceLock<EntryIndex> = OnceLock::new();
-    INDEX.get_or_init(|| {
-        let mut index = EntryIndex {
-            direct: HashMap::new(),
-            continuation: HashMap::new(),
-        };
-        for (position, entry) in ENTRIES.iter().enumerate() {
-            index
-                .direct
-                .entry((entry.module, entry.function, usize::from(entry.arity)))
-                .or_insert(position);
-            if let Some((module, function, arity)) = continuation_parts(entry.continuation) {
-                index
-                    .continuation
-                    .entry((module, function, arity))
-                    .or_insert(position);
-            }
-        }
-        index
-    })
-}
-
-fn lookup_entry(module: &str, function: &str, arity: usize) -> Option<&'static Entry> {
-    let index = entry_index();
-    index
-        .direct
-        .get(&(module, function, arity))
-        .or_else(|| index.continuation.get(&(module, function, arity)))
-        .map(|&position| &ENTRIES[position])
-}
-
 /// The export a trap continues in. erts `BIF_TRAP` names the trap `Export*` directly; here the
 /// name-keyed lookup is done once, when the trap is installed, and a resume reads the result.
 pub(crate) struct ContinuationTarget {
@@ -244,8 +115,6 @@ pub(crate) struct ContinuationTarget {
     pub(crate) arity: usize,
     pub(crate) module_atom: arinsal_term::Atom,
     pub(crate) function_atom: arinsal_term::Atom,
-    /// The Rust handler of the continuation, absent when it is an Erlang export.
-    pub(crate) entry: Option<&'static Entry>,
     /// `trampoline.bif.address` of a hidden trap export (`erts_init_trap_export`).
     pub(crate) trap_function: Option<usize>,
 }
@@ -256,12 +125,6 @@ impl std::fmt::Debug for ContinuationTarget {
             .field("continuation", &self.continuation)
             .field("arity", &self.arity)
             .finish()
-    }
-}
-
-impl ContinuationTarget {
-    fn is(&self, module: &str, function: &str, arity: usize) -> bool {
-        self.arity == arity && self.function == function && self.module == module
     }
 }
 
@@ -310,7 +173,6 @@ pub(crate) fn continuation_target(continuation: &'static str) -> &'static Contin
             function_atom: global_atoms()
                 .intern(function)
                 .expect("continuation function atom"),
-            entry: lookup_entry(module, function, arity),
             trap_function: u8::try_from(arity)
                 .ok()
                 .and_then(|arity| crate::bif_table::trap_function(module, function, arity)),
@@ -337,40 +199,8 @@ pub(crate) fn take_export_trap(process: &mut Process) -> Option<crate::ExportTra
     Some(crate::ExportTrap::new(process, pending.continuation, args))
 }
 
-/// Run the trap continuation export. `beam_bif_export_trap` does this on schedule-in:
-/// the continuation is an ordinary call, and only that call may trap again.
-pub(crate) fn run_trapped_export(
-    process: &mut Process,
-    ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-) -> Option<Result<ResumeResult, VmError>> {
-    let target = process.cold.as_ref()?.bif_trap.as_ref()?.target;
-    let (module, function, arity) = (target.module, target.function, target.arity);
-    // An Erlang export has no Rust handler: the trap calls it with the saved arguments.
-    // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
-    // arguments), OTP-29.1.1.
-    if target.entry.is_none() {
-        return take_export_trap(process).map(|trap| Ok(ResumeResult::Export(trap)));
-    }
-    let args = [
-        process.x.first().copied().unwrap_or(Term::NIL),
-        process.x.get(1).copied().unwrap_or(Term::NIL),
-        process.x.get(2).copied().unwrap_or(Term::NIL),
-        Term::NIL,
-    ];
-    execute_named(
-        process,
-        module,
-        function,
-        bif_export_trap_pc(),
-        arity,
-        args,
-        ctx,
-    )
-    .map(|result| result.map(ResumeResult::Handler))
-}
-
 /// Install the trap state of a BIF that traps to an Erlang export. The scheduler then runs
-/// the export at `beam_bif_export_trap`, the way an export trap of a Rust continuation runs.
+/// the export at `beam_bif_export_trap` on schedule-in.
 // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: up to four arguments in X0-X3),
 // OTP-29.1.1.
 /// `schedule_out` is whether the context switch of the trap (`context_switch_simplified`) is
@@ -401,12 +231,9 @@ pub(crate) fn install_export_trap(
         import,
         continuation: trap.target.continuation,
         target: trap.target,
-        state: argument_trap_state(NoContext),
-        state_term: None,
         gc_was_enabled,
         arity,
         callee,
-        root_args: 0,
         args: {
             let mut saved = [Term::NIL; 4];
             saved[..arity].copy_from_slice(&trap.args);
@@ -423,30 +250,6 @@ pub(crate) fn continuation_parts(
     Some((module, function, arity_text.parse().ok()?))
 }
 
-/// The BIF a trap error is blamed on. `ERTS_BIF_ERROR_TRAPPED` names `sp->bif`, the
-/// export that first trapped, not the continuation that was running when it failed.
-fn original_trap_report<'a>(
-    process: &Process,
-    module_name: &'a str,
-    function_name: &'a str,
-    arity: usize,
-    continuation_resume: bool,
-) -> (&'a str, &'a str, usize) {
-    if continuation_resume
-        && let Some(pending) = process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.bif_trap.as_ref())
-    {
-        let module = global_atoms().text(pending.callee.0).unwrap_or(module_name);
-        let function = global_atoms()
-            .text(pending.callee.1)
-            .unwrap_or(function_name);
-        return (module, function, pending.arity);
-    }
-    (module_name, function_name, arity)
-}
-
 /// Point `c_p->i` at `beam_bif_export_trap` and record the continuation export's arity.
 // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1.
 pub(crate) fn arm_export_trap(process: &mut Process) {
@@ -459,445 +262,6 @@ pub(crate) fn arm_export_trap(process: &mut Process) {
         process.heap.abi.arity = arity as u8;
     }
     process.heap.abi.i = bif_export_trap as *const u8 as *const _;
-}
-
-pub(crate) fn execute_named(
-    process: &mut Process,
-    module_name: &str,
-    function_name: &str,
-    import: usize,
-    arity: usize,
-    mut args: [Term; 4],
-    mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-) -> Option<Result<HandlerResult, VmError>> {
-    let gc_enabled_on_entry = process.heap.gc_enabled;
-    let pending_site = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.bif_trap.as_ref())
-        .map(|pending| {
-            (
-                (pending.caller_module, pending.caller_ip) == process.trap_site(),
-                pending.import == import,
-            )
-        });
-    // The continuation export is an ordinary call of its own MFA. It is not a retry of
-    // the call site that first trapped, so the site check does not name it.
-    let continuation_resume = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.bif_trap.as_ref())
-        .is_some_and(|pending| pending.target.is(module_name, function_name, arity));
-    let pending_matches = pending_site == Some((true, true)) || continuation_resume;
-    if pending_site.is_some_and(|(same_site, _)| !same_site) && !continuation_resume {
-        // A trap continuation belongs to exactly one interrupted call. An
-        // exception can redirect control without re-entering that call, so
-        // discard its state before dispatching a call from another site. The
-        // same site may first dispatch `apply` before reaching the trapped BIF.
-        if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
-            process.set_gc_enabled(pending.gc_was_enabled);
-        }
-    }
-    // A resume names its handler through the trap, the way BIF_TRAP names the `Export*`.
-    let entry = if continuation_resume {
-        process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.bif_trap.as_ref())
-            .and_then(|pending| pending.target.entry)
-    } else {
-        lookup_entry(module_name, function_name, arity)
-    };
-    let pending = pending_matches
-        .then(|| {
-            process
-                .cold
-                .as_ref()
-                .and_then(|cold| cold.bif_trap.as_ref())
-        })
-        .flatten();
-    let gc_was_enabled = pending.map_or(gc_enabled_on_entry, |pending| pending.gc_was_enabled);
-    let (handler, state) = if let Some(pending) = pending {
-        let Some(entry) = entry else {
-            if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
-                process.set_gc_enabled(pending.gc_was_enabled);
-            }
-            return Some(Err(VmError::Unsupported(
-                "missing BIF continuation entry".into(),
-            )));
-        };
-        if entry.continuation != pending.continuation {
-            if pending_site == Some((true, true))
-                && !continuation_resume
-                && pending.target.entry.is_none()
-                && let Some(Ok(ResumeResult::Export(trap))) =
-                    run_trapped_export(process, ctx.as_deref_mut())
-            {
-                return Some(Err(VmError::TrapExport(trap)));
-            }
-            if let Some(pending) = process.take_work(|w| w.bif_trap.take()) {
-                process.set_gc_enabled(pending.gc_was_enabled);
-            }
-            return Some(Err(VmError::Unsupported(
-                "BIF continuation export mismatch".into(),
-            )));
-        }
-        // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
-        // arguments), OTP-29.1.1: a resumed call takes its arguments from the trap state.
-        args = pending.args;
-        (entry.handler, Some(MagicBin::clone(&pending.state)))
-    } else {
-        (entry?.handler, None)
-    };
-    let pid = ctx.as_deref().map(|run| run.pid());
-    let resumed = state.is_some();
-    // The continuation export has its own arity (binary_copy_trap/3).
-    // The handler still sees the original BIF's arguments, which the trap state kept.
-    let call_arity = if resumed {
-        process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.bif_trap.as_ref())
-            .map(|pending| pending.arity)
-            .unwrap_or(arity)
-    } else {
-        arity
-    };
-    let fcalls_in = process.heap.abi.fcalls;
-    let result = handler(
-        process,
-        &args[..call_arity.min(args.len())],
-        state.as_ref(),
-        pid,
-        gc_was_enabled,
-    );
-    process.trap_work = fcalls_in.saturating_sub(process.heap.abi.fcalls).max(0);
-    // Captured before the match drops the trap state. A continuation failure is still
-    // the original BIF's error (erl_iolist.c ERTS_BIF_ERROR_TRAPPED1(c_p, reason, sp->bif, sp->arg)).
-    let report = original_trap_report(
-        process,
-        module_name,
-        function_name,
-        arity,
-        continuation_resume,
-    );
-    Some(match result {
-        Err(error) => {
-            process.slice_mut().bif_trap = None;
-            clear_export_trap(process);
-            process.set_gc_enabled(gc_was_enabled);
-            // Re-enabling GC may collect: the X registers, not the copies, hold the live
-            // arguments.
-            let args = call_args(process, &args, report.2, resumed);
-            Err(exceptions::bif_error(
-                process, report.0, report.1, &args, error,
-            ))
-        }
-        Ok(HandlerResult::Done { value, reductions }) => {
-            process.slice_mut().bif_trap = None;
-            clear_export_trap(process);
-            process.set_gc_enabled(gc_was_enabled);
-            charge(process, ctx, reductions);
-            Ok(HandlerResult::Done { value, reductions })
-        }
-        Ok(HandlerResult::Yield {
-            continuation,
-            state,
-            reductions,
-        }) => {
-            let carried_state_term = resumed
-                .then(|| {
-                    process
-                        .cold
-                        .as_ref()
-                        .and_then(|cold| cold.bif_trap.as_ref())
-                        .filter(|pending| MagicBin::ptr_eq(&pending.state, &state))
-                        .map(|pending| pending.state_term)
-                })
-                .flatten();
-            let state_term = if let Some(state_term) = carried_state_term {
-                state_term
-            } else {
-                match trap_state_term(process, &state) {
-                    Ok(state_term) => state_term,
-                    Err(_) => {
-                        process.slice_mut().bif_trap = None;
-                        clear_export_trap(process);
-                        process.set_gc_enabled(gc_was_enabled);
-                        let args = call_args(process, &args, report.2, resumed);
-                        return Some(Err(exceptions::bif_error(
-                            process,
-                            report.0,
-                            report.1,
-                            &args,
-                            BifError::SystemLimit,
-                        )));
-                    }
-                }
-            };
-            // Which continuations stay collectable while parked is decided in one place,
-            // `trap_gc_policy`; every other one disables collection as erts does before a
-            // state-carrying BIF_TRAP (a ptab list or code-permission waiter keeps no heap
-            // term of its own, erts runs GC tasks of such a suspended process).
-            let gc_policy = trap_gc_policy(continuation);
-            if gc_policy == TrapGc::Disabled {
-                process.set_gc_enabled(false);
-            }
-            // A later slice of the continuation must keep blaming the BIF that trapped,
-            // not the continuation export that is running now.
-            let (callee, trap_arity) = if resumed {
-                process
-                    .cold
-                    .as_ref()
-                    .and_then(|cold| cold.bif_trap.as_ref())
-                    .map(|pending| (pending.callee, pending.arity))
-                    .expect("resumed trap")
-            } else {
-                (
-                    (
-                        global_atoms().intern(module_name).expect("BIF module atom"),
-                        global_atoms()
-                            .intern(function_name)
-                            .expect("BIF function atom"),
-                    ),
-                    // BIF_TRAP keeps at most three arguments (bif.h:316-326); a four-argument
-                    // BIF such as re:internal_run/4 traps to a three-argument export.
-                    arity.min(3),
-                )
-            };
-            process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-                caller_module: process.trap_site().0,
-                caller_ip: process.trap_site().1,
-                schedule_out: false,
-                import,
-                continuation,
-                target: continuation_target(continuation),
-                state,
-                state_term,
-                gc_was_enabled,
-                arity: trap_arity,
-                callee,
-                root_args: 0,
-                args: if resumed {
-                    args
-                } else {
-                    let live = live_args(process, &args, arity.min(4));
-                    let mut saved = [Term::NIL; 4];
-                    saved[..live.len()].copy_from_slice(&live);
-                    saved
-                },
-            });
-            charge(process, ctx, reductions);
-            // Port of erts/emulator/beam/erl_gc.c (erts_gc_after_bif_call_lhf with a
-            // TRAP result collects with the trap's arguments as roots), OTP-29.1.1.
-            Ok(HandlerResult::Yield {
-                continuation,
-                state: process
-                    .cold
-                    .as_ref()
-                    .and_then(|cold| cold.bif_trap.as_ref())
-                    .map(|pending| MagicBin::clone(&pending.state))
-                    .expect("stored continuation"),
-                reductions,
-            })
-        }
-    })
-}
-
-/// The trapping BIF a light BIF call runs straight from native code.
-///
-/// `erts_debug:set_internal_state/2` traps only for `code_mod_permission` and needs the
-/// scheduler's pid for it, so it keeps the executor path.
-pub(crate) fn light_entry(module: &str, function: &str, arity: u8) -> Option<&'static Entry> {
-    if module == "erts_debug" {
-        return None;
-    }
-    ENTRIES
-        .iter()
-        .find(|entry| entry.module == module && entry.function == function && entry.arity == arity)
-}
-
-/// Outcome of a trapping BIF run from a light BIF call.
-pub(crate) enum LightTrap {
-    /// The BIF finished: its value or its error, like any light BIF's result.
-    Returned(Result<Term, BifError>),
-    /// The BIF trapped to its continuation export (`THE_NON_VALUE` with `freason == TRAP`);
-    /// the call site context-switches and the scheduler resumes it through the trap state.
-    Trapped,
-}
-
-/// Runs a trapping BIF from a light BIF call, with no trap pending for the process.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared), OTP-29.1.1:
-// a trapping BIF is called like any other BIF; one that finishes returns its value at once,
-// and one that traps (BIF_TRAP, bif.h) leaves through `context_switch_simplified` to resume
-// in its continuation export.
-pub(crate) fn call_light(
-    process: &mut Process,
-    entry: &'static Entry,
-    import: usize,
-    callee: (arinsal_term::Atom, arinsal_term::Atom),
-    args: &[Term],
-) -> LightTrap {
-    let gc_was_enabled = process.heap.gc_enabled;
-    let pid = process.self_pid;
-    let result = (entry.handler)(process, args, None, pid, gc_was_enabled);
-    finish_light(process, import, callee, args, gc_was_enabled, result)
-}
-
-/// The result of a trapping BIF's first run, as a light BIF call sees it: a value, an error,
-/// or the trap it installs (`BIF_TRAP`).
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared), OTP-29.1.1.
-pub(crate) fn finish_light(
-    process: &mut Process,
-    import: usize,
-    callee: (arinsal_term::Atom, arinsal_term::Atom),
-    args: &[Term],
-    gc_was_enabled: bool,
-    result: Result<HandlerResult, BifError>,
-) -> LightTrap {
-    let (result, reductions) = match result {
-        Err(error) => (Err(error), 0),
-        Ok(HandlerResult::Done { value, reductions }) => (Ok(value), reductions),
-        Ok(HandlerResult::Yield {
-            continuation,
-            state,
-            reductions,
-        }) => {
-            let gc_policy = trap_gc_policy(continuation);
-            if gc_policy == TrapGc::Disabled {
-                process.set_gc_enabled(false);
-            }
-            let mut saved = [Term::NIL; 4];
-            let kept = args.len().min(4);
-            saved[..kept].copy_from_slice(&args[..kept]);
-            let Ok(state_term) = trap_state_term(process, &state) else {
-                return LightTrap::Returned(Err(BifError::SystemLimit));
-            };
-            // The scheduler binds the trap to its call site when it context-switches.
-            process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-                caller_module: process.trap_site().0,
-                caller_ip: process.trap_site().1,
-                schedule_out: true,
-                import,
-                continuation,
-                target: continuation_target(continuation),
-                state,
-                state_term,
-                gc_was_enabled,
-                arity: kept,
-                callee,
-                root_args: 0,
-                args: saved,
-            });
-            charge_light(process, reductions);
-            return LightTrap::Trapped;
-        }
-    };
-    process.set_gc_enabled(gc_was_enabled);
-    charge_light(process, reductions);
-    LightTrap::Returned(result)
-}
-
-/// Charges a light trapping BIF's reductions against FCALLS (BUMP_REDS, bif.h); the call site
-/// has charged the call itself.
-pub(crate) fn charge_light(process: &mut Process, reductions: u32) {
-    process.heap.abi.fcalls = process
-        .heap
-        .abi
-        .fcalls
-        .saturating_sub(reductions.min(i32::MAX as u32) as i32)
-        .max(0);
-}
-
-/// The call's arguments as the X registers hold them now; a collection since the copies
-/// were taken has moved boxed arguments.
-fn live_args(process: &Process, copies: &[Term; 4], arity: usize) -> Vec<Term> {
-    (0..arity)
-        .map(|slot| process.x.get(slot).copied().unwrap_or(copies[slot]))
-        .collect()
-}
-
-/// The arguments for an error report: those held in the trap state on a resumed call, the live
-/// X registers on the first call.
-fn call_args(process: &Process, saved: &[Term; 4], arity: usize, resumed: bool) -> Vec<Term> {
-    if resumed {
-        saved[..arity.min(4)].to_vec()
-    } else {
-        live_args(process, saved, arity)
-    }
-}
-
-/// What one call of a trapping BIF costs the process and its scheduler slice.
-///
-/// A handler decrements the process counter itself while it works (`BUMP_REDS` through its
-/// `Ctx`), and some also return that work as the charge for `charge` to take again. The call
-/// is billed for the work once, on FCALLS, which the context switch reads as `REDS_IN -
-/// FCALLS`. A call is billed no more than the counter held, since `BUMP_REDS` stops at zero.
-pub(crate) struct TrapMeter {
-    fcalls: i32,
-    call_counted: bool,
-}
-
-impl TrapMeter {
-    /// The call is an instruction that already counted its own reduction.
-    pub(crate) fn start(
-        process: &Process,
-        _ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
-    ) -> Self {
-        Self {
-            fcalls: process.heap.abi.fcalls,
-            call_counted: true,
-        }
-    }
-
-    /// The call is the continuation export, run by the scheduler on schedule-in: its call
-    /// costs one reduction of its own.
-    pub(crate) fn start_continuation(
-        process: &Process,
-        ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
-    ) -> Self {
-        Self {
-            call_counted: false,
-            ..Self::start(process, ctx)
-        }
-    }
-
-    /// Settle the call's cost. `returned` is the charge the handler reported.
-    pub(crate) fn finish(
-        self,
-        process: &mut Process,
-        _ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-        returned: u32,
-    ) {
-        let inside = u32::try_from(process.trap_work).unwrap_or(0);
-        let held = u32::try_from(self.fcalls.max(1)).unwrap_or(1);
-        // The instruction already took the call's own reduction from FCALLS.
-        let work = inside
-            .max(returned.max(1))
-            .min(held)
-            .saturating_sub(u32::from(self.call_counted));
-        process.heap.abi.fcalls = self
-            .fcalls
-            .saturating_sub(i32::try_from(work).unwrap_or(i32::MAX))
-            .max(0);
-    }
-}
-
-// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1: the call's own reduction is
-// taken by the instruction that called the BIF (`subs FCALLS`), never added here: a traced BIF
-// call takes none, so a floor of one reduction overcharged it.
-fn charge(
-    process: &mut Process,
-    _ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-    reductions: u32,
-) {
-    let charge = reductions;
-    process.heap.abi.fcalls = process
-        .heap
-        .abi
-        .fcalls
-        .saturating_sub(charge.min(i32::MAX as u32) as i32)
-        .max(0);
 }
 
 /// `ERTS_VBUMP_ALL_REDS`: the rest of the slice is given up without being the process's own
@@ -956,6 +320,7 @@ pub(crate) fn finish_parked_dsend(process: &mut Process, sender: arinsal_sched::
 mod export_trap_tests {
     use super::*;
     use arinsal_etf::OwnedTerm;
+    use arinsal_term::TermBuilder;
 
     /// A collection between the trap and its resume must keep the trapped arguments: they are
     /// live X registers now, not state that is only valid while GC is disabled.
@@ -984,7 +349,7 @@ mod export_trap_tests {
             .collect_arg_reg(process.gc_live, &mut [], 0)
             .unwrap();
 
-        let Some(Ok(ResumeResult::Export(resumed))) = run_trapped_export(&mut process, None) else {
+        let Some(resumed) = take_export_trap(&mut process) else {
             panic!("the export trap resumes as an export call");
         };
         assert_eq!(

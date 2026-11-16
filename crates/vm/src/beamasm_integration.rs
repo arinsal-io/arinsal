@@ -136,8 +136,6 @@ pub(crate) struct DispatchTarget {
     pub bif: Option<arinsal_bifs::BifFn>,
     pub class: arinsal_loader::ImportClass,
     pub native_bits: usize,
-    /// The BIF has a continuation entry in `bif_traps`; others skip that table on every call.
-    pub trap_entry: bool,
     /// The MFA is a light (not heap) BIF in the BIF table (erts `Export.bif_number` with the
     /// light-BIF kind), looked up once at intern.
     pub light_kind: bool,
@@ -154,9 +152,6 @@ pub(crate) struct DispatchTarget {
     /// The process BIF a light BIF call runs straight away, for a native that needs only its
     /// process (see `natives::ProcessBif`); the executor still runs it for interpreted code.
     pub light_process_bif: Option<crate::natives::ProcessBif>,
-    /// The trapping BIF a light BIF call runs straight away; it leaves native code only when
-    /// it traps (see `bif_traps::call_light`).
-    pub(crate) light_trap_bif: Option<&'static crate::bif_traps::Entry>,
 }
 
 /// Whether `module:function/arity` is a light BIF of the BIF table.
@@ -197,7 +192,7 @@ impl DispatchTarget {
             arinsal_loader::ImportClass::Native
                 | arinsal_loader::ImportClass::Dynamic
                 | arinsal_loader::ImportClass::Fun
-        ) || self.trap_entry
+        )
     }
 }
 
@@ -320,26 +315,13 @@ impl DispatchRegistry {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
             // OTP-29.1.1: erts calls every BIF from the generated code with `c_p`, so a native
             // that needs only its process is called the same way.
-            leaked.light_process_bif = if (leaked.class == arinsal_loader::ImportClass::Native
+            leaked.light_process_bif = if leaked.class == arinsal_loader::ImportClass::Native
                 || (leaked.class == arinsal_loader::ImportClass::Fun
                     && leaked.module == "erlang"
                     && ((leaked.function == "fun_info" && leaked.arity == 2)
-                        || (leaked.function == "make_fun" && leaked.arity == 3))))
-                && !leaked.trap_entry
+                        || (leaked.function == "make_fun" && leaked.arity == 3)))
             {
                 crate::natives::process_bif(&leaked.module, &leaked.function, leaked.arity)
-            } else {
-                None
-            };
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared),
-            // OTP-29.1.1: a trapping BIF is a BIF like any other at its call site.
-            leaked.light_trap_bif = if leaked.trap_entry
-                && leaked.direct_ets.is_none()
-                && !matches!(
-                    leaked.class,
-                    arinsal_loader::ImportClass::Dynamic | arinsal_loader::ImportClass::Fun
-                ) {
-                crate::bif_traps::light_entry(&leaked.module, &leaked.function, leaked.arity)
             } else {
                 None
             };
@@ -601,7 +583,6 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
         Some(DispatchTarget {
             // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
             slot: new_export_slot(mfa, trampoline, save_calls),
-            trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
             light_kind: light_kind(&module, &function, mfa.2),
             direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2),
             module: module.clone(),
@@ -615,7 +596,6 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
             light_bif: None,
             scheduler_counter: None,
             light_process_bif: None,
-            light_trap_bif: None,
         })
     })?;
     Some(entry.export_object())
@@ -665,7 +645,6 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
-                trap_entry: crate::bif_traps::traps(import.module, import.function, import.arity),
                 light_kind: light_kind(import.module, import.function, import.arity),
                 direct_ets: crate::natives::ets::direct_entry(
                     import.module,
@@ -683,7 +662,6 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
                 light_bif: None,
                 scheduler_counter: None,
                 light_process_bif: None,
-                light_trap_bif: None,
             })
         })?;
         bindings.push((mfa, entry.export_object()));
@@ -713,7 +691,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
             slot: new_export_slot(key, trampoline, save_calls),
-            trap_entry: crate::bif_traps::traps(module, function, arity),
             light_kind: light_kind(module, function, arity),
             direct_ets: crate::natives::ets::direct_entry(module, function, arity),
             module: module.to_owned(),
@@ -727,7 +704,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             light_bif: None,
             scheduler_counter: None,
             light_process_bif: None,
-            light_trap_bif: None,
         })
     }));
     let identity = Arc::as_ptr(entry.slot) as usize;
@@ -755,7 +731,6 @@ fn publish_module(
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
-                trap_entry: crate::bif_traps::traps(&module.name, export.function, export.arity),
                 light_kind: light_kind(&module.name, export.function, export.arity),
                 direct_ets: crate::natives::ets::direct_entry(
                     &module.name,
@@ -773,7 +748,6 @@ fn publish_module(
                 light_bif: None,
                 scheduler_counter: None,
                 light_process_bif: None,
-                light_trap_bif: None,
             })
         });
         if let Some(target) = target {
@@ -2311,12 +2285,11 @@ pub(crate) fn count_call_unported(
         },
         pc => match export_dispatch(pc) {
             Some(export) => format!(
-                "export {}:{}/{} class={:?} trap_entry={} light={}{}",
+                "export {}:{}/{} class={:?} light={}{}",
                 export.module,
                 export.function,
                 export.arity,
                 export.class,
-                export.trap_entry,
                 export.light_kind,
                 x0.as_atom()
                     .and_then(|atom| atoms.text(atom))

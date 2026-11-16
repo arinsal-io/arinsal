@@ -115,9 +115,7 @@ fn apply_plain_bif(
     }
     let bif = arinsal_bifs::lookup(module, function, arity)
         .or_else(|| crate::natives::plain_static_nif_lookup(module, function, arity))?;
-    if crate::natives::classify(module, function, arity, true).0 != ImportClass::Pure
-        || crate::bif_traps::traps(module, function, arity)
-    {
+    if crate::natives::classify(module, function, arity, true).0 != ImportClass::Pure {
         return None;
     }
     table
@@ -764,49 +762,12 @@ impl Vm {
                 }
             }
         }
-        // Trapping BIFs must be intercepted before native dispatch: dynamic
-        // apply may otherwise enter a synchronous fast path for the same MFA.
         // The export of a plain BIF is found by its atoms and run as a static call of it
-        // would, without matching names against every family of natives. An interrupted
-        // trapping BIF keeps its state for `execute_named` to settle first.
+        // would, without matching names against every family of natives.
         if let Some((module_atom, function_atom)) = atoms
-            && p.cold.as_ref().is_none_or(|cold| cold.bif_trap.is_none())
             && let Some(bif) = apply_plain_bif(module_atom, function_atom, module, function, arity)
         {
             return self.run_apply_bif(p, ctx, module, function, arity, bif);
-        }
-        // A trap through `apply` is keyed as an apply: a static call is keyed by its native
-        // call target instead, so the two never resume each other's continuation.
-        let trap_key = crate::bif_traps::APPLY_TRAP_KEY;
-        let trap_args = [
-            self.x_regs()?.first().copied().unwrap_or(Term::NIL),
-            self.x_regs()?.get(1).copied().unwrap_or(Term::NIL),
-            self.x_regs()?.get(2).copied().unwrap_or(Term::NIL),
-            self.x_regs()?.get(3).copied().unwrap_or(Term::NIL),
-        ];
-        let meter = crate::bif_traps::TrapMeter::start(p, ctx.as_deref());
-        if let Some(result) = crate::bif_traps::execute_named(
-            p,
-            module,
-            function,
-            trap_key,
-            arity,
-            trap_args,
-            ctx.as_deref_mut(),
-        ) {
-            let result = match result {
-                // BIF_TRAP* to an export: the trap's context switch comes first.
-                Err(VmError::TrapExport(trap)) => return self.bif_trap_from_executor(p, trap),
-                result => result?,
-            };
-            meter.finish(p, ctx.as_deref_mut(), result.reductions());
-            return match result {
-                crate::bif_traps::HandlerResult::Done { value, .. } => {
-                    self.x_regs()?[0] = p.gc_after_bif(value)?;
-                    Ok(Self::return_value(p, self.x_regs()?[0]))
-                }
-                crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
-            };
         }
         // `!` is an export alias for the process-aware `send/2` BIF.
         let native_function = if module == "erlang" && function == "!" && arity == 2 {

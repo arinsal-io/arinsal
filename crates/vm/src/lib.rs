@@ -78,7 +78,7 @@ use arinsal_beamasm::{ExitReason, ProcessHeader, SchedulerRegisters};
 use arinsal_bifs::Ctx;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_loader::{ImportClass, Module};
-use arinsal_term::{GcStats, ProcessHeap, Term, TermBuilder};
+use arinsal_term::{GcStats, ProcessHeap, Term};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -98,6 +98,7 @@ pub(crate) use proc_create::ProcessStats;
 mod boot_loop1_shared_tests {
     use super::*;
     use arinsal_difftest::RefErl;
+    use arinsal_term::TermBuilder;
 
     #[test]
     fn collection_roots_only_the_live_registers() {

@@ -76,10 +76,6 @@ impl Process {
                         .ets_select
                         .as_ref()
                         .is_none_or(|state| state.saved.is_empty())
-                    && cold
-                        .bif_trap
-                        .as_ref()
-                        .is_none_or(|trap| !trap.args_are_roots())
                     && cold.call_memory.is_empty()
             })
             && !self.has_dirty_result_roots()
@@ -226,18 +222,6 @@ impl Process {
             roots.push(&mut cold.apply_roots);
             if let Some(pending) = cold.nif_pending.as_mut() {
                 roots.push(pending.roots_mut());
-            }
-            if let Some(trap) = cold.work.bif_trap.as_mut() {
-                // erts keeps no process-heap pointer in a parked BIF's state that a collection
-                // would miss: the arguments (X registers) carry the terms, or the process is not
-                // collectable (`F_DISABLE_GC`).
-                let root_args = trap.root_args_len();
-                if root_args != 0 {
-                    roots.push(&mut trap.args[..root_args]);
-                }
-                if let Some(state) = trap.state_term.as_mut() {
-                    roots.push_term(state);
-                }
             }
             if let Some(cursor) = cold
                 .ets_insert

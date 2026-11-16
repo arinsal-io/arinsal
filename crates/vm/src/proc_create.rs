@@ -390,8 +390,6 @@ pub struct Process {
     /// `REDS_IN`: FCALLS at the start of the current native slice.
     /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
     pub(crate) reds_in: i32,
-    /// FCALLS the last trapping BIF handler spent on its own, before the call's charge.
-    pub(crate) trap_work: i32,
     /// `esdp->virtual_reds`: reductions the slice gave up through `ERTS_VBUMP_ALL_REDS` since
     /// the scheduler last folded them. They end the slice but are not the process's own work.
     pub(crate) virtual_reds: u32,
@@ -1505,39 +1503,15 @@ pub(crate) struct BifTrapPending {
     /// The continuation export, resolved when the trap is installed (erts BIF_TRAP names the
     /// trap `Export*` directly).
     pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
-    pub(crate) state: arinsal_term::MagicBin,
-    /// The live magic-reference thing passed to the continuation export, when erts allocates one.
-    pub(crate) state_term: Option<Term>,
     pub(crate) gc_was_enabled: bool,
     /// The call's arguments, kept with the trap state like the arguments of a BIF_TRAP export:
     /// a retry never reads them back from the X registers.
     pub(crate) args: [Term; 4],
     /// Number of meaningful entries in `args`.
     pub(crate) arity: usize,
-    /// Leading `args` entries that are collection roots: the only heap terms this trap keeps
-    /// while the process is collectable. A trap with state that holds heap terms of its own
-    /// runs with collection disabled and has none.
-    pub(crate) root_args: usize,
     /// The trapped BIF's module and function: an `apply` that trapped is redone as
     /// `apply(Module, Function, Args)` built from the trap state.
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
-}
-impl BifTrapPending {
-    /// Whether `args` are the trapped call's live registers: they are collection roots, and
-    /// the caller's own X registers are dead while the process waits in the trap.
-    // Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn: the arguments are `reg[0..n]`),
-    // OTP-29.1.1.
-    #[inline]
-    pub(crate) fn args_are_roots(&self) -> bool {
-        self.root_args != 0
-    }
-
-    /// Number of leading `args` entries that are roots, chosen when the trap was installed
-    /// (`bif_traps::trap_gc_policy`).
-    #[inline]
-    pub(crate) fn root_args_len(&self) -> usize {
-        self.root_args
-    }
 }
 
 impl Process {
@@ -2076,7 +2050,6 @@ impl Process {
             gc_live: 0,
             max_heap_peak: 0,
             reds_in: 4000,
-            trap_work: 0,
             virtual_reds: 0,
             reductions_used: 0,
             delay_gc: false,
@@ -2823,7 +2796,6 @@ mod layout_report {
             size_of_val(&process.heap.abi.fcalls)
         );
         eprintln!("  Process.reds_in {}", size_of_val(&process.reds_in));
-        eprintln!("  Process.trap_work {}", size_of_val(&process.trap_work));
         eprintln!(
             "  Process.virtual_reds {}",
             size_of_val(&process.virtual_reds)

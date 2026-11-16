@@ -375,140 +375,42 @@ impl Executor {
                                 pending.arity,
                             ))
                         });
-                    let meter =
-                        crate::bif_traps::TrapMeter::start_continuation(process, Some(&*ctx));
-                    let trapped = crate::bif_traps::run_trapped_export(process, Some(ctx));
-                    if let Some(Ok(crate::bif_traps::ResumeResult::Handler(result))) = &trapped {
-                        meter.finish(process, Some(ctx), result.reductions());
-                    }
+                    // The trapped BIF's continuation is an Erlang export: it is called with the
+                    // saved arguments, and returns to the caller's native continuation.
+                    // Port of erts/emulator/beam/beam_common.c (BIF_TRAP), OTP-29.1.1.
+                    let Some(trap) = crate::bif_traps::take_export_trap(process) else {
+                        return Ok(Flow::Break(Err(VmError::Unsupported(
+                            "missing BIF trap export".into(),
+                        ))));
+                    };
+                    process.native_apply = true;
+                    let outcome = self.vm.trap_to_export(process, trap, Some(ctx));
+                    process.native_apply = false;
+                    // The trap export is the same BIF and failed after its trap:
+                    // ERTS_BIF_ERROR_TRAPPED raises it in the process, as below.
+                    // The traced BIF's return or exception event belongs to the
+                    // slice its continuation finishes in.
                     if let Some((module, function, arity)) = &trapped_callee {
-                        let outcome = match &trapped {
-                            Some(Ok(crate::bif_traps::ResumeResult::Handler(
-                                crate::bif_traps::HandlerResult::Done { value, .. },
-                            ))) => Some(Ok(*value)),
-                            Some(Err(VmError::Trap(trap))) => {
-                                crate::exceptions::trace_class_reason(
-                                    process,
-                                    trap.class,
-                                    trap.reason,
-                                )
-                                .ok()
-                                .map(Err)
-                            }
+                        let traced = match &outcome {
+                            Ok(crate::ImportOutcome::Returned(value)) => Some(Ok(*value)),
+                            Err(VmError::Trap(trap)) => crate::exceptions::trace_class_reason(
+                                process,
+                                trap.class,
+                                trap.reason,
+                            )
+                            .ok()
+                            .map(Err),
                             _ => None,
                         };
-                        if let Some(outcome) = outcome {
+                        if let Some(traced) = traced {
                             let args = vec![Term::NIL; *arity];
                             self.vm.trace_native_return_outcome(
-                                process, ctx, module, function, &args, outcome,
+                                process, ctx, module, function, &args, traced,
                             );
                         }
                     }
-                    match trapped {
-                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
-                            crate::bif_traps::HandlerResult::Yield { .. },
-                        ))) => {
-                            if let Some(pending) = process.bif_trap_mut() {
-                                pending.schedule_out = false;
-                            }
-                            crate::bif_traps::arm_export_trap(process);
-                            process.set_native_retry(Some(target_pc));
-                            process.set_native_pc(Some(code_ptr));
-                            return Ok(Flow::Break(Ok(RunState::Yield)));
-                        }
-                        // The trapped BIF's continuation is an Erlang export: it is
-                        // called with the saved arguments, and returns to the caller's
-                        // native continuation. Port of erts/emulator/beam/beam_common.c
-                        // (BIF_TRAP), OTP-29.1.1.
-                        Some(Ok(crate::bif_traps::ResumeResult::Export(trap))) => {
-                            process.native_apply = true;
-                            let outcome = self.vm.trap_to_export(process, trap, Some(ctx));
-                            process.native_apply = false;
-                            // The trap export is the same BIF and failed after its trap:
-                            // ERTS_BIF_ERROR_TRAPPED raises it in the process, as below.
-                            // The traced BIF's return or exception event belongs to the
-                            // slice its continuation finishes in, as for a handler above.
-                            if let Some((module, function, arity)) = &trapped_callee {
-                                let traced = match &outcome {
-                                    Ok(crate::ImportOutcome::Returned(value)) => Some(Ok(*value)),
-                                    Err(VmError::Trap(trap)) => {
-                                        crate::exceptions::trace_class_reason(
-                                            process,
-                                            trap.class,
-                                            trap.reason,
-                                        )
-                                        .ok()
-                                        .map(Err)
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(traced) = traced {
-                                    let args = vec![Term::NIL; *arity];
-                                    self.vm.trace_native_return_outcome(
-                                        process, ctx, module, function, &args, traced,
-                                    );
-                                }
-                            }
-                            let outcome = match outcome {
-                                Err(VmError::Trap(trap)) => {
-                                    process.native_error_pc = call_site_pc;
-                                    if process.heap.stack_get(0).is_some_and(|word| {
-                                        word.tagged_word() as usize == resume_pc
-                                    }) {
-                                        process.heap.release_stack(1);
-                                    }
-                                    if let Some(error) = crate::exceptions::resume(
-                                        &mut self.vm,
-                                        process,
-                                        Some(ctx),
-                                        trap,
-                                    )? {
-                                        return Ok(Flow::Break(Err(error)));
-                                    }
-                                    process.heap.abi.exc.freason = 0;
-                                    process.heap.abi.exc.fvalue = 0;
-                                    process.heap.abi.exc.ftrace = 0;
-                                    return Ok(Flow::Continue);
-                                }
-                                outcome => outcome?,
-                            };
-                            match outcome {
-                                crate::ImportOutcome::Dispatch => {}
-                                crate::ImportOutcome::Yield => {
-                                    // The trap export BIF_TRAPped again: the process stays at
-                                    // beam_bif_export_trap in this code.
-                                    if process.native_pc().is_none() {
-                                        process.set_native_pc(Some(code_ptr));
-                                    }
-                                    if process.native_pc().is_some()
-                                        && native_transfer_continues(process)
-                                    {
-                                        return Ok(Flow::Continue);
-                                    }
-                                    return Ok(Flow::Break(Ok(RunState::Yield)));
-                                }
-                                crate::ImportOutcome::Returned(value) => {
-                                    self.native_registers.x_reg_array[0] = value;
-                                    if process.native_pc().is_none() {
-                                        return Ok(Flow::Break(Ok(RunState::Done(value))));
-                                    }
-                                }
-                            }
-                            return Ok(Flow::Continue);
-                        }
-                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
-                            crate::bif_traps::HandlerResult::Done { value, .. },
-                        ))) => {
-                            self.native_registers.x_reg_array[0] = value;
-                            if !resume_after_native_return(process) {
-                                return Ok(Flow::Break(Ok(RunState::Done(value))));
-                            }
-                            return Ok(Flow::Continue);
-                        }
-                        // The continuation export raised. It is the same BIF
-                        // failure erts reports with ERTS_BIF_ERROR_TRAPPED:
-                        // catch sees it, and the process does not exit.
-                        Some(Err(VmError::Trap(trap))) => {
+                    let outcome = match outcome {
+                        Err(VmError::Trap(trap)) => {
                             process.native_error_pc = call_site_pc;
                             if process
                                 .heap
@@ -527,27 +429,29 @@ impl Executor {
                             process.heap.abi.exc.ftrace = 0;
                             return Ok(Flow::Continue);
                         }
-                        // The continuation BIF_TRAPped to an export again: that trap is a
-                        // context switch of its own, and this beam_bif_export_trap calls the
-                        // export on the next schedule-in. Port of erts/emulator/beam/bif.h:
-                        // 316-326 and jit/arm/instr_bif.cpp:515-536, OTP-29.1.1.
-                        Some(Err(VmError::TrapExport(trap))) => {
-                            let callee = (trap.target.module_atom, trap.target.function_atom);
-                            crate::bif_traps::install_export_trap(
-                                process, target_pc, callee, &trap, false,
-                            );
-                            crate::bif_traps::arm_export_trap(process);
-                            process.set_native_retry(Some(target_pc));
-                            process.set_native_pc(Some(code_ptr));
+                        outcome => outcome?,
+                    };
+                    match outcome {
+                        crate::ImportOutcome::Dispatch => {}
+                        crate::ImportOutcome::Yield => {
+                            // The trap export BIF_TRAPped again: the process stays at
+                            // beam_bif_export_trap in this code.
+                            if process.native_pc().is_none() {
+                                process.set_native_pc(Some(code_ptr));
+                            }
+                            if process.native_pc().is_some() && native_transfer_continues(process) {
+                                return Ok(Flow::Continue);
+                            }
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
-                        Some(Err(error)) => return Err(error),
-                        None => {
-                            return Ok(Flow::Break(Err(VmError::Unsupported(
-                                "missing BIF trap export".into(),
-                            ))));
+                        crate::ImportOutcome::Returned(value) => {
+                            self.native_registers.x_reg_array[0] = value;
+                            if process.native_pc().is_none() {
+                                return Ok(Flow::Break(Ok(RunState::Done(value))));
+                            }
                         }
                     }
+                    return Ok(Flow::Continue);
                 }
                 let Some(export) = crate::beamasm_integration::export_dispatch(target_pc) else {
                     return Err(VmError::Unsupported(format!(
@@ -569,15 +473,14 @@ impl Executor {
                     arinsal_loader::ImportClass::Native
                         | arinsal_loader::ImportClass::Dynamic
                         | arinsal_loader::ImportClass::Fun
-                ) || export.trap_entry
-                    || (crate::trace_bp::any_pattern()
-                        && export.bif.is_some()
-                        && crate::trace_bp::selects(
-                            process,
-                            &export.module,
-                            &export.function,
-                            export.arity,
-                        ))
+                ) || (crate::trace_bp::any_pattern()
+                    && export.bif.is_some()
+                    && crate::trace_bp::selects(
+                        process,
+                        &export.module,
+                        &export.function,
+                        export.arity,
+                    ))
                 {
                     let saved_arguments: smallvec::SmallVec<[Term; 8]> =
                         smallvec::SmallVec::from_slice(
@@ -616,33 +519,6 @@ impl Executor {
                             _ => self.vm.fun_info_mfa(process),
                         })
                     } else {
-                        // Port of erts/emulator/beam/beam_common.c (BIF trap to a
-                        // continuation export), OTP-29.1.1: a trapping BIF keeps
-                        // its state between retries of this native call site.
-                        let trap_args = [
-                            self.native_registers
-                                .x_reg_array
-                                .first()
-                                .copied()
-                                .unwrap_or(Term::NIL),
-                            self.native_registers
-                                .x_reg_array
-                                .get(1)
-                                .copied()
-                                .unwrap_or(Term::NIL),
-                            self.native_registers
-                                .x_reg_array
-                                .get(2)
-                                .copied()
-                                .unwrap_or(Term::NIL),
-                            self.native_registers
-                                .x_reg_array
-                                .get(3)
-                                .copied()
-                                .unwrap_or(Term::NIL),
-                        ];
-                        let traps_here = export.trap_entry
-                            || process.slice().is_some_and(|work| work.bif_trap.is_some());
                         // Port of erts/emulator/beam/jit/arm/process_main.cpp
                         // (context_switch_simplified), OTP-29.1.1: a light BIF
                         // call that trapped context-switches; the process
@@ -659,205 +535,81 @@ impl Executor {
                             crate::native_helpers::debug_assert_native_heap(process);
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
-                        // A traced trapping BIF reports its call once, when it is
-                        // first entered, and its return when it finishes.
-                        // Port of erts/emulator/beam/beam_bp.c:321-330
-                        // (erts_export_is_bif_traced), OTP-29.1.1.
-                        let trap_traced = if traps_here
-                            && crate::bif_traps::traps(
-                                &export.module,
-                                &export.function,
-                                export.arity,
-                            ) {
-                            self.vm.trace_native_call_named(
-                                process,
-                                ctx,
-                                &export.module,
-                                &export.function,
-                                usize::from(export.arity),
-                                (usize::MAX, call_site_pc),
-                                // The trampoline pushed the CP: a tail apply's is a trace
-                                // frame of its caller (fixup_cp_before_trace).
-                                crate::trace::StackScan::Top,
-                            )
-                        } else {
-                            None
-                        };
-                        let meter =
-                            crate::bif_traps::TrapMeter::start_continuation(process, Some(&*ctx));
-                        if traps_here
-                            && let Some(trapped) = crate::bif_traps::execute_named(
-                                process,
-                                &export.module,
-                                &export.function,
-                                target_pc,
-                                usize::from(export.arity),
-                                trap_args,
-                                Some(ctx),
-                            )
-                        {
-                            if let Ok(result) = &trapped {
-                                meter.finish(process, Some(ctx), result.reductions());
-                            }
-                            let outcome = match trapped {
-                                Ok(crate::bif_traps::HandlerResult::Yield { .. }) => {
-                                    // The continuation export runs on the next
-                                    // schedule-in. This call site is not redone.
-                                    if let Some(pending) = process.bif_trap_mut() {
-                                        pending.schedule_out = false;
-                                    }
-                                    crate::bif_traps::arm_export_trap(process);
-                                    process.set_native_retry(Some(
-                                        crate::bif_traps::bif_export_trap_pc(),
-                                    ));
-                                    process.set_native_pc(Some(code_ptr));
-                                    return Ok(Flow::Break(Ok(RunState::Yield)));
-                                }
-                                Ok(crate::bif_traps::HandlerResult::Done { value, .. }) => {
-                                    self.native_registers.x_reg_array[0] =
-                                        process.gc_after_bif(value)?;
-                                    Some(Ok(self.native_registers.x_reg_array[0]))
-                                }
-                                // BIF_TRAP* to an export: context_switch_simplified, and
-                                // beam_bif_export_trap calls the export on schedule-in.
-                                // Port of erts/emulator/beam/bif.h:316-326 and
-                                // jit/arm/instr_bif.cpp:515-536 (call_bif_shared), OTP-29.1.1.
-                                Err(VmError::TrapExport(trap)) => {
-                                    let callee = (export.module_atom, export.function_atom);
-                                    // The yield below is the trap's context switch.
-                                    crate::bif_traps::install_export_trap(
-                                        process, target_pc, callee, &trap, false,
-                                    );
-                                    crate::bif_traps::arm_export_trap(process);
-                                    process.set_native_retry(Some(
-                                        crate::bif_traps::bif_export_trap_pc(),
-                                    ));
-                                    process.set_native_pc(Some(code_ptr));
-                                    return Ok(Flow::Break(Ok(RunState::Yield)));
-                                }
-                                Err(error) => Some(Err(error)),
-                            };
-                            if let (Some((module, function, args)), Some(result)) =
-                                (&trap_traced, &outcome)
-                            {
-                                let reduced = match result {
-                                    Ok(value) => Some(Ok(*value)),
-                                    Err(VmError::Exception { reason, frame }) => {
-                                        legacy_exception_trap(
-                                            process,
-                                            &self.native_registers.x_reg_array,
-                                            reason,
-                                            frame,
-                                        )
-                                        .ok()
-                                        .and_then(|trap| {
-                                            crate::exceptions::trace_class_reason(
-                                                process,
-                                                trap.class,
-                                                trap.reason,
-                                            )
-                                            .ok()
-                                        })
-                                        .map(Err)
-                                    }
-                                    Err(VmError::Trap(trap)) => {
-                                        crate::exceptions::trace_class_reason(
-                                            process,
-                                            trap.class,
-                                            trap.reason,
-                                        )
-                                        .ok()
-                                        .map(Err)
-                                    }
-                                    Err(_) => None,
-                                };
-                                if let Some(reduced) = reduced {
-                                    self.vm.trace_native_return_outcome(
-                                        process, ctx, module, function, args, reduced,
-                                    );
-                                }
-                            }
-                            outcome
-                        } else {
-                            // The BIF runs at the native call site (erts c_p->i).
-                            let position_before = process.position_marker();
-                            process.native_call_pc = call_site_pc;
-                            let traced = self.vm.trace_native_call_named(
-                                process,
-                                ctx,
-                                &export.module,
-                                &export.function,
-                                usize::from(export.arity),
-                                (usize::MAX, call_site_pc),
-                                // The trampoline pushed the CP: a tail apply's is a trace
-                                // frame of its caller (fixup_cp_before_trace).
-                                crate::trace::StackScan::Top,
-                            );
-                            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp
-                            // (call_light_bif_shared), OTP-29.1.1: a light BIF
-                            // runs with E at the caller's frame; the return
-                            // address is pushed only when it traps. A heavy BIF
-                            // is entered through its export entry, whose frame
-                            // holds the return address.
-                            let light = process.native_light_bif_call && export.light_kind;
-                            let hidden = usize::from(
-                                light
-                                    && process.heap.stack_get(0).is_some_and(|word| {
-                                        word.tagged_word() as usize == resume_pc
-                                    }),
-                            );
-                            process.heap.set_bif_hidden_words(hidden);
-                            let result = self.vm.dispatch_native(
-                                process,
-                                ctx,
-                                &export.module,
-                                &export.function,
-                                usize::from(export.arity),
-                                (export.class, export.native_bits),
-                            );
-                            process.heap.set_bif_hidden_words(0);
-                            process.native_call_pc = 0;
-                            // A BIF that traps to an Erlang export (erts BIF_TRAP*)
-                            // context-switches to beam_bif_export_trap, which runs
-                            // the export on schedule-in. Port of erts/emulator/beam/
-                            // jit/arm/instr_bif.cpp (trap to the export), OTP-29.1.1.
-                            let result = match result {
-                                Some(Err(VmError::TrapExport(trap))) => {
-                                    let callee = (export.module_atom, export.function_atom);
-                                    // The yield below is the trap's context switch.
-                                    crate::bif_traps::install_export_trap(
-                                        process, target_pc, callee, &trap, false,
-                                    );
-                                    crate::bif_traps::arm_export_trap(process);
-                                    process.set_native_retry(Some(
-                                        crate::bif_traps::bif_export_trap_pc(),
-                                    ));
-                                    process.set_native_pc(Some(code_ptr));
-                                    return Ok(Flow::Break(Ok(RunState::Yield)));
-                                }
-                                other => other,
-                            };
-                            if let (Some((module, function, args)), Some(result)) =
-                                (&traced, &result)
-                            {
-                                self.vm.trace_native_return(
-                                    process, ctx, module, function, args, result,
+                        // The BIF runs at the native call site (erts c_p->i).
+                        let position_before = process.position_marker();
+                        process.native_call_pc = call_site_pc;
+                        let traced = self.vm.trace_native_call_named(
+                            process,
+                            ctx,
+                            &export.module,
+                            &export.function,
+                            usize::from(export.arity),
+                            (usize::MAX, call_site_pc),
+                            // The trampoline pushed the CP: a tail apply's is a trace
+                            // frame of its caller (fixup_cp_before_trace).
+                            crate::trace::StackScan::Top,
+                        );
+                        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp
+                        // (call_light_bif_shared), OTP-29.1.1: a light BIF
+                        // runs with E at the caller's frame; the return
+                        // address is pushed only when it traps. A heavy BIF
+                        // is entered through its export entry, whose frame
+                        // holds the return address.
+                        let light = process.native_light_bif_call && export.light_kind;
+                        let hidden = usize::from(
+                            light
+                                && process
+                                    .heap
+                                    .stack_get(0)
+                                    .is_some_and(|word| word.tagged_word() as usize == resume_pc),
+                        );
+                        process.heap.set_bif_hidden_words(hidden);
+                        let result = self.vm.dispatch_native(
+                            process,
+                            ctx,
+                            &export.module,
+                            &export.function,
+                            usize::from(export.arity),
+                            (export.class, export.native_bits),
+                        );
+                        process.heap.set_bif_hidden_words(0);
+                        process.native_call_pc = 0;
+                        // A BIF that traps to an Erlang export (erts BIF_TRAP*)
+                        // context-switches to beam_bif_export_trap, which runs
+                        // the export on schedule-in. Port of erts/emulator/beam/
+                        // jit/arm/instr_bif.cpp (trap to the export), OTP-29.1.1.
+                        let result = match result {
+                            Some(Err(VmError::TrapExport(trap))) => {
+                                let callee = (export.module_atom, export.function_atom);
+                                // The yield below is the trap's context switch.
+                                crate::bif_traps::install_export_trap(
+                                    process, target_pc, callee, &trap, false,
                                 );
+                                crate::bif_traps::arm_export_trap(process);
+                                process
+                                    .set_native_retry(Some(crate::bif_traps::bif_export_trap_pc()));
+                                process.set_native_pc(Some(code_ptr));
+                                return Ok(Flow::Break(Ok(RunState::Yield)));
                             }
-                            // Port of erts/emulator/beam/beam_bif_load.c:793
-                            // (call_on_load_function_1), OTP-29.1.1: the BIF traps
-                            // into the on_load function like a call; the native
-                            // continuation the trampoline pushed is its CP.
-                            if export.module == "erlang"
-                                && export.function == "call_on_load_function"
-                                && matches!(result, Some(Ok(_)))
-                                && process.position_marker() != position_before
-                            {
-                                process.tick();
-                                return Ok(Flow::Continue);
-                            }
-                            result
+                            other => other,
+                        };
+                        if let (Some((module, function, args)), Some(result)) = (&traced, &result) {
+                            self.vm
+                                .trace_native_return(process, ctx, module, function, args, result);
                         }
+                        // Port of erts/emulator/beam/beam_bif_load.c:793
+                        // (call_on_load_function_1), OTP-29.1.1: the BIF traps
+                        // into the on_load function like a call; the native
+                        // continuation the trampoline pushed is its CP.
+                        if export.module == "erlang"
+                            && export.function == "call_on_load_function"
+                            && matches!(result, Some(Ok(_)))
+                            && process.position_marker() != position_before
+                        {
+                            process.tick();
+                            return Ok(Flow::Continue);
+                        }
+                        result
                     };
                     let result = result.or_else(|| {
                         let arity = usize::from(export.arity);

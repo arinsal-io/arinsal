@@ -57,7 +57,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).gc_live).write(x_registers);
         std::ptr::addr_of_mut!((*process).max_heap_peak).write(0);
         std::ptr::addr_of_mut!((*process).reds_in).write(4000);
-        std::ptr::addr_of_mut!((*process).trap_work).write(0);
         std::ptr::addr_of_mut!((*process).virtual_reds).write(0);
         std::ptr::addr_of_mut!((*process).reductions_used).write(0);
         std::ptr::addr_of_mut!((*process).gc_deferred).write(false);
@@ -140,7 +139,6 @@ fn process_fields_are_initialized(process: Process) {
         gc_live,
         max_heap_peak,
         reds_in,
-        trap_work,
         virtual_reds,
         reductions_used,
         gc_deferred,
@@ -208,7 +206,6 @@ fn process_fields_are_initialized(process: Process) {
         gc_live,
         max_heap_peak,
         reds_in,
-        trap_work,
         virtual_reds,
         reductions_used,
         gc_deferred,
