@@ -41,6 +41,7 @@ mod maps_iterator_differential;
 mod maps_moved_differential;
 mod maps_ycf_bifs_differential;
 mod maps_yield;
+mod math_differential;
 mod misc_bifs;
 mod missing_bifs;
 mod moved_bif_differential;

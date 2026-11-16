@@ -1,9 +1,11 @@
-//! Platform math calls used by the math BIFs.
+//! Raw libm calls used by erl_math.c BIF bodies.
+//!
+//! Port of erts/emulator/beam/erl_math.c (math_call_1, math_call_errno_1, math_call_2),
+//! OTP-29.1.1.
 
 use std::ffi::c_int;
 
-// Port of erts/emulator/beam/erl_math.c (math_call_1, math_call_2,
-// math_call_errno_1), OTP-29.1.1.
+// SAFETY: declarations match the platform C libm ABI and errno accessor signatures.
 #[link(name = "m")]
 unsafe extern "C" {
     #[link_name = "acos"]
@@ -60,51 +62,65 @@ unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
 }
 
-fn call1(func: unsafe extern "C" fn(f64) -> f64, x: f64) -> f64 {
-    // SAFETY: `func` is one of the declared platform libm functions and takes an f64.
-    unsafe { func(x) }
+macro_rules! unary {
+    ($($name:ident => $function:ident),* $(,)?) => {
+        $(
+            pub(super) fn $name(value: f64) -> f64 {
+                // SAFETY: each declaration is the platform libm function with this f64 signature.
+                unsafe { $function(value) }
+            }
+        )*
+    };
 }
 
-fn call2(func: unsafe extern "C" fn(f64, f64) -> f64, x: f64, y: f64) -> f64 {
-    // SAFETY: `func` is one of the declared platform libm functions and takes two f64s.
-    unsafe { func(x, y) }
+unary!(
+    acos => c_acos,
+    acosh => c_acosh,
+    asin => c_asin,
+    asinh => c_asinh,
+    atan => c_atan,
+    atanh => c_atanh,
+    ceil => c_ceil,
+    cos => c_cos,
+    cosh => c_cosh,
+    erf => c_erf,
+    erfc => c_erfc,
+    exp => c_exp,
+    floor => c_floor,
+    log => c_log,
+    log10 => c_log10,
+    log2 => c_log2,
+    sin => c_sin,
+    sinh => c_sinh,
+    sqrt => c_sqrt,
+    tan => c_tan,
+    tanh => c_tanh,
+);
+
+macro_rules! binary {
+    ($($name:ident => $function:ident),* $(,)?) => {
+        $(
+            pub(super) fn $name(first: f64, second: f64) -> f64 {
+                // SAFETY: each declaration is the platform libm function with this f64 signature.
+                unsafe { $function(first, second) }
+            }
+        )*
+    };
 }
 
-fn call_errno1(func: unsafe extern "C" fn(f64) -> f64, x: f64) -> (f64, bool) {
-    // SAFETY: The platform errno accessor returns this thread's errno slot; `func` is a
-    // declared libm function with the matching signature.
+binary!(atan2 => c_atan2, fmod => c_fmod, pow => c_pow);
+
+/// Run a C99 errno-sensitive math call, preserving errno across result construction.
+pub(super) fn with_errno<T>(call: impl FnOnce() -> T) -> (T, bool) {
+    // SAFETY: the platform accessor returns this thread's errno slot; the call runs on this
+    // thread, and the slot remains valid through result construction.
     unsafe {
         #[cfg(target_vendor = "apple")]
         let errno = __error();
         #[cfg(not(target_vendor = "apple"))]
         let errno = __errno_location();
         *errno = 0;
-        let result = func(x);
+        let result = call();
         (result, *errno != 0)
     }
-}
-
-macro_rules! unary {
-    ($($name:ident => $func:ident),* $(,)?) => {$(
-        pub(crate) fn $name(x: f64) -> f64 { call1($func, x) }
-    )*};
-}
-unary!(acosh => c_acosh, asinh => c_asinh, atan => c_atan,
-    atanh => c_atanh, ceil => c_ceil, cos => c_cos, cosh => c_cosh, erf => c_erf, erfc => c_erfc,
-    exp => c_exp, floor => c_floor, log => c_log, log10 => c_log10, log2 => c_log2, sin => c_sin,
-    sinh => c_sinh, sqrt => c_sqrt, tan => c_tan, tanh => c_tanh);
-
-macro_rules! binary {
-    ($($name:ident => $func:ident),* $(,)?) => {$(
-        pub(crate) fn $name(x: f64, y: f64) -> f64 { call2($func, x, y) }
-    )*};
-}
-binary!(atan2 => c_atan2, fmod => c_fmod, pow => c_pow);
-
-pub(crate) fn asin_errno(x: f64) -> (f64, bool) {
-    call_errno1(c_asin, x)
-}
-
-pub(crate) fn acos_errno(x: f64) -> (f64, bool) {
-    call_errno1(c_acos, x)
 }

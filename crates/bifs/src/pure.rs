@@ -10,7 +10,6 @@ use arinsal_term::{
     TermBuilder, TermError, TermKind, atoms, copy_term, flat_size, global_atoms, phash,
 };
 use num_bigint::{BigInt, Sign};
-use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 
 use crate::{BifError, Class, Ctx};
@@ -269,30 +268,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erts_debug", "flat_size", 1) => v.entry::<bodies::debug_flat_size>(),
         ("erts_debug", "same", 2) => v.entry::<bodies::debug_same>(),
         ("unicode", "bin_is_7bit", 1) => v.entry::<bodies::bin_is_7bit>(),
-        ("math", "cos", 1) => v.entry::<bodies::math_cos>(),
-        ("math", "cosh", 1) => v.entry::<bodies::math_cosh>(),
-        ("math", "sin", 1) => v.entry::<bodies::math_sin>(),
-        ("math", "sinh", 1) => v.entry::<bodies::math_sinh>(),
-        ("math", "tan", 1) => v.entry::<bodies::math_tan>(),
-        ("math", "tanh", 1) => v.entry::<bodies::math_tanh>(),
-        ("math", "acos", 1) => v.entry::<bodies::math_acos>(),
-        ("math", "acosh", 1) => v.entry::<bodies::math_acosh>(),
-        ("math", "asin", 1) => v.entry::<bodies::math_asin>(),
-        ("math", "asinh", 1) => v.entry::<bodies::math_asinh>(),
-        ("math", "atan", 1) => v.entry::<bodies::math_atan>(),
-        ("math", "atanh", 1) => v.entry::<bodies::math_atanh>(),
-        ("math", "erf", 1) => v.entry::<bodies::math_erf>(),
-        ("math", "erfc", 1) => v.entry::<bodies::math_erfc>(),
-        ("math", "exp", 1) => v.entry::<bodies::math_exp>(),
-        ("math", "log", 1) => v.entry::<bodies::math_log>(),
-        ("math", "log2", 1) => v.entry::<bodies::math_log2>(),
-        ("math", "log10", 1) => v.entry::<bodies::math_log10>(),
-        ("math", "sqrt", 1) => v.entry::<bodies::math_sqrt>(),
-        ("math", "floor", 1) => v.entry::<bodies::math_floor>(),
-        ("math", "ceil", 1) => v.entry::<bodies::math_ceil>(),
-        ("math", "atan2", 2) => v.entry::<bodies::math_atan2>(),
-        ("math", "pow", 2) => v.entry::<bodies::math_pow>(),
-        ("math", "fmod", 2) => v.entry::<bodies::math_fmod>(),
         _ => return None,
     };
     // A registry entry must correspond to the supported OTP release.
@@ -1392,85 +1367,6 @@ fn error_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         stacktrace: None,
     })
 }
-fn numeric_float(term: Term) -> Result<f64, BifError> {
-    if let Some(n) = term.as_small() {
-        return Ok(n as f64);
-    }
-    // SAFETY: The source number's heap remains live during this call.
-    if let Some(view) = unsafe { term.float_ref() } {
-        return Ok(view.get());
-    }
-    // SAFETY: The source number's heap remains live during this call.
-    if let Some(view) = unsafe { term.big_ref() } {
-        return view.to_bigint().to_f64().ok_or(BifError::Badarith);
-    }
-    Err(BADARG)
-}
-fn math_result(ctx: &mut Ctx<'_>, result: f64) -> Result<Term, BifError> {
-    if !result.is_finite() {
-        return Err(BifError::Badarith);
-    }
-    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .float(result)
-        .expect("infallible BIF heap"))
-}
-fn math_errno_result(
-    ctx: &mut Ctx<'_>,
-    (result, errno_error): (f64, bool),
-) -> Result<Term, BifError> {
-    if errno_error || !result.is_finite() {
-        return Err(BifError::Badarith);
-    }
-    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .float(result)
-        .expect("infallible BIF heap"))
-}
-macro_rules! math_unary {
-    ($($name:ident => $result:ident => $method:expr),* $(,)?) => {$(
-        fn $result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-            math_result(ctx, $method(numeric_float(args[0])?))
-        }
-    )*};
-}
-fn math_asin_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    math_errno_result(ctx, crate::math::asin_errno(numeric_float(args[0])?))
-}
-fn math_acos_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    math_errno_result(ctx, crate::math::acos_errno(numeric_float(args[0])?))
-}
-math_unary!(
-    math_cos => math_cos_result => crate::math::cos,
-    math_cosh => math_cosh_result => crate::math::cosh,
-    math_sin => math_sin_result => crate::math::sin,
-    math_sinh => math_sinh_result => crate::math::sinh,
-    math_tan => math_tan_result => crate::math::tan,
-    math_tanh => math_tanh_result => crate::math::tanh,
-    math_acosh => math_acosh_result => crate::math::acosh,
-    math_asinh => math_asinh_result => crate::math::asinh,
-    math_atan => math_atan_result => crate::math::atan,
-    math_atanh => math_atanh_result => crate::math::atanh,
-    math_erf => math_erf_result => crate::math::erf,
-    math_erfc => math_erfc_result => crate::math::erfc,
-    math_exp => math_exp_result => crate::math::exp,
-    math_log => math_log_result => crate::math::log,
-    math_log2 => math_log2_result => crate::math::log2,
-    math_log10 => math_log10_result => crate::math::log10,
-    math_sqrt => math_sqrt_result => crate::math::sqrt,
-    math_floor => math_floor_result => crate::math::floor,
-    math_ceil => math_ceil_result => crate::math::ceil,
-);
-macro_rules! math_binary {
-    ($($name:ident => $result:ident => $method:expr),* $(,)?) => {$(
-        fn $result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-            math_result(ctx, $method(numeric_float(args[0])?, numeric_float(args[1])?))
-        }
-    )*};
-}
-math_binary!(
-    math_atan2 => math_atan2_result => crate::math::atan2,
-    math_pow => math_pow_result => crate::math::pow,
-    math_fmod => math_fmod_result => crate::math::fmod,
-);
 
 macro_rules! word_adapter {
     ($name:ident, $result:ident) => {
@@ -1515,30 +1411,6 @@ word_adapter!(debug_copy_shared, debug_copy_shared_result);
 word_adapter!(debug_flat_size, debug_flat_size_result);
 word_adapter!(debug_same, debug_same_result);
 word_adapter!(bin_is_7bit, bin_is_7bit_result);
-word_adapter!(math_cos, math_cos_result);
-word_adapter!(math_cosh, math_cosh_result);
-word_adapter!(math_sin, math_sin_result);
-word_adapter!(math_sinh, math_sinh_result);
-word_adapter!(math_tan, math_tan_result);
-word_adapter!(math_tanh, math_tanh_result);
-word_adapter!(math_acos, math_acos_result);
-word_adapter!(math_acosh, math_acosh_result);
-word_adapter!(math_asin, math_asin_result);
-word_adapter!(math_asinh, math_asinh_result);
-word_adapter!(math_atan, math_atan_result);
-word_adapter!(math_atanh, math_atanh_result);
-word_adapter!(math_erf, math_erf_result);
-word_adapter!(math_erfc, math_erfc_result);
-word_adapter!(math_exp, math_exp_result);
-word_adapter!(math_log, math_log_result);
-word_adapter!(math_log2, math_log2_result);
-word_adapter!(math_log10, math_log10_result);
-word_adapter!(math_sqrt, math_sqrt_result);
-word_adapter!(math_floor, math_floor_result);
-word_adapter!(math_ceil, math_ceil_result);
-word_adapter!(math_atan2, math_atan2_result);
-word_adapter!(math_pow, math_pow_result);
-word_adapter!(math_fmod, math_fmod_result);
 
 crate::word_bif_bodies_in!(word_bodies;
     size, node,
@@ -1547,11 +1419,7 @@ crate::word_bif_bodies_in!(word_bodies;
     float_to_binary, list_to_float, binary_to_float, integer_to_binary,
     is_integer_range, is_function, is_builtin, error,
     cmp_term, debug_copy_shared, debug_flat_size, debug_same,
-    bin_is_7bit, math_cos, math_cosh, math_sin, math_sinh, math_tan, math_tanh,
-    math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atanh, math_erf,
-    math_erfc, math_exp, math_log, math_log2, math_log10, math_sqrt, math_floor,
-    math_ceil, math_atan2, math_pow, math_fmod, atom_to_list, list_to_atom,
-    list_to_existing_atom
+    bin_is_7bit, atom_to_list, list_to_atom, list_to_existing_atom
 );
 mod bodies {
     pub(super) use super::word_bodies::*;

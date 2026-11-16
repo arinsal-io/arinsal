@@ -26,7 +26,6 @@ mod binary_mod;
 mod dirty;
 mod lists;
 mod maps_bifs;
-mod math;
 mod pure;
 mod sys;
 mod time;

@@ -171,26 +171,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
         ("erlang", "error", 2) => vec![term(n), list(vec![term(n + 1)])],
         ("erlang", "error", 3) => vec![term(n), list(vec![]), list(vec![])],
         ("erlang", "unique_integer", 1) => vec![list(vec![atom("positive")])],
-        ("math", "acos" | "asin" | "atanh", 1) => {
-            vec![O::Float((n % 199) as f64 / 100.0 - 0.99)]
-        }
-        ("math", "acosh", 1) => vec![O::Float((n % 1000) as f64 / 100.0 + 1.0)],
-        ("math", "log" | "log2" | "log10" | "sqrt", 1) => {
-            vec![O::Float((n % 1000) as f64 / 100.0 + 0.01)]
-        }
-        ("math", _, 1) => vec![O::Float((n % 1000) as f64 / 100.0 - 5.0)],
-        ("math", "pow", 2) => vec![
-            O::Float((n % 100) as f64 / 10.0 + 0.1),
-            O::Float((n % 20) as f64 / 10.0),
-        ],
-        ("math", "fmod", 2) => vec![
-            O::Float((n % 100) as f64 / 10.0),
-            O::Float((n % 20) as f64 / 10.0 + 0.1),
-        ],
-        ("math", _, 2) => vec![
-            O::Float((n % 100) as f64 / 10.0),
-            O::Float((n % 20) as f64 / 10.0),
-        ],
         _ => vec![term(n); arity as usize],
     }
 }

@@ -168,8 +168,8 @@ use crate::native_helpers::{
 };
 use crate::natives::{
     bif_phash2, binary, erl_bif_atomics, erl_bif_chksum, erl_bif_guard, erl_bif_info,
-    erl_bif_lists, erl_bif_op, erl_hl_timer, erl_iolist, erl_map, erl_process_dict, external,
-    register,
+    erl_bif_lists, erl_bif_op, erl_hl_timer, erl_iolist, erl_map, erl_math, erl_process_dict,
+    external, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -216,6 +216,31 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("lists", "keymember", 3) => bif!(erl_bif_lists::lists_keymember_3),
         ("lists", "keysearch", 3) => bif!(erl_bif_lists::lists_keysearch_3),
         ("lists", "keyfind", 3) => bif!(erl_bif_lists::lists_keyfind_3),
+        // erl_math.c
+        ("math", "cos", 1) => bif!(erl_math::cos_1),
+        ("math", "cosh", 1) => bif!(erl_math::cosh_1),
+        ("math", "sin", 1) => bif!(erl_math::sin_1),
+        ("math", "sinh", 1) => bif!(erl_math::sinh_1),
+        ("math", "tan", 1) => bif!(erl_math::tan_1),
+        ("math", "tanh", 1) => bif!(erl_math::tanh_1),
+        ("math", "acos", 1) => bif!(erl_math::acos_1),
+        ("math", "acosh", 1) => bif!(erl_math::acosh_1),
+        ("math", "asin", 1) => bif!(erl_math::asin_1),
+        ("math", "asinh", 1) => bif!(erl_math::asinh_1),
+        ("math", "atan", 1) => bif!(erl_math::atan_1),
+        ("math", "atanh", 1) => bif!(erl_math::atanh_1),
+        ("math", "erf", 1) => bif!(erl_math::erf_1),
+        ("math", "erfc", 1) => bif!(erl_math::erfc_1),
+        ("math", "exp", 1) => bif!(erl_math::exp_1),
+        ("math", "log", 1) => bif!(erl_math::log_1),
+        ("math", "log2", 1) => bif!(erl_math::log2_1),
+        ("math", "log10", 1) => bif!(erl_math::log10_1),
+        ("math", "pow", 2) => bif!(erl_math::pow_2),
+        ("math", "sqrt", 1) => bif!(erl_math::sqrt_1),
+        ("math", "ceil", 1) => bif!(erl_math::ceil_1),
+        ("math", "floor", 1) => bif!(erl_math::floor_1),
+        ("math", "fmod", 2) => bif!(erl_math::fmod_2),
+        ("math", "atan2", 2) => bif!(erl_math::atan2_2),
         // erl_bif_chksum.c
         ("erlang", "crc32", 1) => bif!(erl_bif_chksum::crc32_1),
         ("erlang", "crc32", 2) => bif!(erl_bif_chksum::crc32_2),
