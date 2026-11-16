@@ -646,6 +646,150 @@ fn fast_encode_kind<'h>(term: Term) -> FastEncodeKind<'h> {
     }
 }
 
+/// The rare terms of `encode_size_struct_int` (maps, bignums, bitstrings, pids, ports, refs,
+/// funs, records), out of line so that the common-term loop stays compact. Returns the size, the
+/// extra bytes of nested `LOCAL_EXT` headers and the next object when the term has elements.
+// Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn size_rare(
+    kind: TermKind,
+    obj: Term,
+    opts: &mut EncodeOpts,
+    node_source: Option<fn() -> (Atom, u32)>,
+    stack: &mut WStack,
+    table: &arinsal_term::AtomTable,
+) -> Result<(usize, usize, Option<Term>), EncodeError> {
+    let minor = opts.minor;
+    let mut added = 0usize;
+    let mut local_headers = 0usize;
+    let mut next = None;
+    macro_rules! add {
+        ($size:expr) => {{
+            added = $size;
+        }};
+    }
+    match kind {
+        TermKind::Map => {
+            let checked = arinsal_maps::checked_map(obj).map_err(|_| EncodeError::BadArg)?;
+            match checked.kind() {
+                arinsal_maps::CheckedMapKind::Flatmap(_) => {
+                    let size = checked.size();
+                    add!(5);
+                    if size > 0 {
+                        push_size_array(stack, obj, size, ARRAY_FLAT_VALUES);
+                        push_size_array(stack, obj, size, ARRAY_FLAT_KEYS);
+                    }
+                }
+                arinsal_maps::CheckedMapKind::Hashmap(_) => {
+                    let children =
+                        arinsal_term::MapNodeChildren::new(obj).ok_or(EncodeError::BadArg)?;
+                    if children.is_head() {
+                        add!(5);
+                    }
+                    push_hashmap_root_tasks(stack, obj, size_op(SIZE_HASHMAP_NODE), None)?;
+                }
+            }
+        }
+        TermKind::Pid | TermKind::Port | TermKind::Ref => {
+            // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
+            let internal = is_internal_identity(obj);
+            if internal && !opts.local {
+                resolve_local_node(opts, node_source);
+            }
+            let identity = obj.identity().ok_or(EncodeError::BadArg)?;
+            let identity = local_identity(identity, internal, opts.local, opts.local_node);
+            let node_size = if opts.local && internal {
+                1
+            } else {
+                atom_size_in(
+                    table,
+                    match identity {
+                        Identity::Pid { node, .. }
+                        | Identity::Port { node, .. }
+                        | Identity::Ref { node, .. } => node,
+                    },
+                    minor,
+                )?
+            };
+            let size = match identity {
+                Identity::Pid { .. } => 1 + node_size + 12,
+                Identity::Port { .. } => 1 + node_size + 12,
+                Identity::Ref { ids, .. } => 1 + 2 + node_size + 4 + 4 * ids.len(),
+            };
+            add!(size);
+        }
+        TermKind::Fun => {
+            let fun = fun_of(obj)?;
+            match &fun {
+                FunRef::Export { entry } => {
+                    add!(
+                        1 + atom_size_in(table, entry.module, minor)?
+                            + atom_size_in(table, entry.function, minor)?
+                            + small_size(i64::from(entry.arity))
+                    );
+                    // Port of external.c EXPORT_EXT: the arity is emitted by a nested enc_term.
+                    if opts.local {
+                        local_headers += 5;
+                    }
+                }
+                FunRef::Local { entry, .. } => {
+                    add!(
+                        1 + 4
+                            + 1
+                            + 16
+                            + 4
+                            + 4
+                            + atom_size_in(table, entry.module, minor)?
+                            + small_size(i64::from(entry.old_index))
+                            + small_size(i64::from(entry.old_uniq))
+                    );
+                    // Port of external.c FUN_DEF: old_index and old_uniq use nested enc_term.
+                    if opts.local {
+                        local_headers += 10;
+                    }
+                    stack.push(entry.pid.word());
+                    let free = fun.num_free();
+                    if free > 1 {
+                        push_size_array(stack, obj, free - 1, ARRAY_FUN_ENV);
+                    }
+                    if free != 0 {
+                        next = Some(fun.free(0).ok_or(EncodeError::BadArg)?);
+                    }
+                }
+            }
+        }
+        TermKind::Record => {
+            let record = record_of(obj)?;
+            let mut size = 1
+                + 4
+                + 1
+                + atom_size_in(table, record.module(), minor)?
+                + atom_size_in(table, record.name(), minor)?;
+            for index in 0..record.len() {
+                let sorted = record.sorted_index(index).ok_or(EncodeError::BadArg)?;
+                size = size
+                    .checked_add(atom_size_in(
+                        table,
+                        record.key(sorted).ok_or(EncodeError::BadArg)?,
+                        minor,
+                    )?)
+                    .ok_or(EncodeError::SystemLimit)?;
+            }
+            add!(size);
+            let values = record.len();
+            if values > 1 {
+                push_size_array(stack, obj, values - 1, ARRAY_RECORD);
+            }
+            if values != 0 {
+                next = Some(record.value(0).ok_or(EncodeError::BadArg)?);
+            }
+        }
+        _ => return Err(EncodeError::BadArg),
+    }
+    Ok((added, local_headers, next))
+}
+
 /// The work stack of the encoder passes (`DECLARE_WSTACK` with the default size).
 type WStack = arinsal_term::raw::WordStack<32>;
 
@@ -1209,15 +1353,6 @@ impl EncodeWalk {
                     .ok_or(EncodeError::SystemLimit)?;
             }};
         }
-        macro_rules! add_recursive_local_headers {
-            ($count:expr) => {
-                if opts.local {
-                    output_total = output_total
-                        .checked_add(5 * $count)
-                        .ok_or(EncodeError::SystemLimit)?;
-                }
-            };
-        }
         loop {
             // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
             if work + 1 >= budget {
@@ -1255,40 +1390,6 @@ impl EncodeWalk {
                         continue;
                     }
                 }
-                FastEncodeKind::Rare(TermKind::Number) => {
-                    if obj.header().is_some_and(|header| header & 63 == 0x18) {
-                        add!(if minor == 0 { 32 } else { 9 });
-                    } else {
-                        add!(bignum_size(obj)?);
-                    }
-                }
-                FastEncodeKind::Rare(TermKind::Map) => {
-                    let checked =
-                        arinsal_maps::checked_map(obj).map_err(|_| EncodeError::BadArg)?;
-                    match checked.kind() {
-                        arinsal_maps::CheckedMapKind::Flatmap(_) => {
-                            let size = checked.size();
-                            add!(5);
-                            if size > 0 {
-                                push_size_array(&mut stack, obj, size, ARRAY_FLAT_VALUES);
-                                push_size_array(&mut stack, obj, size, ARRAY_FLAT_KEYS);
-                            }
-                        }
-                        arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                            let children = arinsal_term::MapNodeChildren::new(obj)
-                                .ok_or(EncodeError::BadArg)?;
-                            if children.is_head() {
-                                add!(5);
-                            }
-                            push_hashmap_root_tasks(
-                                &mut stack,
-                                obj,
-                                size_op(SIZE_HASHMAP_NODE),
-                                None,
-                            )?;
-                        }
-                    }
-                }
                 FastEncodeKind::Rare(TermKind::Bitstring) => {
                     let bits = arinsal_term::erl_bits::bitstring_bit_len(obj)
                         .ok_or(EncodeError::BadArg)?;
@@ -1296,99 +1397,25 @@ impl EncodeWalk {
                     let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
                     add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
                 }
-                FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
-                    // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
-                    let internal = is_internal_identity(obj);
-                    if internal && !opts.local {
-                        resolve_local_node(&mut opts, node_source);
-                    }
-                    let identity = obj.identity().ok_or(EncodeError::BadArg)?;
-                    let identity = local_identity(identity, internal, opts.local, opts.local_node);
-                    let node_size = if opts.local && internal {
-                        1
+                FastEncodeKind::Rare(TermKind::Number) => {
+                    if obj.header().is_some_and(|header| header & 63 == 0x18) {
+                        add!(if minor == 0 { 32 } else { 9 });
                     } else {
-                        atom_size_in(
-                            table,
-                            match identity {
-                                Identity::Pid { node, .. }
-                                | Identity::Port { node, .. }
-                                | Identity::Ref { node, .. } => node,
-                            },
-                            minor,
-                        )?
-                    };
-                    let size = match identity {
-                        Identity::Pid { .. } => 1 + node_size + 12,
-                        Identity::Port { .. } => 1 + node_size + 12,
-                        Identity::Ref { ids, .. } => 1 + 2 + node_size + 4 + 4 * ids.len(),
-                    };
-                    add!(size);
-                }
-                FastEncodeKind::Rare(TermKind::Fun) => {
-                    let fun = fun_of(obj)?;
-                    match &fun {
-                        FunRef::Export { entry } => {
-                            add!(
-                                1 + atom_size_in(table, entry.module, minor)?
-                                    + atom_size_in(table, entry.function, minor)?
-                                    + small_size(i64::from(entry.arity))
-                            );
-                            // Port of external.c EXPORT_EXT: the arity is emitted by a nested enc_term.
-                            add_recursive_local_headers!(1);
-                        }
-                        FunRef::Local { entry, .. } => {
-                            add!(
-                                1 + 4
-                                    + 1
-                                    + 16
-                                    + 4
-                                    + 4
-                                    + atom_size_in(table, entry.module, minor)?
-                                    + small_size(i64::from(entry.old_index))
-                                    + small_size(i64::from(entry.old_uniq))
-                            );
-                            // Port of external.c FUN_DEF: old_index and old_uniq use nested enc_term.
-                            add_recursive_local_headers!(2);
-                            stack.push(entry.pid.word());
-                            let free = fun.num_free();
-                            if free > 1 {
-                                push_size_array(&mut stack, obj, free - 1, ARRAY_FUN_ENV);
-                            }
-                            if free != 0 {
-                                obj = fun.free(0).ok_or(EncodeError::BadArg)?;
-                                continue;
-                            }
-                        }
+                        add!(bignum_size(obj)?);
                     }
                 }
-                FastEncodeKind::Rare(TermKind::Record) => {
-                    let record = record_of(obj)?;
-                    let mut size = 1
-                        + 4
-                        + 1
-                        + atom_size_in(table, record.module(), minor)?
-                        + atom_size_in(table, record.name(), minor)?;
-                    for index in 0..record.len() {
-                        let sorted = record.sorted_index(index).ok_or(EncodeError::BadArg)?;
-                        size = size
-                            .checked_add(atom_size_in(
-                                table,
-                                record.key(sorted).ok_or(EncodeError::BadArg)?,
-                                minor,
-                            )?)
-                            .ok_or(EncodeError::SystemLimit)?;
-                    }
-                    add!(size);
-                    let values = record.len();
-                    if values > 1 {
-                        push_size_array(&mut stack, obj, values - 1, ARRAY_RECORD);
-                    }
-                    if values != 0 {
-                        obj = record.value(0).ok_or(EncodeError::BadArg)?;
+                FastEncodeKind::Rare(kind) => {
+                    let (size, local_headers, next) =
+                        size_rare(kind, obj, &mut opts, node_source, &mut stack, table)?;
+                    total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
+                    output_total = output_total
+                        .checked_add(size + local_headers)
+                        .ok_or(EncodeError::SystemLimit)?;
+                    if let Some(next) = next {
+                        obj = next;
                         continue;
                     }
                 }
-                FastEncodeKind::Rare(_) => return Err(EncodeError::BadArg),
             }
             match size_pop(&mut stack)? {
                 Some(next) => obj = next,
