@@ -1050,7 +1050,7 @@ fn prepare_private_append_nonwritable<H: HeapAlloc>(
     }
 }
 
-impl<H: HeapAlloc> TermBuilder<'_, H> {
+impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
     /// Copy a nonwritable private-append Binary into its new heap-fragment writer.
     // Port of erts/emulator/beam/erl_bits.c:1994-2009 (`HeapFragOnlyAlloc` and `build_writable_bitstring`), OTP-29.1.1.
     pub fn writable_binary_copy_in_fragment_with_address(

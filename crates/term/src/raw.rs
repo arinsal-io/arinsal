@@ -1235,3 +1235,39 @@ pub fn atom_literal_bytes(bin: Term, len: usize) -> &'static [u8] {
     debug_assert!(bytes.is_some_and(|bytes| bytes.len() == len));
     bytes.unwrap_or(&[])
 }
+
+/// The final binary of the iolist and term-to-binary passes: a unique writer of `byte_len`
+/// bytes that the pass fills in place and `finish_iolist_binary_output` then shares.
+// Port of erts/emulator/beam/erl_bits.c (erts_bin_nrml_alloc + ProcBin of the result of
+// erts_iolist_to_buf / erts_term_to_binary_int), OTP-29.1.1.
+pub fn allocate_iolist_binary<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    byte_len: usize,
+) -> Result<Term, TermError> {
+    if byte_len == 0 {
+        return crate::TermBuilder::new(heap).binary(&[]);
+    }
+    let bit_len = byte_len
+        .checked_mul(8)
+        .filter(|bits| *bits <= isize::MAX as usize)
+        .ok_or(TermError::SystemLimit)?;
+    let term = crate::TermBuilder::new(heap).writable_binary(&[], 0, byte_len)?;
+    crate::writable_extend_private(term, bit_len)?;
+    Ok(term)
+}
+
+/// Give the pass that allocated `term` with [`allocate_iolist_binary`] a mutable view of its
+/// bytes for the duration of `f`; `None` when `term` is not an active writer.
+///
+/// The view cannot escape `f`, and the pass owns the writer, so nothing else reads the bytes.
+pub fn with_iolist_binary_output<R>(term: Term, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+    // SAFETY: the writer was allocated by the running pass, which is the only user of its bytes
+    // until `finish_iolist_binary_output`, and the view ends with `f`.
+    let output = unsafe { crate::writable_bytes_mut(term) }?;
+    Some(f(output))
+}
+
+/// End the unique writer before the completed binary is shared with Erlang code.
+pub fn finish_iolist_binary_output(term: Term) {
+    crate::writable_finalize(term);
+}

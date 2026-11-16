@@ -17,8 +17,8 @@ use crate::natives::erl_iolist::{charge, create_holder, gc_enable};
 use crate::natives::external_dec::{B2tContext, B2tState};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, ProcessHeapHandle};
-use arinsal_external::{EncodeError, TtbContext, TtbState};
-use arinsal_term::{RefcBinary, Term, TermBuilder, atoms};
+use arinsal_external::{EncodeError, TERM_TO_BINARY_LOOP_FACTOR, TtbContext, TtbState, TtbStep};
+use arinsal_term::{Term, TermBuilder, atoms};
 
 /// The BIF error of a failure of either layer.
 trait ToBifError {
@@ -40,9 +40,6 @@ impl ToBifError for EncodeError {
     }
 }
 
-/// `TERM_TO_BINARY_LOOP_FACTOR`.
-const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
-
 /// `sizeof(TTBContext)` on a 64-bit build (its encode union is the largest member): the magic
 /// binary's `orig_size`.
 // Port of erts/emulator/beam/dist.h (TTBContext), OTP-29.1.1.
@@ -63,31 +60,11 @@ const TTB_BIFS: [(&str, usize, bool); 4] = [
 
 type TtbHolder = TrapContext<Option<TtbContext>>;
 
-/// What one pass of `erts_term_to_binary_int` produced.
-enum TtbStep {
-    /// The result and the reductions to bump (`BUMP_REDS`).
-    Done(Term, usize),
-    /// The context ran out of reductions and must be exported.
-    Yield,
-    /// `THE_NON_VALUE` (SYSTEM_LIMIT or an encode error), with the work done.
-    Failed(BifError, usize),
-}
-
 /// Node name and creation for locally tagged pids, ports and references; read only when the
 /// term being encoded holds one (erts reads `erts_this_node` in `enc_internal_pid`).
 fn local_node_source() -> (arinsal_term::Atom, u32) {
     // `erts_this_node` is read without any lock.
     arinsal_term::this_node()
-}
-
-/// The reductions `term_to_binary` charges for `work` units: one for an encoding that fits an
-/// on-heap binary, `work / TERM_TO_BINARY_LOOP_FACTOR` otherwise.
-fn charge_for(walk: &TtbContext, work: usize) -> usize {
-    if walk.finishes_simple() {
-        1
-    } else {
-        work / TERM_TO_BINARY_LOOP_FACTOR
-    }
 }
 
 /// `erlang:term_to_binary/1`.
@@ -258,14 +235,18 @@ fn ttb_outcome(
     let reds = process.heap.abi.fcalls.max(0) as usize;
     let chunk = reds.saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
     let trapped = mref.is_some();
-    match ttb_pass(process, context, chunk) {
+    match arinsal_external::erts_term_to_binary_int(
+        &mut ProcessHeapHandle(&mut process.heap),
+        context,
+        chunk,
+    ) {
         TtbStep::Failed(error, work) => {
-            abandon(context);
+            context.abandon();
             charge(process, work / TERM_TO_BINARY_LOOP_FACTOR);
             if trapped && (gc_enable(process) || process.heap.bin_vheap_gc_due()) {
                 crate::bif_traps::vbump_all_reds(process);
             }
-            TtbOutcome::Failed(error)
+            TtbOutcome::Failed(error.to_bif())
         }
         TtbStep::Done(value, bump) => {
             charge(process, bump);
@@ -337,193 +318,6 @@ pub(crate) fn erts_debug_term_to_binary(
 /// context is left spent.
 fn take_context(context: &mut TtbContext) -> TtbContext {
     std::mem::replace(context, TtbContext::completed())
-}
-
-/// Releases the writable staging binaries of a context that failed.
-fn abandon(context: &mut TtbContext) {
-    match &context.state {
-        TtbState::EncodeStaged(output) => arinsal_bifs::finish_iolist_binary_output(*output),
-        TtbState::Compress {
-            source,
-            destination,
-        } => {
-            arinsal_bifs::finish_iolist_binary_output(*source);
-            arinsal_bifs::finish_iolist_binary_output(*destination);
-        }
-        _ => {}
-    }
-}
-
-/// The `for (;;) switch (context->state)` loop of `erts_term_to_binary_int`.
-fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> TtbStep {
-    let mut work = 0usize;
-    macro_rules! tri {
-        ($e:expr) => {
-            match $e {
-                Ok(value) => value,
-                Err(error) => return TtbStep::Failed(error.to_bif(), work),
-            }
-        };
-    }
-    loop {
-        match &mut context.state {
-            TtbState::Size => {
-                let (sized, size_work) = tri!(context.step_size(chunk.saturating_sub(work)));
-                work += size_work;
-                if !sized {
-                    return TtbStep::Yield;
-                }
-                if context.finishes_simple() {
-                    // erts_term_to_binary_simple: finish in one go, BUMP_REDS(p, 1).
-                    let mut heap = ProcessHeapHandle(&mut process.heap);
-                    let value = tri!(context.encode_simple_binary(&mut heap));
-                    return TtbStep::Done(value, 1);
-                }
-                let size = tri!(context.output_size().ok_or(BifError::SystemLimit));
-                if context.uses_compression() {
-                    let mut heap = ProcessHeapHandle(&mut process.heap);
-                    let output = tri!(arinsal_bifs::allocate_iolist_binary(&mut heap, size));
-                    context.state = TtbState::EncodeStaged(output);
-                } else {
-                    // erts_bin_nrml_alloc(size): the result binary the pass fills in place.
-                    let binary =
-                        tri!(RefcBinary::new_zeroed(size).map_err(|_| BifError::SystemLimit));
-                    context.state = TtbState::Encode(Some(binary));
-                }
-            }
-            TtbState::Encode(binary) => {
-                // The result binary leaves the state while the pass fills it.
-                let mut binary = binary.take();
-                let size = tri!(context.output_size().ok_or(BifError::SystemLimit));
-                let budget = chunk.saturating_sub(work);
-                let bytes = tri!(
-                    binary
-                        .as_mut()
-                        .and_then(RefcBinary::bytes_mut_unique)
-                        .ok_or(BifError::SystemLimit)
-                );
-                let (done, encode_work) = tri!(context.step_into(bytes, budget));
-                work += encode_work;
-                if !done {
-                    context.state = TtbState::Encode(binary);
-                    return TtbStep::Yield;
-                }
-                let binary = binary.take().expect("the result binary");
-                let mut heap = ProcessHeapHandle(&mut process.heap);
-                let value = tri!(arinsal_external::install_refc_binary(
-                    &mut heap, binary, size
-                ));
-                return TtbStep::Done(value, charge_for(&*context, work));
-            }
-            TtbState::EncodeStaged(output) => {
-                let output = *output;
-                let budget = chunk.saturating_sub(work);
-                let encoded = arinsal_bifs::with_iolist_binary_output(output, |bytes| {
-                    context.step_into(bytes, budget).map_err(ToBifError::to_bif)
-                });
-                let (done, encode_work) = tri!(encoded);
-                work += encode_work;
-                if !done {
-                    return TtbStep::Yield;
-                }
-                arinsal_bifs::finish_iolist_binary_output(output);
-                // The deflate stream starts: the destination holds the 6-byte header.
-                let size = tri!(context.output_size().ok_or(BifError::SystemLimit));
-                let mut heap = ProcessHeapHandle(&mut process.heap);
-                let destination = tri!(arinsal_bifs::allocate_iolist_binary(&mut heap, size));
-                tri!(arinsal_bifs::with_iolist_binary_output(
-                    destination,
-                    |bytes| {
-                        bytes[..6].copy_from_slice(&[131, 80, 0, 0, 0, 0]);
-                        bytes[2..6].copy_from_slice(&((size - 1) as u32).to_be_bytes());
-                        Ok(())
-                    }
-                ));
-                context.state = TtbState::Compress {
-                    source: output,
-                    destination,
-                };
-            }
-            TtbState::Iovec => {
-                let (done, step_work) = tri!(context.step(chunk.saturating_sub(work)));
-                work += step_work;
-                if !done {
-                    return TtbStep::Yield;
-                }
-                let bump = charge_for(&*context, work);
-                let walk = std::mem::replace(context, TtbContext::completed());
-                let value = tri!(finish_iovec(process, walk));
-                return TtbStep::Done(value, bump);
-            }
-            TtbState::Compress {
-                source,
-                destination,
-            } => {
-                let (source, destination) = (*source, *destination);
-                let size = tri!(context.output_size().ok_or(BifError::SystemLimit));
-                let walk = &mut *context;
-                if !walk.compression_output_full() {
-                    let budget = chunk.saturating_sub(work).max(1);
-                    let progress = tri!(
-                        arinsal_bifs::with_binary_bytes(source, |view| {
-                            arinsal_bifs::with_iolist_binary_output(destination, |bytes| {
-                                walk.compress_into(&view.bytes()[1..], &mut bytes[6..], budget)
-                                    .map_err(ToBifError::to_bif)
-                            })
-                        })
-                        .and_then(|result| result)
-                    );
-                    work += progress.1;
-                    if !progress.0 && !walk.compression_output_full() {
-                        return TtbStep::Yield;
-                    }
-                }
-                if walk.compression_is_useful() {
-                    let payload = tri!(walk.compressed_payload_len().ok_or(BifError::SystemLimit));
-                    let final_size = tri!(6usize.checked_add(payload).ok_or(BifError::SystemLimit));
-                    tri!(
-                        final_size
-                            .checked_mul(8)
-                            .ok_or(BifError::SystemLimit)
-                            .and_then(|bits| arinsal_term::writable_resize_private(
-                                destination,
-                                bits
-                            )
-                            .map_err(|_| BifError::SystemLimit))
-                    );
-                    arinsal_bifs::finish_iolist_binary_output(destination);
-                    return TtbStep::Done(destination, charge_for(walk, work));
-                }
-                if walk.compression_output_full() || walk.compression_finished() {
-                    // Compression did not pay: the plain encoding is the result.
-                    arinsal_bifs::finish_iolist_binary_output(destination);
-                    let _ = size;
-                    return TtbStep::Done(source, charge_for(walk, work));
-                }
-                return TtbStep::Yield;
-            }
-        }
-    }
-}
-
-/// The `iovec` branch of `return_normal`: the parts of the encoding as a list of binaries, or
-/// the one compressed binary.
-// Port of erts/emulator/beam/external.c (erts_term_to_binary_int, return_normal), OTP-29.1.1.
-fn finish_iovec(process: &mut Process, walk: TtbContext) -> Result<Term, BifError> {
-    let mut heap = ProcessHeapHandle(&mut process.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let (parts, compressed) = walk.finish_iovec().map_err(ToBifError::to_bif)?;
-    let terms = parts
-        .iter()
-        .map(|bytes| builder.binary(bytes).map_err(|_| BifError::SystemLimit))
-        .collect::<Result<Vec<_>, _>>()?;
-    if compressed {
-        Ok(terms[0])
-    } else {
-        builder
-            .list_from_iter(terms)
-            .map_err(|_| BifError::SystemLimit)
-    }
 }
 
 /// `erlang:external_size/1`.

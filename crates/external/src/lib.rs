@@ -6,7 +6,10 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
-use arinsal_term::raw::{Cons, Tuple, term_at_pointer, term_from_bits};
+use arinsal_term::raw::{
+    BinRef, Cons, Tuple, allocate_iolist_binary, finish_iolist_binary_output, term_at_pointer,
+    term_from_bits, with_iolist_binary_output,
+};
 use arinsal_term::{
     Atom, FunRef, HeapAlloc, Identity, RefcBinary, Term, TermBuilder, TermKind, atoms, cmp_exact,
     global_atoms,
@@ -1320,6 +1323,223 @@ impl MapSort {
     }
 }
 
+/// `TERM_TO_BINARY_LOOP_FACTOR`: bytes of encoding per reduction.
+pub const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
+
+/// What one pass of `erts_term_to_binary_int` produced.
+pub enum TtbStep {
+    /// The result and the reductions to bump (`BUMP_REDS`).
+    Done(Term, usize),
+    /// The context ran out of reductions and must be exported.
+    Yield,
+    /// `THE_NON_VALUE` (SYSTEM_LIMIT or an encode error), with the work done.
+    Failed(EncodeError, usize),
+}
+
+/// The reductions `term_to_binary` charges for `work` units: one for an encoding that fits an
+/// on-heap binary, `work / TERM_TO_BINARY_LOOP_FACTOR` otherwise.
+fn charge_for(context: &TtbContext, work: usize) -> usize {
+    if context.finishes_simple() {
+        1
+    } else {
+        work / TERM_TO_BINARY_LOOP_FACTOR
+    }
+}
+
+impl TtbContext {
+    /// Releases the writable staging binaries of a context that failed.
+    // Port of erts/emulator/beam/external.c (ttb_context_destructor), OTP-29.1.1.
+    pub fn abandon(&mut self) {
+        match &self.state {
+            TtbState::EncodeStaged(output) => finish_iolist_binary_output(*output),
+            TtbState::Compress {
+                source,
+                destination,
+            } => {
+                finish_iolist_binary_output(*source);
+                finish_iolist_binary_output(*destination);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The `for (;;) switch (context->state)` loop of `erts_term_to_binary_int`: runs the passes
+/// of the context with `chunk` units of work until the result is built or the work runs out.
+// Port of erts/emulator/beam/external.c (erts_term_to_binary_int), OTP-29.1.1.
+pub fn erts_term_to_binary_int<H: HeapAlloc>(
+    heap: &mut H,
+    context: &mut TtbContext,
+    chunk: usize,
+) -> TtbStep {
+    let mut work = 0usize;
+    macro_rules! tri {
+        ($e:expr) => {
+            match $e {
+                Ok(value) => value,
+                Err(error) => return TtbStep::Failed(error, work),
+            }
+        };
+    }
+    loop {
+        match &mut context.state {
+            TtbState::Size => {
+                let (sized, size_work) = tri!(context.step_size(chunk.saturating_sub(work)));
+                work += size_work;
+                if !sized {
+                    return TtbStep::Yield;
+                }
+                if context.finishes_simple() {
+                    // erts_term_to_binary_simple: finish in one go, BUMP_REDS(p, 1).
+                    let value = tri!(context.encode_simple_binary(heap));
+                    return TtbStep::Done(value, 1);
+                }
+                let size = tri!(context.output_size().ok_or(EncodeError::SystemLimit));
+                if context.uses_compression() {
+                    let output = tri!(
+                        allocate_iolist_binary(heap, size).map_err(|_| EncodeError::SystemLimit)
+                    );
+                    context.state = TtbState::EncodeStaged(output);
+                } else {
+                    // erts_bin_nrml_alloc(size): the result binary the pass fills in place.
+                    let binary =
+                        tri!(RefcBinary::new_zeroed(size).map_err(|_| EncodeError::SystemLimit));
+                    context.state = TtbState::Encode(Some(binary));
+                }
+            }
+            TtbState::Encode(binary) => {
+                // The result binary leaves the state while the pass fills it.
+                let mut binary = binary.take();
+                let size = tri!(context.output_size().ok_or(EncodeError::SystemLimit));
+                let budget = chunk.saturating_sub(work);
+                let bytes = tri!(
+                    binary
+                        .as_mut()
+                        .and_then(RefcBinary::bytes_mut_unique)
+                        .ok_or(EncodeError::SystemLimit)
+                );
+                let (done, encode_work) = tri!(context.step_into(bytes, budget));
+                work += encode_work;
+                if !done {
+                    context.state = TtbState::Encode(binary);
+                    return TtbStep::Yield;
+                }
+                let binary = binary.take().expect("the result binary");
+                let value = tri!(install_refc_binary(heap, binary, size));
+                return TtbStep::Done(value, charge_for(context, work));
+            }
+            TtbState::EncodeStaged(output) => {
+                let output = *output;
+                let budget = chunk.saturating_sub(work);
+                let encoded = tri!(
+                    with_iolist_binary_output(output, |bytes| context.step_into(bytes, budget))
+                        .ok_or(EncodeError::SystemLimit)
+                );
+                let (done, encode_work) = tri!(encoded);
+                work += encode_work;
+                if !done {
+                    return TtbStep::Yield;
+                }
+                finish_iolist_binary_output(output);
+                // The deflate stream starts: the destination holds the 6-byte header.
+                let size = tri!(context.output_size().ok_or(EncodeError::SystemLimit));
+                let destination =
+                    tri!(allocate_iolist_binary(heap, size).map_err(|_| EncodeError::SystemLimit));
+                tri!(
+                    with_iolist_binary_output(destination, |bytes| {
+                        bytes[..6].copy_from_slice(&[131, 80, 0, 0, 0, 0]);
+                        bytes[2..6].copy_from_slice(&((size - 1) as u32).to_be_bytes());
+                    })
+                    .ok_or(EncodeError::SystemLimit)
+                );
+                context.state = TtbState::Compress {
+                    source: output,
+                    destination,
+                };
+            }
+            TtbState::Iovec => {
+                let (done, step_work) = tri!(context.step(chunk.saturating_sub(work)));
+                work += step_work;
+                if !done {
+                    return TtbStep::Yield;
+                }
+                let bump = charge_for(context, work);
+                let finished = std::mem::replace(context, TtbContext::completed());
+                let value = tri!(finish_iovec(heap, finished));
+                return TtbStep::Done(value, bump);
+            }
+            TtbState::Compress {
+                source,
+                destination,
+            } => {
+                let (source, destination) = (*source, *destination);
+                if !context.compression_output_full() {
+                    let budget = chunk.saturating_sub(work).max(1);
+                    let plain = tri!(BinRef::try_from(source).map_err(|_| EncodeError::BadArg));
+                    let plain = tri!(plain.bytes().ok_or(EncodeError::BadArg));
+                    let progress = tri!(
+                        with_iolist_binary_output(destination, |bytes| {
+                            context.compress_into(&plain[1..], &mut bytes[6..], budget)
+                        })
+                        .ok_or(EncodeError::SystemLimit)
+                    );
+                    let progress = tri!(progress);
+                    work += progress.1;
+                    if !progress.0 && !context.compression_output_full() {
+                        return TtbStep::Yield;
+                    }
+                }
+                if context.compression_is_useful() {
+                    let payload = tri!(
+                        context
+                            .compressed_payload_len()
+                            .ok_or(EncodeError::SystemLimit)
+                    );
+                    let final_size =
+                        tri!(6usize.checked_add(payload).ok_or(EncodeError::SystemLimit));
+                    tri!(
+                        final_size
+                            .checked_mul(8)
+                            .ok_or(EncodeError::SystemLimit)
+                            .and_then(|bits| arinsal_term::writable_resize_private(
+                                destination,
+                                bits
+                            )
+                            .map_err(|_| EncodeError::SystemLimit))
+                    );
+                    finish_iolist_binary_output(destination);
+                    return TtbStep::Done(destination, charge_for(context, work));
+                }
+                if context.compression_output_full() || context.compression_finished() {
+                    // Compression did not pay: the plain encoding is the result.
+                    finish_iolist_binary_output(destination);
+                    return TtbStep::Done(source, charge_for(context, work));
+                }
+                return TtbStep::Yield;
+            }
+        }
+    }
+}
+
+/// The `iovec` branch of `return_normal`: the parts of the encoding as a list of binaries, or
+/// the one compressed binary.
+// Port of erts/emulator/beam/external.c (erts_term_to_binary_int, return_normal), OTP-29.1.1.
+fn finish_iovec<H: HeapAlloc>(heap: &mut H, context: TtbContext) -> Result<Term, EncodeError> {
+    let mut builder = TermBuilder::new(heap);
+    let (parts, compressed) = context.finish_iovec()?;
+    let terms = parts
+        .iter()
+        .map(|bytes| builder.binary(bytes).map_err(|_| EncodeError::SystemLimit))
+        .collect::<Result<Vec<_>, _>>()?;
+    if compressed {
+        Ok(terms[0])
+    } else {
+        builder
+            .list_from_iter(terms)
+            .map_err(|_| EncodeError::SystemLimit)
+    }
+}
+
 /// Build the heap term of a refc binary that holds a finished encoding of `size` bytes.
 pub fn install_refc_binary<H: HeapAlloc>(
     heap: &mut H,
@@ -1365,6 +1585,14 @@ struct TtbEncodeContext {
     free_first: bool,
 }
 
+/// `TTBCompressContext`: the zlib stream of the `TTBCompress` state across a yield.
+// Port of erts/emulator/beam/external.c (TTBCompressContext), OTP-29.1.1.
+#[derive(Default)]
+struct TtbCompressContext {
+    stream: Option<Compress>,
+    finished: bool,
+}
+
 /// `TTBContext.state` with the members of its union.
 pub enum TtbState {
     /// `TTBSize`: the walk is sizing the term.
@@ -1394,6 +1622,7 @@ pub struct TtbContext {
     opts: EncodeOpts,
     size: TtbSizeContext,
     encode: TtbEncodeContext,
+    compress: TtbCompressContext,
     iovec: bool,
     /// State that the plain `term_to_binary` path never touches (`s.cc`, the iovec splits, the
     /// deterministic map sort and the local hash), out of line so that the context stays small.
@@ -1413,8 +1642,6 @@ struct EncodeCold {
     splits: Vec<(usize, usize)>,
     map_sort: Option<Box<MapSort>>,
     local_hash: Option<BlockHashWalk>,
-    compressor: Option<Compress>,
-    compression_finished: bool,
 }
 
 impl TtbContext {
@@ -1441,6 +1668,7 @@ impl TtbContext {
                 direct_started: false,
                 free_first: false,
             },
+            compress: TtbCompressContext::default(),
             iovec: false,
             cold: None,
             record_splits: false,
@@ -1498,6 +1726,7 @@ impl TtbContext {
                 direct_started: false,
                 free_first: true,
             },
+            compress: TtbCompressContext::default(),
             iovec: false,
             cold: None,
             record_splits: false,
@@ -1534,132 +1763,13 @@ impl TtbContext {
         !(self.iovec && plain) && self.size.encoded <= 64
     }
 
-    /// `encode_size_struct_int`: size the term with `budget` yield counts, a loop over a
-    /// frame-local work stack; on running out of budget only the stack, the pending object and
-    /// the sizes so far are saved into the context. Returns whether the pass finished.
-    // Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
-    #[inline(always)]
-    fn encode_size_struct_int(
-        &mut self,
-        budget: usize,
-        consumed: &mut usize,
-    ) -> Result<bool, EncodeError> {
-        let mut opts = self.opts;
-        let node_source = self.node_source;
-        let mut stack = WStack::new();
-        stack.restore(&mut self.size.work);
-        let table = global_atoms();
-        let minor = opts.minor;
-        let mut total = self.size.encoded;
-        let mut output_total = self.size.output;
-        let mut work = *consumed;
-        let mut obj = match self.size.current.take() {
-            Some(obj) => obj,
-            None => match size_pop(&mut stack)? {
-                Some(obj) => obj,
-                None => return Ok(true),
-            },
-        };
-        macro_rules! save {
-            ($pending:expr) => {{
-                self.opts = opts;
-                stack.save(&mut self.size.work);
-                self.size.current = $pending;
-                self.size.encoded = total;
-                self.size.output = output_total;
-                *consumed = work;
-            }};
-        }
-        macro_rules! add {
-            ($size:expr) => {{
-                let size = $size;
-                total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
-                output_total = output_total
-                    .checked_add(size)
-                    .ok_or(EncodeError::SystemLimit)?;
-            }};
-        }
-        loop {
-            // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
-            if work + 1 >= budget {
-                save!(Some(obj));
-                return Ok(false);
-            }
-            work += 1;
-            match fast_encode_kind(obj) {
-                FastEncodeKind::Small(value) => add!(small_size(value)),
-                FastEncodeKind::Atom(atom) => add!(atom_size_in(table, atom, minor)?),
-                FastEncodeKind::Nil => add!(1),
-                FastEncodeKind::List(cons) => {
-                    // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
-                    let (len, is_string) = external_string_prefix(obj, cons);
-                    work += len / 2;
-                    if is_string {
-                        add!(3 + len);
-                    } else {
-                        add!(5);
-                        let (head, rest) = cons.pair();
-                        push_term_task(&mut stack, size_op(SIZE_LIST_TAIL), rest);
-                        obj = head;
-                        continue;
-                    }
-                }
-                FastEncodeKind::Tuple(tuple) => {
-                    let arity = tuple.arity();
-                    add!(if arity <= 255 { 2 } else { 5 });
-                    if arity > 0 {
-                        if arity > 1 {
-                            let pointer = tuple.element_pointer(1).ok_or(EncodeError::BadArg)?;
-                            push_size_tuple_array(&mut stack, pointer, arity - 1);
-                        }
-                        obj = tuple.get(0).ok_or(EncodeError::BadArg)?;
-                        continue;
-                    }
-                }
-                FastEncodeKind::Rare(TermKind::Bitstring) => {
-                    let bits = arinsal_term::erl_bits::bitstring_bit_len(obj)
-                        .ok_or(EncodeError::BadArg)?;
-                    let len = bits.div_ceil(8);
-                    let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
-                    add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
-                }
-                FastEncodeKind::Rare(TermKind::Number) => {
-                    if obj.header().is_some_and(|header| header & 63 == 0x18) {
-                        add!(if minor == 0 { 32 } else { 9 });
-                    } else {
-                        add!(bignum_size(obj)?);
-                    }
-                }
-                FastEncodeKind::Rare(kind) => {
-                    let (size, local_headers, next) =
-                        size_rare(kind, obj, &mut opts, node_source, &mut stack, table)?;
-                    total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
-                    output_total = output_total
-                        .checked_add(size + local_headers)
-                        .ok_or(EncodeError::SystemLimit)?;
-                    if let Some(next) = next {
-                        obj = next;
-                        continue;
-                    }
-                }
-            }
-            match size_pop(&mut stack)? {
-                Some(next) => obj = next,
-                None => {
-                    save!(None);
-                    return Ok(true);
-                }
-            }
-        }
-    }
-
     /// Advance the size pass used before result allocation.
     pub fn step_size(&mut self, budget: usize) -> Result<(bool, usize), EncodeError> {
         if self.size.done {
             return Ok((true, 0));
         }
         let mut consumed = 0;
-        let done = self.encode_size_struct_int(budget, &mut consumed)?;
+        let done = encode_size_struct_int(self, budget, &mut consumed)?;
         if done {
             self.size.done = true;
         }
@@ -1675,7 +1785,7 @@ impl TtbContext {
                 output.extend_from_slice(&[121, 0, 0, 0, 0]);
             }
         }
-        let result = self.step_with_output(budget, &mut output, 0);
+        let result = enc_term_int(self, budget, &mut output, 0);
         self.cold().out = output;
         result
     }
@@ -1709,7 +1819,7 @@ impl TtbContext {
             }
         }
         let mut writer = OutputSlice::new(output, self.encode.written);
-        let (mut done, used) = self.step_with_output(budget, &mut writer, size_work)?;
+        let (mut done, used) = enc_term_int(self, budget, &mut writer, size_work)?;
         self.encode.written = writer.len();
         if writer.failed() {
             return Err(EncodeError::SystemLimit);
@@ -1833,9 +1943,9 @@ impl TtbContext {
             .compressed
             .filter(|level| *level > 0)
             .ok_or(EncodeError::BadArg)?;
-        let cold = self.cold();
-        let compressor = cold
-            .compressor
+        let compress = &mut self.compress;
+        let compressor = compress
+            .stream
             .get_or_insert_with(|| Compress::new(Compression::new(level as u32), true));
         let input_at =
             usize::try_from(compressor.total_in()).map_err(|_| EncodeError::SystemLimit)?;
@@ -1845,7 +1955,7 @@ impl TtbContext {
             return Err(EncodeError::SystemLimit);
         }
         if output_at == output.len() {
-            return Ok((cold.compression_finished, 0));
+            return Ok((compress.finished, 0));
         }
         let end = output_at.saturating_add(budget.max(1)).min(output.len());
         let before = compressor.total_out();
@@ -1858,341 +1968,36 @@ impl TtbContext {
             .map_err(|_| EncodeError::SystemLimit)?;
         let written = usize::try_from(compressor.total_out() - before)
             .map_err(|_| EncodeError::SystemLimit)?;
-        cold.compression_finished = status == Status::StreamEnd;
-        Ok((cold.compression_finished, written))
+        compress.finished = status == Status::StreamEnd;
+        Ok((compress.finished, written))
     }
 
     /// Whether the compressed stream fits the size of its plain ETF binary.
     pub fn compression_is_useful(&self) -> bool {
-        self.cold.as_ref().is_some_and(|cold| {
-            cold.compression_finished
-                && cold.compressor.as_ref().is_some_and(|compressor| {
-                    compressor.total_out().saturating_add(6) <= self.size.output as u64
-                })
-        })
+        self.compress.finished
+            && self.compress.stream.as_ref().is_some_and(|compressor| {
+                compressor.total_out().saturating_add(6) <= self.size.output as u64
+            })
     }
 
     /// Whether the zlib stream reached its final block.
     pub fn compression_finished(&self) -> bool {
-        self.cold
-            .as_ref()
-            .is_some_and(|cold| cold.compression_finished)
+        self.compress.finished
     }
 
     /// Number of compressed payload bytes emitted so far.
     pub fn compressed_payload_len(&self) -> Option<usize> {
-        self.cold
+        self.compress
+            .stream
             .as_ref()
-            .and_then(|cold| cold.compressor.as_ref())
             .and_then(|compressor| usize::try_from(compressor.total_out()).ok())
     }
 
     /// Whether the destination has no remaining compressed payload capacity.
     pub fn compression_output_full(&self) -> bool {
-        self.cold
-            .as_ref()
-            .and_then(|cold| cold.compressor.as_ref())
-            .is_some_and(|compressor| {
-                compressor.total_out() >= self.size.output.saturating_sub(6) as u64
-            })
-    }
-
-    // Port of erts/emulator/beam/external.c:3253 (enc_term_int), OTP-29.1.1.
-    fn step_with_output(
-        &mut self,
-        budget: usize,
-        out: &mut impl ByteOutput,
-        mut consumed: usize,
-    ) -> Result<(bool, usize), EncodeError> {
-        if !self.size.done {
-            let (done, size_work) = self.step_size(budget)?;
-            consumed += size_work;
-            if !done {
-                return Ok((false, budget));
-            }
-        }
-        let mut opts = self.opts;
-        let node_source = self.node_source;
-        let record_splits = self.record_splits;
-        let iovec = self.iovec;
-        let table = global_atoms();
-        // The stack and the pending object live in locals so that the output writes cannot
-        // alias them; erts keeps them in registers (`DECLARE_WSTACK`, `obj`).
-        let mut stack = WStack::new();
-        stack.restore(&mut self.encode.work);
-        let mut cur = self.encode.current.take();
-        let mut free_first = self.encode.free_first;
-        loop {
-            if consumed + 1 >= budget && !(free_first && (cur.is_some() || !stack.is_empty())) {
-                break;
-            }
-            let term = if let Some(term) = cur.take() {
-                term
-            } else {
-                // outer_loop
-                let Some(object_word) = stack.pop() else {
-                    break;
-                };
-                let command = stack.pop_word();
-                let code = command >> 4;
-                if code == ENC_TERM_CODE {
-                    term_from_bits(object_word)
-                } else if code == ENC_ONE_CONS_CODE {
-                    let list = term_from_bits(object_word);
-                    let cons = Cons::try_from(list).map_err(|_| EncodeError::BadArg)?;
-                    encode_one_cons(&mut stack, out, cons)?
-                } else if code == ENC_MAP_PAIR_CODE {
-                    let remaining =
-                        usize::try_from(object_word).map_err(|_| EncodeError::BadArg)?;
-                    let container = term_from_bits(stack.pop_word());
-                    let (key, value) = flatmap_pair(container, remaining)?;
-                    if remaining > 1 {
-                        push_flatmap_task(&mut stack, container, remaining - 1)?;
-                    }
-                    push_term_task(&mut stack, ENC_TERM, value);
-                    key
-                } else if code >= ENC_LAST_ARRAY_ELEMENT {
-                    // ENC_LAST_ARRAY_ELEMENT+N: a tuple element pointer and count.
-                    let remaining = code - ENC_LAST_ARRAY_ELEMENT + 1;
-                    let pointer = object_word;
-                    let element = term_at_pointer(pointer);
-                    if remaining > 1 {
-                        push_tuple_pointer_task(
-                            &mut stack,
-                            stack_command((code - 1) as i64),
-                            pointer + 8,
-                        );
-                    }
-                    element
-                } else if code == ENC_PATCH_FUN_SIZE_CODE {
-                    consumed += 1;
-                    let at = usize::try_from(object_word).map_err(|_| EncodeError::BadArg)?;
-                    let size =
-                        u32::try_from(out.len() - at).map_err(|_| EncodeError::SystemLimit)?;
-                    out.patch(at, &size.to_be_bytes());
-                    continue;
-                } else if code == ENC_BIN_COPY_CODE {
-                    let term = term_from_bits(object_word);
-                    let bits = pop_stack_small(&mut stack);
-                    let copied = pop_stack_small(&mut stack);
-                    let start = pop_stack_small(&mut stack);
-                    // Port of erts/emulator/beam/external.c:3368 (ENC_BIN_COPY), OTP-29.1.1.
-                    let len = bits.div_ceil(8);
-                    let available = budget.saturating_sub(consumed);
-                    if available == 0 {
-                        stack.push(stack_small(start)?);
-                        stack.push(stack_small(copied)?);
-                        stack.push(stack_small(bits)?);
-                        stack.push(ENC_BIN_COPY);
-                        stack.push(term.word());
-                        break;
-                    }
-                    let amount = len.saturating_sub(copied).min(available);
-                    let bit_count = (amount * 8).min(bits.saturating_sub(copied * 8));
-                    out.write_bitstring(term, copied * 8, bit_count)?;
-                    consumed += amount;
-                    if copied + amount < len {
-                        stack.push(stack_small(start)?);
-                        stack.push(stack_small(copied + amount)?);
-                        stack.push(stack_small(bits)?);
-                        stack.push(ENC_BIN_COPY);
-                        stack.push(term.word());
-                    } else {
-                        if !bits.is_multiple_of(8) {
-                            out.mask_last(0xff << (8 - bits % 8));
-                        }
-                        if len > 64 && record_splits {
-                            self.cold().splits.push((start, out.len()));
-                        }
-                    }
-                    continue;
-                } else if code == ENC_HASHMAP_NODE_CODE {
-                    let node = term_from_bits(object_word);
-                    cur = Some(push_hashmap_node_tasks(
-                        &mut stack,
-                        node,
-                        Some(ENC_HASHMAP_NODE),
-                        Some(ENC_TERM),
-                    )?);
-                    continue;
-                } else if code == ENC_START_SORTING_MAP_CODE {
-                    debug_assert_eq!(object_word, Term::NON_VALUE.word());
-                    let mut sorting = self.cold().map_sort.take().ok_or(EncodeError::BadArg)?;
-                    let work_budget = budget.saturating_sub(consumed).max(1);
-                    consumed += sorting.step(work_budget);
-                    if sorting.is_done() {
-                        push_sorted_map_tasks(&mut stack, (*sorting).finish());
-                    } else {
-                        self.cold().map_sort = Some(sorting);
-                        stack.push(ENC_START_SORTING_MAP);
-                        stack.push(Term::NON_VALUE.word());
-                    }
-                    continue;
-                } else {
-                    return Err(EncodeError::BadArg);
-                }
-            };
-            if !std::mem::take(&mut free_first) {
-                consumed += 1;
-            }
-            match fast_encode_kind(term) {
-                FastEncodeKind::Small(n) => write_small(out, n),
-                FastEncodeKind::Atom(atom) => {
-                    atom_bytes_in(table, out, atom, opts.minor)?;
-                }
-                FastEncodeKind::Nil => out.push(106),
-                FastEncodeKind::Rare(TermKind::Number) => {
-                    if let Some(header) = term.header() {
-                        if header & 63 == 0x18 {
-                            // SAFETY: a live boxed FLOAT has one initialized data word.
-                            let f = unsafe { term.float_ref() }
-                                .ok_or(EncodeError::BadArg)?
-                                .get();
-                            if opts.minor == 0 {
-                                let s = format!("{f:.20e}");
-                                let (mantissa, exponent) = s.split_once('e').unwrap();
-                                let exp: i32 = exponent.parse().unwrap();
-                                let rendered = format!(
-                                    "{mantissa}e{}{:02}",
-                                    if exp < 0 { '-' } else { '+' },
-                                    exp.abs()
-                                );
-                                out.push(99);
-                                out.extend_from_slice(rendered.as_bytes());
-                                out.extend_zeroed(31 - rendered.len());
-                            } else {
-                                out.push(70);
-                                out.extend_from_slice(&f.to_bits().to_be_bytes());
-                            }
-                        } else {
-                            // SAFETY: a live boxed integer has initialized magnitude words.
-                            let n = unsafe { term.big_ref() }
-                                .ok_or(EncodeError::BadArg)?
-                                .to_bigint();
-                            int_bytes(out, &n);
-                        }
-                    }
-                }
-                FastEncodeKind::List(cons) => {
-                    // Port of erts/emulator/beam/external.c:3703 (LIST_DEF), OTP-29.1.1.
-                    let (len, is_string) = external_string_prefix(term, cons);
-                    if is_string {
-                        out.push(107);
-                        out.extend_from_slice(&(len as u16).to_be_bytes());
-                        let first = cons.head().as_small().ok_or(EncodeError::BadArg)?;
-                        out.push(first as u8);
-                        let mut cursor = cons.tail();
-                        for _ in 1..len {
-                            // external_string_prefix already walked these cons cells.
-                            let cell = Cons::try_from(cursor).map_err(|_| EncodeError::BadArg)?;
-                            out.push(cell.head().as_small().ok_or(EncodeError::BadArg)? as u8);
-                            cursor = cell.tail();
-                        }
-                        consumed += len;
-                    } else {
-                        // Port of erts/emulator/beam/external.c (LIST_DEF), OTP-29.1.1.
-                        consumed += len / 2;
-                        out.push(108);
-                        let len_at = out.len();
-                        out.extend_from_slice(&0u32.to_be_bytes());
-                        // `WSTACK_PUSH2(s, ep, 1)` then `goto encode_one_cons`.
-                        stack.push(stack_small(len_at)?);
-                        stack.push(stack_small(1)?);
-                        cur = Some(encode_one_cons(&mut stack, out, cons)?);
-                    }
-                }
-                FastEncodeKind::Tuple(tuple) => {
-                    let arity = tuple.arity();
-                    if arity <= 255 {
-                        out.extend_from_slice(&[104, arity as u8]);
-                    } else {
-                        out.push(105);
-                        out.extend_from_slice(&(arity as u32).to_be_bytes());
-                    }
-                    if arity > 0 {
-                        // WSTACK_PUSH2(s, ENC_LAST_ARRAY_ELEMENT+i-1, ptr)
-                        let pointer = tuple.element_pointer(0).ok_or(EncodeError::BadArg)?;
-                        push_tuple_pointer_task(
-                            &mut stack,
-                            stack_command((ENC_LAST_ARRAY_ELEMENT + arity as u64 - 1) as i64),
-                            pointer,
-                        );
-                    }
-                }
-                FastEncodeKind::Rare(TermKind::Bitstring) => {
-                    // SAFETY: the binary owner remains live and no append runs during encoding.
-                    let view = unsafe { term.binary_ref() }.ok_or(EncodeError::BadArg)?;
-                    let bits = view.bit_len();
-                    let len = bits.div_ceil(8);
-                    let n = u32::try_from(len)
-                        .map_err(|_| EncodeError::SystemLimit)?
-                        .to_be_bytes();
-                    if bits.is_multiple_of(8) {
-                        out.extend_from_slice(&[109, n[0], n[1], n[2], n[3]]);
-                    } else {
-                        out.extend_from_slice(&[77, n[0], n[1], n[2], n[3], (bits % 8) as u8]);
-                    }
-                    let start = out.len();
-                    if len != 0 {
-                        // Port of erts/emulator/beam/external.c (BITSTRING_DEF), OTP-29.1.1.
-                        let aligned = view.start_bit().is_multiple_of(8);
-                        let copy_payload = bits <= 64 * 8 || !iovec || !aligned;
-                        let left = budget.saturating_sub(consumed);
-                        if copy_payload && len > left.saturating_mul(8) {
-                            stack.push(stack_small(start)?);
-                            stack.push(stack_small(0)?);
-                            stack.push(stack_small(bits)?);
-                            stack.push(ENC_BIN_COPY);
-                            stack.push(term.word());
-                        } else {
-                            if aligned && bits.is_multiple_of(8) {
-                                // copy_binary_to_buffer: one memcpy of the payload.
-                                let from = view.start_bit() / 8;
-                                out.extend_from_slice(
-                                    view.bytes()
-                                        .get(from..from + len)
-                                        .ok_or(EncodeError::BadArg)?,
-                                );
-                            } else {
-                                out.write_bitstring(term, 0, bits)?;
-                                if bits % 8 != 0 {
-                                    out.mask_last(0xff << (8 - bits % 8));
-                                }
-                            }
-                            if len > 64 && record_splits {
-                                self.cold().splits.push((start, out.len()));
-                            }
-                        }
-                    }
-                }
-                FastEncodeKind::Rare(kind) => {
-                    enc_rare(
-                        kind,
-                        term,
-                        out,
-                        &mut stack,
-                        &mut opts,
-                        node_source,
-                        table,
-                        &mut self.cold,
-                    )?;
-                }
-            }
-        }
-        let done = stack.is_empty()
-            && cur.is_none()
-            && self
-                .cold
-                .as_ref()
-                .is_none_or(|cold| cold.map_sort.is_none());
-        self.opts = opts;
-        stack.save(&mut self.encode.work);
-        self.encode.current = cur;
-        self.encode.free_first = !done;
-        if out.failed() || (done && !iovec && out.len() != self.size.output) {
-            return Err(EncodeError::SystemLimit);
-        }
-        Ok((done, if done { consumed } else { budget.max(consumed) }))
+        self.compress.stream.as_ref().is_some_and(|compressor| {
+            compressor.total_out() >= self.size.output.saturating_sub(6) as u64
+        })
     }
 
     /// Finish compression and return the serialized byte vector.
@@ -2346,6 +2151,418 @@ fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, EncodeError
         }
     }
     Ok(plain)
+}
+
+/// `encode_size_struct_int`: size the term with `budget` yield counts, a loop over a
+/// frame-local work stack; on running out of budget only the stack, the pending object and
+/// the sizes so far are saved into the context. Returns whether the pass finished.
+// Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
+#[inline(always)]
+fn encode_size_struct_int(
+    ctx: &mut TtbContext,
+    budget: usize,
+    consumed: &mut usize,
+) -> Result<bool, EncodeError> {
+    let mut opts = ctx.opts;
+    let node_source = ctx.node_source;
+    let mut stack = WStack::new();
+    stack.restore(&mut ctx.size.work);
+    let table = global_atoms();
+    let minor = opts.minor;
+    let mut total = ctx.size.encoded;
+    let mut output_total = ctx.size.output;
+    let mut work = *consumed;
+    let mut obj = match ctx.size.current.take() {
+        Some(obj) => obj,
+        None => match size_pop(&mut stack)? {
+            Some(obj) => obj,
+            None => return Ok(true),
+        },
+    };
+    macro_rules! save {
+        ($pending:expr) => {{
+            ctx.opts = opts;
+            stack.save(&mut ctx.size.work);
+            ctx.size.current = $pending;
+            ctx.size.encoded = total;
+            ctx.size.output = output_total;
+            *consumed = work;
+        }};
+    }
+    macro_rules! add {
+        ($size:expr) => {{
+            let size = $size;
+            total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
+            output_total = output_total
+                .checked_add(size)
+                .ok_or(EncodeError::SystemLimit)?;
+        }};
+    }
+    loop {
+        // `if (ctx && --r <= 0)` of erts: yield before sizing `obj`.
+        if work + 1 >= budget {
+            save!(Some(obj));
+            return Ok(false);
+        }
+        work += 1;
+        match fast_encode_kind(obj) {
+            FastEncodeKind::Small(value) => add!(small_size(value)),
+            FastEncodeKind::Atom(atom) => add!(atom_size_in(table, atom, minor)?),
+            FastEncodeKind::Nil => add!(1),
+            FastEncodeKind::List(cons) => {
+                // Port of erts/emulator/beam/external.c (is_external_string), OTP-29.1.1.
+                let (len, is_string) = external_string_prefix(obj, cons);
+                work += len / 2;
+                if is_string {
+                    add!(3 + len);
+                } else {
+                    add!(5);
+                    let (head, rest) = cons.pair();
+                    push_term_task(&mut stack, size_op(SIZE_LIST_TAIL), rest);
+                    obj = head;
+                    continue;
+                }
+            }
+            FastEncodeKind::Tuple(tuple) => {
+                let arity = tuple.arity();
+                add!(if arity <= 255 { 2 } else { 5 });
+                if arity > 0 {
+                    if arity > 1 {
+                        let pointer = tuple.element_pointer(1).ok_or(EncodeError::BadArg)?;
+                        push_size_tuple_array(&mut stack, pointer, arity - 1);
+                    }
+                    obj = tuple.get(0).ok_or(EncodeError::BadArg)?;
+                    continue;
+                }
+            }
+            FastEncodeKind::Rare(TermKind::Bitstring) => {
+                let bits =
+                    arinsal_term::erl_bits::bitstring_bit_len(obj).ok_or(EncodeError::BadArg)?;
+                let len = bits.div_ceil(8);
+                let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
+                add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
+            }
+            FastEncodeKind::Rare(TermKind::Number) => {
+                if obj.header().is_some_and(|header| header & 63 == 0x18) {
+                    add!(if minor == 0 { 32 } else { 9 });
+                } else {
+                    add!(bignum_size(obj)?);
+                }
+            }
+            FastEncodeKind::Rare(kind) => {
+                let (size, local_headers, next) =
+                    size_rare(kind, obj, &mut opts, node_source, &mut stack, table)?;
+                total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
+                output_total = output_total
+                    .checked_add(size + local_headers)
+                    .ok_or(EncodeError::SystemLimit)?;
+                if let Some(next) = next {
+                    obj = next;
+                    continue;
+                }
+            }
+        }
+        match size_pop(&mut stack)? {
+            Some(next) => obj = next,
+            None => {
+                save!(None);
+                return Ok(true);
+            }
+        }
+    }
+}
+
+// Port of erts/emulator/beam/external.c:3253 (enc_term_int), OTP-29.1.1.
+fn enc_term_int(
+    ctx: &mut TtbContext,
+    budget: usize,
+    out: &mut impl ByteOutput,
+    mut consumed: usize,
+) -> Result<(bool, usize), EncodeError> {
+    if !ctx.size.done {
+        let (done, size_work) = ctx.step_size(budget)?;
+        consumed += size_work;
+        if !done {
+            return Ok((false, budget));
+        }
+    }
+    let mut opts = ctx.opts;
+    let node_source = ctx.node_source;
+    let record_splits = ctx.record_splits;
+    let iovec = ctx.iovec;
+    let table = global_atoms();
+    // The stack and the pending object live in locals so that the output writes cannot
+    // alias them; erts keeps them in registers (`DECLARE_WSTACK`, `obj`).
+    let mut stack = WStack::new();
+    stack.restore(&mut ctx.encode.work);
+    let mut cur = ctx.encode.current.take();
+    let mut free_first = ctx.encode.free_first;
+    loop {
+        if consumed + 1 >= budget && !(free_first && (cur.is_some() || !stack.is_empty())) {
+            break;
+        }
+        let term = if let Some(term) = cur.take() {
+            term
+        } else {
+            // outer_loop
+            let Some(object_word) = stack.pop() else {
+                break;
+            };
+            let command = stack.pop_word();
+            let code = command >> 4;
+            if code == ENC_TERM_CODE {
+                term_from_bits(object_word)
+            } else if code == ENC_ONE_CONS_CODE {
+                let list = term_from_bits(object_word);
+                let cons = Cons::try_from(list).map_err(|_| EncodeError::BadArg)?;
+                encode_one_cons(&mut stack, out, cons)?
+            } else if code == ENC_MAP_PAIR_CODE {
+                let remaining = usize::try_from(object_word).map_err(|_| EncodeError::BadArg)?;
+                let container = term_from_bits(stack.pop_word());
+                let (key, value) = flatmap_pair(container, remaining)?;
+                if remaining > 1 {
+                    push_flatmap_task(&mut stack, container, remaining - 1)?;
+                }
+                push_term_task(&mut stack, ENC_TERM, value);
+                key
+            } else if code >= ENC_LAST_ARRAY_ELEMENT {
+                // ENC_LAST_ARRAY_ELEMENT+N: a tuple element pointer and count.
+                let remaining = code - ENC_LAST_ARRAY_ELEMENT + 1;
+                let pointer = object_word;
+                let element = term_at_pointer(pointer);
+                if remaining > 1 {
+                    push_tuple_pointer_task(
+                        &mut stack,
+                        stack_command((code - 1) as i64),
+                        pointer + 8,
+                    );
+                }
+                element
+            } else if code == ENC_PATCH_FUN_SIZE_CODE {
+                consumed += 1;
+                let at = usize::try_from(object_word).map_err(|_| EncodeError::BadArg)?;
+                let size = u32::try_from(out.len() - at).map_err(|_| EncodeError::SystemLimit)?;
+                out.patch(at, &size.to_be_bytes());
+                continue;
+            } else if code == ENC_BIN_COPY_CODE {
+                let term = term_from_bits(object_word);
+                let bits = pop_stack_small(&mut stack);
+                let copied = pop_stack_small(&mut stack);
+                let start = pop_stack_small(&mut stack);
+                // Port of erts/emulator/beam/external.c:3368 (ENC_BIN_COPY), OTP-29.1.1.
+                let len = bits.div_ceil(8);
+                let available = budget.saturating_sub(consumed);
+                if available == 0 {
+                    stack.push(stack_small(start)?);
+                    stack.push(stack_small(copied)?);
+                    stack.push(stack_small(bits)?);
+                    stack.push(ENC_BIN_COPY);
+                    stack.push(term.word());
+                    break;
+                }
+                let amount = len.saturating_sub(copied).min(available);
+                let bit_count = (amount * 8).min(bits.saturating_sub(copied * 8));
+                out.write_bitstring(term, copied * 8, bit_count)?;
+                consumed += amount;
+                if copied + amount < len {
+                    stack.push(stack_small(start)?);
+                    stack.push(stack_small(copied + amount)?);
+                    stack.push(stack_small(bits)?);
+                    stack.push(ENC_BIN_COPY);
+                    stack.push(term.word());
+                } else {
+                    if !bits.is_multiple_of(8) {
+                        out.mask_last(0xff << (8 - bits % 8));
+                    }
+                    if len > 64 && record_splits {
+                        ctx.cold().splits.push((start, out.len()));
+                    }
+                }
+                continue;
+            } else if code == ENC_HASHMAP_NODE_CODE {
+                let node = term_from_bits(object_word);
+                cur = Some(push_hashmap_node_tasks(
+                    &mut stack,
+                    node,
+                    Some(ENC_HASHMAP_NODE),
+                    Some(ENC_TERM),
+                )?);
+                continue;
+            } else if code == ENC_START_SORTING_MAP_CODE {
+                debug_assert_eq!(object_word, Term::NON_VALUE.word());
+                let mut sorting = ctx.cold().map_sort.take().ok_or(EncodeError::BadArg)?;
+                let work_budget = budget.saturating_sub(consumed).max(1);
+                consumed += sorting.step(work_budget);
+                if sorting.is_done() {
+                    push_sorted_map_tasks(&mut stack, (*sorting).finish());
+                } else {
+                    ctx.cold().map_sort = Some(sorting);
+                    stack.push(ENC_START_SORTING_MAP);
+                    stack.push(Term::NON_VALUE.word());
+                }
+                continue;
+            } else {
+                return Err(EncodeError::BadArg);
+            }
+        };
+        if !std::mem::take(&mut free_first) {
+            consumed += 1;
+        }
+        match fast_encode_kind(term) {
+            FastEncodeKind::Small(n) => write_small(out, n),
+            FastEncodeKind::Atom(atom) => {
+                atom_bytes_in(table, out, atom, opts.minor)?;
+            }
+            FastEncodeKind::Nil => out.push(106),
+            FastEncodeKind::Rare(TermKind::Number) => {
+                if let Some(header) = term.header() {
+                    if header & 63 == 0x18 {
+                        // SAFETY: a live boxed FLOAT has one initialized data word.
+                        let f = unsafe { term.float_ref() }
+                            .ok_or(EncodeError::BadArg)?
+                            .get();
+                        if opts.minor == 0 {
+                            let s = format!("{f:.20e}");
+                            let (mantissa, exponent) = s.split_once('e').unwrap();
+                            let exp: i32 = exponent.parse().unwrap();
+                            let rendered = format!(
+                                "{mantissa}e{}{:02}",
+                                if exp < 0 { '-' } else { '+' },
+                                exp.abs()
+                            );
+                            out.push(99);
+                            out.extend_from_slice(rendered.as_bytes());
+                            out.extend_zeroed(31 - rendered.len());
+                        } else {
+                            out.push(70);
+                            out.extend_from_slice(&f.to_bits().to_be_bytes());
+                        }
+                    } else {
+                        // SAFETY: a live boxed integer has initialized magnitude words.
+                        let n = unsafe { term.big_ref() }
+                            .ok_or(EncodeError::BadArg)?
+                            .to_bigint();
+                        int_bytes(out, &n);
+                    }
+                }
+            }
+            FastEncodeKind::List(cons) => {
+                // Port of erts/emulator/beam/external.c:3703 (LIST_DEF), OTP-29.1.1.
+                let (len, is_string) = external_string_prefix(term, cons);
+                if is_string {
+                    out.push(107);
+                    out.extend_from_slice(&(len as u16).to_be_bytes());
+                    let first = cons.head().as_small().ok_or(EncodeError::BadArg)?;
+                    out.push(first as u8);
+                    let mut cursor = cons.tail();
+                    for _ in 1..len {
+                        // external_string_prefix already walked these cons cells.
+                        let cell = Cons::try_from(cursor).map_err(|_| EncodeError::BadArg)?;
+                        out.push(cell.head().as_small().ok_or(EncodeError::BadArg)? as u8);
+                        cursor = cell.tail();
+                    }
+                    consumed += len;
+                } else {
+                    // Port of erts/emulator/beam/external.c (LIST_DEF), OTP-29.1.1.
+                    consumed += len / 2;
+                    out.push(108);
+                    let len_at = out.len();
+                    out.extend_from_slice(&0u32.to_be_bytes());
+                    // `WSTACK_PUSH2(s, ep, 1)` then `goto encode_one_cons`.
+                    stack.push(stack_small(len_at)?);
+                    stack.push(stack_small(1)?);
+                    cur = Some(encode_one_cons(&mut stack, out, cons)?);
+                }
+            }
+            FastEncodeKind::Tuple(tuple) => {
+                let arity = tuple.arity();
+                if arity <= 255 {
+                    out.extend_from_slice(&[104, arity as u8]);
+                } else {
+                    out.push(105);
+                    out.extend_from_slice(&(arity as u32).to_be_bytes());
+                }
+                if arity > 0 {
+                    // WSTACK_PUSH2(s, ENC_LAST_ARRAY_ELEMENT+i-1, ptr)
+                    let pointer = tuple.element_pointer(0).ok_or(EncodeError::BadArg)?;
+                    push_tuple_pointer_task(
+                        &mut stack,
+                        stack_command((ENC_LAST_ARRAY_ELEMENT + arity as u64 - 1) as i64),
+                        pointer,
+                    );
+                }
+            }
+            FastEncodeKind::Rare(TermKind::Bitstring) => {
+                // SAFETY: the binary owner remains live and no append runs during encoding.
+                let view = unsafe { term.binary_ref() }.ok_or(EncodeError::BadArg)?;
+                let bits = view.bit_len();
+                let len = bits.div_ceil(8);
+                let n = u32::try_from(len)
+                    .map_err(|_| EncodeError::SystemLimit)?
+                    .to_be_bytes();
+                if bits.is_multiple_of(8) {
+                    out.extend_from_slice(&[109, n[0], n[1], n[2], n[3]]);
+                } else {
+                    out.extend_from_slice(&[77, n[0], n[1], n[2], n[3], (bits % 8) as u8]);
+                }
+                let start = out.len();
+                if len != 0 {
+                    // Port of erts/emulator/beam/external.c (BITSTRING_DEF), OTP-29.1.1.
+                    let aligned = view.start_bit().is_multiple_of(8);
+                    let copy_payload = bits <= 64 * 8 || !iovec || !aligned;
+                    let left = budget.saturating_sub(consumed);
+                    if copy_payload && len > left.saturating_mul(8) {
+                        stack.push(stack_small(start)?);
+                        stack.push(stack_small(0)?);
+                        stack.push(stack_small(bits)?);
+                        stack.push(ENC_BIN_COPY);
+                        stack.push(term.word());
+                    } else {
+                        if aligned && bits.is_multiple_of(8) {
+                            // copy_binary_to_buffer: one memcpy of the payload.
+                            let from = view.start_bit() / 8;
+                            out.extend_from_slice(
+                                view.bytes()
+                                    .get(from..from + len)
+                                    .ok_or(EncodeError::BadArg)?,
+                            );
+                        } else {
+                            out.write_bitstring(term, 0, bits)?;
+                            if bits % 8 != 0 {
+                                out.mask_last(0xff << (8 - bits % 8));
+                            }
+                        }
+                        if len > 64 && record_splits {
+                            ctx.cold().splits.push((start, out.len()));
+                        }
+                    }
+                }
+            }
+            FastEncodeKind::Rare(kind) => {
+                enc_rare(
+                    kind,
+                    term,
+                    out,
+                    &mut stack,
+                    &mut opts,
+                    node_source,
+                    table,
+                    &mut ctx.cold,
+                )?;
+            }
+        }
+    }
+    let done = stack.is_empty()
+        && cur.is_none()
+        && ctx.cold.as_ref().is_none_or(|cold| cold.map_sort.is_none());
+    ctx.opts = opts;
+    stack.save(&mut ctx.encode.work);
+    ctx.encode.current = cur;
+    ctx.encode.free_first = !done;
+    if out.failed() || (done && !iovec && out.len() != ctx.size.output) {
+        return Err(EncodeError::SystemLimit);
+    }
+    Ok((done, if done { consumed } else { budget.max(consumed) }))
 }
 
 #[cfg(test)]

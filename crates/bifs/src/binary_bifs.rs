@@ -2,10 +2,7 @@
 
 use std::borrow::Cow;
 
-use arinsal_term::{
-    ConsListBuilder, HeapAlloc, MagicBin, TermBuilder, writable_bytes_mut, writable_extend_private,
-    writable_finalize,
-};
+use arinsal_term::{ConsListBuilder, HeapAlloc, MagicBin, TermBuilder};
 
 use crate::binary_mod::{SearchPattern, SearchPatternHandle, SearchWalk};
 use crate::lists::cons_cell;
@@ -512,25 +509,11 @@ impl IolistVecWalk {
     }
 }
 
-/// Allocate the final writable binary before the iolist copy pass.
 pub fn allocate_iolist_binary<H: HeapAlloc + ?Sized>(
     heap: &mut H,
     byte_len: usize,
 ) -> Result<Term, BifError> {
-    if byte_len == 0 {
-        return TermBuilder::new(&mut super::Heap(heap))
-            .binary(&[])
-            .map_err(|_| BifError::SystemLimit);
-    }
-    let bit_len = byte_len
-        .checked_mul(8)
-        .filter(|bits| *bits <= isize::MAX as usize)
-        .ok_or(BifError::SystemLimit)?;
-    let term = TermBuilder::new(&mut super::Heap(heap))
-        .writable_binary(&[], 0, byte_len)
-        .map_err(|_| BifError::SystemLimit)?;
-    writable_extend_private(term, bit_len).map_err(|_| BifError::SystemLimit)?;
-    Ok(term)
+    arinsal_term::raw::allocate_iolist_binary(heap, byte_len).map_err(|_| BifError::SystemLimit)
 }
 
 /// Give the unique writer a temporary mutable view of its final binary.
@@ -538,14 +521,12 @@ pub fn with_iolist_binary_output<R>(
     term: Term,
     f: impl FnOnce(&mut [u8]) -> Result<R, BifError>,
 ) -> Result<R, BifError> {
-    // SAFETY: the active writer is owned by this process and the callback does not retain a view.
-    let output = unsafe { writable_bytes_mut(term) }.ok_or(BifError::SystemLimit)?;
-    f(output)
+    arinsal_term::raw::with_iolist_binary_output(term, f).ok_or(BifError::SystemLimit)?
 }
 
 /// End the unique writer before the completed binary is shared with Erlang code.
 pub fn finish_iolist_binary_output(term: Term) {
-    writable_finalize(term);
+    arinsal_term::raw::finish_iolist_binary_output(term);
 }
 
 // Port of erts/emulator/beam/binary.c:413-474 (bitstring_to_list_1), OTP-29.1.1.
