@@ -3061,7 +3061,7 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
 /// handler executes `build_stacktrace`.
 pub extern "C" fn arinsal_beamasm_exception_resolver(
     header: *mut ProcessHeader,
-    _registers: *mut arinsal_beamasm::SchedulerRegisters,
+    reg: *mut arinsal_beamasm::SchedulerRegisters,
     _stack: *mut u64,
     bif_info: u64,
 ) -> usize {
@@ -3076,7 +3076,10 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // OTP-29.1.1. The shared fragment already ran `emit_enter_runtime` and stored HTOP and E
     // into `c_p`. `handle_error` runs once from that entry; it does not enter again.
     // The heap indexes are those stored cursors (`c_p->htop`, `c_p->stop`).
-    let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) else {
+    // `handle_error(c_p, pc, reg, bif_mfa)`: the BIF arguments are read from the register array
+    // the fragment passed, the one the failing BIF or instruction was called with.
+    let Some((process, registers)) = crate::native_hooks::scheduler_registers_at(process, reg)
+    else {
         return 0;
     };
     // Port of erts/emulator/beam/beam_common.c:449-570 (`handle_error`), OTP-29.1.1, in its

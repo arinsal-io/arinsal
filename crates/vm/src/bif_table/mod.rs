@@ -238,6 +238,13 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "exit", 1) => bif!(crate::natives::bif::exit_1),
         ("erlang", "throw", 1) => bif!(crate::natives::bif::throw_1),
         ("erlang", "raise", 3) => bif!(crate::natives::bif::raise_3),
+        ("erlang", "tuple_to_list", 1) => bif!(crate::natives::bif::tuple_to_list_1),
+        ("erlang", "list_to_tuple", 1) => bif!(crate::natives::bif::list_to_tuple_1),
+        ("erlang", "make_tuple", 2) => bif!(crate::natives::bif::make_tuple_2),
+        ("erlang", "make_tuple", 3) => bif!(crate::natives::bif::make_tuple_3),
+        ("erlang", "append_element", 2) => bif!(crate::natives::bif::append_element_2),
+        ("erlang", "delete_element", 2) => bif!(crate::natives::bif::delete_element_2),
+        ("erlang", "insert_element", 3) => bif!(crate::natives::bif::insert_element_3),
         // erl_map.c
         ("maps", "put", 3) => bif!(erl_map::maps_put_3),
         ("maps", "update", 3) => bif!(erl_map::maps_update_3),
@@ -268,6 +275,12 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "length", 1) => bif!(erl_bif_guard::length_1),
         ("erlang", "min", 2) => bif!(erl_bif_guard::min_2),
         ("erlang", "max", 2) => bif!(erl_bif_guard::max_2),
+        ("erlang", "abs", 1) => bif!(erl_bif_guard::abs_1),
+        ("erlang", "float", 1) => bif!(erl_bif_guard::float_1),
+        ("erlang", "trunc", 1) => bif!(erl_bif_guard::trunc_1),
+        ("erlang", "round", 1) => bif!(erl_bif_guard::round_1),
+        ("erlang", "ceil", 1) => bif!(erl_bif_guard::ceil_1),
+        ("erlang", "floor", 1) => bif!(erl_bif_guard::floor_1),
         // erl_bif_op.c
         ("erlang", "and", 2) => bif!(erl_bif_op::and_2),
         ("erlang", "or", 2) => bif!(erl_bif_op::or_2),
@@ -540,15 +553,15 @@ mod tests {
 
     #[test]
     fn every_bif_of_arinsal_bifs_has_its_own_entry() {
-        let abs = entry("erlang", "abs", 1).expect("abs");
-        let trunc = entry("erlang", "trunc", 1).expect("trunc");
-        assert_ne!(trunc.plain, abs.plain);
+        let size = entry("erlang", "size", 1).expect("size");
+        let phash = entry("erlang", "phash", 2).expect("phash");
+        assert_ne!(phash.plain, size.plain);
         // Arities that share one body share its entry.
         let node0 = entry("erlang", "node", 0).expect("node/0");
         let node1 = entry("erlang", "node", 1).expect("node/1");
         similar_asserts::assert_eq!(node0.plain, node1.plain);
         assert!(entry("erlang", "no_such_bif", 1).is_none());
-        assert!(entry("erlang", "abs", 2).is_none());
+        assert!(entry("erlang", "size", 2).is_none());
     }
 
     #[test]

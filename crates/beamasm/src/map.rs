@@ -8,7 +8,6 @@ use arinsal_a64::{
 
 use crate::{
     ProcessHeader, Update, emit_enter_runtime, emit_leave_runtime,
-    guard::GuardHelper,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
@@ -23,6 +22,10 @@ const X: [Gpr; 6] = [
 const E: Gpr = Gpr::x(20);
 const HTOP: Gpr = Gpr::x(23);
 const ATOM_TAG: u16 = 0x0b;
+/// [`crate::bif::guard_bif_mfa`] indexes of `erlang:not/1`, `'and'/2` and `'or'/2`.
+const NOT_MFA_INDEX: u64 = 10;
+const AND_MFA_INDEX: u64 = 11;
+const OR_MFA_INDEX: u64 = 12;
 
 // These entries map logical XREG4/5 to their caller-saved hardware registers.
 const fn logical_xreg(index: u8) -> Gpr {
@@ -883,9 +886,8 @@ impl BeamModuleAssembler {
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
-        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_boolean_binary(fail, lhs, rhs, dst, false, runtime)
+        self.emit_boolean_binary(fail, lhs, rhs, dst, false)
     }
 
     /// Emits Erlang's strict boolean `or/2` BIF.
@@ -896,20 +898,13 @@ impl BeamModuleAssembler {
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
-        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_boolean_binary(fail, lhs, rhs, dst, true, runtime)
+        self.emit_boolean_binary(fail, lhs, rhs, dst, true)
     }
 
     /// Emits Erlang's strict boolean `not/1` BIF.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1177-1213, OTP-29.1.1.
-    pub fn emit_bif_not(
-        &mut self,
-        fail: u32,
-        src: ArgVal,
-        dst: ArgVal,
-        runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
+    pub fn emit_bif_not(&mut self, fail: u32, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
         let value = self.source_reg(src)?;
         self.code.emit(|e| e.and_imm(Gpr::x(8), value, !0x40))?;
         self.code.emit(|e| e.cmp_imm(Gpr::x(8), ATOM_TAG, false))?;
@@ -924,9 +919,8 @@ impl BeamModuleAssembler {
             self.store_map_result(dst, Gpr::x(9))?;
             self.code.b(done)?;
             self.code.bind(badarg)?;
-            self.code.emit(|e| e.mov_const(Gpr::x(8), 42))?;
-            self.code.emit(|e| e.mov_const(Gpr::x(9), 0))?;
-            self.emit_guard_runtime_call(runtime as usize, &[Gpr::x(8), value, Gpr::x(9)])?;
+            // `mov_var(XREG0, src); fragment_call(ga->get_handle_not_error())`.
+            self.emit_raise_badarg(NOT_MFA_INDEX, &[value])?;
             self.code.bind(done)?;
             return Ok(());
         }
@@ -942,7 +936,6 @@ impl BeamModuleAssembler {
         rhs: ArgVal,
         dst: ArgVal,
         is_or: bool,
-        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(8), left))?;
@@ -974,9 +967,9 @@ impl BeamModuleAssembler {
             self.store_map_result(dst, Gpr::x(11))?;
             self.code.b(done)?;
             self.code.bind(badarg)?;
-            self.code
-                .emit(|e| e.mov_const(Gpr::x(10), if is_or { 41 } else { 40 }))?;
-            self.emit_guard_runtime_call(runtime as usize, &[Gpr::x(10), Gpr::x(8), Gpr::x(9)])?;
+            // `mov_var(XREG0, src1); mov_var(XREG1, src2); fragment_call(handle_and/or_error)`.
+            let mfa = if is_or { OR_MFA_INDEX } else { AND_MFA_INDEX };
+            self.emit_raise_badarg(mfa, &[Gpr::x(8), Gpr::x(9)])?;
             self.code.bind(done)?;
             return Ok(());
         }

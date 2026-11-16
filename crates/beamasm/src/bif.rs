@@ -49,8 +49,8 @@ arith_mfa!(ERLANG_BSL_MFA, BSL, 2);
 arith_mfa!(ERLANG_BSR_MFA, BSR, 2);
 arith_mfa!(ERLANG_DIV_2_MFA, DIV_2, 2);
 
-fn guard_mfas() -> &'static [ErtsCodeMfa; 10] {
-    static MFAS: OnceLock<[ErtsCodeMfa; 10]> = OnceLock::new();
+fn guard_mfas() -> &'static [ErtsCodeMfa; 13] {
+    static MFAS: OnceLock<[ErtsCodeMfa; 13]> = OnceLock::new();
     MFAS.get_or_init(|| {
         let module = arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word();
         let function = |name| {
@@ -114,6 +114,23 @@ fn guard_mfas() -> &'static [ErtsCodeMfa; 10] {
                 function: function("is_map_key"),
                 arity: 2,
             },
+            // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_handle_not_error,
+            // emit_handle_and_error, emit_handle_or_error: `static ErtsCodeMFA mfa`), OTP-29.1.1.
+            ErtsCodeMfa {
+                module,
+                function: function("not"),
+                arity: 1,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("and"),
+                arity: 2,
+            },
+            ErtsCodeMfa {
+                module,
+                function: function("or"),
+                arity: 2,
+            },
         ]
     })
 }
@@ -121,6 +138,8 @@ fn guard_mfas() -> &'static [ErtsCodeMfa; 10] {
 /// Stable MFA addresses for the inline guard BIFs that raise `badarg`.
 // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:52-56, OTP-29.1.1.
 pub fn guard_bif_mfa(index: usize) -> Option<usize> {
+    // Indexes: 0 element, 1 hd, 2 tl, 3 bit_size, 4 byte_size, 5 map_size, 6 tuple_size,
+    // 7 map_get, 8 length, 9 is_map_key, 10 not, 11 and, 12 or.
     let mfa = guard_mfas().get(index)?;
     Some(std::ptr::from_ref(mfa) as usize)
 }

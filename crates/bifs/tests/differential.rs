@@ -34,14 +34,7 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
     let bin = O::Binary(vec![1, (n % 255) as u8, 3, 4]);
     match (m, f, arity) {
         ("erlang", "length", 1) => vec![seq],
-        ("erlang", "abs" | "float" | "trunc" | "round" | "ceil" | "floor", 1) => {
-            if n.is_multiple_of(2) {
-                vec![O::Int(n as i64 - 500)]
-            } else {
-                vec![O::Float(n as f64 / 7.0 - 70.0)]
-            }
-        }
-        ("erlang", "tuple_to_list" | "size", 1) => vec![tup],
+        ("erlang", "size", 1) => vec![tup],
         ("erlang", "byte_size" | "bit_size" | "binary_to_list", 1) => vec![bin],
         ("erlang", "node", 0) | ("erlang", "make_ref", 0) | ("erlang", "unique_integer", 0) => {
             vec![]
@@ -53,16 +46,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             creation: 0,
         }],
         ("erlang", "phash", 2) => vec![term(n), O::Int((n % 1000 + 1) as i64)],
-        ("erlang", "list_to_tuple", 1) => vec![seq],
-        ("erlang", "make_tuple", 2) => vec![O::Int((n % 8) as i64), term(n)],
-        ("erlang", "make_tuple", 3) => vec![
-            O::Int(3),
-            x.clone(),
-            list(vec![O::Tuple(vec![O::Int(2), term(n)])]),
-        ],
-        ("erlang", "append_element", 2) => vec![tup, term(n)],
-        ("erlang", "delete_element", 2) => vec![O::Int((n % 3 + 1) as i64), tup],
-        ("erlang", "insert_element", 3) => vec![O::Int((n % 4 + 1) as i64), tup, term(n)],
         ("erlang", "++" | "append" | "--" | "subtract", 2) => vec![seq, list(vec![x])],
         ("lists", "reverse", 2) => vec![seq, term(n)],
         ("lists", "member", 2) => vec![x, seq],
@@ -984,32 +967,6 @@ fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
     assert_eq!(aligned_copy, [0b1000_0000]);
     // The binary:at/match/split and binary_to_list bodies are VM bodies
     // (crates/vm/tests/bifs/moved_bif_differential.rs).
-}
-
-#[test]
-fn make_tuple_rejects_arity_above_erts_limit() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let args = [O::Int(1 << 24), atom("value")];
-    let actual = call("erlang", "make_tuple", &args);
-    let expected = reference.call("erlang", "make_tuple", &args);
-    match (actual, expected) {
-        (
-            arinsal_difftest::CallResult::Exception {
-                class: actual_class,
-                reason: actual_reason,
-                ..
-            },
-            arinsal_difftest::CallResult::Exception {
-                class: expected_class,
-                reason: expected_reason,
-                ..
-            },
-        ) => assert_eq!(
-            (actual_class, actual_reason),
-            (expected_class, expected_reason)
-        ),
-        (actual, expected) => panic!("{actual:?} != {expected:?}"),
-    }
 }
 
 #[test]

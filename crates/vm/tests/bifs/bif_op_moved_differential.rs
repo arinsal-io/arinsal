@@ -56,7 +56,20 @@ direct(is_map, [A]) -> erlang:is_map(A);
 direct(error, [A]) -> erlang:error(A);
 direct(exit, [A]) -> erlang:exit(A);
 direct(throw, [A]) -> erlang:throw(A);
-direct(raise, [A, B, C]) -> erlang:raise(A, B, C).
+direct(raise, [A, B, C]) -> erlang:raise(A, B, C);
+direct(abs, [A]) -> erlang:abs(A);
+direct(float, [A]) -> erlang:float(A);
+direct(trunc, [A]) -> erlang:trunc(A);
+direct(round, [A]) -> erlang:round(A);
+direct(ceil, [A]) -> erlang:ceil(A);
+direct(floor, [A]) -> erlang:floor(A);
+direct(tuple_to_list, [A]) -> erlang:tuple_to_list(A);
+direct(list_to_tuple, [A]) -> erlang:list_to_tuple(A);
+direct(make_tuple, [A, B]) -> erlang:make_tuple(A, B);
+direct(make_tuple, [A, B, C]) -> erlang:make_tuple(A, B, C);
+direct(append_element, [A, B]) -> erlang:append_element(A, B);
+direct(delete_element, [A, B]) -> erlang:delete_element(A, B);
+direct(insert_element, [A, B, C]) -> erlang:insert_element(A, B, C).
 
 outcome(Fun) ->
     try Fun() of
@@ -113,6 +126,19 @@ const BIFS: &[(&str, usize)] = &[
     ("exit", 1),
     ("throw", 1),
     ("raise", 3),
+    ("abs", 1),
+    ("float", 1),
+    ("trunc", 1),
+    ("round", 1),
+    ("ceil", 1),
+    ("floor", 1),
+    ("tuple_to_list", 1),
+    ("list_to_tuple", 1),
+    ("make_tuple", 2),
+    ("make_tuple", 3),
+    ("append_element", 2),
+    ("delete_element", 2),
+    ("insert_element", 3),
 ];
 
 fn atom(s: &str) -> O {
@@ -146,6 +172,38 @@ fn args(f: &str, arity: usize, n: usize) -> Vec<O> {
     let tup = O::Tuple(vec![atom("a"), x, atom("b")]);
     let index = O::Int((n % 5) as i64);
     match (f, arity) {
+        ("abs" | "float" | "trunc" | "round" | "ceil" | "floor", 1) => vec![match n % 4 {
+            0 => O::Int(n as i64 - 500),
+            1 => O::Float(n as f64 / 7.0 - 70.0),
+            2 => O::Float(-(n as f64) * 1.0e20),
+            _ => term(n),
+        }],
+        ("tuple_to_list", 1) => vec![if n.is_multiple_of(3) { term(n) } else { tup }],
+        ("list_to_tuple", 1) => vec![if n.is_multiple_of(3) { term(n) } else { seq }],
+        ("make_tuple", 2) => vec![
+            match n % 5 {
+                0 => O::Int(1 << 24),
+                1 => O::Int(-1),
+                _ => O::Int((n % 8) as i64),
+            },
+            term(n),
+        ],
+        ("make_tuple", 3) => vec![
+            O::Int((n % 4) as i64),
+            term(n),
+            match n % 4 {
+                0 => O::list(vec![O::Tuple(vec![O::Int(2), term(n)])]),
+                1 => O::list(vec![
+                    O::Tuple(vec![O::Int(1), atom("a")]),
+                    O::Tuple(vec![O::Int(3), term(n)]),
+                ]),
+                2 => term(n),
+                _ => O::list(vec![O::Tuple(vec![O::Int(1), atom("a"), atom("b")])]),
+            },
+        ],
+        ("append_element", 2) => vec![if n.is_multiple_of(3) { term(n) } else { tup }, term(n)],
+        ("delete_element", 2) => vec![index, tup],
+        ("insert_element", 3) => vec![index, tup, term(n)],
         ("hd" | "tl", 1) => vec![if n.is_multiple_of(3) { term(n) } else { seq }],
         ("tuple_size", 1) => vec![if n.is_multiple_of(3) { term(n) } else { tup }],
         ("element", 2) => vec![index, tup],

@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn pure_bif_imports_skip_family_dispatch() {
         use arinsal_loader::ImportClass;
-        let (class, bits) = classify("erlang", "abs", 1, true);
+        let (class, bits) = classify("erlang", "size", 1, true);
         assert_eq!(class, ImportClass::Pure);
         assert_eq!(bits, 0);
         // A BIF whose body is its `bif_table` entry has no named native.

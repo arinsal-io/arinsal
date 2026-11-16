@@ -50,24 +50,38 @@ pub(crate) fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmEr
     }
 }
 
-/// `BIF_ERROR(c_p, BADARG)` of `erlang:function/arity` called with `args` (`BIF_ARG_1..n`):
-/// the exception names the BIF and its arguments as `save_stacktrace` does from
-/// `c_p->current` and the BIF's argument array.
-// Port of erts/emulator/beam/bif.h (BIF_ERROR) and beam_common.c (save_stacktrace), OTP-29.1.1.
+/// `BIF_ERROR(c_p, BADARG)`: only `freason`; `handle_error` names the BIF from `c_p->current`
+/// and its arguments from the register array the BIF was called with.
+// Port of erts/emulator/beam/bif.h (BIF_ERROR), OTP-29.1.1.
 #[cold]
 #[inline(never)]
-pub(crate) fn bif_badarg(c_p: *mut ProcessHeader, i: u64, function: &str, args: &[Term]) -> u64 {
+pub(crate) fn bif_badarg(c_p: *mut ProcessHeader) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let error = crate::exceptions::bif_error(
-        process,
-        "erlang",
-        function,
-        args,
-        arinsal_bifs::BifError::BADARG,
-    );
-    bif_ret(c_p, i, Err(error))
+    process.heap.abi.exc.freason = arinsal_term::exc::EXC_BADARG;
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `BIF_ERROR(c_p, SYSTEM_LIMIT)`.
+// Port of erts/emulator/beam/bif.h (BIF_ERROR), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+pub(crate) fn bif_system_limit(c_p: *mut ProcessHeader) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.abi.exc.freason = arinsal_term::exc::EXC_SYSTEM_LIMIT;
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `BIF_RET` of a term built on the process heap, or `BIF_ERROR(c_p, SYSTEM_LIMIT)`.
+#[inline(always)]
+fn heap_ret(c_p: *mut ProcessHeader, built: Result<Term, arinsal_term::TermError>) -> u64 {
+    match built {
+        Ok(term) => crate::native_hooks::raw(term),
+        Err(_) => bif_system_limit(c_p),
+    }
 }
 
 /// `monitor/2`.
@@ -1686,27 +1700,27 @@ pub(crate) extern "C" fn unalias_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u
 /// `hd/1`. The JIT has its own implementation (`get_hd` and the guard BIF); this is the body
 /// `apply` and the export entry reach.
 // Port of erts/emulator/beam/bif.c (hd_1), OTP-29.1.1.
-pub(crate) extern "C" fn hd_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn hd_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [list] = bif_args::<1>(reg);
     match arinsal_term::raw::Cons::try_from(list) {
         Ok(cons) => crate::native_hooks::raw(cons.head()),
-        Err(_) => bif_badarg(c_p, i, "hd", &[list]),
+        Err(_) => bif_badarg(c_p),
     }
 }
 
 /// `tl/1`.
 // Port of erts/emulator/beam/bif.c (tl_1), OTP-29.1.1.
-pub(crate) extern "C" fn tl_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn tl_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [list] = bif_args::<1>(reg);
     match arinsal_term::raw::Cons::try_from(list) {
         Ok(cons) => crate::native_hooks::raw(cons.tail()),
-        Err(_) => bif_badarg(c_p, i, "tl", &[list]),
+        Err(_) => bif_badarg(c_p),
     }
 }
 
 /// `element/2`.
 // Port of erts/emulator/beam/bif.c (element_2), OTP-29.1.1.
-pub(crate) extern "C" fn element_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn element_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [index, tuple] = bif_args::<2>(reg);
     let element = index
         .as_small()
@@ -1715,25 +1729,25 @@ pub(crate) extern "C" fn element_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u6
         .and_then(|(ix, tuple)| tuple.get(ix as usize - 1));
     match element {
         Some(value) => crate::native_hooks::raw(value),
-        None => bif_badarg(c_p, i, "element", &[index, tuple]),
+        None => bif_badarg(c_p),
     }
 }
 
 /// `tuple_size/1`.
 // Port of erts/emulator/beam/bif.c (tuple_size_1), OTP-29.1.1.
-pub(crate) extern "C" fn tuple_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn tuple_size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [term] = bif_args::<1>(reg);
     match arinsal_term::raw::Tuple::try_from(term) {
         // A tuple's arity is below 2^24, a small integer.
         Ok(tuple) => Term::small(tuple.arity() as i64).map_or(0, crate::native_hooks::raw),
-        Err(_) => bif_badarg(c_p, i, "tuple_size", &[term]),
+        Err(_) => bif_badarg(c_p),
     }
 }
 
 /// `setelement/3`: one `HAlloc` of `arity + 1` words, the copy of the tuple, then the replaced
 /// element.
 // Port of erts/emulator/beam/bif.c (setelement_3), OTP-29.1.1.
-pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -1744,7 +1758,7 @@ pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, i:
         .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
         .filter(|(ix, source)| *ix >= 1 && *ix as usize <= source.arity())
     else {
-        return bif_badarg(c_p, i, "setelement", &[index, tuple, value]);
+        return bif_badarg(c_p);
     };
     let slot = ix as usize - 1;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -1757,13 +1771,7 @@ pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, i:
     });
     match built {
         Ok(tuple) => crate::native_hooks::raw(tuple),
-        Err(_) => bif_ret(
-            c_p,
-            i,
-            Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-                atoms::SYSTEM_LIMIT,
-            )))),
-        ),
+        Err(_) => bif_system_limit(c_p),
     }
 }
 
@@ -1853,4 +1861,206 @@ fn valid_raise_stacktrace(stacktrace: Term) -> bool {
         tail = cons.tail();
     }
     tail == Term::NIL
+}
+
+/// `ERTS_MAX_TUPLE_SIZE`.
+// Port of erts/emulator/beam/erl_term.h (ERTS_MAX_TUPLE_SIZE), OTP-29.1.1.
+const ERTS_MAX_TUPLE_SIZE: usize = (1 << 24) - 1;
+
+/// `tuple_to_list/1`: `n` cons cells, filled from the last element to the first.
+// Port of erts/emulator/beam/bif.c (tuple_to_list_1), OTP-29.1.1.
+pub(crate) extern "C" fn tuple_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [term] = bif_args::<1>(reg);
+    let Ok(tuple) = arinsal_term::raw::Tuple::try_from(term) else {
+        return bif_badarg(c_p);
+    };
+    let n = tuple.arity();
+    if n == 0 {
+        return crate::native_hooks::raw(Term::NIL);
+    }
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let built = arinsal_term::TermBuilder::new(&mut heap)
+        .reserve_cons_list(n)
+        .and_then(|cells| {
+            cells.prepend_exact_with_tail(
+                (0..n).rev().map(|at| tuple.get(at).unwrap_or(Term::NIL)),
+                Term::NIL,
+            )
+        });
+    heap_ret(c_p, built)
+}
+
+/// `list_to_tuple/1`.
+// Port of erts/emulator/beam/bif.c (list_to_tuple_1), OTP-29.1.1.
+pub(crate) extern "C" fn list_to_tuple_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [list] = bif_args::<1>(reg);
+    let Ok(list) = arinsal_term::raw::ProperList::try_from(list) else {
+        return bif_badarg(c_p);
+    };
+    if list.len() > ERTS_MAX_TUPLE_SIZE {
+        return bif_badarg(c_p);
+    }
+    let built = list.to_tuple(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap));
+    heap_ret(c_p, built)
+}
+
+/// The arity argument of `make_tuple/2,3`, `None` for `BADARG`.
+fn make_tuple_arity(n: Term) -> Option<usize> {
+    n.as_small()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n <= ERTS_MAX_TUPLE_SIZE)
+}
+
+/// `make_tuple/2`.
+// Port of erts/emulator/beam/bif.c (make_tuple_2), OTP-29.1.1.
+pub(crate) extern "C" fn make_tuple_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [n, initial] = bif_args::<2>(reg);
+    let Some(n) = make_tuple_arity(n) else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(n, |_, _| initial);
+    heap_ret(c_p, built)
+}
+
+/// `make_tuple/3`: the tuple of `BIF_ARG_2`, then each `{Index, Value}` of the list stored.
+// Port of erts/emulator/beam/bif.c (make_tuple_3), OTP-29.1.1.
+pub(crate) extern "C" fn make_tuple_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    use arinsal_term::raw::{Cons, Tuple};
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [n, initial, mut list] = bif_args::<3>(reg);
+    let Some(limit) = make_tuple_arity(n) else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut builder = arinsal_term::TermBuilder::new(&mut heap);
+    let mut tuple = if limit == 0 {
+        None
+    } else {
+        match builder.reserve_tuple(limit, initial) {
+            Ok(tuple) => Some(tuple),
+            Err(_) => return bif_system_limit(c_p),
+        }
+    };
+    while let Ok(cons) = Cons::try_from(list) {
+        list = cons.tail();
+        let entry = Tuple::try_from(cons.head())
+            .ok()
+            .filter(|entry| entry.arity() == 2);
+        let slot = entry
+            .and_then(|entry| entry.get(0)?.as_small())
+            .and_then(|index| usize::try_from(index).ok()?.checked_sub(1))
+            .filter(|slot| *slot < limit);
+        let stored = match (slot, entry.and_then(|entry| entry.get(1)), tuple.as_mut()) {
+            (Some(slot), Some(value), Some(tuple)) => tuple.set(slot, value).is_ok(),
+            _ => false,
+        };
+        if !stored {
+            return bif_badarg(c_p);
+        }
+    }
+    if list != Term::NIL {
+        return bif_badarg(c_p);
+    }
+    match tuple {
+        Some(tuple) => crate::native_hooks::raw(tuple.finish()),
+        None => heap_ret(c_p, builder.tuple_from_fn(0, |_, _| Term::NIL)),
+    }
+}
+
+/// `append_element/2`.
+// Port of erts/emulator/beam/bif.c (append_element_2), OTP-29.1.1.
+pub(crate) extern "C" fn append_element_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [tuple, value] = bif_args::<2>(reg);
+    let Some(source) = arinsal_term::raw::Tuple::try_from(tuple)
+        .ok()
+        .filter(|source| source.arity() < ERTS_MAX_TUPLE_SIZE)
+    else {
+        return bif_badarg(c_p);
+    };
+    let arity = source.arity();
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(arity + 1, |at, _| {
+        if at == arity {
+            value
+        } else {
+            source.get(at).unwrap_or(Term::NIL)
+        }
+    });
+    heap_ret(c_p, built)
+}
+
+/// `delete_element/2`.
+// Port of erts/emulator/beam/bif.c (delete_element_2), OTP-29.1.1.
+pub(crate) extern "C" fn delete_element_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [index, tuple] = bif_args::<2>(reg);
+    let Some((slot, source)) = index
+        .as_small()
+        .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
+        .filter(|(ix, source)| *ix >= 1 && *ix as usize <= source.arity())
+        .map(|(ix, source)| (ix as usize - 1, source))
+    else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let built =
+        arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(source.arity() - 1, |at, _| {
+            source
+                .get(if at < slot { at } else { at + 1 })
+                .unwrap_or(Term::NIL)
+        });
+    heap_ret(c_p, built)
+}
+
+/// `insert_element/3`.
+// Port of erts/emulator/beam/bif.c (insert_element_3), OTP-29.1.1.
+pub(crate) extern "C" fn insert_element_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [index, tuple, value] = bif_args::<3>(reg);
+    let Some((slot, source)) = index
+        .as_small()
+        .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
+        .filter(|(ix, source)| {
+            *ix >= 1 && *ix as usize <= source.arity() + 1 && source.arity() < ERTS_MAX_TUPLE_SIZE
+        })
+        .map(|(ix, source)| (ix as usize - 1, source))
+    else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(
+        source.arity() + 1,
+        |at, _| match at.cmp(&slot) {
+            std::cmp::Ordering::Less => source.get(at).unwrap_or(Term::NIL),
+            std::cmp::Ordering::Equal => value,
+            std::cmp::Ordering::Greater => source.get(at - 1).unwrap_or(Term::NIL),
+        },
+    );
+    heap_ret(c_p, built)
 }

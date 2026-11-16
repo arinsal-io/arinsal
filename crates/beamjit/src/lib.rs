@@ -3993,15 +3993,15 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             match GENERIC {
                 erts_tables::GENOP_BIF_AND_4 => {
                     count(4)?;
-                    assembler.emit_bif_and(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
+                    assembler.emit_bif_and(n(0)?, value(1)?, value(2)?, value(3)?)
                 }
                 erts_tables::GENOP_BIF_OR_4 => {
                     count(4)?;
-                    assembler.emit_bif_or(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
+                    assembler.emit_bif_or(n(0)?, value(1)?, value(2)?, value(3)?)
                 }
                 erts_tables::GENOP_BIF_NOT_3 => {
                     count(3)?;
-                    assembler.emit_bif_not(n(0)?, value(1)?, value(2)?, runtime)
+                    assembler.emit_bif_not(n(0)?, value(1)?, value(2)?)
                 }
                 erts_tables::GENOP_BIF_HD_2 | erts_tables::GENOP_BIF_TL_2 => {
                     count(2)?;

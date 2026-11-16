@@ -1041,8 +1041,14 @@ mod tests {
     #[test]
     fn purged_native_body_slots_are_reused() {
         let code = node();
-        let native =
-            crate::natives::nif::NativeFn::Bif(arinsal_bifs::lookup("erlang", "abs", 1).unwrap());
+        // Any body: the slots hold function pointers, not BIF registry entries.
+        fn body(
+            _: &mut arinsal_bifs::Ctx<'_>,
+            _: &[arinsal_term::Term],
+        ) -> Result<arinsal_term::Term, arinsal_bifs::BifError> {
+            Ok(arinsal_term::Term::NIL)
+        }
+        let native = crate::natives::nif::NativeFn::Bif(body);
         let first = code.push_native_fn(native.clone()).unwrap();
         let second = code.push_native_fn(native.clone()).unwrap();
         assert_eq!((first, second), (0, 1));

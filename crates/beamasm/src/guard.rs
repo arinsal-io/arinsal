@@ -2111,6 +2111,40 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// `emit_raise_badarg(&mfa)` of a guard BIF without a failure label: the operands go to X0
+    /// (and X1), `freason = BADARG`, and `handle_error` names `mfa` with those registers.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_badarg) and
+    // instr_guard_bifs.cpp (emit_bif_not, emit_bif_and, emit_bif_or), OTP-29.1.1.
+    pub(super) fn emit_raise_badarg(
+        &mut self,
+        mfa_index: u64,
+        operands: &[Gpr],
+    ) -> Result<(), ModuleError> {
+        let mfa = crate::bif::guard_bif_mfa(mfa_index as usize)
+            .ok_or(ModuleError::InvalidOperand("guard BIF MFA index"))?;
+        let x_regs = [Gpr::x(25), Gpr::x(26)];
+        if operands.len() > x_regs.len() {
+            return Err(ModuleError::InvalidOperand("guard BIF arity"));
+        }
+        self.code.emit(|e| {
+            // X1 first: a second operand may live in X0's machine register.
+            for (target, source) in x_regs.iter().zip(operands).rev() {
+                if target != source {
+                    e.mov_reg(*target, *source)?;
+                }
+            }
+            e.mov_const(Gpr::x(9), crate::exc::EXC_BADARG)?;
+            e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+            e.mov_const(Gpr::x(3), mfa as u64)?;
+            e.str_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.branch_error_preserving_bif()
+    }
+
     pub(super) fn set_badarg_mfa(&mut self, index: u64) -> Result<(), ModuleError> {
         let index = usize::try_from(index)
             .map_err(|_| ModuleError::InvalidOperand("guard BIF MFA index"))?;

@@ -1,7 +1,8 @@
 //! The trapping `length/1` of erl_bif_guard.c.
 //!
 //! Port of erts/emulator/beam/erl_bif_guard.c (length_1, erlang_length_trap,
-//! erts_trapping_length_1, min_2, max_2), OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
+//! erts_trapping_length_1, min_2, max_2, abs_1, float_1, trunc_1, round_1, ceil_1, floor_1),
+//! OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
 //! `length/1` is called from native code and `apply/3`; a list too long for the reductions left
 //! traps to the hidden `erlang:length/3` (`erlang_length_export`, installed by
 //! `erts_init_trap_export`) with `(List, Length, OriginalList)`.
@@ -100,4 +101,59 @@ pub(crate) extern "C" fn max_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64)
         a
     };
     crate::native_hooks::raw(max)
+}
+
+/// A one-argument number BIF of erl_bif_guard.c: the result on the process heap, or
+/// `BIF_ERROR(BIF_P, BADARG)`.
+#[inline(always)]
+fn number_bif(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    body: fn(Term, &mut ProcessHeapHandle<'_>) -> arinsal_arith::ArithResult,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [arg] = crate::bif_table::bif_args::<1>(reg);
+    match body(arg, &mut ProcessHeapHandle(&mut process.heap)) {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(_) => crate::natives::bif::bif_badarg(c_p),
+    }
+}
+
+/// `erlang:abs/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (abs_1), OTP-29.1.1.
+pub(crate) extern "C" fn abs_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    number_bif(c_p, reg, |a, heap| arinsal_arith::abs(a, heap))
+}
+
+/// `erlang:float/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (float_1), OTP-29.1.1.
+pub(crate) extern "C" fn float_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    number_bif(c_p, reg, |a, heap| arinsal_arith::to_float(a, heap))
+}
+
+/// `erlang:trunc/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (trunc_1), OTP-29.1.1.
+pub(crate) extern "C" fn trunc_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    number_bif(c_p, reg, |a, heap| arinsal_arith::trunc(a, heap))
+}
+
+/// `erlang:round/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (round_1), OTP-29.1.1.
+pub(crate) extern "C" fn round_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    number_bif(c_p, reg, |a, heap| arinsal_arith::round(a, heap))
+}
+
+/// `erlang:ceil/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (ceil_1), OTP-29.1.1.
+pub(crate) extern "C" fn ceil_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    number_bif(c_p, reg, |a, heap| arinsal_arith::ceil(a, heap))
+}
+
+/// `erlang:floor/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (floor_1), OTP-29.1.1.
+pub(crate) extern "C" fn floor_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    number_bif(c_p, reg, |a, heap| arinsal_arith::floor(a, heap))
 }

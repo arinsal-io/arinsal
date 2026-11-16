@@ -112,7 +112,9 @@ pub(crate) fn scheduler_registers(
     scheduler_registers_at(process, registers)
 }
 
-fn scheduler_registers_at(
+/// The process and the register file `reg` a native fragment passed (`esdp->registers`, which
+/// erts hands to `handle_error` and the BIFs as `reg`).
+pub(crate) fn scheduler_registers_at(
     process: &mut Process,
     registers: *mut SchedulerRegisters,
 ) -> Option<(&mut Process, &mut SchedulerRegisters)> {
@@ -675,10 +677,6 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
                 .then(|| a.header().map(|header| ((header >> 8) & 255) as i64))
                 .flatten();
             u64::from(requested.is_some() && requested == actual)
-        }
-        40..=42 => {
-            set_error(process, "badarg");
-            0
         }
         _ => 0,
     }

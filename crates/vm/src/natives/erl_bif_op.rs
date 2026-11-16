@@ -31,45 +31,39 @@ fn bool_arg(term: Term) -> Option<bool> {
 
 /// A two-boolean operator: the result, or `BIF_ERROR(BIF_P, BADARG)`.
 #[inline(always)]
-fn boolean_op(
-    c_p: *mut ProcessHeader,
-    reg: *mut u64,
-    i: u64,
-    name: &str,
-    op: fn(bool, bool) -> bool,
-) -> u64 {
+fn boolean_op(c_p: *mut ProcessHeader, reg: *mut u64, op: fn(bool, bool) -> bool) -> u64 {
     let [a, b] = bif_args::<2>(reg);
     match (bool_arg(a), bool_arg(b)) {
         (Some(x), Some(y)) => boolean(op(x, y)),
-        _ => bif_badarg(c_p, i, name, &[a, b]),
+        _ => bif_badarg(c_p),
     }
 }
 
 /// `erlang:'and'/2`.
 // Port of erts/emulator/beam/erl_bif_op.c (and_2), OTP-29.1.1.
-pub(crate) extern "C" fn and_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    boolean_op(c_p, reg, i, "and", |a, b| a & b)
+pub(crate) extern "C" fn and_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    boolean_op(c_p, reg, |a, b| a & b)
 }
 
 /// `erlang:'or'/2`.
 // Port of erts/emulator/beam/erl_bif_op.c (or_2), OTP-29.1.1.
-pub(crate) extern "C" fn or_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    boolean_op(c_p, reg, i, "or", |a, b| a | b)
+pub(crate) extern "C" fn or_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    boolean_op(c_p, reg, |a, b| a | b)
 }
 
 /// `erlang:'xor'/2`.
 // Port of erts/emulator/beam/erl_bif_op.c (xor_2), OTP-29.1.1.
-pub(crate) extern "C" fn xor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    boolean_op(c_p, reg, i, "xor", |a, b| a ^ b)
+pub(crate) extern "C" fn xor_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    boolean_op(c_p, reg, |a, b| a ^ b)
 }
 
 /// `erlang:'not'/1`.
 // Port of erts/emulator/beam/erl_bif_op.c (not_1), OTP-29.1.1.
-pub(crate) extern "C" fn not_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn not_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [a] = bif_args::<1>(reg);
     match bool_arg(a) {
         Some(value) => boolean(!value),
-        None => bif_badarg(c_p, i, "not", &[a]),
+        None => bif_badarg(c_p),
     }
 }
 
@@ -200,10 +194,10 @@ fn tagged_tuple_arity(term: Term, tag: Term) -> Option<usize> {
 
 /// `erlang:is_record/2`.
 // Port of erts/emulator/beam/erl_bif_op.c (is_record_2), OTP-29.1.1.
-pub(crate) extern "C" fn is_record_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn is_record_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [term, tag] = bif_args::<2>(reg);
     if tag.as_atom().is_none() {
-        return bif_badarg(c_p, i, "is_record", &[term, tag]);
+        return bif_badarg(c_p);
     }
     if tagged_tuple_arity(term, tag).is_some() {
         return boolean(true);
@@ -217,10 +211,10 @@ pub(crate) extern "C" fn is_record_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
 
 /// `erlang:is_record/3`.
 // Port of erts/emulator/beam/erl_bif_op.c (is_record_3), OTP-29.1.1.
-pub(crate) extern "C" fn is_record_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn is_record_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [term, tag, size] = bif_args::<3>(reg);
     if tag.as_atom().is_none() {
-        return bif_badarg(c_p, i, "is_record", &[term, tag, size]);
+        return bif_badarg(c_p);
     }
     if size.as_atom().is_some() {
         // Port of erts/emulator/beam/erl_record.c (erl_is_native_record): the definition's
@@ -233,6 +227,6 @@ pub(crate) extern "C" fn is_record_3(c_p: *mut ProcessHeader, reg: *mut u64, i: 
         Some(size) => boolean(
             tagged_tuple_arity(term, tag).is_some_and(|arity| i64::try_from(arity) == Ok(size)),
         ),
-        None => bif_badarg(c_p, i, "is_record", &[term, tag, size]),
+        None => bif_badarg(c_p),
     }
 }

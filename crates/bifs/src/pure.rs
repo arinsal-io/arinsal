@@ -10,7 +10,7 @@ use arinsal_term::{
     TermBuilder, TermError, TermKind, atoms, copy_term, flat_size, global_atoms, phash,
 };
 use num_bigint::{BigInt, Sign};
-use num_traits::{FromPrimitive, ToPrimitive};
+use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 
 use crate::{BifError, Class, Ctx};
@@ -241,12 +241,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         return Some(bif);
     }
     let f = match (module, name, arity) {
-        ("erlang", "abs", 1) => v.entry::<bodies::abs>(),
-        ("erlang", "float", 1) => v.entry::<bodies::to_float>(),
-        ("erlang", "trunc", 1) => v.entry::<bodies::trunc>(),
-        ("erlang", "round", 1) => v.entry::<bodies::round>(),
-        ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
-        ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
         ("erlang", "size", 1) => v.entry::<bodies::size>(),
         ("erlang", "node", 0 | 1) => v.entry::<bodies::node>(),
         ("erlang", "phash", 2) => v.entry::<bodies::phash_bif>(),
@@ -254,12 +248,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "unique_integer", 0 | 1) => v.entry::<bodies::unique_integer>(),
         ("erlang" | "os", "system_time", 0 | 1) => v.entry::<bodies::system_time>(),
         ("erts_internal", "time_unit" | "perf_counter_unit", 0) => v.entry::<bodies::time_unit>(),
-        ("erlang", "tuple_to_list", 1) => v.entry::<word_bodies::tuple_to_list>(),
-        ("erlang", "list_to_tuple", 1) => v.entry::<process_bodies::list_to_tuple>(),
-        ("erlang", "make_tuple", 2 | 3) => v.entry::<process_bodies::make_tuple>(),
-        ("erlang", "append_element", 2) => v.entry::<process_bodies::append_element>(),
-        ("erlang", "delete_element", 2) => v.entry::<process_bodies::delete_element>(),
-        ("erlang", "insert_element", 3) => v.entry::<process_bodies::insert_element>(),
         ("erlang", "atom_to_list", 1) => v.entry::<process_bodies::atom_to_list>(),
         ("erlang", "list_to_atom", 1) => v.entry::<process_bodies::list_to_atom>(),
         ("erlang", "list_to_existing_atom", 1) => {
@@ -405,16 +393,6 @@ fn for_each_cons(
         Err(BADARG)
     } else {
         Ok(())
-    }
-}
-
-const MAX_TUPLE_SIZE: usize = (1 << 24) - 1;
-
-fn check_tuple_arity(size: usize) -> Result<(), BifError> {
-    if size <= MAX_TUPLE_SIZE {
-        Ok(())
-    } else {
-        Err(BADARG)
     }
 }
 
@@ -700,150 +678,6 @@ fn time_unit_result(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
 }
 
 #[inline]
-fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/bif.c:3762-3777 (tuple_to_list_1), OTP-29.1.1.
-    let Ok(values) = tuple_view(&args[0]) else {
-        return ctx.badarg();
-    };
-    let len = values.len();
-    if len == 0 {
-        return Term::NIL;
-    }
-    // The element words are copied straight into the cons cells, last to first, like the
-    // paired `CONS(hp, tup[n], res)` loop of tuple_to_list_1, with no per-element bounds check.
-    let built = TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .reserve_cons_list(len)
-        .and_then(|list| list.prepend_tuple_words_with_tail(values.words(), Term::NIL));
-    match built {
-        Ok(list) => list,
-        Err(_) => ctx.system_limit(),
-    }
-}
-fn list_to_tuple_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
-    let list = arinsal_term::raw::ProperList::try_from(args[0]).map_err(|_| BADARG)?;
-    let len = list.len();
-    check_tuple_arity(len)?;
-    list.to_tuple(&mut ctx.heap)
-        .map_err(|_| BifError::SystemLimit)
-}
-fn make_tuple_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3006-3076 (make_tuple_2/3), OTP-29.1.1.
-    let n = args[0].as_small().ok_or(BADARG)?;
-    if n < 0 || check_tuple_arity(n as usize).is_err() {
-        return Err(BADARG);
-    }
-    let arity = n as usize;
-    if arity == 0 {
-        if args.len() == 3 {
-            for_each_cons(args[2], |entry| {
-                if tuple_arity(entry)? != 2 {
-                    return Err(BADARG);
-                }
-                let index = tuple_element(entry, 0)?.as_small().ok_or(BADARG)?;
-                if index < 1 || index > n {
-                    return Err(BADARG);
-                }
-                Ok(())
-            })?;
-        }
-        return Ok(TermBuilder::new(&mut ctx.heap)
-            .tuple_from_fn(0, |_, _| unreachable!())
-            .expect("empty tuple is static"));
-    }
-    let mut builder = TermBuilder::new(&mut ctx.heap);
-    let mut tuple = builder
-        .reserve_tuple(arity, args[1])
-        .map_err(|_| BifError::SystemLimit)?;
-    if args.len() == 3 {
-        for_each_cons(args[2], |entry| {
-            if tuple_arity(entry)? != 2 {
-                return Err(BADARG);
-            }
-            let index = tuple_element(entry, 0)?.as_small().ok_or(BADARG)?;
-            if index < 1 || index > n {
-                return Err(BADARG);
-            }
-            tuple
-                .set(index as usize - 1, tuple_element(entry, 1)?)
-                .expect("tuple index was validated");
-            Ok(())
-        })?;
-    }
-    Ok(tuple.finish())
-}
-fn append_element_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3083 (append_element_2), OTP-29.1.1.
-    let source = tuple_view(&args[0])?;
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .tuple_append(&source, args[1])
-        .map_err(|error| match error {
-            TermError::BadArg => BADARG,
-            _ => BifError::SystemLimit,
-        })
-}
-fn delete_element_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3144-3178 (delete_element_2), OTP-29.1.1.
-    let index = args[0].as_small().ok_or(BADARG)?;
-    if index < 1 {
-        return Err(BADARG);
-    }
-    let source = tuple_view(&args[1])?;
-    let arity = source.len();
-    if index as usize > arity {
-        return Err(BADARG);
-    }
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .tuple_from_fn(arity - 1, |slot, _| {
-            source
-                .element(if slot + 1 < index as usize {
-                    slot
-                } else {
-                    slot + 1
-                })
-                .expect("tuple index was validated")
-        })
-        .map_err(|_| BifError::SystemLimit)
-}
-fn insert_element_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3110-3141 (insert_element_3), OTP-29.1.1.
-    let index = args[0].as_small().ok_or(BADARG)?;
-    if index < 1 {
-        return Err(BADARG);
-    }
-    let source = tuple_view(&args[1])?;
-    let arity = source.len();
-    if index as usize > arity + 1 {
-        return Err(BADARG);
-    }
-    let inserted = args[2];
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .tuple_from_fn(arity + 1, |slot, _| {
-            if slot + 1 == index as usize {
-                inserted
-            } else {
-                source
-                    .element(if slot + 1 < index as usize {
-                        slot
-                    } else {
-                        slot - 1
-                    })
-                    .expect("tuple index was validated")
-            }
-        })
-        .map_err(|_| BifError::SystemLimit)
-}
-
-#[cfg(test)]
-mod tuple_limit_tests {
-    use super::{MAX_TUPLE_SIZE, check_tuple_arity};
-
-    #[test]
-    fn tuple_arity_limit_matches_erts_header_capacity() {
-        assert!(check_tuple_arity(MAX_TUPLE_SIZE).is_ok());
-        assert!(check_tuple_arity(MAX_TUPLE_SIZE + 1).is_err());
-    }
-}
 pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
@@ -1761,56 +1595,6 @@ fn numeric_float(term: Term) -> Result<f64, BifError> {
     }
     Err(BADARG)
 }
-fn abs_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The source float heap remains live during this call.
-    if let Some(view) = unsafe { args[0].float_ref() } {
-        return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .float(view.get().abs())
-            .expect("infallible BIF heap"));
-    }
-    let value = bigint(args[0])?;
-    let positive = if value.sign() == Sign::Minus {
-        -value
-    } else {
-        value
-    };
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .int_from_bigint(&positive)
-        .map_err(|_| BifError::SystemLimit)
-}
-fn to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The source float heap remains live during this call.
-    if unsafe { args[0].float_ref() }.is_some() {
-        return Ok(args[0]);
-    }
-    let value = bigint(args[0])?.to_f64().ok_or(BADARG)?;
-    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .float(value)
-        .expect("infallible BIF heap"))
-}
-fn float_integer(ctx: &mut Ctx<'_>, term: Term, op: fn(f64) -> f64) -> Result<Term, BifError> {
-    // SAFETY: The source float heap remains live during this call.
-    let Some(view) = (unsafe { term.float_ref() }) else {
-        bigint(term)?;
-        return Ok(term);
-    };
-    let value = BigInt::from_f64(op(view.get())).ok_or(BADARG)?;
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .int_from_bigint(&value)
-        .map_err(|_| BifError::SystemLimit)
-}
-fn trunc_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    float_integer(ctx, args[0], f64::trunc)
-}
-fn round_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    float_integer(ctx, args[0], f64::round)
-}
-fn ceil_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    float_integer(ctx, args[0], f64::ceil)
-}
-fn floor_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    float_integer(ctx, args[0], f64::floor)
-}
 fn math_result(ctx: &mut Ctx<'_>, result: f64) -> Result<Term, BifError> {
     if !result.is_finite() {
         return Err(BifError::Badarith);
@@ -1892,12 +1676,6 @@ macro_rules! word_adapter {
     };
 }
 
-word_adapter!(abs, abs_result);
-word_adapter!(to_float, to_float_result);
-word_adapter!(trunc, trunc_result);
-word_adapter!(round, round_result);
-word_adapter!(ceil, ceil_result);
-word_adapter!(floor, floor_result);
 word_adapter!(size, size_result);
 word_adapter!(node, node_result);
 word_adapter!(phash_bif, phash_bif_result);
@@ -1905,11 +1683,6 @@ word_adapter!(make_ref, make_ref_result);
 word_adapter!(unique_integer, unique_integer_result);
 word_adapter!(system_time, system_time_result);
 word_adapter!(time_unit, time_unit_result);
-word_adapter!(list_to_tuple, list_to_tuple_result);
-word_adapter!(make_tuple, make_tuple_result);
-word_adapter!(append_element, append_element_result);
-word_adapter!(delete_element, delete_element_result);
-word_adapter!(insert_element, insert_element_result);
 word_adapter!(atom_to_list, atom_to_list_result);
 word_adapter!(list_to_atom, list_to_atom_result);
 word_adapter!(list_to_existing_atom, list_to_existing_atom_result);
@@ -1957,7 +1730,7 @@ word_adapter!(math_pow, math_pow_result);
 word_adapter!(math_fmod, math_fmod_result);
 
 crate::word_bif_bodies_in!(word_bodies;
-    abs, to_float, trunc, round, ceil, floor, size, node,
+    size, node,
     phash_bif, make_ref, unique_integer, system_time, time_unit,
     atom_to_binary, binary_to_atom, binary_to_existing_atom, float_to_list,
     float_to_binary, list_to_float, binary_to_float, integer_to_binary,
@@ -1966,9 +1739,8 @@ crate::word_bif_bodies_in!(word_bodies;
     bin_is_7bit, math_cos, math_cosh, math_sin, math_sinh, math_tan, math_tanh,
     math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atanh, math_erf,
     math_erfc, math_exp, math_log, math_log2, math_log10, math_sqrt, math_floor,
-    math_ceil, math_atan2, math_pow, math_fmod, list_to_tuple, make_tuple,
-    append_element, delete_element, insert_element, atom_to_list, list_to_atom,
-    list_to_existing_atom, tuple_to_list
+    math_ceil, math_atan2, math_pow, math_fmod, atom_to_list, list_to_atom,
+    list_to_existing_atom
 );
 mod bodies {
     pub(super) use super::word_bodies::*;
