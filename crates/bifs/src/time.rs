@@ -159,13 +159,6 @@ pub fn monotonic_time_nanos() -> i128 {
 // unit), OTP-29.1.1.
 pub const MONOTONIC_TIME_START_EXTERNAL: i64 = (-(1_i64 << 59) / 1_000_000_000) * 1_000_000_000;
 
-/// `ERTS_MONOTONIC_TIME_END_EXTERNAL`: the last external monotonic time before the internal
-/// range ends.
-// Port of erts/emulator/beam/erl_time.h (ERTS_MONOTONIC_TIME_END_EXTERNAL, ERTS_MONOTONIC_BEGIN,
-// ERTS_MONOTONIC_END), OTP-29.1.1.
-pub const MONOTONIC_TIME_END_EXTERNAL: i64 =
-    MONOTONIC_TIME_START_EXTERNAL + ((i64::MAX / 1_000_000_000) * 1_000_000_000 - 1_000_000_000);
-
 /// Return OTP's raw internal monotonic clock value for call_time accounting.
 // Port of erts/emulator/beam/beam_bp.c (get_mtime), OTP-29.1.1. On macOS, OTP's
 // ERTS_MONOTONIC unit is nanoseconds; unlike trace timestamps in erl_trace.c, call_time does not

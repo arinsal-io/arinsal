@@ -653,20 +653,6 @@ fn binary_search_megabyte_benchmark() {
 }
 
 #[test]
-fn system_info_snifs_matches_otp() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let expected = reference.call("erlang", "system_info", &[atom("snifs")]);
-    let mut heap = ProcessHeap::with_words(16_384);
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let selector = arinsal_term::from_owned(&atom("snifs"), &mut allocator).unwrap();
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut allocator, &mut state);
-    let actual = lookup("erlang", "system_info", 1).unwrap()(&mut ctx, &[selector]).unwrap();
-    let actual = CallResult::Ok(to_owned(actual).unwrap());
-    assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
-}
-
-#[test]
 fn binary_to_atom_oversized_name_is_system_limit() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     for mut bytes in [vec![0; 256], vec![0; 512]] {

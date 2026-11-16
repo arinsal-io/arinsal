@@ -194,6 +194,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "registered", 0) => bif!(register::registered_0),
         // erl_bif_info.c
         ("erlang", "is_process_alive", 1) => bif!(erl_bif_info::is_process_alive_1),
+        ("erlang", "system_info", 1) => bif!(erl_bif_info::system_info_1),
         ("erlang", "process_info", 2) => {
             bif!(crate::native_helpers::process_info_2_light)
         }

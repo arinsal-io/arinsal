@@ -419,44 +419,6 @@ fn current_reductions(process: &Process) -> u64 {
     .unwrap_or(0)
 }
 
-/// `erlang:system_info/1` for every item that needs only the calling process.
-pub(crate) fn system_info_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [selector] = args else {
-        return None;
-    };
-    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1: a plain BIF that
-    // answers every item from `c_p` and globals. The same items, in the same order, as the
-    // scheduler path: the process-only ones, then the process-independent table.
-    if let Some(name) = selector
-        .as_atom()
-        .and_then(|atom| global_atoms().text(atom))
-    {
-        if let Some(item) = system_info_process_item(process, name) {
-            // A trap (`cpu_topology` formats in an Erlang function) needs the scheduler path.
-            return match item {
-                Ok(value) => Some(Ok(value)),
-                Err(VmError::Trap(trap)) => Some(Err(trap)),
-                Err(_) => None,
-            };
-        }
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = arinsal_bifs::Ctx::new(&mut heap, &mut state);
-        return arinsal_bifs::system_info_light_item(&mut ctx, *selector).map(|item| {
-            item.map_err(|error| match error {
-                arinsal_bifs::BifError::SystemLimit => {
-                    crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
-                }
-                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::BADARG)),
-            })
-        });
-    }
-    None
-}
-
 fn call_statistics(
     _vm: &mut Vm,
     process: &mut Process,
@@ -1178,6 +1140,9 @@ fn system_info(
     if let Some(item) = name.and_then(|name| system_info_process_item(process, name)) {
         return Some(item);
     }
+    if let Some(item) = crate::natives::erl_bif_info::system_info_light_item(process, selector) {
+        return Some(item);
+    }
     match name {
         // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
         Some("info" | "procs" | "loaded" | "dist") => {
@@ -1190,8 +1155,7 @@ fn system_info(
                 .ok_or_else(badarg),
         ),
         Some("allocated_areas") => Some(memory_areas(vm, process)),
-        _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
-        _ => None,
+        _ => Some(Err(badarg())),
     }
 }
 

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use arinsal_term::{Term, TermBuilder, global_atoms};
 
-use crate::pure::{Heap, atom_name, tuple_build};
+use crate::pure::Heap;
 use crate::{BifError, Ctx};
 
 static PERF_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -17,13 +17,10 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "system_info", 1) => v.entry::<word_bodies::system_info>(),
-        ("erts_internal", "no_aux_work_threads", 0) => {
-            v.entry::<word_bodies::no_aux_work_threads>()
-        }
-        ("os", "getenv", 1) => v.entry::<word_bodies::getenv>(),
-        ("os", "getpid", 0) => v.entry::<word_bodies::getpid>(),
-        ("os", "perf_counter", 0) => v.entry::<word_bodies::perf_counter>(),
+        ("erts_internal", "no_aux_work_threads", 0) => v.entry::<bodies::no_aux_work_threads>(),
+        ("os", "getenv", 1) => v.entry::<bodies::getenv>(),
+        ("os", "getpid", 0) => v.entry::<bodies::getpid>(),
+        ("os", "perf_counter", 0) => v.entry::<bodies::perf_counter>(),
         _ => return None,
     };
     if module == "os" || arinsal_spec::bif_lookup(module, name, arity).is_some() {
@@ -46,14 +43,6 @@ fn integer(ctx: &mut Ctx<'_>, value: u64) -> Result<Term, BifError> {
         .int_from_bigint(&num_bigint::BigInt::from(value))
         .map_err(|_| BifError::SystemLimit)
 }
-fn signed(ctx: &mut Ctx<'_>, value: i64) -> Result<Term, BifError> {
-    if let Some(term) = Term::small(value) {
-        return Ok(term);
-    }
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .int_from_bigint(&num_bigint::BigInt::from(value))
-        .map_err(|_| BifError::SystemLimit)
-}
 fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
     let mut tail = Term::NIL;
     for ch in value.chars().rev() {
@@ -65,291 +54,11 @@ fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
     Ok(tail)
 }
 
-/// The items of `system_info/1` that this table answers from process-independent state, so the
-/// light BIF path can run them with only the calling process's heap. Port of
-/// erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1, which runs every one of
-/// them inside the plain BIF. `None` for any other selector.
-pub fn system_info_light_item(ctx: &mut Ctx<'_>, key: Term) -> Option<Result<Term, BifError>> {
-    let light = matches!(
-        atom_name(key)?,
-        "otp_release"
-            | "version"
-            | "system_version"
-            | "wordsize"
-            | "start_time"
-            | "end_time"
-            | "break_ignored"
-            | "async_dist"
-            | "eager_check_io"
-            | "dynamic_trace"
-            | "dynamic_trace_probes"
-            | "c_compiler_used"
-            | "delayed_node_table_gc"
-            | "context_reductions"
-            | "logical_processors"
-            | "logical_processors_available"
-            | "logical_processors_online"
-            | "outstanding_system_requests_limit"
-            | "process_limit"
-            | "port_limit"
-            | "ets_limit"
-            | "machine"
-            | "system_architecture"
-            | "emu_flavor"
-            | "build_type"
-            | "emu_type"
-            | "os_type"
-            | "os_version"
-            | "endian"
-            | "heap_type"
-            | "time_correction"
-            | "kernel_poll"
-            | "time_offset"
-            | "time_warp_mode"
-            | "os_monotonic_time_source"
-            | "os_system_time_source"
-            | "smp_support"
-            | "constant_pool_support"
-            | "hipe_architecture"
-            | "ets_realloc_moves"
-            | "compat_rel"
-            | "snifs"
-    );
-    light.then(|| system_info_result(ctx, &[key]))
-}
-
-// Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
-fn system_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let key = atom_name(args[0]).ok_or(BifError::BADARG)?;
-    let info = arinsal_alloc::cpuinfo::cpu_info();
-    let (cpus, online) = arinsal_alloc::cpuinfo::default_schedulers();
-    let (cpus, online) = (cpus as u64, online as u64);
-    match key {
-        "otp_release" => string(ctx, "29"),
-        "version" => string(ctx, "17.1"),
-        "system_version" => string(
-            ctx,
-            &format!(
-                "Erlang/OTP 29 [erts-17.1] [arinsal {}] [{}-bit] [smp:{cpus}:{online}] [ds:{cpus}:{online}:10] [async-threads:1] [jit]\n",
-                env!("CARGO_PKG_VERSION"),
-                std::mem::size_of::<usize>() * 8
-            ),
-        ),
-        "wordsize" => integer(ctx, std::mem::size_of::<usize>() as u64),
-        // Port of erts/emulator/beam/erl_bif_info.c:2855-2858 (start_time, end_time) and
-        // erl_time_sup.c (make_time_val), OTP-29.1.1.
-        "start_time" => signed(ctx, crate::time::MONOTONIC_TIME_START_EXTERNAL),
-        "end_time" => signed(ctx, crate::time::MONOTONIC_TIME_END_EXTERNAL),
-        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1: break_ignored reads
-        // `ignore_break`, +Bi), OTP-29.1.1.
-        "break_ignored" => Ok(atom(
-            if arinsal_args::active_emulator_flags().ignore_break {
-                "true"
-            } else {
-                "false"
-            },
-        )),
-        // Port of erts/emulator/beam/erl_bif_info.c:2980 (system_info_1: async_dist reads
-        // `erts_default_spo_flags & SPO_ASYNC_DIST`, +pad), OTP-29.1.1.
-        "async_dist" => Ok(atom(
-            if arinsal_args::active_emulator_flags().async_dist == Some(true) {
-                "true"
-            } else {
-                "false"
-            },
-        )),
-        "dynamic_trace_probes" => Ok(atom("false")),
-        "eager_check_io" => Ok(atom("true")),
-        // No DTrace, SystemTap or LTTng support is built in (USE_DTRACE, USE_SYSTEMTAP, USE_LTTNG).
-        "dynamic_trace" => Ok(atom("none")),
-        // Port of erts/emulator/beam/erl_bif_info.c:3426 (delayed_node_table_gc, +zdntgc),
-        // OTP-29.1.1. The VM answers it from the live node table delay; this is the boot value.
-        "delayed_node_table_gc" => {
-            match arinsal_args::active_emulator_flags().delayed_node_table_gc {
-                Some(arinsal_args::DelayedNodeTableGc::Infinity) => Ok(atom("infinity")),
-                Some(arinsal_args::DelayedNodeTableGc::Seconds(secs)) => {
-                    integer(ctx, u64::from(secs))
-                }
-                None => integer(ctx, 60),
-            }
-        }
-        // Port of erts/emulator/beam/erl_bif_info.c:2688 (c_compiler_used): the reference build
-        // is compiled by clang, which defines __GNUC__ 4, __GNUC_MINOR__ 2, __GNUC_PATCHLEVEL__ 1.
-        "c_compiler_used" => {
-            let version = tuple_build(
-                ctx,
-                &[
-                    Term::small(4).unwrap(),
-                    Term::small(2).unwrap(),
-                    Term::small(1).unwrap(),
-                ],
-            );
-            Ok(tuple_build(ctx, &[atom("gnuc"), version]))
-        }
-        "context_reductions" => integer(ctx, 4000),
-        "schedulers" => integer(ctx, cpus),
-        "schedulers_online" => integer(ctx, online),
-        "logical_processors" => integer(ctx, info.configured as u64),
-        "logical_processors_available" => integer(ctx, info.available as u64),
-        "logical_processors_online" => integer(ctx, info.online as u64),
-        "dirty_cpu_schedulers" => integer(ctx, cpus),
-        "dirty_cpu_schedulers_online" => integer(ctx, online),
-        "dirty_io_schedulers" => integer(ctx, 10),
-        // Port of erts/emulator/beam/erl_bif_info.c:2876 and
-        // erts/emulator/beam/erl_init.c:1354, OTP-29.1.1.
-        "outstanding_system_requests_limit" => integer(ctx, cpus.saturating_mul(2)),
-        "thread_pool_size" => integer(ctx, 1),
-        "process_limit" => integer(
-            ctx,
-            u64::from(arinsal_term::ptab::process_table_layout().max()),
-        ),
-        "atom_limit" => integer(ctx, global_atoms().limit() as u64),
-        "port_limit" => integer(
-            ctx,
-            u64::from(arinsal_term::ptab::port_table_layout().max()),
-        ),
-        "ets_limit" => integer(ctx, 8192),
-        "fullsweep_after" => tagged_integer(ctx, "fullsweep_after", 65_535),
-        "min_heap_size" => tagged_integer(
-            ctx,
-            "min_heap_size",
-            arinsal_term::erts_next_heap_size(233, 0).unwrap() as i64,
-        ),
-        "min_bin_vheap_size" => tagged_integer(
-            ctx,
-            "min_bin_vheap_size",
-            arinsal_term::erts_next_heap_size(46_422, 0).unwrap() as i64,
-        ),
-        "max_heap_size" => {
-            let map_items = [
-                (atom("size"), Term::small(0).unwrap()),
-                (atom("kill"), atom("true")),
-                (atom("error_logger"), atom("true")),
-                (atom("include_shared_binaries"), atom("false")),
-            ];
-            let mut heap = Heap(&mut ctx.heap);
-            arinsal_maps::from_list(&map_items, &mut heap).map_err(|_| BifError::SystemLimit)
-        }
-        // Port of erts/emulator/beam/erl_bif_info.c:3521 (atom_count), OTP-29.1.1. The process and
-        // port counts need the VM's tables; the VM answers them before this table is consulted.
-        "atom_count" => integer(ctx, global_atoms().len() as u64),
-        "machine" => string(ctx, "BEAM"),
-        // Port of erts/emulator/beam/erl_bif_info.c:3019-3024 (system_architecture) and
-        // erts/emulator/utils/make_version:74 (ERLANG_ARCHITECTURE), OTP-29.1.1: the configure
-        // triple, fixed when the runtime is built (crates/bifs/build.rs).
-        "system_architecture" => string(ctx, env!("ARINSAL_SYSTEM_ARCHITECTURE")),
-        // Port of erts/emulator/beam/erl_bif_info.c (system_info emu_flavor), OTP-29.1.1.
-        // The runtime is the JIT build only, as the reference install is.
-        "emu_flavor" => Ok(atom("jit")),
-        "build_type" | "emu_type" => Ok(atom("opt")),
-        "os_type" => Ok(os_type()),
-        "endian" => Ok(atom(if cfg!(target_endian = "little") {
-            "little"
-        } else {
-            "big"
-        })),
-        "heap_type" => Ok(atom("private")),
-        "garbage_collection" => {
-            let entries = [
-                ("max_heap_size", 0),
-                (
-                    "min_bin_vheap_size",
-                    arinsal_term::erts_next_heap_size(46_422, 0).unwrap() as i64,
-                ),
-                (
-                    "min_heap_size",
-                    arinsal_term::erts_next_heap_size(233, 0).unwrap() as i64,
-                ),
-                ("fullsweep_after", 65_535),
-            ];
-            let mut list = Term::NIL;
-            for (name, value) in entries.into_iter().rev() {
-                let pair = tuple_build(ctx, &[atom(name), Term::small(value).unwrap()]);
-                list = TermBuilder::new(&mut Heap(&mut ctx.heap))
-                    .cons(pair, list)
-                    .map_err(|_| BifError::SystemLimit)?;
-            }
-            Ok(list)
-        }
-        "alloc_util_allocators" => atom_list(
-            ctx,
-            &[
-                "temp_alloc",
-                "sl_alloc",
-                "std_alloc",
-                "ll_alloc",
-                "eheap_alloc",
-                "ets_alloc",
-                "fix_alloc",
-                "literal_alloc",
-                "binary_alloc",
-                "driver_alloc",
-            ],
-        ),
-        "multi_scheduling" => Ok(atom("enabled")),
-        "message_queue_data" => Ok(atom("on_heap")),
-        "time_correction" | "kernel_poll" => Ok(atom("true")),
-        "time_offset" => Ok(atom("volatile")),
-        "time_warp_mode" => Ok(atom("multi_time_warp")),
-        // Proplist shape of erl_time_sup.c (erts_monotonic_time_source / system time source).
-        // Native ticks are nanoseconds, so resolution is 1e9 rather than the raw OS counter.
-        "os_monotonic_time_source" => clock_source(ctx, monotonic_clock_id(), true),
-        "os_system_time_source" => clock_source(ctx, "CLOCK_REALTIME", false),
-        "os_version" => Ok(os_version()),
-        "scheduler_bind_type" => Ok(atom("unbound")),
-        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1: smp_support,
-        // constant_pool_support, hipe_architecture, ets_realloc_moves, compat_rel), OTP-29.1.1.
-        // `thread_support` and `async_threads` are not items in erts.
-        "smp_support" | "constant_pool_support" => Ok(atom("true")),
-        "hipe_architecture" => Ok(atom("undefined")),
-        "ets_realloc_moves" => Ok(atom("false")),
-        "compat_rel" => Ok(Term::small(29).expect("small")),
-        // Port of erts/emulator/beam/erl_bif_info.c:2742-2768 (build_snifs_term), OTP-29.1.1.
-        "snifs" => {
-            let mut list = Term::NIL;
-            for bif in arinsal_spec::BIFS.iter() {
-                if !bif.module.contains('.') {
-                    let entry = tuple_build(
-                        ctx,
-                        &[
-                            atom(bif.module),
-                            atom(bif.name),
-                            Term::small(i64::from(bif.arity)).unwrap(),
-                        ],
-                    );
-                    list = TermBuilder::new(&mut Heap(&mut ctx.heap))
-                        .cons(entry, list)
-                        .map_err(|_| BifError::SystemLimit)?;
-                }
-            }
-            Ok(list)
-        }
-        _ => Err(BifError::BADARG),
-    }
-}
-
-fn atom_list(ctx: &mut Ctx<'_>, names: &[&str]) -> Result<Term, BifError> {
-    let mut list = Term::NIL;
-    for name in names.iter().rev() {
-        list = TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .cons(atom(name), list)
-            .map_err(|_| BifError::SystemLimit)?;
-    }
-    Ok(list)
-}
-
 fn no_aux_work_threads_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_process.c:9234 and :6219-6223, OTP-29.1.1.
     // The runtime uses one standard auxiliary worker and no dirty allocator instances.
     let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0 as u64;
     integer(ctx, schedulers.saturating_add(1))
-}
-
-fn tagged_integer(ctx: &mut Ctx<'_>, key: &str, value: i64) -> Result<Term, BifError> {
-    Ok(tuple_build(
-        ctx,
-        &[atom(key), Term::small(value).ok_or(BifError::SystemLimit)?],
-    ))
 }
 
 fn os_string(ctx: &mut Ctx<'_>, value: OsString) -> Result<Term, BifError> {
@@ -374,45 +83,6 @@ fn getpid_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // SAFETY: getpid has no preconditions and does not retain pointers.
     string(ctx, &unsafe { libc::getpid() }.to_string())
 }
-fn monotonic_clock_id() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "CLOCK_UPTIME_RAW"
-    } else {
-        "CLOCK_MONOTONIC"
-    }
-}
-
-fn clock_source(ctx: &mut Ctx<'_>, clock_id: &str, monotonic: bool) -> Result<Term, BifError> {
-    let resolution = Term::small(1_000_000_000).expect("nanosecond resolution fits");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let time = integer(ctx, u64::try_from(nanos).unwrap_or(u64::MAX))?;
-    let mut pairs = vec![
-        pair(ctx, "function", atom("clock_gettime"))?,
-        pair(ctx, "clock_id", atom(clock_id))?,
-        pair(ctx, "resolution", resolution)?,
-    ];
-    if monotonic {
-        pairs.push(pair(ctx, "used_resolution", resolution)?);
-        pairs.push(pair(ctx, "extended", atom("no"))?);
-    }
-    pairs.push(pair(ctx, "parallel", atom("yes"))?);
-    pairs.push(pair(ctx, "time", time)?);
-    let mut list = Term::NIL;
-    for entry in pairs.into_iter().rev() {
-        list = TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .cons(entry, list)
-            .map_err(|_| BifError::SystemLimit)?;
-    }
-    Ok(list)
-}
-
-fn pair(ctx: &mut Ctx<'_>, key: &str, value: Term) -> Result<Term, BifError> {
-    Ok(tuple_build(ctx, &[atom(key), value]))
-}
-
 /// The performance counter in nanoseconds (`erts_sys_perf_counter`); native
 /// `os:perf_counter/0` calls it directly.
 // Port of erts/emulator/sys/unix/erl_unix_sys.h:286-296 (erts_sys_perf_counter), OTP-29.1.1.
@@ -433,10 +103,9 @@ macro_rules! word_adapters {
         })+
     };
 }
-word_adapters!(system_info => system_info_result, no_aux_work_threads => no_aux_work_threads_result,
-    getenv => getenv_result, getpid => getpid_result, perf_counter => perf_counter_result);
-crate::word_bif_bodies_in!(word_bodies; system_info, no_aux_work_threads, getenv, getpid,
-    perf_counter);
+word_adapters!(no_aux_work_threads => no_aux_work_threads_result, getenv => getenv_result,
+    getpid => getpid_result, perf_counter => perf_counter_result);
+crate::word_bif_bodies_in!(bodies; no_aux_work_threads, getenv, getpid, perf_counter);
 
 /// Build the `os_type` and `os_version` global literals.
 // Port of erts/emulator/beam/erl_bif_info.c (os_info_init), OTP-29.1.1. Guarded by a `Once`
