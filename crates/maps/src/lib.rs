@@ -27,19 +27,16 @@ const MAP_HEADER_FLATMAP: u64 = MAP | (1 << 8);
 const LIMIT: usize = 32;
 
 /// Map operation error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapError {
     /// `{badmap, Term}`.
     Badmap(Term),
     /// `{badkey, Key}`.
     Badkey(Term),
-    /// Caller must collect garbage and retry; `0` means the operation has no whole-operation hint.
-    HeapFull { need_words: usize },
     /// Invalid iterator term or path.
     Badarg(Term),
-    /// Unsupported key term. Retained for API compatibility; map operations no longer produce it.
-    #[deprecated(note = "map keys use arinsal-term hashing and comparison")]
-    UnsupportedKey(Term),
+    /// A fallible heap allocator could not reserve storage for a map object.
+    Allocation,
 }
 
 /// Map operation result.
@@ -232,13 +229,7 @@ fn unique(pairs: &[(Term, Term)]) -> Vec<(Term, Term)> {
 fn flat<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
     let ks: Vec<Term> = pairs.iter().map(|p| p.0).collect();
     let vs: Vec<Term> = pairs.iter().map(|p| p.1).collect();
-    merge::flatmap_from_sorted(&ks, &vs, heap).map_err(|_| MapError::HeapFull {
-        need_words: if pairs.is_empty() {
-            3
-        } else {
-            4 + 2 * pairs.len()
-        },
-    })
+    merge::flatmap_from_sorted(&ks, &vs, heap).map_err(|_| MapError::Allocation)
 }
 /// The empty flatmap, sharing the static empty key tuple.
 fn empty_flatmap<H: HeapAlloc + ?Sized>(heap: &mut H) -> Result<Term, TermError> {
@@ -389,9 +380,7 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
                 3 + 2 * (divergence - leaf_split_level)
             };
         }
-        let mut cursor = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let mut cursor = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         let inserted = cursor;
         *cursor = bits(key);
         *cursor.add(1) = bits(value);
@@ -587,17 +576,14 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
         // erts flattens only after the deletion walk has already found the key.
         let new_size = map_size - 1;
         if new_size <= LIMIT {
-            let words = 4 + 2 * new_size;
             return merge::flatmap_from_hashmap_without(map, key, new_size, heap)
-                .map_err(|_| MapError::HeapFull { need_words: words });
+                .map_err(|_| MapError::Allocation);
         }
 
         let need_words = reserve_words
             .checked_sub(1)
             .expect("a hashmap deletion path reserves at least one word");
-        let mut cursor = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let mut cursor = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         let start = cursor;
         let mut replacement = None;
 
@@ -1064,8 +1050,7 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
     }
     let tuple_words = if n == 1 { 0 } else { n };
     let need_words = tuple_words + FLATMAP_HEADER_WORDS + n - 1;
-    let (output, start) =
-        merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+    let (output, start) = merge::produce(heap, need_words).map_err(|_| MapError::Allocation)?;
     let (tuple, rest) = output.split_at_mut(tuple_words);
     let (header, values) = rest.split_at_mut(FLATMAP_HEADER_WORDS);
     if n > 1 {
@@ -1161,8 +1146,7 @@ fn flatmap_next_words<H: HeapAlloc + ?Sized>(
     let n = ks.len();
     if list_mode {
         let need_words = 5 * n;
-        let (output, start) =
-            merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+        let (output, start) = merge::produce(heap, need_words).map_err(|_| MapError::Allocation)?;
         let mut at = start;
         let mut res = acc;
         let pairs = ks.iter().rev().zip(vs.iter().rev());
@@ -1178,8 +1162,7 @@ fn flatmap_next_words<H: HeapAlloc + ?Sized>(
         Ok(res)
     } else {
         let need_words = 4 * n;
-        let (output, start) =
-            merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+        let (output, start) = merge::produce(heap, need_words).map_err(|_| MapError::Allocation)?;
         let mut at = start;
         let mut res = NONE;
         let pairs = ks.iter().rev().zip(vs.iter().rev());
@@ -1206,7 +1189,7 @@ pub fn cons_pair<H: HeapAlloc + ?Sized>(
     value: Term,
     tail: Term,
 ) -> MapResult<Term> {
-    let (words, at) = merge::produce(heap, 5).map_err(|_| MapError::HeapFull { need_words: 5 })?;
+    let (words, at) = merge::produce(heap, 5).map_err(|_| MapError::Allocation)?;
     words[0].write(2 << 6);
     words[1].write(bits(key));
     words[2].write(bits(value));
@@ -1291,9 +1274,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
         let n = *mp.add(1) as usize;
         if n == 0 {
             let need_words = FLATMAP_HEADER_WORDS + 1 + 2;
-            let hp = heap
-                .alloc(need_words)
-                .ok_or(MapError::HeapFull { need_words })?;
+            let hp = heap.alloc(need_words).ok_or(MapError::Allocation)?;
             *hp = 1 << 6;
             *hp.add(1) = bits(key);
             let m = hp.add(2);
@@ -1309,9 +1290,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
 
         // Only allocate for values, assuming the key tuple stays intact.
         let first = FLATMAP_HEADER_WORDS + n;
-        let shp = heap.alloc(first).ok_or(MapError::HeapFull {
-            need_words: first + FLATMAP_HEADER_WORDS + n + 1,
-        })?;
+        let shp = heap.alloc(first).ok_or(MapError::Allocation)?;
         *shp = MAP_HEADER_FLATMAP;
         *shp.add(1) = n as u64;
         *shp.add(2) = *mp.add(2);
@@ -1355,9 +1334,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
         let second = FLATMAP_HEADER_WORDS + n + 1;
         let Some(hp) = heap.alloc(second) else {
             release!(heap, shp.add(first), shp);
-            return Err(MapError::HeapFull {
-                need_words: first + second,
-            });
+            return Err(MapError::Allocation);
         };
         *shp = ((n + 1) as u64) << 6;
         *hp = MAP_HEADER_FLATMAP;
@@ -1464,9 +1441,7 @@ pub fn update<H: HeapAlloc + ?Sized>(
         let ks = term(*mp.add(2)).raw_ptr().add(1);
         let vs = mp.add(FLATMAP_HEADER_WORDS);
         let need_words = FLATMAP_HEADER_WORDS + n;
-        let shp = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let shp = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         *shp = MAP_HEADER_FLATMAP;
         *shp.add(1) = n as u64;
         *shp.add(2) = *mp.add(2);
@@ -1528,9 +1503,7 @@ pub fn gc_new_map<H: HeapAlloc + ?Sized>(
         return flat(&[], heap);
     }
     let need_words = n + 4;
-    let thp = heap
-        .alloc(need_words)
-        .ok_or(MapError::HeapFull { need_words })?;
+    let thp = heap.alloc(need_words).ok_or(MapError::Allocation)?;
     // SAFETY: the allocation holds the key tuple, the flatmap header and the values.
     unsafe {
         *thp = (pairs as u64) << 6;
@@ -1587,9 +1560,7 @@ pub fn gc_update_map_assoc<H: HeapAlloc + ?Sized>(
             return gc_new_map(n, arg, heap);
         }
         let need_words = 2 * (num_old + num_updates) + 1 + FLATMAP_HEADER_WORDS;
-        let mp = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let mp = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         let end = mp.add(need_words);
         *mp = MAP_HEADER_FLATMAP;
         let mut hp = mp.add(FLATMAP_HEADER_WORDS);
@@ -1731,9 +1702,7 @@ pub fn gc_update_map_exact<H: HeapAlloc + ?Sized>(
             return Err(MapError::Badkey(arg(0)));
         }
         let need_words = num_old + FLATMAP_HEADER_WORDS;
-        let mp = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let mp = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         let end = mp.add(need_words);
         *mp = MAP_HEADER_FLATMAP;
         *mp.add(1) = num_old as u64;
@@ -1774,8 +1743,7 @@ pub fn gc_update_map_exact<H: HeapAlloc + ?Sized>(
 
 /// Apply instruction key-value updates; exact mode rejects missing keys.
 ///
-/// Sorts the pairs like the loader's `map_key_sort` and runs the instruction bodies; a
-/// `HeapFull` result asks the caller to collect and retry.
+/// Sorts the pairs like the loader's `map_key_sort` and runs the instruction bodies.
 pub fn put_many<H: HeapAlloc + ?Sized>(
     map: Term,
     pairs: &[(Term, Term)],
@@ -1922,13 +1890,12 @@ pub fn flatmap_projection_list<H: HeapAlloc + ?Sized>(
 ) -> MapResult<Term> {
     let (key_words, value_words, _) = merge::flatmap_kv_with_size(map.term(), map.size());
     let words = if keys { key_words } else { value_words };
-    let needed = 2 * words.len();
     let output = TermBuilder::new(heap)
         .reserve_cons_list(words.len())
-        .map_err(|_| MapError::HeapFull { need_words: needed })?;
+        .map_err(|_| MapError::Allocation)?;
     output
         .prepend_exact_words_with_tail(words, Term::NIL)
-        .map_err(|_| MapError::HeapFull { need_words: needed })
+        .map_err(|_| MapError::Allocation)
 }
 
 /// Lookup several keys; absent keys return `None`.
@@ -1973,9 +1940,7 @@ fn iterator_term_order<H: HeapAlloc + ?Sized>(
         }
     }
     let need_words = 2 + 2 * keys.len();
-    let mut p = heap
-        .alloc(need_words)
-        .ok_or(MapError::HeapFull { need_words })?;
+    let mut p = heap.alloc(need_words).ok_or(MapError::Allocation)?;
     let mut path = if ordered.is_some() {
         Term::NIL
     } else {
@@ -2073,9 +2038,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
             return Ok(NONE);
         }
         let need_words = 4 * entries.len();
-        let p = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let p = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         let mut result = NONE;
         for (i, (key, value)) in entries.into_iter().rev().enumerate() {
             // SAFETY: one allocation reserves a three-element tuple per pair.
@@ -2106,9 +2069,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
             return Err(MapError::Badarg(iterator));
         }
         let need_words = 4 * entries.len();
-        let p = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
+        let p = heap.alloc(need_words).ok_or(MapError::Allocation)?;
         let mut result = NONE;
         for (i, (key, value)) in entries.into_iter().rev().enumerate() {
             // SAFETY: one allocation reserves a three-element tuple per pair.
@@ -2159,9 +2120,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
         _ => 0,
     };
     let need_words = 4 + if next_path.is_some() { 2 + extra } else { 0 };
-    let p = heap
-        .alloc(need_words)
-        .ok_or(MapError::HeapFull { need_words })?;
+    let p = heap.alloc(need_words).ok_or(MapError::Allocation)?;
     // SAFETY: the allocation reserves a three-element tuple and optional cons.
     unsafe {
         *p = 3 << 6;

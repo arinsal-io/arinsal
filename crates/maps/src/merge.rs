@@ -144,11 +144,7 @@ fn hashmap_subtree_size(node: Term) -> usize {
 /// use `ProcessHeapHandle`, so heap exhaustion is only possible for callers that
 /// deliberately supply a finite standalone heap.
 pub(crate) fn allocation_result<T>(result: Result<T, TermError>) -> MapResult<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(TermError::HeapFull) => Err(MapError::HeapFull { need_words: 0 }),
-        Err(error) => unreachable!("map construction failed: {error:?}"),
-    }
+    result.map_err(|_| MapError::Allocation)
 }
 
 /// Build a flatmap from key/value arrays already in flatmap key order.
@@ -603,15 +599,14 @@ pub const MAP_MERGE_LOOP_FACTOR: isize = 8;
 /// merged map, or `None` when the budget ran out and the call must trap.
 ///
 /// Port of erts/emulator/beam/erl_map.c:1558-1861 (hashmap_merge), OTP-29.1.1.
-/// The heap must not fail (erts allocates with `HAlloc`): a `HeapFull` error
-/// carries no size and leaves the context unusable. Use [`merge`] with a
-/// fallible heap.
+/// Runtime callers use the process heap factory, which grows a heap fragment when
+/// the young heap cannot hold the allocation. Finite test heaps can still fail.
 pub fn hashmap_merge<H: HeapAlloc + ?Sized>(
     ctx: &mut HashmapMergeContext,
     reds: &mut isize,
     heap: &mut H,
 ) -> MapResult<Option<Term>> {
-    hashmap_merge_loop(ctx, reds, heap).map_err(|_| MapError::HeapFull { need_words: 0 })
+    hashmap_merge_loop(ctx, reds, heap).map_err(|_| MapError::Allocation)
 }
 
 fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
@@ -930,9 +925,7 @@ impl HashmapFromPairs {
     pub fn new<H: HeapAlloc + ?Sized>(size: usize, heap: &mut H) -> MapResult<Self> {
         let leaves = arinsal_term::TermBuilder::new(heap)
             .reserve_cons_list(size)
-            .map_err(|_| MapError::HeapFull {
-                need_words: 2 * size,
-            })?;
+            .map_err(|_| MapError::Allocation)?;
         Ok(Self {
             leaves: Some(leaves),
             entries: Vec::with_capacity(size),
@@ -948,7 +941,7 @@ impl HashmapFromPairs {
         let leaves = self.leaves.as_mut().expect("leaf phase is active");
         let val = leaves
             .cons_cell(key, value)
-            .map_err(|_| MapError::HeapFull { need_words: 0 })?;
+            .map_err(|_| MapError::Allocation)?;
         let index = self.entries.len();
         self.entries.push(arinsal_term::HxNode {
             hx,
@@ -975,7 +968,7 @@ impl HashmapFromPairs {
             .fill_cons_cells_with(count, pairs, |index, key, _, leaf| {
                 entries.push(arinsal_term::HxNode::new(key, leaf, index));
             })
-            .map_err(|_| MapError::HeapFull { need_words: 0 })
+            .map_err(|_| MapError::Allocation)
     }
 
     /// Finish leaf setup and begin the structural HAMT build.
@@ -997,18 +990,18 @@ impl HashmapFromPairs {
         reds: &mut i64,
         heap: &mut H,
     ) -> MapResult<Option<Term>> {
-        // The process heap grows by fragments, so exhaustion is not expected here.
-        let heap_full = |_| MapError::HeapFull { need_words: 0 };
         let Some(res) = self
             .build
             .as_mut()
             .expect("leaf setup finished")
             .step(reds, heap)
-            .map_err(heap_full)?
+            .map_err(|_| MapError::Allocation)?
         else {
             return Ok(None);
         };
-        flatmap_if_small(res, heap).map(Some).map_err(heap_full)
+        flatmap_if_small(res, heap)
+            .map(Some)
+            .map_err(|_| MapError::Allocation)
     }
 }
 

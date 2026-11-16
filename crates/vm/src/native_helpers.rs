@@ -4130,7 +4130,7 @@ fn map_result(
             set_tagged_error(process, "badmap", map);
             0
         }
-        Err(arinsal_maps::MapError::HeapFull { .. }) => {
+        Err(arinsal_maps::MapError::Allocation) => {
             crate::native_hooks::set_error(process, "system_limit");
             0
         }

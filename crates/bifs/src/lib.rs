@@ -25,7 +25,6 @@ mod arith;
 mod binary_mod;
 mod dirty;
 mod lists;
-mod maps_bifs;
 mod pure;
 mod sys;
 mod time;
@@ -39,7 +38,6 @@ pub use lists::{
     REVERSE_ONHEAP_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, append_onheap_direct,
     length_slice, lists_append, lists_key, lists_member, lists_reverse, reverse_onheap_direct,
 };
-pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk};
 pub use pure::{
     B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistVecWalk,
     Phash2Cont, Phash2Run, allocate_iolist_binary, atom_to_list_term, binary_bytes, binary_part_2,

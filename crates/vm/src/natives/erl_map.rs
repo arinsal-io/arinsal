@@ -11,8 +11,10 @@ use crate::VmError;
 use crate::bif_traps::TrapContext;
 use crate::natives::bif::bif_ret;
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifCall, BifError, Ctx, MapsBuildWalk, MapsProjectionWalk, ProcessHeapHandle};
-use arinsal_maps::{HashmapMergeContext, MAP_MERGE_LOOP_FACTOR};
+use arinsal_bifs::BifError;
+use arinsal_bifs::ProcessHeapHandle;
+use arinsal_maps::{HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MapError};
+use arinsal_term::raw::{Cons, MapListValidator, Tuple, ValidatedMapPairs};
 use arinsal_term::{MagicBin, Term, TermBuilder, atoms};
 
 /// `sizeof(erts_ycf_trap_driver_state_holder)` on a 64-bit build: the magic binary's
@@ -26,9 +28,9 @@ const FROM_LIST_ITERATIONS_PER_RED: i64 = 40;
 const PROJECTION_ITERATIONS_PER_RED: i64 = 15;
 
 /// The YCF trap state of `maps:from_list/1` and `maps:from_keys/2`.
-type BuildState = TrapContext<Option<MapsBuildWalk>>;
+type BuildState = TrapContext<Option<MapBuildWalk>>;
 /// The YCF trap state of `maps:keys/1` and `maps:values/1`.
-type ProjectionState = TrapContext<Option<MapsProjectionWalk>>;
+type ProjectionState = TrapContext<Option<MapProjectionWalk>>;
 
 /// `maps:from_list/1`.
 // Port of erts/emulator/beam/erl_map.c (maps_from_list_1), OTP-29.1.1.
@@ -162,7 +164,432 @@ fn is_boxed(term: Term) -> bool {
     term.tagged_word() & 3 == 2
 }
 
+/// Resumable `maps:keys/1` and `maps:values/1` walk over a HAMT.
+// Port of erts/emulator/beam/erl_map.c:2801-2878 (hashmap_keys, hashmap_values), OTP-29.1.1.
+struct MapProjectionWalk {
+    iter: arinsal_term::MapReverseIter,
+    keys: bool,
+    remaining: usize,
+    pending: Option<Term>,
+    output: arinsal_term::ConsListBuilder,
+}
+
+impl MapProjectionWalk {
+    /// The flatmap helpers build a list without entering a YCF loop.
+    // Port of erts/emulator/beam/erl_map.c:1207-1237 and :2262-2292, OTP-29.1.1.
+    #[inline]
+    fn start_flat(
+        map: Term,
+        keys: bool,
+        heap: &mut ProcessHeapHandle<'_>,
+    ) -> Result<Option<Term>, MapError> {
+        let checked = arinsal_maps::checked_map(map)?;
+        match checked.kind() {
+            arinsal_maps::CheckedMapKind::Flatmap(flat) => {
+                if flat.size() == 0 {
+                    return Ok(Some(Term::NIL));
+                }
+                arinsal_maps::flatmap_projection_list(flat, keys, heap).map(Some)
+            }
+            arinsal_maps::CheckedMapKind::Hashmap(_) => Ok(None),
+        }
+    }
+
+    /// Reserve the full result and initialize a reversed HAMT iterator before yielding.
+    // Port of erts/emulator/beam/erl_map.c:2825-2827 and :2869-2871, OTP-29.1.1.
+    #[inline(never)]
+    fn start_hashmap(
+        map: Term,
+        keys: bool,
+        heap: &mut ProcessHeapHandle<'_>,
+    ) -> Result<Self, MapError> {
+        let checked = arinsal_maps::checked_map(map)?;
+        let iter = arinsal_term::MapReverseIter::new(map).expect("checked hashmap");
+        let output = TermBuilder::new(heap)
+            .reserve_cons_list(checked.size())
+            .map_err(|_| MapError::Allocation)?;
+        Ok(Self {
+            iter,
+            keys,
+            remaining: checked.size(),
+            pending: None,
+            output,
+        })
+    }
+
+    /// Run the YCF loop, retaining the condition's current leaf when its loop budget expires.
+    fn step(&mut self, reds: &mut i64) -> Result<bool, MapError> {
+        if let Some(item) = self.pending.take() {
+            self.output
+                .prepend_chunk(1, std::iter::once(item))
+                .map_err(|_| MapError::Badarg(Term::NIL))?;
+            self.remaining -= 1;
+        }
+        while self.remaining != 0 {
+            let Some((key, value)) = self.iter.next() else {
+                return Err(MapError::Badarg(Term::NIL));
+            };
+            let item = if self.keys { key } else { value };
+            *reds -= 1;
+            if *reds <= 0 {
+                self.pending = Some(item);
+                return Ok(false);
+            }
+            self.output
+                .prepend_chunk(1, std::iter::once(item))
+                .map_err(|_| MapError::Badarg(Term::NIL))?;
+            self.remaining -= 1;
+        }
+        Ok(true)
+    }
+
+    /// Finish after the reverse iterator has exhausted every map entry.
+    fn finish(self) -> Term {
+        self.output
+            .finish(Term::NIL)
+            .expect("all hashmap entries were projected")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MapBuildPhase {
+    Validate,
+    ValidateBody,
+    Leaves,
+    LeavesBody,
+    Build,
+}
+
+/// Resumable validation, leaf construction and HAMT building for map constructors.
+// Port of erts/emulator/beam/erl_map.c:278-366 and :482-591, OTP-29.1.1.
+struct MapBuildWalk {
+    list: Term,
+    fill: Option<Term>,
+    phase: MapBuildPhase,
+    cursor: Term,
+    size: usize,
+    validator: Option<MapListValidator<'static>>,
+    pairs: Option<ValidatedMapPairs<'static>>,
+    leaves_written: usize,
+    build: Option<arinsal_maps::HashmapFromPairs>,
+}
+
+impl MapBuildWalk {
+    // Port of erts/emulator/beam/erl_map.c:321-366 (maps_from_list_1_helper), OTP-29.1.1.
+    fn from_list(list: Term) -> Self {
+        Self::new(list, None)
+    }
+
+    // Port of erts/emulator/beam/erl_map.c:279-309 (maps_from_keys_2_helper), OTP-29.1.1.
+    fn from_keys(list: Term, value: Term) -> Self {
+        Self::new(list, Some(value))
+    }
+
+    // Port of erts/emulator/beam/erl_map.c:279-366 (constructor state), OTP-29.1.1.
+    fn new(list: Term, fill: Option<Term>) -> Self {
+        Self {
+            list,
+            fill,
+            phase: MapBuildPhase::Validate,
+            cursor: list,
+            size: 0,
+            validator: fill.is_none().then(|| MapListValidator::new(list)),
+            pairs: None,
+            leaves_written: 0,
+            build: None,
+        }
+    }
+
+    fn badarg() -> MapError {
+        MapError::Badarg(Term::NIL)
+    }
+
+    fn cell(cursor: Term) -> Result<(Term, Term), MapError> {
+        Cons::try_from(cursor)
+            .map(Cons::pair)
+            .map_err(|_| Self::badarg())
+    }
+
+    fn element(fill: Option<Term>, item: Term) -> Result<(Term, Term), MapError> {
+        if let Some(value) = fill {
+            return Ok((item, value));
+        }
+        let tuple = Tuple::try_from(item).map_err(|_| Self::badarg())?;
+        if tuple.arity() != 2 {
+            return Err(Self::badarg());
+        }
+        let mut fields = tuple.elements();
+        Ok((
+            fields.next().ok_or_else(Self::badarg)?,
+            fields.next().ok_or_else(Self::badarg)?,
+        ))
+    }
+
+    /// Continue the two YCF list loops and the HAMT builder with the current reduction budget.
+    // Port of erts/emulator/beam/erl_map.c:279-366 and :482-591 (YCF helper loops), OTP-29.1.1.
+    fn step(
+        &mut self,
+        heap: &mut ProcessHeapHandle<'_>,
+        reds: &mut i64,
+    ) -> Result<Option<Term>, MapError> {
+        loop {
+            if matches!(self.phase, MapBuildPhase::Validate) {
+                let mut cursor = self.cursor;
+                let mut size = self.size;
+                let mut remaining_reds = *reds;
+                if self.fill.is_some() {
+                    while let Ok(cons) = Cons::try_from(cursor) {
+                        remaining_reds -= 1;
+                        if remaining_reds <= 0 {
+                            self.phase = MapBuildPhase::ValidateBody;
+                            self.cursor = cursor;
+                            self.size = size;
+                            *reds = remaining_reds;
+                            return Ok(None);
+                        }
+                        size += 1;
+                        cursor = cons.tail();
+                    }
+                } else {
+                    loop {
+                        let cons = self
+                            .validator
+                            .as_mut()
+                            .expect("from_list validation state")
+                            .current()
+                            .map_err(|_| Self::badarg())?;
+                        let Some(cons) = cons else { break };
+                        remaining_reds -= 1;
+                        if remaining_reds <= 0 {
+                            self.phase = MapBuildPhase::ValidateBody;
+                            self.cursor = cursor;
+                            self.size = size;
+                            *reds = remaining_reds;
+                            return Ok(None);
+                        }
+                        cons.advance().map_err(|_| Self::badarg())?;
+                        size += 1;
+                    }
+                }
+                self.cursor = cursor;
+                self.size = size;
+                *reds = remaining_reds;
+                let validated = if self.fill.is_none() {
+                    Some(
+                        self.validator
+                            .take()
+                            .expect("from_list validation state")
+                            .finish()
+                            .map_err(|_| Self::badarg())?,
+                    )
+                } else {
+                    if self.cursor != Term::NIL {
+                        return Err(Self::badarg());
+                    }
+                    None
+                };
+                if self.size <= 32 {
+                    let pairs = if let Some(validated) = validated {
+                        validated.pairs()
+                    } else {
+                        let fill = self.fill;
+                        let mut cursor = self.list;
+                        let pairs = std::iter::from_fn(|| {
+                            let (head, tail) = Self::cell(cursor).ok()?;
+                            cursor = tail;
+                            Self::element(fill, head).ok()
+                        });
+                        return arinsal_maps::from_small_pairs(self.size, pairs, heap)
+                            .map(Some)
+                            .map_err(|_| Self::badarg());
+                    };
+                    return arinsal_maps::from_small_pairs(self.size, pairs, heap)
+                        .map(Some)
+                        .map_err(|_| Self::badarg());
+                }
+                self.cursor = self.list;
+                if let Some(validated) = validated {
+                    self.pairs = Some(validated.pairs());
+                }
+                self.build = Some(
+                    arinsal_maps::HashmapFromPairs::new(self.size, heap)
+                        .map_err(|_| Self::badarg())?,
+                );
+                self.phase = MapBuildPhase::Leaves;
+            }
+
+            if matches!(
+                self.phase,
+                MapBuildPhase::Leaves | MapBuildPhase::LeavesBody
+            ) {
+                let mut resumed_body = matches!(self.phase, MapBuildPhase::LeavesBody);
+                loop {
+                    if self.fill.is_none() {
+                        if resumed_body {
+                            let (key, value) = self
+                                .pairs
+                                .as_mut()
+                                .expect("validated pair iterator")
+                                .next()
+                                .expect("remaining validated map pair");
+                            self.build
+                                .as_mut()
+                                .expect("hashmap leaf builder")
+                                .push(key, value)
+                                .map_err(|_| Self::badarg())?;
+                            self.leaves_written += 1;
+                            self.phase = MapBuildPhase::Leaves;
+                            resumed_body = false;
+                            continue;
+                        }
+                        if self.leaves_written < self.size {
+                            *reds -= 1;
+                            if *reds <= 0 {
+                                self.phase = MapBuildPhase::LeavesBody;
+                                return Ok(None);
+                            }
+                            let count = (self.size - self.leaves_written).min(*reds as usize);
+                            self.build
+                                .as_mut()
+                                .expect("hashmap leaf builder")
+                                .push_chunk(
+                                    count,
+                                    self.pairs
+                                        .as_mut()
+                                        .expect("validated pair iterator")
+                                        .by_ref(),
+                                )
+                                .map_err(|_| Self::badarg())?;
+                            self.leaves_written += count;
+                            *reds -= count.saturating_sub(1) as i64;
+                            continue;
+                        }
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .finish_leaves();
+                        self.pairs = None;
+                        self.phase = MapBuildPhase::Build;
+                        break;
+                    }
+                    if resumed_body {
+                        let (head, tail) = Self::cell(self.cursor)?;
+                        let (key, value) = Self::element(self.fill, head)?;
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .push(key, value)
+                            .map_err(|_| Self::badarg())?;
+                        self.cursor = tail;
+                        self.leaves_written += 1;
+                        self.phase = MapBuildPhase::Leaves;
+                        resumed_body = false;
+                        continue;
+                    }
+                    if let Ok(cons) = Cons::try_from(self.cursor) {
+                        *reds -= 1;
+                        if *reds <= 0 {
+                            self.phase = MapBuildPhase::LeavesBody;
+                            return Ok(None);
+                        }
+                        let count = (self.size - self.leaves_written).min(*reds as usize);
+                        let fill = self.fill;
+                        let (head, mut cursor) = cons.pair();
+                        let first = Self::element(fill, head)?;
+                        let rest = std::iter::from_fn(|| {
+                            let (head, tail) = Self::cell(cursor).ok()?;
+                            cursor = tail;
+                            Self::element(fill, head).ok()
+                        });
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .push_chunk(count, std::iter::once(first).chain(rest))
+                            .map_err(|_| Self::badarg())?;
+                        self.cursor = cursor;
+                        self.leaves_written += count;
+                        *reds -= count.saturating_sub(1) as i64;
+                        continue;
+                    }
+                    self.build
+                        .as_mut()
+                        .expect("hashmap leaf builder")
+                        .finish_leaves();
+                    self.phase = MapBuildPhase::Build;
+                    break;
+                }
+            }
+
+            match self.phase {
+                MapBuildPhase::Validate => unreachable!("validation loop handles this phase"),
+                MapBuildPhase::ValidateBody => {
+                    if self.fill.is_some() {
+                        self.cursor = Self::cell(self.cursor)?.1;
+                    } else {
+                        self.validator
+                            .as_mut()
+                            .expect("from_list validation state")
+                            .current()
+                            .map_err(|_| Self::badarg())?
+                            .expect("validation body has current cell")
+                            .advance()
+                            .map_err(|_| Self::badarg())?;
+                    }
+                    self.size += 1;
+                    self.phase = MapBuildPhase::Validate;
+                }
+                MapBuildPhase::Leaves | MapBuildPhase::LeavesBody => {
+                    unreachable!("leaf loop handles these phases")
+                }
+                MapBuildPhase::Build => {
+                    return self
+                        .build
+                        .as_mut()
+                        .expect("hashmap builder")
+                        .step(reds, heap)
+                        .map_err(|_| Self::badarg());
+                }
+            }
+        }
+    }
+}
+
 /// `BIF_ERROR(p, reason)` of a body below.
+#[cold]
+#[inline(never)]
+fn map_error(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    process: &mut crate::Process,
+    export: &'static str,
+    arity: usize,
+    error: MapError,
+) -> u64 {
+    let error = match error {
+        MapError::Badmap(value) => tagged_bif_error(process, atoms::BADMAP, value),
+        MapError::Badkey(value) => tagged_bif_error(process, atoms::BADKEY, value),
+        MapError::Badarg(_) => BifError::BADARG,
+        MapError::Allocation => BifError::SystemLimit,
+    };
+    ycf_error(c_p, reg, i, process, export, arity, error)
+}
+
+/// Construct `fvalue` for `BIF_ERROR(p, BADMAP|BADKEY)`, then raise it with the BIF frame.
+// Port of erts/emulator/beam/erl_map.c (BIF_ERROR sites in the four moved BIFs), OTP-29.1.1.
+fn tagged_bif_error(
+    process: &mut crate::Process,
+    tag: arinsal_term::Atom,
+    value: Term,
+) -> BifError {
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    match TermBuilder::new(&mut heap).tuple2(Term::atom(tag), value) {
+        Ok(reason) => BifError::Error(reason),
+        Err(_) => BifError::SystemLimit,
+    }
+}
+
+/// `BIF_ERROR` of the existing map BIF bodies that report a process-independent error value.
 #[cold]
 #[inline(never)]
 fn ycf_error(
@@ -172,7 +599,7 @@ fn ycf_error(
     process: &mut crate::Process,
     export: &'static str,
     arity: usize,
-    error: arinsal_bifs::BifError,
+    error: BifError,
 ) -> u64 {
     let (module, rest) = export.split_once(':').unwrap_or(("maps", export));
     let function = rest.split_once('/').map_or(rest, |(function, _)| function);
@@ -239,7 +666,12 @@ fn maps_build(
     };
     process.heap.note_bif_entry();
     let arity = if from_keys { 2 } else { 1 };
-    let [list, fill] = crate::bif_table::bif_args::<2>(reg);
+    let (list, fill) = if from_keys {
+        let [list, fill] = crate::bif_table::bif_args::<2>(reg);
+        (list, fill)
+    } else {
+        (crate::bif_table::bif_args::<1>(reg)[0], Term::NIL)
+    };
     let init = ycf_reds(process, FROM_LIST_ITERATIONS_PER_RED);
     let mut reds = init;
     // Continue a trapped call: the state is ours when its holder is a `BuildState`.
@@ -250,9 +682,7 @@ fn maps_build(
             let mut guard = state.lock().expect("maps build state");
             let walk = guard.as_mut()?;
             let mut heap = ProcessHeapHandle(&mut process.heap);
-            let mut call = BifCall::default();
-            let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
-            let step = walk.step(&mut ctx, &mut reds);
+            let step = walk.step(&mut heap, &mut reds);
             if !matches!(step, Ok(None)) {
                 // The trap state is gone: ycf_continue returned without a new trap state.
                 *guard = None;
@@ -269,21 +699,19 @@ fn maps_build(
                     process.set_gc_enabled(false);
                     return ycf_trap(c_p, reg, i, process, export, arity, list);
                 }
-                Err(error) => return ycf_error(c_p, reg, i, process, export, arity, error),
+                Err(error) => return map_error(c_p, reg, i, process, export, arity, error),
             }
         }
         // A spent state (its holder has no trap state) starts a new call, as erts does.
         _ => {
             let mut walk = if from_keys {
-                MapsBuildWalk::from_keys(list, fill)
+                MapBuildWalk::from_keys(list, fill)
             } else {
-                MapsBuildWalk::from_list(list)
+                MapBuildWalk::from_list(list)
             };
             let step = {
                 let mut heap = ProcessHeapHandle(&mut process.heap);
-                let mut call = BifCall::default();
-                let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
-                walk.step(&mut ctx, &mut reds)
+                walk.step(&mut heap, &mut reds)
             };
             (walk, step)
         }
@@ -293,7 +721,7 @@ fn maps_build(
     match step {
         Ok(Some(value)) => crate::native_hooks::raw(value),
         Ok(None) => build_first_trap(c_p, reg, i, process, export, arity, walk),
-        Err(error) => ycf_error(c_p, reg, i, process, export, arity, error),
+        Err(error) => map_error(c_p, reg, i, process, export, arity, error),
     }
 }
 
@@ -308,7 +736,7 @@ fn build_first_trap(
     process: &mut crate::Process,
     export: &'static str,
     arity: usize,
-    walk: MapsBuildWalk,
+    walk: MapBuildWalk,
 ) -> u64 {
     let state_mref = match create_state_mref::<BuildState>(
         process,
@@ -350,14 +778,12 @@ fn maps_projection(
     // The flatmap arm runs without consuming YCF reductions and never yields.
     let flat = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut call = BifCall::default();
-        let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
-        MapsProjectionWalk::start_flat(&mut ctx, map, keys)
+        MapProjectionWalk::start_flat(map, keys, &mut heap)
     };
     match flat {
         Ok(Some(value)) => crate::native_hooks::raw(value),
         Ok(None) => projection_hashmap(c_p, reg, i, process, export, keys, map),
-        Err(error) => ycf_error(c_p, reg, i, process, export, 1, error),
+        Err(error) => map_error(c_p, reg, i, process, export, 1, error),
     }
 }
 
@@ -376,15 +802,16 @@ fn projection_hashmap(
     let mut reds = init;
     let started = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut call = BifCall::default();
-        let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
-        MapsProjectionWalk::start_hashmap(&mut ctx, map, keys)
+        MapProjectionWalk::start_hashmap(map, keys, &mut heap)
     };
     let mut walk = match started {
         Ok(walk) => walk,
-        Err(error) => return ycf_error(c_p, reg, i, process, export, 1, error),
+        Err(error) => return map_error(c_p, reg, i, process, export, 1, error),
     };
-    let done = walk.step(&mut reds);
+    let done = match walk.step(&mut reds) {
+        Ok(done) => done,
+        Err(error) => return map_error(c_p, reg, i, process, export, 1, error),
+    };
     ycf_bump_reds(process, init, reds, PROJECTION_ITERATIONS_PER_RED);
     if done {
         return crate::native_hooks::raw(walk.finish());
@@ -419,10 +846,14 @@ fn projection_resume(
     let resumed = state_mref.with_magic_payload::<ProjectionState, _>(|state| {
         let mut guard = state.lock().expect("maps projection state");
         let walk = guard.as_mut()?;
-        if !walk.step(&mut reds) {
-            return Some(None);
+        match walk.step(&mut reds) {
+            Ok(false) => Some(Ok(None)),
+            Ok(true) => guard.take().map(|walk| Ok(Some(walk.finish()))),
+            Err(error) => {
+                guard.take();
+                Some(Err(error))
+            }
         }
-        guard.take().map(|walk| Some(walk.finish()))
     });
     let Some(Some(result)) = resumed else {
         unreachable!("the caller checked the trap state");
@@ -431,11 +862,12 @@ fn projection_resume(
     process.set_gc_enabled(true);
     ycf_bump_reds(process, init, reds, PROJECTION_ITERATIONS_PER_RED);
     match result {
-        Some(value) => crate::native_hooks::raw(value),
-        None => {
+        Ok(Some(value)) => crate::native_hooks::raw(value),
+        Ok(None) => {
             process.set_gc_enabled(false);
             ycf_trap(c_p, reg, i, process, export, 1, state_mref)
         }
+        Err(error) => map_error(c_p, reg, i, process, export, 1, error),
     }
 }
 
@@ -463,11 +895,16 @@ fn bif_error_tagged(
     value: Term,
 ) -> u64 {
     let mut heap = ProcessHeapHandle(&mut process.heap);
-    let error = match TermBuilder::new(&mut heap).tuple2(tag, value) {
-        Ok(reason) => BifError::Error(reason),
-        Err(_) => BifError::SystemLimit,
+    let reason = match TermBuilder::new(&mut heap).tuple2(tag, value) {
+        Ok(reason) => reason,
+        Err(_) => return system_limit(c_p, i),
     };
-    ycf_error(c_p, reg, i, process, export, arity, error)
+    let _ = (reg, process, export, arity);
+    bif_ret(
+        c_p,
+        i,
+        Err(VmError::Trap(crate::exceptions::Trap::error(reason))),
+    )
 }
 
 /// `BIF_ERROR(p, SYSTEM_LIMIT)` of a failed `HAlloc`, which erts cannot hit (the heap grows).
@@ -828,7 +1265,7 @@ fn map_failure(
             Term::atom(atoms::BADKEY),
             key,
         ),
-        MapError::HeapFull { .. } => system_limit(c_p, i),
+        MapError::Allocation => system_limit(c_p, i),
         _ => ycf_error(c_p, reg, i, process, export, arity, BifError::BADARG),
     }
 }
@@ -900,7 +1337,7 @@ pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
         Some((value, rest)) => TermBuilder::new(&mut heap)
             .tuple2(value, rest)
             .map(Some)
-            .map_err(|_| arinsal_maps::MapError::HeapFull { need_words: 3 }),
+            .map_err(|_| arinsal_maps::MapError::Allocation),
         None => Ok(None),
     });
     match result {

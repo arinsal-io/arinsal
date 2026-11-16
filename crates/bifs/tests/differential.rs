@@ -653,69 +653,6 @@ fn binary_search_megabyte_benchmark() {
 }
 
 #[test]
-fn map_projections_walk_collision_nodes() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let pairs = [(1_i64, 10_i64), (2, 20), (3, 30)];
-    let expected_map = O::Map(
-        pairs
-            .iter()
-            .map(|(key, value)| (O::Int(*key), O::Int(*value)))
-            .collect(),
-    );
-    let mut heap = ProcessHeap::with_words(256);
-    let entries = pairs.map(|(key, value)| {
-        (
-            0,
-            arinsal_term::Term::small(key).unwrap(),
-            arinsal_term::Term::small(value).unwrap(),
-        )
-    });
-    let mut leaves = arinsal_term::hashmap_leaves_hashed(&entries, &mut heap).unwrap();
-    let map = arinsal_term::hashmap_from_unsorted_array(&mut leaves, false, &mut heap)
-        .unwrap()
-        .unwrap();
-    assert!(map.is_hashmap());
-
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut allocator, &mut state);
-    for name in ["keys", "values"] {
-        // maps_keys_1_helper / maps_values_1_helper over a hashmap: the walk erl_map.rs runs.
-        let keys = name == "keys";
-        let mut walk =
-            arinsal_bifs::MapsProjectionWalk::start_hashmap(&mut ctx, map, keys).unwrap();
-        let mut reds = i64::MAX;
-        while !walk.step(&mut reds) {}
-        let actual = to_owned(walk.finish()).unwrap();
-        let expected = reference.call("maps", name, std::slice::from_ref(&expected_map));
-        let CallResult::Ok(O::List { elems, tail }) = &expected else {
-            panic!("OTP maps:{name} did not return a proper list: {expected:?}");
-        };
-        similar_asserts::assert_eq!(tail.as_ref(), &O::Nil);
-        let mut actual_values = match &actual {
-            O::List { elems, tail } if tail.as_ref() == &O::Nil => elems
-                .iter()
-                .map(|term| match term {
-                    O::Int(value) => *value,
-                    other => panic!("unexpected projection element: {other:?}"),
-                })
-                .collect::<Vec<_>>(),
-            other => panic!("maps:{name} returned {other:?}"),
-        };
-        let mut expected_values = elems
-            .iter()
-            .map(|term| match term {
-                O::Int(value) => *value,
-                other => panic!("unexpected OTP projection element: {other:?}"),
-            })
-            .collect::<Vec<_>>();
-        actual_values.sort_unstable();
-        expected_values.sort_unstable();
-        similar_asserts::assert_eq!(actual_values, expected_values, "maps:{name} collision node");
-    }
-}
-
-#[test]
 fn system_info_snifs_matches_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let expected = reference.call("erlang", "system_info", &[atom("snifs")]);

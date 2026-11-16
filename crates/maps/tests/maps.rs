@@ -1,5 +1,6 @@
 use arinsal_maps::{MapError, from_pairs, get, iter, merge, put, put_many, remove, size, update};
 use arinsal_term::{LiteralArea, Term, VecHeap};
+use similar_asserts::assert_eq;
 use std::process::Command;
 
 fn small(n: i64) -> Term {
@@ -126,20 +127,17 @@ fn mutation_and_heap_full() {
     );
     assert_eq!(get(small(42), small(1)), Err(MapError::Badmap(small(42))));
     let mut tiny = arinsal_term::ProcessHeap::with_words(2);
-    assert_eq!(
-        from_pairs(&[], &mut tiny),
-        Err(MapError::HeapFull { need_words: 3 })
-    );
+    assert_eq!(from_pairs(&[], &mut tiny), Err(MapError::Allocation));
     assert_eq!(tiny.used_words(), 0);
     let original = from_pairs(&pairs(32), &mut heap).unwrap();
     let mut tiny = arinsal_term::ProcessHeap::with_words(5);
     let result = put(original, small(33), small(33), &mut tiny);
-    assert!(matches!(result, Err(MapError::HeapFull { need_words: _ })));
+    assert!(matches!(result, Err(MapError::Allocation)));
     assert_eq!(tiny.used_words(), 0);
     let large_key = from_pairs(&pairs(33), &mut heap).unwrap();
     let mut tiny = arinsal_term::ProcessHeap::with_words(1);
     let result = put(large_key, small(34), small(34), &mut tiny);
-    assert!(matches!(result, Err(MapError::HeapFull { need_words: _ })));
+    assert!(matches!(result, Err(MapError::Allocation)));
     assert_eq!(tiny.used_words(), 0);
     let nested = from_pairs(&[(large_key, small(1))], &mut heap).unwrap();
     assert_eq!(get(nested, large_key), Ok(Some(small(1))));

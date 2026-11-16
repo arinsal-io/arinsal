@@ -6,6 +6,7 @@ use arinsal_maps::{
     HashmapMergeContext, MapError, from_keys, from_list, hashmap_merge, merge, put,
 };
 use arinsal_term::{ProcessHeap, Term, VecHeap};
+use similar_asserts::assert_eq;
 use std::collections::HashSet;
 use std::process::Command;
 
@@ -203,7 +204,7 @@ fn merge_reuses_shared_hamt_subtrees_like_erts() {
 type Attempt<'a> = dyn Fn(&mut ProcessHeap) -> Result<Term, MapError> + 'a;
 
 #[test]
-fn finite_heap_returns_heap_full_without_replaying_construction() {
+fn finite_heap_returns_allocation_error_without_replaying_construction() {
     arinsal_term::init_global_literals();
     let mut heap = VecHeap::new();
     let left = int_map(&mut heap, 1..=200, 0);
@@ -223,7 +224,7 @@ fn finite_heap_returns_heap_full_without_replaying_construction() {
     ];
     for attempt in attempts {
         let mut tiny = ProcessHeap::with_words(16);
-        assert!(matches!(attempt(&mut tiny), Err(MapError::HeapFull { .. })));
+        assert!(matches!(attempt(&mut tiny), Err(MapError::Allocation)));
     }
 }
 

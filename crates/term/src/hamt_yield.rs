@@ -132,7 +132,9 @@ struct Frame {
 #[derive(Clone, Copy)]
 enum PartPhase {
     FastTest,
+    FastCompare,
     SlowTest,
+    SlowCompare,
 }
 
 /// `erts_qsort_partion_array` in flight.
@@ -259,8 +261,9 @@ impl Qsort {
         let mut pivot_part_end = p.pivot_part_end;
         let mut last_part_start = p.last_part_start;
         let mut remaining_reds = *reds;
+        let mut phase = p.ph;
 
-        if matches!(p.ph, PartPhase::FastTest) {
+        if matches!(phase, PartPhase::FastTest | PartPhase::FastCompare) {
             loop {
                 if curr == second_part_start {
                     // Port of the successful fast path in utils.c:3521-3527.
@@ -269,14 +272,18 @@ impl Qsort {
                     *reds = remaining_reds;
                     return Some((start, second_part_start));
                 }
-                remaining_reds -= 1;
-                if remaining_reds <= 0 {
-                    *reds = remaining_reds;
-                    p.curr = curr;
-                    p.second_part_start = second_part_start;
-                    p.ph = PartPhase::FastTest;
-                    return None;
+                if matches!(phase, PartPhase::FastTest) {
+                    remaining_reds -= 1;
+                    if remaining_reds <= 0 {
+                        *reds = remaining_reds;
+                        p.curr = curr;
+                        p.second_part_start = second_part_start;
+                        // YCF resumes after the consume check, before this comparison.
+                        p.ph = PartPhase::FastCompare;
+                        return None;
+                    }
                 }
+                phase = PartPhase::FastTest;
 
                 // Port of the fast loop in utils.c:3511-3520. Keep the indices local
                 // until a yield, as the C function does across its reduction check.
@@ -304,17 +311,21 @@ impl Qsort {
                 *reds = remaining_reds;
                 return Some((pivot_part_start, pivot_part_end));
             }
-            remaining_reds -= 1;
-            if remaining_reds <= 0 {
-                *reds = remaining_reds;
-                p.curr = curr;
-                p.second_part_start = second_part_start;
-                p.pivot_part_start = pivot_part_start;
-                p.pivot_part_end = pivot_part_end;
-                p.last_part_start = last_part_start;
-                p.ph = PartPhase::SlowTest;
-                return None;
+            if !matches!(phase, PartPhase::SlowCompare) {
+                remaining_reds -= 1;
+                if remaining_reds <= 0 {
+                    *reds = remaining_reds;
+                    p.curr = curr;
+                    p.second_part_start = second_part_start;
+                    p.pivot_part_start = pivot_part_start;
+                    p.pivot_part_end = pivot_part_end;
+                    p.last_part_start = last_part_start;
+                    // YCF resumes after the consume check, before this comparison.
+                    p.ph = PartPhase::SlowCompare;
+                    return None;
+                }
             }
+            phase = PartPhase::SlowTest;
 
             // Port of the duplicate-pivot loop in utils.c:3555-3572.
             let c = compare(
