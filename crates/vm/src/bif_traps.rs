@@ -32,7 +32,6 @@ pub(crate) struct NoContext;
 arinsal_term::magic_payload!(
     NoContext => no_context_destructor,
     TrapContext<arinsal_bifs::Phash2Cont> => make_hash2_destructor,
-    TrapContext<BinaryCopyState> => binary_copy_destructor,
     TrapContext<crate::dist::DsigSendContext> => dsig_send_context_destructor,
 
 );
@@ -82,14 +81,6 @@ pub(crate) fn trap_gc_policy(continuation: &str) -> TrapGc {
     }
 }
 
-/// Whether the trap state of a parked BIF holds process-heap terms of its own.
-pub(crate) fn state_holds_heap_terms(state: &MagicBin) -> bool {
-    macro_rules! any {
-        ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<TrapContext<$t>>().is_some())* };
-    }
-    any!(BinaryCopyState,)
-}
-
 /// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
 /// calls (erts BIF_TRAP*: `c_p->i` is the export, the arguments are its X registers).
 pub(crate) enum ResumeResult {
@@ -114,7 +105,6 @@ pub(crate) struct Entry {
     handler: Handler,
 }
 
-const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 /// `dsend_continue_trap_export`.
 pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
 // sizeof(ErtsDSigSendContext) (dist.h), measured with a C probe against the configured OTP-29.1.1
@@ -193,28 +183,7 @@ fn clear_export_trap(process: &mut Process) {
     }
 }
 
-const ENTRIES: &[Entry] = &[
-    Entry {
-        module: "binary",
-        function: "copy",
-        arity: 1,
-        continuation: BINARY_COPY_CONTINUATION,
-        handler: binary_copy,
-    },
-    Entry {
-        module: "binary",
-        function: "copy",
-        arity: 2,
-        continuation: BINARY_COPY_CONTINUATION,
-        handler: binary_copy,
-    },
-];
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2365-2374 (CopyBinState), OTP-29.1.1.
-struct BinaryCopyState {
-    result: Term,
-    copied_bits: usize,
-}
+const ENTRIES: &[Entry] = &[];
 
 /// Key of a trapped call made through `apply` when the caller does not import the BIF.
 pub(crate) const APPLY_TRAP_KEY: usize = usize::MAX;
@@ -931,9 +900,6 @@ fn charge(
         .max(0);
 }
 
-/// Bits copied per reduction: a cache line (`ERTS_CACHE_LINE_SIZE * 8`, 64-byte lines).
-const BITSTRING_COPY_LOOP_FACTOR: u64 = 64 * 8;
-
 /// `ERTS_VBUMP_ALL_REDS`: the rest of the slice is given up without being the process's own
 /// work. The scheduler leaves the process at the next reduction check, and `virtual_reds`
 /// keeps the given-up amount out of the process's reduction count.
@@ -944,153 +910,6 @@ pub(crate) fn vbump_all_reds(process: &mut Process) {
             .saturating_add(process.heap.abi.fcalls as u32);
     }
     process.heap.abi.fcalls = 0;
-}
-
-/// `get_reds`: the loop budget of one slice, `ERTS_BIF_REDS_LEFT * loop_factor`, capped by
-/// the `binary_loop_limit` debug state and never zero.
-fn binary_loop_budget(process: &Process, loop_factor: u64) -> u64 {
-    let reds = u64::try_from(process.heap.abi.fcalls.max(0))
-        .unwrap_or(0)
-        .saturating_mul(loop_factor);
-    let limit = crate::natives::erts_debug::binary_loop_limit();
-    if limit != 0 && limit < reds {
-        return limit;
-    }
-    reds.max(1)
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2400-2495
-// (do_binary_copy, binary_copy_trap), OTP-29.1.1.
-fn binary_copy(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    let input = args[0];
-    let count = if args.len() == 2 {
-        args[1]
-            .as_small()
-            .filter(|count| *count >= 0)
-            .ok_or(BifError::BADARG)? as usize
-    } else {
-        1
-    };
-    let input_bits = arinsal_bifs::bitstring_bit_len(input)?;
-    if !input_bits.is_multiple_of(8) {
-        return Err(BifError::BADARG);
-    }
-    let input_len = input_bits / 8;
-    let len = input_len
-        .checked_mul(count)
-        .filter(|len| *len <= (1 << 30))
-        .ok_or(BifError::SystemLimit)?;
-    if len == 0 || input_len == 0 {
-        let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-            .binary(&[])
-            .map_err(|_| BifError::SystemLimit)?;
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: 1,
-        });
-    }
-    let target_bits = len.checked_mul(8).ok_or(BifError::SystemLimit)?;
-    let max_copy_bits = usize::try_from(binary_loop_budget(process, BITSTRING_COPY_LOOP_FACTOR))
-        .unwrap_or(usize::MAX);
-    if let Some(state) = state {
-        let state = MagicBin::clone(state);
-        let copy = state
-            .downcast_ref::<TrapContext<BinaryCopyState>>()
-            .ok_or(BifError::BADARG)?;
-        let mut copy = copy.lock().map_err(|_| BifError::SystemLimit)?;
-        let initial_target_offset = copy.copied_bits;
-        let mut trap_offset = target_bits;
-        if (usize::MAX - max_copy_bits) < initial_target_offset
-            && initial_target_offset.saturating_add(max_copy_bits) < trap_offset
-        {
-            trap_offset = initial_target_offset + max_copy_bits;
-        }
-        let copied_bits = copy_binary_to(input, copy.result, initial_target_offset, trap_offset)?;
-        copy.copied_bits = copied_bits;
-        if copied_bits == target_bits {
-            let bits_copied = copied_bits - initial_target_offset;
-            let result = copy.result;
-            drop(copy);
-            arinsal_bifs::finish_iolist_binary_output(result);
-            process.set_gc_enabled(restore_gc);
-            return Ok(HandlerResult::Done {
-                value: result,
-                reductions: reductions_from(
-                    (bits_copied / BITSTRING_COPY_LOOP_FACTOR as usize) as u64,
-                ),
-            });
-        }
-        drop(copy);
-        vbump_all_reds(process);
-        return Ok(HandlerResult::Yield {
-            continuation: BINARY_COPY_CONTINUATION,
-            state,
-            reductions: 0,
-        });
-    }
-
-    if max_copy_bits >= target_bits {
-        let mut copy_error = None;
-        let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-            .binary_from_fn(len, |destination| {
-                if let Err(error) =
-                    arinsal_bifs::copy_binary_pattern(input, destination, 0, target_bits)
-                {
-                    copy_error = Some(error);
-                }
-            })
-            .map_err(|_| BifError::SystemLimit)?;
-        if let Some(error) = copy_error {
-            return Err(error);
-        }
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: reductions_from((target_bits / BITSTRING_COPY_LOOP_FACTOR as usize) as u64),
-        });
-    }
-
-    let result = arinsal_bifs::allocate_iolist_binary(
-        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-        len,
-    )?;
-    let copied_bits = copy_binary_to(input, result, 0, max_copy_bits.min(target_bits))?;
-    debug_assert!(copied_bits < target_bits);
-    vbump_all_reds(process);
-    Ok(HandlerResult::Yield {
-        continuation: BINARY_COPY_CONTINUATION,
-        state: argument_trap_state(TrapContext::new(BinaryCopyState {
-            result,
-            copied_bits,
-        })),
-        reductions: 0,
-    })
-}
-
-// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1.
-fn reductions_from(reductions: u64) -> u32 {
-    u32::try_from(reductions).unwrap_or(u32::MAX)
-}
-
-/// Continue `binary_copy_loop` in the final binary allocated by `do_binary_copy`.
-// Port of erts/emulator/beam/erl_bif_binary.c:2379-2398 (binary_copy_loop), OTP-29.1.1.
-fn copy_binary_to(
-    input: Term,
-    result: Term,
-    copied_bits: usize,
-    trap_offset: usize,
-) -> Result<usize, BifError> {
-    let mut copied = copied_bits;
-    arinsal_bifs::with_iolist_binary_output(result, |destination| {
-        copied = arinsal_bifs::copy_binary_pattern(input, destination, copied_bits, trap_offset)?;
-        Ok(())
-    })?;
-    Ok(copied)
 }
 
 /// `erts_dsend_export_trap_context`: the magic binary of a parked distributed send, as the

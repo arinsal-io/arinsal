@@ -16,6 +16,7 @@ mod binary_c_differential;
 mod binary_copy_reductions;
 mod binary_find_differential;
 mod binary_iolist_differential;
+mod binary_misc_differential;
 mod binary_replace_differential;
 mod binary_search_differential;
 mod binary_to_list_trap;

@@ -1475,3 +1475,567 @@ pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64
         None => bif_ret(c_p, i, Err(badarg())),
     }
 }
+
+// ---- first / last / at / referenced_byte_size / longest_common_* / copy / *_unsigned --------
+
+/// `erts_new_binary_from_data`.
+fn binary(process: &mut crate::Process, bytes: &[u8]) -> Term {
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .binary(bytes)
+        .expect("HAlloc")
+}
+
+fn small_term(value: usize) -> Term {
+    Term::small(value as i64).expect("a byte or a small length is a small integer")
+}
+
+/// A `bitstring`-checked binary's bytes for the one-argument BIFs.
+macro_rules! byte_bif {
+    ($c_p:ident, $reg:ident, $i:ident, |$bytes:ident, $process:ident| $body:expr) => {{
+        let Some($process) = crate::native_hooks::process_from_header($c_p) else {
+            return 0;
+        };
+        $process.heap.note_bif_entry();
+        let [bin] = crate::bif_table::bif_args::<1>($reg);
+        match with_binary_input(bin, |$bytes| Ok($body)) {
+            Ok(Some(value)) => crate::native_hooks::raw(value),
+            _ => bif_ret($c_p, $i, Err(badarg())),
+        }
+    }};
+}
+
+/// `binary:first/1`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_first_1), OTP-29.1.1.
+pub(crate) extern "C" fn binary_first_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    byte_bif!(c_p, reg, i, |bytes, _process| bytes
+        .first()
+        .map(|&byte| small_term(usize::from(byte))))
+}
+
+/// `binary:last/1`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_last_1), OTP-29.1.1.
+pub(crate) extern "C" fn binary_last_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    byte_bif!(c_p, reg, i, |bytes, _process| bytes
+        .last()
+        .map(|&byte| small_term(usize::from(byte))))
+}
+
+/// `binary:at/2`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_at_2), OTP-29.1.1.
+pub(crate) extern "C" fn binary_at_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [bin, position] = crate::bif_table::bif_args::<2>(reg);
+    let value = (|| {
+        let view = BinRef::try_from(bin).ok()?;
+        let index = usize::try_from(position.as_small()?).ok()?;
+        if !view.bit_len().is_multiple_of(8) || index >= view.bit_len() / 8 {
+            return None;
+        }
+        let window = view.window();
+        let byte_offset = view.start_bit() / 8 + index;
+        let shift = view.start_bit() % 8;
+        let first = window[byte_offset];
+        let byte = if shift == 0 {
+            first
+        } else {
+            (first << shift) | (window[byte_offset + 1] >> (8 - shift))
+        };
+        Some(small_term(usize::from(byte)))
+    })();
+    match value {
+        Some(value) => crate::native_hooks::raw(value),
+        None => bif_ret(c_p, i, Err(badarg())),
+    }
+}
+
+/// `term_to_Uint`: a non-negative small or big integer that fits a word.
+fn term_to_uint(term: Term) -> Option<usize> {
+    match term.as_small() {
+        Some(n) => usize::try_from(n).ok(),
+        None => arinsal_term::raw::big_value(term).and_then(|n| usize::try_from(n).ok()),
+    }
+}
+
+/// `binary:referenced_byte_size/1`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_referenced_byte_size_1), OTP-29.1.1.
+pub(crate) extern "C" fn binary_referenced_byte_size_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [bin] = crate::bif_table::bif_args::<1>(reg);
+    let Ok(view) = BinRef::try_from(bin) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let size = view.referenced_byte_size();
+    let value =
+        TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).int_from_u64(size as u64);
+    match value {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+    }
+}
+
+/// `COMMON_LOOP_FACTOR`.
+const COMMON_LOOP_FACTOR: usize = 10;
+/// Bits compared per step: one cache line (`NBITS(sizeof(__scratchpad[0]))`).
+const COMMON_STRIDE_BITS: usize = 64 * 8;
+
+const BINARY_LONGEST_PREFIX_TRAP: &str = "erlang:binary_longest_prefix_trap/4";
+const BINARY_LONGEST_SUFFIX_TRAP: &str = "erlang:binary_longest_suffix_trap/4";
+
+/// `get_reds(p, COMMON_LOOP_FACTOR)`.
+fn common_reds(process: &crate::Process) -> usize {
+    let reds = (process.heap.abi.fcalls.max(0) as usize).saturating_mul(COMMON_LOOP_FACTOR);
+    let limit = crate::natives::erts_debug::binary_loop_limit() as usize;
+    if limit != 0 && limit < reds {
+        return limit;
+    }
+    reds.max(1)
+}
+
+/// `longest_common_copy_bits`: `stride` bits of `binary` at `position` from its start (prefix)
+/// or from its end (suffix), left aligned in `scratch`.
+fn longest_common_bits(
+    suffix: bool,
+    binary: Term,
+    scratch: &mut [u8; 64],
+    position: usize,
+    stride: usize,
+) {
+    let size = BinRef::try_from(binary).map_or(0, BinRef::bit_len);
+    let start = if suffix {
+        size - position - stride
+    } else {
+        position
+    };
+    let _ = arinsal_term::erl_bits::copy_bitstring_range(binary, start, &mut scratch[..], stride);
+}
+
+/// `continue_longest_common`: compare the binaries of the tuple `binaries` stride by stride from
+/// `binary_index` at `position` (both counted from the front, or the back for a suffix).
+// Port of erts/emulator/beam/erl_bif_binary.c (continue_longest_common), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn continue_longest_common(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut crate::Process,
+    suffix: bool,
+    binaries: Term,
+    mut binary_index: usize,
+    mut smallest_size: usize,
+    mut position: usize,
+) -> u64 {
+    let count = arinsal_bifs::tuple_arity(binaries).unwrap_or(0);
+    let items: Vec<Term> = (0..count)
+        .filter_map(|index| arinsal_bifs::tuple_element(binaries, index).ok())
+        .collect();
+    if items.len() != count || binary_index == 0 || binary_index >= count {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    let save_reds = common_reds(process) as i64;
+    let mut reds = save_reds;
+    loop {
+        if reds < 0 {
+            process.heap.abi.fcalls = 0;
+            let mut handle = ProcessHeapHandle(&mut process.heap);
+            let mut builder = TermBuilder::new(&mut handle);
+            let index = Term::small(binary_index as i64).expect("a small index");
+            let size = builder.int_from_u64(smallest_size as u64).expect("HAlloc");
+            let pos = builder.int_from_u64(position as u64).expect("HAlloc");
+            let export = if suffix {
+                BINARY_LONGEST_SUFFIX_TRAP
+            } else {
+                BINARY_LONGEST_PREFIX_TRAP
+            };
+            let trap = bif_trap(process, export, vec![binaries, index, size, pos]);
+            return bif_ret(c_p, i, Err(trap));
+        }
+        let mut stride = (smallest_size - position).min(COMMON_STRIDE_BITS);
+        let mut reference = [0u8; 64];
+        longest_common_bits(suffix, items[0], &mut reference, position, stride);
+        let mut reference_at = 0usize;
+        // All other binaries at this position, advancing it iff they all agree.
+        while reds >= 0 && position < smallest_size {
+            let mut compared = [0u8; 64];
+            longest_common_bits(suffix, items[binary_index], &mut compared, position, stride);
+            let mut offset = 0;
+            while offset < stride {
+                let index = if suffix {
+                    (stride - offset - 8) / 8
+                } else {
+                    offset / 8
+                };
+                if reference[reference_at + index] != compared[index] {
+                    smallest_size = position + offset;
+                    stride = offset;
+                    if suffix {
+                        // The next binary is compared with the smaller stride, which places
+                        // its tail at another offset: the reference moves with it.
+                        reference_at += index + 1;
+                    }
+                    break;
+                }
+                offset += 8;
+            }
+            binary_index += 1;
+            reds -= stride as i64;
+            if binary_index == count {
+                position += stride;
+                binary_index = 1;
+                break;
+            }
+        }
+        if position >= smallest_size {
+            break;
+        }
+    }
+    charge(
+        process,
+        ((save_reds - reds) / COMMON_LOOP_FACTOR as i64).max(0) as usize,
+    );
+    crate::native_hooks::raw(small_term(position / 8))
+}
+
+/// `start_longest_common`.
+// Port of erts/emulator/beam/erl_bif_binary.c (start_longest_common), OTP-29.1.1.
+fn longest_common(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, suffix: bool) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [list] = crate::bif_table::bif_args::<1>(reg);
+    let mut smallest_size = usize::MAX;
+    let mut binaries = Vec::new();
+    let mut rest = list;
+    while let Some((head, tail)) = cons_cell(rest) {
+        let size = match BinRef::try_from(head) {
+            Ok(view) if view.bit_len().is_multiple_of(8) => view.bit_len(),
+            _ => return bif_ret(c_p, i, Err(badarg())),
+        };
+        smallest_size = smallest_size.min(size);
+        binaries.push(head);
+        rest = tail;
+    }
+    if rest != Term::NIL || binaries.is_empty() {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    // Trivial cases are weeded out as they complicate the main loop.
+    if smallest_size == 0 || binaries.len() == 1 {
+        return crate::native_hooks::raw(small_term(smallest_size / 8));
+    }
+    let tuple = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .tuple(&binaries)
+        .expect("HAlloc");
+    continue_longest_common(c_p, i, process, suffix, tuple, 1, smallest_size, 0)
+}
+
+fn longest_common_trap(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, suffix: bool) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [binaries, index, size, position] = crate::bif_table::bif_args::<4>(reg);
+    let to_uint = |term: Term| term.as_small().and_then(|n| usize::try_from(n).ok());
+    let (Some(index), Some(size), Some(position)) =
+        (to_uint(index), to_uint(size), to_uint(position))
+    else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    continue_longest_common(c_p, i, process, suffix, binaries, index, size, position)
+}
+
+/// `erlang:binary_longest_prefix_trap/4`.
+pub(crate) extern "C" fn binary_longest_prefix_trap(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    longest_common_trap(c_p, reg, i, false)
+}
+
+/// `erlang:binary_longest_suffix_trap/4`.
+pub(crate) extern "C" fn binary_longest_suffix_trap(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    longest_common_trap(c_p, reg, i, true)
+}
+
+/// `binary:longest_common_prefix/1`.
+pub(crate) extern "C" fn binary_longest_common_prefix_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    longest_common(c_p, reg, i, false)
+}
+
+/// `binary:longest_common_suffix/1`.
+pub(crate) extern "C" fn binary_longest_common_suffix_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    longest_common(c_p, reg, i, true)
+}
+
+/// The byte order of `encode_unsigned/2` and `decode_unsigned/2`: `true` for little endian.
+fn little_endian(order: Option<Term>) -> Option<bool> {
+    let Some(order) = order else {
+        return Some(false);
+    };
+    match atom_name(order)?.as_str() {
+        "big" => Some(false),
+        "little" => Some(true),
+        _ => None,
+    }
+}
+
+fn encode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_arg_vec(reg, arity);
+    let value = args[0]
+        .as_small()
+        .map(num_bigint::BigInt::from)
+        .or_else(|| arinsal_term::raw::big_value(args[0]));
+    let (Some(value), Some(little)) = (value, little_endian(args.get(1).copied())) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    if value.sign() == num_bigint::Sign::Minus {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    let mut bytes = value.to_bytes_be().1;
+    if bytes.is_empty() {
+        bytes.push(0);
+    }
+    if little {
+        bytes.reverse();
+    }
+    let result = binary(process, &bytes);
+    crate::native_hooks::raw(result)
+}
+
+/// `binary:encode_unsigned/1`.
+pub(crate) extern "C" fn binary_encode_unsigned_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    encode_unsigned(c_p, reg, i, 1)
+}
+
+/// `binary:encode_unsigned/2`.
+pub(crate) extern "C" fn binary_encode_unsigned_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    encode_unsigned(c_p, reg, i, 2)
+}
+
+fn decode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_arg_vec(reg, arity);
+    let Some(little) = little_endian(args.get(1).copied()) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let value = with_binary_input(args[0], |bytes| {
+        Ok(if little {
+            num_bigint::BigInt::from_bytes_le(num_bigint::Sign::Plus, bytes)
+        } else {
+            num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes)
+        })
+    });
+    let Ok(value) = value else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    match TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).int_from_bigint(&value) {
+        Ok(term) => crate::native_hooks::raw(term),
+        Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+    }
+}
+
+/// `binary:decode_unsigned/1`.
+pub(crate) extern "C" fn binary_decode_unsigned_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    decode_unsigned(c_p, reg, i, 1)
+}
+
+/// `binary:decode_unsigned/2`.
+pub(crate) extern "C" fn binary_decode_unsigned_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    decode_unsigned(c_p, reg, i, 2)
+}
+
+/// Bits copied per reduction: a cache line (`ERTS_CACHE_LINE_SIZE * 8`).
+const BITSTRING_COPY_LOOP_FACTOR: usize = 64 * 8;
+
+const BINARY_COPY_TRAP: &str = "erlang:binary_copy_trap/3";
+
+/// `binary_copy_loop` into the writable result binary `result`, from `copied_bits` to
+/// `trap_offset`; the bits copied so far.
+fn copy_loop(
+    input: Term,
+    result: Term,
+    copied_bits: usize,
+    trap_offset: usize,
+) -> Result<usize, BifError> {
+    let mut copied = copied_bits;
+    arinsal_term::raw::with_iolist_binary_output(result, |destination| {
+        copied = arinsal_bifs::copy_binary_pattern(input, destination, copied_bits, trap_offset)?;
+        Ok(())
+    })
+    .ok_or(BifError::SystemLimit)??;
+    Ok(copied)
+}
+
+/// `get_reds` for the copy loops.
+fn copy_reds(process: &crate::Process) -> usize {
+    let reds = (process.heap.abi.fcalls.max(0) as usize).saturating_mul(BITSTRING_COPY_LOOP_FACTOR);
+    let limit = crate::natives::erts_debug::binary_loop_limit() as usize;
+    if limit != 0 && limit < reds {
+        return limit;
+    }
+    reds.max(1)
+}
+
+/// `do_binary_copy`.
+// Port of erts/emulator/beam/erl_bif_binary.c (do_binary_copy), OTP-29.1.1.
+fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (bin, count) = if arity == 1 {
+        let [bin] = crate::bif_table::bif_args::<1>(reg);
+        (bin, Some(1))
+    } else {
+        let [bin, count] = crate::bif_table::bif_args::<2>(reg);
+        (bin, term_to_uint(count))
+    };
+    let (Ok(view), Some(count)) = (BinRef::try_from(bin), count) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let bits = view.bit_len();
+    if !bits.is_multiple_of(8) {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    let source_len = bits / 8;
+    if count == 0 || source_len == 0 {
+        let empty = binary(process, &[]);
+        return crate::native_hooks::raw(empty);
+    }
+    if count >= usize::MAX / bits {
+        return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
+    }
+    let length = source_len * count;
+    let target_bits = length * 8;
+    let max_copy_bits = copy_reds(process);
+    if max_copy_bits >= target_bits {
+        // One slice: the whole result is built in place.
+        let mut copy_error = None;
+        let built = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).binary_from_fn(
+            length,
+            |destination| {
+                if let Err(error) =
+                    arinsal_bifs::copy_binary_pattern(bin, destination, 0, target_bits)
+                {
+                    copy_error = Some(error);
+                }
+            },
+        );
+        return match (built, copy_error) {
+            (Ok(value), None) => {
+                charge(process, target_bits / BITSTRING_COPY_LOOP_FACTOR);
+                crate::native_hooks::raw(value)
+            }
+            (_, Some(error)) => bif_ret(c_p, i, Err(find_error(error))),
+            (Err(_), None) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+        };
+    }
+    let Ok(result) = arinsal_term::raw::allocate_iolist_binary(
+        &mut ProcessHeapHandle(&mut process.heap),
+        length,
+    ) else {
+        return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
+    };
+    let Ok(copied) = copy_loop(bin, result, 0, max_copy_bits.min(target_bits)) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    // `ERTS_BIF_YIELD3(binary_copy_trap_export, bin, result, copied_bits)`.
+    crate::bif_traps::vbump_all_reds(process);
+    let copied_term = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(copied as u64)
+        .expect("HAlloc");
+    let trap = bif_trap(process, BINARY_COPY_TRAP, vec![bin, result, copied_term]);
+    bif_ret(c_p, i, Err(trap))
+}
+
+/// `binary:copy/1`.
+pub(crate) extern "C" fn binary_copy_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    do_binary_copy(c_p, reg, i, 1)
+}
+
+/// `binary:copy/2`.
+pub(crate) extern "C" fn binary_copy_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    do_binary_copy(c_p, reg, i, 2)
+}
+
+/// `erlang:binary_copy_trap/3`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_copy_trap), OTP-29.1.1.
+pub(crate) extern "C" fn binary_copy_trap(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [bin, result, copied_term] = crate::bif_table::bif_args::<3>(reg);
+    let (Some(copied_bits), Ok(target)) = (
+        copied_term.as_small().and_then(|n| usize::try_from(n).ok()),
+        BinRef::try_from(result),
+    ) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let target_size = target.bit_len();
+    let max_copy_bits = copy_reds(process);
+    let initial_target_offset = copied_bits;
+    let mut trap_offset = target_size;
+    if (usize::MAX - max_copy_bits) < initial_target_offset
+        && initial_target_offset.saturating_add(max_copy_bits) < trap_offset
+    {
+        trap_offset = initial_target_offset + max_copy_bits;
+    }
+    let Ok(copied) = copy_loop(bin, result, copied_bits, trap_offset) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    if copied == target_size {
+        charge(
+            process,
+            (copied - initial_target_offset) / BITSTRING_COPY_LOOP_FACTOR,
+        );
+        arinsal_term::raw::finish_iolist_binary_output(result);
+        return crate::native_hooks::raw(result);
+    }
+    crate::bif_traps::vbump_all_reds(process);
+    let copied_term = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(copied as u64)
+        .expect("HAlloc");
+    let trap = bif_trap(process, BINARY_COPY_TRAP, vec![bin, result, copied_term]);
+    bif_ret(c_p, i, Err(trap))
+}

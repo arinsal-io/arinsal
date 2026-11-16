@@ -229,17 +229,8 @@ impl Process {
             }
             if let Some(trap) = cold.work.bif_trap.as_mut() {
                 // erts keeps no process-heap pointer in a parked BIF's state that a collection
-                // would miss: either the arguments (X registers) carry the terms, or the
-                // process is not collectable (`F_DISABLE_GC`). A trap whose state holds
-                // heap terms must therefore not be collected unless they are roots.
-                debug_assert!(
-                    !self.heap.gc_enabled
-                        || trap.root_args_len() != 0
-                        || trap.target.entry.is_none()
-                        || !crate::bif_traps::state_holds_heap_terms(&trap.state),
-                    "collection with an unrooted heap term in the trap state of {}",
-                    trap.continuation
-                );
+                // would miss: the arguments (X registers) carry the terms, or the process is not
+                // collectable (`F_DISABLE_GC`).
                 let root_args = trap.root_args_len();
                 if root_args != 0 {
                     roots.push(&mut trap.args[..root_args]);

@@ -20,15 +20,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => {
             v.entry::<word_bodies::binary_part>()
         }
-        ("binary", "first", 1) => v.entry::<word_bodies::binary_first>(),
-        ("binary", "last", 1) => v.entry::<word_bodies::binary_last>(),
-        ("binary", "at", 2) => v.entry::<word_bodies::binary_at>(),
-        ("binary", "copy", 1 | 2) => v.entry::<word_bodies::binary_copy>(),
-        ("binary", "referenced_byte_size", 1) => v.entry::<word_bodies::referenced_byte_size>(),
-        ("binary", "longest_common_prefix", 1) => v.entry::<word_bodies::longest_common_prefix>(),
-        ("binary", "longest_common_suffix", 1) => v.entry::<word_bodies::longest_common_suffix>(),
-        ("binary", "encode_unsigned", 1 | 2) => v.entry::<word_bodies::encode_unsigned>(),
-        ("binary", "decode_unsigned", 1 | 2) => v.entry::<word_bodies::decode_unsigned>(),
         _ => return None,
     };
     Some(bif)
@@ -489,191 +480,7 @@ pub fn binary_part_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
     binary_part_result(ctx, args)
 }
 
-// Port of erts/emulator/beam/erl_bif_binary.c:2286-2313 (binary_first_1), OTP-29.1.1.
-#[inline(always)]
-fn binary_first_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    with_binary_input(args[0], |bytes| {
-        let byte = bytes.first().ok_or(BADARG)?;
-        integer(ctx, usize::from(*byte))
-    })
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2316-2343 (binary_last_1), OTP-29.1.1.
-#[inline(always)]
-fn binary_last_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    with_binary_input(args[0], |bytes| {
-        let byte = bytes.last().ok_or(BADARG)?;
-        integer(ctx, usize::from(*byte))
-    })
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2335-2368 (binary_at_2), OTP-29.1.1.
-#[inline(always)]
-fn binary_at_result(_ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    with_binary_bytes(args[0], |view| {
-        if !view.bit_len().is_multiple_of(8) {
-            return Err(BADARG);
-        }
-        let index = args[1].as_small().ok_or(BADARG)?;
-        let index = usize::try_from(index).map_err(|_| BADARG)?;
-        if index >= view.bit_len() / 8 {
-            return Err(BADARG);
-        }
-        let byte_offset = view.start_bit() / 8 + index;
-        let shift = view.start_bit() % 8;
-        let first = view.bytes()[byte_offset];
-        let byte = if shift == 0 {
-            first
-        } else {
-            (first << shift) | (view.bytes()[byte_offset + 1] >> (8 - shift))
-        };
-        Term::small(i64::from(byte)).ok_or(BADARG)
-    })?
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2400-2447 (do_binary_copy), OTP-29.1.1.
-fn binary_copy_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bits = bitstring_bit_len(args[0])?;
-    let count = if args.len() == 2 {
-        args[1].as_small().ok_or(BADARG)?
-    } else {
-        1
-    };
-    if !bits.is_multiple_of(8) || count < 0 {
-        return Err(BADARG);
-    }
-    let count = usize::try_from(count).map_err(|_| BifError::SystemLimit)?;
-    let source_len = bits / 8;
-    if count == 0 || source_len == 0 {
-        return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .binary(&[])
-            .expect("infallible BIF heap"));
-    }
-    if count >= (usize::MAX / source_len) {
-        return Err(BifError::SystemLimit);
-    }
-    let length = source_len * count;
-    if length > (1 << 30) {
-        return Err(BifError::SystemLimit);
-    }
-    let target_bits = length.checked_mul(8).ok_or(BifError::SystemLimit)?;
-    let mut copy_error = None;
-    let result = TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .binary_from_fn(length, |output| {
-            if let Err(error) = copy_binary_pattern(args[0], output, 0, target_bits) {
-                copy_error = Some(error);
-            }
-        })
-        .map_err(|_| BifError::SystemLimit)?;
-    copy_error.map_or(Ok(result), Err)
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2515-2555 (binary_referenced_byte_size_1), OTP-29.1.1.
-#[inline(always)]
-fn referenced_byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = with_binary_bytes(args[0], |view| view.referenced_size())?;
-    integer(ctx, bytes)
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2183-2284 (start_longest_common), OTP-29.1.1.
-fn longest_common_prefix_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let binaries = list(args[0])?;
-    let first = *binaries.first().ok_or(BADARG)?;
-    with_binary_input(first, |first_bytes| {
-        let mut length = 0;
-        for (index, byte) in first_bytes.iter().enumerate() {
-            let mut all_match = true;
-            for other in binaries.iter().skip(1) {
-                if !with_binary_input(*other, |other_bytes| {
-                    Ok(other_bytes.get(index) == Some(byte))
-                })? {
-                    all_match = false;
-                    break;
-                }
-            }
-            if !all_match {
-                break;
-            }
-            length += 1;
-        }
-        integer(ctx, length)
-    })
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2183-2284 (start_longest_common), OTP-29.1.1.
-fn longest_common_suffix_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let binaries = list(args[0])?;
-    let first = *binaries.first().ok_or(BADARG)?;
-    with_binary_input(first, |first_bytes| {
-        let mut length = 0;
-        for (index, byte) in first_bytes.iter().rev().enumerate() {
-            let mut all_match = true;
-            for other in binaries.iter().skip(1) {
-                if !with_binary_input(*other, |other_bytes| {
-                    Ok(other_bytes.len() > index
-                        && other_bytes[other_bytes.len() - index - 1] == *byte)
-                })? {
-                    all_match = false;
-                    break;
-                }
-            }
-            if !all_match {
-                break;
-            }
-            length += 1;
-        }
-        integer(ctx, length)
-    })
-}
-
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (do_binary_match_compile), OTP-29.1.1.
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2572-2683 (unsigned endian parsing), OTP-29.1.1.
-fn byte_order(args: &[Term]) -> Result<bool, BifError> {
-    if args.len() == 1 {
-        return Ok(false);
-    }
-    match atom_name(args[1]) {
-        Some("big") => Ok(false),
-        Some("little") => Ok(true),
-        _ => Err(BADARG),
-    }
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2572-2647, 2818-2826 (encode_unsigned), OTP-29.1.1.
-#[inline(always)]
-fn encode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let value = bigint(args[0])?;
-    if value.sign() == Sign::Minus {
-        return Err(BADARG);
-    }
-    let mut bytes = value.to_bytes_be().1;
-    if bytes.is_empty() {
-        bytes.push(0);
-    }
-    if byte_order(args)? {
-        bytes.reverse();
-    }
-    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .binary(&bytes)
-        .expect("infallible BIF heap"))
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:2649-2683, 2828-2835 (decode_unsigned), OTP-29.1.1.
-#[inline(always)]
-fn decode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let little_endian = byte_order(args)?;
-    with_binary_input(args[0], |bytes| {
-        let value = if little_endian {
-            BigInt::from_bytes_le(Sign::Plus, bytes)
-        } else {
-            BigInt::from_bytes_be(Sign::Plus, bytes)
-        };
-        TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .int_from_bigint(&value)
-            .map_err(|_| BifError::SystemLimit)
-    })
-}
 
 macro_rules! word_result_body {
     ($name:ident, $result:ident) => {
@@ -690,27 +497,9 @@ macro_rules! word_result_body {
 word_result_body!(byte_size, byte_size_result);
 word_result_body!(bit_size, bit_size_result);
 word_result_body!(binary_part, binary_part_result);
-word_result_body!(binary_first, binary_first_result);
-word_result_body!(binary_last, binary_last_result);
-word_result_body!(binary_at, binary_at_result);
-word_result_body!(binary_copy, binary_copy_result);
-word_result_body!(referenced_byte_size, referenced_byte_size_result);
-word_result_body!(longest_common_prefix, longest_common_prefix_result);
-word_result_body!(longest_common_suffix, longest_common_suffix_result);
-word_result_body!(encode_unsigned, encode_unsigned_result);
-word_result_body!(decode_unsigned, decode_unsigned_result);
 
 crate::word_bif_bodies_in!(word_bodies;
     byte_size,
     bit_size,
     binary_part,
-    binary_first,
-    binary_last,
-    binary_at,
-    binary_copy,
-    referenced_byte_size,
-    longest_common_prefix,
-    longest_common_suffix,
-    encode_unsigned,
-    decode_unsigned,
 );

@@ -325,6 +325,24 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("binary", "matches", 3) => bif!(erl_bif_binary::binary_matches_3),
         ("binary", "split", 2) => bif!(erl_bif_binary::binary_split_2),
         ("binary", "split", 3) => bif!(erl_bif_binary::binary_split_3),
+        ("binary", "first", 1) => bif!(erl_bif_binary::binary_first_1),
+        ("binary", "last", 1) => bif!(erl_bif_binary::binary_last_1),
+        ("binary", "at", 2) => bif!(erl_bif_binary::binary_at_2),
+        ("binary", "referenced_byte_size", 1) => {
+            bif!(erl_bif_binary::binary_referenced_byte_size_1)
+        }
+        ("binary", "longest_common_prefix", 1) => {
+            bif!(erl_bif_binary::binary_longest_common_prefix_1)
+        }
+        ("binary", "longest_common_suffix", 1) => {
+            bif!(erl_bif_binary::binary_longest_common_suffix_1)
+        }
+        ("binary", "encode_unsigned", 1) => bif!(erl_bif_binary::binary_encode_unsigned_1),
+        ("binary", "encode_unsigned", 2) => bif!(erl_bif_binary::binary_encode_unsigned_2),
+        ("binary", "decode_unsigned", 1) => bif!(erl_bif_binary::binary_decode_unsigned_1),
+        ("binary", "decode_unsigned", 2) => bif!(erl_bif_binary::binary_decode_unsigned_2),
+        ("binary", "copy", 1) => bif!(erl_bif_binary::binary_copy_1),
+        ("binary", "copy", 2) => bif!(erl_bif_binary::binary_copy_2),
         // erl_unicode.c
         ("unicode", "characters_to_binary", 2) => {
             bif!(erl_unicode::unicode_characters_to_binary_2)
@@ -501,6 +519,13 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
             bif!(binary::binary_to_list_continue_1)
         }
         ("erlang", "binary_find_trap", 3) => bif!(erl_bif_binary::binary_find_trap),
+        ("erlang", "binary_copy_trap", 3) => bif!(erl_bif_binary::binary_copy_trap),
+        ("erlang", "binary_longest_prefix_trap", 4) => {
+            bif!(erl_bif_binary::binary_longest_prefix_trap)
+        }
+        ("erlang", "binary_longest_suffix_trap", 4) => {
+            bif!(erl_bif_binary::binary_longest_suffix_trap)
+        }
         ("erlang", "characters_to_utf8_trap", 4) => bif!(erl_unicode::characters_to_utf8_trap),
         ("erlang", "characters_to_list_trap_1", 3) => bif!(erl_unicode::characters_to_list_trap_1),
         ("erlang", "characters_to_list_trap_2", 3) => bif!(erl_unicode::characters_to_list_trap_2),

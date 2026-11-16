@@ -807,6 +807,8 @@ pub struct BinRef<'h> {
     bytes: &'h [u8],
     start_bit: usize,
     bit_len: usize,
+    /// `br->val->orig_size` when an off-heap binary owns the bytes (`br != NULL`).
+    orig_size: Option<usize>,
 }
 
 impl TryFrom<Term> for BinRef<'_> {
@@ -822,6 +824,7 @@ impl TryFrom<Term> for BinRef<'_> {
             bytes: view.bytes(),
             start_bit: view.start_bit(),
             bit_len: view.bit_len(),
+            orig_size: view.is_off_heap().then(|| view.referenced_size()),
         })
     }
 }
@@ -831,6 +834,12 @@ impl<'h> BinRef<'h> {
     #[inline(always)]
     pub fn bit_len(self) -> usize {
         self.bit_len
+    }
+
+    /// The size `binary:referenced_byte_size/1` reports: the owner's `orig_size` for an off-heap
+    /// binary, else `BYTE_SIZE` (floor) of the bit size.
+    pub fn referenced_byte_size(self) -> usize {
+        self.orig_size.unwrap_or(self.bit_len / 8)
     }
 
     /// Offset of the first bit inside the backing bytes.

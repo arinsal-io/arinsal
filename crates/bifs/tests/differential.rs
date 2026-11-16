@@ -381,31 +381,6 @@ fn wall_clock_bifs_track_otp() {
 }
 
 #[test]
-fn referenced_byte_size_keeps_subbinary_owner() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let bytes = vec![7_u8; 1000];
-    let expected = reference.call(
-        "binary",
-        "referenced_byte_size",
-        &[O::Binary(bytes.clone())],
-    );
-    let mut heap = ProcessHeap::with_words(128);
-    let mut builder = TermBuilder::new(&mut heap);
-    let original = builder.binary(&bytes).expect("binary");
-    let subbinary = builder
-        .sub_binary(original, 100 * 8, 100 * 8)
-        .expect("subbinary");
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut allocator, &mut state);
-    let bif = lookup("binary", "referenced_byte_size", 1).expect("BIF");
-    let actual = arinsal_difftest::CallResult::Ok(
-        to_owned(bif(&mut ctx, &[subbinary]).expect("size")).expect("term"),
-    );
-    assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
-}
-
-#[test]
 fn new_bifs_valid_inputs_match_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     for n in 0..1000 {
