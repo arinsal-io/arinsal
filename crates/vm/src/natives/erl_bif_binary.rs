@@ -82,6 +82,7 @@ const NO_NODE: usize = usize::MAX;
 const MC_LOOP_FACTOR: usize = 8;
 
 /// Compiled search data shared by `binary:compile_pattern/1` and search calls.
+#[derive(Clone)]
 pub(crate) enum SearchPattern {
     BoyerMoore(BoyerMoore),
     AhoCorasick(AhoCorasick),
@@ -145,6 +146,7 @@ impl SearchPattern {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct BoyerMoore {
     data: Vec<[u8; 8]>,
     width: usize,
@@ -270,11 +272,13 @@ fn suffixes(pattern: &[u8]) -> Result<Vec<isize>, BifError> {
     Ok(suffixes)
 }
 
+#[derive(Clone)]
 pub(crate) struct AhoCorasick {
     nodes: Vec<Node>,
     erts_payload_size: usize,
 }
 
+#[derive(Clone)]
 struct Node {
     depth: u32,
     final_pattern: i32,
@@ -419,6 +423,31 @@ pub(crate) struct SearchWalk {
 }
 
 impl SearchWalk {
+    fn pattern_payload_size(&self) -> usize {
+        self.pattern.erts_payload_size()
+    }
+
+    /// `bf_context_export` of the pattern: the compiled data lives in a magic binary that the
+    /// trap's third argument names (`ctx->pat_term`); a pattern that is already compiled
+    /// (`{bm | ac, Ref}`) is that binary.
+    pub(crate) fn export_pattern(&mut self, orig_size: usize) -> MagicBin {
+        if let SearchPatternHandle::Shared(owner) = &self.pattern {
+            return owner.clone();
+        }
+        let bin = MagicBin::with_orig_size_and_refn(
+            (*self.pattern).clone(),
+            orig_size,
+            arinsal_bifs::next_ref_words(),
+        );
+        self.pattern = SearchPatternHandle::Shared(bin.clone());
+        bin
+    }
+
+    /// `ctx->pat_bin = pat_bin`: the pattern of the trap's third argument.
+    pub(crate) fn set_pattern(&mut self, owner: MagicBin) {
+        self.pattern = SearchPatternHandle::Shared(owner);
+    }
+
     /// Start searching at `scope.0` and stop at `scope.1`.
     // Port of erts/emulator/beam/erl_bif_binary.c:624-635, 827-833,
     // 892-900 (search-state initialization), OTP-29.1.1.
@@ -803,7 +832,8 @@ impl SearchWalk {
         let mut found = std::mem::take(saved_found);
         let mut done = *saved_done;
         let mut work = 0;
-        while !done && position < end && work < budget {
+        // `if (--reds == 0)` before each byte: a call with `budget` left scans `budget - 1`.
+        while !done && position < end && work + 1 < budget {
             let byte = bytes[position] as usize;
             while pattern.nodes[current].edges[byte] == NO_NODE
                 && pattern.nodes[current].failure != current
@@ -1032,6 +1062,17 @@ pub(crate) struct BinarySearchWalk {
 }
 
 impl BinarySearchWalk {
+    /// `ctx->pat_bin = pat_bin` of `binary_find_trap`.
+    fn set_pattern(&mut self, owner: MagicBin) {
+        self.walk.set_pattern(owner);
+    }
+
+    /// `bf_context_export`'s pattern: see [`SearchWalk::export_pattern`].
+    fn export_pattern(&mut self) -> MagicBin {
+        let size = arinsal_term::MAGIC_BIN_DATA_OFFSET + self.walk.pattern_payload_size();
+        self.walk.export_pattern(size)
+    }
+
     /// Parse BIF options and prepare a Boyer–Moore or Aho–Corasick walk.
     pub fn new(kind: BinarySearchKind, args: &[Term]) -> Result<Self, BifError> {
         let compiled = pattern(args[1])?;
@@ -1109,9 +1150,17 @@ impl BinarySearchWalk {
                 _ => 0,
             }
         });
-        while left > 0 && work < budget {
-            work += 1;
-            left -= 1;
+        // `if (--reds == 0)` before each item: a call with `reds` left builds `reds - 1`
+        // items and then traps with none left (and the whole budget charged).
+        let reds = budget.saturating_sub(work);
+        if left > 0 {
+            if left < reds {
+                work += left;
+                left = 0;
+            } else {
+                left -= reds.saturating_sub(1);
+                work = budget;
+            }
         }
         self.result_left = Some(left);
         (left == 0, work)
@@ -1316,18 +1365,27 @@ fn binary_find(
     if !done {
         // The context leaves the stack for a magic binary and collection is disabled while
         // the call is parked.
+        // `bf_context_export`: the context and the compiled pattern each get a magic binary,
+        // and the trap carries both references (`ctx->trap_term`, `ctx->pat_term`).
+        let pat_bin = search.export_pattern();
         let bin = MagicBin::with_erts_payload_size_and_refn(
             FindHolder::new(search),
             ERTS_BINARY_FIND_CONTEXT_SIZE,
             arinsal_bifs::next_ref_words(),
         );
-        let mref = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).magic_ref(bin);
-        let Ok(mref) = mref else {
+        let refs = {
+            let mut heap = ProcessHeapHandle(&mut process.heap);
+            let mut builder = TermBuilder::new(&mut heap);
+            builder
+                .magic_ref(bin)
+                .and_then(|mref| builder.magic_ref(pat_bin).map(|pat| (mref, pat)))
+        };
+        let Ok((mref, pat_term)) = refs else {
             return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
         };
         process.set_gc_enabled(false);
         process.heap.abi.fcalls = 0;
-        let trap = bif_trap(process, BINARY_FIND_TRAP, vec![args[0], mref, Term::NIL]);
+        let trap = bif_trap(process, BINARY_FIND_TRAP, vec![args[0], mref, pat_term]);
         return bif_ret(c_p, i, Err(trap));
     }
     charge(process, work / SEARCH_LOOP_FACTOR);
@@ -1387,8 +1445,13 @@ pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64
     process.heap.note_bif_entry();
     let [subject, mref, pattern] = crate::bif_table::bif_args::<3>(reg);
     let initial = get_reds(process);
+    let Some(pat_bin) = pattern.magic_owner() else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
     let stepped = mref.with_magic_payload::<FindHolder, _>(|holder| {
         let mut search = holder.lock().expect("binary_find context");
+        // `ctx->pat_bin = pat_bin`.
+        search.set_pattern(pat_bin);
         let (done, work) = search.step(initial);
         if !done {
             return (false, work, None);

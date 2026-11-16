@@ -30,14 +30,7 @@ run() ->
              fun(S, P, O) -> binary:split(S, P, O) end, fun(S, P, _) -> binary:match(S, P) end,
              fun(S, P, _) -> binary:matches(S, P) end, fun(S, P, _) -> binary:split(S, P) end],
     Compile = [f(fun() -> element(1, binary:compile_pattern(P)) end) || P <- Pats],
-    %% The reductions of the searches of the large subjects, which trap, are not compared: the
-    %% result-building loops of those calls charge a few reductions (1 to 5 of 6000) more in
-    %% erts than here. The results are compared for every call.
-    Results = [{erlang:phash2(f(fun() -> C(S, P, O) end)),
-                case is_binary(S) andalso byte_size(S) > 100000 of
-                    true -> 0;
-                    false -> f(fun() -> reds(fun() -> C(S, P, O) end) end)
-                end}
+    Results = [{erlang:phash2(f(fun() -> C(S, P, O) end)), f(fun() -> reds(fun() -> C(S, P, O) end) end)}
                || S <- Subjects, P <- Pats, O <- Opts, C <- Calls, valid(S, P, O)],
     {Compile, length(Results), erlang:phash2(Results)}.
 %% Keep the number of combinations of the large subjects bounded.
