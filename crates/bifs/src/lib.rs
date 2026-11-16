@@ -21,8 +21,6 @@ use std::sync::Arc;
 
 use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, NativeAbi, Node, ProcessHeap, Term};
 
-mod arith;
-mod dirty;
 mod pure;
 mod sys;
 mod time;
@@ -480,16 +478,10 @@ pub fn visit_bif<V: BifTableVisitor>(
     arity: u8,
     visitor: &mut V,
 ) -> Option<V::Output> {
-    if let Some(found) = arith::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
     if let Some(found) = time::lookup(module, name, arity, visitor) {
         return Some(found);
     }
     if let Some(found) = sys::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
-    if let Some(found) = dirty::lookup(module, name, arity, visitor) {
         return Some(found);
     }
     if let Some(found) = pure::lookup(module, name, arity, visitor) {
@@ -519,32 +511,6 @@ macro_rules! bif_bodies {
     };
 }
 pub(crate) use bif_bodies;
-
-/// Process-shaped BIF bodies in a separate table module for mixed families.
-macro_rules! process_bif_bodies_in {
-    ($module:ident; $($bif:ident),* $(,)?) => {
-        #[allow(non_camel_case_types)]
-        mod $module {
-            $(
-                pub(super) struct $bif;
-                impl $crate::BifBody for $bif {
-                    fn call(ctx: &mut $crate::Ctx<'_>, args: &[arinsal_term::Term])
-                        -> Result<arinsal_term::Term, $crate::BifError>
-                    {
-                        <Self as $crate::BifBody>::call_process(ctx, args, 0)
-                    }
-                    fn call_process(process: &mut $crate::ProcessBif<'_>, args: &[arinsal_term::Term], instruction: usize)
-                        -> Result<arinsal_term::Term, $crate::BifError>
-                    {
-                        let _ = instruction;
-                        super::$bif(process, args)
-                    }
-                }
-            )*
-        }
-    };
-}
-pub(crate) use process_bif_bodies_in;
 
 /// Bodies that return a term or [`arinsal_term::Term::NON_VALUE`] (erts' BIF shape), in their
 /// own table module. `call_word` is the body itself; `call` adapts it for callers that want a

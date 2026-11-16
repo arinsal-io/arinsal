@@ -2,6 +2,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod arith_moved_differential;
 mod arith_red;
 mod atom_order_differential;
 mod atom_table_differential;

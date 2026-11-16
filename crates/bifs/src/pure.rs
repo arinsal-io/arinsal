@@ -803,34 +803,6 @@ pub fn binary_bytes(term: Term) -> Result<Vec<u8>, BifError> {
     Ok(bytes)
 }
 
-/// Borrow aligned bytes directly, copying only when a byte-aligned bitstring starts mid-byte.
-///
-/// Port of erts/emulator/beam/erl_bits.h:596-638 (`erts_get_aligned_binary_bytes`), OTP-29.1.1.
-/// Ordinary binaries require no scratch buffer.
-pub(crate) fn with_aligned_binary_bytes<R>(
-    term: Term,
-    f: impl FnOnce(&[u8]) -> R,
-) -> Result<R, BifError> {
-    with_binary_bytes(term, |view| {
-        let bits = view.bit_len();
-        if !bits.is_multiple_of(8) {
-            return Err(BADARG);
-        }
-        let len = bits / 8;
-        let start_bit = view.start_bit();
-        if start_bit.is_multiple_of(8) {
-            let start = start_bit / 8;
-            let end = start.checked_add(len).ok_or(BADARG)?;
-            let bytes = view.bytes().get(start..end).ok_or(BADARG)?;
-            return Ok(f(bytes));
-        }
-
-        let mut aligned = vec![0; len];
-        copy_bitstring_view_range_to(&view, 0, &mut aligned, 0, bits)?;
-        Ok(f(&aligned))
-    })?
-}
-
 /// Copy a bounded byte range from a live, byte-aligned bitstring.
 pub fn copy_binary_range(term: Term, start: usize, output: &mut [u8]) -> Result<(), BifError> {
     let bits = output.len().checked_mul(8).ok_or(BADARG)?;

@@ -166,7 +166,7 @@ use crate::native_helpers::{
     persistent_term_get_2_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, binary, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
+    bif_phash2, binary, erl_arith, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
     erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_hl_timer, erl_iolist, erl_map,
     erl_math, erl_process_dict, erl_ptab, erl_unicode, external, register,
 };
@@ -400,6 +400,26 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "is_record", 2) => bif!(erl_bif_op::is_record_2),
         ("erlang", "is_record", 3) => bif!(erl_bif_op::is_record_3),
         ("erlang", "is_map", 1) => bif!(erl_bif_op::is_map_1),
+        // erl_arith.c
+        ("erlang", "+", 1) => bif!(erl_arith::plus_1),
+        ("erlang", "+", 2) => bif!(erl_arith::add_2),
+        ("erlang", "-", 1) => bif!(erl_arith::neg_1),
+        ("erlang", "-", 2) => bif!(erl_arith::sub_2),
+        ("erlang", "*", 2) => bif!(erl_arith::mul_2),
+        ("erlang", "/", 2) => bif!(erl_arith::fdiv_2),
+        ("erlang", "div", 2) => bif!(erl_arith::int_div_2),
+        ("erlang", "rem", 2) => bif!(erl_arith::rem_2),
+        ("erlang", "band", 2) => bif!(erl_arith::band_2),
+        ("erlang", "bor", 2) => bif!(erl_arith::bor_2),
+        ("erlang", "bxor", 2) => bif!(erl_arith::bxor_2),
+        ("erlang", "bsl", 2) => bif!(erl_arith::bsl_2),
+        ("erlang", "bsr", 2) => bif!(erl_arith::bsr_2),
+        ("erlang", "bnot", 1) => bif!(erl_arith::bnot_1),
+        ("erlang", "integer_to_list", 1) => bif!(erl_arith::integer_to_list_1),
+        ("erlang", "integer_to_list", 2) => bif!(erl_arith::integer_to_list_2),
+        ("erlang", "integer_to_binary", 2) => bif!(erl_arith::integer_to_binary_2),
+        ("erts_internal", "list_to_integer", 2) => bif!(erl_arith::list_to_integer_2),
+        ("erts_internal", "binary_to_integer", 2) => bif!(erl_arith::binary_to_integer_2),
         // erl_process_dict.c
         ("erlang", "get", 0) => bif!(erl_process_dict::get_0),
         ("erlang", "get", 1) => bif!(erl_process_dict::get_1),

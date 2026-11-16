@@ -381,26 +381,6 @@ fn wall_clock_bifs_track_otp() {
 }
 
 #[test]
-fn new_bifs_valid_inputs_match_otp() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    for n in 0..1000 {
-        let positive_cases = [
-            ("erlang", "+", vec![O::Int(n), O::Int(n + 1)]),
-            ("erlang", "div", vec![O::Int(n), O::Int(7)]),
-            ("erlang", "bsl", vec![O::Int(n), O::Int(n % 20)]),
-        ];
-        for (module, name, input) in positive_cases {
-            let actual = call(module, name, &input);
-            let expected = reference.call(module, name, &input);
-            assert!(
-                equivalent(&actual, &expected),
-                "{module}:{name} {input:?}: {actual:?} != {expected:?}"
-            );
-        }
-    }
-}
-
-#[test]
 fn calendar_conversions_match_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     for n in 0..1000 {
