@@ -806,9 +806,6 @@ impl Vm {
                     Ok(Self::return_value(p, self.x_regs()?[0]))
                 }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
-                crate::bif_traps::HandlerResult::Export(_) => {
-                    unreachable!("execute_named converts export traps to VM transfers")
-                }
             };
         }
         // `!` is an export alias for the process-aware `send/2` BIF.

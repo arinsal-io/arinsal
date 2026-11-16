@@ -47,8 +47,6 @@ pub(crate) enum HandlerResult {
         state: MagicBin,
         reductions: u32,
     },
-    /// Transfer directly to the BIF's export continuation without scheduling out.
-    Export(crate::ExportTrap),
 }
 
 impl HandlerResult {
@@ -56,7 +54,6 @@ impl HandlerResult {
     pub(crate) fn reductions(&self) -> u32 {
         match self {
             Self::Done { reductions, .. } | Self::Yield { reductions, .. } => *reductions,
-            Self::Export(_) => 0,
         }
     }
 }
@@ -400,12 +397,7 @@ pub(crate) fn run_trapped_export(
         args,
         ctx,
     )
-    .map(|result| {
-        result.map(|handler| match handler {
-            HandlerResult::Export(trap) => ResumeResult::Export(trap),
-            handler => ResumeResult::Handler(handler),
-        })
-    })
+    .map(|result| result.map(ResumeResult::Handler))
 }
 
 /// Install the trap state of a BIF that traps to an Erlang export. The scheduler then runs
@@ -740,13 +732,6 @@ pub(crate) fn execute_named(
                 reductions,
             })
         }
-        Ok(HandlerResult::Export(trap)) => {
-            process.slice_mut().bif_trap = None;
-            clear_export_trap(process);
-            process.set_gc_enabled(gc_was_enabled);
-            charge(process, ctx, 0);
-            return Some(Err(VmError::TrapExport(trap)));
-        }
     })
 }
 
@@ -836,35 +821,6 @@ pub(crate) fn finish_light(
                 args: saved,
             });
             charge_light(process, reductions);
-            return LightTrap::Trapped;
-        }
-        Ok(HandlerResult::Export(trap)) => {
-            let state = argument_trap_state(NoContext);
-            let Ok(state_term) = trap_state_term(process, &state) else {
-                return LightTrap::Returned(Err(BifError::SystemLimit));
-            };
-            let mut saved = [Term::NIL; 4];
-            let kept = trap.args.len().min(saved.len());
-            saved[..kept].copy_from_slice(&trap.args[..kept]);
-            process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-                caller_module: process.trap_site().0,
-                caller_ip: process.trap_site().1,
-                // BIF_TRAP to an export is a context switch like any other trap
-                // (instr_bif.cpp, call_light_bif_shared: context_switch_simplified);
-                // `beam_bif_export_trap` calls the export on schedule-in.
-                schedule_out: true,
-                import,
-                continuation: trap.target.continuation,
-                target: trap.target,
-                state,
-                state_term,
-                gc_was_enabled,
-                arity: kept,
-                callee,
-                root_args: 0,
-                args: saved,
-            });
-            charge_light(process, 0);
             return LightTrap::Trapped;
         }
     };
