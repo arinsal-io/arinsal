@@ -33,7 +33,7 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
     let tup = O::Tuple(vec![atom("a"), x.clone(), atom("b")]);
     let bin = O::Binary(vec![1, (n % 255) as u8, 3, 4]);
     match (m, f, arity) {
-        ("erlang", "length" | "hd" | "tl", 1) => vec![seq],
+        ("erlang", "length", 1) => vec![seq],
         ("erlang", "abs" | "float" | "trunc" | "round" | "ceil" | "floor", 1) => {
             if n.is_multiple_of(2) {
                 vec![O::Int(n as i64 - 500)]
@@ -41,10 +41,8 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
                 vec![O::Float(n as f64 / 7.0 - 70.0)]
             }
         }
-        ("erlang", "tuple_size" | "tuple_to_list" | "size", 1) => vec![tup],
+        ("erlang", "tuple_to_list" | "size", 1) => vec![tup],
         ("erlang", "byte_size" | "bit_size" | "binary_to_list", 1) => vec![bin],
-        ("erlang", "element", 2) => vec![O::Int((n % 3 + 1) as i64), tup],
-        ("erlang", "setelement", 3) => vec![O::Int((n % 3 + 1) as i64), tup, term(n)],
         ("erlang", "node", 0) | ("erlang", "make_ref", 0) | ("erlang", "unique_integer", 0) => {
             vec![]
         }
@@ -54,14 +52,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             serial: 0,
             creation: 0,
         }],
-        ("erlang", "min" | "max" | "==" | "/=" | "=:=" | "=/=" | "<" | "=<" | ">" | ">=", 2) => {
-            vec![term(n), term(n + 1)]
-        }
-        ("erlang", "not", 1) => vec![atom(if n.is_multiple_of(2) { "true" } else { "false" })],
-        ("erlang", "and" | "or" | "xor", 2) => vec![
-            atom(if n.is_multiple_of(2) { "true" } else { "false" }),
-            atom(if n.is_multiple_of(3) { "true" } else { "false" }),
-        ],
         ("erlang", "phash", 2) => vec![term(n), O::Int((n % 1000 + 1) as i64)],
         ("erlang", "list_to_tuple", 1) => vec![seq],
         ("erlang", "make_tuple", 2) => vec![O::Int((n % 8) as i64), term(n)],
@@ -182,9 +172,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             })]),
         ],
         ("erlang", "is_function", 2) => vec![term(n), O::Int((n % 5) as i64)],
-        ("erlang", "is_record", 1) => vec![term(n)],
-        ("erlang", "is_record", 2) => vec![tup, atom("a")],
-        ("erlang", "is_record", 3) => vec![tup, atom("a"), O::Int(3)],
         ("erts_internal", "cmp_term" | "same", 2) => vec![term(n), term(n + 1)],
         ("erts_debug", "same", 2) => vec![term(n), term(n + 1)],
         ("erts_debug", "flat_size", 1) => vec![term(n)],
@@ -198,10 +185,8 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             }),
             O::Int(1),
         ],
-        ("erlang", "error" | "exit" | "throw", 1) => vec![term(n)],
         ("erlang", "error", 2) => vec![term(n), list(vec![term(n + 1)])],
         ("erlang", "error", 3) => vec![term(n), list(vec![]), list(vec![])],
-        ("erlang", "raise", 3) => vec![atom("error"), term(n), O::Nil],
         ("erlang", "unique_integer", 1) => vec![list(vec![atom("positive")])],
         ("math", "acos" | "asin" | "atanh", 1) => {
             vec![O::Float((n % 199) as f64 / 100.0 - 0.99)]

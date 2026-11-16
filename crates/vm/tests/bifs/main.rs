@@ -6,6 +6,7 @@ mod arith_red;
 mod atom_order_differential;
 mod atom_table_differential;
 mod atomics_error_info;
+mod bif_op_moved_differential;
 mod bif_trap_append;
 mod bif_trap_subtract;
 mod big_integer_select_differential;

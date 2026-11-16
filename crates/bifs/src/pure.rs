@@ -7,8 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
     AtomEncoding, AtomError, BinaryRef, ExternalBinary, HeapAlloc, MagicBin, Node, Term,
-    TermBuilder, TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms,
-    loose_eq, phash,
+    TermBuilder, TermError, TermKind, atoms, copy_term, flat_size, global_atoms, phash,
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -248,27 +247,8 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "round", 1) => v.entry::<bodies::round>(),
         ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
         ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
-        ("erlang", "hd", 1) => v.entry::<word_bodies::hd>(),
-        ("erlang", "tl", 1) => v.entry::<word_bodies::tl>(),
-        ("erlang", "element", 2) => v.entry::<word_bodies::element>(),
-        ("erlang", "setelement", 3) => v.entry::<word_bodies::setelement>(),
-        ("erlang", "tuple_size", 1) => v.entry::<process_bodies::tuple_size>(),
         ("erlang", "size", 1) => v.entry::<bodies::size>(),
         ("erlang", "node", 0 | 1) => v.entry::<bodies::node>(),
-        ("erlang", "min", 2) => v.entry::<bodies::min>(),
-        ("erlang", "max", 2) => v.entry::<bodies::max>(),
-        ("erlang", "not", 1) => v.entry::<bodies::not>(),
-        ("erlang", "and", 2) => v.entry::<bodies::and>(),
-        ("erlang", "or", 2) => v.entry::<bodies::or>(),
-        ("erlang", "xor", 2) => v.entry::<bodies::xor>(),
-        ("erlang", "==", 2) => v.entry::<bodies::eq>(),
-        ("erlang", "/=", 2) => v.entry::<bodies::ne>(),
-        ("erlang", "=:=", 2) => v.entry::<bodies::exact_eq_bif>(),
-        ("erlang", "=/=", 2) => v.entry::<bodies::exact_ne>(),
-        ("erlang", "<", 2) => v.entry::<bodies::lt>(),
-        ("erlang", "=<", 2) => v.entry::<bodies::le>(),
-        ("erlang", ">", 2) => v.entry::<bodies::gt>(),
-        ("erlang", ">=", 2) => v.entry::<bodies::ge>(),
         ("erlang", "phash", 2) => v.entry::<bodies::phash_bif>(),
         ("erlang", "make_ref", 0) => v.entry::<bodies::make_ref>(),
         ("erlang", "unique_integer", 0 | 1) => v.entry::<bodies::unique_integer>(),
@@ -293,27 +273,10 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "list_to_float", 1) => v.entry::<bodies::list_to_float>(),
         ("erlang", "binary_to_float", 1) => v.entry::<bodies::binary_to_float>(),
         ("erlang", "integer_to_binary", 1 | 2) => v.entry::<bodies::integer_to_binary>(),
-        ("erlang", "is_atom", 1) => v.entry::<bodies::is_atom>(),
-        ("erlang", "is_list", 1) => v.entry::<bodies::is_list>(),
-        ("erlang", "is_tuple", 1) => v.entry::<bodies::is_tuple>(),
-        ("erlang", "is_float", 1) => v.entry::<bodies::is_float>(),
-        ("erlang", "is_integer", 1) => v.entry::<bodies::is_integer>(),
         ("erlang", "is_integer", 3) => v.entry::<bodies::is_integer_range>(),
-        ("erlang", "is_number", 1) => v.entry::<bodies::is_number>(),
-        ("erlang", "is_pid", 1) => v.entry::<bodies::is_pid>(),
-        ("erlang", "is_port", 1) => v.entry::<bodies::is_port>(),
-        ("erlang", "is_reference", 1) => v.entry::<bodies::is_reference>(),
-        ("erlang", "is_binary", 1) => v.entry::<bodies::is_binary>(),
-        ("erlang", "is_bitstring", 1) => v.entry::<bodies::is_bitstring>(),
-        ("erlang", "is_function", 1 | 2) => v.entry::<bodies::is_function>(),
-        ("erlang", "is_record", 1..=3) => v.entry::<bodies::is_record>(),
-        ("erlang", "is_boolean", 1) => v.entry::<bodies::is_boolean>(),
-        ("erlang", "is_map", 1) => v.entry::<bodies::is_map>(),
+        ("erlang", "is_function", 2) => v.entry::<bodies::is_function>(),
         ("erlang", "is_builtin", 3) => v.entry::<bodies::is_builtin>(),
-        ("erlang", "error", 1..=3) => v.entry::<bodies::error>(),
-        ("erlang", "exit", 1) => v.entry::<bodies::exit>(),
-        ("erlang", "throw", 1) => v.entry::<bodies::throw>(),
-        ("erlang", "raise", 3) => v.entry::<bodies::raise>(),
+        ("erlang", "error", 2 | 3) => v.entry::<bodies::error>(),
         ("erts_internal", "cmp_term", 2) => v.entry::<bodies::cmp_term>(),
         ("erts_debug", "copy_shared", 2) => v.entry::<bodies::debug_copy_shared>(),
         ("erts_debug", "flat_size", 1) => v.entry::<bodies::debug_flat_size>(),
@@ -351,14 +314,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 
 pub(super) fn bool_term(value: bool) -> Term {
     Term::atom(if value { atoms::TRUE } else { atoms::FALSE })
-}
-
-fn bool_value(term: Term) -> Result<bool, BifError> {
-    match term.as_atom() {
-        Some(atom) if atom == atoms::TRUE => Ok(true),
-        Some(atom) if atom == atoms::FALSE => Ok(false),
-        _ => Err(BADARG),
-    }
 }
 
 pub(super) fn integer(ctx: &mut Ctx<'_>, value: usize) -> Result<Term, BifError> {
@@ -487,64 +442,6 @@ pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
         .expect("infallible BIF heap")
 }
 
-fn hd(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/bif.c:2918-2930 (hd_1), OTP-29.1.1.
-    // SAFETY: The input heap is live and stable.
-    match unsafe { args[0].cons_ref() } {
-        Some((head, _)) => head,
-        None => ctx.badarg(),
-    }
-}
-fn tl(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/bif.c:2931-2943 (tl_1), OTP-29.1.1.
-    // SAFETY: The input heap is live and stable.
-    match unsafe { args[0].cons_ref() } {
-        Some((_, tail)) => tail,
-        None => ctx.badarg(),
-    }
-}
-fn element(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/bif.c:2944-2963 (element_2), OTP-29.1.1.
-    let Some(index) = args[0].as_small().filter(|index| *index >= 1) else {
-        return ctx.badarg();
-    };
-    match tuple_view(&args[1])
-        .ok()
-        .and_then(|tuple| tuple.element(index as usize - 1))
-    {
-        Some(value) => value,
-        None => ctx.badarg(),
-    }
-}
-fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    // Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1:
-    // one `HAlloc` of `arity + 1` words, `sys_memcpy` of the tuple, then the
-    // replaced element. No per-element closure.
-    let Some(index) = args[0].as_small().filter(|index| *index >= 1) else {
-        return ctx.badarg();
-    };
-    let Ok(source) = tuple_view(&args[1]) else {
-        return ctx.badarg();
-    };
-    let arity = source.len();
-    if index as usize > arity {
-        return ctx.badarg();
-    }
-    let replacement = args[2];
-    let built = TermBuilder::new(&mut Heap(&mut ctx.heap)).tuple_from_fn(arity, |slot, _| {
-        if slot + 1 == index as usize {
-            replacement
-        } else {
-            source
-                .element(slot)
-                .expect("tuple arity was read from source")
-        }
-    });
-    match built {
-        Ok(tuple) => tuple,
-        Err(_) => ctx.system_limit(),
-    }
-}
 fn tuple_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:2963-2973 (tuple_size_1), OTP-29.1.1.
     let arity = tuple_view(&args[0])?.len();
@@ -573,49 +470,6 @@ fn node_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     };
     Ok(Term::atom(name))
 }
-fn min_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(if cmp(args[0], args[1]) == Ordering::Greater {
-        args[1]
-    } else {
-        args[0]
-    })
-}
-fn max_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(if cmp(args[0], args[1]) == Ordering::Less {
-        args[1]
-    } else {
-        args[0]
-    })
-}
-fn not_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(!bool_value(args[0])?))
-}
-fn and_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(bool_value(args[0])? & bool_value(args[1])?))
-}
-fn or_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(bool_value(args[0])? | bool_value(args[1])?))
-}
-fn xor_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(bool_value(args[0])? ^ bool_value(args[1])?))
-}
-
-macro_rules! compare {
-    ($name:ident, $result:ident, $body:expr) => {
-        fn $result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-            Ok(bool_term($body(args[0], args[1])))
-        }
-    };
-}
-compare!(eq, eq_result, loose_eq);
-compare!(exact_eq_bif, exact_eq_bif_result, exact_eq);
-compare!(ne, ne_result, |a, b| !loose_eq(a, b));
-compare!(exact_ne, exact_ne_result, |a, b| !exact_eq(a, b));
-compare!(lt, lt_result, |a, b| cmp(a, b) == Ordering::Less);
-compare!(le, le_result, |a, b| cmp(a, b) != Ordering::Greater);
-compare!(gt, gt_result, |a, b| cmp(a, b) == Ordering::Greater);
-compare!(ge, ge_result, |a, b| cmp(a, b) != Ordering::Less);
-
 /// Resume state of `erlang:phash2/1,2`.
 ///
 /// Port of the trap state `trapping_make_hash2` hands back in
@@ -1810,59 +1664,6 @@ pub(super) fn bigint(term: Term) -> Result<BigInt, BifError> {
         .map(|view| view.to_bigint())
         .ok_or(BADARG)
 }
-macro_rules! predicate {
-    ($name:ident, $result:ident, $body:expr) => {
-        fn $result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-            Ok(bool_term($body(args[0])))
-        }
-    };
-}
-predicate!(is_atom, is_atom_result, |t: Term| t.classify()
-    == TermKind::Atom);
-predicate!(is_list, is_list_result, |t: Term| matches!(
-    t.classify(),
-    TermKind::List | TermKind::Nil
-));
-predicate!(is_tuple, is_tuple_result, |t: Term| matches!(
-    t.classify(),
-    TermKind::Tuple | TermKind::Record
-));
-predicate!(is_float, is_float_result, |t: Term| t.classify()
-    == TermKind::Number
-    && t.as_small().is_none()
-    && {
-        // SAFETY: A live boxed number can be queried through its typed view.
-        unsafe { t.float_ref() }.is_some()
-    });
-predicate!(is_integer, is_integer_result, |t: Term| t
-    .as_small()
-    .is_some()
-    || {
-        // SAFETY: A live boxed number can be queried through its typed view.
-        unsafe { t.big_ref() }.is_some()
-    });
-predicate!(is_number, is_number_result, |t: Term| t.classify()
-    == TermKind::Number);
-predicate!(is_pid, is_pid_result, |t: Term| t.classify()
-    == TermKind::Pid);
-predicate!(is_port, is_port_result, |t: Term| t.classify()
-    == TermKind::Port);
-predicate!(is_reference, is_reference_result, |t: Term| t.classify()
-    == TermKind::Ref);
-predicate!(is_bitstring, is_bitstring_result, |t: Term| t.classify()
-    == TermKind::Bitstring);
-predicate!(is_binary, is_binary_result, |t: Term| {
-    // SAFETY: The source heap and binary owner remain live.
-    unsafe { t.binary_ref() }.is_some_and(|b| b.bit_len() % 8 == 0)
-});
-predicate!(
-    is_boolean,
-    is_boolean_result,
-    |t: Term| matches!(t.as_atom(), Some(a) if a == atoms::TRUE || a == atoms::FALSE)
-);
-predicate!(is_map, is_map_result, |t: Term| t.classify()
-    == TermKind::Map);
-
 fn is_integer_range_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_guard.c:337 (is_integer_3), OTP-29.1.1.
     let lower = bigint(args[1])?;
@@ -1889,31 +1690,6 @@ fn is_function_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> 
         arinsal_term::FunRef::Export { entry } => entry.arity,
     };
     Ok(bool_term(actual as i64 == arity))
-}
-fn is_record_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if args.len() == 1 {
-        return Ok(bool_term(args[0].classify() == TermKind::Record));
-    }
-    if args[1].as_atom().is_none() {
-        return Err(BADARG);
-    }
-    let arity = if args.len() == 3 {
-        if args[2].classify() == TermKind::Number && args[2].as_small().is_none() {
-            return Err(BADARG);
-        }
-        Some(args[2].as_small())
-    } else {
-        None
-    };
-    let Ok(tuple_size) = tuple_arity(args[0]) else {
-        return Ok(bool_term(false));
-    };
-    if tuple_size == 0 || tuple_element(args[0], 0)? != args[1] {
-        return Ok(bool_term(false));
-    }
-    Ok(bool_term(
-        arity.is_none_or(|n| n == Some(tuple_size as i64)),
-    ))
 }
 fn cmp_term_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:5417-5427 and erl_utils.h:122, OTP-29.1.1.
@@ -1971,66 +1747,6 @@ fn error_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         stacktrace: None,
     })
 }
-fn exit_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Err(BifError::Raise {
-        class: Class::Exit,
-        reason: args[0],
-        stacktrace: None,
-    })
-}
-fn throw_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Err(BifError::Raise {
-        class: Class::Throw,
-        reason: args[0],
-        stacktrace: None,
-    })
-}
-/// `erlang:raise/3`.
-// Port of erts/emulator/beam/bif.c (raise_3), OTP-29.1.1: the class is one of three atoms, an
-// invalid class or stacktrace returns `badarg` as a value, and the exception leaves the
-// reason in `fvalue` and the stacktrace in `ftrace`.
-fn raise(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-    use arinsal_term::atoms;
-    let badarg = Term::atom(atoms::BADARG);
-    let class = match args[0].as_atom() {
-        Some(atom) if atom == atoms::ERROR => Class::Error,
-        Some(atom) if atom == atoms::EXIT => Class::Exit,
-        Some(atom) if atom == atoms::THROW => Class::Throw,
-        _ => return badarg,
-    };
-    if !valid_raise_stacktrace(args[2]) {
-        return badarg;
-    }
-    ctx.fail(BifError::Raise {
-        class,
-        reason: args[1],
-        stacktrace: Some(args[2]),
-    })
-}
-
-// Port of erts/emulator/beam/bif.c (raise_3 stacktrace validation), OTP-29.1.1: each frame
-// is checked in place through its tuple header, as `tuple_val`/`arityval` do.
-fn valid_raise_stacktrace(stacktrace: Term) -> bool {
-    let valid_location = |location: Option<Term>| {
-        location.is_some_and(|l| matches!(l.classify(), TermKind::List | TermKind::Nil))
-    };
-    let is_atom = |term: Option<Term>| term.is_some_and(|t| t.classify() == TermKind::Atom);
-    for_each_cons(stacktrace, |frame| {
-        let view = tuple_view(&frame)?;
-        let first = view.element(0);
-        let is_fun = first.is_some_and(|t| t.classify() == TermKind::Fun);
-        let valid = match view.len() {
-            2 => is_fun,
-            3 if is_fun => valid_location(view.element(2)),
-            3 => is_atom(first) && is_atom(view.element(1)),
-            4 => is_atom(first) && is_atom(view.element(1)) && valid_location(view.element(3)),
-            _ => false,
-        };
-        if valid { Ok(()) } else { Err(BADARG) }
-    })
-    .is_ok()
-}
-
 fn numeric_float(term: Term) -> Result<f64, BifError> {
     if let Some(n) = term.as_small() {
         return Ok(n as f64);
@@ -2176,25 +1892,6 @@ macro_rules! word_adapter {
     };
 }
 
-macro_rules! primary_exception_adapter {
-    ($name:ident, $result:ident, $class:ident) => {
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-            if args.len() == 1 {
-                ctx.fail_exception(Class::$class, args[0])
-            } else {
-                match $result(ctx, args) {
-                    Ok(value) if ctx.has_deferred() => match ctx.take_deferred() {
-                        Some(trap) => ctx.trap(*trap),
-                        None => value,
-                    },
-                    Ok(value) => value,
-                    Err(error) => ctx.fail(error),
-                }
-            }
-        }
-    };
-}
-
 word_adapter!(abs, abs_result);
 word_adapter!(to_float, to_float_result);
 word_adapter!(trunc, trunc_result);
@@ -2202,22 +1899,7 @@ word_adapter!(round, round_result);
 word_adapter!(ceil, ceil_result);
 word_adapter!(floor, floor_result);
 word_adapter!(size, size_result);
-word_adapter!(tuple_size, tuple_size_result);
 word_adapter!(node, node_result);
-word_adapter!(min, min_result);
-word_adapter!(max, max_result);
-word_adapter!(not, not_result);
-word_adapter!(and, and_result);
-word_adapter!(or, or_result);
-word_adapter!(xor, xor_result);
-word_adapter!(eq, eq_result);
-word_adapter!(ne, ne_result);
-word_adapter!(exact_eq_bif, exact_eq_bif_result);
-word_adapter!(exact_ne, exact_ne_result);
-word_adapter!(lt, lt_result);
-word_adapter!(le, le_result);
-word_adapter!(gt, gt_result);
-word_adapter!(ge, ge_result);
 word_adapter!(phash_bif, phash_bif_result);
 word_adapter!(make_ref, make_ref_result);
 word_adapter!(unique_integer, unique_integer_result);
@@ -2239,27 +1921,11 @@ word_adapter!(float_to_binary, float_to_binary_result);
 word_adapter!(list_to_float, list_to_float_result);
 word_adapter!(binary_to_float, binary_to_float_result);
 word_adapter!(integer_to_binary, integer_to_binary_result);
-word_adapter!(is_atom, is_atom_result);
-word_adapter!(is_list, is_list_result);
-word_adapter!(is_tuple, is_tuple_result);
-word_adapter!(is_float, is_float_result);
-word_adapter!(is_integer, is_integer_result);
 word_adapter!(is_integer_range, is_integer_range_result);
-word_adapter!(is_number, is_number_result);
-word_adapter!(is_pid, is_pid_result);
-word_adapter!(is_port, is_port_result);
-word_adapter!(is_reference, is_reference_result);
-word_adapter!(is_binary, is_binary_result);
-word_adapter!(is_bitstring, is_bitstring_result);
 word_adapter!(is_function, is_function_result);
-word_adapter!(is_record, is_record_result);
-word_adapter!(is_boolean, is_boolean_result);
-word_adapter!(is_map, is_map_result);
 word_adapter!(is_builtin, is_builtin_result);
-// Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1.
-primary_exception_adapter!(error, error_result, Error);
-primary_exception_adapter!(exit, exit_result, Exit);
-primary_exception_adapter!(throw, throw_result, Throw);
+// Port of erts/emulator/beam/bif.c (error_2, error_3), OTP-29.1.1.
+word_adapter!(error, error_result);
 word_adapter!(cmp_term, cmp_term_result);
 word_adapter!(debug_copy_shared, debug_copy_shared_result);
 word_adapter!(debug_flat_size, debug_flat_size_result);
@@ -2291,21 +1957,18 @@ word_adapter!(math_pow, math_pow_result);
 word_adapter!(math_fmod, math_fmod_result);
 
 crate::word_bif_bodies_in!(word_bodies;
-    abs, to_float, trunc, round, ceil, floor, size, tuple_size, node,
-    min, max, not, and, or, xor, eq, ne, exact_eq_bif, exact_ne, lt, le, gt, ge,
+    abs, to_float, trunc, round, ceil, floor, size, node,
     phash_bif, make_ref, unique_integer, system_time, time_unit,
     atom_to_binary, binary_to_atom, binary_to_existing_atom, float_to_list,
     float_to_binary, list_to_float, binary_to_float, integer_to_binary,
-    is_atom, is_list, is_tuple, is_float, is_integer, is_integer_range, is_number,
-    is_pid, is_port, is_reference, is_binary, is_bitstring, is_function, is_record,
-    is_boolean, is_map, is_builtin, error, exit,
-    throw, raise, cmp_term, debug_copy_shared, debug_flat_size, debug_same,
+    is_integer_range, is_function, is_builtin, error,
+    cmp_term, debug_copy_shared, debug_flat_size, debug_same,
     bin_is_7bit, math_cos, math_cosh, math_sin, math_sinh, math_tan, math_tanh,
     math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atanh, math_erf,
     math_erfc, math_exp, math_log, math_log2, math_log10, math_sqrt, math_floor,
     math_ceil, math_atan2, math_pow, math_fmod, list_to_tuple, make_tuple,
     append_element, delete_element, insert_element, atom_to_list, list_to_atom,
-    list_to_existing_atom, hd, tl, element, setelement, tuple_to_list
+    list_to_existing_atom, tuple_to_list
 );
 mod bodies {
     pub(super) use super::word_bodies::*;

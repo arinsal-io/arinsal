@@ -12,6 +12,7 @@ pub(crate) mod erl_bif_chksum;
 pub(crate) mod erl_bif_guard;
 pub(crate) mod erl_bif_info;
 pub(crate) mod erl_bif_lists;
+pub(crate) mod erl_bif_op;
 pub(crate) mod erl_bif_os;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
@@ -751,7 +752,7 @@ mod tests {
     #[test]
     fn pure_bif_imports_skip_family_dispatch() {
         use arinsal_loader::ImportClass;
-        let (class, bits) = classify("erlang", "element", 2, true);
+        let (class, bits) = classify("erlang", "abs", 1, true);
         assert_eq!(class, ImportClass::Pure);
         assert_eq!(bits, 0);
         // A BIF whose body is its `bif_table` entry has no named native.

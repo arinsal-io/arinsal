@@ -1496,59 +1496,6 @@ fn arith_bif_error(error: arinsal_arith::ArithError) -> arinsal_bifs::BifError {
     }
 }
 
-/// `setelement/3`: one bump and a copy of the tuple.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:151-166 (emit_i_bif) and
-// erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1.
-pub(crate) extern "C" fn setelement_light(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    i: u64,
-) -> u64 {
-    match setelement_write(header, regs) {
-        Some(raw) => raw,
-        None => plain_bif_light(header, regs, i),
-    }
-}
-
-/// `Some` is the new tuple. `None` sends errors through the generic BIF body.
-fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
-    if header.is_null() || regs.is_null() {
-        return None;
-    }
-    // SAFETY: reg[0..2] are BIF_ARG_1..3. A tuple's header is the word at the
-    // untagged pointer. HTOP was stored by `emit_enter_runtime`.
-    unsafe {
-        let index = crate::native_hooks::from_raw(*regs);
-        let tuple = crate::native_hooks::from_raw(*regs.add(1));
-        let value = *regs.add(2);
-        let ix = index.as_small().filter(|ix| *ix >= 1)?;
-        let hdr = tuple.header()?;
-        if hdr & 63 != 0 {
-            return None;
-        }
-        let arity = (hdr >> 6) as usize;
-        let slot = ix as usize;
-        if slot > arity {
-            return None;
-        }
-        let src = tuple.raw_ptr();
-        let size = arity + 1;
-        let process = &mut *header.cast::<crate::Process>();
-        let htop = process.heap.abi.htop;
-        let stop = process.heap.abi.stop;
-        let top = htop as usize;
-        let limit = (stop as usize).saturating_sub(arinsal_term::S_REDZONE * 8);
-        if htop.is_null() || stop.is_null() || top.saturating_add(size.saturating_mul(8)) > limit {
-            return None;
-        }
-        std::ptr::copy_nonoverlapping(src, htop, size);
-        htop.add(slot).write(value);
-        let next = htop.add(size);
-        process.heap.abi.htop = next;
-        Some((htop as u64) | 2)
-    }
-}
-
 /// `make_ref/0`. `HAlloc` of three words and `esdp->ref++`, then the term.
 // Port of erts/emulator/beam/erl_bif_unique.c:821-833 (`make_ref_0`) and
 // erl_bif_unique.h:190-198 (`erts_sched_make_ref_in_buffer`), OTP-29.1.1.
@@ -2392,61 +2339,7 @@ fn call_plain_bif_word(
     }
     let deferred = ctx.take_deferred();
     let error = ctx.take_error();
-    // Port of erts/emulator/beam/bif.c (raise_3, error_1, exit_1, throw_1), OTP-29.1.1: the BIF
-    // set `freason`, `fvalue` and (raise/3) `ftrace` itself and returned THE_NON_VALUE. They go
-    // to handle_error as they are: `raise/3` with an immediate stacktrace, or `error/1`,
-    // `exit/1` and `throw/1` with exactly `EXC_ERROR` / `EXC_EXIT` / `EXC_THROWN`.
-    if deferred.is_none()
-        && error.is_none()
-        && (process.heap.abi.exc.ftrace != 0
-            && process.heap.abi.exc.freason
-                & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
-                == 0
-            || export.arity == 1
-                && export.module_atom == arinsal_term::atoms::ERLANG
-                && matches!(
-                    export.function_atom,
-                    arinsal_term::atoms::ERROR
-                        | arinsal_term::atoms::EXIT
-                        | arinsal_term::atoms::THROW
-                )
-                && process.heap.abi.exc.ftrace == 0
-                && matches!(
-                    process.heap.abi.exc.freason,
-                    arinsal_beamasm::exc::EXC_ERROR
-                        | arinsal_beamasm::exc::EXC_EXIT
-                        | arinsal_beamasm::exc::EXC_THROWN
-                ))
-    {
-        // ERTS_IS_GC_DESIRED_INTERNAL runs before the THE_NON_VALUE test
-        // (instr_bif.cpp:486-523); the failure words stay as the BIF wrote them.
-        if process.heap.gc_after_bif_desired() {
-            return gc_after_raised_bif(process, arity);
-        }
-        return 0;
-    }
     plain_bif_word_slow(process, registers, identity, export, word, deferred, error)
-}
-
-/// The collection after a BIF that raised with its failure already in `freason`, `fvalue`
-/// and `ftrace`: those are process roots, as are the BIF's argument registers.
-// Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf: a non-value result
-// collects with `arity` live registers), OTP-29.1.1.
-#[cold]
-#[inline(never)]
-fn gc_after_raised_bif(process: &mut crate::Process, arity: usize) -> u64 {
-    match process.collect_heap_roots(arity, &mut [], 0) {
-        Ok(stats) => {
-            crate::natives::sys::after_collection(
-                process,
-                stats.collections,
-                stats.words_reclaimed,
-            );
-            process.charge_gc_stats(&stats);
-        }
-        Err(_) => crate::native_hooks::set_error(process, "system_limit"),
-    }
-    0
 }
 
 /// The tail of [`call_plain_bif_word`] for a failure, a trap or a due collection, out of line
@@ -2469,8 +2362,6 @@ fn plain_bif_word_slow(
     } else {
         error
     };
-    // `raise/3` with an immediate stacktrace (`throw/1` compiles to it) is complete in the
-    // failure words: set them and return the non-value, as erts' `raise_3` does.
     let result = if word == arinsal_term::THE_NON_VALUE {
         Err(error.unwrap_or(arinsal_bifs::BifError::BADARG))
     } else {

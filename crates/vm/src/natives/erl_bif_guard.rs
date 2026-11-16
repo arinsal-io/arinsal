@@ -1,7 +1,7 @@
 //! The trapping `length/1` of erl_bif_guard.c.
 //!
 //! Port of erts/emulator/beam/erl_bif_guard.c (length_1, erlang_length_trap,
-//! erts_trapping_length_1), OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
+//! erts_trapping_length_1, min_2, max_2), OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
 //! `length/1` is called from native code and `apply/3`; a list too long for the reductions left
 //! traps to the hidden `erlang:length/3` (`erlang_length_export`, installed by
 //! `erts_init_trap_export`) with `(List, Length, OriginalList)`.
@@ -76,4 +76,28 @@ fn length_run(
             bif_ret(c_p, i, Err(error))
         }
     }
+}
+
+/// `erlang:min/2`.
+// Port of erts/emulator/beam/erl_bif_guard.c (min_2), OTP-29.1.1.
+pub(crate) extern "C" fn min_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [a, b] = crate::bif_table::bif_args::<2>(reg);
+    let min = if arinsal_term::cmp(a, b) == std::cmp::Ordering::Greater {
+        b
+    } else {
+        a
+    };
+    crate::native_hooks::raw(min)
+}
+
+/// `erlang:max/2`.
+// Port of erts/emulator/beam/erl_bif_guard.c (max_2), OTP-29.1.1.
+pub(crate) extern "C" fn max_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [a, b] = crate::bif_table::bif_args::<2>(reg);
+    let max = if arinsal_term::cmp(a, b) == std::cmp::Ordering::Less {
+        b
+    } else {
+        a
+    };
+    crate::native_hooks::raw(max)
 }

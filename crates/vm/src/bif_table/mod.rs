@@ -5,6 +5,7 @@
 //! branches to it with `(c_p, reg, I)`. `invoke_dispatch_bif` is not that pointer.
 
 mod raw;
+pub(crate) use raw::bif_args;
 
 use arinsal_beamasm::ProcessHeader;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -163,11 +164,11 @@ fn function_at(index: usize) -> Option<Bif> {
 use crate::native_helpers::{
     atom_to_list_light, binary_part_2_light, binary_part_3_light, bit_size_light, byte_size_light,
     integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
-    persistent_term_get_2_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
+    persistent_term_get_2_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, binary, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_hl_timer,
-    erl_iolist, erl_map, erl_process_dict, external, register,
+    bif_phash2, binary, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_bif_op,
+    erl_hl_timer, erl_iolist, erl_map, erl_process_dict, external, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -228,6 +229,15 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         // bif.c
         ("erlang", "phash2", 1) => bif!(bif_phash2::phash2_1),
         ("erlang", "phash2", 2) => bif!(bif_phash2::phash2_2),
+        ("erlang", "hd", 1) => bif!(crate::natives::bif::hd_1),
+        ("erlang", "tl", 1) => bif!(crate::natives::bif::tl_1),
+        ("erlang", "element", 2) => bif!(crate::natives::bif::element_2),
+        ("erlang", "setelement", 3) => bif!(crate::natives::bif::setelement_3),
+        ("erlang", "tuple_size", 1) => bif!(crate::natives::bif::tuple_size_1),
+        ("erlang", "error", 1) => bif!(crate::natives::bif::error_1),
+        ("erlang", "exit", 1) => bif!(crate::natives::bif::exit_1),
+        ("erlang", "throw", 1) => bif!(crate::natives::bif::throw_1),
+        ("erlang", "raise", 3) => bif!(crate::natives::bif::raise_3),
         // erl_map.c
         ("maps", "put", 3) => bif!(erl_map::maps_put_3),
         ("maps", "update", 3) => bif!(erl_map::maps_update_3),
@@ -256,6 +266,38 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "iolist_to_iovec", 1) => bif!(erl_iolist::iolist_to_iovec_1),
         // erl_bif_guard.c
         ("erlang", "length", 1) => bif!(erl_bif_guard::length_1),
+        ("erlang", "min", 2) => bif!(erl_bif_guard::min_2),
+        ("erlang", "max", 2) => bif!(erl_bif_guard::max_2),
+        // erl_bif_op.c
+        ("erlang", "and", 2) => bif!(erl_bif_op::and_2),
+        ("erlang", "or", 2) => bif!(erl_bif_op::or_2),
+        ("erlang", "xor", 2) => bif!(erl_bif_op::xor_2),
+        ("erlang", "not", 1) => bif!(erl_bif_op::not_1),
+        ("erlang", ">", 2) => bif!(erl_bif_op::sgt_2),
+        ("erlang", ">=", 2) => bif!(erl_bif_op::sge_2),
+        ("erlang", "<", 2) => bif!(erl_bif_op::slt_2),
+        ("erlang", "=<", 2) => bif!(erl_bif_op::sle_2),
+        ("erlang", "=:=", 2) => bif!(erl_bif_op::seq_2),
+        ("erlang", "==", 2) => bif!(erl_bif_op::seqeq_2),
+        ("erlang", "=/=", 2) => bif!(erl_bif_op::sneq_2),
+        ("erlang", "/=", 2) => bif!(erl_bif_op::sneqeq_2),
+        ("erlang", "is_atom", 1) => bif!(erl_bif_op::is_atom_1),
+        ("erlang", "is_list", 1) => bif!(erl_bif_op::is_list_1),
+        ("erlang", "is_tuple", 1) => bif!(erl_bif_op::is_tuple_1),
+        ("erlang", "is_float", 1) => bif!(erl_bif_op::is_float_1),
+        ("erlang", "is_integer", 1) => bif!(erl_bif_op::is_integer_1),
+        ("erlang", "is_number", 1) => bif!(erl_bif_op::is_number_1),
+        ("erlang", "is_pid", 1) => bif!(erl_bif_op::is_pid_1),
+        ("erlang", "is_port", 1) => bif!(erl_bif_op::is_port_1),
+        ("erlang", "is_reference", 1) => bif!(erl_bif_op::is_reference_1),
+        ("erlang", "is_binary", 1) => bif!(erl_bif_op::is_binary_1),
+        ("erlang", "is_bitstring", 1) => bif!(erl_bif_op::is_bitstring_1),
+        ("erlang", "is_function", 1) => bif!(erl_bif_op::is_function_1),
+        ("erlang", "is_boolean", 1) => bif!(erl_bif_op::is_boolean_1),
+        ("erlang", "is_record", 1) => bif!(erl_bif_op::is_record_1),
+        ("erlang", "is_record", 2) => bif!(erl_bif_op::is_record_2),
+        ("erlang", "is_record", 3) => bif!(erl_bif_op::is_record_3),
+        ("erlang", "is_map", 1) => bif!(erl_bif_op::is_map_1),
         // erl_process_dict.c
         ("erlang", "get", 0) => bif!(erl_process_dict::get_0),
         ("erlang", "get", 1) => bif!(erl_process_dict::get_1),
@@ -280,7 +322,6 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "binary_part", 3) | ("binary", "part", 3) => {
             bif!(binary_part_3_light)
         }
-        ("erlang", "setelement", 3) => bif!(setelement_light),
         ("erlang", "make_ref", 0) => bif!(make_ref_light),
         ("erlang", "unique_integer", 0) => bif!(unique_integer_0_light),
         ("erlang", "unique_integer", 1) => bif!(unique_integer_1_light),
@@ -499,15 +540,15 @@ mod tests {
 
     #[test]
     fn every_bif_of_arinsal_bifs_has_its_own_entry() {
-        let element = entry("erlang", "element", 2).expect("element");
-        let hd = entry("erlang", "hd", 1).expect("hd");
-        assert_ne!(hd.plain, element.plain);
+        let abs = entry("erlang", "abs", 1).expect("abs");
+        let trunc = entry("erlang", "trunc", 1).expect("trunc");
+        assert_ne!(trunc.plain, abs.plain);
         // Arities that share one body share its entry.
         let node0 = entry("erlang", "node", 0).expect("node/0");
         let node1 = entry("erlang", "node", 1).expect("node/1");
         similar_asserts::assert_eq!(node0.plain, node1.plain);
         assert!(entry("erlang", "no_such_bif", 1).is_none());
-        assert!(entry("erlang", "element", 3).is_none());
+        assert!(entry("erlang", "abs", 2).is_none());
     }
 
     #[test]

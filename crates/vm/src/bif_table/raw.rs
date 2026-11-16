@@ -40,3 +40,18 @@ pub(super) fn bif_at(address: usize) -> Bif {
     // SAFETY: per the contract above, `address` is a `Bif` function pointer cast to usize.
     unsafe { std::mem::transmute::<usize, Bif>(address) }
 }
+
+/// `BIF_ARG_1 .. BIF_ARG_N`: `reg[0..N]` of the `(c_p, reg, I)` a BIF is called with.
+///
+/// `reg` must be the register array the call passes: the X registers (`call_light_bif`,
+/// the export trampoline, the executor) or the operand array of `i_bif*`, holding at least
+/// `N` terms for a BIF of arity `N`.
+// Port of erts/emulator/beam/bif.h (BIF_ARG_1..3 = `BIF__ARGS[0..2]`), OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn bif_args<const N: usize>(reg: *const u64) -> [arinsal_term::Term; N] {
+    debug_assert!(!reg.is_null());
+    // SAFETY: per the contract above, `reg[0..N]` are initialized argument words of the
+    // running BIF, which no other thread writes while it runs.
+    let words = unsafe { std::ptr::read(reg.cast::<[u64; N]>()) };
+    words.map(crate::native_hooks::from_raw)
+}

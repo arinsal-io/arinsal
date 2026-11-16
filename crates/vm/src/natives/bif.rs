@@ -8,6 +8,7 @@
 //! internal pid of an untraced sender) reach the scheduler's data, as erts reaches `esdp`
 //! through `erts_proc_sched_data(c_p)` only where a BIF needs it.
 
+use crate::bif_table::bif_args;
 use crate::natives::erl_process::{
     CreateError, ErlSpawnOpts, ParseResult, erl_create_process, erts_parse_spawn_opts,
 };
@@ -17,7 +18,7 @@ use crate::signals::OriginDemonitor;
 use crate::{Process, Vm, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{Term, atoms};
+use arinsal_term::{Term, TermKind, atoms};
 
 /// The executor's scheduler data, when the executor calls the BIF by its MFA (an `apply` it
 /// resolves, a traced call). Native code passes `None` and the distributed arm reaches the
@@ -47,6 +48,26 @@ pub(crate) fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmEr
         Ok(value) => crate::native_hooks::raw(value),
         Err(error) => crate::native_helpers::bif_return_current(c_p, i, error),
     }
+}
+
+/// `BIF_ERROR(c_p, BADARG)` of `erlang:function/arity` called with `args` (`BIF_ARG_1..n`):
+/// the exception names the BIF and its arguments as `save_stacktrace` does from
+/// `c_p->current` and the BIF's argument array.
+// Port of erts/emulator/beam/bif.h (BIF_ERROR) and beam_common.c (save_stacktrace), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+pub(crate) fn bif_badarg(c_p: *mut ProcessHeader, i: u64, function: &str, args: &[Term]) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let error = crate::exceptions::bif_error(
+        process,
+        "erlang",
+        function,
+        args,
+        arinsal_bifs::BifError::BADARG,
+    );
+    bif_ret(c_p, i, Err(error))
 }
 
 /// `monitor/2`.
@@ -1660,4 +1681,176 @@ pub(crate) extern "C" fn unalias_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u
         }))
     };
     bif_ret(c_p, i, result)
+}
+
+/// `hd/1`. The JIT has its own implementation (`get_hd` and the guard BIF); this is the body
+/// `apply` and the export entry reach.
+// Port of erts/emulator/beam/bif.c (hd_1), OTP-29.1.1.
+pub(crate) extern "C" fn hd_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [list] = bif_args::<1>(reg);
+    match arinsal_term::raw::Cons::try_from(list) {
+        Ok(cons) => crate::native_hooks::raw(cons.head()),
+        Err(_) => bif_badarg(c_p, i, "hd", &[list]),
+    }
+}
+
+/// `tl/1`.
+// Port of erts/emulator/beam/bif.c (tl_1), OTP-29.1.1.
+pub(crate) extern "C" fn tl_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [list] = bif_args::<1>(reg);
+    match arinsal_term::raw::Cons::try_from(list) {
+        Ok(cons) => crate::native_hooks::raw(cons.tail()),
+        Err(_) => bif_badarg(c_p, i, "tl", &[list]),
+    }
+}
+
+/// `element/2`.
+// Port of erts/emulator/beam/bif.c (element_2), OTP-29.1.1.
+pub(crate) extern "C" fn element_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [index, tuple] = bif_args::<2>(reg);
+    let element = index
+        .as_small()
+        .filter(|ix| *ix >= 1)
+        .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
+        .and_then(|(ix, tuple)| tuple.get(ix as usize - 1));
+    match element {
+        Some(value) => crate::native_hooks::raw(value),
+        None => bif_badarg(c_p, i, "element", &[index, tuple]),
+    }
+}
+
+/// `tuple_size/1`.
+// Port of erts/emulator/beam/bif.c (tuple_size_1), OTP-29.1.1.
+pub(crate) extern "C" fn tuple_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [term] = bif_args::<1>(reg);
+    match arinsal_term::raw::Tuple::try_from(term) {
+        // A tuple's arity is below 2^24, a small integer.
+        Ok(tuple) => Term::small(tuple.arity() as i64).map_or(0, crate::native_hooks::raw),
+        Err(_) => bif_badarg(c_p, i, "tuple_size", &[term]),
+    }
+}
+
+/// `setelement/3`: one `HAlloc` of `arity + 1` words, the copy of the tuple, then the replaced
+/// element.
+// Port of erts/emulator/beam/bif.c (setelement_3), OTP-29.1.1.
+pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [index, tuple, value] = bif_args::<3>(reg);
+    let Some((ix, source)) = index
+        .as_small()
+        .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
+        .filter(|(ix, source)| *ix >= 1 && *ix as usize <= source.arity())
+    else {
+        return bif_badarg(c_p, i, "setelement", &[index, tuple, value]);
+    };
+    let slot = ix as usize - 1;
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(source.arity(), |at, _| {
+        if at == slot {
+            value
+        } else {
+            source.get(at).unwrap_or(Term::NIL)
+        }
+    });
+    match built {
+        Ok(tuple) => crate::native_hooks::raw(tuple),
+        Err(_) => bif_ret(
+            c_p,
+            i,
+            Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                atoms::SYSTEM_LIMIT,
+            )))),
+        ),
+    }
+}
+
+/// `BIF_P->fvalue = BIF_ARG_1; BIF_ERROR(BIF_P, freason)`.
+#[inline(always)]
+fn primary_exception(c_p: *mut ProcessHeader, reg: *mut u64, freason: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let [reason] = bif_args::<1>(reg);
+    let exc = &mut process.heap.abi.exc;
+    exc.freason = freason;
+    exc.fvalue = reason.word();
+    exc.ftrace = 0;
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `error/1`.
+// Port of erts/emulator/beam/bif.c (error_1), OTP-29.1.1.
+pub(crate) extern "C" fn error_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    primary_exception(c_p, reg, arinsal_term::exc::EXC_ERROR)
+}
+
+/// `exit/1`.
+// Port of erts/emulator/beam/bif.c (exit_1), OTP-29.1.1.
+pub(crate) extern "C" fn exit_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    primary_exception(c_p, reg, arinsal_term::exc::EXC_EXIT)
+}
+
+/// `throw/1`.
+// Port of erts/emulator/beam/bif.c (throw_1), OTP-29.1.1.
+pub(crate) extern "C" fn throw_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    primary_exception(c_p, reg, arinsal_term::exc::EXC_THROWN)
+}
+
+/// `erlang:raise/3`: a bad class or stacktrace returns the atom `badarg`; otherwise the
+/// exception leaves `fvalue` = the reason and `ftrace` = the stacktrace.
+// Port of erts/emulator/beam/bif.c (raise_3), OTP-29.1.1.
+pub(crate) extern "C" fn raise_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    use arinsal_term::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN};
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let [class, value, stacktrace] = bif_args::<3>(reg);
+    let freason = match class.as_atom() {
+        Some(atom) if atom == atoms::ERROR => EXC_ERROR,
+        Some(atom) if atom == atoms::EXIT => EXC_EXIT,
+        Some(atom) if atom == atoms::THROW => EXC_THROWN,
+        _ => return crate::native_hooks::raw(Term::atom(atoms::BADARG)),
+    };
+    if !valid_raise_stacktrace(stacktrace) {
+        return crate::native_hooks::raw(Term::atom(atoms::BADARG));
+    }
+    let exc = &mut process.heap.abi.exc;
+    exc.freason = freason;
+    exc.fvalue = value.word();
+    exc.ftrace = stacktrace.word();
+    arinsal_term::THE_NON_VALUE
+}
+
+/// The syntax check of `raise_3`: a proper list of `{Fun, Args}`, `{Fun, Args, Location}`,
+/// `{M, F, A}` or `{M, F, A, Location}` frames, each `Location` a list.
+// Port of erts/emulator/beam/bif.c (raise_3: the stacktrace loop), OTP-29.1.1.
+fn valid_raise_stacktrace(stacktrace: Term) -> bool {
+    use arinsal_term::raw::{Cons, Tuple};
+    let is_atom = |term: Option<Term>| term.is_some_and(|t| t.as_atom().is_some());
+    let is_fun = |term: Option<Term>| term.is_some_and(|t| t.classify() == TermKind::Fun);
+    let is_location = |term: Option<Term>| {
+        term.is_some_and(|t| matches!(t.classify(), TermKind::List | TermKind::Nil))
+    };
+    let mut tail = stacktrace;
+    while let Ok(cons) = Cons::try_from(tail) {
+        let Ok(frame) = Tuple::try_from(cons.head()) else {
+            return false;
+        };
+        let first = frame.get(0);
+        let valid = match frame.arity() {
+            2 => is_fun(first),
+            3 if is_fun(first) => is_location(frame.get(2)),
+            3 => is_atom(first) && is_atom(frame.get(1)),
+            4 => is_atom(first) && is_atom(frame.get(1)) && is_location(frame.get(3)),
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+        tail = cons.tail();
+    }
+    tail == Term::NIL
 }

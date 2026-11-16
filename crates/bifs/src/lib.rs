@@ -276,31 +276,6 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
         Term::NON_VALUE
     }
 
-    /// Leave a primary exception in the process failure words without an argument-list flag.
-    ///
-    /// Port of erts/emulator/beam/bif.c (error_1, exit_1, throw_1), OTP-29.1.1.
-    #[inline]
-    pub fn fail_exception(&mut self, class: Class, reason: Term) -> Term {
-        if self.state.uses_process_exc
-            && let Some(abi) = self.heap.native_abi_mut()
-        {
-            abi.exc.freason = match class {
-                Class::Error => arinsal_term::exc::EXC_ERROR,
-                Class::Exit => arinsal_term::exc::EXC_EXIT,
-                Class::Throw => arinsal_term::exc::EXC_THROWN,
-            };
-            abi.exc.fvalue = reason.word();
-            abi.exc.ftrace = 0;
-        } else {
-            self.state.error = Some(BifError::Raise {
-                class,
-                reason,
-                stacktrace: None,
-            });
-        }
-        Term::NON_VALUE
-    }
-
     /// `BIF_ERROR(p, BADARG)`.
     #[inline]
     pub fn badarg(&mut self) -> Term {

@@ -1042,7 +1042,7 @@ mod tests {
     fn purged_native_body_slots_are_reused() {
         let code = node();
         let native =
-            crate::natives::nif::NativeFn::Bif(arinsal_bifs::lookup("erlang", "hd", 1).unwrap());
+            crate::natives::nif::NativeFn::Bif(arinsal_bifs::lookup("erlang", "abs", 1).unwrap());
         let first = code.push_native_fn(native.clone()).unwrap();
         let second = code.push_native_fn(native.clone()).unwrap();
         assert_eq!((first, second), (0, 1));
