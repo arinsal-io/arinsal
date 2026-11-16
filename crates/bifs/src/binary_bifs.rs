@@ -2,10 +2,10 @@
 
 use std::borrow::Cow;
 
+use arinsal_term::raw::Cons;
 use arinsal_term::{ConsListBuilder, HeapAlloc, MagicBin, TermBuilder};
 
 use crate::binary_mod::{SearchPattern, SearchPatternHandle, SearchWalk};
-use crate::lists::cons_cell;
 use crate::{BifError, Ctx};
 
 use super::*;
@@ -782,7 +782,7 @@ fn compile_search_pattern(term: Term) -> Result<SearchPattern, BifError> {
             let mut patterns = Vec::new();
             let mut remaining = term;
             while remaining != Term::NIL {
-                let Some((candidate, tail)) = cons_cell(remaining) else {
+                let Some((candidate, tail)) = Cons::try_from(remaining).ok().map(Cons::pair) else {
                     return Err(BADARG);
                 };
                 let bytes = binary_bytes(candidate)?;
@@ -1095,7 +1095,7 @@ fn split_options(
     let mut scope = (0, len);
     let mut rest = options;
     while rest != Term::NIL {
-        let Some((option, tail)) = cons_cell(rest) else {
+        let Some((option, tail)) = Cons::try_from(rest).ok().map(Cons::pair) else {
             return Err(BADARG);
         };
         rest = tail;

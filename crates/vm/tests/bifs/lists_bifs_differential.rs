@@ -68,6 +68,10 @@ cases() ->
         fun() -> lists:keysearch(c, 3, Tuples) end,
         fun() -> lists:keysearch(299999, 1, LongKv) end,
         fun() -> Seq -- [2, 2.0, 4] end,
+        fun() -> lists:seq(1, 16) -- [1, 8, 16] end,
+        fun() -> lists:seq(1, 40) -- lists:seq(1, 16) end,
+        fun() -> lists:seq(1, 17) -- lists:seq(1, 17) end,
+        fun() -> lists:seq(1, 40) -- lists:seq(1, 17) end,
         fun() -> Seq -- Improper end,
         fun() -> Improper -- [1] end,
         fun() -> [] -- x end,
@@ -121,7 +125,7 @@ fn list_bifs_match_otp() {
     else {
         panic!("cases/0 did not return a list: {actual:?}");
     };
-    assert_eq!(want.len(), got.len());
+    similar_asserts::assert_eq!(want.len(), got.len());
     let mismatches: Vec<String> = want
         .iter()
         .zip(got)

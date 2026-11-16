@@ -7,10 +7,11 @@
 //! traps to the hidden `erlang:length/3` (`erlang_length_export`, installed by
 //! `erts_init_trap_export`) with `(List, Length, OriginalList)`.
 
-use crate::natives::bif::bif_ret;
+use crate::natives::bif::{bif_badarg, bif_ret, bif_system_limit};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifCall, Ctx, LengthStep, ProcessHeapHandle};
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_term::Term;
+use arinsal_term::raw::Cons;
 
 /// `erlang:length/1`.
 // Port of erts/emulator/beam/erl_bif_guard.c (length_1), OTP-29.1.1.
@@ -33,7 +34,7 @@ pub(crate) extern "C" fn erlang_length_trap(c_p: *mut ProcessHeader, reg: *mut u
     process.heap.note_bif_entry();
     let [list, acc, original] = crate::bif_table::bif_args::<3>(reg);
     let Some(acc) = acc.as_small().and_then(|acc| usize::try_from(acc).ok()) else {
-        return bif_ret(c_p, i, Err(crate::natives::bif::badarg()));
+        return bif_badarg(c_p);
     };
     length_run(c_p, reg, i, process, list, acc, original)
 }
@@ -50,30 +51,40 @@ fn length_run(
     acc: usize,
     original: Term,
 ) -> u64 {
-    let step = {
-        let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut call = BifCall::default();
-        let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
-        arinsal_bifs::length_slice(&mut ctx, list, acc)
-    };
-    match step {
-        Ok(LengthStep::Done(value)) => crate::native_hooks::raw(value),
-        Ok(LengthStep::More(cont)) => {
-            let acc = Term::small(cont.acc() as i64).expect("a list length is a small integer");
-            let trap = crate::natives::erl_bif_lists::bif_trap(
-                process,
-                "erlang:length/3",
-                vec![cont.list(), acc, original],
-            );
-            bif_ret(c_p, i, Err(trap))
-        }
-        Err(error) => {
-            crate::bif_table::set_bif_arg(reg, 0, original);
-            let error =
-                crate::exceptions::bif_error(process, "erlang", "length", &[original], error);
-            bif_ret(c_p, i, Err(error))
-        }
+    let budget = process.heap.abi.fcalls.max(0) as usize * 16;
+    let mut cursor = list;
+    let mut count = acc;
+    let mut scanned = 0usize;
+    while scanned < budget {
+        let Some(cons) = Cons::try_from(cursor).ok() else {
+            break;
+        };
+        cursor = cons.tail();
+        count += 1;
+        scanned += 1;
     }
+    if Cons::try_from(cursor).is_ok() {
+        process.heap.abi.fcalls = 0;
+        let Some(acc) = i64::try_from(count).ok().and_then(Term::small) else {
+            return bif_system_limit(c_p);
+        };
+        let trap = crate::natives::erl_bif_lists::bif_trap(
+            process,
+            "erlang:length/3",
+            vec![cursor, acc, original],
+        );
+        return bif_ret(c_p, i, Err(trap));
+    }
+    if cursor != Term::NIL {
+        crate::bif_table::set_bif_arg(reg, 0, original);
+        return bif_badarg(c_p);
+    }
+    let reds = (scanned / 16).min(i32::MAX as usize) as i32;
+    process.heap.abi.fcalls = (process.heap.abi.fcalls - reds).max(0);
+    let Some(value) = i64::try_from(count).ok().and_then(Term::small) else {
+        return bif_system_limit(c_p);
+    };
+    crate::native_hooks::raw(value)
 }
 
 /// `erlang:min/2`.

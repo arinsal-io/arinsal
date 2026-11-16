@@ -24,19 +24,11 @@ use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, NativeAbi, Node, Process
 mod arith;
 mod binary_mod;
 mod dirty;
-mod lists;
 mod pure;
 mod sys;
 mod time;
 mod unique;
 
-pub use lists::{
-    APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
-    KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont, LengthStep,
-    MEMBER_PER_RED, MemberCont, MemberStep, REVERSE_CELLS_PER_RED, REVERSE_ONHEAP_CELLS_PER_RED,
-    ReverseCont, ReverseStep, SubtractWalk, append_onheap_direct, length_slice, lists_append,
-    lists_key, lists_member, lists_reverse, reverse_onheap_direct,
-};
 pub use pure::{
     B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistVecWalk,
     Phash2Cont, Phash2Run, allocate_iolist_binary, atom_to_list_term, binary_bytes, binary_part_2,
