@@ -4095,16 +4095,11 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
     if flags & (TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP | MONOTONIC_TIMESTAMP) == 0 {
         return None;
     }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if flags & TIMESTAMP != 0 {
-        let now = arinsal_bifs::lookup("erlang", "now", 0)?;
-        let mut state = arinsal_bifs::BifState::default();
-        return now(
-            &mut arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state),
-            &[],
-        )
-        .ok();
+        // erl_trace.c: `get_now(&ms, &s, &us)` then the {Mega, Sec, Micro} tuple.
+        return crate::natives::erl_time_sup::now_tuple(process).ok();
     }
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let monotonic = TermBuilder::new(&mut heap)
         .int_from_i128(arinsal_sched::erl_time_sup::monotonic_time_nanos())
         .ok()?;

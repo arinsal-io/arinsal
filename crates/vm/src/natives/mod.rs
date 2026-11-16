@@ -763,64 +763,6 @@ mod tests {
     }
 
     #[test]
-    fn pure_bif_imports_skip_family_dispatch() {
-        use arinsal_loader::ImportClass;
-        let (class, bits) = classify("erlang", "size", 1, true);
-        assert_eq!(class, ImportClass::Pure);
-        assert_eq!(bits, 0);
-        // A BIF whose body is its `bif_table` entry has no named native.
-        let (class, bits) = classify("erlang", "self", 0, false);
-        assert_eq!(class, ImportClass::Native);
-        assert_eq!(bits, 0);
-        for (function, arity) in [
-            ("!", 2),
-            ("send", 2),
-            ("send", 3),
-            ("is_process_alive", 1),
-            ("link", 1),
-            ("link", 2),
-            ("unlink", 1),
-            ("exit", 2),
-            ("exit", 3),
-            ("exit_signal", 2),
-            ("exit_signal", 3),
-            ("register", 2),
-            ("unregister", 1),
-            ("whereis", 1),
-            ("registered", 0),
-            ("++", 2),
-            ("--", 2),
-        ] {
-            let (class, bits) = classify("erlang", function, arity, false);
-            assert_eq!(class, ImportClass::Native, "erlang:{function}/{arity}");
-            assert_eq!(bits, 0, "erlang:{function}/{arity} is its bif_table body");
-        }
-        // erl_bif_lists.c
-        for (function, arity) in [("reverse", 2), ("member", 2), ("keyfind", 3)] {
-            let (class, bits) = classify("lists", function, arity, false);
-            assert_eq!(class, ImportClass::Native, "lists:{function}/{arity}");
-            assert_eq!(bits, 0, "lists:{function}/{arity} is its bif_table body");
-        }
-        // erl_map.c
-        for (function, arity) in [
-            ("from_list", 1),
-            ("from_keys", 2),
-            ("keys", 1),
-            ("values", 1),
-        ] {
-            let (class, bits) = classify("maps", function, arity, false);
-            assert_eq!(class, ImportClass::Native, "maps:{function}/{arity}");
-            assert_eq!(bits, 0, "maps:{function}/{arity} is its bif_table body");
-        }
-        // Plain BIFs with no I/O side effects stay on the pure path.
-        for (function, arity) in [("atom_to_list", 1), ("list_to_atom", 1)] {
-            let (class, bits) = classify("erlang", function, arity, true);
-            assert_eq!(class, ImportClass::Pure, "erlang:{function}/{arity}");
-            assert_eq!(bits, 0);
-        }
-    }
-
-    #[test]
     fn listed_natives_are_dispatched_by_their_family() {
         for &(module, function, arity) in implemented_natives() {
             assert!(

@@ -1757,6 +1757,26 @@ pub(crate) fn decode_failure(
         return Some(BifError::Dirty(class));
     }
     let class = crate::stacktrace::class_from_freason(freason)?;
+    // beam_common.c handle_error: EXF_ARGLIST (set only by error/2,3) carries
+    // `{Reason, Args[, ErrorInfo]}` in fvalue; the reason is its first element and the
+    // caller's frame takes Args (the executor reads them from the BIF arguments).
+    let fvalue = if freason & EXF_ARGLIST != 0
+        && let Ok(tuple) = arinsal_term::raw::Tuple::try_from(fvalue)
+        && tuple.arity()
+            == if freason & EXF_HAS_EXT_INFO != 0 {
+                3
+            } else {
+                2
+            } {
+        if freason & EXF_HAS_EXT_INFO != 0
+            && let Some(info) = tuple.get(2)
+        {
+            exc.fvalue = crate::native_hooks::raw(info);
+        }
+        tuple.get(0)?
+    } else {
+        fvalue
+    };
     Some(match exc_index(freason) {
         3 => BifError::Badarg {
             cause: (freason & EXF_HAS_EXT_INFO != 0).then_some(ftrace),
@@ -2561,21 +2581,10 @@ fn native_exception_class(freason: u64, error_arglist: bool) -> Option<arinsal_b
 }
 
 /// Identifies `error/2,3`'s encoded arglist using the same BIF MFA passed to `handle_error`.
-pub(crate) fn is_error_arglist(process: &crate::Process, bif_info: u64, freason: u64) -> bool {
+pub(crate) fn is_error_arglist(_process: &crate::Process, _bif_info: u64, freason: u64) -> bool {
+    // beam_common.c handle_error: `if (c_p->freason & EXF_ARGLIST)` — only error/2,3 set it.
     use arinsal_beamasm::exc::{EXC_ERROR, EXF_ARGLIST, EXF_HAS_EXT_INFO};
-    if freason & EXF_ARGLIST == 0 || freason & !(EXF_ARGLIST | EXF_HAS_EXT_INFO) != EXC_ERROR {
-        return false;
-    }
-    let bif_info = if bif_info == 0 {
-        process.heap.abi.current as usize as u64
-    } else {
-        bif_info
-    };
-    arinsal_beamasm::bif::static_bif_mfa(bif_info).is_some_and(|(module, function, arity)| {
-        module == arinsal_term::atoms::ERLANG
-            && function == arinsal_term::atoms::ERROR
-            && matches!(arity, 2 | 3)
-    })
+    freason & EXF_ARGLIST != 0 && freason & !(EXF_ARGLIST | EXF_HAS_EXT_INFO) == EXC_ERROR
 }
 
 /// Unpacks the `Value = {Reason, Args[, ErrorInfo]}` used by `erlang:error/2,3`.

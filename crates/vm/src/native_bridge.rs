@@ -1256,9 +1256,17 @@ fn native_exit(
     } else if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
         && process.heap.abi.exc.ftrace != 0
     {
-        // `raise/3` with an immediate stacktrace left everything in the failure words.
+        // `raise/3` with an immediate stacktrace left everything in the failure words; for
+        // error/2,3 (EXC_ERROR_2/3) handle_error first unpacks `{Reason, Args[, Info]}`.
         let freason = process.heap.abi.exc.freason;
-        let reason = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+        let reason = if crate::native_helpers::is_error_arglist(process, 0, freason)
+            && let Some((reason, _args)) =
+                crate::native_helpers::unpack_error_arglist(process, freason)
+        {
+            reason
+        } else {
+            crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
+        };
         let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
         process.heap.abi.exc.ftrace = 0;
         let class =

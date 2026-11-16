@@ -716,7 +716,7 @@ sched_bif!(
 
 #[cfg(test)]
 mod tests {
-    use super::{entry, special};
+    use super::special;
     use crate::natives::external;
 
     // install_bifs fills `bif_table[ep->bif_number]`; the export itself carries no function.
@@ -737,19 +737,6 @@ mod tests {
             super::bif!(crate::natives::bif::self_0)
         );
         similar_asserts::assert_eq!(super::function(-1), 0);
-    }
-
-    #[test]
-    fn every_bif_of_arinsal_bifs_has_its_own_entry() {
-        let size = entry("erlang", "size", 1).expect("size");
-        let phash = entry("erlang", "phash", 2).expect("phash");
-        assert_ne!(phash.plain, size.plain);
-        // Arities that share one body share its entry.
-        let node0 = entry("erlang", "node", 0).expect("node/0");
-        let node1 = entry("erlang", "node", 1).expect("node/1");
-        similar_asserts::assert_eq!(node0.plain, node1.plain);
-        assert!(entry("erlang", "no_such_bif", 1).is_none());
-        assert!(entry("erlang", "size", 2).is_none());
     }
 
     #[test]

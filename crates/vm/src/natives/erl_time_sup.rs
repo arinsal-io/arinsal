@@ -129,8 +129,9 @@ fn convert_native(
             / NATIVE;
         return integer(process, result + offset);
     }
+    // trap_to_erlang_code: `val + muloff*ERTS_MONOTONIC_OFFSET_NATIVE`.
     let native = Term::small(NATIVE as i64).ok_or_else(system_limit)?;
-    let value = integer(process, value)?;
+    let value = integer(process, external_value)?;
     Err(bif_trap(
         process,
         "erlang:convert_time_unit/3",
@@ -288,7 +289,7 @@ pub(crate) extern "C" fn os_timestamp_0(c_p: *mut ProcessHeader, _reg: *mut u64,
     })
 }
 
-fn now_tuple(process: &mut Process) -> Result<Term, VmError> {
+pub(crate) fn now_tuple(process: &mut Process) -> Result<Term, VmError> {
     let micros = arinsal_sched::erl_time_sup::next_now_micros().ok_or_else(system_limit)?;
     timestamp_tuple(process, i128::from(micros))
 }
