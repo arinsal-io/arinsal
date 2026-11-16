@@ -677,6 +677,7 @@ fn b2t_init_reds(process: &Process, ctx: &mut B2tContext<'_>) {
 /// machine with `ERTS_BIF_REDS_LEFT * 128` bytes of budget; it traps through
 /// `erts_internal:binary_to_term_trap/1` when that runs out.
 // Port of erts/emulator/beam/external.c (binary_to_term_int), OTP-29.1.1.
+#[inline(always)]
 fn binary_to_term_int(
     c_p: *mut ProcessHeader,
     reg: *mut u64,

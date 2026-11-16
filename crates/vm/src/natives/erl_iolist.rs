@@ -646,9 +646,7 @@ fn iolist_binary_step(
     };
     let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
     let stepped = match output {
-        IolistOutput::Small(writer) => {
-            walk.step_to_heap_binary(&mut process.heap, writer, yield_count)
-        }
+        IolistOutput::Small(writer) => walk.step(writer.bytes_mut(), yield_count),
         IolistOutput::Bitstring(bytes) => walk.step(bytes, yield_count),
         IolistOutput::Writable(term) => arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
             Ok(walk.step(bytes, yield_count))
@@ -680,9 +678,12 @@ fn iolist_binary_step(
     }
     let (bit_len, bitstring) = (*bit_len, *bitstring);
     let value = match output {
-        IolistOutput::Small(writer) => writer
-            .finish(&mut process.heap)
-            .map_err(|_| BifError::SystemLimit)?,
+        IolistOutput::Small(writer) => {
+            writer.set_written(bit_len / 8);
+            writer
+                .finish(&mut process.heap)
+                .map_err(|_| BifError::SystemLimit)?
+        }
         IolistOutput::Bitstring(bytes) => {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let mut builder = TermBuilder::new(&mut heap);

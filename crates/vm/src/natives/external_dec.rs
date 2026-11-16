@@ -139,9 +139,9 @@ fn decode_input(args: &[Term]) -> Result<DecodeInput<'_>, BifError> {
     if !view.bit_len().is_multiple_of(8) {
         return Err(BifError::BADARG);
     }
-    let can_borrow = view.is_refc()
-        && view.start_bit().is_multiple_of(8)
-        && !arinsal_term::is_writable_binary(term);
+    // `erts_get_aligned_binary_bytes_extra`: aligned bytes are used where they lie (heap binary,
+    // refc binary or sub binary); only an unaligned sub binary is copied.
+    let can_borrow = view.start_bit().is_multiple_of(8) && !arinsal_term::is_writable_binary(term);
     if can_borrow {
         let offset = view.start_bit() / 8;
         let len = view.bit_len() / 8;
@@ -195,6 +195,7 @@ pub(crate) struct B2tContext<'a> {
 
 impl<'a> B2tContext<'a> {
     /// Start decoding an ETF binary while borrowing a reference-counted input payload.
+    #[inline(always)]
     pub(crate) fn new(args: &'a [Term], arity: usize) -> Result<Self, BifError> {
         let opts = decode_options(args.get(1).copied())?;
         let input = decode_input(args)?;
@@ -305,14 +306,19 @@ impl<'a> B2tContext<'a> {
         let input = match input {
             DecodeInput::Inline(bytes) => DecodeInput::Inline(bytes),
             DecodeInput::Refc { owner, offset, len } => DecodeInput::Refc { owner, offset, len },
+            // A heap binary lives in the process heap, which a trap leaves: the context keeps
+            // its own bytes (the trapped export holds no pointer into the heap).
             DecodeInput::Borrowed {
-                term, offset, len, ..
+                bytes,
+                term,
+                offset,
+                len,
             } => match binary_owner(term) {
                 // `new` excluded active writable handles. The process can still expose an
                 // immutable bitstring backed by a writable owner; pin it like the BIF argument
                 // root held by erts across a trap.
                 Some(BinaryOwner::Binary(owner)) => DecodeInput::Refc { owner, offset, len },
-                _ => return Err(BifError::BADARG),
+                _ => DecodeInput::Inline(Box::from(bytes)),
             },
         };
         Ok(B2tContext {

@@ -962,6 +962,24 @@ impl HeapBinaryWriter {
         self.bytes == 0
     }
 
+    /// The reserved payload, which `erts_iolist_to_buf` fills in place: the heap binary
+    /// `erts_new_bitstring` returned together with its data pointer (`to_base`).
+    // Port of erts/emulator/beam/erl_bits.c (erts_new_bitstring), OTP-29.1.1.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        assert!(!self.finished, "heap binary writer is finalized");
+        let data = (self.term.0 & !7) as *mut u64;
+        // SAFETY: `new` reserved `2 + ceil(bytes / 8)` words at `start` on the young heap or in
+        // a heap fragment of the process, zeroed the payload words, and disabled GC, so the
+        // block neither moves nor is shared while this writer, which borrows `self`, lives.
+        unsafe { std::slice::from_raw_parts_mut(data.wrapping_add(2).cast::<u8>(), self.bytes) }
+    }
+
+    /// Record that the payload was filled through [`Self::bytes_mut`].
+    pub fn set_written(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes, "written bytes exceed the reservation");
+        self.written = bytes;
+    }
+
     /// Append the next source chunk at the retained write offset.
     // Port of erts/emulator/beam/erl_iolist.c:425-620 (`generic_iolist_copy`), OTP-29.1.1.
     pub fn write(&mut self, heap: &mut ProcessHeap, chunk: &[u8]) -> Result<(), TermError> {
