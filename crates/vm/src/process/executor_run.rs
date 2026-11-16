@@ -277,7 +277,11 @@ impl Executor {
                                 break Ok(RunState::Yield);
                             }
                             process.slice_mut().native_dirty_nif = None;
-                            match crate::native_helpers::run_static_nif(process, identity) {
+                            match crate::native_helpers::run_static_nif(
+                                process,
+                                &self.native_registers.x_reg_array,
+                                identity,
+                            ) {
                                 Ok(value) => {
                                     self.native_registers.x_reg_array[0] = value;
                                     process.native_continuation_resume = true;

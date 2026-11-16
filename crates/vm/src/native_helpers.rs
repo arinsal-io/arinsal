@@ -34,10 +34,11 @@ pub extern "C" fn arinsal_beamasm_raise_class(
     }
     let empty_class = crate::exceptions::empty_trace_class(trace);
     let raw_class = crate::stacktrace::raw_class(process, trace);
-    let class = empty_class
-        .or(raw_class)
-        .or(process.exc_class)
-        .or_else(|| crate::exceptions::parse_class(process.x[3]));
+    let class = empty_class.or(raw_class).or(process.exc_class).or_else(|| {
+        // x3 of `reg` holds the class atom a catch put there (found_catch).
+        let reg = crate::process::sched_data::sched_registers(process)?;
+        crate::exceptions::parse_class(reg[3])
+    });
     // Port of erts/emulator/beam/beam_common.c (erts_sanitize_freason), OTP-29.1.1: a valid
     // stacktrace is re-raised as is.
     let reraise = arinsal_beamasm::catch::RERAISE;
@@ -93,7 +94,9 @@ pub extern "C" fn arinsal_beamasm_build_stacktrace(
     let trace = crate::native_hooks::from_raw(trace_raw);
     match crate::exceptions::materialize(process, trace) {
         Ok(value) => {
-            process.x[0] = value;
+            if let Some(reg) = crate::process::sched_data::sched_registers(process) {
+                reg[0] = value;
+            }
             crate::native_hooks::raw(value)
         }
         Err(_) => {
@@ -523,15 +526,16 @@ pub(crate) fn static_nif_job(
     }))
 }
 
-/// Runs a static NIF with the arguments in `process.x`, for a dirty NIF call the executor
+/// Runs a static NIF with the arguments in `reg`, for a dirty NIF call the executor
 /// performs on a dirty scheduler, or takes the result of its dirty job. [`BOUND_NIF`]
 /// resumes the call of a NIF bound by `load_nif` that the process carries.
 pub(crate) fn run_static_nif(
     process: &mut crate::Process,
+    reg: &[Term],
     identity: usize,
 ) -> Result<Term, crate::VmError> {
     if identity == BOUND_NIF {
-        return run_bound_nif(process);
+        return run_bound_nif(process, reg);
     }
     let nif = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&identity)?;
@@ -551,7 +555,7 @@ pub(crate) fn run_static_nif(
     if module == "prim_tty" {
         crate::natives::tty::note_caller_native(process);
     }
-    let args = process.x[..usize::from(arity)].to_vec();
+    let args = reg[..usize::from(arity)].to_vec();
     let pending = process
         .cold
         .as_mut()
@@ -578,7 +582,7 @@ pub(crate) fn run_static_nif(
 /// Resumes the dirty call or continuation of a NIF bound by `load_nif` that native code
 /// handed to the executor.
 // Port of erts/emulator/beam/erl_nif.c:426-520 (erts_call_dirty_nif), OTP-29.1.1.
-fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
+fn run_bound_nif(process: &mut crate::Process, reg: &[Term]) -> Result<Term, crate::VmError> {
     let Some(pending) = process
         .cold
         .as_mut()
@@ -593,7 +597,7 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
         (module.to_owned(), function.to_owned(), usize::from(arity))
     };
     crate::natives::nif::refresh_hub_native(process);
-    let args = process.x.get(..arity).unwrap_or_default().to_vec();
+    let args = reg.get(..arity).unwrap_or_default().to_vec();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::natives::nif::resume_pending(&mut process.heap, pending)
     }))
@@ -609,12 +613,13 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
 /// the dirty scheduler executor or an exception.
 fn leave_native_nif(
     process: &mut crate::Process,
+    reg: &mut [Term],
     result: std::thread::Result<Result<Term, arinsal_bifs::BifError>>,
     (identity, arity): (usize, u8),
 ) -> u64 {
     match result {
         Ok(Ok(value)) => {
-            process.x[0] = value;
+            reg[0] = value;
             crate::native_hooks::raw(value)
         }
         Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
@@ -627,7 +632,7 @@ fn leave_native_nif(
             trap_to_dirty_nif(process, identity, class, arity)
         }
         Ok(Err(error)) => {
-            let args = process.x[..usize::from(arity)].to_vec();
+            let args = reg[..usize::from(arity)].to_vec();
             let bif_mfa = crate::beamasm_integration::export_dispatch(identity)
                 .map_or(0, |export| std::ptr::from_ref(export.mfa()) as usize);
             set_native_bif_error(process, bif_mfa, &args, error);
@@ -644,6 +649,11 @@ fn leave_native_nif(
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900, OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identity: u64) -> u64 {
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    // `erts_proc_sched_data(c_p)->registers`: the NIF's arguments.
+    let Some(reg) = crate::process::sched_data::sched_registers(process) else {
+        crate::native_hooks::set_error(process, "system_limit");
         return 0;
     };
     let Some(nif) = static_nifs().lock().ok().and_then(|nifs| {
@@ -670,13 +680,9 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
         crate::natives::tty::note_caller_native(process);
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::calls::call_bif(
-            &mut process.heap,
-            nif.entry,
-            &process.x[..usize::from(nif.arity)],
-        )
+        crate::calls::call_bif(&mut process.heap, nif.entry, &reg[..usize::from(nif.arity)])
     }));
-    leave_native_nif(process, result, (identity as usize, nif.arity))
+    leave_native_nif(process, reg, result, (identity as usize, nif.arity))
 }
 
 /// Calls the NIF that `load_nif` bound to a native call-NIF body.
@@ -685,6 +691,11 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
 // (beam_jit_call_nif), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64) -> u64 {
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    // `erts_proc_sched_data(c_p)->registers`: the NIF's arguments.
+    let Some(reg) = crate::process::sched_data::sched_registers(process) else {
+        crate::native_hooks::set_error(process, "system_limit");
         return 0;
     };
     // SAFETY: `site` is the address this call-NIF body was compiled with: a boxed
@@ -696,13 +707,9 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
         return 0;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::natives::nif::call_native(
-            &mut process.heap,
-            native,
-            &process.x[..usize::from(site.arity)],
-        )
+        crate::natives::nif::call_native(&mut process.heap, native, &reg[..usize::from(site.arity)])
     }));
-    leave_native_nif(process, result, (BOUND_NIF, site.arity))
+    leave_native_nif(process, reg, result, (BOUND_NIF, site.arity))
 }
 
 /// The dirty scheduler class static NIF `module:function/arity` is flagged with in its library's
@@ -1224,7 +1231,7 @@ pub(crate) extern "C" fn atom_to_list_light(
     // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
     // finds its export through `c_p->current`, which the call fragment set.
     let (descriptor, _) = crate::bif_table::current_export(header);
-    if let Some(raw) = atom_to_list_latin1(header) {
+    if let Some(raw) = atom_to_list_latin1(header, regs) {
         return raw;
     }
     allocating_bif(header, regs, descriptor, 1, |heap, arg| {
@@ -1234,9 +1241,9 @@ pub(crate) extern "C" fn atom_to_list_light(
 
 /// ASCII / single-byte latin1: one `HAlloc` and `buf_to_intlist`. `None` is a
 /// non-atom, a multi-byte name, or a heap that needs a fragment.
-fn atom_to_list_latin1(header: *mut ProcessHeader) -> Option<u64> {
+fn atom_to_list_latin1(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
     let process = crate::native_hooks::process_from_header(header)?;
-    let arg = process.x.first().copied()?;
+    let [arg] = crate::bif_table::bif_args::<1>(regs);
     let text = arinsal_term::global_atoms().text(arg.as_atom()?)?;
     let bytes = text.as_bytes();
     // Atoms are stored as UTF-8. `latin1_chars == len` is exactly the
@@ -1349,13 +1356,13 @@ fn binary_guard_result(
     export: ExportDispatch,
     guard: crate::bif_table::BinaryGuard,
     args: &[Term],
-    light: bool,
+    light: Option<*mut u64>,
 ) -> u64 {
     let result = binary_guard_apply(process, guard, args);
     match result {
         Ok(value) => {
-            if light {
-                process.x[0] = value;
+            if let Some(regs) = light {
+                crate::bif_table::set_bif_arg(regs, 0, value);
             }
             crate::native_hooks::raw(value)
         }
@@ -1368,6 +1375,7 @@ fn binary_guard_result(
 
 fn binary_guard_light(
     header: *mut ProcessHeader,
+    regs: *mut u64,
     descriptor: u64,
     guard: crate::bif_table::BinaryGuard,
     arity: usize,
@@ -1378,16 +1386,15 @@ fn binary_guard_light(
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let mut args = [Term::NIL; 3];
-    args[..arity].copy_from_slice(&process.x[..arity]);
-    binary_guard_result(process, export, guard, &args[..arity], true)
+    let args = crate::bif_table::bif_args::<3>(regs);
+    binary_guard_result(process, export, guard, &args[..arity], Some(regs))
 }
 
 /// Dedicated BeamAsm entry for `byte_size/1` and its guard form.
 // Port of erts/emulator/beam/erl_bif_guard.c:376 (`byte_size_1`), OTP-29.1.1.
 pub(crate) extern "C" fn byte_size_light(
     header: *mut ProcessHeader,
-    _regs: *mut u64,
+    regs: *mut u64,
     _i: u64,
 ) -> u64 {
     // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
@@ -1395,6 +1402,7 @@ pub(crate) extern "C" fn byte_size_light(
     let (descriptor, _) = crate::bif_table::current_export(header);
     binary_guard_light(
         header,
+        regs,
         descriptor,
         crate::bif_table::BinaryGuard::ByteSize,
         1,
@@ -1405,7 +1413,7 @@ pub(crate) extern "C" fn byte_size_light(
 // Port of erts/emulator/beam/erl_bif_guard.c:354 (`bit_size_1`), OTP-29.1.1.
 pub(crate) extern "C" fn bit_size_light(
     header: *mut ProcessHeader,
-    _regs: *mut u64,
+    regs: *mut u64,
     _i: u64,
 ) -> u64 {
     // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
@@ -1413,6 +1421,7 @@ pub(crate) extern "C" fn bit_size_light(
     let (descriptor, _) = crate::bif_table::current_export(header);
     binary_guard_light(
         header,
+        regs,
         descriptor,
         crate::bif_table::BinaryGuard::BitSize,
         1,
@@ -1423,7 +1432,7 @@ pub(crate) extern "C" fn bit_size_light(
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
 pub(crate) extern "C" fn binary_part_2_light(
     header: *mut ProcessHeader,
-    _regs: *mut u64,
+    regs: *mut u64,
     _i: u64,
 ) -> u64 {
     // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
@@ -1431,6 +1440,7 @@ pub(crate) extern "C" fn binary_part_2_light(
     let (descriptor, _) = crate::bif_table::current_export(header);
     binary_guard_light(
         header,
+        regs,
         descriptor,
         crate::bif_table::BinaryGuard::BinaryPart2,
         2,
@@ -2479,11 +2489,8 @@ fn process_bif_result(
     // The collection after the BIF is the caller's (erts_gc_after_bif_call_lhf in the call
     // fragment, beam_jit_call_bif, or the executor's call site), not this epilogue's.
     match result {
-        Ok(value) => {
-            let value = crate::native_hooks::raw(value);
-            process.x[0] = crate::native_hooks::from_raw(value);
-            value
-        }
+        // The call fragment stores the value in x0.
+        Ok(value) => crate::native_hooks::raw(value),
         Err(trap) => process_bif_error(process, export, trap),
     }
 }
@@ -2505,9 +2512,8 @@ fn bif_trap_export(
     }
     // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and set `c_p->arity`: they
     // are the live roots of the collection the caller runs after the BIF.
+    // `install_export_trap` writes them to the registers.
     let arity = export_trap.args.len();
-    process.x.ensure_x(arity);
-    process.x[..arity].copy_from_slice(&export_trap.args);
     process.gc_live = arity;
     process.heap.abi.arity = arity as u8;
     crate::bif_traps::install_export_trap(
@@ -2665,8 +2671,9 @@ fn process_bif_error(
         if let (Some(m), Some(f)) = (atoms.text(*module), atoms.text(*function))
             && let Some(bif) = crate::beamasm_integration::bif_mfa_export(m, f, terms.len() as u8)
         {
-            process.x.ensure_x(terms.len());
-            process.x[..terms.len()].copy_from_slice(terms);
+            if let Some(reg) = crate::process::sched_data::sched_registers(process) {
+                reg[..terms.len()].copy_from_slice(terms);
+            }
             export = bif;
         }
     }
@@ -2744,7 +2751,7 @@ fn plain_bif_result(
             registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
             value
         }
-        Err(error) => plain_bif_error(process, export, error),
+        Err(error) => plain_bif_error(process, registers, export, error),
     }
 }
 
@@ -2855,10 +2862,11 @@ fn gc_after_plain_bif(
 #[inline(never)]
 fn plain_bif_error(
     process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
     export: ExportDispatch,
     error: arinsal_bifs::BifError,
 ) -> u64 {
-    let args = process.x[..usize::from(export.arity)].to_vec();
+    let args = registers.x_reg_array[..usize::from(export.arity)].to_vec();
     set_native_bif_export_error(process, export, &args, error);
     0
 }
@@ -2985,8 +2993,10 @@ fn set_native_bif_context(process: &mut crate::Process, bif_mfa: usize, args: &[
     if bif_mfa != 0 {
         process.heap.abi.current = bif_mfa as *const std::ffi::c_void;
     }
-    let count = args.len().min(process.x.len());
-    process.x[..count].copy_from_slice(&args[..count]);
+    if let Some(reg) = crate::process::sched_data::sched_registers(process) {
+        let count = args.len().min(reg.len());
+        reg[..count].copy_from_slice(&args[..count]);
+    }
 }
 
 fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifError) {
@@ -3577,6 +3587,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     if arity + 1 >= registers.x_reg_array.len() {
         return apply_error(
             process,
+            registers,
             Term::NIL,
             Term::NIL,
             Term::NIL,
@@ -3593,6 +3604,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
         {
             return apply_error(
                 process,
+                registers,
                 module,
                 function,
                 Term::NIL,
@@ -3611,6 +3623,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
         else {
             return apply_error(
                 process,
+                registers,
                 module,
                 function,
                 Term::NIL,
@@ -3619,6 +3632,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
         };
         return apply_error(
             process,
+            registers,
             module,
             function,
             list,
@@ -3645,6 +3659,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     }) else {
         return apply_error(
             process,
+            registers,
             module,
             function,
             Term::NIL,
@@ -3666,15 +3681,16 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
 // jit/arm/instr_call.cpp:205-244 (emit_variable_apply), OTP-29.1.1.
 fn apply_error(
     process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
     module: Term,
     function: Term,
     args: Term,
     reason: arinsal_bifs::BifError,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     set_light_bif_error(process, &reason);
-    process.x[0] = module;
-    process.x[1] = function;
-    process.x[2] = args;
+    registers.x_reg_array[0] = module;
+    registers.x_reg_array[1] = function;
+    registers.x_reg_array[2] = args;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:211 (`static ErtsCodeMFA apply3_mfa`).
     static APPLY3_MFA: std::sync::OnceLock<arinsal_term::ErtsCodeMfa> = std::sync::OnceLock::new();
     let mfa = APPLY3_MFA.get_or_init(|| arinsal_term::ErtsCodeMfa {
@@ -3736,6 +3752,7 @@ fn apply3(
     let (Some(module_atom), Some(function_atom)) = (module.as_atom(), function.as_atom()) else {
         return apply_error(
             process,
+            registers,
             module,
             function,
             args,
@@ -3749,6 +3766,7 @@ fn apply3(
         if arity >= registers.x_reg_array.len() - 1 {
             return apply_error(
                 process,
+                registers,
                 module,
                 function,
                 args,
@@ -3760,6 +3778,7 @@ fn apply3(
     if list != Term::NIL {
         return apply_error(
             process,
+            registers,
             module,
             function,
             args,
@@ -3769,6 +3788,7 @@ fn apply3(
     let Ok(arity) = u8::try_from(arity) else {
         return apply_error(
             process,
+            registers,
             module,
             function,
             args,
@@ -3792,6 +3812,7 @@ fn apply3(
     }) else {
         return apply_error(
             process,
+            registers,
             Term::atom(module),
             Term::atom(function),
             args,
@@ -4671,16 +4692,16 @@ pub(crate) extern "C" fn process_info_2_light(
     regs: *mut u64,
     i: u64,
 ) -> u64 {
-    if let Some(raw) = process_info_2_self(header) {
+    if let Some(raw) = process_info_2_self(header, regs) {
         return raw;
     }
     yield_executor_bif(header, regs, i)
 }
 
-fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
+fn process_info_2_self(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
     let process = crate::native_hooks::enter_runtime(header)?;
-    let pid = arinsal_sched::Pid::from_term(process.x.first().copied()?)?;
-    let item = process.x.get(1).copied()?;
+    let [pid, item] = crate::bif_table::bif_args::<2>(regs);
+    let pid = arinsal_sched::Pid::from_term(pid)?;
     let result = crate::natives::proc::process_info_light(process, pid, item);
     // The builder allocates on the process heap. Write the cursor back on every outcome, so an
     // executor fallback re-enters from the header with the same heap.
@@ -4697,7 +4718,7 @@ fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
                     return Some(0);
                 }
                 let Ok(term) = result else { return Some(0) };
-                process.x[0] = term;
+                crate::bif_table::set_bif_arg(regs, 0, term);
                 return Some(crate::native_hooks::raw(term));
             }
             Some(crate::native_hooks::raw(term))

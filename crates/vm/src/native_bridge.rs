@@ -780,7 +780,9 @@ pub(crate) fn next_catch(
 /// Port of erts/emulator/beam/beam_common.c:532-570 (`handle_error` register writes) and
 /// :650-678 (`found_catch`), OTP-29.1.1. The stack and catch word change only once the scan
 /// found the handler.
-#[inline]
+// A function of its own, as `found_catch` in beam_common.c: inlined into the exception
+// resolver it made `try … catch` 6% slower (the resolver's frame and register pressure grew).
+#[inline(never)]
 fn found_catch(
     process: &mut Process,
     reg: &mut [Term],
