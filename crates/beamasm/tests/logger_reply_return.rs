@@ -16,6 +16,7 @@ extern "C" fn unused_get_elements(
     _module: u64,
     _table: u64,
     _stack: u64,
+    _reg: *mut u64,
 ) -> u64 {
     panic!("reply_return uses the inline flatmap lookup")
 }
@@ -26,6 +27,7 @@ extern "C" fn unused_map_update(
     _registers: u64,
     _live: u64,
     _count: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }

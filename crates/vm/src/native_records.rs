@@ -301,12 +301,14 @@ fn update_record(
 /// every key was found.
 pub extern "C" fn arinsal_beamasm_get_record_elements(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    registers: *mut SchedulerRegisters,
     source: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, registers)) = native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) =
+        native_hooks::enter_runtime_reg(header, registers.cast::<u64>())
+    else {
         return 0;
     };
     let (Ok(count), Ok(base)) = (usize::try_from(count), usize::try_from(base)) else {

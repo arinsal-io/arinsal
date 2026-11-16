@@ -110,18 +110,6 @@ pub(crate) fn enter_runtime_after_bif<'a>(
     scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
 }
 
-/// The process and the register file it is attached to, for a helper whose fragment does not
-/// pass `reg` yet (XREG-1: each caller moves to [`enter_runtime_reg`] as its fragment starts
-/// passing `x19`; this accessor goes with the attached `ArgRegs`).
-#[track_caller]
-pub(crate) fn enter_runtime_attached<'a>(
-    header: *mut ProcessHeader,
-) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
-    let process = process_from_header(header)?;
-    process.heap.note_bif_entry();
-    scheduler_registers(process)
-}
-
 /// Process and register base passed by a BeamAsm helper that already has `x19`'s reg pointer.
 pub(crate) fn enter_runtime_with_registers<'a>(
     header: &'a mut ProcessHeader,

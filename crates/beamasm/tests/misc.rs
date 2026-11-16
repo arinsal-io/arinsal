@@ -17,6 +17,7 @@ extern "C" fn apply_hook(
     arity: u32,
     _: u64,
     _: u32,
+    _: *mut u64,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue = u64::from(arity));
     arinsal_beamasm::misc::ApplyResolution {
@@ -29,6 +30,7 @@ extern "C" fn apply3_hook(
     _: *mut ProcessHeader,
     _: u64,
     _: u32,
+    _: *mut u64,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     arinsal_beamasm::misc::ApplyResolution::default()
 }

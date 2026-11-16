@@ -24,6 +24,7 @@ extern "C" fn get_elements(
     _module: u64,
     _table: u64,
     _stack: u64,
+    _reg: *mut u64,
 ) -> u64 {
     arinsal_beamasm::rt::scheduler_registers_mut(
         ACTIVE_REGS.load(std::sync::atomic::Ordering::Relaxed),
@@ -34,7 +35,14 @@ extern "C" fn get_elements(
     );
     1
 }
-extern "C" fn update(_p: *mut ProcessHeader, _a: u64, _b: u64, _c: u64, _d: u64) -> u64 {
+extern "C" fn update(
+    _p: *mut ProcessHeader,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _d: u64,
+    _reg: *mut u64,
+) -> u64 {
     RESULT.with(Cell::get)
 }
 

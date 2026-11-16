@@ -8,7 +8,8 @@ pub type BsMatchHelper = extern "C" fn(*mut crate::ProcessHeader, u32, u64, u64,
 /// Runtime hook for the `bs_match` commands that decode fields (integer, binary, tail, `=:=`).
 /// Arguments: the command kind, then the live X register count; the operands are staged in
 /// [`crate::SchedulerRegisters::match_staging`]. Zero means the match failed.
-pub type BsMatchCmdHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64) -> u64;
+/// The last argument is `reg` (x19), whose staging slots hold the command's operands.
+pub type BsMatchCmdHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64, *mut u64) -> u64;
 /// Words of a `SUB_BITS` object (erts/emulator/beam/erl_bits.h, ERL_SUB_BITS_SIZE).
 const ERL_SUB_BITS_SIZE: u32 = 5;
 /// Heap words for an extracted bitstring: a sub-bitstring, or an on-heap copy of at most
@@ -53,6 +54,7 @@ impl BeamModuleAssembler {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
             e.mov_const(Gpr::x(1), u64::from(kind))?;
             e.mov_const(Gpr::x(2), u64::from(live))?;
+            e.mov_reg(Gpr::x(3), Gpr::x(19))?;
             Ok(())
         })?;
         self.fragment_call(helper as usize)?;

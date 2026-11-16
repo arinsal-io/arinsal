@@ -15,7 +15,8 @@ pub struct ApplyResolution {
 }
 
 /// Resolves `apply Arity` to an export, a native entry or the interpreter fragment.
-pub type ApplyHook = extern "C" fn(*mut crate::ProcessHeader, u32, u64, u32) -> ApplyResolution;
+pub type ApplyHook =
+    extern "C" fn(*mut crate::ProcessHeader, u32, u64, u32, *mut u64) -> ApplyResolution;
 
 impl BeamModuleAssembler {
     /// `send`: `call_light_bif_shared` with `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2`.
@@ -60,7 +61,8 @@ pub enum ApplyKind {
 ///
 /// The return address (non-zero for a tail apply) and stack offset are those of [`ApplyHook`],
 /// for `apply_bif_error_adjustment`.
-pub type Apply3Hook = extern "C" fn(*mut crate::ProcessHeader, u64, u32) -> ApplyResolution;
+pub type Apply3Hook =
+    extern "C" fn(*mut crate::ProcessHeader, u64, u32, *mut u64) -> ApplyResolution;
 
 /// Runtime entry points used by the apply instructions.
 #[derive(Clone, Copy, Debug)]
@@ -144,7 +146,8 @@ fn emit_apply_common(
             asm.code.emit(|e| e.mov_const(Gpr::x(11), 0))?;
             asm.emit_runtime_hook_unchecked(
                 runtime.resolver as usize,
-                &[Gpr::x(9), Gpr::x(10), Gpr::x(11)],
+                // The last argument is `reg` (x19): the resolver moves the arguments there.
+                &[Gpr::x(9), Gpr::x(10), Gpr::x(11), Gpr::x(19)],
                 live,
                 update,
             )?;
@@ -162,7 +165,7 @@ fn emit_apply_common(
             asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
             asm.emit_runtime_hook_unchecked(
                 runtime.apply3_resolver as usize,
-                &[Gpr::x(9), Gpr::x(10)],
+                &[Gpr::x(9), Gpr::x(10), Gpr::x(19)],
                 live,
                 update,
             )?;

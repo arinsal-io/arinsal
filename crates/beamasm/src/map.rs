@@ -35,9 +35,11 @@ const fn logical_xreg(index: u8) -> Gpr {
 /// Runtime implementation for OTP's generic map get helper.
 pub type MapGetHelper = extern "C" fn(*mut ProcessHeader, u64, u64, u64) -> u64;
 /// Runtime implementation for OTP's multi-key map get helper.
-pub type MapGetElementsHelper = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64) -> u64;
+pub type MapGetElementsHelper =
+    extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64, *mut u64) -> u64;
 /// Runtime implementation for map construction and updates; argument terms are staged at X6.
-pub type MapUpdateHelper = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64) -> u64;
+/// The last argument is `reg` (x19), the X register array the staged vector lives in.
+pub type MapUpdateHelper = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64, *mut u64) -> u64;
 
 /// Destination of one lookup in a module-owned multi-key lookup table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -721,7 +723,7 @@ impl BeamModuleAssembler {
         emit_map_runtime(
             self,
             runtime.get_elements as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4), Gpr::x(19)],
             6,
             Update::X_REGS,
         )?;
@@ -787,7 +789,7 @@ impl BeamModuleAssembler {
         emit_map_runtime(
             self,
             runtime.new_map as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4), Gpr::x(19)],
             6,
             Update::HEAP_ALLOC
                 .union(Update::X_REGS)
@@ -1153,6 +1155,7 @@ fn emit_update_map_single_exact_body_shared(
     code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
         e.add_imm(Gpr::x(4), Gpr::x(19), (tmp_mem1 >> 12) as u16, true)?;
+        e.mov_reg(Gpr::x(5), Gpr::x(19))?;
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
     })?;
@@ -1198,6 +1201,7 @@ fn emit_update_map_shared(
         if !single {
             e.mov_reg(ARG3, Gpr::x(19))?;
         }
+        e.mov_reg(Gpr::x(5), Gpr::x(19))?;
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
     })?;

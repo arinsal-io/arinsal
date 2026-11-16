@@ -246,6 +246,7 @@ impl ModuleEnv for CorpusEnv {
             _: u32,
             _: u64,
             _: u32,
+            _: *mut u64,
         ) -> arinsal_beamasm::misc::ApplyResolution {
             arinsal_beamasm::misc::ApplyResolution::default()
         }
@@ -253,6 +254,7 @@ impl ModuleEnv for CorpusEnv {
             _: *mut ProcessHeader,
             _: u64,
             _: u32,
+            _: *mut u64,
         ) -> arinsal_beamasm::misc::ApplyResolution {
             arinsal_beamasm::misc::ApplyResolution::default()
         }
@@ -407,7 +409,14 @@ extern "C" fn bs_match(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) ->
 extern "C" fn map_get(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
     0
 }
-extern "C" fn map_many(_: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) -> u64 {
+extern "C" fn map_many(
+    _: *mut ProcessHeader,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _reg: *mut u64,
+) -> u64 {
     0
 }
 extern "C" fn exception(

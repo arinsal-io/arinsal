@@ -775,9 +775,10 @@ pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
     header: *mut ProcessHeader,
     identity: u64,
     export: Option<ExportDispatch>,
+    reg: *mut u64,
 ) -> u64 {
     // THE_NON_VALUE raises, 1 hands the call to the interpreter, any term word is the result.
-    invoke_dispatch_bif(header, identity as usize, 0, export, true).unwrap_or(1)
+    invoke_dispatch_bif(header, reg, identity as usize, 0, export, true).unwrap_or(1)
 }
 
 /// `call_error_handler` of the export trampoline: the export of
@@ -787,11 +788,12 @@ pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
 pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
     header: *mut ProcessHeader,
     export: Option<ExportDispatch>,
+    reg: *mut u64,
 ) -> usize {
     let Some(stub) = export else {
         return 0;
     };
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let Some(runtime) = process.runtime.as_ref() else {
@@ -863,6 +865,7 @@ pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
     identity: u64,
     site: u64,
     export: Option<ExportDispatch>,
+    reg: *mut u64,
 ) -> u64 {
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:421-447 (call_light_bif_shared's
     // dynamic_runtime_call of the BIF pointer), OTP-29.1.1: make_ref/0 and
@@ -872,10 +875,10 @@ pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
         && export.scheduler_counter.is_some()
         && !crate::trace_bp::any_pattern()
     {
-        return scheduler_counter_entry(header, identity, site, export);
+        return scheduler_counter_entry(header, reg, identity, site, export);
     }
     // `site` is only meaningful for the breakpoint trampoline.
-    call_light_bif_body(header, identity, site, export)
+    call_light_bif_body(header, reg, identity, site, export)
 }
 
 /// The shared fragment's general path. Out of line so a counter BIF does not
@@ -883,11 +886,12 @@ pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
 #[inline(never)]
 fn call_light_bif_body(
     header: *mut ProcessHeader,
+    reg: *mut u64,
     identity: u64,
     site: u64,
     export: Option<ExportDispatch>,
 ) -> u64 {
-    invoke_dispatch_bif(header, identity as usize, site as usize, export, false).unwrap_or(0)
+    invoke_dispatch_bif(header, reg, identity as usize, site as usize, export, false).unwrap_or(0)
 }
 
 /// `make_ref/0` and `unique_integer/0,1` from the light-BIF fragment.
@@ -897,19 +901,20 @@ fn call_light_bif_body(
 #[inline(never)]
 fn scheduler_counter_entry(
     header: *mut ProcessHeader,
+    reg: *mut u64,
     identity: u64,
     site: u64,
     export: ExportDispatch,
 ) -> u64 {
     {
-        let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+        let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
             return 0;
         };
         if registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
             return fast_scheduler_bif(process, registers, export, false).unwrap_or(0);
         }
     }
-    call_light_bif_body(header, identity, site, Some(export))
+    call_light_bif_body(header, reg, identity, site, Some(export))
 }
 
 /// `persistent_term:get/1` from the export's function pointer.
@@ -963,8 +968,9 @@ pub(crate) extern "C" fn persistent_term_get_2_light(
 pub extern "C" fn arinsal_beamasm_native_trace_return(
     header: *mut ProcessHeader,
     kind: u64,
+    reg: *mut u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let Some(kind) = crate::trace::TraceFrameKind::from_index(kind) else {
@@ -1046,8 +1052,9 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     header: *mut ProcessHeader,
     pc: u64,
     live: u64,
+    reg: *mut u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let Ok(live) = usize::try_from(live) else {
@@ -1091,8 +1098,11 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
 /// Restores the live X register prefix from the stack below a returning breakpoint handler.
 // Port of erts/emulator/beam/beam_bp.c:1868-1882
 // (erts_line_breakpoint_hit__cleanup), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(header: *mut ProcessHeader) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let mut live = 0usize;
@@ -1750,6 +1760,7 @@ pub(crate) extern "C" fn trap_bif_light(
 #[inline(always)]
 fn invoke_dispatch_bif(
     header: *mut ProcessHeader,
+    reg: *mut u64,
     identity: usize,
     site: usize,
     export: Option<ExportDispatch>,
@@ -1757,7 +1768,7 @@ fn invoke_dispatch_bif(
 ) -> Option<u64> {
     // The BIF reads its arguments from the register array; only the paths that work on
     // `process.x` (send, the direct table BIFs) load it.
-    let (process, registers) = crate::native_hooks::enter_runtime_attached(header)?;
+    let (process, registers) = crate::native_hooks::enter_runtime_reg(header, reg)?;
     if let Some(export) = export {
         if export_call {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
@@ -3565,9 +3576,10 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     arity: u32,
     return_ip: u64,
     stack_offset: u32,
+    reg: *mut u64,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     use arinsal_beamasm::misc::ApplyResolution;
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return ApplyResolution::default();
     };
     let arity = arity as usize;
@@ -3685,8 +3697,9 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
     header: *mut ProcessHeader,
     return_ip: u64,
     stack_offset: u32,
+    reg: *mut u64,
 ) -> arinsal_beamasm::misc::ApplyResolution {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return arinsal_beamasm::misc::ApplyResolution::default();
     };
     apply3(process, registers, return_ip, stack_offset)
@@ -3810,8 +3823,9 @@ pub extern "C" fn arinsal_beamasm_map_new(
     _registers: u64,
     live: u64,
     count: u64,
+    reg: *mut u64,
 ) -> u64 {
-    arinsal_beamasm_map_change(header, source, live, count, MapChange::New)
+    arinsal_beamasm_map_change(header, reg, source, live, count, MapChange::New)
 }
 
 /// Applies associative updates from the staged key/value vector.
@@ -3823,8 +3837,9 @@ pub extern "C" fn arinsal_beamasm_map_assoc(
     _registers: u64,
     live: u64,
     count: u64,
+    reg: *mut u64,
 ) -> u64 {
-    arinsal_beamasm_map_change(header, source, live, count, MapChange::Assoc)
+    arinsal_beamasm_map_change(header, reg, source, live, count, MapChange::Assoc)
 }
 
 /// Applies exact updates from the staged key/value vector.
@@ -3836,8 +3851,9 @@ pub extern "C" fn arinsal_beamasm_map_exact(
     _registers: u64,
     live: u64,
     count: u64,
+    reg: *mut u64,
 ) -> u64 {
-    arinsal_beamasm_map_change(header, source, live, count, MapChange::Exact)
+    arinsal_beamasm_map_change(header, reg, source, live, count, MapChange::Exact)
 }
 
 /// `Map#{Key => Value}` with a single pair: `erts_maps_put` without the register array.
@@ -3849,8 +3865,9 @@ pub extern "C" fn arinsal_beamasm_map_put_single(
     value: u64,
     map: u64,
     _unused: u64,
+    reg: *mut u64,
 ) -> u64 {
-    map_single::<false>(header, key, value, map, 0)
+    map_single::<false>(header, key, value, map, 0, reg)
 }
 
 /// `Map#{Key := Value}` with a single pair and no failure label: `erts_maps_update`; returns
@@ -3863,8 +3880,9 @@ pub extern "C" fn arinsal_beamasm_map_update_single(
     value: u64,
     map: u64,
     result_pointer: u64,
+    reg: *mut u64,
 ) -> u64 {
-    map_single::<true>(header, key, value, map, result_pointer)
+    map_single::<true>(header, key, value, map, result_pointer, reg)
 }
 
 #[inline(always)]
@@ -3897,6 +3915,7 @@ fn map_single<const EXACT: bool>(
     value: u64,
     map: u64,
     result_pointer: u64,
+    reg: *mut u64,
 ) -> u64 {
     // erts_maps_put/erts_maps_update consume their operands from arguments and
     // do not read the X register array.
@@ -3911,7 +3930,7 @@ fn map_single<const EXACT: bool>(
             return raw;
         }
     }
-    map_single_generic::<EXACT>(header, key, value, map, result_pointer)
+    map_single_generic::<EXACT>(header, key, value, map, result_pointer, reg)
 }
 
 /// The heap-fragment path of a single-pair map update: used by the exact update and when the
@@ -3923,11 +3942,12 @@ fn map_single_generic<const EXACT: bool>(
     value: u64,
     map: u64,
     result_pointer: u64,
+    reg: *mut u64,
 ) -> u64 {
     // Two monomorphic helpers: the put entry carries no exact-update state.
     let exact = EXACT;
     let (process, registers) = if exact {
-        let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+        let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
             return 0;
         };
         (process, Some(registers))
@@ -3986,12 +4006,13 @@ enum MapChange {
 // read from the register array after any collection, like erts' GET_TERM.
 fn arinsal_beamasm_map_change(
     header: *mut ProcessHeader,
+    reg: *mut u64,
     source: u64,
     live: u64,
     count: u64,
     change: MapChange,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let Some(n) = usize::try_from(count).ok().and_then(|c| c.checked_mul(2)) else {
@@ -4006,7 +4027,7 @@ fn arinsal_beamasm_map_change(
     if source_slot >= crate::proc_create::ATTACHED_X_REGS {
         return 0;
     }
-    process.x[source_slot] = crate::native_hooks::from_raw(source);
+    registers.x_reg_array[source_slot] = crate::native_hooks::from_raw(source);
     let map = crate::native_hooks::from_raw(source);
     let need = match change {
         MapChange::New => arinsal_maps::new_map_need(n),
@@ -4016,13 +4037,13 @@ fn arinsal_beamasm_map_change(
     if process.heap.words_left() < need {
         // X registers between the live prefix and the staged vector are dead and may hold
         // stale words; they must not become GC roots.
-        process.x[live..base].fill(Term::NIL);
+        registers.x_reg_array[live..base].fill(Term::NIL);
         if crate::native_hooks::collect_native(process, registers, need, source_slot + 1).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
             return 0;
         }
     }
-    let x = &process.x;
+    let x = &registers.x_reg_array;
     let arg = |i: usize| x[base + i];
     let map = x[source_slot];
     let mut heap = crate::ProcessHeapHandle(&mut process.heap);
@@ -4103,8 +4124,9 @@ pub extern "C" fn arinsal_beamasm_map_get_elements(
     module_handle: u64,
     table_index: u64,
     stack_pointer: u64,
+    reg: *mut u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let Ok(table_index) = usize::try_from(table_index) else {
@@ -4372,15 +4394,16 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     header: *mut ProcessHeader,
     kind: u64,
     live: u64,
+    reg: *mut u64,
 ) -> u64 {
     use arinsal_bits::{BitsError, MatchOps, SegFlags};
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_attached(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let base = live as usize;
     let Some(root_live) = base
         .checked_add(4)
-        .filter(|&count| count <= process.x.len())
+        .filter(|&count| count <= registers.x_reg_array.len())
     else {
         crate::native_hooks::set_error(process, "system_limit");
         return 0;
@@ -4389,23 +4412,23 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     // prefix. Registers beyond `live` are dead and may contain non-term scratch values.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_gc_test_preserve), OTP-29.1.1.
     for (index, slot) in registers.match_staging.iter().enumerate() {
-        process.x[base + index] = crate::native_hooks::from_raw(*slot);
+        registers.x_reg_array[base + index] = crate::native_hooks::from_raw(*slot);
     }
     let small = |term: Term| term.as_small().and_then(|n| usize::try_from(n).ok());
     let mut result: Option<Result<Option<Term>, BitsError>> = None;
     let mut request = 8usize;
     for _ in 0..8 {
-        let ctx = process.x[base];
+        let ctx = registers.x_reg_array[base];
         let outcome = match kind {
             // integer / binary: flags, size, unit
             0 | 1 => {
-                let bits = small(process.x[base + 2])
-                    .zip(small(process.x[base + 3]))
+                let bits = small(registers.x_reg_array[base + 2])
+                    .zip(small(registers.x_reg_array[base + 3]))
                     .and_then(|(size, unit)| size.checked_mul(unit));
                 match bits {
                     None => Ok(None),
                     Some(bits) if kind == 0 => {
-                        let flags = small(process.x[base + 1]).unwrap_or(0);
+                        let flags = small(registers.x_reg_array[base + 1]).unwrap_or(0);
                         ctx.get_integer(
                             bits,
                             SegFlags {
@@ -4419,13 +4442,13 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
                     Some(bits) => ctx.get_binary(bits, &mut process.heap),
                 }
             }
-            2 => match small(process.x[base + 1]) {
+            2 => match small(registers.x_reg_array[base + 1]) {
                 Some(unit) => ctx.get_tail_unit(unit, &mut process.heap),
                 None => Ok(None),
             },
             _ => {
-                let expected = process.x[base + 2];
-                match small(process.x[base + 1]) {
+                let expected = registers.x_reg_array[base + 2];
+                match small(registers.x_reg_array[base + 1]) {
                     None => Ok(None),
                     Some(bits) => {
                         if let Some(value) = expected
@@ -4469,7 +4492,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
         }
     }
     for (index, slot) in registers.match_staging.iter_mut().enumerate() {
-        *slot = crate::native_hooks::raw(process.x[base + index]);
+        *slot = crate::native_hooks::raw(registers.x_reg_array[base + index]);
     }
     match result {
         Some(Ok(Some(term))) => crate::native_hooks::raw(term),

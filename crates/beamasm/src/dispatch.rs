@@ -912,6 +912,7 @@ fn emit_export_fragment(
         code.emit(|encoder| {
             encoder.ldr_uoff(Gpr::x(1), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
             encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            encoder.mov_reg(Gpr::x(2), Gpr::x(19))?;
             encoder.mov_const(Gpr::x(17), error_handler_helper as u64)?;
             encoder.blr(Gpr::x(17))
         })?;
@@ -1049,6 +1050,7 @@ fn emit_export_fragment(
         )?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(3), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1492,11 +1494,11 @@ fn emit_call_light_bif_shared(
     code.bind(helper_call)?;
     code.emit(|encoder| {
         // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
-        // x3 = the export's descriptor word.
+        // x3 = the export's descriptor word, x4 = `reg`.
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(3))?;
         encoder.mov_reg(Gpr::x(2), Gpr::x(3))?;
-        encoder.mov_reg(Gpr::x(4), Gpr::x(3))?;
+        encoder.mov_reg(Gpr::x(4), Gpr::x(19))?;
         encoder.ldr_uoff(Gpr::x(3), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))
@@ -1603,6 +1605,8 @@ fn emit_helper_fragment(
     emit_enter_runtime(code, live, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         // Port of beam_asm.hpp:437-440 (emit_enter_runtime_frame), OTP-29.1.1.
+        // `reg` after the helper's (c_p, identity, site, export).
+        encoder.mov_reg(Gpr::x(4), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         Ok(())
@@ -1718,6 +1722,7 @@ fn emit_line_breakpoint_shared(
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), pc_slot)?;
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
+        encoder.mov_reg(Gpr::x(3), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), helpers.prepare_call as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1731,6 +1736,7 @@ fn emit_line_breakpoint_shared(
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), helpers.cleanup as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1807,6 +1813,7 @@ fn emit_run_process_fragment(
         // No return address and no stack offset: not a tail apply in module code.
         encoder.mov_const(Gpr::x(1), 0)?;
         encoder.mov_const(Gpr::x(2), 0)?;
+        encoder.mov_reg(Gpr::x(3), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), resolver as u64)?;
         encoder.blr(Gpr::x(17))
     })?;

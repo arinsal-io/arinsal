@@ -210,6 +210,7 @@ extern "C" fn map_get_elements_helper(
     _module: u64,
     _table: u64,
     _stack: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }
@@ -220,6 +221,7 @@ extern "C" fn map_update_helper(
     _registers: u64,
     _live: u64,
     _count: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }

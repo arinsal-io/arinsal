@@ -425,7 +425,12 @@ fn int_segments(
     )
 }
 
-extern "C" fn match_command(_process: *mut ProcessHeader, _kind: u64, _live: u64) -> u64 {
+extern "C" fn match_command(
+    _process: *mut ProcessHeader,
+    _kind: u64,
+    _live: u64,
+    _reg: *mut u64,
+) -> u64 {
     0
 }
 

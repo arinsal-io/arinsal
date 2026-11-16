@@ -243,6 +243,7 @@ extern "C" fn unused_map_elements(
     _module: u64,
     _table: u64,
     _stack: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }
@@ -252,6 +253,7 @@ extern "C" fn unused_map_update(
     _b: u64,
     _c: u64,
     _d: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }

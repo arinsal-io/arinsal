@@ -245,6 +245,8 @@ core::arch::global_asm!(
     "stp d12, d13, [x15, #32]",
     "stp d14, d15, [x15, #48]",
     "mov x0, x21",
+    // `reg`: the hook roots and reloads the X registers through it.
+    "mov x2, x19",
     "ldr x16, [x19, #16424]",
     "blr x16",
     "mov x14, x0",

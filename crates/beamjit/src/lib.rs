@@ -376,7 +376,12 @@ extern "C" fn unused_record_elements(
     0
 }
 
-extern "C" fn unused_bs_match_cmd(_process: *mut ProcessHeader, _kind: u64, _live: u64) -> u64 {
+extern "C" fn unused_bs_match_cmd(
+    _process: *mut ProcessHeader,
+    _kind: u64,
+    _live: u64,
+    _reg: *mut u64,
+) -> u64 {
     0
 }
 
@@ -393,6 +398,7 @@ extern "C" fn unused_apply_resolver(
     _arity: u32,
     _return_ip: u64,
     _stack_offset: u32,
+    _: *mut u64,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     arinsal_beamasm::misc::ApplyResolution::default()
 }
@@ -401,6 +407,7 @@ extern "C" fn unused_apply3_resolver(
     _process: *mut ProcessHeader,
     _return_ip: u64,
     _stack_offset: u32,
+    _: *mut u64,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     arinsal_beamasm::misc::ApplyResolution::default()
 }

@@ -60,7 +60,14 @@ extern "C" fn map_get(process: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u6
     VALUE
 }
 
-extern "C" fn map_get_elements(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) -> u64 {
+extern "C" fn map_get_elements(
+    process: *mut ProcessHeader,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _reg: *mut u64,
+) -> u64 {
     observe(process);
     rt::scheduler_registers_mut(ACTIVE_REGS.load(Ordering::Relaxed), |regs| {
         regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(REG_OUTPUT);
@@ -68,7 +75,14 @@ extern "C" fn map_get_elements(process: *mut ProcessHeader, _: u64, _: u64, _: u
     1
 }
 
-extern "C" fn map_update(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) -> u64 {
+extern "C" fn map_update(
+    process: *mut ProcessHeader,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _reg: *mut u64,
+) -> u64 {
     observe(process);
     VALUE
 }

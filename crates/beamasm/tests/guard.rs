@@ -1251,10 +1251,18 @@ extern "C" fn unused_get_elements(
     _b: u64,
     _c: u64,
     _d: u64,
+    _reg: *mut u64,
 ) -> u64 {
     0
 }
-extern "C" fn unused_map_update(_p: *mut ProcessHeader, _a: u64, _b: u64, _c: u64, _d: u64) -> u64 {
+extern "C" fn unused_map_update(
+    _p: *mut ProcessHeader,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _d: u64,
+    _reg: *mut u64,
+) -> u64 {
     0
 }
 
