@@ -162,8 +162,7 @@ fn function_at(index: usize) -> Option<Bif> {
 }
 
 use crate::native_helpers::{
-    atom_to_list_light, binary_part_2_light, binary_part_3_light, bit_size_light, byte_size_light,
-    integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
+    atom_to_list_light, integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
     persistent_term_get_2_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
@@ -171,14 +170,6 @@ use crate::natives::{
     erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_hl_timer, erl_iolist, erl_map,
     erl_math, erl_process_dict, erl_ptab, erl_unicode, external, register,
 };
-
-/// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
-#[derive(Clone, Copy)]
-pub(crate) enum BinaryGuard {
-    ByteSize,
-    BitSize,
-    BinaryPart2,
-}
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
 ///
@@ -425,13 +416,13 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("os", "set_signal", 2) => bif!(crate::natives::erl_bif_os::set_signal_2),
         ("erlang", "atom_to_list", 1) => bif!(atom_to_list_light),
         ("erlang", "integer_to_binary", 1) => bif!(integer_to_binary_light),
-        ("erlang", "byte_size", 1) => bif!(byte_size_light),
-        ("erlang", "bit_size", 1) => bif!(bit_size_light),
+        ("erlang", "byte_size", 1) => bif!(erl_bif_guard::byte_size_1),
+        ("erlang", "bit_size", 1) => bif!(erl_bif_guard::bit_size_1),
         ("erlang", "binary_part", 2) | ("binary", "part", 2) => {
-            bif!(binary_part_2_light)
+            bif!(erl_bif_binary::binary_part_2)
         }
         ("erlang", "binary_part", 3) | ("binary", "part", 3) => {
-            bif!(binary_part_3_light)
+            bif!(erl_bif_binary::binary_part_3)
         }
         ("erlang", "make_ref", 0) => bif!(make_ref_light),
         ("erlang", "unique_integer", 0) => bif!(unique_integer_0_light),

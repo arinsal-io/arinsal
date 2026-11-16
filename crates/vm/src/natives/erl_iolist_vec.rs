@@ -1,83 +1,26 @@
-//! Binary and iolist BIFs ported from ERTS binary and iolist code.
+//! The `iolist_to_iovec/1` walk of erl_iolist.c.
+//!
+//! Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_1, the size and copy passes of
+//! iolist_to_iovec_engine), OTP-29.1.1. The passes are resumable: each runs for a number of
+//! yield counts and reports how many it used; `natives::erl_iolist` charges reductions and traps.
 
-use std::borrow::Cow;
+use arinsal_bifs::BifError;
+use arinsal_term::raw::{BinRef, Cons};
+use arinsal_term::{HeapAlloc, Term, TermBuilder, TermKind};
 
-use arinsal_term::{HeapAlloc, TermBuilder};
+const BADARG: BifError = BifError::BADARG;
 
-use crate::{BifError, Ctx};
-
-use super::*;
-
-pub(super) fn lookup<V: crate::BifTableVisitor>(
-    module: &str,
-    name: &str,
-    arity: u8,
-    v: &mut V,
-) -> Option<V::Output> {
-    let bif = match (module, name, arity) {
-        ("erlang", "byte_size", 1) => v.entry::<word_bodies::byte_size>(),
-        ("erlang", "bit_size", 1) => v.entry::<word_bodies::bit_size>(),
-        ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => {
-            v.entry::<word_bodies::binary_part>()
-        }
-        _ => return None,
-    };
-    Some(bif)
+fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
+    Cons::try_from(term).ok().map(Cons::pair).ok_or(BADARG)
 }
 
-// Port of erts/emulator/beam/erl_bif_guard.c:376 (byte_size_1), OTP-29.1.1.
-#[inline(always)]
-fn byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bits = bitstring_bit_len(args[0])?;
-    integer(ctx, bits.div_ceil(8))
-}
-
-// Port of erts/emulator/beam/erl_bif_guard.c:354 (bit_size_1), OTP-29.1.1.
-#[inline(always)]
-fn bit_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    integer(ctx, bitstring_bit_len(args[0])?)
-}
-
-/// Use the original byte slice when aligned; OTP likewise allocates a
-/// temporary byte-aligned copy only for a bit-offset binary.
-// Port of erts/emulator/beam/erl_bits.h:606-630
-// (erts_get_aligned_binary_bytes_extra), OTP-29.1.1.
-fn binary_input<'a>(view: &'a BinaryRef<'_>) -> Result<Cow<'a, [u8]>, BifError> {
-    if !view.bit_len().is_multiple_of(8) {
-        return Err(BADARG);
-    }
-    let byte_count = view.bit_len() / 8;
-    if view.start_bit().is_multiple_of(8) {
-        let start = view.start_bit() / 8;
-        let end = start.checked_add(byte_count).ok_or(BADARG)?;
-        return view
-            .bytes()
-            .get(start..end)
-            .map(Cow::Borrowed)
-            .ok_or(BADARG);
-    }
-
-    let mut aligned = vec![0; byte_count];
-    let byte_offset = view.start_bit() / 8;
-    let bit_offset = view.start_bit() % 8;
-    for (index, byte) in aligned.iter_mut().enumerate() {
-        let source = byte_offset + index;
-        *byte = view.bytes()[source] << bit_offset;
-        if bit_offset != 0 {
-            *byte |= view.bytes()[source + 1] >> (8 - bit_offset);
-        }
-    }
-    Ok(Cow::Owned(aligned))
-}
-
-pub(super) fn with_binary_input<R>(
+fn copy_bitstring_range(
     term: Term,
-    f: impl FnOnce(&[u8]) -> Result<R, BifError>,
-) -> Result<R, BifError> {
-    with_binary_bytes(term, |view| {
-        let bytes = binary_input(&view)?;
-        f(&bytes)
-    })?
+    start: usize,
+    output: &mut [u8],
+    bit_count: usize,
+) -> Result<(), BifError> {
+    arinsal_term::erl_bits::copy_bitstring_range(term, start, output, bit_count).map_err(|_| BADARG)
 }
 
 /// Bits at or below which `iolist_to_iovec/1` copies a binary into the shared run (OTP-29.1.1).
@@ -89,7 +32,9 @@ fn iol2v_should_copy(start_bit: usize, bit_len: usize) -> bool {
 }
 
 fn bitstring_geometry(term: Term) -> Result<(usize, usize), BifError> {
-    with_binary_bytes(term, |view| (view.start_bit(), view.bit_len()))
+    BinRef::try_from(term)
+        .map(|view| (view.start_bit(), view.bit_len()))
+        .map_err(|_| BADARG)
 }
 
 /// Yield counts one reduction buys in the iolist size and copy passes.
@@ -98,12 +43,12 @@ const IOL2V_YIELDS_PER_RED: usize = 8;
 const IOL2V_COPY_BITS_PER_YIELD: usize = 32 * 8;
 
 /// Reductions charged for `used` yield counts.
-pub fn iolist_yield_reductions(used: usize) -> usize {
+pub(crate) fn iolist_yield_reductions(used: usize) -> usize {
     used.saturating_sub(1) / IOL2V_YIELDS_PER_RED + 1
 }
 
 /// The `[]`, `Bin` and `[Bin]` cases of `iolist_to_iovec/1` that need no traversal.
-pub fn iolist_to_iovec_shortcut<H: HeapAlloc + ?Sized>(
+pub(crate) fn iolist_to_iovec_shortcut<H: HeapAlloc + ?Sized>(
     heap: &mut H,
     root: Term,
 ) -> Result<Option<Term>, BifError> {
@@ -130,7 +75,7 @@ pub fn iolist_to_iovec_shortcut<H: HeapAlloc + ?Sized>(
     if root.classify() == TermKind::List {
         return Ok(Some(root));
     }
-    TermBuilder::new(&mut Heap(heap))
+    TermBuilder::new(heap)
         .list_from_iter([single])
         .map(Some)
         .map_err(|_| BifError::SystemLimit)
@@ -142,7 +87,7 @@ enum VecSegment {
 }
 
 /// Resumable size and copy passes of `iolist_to_iovec/1`.
-pub struct IolistVecWalk {
+pub(crate) struct IolistVecWalk {
     root: Term,
     obj: Term,
     stack: arinsal_term::EStack<8>,
@@ -156,7 +101,7 @@ pub struct IolistVecWalk {
 
 impl IolistVecWalk {
     /// Start traversing an iolist rooted in a stable process heap.
-    pub fn new(root: Term) -> Self {
+    pub(crate) fn new(root: Term) -> Self {
         Self {
             root,
             obj: root,
@@ -171,14 +116,14 @@ impl IolistVecWalk {
     }
 
     /// Whether the sizing pass has finished.
-    pub fn sized(&self) -> bool {
+    pub(crate) fn sized(&self) -> bool {
         self.sized
     }
 
     /// Run the sizing pass for at most `budget` yield counts.
     ///
     /// Returns whether the pass finished and the yield counts used.
-    pub fn size_step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
+    pub(crate) fn size_step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
         let init = isize::try_from(budget).unwrap_or(isize::MAX);
         let mut yield_count = init;
         let used = |yield_count: isize| (init - yield_count) as usize;
@@ -315,7 +260,7 @@ impl IolistVecWalk {
     /// Run the copy pass for at most `budget` yield counts.
     ///
     /// Returns whether the pass finished and the yield counts used.
-    pub fn copy_step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
+    pub(crate) fn copy_step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
         let init = isize::try_from(budget).unwrap_or(isize::MAX);
         let mut yield_count = init;
         let mut obj = self.obj;
@@ -372,19 +317,20 @@ impl IolistVecWalk {
     ///
     /// OTP allocates one off-heap binary for every copied run and returns
     /// sub-binaries of it.
-    pub fn finish<H: HeapAlloc + ?Sized>(&mut self, heap: &mut H) -> Result<Term, BifError> {
+    pub(crate) fn finish<H: HeapAlloc + ?Sized>(&mut self, heap: &mut H) -> Result<Term, BifError> {
         if self.copied.len() != self.size {
             return Err(BifError::SystemLimit);
         }
         let shared = if self.copied.is_empty() || !heap.supports_writable_binary() {
             None
         } else {
-            let shared = allocate_iolist_binary(heap, self.copied.len())?;
-            with_iolist_binary_output(shared, |output| {
+            let shared = arinsal_term::raw::allocate_iolist_binary(heap, self.copied.len())
+                .map_err(|_| BifError::SystemLimit)?;
+            arinsal_term::raw::with_iolist_binary_output(shared, |output| {
                 output.copy_from_slice(&self.copied);
-                Ok(())
-            })?;
-            finish_iolist_binary_output(shared);
+            })
+            .ok_or(BifError::SystemLimit)?;
+            arinsal_term::raw::finish_iolist_binary_output(shared);
             Some(shared)
         };
         let mut terms = Vec::with_capacity(self.segments.len());
@@ -392,8 +338,7 @@ impl IolistVecWalk {
             terms.push(match segment {
                 VecSegment::Large(term) => term,
                 VecSegment::Run(start, len) => {
-                    let mut heap = Heap(&mut *heap);
-                    let mut builder = TermBuilder::new(&mut heap);
+                    let mut builder = TermBuilder::new(&mut *heap);
                     match shared {
                         Some(shared) => builder.sub_binary(shared, start * 8, len * 8),
                         None => builder.binary(&self.copied[start..start + len]),
@@ -402,104 +347,8 @@ impl IolistVecWalk {
                 }
             });
         }
-        TermBuilder::new(&mut Heap(heap))
+        TermBuilder::new(heap)
             .list_from_iter(terms)
             .map_err(|_| BifError::SystemLimit)
     }
 }
-
-pub fn allocate_iolist_binary<H: HeapAlloc + ?Sized>(
-    heap: &mut H,
-    byte_len: usize,
-) -> Result<Term, BifError> {
-    arinsal_term::raw::allocate_iolist_binary(heap, byte_len).map_err(|_| BifError::SystemLimit)
-}
-
-/// Give the unique writer a temporary mutable view of its final binary.
-pub fn with_iolist_binary_output<R>(
-    term: Term,
-    f: impl FnOnce(&mut [u8]) -> Result<R, BifError>,
-) -> Result<R, BifError> {
-    arinsal_term::raw::with_iolist_binary_output(term, f).ok_or(BifError::SystemLimit)?
-}
-
-/// End the unique writer before the completed binary is shared with Erlang code.
-pub fn finish_iolist_binary_output(term: Term) {
-    arinsal_term::raw::finish_iolist_binary_output(term);
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (erts_binary_part), OTP-29.1.1.
-#[inline(always)]
-fn binary_part_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (mut position, mut length) = if args.len() == 2 {
-        if tuple_arity(args[1])? != 2 {
-            return Err(BADARG);
-        }
-        (
-            tuple_element(args[1], 0)?.as_small().ok_or(BADARG)?,
-            tuple_element(args[1], 1)?.as_small().ok_or(BADARG)?,
-        )
-    } else {
-        (
-            args[1].as_small().ok_or(BADARG)?,
-            args[2].as_small().ok_or(BADARG)?,
-        )
-    };
-    if length < 0 {
-        length = length.checked_neg().ok_or(BADARG)?;
-        if length > position {
-            return Err(BADARG);
-        }
-        position -= length;
-    }
-    if position < 0 || length < 0 || position.checked_add(length).is_none() {
-        return Err(BADARG);
-    }
-    let start_bits = usize::try_from(position)
-        .ok()
-        .and_then(|value| value.checked_mul(8))
-        .ok_or(BADARG)?;
-    let length_bits = usize::try_from(length)
-        .ok()
-        .and_then(|value| value.checked_mul(8))
-        .ok_or(BADARG)?;
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .sub_binary_bif(args[0], start_bits, length_bits)
-        .map_err(|error| match error {
-            arinsal_term::TermError::BadArg => BADARG,
-            _ => BifError::SystemLimit,
-        })
-}
-
-/// Execute the tuple-range form of `binary:part/2` without resolving the BIF name again.
-// Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
-pub fn binary_part_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if args.len() != 2 {
-        return Err(BADARG);
-    }
-    binary_part_result(ctx, args)
-}
-
-// Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (do_binary_match_compile), OTP-29.1.1.
-
-macro_rules! word_result_body {
-    ($name:ident, $result:ident) => {
-        #[inline(always)]
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-            match $result(ctx, args) {
-                Ok(value) => value,
-                Err(error) => ctx.fail(error),
-            }
-        }
-    };
-}
-
-word_result_body!(byte_size, byte_size_result);
-word_result_body!(bit_size, bit_size_result);
-word_result_body!(binary_part, binary_part_result);
-
-crate::word_bif_bodies_in!(word_bodies;
-    byte_size,
-    bit_size,
-    binary_part,
-);

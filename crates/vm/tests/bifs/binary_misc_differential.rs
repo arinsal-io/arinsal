@@ -29,9 +29,11 @@ run() ->
     Orders = [big, little, foo, 1],
     Counts = [0, 1, 2, 7, 100, -1, a, 70000, 100000, 1 bsl 62],
     [{N, both(fun() -> F(B) end)} || B <- Bins, {N, F} <- [{first, fun binary:first/1}, {last, fun binary:last/1},
-        {rbs, fun binary:referenced_byte_size/1}, {dec1, fun binary:decode_unsigned/1},
+        {rbs, fun binary:referenced_byte_size/1}, {bsz, fun erlang:byte_size/1}, {bitsz, fun erlang:bit_size/1}, {dec1, fun binary:decode_unsigned/1},
         {decl, fun(X) -> binary:decode_unsigned(X, little) end}, {decb, fun(X) -> binary:decode_unsigned(X, big) end},
         {copy1, fun binary:copy/1}]] ++
+    [{part, erlang:phash2(P), both(fun() -> binary:part(B, P) end), both(fun() -> erlang:binary_part(B, element(1, P), element(2, P)) end)}
+     || B <- Bins, P <- [{0, 0}, {0, 3}, {2, 5}, {3, -3}, {100, 1}, {1, -2}, {a, 1}, {-1, 1}, {1 bsl 62, 1}, {0, -1}]] ++
     [{at, I, both(fun() -> binary:at(B, I) end)} || B <- Bins, I <- [0, 1, 2, 6, 100, -1, a]] ++
     [{lcp, both(fun() -> binary:longest_common_prefix(L) end), both(fun() -> binary:longest_common_suffix(L) end)}
      || L <- Lists] ++

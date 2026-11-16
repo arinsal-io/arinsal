@@ -11,8 +11,11 @@
 use crate::Process;
 use crate::bif_traps::TrapContext;
 use crate::natives::bif::bif_ret;
+use crate::natives::erl_iolist_vec::{
+    IolistVecWalk, iolist_to_iovec_shortcut, iolist_yield_reductions,
+};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifCall, BifError, Ctx, IolistVecWalk, ProcessHeapHandle};
+use arinsal_bifs::{BifCall, BifError, Ctx, ProcessHeapHandle};
 use arinsal_term::erl_iolist::{IolistCopyWalk, IolistError, IolistProgress, IolistSizeWalk};
 use arinsal_term::{MagicBin, Term, TermBuilder, TermKind};
 
@@ -233,7 +236,7 @@ fn iolist_size_dispatch(
             Ok((_, work)) | Err((_, work)) => work,
         };
         // generic_iolist_size's BUMP_REDS of the yield counts used.
-        charge(process, arinsal_bifs::iolist_yield_reductions(work));
+        charge(process, iolist_yield_reductions(work));
         match step {
             Ok((false, _)) => {
                 let mref = match mref {
@@ -517,7 +520,7 @@ enum IolistOutput {
 impl IolistOutput {
     fn finish_writer(&self) {
         if let Self::Writable(term) = self {
-            arinsal_bifs::finish_iolist_binary_output(*term);
+            arinsal_term::raw::finish_iolist_binary_output(*term);
         }
     }
 }
@@ -557,10 +560,11 @@ fn iolist_copy_setup(
     }
     let byte_len = size.take_size();
     if byte_len == 0 {
-        let value = arinsal_bifs::allocate_iolist_binary(
+        let value = arinsal_term::raw::allocate_iolist_binary(
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             0,
-        )?;
+        )
+        .map_err(|_| BifError::SystemLimit)?;
         return Ok(IolistCopySetup {
             empty: Some(value),
             ready: None,
@@ -580,10 +584,13 @@ fn iolist_copy_setup(
             )),
         });
     }
-    let output = IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
-        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-        byte_len,
-    )?);
+    let output = IolistOutput::Writable(
+        arinsal_term::raw::allocate_iolist_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            byte_len,
+        )
+        .map_err(|_| BifError::SystemLimit)?,
+    );
     Ok(IolistCopySetup {
         empty: None,
         ready: Some((output, byte_len * 8, IolistCopyWalk::new(root))),
@@ -656,9 +663,12 @@ fn iolist_binary_step(
     let stepped = match output {
         IolistOutput::Small(writer) => bif_progress(walk.step(writer.bytes_mut(), yield_count)),
         IolistOutput::Bitstring(bytes) => bif_progress(walk.step(bytes, yield_count)),
-        IolistOutput::Writable(term) => arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
-            Ok(bif_progress(walk.step(bytes, yield_count)))
-        })?,
+        IolistOutput::Writable(term) => {
+            arinsal_term::raw::with_iolist_binary_output(*term, |bytes| {
+                bif_progress(walk.step(bytes, yield_count))
+            })
+            .ok_or(BifError::SystemLimit)?
+        }
     };
     let (done, work) = match stepped {
         Ok(progress) => progress,
@@ -703,7 +713,7 @@ fn iolist_binary_step(
             .map_err(|_| BifError::SystemLimit)?
         }
         IolistOutput::Writable(term) => {
-            arinsal_bifs::finish_iolist_binary_output(*term);
+            arinsal_term::raw::finish_iolist_binary_output(*term);
             *term
         }
     };
@@ -724,7 +734,7 @@ pub(crate) extern "C" fn iolist_to_iovec_1(c_p: *mut ProcessHeader, reg: *mut u6
     let [arg] = crate::bif_table::bif_args::<1>(reg);
     let shortcut = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
-        arinsal_bifs::iolist_to_iovec_shortcut(&mut heap, arg)
+        iolist_to_iovec_shortcut(&mut heap, arg)
     };
     match shortcut {
         Ok(Some(value)) => return crate::native_hooks::raw(value),
@@ -787,11 +797,11 @@ fn iolist_to_iovec_dispatch(
                 .size_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED))
             {
                 Err((error, used)) => {
-                    return Err((error, arinsal_bifs::iolist_yield_reductions(used)));
+                    return Err((error, iolist_yield_reductions(used)));
                 }
                 Ok((false, _)) => return Ok((None, entry_reds)),
                 Ok((true, used)) => {
-                    let reds = arinsal_bifs::iolist_yield_reductions(used);
+                    let reds = iolist_yield_reductions(used);
                     spent += reds;
                     reds_left = reds_left.saturating_sub(reds);
                 }
@@ -807,10 +817,10 @@ fn iolist_to_iovec_dispatch(
             .walk
             .copy_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED))
         {
-            Err((error, used)) => Err((error, spent + arinsal_bifs::iolist_yield_reductions(used))),
+            Err((error, used)) => Err((error, spent + iolist_yield_reductions(used))),
             Ok((false, _)) => Ok((None, entry_reds)),
             Ok((true, used)) => {
-                let reds = spent + arinsal_bifs::iolist_yield_reductions(used);
+                let reds = spent + iolist_yield_reductions(used);
                 let finished = {
                     let mut heap = ProcessHeapHandle(&mut process.heap);
                     state.walk.finish(&mut heap)

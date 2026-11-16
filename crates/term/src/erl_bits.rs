@@ -13,6 +13,23 @@ pub fn bitstring_bit_len(term: Term) -> Option<usize> {
     BinRef::try_from(term).ok().map(BinRef::bit_len)
 }
 
+/// The bytes of a byte-sized binary, copied to an aligned buffer when the binary starts
+/// inside a byte; `None` for a bitstring with tail bits or any other term.
+// Port of erts/emulator/beam/erl_bits.h (erts_get_aligned_binary_bytes_extra), OTP-29.1.1.
+pub fn with_aligned_bytes<R>(term: Term, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let view = BinRef::try_from(term).ok()?;
+    if let Some(bytes) = view.bytes() {
+        return Some(f(bytes));
+    }
+    let bits = view.bit_len();
+    if !bits.is_multiple_of(8) {
+        return None;
+    }
+    let mut copy = vec![0u8; bits / 8];
+    copy_bitstring_range(term, 0, &mut copy, bits).ok()?;
+    Some(f(&copy))
+}
+
 /// Copy `bit_count` bits of `term` from bit `start` into `output`, most significant bit first,
 /// zero-filling the rest of `output`.
 // Port of erts/emulator/beam/erl_bits.c (erts_copy_bits_fwd), OTP-29.1.1.

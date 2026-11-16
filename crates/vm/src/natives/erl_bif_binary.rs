@@ -22,18 +22,7 @@ fn with_binary_input<R>(
     term: Term,
     f: impl FnOnce(&[u8]) -> Result<R, BifError>,
 ) -> Result<R, BifError> {
-    let view = BinRef::try_from(term).map_err(|_| BifError::BADARG)?;
-    if let Some(bytes) = view.bytes() {
-        return f(bytes);
-    }
-    let bits = view.bit_len();
-    if !bits.is_multiple_of(8) {
-        return Err(BifError::BADARG);
-    }
-    let mut copy = vec![0u8; bits / 8];
-    arinsal_term::erl_bits::copy_bitstring_range(term, 0, &mut copy, bits)
-        .map_err(|_| BifError::BADARG)?;
-    f(&copy)
+    arinsal_term::erl_bits::with_aligned_bytes(term, f).unwrap_or(Err(BifError::BADARG))
 }
 
 /// The bytes of a byte-sized binary as an owned vector.
@@ -1889,21 +1878,57 @@ const BITSTRING_COPY_LOOP_FACTOR: usize = 64 * 8;
 
 const BINARY_COPY_TRAP: &str = "erlang:binary_copy_trap/3";
 
-/// `binary_copy_loop` into the writable result binary `result`, from `copied_bits` to
-/// `trap_offset`; the bits copied so far.
+/// `copy_binary_to_buffer` for a byte-aligned destination: `count` source bytes starting at bit
+/// `source_bit` of `window`, shifted when the source starts inside a byte.
+// Port of erts/emulator/beam/erl_bits.h (copy_binary_to_buffer), OTP-29.1.1.
+fn copy_binary_to_buffer(target: &mut [u8], window: &[u8], source_bit: usize, count: usize) {
+    let from = source_bit / 8;
+    let shift = source_bit % 8;
+    if shift == 0 {
+        target[..count].copy_from_slice(&window[from..from + count]);
+        return;
+    }
+    for (index, byte) in target[..count].iter_mut().enumerate() {
+        *byte = (window[from + index] << shift) | (window[from + index + 1] >> (8 - shift));
+    }
+}
+
+/// `binary_copy_loop`: repeat the source into `target` from `copied_bits` up to `trap_offset`;
+/// the bits copied so far. Sizes are whole bytes, so every stride is byte aligned in `target`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_copy_loop), OTP-29.1.1.
+fn binary_copy_loop(
+    source: BinRef,
+    target: &mut [u8],
+    mut copied_bits: usize,
+    trap_offset: usize,
+) -> usize {
+    let source_size = source.bit_len();
+    while copied_bits < trap_offset {
+        let copy_offset = copied_bits % source_size;
+        let copy_stride = (trap_offset - copied_bits).min(source_size - copy_offset);
+        copy_binary_to_buffer(
+            &mut target[copied_bits / 8..],
+            source.window(),
+            source.start_bit() + copy_offset,
+            copy_stride / 8,
+        );
+        copied_bits += copy_stride;
+    }
+    copied_bits
+}
+
+/// `binary_copy_loop` into the writable result binary `result`; the bits copied so far.
 fn copy_loop(
     input: Term,
     result: Term,
     copied_bits: usize,
     trap_offset: usize,
 ) -> Result<usize, BifError> {
-    let mut copied = copied_bits;
+    let source = BinRef::try_from(input).map_err(|_| BifError::BADARG)?;
     arinsal_term::raw::with_iolist_binary_output(result, |destination| {
-        copied = arinsal_bifs::copy_binary_pattern(input, destination, copied_bits, trap_offset)?;
-        Ok(())
+        binary_copy_loop(source, destination, copied_bits, trap_offset)
     })
-    .ok_or(BifError::SystemLimit)??;
-    Ok(copied)
+    .ok_or(BifError::SystemLimit)
 }
 
 /// `get_reds` for the copy loops.
@@ -1950,24 +1975,18 @@ fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) 
     let max_copy_bits = copy_reds(process);
     if max_copy_bits >= target_bits {
         // One slice: the whole result is built in place.
-        let mut copy_error = None;
         let built = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).binary_from_fn(
             length,
             |destination| {
-                if let Err(error) =
-                    arinsal_bifs::copy_binary_pattern(bin, destination, 0, target_bits)
-                {
-                    copy_error = Some(error);
-                }
+                binary_copy_loop(view, destination, 0, target_bits);
             },
         );
-        return match (built, copy_error) {
-            (Ok(value), None) => {
+        return match built {
+            Ok(value) => {
                 charge(process, target_bits / BITSTRING_COPY_LOOP_FACTOR);
                 crate::native_hooks::raw(value)
             }
-            (_, Some(error)) => bif_ret(c_p, i, Err(find_error(error))),
-            (Err(_), None) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+            Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
         };
     }
     let Ok(result) = arinsal_term::raw::allocate_iolist_binary(
@@ -2038,4 +2057,70 @@ pub(crate) extern "C" fn binary_copy_trap(c_p: *mut ProcessHeader, reg: *mut u64
         .expect("HAlloc");
     let trap = bif_trap(process, BINARY_COPY_TRAP, vec![bin, result, copied_term]);
     bif_ret(c_p, i, Err(trap))
+}
+
+/// `binary_part/2,3` and `binary:part/2,3`.
+// Port of erts/emulator/beam/erl_bif_binary.c (erts_binary_part, binary_part_2, binary_part_3),
+// OTP-29.1.1.
+fn binary_part(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let (bin, mut position, mut length) = if arity == 2 {
+        let [bin, range] = crate::bif_table::bif_args::<2>(reg);
+        let pair = arinsal_bifs::tuple_arity(range)
+            .ok()
+            .filter(|arity| *arity == 2)
+            .and_then(|_| {
+                let position = arinsal_bifs::tuple_element(range, 0).ok()?.as_small()?;
+                let length = arinsal_bifs::tuple_element(range, 1).ok()?.as_small()?;
+                Some((position, length))
+            });
+        match pair {
+            Some((position, length)) => (bin, position, length),
+            None => return bif_ret(c_p, i, Err(badarg())),
+        }
+    } else {
+        let [bin, position, length] = crate::bif_table::bif_args::<3>(reg);
+        match (position.as_small(), length.as_small()) {
+            (Some(position), Some(length)) => (bin, position, length),
+            _ => return bif_ret(c_p, i, Err(badarg())),
+        }
+    };
+    if length < 0 {
+        length = match length.checked_neg() {
+            Some(length) if length <= position => length,
+            _ => return bif_ret(c_p, i, Err(badarg())),
+        };
+        position -= length;
+    }
+    if position < 0 || length < 0 || position.checked_add(length).is_none() {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    let (Some(start), Some(length)) = (
+        usize::try_from(position)
+            .ok()
+            .and_then(|n| n.checked_mul(8)),
+        usize::try_from(length).ok().and_then(|n| n.checked_mul(8)),
+    ) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let result = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .sub_binary_bif(bin, start, length);
+    match result {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(arinsal_term::TermError::BadArg) => bif_ret(c_p, i, Err(badarg())),
+        Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+    }
+}
+
+/// `binary_part/2` and `binary:part/2`.
+pub(crate) extern "C" fn binary_part_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_part(c_p, reg, i, 2)
+}
+
+/// `binary_part/3` and `binary:part/3`.
+pub(crate) extern "C" fn binary_part_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_part(c_p, reg, i, 3)
 }

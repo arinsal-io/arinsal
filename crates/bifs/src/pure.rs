@@ -14,13 +14,6 @@ use smallvec::SmallVec;
 
 use crate::{BifError, Class, Ctx};
 
-#[path = "binary_bifs.rs"]
-mod binary_bifs;
-pub use binary_bifs::{
-    IolistVecWalk, allocate_iolist_binary, binary_part_2, finish_iolist_binary_output,
-    iolist_to_iovec_shortcut, iolist_yield_reductions, with_iolist_binary_output,
-};
-
 const BADARG: BifError = BifError::BADARG;
 
 use crate::unique::next_ref_words;
@@ -234,9 +227,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     arity: u8,
     v: &mut V,
 ) -> Option<V::Output> {
-    if let Some(bif) = binary_bifs::lookup(module, name, arity, v) {
-        return Some(bif);
-    }
     let f = match (module, name, arity) {
         ("erlang", "size", 1) => v.entry::<bodies::size>(),
         ("erlang", "node", 0 | 1) => v.entry::<bodies::node>(),
@@ -1019,66 +1009,6 @@ fn copy_bitstring_view_range_to(
     Ok(())
 }
 
-/// Repeat a byte-aligned bitstring into `destination` through `trap_offset` bits.
-// Port of erts/emulator/beam/erl_bif_binary.c:2379-2398 (binary_copy_loop), OTP-29.1.1.
-pub fn copy_binary_pattern(
-    term: Term,
-    destination: &mut [u8],
-    copied_bits: usize,
-    trap_offset: usize,
-) -> Result<usize, BifError> {
-    let target_size = destination.len().checked_mul(8).ok_or(BADARG)?;
-    if copied_bits > trap_offset || trap_offset > target_size {
-        return Err(BADARG);
-    }
-
-    with_binary_bytes(term, |view| {
-        let source_size = view.bit_len();
-        if !source_size.is_multiple_of(8) || source_size == 0 {
-            return Err(BADARG);
-        }
-        if copied_bits.is_multiple_of(8)
-            && trap_offset.is_multiple_of(8)
-            && view.start_bit().is_multiple_of(8)
-        {
-            // Port of copy_binary_to_buffer's byte-aligned sys_memcpy path, erl_bits.h:541-552.
-            let source = view.bytes();
-            let source_bytes = source_size / 8;
-            let source_base = view.start_bit() / 8;
-            let source_end = source_base.checked_add(source_bytes).ok_or(BADARG)?;
-            if source_end > source.len() {
-                return Err(BADARG);
-            }
-            let mut copied_bytes = copied_bits / 8;
-            let trap_bytes = trap_offset / 8;
-            while copied_bytes < trap_bytes {
-                let source_offset = copied_bytes % source_bytes;
-                let count = (trap_bytes - copied_bytes).min(source_bytes - source_offset);
-                let source_start = source_base + source_offset;
-                let target_end = copied_bytes + count;
-                destination[copied_bytes..target_end]
-                    .copy_from_slice(&source[source_start..source_start + count]);
-                copied_bytes = target_end;
-            }
-            return Ok(trap_offset);
-        }
-        let mut copied_bits = copied_bits;
-        while copied_bits < trap_offset {
-            let source_offset = copied_bits % source_size;
-            let copy_stride = (trap_offset - copied_bits).min(source_size - source_offset);
-            copy_bitstring_view_range_to(
-                &view,
-                source_offset,
-                destination,
-                copied_bits,
-                copy_stride,
-            )?;
-            copied_bits += copy_stride;
-        }
-        Ok(copied_bits)
-    })?
-}
-
 /// Copy significant bits into a most-significant-bit-first packed byte slice.
 // Port of erts/emulator/beam/erl_bits.c:2389-2515 (erts_copy_bits_fwd), OTP-29.1.1.
 pub fn copy_bitstring_range(
@@ -1103,7 +1033,7 @@ fn binary_to_atom_inner(args: &[Term], existing: bool) -> Result<Term, BifError>
         "utf8" => AtomEncoding::Utf8,
         _ => AtomEncoding::Latin1,
     };
-    binary_bifs::with_binary_input(args[0], |bytes| {
+    arinsal_term::erl_bits::with_aligned_bytes(args[0], |bytes| {
         // Port of erl_unicode.c:1963 (binary_to_atom), OTP-29.1.1.
         let table = global_atoms();
         let atom = if existing {
@@ -1119,6 +1049,7 @@ fn binary_to_atom_inner(args: &[Term], existing: bool) -> Result<Term, BifError>
         };
         Ok(Term::atom(atom))
     })
+    .unwrap_or(Err(BADARG))
 }
 fn binary_to_atom_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     binary_to_atom_inner(args, false)
@@ -1208,12 +1139,13 @@ fn list_to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErr
         .expect("infallible BIF heap"))
 }
 fn binary_to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    binary_bifs::with_binary_input(args[0], |bytes| {
+    arinsal_term::erl_bits::with_aligned_bytes(args[0], |bytes| {
         let value = arinsal_float::list_to_float(bytes).map_err(|_| BADARG)?;
         Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
             .float(value)
             .expect("infallible BIF heap"))
     })
+    .unwrap_or(Err(BADARG))
 }
 fn integer_text(args: &[Term]) -> Result<String, BifError> {
     let base = if args.len() == 2 {
@@ -1319,8 +1251,8 @@ fn debug_same_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn bin_is_7bit_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(
-        binary_bifs::with_binary_input(args[0], |bytes| Ok(bytes.iter().all(u8::is_ascii)))
-            .is_ok_and(|is_ascii| is_ascii),
+        arinsal_term::erl_bits::with_aligned_bytes(args[0], |bytes| bytes.iter().all(u8::is_ascii))
+            .is_some_and(|is_ascii| is_ascii),
     ))
 }
 fn is_builtin_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

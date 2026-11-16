@@ -165,3 +165,43 @@ pub(crate) extern "C" fn ceil_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64)
 pub(crate) extern "C" fn floor_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     number_bif(c_p, reg, |a, heap| arinsal_arith::floor(a, heap))
 }
+
+/// `erlang:byte_size/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (byte_size_1), OTP-29.1.1.
+pub(crate) extern "C" fn byte_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    bitstring_size(c_p, reg, i, |bits| bits.div_ceil(8))
+}
+
+/// `erlang:bit_size/1`.
+// Port of erts/emulator/beam/erl_bif_guard.c (bit_size_1), OTP-29.1.1.
+pub(crate) extern "C" fn bit_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    bitstring_size(c_p, reg, i, |bits| bits)
+}
+
+fn bitstring_size(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    size: impl FnOnce(usize) -> usize,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let [bin] = crate::bif_table::bif_args::<1>(reg);
+    let Some(bits) = arinsal_term::erl_bits::bitstring_bit_len(bin) else {
+        return bif_ret(c_p, i, Err(crate::natives::bif::badarg()));
+    };
+    let value = size(bits);
+    match Term::small(value as i64) {
+        Some(small) => crate::native_hooks::raw(small),
+        None => {
+            // `erts_make_integer` of a size above the small range.
+            process.heap.note_bif_entry();
+            let mut heap = ProcessHeapHandle(&mut process.heap);
+            let term = arinsal_term::TermBuilder::new(&mut heap)
+                .int_from_u64(value as u64)
+                .expect("HAlloc");
+            crate::native_hooks::raw(term)
+        }
+    }
+}
