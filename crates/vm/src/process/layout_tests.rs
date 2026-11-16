@@ -19,7 +19,9 @@ fn off_heap_message_fragment_stays_outside_gc_roots_until_removed() {
 
     assert!(process.inbox.gc_root_snapshot().1.is_empty());
     assert_eq!(process.heap.total_heap_size_words(), heap_words);
-    process.collect_heap_roots(0, &mut [], 0).unwrap();
+    process
+        .collect_heap_roots_objv(&mut [], &mut [], 0)
+        .unwrap();
     let term = process
         .inbox
         .remove_to_heap(&mut process.heap)
@@ -41,7 +43,9 @@ fn on_heap_message_is_a_gc_root_in_the_process_heap() {
     // The fetched message keeps its fragment until a collection moves it onto the heap.
     assert!(process.inbox.gc_root_snapshot().1.is_empty());
     assert!(!process.inbox.is_on_heap_at_save());
-    process.collect_heap_roots(0, &mut [], 0).unwrap();
+    process
+        .collect_heap_roots_objv(&mut [], &mut [], 0)
+        .unwrap();
     assert_eq!(process.inbox.gc_root_snapshot().1.len(), 1);
     assert_eq!(process.inbox.entries.len(), 1);
     assert!(
@@ -49,7 +53,9 @@ fn on_heap_message_is_a_gc_root_in_the_process_heap() {
             .fragment
             .is_none()
     );
-    process.collect_heap_roots(0, &mut [], 0).unwrap();
+    process
+        .collect_heap_roots_objv(&mut [], &mut [], 0)
+        .unwrap();
     let term = process
         .inbox
         .remove_to_heap(&mut process.heap)
@@ -71,7 +77,7 @@ fn collection_publishes_the_new_heap_to_the_native_header() {
     arinsal_sched::Task::init_in_place(&mut process);
     let before = (process.heap.abi.heap, process.heap.abi.hend);
     // Force a collection that grows the young heap.
-    process.ensure(1 << 14, 0).unwrap();
+    process.ensure_objv(1 << 14, &mut []).unwrap();
     let (heap, hend) = process.heap.heap_bounds();
     let (htop, stop) = process.heap.heap_cursor();
     assert_ne!(
@@ -111,7 +117,9 @@ fn post_bif_result_root_survives_collection_in_the_fast_arm() {
         .unwrap();
     let expected = arinsal_term::to_owned(result).unwrap();
     let mut roots = [result];
-    let stats = process.collect_heap_roots(0, &mut roots, 0).unwrap();
+    let stats = process
+        .collect_heap_roots_objv(&mut [], &mut roots, 0)
+        .unwrap();
     assert_eq!(stats.collections, 1);
     assert_ne!(roots[0], result);
     assert_eq!(arinsal_term::to_owned(roots[0]).unwrap(), expected);

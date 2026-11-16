@@ -401,7 +401,7 @@ impl Process {
         }
         let live = switched_out_live(self);
         self.verify_dirty_gc_roots(live, "before dirty GC");
-        let stats = self.collect_heap_roots(live, &mut [], 0)?;
+        let stats = self.collect_arg_reg(live, &mut [], 0)?;
         self.verify_dirty_gc_roots(live, "after dirty GC");
         crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         Ok(())

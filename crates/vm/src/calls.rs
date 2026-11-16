@@ -110,8 +110,8 @@ pub(super) fn gc_after_bif(
     } else {
         None
     };
-    let stats = process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
-    arguments.copy_from_slice(&process.x[..arguments.len()]);
+    // `arguments` is the `reg[..arity]` the caller holds (erts' `regs`, `arity`).
+    let stats = process.collect_heap_roots_objv(arguments, &mut roots, 0)?;
     if let Some(error_roots) = error_roots
         && let Err(error) = result
     {
@@ -210,7 +210,9 @@ pub(crate) fn gc_after_native_parts(
     } else {
         None
     };
-    let stats = process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
+    // The arguments are rooted in `roots` (copied from the caller's registers, which it
+    // writes back), so the collection takes no other register roots.
+    let stats = process.collect_heap_roots_objv(&mut [], &mut roots, 0)?;
     arguments.copy_from_slice(&roots[..arguments.len()]);
     if let Some(NativeErrorRoots::Trap { reason, trace, top }) = error_roots
         && let Some(trap) = raised

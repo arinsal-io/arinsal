@@ -676,6 +676,7 @@ impl Vm {
         // epilogue raises or returns. A value roots only the result; an error roots the
         // argument registers.
         let mut result = result;
+        // `bif_args` are this call's `reg[..arity]`: the error raised below names them.
         crate::calls::gc_after_bif(p, &mut bif_args, &mut result)?;
         let result = match result {
             Err(error @ BifError::Raise { .. })

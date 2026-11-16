@@ -134,7 +134,7 @@ impl Process {
             return Ok(());
         }
         let live = live.min(self.x.len());
-        let gc = self.collect_heap_roots(live, &mut [], 0)?;
+        let gc = self.collect_arg_reg(live, &mut [], 0)?;
         crate::natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
         Ok(())
     }
@@ -187,13 +187,18 @@ impl Process {
 
     /// Collect live registers together with only on-heap mailbox message roots.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
-    pub(crate) fn collect_heap_roots(
+    /// A collection of a process that is not running Erlang code: its roots are the saved
+    /// `c_p->arg_reg` up to `live` (`c_p->arity`), as erts' system tasks, switch-out and
+    /// dirty collections root them.
+    // Port of erts/emulator/beam/erl_gc.c (garbage_collect with `p->arg_reg`, `p->arity`),
+    // OTP-29.1.1.
+    pub(crate) fn collect_arg_reg(
         &mut self,
         live_x: usize,
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
-        let mut x = self.take_x_for_gc();
+        let mut x = self.take_arg_reg();
         let collected = self.collect_heap_roots_objv(&mut x[..live_x], extra, min_free);
         self.x = x;
         collected
@@ -212,10 +217,8 @@ impl Process {
         self.collect_roots(objv, extra, min_free, false)
     }
 
-    /// The process's X file, taken out for a collection whose caller does not hold the
-    /// register array yet (XREG-1: these callers move to [`Self::collect_heap_roots_objv`]
-    /// with the `reg` they are given; this goes with the attached `ArgRegs`).
-    pub(crate) fn take_x_for_gc(&mut self) -> crate::proc_create::ArgRegs {
+    /// The saved `c_p->arg_reg`, taken out while a collection roots it.
+    pub(crate) fn take_arg_reg(&mut self) -> crate::proc_create::ArgRegs {
         std::mem::replace(&mut self.x, crate::proc_create::ArgRegs::empty())
     }
 
@@ -225,7 +228,7 @@ impl Process {
         &mut self,
         live_x: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
-        let mut x = self.take_x_for_gc();
+        let mut x = self.take_arg_reg();
         let collected = self.collect_roots(&mut x[..live_x], &mut [], 0, true);
         self.x = x;
         let stats = collected?;
@@ -353,7 +356,7 @@ impl Process {
     #[inline(never)]
     fn collect_bin_vheap_now(&mut self, live_x: usize) -> Result<(), VmError> {
         let live_x = live_x.min(self.x.len());
-        let stats = self.collect_heap_roots(live_x, &mut [], 0)?;
+        let stats = self.collect_arg_reg(live_x, &mut [], 0)?;
         crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         self.charge_gc_stats(&stats);
         Ok(())

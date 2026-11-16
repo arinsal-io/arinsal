@@ -2599,7 +2599,7 @@ pub(crate) fn collect_heap(
     }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
     let live = process.gc_live;
-    let collected = process.collect_heap_roots(live, keep, 0);
+    let collected = process.collect_arg_reg(live, keep, 0);
     process.heap.set_fullsweep_after(fullsweep_after);
     let stats = collected?;
     // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates

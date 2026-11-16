@@ -778,7 +778,19 @@ pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
     reg: *mut u64,
 ) -> u64 {
     // THE_NON_VALUE raises, 1 hands the call to the interpreter, any term word is the result.
-    invoke_dispatch_bif(header, reg, identity as usize, 0, export, true).unwrap_or(1)
+    let raw = invoke_dispatch_bif(header, reg, identity as usize, 0, export, true).unwrap_or(1);
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_call_bif:
+    // ERTS_IS_GC_AFTER_BIF_DESIRED, then erts_gc_after_bif_call_lhf with `reg`), OTP-29.1.1:
+    // the export entry's BIF call collects after the BIF, for a value or the non-value.
+    if raw != 1
+        && let Some(export) = export
+        && let Some((process, registers)) =
+            crate::native_hooks::enter_runtime_after_bif(header, reg)
+        && process.heap.gc_after_bif_desired()
+    {
+        return gc_after_bif_call(process, registers, export, raw);
+    }
+    raw
 }
 
 /// `call_error_handler` of the export trampoline: the export of
@@ -1710,7 +1722,7 @@ fn thin_bif_failed(
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    process_bif_result(process, export, usize::from(export.arity), Err(trap))
+    process_bif_result(process, export, Err(trap))
 }
 
 /// An ETS or process-dictionary BIF whose body is `direct_ets`.
@@ -2502,7 +2514,7 @@ fn call_process_bif(
                 process.x[0] = value;
                 crate::native_hooks::raw(value)
             }
-            Err(error) => process_bif_result(process, export, arity, Err(error)),
+            Err(error) => process_bif_result(process, export, Err(error)),
         });
     }
     // The light fragment tests the collection after its call (instr_bif.cpp:488-523).
@@ -2516,7 +2528,7 @@ fn call_process_bif(
         process.x[0] = value;
         return Some(crate::native_hooks::raw(value));
     }
-    Some(process_bif_result(process, export, arity, result))
+    Some(process_bif_result(process, export, result))
 }
 
 /// A process BIF's exception, or a value after which a collection is desired.
@@ -2527,22 +2539,10 @@ fn call_process_bif(
 fn process_bif_result(
     process: &mut crate::Process,
     export: ExportDispatch,
-    arity: usize,
-    mut result: Result<Term, crate::exceptions::Trap>,
+    result: Result<Term, crate::exceptions::Trap>,
 ) -> u64 {
-    let collected = process.heap.gc_after_bif_desired();
-    if collected {
-        let mut args = argument_registers(process, arity);
-        let (value, raised) = match &mut result {
-            Ok(value) => (Some(value), None),
-            Err(trap) => (None, Some(trap)),
-        };
-        let gc = crate::calls::gc_after_native_parts(process, &mut args, value, raised);
-        if gc.is_err() {
-            crate::native_hooks::set_error(process, "system_limit");
-            return 0;
-        }
-    }
+    // The collection after the BIF is the caller's (erts_gc_after_bif_call_lhf in the call
+    // fragment, beam_jit_call_bif, or the executor's call site), not this epilogue's.
     match result {
         Ok(value) => {
             let value = crate::native_hooks::raw(value);
@@ -2560,7 +2560,7 @@ fn process_bif_result(
 fn bif_trap_export(
     process: &mut crate::Process,
     export: ExportDispatch,
-    mut export_trap: crate::ExportTrap,
+    export_trap: crate::ExportTrap,
     identity: usize,
 ) -> u64 {
     // erl_gc.c:430-436 (erts_gc_after_bif_call_lhf): the first trap with F_DISABLE_GC saves
@@ -2568,16 +2568,13 @@ fn bif_trap_export(
     if !process.heap.gc_enabled {
         process.heap.save_live_frags_mark();
     }
-    // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and are the live roots
-    // while the process is parked in `beam_bif_export_trap`.
-    if crate::calls::gc_after_native_parts(process, &mut export_trap.args, None, None).is_err() {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    }
+    // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and set `c_p->arity`: they
+    // are the live roots of the collection the caller runs after the BIF.
     let arity = export_trap.args.len();
     process.x.ensure_x(arity);
     process.x[..arity].copy_from_slice(&export_trap.args);
     process.gc_live = arity;
+    process.heap.abi.arity = arity as u8;
     crate::bif_traps::install_export_trap(
         process,
         identity,
@@ -2592,8 +2589,8 @@ fn bif_trap_export(
 
 /// The shared BIF epilogue for a BIF body that reports its result as `Result<Term, VmError>`:
 /// a value, `BIF_ERROR`, or `BIF_TRAP*` complete here, in native code, as erts'
-/// `call_light_bif_shared` / `call_bif_shared` complete them; GC after the BIF is
-/// [`process_bif_result`]'s. An outcome only the scheduler completes (ERTS_BIF_YIELD, a dirty
+/// `call_light_bif_shared` / `call_bif_shared` complete them; GC after the BIF is the call
+/// site's (`erts_gc_after_bif_call_lhf` with `reg`). An outcome only the scheduler completes (ERTS_BIF_YIELD, a dirty
 /// BIF on a normal scheduler, hibernation, a VM failure) is THE_NON_VALUE with
 /// `TRAP` to the call itself; the scheduler takes the stored outcome instead of calling the
 /// BIF again.
@@ -2606,7 +2603,6 @@ pub(crate) fn bif_return(
     light_call: bool,
     result: Result<Term, crate::VmError>,
 ) -> u64 {
-    let arity = usize::from(export.arity);
     let result = match result {
         Ok(value) => Ok(value),
         Err(crate::VmError::Trap(trap)) => Err(trap),
@@ -2623,7 +2619,7 @@ pub(crate) fn bif_return(
         }
         Err(error) => return bif_scheduler_outcome(process, export, identity, light_call, error),
     };
-    process_bif_result(process, export, arity, result)
+    process_bif_result(process, export, result)
 }
 
 /// [`bif_return`] of a `bif_table[].f` body's failure: `BIF_ERROR`, `BIF_TRAP*` or an outcome
@@ -2789,24 +2785,18 @@ pub(crate) fn bif_error(process: &mut crate::Process, trap: crate::exceptions::T
     0
 }
 
-/// A copy of the first `arity` X registers, for a cold path that hands the arguments to a
-/// function that also takes the process.
-fn argument_registers(process: &crate::Process, arity: usize) -> smallvec::SmallVec<[Term; 8]> {
-    process.x[..arity].iter().copied().collect()
-}
-
 /// An error, or a value after which a collection is desired.
 #[cold]
 #[inline(never)]
 fn plain_bif_result(
     process: &mut crate::Process,
-    _registers: &mut arinsal_beamasm::SchedulerRegisters,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
     export: ExportDispatch,
     arity: usize,
     mut result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
     let collected = process.heap.gc_after_bif_desired();
-    if collected && !gc_after_plain_bif(process, arity, &mut result) {
+    if collected && !gc_after_plain_bif(process, &mut registers.x_reg_array[..arity], &mut result) {
         return 0;
     }
     match result {
@@ -2842,6 +2832,18 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
+    gc_after_bif_call(process, registers, export, value)
+}
+
+/// `erts_gc_after_bif_call_lhf(c_p, live_hf_end, result, reg, arity)`: the result (a term or
+/// the non-value) after the BIF of `export`, collected with `reg` as the roots.
+// Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
+fn gc_after_bif_call(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    value: u64,
+) -> u64 {
     // erl_gc.c:428-445 (erts_gc_after_bif_call_lhf): with F_DISABLE_GC the result is returned
     // without a collection.
     if !process.heap.gc_enabled {
@@ -2901,11 +2903,10 @@ fn gc_after_failed_bif(
 #[inline(never)]
 fn gc_after_plain_bif(
     process: &mut crate::Process,
-    arity: usize,
+    reg: &mut [Term],
     result: &mut Result<Term, arinsal_bifs::BifError>,
 ) -> bool {
-    let mut args = argument_registers(process, arity);
-    let collected = crate::calls::gc_after_bif(process, &mut args, result);
+    let collected = crate::calls::gc_after_bif(process, reg, result);
     if collected.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
         return false;
@@ -4740,7 +4741,8 @@ fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
             // the result as the only root.
             if process.heap.gc_after_bif_desired() {
                 let mut result = Ok(term);
-                if !gc_after_plain_bif(process, 2, &mut result) {
+                // A value roots only itself (erl_gc.c:460-464).
+                if !gc_after_plain_bif(process, &mut [], &mut result) {
                     return Some(0);
                 }
                 let Ok(term) = result else { return Some(0) };

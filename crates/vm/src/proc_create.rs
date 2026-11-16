@@ -2138,16 +2138,7 @@ impl Process {
         }
         process
     }
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
-        let cost = self.ensure_roots_cost(words, live)?;
-        if cost != 0 {
-            self.bump_gc_reds(cost);
-        }
-        Ok(())
-    }
-    /// [`Process::ensure`] with the no-collection case inline, for the native entry that runs
+    /// [`Process::ensure_objv`] with the no-collection case inline, for the native entry that runs
     /// once per scheduling turn.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1: the
     // entry check only reads the heap cursors unless a collection is wanted.
@@ -2162,7 +2153,7 @@ impl Process {
         }
         self.ensure_objv(words, objv)
     }
-    /// [`Process::ensure`] that returns the collection's reduction cost instead of charging it,
+    /// [`Process::ensure_objv`] that returns the collection's reduction cost instead of charging it,
     /// for `arinsal_beamasm_gc_sync`, whose generated code subtracts the cost from FCALLS.
     #[cold]
     #[inline(never)]
@@ -2214,20 +2205,7 @@ impl Process {
         }
         self.ensure_objv(words, objv).map(|()| true)
     }
-    /// Collect with `live` X roots; the registers above them are left as they are.
-    #[cold]
-    #[inline(never)]
-    fn ensure_roots_cost(&mut self, words: usize, live: usize) -> Result<u32, VmError> {
-        if live > self.x.len() {
-            return Err(VmError::Unsupported("live X register count".into()));
-        }
-        let mut x = self.take_x_for_gc();
-        let cost = self.ensure_objv_cost(words, &mut x[..live]);
-        self.x = x;
-        cost
-    }
-
-    /// [`Process::ensure`] rooting `objv`, the register array prefix the caller holds
+    /// [`Process::ensure_objv`] rooting `objv`, the register array prefix the caller holds
     /// (`erts_garbage_collect(p, need, reg, live)`).
     // Port of erts/emulator/beam/erl_gc.c (erts_garbage_collect), OTP-29.1.1.
     #[cold]

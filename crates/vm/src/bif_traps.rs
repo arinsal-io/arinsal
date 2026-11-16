@@ -2037,11 +2037,12 @@ fn build_ptab_result(
         }
         return ptab_yield(process, state, accumulator, spent);
     }
-    set_ptab_accumulator(process, accumulator)?;
+    let mut objv = [accumulator];
     process
-        .ensure(conses.saturating_mul(2), 1)
+        .ensure_objv(conses.saturating_mul(2), &mut objv)
         .map_err(|_| BifError::SystemLimit)?;
-    let accumulator = process.x[0];
+    let [accumulator] = objv;
+    set_ptab_accumulator(process, accumulator)?;
     let start = terms.len() - conses;
     let built = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .reserve_cons_list(conses)
@@ -2397,7 +2398,7 @@ mod export_trap_tests {
 
         // A collection while the process is scheduled out: the live X registers are the roots.
         process
-            .collect_heap_roots(process.gc_live, &mut [], 0)
+            .collect_arg_reg(process.gc_live, &mut [], 0)
             .unwrap();
 
         let Some(Ok(ResumeResult::Export(resumed))) = run_trapped_export(&mut process, None) else {
