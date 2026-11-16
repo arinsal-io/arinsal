@@ -37,9 +37,11 @@ fn float_result(process: &mut Process, value: f64) -> Result<Term, VmError> {
     if !value.is_finite() {
         return Err(badarith());
     }
-    Ok(TermBuilder::new(&mut process.heap)
+    // erts HAlloc: the process heap, or a heap fragment when it is full.
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    TermBuilder::new(&mut heap)
         .float(value)
-        .expect("process heap follows erts HAlloc"))
+        .map_err(|_| crate::natives::erl_process::system_limit())
 }
 
 fn math_call_1(
