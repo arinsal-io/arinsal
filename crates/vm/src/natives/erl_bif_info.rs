@@ -176,6 +176,7 @@ fn system_info_light_name(key: Term) -> Option<&'static str> {
             | "endian"
             | "heap_type"
             | "time_correction"
+            | "message_queue_data"
             | "kernel_poll"
             | "time_offset"
             | "time_warp_mode"
