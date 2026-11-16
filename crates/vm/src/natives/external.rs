@@ -151,7 +151,8 @@ fn term_to_binary_start(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, bif_ix: 
         },
         walk,
     };
-    erts_term_to_binary_int(c_p, reg, i, process, bif_ix, (term, opts), context, None)
+    let mut context = context;
+    erts_term_to_binary_int(c_p, reg, i, process, bif_ix, (term, opts), &mut context, None)
 }
 
 /// `erts_internal:term_to_binary_trap/1`.
@@ -183,7 +184,7 @@ pub(crate) extern "C" fn term_to_binary_trap_1(
     let context = mref
         .with_magic_payload::<TtbHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
-    let Some(context) = context else {
+    let Some(mut context) = context else {
         return bif_ret(c_p, i, Err(badarg()));
     };
     erts_term_to_binary_int(
@@ -193,7 +194,7 @@ pub(crate) extern "C" fn term_to_binary_trap_1(
         process,
         bif_ix,
         (term, opts),
-        context,
+        &mut context,
         Some(mref),
     )
 }
@@ -210,7 +211,7 @@ fn erts_term_to_binary_int(
     process: &mut Process,
     bif_ix: usize,
     (term, opts): (Term, Term),
-    context: TtbContext,
+    context: &mut TtbContext,
     mref: Option<Term>,
 ) -> u64 {
     let (name, arity, _) = TTB_BIFS[bif_ix];
@@ -246,15 +247,15 @@ fn ttb_outcome(
     process: &mut Process,
     bif_ix: usize,
     (term, opts): (Term, Term),
-    mut context: TtbContext,
+    context: &mut TtbContext,
     mref: Option<Term>,
 ) -> TtbOutcome {
     let reds = process.heap.abi.fcalls.max(0) as usize;
     let chunk = reds.saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
     let trapped = mref.is_some();
-    match ttb_pass(process, &mut context, chunk) {
+    match ttb_pass(process, context, chunk) {
         TtbStep::Failed(error, work) => {
-            abandon(&mut context);
+            abandon(context);
             charge(process, work / TERM_TO_BINARY_LOOP_FACTOR);
             if trapped && (gc_enable(process) || process.heap.bin_vheap_gc_due()) {
                 crate::bif_traps::vbump_all_reds(process);
@@ -276,6 +277,7 @@ fn ttb_outcome(
             // EXPORT_CONTEXT, then RETURN_STATE.
             let mref = match mref {
                 Some(mref) => {
+                    let context = take_context(context);
                     let _ = mref.with_magic_payload::<TtbHolder, _>(|holder| {
                         *holder.lock().expect("term_to_binary context") = Some(context);
                     });
@@ -284,7 +286,7 @@ fn ttb_outcome(
                 None => {
                     let Some(mref) = create_holder(
                         process,
-                        TtbHolder::new(Some(context)),
+                        TtbHolder::new(Some(take_context(context))),
                         ERTS_TTB_CONTEXT_SIZE,
                     ) else {
                         return TtbOutcome::Failed(BifError::SystemLimit);
@@ -321,13 +323,26 @@ pub(crate) fn erts_debug_term_to_binary(
         state: TtbState::Size,
         walk,
     };
-    match ttb_outcome(process, 1, (term, opts), context, None) {
+    let mut context = context;
+    match ttb_outcome(process, 1, (term, opts), &mut context, None) {
         TtbOutcome::Value(value) => Ok(value),
         TtbOutcome::Trap(trap) => Err(trap),
         TtbOutcome::Failed(_) => Err(crate::VmError::Trap(crate::exceptions::Trap::error(
             Term::atom(atoms::SYSTEM_LIMIT),
         ))),
     }
+}
+
+/// The context of a call that yields moves into its magic binary (`EXPORT_CONTEXT`); the stack
+/// context is left spent.
+fn take_context(context: &mut TtbContext) -> TtbContext {
+    std::mem::replace(
+        context,
+        TtbContext {
+            state: TtbState::Size,
+            walk: EncodeWalk::completed(),
+        },
+    )
 }
 
 /// Releases the writable staging binaries of a context that failed.
