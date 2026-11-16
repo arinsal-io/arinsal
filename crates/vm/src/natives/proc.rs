@@ -1918,7 +1918,6 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
 /// `erts_internal` entries are BIFs, so the `erlang` wrappers stay in BEAM.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "group_leader", 3),
-    ("erlang", "processes", 0),
     ("erlang", "pid_to_list", 1),  // elixir_loop1
     ("erlang", "ref_to_list", 1),  // mix_loop6
     ("erlang", "port_to_list", 1), // mix_loop6
@@ -2837,17 +2836,6 @@ pub(crate) fn failure_reply(
     }
 }
 
-fn processes(process: &mut Process) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/bif.c:4097 (processes_0), OTP-29.1.1.
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let pids = runtime
-        .process_pids()
-        .into_iter()
-        .filter_map(Pid::to_term)
-        .collect::<Vec<_>>();
-    make_list(process, pids)
-}
-
 // Port of erts/emulator/beam/bif.c:4898 (erts_internal_group_leader_3), OTP-29.1.1: the
 // target, the caller itself included, gets the group-leader signal and the caller receives
 // `{Ref, Result}` when the target handles it.
@@ -2989,7 +2977,6 @@ fn call_values(
             ("group_leader", [leader, pid, reference]) if module == "erts_internal" => {
                 group_leader_3(process, ctx, *leader, *pid, *reference)
             }
-            ("processes", []) => processes(process),
             // Port of erts/emulator/beam/erl_bif_info.c:4932-4945,
             // OTP-29.1.1. System processes are tracked when the VM creates them.
             ("is_system_process", [target]) if module == "erts_internal" => {

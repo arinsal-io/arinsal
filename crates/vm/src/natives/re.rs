@@ -9,9 +9,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("re", "version", 0),
     ("re", "compile", 1),
     ("re", "compile", 2),
-    ("re", "run", 2),
-    ("re", "run", 3),
-    ("re", "internal_run", 4),
     ("re", "inspect", 2),
     ("re", "import", 1),
 ];

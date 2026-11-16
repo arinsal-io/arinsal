@@ -46,6 +46,7 @@ mod misc_bifs;
 mod missing_bifs;
 mod moved_bif_differential;
 mod phash2_unaligned_differential;
+mod ptab_list_trap;
 mod re;
 mod re_error_info;
 mod re_run_yield;

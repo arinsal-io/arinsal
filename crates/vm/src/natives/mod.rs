@@ -15,6 +15,7 @@ pub(crate) mod erl_bif_info;
 pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_op;
 pub(crate) mod erl_bif_os;
+pub(crate) mod erl_bif_re;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_iolist;
@@ -23,6 +24,7 @@ pub(crate) mod erl_map;
 pub(crate) mod erl_math;
 pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
+pub(crate) mod erl_ptab;
 pub(crate) mod erl_unicode;
 mod erl_unicode_normalize;
 pub(crate) mod erts_debug;
@@ -285,7 +287,6 @@ const PORT_IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "port_command", 3),
     ("erts_internal", "port_close", 1),
     ("erts_internal", "port_connect", 2),
-    ("erlang", "ports", 0),
     ("erts_internal", "port_info", 1),
     ("erts_internal", "port_info", 2),
     ("erts_internal", "port_control", 3),

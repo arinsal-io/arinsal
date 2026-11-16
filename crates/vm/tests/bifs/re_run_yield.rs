@@ -6,7 +6,7 @@ const MODULE: &str = "re_run_yield";
 const SOURCE: &str = r#"
 -module(re_run_yield).
 -export([kill/0, same_result/0, kill_internal/0, internal_result/0, edge_cases/0,
-         sub_binaries/0, sub_binary_fallbacks/0, unicode_global/0]).
+         sub_binaries/0, sub_binary_fallbacks/0, unicode_global/0, trapping_result/0]).
 kill() ->
     Subject = binary:copy(<<"hejsan">>, 100000),
     {ok, Compiled} = re:compile(<<"\\w+\\d">>, []),
@@ -56,6 +56,9 @@ unicode_global() ->
     {ok, Compiled} = re:compile("é", [unicode]),
     [re:run("éaé", "é", [unicode, global, {capture, all, list}]),
      re:run("éaé", Compiled, [global, {capture, all, binary}])].
+trapping_result() ->
+    Subject = binary:copy(<<"a">>, 1000000),
+    re:run(Subject, <<"^a+$">>, [{capture, none}]).
 "#;
 
 fn both(function: &str) -> (CallResult, CallResult) {
@@ -110,4 +113,10 @@ fn binary_captures_keep_or_copy_the_subject_as_erts_does() {
         let (expected, actual) = both(function);
         similar_asserts::assert_eq!(expected, actual, "{function}");
     }
+}
+
+#[test]
+fn a_large_match_resumes_through_the_hidden_trap_export() {
+    let (expected, actual) = both("trapping_result");
+    similar_asserts::assert_eq!(expected, actual);
 }

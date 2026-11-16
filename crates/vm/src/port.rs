@@ -4164,7 +4164,6 @@ pub(crate) fn family(
         ("port_set_data", [port, data]) if module == "erlang" => {
             port_set_data(process, *port, *data)
         }
-        ("ports", []) if module == "erlang" => ports(vm, process),
         ("port_info", [port]) if module == "erts_internal" => port_info(process, *port, None),
         ("port_info", [port, item]) if module == "erts_internal" => {
             port_info(process, *port, Some(*item))
@@ -5621,25 +5620,6 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
     send_message(process, port, envelope)
 }
 
-fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/bif.c:4125 (ports/0), OTP-29.1.1.
-    // The forker is port zero and exists even when no user port is open.
-    let mut values = vec![Term::port(0).expect("standard I/O port tag")];
-    if let Some(runtime) = &process.runtime {
-        values.extend(
-            runtime
-                .ports
-                .ids()
-                .into_iter()
-                .filter(|id| *id != 0)
-                .filter_map(Term::port),
-        );
-    }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    TermBuilder::new(&mut heap)
-        .list_from_iter(values)
-        .map_err(|e| VmError::Unsupported(format!("ports list: {e:?}")))
-}
 /// `port_info` of port zero, the forker driver's port.
 // Port of erts/emulator/beam/io.c (port_info) for the port erts creates in
 // erts/emulator/sys/unix/sys_drivers.c:291 (forker_init), OTP-29.1.1.

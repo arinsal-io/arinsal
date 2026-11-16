@@ -168,8 +168,8 @@ use crate::native_helpers::{
 };
 use crate::natives::{
     bif_phash2, binary, erl_bif_atomics, erl_bif_chksum, erl_bif_guard, erl_bif_info,
-    erl_bif_lists, erl_bif_op, erl_hl_timer, erl_iolist, erl_map, erl_math, erl_process_dict,
-    erl_unicode, external, register,
+    erl_bif_lists, erl_bif_op, erl_bif_re, erl_hl_timer, erl_iolist, erl_map, erl_math,
+    erl_process_dict, erl_ptab, erl_unicode, external, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -187,6 +187,13 @@ pub(crate) enum BinaryGuard {
 /// pointer.
 pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> {
     let func = match (module, function, arity) {
+        // erl_bif_re.c
+        ("re", "run", 2) => bif!(erl_bif_re::re_run_2),
+        ("re", "run", 3) => bif!(erl_bif_re::re_run_3),
+        ("re", "internal_run", 4) => bif!(erl_bif_re::re_internal_run_4),
+        // erl_ptab.c / bif.c
+        ("erlang", "processes", 0) => bif!(erl_ptab::processes_0),
+        ("erlang", "ports", 0) => bif!(erl_ptab::ports_0),
         // register.c
         ("erlang", "register", 2) => bif!(register::register_2),
         ("erlang", "unregister", 1) => bif!(register::unregister_1),
@@ -470,6 +477,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 // fixed here when the export is created.
 pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<usize> {
     Some(match (module, function, arity) {
+        ("erlang", "re_run_trap", 3) => bif!(erl_bif_re::re_run_trap_3),
+        ("erlang", "ptab_list_continue", 2) => bif!(erl_ptab::ptab_list_continue_2),
         ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
