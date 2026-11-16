@@ -54,6 +54,10 @@ impl Process {
             && self.sig_cont().is_empty()
             && self.dictionary.is_none()
             && !self.seq_token_root.is_pointer()
+            // `fvalue` and `ftrace` are roots (erl_gc.c:2678-2690); a BIF that failed before
+            // `erts_gc_after_bif_call_lhf` collects keeps its exception there.
+            && !matches!(self.heap.abi.exc.fvalue & 3, 1 | 2)
+            && !matches!(self.heap.abi.exc.ftrace & 3, 1 | 2)
             && self.apply_inline_len == 0
             && self.cold.as_ref().is_none_or(|cold| {
                 cold.persistent_get_all.is_none()

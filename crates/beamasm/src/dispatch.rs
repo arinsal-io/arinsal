@@ -1061,16 +1061,17 @@ fn emit_export_fragment(
     code.b(return_term)?;
     code.bind(direct_done)?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
-    code.cbz(Gpr::x(0), direct_non_value)?;
+    let check_return = code.new_label();
     if gc_helper != 0 {
         // Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_call_bif:
         // ERTS_IS_GC_AFTER_BIF_DESIRED → erts_gc_after_bif_call_lhf), OTP-29.1.1: the export
         // entry of a BIF goes through call_bif_shared, which collects after the BIF just as
-        // the light fragment does. The result is spilled and the arguments stay live; a
-        // failed collection returns the non-value with its reason set.
+        // the light fragment does, before the result is looked at: a failed or trapping BIF
+        // collects too. The result (or the non-value) is spilled and passed to the collector,
+        // which roots it, or the arguments when there is none.
         let gc_after_bif = code.new_label();
         emit_gc_desired_test(code, gc, gc_after_bif)?;
-        code.b(return_term)?;
+        code.b(check_return)?;
         code.bind(gc_after_bif)?;
         code.emit(|encoder| encoder.str_uoff(Gpr::x(0), Gpr::sp(), 24))?;
         emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
@@ -1084,9 +1085,9 @@ fn emit_export_fragment(
             encoder.blr(Gpr::x(17))
         })?;
         emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
-        code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
-        code.b_cond(Cond::Eq, direct_non_value)?;
     }
+    code.bind(check_return)?;
+    code.cbz(Gpr::x(0), direct_non_value)?;
     code.b(return_term)?;
     code.bind(direct_non_value)?;
     code.emit(|encoder| {
@@ -1330,8 +1331,8 @@ fn emit_call_light_bif_shared(
 ) -> Result<(), BufferError> {
     let trace = code.new_label();
     let yield_bif = code.new_label();
-    let success = code.new_label();
     let store = code.new_label();
+    let check_return = code.new_label();
     let gc_after_bif = code.new_label();
     let not_value = code.new_label();
     let trap = code.new_label();
@@ -1401,7 +1402,18 @@ fn emit_call_light_bif_shared(
     }
     code.bind(after_bif)?;
     emit_leave_light_bif(code)?;
-    code.cbnz(Gpr::x(0), success)?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523 (ERTS_IS_GC_DESIRED_INTERNAL),
+    // OTP-29.1.1: the test runs before the result is looked at, so a BIF that fails or traps
+    // also collects the heap fragments that outgrew the free heap (erts_gc_after_bif_call_lhf
+    // takes the non-value too). It reads the live process fields (`F_DISABLE_GC`, `mbuf_sz`,
+    // `off_heap.overhead`, `bin_vheap_sz`) and the header's `htop`/`stop`, as erts does.
+    // Without a collection helper no test is emitted (test fragments use zero sizes).
+    if gc_helper != 0 {
+        emit_gc_desired_test(code, gc, gc_after_bif)?;
+    }
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:516-546 (check_bif_return), OTP-29.1.1.
+    code.bind(check_return)?;
+    code.cbnz(Gpr::x(0), store)?;
     code.bind(not_value)?;
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
@@ -1446,14 +1458,6 @@ fn emit_call_light_bif_shared(
         encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
         encoder.br(Gpr::x(30))
     })?;
-    code.bind(success)?;
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523 (ERTS_IS_GC_DESIRED_INTERNAL),
-    // OTP-29.1.1: the test reads the live process fields (`F_DISABLE_GC`, `mbuf_sz`,
-    // `off_heap.overhead`, `bin_vheap_sz`) and the header's `htop`/`stop`, as erts does.
-    // Without a collection helper no test is emitted (test fragments use zero sizes).
-    if gc_helper != 0 {
-        emit_gc_desired_test(code, gc, gc_after_bif)?;
-    }
     code.bind(store)?;
     code.emit(|encoder| {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523, OTP-29.1.1.
@@ -1466,8 +1470,9 @@ fn emit_call_light_bif_shared(
     })?;
     if gc_helper != 0 {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:549-570 (gc_after_bif_call), OTP-29.1.1:
-        // the result is spilled, the runtime is entered as for the BIF, and the collection
-        // keeps the arguments live. A zero result is an error that `not_value` raises.
+        // the result (a term or the non-value) is spilled, the runtime is entered as for the
+        // BIF, and the collection roots the result, or the arguments when there is none; then
+        // check_bif_return looks at what it returned.
         code.bind(gc_after_bif)?;
         code.emit(|encoder| encoder.str_uoff(Gpr::x(0), Gpr::sp(), 24))?;
         emit_enter_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
@@ -1481,9 +1486,7 @@ fn emit_call_light_bif_shared(
             encoder.blr(Gpr::x(17))
         })?;
         emit_leave_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
-        code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
-        code.b_cond(Cond::Eq, not_value)?;
-        code.b(store)?;
+        code.b(check_return)?;
     }
     code.bind(helper_call)?;
     code.emit(|encoder| {

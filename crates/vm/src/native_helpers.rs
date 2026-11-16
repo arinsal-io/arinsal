@@ -2816,10 +2816,15 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
     // erl_gc.c:428-445 (erts_gc_after_bif_call_lhf): with F_DISABLE_GC the result is returned
     // without a collection.
     if !process.heap.gc_enabled {
-        process.x[0] = crate::native_hooks::from_raw(value);
+        if value != arinsal_term::THE_NON_VALUE {
+            process.x[0] = crate::native_hooks::from_raw(value);
+        }
         return value;
     }
     let arity = usize::from(export.arity);
+    if value == arinsal_term::THE_NON_VALUE {
+        return gc_after_failed_bif(process, arity);
+    }
     plain_bif_result(
         process,
         registers,
@@ -2827,6 +2832,32 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
         arity,
         Ok(crate::native_hooks::from_raw(value)),
     )
+}
+
+/// `erts_gc_after_bif_call_lhf` for a BIF that returned the non-value: the exception (or
+/// trap) stays in `freason`/`fvalue`/`ftrace`, which the collection roots, and the live X
+/// registers are the BIF's arguments (`arity`), or `c_p->arity` after a BIF_TRAP.
+// Port of erts/emulator/beam/erl_gc.c:454-459 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn gc_after_failed_bif(process: &mut crate::Process, arity: usize) -> u64 {
+    let live = if process.heap.abi.exc.freason == arinsal_term::exc::TRAP {
+        usize::from(process.heap.abi.arity)
+    } else {
+        arity
+    };
+    match process.collect_heap_roots(live, &mut [], 0) {
+        Ok(stats) => {
+            crate::natives::sys::after_collection(
+                process,
+                stats.collections,
+                stats.words_reclaimed,
+            );
+            process.charge_gc_stats(&stats);
+        }
+        Err(_) => crate::native_hooks::set_error(process, "system_limit"),
+    }
+    arinsal_term::THE_NON_VALUE
 }
 
 /// Collects after a BIF whose heap fragments outgrew the free heap; false when the
