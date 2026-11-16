@@ -61,13 +61,13 @@ fn trapping_make_hash2(
     bif: &'static str,
 ) -> Result<Term, VmError> {
     // `ASSERT(p->flags & F_DISABLE_GC); erts_set_gc_state(p, 1);` after restoring the context.
-    let resumed = term.with_magic_payload::<TrapContext<Phash2Cont>, _>(|context| {
-        let mut context = context.lock().expect("phash2 context");
+    let resumed = term.with_magic_payload_mut::<TrapContext<Phash2Cont>, _>(|context| {
+        let context = &mut context.0;
         process.set_gc_enabled(true);
         let mut heap = ProcessHeapHandle(&mut process.heap);
         let mut call = BifCall::default();
         let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
-        arinsal_bifs::phash2_slice(&mut ctx, &mut context)
+        arinsal_bifs::phash2_slice(&mut ctx, context)
     });
     let trap_args = |state: Term| match range {
         Some(range) => vec![state, range],

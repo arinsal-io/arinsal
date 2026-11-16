@@ -53,8 +53,7 @@ pub(crate) extern "C" fn re_internal_run_4(c_p: *mut ProcessHeader, reg: *mut u6
 // Port of erts/emulator/beam/erl_bif_re.c (re_match_trap), OTP-29.1.1.
 pub(crate) extern "C" fn re_run_trap_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let [subject, pattern, restart] = bif_args::<3>(reg);
-    let prior =
-        restart.with_magic_payload::<RestartContext, _>(|context| context.lock().ok()?.take());
+    let prior = restart.with_magic_payload_mut::<RestartContext, _>(|context| context.0.take());
     let Some(Some(prior)) = prior else {
         let Some(process) = crate::native_hooks::process_from_header(c_p) else {
             return 0;
@@ -123,8 +122,8 @@ fn run(
                 arinsal_re::Progress::Yield(run) => {
                     let restart = if let Some(restart) = restart_term {
                         if restart
-                            .with_magic_payload::<RestartContext, _>(|context| {
-                                let mut context = context.lock().ok()?;
+                            .with_magic_payload_mut::<RestartContext, _>(|context| {
+                                let context = &mut context.0;
                                 *context = Some(run);
                                 Some(())
                             })

@@ -169,10 +169,10 @@ fn append_resume(
     lhs: Term,
     export: &'static str,
 ) -> u64 {
-    let resumed = lhs.with_magic_payload::<TrapContext<AppendContext>, _>(|context| {
-        let mut context = context.lock().expect("append context");
+    let resumed = lhs.with_magic_payload_mut::<TrapContext<AppendContext>, _>(|context| {
+        let context = &mut context.0;
         let originals = (context.lhs_original, context.rhs_original);
-        (append_continue(process, &mut context), originals)
+        (append_continue(process, context), originals)
     });
     let Some((result, (lhs_original, rhs_original))) = resumed else {
         return bif_badarg(c_p);
@@ -711,8 +711,8 @@ fn subtract(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, export: &'static str
             Err(_) => bif_system_limit(c_p),
         };
     }
-    let resumed = lhs.with_magic_payload::<TrapContext<SubtractContext>, _>(|context| {
-        let mut context = context.lock().expect("subtract context");
+    let resumed = lhs.with_magic_payload_mut::<TrapContext<SubtractContext>, _>(|context| {
+        let context = &mut context.0;
         let originals = context.originals();
         (context.step(process), originals)
     });

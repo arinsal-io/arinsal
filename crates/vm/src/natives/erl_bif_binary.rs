@@ -1437,8 +1437,8 @@ pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64
     let Some(pat_bin) = pattern.magic_owner() else {
         return bif_ret(c_p, i, Err(badarg()));
     };
-    let stepped = mref.with_magic_payload::<FindHolder, _>(|holder| {
-        let mut search = holder.lock().expect("binary_find context");
+    let stepped = mref.with_magic_payload_mut::<FindHolder, _>(|holder| {
+        let search = &mut holder.0;
         // `ctx->pat_bin = pat_bin`.
         search.set_pattern(pat_bin);
         let (done, work) = search.step(initial);

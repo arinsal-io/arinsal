@@ -347,9 +347,9 @@ fn binary_to_list_chunk(
         .saturating_add(1)
         .saturating_mul(B2L_BYTES_PER_REDUCTION);
     let stepped = mref
-        .with_magic_payload::<B2lHolder, _>(|holder| {
-            let mut walk = holder.lock().expect("binary_to_list state");
-            chunk_locked(process, &mut walk, size)
+        .with_magic_payload_mut::<B2lHolder, _>(|holder| {
+            let walk = &mut holder.0;
+            chunk_locked(process, walk, size)
         })
         .unwrap_or_else(|| Err(badarg()));
     match stepped {

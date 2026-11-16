@@ -172,7 +172,7 @@ pub(crate) extern "C" fn iolist_size_continue_1(
     process.heap.note_bif_entry();
     let [mref] = crate::bif_table::bif_args::<1>(reg);
     let state = mref
-        .with_magic_payload::<SizeHolder, _>(|holder| holder.lock().ok()?.take())
+        .with_magic_payload_mut::<SizeHolder, _>(|holder| holder.0.take())
         .flatten();
     match state {
         Some(mut state) => {
@@ -239,8 +239,8 @@ fn iolist_size_dispatch(
                 let arg = state.arg;
                 let mref = match mref {
                     Some(mref) => {
-                        let _ = mref.with_magic_payload::<SizeHolder, _>(|holder| {
-                            *holder.lock().expect("iolist size state") = Some(state);
+                        let _ = mref.with_magic_payload_mut::<SizeHolder, _>(|holder| {
+                            holder.0 = Some(state);
                         });
                         mref
                     }
@@ -415,7 +415,7 @@ pub(crate) extern "C" fn list_to_bitstring_continue_1(
     process.heap.note_bif_entry();
     let [mref] = crate::bif_table::bif_args::<1>(reg);
     let state = mref
-        .with_magic_payload::<L2bHolder, _>(|holder| holder.lock().ok()?.take())
+        .with_magic_payload_mut::<L2bHolder, _>(|holder| holder.0.take())
         .flatten();
     match state {
         Some(mut state) => {
@@ -485,8 +485,8 @@ fn list_to_bitstring_dispatch(
         IolistAction::Yield => {
             let mref = match mref {
                 Some(mref) => {
-                    let _ = mref.with_magic_payload::<L2bHolder, _>(|holder| {
-                        *holder.lock().expect("l2b state") = Some(state);
+                    let _ = mref.with_magic_payload_mut::<L2bHolder, _>(|holder| {
+                        holder.0 = Some(state);
                     });
                     mref
                 }
@@ -587,7 +587,7 @@ pub(crate) extern "C" fn iolist_to_iovec_continue_1(
     process.heap.note_bif_entry();
     let [mref] = crate::bif_table::bif_args::<1>(reg);
     let state = mref
-        .with_magic_payload::<VecHolder, _>(|holder| holder.lock().ok()?.take())
+        .with_magic_payload_mut::<VecHolder, _>(|holder| holder.0.take())
         .flatten();
     match state {
         Some(mut state) => {
@@ -658,8 +658,8 @@ fn iolist_to_iovec_dispatch(
         IolistAction::Yield => {
             let mref = match mref {
                 Some(mref) => {
-                    let _ = mref.with_magic_payload::<VecHolder, _>(|holder| {
-                        *holder.lock().expect("iovec state") = Some(state);
+                    let _ = mref.with_magic_payload_mut::<VecHolder, _>(|holder| {
+                        holder.0 = Some(state);
                     });
                     mref
                 }

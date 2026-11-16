@@ -73,15 +73,15 @@ pub(crate) extern "C" fn ptab_list_continue_2(
     };
     process.heap.note_bif_entry();
     let reds_left = process.heap.abi.fcalls.max(0) as u32;
-    let result = magic_ref.with_magic_payload::<TrapContext<PtabListBifData>, _>(|state| {
-        let mut state = state.lock().map_err(|_| BifError::SystemLimit)?;
+    let result = magic_ref.with_magic_payload_mut::<TrapContext<PtabListBifData>, _>(|state| {
+        let state = &mut state.0;
         let table_max = match &*state {
             PtabListBifData::Processes(_) => arinsal_term::ptab::process_table_layout().max(),
             PtabListBifData::Ports(_) => arinsal_term::ptab::port_table_layout().max(),
         };
         ptab_list_bif_engine(
             process,
-            &mut state,
+            state,
             &mut accumulator,
             Some(&mut magic_ref),
             table_max,
@@ -226,11 +226,18 @@ fn run_state(
     table_max: u32,
     reds_left: u32,
 ) -> Result<bool, BifError> {
-    let state = state
-        .downcast_ref::<TrapContext<PtabListBifData>>()
-        .ok_or(BifError::BADARG)?;
-    let mut state = state.lock().map_err(|_| BifError::SystemLimit)?;
-    ptab_list_bif_engine(process, &mut state, accumulator, None, table_max, reds_left)
+    state
+        .with_payload_mut::<TrapContext<PtabListBifData>, _>(|state| {
+            ptab_list_bif_engine(
+                process,
+                &mut state.0,
+                accumulator,
+                None,
+                table_max,
+                reds_left,
+            )
+        })
+        .ok_or(BifError::BADARG)?
 }
 
 /// The Rust table snapshots preserve erts' initial interval and deleted-entry reconciliation.

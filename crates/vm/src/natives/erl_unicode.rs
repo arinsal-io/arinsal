@@ -1429,8 +1429,8 @@ pub(crate) extern "C" fn characters_to_list_trap_1(
     process.heap.note_bif_entry();
     let [mref, rest, encoding] = crate::bif_table::bif_args::<3>(reg);
     let latin1 = encoding == Term::atom(atoms::LATIN1);
-    let taken = mref.with_magic_payload::<RestartHolder, _>(|holder| {
-        let mut rc = holder.lock().ok()?;
+    let taken = mref.with_magic_payload_mut::<RestartHolder, _>(|holder| {
+        let rc = &mut holder.0;
         Some((
             std::mem::take(&mut rc.bytes),
             rc.num_bytes_to_process,
@@ -1484,8 +1484,8 @@ pub(crate) extern "C" fn characters_to_list_trap_2(
     };
     process.heap.note_bif_entry();
     let [mref, rest, tail] = crate::bif_table::bif_args::<3>(reg);
-    let taken = mref.with_magic_payload::<RestartHolder, _>(|holder| {
-        let mut rc = holder.lock().ok()?;
+    let taken = mref.with_magic_payload_mut::<RestartHolder, _>(|holder| {
+        let rc = &mut holder.0;
         Some((
             std::mem::take(&mut rc.bytes),
             rc.num_processed_bytes,

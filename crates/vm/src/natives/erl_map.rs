@@ -676,10 +676,10 @@ fn maps_build(
     let mut reds = init;
     // Continue a trapped call: the state is ours when its holder is a `BuildState`.
     let resumed = is_boxed(list).then(|| {
-        list.with_magic_payload::<BuildState, _>(|state| {
+        list.with_magic_payload_mut::<BuildState, _>(|state| {
             // erts_set_gc_state(p, 1)
             process.set_gc_enabled(true);
-            let mut guard = state.lock().expect("maps build state");
+            let guard = &mut state.0;
             let walk = guard.as_mut()?;
             let mut heap = ProcessHeapHandle(&mut process.heap);
             let step = walk.step(&mut heap, &mut reds);
@@ -769,9 +769,7 @@ fn maps_projection(
     // `is_internal_magic_ref(bif_args[0])` with the driver's destructor: continue a trapped
     // call before looking at the argument as a map.
     if is_boxed(map)
-        && map.with_magic_payload::<ProjectionState, _>(|state| {
-            state.lock().is_ok_and(|walk| walk.is_some())
-        }) == Some(true)
+        && map.with_magic_payload_mut::<ProjectionState, _>(|state| state.0.is_some()) == Some(true)
     {
         return projection_resume(c_p, reg, i, process, export, map);
     }
@@ -843,8 +841,8 @@ fn projection_resume(
 ) -> u64 {
     let init = ycf_reds(process, PROJECTION_ITERATIONS_PER_RED);
     let mut reds = init;
-    let resumed = state_mref.with_magic_payload::<ProjectionState, _>(|state| {
-        let mut guard = state.lock().expect("maps projection state");
+    let resumed = state_mref.with_magic_payload_mut::<ProjectionState, _>(|state| {
+        let guard = &mut state.0;
         let walk = guard.as_mut()?;
         match walk.step(&mut reds) {
             Ok(false) => Some(Ok(None)),
@@ -1034,7 +1032,7 @@ pub(crate) extern "C" fn maps_merge_trap_1(c_p: *mut ProcessHeader, reg: *mut u6
     let [state_mref] = crate::bif_table::bif_args::<1>(reg);
     // `erts_magic_ref2bin(BIF_ARG_1)`: only `hashmap_merge` traps here, with its own state.
     let merge = state_mref
-        .with_magic_payload::<MergeState, _>(|state| state.lock().ok()?.take())
+        .with_magic_payload_mut::<MergeState, _>(|state| state.0.take())
         .flatten();
     match merge {
         Some(merge) => hashmap_merge(c_p, reg, i, process, merge, Some(state_mref)),
@@ -1082,8 +1080,8 @@ fn hashmap_merge(
         Ok(None) => {
             let state_mref = match trap_bin {
                 Some(state_mref) => {
-                    let _ = state_mref.with_magic_payload::<MergeState, _>(|state| {
-                        *state.lock().expect("hashmap merge state") = Some(merge);
+                    let _ = state_mref.with_magic_payload_mut::<MergeState, _>(|state| {
+                        state.0 = Some(merge);
                     });
                     state_mref
                 }

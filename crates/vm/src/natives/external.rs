@@ -164,7 +164,7 @@ pub(crate) extern "C" fn term_to_binary_trap_1(
         return bif_ret(c_p, i, Err(badarg()));
     }
     let context = mref
-        .with_magic_payload::<TtbHolder, _>(|holder| holder.lock().ok()?.take())
+        .with_magic_payload_mut::<TtbHolder, _>(|holder| holder.0.take())
         .flatten();
     let Some(mut context) = context else {
         return bif_ret(c_p, i, Err(badarg()));
@@ -264,8 +264,8 @@ fn ttb_outcome(
             let mref = match mref {
                 Some(mref) => {
                     let context = take_context(context);
-                    let _ = mref.with_magic_payload::<TtbHolder, _>(|holder| {
-                        *holder.lock().expect("term_to_binary context") = Some(context);
+                    let _ = mref.with_magic_payload_mut::<TtbHolder, _>(|holder| {
+                        holder.0 = Some(context);
                     });
                     mref
                 }
@@ -466,7 +466,7 @@ pub(crate) extern "C" fn binary_to_term_trap_1(
     process.heap.note_bif_entry();
     let [mref] = crate::bif_table::bif_args::<1>(reg);
     let context = mref
-        .with_magic_payload::<B2tHolder, _>(|holder| holder.lock().ok()?.take())
+        .with_magic_payload_mut::<B2tHolder, _>(|holder| holder.0.take())
         .flatten();
     let Some(mut ctx) = context else {
         return bif_ret(c_p, i, Err(badarg()));
@@ -526,8 +526,8 @@ fn b2t_exit_exported(
         return b2t_finish(c_p, reg, i, process, &mut ctx, exit);
     }
     let mref = ctx.trap_bin.expect("exported context has a trap_bin");
-    let _ = mref.with_magic_payload::<B2tHolder, _>(|holder| {
-        *holder.lock().expect("binary_to_term context") = Some(ctx);
+    let _ = mref.with_magic_payload_mut::<B2tHolder, _>(|holder| {
+        holder.0 = Some(ctx);
     });
     process.heap.abi.fcalls = 0;
     let trap = bif_trap(process, BINARY_TO_TERM_TRAP, vec![mref]);

@@ -7,20 +7,36 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// The data of a trap context's magic binary: the C context struct (`ErtsAppendContext`,
-/// `TTBContext`, ...) behind the lock the resuming BIF takes. A local type so that every
-/// context gets its own named destructor.
-pub(crate) struct TrapContext<T>(Mutex<T>);
+/// `TTBContext`, ...) inline in the magic binary, mutated in place by the owning process as
+/// erts does through ERTS_MAGIC_BIN_DATA. A local type so that every context gets its own named
+/// destructor.
+#[repr(transparent)]
+pub(crate) struct TrapContext<T>(pub(crate) T);
 
 impl<T> TrapContext<T> {
     pub(crate) fn new(context: T) -> Self {
-        Self(Mutex::new(context))
+        Self(context)
     }
 }
 
 impl<T> std::ops::Deref for TrapContext<T> {
-    type Target = Mutex<T>;
-    fn deref(&self) -> &Mutex<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         &self.0
+    }
+}
+
+// SAFETY: a trap context is created by the BIF that traps and reachable only through the trap
+// term in that process's own registers (erts ERTS_MAGIC_BIN_DATA of a trap export's state); the
+// process runs on one scheduler thread at a time, so no two accesses to the payload overlap.
+unsafe impl<T> arinsal_term::ExclusiveMagicPayload for TrapContext<T> where
+    TrapContext<T>: arinsal_term::MagicPayload
+{
+}
+
+impl<T> std::ops::DerefMut for TrapContext<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
     }
 }
 
@@ -309,10 +325,9 @@ pub(crate) fn finish_parked_dsend(process: &mut Process, sender: arinsal_sched::
     else {
         return;
     };
-    let _ = context.with_magic_payload::<TrapContext<crate::dist::DsigSendContext>, _>(|ctx| {
-        if let Ok(mut ctx) = ctx.lock() {
-            crate::dist::dsend_exit(process, &mut ctx, sender);
-        }
+    let _ = context.with_magic_payload_mut::<TrapContext<crate::dist::DsigSendContext>, _>(|ctx| {
+        let ctx = &mut ctx.0;
+        crate::dist::dsend_exit(process, ctx, sender);
     });
 }
 

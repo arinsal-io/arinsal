@@ -724,10 +724,10 @@ pub(crate) extern "C" fn dsend_continue_trap_1(
         return bif_ret(c_p, i, Err(badarg()));
     };
     let outcome = context
-        .with_magic_payload::<crate::bif_traps::TrapContext<crate::dist::DsigSendContext>, _>(
+        .with_magic_payload_mut::<crate::bif_traps::TrapContext<crate::dist::DsigSendContext>, _>(
             |ctx| {
-                let mut ctx = ctx.lock().ok()?;
-                let result = crate::dist::dsend_continue(process, &mut ctx, sender).ok()?;
+                let ctx = &mut ctx.0;
+                let result = crate::dist::dsend_continue(process, ctx, sender).ok()?;
                 Some((result, ctx.return_term()))
             },
         )

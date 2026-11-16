@@ -113,7 +113,8 @@ pub use ops::{
 };
 pub use owned::{from_owned, to_owned};
 pub use raw::magic_bin::{
-    MAGIC_BIN_DATA_OFFSET, MagicBin, MagicDestructor, MagicPayload, MagicRef, MagicWeak,
+    ExclusiveMagicPayload, MAGIC_BIN_DATA_OFFSET, MagicBin, MagicDestructor, MagicPayload,
+    MagicRef, MagicWeak,
 };
 pub use record::{
     RecordRef, RecordSnapshot, record_map_pairs, term_sequence, term_sequence_frames,

@@ -46,6 +46,29 @@ pub unsafe trait MagicPayload: Send + Sync + Sized + 'static {
     }
 }
 
+/// A magic payload that can only be mutated by the one process that owns its trap reference.
+///
+/// Shared payloads such as atomics arrays, compiled binary patterns, and table handles must not
+/// implement this trait. Their access remains immutable or uses their own synchronization.
+///
+/// # Safety
+/// Every live reference to this payload must remain reachable only by its owning process, and
+/// the runtime must never run two accesses to it concurrently. This must hold for every safe
+/// path that can obtain the payload, for its entire lifetime.
+pub unsafe trait ExclusiveMagicPayload: MagicPayload {}
+
+/// Mark a magic payload whose state is confined to one process's trap continuation.
+///
+/// Use only for payloads stored in a process-local trap reference. Do not use for magic binaries
+/// that can be shared between processes or accessed concurrently.
+#[macro_export]
+macro_rules! exclusive_magic_payload {
+    ($($ty:ty),+ $(,)?) => {$(
+        // SAFETY: the invocation asserts this payload's process-local trap lifetime.
+        unsafe impl $crate::ExclusiveMagicPayload for $ty {}
+    )+};
+}
+
 /// Declare the magic binary destructor of a payload type, like the named destructor erts
 /// passes to `erts_create_magic_binary` (`db_table_tid_destructor`, `cleanup_match_pseudo_process`, ...).
 ///
@@ -199,6 +222,28 @@ impl MagicRef {
         })
     }
 
+    /// Mutates the inline payload of a process-exclusive trap reference.
+    #[inline]
+    fn with_payload_mut<T: ExclusiveMagicPayload, R>(
+        &self,
+        visit: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        if !std::ptr::fn_addr_eq(self.destructor, T::DESTRUCTOR) {
+            return None;
+        }
+        // SAFETY: the exclusive payload marker guarantees that only its owning process can
+        // access this payload and that the scheduler runs that process on one thread at a time.
+        // The matching destructor also proves that the inline bytes contain a live `T`.
+        let payload = unsafe {
+            &mut *std::ptr::from_ref(self)
+                .cast_mut()
+                .cast::<u8>()
+                .add(data_offset::<T>())
+                .cast::<T>()
+        };
+        Some(visit(payload))
+    }
+
     /// Mutably accesses this block's `T` payload while its destructor is running.
     #[inline]
     pub fn downcast_mut<T: MagicPayload>(&mut self) -> Option<&mut T> {
@@ -327,6 +372,18 @@ impl MagicBin {
     ) -> Self {
         refn[1] |= 1 << 17;
         Self::create_x(payload, trailing, trailing_align, orig_size, refn)
+    }
+
+    /// Mutates an inline payload that is confined to this process's trap continuation.
+    ///
+    /// `None` means the magic binary does not contain `T`. Only payload types implementing
+    /// [`ExclusiveMagicPayload`] can use this API; shared magic payloads remain immutable here.
+    pub fn with_payload_mut<T: ExclusiveMagicPayload, R>(
+        &self,
+        visit: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let block: &MagicRef = self;
+        block.with_payload_mut(visit)
     }
 
     /// The pointer for a byte span inside the payload's retained data, preserving its provenance.
@@ -743,6 +800,22 @@ pub(crate) fn thing_block<'a>(word: u64) -> &'a MagicRef {
     // SAFETY: callers pass the pointer word of a live magic reference thing, which holds a
     // count for the duration of the borrow.
     unsafe { &*(word as *const MagicRef) }
+}
+
+impl crate::Term {
+    /// Mutates the inline payload of a process-local trap reference.
+    ///
+    /// `None` means the term is not a magic reference or its payload is not `T`. The caller
+    /// must be executing the owning process's continuation; shared magic payloads do not
+    /// implement [`ExclusiveMagicPayload`].
+    // Port of erts/emulator/beam/erl_binary.h (`ERTS_MAGIC_BIN_DATA`), OTP-29.1.1.
+    pub fn with_magic_payload_mut<T: ExclusiveMagicPayload, R>(
+        self,
+        visit: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let magic = thing_block(self.magic_word()?);
+        magic.with_payload_mut(visit)
+    }
 }
 
 // Port of erts/emulator/beam/erl_bif_unique.c (magic_ref_table), OTP-29.1.1: reference
