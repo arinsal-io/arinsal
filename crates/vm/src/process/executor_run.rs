@@ -210,18 +210,17 @@ impl Executor {
                             process.take_dirty_bif_continuation()
                         {
                             let arity = usize::from(arity);
-                            process.x.ensure_x(arity + 2);
-                            process.x[arity] = Term::atom(
+                            self.native_registers.x_reg_array[arity] = Term::atom(
                                 arinsal_term::global_atoms().intern(module).map_err(|_| {
                                     VmError::Unsupported("dirty continuation module atom".into())
                                 })?,
                             );
-                            process.x[arity + 1] = Term::atom(
+                            self.native_registers.x_reg_array[arity + 1] = Term::atom(
                                 arinsal_term::global_atoms().intern(function).map_err(|_| {
                                     VmError::Unsupported("dirty continuation function atom".into())
                                 })?,
                             );
-                            process.x[..arity].copy_from_slice(&args);
+                            self.native_registers.x_reg_array[..arity].copy_from_slice(&args);
                             process.heap.abi.arity = arity as u8;
                             process.gc_live = arity;
                             let continuation = self.vm.apply_fixed(process, arity, Some(ctx));
@@ -280,7 +279,7 @@ impl Executor {
                             process.slice_mut().native_dirty_nif = None;
                             match crate::native_helpers::run_static_nif(process, identity) {
                                 Ok(value) => {
-                                    process.x[0] = value;
+                                    self.native_registers.x_reg_array[0] = value;
                                     process.native_continuation_resume = true;
                                     process.set_native_resume_arity(1);
                                     process.set_native_pc(Some(resume_pc));
@@ -349,7 +348,7 @@ impl Executor {
                                 as *const () as usize;
                             if resume_pc == bridge {
                                 if !resume_after_native_return(process) {
-                                    break Ok(RunState::Done(process.x[0]));
+                                    break Ok(RunState::Done(self.native_registers.x_reg_array[0]));
                                 }
                             } else {
                                 process.native_continuation_resume = true;
@@ -381,7 +380,7 @@ impl Executor {
                                 }) {
                                     eprintln!(
                                         "arinsal boot: decode_path input={:?}",
-                                        process.x.first()
+                                        self.native_registers.x_reg_array.first()
                                     );
                                 }
                             }
@@ -480,7 +479,7 @@ impl Executor {
                             {
                                 eprintln!(
                                     "arinsal boot: decode_path exit={outcome:?} output={:?}",
-                                    process.x.first()
+                                    self.native_registers.x_reg_array.first()
                                 );
                             }
                             match self.after_native(process, ctx, outcome, code_ptr, &mut reenter) {
@@ -535,7 +534,7 @@ impl Executor {
                                     && let Some((mfa, arity)) = frame.rsplit_once('/')
                                     && let Some((module, function)) = mfa.split_once(':')
                                     && let Ok(arity) = arity.parse::<usize>()
-                                    && arity <= process.x.len()
+                                    && arity <= self.native_registers.x_reg_array.len()
                                 {
                                     trap.top = Some(crate::stacktrace::TopFrame::Bif {
                                         module: arinsal_term::global_atoms()
@@ -549,7 +548,7 @@ impl Executor {
                                                 VmError::Unsupported("undef function atom".into())
                                             })?,
                                         args: crate::stacktrace::BifArgs::from_terms(
-                                            &process.x[..arity],
+                                            &self.native_registers.x_reg_array[..arity],
                                         )?,
                                         info: crate::stacktrace::BifErrorInfo::None,
                                     });

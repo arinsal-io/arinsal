@@ -86,28 +86,42 @@ pub(crate) fn plain_static_nif_lookup(
 pub(crate) mod node;
 pub(crate) mod proc;
 
-/// Arguments passed to a process-aware native. Register windows stay in X
-/// registers and are copied only when a legacy family needs a slice.
+/// Arguments passed to a process-aware native. Register windows stay in the scheduler's
+/// register array `reg` and are copied only when a legacy family needs a slice.
 #[derive(Clone, Copy)]
 pub(crate) enum NativeArgs<'a> {
-    Registers(usize),
+    /// `reg[..arity]`: the address of the register array (`esdp->registers`) and the arity.
+    Registers(usize, usize),
     Slice(&'a [Term]),
 }
 
 impl NativeArgs<'_> {
+    /// The first `arity` registers of the scheduler's register array `reg`.
+    pub(crate) fn registers(reg: &mut [Term], arity: usize) -> Self {
+        Self::Registers(reg.as_mut_ptr() as usize, arity)
+    }
+
     #[inline]
     pub(crate) fn len(self) -> usize {
         match self {
-            Self::Registers(arity) => arity,
+            Self::Registers(_, arity) => arity,
             Self::Slice(args) => args.len(),
         }
     }
 
+    /// The registers, read when the native asks for them (a collection may have moved them).
+    fn register_window<'r>(reg: usize, arity: usize) -> &'r [Term] {
+        crate::native_hooks::registers_at(reg as *mut arinsal_beamasm::SchedulerRegisters)
+            .map_or(&[], |registers| &registers.x_reg_array[..arity])
+    }
+
     #[inline]
-    pub(crate) fn get(self, process: &Process, index: usize) -> Option<Term> {
+    pub(crate) fn get(self, _process: &Process, index: usize) -> Option<Term> {
         match self {
-            Self::Registers(arity) if index < arity => process.x.get(index).copied(),
-            Self::Registers(_) => None,
+            Self::Registers(reg, arity) if index < arity => {
+                Self::register_window(reg, arity).get(index).copied()
+            }
+            Self::Registers(..) => None,
             Self::Slice(args) => args.get(index).copied(),
         }
     }
@@ -119,27 +133,14 @@ impl NativeArgs<'_> {
     ) -> R {
         match self {
             Self::Slice(args) => f(process, args),
-            Self::Registers(0) => f(process, &[]),
-            Self::Registers(1) => {
-                let values = [process.x[0]];
-                f(process, &values)
-            }
-            Self::Registers(2) => {
-                let values = [process.x[0], process.x[1]];
-                f(process, &values)
-            }
-            Self::Registers(3) => {
-                let values = [process.x[0], process.x[1], process.x[2]];
-                f(process, &values)
-            }
-            Self::Registers(arity) if arity <= 8 => {
+            Self::Registers(_, 0) => f(process, &[]),
+            Self::Registers(reg, arity) if arity <= 8 => {
                 let mut values = [Term::NIL; 8];
-                values[..arity].copy_from_slice(&process.x[..arity]);
+                values[..arity].copy_from_slice(Self::register_window(reg, arity));
                 f(process, &values[..arity])
             }
-            Self::Registers(arity) => {
-                let mut values = Vec::with_capacity(arity);
-                values.extend_from_slice(&process.x[..arity]);
+            Self::Registers(reg, arity) => {
+                let values = Self::register_window(reg, arity).to_vec();
                 f(process, &values)
             }
         }

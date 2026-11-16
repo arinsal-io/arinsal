@@ -80,7 +80,7 @@ impl Executor {
                         .as_ref()
                         .and_then(|cold| cold.bif_trap.as_ref())
                         .map(|pending| (pending.callee.0, pending.callee.1, pending.arity)),
-                    process.x[0],
+                    self.native_registers.x_reg_array[0],
                 );
                 // The native call site names the caller only if the called BIF
                 // raises; any other continuation must not inherit it.
@@ -101,7 +101,9 @@ impl Executor {
                         arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
                     if resume_pc == bridge {
                         if !resume_after_native_return(process) {
-                            return Ok(Flow::Break(Ok(RunState::Done(process.x[0]))));
+                            return Ok(Flow::Break(Ok(RunState::Done(
+                                self.native_registers.x_reg_array[0],
+                            ))));
                         }
                     } else {
                         process.native_continuation_resume = true;
@@ -190,7 +192,7 @@ impl Executor {
                         ))));
                     }
                     for index in 0..live {
-                        let value = process.x[index];
+                        let value = self.native_registers.x_reg_array[index];
                         if !process.heap.stack_set(index, value) {
                             break;
                         }
@@ -222,13 +224,14 @@ impl Executor {
                     let handler_function = arinsal_term::global_atoms()
                         .intern("breakpoint")
                         .map_err(|_| VmError::Unsupported("atom table".into()))?;
-                    process.x[0] = Term::atom(module_atom);
-                    process.x[1] = Term::atom(function_atom);
-                    process.x[2] =
+                    self.native_registers.x_reg_array[0] = Term::atom(module_atom);
+                    self.native_registers.x_reg_array[1] = Term::atom(function_atom);
+                    self.native_registers.x_reg_array[2] =
                         Term::small(i64::from(function.arity)).expect("arity is a small integer");
-                    process.x[3] = Term::small(i64::from(line)).expect("line is a small integer");
-                    process.x[4] = Term::atom(handler_module);
-                    process.x[5] = Term::atom(handler_function);
+                    self.native_registers.x_reg_array[3] =
+                        Term::small(i64::from(line)).expect("line is a small integer");
+                    self.native_registers.x_reg_array[4] = Term::atom(handler_module);
+                    self.native_registers.x_reg_array[5] = Term::atom(handler_function);
                     process.gc_live = 4;
                     process.native_apply = true;
                     let result = self.vm.apply_fixed(process, 4, Some(ctx));
@@ -242,7 +245,7 @@ impl Executor {
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
                         crate::ImportOutcome::Returned(value) => {
-                            process.x[0] = value;
+                            self.native_registers.x_reg_array[0] = value;
                             if process.native_pc().is_none() {
                                 return Ok(Flow::Break(Ok(RunState::Done(value))));
                             }
@@ -268,7 +271,8 @@ impl Executor {
                     }
                     // The trace callbacks read every argument from the scheduler
                     // array, which is the process's X file.
-                    let arity = usize::from(function.arity).min(process.x.len());
+                    let arity =
+                        usize::from(function.arity).min(self.native_registers.x_reg_array.len());
                     let actions = crate::trace::executor_native_call_event(
                         &mut self.vm,
                         process,
@@ -311,7 +315,7 @@ impl Executor {
                                 return Ok(Flow::Break(Ok(RunState::Yield)));
                             }
                             crate::ImportOutcome::Returned(value) => {
-                                process.x[0] = value;
+                                self.native_registers.x_reg_array[0] = value;
                                 if process.native_pc().is_none() {
                                     return Ok(Flow::Break(Ok(RunState::Done(value))));
                                 }
@@ -484,7 +488,7 @@ impl Executor {
                                     return Ok(Flow::Break(Ok(RunState::Yield)));
                                 }
                                 crate::ImportOutcome::Returned(value) => {
-                                    process.x[0] = value;
+                                    self.native_registers.x_reg_array[0] = value;
                                     if process.native_pc().is_none() {
                                         return Ok(Flow::Break(Ok(RunState::Done(value))));
                                     }
@@ -495,7 +499,7 @@ impl Executor {
                         Some(Ok(crate::bif_traps::ResumeResult::Handler(
                             crate::bif_traps::HandlerResult::Done { value, .. },
                         ))) => {
-                            process.x[0] = value;
+                            self.native_registers.x_reg_array[0] = value;
                             if !resume_after_native_return(process) {
                                 return Ok(Flow::Break(Ok(RunState::Done(value))));
                             }
@@ -581,7 +585,9 @@ impl Executor {
                         ))
                 {
                     let saved_arguments: smallvec::SmallVec<[Term; 8]> =
-                        smallvec::SmallVec::from_slice(&process.x[..usize::from(export.arity)]);
+                        smallvec::SmallVec::from_slice(
+                            &self.native_registers.x_reg_array[..usize::from(export.arity)],
+                        );
                     let collections_before = process.stats.gc.collections;
                     // erlang:make_fun/3 is implemented by the VM's call path (funs.rs), not
                     // by the native BIF table; handle it here like the interpreter does.
@@ -604,7 +610,11 @@ impl Executor {
                     {
                         Some(match export.function.as_str() {
                             "make_fun" => {
-                                let args = [process.x[0], process.x[1], process.x[2]];
+                                let args = [
+                                    self.native_registers.x_reg_array[0],
+                                    self.native_registers.x_reg_array[1],
+                                    self.native_registers.x_reg_array[2],
+                                ];
                                 self.vm.make_export_fun(process, &args)
                             }
                             "fun_info" => self.vm.fun_info(process, export.arity == 2),
@@ -615,10 +625,26 @@ impl Executor {
                         // continuation export), OTP-29.1.1: a trapping BIF keeps
                         // its state between retries of this native call site.
                         let trap_args = [
-                            process.x.first().copied().unwrap_or(Term::NIL),
-                            process.x.get(1).copied().unwrap_or(Term::NIL),
-                            process.x.get(2).copied().unwrap_or(Term::NIL),
-                            process.x.get(3).copied().unwrap_or(Term::NIL),
+                            self.native_registers
+                                .x_reg_array
+                                .first()
+                                .copied()
+                                .unwrap_or(Term::NIL),
+                            self.native_registers
+                                .x_reg_array
+                                .get(1)
+                                .copied()
+                                .unwrap_or(Term::NIL),
+                            self.native_registers
+                                .x_reg_array
+                                .get(2)
+                                .copied()
+                                .unwrap_or(Term::NIL),
+                            self.native_registers
+                                .x_reg_array
+                                .get(3)
+                                .copied()
+                                .unwrap_or(Term::NIL),
                         ];
                         let traps_here = export.trap_entry
                             || process.slice().is_some_and(|work| work.bif_trap.is_some());
@@ -693,8 +719,9 @@ impl Executor {
                                     return Ok(Flow::Break(Ok(RunState::Yield)));
                                 }
                                 Ok(crate::bif_traps::HandlerResult::Done { value, .. }) => {
-                                    process.x[0] = process.gc_after_bif(value)?;
-                                    Some(Ok(process.x[0]))
+                                    self.native_registers.x_reg_array[0] =
+                                        process.gc_after_bif(value)?;
+                                    Some(Ok(self.native_registers.x_reg_array[0]))
                                 }
                                 Ok(crate::bif_traps::HandlerResult::Export(_)) => {
                                     unreachable!("resumed BIF handler export")
@@ -849,7 +876,7 @@ impl Executor {
                         Some(match result {
                             Ok(value) => Ok(value),
                             Err(error) => {
-                                let arguments = process.x[..arity].to_vec();
+                                let arguments = self.native_registers.x_reg_array[..arity].to_vec();
                                 Err(crate::exceptions::bif_error_with_atoms(
                                     process,
                                     &export.module,
@@ -892,7 +919,8 @@ impl Executor {
                                         // by any collection the call ran; the copies taken
                                         // before it are stale.
                                         args: crate::stacktrace::BifArgs::from_terms(
-                                            &process.x[..saved_arguments.len()],
+                                            &self.native_registers.x_reg_array
+                                                [..saved_arguments.len()],
                                         )?,
                                         info: crate::stacktrace::BifErrorInfo::Plain,
                                     });
@@ -929,8 +957,11 @@ impl Executor {
                                 // yielding BIF that allocated) moved the
                                 // registers; the copies taken before it are stale.
                                 if process.stats.gc.collections == collections_before {
-                                    for (register, value) in
-                                        process.x.iter_mut().zip(&saved_arguments)
+                                    for (register, value) in self
+                                        .native_registers
+                                        .x_reg_array
+                                        .iter_mut()
+                                        .zip(&saved_arguments)
                                     {
                                         *register = *value;
                                     }
@@ -946,8 +977,11 @@ impl Executor {
                                 // (erts_gc_after_bif_call_lhf) moved the registers; the
                                 // copies taken before it are stale.
                                 if process.stats.gc.collections == collections_before {
-                                    for (register, value) in
-                                        process.x.iter_mut().zip(&saved_arguments)
+                                    for (register, value) in self
+                                        .native_registers
+                                        .x_reg_array
+                                        .iter_mut()
+                                        .zip(&saved_arguments)
                                     {
                                         *register = *value;
                                     }
@@ -1001,7 +1035,7 @@ impl Executor {
                             }
                             Err(error) => return Err(error),
                         };
-                        process.x[0] = value;
+                        self.native_registers.x_reg_array[0] = value;
                         if !resume_after_native_return(process) {
                             return Ok(Flow::Break(Ok(RunState::Done(value))));
                         }
@@ -1029,7 +1063,9 @@ impl Executor {
                         } {
                             Ok(module_id) => module_id,
                             Err(_) => {
-                                let saved = process.x[..usize::from(export.arity)].to_vec();
+                                let saved = self.native_registers.x_reg_array
+                                    [..usize::from(export.arity)]
+                                    .to_vec();
                                 let outcome = match self.vm.call_undefined_function(
                                     process,
                                     &export.module,
@@ -1061,7 +1097,7 @@ impl Executor {
                                         return Ok(Flow::Break(Ok(RunState::Yield)));
                                     }
                                     crate::ImportOutcome::Returned(value) => {
-                                        process.x[0] = value;
+                                        self.native_registers.x_reg_array[0] = value;
                                         if process.native_pc().is_none() {
                                             return Ok(Flow::Break(Ok(RunState::Done(value))));
                                         }
@@ -1129,7 +1165,8 @@ impl Executor {
                     // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
                     // callee's own `i_test_yield` at its native entry.
                 } else {
-                    let saved = process.x[..usize::from(export.arity)].to_vec();
+                    let saved =
+                        self.native_registers.x_reg_array[..usize::from(export.arity)].to_vec();
                     let outcome = match self.vm.call_undefined_function(
                         process,
                         &export.module,
@@ -1155,7 +1192,7 @@ impl Executor {
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
                         crate::ImportOutcome::Returned(value) => {
-                            process.x[0] = value;
+                            self.native_registers.x_reg_array[0] = value;
                             if process.native_pc().is_none() {
                                 return Ok(Flow::Break(Ok(RunState::Done(value))));
                             }
@@ -1169,7 +1206,9 @@ impl Executor {
             }
             arinsal_beamasm::ExitReason::Returned => {
                 if !resume_after_native_return(process) {
-                    return Ok(Flow::Break(Ok(RunState::Done(process.x[0]))));
+                    return Ok(Flow::Break(Ok(RunState::Done(
+                        self.native_registers.x_reg_array[0],
+                    ))));
                 }
                 return Ok(Flow::Continue);
             }

@@ -17,7 +17,10 @@ impl Vm {
                 "native arity {arity} exceeds register file"
             ))));
         }
-        p.x.ensure_x(arity);
+        let reg = match self.x_regs() {
+            Ok(reg) => reg,
+            Err(error) => return Some(Err(error)),
+        };
         // The body charges BUMP_REDS on FCALLS, as from native code.
         let mut result = self.dispatch_native_source(
             p,
@@ -25,7 +28,7 @@ impl Vm {
             module,
             function,
             resolved,
-            natives::NativeArgs::Registers(arity),
+            natives::NativeArgs::registers(reg, arity),
         );
         // Port of erts/emulator/beam/erl_gc.c:454-456 (erts_gc_after_bif_call_lhf: a BIF_TRAP
         // collects with `regs` up to `p->arity`), OTP-29.1.1: BIF_TRAP's arguments are the
@@ -44,17 +47,17 @@ impl Vm {
             // roots the registers as they are now, not values saved before the call.
             let mut inline_arguments = [Term::NIL; 8];
             let mut overflow_arguments =
-                (arity > inline_arguments.len()).then(|| p.x[..arity].to_vec());
+                (arity > inline_arguments.len()).then(|| reg[..arity].to_vec());
             let arguments = if let Some(arguments) = overflow_arguments.as_mut() {
                 arguments.as_mut_slice()
             } else {
-                inline_arguments[..arity].copy_from_slice(&p.x[..arity]);
+                inline_arguments[..arity].copy_from_slice(&reg[..arity]);
                 &mut inline_arguments[..arity]
             };
             if let Err(error) = calls::gc_after_native(p, arguments, result) {
                 return Some(Err(error));
             }
-            p.x[..arity].copy_from_slice(arguments);
+            reg[..arity].copy_from_slice(arguments);
         }
         result
     }
@@ -102,14 +105,17 @@ impl Vm {
             // A native BIF without a named entry is its `bif_table` body.
             None if class == ImportClass::Native => {
                 // `bif_table[].f` reads its arguments from the register array.
+                let reg = match self.x_regs() {
+                    Ok(reg) => reg,
+                    Err(error) => return Some(Err(error)),
+                };
                 if let natives::NativeArgs::Slice(values) = args {
-                    p.x.ensure_x(values.len());
-                    p.x[..values.len()].copy_from_slice(values);
+                    reg[..values.len()].copy_from_slice(values);
                 }
                 // `erts_proc_sched_data(c_p)`: the body reaches this scheduler's data as it
                 // does from native code.
                 let _slice = crate::process::sched_data::NativeSlice::enter(self, ctx);
-                crate::bif_table::call_from_executor(p, module, function, args.len())
+                crate::bif_table::call_from_executor(p, reg, module, function, args.len())
             }
             None => None,
         }

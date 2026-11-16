@@ -1047,7 +1047,7 @@ pub fn run_native(
             function.module,
             function.function,
             function.arity,
-            process.x[0].tagged_word()
+            registers.x_reg_array[0].tagged_word()
         );
     }
     process.native_error_pc = 0;
@@ -1116,7 +1116,7 @@ pub fn run_native(
             function.module,
             function.function,
             function.arity,
-            process.x[0].tagged_word(),
+            registers.x_reg_array[0].tagged_word(),
             process.heap.abi.exc.freason
         );
     }
@@ -1176,7 +1176,7 @@ fn native_exit(
             function.module,
             function.function,
             function.arity,
-            process.x[0].tagged_word(),
+            registers.x_reg_array[0].tagged_word(),
             process.heap.abi.i,
             process.heap.abi.stop
         );
@@ -1224,7 +1224,7 @@ fn native_exit(
             .get(function.function)
             .ok_or_else(|| VmError::Unsupported("function_clause function atom".into()))?;
         let arity = usize::from(function.arity);
-        let args = process.x[..arity].to_vec();
+        let args = registers.x_reg_array[..arity].to_vec();
         if exception_trace {
             eprintln!(
                 "native function_clause in {:?} args={:?}",

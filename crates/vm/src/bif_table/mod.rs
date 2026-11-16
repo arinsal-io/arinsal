@@ -97,6 +97,7 @@ pub(crate) fn current_export(header: *mut ProcessHeader) -> (u64, u64) {
 // table), OTP-29.1.1.
 pub(crate) fn call_from_executor(
     process: &mut crate::Process,
+    reg: &mut [arinsal_term::Term],
     module: &str,
     function: &str,
     arity: usize,
@@ -111,10 +112,9 @@ pub(crate) fn call_from_executor(
     // `&exp->info.mfa` in `c_p->current` first, which BIF_ERROR and BIF_TRAP* name.
     let export = crate::beamasm_integration::bif_mfa_export(module, function, arity8)?;
     process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
-    process.x.ensure_x(arity.max(1));
-    let reg = std::ptr::from_mut(&mut process.x[0]).cast::<u64>();
+    let reg_ptr = reg.as_mut_ptr().cast::<u64>();
     let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();
-    let raw = func(c_p, reg, 0);
+    let raw = func(c_p, reg_ptr, 0);
     if raw != arinsal_term::THE_NON_VALUE {
         return Some(Ok(crate::native_hooks::from_raw(raw)));
     }
@@ -131,7 +131,7 @@ pub(crate) fn call_from_executor(
             ))
         });
     let (module, function, arity) = named.unwrap_or((module, function, arity));
-    let args = process.x[..arity].to_vec();
+    let args = reg[..arity].to_vec();
     Some(Err(
         match crate::native_helpers::decode_failure(&mut process.heap.abi.exc) {
             Some(error) => crate::exceptions::bif_error(process, module, function, &args, error),

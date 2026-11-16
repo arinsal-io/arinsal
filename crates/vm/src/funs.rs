@@ -25,7 +25,7 @@ pub(super) fn call_error_reason(
 ) -> Result<Term, VmError> {
     let is_fun = fun.classify() == TermKind::Fun;
     p.ensure_objv(6 + arity * 2, &mut reg[..arity + 1])?;
-    let fun = p.x[arity];
+    let fun = reg[arity];
     let mut builder = TermBuilder::new(&mut p.heap);
     let kind = global_atoms()
         .intern(if is_fun { "badarity" } else { "badfun" })
@@ -36,7 +36,7 @@ pub(super) fn call_error_reason(
             .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")));
     }
     let mut args = Term::NIL;
-    for value in p.x[..arity].iter().rev().copied() {
+    for value in reg[..arity].iter().rev().copied() {
         args = builder
             .cons(value, args)
             .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))?;
@@ -167,6 +167,11 @@ impl Vm {
         .ok_or_else(|| VmError::Unsupported("no scheduler registers".into()))
     }
 
+    /// `reg`, the whole register array of `esdp->registers`.
+    pub(crate) fn x_regs<'a>(&self) -> Result<&'a mut [Term], VmError> {
+        self.reg_prefix(crate::proc_create::ATTACHED_X_REGS)
+    }
+
     pub(super) fn eval_erlang_fun_builtin(
         &mut self,
         function: &str,
@@ -177,7 +182,14 @@ impl Vm {
             ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1) => {
                 // elixir_loop1
                 let mut p = Process::new();
-                p.x[..arity].copy_from_slice(args);
+                // This VM runs the call itself, as a scheduler does: its register file is
+                // `esdp->registers` for the call.
+                let mut registers = Box::<arinsal_beamasm::SchedulerRegisters>::default();
+                registers.x_reg_array[..arity].copy_from_slice(args);
+                let previous = std::mem::replace(
+                    &mut self.esdp_registers,
+                    std::ptr::from_mut(registers.as_mut()) as usize,
+                );
                 p.gc_live = arity;
                 let value = match function {
                     "apply" => match self.apply_bif(&mut p, arity, None) {
@@ -185,6 +197,7 @@ impl Vm {
                         Ok(ImportOutcome::Dispatch) | Ok(ImportOutcome::Yield) => {
                             // The apply resolved to Erlang code: erts runs it in the calling
                             // process's native code, which here is a scheduled process.
+                            self.esdp_registers = previous;
                             return Some(self.eval_in_scheduled_process("erlang", function, args));
                         }
                         Err(error) => Err(error),
@@ -207,6 +220,8 @@ impl Vm {
                     }
                     other => other,
                 };
+                self.esdp_registers = previous;
+                drop(registers);
                 value.map(|term| {
                     p.stats.heap_words = p.heap.capacity_words();
                     EvalResult {
@@ -233,8 +248,7 @@ impl Vm {
         if arity >= crate::proc_create::ATTACHED_X_REGS {
             return Err(VmError::Unsupported("fun arity exceeds X registers".into()));
         }
-        p.x.ensure_x(arity + 1);
-        p.x[arity] = fun;
+        self.x_regs()?[arity] = fun;
         // SAFETY: The fun is held in an X register while this process is live.
         let view = unsafe { fun.fun_ref() };
         let actual = match &view {
@@ -279,10 +293,9 @@ impl Vm {
                         "closure environment exceeds X registers".into(),
                     ));
                 }
-                p.x.ensure_x(need);
                 for (i, &word) in free_vars.iter().enumerate() {
                     // SAFETY: The fun header bounds the environment and every word is a term.
-                    p.x[arity + i] = unsafe { std::mem::transmute::<u64, Term>(word) };
+                    self.x_regs()?[arity + i] = unsafe { std::mem::transmute::<u64, Term>(word) };
                 }
                 p.gc_live = arity + free_vars.len();
                 self.set_position(p, module_id, target)?;
@@ -362,16 +375,15 @@ impl Vm {
             arity.saturating_mul(2).saturating_add(4),
             self.reg_prefix(arity + 1)?,
         )?;
-        let fun = p.x[arity];
-        let args: Vec<Term> = p.x[..arity].to_vec();
+        let fun = self.x_regs()?[arity];
+        let args: Vec<Term> = self.x_regs()?[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("lambda arg list: {error:?}")))?;
-        p.x.ensure_x(4);
-        p.x[0] = Term::atom(module);
-        p.x[1] = fun;
-        p.x[2] = list;
-        p.x[3] = Term::NIL;
+        self.x_regs()?[0] = Term::atom(module);
+        self.x_regs()?[1] = fun;
+        self.x_regs()?[2] = list;
+        self.x_regs()?[3] = Term::NIL;
         self.call_named(p, &handler, function, 3, ctx)
     }
 
@@ -460,13 +472,11 @@ impl Vm {
             // touch FCALLS, and an Erlang export charges its call in its own `i_test_yield`
             // (jit/arm/ops.tab, int_func_start).
             p.gc_live = arity;
-            p.x.ensure_x(arity);
-            p.x[..arity].copy_from_slice(&trap.args);
+            self.x_regs()?[..arity].copy_from_slice(&trap.args);
             self.set_position(p, module_id, target)?;
             return Ok(ImportOutcome::Dispatch);
         }
-        p.x.ensure_x(arity);
-        p.x[..arity].copy_from_slice(&trap.args);
+        self.x_regs()?[..arity].copy_from_slice(&trap.args);
         // A BIF traps to its `bif_trap_export` entry (erl_bif_table.c, erts_init_trap_export),
         // which has no breakpoint: the continuation is not a traced call of its own.
         if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
@@ -603,9 +613,9 @@ impl Vm {
             let mut heap = ProcessHeapHandle(&mut p.heap);
             let mut state = arinsal_bifs::BifState::default();
             let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
-            bif(&mut bif_ctx, &p.x[..arity])
+            bif(&mut bif_ctx, &self.x_regs()?[..arity])
         };
-        let mut bif_args = p.x[..arity].to_vec();
+        let mut bif_args = self.x_regs()?[..arity].to_vec();
         if matches!(&result, Err(BifError::DirtyTrap)) {
             // Port of erts/emulator/beam/bif.c:5612-5627 (dirty_bif_trap): restore the
             // saved BIF arguments and continue at the export saved by the dirty scheduler.
@@ -618,14 +628,13 @@ impl Vm {
             };
             p.take_dirty_bif_original();
             let target_arity = usize::from(target_arity);
-            p.x.ensure_x(target_arity + 2);
-            p.x[..target_arity].copy_from_slice(&args);
-            p.x[target_arity] = Term::atom(
+            self.x_regs()?[..target_arity].copy_from_slice(&args);
+            self.x_regs()?[target_arity] = Term::atom(
                 global_atoms()
                     .intern(target_module)
                     .map_err(|_| VmError::Unsupported("dirty trap module atom".into()))?,
             );
-            p.x[target_arity + 1] = Term::atom(
+            self.x_regs()?[target_arity + 1] = Term::atom(
                 global_atoms()
                     .intern(target_function)
                     .map_err(|_| VmError::Unsupported("dirty trap function atom".into()))?,
@@ -683,7 +692,7 @@ impl Vm {
             BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
             error => exceptions::bif_error(p, module, function, &bif_args, error),
         })?;
-        p.x[0] = result;
+        self.x_regs()?[0] = result;
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_bif_shared, bif_nif_epilogue)
         // and instr_call.cpp (emit_variable_apply, emit_fixed_apply), OTP-29.1.1: neither the
         // apply nor the BIF stub decrements FCALLS; the BIF's own BUMP_REDS, already taken
@@ -718,7 +727,7 @@ impl Vm {
                 if let Some(result) = self.dispatch_resolved_entry(
                     p,
                     run,
-                    crate::natives::NativeArgs::Registers(arity),
+                    crate::natives::NativeArgs::registers(self.x_regs()?, arity),
                     entry,
                 ) {
                     let result = match result {
@@ -738,7 +747,9 @@ impl Vm {
                             trap.top = Some(crate::stacktrace::TopFrame::Bif {
                                 module: module_atom,
                                 function: function_atom,
-                                args: crate::stacktrace::BifArgs::from_terms(&p.x[..arity])?,
+                                args: crate::stacktrace::BifArgs::from_terms(
+                                    &self.x_regs()?[..arity],
+                                )?,
                                 info: crate::stacktrace::BifErrorInfo::Plain,
                             });
                             Err(VmError::Trap(trap))
@@ -748,7 +759,7 @@ impl Vm {
                     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776
                     // (call_bif_shared, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the export
                     // trampoline an apply reaches collects after the BIF as a static call does.
-                    p.x[0] = p.gc_after_bif(result?)?;
+                    self.x_regs()?[0] = p.gc_after_bif(result?)?;
                     return Ok(Self::return_value_after_dirty(p));
                 }
             }
@@ -768,10 +779,10 @@ impl Vm {
         // call target instead, so the two never resume each other's continuation.
         let trap_key = crate::bif_traps::APPLY_TRAP_KEY;
         let trap_args = [
-            p.x.first().copied().unwrap_or(Term::NIL),
-            p.x.get(1).copied().unwrap_or(Term::NIL),
-            p.x.get(2).copied().unwrap_or(Term::NIL),
-            p.x.get(3).copied().unwrap_or(Term::NIL),
+            self.x_regs()?.first().copied().unwrap_or(Term::NIL),
+            self.x_regs()?.get(1).copied().unwrap_or(Term::NIL),
+            self.x_regs()?.get(2).copied().unwrap_or(Term::NIL),
+            self.x_regs()?.get(3).copied().unwrap_or(Term::NIL),
         ];
         let meter = crate::bif_traps::TrapMeter::start(p, ctx.as_deref());
         if let Some(result) = crate::bif_traps::execute_named(
@@ -791,7 +802,7 @@ impl Vm {
             meter.finish(p, ctx.as_deref_mut(), result.reductions());
             return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
-                    p.x[0] = p.gc_after_bif(value)?;
+                    self.x_regs()?[0] = p.gc_after_bif(value)?;
                     Ok(Self::return_value(p))
                 }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
@@ -840,7 +851,7 @@ impl Vm {
                     trap.top = Some(crate::stacktrace::TopFrame::Bif {
                         module: module_atom,
                         function: function_atom,
-                        args: crate::stacktrace::BifArgs::from_terms(&p.x[..arity])?,
+                        args: crate::stacktrace::BifArgs::from_terms(&self.x_regs()?[..arity])?,
                         info: crate::stacktrace::BifErrorInfo::Plain,
                     });
                     Err(VmError::Trap(trap))
@@ -853,22 +864,22 @@ impl Vm {
                 }
                 result => result,
             };
-            p.x[0] = result?;
+            self.x_regs()?[0] = result?;
             return Ok(Self::return_value_after_dirty(p));
         }
         // elixir_loop1: apply/3 reaches this path without an import slot.
         // sys_core_fold:fold_lit_args/4 applies erlang:make_fun/3 the same way.
         if module == "erlang" && function == "make_fun" && arity == 3 {
-            let args = [p.x[0], p.x[1], p.x[2]];
-            p.x[0] = self.make_export_fun(p, &args)?;
+            let args = [self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]];
+            self.x_regs()?[0] = self.make_export_fun(p, &args)?;
             return Ok(Self::return_value(p));
         }
         if module == "erlang" && function == "fun_info" && (arity == 1 || arity == 2) {
-            p.x[0] = self.fun_info(p, arity == 2)?;
+            self.x_regs()?[0] = self.fun_info(p, arity == 2)?;
             return Ok(Self::return_value(p));
         }
         if module == "erlang" && function == "fun_info_mfa" && arity == 1 {
-            p.x[0] = self.fun_info_mfa(p)?;
+            self.x_regs()?[0] = self.fun_info_mfa(p)?;
             return Ok(Self::return_value(p));
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
@@ -998,7 +1009,7 @@ impl Vm {
             arity.saturating_mul(2).saturating_add(8),
             self.reg_prefix(arity)?,
         )?;
-        let args: Vec<Term> = p.x[..arity].to_vec();
+        let args: Vec<Term> = self.x_regs()?[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("undef arg list: {error:?}")))?;
@@ -1008,9 +1019,9 @@ impl Vm {
         let function_atom = global_atoms()
             .intern(function)
             .map_err(|_| VmError::Unsupported("undef function atom".into()))?;
-        p.x[0] = Term::atom(module_atom);
-        p.x[1] = Term::atom(function_atom);
-        p.x[2] = list;
+        self.x_regs()?[0] = Term::atom(module_atom);
+        self.x_regs()?[1] = Term::atom(function_atom);
+        self.x_regs()?[2] = list;
         self.call_named(p, &handler, "undefined_function", 3, ctx)
     }
 
@@ -1042,7 +1053,7 @@ impl Vm {
             arity.saturating_mul(2).saturating_add(8),
             self.reg_prefix(arity)?,
         )?;
-        let args = p.x[..arity].to_vec();
+        let args = self.x_regs()?[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("breakpoint arg list: {error:?}")))?;
@@ -1052,9 +1063,9 @@ impl Vm {
         let function_atom = global_atoms()
             .intern(function)
             .map_err(|_| VmError::Unsupported("breakpoint function atom".into()))?;
-        p.x[0] = Term::atom(module_atom);
-        p.x[1] = Term::atom(function_atom);
-        p.x[2] = list;
+        self.x_regs()?[0] = Term::atom(module_atom);
+        self.x_regs()?[1] = Term::atom(function_atom);
+        self.x_regs()?[2] = list;
         self.call_named(p, &handler, "breakpoint", 3, ctx)
     }
 
@@ -1068,17 +1079,18 @@ impl Vm {
         if arity + 1 >= crate::proc_create::ATTACHED_X_REGS {
             return Err(self.exception(p, "system_limit"));
         }
-        p.x.ensure_x(arity + 2);
-        if p.x[arity].as_atom().is_none() || p.x[arity + 1].as_atom().is_none() {
+        if self.x_regs()?[arity].as_atom().is_none()
+            || self.x_regs()?[arity + 1].as_atom().is_none()
+        {
             // Port of erts/emulator/beam/beam_common.c:1543-1550 (fixed_apply), OTP-29.1.1.
             let words = arity
                 .checked_mul(2)
                 .ok_or_else(|| self.exception(p, "system_limit"))?;
             p.ensure_objv(words, self.reg_prefix(arity + 2)?)?;
-            let module_term = p.x[arity];
-            let function_term = p.x[arity + 1];
+            let module_term = self.x_regs()?[arity];
+            let function_term = self.x_regs()?[arity + 1];
             let arguments = TermBuilder::new(&mut p.heap)
-                .list_from_iter(p.x[..arity].iter().copied())
+                .list_from_iter(self.x_regs()?[..arity].iter().copied())
                 .map_err(|error| VmError::Unsupported(format!("apply args {error:?}")))?;
             return Err(exceptions::bif_error(
                 p,
@@ -1088,8 +1100,8 @@ impl Vm {
                 BifError::BADARG,
             ));
         }
-        let module_term = p.x[arity];
-        let function_term = p.x[arity + 1];
+        let module_term = self.x_regs()?[arity];
+        let function_term = self.x_regs()?[arity + 1];
         let module_atom = module_term.as_atom();
         let function_atom = function_term.as_atom();
         let module_atom = module_atom.expect("checked apply module");
@@ -1135,11 +1147,17 @@ impl Vm {
     ) -> Result<ImportOutcome, VmError> {
         let original_position = p.position_marker();
         let original_gc_live = p.gc_live;
-        let original_operands = [p.x[0], p.x[1], p.x[2]];
+        let original_operands = [self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]];
         let (module_term, function_term, arguments_term, target) = if arity == 2 {
-            (p.x[0], p.x[1], p.x[1], Some(p.x[0]))
+            (
+                self.x_regs()?[0],
+                self.x_regs()?[1],
+                self.x_regs()?[1],
+                Some(self.x_regs()?[0]),
+            )
         } else {
-            let (module, function, arguments) = unwrap_nested_apply(p.x[0], p.x[1], p.x[2]);
+            let (module, function, arguments) =
+                unwrap_nested_apply(self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]);
             (module, function, arguments, None)
         };
         let named = if arity == 3 {
@@ -1185,8 +1203,7 @@ impl Vm {
                 BifError::SystemLimit,
             ));
         }
-        p.x.ensure_x(args.len() + 1);
-        p.x[..args.len()].copy_from_slice(&args);
+        self.x_regs()?[..args.len()].copy_from_slice(&args);
         if named.is_some_and(|(module, function)| {
             global_atoms().text(module) == Some("erlang")
                 && global_atoms().text(function) == Some("apply")
@@ -1258,7 +1275,7 @@ impl Vm {
         if matches!(&result, Err(VmError::Dirty(_))) || reexec_apply {
             // Only a yield that re-executes this apply may restore its argument registers; a yield after the
             // callee returned (reductions exhausted, ip advanced) must keep the result in x0.
-            p.x[..operand_len].copy_from_slice(&operand_buf[..operand_len]);
+            self.x_regs()?[..operand_len].copy_from_slice(&operand_buf[..operand_len]);
             p.gc_live = original_gc_live;
         } else if result.is_ok() {
             // The deferred collector runs before the next instruction. A completed callee
@@ -1318,7 +1335,8 @@ impl Vm {
     pub(super) fn fun_info_mfa(&self, p: &mut Process) -> Result<Term, VmError> {
         p.ensure_objv(4, self.reg_prefix(1)?)?;
         // SAFETY: X0 retains the fun throughout this BIF; tuple construction cannot collect.
-        let view = unsafe { p.x[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
+        let view =
+            unsafe { self.x_regs()?[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
         let (module, name, arity) = match view {
             FunRef::Local { entry, .. } => {
                 (entry.module, self.fun_function_name(entry), entry.arity)
@@ -1375,11 +1393,11 @@ impl Vm {
     pub(super) fn fun_info(&self, p: &mut Process, keyed: bool) -> Result<Term, VmError> {
         // Port of erts/emulator/beam/erl_bif_info.c:3912 (fun_info_2), OTP-29.1.1.
         p.ensure_objv(1024, self.reg_prefix(usize::from(keyed) + 1)?)?;
-        let fun = p.x[0];
+        let fun = self.x_regs()?[0];
         // SAFETY: X0 retains the fun throughout construction; no collection follows.
         let view = unsafe { fun.fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
         let requested = if keyed {
-            Some(atom_name(p.x[1]).ok_or_else(|| self.exception(p, "badarg"))?)
+            Some(atom_name(self.x_regs()?[1]).ok_or_else(|| self.exception(p, "badarg"))?)
         } else {
             None
         };
@@ -1493,7 +1511,7 @@ impl Vm {
 /// `{badfun, Fun}` for a fun whose code is no longer loaded.
 fn badfun_reason(p: &mut Process, reg: &mut [Term], arity: usize) -> Result<Term, VmError> {
     p.ensure_objv(3, &mut reg[..arity + 1])?;
-    let fun = p.x[arity];
+    let fun = reg[arity];
     let kind = global_atoms()
         .intern("badfun")
         .map_err(|_| VmError::Unsupported("exception atom".into()))?;
