@@ -18,11 +18,13 @@ pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_op;
 pub(crate) mod erl_bif_os;
 pub(crate) mod erl_bif_re;
+pub(crate) mod erl_bif_unique;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_iolist;
 pub(crate) mod erl_iolist_generic;
 pub(crate) mod erl_map;
+pub(crate) mod erl_time_sup;
 // Port of erts/emulator/beam/erl_math.c, OTP-29.1.1.
 pub(crate) mod erl_math;
 pub(crate) mod erl_process;

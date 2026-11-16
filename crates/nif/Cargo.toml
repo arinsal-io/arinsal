@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 arinsal-term.workspace = true
+arinsal-sched.workspace = true
 arinsal-bifs.workspace = true
 arinsal-external = { path = "../external" }
 arinsal-maps.workspace = true

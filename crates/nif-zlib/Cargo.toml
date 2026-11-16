@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 arinsal-bifs.workspace = true
 arinsal-term.workspace = true
+arinsal-sched.workspace = true
 arinsal-etf.workspace = true
 num-traits.workspace = true
 libc = "0.2.175"

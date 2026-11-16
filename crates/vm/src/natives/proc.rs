@@ -3332,11 +3332,11 @@ fn suspend_core(
         atoms::FALSE
     });
     let reference = if outcome.sync {
-        let id = arinsal_bifs::next_ref_id();
+        let id = arinsal_sched::unique::next_ref_id();
         Some(
             Term::local_ref(
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                arinsal_bifs::ordinary_ref_words(id),
+                arinsal_sched::unique::ordinary_ref_words(id),
             )
             .map_err(|error| VmError::Unsupported(format!("suspend reference: {error:?}")))?,
         )

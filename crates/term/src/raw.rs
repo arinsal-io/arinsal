@@ -6,12 +6,62 @@
 //! [`Tuple`], [`boxed_header`]); it is public so that BIF loops outside this crate can walk
 //! lists and tuples with erts-shaped code while staying in safe Rust.
 
-use crate::{ARITY, BIN_REF, HEAP_BITS, HeapAlloc, SUB_BITS, Term, TermError};
+use crate::{ARITY, BIN_REF, HEAP_BITS, HeapAlloc, ProcessHeap, SUB_BITS, Term, TermError};
 use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 
 pub mod magic_bin;
+
+/// Allocate an ordinary local reference before invoking the callback that returns its numbers.
+// Port of erts/emulator/beam/erl_bif_unique.c (`make_ref_0`), OTP-29.1.1.
+pub fn local_ref_with_ids(
+    heap: &mut (impl HeapAlloc + ?Sized),
+    ids: impl FnOnce() -> [u32; 3],
+) -> Option<Term> {
+    let ptr = heap.alloc_with_extra(3, 0)?;
+    Some(write_local_ref(ptr, ids()))
+}
+
+/// Process-heap `HAlloc` and fragment fallback, followed by the scheduler reference operation.
+// Port of erts/emulator/beam/erl_bif_unique.c (`make_ref_0`), OTP-29.1.1.
+pub fn local_ref_with_process_heap(heap: &mut ProcessHeap, ids: impl FnOnce() -> [u32; 3]) -> Term {
+    let ptr = heap
+        .alloc_halloc(3)
+        .unwrap_or_else(|| heap.heap_fragment(3));
+    write_local_ref(ptr, ids())
+}
+
+/// Write an ordinary or PID reference into a caller-reserved heap object.
+// Port of erts/emulator/beam/erl_term.h (`write_ref_thing`, `write_pid_ref_thing`), OTP-29.1.1.
+pub(crate) fn write_ref_thing(ptr: *mut u64, ids: [u32; 3], pid_data: Option<u64>) {
+    // SAFETY: `ptr` is reserved for exactly three ordinary-ref words or four PID-ref words by
+    // `Term::local_ref_with_pid` before this function is called.
+    unsafe {
+        *ptr = if pid_data.is_some() {
+            crate::PID_REF_THING_HEADER
+        } else {
+            crate::REF_THING_HEADER
+        };
+        *ptr.add(1) = ((ids[0] as u64) << 32) | 0xffff_ffff;
+        *ptr.add(2) = ((ids[2] as u64) << 32) | ids[1] as u64;
+        if let Some(pid_data) = pid_data {
+            *ptr.add(3) = pid_data;
+        }
+    }
+}
+
+#[inline]
+fn write_local_ref(ptr: *mut u64, ids: [u32; 3]) -> Term {
+    // Port of erts/emulator/beam/erl_term.h (`write_ref_thing`), OTP-29.1.1.
+    // SAFETY: both callers reserve exactly three writable heap words before calling this helper.
+    unsafe {
+        *ptr = crate::REF_THING_HEADER;
+        *ptr.add(1) = ((ids[0] as u64) << 32) | 0xffff_ffff;
+        *ptr.add(2) = ((ids[2] as u64) << 32) | ids[1] as u64;
+    }
+    Term::from_ptr(ptr, 2)
+}
 
 /// Rebuilds a term from its tagged word after it has been held by the ETF work stack.
 ///

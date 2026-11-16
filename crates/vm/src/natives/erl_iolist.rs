@@ -94,8 +94,11 @@ pub(crate) fn create_holder<T: arinsal_term::MagicPayload>(
     holder: T,
     c_size: usize,
 ) -> Option<Term> {
-    let state: MagicBin =
-        MagicBin::with_erts_payload_size_and_refn(holder, c_size, arinsal_bifs::next_ref_words());
+    let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
+        holder,
+        c_size,
+        arinsal_sched::unique::next_ref_words(),
+    );
     let mref = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap).magic_ref(state).ok()?

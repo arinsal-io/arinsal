@@ -1628,10 +1628,9 @@ fn internal_state_tuple_get(
         let (Some(first), Some(second)) = (owned_uint(first), owned_uint(second)) else {
             return Err(badarg());
         };
-        let value = match arinsal_bifs::debug_make_unique_integer(first, second) {
-            arinsal_bifs::UniqueInt::Small(value) => BigInt::from(value),
-            arinsal_bifs::UniqueInt::Big(value) => value,
-        };
+        let value = BigInt::from(arinsal_sched::unique::debug_make_unique_integer(
+            first, second,
+        ));
         return from_owned(
             &OwnedTerm::BigInt(value),
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
@@ -3182,7 +3181,7 @@ fn internal_state_set(
             let owner = arinsal_term::MagicBin::with_erts_payload_size_and_refn(
                 EmptyMagicRef,
                 0,
-                arinsal_bifs::ordinary_ref_words(process.next_ref()),
+                arinsal_sched::unique::ordinary_ref_words(process.next_ref()),
             );
             let address = arinsal_term::MagicBin::as_ptr(&owner) as usize;
             let reference = TermBuilder::new(&mut process.heap)

@@ -108,9 +108,6 @@ pub(super) struct Executor {
     pub(super) current_process: crate::natives::nif::CurrentProcess,
     /// The scheduler thread's hub is bound to `current_process`.
     pub(super) hub_bound: bool,
-    /// The reference and unique-integer counters of this scheduler, bound on its first turn
-    /// (`esdp->ref`, `esdp->unique`): a process scheduled in takes them from here.
-    pub(super) ref_state: Option<arinsal_bifs::SchedulerRefState>,
     pub(super) vm: Vm,
     /// Native register backing is scheduler-local, as required by x19.
     pub(super) native_registers: SchedulerRegisters,
@@ -508,7 +505,6 @@ pub(super) fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
     Box::new(Executor {
         current_process: Default::default(),
         hub_bound: false,
-        ref_state: None,
         vm: Vm::shared_replica(&runtime.paths),
         native_registers: {
             let mut registers = SchedulerRegisters::default();

@@ -1812,7 +1812,7 @@ fn start(
     let _ = (vm, port);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
-        .local_ref(arinsal_bifs::ordinary_ref_words(reference))
+        .local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
         .map_err(|_| badarg())
 }
 
@@ -1964,7 +1964,7 @@ fn start_dyn_driver(
         drv_port.expect_init_ack();
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         return TermBuilder::new(&mut heap)
-            .local_ref(arinsal_bifs::ordinary_ref_words(reference))
+            .local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
             .map_err(|_| badarg());
     }
     Ok(port)
@@ -2464,7 +2464,7 @@ fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
     };
     let mut heap = ProcessHeap::with_words(16);
     let Ok(reference) =
-        TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
+        TermBuilder::new(&mut heap).local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
     else {
         return;
     };
@@ -2489,7 +2489,7 @@ struct VmHooks {
 
 impl arinsal_drv::SystemHooks for VmHooks {
     fn monotonic_nanos(&self) -> i128 {
-        arinsal_bifs::monotonic_time_nanos()
+        arinsal_sched::erl_time_sup::monotonic_time_nanos()
     }
 
     fn time_offset_nanos(&self) -> i128 {
@@ -2498,7 +2498,7 @@ impl arinsal_drv::SystemHooks for VmHooks {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as i128;
-            wall - arinsal_bifs::monotonic_time_nanos()
+            wall - arinsal_sched::erl_time_sup::monotonic_time_nanos()
         })
     }
 
@@ -2735,8 +2735,8 @@ fn notify_links_monitors(
         let name = monitor.info().port_name();
         let mut heap = ProcessHeap::with_words(32);
         if reason.is_pointer() {
-            let Ok(reference_term) =
-                TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
+            let Ok(reference_term) = TermBuilder::new(&mut heap)
+                .local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
             else {
                 continue;
             };

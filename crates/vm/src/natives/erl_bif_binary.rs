@@ -426,7 +426,7 @@ impl SearchWalk {
         let bin = MagicBin::with_orig_size_and_refn(
             (*self.pattern).clone(),
             orig_size,
-            arinsal_bifs::next_ref_words(),
+            arinsal_sched::unique::next_ref_words(),
         );
         self.pattern = SearchPatternHandle::Shared(bin.clone());
         bin
@@ -983,7 +983,7 @@ fn compile_pattern_result<H: HeapAlloc + ?Sized>(
         .magic_ref(MagicBin::with_orig_size_and_refn(
             compiled,
             orig_size,
-            arinsal_bifs::next_ref_words(),
+            arinsal_sched::unique::next_ref_words(),
         ))
         .map_err(|_| BifError::SystemLimit)?;
     TermBuilder::new(heap)
@@ -1360,7 +1360,7 @@ fn binary_find(
         let bin = MagicBin::with_erts_payload_size_and_refn(
             FindHolder::new(search),
             ERTS_BINARY_FIND_CONTEXT_SIZE,
-            arinsal_bifs::next_ref_words(),
+            arinsal_sched::unique::next_ref_words(),
         );
         let refs = {
             let mut heap = ProcessHeapHandle(&mut process.heap);

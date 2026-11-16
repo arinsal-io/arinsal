@@ -276,7 +276,7 @@ impl Runtime {
 
     #[inline]
     pub(crate) fn next_ref(&self) -> u64 {
-        arinsal_bifs::next_ref_id()
+        arinsal_sched::unique::next_ref_id()
     }
 
     /// The scheduler once it exists; unlike [`Runtime::scheduler`] a missing one builds no error.

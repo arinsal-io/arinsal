@@ -206,7 +206,7 @@ pub(crate) fn make_resource<T: arinsal_term::MagicPayload>(
         .magic_ref(MagicBin::with_orig_size_and_refn(
             payload,
             orig_size,
-            arinsal_bifs::next_ref_words(),
+            arinsal_sched::unique::next_ref_words(),
         ))
         .map_err(|_| BifError::SystemLimit)
 }

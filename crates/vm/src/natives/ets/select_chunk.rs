@@ -250,7 +250,7 @@ pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> MagicBin {
     MagicBin::with_erts_payload_size_and_refn(
         MatchProgRef(Arc::clone(program)),
         program.erts_magic_payload_size(),
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     )
 }
 

@@ -1,21 +1,14 @@
 //! Pure BIFs implemented against stable heap terms.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
     BinaryRef, ExternalBinary, HeapAlloc, MagicBin, Node, Term, TermBuilder, TermError, TermKind,
-    global_atoms,
 };
-use num_bigint::{BigInt, Sign};
 
 use crate::{BifError, Ctx};
 
 const BADARG: BifError = BifError::BADARG;
-
-use crate::unique::next_ref_words;
-pub use crate::unique::{next_ref_id, next_unique_monotonic};
 
 pub(super) struct Heap<'a, H: HeapAlloc + ?Sized>(pub(super) &'a mut H);
 impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
@@ -101,23 +94,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn supports_magic(&self) -> bool {
         self.0.supports_magic()
     }
-}
-
-pub(super) fn lookup<V: crate::BifTableVisitor>(
-    module: &str,
-    name: &str,
-    arity: u8,
-    v: &mut V,
-) -> Option<V::Output> {
-    let f = match (module, name, arity) {
-        ("erlang", "make_ref", 0) => v.entry::<bodies::make_ref>(),
-        ("erlang", "unique_integer", 0 | 1) => v.entry::<bodies::unique_integer>(),
-        ("erlang" | "os", "system_time", 0 | 1) => v.entry::<bodies::system_time>(),
-        ("erts_internal", "time_unit" | "perf_counter_unit", 0) => v.entry::<bodies::time_unit>(),
-        _ => return None,
-    };
-    // A registry entry must correspond to the supported OTP release.
-    arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
 }
 
 pub(super) fn integer(ctx: &mut Ctx<'_>, value: usize) -> Result<Term, BifError> {
@@ -210,12 +186,6 @@ fn for_each_cons(
     } else {
         Ok(())
     }
-}
-
-pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .tuple(values)
-        .expect("infallible BIF heap")
 }
 
 /// Resume state of `erlang:phash2/1,2`.
@@ -342,110 +312,6 @@ pub fn phash2_immediate_1(term: Term) -> Option<Term> {
     Some(Term::small(i64::from(hash & ((1 << 27) - 1))).expect("27-bit phash2 is a small"))
 }
 
-fn make_ref_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_unique.c:821-833 (make_ref_0), OTP-29.1.1.
-    // `erts_sched_make_ref_in_buffer` writes the three words straight into the
-    // heap buffer; the id is not packed and unpacked on the way.
-    Term::local_ref(&mut ctx.heap, next_ref_words()).map_err(|_| BifError::SystemLimit)
-}
-
-/// `erlang:unique_integer/0` and `/1` counter step, before the term is built.
-// Port of erts/emulator/beam/erl_bif_unique.c:835-871 (unique_integer_0/1), OTP-29.1.1.
-pub fn eval_unique_integer(args: &[Term]) -> Result<crate::unique::UniqueInt, BifError> {
-    let mut positive = false;
-    let mut monotonic = false;
-    if let Some(options) = args.first() {
-        let positive_atom = unique_flag_atom("positive");
-        let monotonic_atom = unique_flag_atom("monotonic");
-        // The option list is walked in place. Building a `Vec` for `[positive]`
-        // is not what `unique_integer_1` does.
-        for_each_cons(*options, |option| match option.as_atom() {
-            Some(atom) if atom == positive_atom => {
-                positive = true;
-                Ok(())
-            }
-            Some(atom) if atom == monotonic_atom => {
-                monotonic = true;
-                Ok(())
-            }
-            _ => Err(BADARG),
-        })?;
-    }
-    if monotonic {
-        return if positive {
-            let value = crate::unique::next_unique_monotonic_positive();
-            if let Ok(small) = i64::try_from(value) {
-                Ok(crate::unique::UniqueInt::Small(small))
-            } else {
-                Ok(crate::unique::UniqueInt::Big(BigInt::from(value)))
-            }
-        } else {
-            Ok(crate::unique::UniqueInt::Small(next_unique_monotonic()))
-        };
-    }
-    Ok(crate::unique::next_unique_integer(positive))
-}
-
-fn unique_flag_atom(name: &'static str) -> arinsal_term::Atom {
-    static POSITIVE: OnceLock<arinsal_term::Atom> = OnceLock::new();
-    static MONOTONIC: OnceLock<arinsal_term::Atom> = OnceLock::new();
-    let slot = if name == "positive" {
-        &POSITIVE
-    } else {
-        &MONOTONIC
-    };
-    *slot.get_or_init(|| global_atoms().intern(name).expect("unique_integer flag"))
-}
-
-fn unique_integer_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_unique.c:835-871 (unique_integer_0/1), OTP-29.1.1.
-    match eval_unique_integer(args)? {
-        crate::unique::UniqueInt::Small(value) => {
-            Ok(Term::small(value).expect("unique integer small"))
-        }
-        crate::unique::UniqueInt::Big(value) => TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .int_from_bigint(&value)
-            .map_err(|_| BifError::SystemLimit),
-    }
-}
-fn system_time_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let units_per_second = if let Some(unit) = args.first() {
-        if let Some(name) = atom_name(*unit) {
-            // Port of erts/emulator/beam/erl_time_sup.c:2277 (time_unit_conversion), OTP-29.1.1.
-            // Plural atoms (`nano_seconds` and the rest) are aliases of the singular units.
-            BigInt::from(match name {
-                "native" | "nanosecond" | "nano_seconds" => 1_000_000_000,
-                "microsecond" | "micro_seconds" => 1_000_000,
-                "millisecond" | "milli_seconds" => 1_000,
-                "second" | "seconds" => 1,
-                _ => return Err(BADARG),
-            })
-        } else {
-            let value = bigint(*unit)?;
-            if value.sign() != Sign::Plus {
-                return Err(BADARG);
-            }
-            value
-        }
-    } else {
-        BigInt::from(1_000_000_000)
-    };
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| BifError::SystemLimit)?;
-    let value = BigInt::from(elapsed.as_nanos()) * units_per_second / 1_000_000_000_u64;
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .int_from_bigint(&value)
-        .map_err(|_| BifError::SystemLimit)
-}
-fn time_unit_result(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    Ok(Term::small(1_000_000_000).expect("small time unit"))
-}
-
-#[inline]
-pub(super) fn atom_name(term: Term) -> Option<&'static str> {
-    global_atoms().text(term.as_atom()?)
-}
 /// Copy a byte-aligned binary's significant bytes for a VM continuation.
 pub fn binary_bytes(term: Term) -> Result<Vec<u8>, BifError> {
     let bits = bitstring_bit_len(term)?;
@@ -676,35 +542,4 @@ pub fn bitstring_bit_len(term: Term) -> Result<usize, BifError> {
 pub(crate) fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
     // SAFETY: The source heap remains live throughout the BIF call.
     unsafe { term.cons_ref() }.ok_or(BADARG)
-}
-pub(super) fn bigint(term: Term) -> Result<BigInt, BifError> {
-    if let Some(n) = term.as_small() {
-        return Ok(BigInt::from(n));
-    }
-    // SAFETY: The number heap remains live for this call.
-    unsafe { term.big_ref() }
-        .map(|view| view.to_bigint())
-        .ok_or(BADARG)
-}
-macro_rules! word_adapter {
-    ($name:ident, $result:ident) => {
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
-            match $result(ctx, args) {
-                Ok(value) => value,
-                Err(error) => ctx.fail(error),
-            }
-        }
-    };
-}
-
-word_adapter!(make_ref, make_ref_result);
-word_adapter!(unique_integer, unique_integer_result);
-word_adapter!(system_time, system_time_result);
-word_adapter!(time_unit, time_unit_result);
-
-crate::word_bif_bodies_in!(word_bodies;
-    make_ref, unique_integer, system_time, time_unit
-);
-mod bodies {
-    pub(super) use super::word_bodies::*;
 }

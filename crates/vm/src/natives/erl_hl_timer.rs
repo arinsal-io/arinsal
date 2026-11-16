@@ -154,7 +154,7 @@ fn bif_timer(
         .as_small()
         .ok_or_else(|| badarg_cause(function, arity, "time"))?;
     let ms = if absolute {
-        let now = arinsal_bifs::monotonic_time_milliseconds();
+        let now = arinsal_sched::erl_time_sup::monotonic_time_milliseconds();
         (i128::from(time) - now).clamp(0, i128::from(u64::MAX)) as u64
     } else {
         u64::try_from(time).map_err(|_| badarg_cause(function, arity, "time"))?
@@ -385,7 +385,7 @@ fn await_timer_access(
         }) => OwnedTerm::Ref {
             node: node.clone(),
             creation,
-            ids: arinsal_bifs::ordinary_ref_words(id).to_vec(),
+            ids: arinsal_sched::unique::ordinary_ref_words(id).to_vec(),
         },
         _ => return Err(badarg()),
     };

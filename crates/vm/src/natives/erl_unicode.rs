@@ -932,7 +932,7 @@ fn make_magic_bin_for_restart(process: &mut Process, rc: RestartContext) -> Term
     let bin = arinsal_term::MagicBin::with_erts_payload_size_and_refn(
         RestartHolder::new(rc),
         ERTS_RESTART_CONTEXT_SIZE,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .magic_ref(bin)

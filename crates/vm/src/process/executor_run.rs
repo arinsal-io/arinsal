@@ -30,27 +30,6 @@ impl Executor {
         }
         if !cached {
             process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
-            // Port of erts/emulator/beam/erl_process.h:2595 (erts_proc_sched_data): the process
-            // turn uses the scheduler thread's reference and unique-integer counters.
-            let thr = arinsal_bifs::scheduler_thr_id(
-                ctx.scheduler_id().map(|id| id as u32),
-                ctx.scheduler_count() as u32,
-            );
-            if process
-                .scheduler_ref_state
-                .as_ref()
-                .is_none_or(|state| state.thr_id() != thr)
-            {
-                let state = match self.ref_state {
-                    Some(state) if state.thr_id() == thr => state,
-                    _ => {
-                        let state = arinsal_bifs::bind_scheduler_ref_state(thr);
-                        self.ref_state = Some(state);
-                        state
-                    }
-                };
-                process.scheduler_ref_state = Some(state);
-            }
             process.exec_key = exec_key;
         }
         let schedule_started = crate::natives::erts_debug::long_schedule_monitored(process)

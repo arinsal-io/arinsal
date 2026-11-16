@@ -16,6 +16,7 @@ arinsal-etf.workspace = true
 arinsal-nif-file.workspace = true
 arinsal-nif = { path = "../nif" }
 arinsal-term.workspace = true
+arinsal-sched.workspace = true
 libc = "0.2.175"
 rustix = "1.1.5"
 socket2 = { version = "0.6.0", features = ["all"] }

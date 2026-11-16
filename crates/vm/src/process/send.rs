@@ -622,16 +622,12 @@ impl Process {
     /// at most one slice. A process sending to itself with an on-heap queue copies nothing.
     // Port of erts/emulator/beam/erl_message.c (erts_send_message, the `BUMP_REDS` after
     // `erts_queue_proc_message`), OTP-29.1.1.
-    /// A new reference id from the running scheduler's counter, through the process.
-    // Port of erts/emulator/beam/erl_bif_unique.h:170-177 (erts_sched_make_ref_in_array with
-    // `esdp = erts_proc_sched_data(c_p)`), OTP-29.1.1: no thread lookup. A process that has not
-    // been scheduled yet falls back to the thread's counters.
+    /// A new reference id from the running scheduler's `ErtsSchedulerData`.
+    // Port of erts/emulator/beam/erl_bif_unique.h:170-177 (`erts_sched_make_ref_in_array`),
+    // OTP-29.1.1.
     #[inline]
     pub(crate) fn next_ref(&self) -> u64 {
-        match self.scheduler_ref_state {
-            Some(state) => state.bump_ref(),
-            None => arinsal_bifs::next_ref_id(),
-        }
+        arinsal_sched::unique::next_ref_id()
     }
 
     /// The running scheduler's native sender: one thread-local read for the first use in a run,

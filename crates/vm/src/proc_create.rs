@@ -417,11 +417,8 @@ pub struct Process {
     pub(crate) scheduler_id: u32,
     /// `RunCtx::scheduler_key` the scheduler-derived state of `Process::run` was set up for.
     pub(crate) run_key: u64,
-    /// The same for `Executor::run`'s per-scheduler state (pid words, reference state).
+    /// The same for `Executor::run`'s scheduler-derived PID words.
     pub(crate) exec_key: u64,
-    /// Reference and `unique_integer` counters of the scheduler running this process.
-    /// Port of `c_p->scheduler_data` (`ref` and `unique`), OTP-29.1.1.
-    pub(crate) scheduler_ref_state: Option<arinsal_bifs::SchedulerRefState>,
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
@@ -2062,7 +2059,6 @@ impl Process {
             on_managed: false,
             native: None,
             scheduler_id: 0,
-            scheduler_ref_state: None,
             run_key: 0,
             exec_key: 0,
             hibernated: false,
@@ -2824,10 +2820,6 @@ mod layout_report {
             "  Process.scheduler_id {}",
             size_of_val(&process.scheduler_id)
         );
-        eprintln!(
-            "  Process.scheduler_ref_state {}",
-            size_of_val(&process.scheduler_ref_state)
-        );
         eprintln!("  Process.hibernated {}", size_of_val(&process.hibernated));
         eprintln!(
             "  Process.signal_probe {}",
@@ -2975,10 +2967,6 @@ mod layout_report {
         field!(
             "native_dirty_nif",
             Option<(usize, usize, arinsal_bifs::SchedulerClass)>
-        );
-        eprintln!(
-            "Option<SchedulerRefState> {}",
-            size_of::<Option<arinsal_bifs::SchedulerRefState>>()
         );
     }
 }

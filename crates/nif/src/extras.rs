@@ -363,7 +363,7 @@ pub extern "C" fn enif_make_monitor_term(e: *mut ErlNifEnv, m: *const [u8; 32]) 
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
     let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
-        .local_ref(arinsal_bifs::ordinary_ref_words(id))
+        .local_ref(arinsal_sched::unique::ordinary_ref_words(id))
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
 }
 
@@ -477,18 +477,18 @@ fn convert_nanos(nanos: i128, unit: c_int) -> i64 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_monotonic_time(unit: c_int) -> i64 {
-    convert_nanos(arinsal_bifs::monotonic_time_nanos(), unit)
+    convert_nanos(arinsal_sched::erl_time_sup::monotonic_time_nanos(), unit)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_time_offset(unit: c_int) -> i64 {
-    match arinsal_bifs::time_offset_nanos_value() {
+    match arinsal_sched::erl_time_sup::time_offset_nanos_value() {
         Some(offset) => convert_nanos(offset, unit),
         None => i64::MIN,
     }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_now_time(e: *mut ErlNifEnv) -> Term {
-    let Ok(micros) = arinsal_bifs::next_now_micros() else {
+    let Some(micros) = arinsal_sched::erl_time_sup::next_now_micros() else {
         return terms::enif_make_badarg(e);
     };
     let parts = [
@@ -521,25 +521,21 @@ pub extern "C" fn enif_cpu_time(e: *mut ErlNifEnv) -> Term {
 pub extern "C" fn enif_make_unique_integer(e: *mut ErlNifEnv, properties: c_int) -> Term {
     let positive = properties & 1 != 0;
     if properties & 2 != 0 {
-        if positive {
-            let value = arinsal_bifs::next_unique_monotonic_positive();
-            return match i64::try_from(value) {
-                Ok(small) => terms::enif_make_long(e, small),
-                Err(_) => terms::enif_make_ulong(e, value),
-            };
-        }
-        return terms::enif_make_long(e, arinsal_bifs::next_unique_monotonic());
+        let value = if positive {
+            arinsal_sched::unique::next_unique_monotonic_positive()
+        } else {
+            arinsal_sched::unique::next_unique_monotonic()
+        };
+        let env = deref_mut(e);
+        return TermBuilder::new(&mut env.heap)
+            .int_from_i128(value)
+            .unwrap_or_else(|_| terms::enif_make_badarg(e));
     }
-    match arinsal_bifs::next_unique_integer(positive) {
-        arinsal_bifs::UniqueInt::Small(value) => terms::enif_make_long(e, value),
-        arinsal_bifs::UniqueInt::Big(value) => {
-            // SAFETY: the NIF passes its live environment.
-            let env = deref_mut(e);
-            TermBuilder::new(&mut env.heap)
-                .int_from_bigint(&value)
-                .unwrap_or_else(|_| terms::enif_make_badarg(e))
-        }
-    }
+    let value = arinsal_sched::unique::next_unique_integer(positive);
+    let env = deref_mut(e);
+    TermBuilder::new(&mut env.heap)
+        .int_from_i128(value)
+        .unwrap_or_else(|_| terms::enif_make_badarg(e))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_getenv(key: *const c_char, value: *mut c_char, size: *mut usize) -> c_int {

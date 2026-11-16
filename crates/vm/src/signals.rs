@@ -447,7 +447,7 @@ const FLUSH_MONITOR_CONTINUATION: &str = "erts_internal:flush_monitor_messages/3
 
 pub(crate) fn reference(process: &mut Process, id: u64) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    Term::local_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id))
+    Term::local_ref(&mut heap, arinsal_sched::unique::ordinary_ref_words(id))
         .map_err(|error| VmError::Unsupported(format!("reference allocation: {error:?}")))
 }
 
@@ -458,17 +458,23 @@ pub(crate) fn pid_reference(process: &mut Process, id: u64, owner: Pid) -> Resul
     let owner = owner
         .to_term()
         .ok_or_else(|| VmError::Unsupported("PID reference owner is not representable".into()))?;
-    Term::local_pid_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id), owner)
-        .map_err(|error| VmError::Unsupported(format!("PID reference allocation: {error:?}")))
+    Term::local_pid_ref(
+        &mut heap,
+        arinsal_sched::unique::ordinary_ref_words(id),
+        owner,
+    )
+    .map_err(|error| VmError::Unsupported(format!("PID reference allocation: {error:?}")))
 }
 
 pub(crate) fn ref_id(term: Term) -> Option<u64> {
     if let Some(ids) = term.local_ref_numbers() {
-        return Some(arinsal_bifs::ordinary_ref_key(ids));
+        return Some(arinsal_sched::unique::ordinary_ref_key(ids));
     }
     match term.identity()? {
         arinsal_term::Identity::Ref { ids, .. } if ids.len() == 3 && ids[2] != u32::MAX => {
-            Some(arinsal_bifs::ordinary_ref_key([ids[0], ids[1], ids[2]]))
+            Some(arinsal_sched::unique::ordinary_ref_key([
+                ids[0], ids[1], ids[2],
+            ]))
         }
         _ => None,
     }

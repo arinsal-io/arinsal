@@ -578,7 +578,7 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         pid: &arinsal_etf::OwnedTerm,
         make_target: &mut dyn FnMut(u64) -> arinsal_nif::ResourceMonitor,
     ) -> Option<u64> {
-        let id = arinsal_bifs::next_ref_id();
+        let id = arinsal_sched::unique::next_ref_id();
         let monitor = Arc::new(make_target(id));
         let target = owned_local_pid(pid)?;
         let hub = hub_for_pid(target)?;

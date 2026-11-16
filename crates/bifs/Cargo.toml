@@ -15,6 +15,7 @@ arinsal-args.workspace = true
 rustix = { version = "1.1.5", features = ["system"] }
 arinsal-spec.workspace = true
 arinsal-term.workspace = true
+arinsal-sched.workspace = true
 arinsal-etf.workspace = true
 arinsal-arith.workspace = true
 arinsal-maps.workspace = true

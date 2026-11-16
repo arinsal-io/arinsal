@@ -108,7 +108,7 @@ fn new_magic_ref<T: arinsal_term::MagicPayload>(
     let owner = MagicBin::with_erts_payload_size_and_refn(
         payload,
         payload_size,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     let mut heap = ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
@@ -521,7 +521,7 @@ mod tests {
                 .magic_ref(MagicBin::with_erts_payload_size_and_refn(
                     payload,
                     24,
-                    arinsal_bifs::next_ref_words(),
+                    arinsal_sched::unique::next_ref_words(),
                 ))
                 .unwrap()
         };

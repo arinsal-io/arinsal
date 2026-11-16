@@ -251,7 +251,7 @@ pub extern "C" fn enif_monitor_process(
         let Some(rm) = resource.monitors.as_ref() else {
             return -1;
         };
-        let id = arinsal_bifs::next_ref_id();
+        let id = arinsal_sched::unique::next_ref_id();
         // The monitor handle is optional (the caller may pass NULL).
         if !monitor.is_null() {
             // The NIF passes a writable monitor buffer when it is non-NULL.

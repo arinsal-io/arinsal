@@ -59,13 +59,13 @@ struct Reply {
 pub(crate) fn reference_term(process: &mut Process, reference: u64) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
-        .local_ref(arinsal_bifs::ordinary_ref_words(reference))
+        .local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
         .map_err(|_| badarg())
 }
 
 impl Reply {
     fn new(to: Pid, scheduler: Arc<Scheduler<Process>>) -> (Self, u64) {
-        let reference = arinsal_bifs::next_ref_id();
+        let reference = arinsal_sched::unique::next_ref_id();
         (
             Reply {
                 to,
@@ -87,8 +87,8 @@ impl Reply {
             return;
         };
         let reference = self.reference;
-        let Ok(reference) =
-            TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
+        let Ok(reference) = TermBuilder::new(&mut heap)
+            .local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
         else {
             return;
         };

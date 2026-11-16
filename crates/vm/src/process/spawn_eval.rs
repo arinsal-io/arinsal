@@ -382,7 +382,7 @@ impl Vm {
                 };
                 // `erts_no_schedulers` is what `system_info(schedulers)` reports; a run with fewer
                 // worker threads than that keeps the layout of the reported scheduler count.
-                arinsal_bifs::init_unique_scheduler_count(
+                arinsal_sched::unique::init_unique_scheduler_count(
                     config.workers.max(crate::natives::sys::schedulers_total()) as u32,
                     config.dirty_cpu_schedulers as u32,
                     config.dirty_io_schedulers as u32,

@@ -154,7 +154,7 @@ pub(crate) struct ReferenceOrder;
 impl KeyOrder for ReferenceOrder {
     fn compare(left: u64, right: u64) -> Ordering {
         let bytes = |reference: u64| {
-            arinsal_bifs::ordinary_ref_words(reference)
+            arinsal_sched::unique::ordinary_ref_words(reference)
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
         };
@@ -2827,7 +2827,7 @@ mod tests {
         for reference in 0..64u64 {
             let (origin, target) = TestMonitor::create(
                 node_type::MONITOR_PROC,
-                MonitorReference::ordinary(arinsal_bifs::ordinary_ref_key([
+                MonitorReference::ordinary(arinsal_sched::unique::ordinary_ref_key([
                     reference as u32,
                     1,
                     0,
@@ -2840,7 +2840,11 @@ mod tests {
             );
             origins.insert(origin);
             targets.insert(target);
-            sent.push(arinsal_bifs::ordinary_ref_key([reference as u32, 1, 0]));
+            sent.push(arinsal_sched::unique::ordinary_ref_key([
+                reference as u32,
+                1,
+                0,
+            ]));
         }
         check_tree(&origins);
         assert_eq!(targets.iter().count(), 64);
@@ -2908,8 +2912,8 @@ mod tests {
 
     #[test]
     fn reference_order_is_memcmp_of_the_reference_words() {
-        let low = arinsal_bifs::ordinary_ref_key([0x0100, 0, 0]);
-        let high = arinsal_bifs::ordinary_ref_key([0x0001, 0, 0]);
+        let low = arinsal_sched::unique::ordinary_ref_key([0x0100, 0, 0]);
+        let high = arinsal_sched::unique::ordinary_ref_key([0x0001, 0, 0]);
         // Little-endian memcmp: the low byte of the first word decides first.
         assert_eq!(ReferenceOrder::compare(low, high), Ordering::Less);
     }

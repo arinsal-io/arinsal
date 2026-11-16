@@ -23,28 +23,16 @@ use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, NativeAbi, Node, Process
 
 mod pure;
 mod sys;
-mod time;
-mod unique;
 
 pub use pure::{
     Phash2Cont, Phash2Run, binary_bytes, bitstring_bit_len, copy_binary_range,
-    copy_bitstring_range, copy_bitstring_range_to, eval_unique_integer, for_each_list_term,
-    next_ref_id, next_unique_monotonic, phash2_immediate_1, phash2_range_arg,
-    phash2_run_1_after_immediate_check, phash2_run_2, phash2_slice, proper_list_terms,
-    singleton_bitstring, tuple_arity, tuple_element, tuple_pair, tuple_terms, with_binary_bytes,
-};
-pub use time::{
-    monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
-    time_offset_nanos_value,
-};
-pub use unique::{
-    SchedulerRefState, UniqueInt, bind_scheduler_ref_state, debug_make_unique_integer,
-    init_unique_scheduler_count, next_ref_words, next_unique_integer,
-    next_unique_monotonic_positive, ordinary_ref_key, ordinary_ref_words, scheduler_thr_id,
+    copy_bitstring_range, copy_bitstring_range_to, for_each_list_term, phash2_immediate_1,
+    phash2_range_arg, phash2_run_1_after_immediate_check, phash2_run_2, phash2_slice,
+    proper_list_terms, singleton_bitstring, tuple_arity, tuple_element, tuple_pair, tuple_terms,
+    with_binary_bytes,
 };
 
 pub use sys::{os_info_init, os_type, os_version, sys_perf_counter};
-pub use time::initialize_time_origin;
 
 /// Exception class, as in `erlang:raise/3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,13 +466,7 @@ pub fn visit_bif<V: BifTableVisitor>(
     arity: u8,
     visitor: &mut V,
 ) -> Option<V::Output> {
-    if let Some(found) = time::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
     if let Some(found) = sys::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
-    if let Some(found) = pure::lookup(module, name, arity, visitor) {
         return Some(found);
     }
     None

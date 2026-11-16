@@ -146,7 +146,7 @@ fn run(
                         let state = MagicBin::with_erts_payload_size_and_refn(
                             TrapContext::new(Some(run)),
                             ERTS_REGEX_RESTART_CONTEXT_SIZE,
-                            arinsal_bifs::next_ref_words(),
+                            arinsal_sched::unique::next_ref_words(),
                         );
                         crate::bif_traps::vbump_all_reds(process);
                         match TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))

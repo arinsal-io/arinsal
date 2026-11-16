@@ -634,10 +634,8 @@ pub extern "C" fn enif_make_copy(e: *mut ErlNifEnv, t: Term) -> Term {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_ref(e: *mut ErlNifEnv) -> Term {
-    let id = arinsal_bifs::next_ref_id();
-    built(env(e), |b| {
-        b.local_ref(arinsal_bifs::ordinary_ref_words(id))
-    })
+    Term::local_ref_with_ids(&mut env(e).heap, arinsal_sched::unique::next_ref_words)
+        .unwrap_or_else(|| enif_make_badarg(e))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_badarg(e: *mut ErlNifEnv) -> Term {

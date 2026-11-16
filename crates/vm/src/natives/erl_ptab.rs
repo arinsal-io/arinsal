@@ -188,7 +188,7 @@ fn ptab_list(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, processes: bool) ->
     let state = MagicBin::with_erts_payload_size_and_refn(
         TrapContext::new(state),
         ERTS_PTAB_LIST_STATE_SIZE,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     let mut accumulator = Term::NIL;
     let done = if reds_left < MIN_START_REDS {

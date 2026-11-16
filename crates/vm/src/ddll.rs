@@ -266,7 +266,7 @@ fn add_proc(handle: &mut DeHandle, pid: Pid, awaiting: Awaiting, dereferenced: b
     let reference = if awaiting == Awaiting::Loaded {
         0
     } else {
-        arinsal_bifs::next_ref_id()
+        arinsal_sched::unique::next_ref_id()
     };
     handle.procs.insert(
         0,
@@ -459,7 +459,7 @@ fn load_error(code: i32) -> O {
 
 fn notice_term(heap: &mut ProcessHeap, notice: &Notice) -> Option<Term> {
     let reference = TermBuilder::new(heap)
-        .local_ref(arinsal_bifs::ordinary_ref_words(notice.reference))
+        .local_ref(arinsal_sched::unique::ordinary_ref_words(notice.reference))
         .ok()?;
     let tag = match notice.error {
         None => crate::atom_cache::put(notice.tag),
@@ -1049,7 +1049,7 @@ pub(crate) fn monitor(
         }
     };
     let (kind, tag) = immediate.expect("immediate notification");
-    let reference = crate::signals::reference(process, arinsal_bifs::next_ref_id())?;
+    let reference = crate::signals::reference(process, arinsal_sched::unique::next_ref_id())?;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let message = TermBuilder::new(&mut heap)
         .tuple(&[

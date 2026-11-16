@@ -2295,7 +2295,7 @@ fn call_event_scope(
             if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
                 && let Some(bdt) = hit.time.as_ref()
             {
-                let time = arinsal_bifs::monotonic_time_raw_nanos();
+                let time = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
                 prev = crate::trace_bp::trace_call_acc(
                     process,
                     pid,
@@ -4106,11 +4106,11 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
         .ok();
     }
     let monotonic = TermBuilder::new(&mut heap)
-        .int_from_i128(arinsal_bifs::monotonic_time_nanos())
+        .int_from_i128(arinsal_sched::erl_time_sup::monotonic_time_nanos())
         .ok()?;
     if flags & STRICT_MONOTONIC_TIMESTAMP != 0 {
         let unique = TermBuilder::new(&mut heap)
-            .int_from_i64(arinsal_bifs::next_unique_monotonic())
+            .int_from_i128(arinsal_sched::unique::next_unique_monotonic())
             .ok()?;
         return TermBuilder::new(&mut heap).tuple(&[monotonic, unique]).ok();
     }
@@ -4298,7 +4298,7 @@ pub(crate) fn session_handle(process: &Process, session: u64) -> arinsal_term::M
             breakpoints,
         },
         248,
-        arinsal_bifs::ordinary_ref_words(process.next_ref()),
+        arinsal_sched::unique::ordinary_ref_words(process.next_ref()),
     );
     let magic_id = handle.id();
     session_handle_ids()

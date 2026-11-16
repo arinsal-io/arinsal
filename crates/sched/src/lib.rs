@@ -57,6 +57,7 @@
 //! ```
 
 mod balance;
+pub mod erl_time_sup;
 mod mailbox;
 mod ports;
 mod proc_ref;
@@ -69,6 +70,7 @@ mod thr_progress;
 mod thr_queue;
 mod timer;
 pub mod twheel;
+pub mod unique;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
@@ -10301,6 +10303,10 @@ fn schedule_next<T: Task>(
 }
 
 fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
+    // Port of erts/emulator/beam/erl_process.c (init_scheduler_data): `ref` and `unique`
+    // belong to this scheduler thread for its lifetime.
+    let bif_scheduler_data = unique::ErtsSchedulerData::new_normal(id as u32 + 1);
+    let _bif_scheduler_binding = bif_scheduler_data.bind();
     inner.sleepers[id]
         .set(thread::current())
         .expect("worker registers once");
@@ -10561,6 +10567,16 @@ fn wakeup_other_check<T: Task>(inner: &Inner<T>, local: &mut Local<T>) {
 /// Port of erts/emulator/beam/erl_process.c:9600 (erts_schedule for dirty schedulers) and
 /// erl_process.c:3404 (scheduler_wait on a dirty run queue), OTP-29.1.1.
 fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: usize) {
+    // Port of erts/emulator/beam/erl_process.c:8830, 8880 (`sched_dirty_cpu_thread_func`,
+    // `sched_dirty_io_thread_func`): CPU IDs follow normal schedulers; IO IDs follow CPU ones.
+    let normal_schedulers = unique::normal_scheduler_count();
+    let thr_id = normal_schedulers
+        + match kind {
+            DirtyKind::Cpu => index as u32 + 1,
+            DirtyKind::Io => inner.config.dirty_cpu_schedulers as u32 + index as u32 + 1,
+        };
+    let bif_scheduler_data = unique::ErtsSchedulerData::new_dirty(thr_id);
+    let _bif_scheduler_binding = bif_scheduler_data.bind();
     SCHEDULER_TYPE.with(|current| current.set(kind.into()));
     // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1: a dirty
     // scheduler uses instance 0 unless dirty allocator instances are configured.

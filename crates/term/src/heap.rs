@@ -5796,6 +5796,26 @@ impl Term {
         Self::local_ref_with_pid(heap, ids, None)
     }
 
+    /// Allocate an ordinary local reference before obtaining its scheduler counter values.
+    // Port of erts/emulator/beam/erl_bif_unique.c (`make_ref_0`), OTP-29.1.1.
+    #[inline]
+    pub fn local_ref_with_ids(
+        heap: &mut (impl HeapAlloc + ?Sized),
+        ids: impl FnOnce() -> [u32; 3],
+    ) -> Option<Self> {
+        crate::raw::local_ref_with_ids(heap, ids)
+    }
+
+    /// Allocate an ordinary local reference with process `HAlloc` and heap-fragment fallback.
+    // Port of erts/emulator/beam/erl_bif_unique.c (`make_ref_0`), OTP-29.1.1.
+    #[inline]
+    pub fn local_ref_with_process_heap(
+        heap: &mut ProcessHeap,
+        ids: impl FnOnce() -> [u32; 3],
+    ) -> Self {
+        crate::raw::local_ref_with_process_heap(heap, ids)
+    }
+
     /// Construct a local PID reference with its three reference numbers and creator PID.
     ///
     /// Port of erts/emulator/beam/erl_term.h:905-919 (`write_pid_ref_thing`), OTP-29.1.1.
@@ -5837,20 +5857,7 @@ impl Term {
         }
         let words = if pid_data.is_some() { 4 } else { 3 };
         let p = heap.alloc(words).ok_or(TermError::HeapFull)?;
-        // SAFETY: the allocation reserves the exact ordinary or PID-ref thing size, matching
-        // the 64-bit little-endian ErtsORefThing/ErtsPRefThing layouts.
-        unsafe {
-            *p = if pid_data.is_some() {
-                crate::PID_REF_THING_HEADER
-            } else {
-                crate::REF_THING_HEADER
-            };
-            *p.add(1) = ((ids[0] as u64) << 32) | 0xffff_ffff;
-            *p.add(2) = ((ids[2] as u64) << 32) | ids[1] as u64;
-            if let Some(pid_data) = pid_data {
-                *p.add(3) = pid_data;
-            }
-        }
+        crate::raw::write_ref_thing(p, ids, pid_data);
         Ok(Term::from_ptr(p, 2))
     }
 }

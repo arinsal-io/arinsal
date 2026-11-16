@@ -161,14 +161,11 @@ fn function_at(index: usize) -> Option<Bif> {
     Some(raw::bif_at(address))
 }
 
-use crate::native_helpers::{
-    make_ref_light, persistent_term_get_1_light, persistent_term_get_2_light,
-    unique_integer_0_light, unique_integer_1_light,
-};
+use crate::native_helpers::{persistent_term_get_1_light, persistent_term_get_2_light};
 use crate::natives::{
     bif_phash2, binary, erl_arith, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
-    erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_hl_timer, erl_iolist, erl_map,
-    erl_math, erl_process_dict, erl_ptab, erl_unicode, external, register,
+    erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_bif_unique, erl_hl_timer, erl_iolist,
+    erl_map, erl_math, erl_process_dict, erl_ptab, erl_time_sup, erl_unicode, external, register,
 };
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
@@ -251,6 +248,42 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "md5_init", 0) => bif!(erl_bif_chksum::md5_init_0),
         ("erlang", "md5_update", 2) => bif!(erl_bif_chksum::md5_update_2),
         ("erlang", "md5_final", 1) => bif!(erl_bif_chksum::md5_final_1),
+        // erl_bif_unique.c
+        ("erlang", "make_ref", 0) => bif!(erl_bif_unique::make_ref_0),
+        ("erlang", "unique_integer", 0) => bif!(erl_bif_unique::unique_integer_0),
+        ("erlang", "unique_integer", 1) => bif!(erl_bif_unique::unique_integer_1),
+        // erl_time_sup.c and its clock/calendar BIFs
+        ("erlang", "monotonic_time", 0) => bif!(erl_time_sup::monotonic_time_0),
+        ("erlang", "monotonic_time", 1) => bif!(erl_time_sup::monotonic_time_1),
+        ("erlang", "system_time", 0) => bif!(erl_time_sup::system_time_0),
+        ("erlang", "system_time", 1) => bif!(erl_time_sup::system_time_1),
+        ("os", "system_time", 0) => bif!(erl_time_sup::os_system_time_0),
+        ("os", "system_time", 1) => bif!(erl_time_sup::os_system_time_1),
+        ("erlang", "time_offset", 0) => bif!(erl_time_sup::time_offset_0),
+        ("erlang", "time_offset", 1) => bif!(erl_time_sup::time_offset_1),
+        ("erlang", "timestamp", 0) => bif!(erl_time_sup::timestamp_0),
+        ("os", "timestamp", 0) => bif!(erl_time_sup::os_timestamp_0),
+        ("erlang", "now", 0) => bif!(erl_time_sup::now_0),
+        ("erlang", "time", 0) => bif!(erl_time_sup::time_0),
+        ("erlang", "date", 0) => bif!(erl_time_sup::date_0),
+        ("erlang", "localtime", 0) => bif!(erl_time_sup::localtime_0),
+        ("erlang", "universaltime", 0) => bif!(erl_time_sup::universaltime_0),
+        ("erlang", "localtime_to_universaltime", 2) => {
+            bif!(erl_time_sup::localtime_to_universaltime_2)
+        }
+        ("erlang", "universaltime_to_localtime", 1) => {
+            bif!(erl_time_sup::universaltime_to_localtime_1)
+        }
+        ("erlang", "universaltime_to_posixtime", 1) => {
+            bif!(erl_time_sup::universaltime_to_posixtime_1)
+        }
+        ("erlang", "posixtime_to_universaltime", 1) => {
+            bif!(erl_time_sup::posixtime_to_universaltime_1)
+        }
+        ("erts_internal", "time_unit", 0) => bif!(erl_time_sup::time_unit_0),
+        ("erts_internal", "perf_counter_unit", 0) => {
+            bif!(erl_time_sup::perf_counter_unit_0)
+        }
         // erl_bif_atomics.c
         ("erts_internal", "atomics_new", 2) => bif!(erl_bif_atomics::atomics_new_2),
         ("atomics", "put", 3) => bif!(erl_bif_atomics::atomics_put_3),
@@ -475,9 +508,6 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "binary_part", 3) | ("binary", "part", 3) => {
             bif!(erl_bif_binary::binary_part_3)
         }
-        ("erlang", "make_ref", 0) => bif!(make_ref_light),
-        ("erlang", "unique_integer", 0) => bif!(unique_integer_0_light),
-        ("erlang", "unique_integer", 1) => bif!(unique_integer_1_light),
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
         ("erlang", "node", 0) => bif!(crate::dist::node_0),
         ("erlang", "node", 1) => bif!(crate::dist::node_1),

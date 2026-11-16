@@ -85,7 +85,7 @@ where
     let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         TrapContext::new(context),
         c_size,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .magic_ref(state)

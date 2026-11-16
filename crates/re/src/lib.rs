@@ -989,7 +989,7 @@ fn compiled_magic_term(
     let owner = MagicBin::with_erts_payload_size_and_refn(
         RegexHandle(code.into_raw()),
         8,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     let fields = [
         atom_term("re_pattern")?,
@@ -1065,7 +1065,7 @@ fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifErro
         .magic_ref(MagicBin::with_erts_payload_size_and_refn(
             RegexHandle(code.into_raw()),
             8,
-            arinsal_bifs::next_ref_words(),
+            arinsal_sched::unique::next_ref_words(),
         ))
         .map_err(|_| BifError::SystemLimit)?;
     terms.push(reference);

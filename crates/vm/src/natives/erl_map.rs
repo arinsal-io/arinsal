@@ -640,7 +640,7 @@ fn create_state_mref<T: arinsal_term::MagicPayload>(
     let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         state,
         c_payload_size,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     let mut heap = ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap).magic_ref(state).map_err(|_| {

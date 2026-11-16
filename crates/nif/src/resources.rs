@@ -482,7 +482,7 @@ pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_
         size.max(1),
         DATA_ALIGN,
         orig_size,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     crate::raw::give_resource_count(bin)
 }

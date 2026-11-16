@@ -1263,7 +1263,7 @@ pub(crate) fn native_breakpoint_accounting(
         if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
             && let Some(bdt) = bp.time.as_ref()
         {
-            let time = arinsal_bifs::monotonic_time_raw_nanos();
+            let time = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
             prev = trace_call_acc(process, pid, bp.session, false, entry.ci, time, bdt);
         }
         if bp_flags & BPF_MEM_TRACE_ACTIVE != 0
@@ -2185,7 +2185,7 @@ pub(crate) fn call_trace_return(
                 let pbt = &pbt_list(process, false)[pbt_index];
                 (pbt.ci, pbt.accumulator)
             };
-            let time = arinsal_bifs::monotonic_time_raw_nanos();
+            let time = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
             // Might have been removed by trace_pattern(false).
             if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, pbt_index, ci, false)) {
                 bdt.accum(pid, 0, time - accumulator);
@@ -2219,7 +2219,7 @@ pub(crate) fn call_trace_return(
 /// accounting.
 // Port of erts/emulator/beam/beam_bp.c:2017-2073 (erts_schedule_time_break), OTP-29.1.1.
 pub(crate) fn schedule_time_break(process: &mut Process, pid: Pid, out: bool) {
-    let now = arinsal_bifs::monotonic_time_raw_nanos();
+    let now = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
     let entries = pbt_list(process, false).clone();
     if out {
         // When a process is scheduled out, add its delta to the previous breakpoint.

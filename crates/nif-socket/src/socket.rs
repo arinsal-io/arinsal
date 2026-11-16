@@ -417,7 +417,7 @@ fn reference(
             ctype,
         },
         SOCKET_MAGIC_ORIG_SIZE,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     let reference = O::MagicRef(arinsal_term::magic_handle(magic.clone()));
     let h = Sock(magic);

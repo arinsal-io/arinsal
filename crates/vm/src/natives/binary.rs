@@ -404,7 +404,7 @@ fn create_state(process: &mut crate::Process, walk: B2lState) -> Option<Term> {
     let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         B2lHolder::new(walk),
         ERTS_B2L_STATE_SIZE,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     );
     let mut heap = ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap).magic_ref(state).ok()

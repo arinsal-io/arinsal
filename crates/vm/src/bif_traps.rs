@@ -48,7 +48,7 @@ fn magic_binary_state<T: arinsal_term::MagicPayload>(
     MagicBin::with_erts_payload_size_and_refn(
         payload,
         c_payload_size,
-        arinsal_bifs::next_ref_words(),
+        arinsal_sched::unique::next_ref_words(),
     )
 }
 

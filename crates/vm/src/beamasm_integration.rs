@@ -112,17 +112,6 @@ impl NativeTargetCache {
     }
 }
 
-/// A BIF whose hot path is the scheduler-local counter in `erl_bif_unique.c`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SchedulerCounterBif {
-    /// `erlang:make_ref/0`.
-    MakeRef,
-    /// `erlang:unique_integer/0`.
-    Unique0,
-    /// `erlang:unique_integer/1`.
-    Unique1,
-}
-
 #[derive(Clone)]
 #[repr(C)]
 pub(crate) struct DispatchTarget {
@@ -147,8 +136,6 @@ pub(crate) struct DispatchTarget {
     /// The BIF a light BIF call runs straight away: set when it neither traps nor runs in
     /// the executor nor on the table fast path, so the call checks one word.
     pub light_bif: Option<arinsal_bifs::BifFn>,
-    /// `make_ref/0` or `unique_integer/0,1`, which bump the scheduler's own counter.
-    pub scheduler_counter: Option<SchedulerCounterBif>,
     /// The process BIF a light BIF call runs straight away, for a native that needs only its
     /// process (see `natives::ProcessBif`); the executor still runs it for interpreted code.
     pub light_process_bif: Option<crate::natives::ProcessBif>,
@@ -302,16 +289,6 @@ impl DispatchRegistry {
             leaked.light_bif = leaked
                 .bif
                 .filter(|_| leaked.direct_ets.is_none() && !leaked.runs_in_executor());
-            leaked.scheduler_counter = match (
-                leaked.module.as_str(),
-                leaked.function.as_str(),
-                leaked.arity,
-            ) {
-                ("erlang", "make_ref", 0) => Some(SchedulerCounterBif::MakeRef),
-                ("erlang", "unique_integer", 0) => Some(SchedulerCounterBif::Unique0),
-                ("erlang", "unique_integer", 1) => Some(SchedulerCounterBif::Unique1),
-                _ => None,
-            };
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
             // OTP-29.1.1: erts calls every BIF from the generated code with `c_p`, so a native
             // that needs only its process is called the same way.
@@ -594,7 +571,6 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
             class,
             native_bits: bits,
             light_bif: None,
-            scheduler_counter: None,
             light_process_bif: None,
         })
     })?;
@@ -660,7 +636,6 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
                 class,
                 native_bits: bits,
                 light_bif: None,
-                scheduler_counter: None,
                 light_process_bif: None,
             })
         })?;
@@ -702,7 +677,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             class,
             native_bits: bits,
             light_bif: None,
-            scheduler_counter: None,
             light_process_bif: None,
         })
     }));
@@ -746,7 +720,6 @@ fn publish_module(
                 class,
                 native_bits: bits,
                 light_bif: None,
-                scheduler_counter: None,
                 light_process_bif: None,
             })
         });

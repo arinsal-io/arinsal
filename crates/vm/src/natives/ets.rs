@@ -1940,7 +1940,7 @@ fn fix_table<H: HeapAlloc>(heap: &mut H, table: &mut Table, caller: Term) -> Res
         ])
         .map_err(|_| system_limit())?;
     let monotonic_time = TermBuilder::new(heap)
-        .int_from_i128(arinsal_bifs::monotonic_time_nanos())
+        .int_from_i128(arinsal_sched::erl_time_sup::monotonic_time_nanos())
         .map_err(|_| system_limit())?;
     table
         .safe_fixtable_for_at(caller, true, system_time, monotonic_time)
@@ -2918,10 +2918,10 @@ fn call_inner(
     } else {
         RegistryAccess::Shared(rt.ets.read().unwrap())
     };
-    let table_refn =
-        (function == EtsBif::New).then(|| arinsal_bifs::ordinary_ref_words(process.next_ref()));
+    let table_refn = (function == EtsBif::New)
+        .then(|| arinsal_sched::unique::ordinary_ref_words(process.next_ref()));
     let match_program_refn = (function == EtsBif::MatchSpecCompile)
-        .then(|| arinsal_bifs::ordinary_ref_words(process.next_ref()));
+        .then(|| arinsal_sched::unique::ordinary_ref_words(process.next_ref()));
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     match (function, args) {
         (EtsBif::New, [name, options]) => {
@@ -3526,7 +3526,7 @@ fn call_inner(
             // one registry, so one reply carries them and the rest are empty.
             // `ets:all/0` waits for `erlang:system_info(schedulers)` replies.
             let id = rt.next_ref();
-            let reference = Term::local_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id))
+            let reference = Term::local_ref(&mut heap, arinsal_sched::unique::ordinary_ref_words(id))
                 .map_err(|_| badarg())?;
             let tables = live_table_terms(&registry, &mut heap)?;
             let table_list = TermBuilder::new(&mut heap)

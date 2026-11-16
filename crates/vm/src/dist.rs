@@ -782,7 +782,9 @@ fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
         return None;
     };
     if ids.len() >= 3 {
-        return Some(arinsal_bifs::ordinary_ref_key([ids[0], ids[1], ids[2]]));
+        return Some(arinsal_sched::unique::ordinary_ref_key([
+            ids[0], ids[1], ids[2],
+        ]));
     }
     let mut value = 0_u64;
     for (index, id) in ids.iter().take(2).enumerate() {
@@ -1087,7 +1089,7 @@ fn notify_auto_connect(
             OwnedTerm::Ref {
                 node: local_name,
                 creation: local_creation,
-                ids: arinsal_bifs::ordinary_ref_words(entry_ref).to_vec(),
+                ids: arinsal_sched::unique::ordinary_ref_words(entry_ref).to_vec(),
             },
         ]),
     ]);
@@ -1882,7 +1884,7 @@ fn dist_spawn_request(
     let options = owned(args[2])?;
     let option_terms = crate::signals::list(args[2]).ok_or_else(badarg)?;
     let kind = atom_name(args[3]).ok_or_else(badarg)?;
-    let id = arinsal_bifs::next_ref_id();
+    let id = arinsal_sched::unique::next_ref_id();
     let reference = crate::signals::reference(process, id)?;
     let reference_owned = owned(reference)?;
     let mut tag = OwnedTerm::Atom("spawn_reply".into());
@@ -3045,7 +3047,7 @@ pub(crate) fn monitor_remote(
     if matches!(&target, OwnedTerm::Tuple(parts) if parts.len() == 2) && !node_tables::is_alive() {
         return Err(badarg());
     }
-    let id = arinsal_bifs::next_ref_id();
+    let id = arinsal_sched::unique::next_ref_id();
     let reference = if alias_mode.is_some() {
         crate::signals::pid_reference(process, id, ctx.pid())?
     } else {

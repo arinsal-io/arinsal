@@ -230,7 +230,11 @@ pub extern "C" fn enif_ioq_peek_head(
         let Some(external) = arinsal_term::ExternalBinary::new::<NifBinary>(
             entry.iov_base.cast(),
             entry.iov_len,
-            MagicBin::with_orig_size_and_refn(held, orig_size, arinsal_bifs::next_ref_words()),
+            MagicBin::with_orig_size_and_refn(
+                held,
+                orig_size,
+                arinsal_sched::unique::next_ref_words(),
+            ),
         ) else {
             return 0;
         };
